@@ -30,7 +30,7 @@ clap = { version = "4", features = ["derive"] }
 rust-ini = "0.21"
 
 # Window / Graphics
-sdl2 = { version = "0.37", features = ["raw-window-handle"] }
+sdl2 = { version = "0.37", features = ["raw-window-handle", "bundled", "static-link"] }
 vulkano = "0.34"
 raw-window-handle = "0.6"
 
