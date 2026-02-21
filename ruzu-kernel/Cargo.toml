@@ -1,0 +1,17 @@
+[package]
+name = "ruzu-kernel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ruzu-common.workspace = true
+ruzu-cpu.workspace = true
+ruzu-loader.workspace = true
+log.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+bitflags.workspace = true
+byteorder.workspace = true
+bytemuck.workspace = true
+memmap2.workspace = true
+parking_lot.workspace = true

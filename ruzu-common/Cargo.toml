@@ -1,0 +1,10 @@
+[package]
+name = "ruzu-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
+bitflags.workspace = true
+bytemuck.workspace = true

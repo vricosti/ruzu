@@ -1,0 +1,11 @@
+[package]
+name = "ruzu-loader"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ruzu-common.workspace = true
+log.workspace = true
+thiserror.workspace = true
+byteorder.workspace = true
+bytemuck.workspace = true
