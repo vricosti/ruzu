@@ -1,0 +1,22 @@
+[package]
+name = "ruzu"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ruzu"
+path = "src/main.rs"
+
+[dependencies]
+ruzu-common.workspace = true
+ruzu-loader.workspace = true
+ruzu-cpu.workspace = true
+ruzu-kernel.workspace = true
+ruzu-service.workspace = true
+ruzu-gpu.workspace = true
+clap.workspace = true
+rust-ini.workspace = true
+sdl2.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true

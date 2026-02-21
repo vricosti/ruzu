@@ -1,0 +1,13 @@
+[package]
+name = "ruzu-gpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ruzu-common.workspace = true
+log.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+vulkano.workspace = true
+raw-window-handle.workspace = true
+parking_lot.workspace = true

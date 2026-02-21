@@ -1,0 +1,11 @@
+[package]
+name = "ruzu-cpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ruzu-common.workspace = true
+log.workspace = true
+thiserror.workspace = true
+bytemuck.workspace = true
+parking_lot.workspace = true

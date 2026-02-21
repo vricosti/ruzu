@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    "ruzu",
+    "ruzu-common",
+    "ruzu-loader",
+    "ruzu-cpu",
+    "ruzu-kernel",
+    "ruzu-service",
+    "ruzu-gpu",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+# Internal crates
+ruzu-common = { path = "ruzu-common" }
+ruzu-loader = { path = "ruzu-loader" }
+ruzu-cpu = { path = "ruzu-cpu" }
+ruzu-kernel = { path = "ruzu-kernel" }
+ruzu-service = { path = "ruzu-service" }
+ruzu-gpu = { path = "ruzu-gpu" }
+
+# CLI / Config
+clap = { version = "4", features = ["derive"] }
+rust-ini = "0.21"
+
+# Window / Graphics
+sdl2 = { version = "0.37", features = ["raw-window-handle"] }
+vulkano = "0.34"
+raw-window-handle = "0.6"
+
+# Core
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+anyhow = "1"
+bitflags = "2"
+byteorder = "1"
+bytemuck = { version = "1", features = ["derive"] }
+memmap2 = "0.9"
+parking_lot = "0.12"
