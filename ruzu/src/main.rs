@@ -240,31 +240,76 @@ fn load_xci_game(path: &PathBuf, keys: &mut KeyManager) -> Result<(nro::CodeSet,
 fn run_headless(kernel: &mut KernelCore) -> Result<()> {
     info!("Starting CPU execution (headless)...");
 
-    let max_steps = 1_000_000;
-    let step = 0;
+    run_cpu_loop(kernel)
+}
 
-    while !kernel.should_stop && step < max_steps {
+/// Core CPU execution loop using the ARM64 interpreter.
+fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
+    use ruzu_cpu::interpreter::Interpreter;
+    use ruzu_cpu::state::{CpuExecutor, HaltReason};
+    use ruzu_kernel::svc::dispatch_svc;
+
+    let mut interp = Interpreter::new();
+
+    loop {
         let process = match kernel.process_mut() {
             Some(p) => p,
             None => break,
         };
 
-        let thread = match process.current_thread_mut() {
-            Some(t) => t,
-            None => {
+        // Use index-based access for split borrows: threads[idx] and memory.
+        let idx = match process.current_thread_idx() {
+            Some(i) if !process.threads[i].is_terminated() => i,
+            _ => {
                 info!("No runnable threads, stopping");
                 break;
             }
         };
 
-        if thread.is_terminated() {
-            info!("Main thread terminated");
-            break;
+        // Run the interpreter until it halts.
+        let reason = interp.run(&mut process.threads[idx].cpu_state, &mut process.memory);
+
+        match reason {
+            HaltReason::Svc(n) => {
+                // Clone CPU state for SVC dispatch, then write back.
+                let mut cpu = kernel.process().unwrap()
+                    .current_thread().unwrap().cpu_state.clone();
+                dispatch_svc(kernel, &mut cpu, n);
+                if let Some(process) = kernel.process_mut() {
+                    if let Some(thread) = process.current_thread_mut() {
+                        thread.cpu_state = cpu;
+                    }
+                }
+            }
+            HaltReason::ExternalHalt => {
+                info!("CPU externally halted");
+                break;
+            }
+            HaltReason::DataAbort { addr } => {
+                log::error!(
+                    "Data abort at 0x{:016X} (PC=0x{:016X})",
+                    addr,
+                    kernel.process().map(|p| p.current_thread()
+                        .map(|t| t.cpu_state.pc).unwrap_or(0)).unwrap_or(0)
+                );
+                break;
+            }
+            HaltReason::InstructionAbort { addr } => {
+                log::error!("Instruction abort at 0x{:016X}", addr);
+                break;
+            }
+            HaltReason::Breakpoint => {
+                info!("Breakpoint hit");
+                break;
+            }
+            HaltReason::Step => {
+                // Single step complete, continue
+            }
         }
 
-        info!("CPU execution requires Dynarmic FFI backend (not yet linked)");
-        info!("Infrastructure is ready: kernel, process, thread, SVCs, memory");
-        break;
+        if kernel.should_stop {
+            break;
+        }
     }
 
     Ok(())
@@ -272,6 +317,9 @@ fn run_headless(kernel: &mut KernelCore) -> Result<()> {
 
 /// Run with SDL2 window and Vulkan renderer.
 fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
+    use ruzu_cpu::interpreter::Interpreter;
+    use ruzu_cpu::state::{CpuExecutor, HaltReason};
+    use ruzu_kernel::svc::dispatch_svc;
     use window::{EmulatorWindow, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 
     let mut emu_window =
@@ -279,6 +327,8 @@ fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
 
     info!("Window created, entering main loop");
     info!("Press ESC or close window to exit");
+
+    let mut interp = Interpreter::new();
 
     loop {
         if !emu_window.poll_events() {
@@ -290,7 +340,45 @@ fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
             break;
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(16));
+        // Run CPU for a batch of instructions per frame.
+        let process = match kernel.process_mut() {
+            Some(p) => p,
+            None => break,
+        };
+
+        // Use index-based access for split borrows: threads[idx] and memory.
+        let idx = match process.current_thread_idx() {
+            Some(i) if !process.threads[i].is_terminated() => i,
+            _ => {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                continue;
+            }
+        };
+
+        let reason = interp.run(&mut process.threads[idx].cpu_state, &mut process.memory);
+
+        match reason {
+            HaltReason::Svc(n) => {
+                let mut cpu = kernel.process().unwrap()
+                    .current_thread().unwrap().cpu_state.clone();
+                dispatch_svc(kernel, &mut cpu, n);
+                if let Some(process) = kernel.process_mut() {
+                    if let Some(thread) = process.current_thread_mut() {
+                        thread.cpu_state = cpu;
+                    }
+                }
+            }
+            HaltReason::ExternalHalt => break,
+            HaltReason::DataAbort { addr } => {
+                log::error!("Data abort at 0x{:016X}", addr);
+                break;
+            }
+            HaltReason::InstructionAbort { addr } => {
+                log::error!("Instruction abort at 0x{:016X}", addr);
+                break;
+            }
+            _ => {}
+        }
     }
 
     Ok(())

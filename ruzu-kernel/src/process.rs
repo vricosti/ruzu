@@ -320,6 +320,21 @@ impl KProcess {
         }
     }
 
+    /// Get the index of the current thread (running or first runnable).
+    ///
+    /// This enables split borrows: callers can use `process.threads[idx]` and
+    /// `process.memory` simultaneously without conflicting borrows.
+    pub fn current_thread_idx(&self) -> Option<usize> {
+        self.threads
+            .iter()
+            .position(|t| t.state == crate::thread::ThreadState::Running)
+            .or_else(|| {
+                self.threads
+                    .iter()
+                    .position(|t| t.state == crate::thread::ThreadState::Runnable)
+            })
+    }
+
     /// Add a client session handle for a service.
     pub fn add_client_session(&mut self, service_name: &str) -> anyhow::Result<Handle> {
         let session = KClientSession::new(service_name.to_string());
