@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 ruzu-common.workspace = true
+ruzu-crypto.workspace = true
 ruzu-loader.workspace = true
 ruzu-cpu.workspace = true
 ruzu-kernel.workspace = true
