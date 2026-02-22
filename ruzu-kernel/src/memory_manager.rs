@@ -770,6 +770,65 @@ impl MemoryManager {
 }
 
 // ---------------------------------------------------------------------------
+// MemoryAccess trait implementation (bridge to ruzu-cpu interpreter)
+// ---------------------------------------------------------------------------
+
+impl ruzu_cpu::memory::MemoryAccess for MemoryManager {
+    fn read_u8(&self, addr: u64) -> Result<u8, ruzu_cpu::memory::MemoryFault> {
+        MemoryManager::read_u8(self, addr).map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr))
+    }
+
+    fn read_u16(&self, addr: u64) -> Result<u16, ruzu_cpu::memory::MemoryFault> {
+        MemoryManager::read_u16(self, addr).map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr))
+    }
+
+    fn read_u32(&self, addr: u64) -> Result<u32, ruzu_cpu::memory::MemoryFault> {
+        MemoryManager::read_u32(self, addr).map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr))
+    }
+
+    fn read_u64(&self, addr: u64) -> Result<u64, ruzu_cpu::memory::MemoryFault> {
+        MemoryManager::read_u64(self, addr).map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr))
+    }
+
+    fn read_u128(&self, addr: u64) -> Result<u128, ruzu_cpu::memory::MemoryFault> {
+        // Read as two u64s (little-endian).
+        let lo = MemoryManager::read_u64(self, addr)
+            .map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr))?;
+        let hi = MemoryManager::read_u64(self, addr + 8)
+            .map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr + 8))?;
+        Ok((lo as u128) | ((hi as u128) << 64))
+    }
+
+    fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ruzu_cpu::memory::MemoryFault> {
+        MemoryManager::write_u8(self, addr, val)
+            .map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr))
+    }
+
+    fn write_u16(&mut self, addr: u64, val: u16) -> Result<(), ruzu_cpu::memory::MemoryFault> {
+        MemoryManager::write_u16(self, addr, val)
+            .map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr))
+    }
+
+    fn write_u32(&mut self, addr: u64, val: u32) -> Result<(), ruzu_cpu::memory::MemoryFault> {
+        MemoryManager::write_u32(self, addr, val)
+            .map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr))
+    }
+
+    fn write_u64(&mut self, addr: u64, val: u64) -> Result<(), ruzu_cpu::memory::MemoryFault> {
+        MemoryManager::write_u64(self, addr, val)
+            .map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr))
+    }
+
+    fn write_u128(&mut self, addr: u64, val: u128) -> Result<(), ruzu_cpu::memory::MemoryFault> {
+        // Write as two u64s (little-endian).
+        MemoryManager::write_u64(self, addr, val as u64)
+            .map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr))?;
+        MemoryManager::write_u64(self, addr + 8, (val >> 64) as u64)
+            .map_err(|_| ruzu_cpu::memory::MemoryFault::Unmapped(addr + 8))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
