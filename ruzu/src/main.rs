@@ -130,21 +130,7 @@ impl IpcHandler for ServiceBridge {
         let create_sub_session = if !response.handles_to_move.is_empty()
             && response.handles_to_move.iter().any(|&h| h == 0)
         {
-            // Map parent service → child sub-service.
-            match service_name {
-                "vi:m" if cmd_id == 2 => Some("vi:IApplicationDisplayService".to_string()),
-                "vi:IApplicationDisplayService" if cmd_id == 100 => {
-                    Some("vi:IHOSBinderDriver".to_string())
-                }
-                "vi:IApplicationDisplayService"
-                    if cmd_id == 101 || cmd_id == 102 || cmd_id == 103 =>
-                {
-                    Some("vi:IApplicationDisplayService".to_string())
-                }
-                "appletOE" if cmd_id == 0 => Some("IApplicationProxy".to_string()),
-                "lm" if cmd_id == 0 => Some("ILogger".to_string()),
-                _ => None,
-            }
+            get_sub_interface(service_name, cmd_id).map(|s| s.to_string())
         } else {
             None
         };
@@ -164,6 +150,52 @@ impl IpcHandler for ServiceBridge {
                 .copied()
                 .collect(),
         }
+    }
+}
+
+// ── Sub-interface routing table ──────────────────────────────────────────────
+
+/// Map (parent_service, cmd_id) → child sub-interface service name.
+///
+/// Returns `None` if the command does not create a sub-interface.
+fn get_sub_interface(service_name: &str, cmd_id: u32) -> Option<&'static str> {
+    match (service_name, cmd_id) {
+        // AM chain
+        ("appletOE", 0) => Some("IApplicationProxy"),
+        ("IApplicationProxy", 0) => Some("am:ICommonStateGetter"),
+        ("IApplicationProxy", 1) => Some("am:ISelfController"),
+        ("IApplicationProxy", 2) => Some("am:IWindowController"),
+        ("IApplicationProxy", 3) => Some("am:IAudioController"),
+        ("IApplicationProxy", 4) => Some("am:IDisplayController"),
+        ("IApplicationProxy", 11) => Some("am:ILibraryAppletCreator"),
+        ("IApplicationProxy", 20) => Some("am:IApplicationFunctions"),
+        // VI chain
+        ("vi:m", 2) => Some("vi:IApplicationDisplayService"),
+        ("vi:IApplicationDisplayService", 100) => Some("vi:IHOSBinderDriver"),
+        ("vi:IApplicationDisplayService", 101..=103) => {
+            Some("vi:IApplicationDisplayService")
+        }
+        // Audio
+        ("audren:u", 0) => Some("audren:IAudioRenderer"),
+        ("audren:u", 2) => Some("audren:IAudioDevice"),
+        ("audout:u", 1) => Some("audout:IAudioOut"),
+        // Filesystem
+        ("fsp-srv", 18) => Some("fsp:IFileSystem"),
+        ("fsp-srv", 200) => Some("fsp:IStorage"),
+        // Account
+        ("acc:u0", 5) => Some("acc:IProfile"),
+        ("acc:u0", 101) => Some("acc:IBaas"),
+        // Time
+        ("time:u", 0 | 1 | 4) => Some("time:ISystemClock"),
+        ("time:u", 2) => Some("time:ISteadyClock"),
+        ("time:u", 3) => Some("time:ITimeZoneService"),
+        // Network / parental
+        ("pctl:s", 0) => Some("pctl:IParentalControlService"),
+        ("nifm:u", 4) => Some("nifm:IGeneralService"),
+        ("friend:u", 0) => Some("friend:IFriendService"),
+        // Logger
+        ("lm", 0) => Some("ILogger"),
+        _ => None,
     }
 }
 
@@ -237,10 +269,20 @@ fn main() -> Result<()> {
         format.label()
     );
 
-    let (code_set, title_id) = match format {
-        GameFormat::Nro => load_nro_game(&game_path)?,
-        GameFormat::Nsp => load_nsp_game(&game_path, &mut keys)?,
-        GameFormat::Xci => load_xci_game(&game_path, &mut keys)?,
+    let (code_set, title_id, rom_data) = match format {
+        GameFormat::Nro => {
+            let raw = std::fs::read(&game_path).context("Failed to read NRO file")?;
+            let (cs, tid) = load_nro_game_from_data(&raw)?;
+            (cs, tid, Some(raw))
+        }
+        GameFormat::Nsp => {
+            let (cs, tid) = load_nsp_game(&game_path, &mut keys)?;
+            (cs, tid, None)
+        }
+        GameFormat::Xci => {
+            let (cs, tid) = load_xci_game(&game_path, &mut keys)?;
+            (cs, tid, None)
+        }
     };
 
     info!(
@@ -294,7 +336,37 @@ fn main() -> Result<()> {
         };
     }
 
-    // ── Phase 5: Create shared state and wire services ──────────────────
+    // ── Extract romfs data from NRO asset header ──────────────────────────
+    let romfs_data: Option<Arc<Vec<u8>>> = code_set.asset_header.as_ref().and_then(|asset| {
+        if asset.romfs.size == 0 {
+            info!("No romfs section in NRO asset header");
+            return None;
+        }
+        // romfs offset is relative to the asset header start (= NRO file_size).
+        // We need the raw NRO data to extract romfs bytes.
+        let raw = rom_data.as_ref()?;
+        // Find the NRO file_size from the header (at offset 0x18).
+        let nro_file_size = if raw.len() >= 0x1C {
+            u32::from_le_bytes([raw[0x18], raw[0x19], raw[0x1A], raw[0x1B]]) as usize
+        } else {
+            return None;
+        };
+        let romfs_start = nro_file_size + asset.romfs.offset as usize;
+        let romfs_end = romfs_start + asset.romfs.size as usize;
+        if romfs_end <= raw.len() {
+            let data = raw[romfs_start..romfs_end].to_vec();
+            info!("Extracted romfs: {} bytes", data.len());
+            Some(Arc::new(data))
+        } else {
+            log::warn!(
+                "romfs extends past file end: offset=0x{:X}, size=0x{:X}, file_len=0x{:X}",
+                romfs_start, asset.romfs.size, raw.len()
+            );
+            None
+        }
+    });
+
+    // ── Create shared state and wire services ────────────────────────────
 
     let hid_shared_mem = Arc::new(RwLock::new(HidSharedMemory::new()));
     let buffer_queue = Arc::new(RwLock::new(BufferQueue::new()));
@@ -329,12 +401,121 @@ fn main() -> Result<()> {
         "vi:IHOSBinderDriver",
         Box::new(ruzu_service::vi::ViBinderService::new(buffer_queue.clone())),
     );
+    // AM service chain
     manager.register_service("appletOE", Box::new(ruzu_service::am::AmService::new()));
     manager.register_service(
         "IApplicationProxy",
         Box::new(ruzu_service::am::ApplicationProxyService::new()),
     );
-    manager.register_service("fsp-srv", Box::new(ruzu_service::fs::FspSrvService::new()));
+    manager.register_service(
+        "am:ICommonStateGetter",
+        Box::new(ruzu_service::am::CommonStateGetterService::new()),
+    );
+    manager.register_service(
+        "am:ISelfController",
+        Box::new(ruzu_service::am::SelfControllerService::new()),
+    );
+    manager.register_service(
+        "am:IWindowController",
+        Box::new(ruzu_service::am::WindowControllerService::new()),
+    );
+    manager.register_service(
+        "am:IApplicationFunctions",
+        Box::new(ruzu_service::am::ApplicationFunctionsService::new()),
+    );
+    manager.register_service(
+        "am:IAudioController",
+        Box::new(ruzu_service::am::AudioControllerService::new()),
+    );
+    manager.register_service(
+        "am:IDisplayController",
+        Box::new(ruzu_service::am::DisplayControllerService::new()),
+    );
+    manager.register_service(
+        "am:ILibraryAppletCreator",
+        Box::new(ruzu_service::am::LibraryAppletCreatorService::new()),
+    );
+
+    // Filesystem
+    manager.register_service(
+        "fsp-srv",
+        Box::new(ruzu_service::fs::FspSrvService::new_with_romfs(romfs_data.clone())),
+    );
+    if let Some(ref romfs) = romfs_data {
+        manager.register_service(
+            "fsp:IStorage",
+            Box::new(ruzu_service::fs::StorageService::new(romfs.clone())),
+        );
+    } else {
+        manager.register_service(
+            "fsp:IStorage",
+            Box::new(ruzu_service::fs::StorageService::new_empty()),
+        );
+    }
+    manager.register_service(
+        "fsp:IFileSystem",
+        Box::new(ruzu_service::fs::FileSystemService::new()),
+    );
+
+    // Audio
+    manager.register_service("audren:u", Box::new(ruzu_service::audio::AudRendererService::new()));
+    manager.register_service(
+        "audren:IAudioRenderer",
+        Box::new(ruzu_service::audio::AudioRendererService::new()),
+    );
+    manager.register_service(
+        "audren:IAudioDevice",
+        Box::new(ruzu_service::audio::AudioDeviceService::new()),
+    );
+    manager.register_service("audout:u", Box::new(ruzu_service::audio::AudOutService::new()));
+    manager.register_service(
+        "audout:IAudioOut",
+        Box::new(ruzu_service::audio::AudioOutService::new()),
+    );
+
+    // Account
+    manager.register_service("acc:u0", Box::new(ruzu_service::account::AccountService::new()));
+    manager.register_service(
+        "acc:IProfile",
+        Box::new(ruzu_service::account::ProfileService::new()),
+    );
+    manager.register_service("acc:IBaas", Box::new(ruzu_service::account::BaasService::new()));
+
+    // Time
+    manager.register_service("time:u", Box::new(ruzu_service::time::TimeService::new()));
+    manager.register_service(
+        "time:ISystemClock",
+        Box::new(ruzu_service::time::SystemClockService::new()),
+    );
+    manager.register_service(
+        "time:ISteadyClock",
+        Box::new(ruzu_service::time::SteadyClockService::new()),
+    );
+    manager.register_service(
+        "time:ITimeZoneService",
+        Box::new(ruzu_service::time::TimeZoneService::new()),
+    );
+
+    // Network / misc
+    manager.register_service("pctl:s", Box::new(ruzu_service::pctl::PctlService::new()));
+    manager.register_service(
+        "pctl:IParentalControlService",
+        Box::new(ruzu_service::pctl::ParentalControlService::new()),
+    );
+    manager.register_service("nifm:u", Box::new(ruzu_service::nifm::NifmService::new()));
+    manager.register_service(
+        "nifm:IGeneralService",
+        Box::new(ruzu_service::nifm::GeneralNetworkService::new()),
+    );
+    manager.register_service("ssl", Box::new(ruzu_service::ssl::SslService::new()));
+    manager.register_service("nsd:u", Box::new(ruzu_service::nsd::NsdService::new()));
+    manager.register_service("friend:u", Box::new(ruzu_service::friends::FriendsService::new()));
+    manager.register_service(
+        "friend:IFriendService",
+        Box::new(ruzu_service::friends::FriendInterfaceService::new()),
+    );
+
+    // Other
     manager.register_service("set:sys", Box::new(ruzu_service::set::SetSysService::new()));
     manager.register_service("lm", Box::new(ruzu_service::lm::LmService::new()));
     manager.register_service("ILogger", Box::new(ruzu_service::lm::LoggerService::new()));
@@ -364,10 +545,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Load an NRO game file.
-fn load_nro_game(path: &PathBuf) -> Result<(nro::CodeSet, u64)> {
-    let rom_data = std::fs::read(path).context("Failed to read NRO file")?;
-    let code_set = nro::load_nro(&rom_data).context("Failed to parse NRO file")?;
+/// Load an NRO game from raw bytes (already read from disk).
+fn load_nro_game_from_data(rom_data: &[u8]) -> Result<(nro::CodeSet, u64)> {
+    let code_set = nro::load_nro(rom_data).context("Failed to parse NRO file")?;
 
     if code_set.is_homebrew {
         info!("Detected homebrew NRO");
