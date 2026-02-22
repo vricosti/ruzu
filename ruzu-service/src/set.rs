@@ -2,9 +2,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `set:sys` -- System Settings service stub.
+//! `set`     -- Plain Settings service stub.
 //!
-//! Commands:
+//! Commands (set:sys):
 //!   0 = GetFirmwareVersion
+//!
+//! Commands (set):
+//!   1 = GetAvailableLanguageCodes
+//!   2 = MakeLanguageCode
+//!   3 = GetAvailableLanguageCodeCount
+//!   4 = GetRegionCode
+//!   5 = GetAvailableLanguageCodes2
+//!   6 = GetAvailableLanguageCodeCount2
 
 use crate::framework::ServiceHandler;
 use crate::ipc::{IpcCommand, IpcResponse};
@@ -88,6 +97,59 @@ impl ServiceHandler for SetSysService {
     }
 }
 
+// ── Plain Settings: set ──────────────────────────────────────────────────────
+
+pub struct SetService;
+
+impl SetService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SetService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServiceHandler for SetService {
+    fn service_name(&self) -> &str {
+        "set"
+    }
+
+    fn handle_request(&mut self, cmd_id: u32, _command: &IpcCommand) -> IpcResponse {
+        log::debug!("set: cmd_id={}", cmd_id);
+        match cmd_id {
+            // GetAvailableLanguageCodes / GetAvailableLanguageCodes2
+            1 | 5 => {
+                log::info!("set: GetAvailableLanguageCodes");
+                // Return a single language: AmericanEnglish (code = 0)
+                IpcResponse::success_with_data(vec![0, 0]) // u64(0) as two u32s
+            }
+            // MakeLanguageCode
+            2 => {
+                log::info!("set: MakeLanguageCode");
+                IpcResponse::success_with_data(vec![0])
+            }
+            // GetAvailableLanguageCodeCount / GetAvailableLanguageCodeCount2
+            3 | 6 => {
+                log::info!("set: GetAvailableLanguageCodeCount");
+                IpcResponse::success_with_data(vec![1])
+            }
+            // GetRegionCode — USA (1)
+            4 => {
+                log::info!("set: GetRegionCode (USA)");
+                IpcResponse::success_with_data(vec![1])
+            }
+            _ => {
+                log::warn!("set: unhandled cmd_id={}", cmd_id);
+                IpcResponse::success()
+            }
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -134,5 +196,32 @@ mod tests {
         let cmd = make_command(99);
         let resp = svc.handle_request(99, &cmd);
         assert!(resp.result.is_success());
+    }
+
+    #[test]
+    fn test_set_get_available_language_codes() {
+        let mut svc = SetService::new();
+        let cmd = make_command(1);
+        let resp = svc.handle_request(1, &cmd);
+        assert!(resp.result.is_success());
+        assert_eq!(resp.data, vec![0, 0]); // AmericanEnglish as u64
+    }
+
+    #[test]
+    fn test_set_get_language_code_count() {
+        let mut svc = SetService::new();
+        let cmd = make_command(3);
+        let resp = svc.handle_request(3, &cmd);
+        assert!(resp.result.is_success());
+        assert_eq!(resp.data, vec![1]);
+    }
+
+    #[test]
+    fn test_set_get_region_code() {
+        let mut svc = SetService::new();
+        let cmd = make_command(4);
+        let resp = svc.handle_request(4, &cmd);
+        assert!(resp.result.is_success());
+        assert_eq!(resp.data, vec![1]); // USA
     }
 }

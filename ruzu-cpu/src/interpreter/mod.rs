@@ -173,6 +173,15 @@ impl Interpreter {
             Stlxp { sf, rt, rt2, rn, rs } => {
                 mem::exec_stlxp(state, mem_access, sf, rt, rt2, rn, rs)
             }
+            Cas { size, rs, rt, rn } => {
+                mem::exec_cas(state, mem_access, size, rs, rt, rn)
+            }
+            Swp { size, rs, rt, rn } => {
+                mem::exec_swp(state, mem_access, size, rs, rt, rn)
+            }
+            AtomicOp { size, rs, rt, rn, op } => {
+                mem::exec_atomic_op(state, mem_access, size, rs, rt, rn, op)
+            }
 
             // -- Branch -----------------------------------------------------
             B { imm } => branch::exec_b(state, imm),
@@ -231,6 +240,12 @@ impl Interpreter {
             Fneg { rd, rn, ftype } => simd::exec_fneg(state, rd, rn, ftype),
             Fabs { rd, rn, ftype } => simd::exec_fabs(state, rd, rn, ftype),
             Fsqrt { rd, rn, ftype } => simd::exec_fsqrt(state, rd, rn, ftype),
+            Fma { ftype, rd, rn, rm, ra, op } => {
+                simd::exec_fma(state, ftype, rd, rn, rm, ra, op)
+            }
+            Frint { ftype, rd, rn, mode } => {
+                simd::exec_frint(state, ftype, rd, rn, mode)
+            }
             LdrSimd { rt, rn, imm, size, mode } => {
                 simd::exec_ldr_simd(state, mem_access, rt, rn, imm, size, mode, state.pc)
             }

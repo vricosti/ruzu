@@ -6,6 +6,7 @@ pub mod framework;
 pub mod sm;
 pub mod set;
 pub mod am;
+pub mod apm;
 pub mod fs;
 pub mod hid;
 pub mod hid_shared_memory;
