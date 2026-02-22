@@ -11,12 +11,18 @@ use crate::thread::ThreadState;
 pub struct KernelCore {
     /// The single process (Phase 1: only one process at a time).
     pub process: Option<KProcess>,
-    /// Simple single-core scheduler.
+    /// Priority-aware round-robin scheduler.
     pub scheduler: Scheduler,
     /// Next process ID.
     next_pid: ProcessId,
     /// Whether the emulation should stop.
     pub should_stop: bool,
+    /// Monotonic tick counter (incremented by instruction budget each slice).
+    pub tick_counter: u64,
+    /// Index of the currently executing thread (set by the main loop before SVC dispatch).
+    pub current_thread_idx: Option<usize>,
+    /// Backing store for shared memory regions.
+    pub shared_memory_pool: Vec<u8>,
 }
 
 impl KernelCore {
@@ -26,6 +32,9 @@ impl KernelCore {
             scheduler: Scheduler::new(),
             next_pid: 1,
             should_stop: false,
+            tick_counter: 0,
+            current_thread_idx: None,
+            shared_memory_pool: Vec::new(),
         }
     }
 

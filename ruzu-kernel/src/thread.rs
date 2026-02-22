@@ -19,6 +19,23 @@ pub enum ThreadState {
     Terminated,
 }
 
+/// Why a thread is waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitReason {
+    /// Not waiting.
+    None,
+    /// WaitSynchronization on one or more handles.
+    Synchronization { handles: Vec<Handle>, timeout_ns: i64 },
+    /// ArbitrateLock — waiting for a mutex.
+    ArbitrateLock { mutex_addr: VAddr, tag: u32 },
+    /// WaitProcessWideKeyAtomic — waiting on a condvar.
+    CondVar { condvar_addr: VAddr, mutex_addr: VAddr },
+    /// WaitForAddress — waiting on an address arbiter.
+    AddressArbiter { addr: VAddr },
+    /// SleepThread with a timeout.
+    Sleep { wake_tick: u64 },
+}
+
 /// Default thread priority (matching Switch defaults).
 pub const DEFAULT_THREAD_PRIORITY: u32 = 44;
 
@@ -58,6 +75,14 @@ pub struct KThread {
     pub owner_process: Handle,
     /// Name for debugging.
     pub name: String,
+    /// Why the thread is blocked (only meaningful when state == Waiting).
+    pub wait_reason: WaitReason,
+    /// Result code set when the thread is woken (SUCCESS/TIMEOUT/CANCELLED).
+    pub wait_result: u32,
+    /// For WaitSynchronization: which handle index was signaled (-1 = none).
+    pub synced_index: i32,
+    /// Tick count when the wait began (for timeout checking).
+    pub wait_start_tick: u64,
 }
 
 impl KThread {
@@ -87,6 +112,10 @@ impl KThread {
             entry_arg: 0,
             owner_process: 0,
             name: format!("Thread-{}", thread_id),
+            wait_reason: WaitReason::None,
+            wait_result: 0,
+            synced_index: -1,
+            wait_start_tick: 0,
         }
     }
 
@@ -97,6 +126,26 @@ impl KThread {
         self.cpu_state.pc = self.entry_point;
     }
 
+    /// Block the thread with the given wait reason.
+    pub fn begin_wait(&mut self, reason: WaitReason, tick: u64) {
+        self.state = ThreadState::Waiting;
+        self.wait_reason = reason;
+        self.wait_result = 0;
+        self.synced_index = -1;
+        self.wait_start_tick = tick;
+    }
+
+    /// Wake the thread from a wait state.
+    pub fn wake(&mut self, result: u32, synced_idx: i32) {
+        self.state = ThreadState::Runnable;
+        self.wait_reason = WaitReason::None;
+        self.wait_result = result;
+        self.synced_index = synced_idx;
+        // Write result and synced index back to CPU registers
+        self.cpu_state.x[0] = result as u64;
+        self.cpu_state.x[1] = synced_idx as u64;
+    }
+
     /// Check if the thread is runnable.
     pub fn is_runnable(&self) -> bool {
         self.state == ThreadState::Runnable
@@ -105,5 +154,44 @@ impl KThread {
     /// Check if the thread is terminated.
     pub fn is_terminated(&self) -> bool {
         self.state == ThreadState::Terminated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruzu_common::ResultCode;
+
+    #[test]
+    fn test_begin_wait_and_wake() {
+        let mut thread = KThread::new(1, 0x1000, 0x8000, 44, 0);
+        thread.start();
+        assert_eq!(thread.state, ThreadState::Runnable);
+
+        thread.begin_wait(
+            WaitReason::Synchronization { handles: vec![1, 2], timeout_ns: 1000 },
+            100,
+        );
+        assert_eq!(thread.state, ThreadState::Waiting);
+        assert_eq!(thread.wait_start_tick, 100);
+
+        thread.wake(ResultCode::SUCCESS.raw(), 0);
+        assert_eq!(thread.state, ThreadState::Runnable);
+        assert_eq!(thread.wait_result, ResultCode::SUCCESS.raw());
+        assert_eq!(thread.synced_index, 0);
+        assert_eq!(thread.cpu_state.x[0], ResultCode::SUCCESS.raw() as u64);
+        assert_eq!(thread.cpu_state.x[1], 0);
+    }
+
+    #[test]
+    fn test_wake_timeout() {
+        let mut thread = KThread::new(1, 0x1000, 0x8000, 44, 0);
+        thread.start();
+        thread.begin_wait(WaitReason::Sleep { wake_tick: 200 }, 100);
+
+        thread.wake(ruzu_common::error::TIMEOUT.raw(), -1);
+        assert_eq!(thread.state, ThreadState::Runnable);
+        assert_eq!(thread.wait_result, ruzu_common::error::TIMEOUT.raw());
+        assert_eq!(thread.synced_index, -1);
     }
 }

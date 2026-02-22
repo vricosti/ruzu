@@ -40,13 +40,24 @@ pub enum StepResult {
 /// Pure-Rust ARM64 interpreter.
 pub struct Interpreter {
     halted: AtomicBool,
+    /// Instruction budget: number of instructions remaining in this time slice.
+    /// 0 means unlimited (no budget).
+    budget: u64,
 }
 
 impl Interpreter {
     pub fn new() -> Self {
         Self {
             halted: AtomicBool::new(false),
+            budget: 0,
         }
+    }
+
+    /// Set the instruction budget for the next `run` call.
+    /// When the budget reaches 0, `run` returns `HaltReason::BudgetExhausted`.
+    /// A budget of 0 means unlimited.
+    pub fn set_budget(&mut self, n: u64) {
+        self.budget = n;
     }
 
     /// Execute a single decoded instruction.
@@ -250,6 +261,14 @@ impl CpuExecutor for Interpreter {
         loop {
             if self.halted.load(Ordering::Relaxed) {
                 return HaltReason::ExternalHalt;
+            }
+
+            // Check instruction budget
+            if self.budget > 0 {
+                self.budget -= 1;
+                if self.budget == 0 {
+                    return HaltReason::BudgetExhausted;
+                }
             }
 
             // Fetch
@@ -476,5 +495,47 @@ mod tests {
         let reason = interp.run(&mut state, &mut mem);
 
         assert!(matches!(reason, HaltReason::InstructionAbort { .. }));
+    }
+
+    #[test]
+    fn test_budget_exhausted() {
+        // Write a loop: SUBS X0, X0, #1; CBNZ X0, -4 (repeats X0 times)
+        // followed by SVC #0. With a budget of 5, it should exhaust before SVC.
+        let mut mem = TestMemory::new();
+        let base: u64 = 0x1000;
+        mem.write_inst(base, 0xD2800140);       // MOVZ X0, #10
+        mem.write_inst(base + 4, 0xF1000400);   // SUBS X0, X0, #1
+        mem.write_inst(base + 8, 0xB5FFFFE0);   // CBNZ X0, -4 (back to SUBS)
+        mem.write_inst(base + 12, 0xD4000001);  // SVC #0
+
+        let mut state = CpuState::new();
+        state.pc = base;
+
+        let mut interp = Interpreter::new();
+        interp.set_budget(5);
+        let reason = interp.run(&mut state, &mut mem);
+
+        assert!(matches!(reason, HaltReason::BudgetExhausted));
+        // X0 should not be 0 since we didn't finish the loop
+        assert!(state.get_reg(0) > 0);
+    }
+
+    #[test]
+    fn test_budget_zero_is_unlimited() {
+        // Budget of 0 means unlimited — should run until SVC.
+        let mut mem = TestMemory::new();
+        let base: u64 = 0x1000;
+        mem.write_inst(base, 0xD2800540);      // MOVZ X0, #42
+        mem.write_inst(base + 4, 0xD4000001);  // SVC #0
+
+        let mut state = CpuState::new();
+        state.pc = base;
+
+        let mut interp = Interpreter::new();
+        interp.set_budget(0); // unlimited
+        let reason = interp.run(&mut state, &mut mem);
+
+        assert_eq!(state.get_reg(0), 42);
+        assert!(matches!(reason, HaltReason::Svc(0)));
     }
 }

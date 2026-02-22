@@ -269,4 +269,6 @@ pub enum HaltReason {
     Step,
     /// CPU was externally halted.
     ExternalHalt,
+    /// Instruction budget exhausted (time slice done).
+    BudgetExhausted,
 }
