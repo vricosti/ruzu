@@ -38,6 +38,96 @@ pub fn find_config_path() -> Option<PathBuf> {
     None
 }
 
+/// Find the keys directory (containing prod.keys / title.keys).
+///
+/// Search order:
+/// 1. Explicit path (from --keys-dir CLI flag)
+/// 2. Windows: %APPDATA%\yuzu\keys\
+/// 3. Linux: ~/.local/share/yuzu/keys/
+/// 4. XDG_DATA_HOME/yuzu/keys/
+pub fn find_keys_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        if path.exists() {
+            return Some(path.clone());
+        }
+        warn!("Specified keys directory not found: {}", path.display());
+    }
+
+    // Windows
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let path = PathBuf::from(&appdata).join("yuzu").join("keys");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // Linux
+    if let Ok(home) = std::env::var("HOME") {
+        let path = PathBuf::from(&home)
+            .join(".local")
+            .join("share")
+            .join("yuzu")
+            .join("keys");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // XDG_DATA_HOME
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        let path = PathBuf::from(&xdg).join("yuzu").join("keys");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+/// Find the games directory.
+///
+/// Search order:
+/// 1. Explicit path (from --games-dir CLI flag)
+/// 2. Config file setting
+/// 3. Default paths
+pub fn find_games_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        if path.exists() {
+            return Some(path.clone());
+        }
+        warn!("Specified games directory not found: {}", path.display());
+    }
+
+    // Check common default paths
+    if let Ok(home) = std::env::var("HOME") {
+        let paths = [
+            PathBuf::from(&home).join("Games").join("Switch"),
+            PathBuf::from(&home).join("games").join("switch"),
+            PathBuf::from(&home).join("roms").join("switch"),
+        ];
+        for path in &paths {
+            if path.exists() {
+                return Some(path.clone());
+            }
+        }
+    }
+
+    // Windows-specific paths
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        let paths = [
+            PathBuf::from(&userprofile).join("Games").join("Switch"),
+            PathBuf::from(&userprofile).join("Documents").join("Switch"),
+        ];
+        for path in &paths {
+            if path.exists() {
+                return Some(path.clone());
+            }
+        }
+    }
+
+    None
+}
+
 /// Load settings from yuzu's sdl2-config.ini file.
 pub fn load_config(path: Option<&PathBuf>) -> Settings {
     let mut settings = Settings::default();

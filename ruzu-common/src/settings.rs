@@ -18,6 +18,10 @@ pub struct Settings {
     pub region: SystemRegion,
     pub title_id: u64,
 
+    // Paths
+    pub keys_dir: Option<std::path::PathBuf>,
+    pub games_dir: Option<std::path::PathBuf>,
+
     // Debug
     pub use_debug_logging: bool,
     pub program_args: String,
@@ -34,6 +38,8 @@ impl Default for Settings {
             language: SystemLanguage::AmericanEnglish,
             region: SystemRegion::Usa,
             title_id: 0,
+            keys_dir: None,
+            games_dir: None,
             use_debug_logging: true,
             program_args: String::new(),
         }

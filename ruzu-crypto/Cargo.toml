@@ -1,0 +1,17 @@
+[package]
+name = "ruzu-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ruzu-common.workspace = true
+aes.workspace = true
+ctr.workspace = true
+cipher.workspace = true
+sha2.workspace = true
+hex.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

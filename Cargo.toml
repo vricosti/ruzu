@@ -2,6 +2,7 @@
 members = [
     "ruzu",
     "ruzu-common",
+    "ruzu-crypto",
     "ruzu-loader",
     "ruzu-cpu",
     "ruzu-kernel",
@@ -19,6 +20,7 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 # Internal crates
 ruzu-common = { path = "ruzu-common" }
+ruzu-crypto = { path = "ruzu-crypto" }
 ruzu-loader = { path = "ruzu-loader" }
 ruzu-cpu = { path = "ruzu-cpu" }
 ruzu-kernel = { path = "ruzu-kernel" }
@@ -34,6 +36,16 @@ sdl2 = { version = "0.37", features = ["raw-window-handle", "bundled", "static-l
 vulkano = "0.34"
 raw-window-handle = "0.6"
 
+# Crypto
+aes = "0.8"
+ctr = "0.9"
+cipher = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+
+# Compression
+lz4_flex = "0.11"
+
 # Core
 log = "0.4"
 env_logger = "0.11"
@@ -44,3 +56,4 @@ byteorder = "1"
 bytemuck = { version = "1", features = ["derive"] }
 memmap2 = "0.9"
 parking_lot = "0.12"
+tempfile = "3"

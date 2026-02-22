@@ -2,23 +2,38 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 mod config;
+mod game_list_ui;
 mod window;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::info;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use ruzu_crypto::KeyManager;
 use ruzu_kernel::KernelCore;
+use ruzu_loader::game_info::{self, GameFormat};
 use ruzu_loader::nro;
+use ruzu_loader::nsp;
+use ruzu_loader::vfs::RealFile;
+use ruzu_loader::xci;
 
 /// ruzu - Nintendo Switch Emulator
 #[derive(Parser, Debug)]
 #[command(name = "ruzu", version, about = "Nintendo Switch Emulator written in Rust")]
 struct Args {
-    /// Path to the game file (NRO)
+    /// Path to the game file (NRO/NSP/XCI). If omitted, shows the game library.
     #[arg(short, long)]
-    game: PathBuf,
+    game: Option<PathBuf>,
+
+    /// Path to the games directory for the library UI
+    #[arg(long)]
+    games_dir: Option<PathBuf>,
+
+    /// Path to the keys directory (containing prod.keys / title.keys)
+    #[arg(long)]
+    keys_dir: Option<PathBuf>,
 
     /// Path to config file (default: auto-detect yuzu config)
     #[arg(short, long)]
@@ -49,13 +64,66 @@ fn main() -> Result<()> {
     let settings = config::load_config(args.config.as_ref());
     info!("Renderer backend: {:?}", settings.renderer_backend);
 
-    // Load NRO file
-    info!("Loading game: {}", args.game.display());
-    let rom_data = std::fs::read(&args.game).context("Failed to read game file")?;
-    let code_set = nro::load_nro(&rom_data).context("Failed to parse NRO file")?;
+    // Initialize key manager
+    let mut keys = KeyManager::new();
+    if let Some(keys_dir) = config::find_keys_dir(args.keys_dir.as_ref()) {
+        info!("Loading keys from: {}", keys_dir.display());
+        if let Err(e) = keys.load_from_directory(&keys_dir) {
+            log::warn!("Failed to load keys: {}", e);
+        }
+    } else {
+        info!("No keys directory found (NCA decryption will not be available)");
+    }
+
+    // Determine game path: either direct or via game library
+    let game_path = match args.game {
+        Some(path) => path,
+        None => {
+            // Show game library UI
+            let games_dir = config::find_games_dir(args.games_dir.as_ref());
+            match games_dir {
+                Some(dir) => {
+                    info!("Scanning games directory: {}", dir.display());
+                    let games = game_info::scan_directory(&dir, &mut keys);
+                    info!("Found {} games", games.len());
+
+                    match game_list_ui::show_game_list(&games)? {
+                        Some(idx) => games[idx].path.clone(),
+                        None => {
+                            info!("No game selected, exiting");
+                            return Ok(());
+                        }
+                    }
+                }
+                None => {
+                    anyhow::bail!(
+                        "No game specified and no games directory found.\n\
+                         Use --game <path> to load a game directly, or\n\
+                         --games-dir <path> to specify a games directory."
+                    );
+                }
+            }
+        }
+    };
+
+    // Detect format and load
+    let format = GameFormat::from_extension(&game_path)
+        .with_context(|| format!("Unsupported file format: {}", game_path.display()))?;
 
     info!(
-        "NRO loaded: text=0x{:X}+0x{:X}, rodata=0x{:X}+0x{:X}, data=0x{:X}+0x{:X}, bss=0x{:X}",
+        "Loading game: {} (format: {})",
+        game_path.display(),
+        format.label()
+    );
+
+    let (code_set, title_id) = match format {
+        GameFormat::Nro => load_nro_game(&game_path)?,
+        GameFormat::Nsp => load_nsp_game(&game_path, &mut keys)?,
+        GameFormat::Xci => load_xci_game(&game_path, &mut keys)?,
+    };
+
+    info!(
+        "Code loaded: text=0x{:X}+0x{:X}, rodata=0x{:X}+0x{:X}, data=0x{:X}+0x{:X}, bss=0x{:X}",
         code_set.segments[0].offset,
         code_set.segments[0].size,
         code_set.segments[1].offset,
@@ -65,15 +133,10 @@ fn main() -> Result<()> {
         code_set.bss_size,
     );
 
-    if code_set.is_homebrew {
-        info!("Detected homebrew NRO");
-    }
-
-    // Create kernel
+    // Create kernel and load code
     let mut kernel = KernelCore::new();
     kernel.create_process("main")?;
 
-    // Extract segments for loading
     let text_seg = &code_set.segments[0];
     let rodata_seg = &code_set.segments[1];
     let data_seg = &code_set.segments[2];
@@ -85,7 +148,6 @@ fn main() -> Result<()> {
     let data_data =
         &code_set.memory[data_seg.offset as usize..(data_seg.offset + data_seg.size) as usize];
 
-    // Load into kernel
     let entry_point = kernel.load_nro(
         text_data,
         rodata_data,
@@ -104,7 +166,11 @@ fn main() -> Result<()> {
 
     // Set title ID
     if let Some(process) = kernel.process_mut() {
-        process.title_id = settings.title_id;
+        process.title_id = if title_id != 0 {
+            title_id
+        } else {
+            settings.title_id
+        };
     }
 
     if args.headless {
@@ -118,17 +184,66 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Load an NRO game file.
+fn load_nro_game(path: &PathBuf) -> Result<(nro::CodeSet, u64)> {
+    let rom_data = std::fs::read(path).context("Failed to read NRO file")?;
+    let code_set = nro::load_nro(&rom_data).context("Failed to parse NRO file")?;
+
+    if code_set.is_homebrew {
+        info!("Detected homebrew NRO");
+    }
+
+    Ok((code_set, 0))
+}
+
+/// Load an NSP game file.
+fn load_nsp_game(path: &PathBuf, keys: &mut KeyManager) -> Result<(nro::CodeSet, u64)> {
+    let file: Arc<dyn ruzu_loader::vfs::VfsFile> =
+        Arc::new(RealFile::open(path).context("Failed to open NSP file")?);
+
+    let result = nsp::load_nsp(file, keys).context("Failed to load NSP")?;
+
+    if let Some(ref title) = result.title {
+        info!("Title: {}", title);
+    }
+    if let Some(ref developer) = result.developer {
+        info!("Developer: {}", developer);
+    }
+    if let Some(ref version) = result.version {
+        info!("Version: {}", version);
+    }
+    info!("Title ID: 0x{:016X}", result.title_id);
+
+    Ok((result.code_set, result.title_id))
+}
+
+/// Load an XCI game file.
+fn load_xci_game(path: &PathBuf, keys: &mut KeyManager) -> Result<(nro::CodeSet, u64)> {
+    let file: Arc<dyn ruzu_loader::vfs::VfsFile> =
+        Arc::new(RealFile::open(path).context("Failed to open XCI file")?);
+
+    let result = xci::load_xci(file, keys)
+        .map_err(|e| anyhow::anyhow!("XCI load error: {}", e))?;
+
+    if let Some(ref title) = result.title {
+        info!("Title: {}", title);
+    }
+    if let Some(ref developer) = result.developer {
+        info!("Developer: {}", developer);
+    }
+    info!("Title ID: 0x{:016X}", result.title_id);
+
+    Ok((result.code_set, result.title_id))
+}
+
 /// Run in headless mode (no window, CPU only).
 fn run_headless(kernel: &mut KernelCore) -> Result<()> {
     info!("Starting CPU execution (headless)...");
 
-    // In Phase 1 without Dynarmic, we can only do a stub execution loop
-    // that demonstrates the SVC handling infrastructure is working
     let max_steps = 1_000_000;
     let step = 0;
 
     while !kernel.should_stop && step < max_steps {
-        // Get current thread's CPU state
         let process = match kernel.process_mut() {
             Some(p) => p,
             None => break,
@@ -146,13 +261,6 @@ fn run_headless(kernel: &mut KernelCore) -> Result<()> {
             info!("Main thread terminated");
             break;
         }
-
-        // In Phase 1, we need a CPU backend (Dynarmic) to actually execute
-        // ARM64 instructions. For now, just demonstrate the infrastructure.
-        // When Dynarmic FFI is integrated, this loop will:
-        // 1. Call jit.run() which executes until SVC/exception
-        // 2. Handle the SVC via dispatch_svc()
-        // 3. Return control to the JIT
 
         info!("CPU execution requires Dynarmic FFI backend (not yet linked)");
         info!("Infrastructure is ready: kernel, process, thread, SVCs, memory");
@@ -172,27 +280,17 @@ fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
     info!("Window created, entering main loop");
     info!("Press ESC or close window to exit");
 
-    // Main loop
     loop {
-        // Poll window events
         if !emu_window.poll_events() {
             info!("Window close requested");
             break;
         }
 
-        // Check if emulation should stop
         if kernel.should_stop {
             break;
         }
 
-        // In Phase 1 without Dynarmic, just keep the window alive
-        // When CPU backend is ready, each frame will:
-        // 1. Run CPU for N cycles
-        // 2. Handle SVCs
-        // 3. Present frame via Vulkan
-
-        // Small sleep to avoid busy-waiting
-        std::thread::sleep(std::time::Duration::from_millis(16)); // ~60fps
+        std::thread::sleep(std::time::Duration::from_millis(16));
     }
 
     Ok(())
