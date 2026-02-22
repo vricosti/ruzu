@@ -60,21 +60,7 @@ pub fn svc_exit_thread(kernel: &mut KernelCore) {
     }
 }
 
-/// SVC 0x0B: SleepThread
-pub fn svc_sleep_thread(ns: i64) {
-    debug!("SleepThread: ns={}", ns);
-
-    if ns > 0 {
-        let duration = std::time::Duration::from_nanos(ns as u64);
-        // Cap sleep to 100ms to keep emulation responsive
-        let capped = duration.min(std::time::Duration::from_millis(100));
-        std::thread::sleep(capped);
-    } else if ns == 0 {
-        // Yield: just return
-        std::thread::yield_now();
-    }
-    // ns == -1 or -2: yield to same/lower priority, just return in Phase 1
-}
+// SleepThread (0x0B) is now implemented in svc.rs with thread wait state support.
 
 /// SVC 0x0C: GetThreadPriority
 pub fn svc_get_thread_priority(kernel: &KernelCore, handle: Handle) -> Result<u32, ResultCode> {

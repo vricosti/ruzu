@@ -243,54 +243,112 @@ fn run_headless(kernel: &mut KernelCore) -> Result<()> {
     run_cpu_loop(kernel)
 }
 
-/// Core CPU execution loop using the ARM64 interpreter.
+/// Instructions per time slice for each thread.
+const INSTRUCTIONS_PER_SLICE: u64 = 50_000;
+
+/// Core CPU execution loop with multi-thread scheduling.
+///
+/// Uses a priority-aware round-robin scheduler. Each thread gets a fixed
+/// instruction budget per time slice. Waiting threads are skipped; timeouts
+/// are checked each iteration.
 fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
     use ruzu_cpu::interpreter::Interpreter;
     use ruzu_cpu::state::{CpuExecutor, HaltReason};
+    use ruzu_kernel::scheduler::Scheduler;
     use ruzu_kernel::svc::dispatch_svc;
+    use ruzu_kernel::thread::ThreadState;
 
     let mut interp = Interpreter::new();
 
     loop {
-        let process = match kernel.process_mut() {
-            Some(p) => p,
-            None => break,
+        if kernel.should_stop {
+            break;
+        }
+
+        // Check timeouts on waiting threads.
+        {
+            let tick = kernel.tick_counter;
+            if let Some(process) = kernel.process_mut() {
+                Scheduler::check_timeouts(&mut process.threads, tick);
+            }
+        }
+
+        // Schedule next thread (priority-aware round-robin).
+        let idx = {
+            let process = match kernel.process() {
+                Some(p) => p,
+                None => break,
+            };
+            let thread_states: Vec<_> = process
+                .threads
+                .iter()
+                .map(|t| (t.handle, t.state, t.priority))
+                .collect();
+            kernel.scheduler.schedule_next(&thread_states)
         };
 
-        // Use index-based access for split borrows: threads[idx] and memory.
-        let idx = match process.current_thread_idx() {
-            Some(i) if !process.threads[i].is_terminated() => i,
-            _ => {
+        let idx = match idx {
+            Some(i) => i,
+            None => {
+                // No runnable threads — check if any are still waiting.
+                let has_waiting = kernel
+                    .process()
+                    .map(|p| {
+                        p.threads
+                            .iter()
+                            .any(|t| t.state == ThreadState::Waiting)
+                    })
+                    .unwrap_or(false);
+
+                if has_waiting {
+                    // Advance time and retry.
+                    kernel.tick_counter += INSTRUCTIONS_PER_SLICE;
+                    continue;
+                }
                 info!("No runnable threads, stopping");
                 break;
             }
         };
 
-        // Run the interpreter until it halts.
-        let reason = interp.run(&mut process.threads[idx].cpu_state, &mut process.memory);
+        // Store current thread index for SVC dispatch.
+        kernel.current_thread_idx = Some(idx);
+
+        // Run interpreter with budget.
+        interp.set_budget(INSTRUCTIONS_PER_SLICE);
+        let process = kernel.process_mut().unwrap();
+        let reason = interp.run(
+            &mut process.threads[idx].cpu_state,
+            &mut process.memory,
+        );
+        kernel.tick_counter += INSTRUCTIONS_PER_SLICE;
 
         match reason {
             HaltReason::Svc(n) => {
                 // Clone CPU state for SVC dispatch, then write back.
-                let mut cpu = kernel.process().unwrap()
-                    .current_thread().unwrap().cpu_state.clone();
+                let mut cpu = kernel.process().unwrap().threads[idx].cpu_state.clone();
                 dispatch_svc(kernel, &mut cpu, n);
                 if let Some(process) = kernel.process_mut() {
-                    if let Some(thread) = process.current_thread_mut() {
-                        thread.cpu_state = cpu;
+                    // Only write back if thread is still runnable (not blocked by the SVC).
+                    if process.threads[idx].state != ThreadState::Waiting {
+                        process.threads[idx].cpu_state = cpu;
                     }
                 }
+            }
+            HaltReason::BudgetExhausted => {
+                // Time slice done, loop to reschedule.
             }
             HaltReason::ExternalHalt => {
                 info!("CPU externally halted");
                 break;
             }
             HaltReason::DataAbort { addr } => {
+                let pc = kernel
+                    .process()
+                    .map(|p| p.threads[idx].cpu_state.pc)
+                    .unwrap_or(0);
                 log::error!(
                     "Data abort at 0x{:016X} (PC=0x{:016X})",
-                    addr,
-                    kernel.process().map(|p| p.current_thread()
-                        .map(|t| t.cpu_state.pc).unwrap_or(0)).unwrap_or(0)
+                    addr, pc
                 );
                 break;
             }
@@ -303,15 +361,12 @@ fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
                 break;
             }
             HaltReason::Step => {
-                // Single step complete, continue
+                // Single step complete, continue.
             }
-        }
-
-        if kernel.should_stop {
-            break;
         }
     }
 
+    kernel.current_thread_idx = None;
     Ok(())
 }
 
@@ -319,7 +374,9 @@ fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
 fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
     use ruzu_cpu::interpreter::Interpreter;
     use ruzu_cpu::state::{CpuExecutor, HaltReason};
+    use ruzu_kernel::scheduler::Scheduler;
     use ruzu_kernel::svc::dispatch_svc;
+    use ruzu_kernel::thread::ThreadState;
     use window::{EmulatorWindow, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 
     let mut emu_window =
@@ -329,6 +386,9 @@ fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
     info!("Press ESC or close window to exit");
 
     let mut interp = Interpreter::new();
+
+    // Number of time slices to run per frame (~60 FPS ≈ 16ms).
+    const SLICES_PER_FRAME: usize = 10;
 
     loop {
         if !emu_window.poll_events() {
@@ -340,45 +400,102 @@ fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
             break;
         }
 
-        // Run CPU for a batch of instructions per frame.
-        let process = match kernel.process_mut() {
-            Some(p) => p,
-            None => break,
-        };
-
-        // Use index-based access for split borrows: threads[idx] and memory.
-        let idx = match process.current_thread_idx() {
-            Some(i) if !process.threads[i].is_terminated() => i,
-            _ => {
-                std::thread::sleep(std::time::Duration::from_millis(16));
-                continue;
+        for _ in 0..SLICES_PER_FRAME {
+            if kernel.should_stop {
+                break;
             }
-        };
 
-        let reason = interp.run(&mut process.threads[idx].cpu_state, &mut process.memory);
-
-        match reason {
-            HaltReason::Svc(n) => {
-                let mut cpu = kernel.process().unwrap()
-                    .current_thread().unwrap().cpu_state.clone();
-                dispatch_svc(kernel, &mut cpu, n);
+            // Check timeouts on waiting threads.
+            {
+                let tick = kernel.tick_counter;
                 if let Some(process) = kernel.process_mut() {
-                    if let Some(thread) = process.current_thread_mut() {
-                        thread.cpu_state = cpu;
+                    Scheduler::check_timeouts(&mut process.threads, tick);
+                    for thread in process.threads.iter_mut() {
+                        if thread.state == ThreadState::Runnable && thread.wait_result != 0 {
+                            thread.cpu_state.x[0] = thread.wait_result as u64;
+                            thread.cpu_state.x[1] = u64::MAX;
+                        }
                     }
                 }
             }
-            HaltReason::ExternalHalt => break,
-            HaltReason::DataAbort { addr } => {
-                log::error!("Data abort at 0x{:016X}", addr);
-                break;
+
+            // Schedule next thread.
+            let idx = {
+                let process = match kernel.process() {
+                    Some(p) => p,
+                    None => break,
+                };
+                let thread_states: Vec<_> = process
+                    .threads
+                    .iter()
+                    .map(|t| (t.handle, t.state, t.priority))
+                    .collect();
+                kernel.scheduler.schedule_next(&thread_states)
+            };
+
+            let idx = match idx {
+                Some(i) => i,
+                None => {
+                    let has_waiting = kernel
+                        .process()
+                        .map(|p| {
+                            p.threads
+                                .iter()
+                                .any(|t| t.state == ThreadState::Waiting)
+                        })
+                        .unwrap_or(false);
+
+                    if has_waiting {
+                        kernel.tick_counter += INSTRUCTIONS_PER_SLICE;
+                        continue;
+                    }
+                    break;
+                }
+            };
+
+            kernel.current_thread_idx = Some(idx);
+
+            interp.set_budget(INSTRUCTIONS_PER_SLICE);
+            let process = kernel.process_mut().unwrap();
+            let reason = interp.run(
+                &mut process.threads[idx].cpu_state,
+                &mut process.memory,
+            );
+            kernel.tick_counter += INSTRUCTIONS_PER_SLICE;
+
+            match reason {
+                HaltReason::Svc(n) => {
+                    let mut cpu =
+                        kernel.process().unwrap().threads[idx].cpu_state.clone();
+                    dispatch_svc(kernel, &mut cpu, n);
+                    if let Some(process) = kernel.process_mut() {
+                        if process.threads[idx].state != ThreadState::Waiting {
+                            process.threads[idx].cpu_state = cpu;
+                        }
+                    }
+                }
+                HaltReason::BudgetExhausted => {
+                    // Time slice done, continue to next slice.
+                }
+                HaltReason::ExternalHalt => {
+                    kernel.should_stop = true;
+                    break;
+                }
+                HaltReason::DataAbort { addr } => {
+                    log::error!("Data abort at 0x{:016X}", addr);
+                    kernel.should_stop = true;
+                    break;
+                }
+                HaltReason::InstructionAbort { addr } => {
+                    log::error!("Instruction abort at 0x{:016X}", addr);
+                    kernel.should_stop = true;
+                    break;
+                }
+                _ => {}
             }
-            HaltReason::InstructionAbort { addr } => {
-                log::error!("Instruction abort at 0x{:016X}", addr);
-                break;
-            }
-            _ => {}
         }
+
+        kernel.current_thread_idx = None;
     }
 
     Ok(())
