@@ -187,7 +187,7 @@ pub struct IpcRequest {
 pub struct KTransferMemory {
     pub addr: VAddr,
     pub size: usize,
-    pub owner_handle: Handle,
+    pub permission: u32,
 }
 
 impl KTransferMemory {
@@ -195,7 +195,7 @@ impl KTransferMemory {
         Self {
             addr,
             size,
-            owner_handle: 0,
+            permission: 0,
         }
     }
 }

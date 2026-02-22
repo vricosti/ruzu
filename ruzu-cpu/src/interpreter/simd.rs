@@ -229,6 +229,38 @@ pub fn exec_fsqrt(state: &mut CpuState, rd: u8, rn: u8, ftype: u8) -> StepResult
     StepResult::Continue
 }
 
+pub fn exec_fma(state: &mut CpuState, ftype: u8, rd: u8, rn: u8, rm: u8,
+                ra: u8, op: u8) -> StepResult {
+    let a = read_fp(state, rn, ftype);
+    let b = read_fp(state, rm, ftype);
+    let c = read_fp(state, ra, ftype);
+    let result = match op {
+        0 => a.mul_add(b, c),      // FMADD:  Rd = Ra + Rn*Rm
+        1 => (-a).mul_add(b, c),   // FMSUB:  Rd = Ra - Rn*Rm
+        2 => (-a).mul_add(b, -c),  // FNMADD: Rd = -(Ra + Rn*Rm)
+        3 => a.mul_add(b, -c),     // FNMSUB: Rd = -(Ra - Rn*Rm)
+        _ => unreachable!(),
+    };
+    write_fp(state, rd, ftype, result);
+    StepResult::Continue
+}
+
+pub fn exec_frint(state: &mut CpuState, ftype: u8, rd: u8, rn: u8,
+                  mode: u8) -> StepResult {
+    let val = read_fp(state, rn, ftype);
+    let result = match mode {
+        0 => val.round_ties_even(),  // FRINTN — nearest, ties to even
+        1 => val.ceil(),             // FRINTP — toward +inf
+        2 => val.floor(),            // FRINTM — toward -inf
+        3 => val.trunc(),            // FRINTZ — toward zero
+        4 => val.round(),            // FRINTA — nearest, ties away from zero
+        6 | 7 => val.round_ties_even(), // FRINTX/FRINTI — current rounding mode
+        _ => val,
+    };
+    write_fp(state, rd, ftype, result);
+    StepResult::Continue
+}
+
 pub fn exec_ldr_simd(state: &mut CpuState, mem: &dyn MemoryAccess,
                       rt: u8, rn: u8, imm: i64, size: u8,
                       mode: AddrMode, pc: u64) -> StepResult {
@@ -450,5 +482,103 @@ mod tests {
         exec_fneg(&mut s, 1, 0, 1);
         let result = f64::from_bits(s.get_vreg_u64(1, 0));
         assert!((result - (-5.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_fmadd() {
+        // FMADD: Rd = Ra + Rn*Rm
+        let mut s = CpuState::new();
+        s.set_vreg_u128(1, 2.0f64.to_bits() as u128); // Rn = 2.0
+        s.set_vreg_u128(2, 3.0f64.to_bits() as u128); // Rm = 3.0
+        s.set_vreg_u128(3, 4.0f64.to_bits() as u128); // Ra = 4.0
+        exec_fma(&mut s, 1, 0, 1, 2, 3, 0); // ftype=1(double), rd=0, rn=1, rm=2, ra=3, op=0
+        let result = f64::from_bits(s.get_vreg_u64(0, 0));
+        assert!((result - 10.0).abs() < f64::EPSILON); // 4.0 + 2.0*3.0 = 10.0
+    }
+
+    #[test]
+    fn test_fmsub() {
+        // FMSUB: Rd = Ra - Rn*Rm
+        let mut s = CpuState::new();
+        s.set_vreg_u128(1, 2.0f64.to_bits() as u128);
+        s.set_vreg_u128(2, 3.0f64.to_bits() as u128);
+        s.set_vreg_u128(3, 4.0f64.to_bits() as u128);
+        exec_fma(&mut s, 1, 0, 1, 2, 3, 1); // op=1 (FMSUB)
+        let result = f64::from_bits(s.get_vreg_u64(0, 0));
+        assert!((result - (-2.0)).abs() < f64::EPSILON); // 4.0 - 6.0 = -2.0
+    }
+
+    #[test]
+    fn test_fnmadd() {
+        // FNMADD: Rd = -(Ra + Rn*Rm)
+        let mut s = CpuState::new();
+        s.set_vreg_u128(1, 2.0f64.to_bits() as u128);
+        s.set_vreg_u128(2, 3.0f64.to_bits() as u128);
+        s.set_vreg_u128(3, 4.0f64.to_bits() as u128);
+        exec_fma(&mut s, 1, 0, 1, 2, 3, 2); // op=2 (FNMADD)
+        let result = f64::from_bits(s.get_vreg_u64(0, 0));
+        assert!((result - (-10.0)).abs() < f64::EPSILON); // -(4.0 + 6.0) = -10.0
+    }
+
+    #[test]
+    fn test_fnmsub() {
+        // FNMSUB: Rd = -(Ra - Rn*Rm) = Rn*Rm - Ra
+        let mut s = CpuState::new();
+        s.set_vreg_u128(1, 2.0f64.to_bits() as u128);
+        s.set_vreg_u128(2, 3.0f64.to_bits() as u128);
+        s.set_vreg_u128(3, 4.0f64.to_bits() as u128);
+        exec_fma(&mut s, 1, 0, 1, 2, 3, 3); // op=3 (FNMSUB)
+        let result = f64::from_bits(s.get_vreg_u64(0, 0));
+        assert!((result - 2.0).abs() < f64::EPSILON); // 6.0 - 4.0 = 2.0
+    }
+
+    #[test]
+    fn test_frintn() {
+        // FRINTN: round to nearest, ties to even
+        let mut s = CpuState::new();
+        s.set_vreg_u128(0, 2.5f64.to_bits() as u128);
+        exec_frint(&mut s, 1, 1, 0, 0); // ftype=1, rd=1, rn=0, mode=0
+        let result = f64::from_bits(s.get_vreg_u64(1, 0));
+        assert!((result - 2.0).abs() < f64::EPSILON); // ties to even → 2.0
+    }
+
+    #[test]
+    fn test_frintp() {
+        // FRINTP: round toward +inf (ceil)
+        let mut s = CpuState::new();
+        s.set_vreg_u128(0, 2.3f64.to_bits() as u128);
+        exec_frint(&mut s, 1, 1, 0, 1); // mode=1
+        let result = f64::from_bits(s.get_vreg_u64(1, 0));
+        assert!((result - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_frintm() {
+        // FRINTM: round toward -inf (floor)
+        let mut s = CpuState::new();
+        s.set_vreg_u128(0, 2.7f64.to_bits() as u128);
+        exec_frint(&mut s, 1, 1, 0, 2); // mode=2
+        let result = f64::from_bits(s.get_vreg_u64(1, 0));
+        assert!((result - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_frintz() {
+        // FRINTZ: round toward zero (truncate)
+        let mut s = CpuState::new();
+        s.set_vreg_u128(0, (-2.7f64).to_bits() as u128);
+        exec_frint(&mut s, 1, 1, 0, 3); // mode=3
+        let result = f64::from_bits(s.get_vreg_u64(1, 0));
+        assert!((result - (-2.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_frinta() {
+        // FRINTA: round to nearest, ties away from zero
+        let mut s = CpuState::new();
+        s.set_vreg_u128(0, 2.5f64.to_bits() as u128);
+        exec_frint(&mut s, 1, 1, 0, 4); // mode=4
+        let result = f64::from_bits(s.get_vreg_u64(1, 0));
+        assert!((result - 3.0).abs() < f64::EPSILON); // ties away → 3.0
     }
 }

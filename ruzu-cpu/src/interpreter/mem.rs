@@ -270,6 +270,75 @@ pub fn exec_stlr(state: &mut CpuState, mem: &mut dyn MemoryAccess,
     }
 }
 
+// CAS = compare and swap (single-threaded, no actual atomicity needed)
+pub fn exec_cas(state: &mut CpuState, mem: &mut dyn MemoryAccess,
+                size: u8, rs: u8, rt: u8, rn: u8) -> StepResult {
+    let addr = state.get_reg(rn as u32);
+    let mask = match size {
+        0 => 0xFFu64,
+        1 => 0xFFFFu64,
+        2 => 0xFFFF_FFFFu64,
+        _ => u64::MAX,
+    };
+    let expected = state.get_reg(rs as u32) & mask;
+    let new_val = state.get_reg(rt as u32) & mask;
+
+    let actual = match mem_read(mem, addr, size, false, size == 3) {
+        Ok(v) => v & mask,
+        Err(a) => return StepResult::MemoryFault(a),
+    };
+
+    if actual == expected {
+        if let Err(a) = mem_write(mem, addr, new_val, size) {
+            return StepResult::MemoryFault(a);
+        }
+    }
+    // Rs always gets the original memory value
+    state.set_reg(rs as u32, actual);
+    StepResult::Continue
+}
+
+// SWP = atomic swap
+pub fn exec_swp(state: &mut CpuState, mem: &mut dyn MemoryAccess,
+                size: u8, rs: u8, rt: u8, rn: u8) -> StepResult {
+    let addr = state.get_reg(rn as u32);
+    let swap_val = state.get_reg(rs as u32);
+
+    let original = match mem_read(mem, addr, size, false, size == 3) {
+        Ok(v) => v,
+        Err(a) => return StepResult::MemoryFault(a),
+    };
+    if let Err(a) = mem_write(mem, addr, swap_val, size) {
+        return StepResult::MemoryFault(a);
+    }
+    state.set_reg(rt as u32, original);
+    StepResult::Continue
+}
+
+// LDADD/LDCLR/LDEOR/LDSET = atomic arithmetic
+pub fn exec_atomic_op(state: &mut CpuState, mem: &mut dyn MemoryAccess,
+                      size: u8, rs: u8, rt: u8, rn: u8, op: u8) -> StepResult {
+    let addr = state.get_reg(rn as u32);
+    let operand = state.get_reg(rs as u32);
+
+    let original = match mem_read(mem, addr, size, false, size == 3) {
+        Ok(v) => v,
+        Err(a) => return StepResult::MemoryFault(a),
+    };
+    let result = match op {
+        0 => original.wrapping_add(operand), // LDADD
+        1 => original & !operand,            // LDCLR (BIC)
+        2 => original ^ operand,             // LDEOR
+        3 => original | operand,             // LDSET (ORR)
+        _ => unreachable!(),
+    };
+    if let Err(a) = mem_write(mem, addr, result, size) {
+        return StepResult::MemoryFault(a);
+    }
+    state.set_reg(rt as u32, original); // Rt gets original value
+    StepResult::Continue
+}
+
 // LDAXP = load-acquire exclusive pair
 pub fn exec_ldaxp(state: &mut CpuState, mem: &dyn MemoryAccess,
                    sf: bool, rt: u8, rt2: u8, rn: u8) -> StepResult {
@@ -315,4 +384,167 @@ pub fn exec_stlxp(state: &mut CpuState, mem: &mut dyn MemoryAccess,
         state.set_reg(rs as u32, 1); // failed
     }
     StepResult::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::{MemoryAccess, MemoryFault};
+
+    struct TestMem {
+        data: Vec<u8>,
+    }
+
+    impl TestMem {
+        fn new() -> Self {
+            Self { data: vec![0u8; 4096] }
+        }
+    }
+
+    impl MemoryAccess for TestMem {
+        fn read_u8(&self, addr: u64) -> Result<u8, MemoryFault> {
+            self.data.get(addr as usize).copied().ok_or(MemoryFault::Unmapped(addr))
+        }
+        fn read_u16(&self, addr: u64) -> Result<u16, MemoryFault> {
+            let o = addr as usize;
+            let s = self.data.get(o..o + 2).ok_or(MemoryFault::Unmapped(addr))?;
+            Ok(u16::from_le_bytes(s.try_into().unwrap()))
+        }
+        fn read_u32(&self, addr: u64) -> Result<u32, MemoryFault> {
+            let o = addr as usize;
+            let s = self.data.get(o..o + 4).ok_or(MemoryFault::Unmapped(addr))?;
+            Ok(u32::from_le_bytes(s.try_into().unwrap()))
+        }
+        fn read_u64(&self, addr: u64) -> Result<u64, MemoryFault> {
+            let o = addr as usize;
+            let s = self.data.get(o..o + 8).ok_or(MemoryFault::Unmapped(addr))?;
+            Ok(u64::from_le_bytes(s.try_into().unwrap()))
+        }
+        fn read_u128(&self, addr: u64) -> Result<u128, MemoryFault> {
+            let o = addr as usize;
+            let s = self.data.get(o..o + 16).ok_or(MemoryFault::Unmapped(addr))?;
+            Ok(u128::from_le_bytes(s.try_into().unwrap()))
+        }
+        fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), MemoryFault> {
+            *self.data.get_mut(addr as usize).ok_or(MemoryFault::Unmapped(addr))? = val;
+            Ok(())
+        }
+        fn write_u16(&mut self, addr: u64, val: u16) -> Result<(), MemoryFault> {
+            let o = addr as usize;
+            let s = self.data.get_mut(o..o + 2).ok_or(MemoryFault::Unmapped(addr))?;
+            s.copy_from_slice(&val.to_le_bytes());
+            Ok(())
+        }
+        fn write_u32(&mut self, addr: u64, val: u32) -> Result<(), MemoryFault> {
+            let o = addr as usize;
+            let s = self.data.get_mut(o..o + 4).ok_or(MemoryFault::Unmapped(addr))?;
+            s.copy_from_slice(&val.to_le_bytes());
+            Ok(())
+        }
+        fn write_u64(&mut self, addr: u64, val: u64) -> Result<(), MemoryFault> {
+            let o = addr as usize;
+            let s = self.data.get_mut(o..o + 8).ok_or(MemoryFault::Unmapped(addr))?;
+            s.copy_from_slice(&val.to_le_bytes());
+            Ok(())
+        }
+        fn write_u128(&mut self, addr: u64, val: u128) -> Result<(), MemoryFault> {
+            let o = addr as usize;
+            let s = self.data.get_mut(o..o + 16).ok_or(MemoryFault::Unmapped(addr))?;
+            s.copy_from_slice(&val.to_le_bytes());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_cas_success() {
+        let mut s = CpuState::new();
+        let mut mem = TestMem::new();
+        mem.write_u32(0x100, 42).unwrap();
+        s.set_reg(2, 0x100);  // Rn = address
+        s.set_reg(0, 42);     // Rs = expected (compare value)
+        s.set_reg(1, 99);     // Rt = new value
+        let r = exec_cas(&mut s, &mut mem, 2, 0, 1, 2); // size=2 (32-bit)
+        assert!(matches!(r, StepResult::Continue));
+        assert_eq!(mem.read_u32(0x100).unwrap(), 99);
+        assert_eq!(s.get_reg(0), 42); // Rs = old value
+    }
+
+    #[test]
+    fn test_cas_fail() {
+        let mut s = CpuState::new();
+        let mut mem = TestMem::new();
+        mem.write_u32(0x100, 42).unwrap();
+        s.set_reg(2, 0x100);
+        s.set_reg(0, 10);     // Rs = wrong expected
+        s.set_reg(1, 99);
+        let r = exec_cas(&mut s, &mut mem, 2, 0, 1, 2);
+        assert!(matches!(r, StepResult::Continue));
+        assert_eq!(mem.read_u32(0x100).unwrap(), 42); // unchanged
+        assert_eq!(s.get_reg(0), 42); // Rs = actual value
+    }
+
+    #[test]
+    fn test_swp() {
+        let mut s = CpuState::new();
+        let mut mem = TestMem::new();
+        mem.write_u32(0x100, 42).unwrap();
+        s.set_reg(2, 0x100);
+        s.set_reg(0, 99);     // Rs = swap value
+        let r = exec_swp(&mut s, &mut mem, 2, 0, 1, 2);
+        assert!(matches!(r, StepResult::Continue));
+        assert_eq!(mem.read_u32(0x100).unwrap(), 99);
+        assert_eq!(s.get_reg(1), 42); // Rt = old value
+    }
+
+    #[test]
+    fn test_ldadd() {
+        let mut s = CpuState::new();
+        let mut mem = TestMem::new();
+        mem.write_u32(0x100, 10).unwrap();
+        s.set_reg(2, 0x100);
+        s.set_reg(0, 5);
+        let r = exec_atomic_op(&mut s, &mut mem, 2, 0, 1, 2, 0);
+        assert!(matches!(r, StepResult::Continue));
+        assert_eq!(mem.read_u32(0x100).unwrap(), 15);
+        assert_eq!(s.get_reg(1), 10);
+    }
+
+    #[test]
+    fn test_ldclr() {
+        let mut s = CpuState::new();
+        let mut mem = TestMem::new();
+        mem.write_u32(0x100, 0xFF).unwrap();
+        s.set_reg(2, 0x100);
+        s.set_reg(0, 0x0F);
+        let r = exec_atomic_op(&mut s, &mut mem, 2, 0, 1, 2, 1);
+        assert!(matches!(r, StepResult::Continue));
+        assert_eq!(mem.read_u32(0x100).unwrap(), 0xF0);
+        assert_eq!(s.get_reg(1), 0xFF);
+    }
+
+    #[test]
+    fn test_ldeor() {
+        let mut s = CpuState::new();
+        let mut mem = TestMem::new();
+        mem.write_u32(0x100, 0xAA).unwrap();
+        s.set_reg(2, 0x100);
+        s.set_reg(0, 0xFF);
+        let r = exec_atomic_op(&mut s, &mut mem, 2, 0, 1, 2, 2);
+        assert!(matches!(r, StepResult::Continue));
+        assert_eq!(mem.read_u32(0x100).unwrap(), 0x55);
+        assert_eq!(s.get_reg(1), 0xAA);
+    }
+
+    #[test]
+    fn test_ldset() {
+        let mut s = CpuState::new();
+        let mut mem = TestMem::new();
+        mem.write_u32(0x100, 0xA0).unwrap();
+        s.set_reg(2, 0x100);
+        s.set_reg(0, 0x0F);
+        let r = exec_atomic_op(&mut s, &mut mem, 2, 0, 1, 2, 3);
+        assert!(matches!(r, StepResult::Continue));
+        assert_eq!(mem.read_u32(0x100).unwrap(), 0xAF);
+        assert_eq!(s.get_reg(1), 0xA0);
+    }
 }

@@ -223,6 +223,22 @@ pub enum Instruction {
     Fneg { rd: u8, rn: u8, ftype: u8 },
     Fabs { rd: u8, rn: u8, ftype: u8 },
     Fsqrt { rd: u8, rn: u8, ftype: u8 },
+    /// FMADD/FMSUB/FNMADD/FNMSUB — fused multiply-add
+    /// op: 0=FMADD, 1=FMSUB, 2=FNMADD, 3=FNMSUB
+    Fma { ftype: u8, rd: u8, rn: u8, rm: u8, ra: u8, op: u8 },
+    /// FRINTN/FRINTP/FRINTM/FRINTZ/FRINTA/FRINTX/FRINTI — FP rounding
+    /// mode: 0=N(nearest), 1=P(+inf), 2=M(-inf), 3=Z(zero), 4=A(tie-away), 6=X(exact), 7=I(current)
+    Frint { ftype: u8, rd: u8, rn: u8, mode: u8 },
+
+    // -- Atomics ------------------------------------------------------------
+
+    /// CAS/CASA/CASL/CASAL — Compare and Swap
+    Cas { size: u8, rs: u8, rt: u8, rn: u8 },
+    /// SWP/SWPA/SWPL/SWPAL — Atomic Swap
+    Swp { size: u8, rs: u8, rt: u8, rn: u8 },
+    /// LDADD/LDCLR/LDEOR/LDSET — Atomic arithmetic
+    /// op: 0=ADD, 1=CLR(BIC), 2=EOR, 3=SET(ORR)
+    AtomicOp { size: u8, rs: u8, rt: u8, rn: u8, op: u8 },
 
     // -- Fallback -----------------------------------------------------------
 
@@ -682,6 +698,13 @@ fn decode_ldst_exclusive(raw: u32) -> Instruction {
     let o1 = bit(raw, 21);
     let sf = size >= 2;
 
+    // CAS/CASA/CASL/CASAL: bit[23]=1, o1(bit[21])=1, Rt2=11111
+    // Must check before the exclusive match below, since CAS overlaps with
+    // STLR/LDAR/LDAXP encodings when bit[23] is not examined.
+    if bit(raw, 23) == 1 && o1 == 1 && rt2 == 0b11111 {
+        return Instruction::Cas { size, rs, rt, rn };
+    }
+
     // Ordered/exclusive combinations
     match (o1, l, o0) {
         // STXR
@@ -699,6 +722,34 @@ fn decode_ldst_exclusive(raw: u32) -> Instruction {
         (1, 1, 0) => Instruction::Ldar { sf, rt, rn, size },
         // LDAXP
         (1, 1, 1) => Instruction::Ldaxp { sf, rt, rt2, rn },
+        _ => Instruction::Unknown { raw },
+    }
+}
+
+/// Decode atomic memory operations: SWP, LDADD, LDCLR, LDEOR, LDSET.
+/// Encoding: size 111000 A R 1 Rs o3 opc[14:12] 00 Rn Rt
+fn decode_atomic_mem(raw: u32) -> Instruction {
+    let size = bits(raw, 31, 30) as u8;
+    let rs = bits(raw, 20, 16) as u8;
+    let rn = bits(raw, 9, 5) as u8;
+    let rt = bits(raw, 4, 0) as u8;
+    let o3 = bit(raw, 15);
+    let opc = bits(raw, 14, 12) as u8;
+
+    if o3 == 1 {
+        // SWP family: o3=1, opc=000
+        if opc == 0b000 {
+            return Instruction::Swp { size, rs, rt, rn };
+        }
+        return Instruction::Unknown { raw };
+    }
+
+    // Atomic arithmetic: o3=0
+    match opc {
+        0b000 => Instruction::AtomicOp { size, rs, rt, rn, op: 0 }, // LDADD
+        0b001 => Instruction::AtomicOp { size, rs, rt, rn, op: 1 }, // LDCLR
+        0b010 => Instruction::AtomicOp { size, rs, rt, rn, op: 2 }, // LDEOR
+        0b011 => Instruction::AtomicOp { size, rs, rt, rn, op: 3 }, // LDSET
         _ => Instruction::Unknown { raw },
     }
 }
@@ -788,6 +839,13 @@ fn decode_ldst_gp(raw: u32) -> Instruction {
         let imm9 = bits(raw, 20, 12);
         let offset = sign_extend(imm9, 9);
         let idx = bits(raw, 11, 10);
+
+        // Atomic memory operations: bit[21]=1, idx=0b00
+        // Encoding: size 111000 A R 1 Rs o3 opc 00 Rn Rt
+        // bit[21]=1 distinguishes atomics from LDUR/STUR (bit[21]=0).
+        if idx == 0b00 && bit(raw, 21) == 1 {
+            return decode_atomic_mem(raw);
+        }
 
         // Register offset: idx = 10, bit [21] = 1
         if idx == 0b10 && bit(raw, 21) == 1 {
@@ -1067,6 +1125,22 @@ fn decode_dp3_source(raw: u32) -> Instruction {
 // ---------------------------------------------------------------------------
 
 fn decode_simd_fp(raw: u32) -> Instruction {
+    // Floating-point data-processing (3 source): FMADD/FMSUB/FNMADD/FNMSUB
+    // [31]=0, [30]=0, [29]=0, [28:24]=11111, [23:22]=ftype, [21]=o1, [20:16]=Rm
+    // [15]=o0, [14:10]=Ra, [9:5]=Rn, [4:0]=Rd
+    if bits(raw, 28, 24) == 0b11111 && bit(raw, 31) == 0 && bit(raw, 30) == 0 && bit(raw, 29) == 0
+    {
+        let ftype = bits(raw, 23, 22) as u8;
+        let o1 = bit(raw, 21);
+        let rm = bits(raw, 20, 16) as u8;
+        let o0 = bit(raw, 15);
+        let ra = bits(raw, 14, 10) as u8;
+        let rn = bits(raw, 9, 5) as u8;
+        let rd = bits(raw, 4, 0) as u8;
+        let op = ((o1 << 1) | o0) as u8;
+        return Instruction::Fma { ftype, rd, rn, rm, ra, op };
+    }
+
     // Floating-point data-processing (2 source)
     // 0 0 0 11110 xx 1 Rm 0000 10 Rn Rd
     if bits(raw, 28, 24) == 0b11110 && bits(raw, 21, 21) == 1
@@ -1110,6 +1184,13 @@ fn decode_simd_fp(raw: u32) -> Instruction {
             0b000100 => Instruction::Fcvt { rd, rn, src_type: ftype, dst_type: 0 },
             0b000101 => Instruction::Fcvt { rd, rn, src_type: ftype, dst_type: 1 },
             0b000111 => Instruction::Fcvt { rd, rn, src_type: ftype, dst_type: 3 },
+            // FRINT*: opcode = 001xxx
+            // 001000=FRINTN, 001001=FRINTP, 001010=FRINTM, 001011=FRINTZ
+            // 001100=FRINTA, 001110=FRINTX, 001111=FRINTI
+            _ if (opcode >> 3) == 0b001 => {
+                let mode = (opcode & 0x7) as u8;
+                Instruction::Frint { ftype, rd, rn, mode }
+            }
             _ => Instruction::Unknown { raw },
         };
     }
@@ -1347,6 +1428,136 @@ mod tests {
         match inst {
             Instruction::MovN { sf: true, rd: 0, imm16: 0, hw: 0 } => {}
             other => panic!("Expected MOVN, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_fmadd() {
+        // FMADD D0, D1, D2, D3: 0x1F420C20
+        let inst = decode(0x1F420C20);
+        match inst {
+            Instruction::Fma { ftype: 1, rd: 0, rn: 1, rm: 2, ra: 3, op: 0 } => {}
+            other => panic!("Expected FMADD, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_fmsub() {
+        // FMSUB D0, D1, D2, D3: o1=0, o0=1 → op=1
+        let inst = decode(0x1F428C20);
+        match inst {
+            Instruction::Fma { ftype: 1, rd: 0, rn: 1, rm: 2, ra: 3, op: 1 } => {}
+            other => panic!("Expected FMSUB, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_fnmadd() {
+        // FNMADD D0, D1, D2, D3: o1=1, o0=0 → op=2
+        let inst = decode(0x1F620C20);
+        match inst {
+            Instruction::Fma { ftype: 1, rd: 0, rn: 1, rm: 2, ra: 3, op: 2 } => {}
+            other => panic!("Expected FNMADD, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_fnmsub() {
+        // FNMSUB D0, D1, D2, D3: o1=1, o0=1 → op=3
+        let inst = decode(0x1F628C20);
+        match inst {
+            Instruction::Fma { ftype: 1, rd: 0, rn: 1, rm: 2, ra: 3, op: 3 } => {}
+            other => panic!("Expected FNMSUB, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_frintn() {
+        // FRINTN D0, D1: opcode=001000, ftype=01 → 0x1E644020
+        let inst = decode(0x1E644020);
+        match inst {
+            Instruction::Frint { ftype: 1, rd: 0, rn: 1, mode: 0 } => {}
+            other => panic!("Expected FRINTN, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_frintz() {
+        // FRINTZ D0, D1: opcode=001011, ftype=01 → 0x1E65C020
+        let inst = decode(0x1E65C020);
+        match inst {
+            Instruction::Frint { ftype: 1, rd: 0, rn: 1, mode: 3 } => {}
+            other => panic!("Expected FRINTZ, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_cas_32() {
+        // CAS W0, W1, [X2]: 0x88A07C41
+        let inst = decode(0x88A07C41);
+        match inst {
+            Instruction::Cas { size: 2, rs: 0, rt: 1, rn: 2 } => {}
+            other => panic!("Expected CAS, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_cas_64() {
+        // CAS X0, X1, [X2]: 0xC8A07C41
+        let inst = decode(0xC8A07C41);
+        match inst {
+            Instruction::Cas { size: 3, rs: 0, rt: 1, rn: 2 } => {}
+            other => panic!("Expected CAS (64-bit), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_swp() {
+        // SWP W0, W1, [X2]: 0xB8208041
+        let inst = decode(0xB8208041);
+        match inst {
+            Instruction::Swp { size: 2, rs: 0, rt: 1, rn: 2 } => {}
+            other => panic!("Expected SWP, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_ldadd() {
+        // LDADD W0, W1, [X2]: 0xB8200041
+        let inst = decode(0xB8200041);
+        match inst {
+            Instruction::AtomicOp { size: 2, rs: 0, rt: 1, rn: 2, op: 0 } => {}
+            other => panic!("Expected LDADD, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_ldclr() {
+        // LDCLR W0, W1, [X2]: 0xB8201041
+        let inst = decode(0xB8201041);
+        match inst {
+            Instruction::AtomicOp { size: 2, rs: 0, rt: 1, rn: 2, op: 1 } => {}
+            other => panic!("Expected LDCLR, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_ldeor() {
+        // LDEOR W0, W1, [X2]: 0xB8202041
+        let inst = decode(0xB8202041);
+        match inst {
+            Instruction::AtomicOp { size: 2, rs: 0, rt: 1, rn: 2, op: 2 } => {}
+            other => panic!("Expected LDEOR, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_ldset() {
+        // LDSET W0, W1, [X2]: 0xB8203041
+        let inst = decode(0xB8203041);
+        match inst {
+            Instruction::AtomicOp { size: 2, rs: 0, rt: 1, rn: 2, op: 3 } => {}
+            other => panic!("Expected LDSET, got {:?}", other),
         }
     }
 }

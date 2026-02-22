@@ -162,6 +162,7 @@ fn get_sub_interface(service_name: &str, cmd_id: u32) -> Option<&'static str> {
     match (service_name, cmd_id) {
         // AM chain
         ("appletOE", 0) => Some("IApplicationProxy"),
+        ("appletAE", 0 | 100 | 200 | 300) => Some("IApplicationProxy"),
         ("IApplicationProxy", 0) => Some("am:ICommonStateGetter"),
         ("IApplicationProxy", 1) => Some("am:ISelfController"),
         ("IApplicationProxy", 2) => Some("am:IWindowController"),
@@ -193,6 +194,8 @@ fn get_sub_interface(service_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("pctl:s", 0) => Some("pctl:IParentalControlService"),
         ("nifm:u", 4) => Some("nifm:IGeneralService"),
         ("friend:u", 0) => Some("friend:IFriendService"),
+        // APM
+        ("apm", 0) => Some("apm:ISession"),
         // Logger
         ("lm", 0) => Some("ILogger"),
         _ => None,
@@ -401,8 +404,19 @@ fn main() -> Result<()> {
         "vi:IHOSBinderDriver",
         Box::new(ruzu_service::vi::ViBinderService::new(buffer_queue.clone())),
     );
+    // APM service
+    manager.register_service("apm", Box::new(ruzu_service::apm::ApmService::new()));
+    manager.register_service(
+        "apm:ISession",
+        Box::new(ruzu_service::apm::ApmSessionService::new()),
+    );
+
     // AM service chain
     manager.register_service("appletOE", Box::new(ruzu_service::am::AmService::new()));
+    manager.register_service(
+        "appletAE",
+        Box::new(ruzu_service::am::AppletAeService::new()),
+    );
     manager.register_service(
         "IApplicationProxy",
         Box::new(ruzu_service::am::ApplicationProxyService::new()),
@@ -515,8 +529,9 @@ fn main() -> Result<()> {
         Box::new(ruzu_service::friends::FriendInterfaceService::new()),
     );
 
-    // Other
+    // Settings
     manager.register_service("set:sys", Box::new(ruzu_service::set::SetSysService::new()));
+    manager.register_service("set", Box::new(ruzu_service::set::SetService::new()));
     manager.register_service("lm", Box::new(ruzu_service::lm::LmService::new()));
     manager.register_service("ILogger", Box::new(ruzu_service::lm::LoggerService::new()));
 

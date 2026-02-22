@@ -55,6 +55,44 @@ impl ServiceHandler for AmService {
     }
 }
 
+// ── Alternative entry: appletAE ──────────────────────────────────────────────
+
+pub struct AppletAeService;
+
+impl AppletAeService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for AppletAeService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServiceHandler for AppletAeService {
+    fn service_name(&self) -> &str {
+        "appletAE"
+    }
+
+    fn handle_request(&mut self, cmd_id: u32, _command: &IpcCommand) -> IpcResponse {
+        log::debug!("appletAE: cmd_id={}", cmd_id);
+        match cmd_id {
+            // OpenSystemAppletProxy / OpenLibraryAppletProxy /
+            // OpenOverlayAppletProxy / OpenApplicationProxy
+            0 | 100 | 200 | 300 => {
+                log::info!("appletAE: OpenProxy (cmd_id={})", cmd_id);
+                IpcResponse::success().with_move_handle(0)
+            }
+            _ => {
+                log::warn!("appletAE: unhandled cmd_id={}", cmd_id);
+                IpcResponse::success()
+            }
+        }
+    }
+}
+
 // ── IApplicationProxy ────────────────────────────────────────────────────────
 
 pub struct ApplicationProxyService;
@@ -534,6 +572,17 @@ mod tests {
         let cmd = make_command(1);
         let resp = svc.handle_request(1, &cmd);
         assert!(resp.result.is_error());
+    }
+
+    #[test]
+    fn test_applet_ae_open_proxy() {
+        let mut svc = AppletAeService::new();
+        for cmd_id in [0, 100, 200, 300] {
+            let cmd = make_command(cmd_id);
+            let resp = svc.handle_request(cmd_id, &cmd);
+            assert!(resp.result.is_success());
+            assert_eq!(resp.handles_to_move, vec![0], "cmd_id={cmd_id} should return move_handle(0)");
+        }
     }
 
     #[test]
