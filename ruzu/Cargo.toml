@@ -18,6 +18,7 @@ ruzu-gpu.workspace = true
 clap.workspace = true
 rust-ini.workspace = true
 sdl2.workspace = true
+parking_lot.workspace = true
 log.workspace = true
 env_logger.workspace = true
 anyhow.workspace = true

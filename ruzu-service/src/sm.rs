@@ -16,11 +16,17 @@ use crate::ipc::{IpcCommand, IpcResponse};
 /// HLE implementation of `sm:`.
 pub struct SmService {
     initialized: bool,
+    /// After a GetService call, this holds the resolved service name
+    /// so the IPC bridge can create a session for it.
+    pub last_get_service_name: Option<String>,
 }
 
 impl SmService {
     pub fn new() -> Self {
-        Self { initialized: false }
+        Self {
+            initialized: false,
+            last_get_service_name: None,
+        }
     }
 }
 
@@ -53,8 +59,11 @@ impl ServiceHandler for SmService {
                 let name = read_service_name(&command.raw_data);
                 log::info!("sm: GetService(\"{}\")", name);
 
-                // The actual handle creation is performed by the SVC layer.
-                // We just acknowledge the request here.
+                // Store the resolved name so the IPC bridge can create a
+                // KClientSession for the target service.
+                self.last_get_service_name = Some(name);
+
+                // The actual handle creation is performed by the IPC bridge.
                 IpcResponse::success()
             }
 
@@ -81,7 +90,7 @@ impl ServiceHandler for SmService {
 }
 
 /// Read a service name (up to 8 bytes) from the first two raw data words.
-fn read_service_name(raw_data: &[u32]) -> String {
+pub fn read_service_name(raw_data: &[u32]) -> String {
     let mut bytes = [0u8; 8];
 
     if let Some(&w0) = raw_data.first() {

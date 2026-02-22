@@ -9,15 +9,24 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::info;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+
 use ruzu_crypto::KeyManager;
+use ruzu_kernel::kernel::{IpcHandler, IpcHandlerResult};
+use ruzu_kernel::objects::{KSharedMemory, KernelObject};
 use ruzu_kernel::KernelCore;
 use ruzu_loader::game_info::{self, GameFormat};
 use ruzu_loader::nro;
 use ruzu_loader::nsp;
 use ruzu_loader::vfs::RealFile;
 use ruzu_loader::xci;
+use ruzu_service::buffer_queue::BufferQueue;
+use ruzu_service::framework::ServiceManager;
+use ruzu_service::hid_shared_memory::HidSharedMemory;
+use ruzu_service::ipc::{self as svc_ipc, IpcResponse};
 
 /// ruzu - Nintendo Switch Emulator
 #[derive(Parser, Debug)]
@@ -47,6 +56,118 @@ struct Args {
     #[arg(long)]
     headless: bool,
 }
+
+// ── IPC Bridge ──────────────────────────────────────────────────────────────
+
+/// Bridges the kernel's SVC layer to the service framework.
+struct ServiceBridge {
+    manager: Arc<RwLock<ServiceManager>>,
+}
+
+impl ServiceBridge {
+    fn new(manager: Arc<RwLock<ServiceManager>>) -> Self {
+        Self { manager }
+    }
+}
+
+impl IpcHandler for ServiceBridge {
+    fn handle_ipc(&self, service_name: &str, tls_data: &[u8]) -> IpcHandlerResult {
+        // Parse the IPC command from TLS data.
+        let cmd = svc_ipc::parse_ipc_command(tls_data).ok();
+
+        let cmd_id = cmd.as_ref().map(|c| c.command_id).unwrap_or(0);
+
+        // Dispatch to the service.
+        let response = cmd.as_ref().and_then(|c| {
+            self.manager.write().handle_request(service_name, c.command_id, c)
+        });
+        let response = response.unwrap_or_else(IpcResponse::success);
+
+        // Build the 0x100-byte response (without handles — those are handled separately).
+        let response_bytes = svc_ipc::build_ipc_response_full(
+            response.result,
+            &response.data,
+            &[], // Handles are passed out-of-band via IpcHandlerResult.
+            &[],
+        );
+
+        // Detect sm:GetService (service_name=="sm:", cmd_id==1) and extract
+        // the target service name so the bridge can create a session.
+        let create_session_for = if service_name == "sm:" && cmd_id == 1 {
+            // Read the resolved name from SmService.
+            let mgr = self.manager.read();
+            if let Some(sm_lock) = mgr.get_service("sm:") {
+                let sm_guard = sm_lock.read();
+                // Downcast to SmService to read last_get_service_name.
+                // Since we can't easily downcast through Box<dyn ServiceHandler>,
+                // we extract the name from the raw_data directly.
+                drop(sm_guard);
+                drop(mgr);
+
+                // Parse service name from the command's raw_data.
+                cmd.as_ref().and_then(|c| {
+                    if c.raw_data.len() >= 2 {
+                        let name = ruzu_service::sm::read_service_name(&c.raw_data);
+                        if !name.is_empty() {
+                            Some(name)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Detect sub-interface creation: services that return move handles.
+        // When a service returns a move handle of 0 (placeholder), the bridge
+        // creates a session to the appropriate sub-interface.
+        let create_sub_session = if !response.handles_to_move.is_empty()
+            && response.handles_to_move.iter().any(|&h| h == 0)
+        {
+            // Map parent service → child sub-service.
+            match service_name {
+                "vi:m" if cmd_id == 2 => Some("vi:IApplicationDisplayService".to_string()),
+                "vi:IApplicationDisplayService" if cmd_id == 100 => {
+                    Some("vi:IHOSBinderDriver".to_string())
+                }
+                "vi:IApplicationDisplayService"
+                    if cmd_id == 101 || cmd_id == 102 || cmd_id == 103 =>
+                {
+                    Some("vi:IApplicationDisplayService".to_string())
+                }
+                "appletOE" if cmd_id == 0 => Some("IApplicationProxy".to_string()),
+                "lm" if cmd_id == 0 => Some("ILogger".to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // The session to create: prefer create_session_for (sm:GetService),
+        // then create_sub_session (sub-interface), then None.
+        let final_session = create_session_for.or(create_sub_session);
+
+        IpcHandlerResult {
+            response_bytes,
+            create_session_for: final_session,
+            copy_handles: response.handles_to_copy.clone(),
+            move_handles: response
+                .handles_to_move
+                .iter()
+                .filter(|&&h| h != 0) // Filter out placeholder handles.
+                .copied()
+                .collect(),
+        }
+    }
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -173,11 +294,70 @@ fn main() -> Result<()> {
         };
     }
 
+    // ── Phase 5: Create shared state and wire services ──────────────────
+
+    let hid_shared_mem = Arc::new(RwLock::new(HidSharedMemory::new()));
+    let buffer_queue = Arc::new(RwLock::new(BufferQueue::new()));
+
+    // Create HID shared memory kernel object.
+    let hid_shm_handle = {
+        let process = kernel.process_mut().unwrap();
+        let shm = KSharedMemory::new(ruzu_service::hid_shared_memory::HID_SHARED_MEMORY_SIZE);
+        process
+            .handle_table
+            .add(KernelObject::SharedMemory(shm))
+            .expect("Failed to create HID shared memory handle")
+    };
+
+    // Create and register services.
+    let mut manager = ServiceManager::new();
+    manager.register_service("sm:", Box::new(ruzu_service::sm::SmService::new()));
+    manager.register_service(
+        "hid",
+        Box::new(ruzu_service::hid::HidService::new_with_shm_handle(hid_shm_handle)),
+    );
+    manager.register_service("nvdrv", Box::new(ruzu_service::nvdrv::NvdrvService::new()));
+    manager.register_service("nvdrv:a", Box::new(ruzu_service::nvdrv::NvdrvService::new()));
+    manager.register_service("nvdrv:s", Box::new(ruzu_service::nvdrv::NvdrvService::new()));
+    manager.register_service("nvdrv:t", Box::new(ruzu_service::nvdrv::NvdrvService::new()));
+    manager.register_service("vi:m", Box::new(ruzu_service::vi::ViManagerService::new()));
+    manager.register_service(
+        "vi:IApplicationDisplayService",
+        Box::new(ruzu_service::vi::ViDisplayService::new(buffer_queue.clone())),
+    );
+    manager.register_service(
+        "vi:IHOSBinderDriver",
+        Box::new(ruzu_service::vi::ViBinderService::new(buffer_queue.clone())),
+    );
+    manager.register_service("appletOE", Box::new(ruzu_service::am::AmService::new()));
+    manager.register_service(
+        "IApplicationProxy",
+        Box::new(ruzu_service::am::ApplicationProxyService::new()),
+    );
+    manager.register_service("fsp-srv", Box::new(ruzu_service::fs::FspSrvService::new()));
+    manager.register_service("set:sys", Box::new(ruzu_service::set::SetSysService::new()));
+    manager.register_service("lm", Box::new(ruzu_service::lm::LmService::new()));
+    manager.register_service("ILogger", Box::new(ruzu_service::lm::LoggerService::new()));
+
+    // Wire IPC bridge.
+    let manager_arc = Arc::new(RwLock::new(manager));
+    let bridge = Arc::new(ServiceBridge::new(manager_arc));
+    kernel.ipc_handler = Some(bridge);
+
+    // Track where the game maps HID shared memory (set by MapSharedMemory SVC).
+    let hid_guest_addr: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
     if args.headless {
         info!("Running in headless mode");
         run_headless(&mut kernel)?;
     } else {
-        run_with_window(&mut kernel)?;
+        run_with_window(
+            &mut kernel,
+            hid_shared_mem,
+            buffer_queue,
+            hid_shm_handle,
+            hid_guest_addr,
+        )?;
     }
 
     info!("Emulation finished");
@@ -247,10 +427,6 @@ fn run_headless(kernel: &mut KernelCore) -> Result<()> {
 const INSTRUCTIONS_PER_SLICE: u64 = 50_000;
 
 /// Core CPU execution loop with multi-thread scheduling.
-///
-/// Uses a priority-aware round-robin scheduler. Each thread gets a fixed
-/// instruction budget per time slice. Waiting threads are skipped; timeouts
-/// are checked each iteration.
 fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
     use ruzu_cpu::interpreter::Interpreter;
     use ruzu_cpu::state::{CpuExecutor, HaltReason};
@@ -370,8 +546,14 @@ fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
     Ok(())
 }
 
-/// Run with SDL2 window and Vulkan renderer.
-fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
+/// Run with SDL2 window, input polling, and framebuffer presentation.
+fn run_with_window(
+    kernel: &mut KernelCore,
+    hid_shared_mem: Arc<RwLock<HidSharedMemory>>,
+    buffer_queue: Arc<RwLock<BufferQueue>>,
+    hid_shm_handle: u32,
+    hid_guest_addr: Arc<AtomicU64>,
+) -> Result<()> {
     use ruzu_cpu::interpreter::Interpreter;
     use ruzu_cpu::state::{CpuExecutor, HaltReason};
     use ruzu_kernel::scheduler::Scheduler;
@@ -384,22 +566,61 @@ fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
 
     info!("Window created, entering main loop");
     info!("Press ESC or close window to exit");
+    info!("Controls: Z=A, X=B, C=X, V=Y, Arrows=D-Pad, Enter=+, RShift=-, Q/E=L/R, A/D=ZL/ZR, IJKL=LStick");
 
     let mut interp = Interpreter::new();
 
-    // Number of time slices to run per frame (~60 FPS ≈ 16ms).
+    // Number of time slices to run per frame (~60 FPS ~ 16ms).
     const SLICES_PER_FRAME: usize = 10;
 
     loop {
-        if !emu_window.poll_events() {
-            info!("Window close requested");
-            break;
-        }
+        // ── Poll SDL2 events and read input ─────────────────────────────
+        let input = match emu_window.poll_events_with_input() {
+            Some(input) => input,
+            None => {
+                info!("Window close requested");
+                break;
+            }
+        };
 
         if kernel.should_stop {
             break;
         }
 
+        // ── Update HID shared memory ────────────────────────────────────
+        {
+            let mut hid = hid_shared_mem.write();
+            hid.update_input(input.buttons, input.l_stick, input.r_stick);
+
+            // Sync HID data to guest memory if the game has mapped it.
+            let guest_addr = hid_guest_addr.load(Ordering::Relaxed);
+            if guest_addr != 0 {
+                if let Some(process) = kernel.process_mut() {
+                    let _ = process.memory.write_bytes(guest_addr, &hid.data);
+                }
+            }
+        }
+
+        // ── Try to detect HID mapping address ──────────────────────────
+        // Check if the game has mapped our HID shared memory handle.
+        // We look for a SharedMemory mapping by checking if the pool offset
+        // matches the HID handle. This is a simplified detection approach.
+        if hid_guest_addr.load(Ordering::Relaxed) == 0 {
+            if let Some(process) = kernel.process() {
+                if let Ok(KernelObject::SharedMemory(shm)) =
+                    process.handle_table.get(hid_shm_handle)
+                {
+                    if shm.backing_offset.is_some() {
+                        // Look for the mapping address by scanning memory regions.
+                        // For now, use a heuristic: HID is typically mapped at a
+                        // specific address in homebrew.
+                        // A more robust approach would track MapSharedMemory calls.
+                    }
+                }
+            }
+        }
+
+        // ── Run CPU slices ──────────────────────────────────────────────
         for _ in 0..SLICES_PER_FRAME {
             if kernel.should_stop {
                 break;
@@ -468,6 +689,21 @@ fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
                     let mut cpu =
                         kernel.process().unwrap().threads[idx].cpu_state.clone();
                     dispatch_svc(kernel, &mut cpu, n);
+
+                    // Track MapSharedMemory calls to detect HID mapping.
+                    if n == 0x13 {
+                        // SVC 0x13 = MapSharedMemory
+                        let map_handle = cpu.x[0] as u32;
+                        let map_addr = cpu.x[1];
+                        if map_handle == hid_shm_handle && map_addr != 0 {
+                            log::info!(
+                                "HID shared memory mapped at guest addr 0x{:X}",
+                                map_addr
+                            );
+                            hid_guest_addr.store(map_addr, Ordering::Relaxed);
+                        }
+                    }
+
                     if let Some(process) = kernel.process_mut() {
                         if process.threads[idx].state != ThreadState::Waiting {
                             process.threads[idx].cpu_state = cpu;
@@ -496,6 +732,33 @@ fn run_with_window(kernel: &mut KernelCore) -> Result<()> {
         }
 
         kernel.current_thread_idx = None;
+
+        // ── Present framebuffer ─────────────────────────────────────────
+        {
+            let mut bq = buffer_queue.write();
+            if let Some((slot, buffer)) = bq.acquire() {
+                let width = buffer.width;
+                let height = buffer.height;
+                let offset = buffer.offset;
+                let size = (width * height * 4) as usize;
+
+                if offset != 0 && size > 0 {
+                    // Read pixel data from guest memory.
+                    let mut pixels = vec![0u8; size];
+                    if let Some(process) = kernel.process() {
+                        for (i, byte) in pixels.iter_mut().enumerate() {
+                            *byte = process
+                                .memory
+                                .read_u8(offset + i as u64)
+                                .unwrap_or(0);
+                        }
+                    }
+                    emu_window.present_framebuffer(&pixels, width, height);
+                }
+
+                bq.release(slot);
+            }
+        }
     }
 
     Ok(())

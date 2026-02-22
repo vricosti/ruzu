@@ -1,11 +1,31 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::sync::Arc;
+
 use ruzu_common::{Handle, ProcessId, VAddr, NRO_BASE_ADDRESS};
 
 use crate::process::KProcess;
 use crate::scheduler::Scheduler;
 use crate::thread::ThreadState;
+
+/// Result returned by an IPC handler after processing a request.
+pub struct IpcHandlerResult {
+    /// 0x100-byte TLS response to write back.
+    pub response_bytes: Vec<u8>,
+    /// If `Some`, the bridge should create a new `KClientSession` for this service name.
+    pub create_session_for: Option<String>,
+    /// Handles to copy into the response handle descriptor.
+    pub copy_handles: Vec<u32>,
+    /// Handles to move into the response handle descriptor.
+    pub move_handles: Vec<u32>,
+}
+
+/// Trait for handling IPC requests. Bridges the kernel SVC layer to the service framework
+/// without creating a circular dependency between `ruzu-kernel` and `ruzu-service`.
+pub trait IpcHandler: Send + Sync {
+    fn handle_ipc(&self, service_name: &str, tls_data: &[u8]) -> IpcHandlerResult;
+}
 
 /// KernelCore: orchestrates all kernel subsystems.
 pub struct KernelCore {
@@ -23,6 +43,8 @@ pub struct KernelCore {
     pub current_thread_idx: Option<usize>,
     /// Backing store for shared memory regions.
     pub shared_memory_pool: Vec<u8>,
+    /// IPC handler bridge: dispatches SendSyncRequest to the service framework.
+    pub ipc_handler: Option<Arc<dyn IpcHandler>>,
 }
 
 impl KernelCore {
@@ -35,6 +57,7 @@ impl KernelCore {
             tick_counter: 0,
             current_thread_idx: None,
             shared_memory_pool: Vec::new(),
+            ipc_handler: None,
         }
     }
 

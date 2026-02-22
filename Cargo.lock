@@ -794,6 +794,7 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
+ "parking_lot",
  "rust-ini",
  "ruzu-common",
  "ruzu-cpu",
