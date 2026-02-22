@@ -1,21 +1,33 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `hid` -- Human Interface Device service stub.
+//! `hid` -- Human Interface Device service.
 //!
 //! Commands:
-//!   0 = CreateAppletResource
+//!   0 = CreateAppletResource — returns the HID shared memory handle
 //!   All others: stub success.
 
 use crate::framework::ServiceHandler;
 use crate::ipc::{IpcCommand, IpcResponse};
 
-/// HLE stub for `hid`.
-pub struct HidService;
+/// HLE implementation of `hid`.
+pub struct HidService {
+    /// Handle to the HID shared memory object (set during initialization).
+    hid_shm_handle: Option<u32>,
+}
 
 impl HidService {
     pub fn new() -> Self {
-        Self
+        Self {
+            hid_shm_handle: None,
+        }
+    }
+
+    /// Create with a pre-assigned shared memory handle.
+    pub fn new_with_shm_handle(handle: u32) -> Self {
+        Self {
+            hid_shm_handle: Some(handle),
+        }
     }
 }
 
@@ -37,7 +49,11 @@ impl ServiceHandler for HidService {
             // ── CreateAppletResource ─────────────────────────────────────
             0 => {
                 log::info!("hid: CreateAppletResource");
-                IpcResponse::success()
+                if let Some(handle) = self.hid_shm_handle {
+                    IpcResponse::success().with_copy_handle(handle)
+                } else {
+                    IpcResponse::success()
+                }
             }
 
             // ── ActivateTouchScreen (11) ─────────────────────────────────
@@ -116,11 +132,21 @@ mod tests {
     }
 
     #[test]
-    fn test_create_applet_resource() {
+    fn test_create_applet_resource_with_handle() {
+        let mut svc = HidService::new_with_shm_handle(42);
+        let cmd = make_command(0);
+        let resp = svc.handle_request(0, &cmd);
+        assert!(resp.result.is_success());
+        assert_eq!(resp.handles_to_copy, vec![42]);
+    }
+
+    #[test]
+    fn test_create_applet_resource_no_handle() {
         let mut svc = HidService::new();
         let cmd = make_command(0);
         let resp = svc.handle_request(0, &cmd);
         assert!(resp.result.is_success());
+        assert!(resp.handles_to_copy.is_empty());
     }
 
     #[test]

@@ -10,7 +10,7 @@ pub mod scheduler;
 pub mod svc;
 pub mod thread;
 
-pub use kernel::KernelCore;
+pub use kernel::{IpcHandler, IpcHandlerResult, KernelCore};
 pub use memory_manager::MemoryManager;
 pub use process::KProcess;
 pub use thread::KThread;
