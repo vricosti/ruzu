@@ -149,6 +149,11 @@ pub enum Instruction {
     Clz { sf: bool, rd: u8, rn: u8 },
     Rev { sf: bool, rd: u8, rn: u8, opc: u8 },
     Rbit { sf: bool, rd: u8, rn: u8 },
+    Adc { sf: bool, rd: u8, rn: u8, rm: u8, set_flags: bool },
+    Sbc { sf: bool, rd: u8, rn: u8, rm: u8, set_flags: bool },
+    VarShift { sf: bool, rd: u8, rn: u8, rm: u8, shift_type: u8 },
+    Smsubl { rd: u8, rn: u8, rm: u8, ra: u8 },
+    Umsubl { rd: u8, rn: u8, rm: u8, ra: u8 },
 
     // -- Load/Store ---------------------------------------------------------
 
@@ -199,6 +204,7 @@ pub enum Instruction {
     // -- System -------------------------------------------------------------
 
     Svc { imm: u16 },
+    Brk { imm: u16 },
     Mrs { rt: u8, sys_reg: u32 },
     Msr { rt: u8, sys_reg: u32 },
     Nop,
@@ -233,6 +239,10 @@ pub enum Instruction {
     /// FRINTN/FRINTP/FRINTM/FRINTZ/FRINTA/FRINTX/FRINTI — FP rounding
     /// mode: 0=N(nearest), 1=P(+inf), 2=M(-inf), 3=Z(zero), 4=A(tie-away), 6=X(exact), 7=I(current)
     Frint { ftype: u8, rd: u8, rn: u8, mode: u8 },
+    Fccmp { rn: u8, rm: u8, nzcv: u8, cond: u8, ftype: u8 },
+    FmovImm { rd: u8, ftype: u8, imm8: u8 },
+    FcvtRound { sf: bool, rd: u8, rn: u8, ftype: u8, rmode: u8, unsigned: bool },
+    FpFixedConv { sf: bool, rd: u8, rn: u8, ftype: u8, fbits: u8, opcode: u8 },
 
     // -- NEON/Advanced SIMD ---------------------------------------------------
 
@@ -266,6 +276,10 @@ pub enum Instruction {
     SimdScalarTwoReg { u: bool, size: u8, opcode: u8, rd: u8, rn: u8 },
     /// Advanced SIMD scalar pairwise (FADDP scalar, FMAXP, FMINP)
     SimdScalarPairwise { u: bool, size: u8, opcode: u8, rd: u8, rn: u8 },
+    /// Advanced SIMD scalar shift by immediate (SHL_S, SSHR_S, USHR_S, SLI_S, SRI_S, etc.)
+    SimdScalarShiftImm { u: bool, immh: u8, immb: u8, opcode: u8, rd: u8, rn: u8 },
+    /// Advanced SIMD scalar x indexed element (FMUL_Se, FMLA_Se, SQDMULH_Ve, etc.)
+    SimdScalarIndexed { u: bool, size: u8, opcode: u8, rd: u8, rn: u8, rm: u8, h: u8, l: u8, m: u8 },
 
     // -- Crypto / CRC32 ------------------------------------------------------
 
@@ -369,7 +383,7 @@ pub fn decode_bitmask_imm(sf: bool, n: u8, immr: u8, imms: u8) -> Option<u64> {
 
 /// Sign-extend `value` from `bits` width to i64.
 #[inline]
-fn sign_extend(value: u32, bits: u32) -> i64 {
+pub(crate) fn sign_extend(value: u32, bits: u32) -> i64 {
     let shift = 64 - bits;
     ((value as i64) << shift) >> shift
 }
@@ -384,13 +398,13 @@ fn sign_extend64(value: u64, bits: u32) -> i64 {
 
 /// Extract a bit field from an instruction word.
 #[inline]
-fn bits(raw: u32, hi: u32, lo: u32) -> u32 {
+pub(crate) fn bits(raw: u32, hi: u32, lo: u32) -> u32 {
     (raw >> lo) & ((1 << (hi - lo + 1)) - 1)
 }
 
 /// Extract a single bit.
 #[inline]
-fn bit(raw: u32, pos: u32) -> u32 {
+pub(crate) fn bit(raw: u32, pos: u32) -> u32 {
     (raw >> pos) & 1
 }
 
@@ -398,8 +412,8 @@ fn bit(raw: u32, pos: u32) -> u32 {
 // Top-level decoder
 // ---------------------------------------------------------------------------
 
-/// Decode a 32-bit A64 instruction word.
-pub fn decode(raw: u32) -> Instruction {
+/// Legacy decoder — kept for migration tests. Use `pattern_decoder::decode` instead.
+pub fn decode_legacy(raw: u32) -> Instruction {
     let op0 = bits(raw, 28, 25);
 
     match op0 {
@@ -418,7 +432,7 @@ pub fn decode(raw: u32) -> Instruction {
 }
 
 // ---------------------------------------------------------------------------
-// Data processing (immediate)
+// Legacy decode routing (test-only, used by decode_legacy for migration tests)
 // ---------------------------------------------------------------------------
 
 fn decode_dp_imm(raw: u32) -> Instruction {
@@ -1600,32 +1614,32 @@ mod tests {
     #[test]
     fn test_decode_nop() {
         // NOP = 0xD503201F
-        let inst = decode(0xD503201F);
+        let inst = decode_legacy(0xD503201F);
         assert!(matches!(inst, Instruction::Nop));
     }
 
     #[test]
     fn test_decode_svc() {
         // SVC #0 = 0xD4000001
-        let inst = decode(0xD4000001);
+        let inst = decode_legacy(0xD4000001);
         assert!(matches!(inst, Instruction::Svc { imm: 0 }));
 
         // SVC #1 = 0xD4000021
-        let inst = decode(0xD4000021);
+        let inst = decode_legacy(0xD4000021);
         assert!(matches!(inst, Instruction::Svc { imm: 1 }));
     }
 
     #[test]
     fn test_decode_ret() {
         // RET (X30) = 0xD65F03C0
-        let inst = decode(0xD65F03C0);
+        let inst = decode_legacy(0xD65F03C0);
         assert!(matches!(inst, Instruction::Ret { rn: 30 }));
     }
 
     #[test]
     fn test_decode_movz() {
         // MOV X0, #42 = MOVZ X0, #42 = 0xD2800540
-        let inst = decode(0xD2800540);
+        let inst = decode_legacy(0xD2800540);
         match inst {
             Instruction::MovZ { sf: true, rd: 0, imm16: 42, hw: 0 } => {}
             other => panic!("Expected MOVZ, got {:?}", other),
@@ -1635,7 +1649,7 @@ mod tests {
     #[test]
     fn test_decode_add_imm() {
         // ADD X1, X0, #1 = 0x91000401
-        let inst = decode(0x91000401);
+        let inst = decode_legacy(0x91000401);
         match inst {
             Instruction::AddImm { sf: true, rd: 1, rn: 0, imm12: 1, shift: false, set_flags: false } => {}
             other => panic!("Expected ADD imm, got {:?}", other),
@@ -1645,7 +1659,7 @@ mod tests {
     #[test]
     fn test_decode_sub_imm_with_flags() {
         // SUBS X0, X0, #1 = 0xF1000400
-        let inst = decode(0xF1000400);
+        let inst = decode_legacy(0xF1000400);
         match inst {
             Instruction::SubImm { sf: true, rd: 0, rn: 0, imm12: 1, shift: false, set_flags: true } => {}
             other => panic!("Expected SUBS imm, got {:?}", other),
@@ -1655,35 +1669,35 @@ mod tests {
     #[test]
     fn test_decode_b() {
         // B #4 = 0x14000001
-        let inst = decode(0x14000001);
+        let inst = decode_legacy(0x14000001);
         assert!(matches!(inst, Instruction::B { imm: 4 }));
     }
 
     #[test]
     fn test_decode_bl() {
         // BL #8 = 0x94000002
-        let inst = decode(0x94000002);
+        let inst = decode_legacy(0x94000002);
         assert!(matches!(inst, Instruction::Bl { imm: 8 }));
     }
 
     #[test]
     fn test_decode_br() {
         // BR X16 = 0xD61F0200
-        let inst = decode(0xD61F0200);
+        let inst = decode_legacy(0xD61F0200);
         assert!(matches!(inst, Instruction::Br { rn: 16 }));
     }
 
     #[test]
     fn test_decode_blr() {
         // BLR X8 = 0xD63F0100
-        let inst = decode(0xD63F0100);
+        let inst = decode_legacy(0xD63F0100);
         assert!(matches!(inst, Instruction::Blr { rn: 8 }));
     }
 
     #[test]
     fn test_decode_cbz() {
         // CBZ X0, #8 = 0xB4000040
-        let inst = decode(0xB4000040);
+        let inst = decode_legacy(0xB4000040);
         match inst {
             Instruction::Cbz { sf: true, rt: 0, imm: 8 } => {}
             other => panic!("Expected CBZ, got {:?}", other),
@@ -1693,7 +1707,7 @@ mod tests {
     #[test]
     fn test_decode_bcond() {
         // B.EQ #4 = 0x54000020
-        let inst = decode(0x54000020);
+        let inst = decode_legacy(0x54000020);
         match inst {
             Instruction::BCond { cond: 0, imm: 4 } => {}
             other => panic!("Expected B.EQ, got {:?}", other),
@@ -1703,7 +1717,7 @@ mod tests {
     #[test]
     fn test_decode_stp() {
         // STP X29, X30, [SP, #-16]! = 0xA9BF7BFD
-        let inst = decode(0xA9BF7BFD);
+        let inst = decode_legacy(0xA9BF7BFD);
         match inst {
             Instruction::Stp { sf: true, rt: 29, rt2: 30, rn: 31, imm: -16, mode: AddrMode::PreIndex } => {}
             other => panic!("Expected STP pre-index, got {:?}", other),
@@ -1713,7 +1727,7 @@ mod tests {
     #[test]
     fn test_decode_ldp() {
         // LDP X29, X30, [SP], #16 = 0xA8C17BFD
-        let inst = decode(0xA8C17BFD);
+        let inst = decode_legacy(0xA8C17BFD);
         match inst {
             Instruction::Ldp { sf: true, rt: 29, rt2: 30, rn: 31, imm: 16, mode: AddrMode::PostIndex } => {}
             other => panic!("Expected LDP post-index, got {:?}", other),
@@ -1723,7 +1737,7 @@ mod tests {
     #[test]
     fn test_decode_adrp() {
         // ADRP X0, #0 = 0x90000000
-        let inst = decode(0x90000000);
+        let inst = decode_legacy(0x90000000);
         match inst {
             Instruction::Adrp { rd: 0, imm: 0 } => {}
             other => panic!("Expected ADRP, got {:?}", other),
@@ -1733,7 +1747,7 @@ mod tests {
     #[test]
     fn test_decode_madd() {
         // MUL X0, X1, X2 = MADD X0, X1, X2, XZR = 0x9B027C20
-        let inst = decode(0x9B027C20);
+        let inst = decode_legacy(0x9B027C20);
         match inst {
             Instruction::Madd { sf: true, rd: 0, rn: 1, rm: 2, ra: 31 } => {}
             other => panic!("Expected MADD, got {:?}", other),
@@ -1759,7 +1773,7 @@ mod tests {
     #[test]
     fn test_decode_movn() {
         // MOV X0, #-1 = MOVN X0, #0 = 0x92800000
-        let inst = decode(0x92800000);
+        let inst = decode_legacy(0x92800000);
         match inst {
             Instruction::MovN { sf: true, rd: 0, imm16: 0, hw: 0 } => {}
             other => panic!("Expected MOVN, got {:?}", other),
@@ -1769,7 +1783,7 @@ mod tests {
     #[test]
     fn test_decode_fmadd() {
         // FMADD D0, D1, D2, D3: 0x1F420C20
-        let inst = decode(0x1F420C20);
+        let inst = decode_legacy(0x1F420C20);
         match inst {
             Instruction::Fma { ftype: 1, rd: 0, rn: 1, rm: 2, ra: 3, op: 0 } => {}
             other => panic!("Expected FMADD, got {:?}", other),
@@ -1779,7 +1793,7 @@ mod tests {
     #[test]
     fn test_decode_fmsub() {
         // FMSUB D0, D1, D2, D3: o1=0, o0=1 → op=1
-        let inst = decode(0x1F428C20);
+        let inst = decode_legacy(0x1F428C20);
         match inst {
             Instruction::Fma { ftype: 1, rd: 0, rn: 1, rm: 2, ra: 3, op: 1 } => {}
             other => panic!("Expected FMSUB, got {:?}", other),
@@ -1789,7 +1803,7 @@ mod tests {
     #[test]
     fn test_decode_fnmadd() {
         // FNMADD D0, D1, D2, D3: o1=1, o0=0 → op=2
-        let inst = decode(0x1F620C20);
+        let inst = decode_legacy(0x1F620C20);
         match inst {
             Instruction::Fma { ftype: 1, rd: 0, rn: 1, rm: 2, ra: 3, op: 2 } => {}
             other => panic!("Expected FNMADD, got {:?}", other),
@@ -1799,7 +1813,7 @@ mod tests {
     #[test]
     fn test_decode_fnmsub() {
         // FNMSUB D0, D1, D2, D3: o1=1, o0=1 → op=3
-        let inst = decode(0x1F628C20);
+        let inst = decode_legacy(0x1F628C20);
         match inst {
             Instruction::Fma { ftype: 1, rd: 0, rn: 1, rm: 2, ra: 3, op: 3 } => {}
             other => panic!("Expected FNMSUB, got {:?}", other),
@@ -1809,7 +1823,7 @@ mod tests {
     #[test]
     fn test_decode_frintn() {
         // FRINTN D0, D1: opcode=001000, ftype=01 → 0x1E644020
-        let inst = decode(0x1E644020);
+        let inst = decode_legacy(0x1E644020);
         match inst {
             Instruction::Frint { ftype: 1, rd: 0, rn: 1, mode: 0 } => {}
             other => panic!("Expected FRINTN, got {:?}", other),
@@ -1819,7 +1833,7 @@ mod tests {
     #[test]
     fn test_decode_frintz() {
         // FRINTZ D0, D1: opcode=001011, ftype=01 → 0x1E65C020
-        let inst = decode(0x1E65C020);
+        let inst = decode_legacy(0x1E65C020);
         match inst {
             Instruction::Frint { ftype: 1, rd: 0, rn: 1, mode: 3 } => {}
             other => panic!("Expected FRINTZ, got {:?}", other),
@@ -1829,7 +1843,7 @@ mod tests {
     #[test]
     fn test_decode_cas_32() {
         // CAS W0, W1, [X2]: 0x88A07C41
-        let inst = decode(0x88A07C41);
+        let inst = decode_legacy(0x88A07C41);
         match inst {
             Instruction::Cas { size: 2, rs: 0, rt: 1, rn: 2 } => {}
             other => panic!("Expected CAS, got {:?}", other),
@@ -1839,7 +1853,7 @@ mod tests {
     #[test]
     fn test_decode_cas_64() {
         // CAS X0, X1, [X2]: 0xC8A07C41
-        let inst = decode(0xC8A07C41);
+        let inst = decode_legacy(0xC8A07C41);
         match inst {
             Instruction::Cas { size: 3, rs: 0, rt: 1, rn: 2 } => {}
             other => panic!("Expected CAS (64-bit), got {:?}", other),
@@ -1849,7 +1863,7 @@ mod tests {
     #[test]
     fn test_decode_swp() {
         // SWP W0, W1, [X2]: 0xB8208041
-        let inst = decode(0xB8208041);
+        let inst = decode_legacy(0xB8208041);
         match inst {
             Instruction::Swp { size: 2, rs: 0, rt: 1, rn: 2 } => {}
             other => panic!("Expected SWP, got {:?}", other),
@@ -1859,7 +1873,7 @@ mod tests {
     #[test]
     fn test_decode_ldadd() {
         // LDADD W0, W1, [X2]: 0xB8200041
-        let inst = decode(0xB8200041);
+        let inst = decode_legacy(0xB8200041);
         match inst {
             Instruction::AtomicOp { size: 2, rs: 0, rt: 1, rn: 2, op: 0 } => {}
             other => panic!("Expected LDADD, got {:?}", other),
@@ -1869,7 +1883,7 @@ mod tests {
     #[test]
     fn test_decode_ldclr() {
         // LDCLR W0, W1, [X2]: 0xB8201041
-        let inst = decode(0xB8201041);
+        let inst = decode_legacy(0xB8201041);
         match inst {
             Instruction::AtomicOp { size: 2, rs: 0, rt: 1, rn: 2, op: 1 } => {}
             other => panic!("Expected LDCLR, got {:?}", other),
@@ -1879,7 +1893,7 @@ mod tests {
     #[test]
     fn test_decode_ldeor() {
         // LDEOR W0, W1, [X2]: 0xB8202041
-        let inst = decode(0xB8202041);
+        let inst = decode_legacy(0xB8202041);
         match inst {
             Instruction::AtomicOp { size: 2, rs: 0, rt: 1, rn: 2, op: 2 } => {}
             other => panic!("Expected LDEOR, got {:?}", other),
@@ -1889,7 +1903,7 @@ mod tests {
     #[test]
     fn test_decode_ldset() {
         // LDSET W0, W1, [X2]: 0xB8203041
-        let inst = decode(0xB8203041);
+        let inst = decode_legacy(0xB8203041);
         match inst {
             Instruction::AtomicOp { size: 2, rs: 0, rt: 1, rn: 2, op: 3 } => {}
             other => panic!("Expected LDSET, got {:?}", other),
@@ -1902,7 +1916,7 @@ mod tests {
         // Encoding: 0_0_0_11010110_Rm_010010_Rn_Rd
         // = 0x1AC24820 for W0, W1, W2
         let raw: u32 = 0b0_0_0_11010110_00010_010010_00001_00000;
-        let inst = decode(raw);
+        let inst = decode_legacy(raw);
         match inst {
             Instruction::Crc32 { sf: false, sz: 2, c: false, rd: 0, rn: 1, rm: 2 } => {}
             other => panic!("Expected CRC32W, got {:?}", other),
@@ -1915,7 +1929,7 @@ mod tests {
         // 01001110_00_10100_00100_10_Rn_Rd
         // = 0x4E284820 for V0, V1
         let raw: u32 = 0b01001110_00_10100_00100_10_00001_00000;
-        let inst = decode(raw);
+        let inst = decode_legacy(raw);
         match inst {
             Instruction::CryptoAes { rd: 0, rn: 1, opcode: 0b00100 } => {}
             other => panic!("Expected AESE, got {:?}", other),
@@ -1927,7 +1941,7 @@ mod tests {
         // SHA256H Q0, Q1, V2.4S
         // 01011110_00_0_Rm_0_100_00_Rn_Rd
         let raw: u32 = 0b01011110_00_0_00010_0_100_00_00001_00000;
-        let inst = decode(raw);
+        let inst = decode_legacy(raw);
         match inst {
             Instruction::CryptoSha3 { rd: 0, rn: 1, rm: 2, opcode: 0b100 } => {}
             other => panic!("Expected SHA256H, got {:?}", other),
@@ -1940,7 +1954,7 @@ mod tests {
         // 0_Q_0_01110_00_0_Rm_0_len_op_00_Rn_Rd
         // Q=0, len=0, op=0
         let raw: u32 = 0b0_0_0_01110_00_0_00010_0_00_0_00_00001_00000;
-        let inst = decode(raw);
+        let inst = decode_legacy(raw);
         match inst {
             Instruction::SimdTbl { q: false, rd: 0, rn: 1, rm: 2, len: 0, op: 0 } => {}
             other => panic!("Expected TBL, got {:?}", other),

@@ -581,6 +581,129 @@ pub fn exec_adrp(state: &mut CpuState, rd: u8, imm: i64) -> StepResult {
     StepResult::Continue
 }
 
+pub fn exec_adc(state: &mut CpuState, sf: bool, rd: u8, rn: u8, rm: u8, set_flags: bool) -> StepResult {
+    let a = state.get_reg(rn as u32);
+    let b = state.get_reg(rm as u32);
+    let carry = if state.c() { 1u64 } else { 0u64 };
+    if sf {
+        let result = a.wrapping_add(b).wrapping_add(carry);
+        if set_flags {
+            // N,Z from result; C,V from double-add
+            let (r1, c1) = a.overflowing_add(b);
+            let (result2, c2) = r1.overflowing_add(carry);
+            let _ = result2;
+            state.set_n(result & (1u64 << 63) != 0);
+            state.set_z(result == 0);
+            state.set_c(c1 || c2);
+            let v1 = ((a ^ !b) & (a ^ result)) >> 63 != 0;
+            state.set_v(v1);
+        }
+        state.set_reg(rd as u32, result);
+    } else {
+        let a32 = a as u32;
+        let b32 = b as u32;
+        let carry32 = carry as u32;
+        let result = a32.wrapping_add(b32).wrapping_add(carry32);
+        if set_flags {
+            let (r1, c1) = a32.overflowing_add(b32);
+            let (_, c2) = r1.overflowing_add(carry32);
+            state.set_n(result & (1u32 << 31) != 0);
+            state.set_z(result == 0);
+            state.set_c(c1 || c2);
+            let v1 = ((a32 ^ !b32) & (a32 ^ result)) >> 31 != 0;
+            state.set_v(v1);
+        }
+        state.set_reg(rd as u32, result as u64);
+    }
+    StepResult::Continue
+}
+
+pub fn exec_sbc(state: &mut CpuState, sf: bool, rd: u8, rn: u8, rm: u8, set_flags: bool) -> StepResult {
+    let a = state.get_reg(rn as u32);
+    let b = state.get_reg(rm as u32);
+    let borrow = if state.c() { 0u64 } else { 1u64 }; // SBC: Rd = Rn - Rm - !C
+    if sf {
+        let result = a.wrapping_sub(b).wrapping_sub(borrow);
+        if set_flags {
+            // For subtraction flags, use: Rd = Rn + NOT(Rm) + C
+            let not_b = !b;
+            let carry_in = if state.c() { 1u64 } else { 0u64 };
+            let (r1, c1) = a.overflowing_add(not_b);
+            let (_, c2) = r1.overflowing_add(carry_in);
+            state.set_n(result & (1u64 << 63) != 0);
+            state.set_z(result == 0);
+            state.set_c(c1 || c2);
+            let v1 = ((a ^ b) & (a ^ result)) >> 63 != 0;
+            state.set_v(v1);
+        }
+        state.set_reg(rd as u32, result);
+    } else {
+        let a32 = a as u32;
+        let b32 = b as u32;
+        let borrow32 = borrow as u32;
+        let result = a32.wrapping_sub(b32).wrapping_sub(borrow32);
+        if set_flags {
+            let not_b32 = !b32;
+            let carry_in = if state.c() { 1u32 } else { 0u32 };
+            let (r1, c1) = a32.overflowing_add(not_b32);
+            let (_, c2) = r1.overflowing_add(carry_in);
+            state.set_n(result & (1u32 << 31) != 0);
+            state.set_z(result == 0);
+            state.set_c(c1 || c2);
+            let v1 = ((a32 ^ b32) & (a32 ^ result)) >> 31 != 0;
+            state.set_v(v1);
+        }
+        state.set_reg(rd as u32, result as u64);
+    }
+    StepResult::Continue
+}
+
+pub fn exec_var_shift(state: &mut CpuState, sf: bool, rd: u8, rn: u8, rm: u8, shift_type: u8) -> StepResult {
+    let val = state.get_reg(rn as u32);
+    let amount = state.get_reg(rm as u32);
+    if sf {
+        let sh = (amount & 63) as u32;
+        let result = match shift_type {
+            0 => val.wrapping_shl(sh),   // LSLV
+            1 => val.wrapping_shr(sh),   // LSRV
+            2 => (val as i64).wrapping_shr(sh) as u64, // ASRV
+            3 => val.rotate_right(sh),   // RORV
+            _ => val,
+        };
+        state.set_reg(rd as u32, result);
+    } else {
+        let v32 = val as u32;
+        let sh = (amount & 31) as u32;
+        let result = match shift_type {
+            0 => v32.wrapping_shl(sh),
+            1 => v32.wrapping_shr(sh),
+            2 => (v32 as i32).wrapping_shr(sh) as u32,
+            3 => v32.rotate_right(sh),
+            _ => v32,
+        };
+        state.set_reg(rd as u32, result as u64);
+    }
+    StepResult::Continue
+}
+
+pub fn exec_smsubl(state: &mut CpuState, rd: u8, rn: u8, rm: u8, ra: u8) -> StepResult {
+    let a = state.get_reg(rn as u32) as i32 as i64;
+    let b = state.get_reg(rm as u32) as i32 as i64;
+    let addend = state.get_reg(ra as u32) as i64;
+    let result = addend.wrapping_sub(a.wrapping_mul(b));
+    state.set_reg(rd as u32, result as u64);
+    StepResult::Continue
+}
+
+pub fn exec_umsubl(state: &mut CpuState, rd: u8, rn: u8, rm: u8, ra: u8) -> StepResult {
+    let a = state.get_reg(rn as u32) as u32 as u64;
+    let b = state.get_reg(rm as u32) as u32 as u64;
+    let addend = state.get_reg(ra as u32);
+    let result = addend.wrapping_sub(a.wrapping_mul(b));
+    state.set_reg(rd as u32, result);
+    StepResult::Continue
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

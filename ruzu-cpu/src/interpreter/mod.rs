@@ -14,7 +14,7 @@ pub mod neon;
 pub mod simd;
 pub mod system;
 
-use crate::decoder::{self, Instruction};
+use crate::decoder::Instruction;
 use crate::memory::MemoryAccess;
 use crate::state::{CpuExecutor, CpuState, HaltReason};
 use ruzu_common::VAddr;
@@ -128,6 +128,11 @@ impl Interpreter {
             Cls { sf, rd, rn } => alu::exec_cls(state, sf, rd, rn),
             Rev { sf, rd, rn, opc } => alu::exec_rev(state, sf, rd, rn, opc),
             Rbit { sf, rd, rn } => alu::exec_rbit(state, sf, rd, rn),
+            Adc { sf, rd, rn, rm, set_flags } => alu::exec_adc(state, sf, rd, rn, rm, set_flags),
+            Sbc { sf, rd, rn, rm, set_flags } => alu::exec_sbc(state, sf, rd, rn, rm, set_flags),
+            VarShift { sf, rd, rn, rm, shift_type } => alu::exec_var_shift(state, sf, rd, rn, rm, shift_type),
+            Smsubl { rd, rn, rm, ra } => alu::exec_smsubl(state, rd, rn, rm, ra),
+            Umsubl { rd, rn, rm, ra } => alu::exec_umsubl(state, rd, rn, rm, ra),
 
             // -- Load/Store -------------------------------------------------
             LdrImm { sf, rt, rn, imm, size, mode, sign_extend } => {
@@ -196,6 +201,7 @@ impl Interpreter {
             Cbnz { sf, rt, imm } => branch::exec_cbnz(state, sf, rt, imm),
             Tbz { rt, bit, imm } => branch::exec_tbz(state, rt, bit, imm),
             Tbnz { rt, bit, imm } => branch::exec_tbnz(state, rt, bit, imm),
+            Brk { imm } => branch::exec_brk(imm),
 
             // -- System -----------------------------------------------------
             Svc { imm } => system::exec_svc(imm),
@@ -248,6 +254,10 @@ impl Interpreter {
             Frint { ftype, rd, rn, mode } => {
                 simd::exec_frint(state, ftype, rd, rn, mode)
             }
+            Fccmp { rn, rm, nzcv, cond, ftype } => simd::exec_fccmp(state, rn, rm, nzcv, cond, ftype),
+            FmovImm { rd, ftype, imm8 } => simd::exec_fmov_imm(state, rd, ftype, imm8),
+            FcvtRound { sf, rd, rn, ftype, rmode, unsigned } => simd::exec_fcvt_round(state, sf, rd, rn, ftype, rmode, unsigned),
+            FpFixedConv { sf, rd, rn, ftype, fbits, opcode } => simd::exec_fp_fixed_conv(state, sf, rd, rn, ftype, fbits, opcode),
             LdrSimd { rt, rn, imm, size, mode } => {
                 simd::exec_ldr_simd(state, mem_access, rt, rn, imm, size, mode, state.pc)
             }
@@ -307,6 +317,12 @@ impl Interpreter {
             SimdScalarPairwise { u, size, opcode, rd, rn } => {
                 neon::exec_simd_scalar_pairwise(state, u, size, opcode, rd, rn)
             }
+            SimdScalarShiftImm { u, immh, immb, opcode, rd, rn } => {
+                neon::exec_simd_scalar_shift_imm(state, u, immh, immb, opcode, rd, rn)
+            }
+            SimdScalarIndexed { u, size, opcode, rd, rn, rm, h, l, m } => {
+                neon::exec_simd_scalar_indexed(state, u, size, opcode, rd, rn, rm, h, l, m)
+            }
             SimdTbl { q, rd, rn, rm, len, op } => {
                 neon::exec_simd_tbl(state, q, rd, rn, rm, len, op)
             }
@@ -359,7 +375,7 @@ impl CpuExecutor for Interpreter {
             };
 
             // Decode
-            let inst = decoder::decode(raw);
+            let inst = crate::pattern_decoder::decode(raw);
 
             // Execute
             let result = self.execute(state, mem, inst);
