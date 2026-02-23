@@ -87,6 +87,10 @@ pub fn exec_tbnz(state: &mut CpuState, rt: u8, bit: u8, imm: i64) -> StepResult 
     }
 }
 
+pub fn exec_brk(_imm: u16) -> StepResult {
+    StepResult::Breakpoint
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

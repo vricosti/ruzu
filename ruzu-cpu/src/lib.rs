@@ -4,6 +4,7 @@
 pub mod decoder;
 pub mod interpreter;
 pub mod memory;
+pub mod pattern_decoder;
 pub mod state;
 
 pub use state::CpuState;

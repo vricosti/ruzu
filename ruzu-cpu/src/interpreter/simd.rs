@@ -424,6 +424,130 @@ pub fn exec_stp_simd(state: &mut CpuState, mem: &mut dyn MemoryAccess,
     StepResult::Continue
 }
 
+pub fn exec_fccmp(state: &mut CpuState, rn: u8, rm: u8, nzcv: u8, cond: u8, ftype: u8) -> StepResult {
+    if state.check_condition(cond) {
+        // Perform normal FP compare
+        exec_fcmp(state, rn, rm, ftype, false)
+    } else {
+        // Set NZCV to the immediate value
+        state.set_n(nzcv & 8 != 0);
+        state.set_z(nzcv & 4 != 0);
+        state.set_c(nzcv & 2 != 0);
+        state.set_v(nzcv & 1 != 0);
+        StepResult::Continue
+    }
+}
+
+pub fn exec_fmov_imm(state: &mut CpuState, rd: u8, ftype: u8, imm8: u8) -> StepResult {
+    // Decode 8-bit FP immediate: sign(1) exp(3+bias) frac(4+padding)
+    let sign = ((imm8 >> 7) & 1) as u64;
+    let exp3 = ((imm8 >> 4) & 0x7) as u64;
+    let frac4 = (imm8 & 0xF) as u64;
+    match ftype {
+        0 => {
+            // Single precision: s eeeeeeee ffff0...0 (32-bit)
+            let exp_top = if exp3 & 4 != 0 { 0b0 } else { 0b1 };
+            let exp_rep = if exp3 & 4 != 0 { 0b11111u64 } else { 0b00000u64 };
+            let biased_exp = (exp_top << 7) | (exp_rep << 2) | (exp3 & 3);
+            let bits = (sign << 31) | (biased_exp << 23) | (frac4 << 19);
+            state.set_vreg_u128(rd as u32, bits as u128);
+        }
+        1 => {
+            // Double precision: s eeeeeeeeeee ffff0...0 (64-bit)
+            let exp_top = if exp3 & 4 != 0 { 0b0u64 } else { 0b1u64 };
+            let exp_rep = if exp3 & 4 != 0 { 0b11111111u64 } else { 0b00000000u64 };
+            let biased_exp = (exp_top << 10) | (exp_rep << 2) | (exp3 & 3);
+            let bits = (sign << 63) | (biased_exp << 52) | (frac4 << 48);
+            state.set_vreg_u128(rd as u32, bits as u128);
+        }
+        _ => {
+            state.set_vreg_u128(rd as u32, 0);
+        }
+    }
+    StepResult::Continue
+}
+
+pub fn exec_fcvt_round(state: &mut CpuState, sf: bool, rd: u8, rn: u8, ftype: u8, rmode: u8, unsigned: bool) -> StepResult {
+    let val = read_fp(state, rn, ftype);
+    // Apply rounding mode
+    let rounded = match rmode {
+        0 => val.round_ties_even(),  // N (nearest, ties to even)
+        1 => val.ceil(),             // P (+inf)
+        2 => val.floor(),            // M (-inf)
+        3 => val.trunc(),            // Z (toward zero)
+        4 => val.round(),            // A (ties away from zero)
+        _ => val.round_ties_even(),
+    };
+    if unsigned {
+        let result = if sf {
+            rounded.clamp(0.0, u64::MAX as f64) as u64
+        } else {
+            rounded.clamp(0.0, u32::MAX as f64) as u32 as u64
+        };
+        state.set_reg(rd as u32, result);
+    } else {
+        let result = if sf {
+            let clamped = rounded.clamp(i64::MIN as f64, i64::MAX as f64);
+            clamped as i64 as u64
+        } else {
+            let clamped = rounded.clamp(i32::MIN as f64, i32::MAX as f64);
+            clamped as i32 as u32 as u64
+        };
+        state.set_reg(rd as u32, result);
+    }
+    StepResult::Continue
+}
+
+pub fn exec_fp_fixed_conv(state: &mut CpuState, sf: bool, rd: u8, rn: u8, ftype: u8, fbits: u8, opcode: u8) -> StepResult {
+    let scale = fbits as f64;
+    match opcode {
+        // SCVTF (fixed-point to FP)
+        0 => {
+            let int_val = if sf {
+                state.get_reg(rn as u32) as i64 as f64
+            } else {
+                state.get_reg(rn as u32) as i32 as f64
+            };
+            let result = int_val / (1u64 << fbits as u64) as f64;
+            write_fp(state, rd, ftype, result);
+        }
+        // UCVTF (fixed-point to FP)
+        1 => {
+            let int_val = if sf {
+                state.get_reg(rn as u32) as f64
+            } else {
+                (state.get_reg(rn as u32) as u32) as f64
+            };
+            let result = int_val / (1u64 << fbits as u64) as f64;
+            write_fp(state, rd, ftype, result);
+        }
+        // FCVTZS (FP to signed fixed-point)
+        2 => {
+            let fp_val = read_fp(state, rn, ftype);
+            let scaled = fp_val * f64::powi(2.0, scale as i32);
+            let result = if sf {
+                scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64 as u64
+            } else {
+                scaled.clamp(i32::MIN as f64, i32::MAX as f64) as i32 as u32 as u64
+            };
+            state.set_reg(rd as u32, result);
+        }
+        // FCVTZU (FP to unsigned fixed-point)
+        3 => {
+            let fp_val = read_fp(state, rn, ftype);
+            let scaled = fp_val * f64::powi(2.0, scale as i32);
+            let result = if sf {
+                scaled.clamp(0.0, u64::MAX as f64) as u64
+            } else {
+                scaled.clamp(0.0, u32::MAX as f64) as u32 as u64
+            };
+            state.set_reg(rd as u32, result);
+        }
+        _ => {}
+    }
+    StepResult::Continue
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

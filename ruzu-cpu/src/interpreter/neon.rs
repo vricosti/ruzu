@@ -1786,6 +1786,87 @@ pub fn exec_simd_tbl(
     StepResult::Continue
 }
 
+pub fn exec_simd_scalar_shift_imm(
+    state: &mut CpuState, u: bool, immh: u8, immb: u8, opcode: u8, rd: u8, rn: u8,
+) -> StepResult {
+    // Determine element size from immh: 0001=8, 001x=16, 01xx=32, 1xxx=64
+    let esize = if immh & 8 != 0 { 64u32 }
+        else if immh & 4 != 0 { 32 }
+        else if immh & 2 != 0 { 16 }
+        else { 8 };
+    let shift_amount = ((immh as u32) << 3 | immb as u32) as u32;
+
+    let src = state.get_vreg_lane(rn as u32, 0, esize);
+    let emask = if esize >= 64 { u64::MAX } else { (1u64 << esize) - 1 };
+
+    let result = match (u, opcode) {
+        // SSHR (scalar)
+        (false, 0b00000) => {
+            let sh = (esize * 2 - shift_amount) as u32;
+            let signed = if esize < 64 {
+                ((src as i64) << (64 - esize)) >> (64 - esize)
+            } else {
+                src as i64
+            };
+            ((signed >> sh) as u64) & emask
+        }
+        // USHR (scalar)
+        (true, 0b00000) => {
+            let sh = (esize * 2 - shift_amount) as u32;
+            (src >> sh) & emask
+        }
+        // SHL (scalar)
+        (false, 0b01010) | (true, 0b01010) => {
+            let sh = shift_amount - esize;
+            (src << sh) & emask
+        }
+        // Default: pass through
+        _ => src & emask,
+    };
+
+    state.set_vreg_u128(rd as u32, 0);
+    state.set_vreg_lane(rd as u32, 0, esize, result);
+    StepResult::Continue
+}
+
+pub fn exec_simd_scalar_indexed(
+    state: &mut CpuState, _u: bool, size: u8, _opcode: u8, rd: u8, rn: u8, rm: u8,
+    h: u8, l: u8, m: u8,
+) -> StepResult {
+    // Scalar x indexed element: extract element from Rm by index, operate with Rn scalar
+    let esize = 8u32 << size;
+
+    // Compute index from h:l:m based on size
+    let index = match size {
+        1 => ((h as u32) << 2) | ((l as u32) << 1) | (m as u32), // 16-bit
+        2 => ((h as u32) << 1) | (l as u32),                      // 32-bit
+        3 => h as u32,                                              // 64-bit
+        _ => 0,
+    };
+
+    let a_val = state.get_vreg_lane(rn as u32, 0, esize);
+    // The Rm register: for size=2, lower 4 bits of rm + m as high bit
+    let rm_full = if size <= 2 { ((m as u32) << 4) | rm as u32 } else { rm as u32 };
+    let b_val = state.get_vreg_lane(rm_full, index, esize);
+
+    // For floating-point ops (most common scalar indexed): multiply
+    let result = if esize == 32 {
+        let a = f32::from_bits(a_val as u32);
+        let b = f32::from_bits(b_val as u32);
+        (a * b).to_bits() as u64
+    } else if esize == 64 {
+        let a = f64::from_bits(a_val);
+        let b = f64::from_bits(b_val);
+        (a * b).to_bits()
+    } else {
+        a_val.wrapping_mul(b_val) & ((1u64 << esize) - 1)
+    };
+
+    state.set_vreg_u128(rd as u32, 0);
+    state.set_vreg_lane(rd as u32, 0, esize, result);
+    StepResult::Continue
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1838,7 +1919,7 @@ mod tests {
     #[test]
     fn test_decode_add_4s() {
         // ADD V0.4S, V1.4S, V2.4S = 0x4EA28420
-        let inst = decoder::decode(0x4EA28420);
+        let inst = crate::pattern_decoder::decode(0x4EA28420);
         match inst {
             decoder::Instruction::SimdThreeSame { q: true, u: false, size: 2, opcode: 0b10000, rd: 0, rn: 1, rm: 2 } => {}
             other => panic!("Expected SimdThreeSame ADD.4S, got {:?}", other),
@@ -2102,7 +2183,7 @@ mod tests {
     #[test]
     fn test_decode_ld1_multi() {
         // LD1 {V0.4S}, [X1]: 0x4C407820
-        let inst = decoder::decode(0x4C407820);
+        let inst = crate::pattern_decoder::decode(0x4C407820);
         match inst {
             decoder::Instruction::SimdLdStMulti {
                 q: true, load: true, opcode: 0b0111, size: 2, rn: 1, rt: 0, rm: None,
@@ -2114,7 +2195,7 @@ mod tests {
     #[test]
     fn test_decode_movi() {
         // MOVI V0.4S, #0: 0x4F000400
-        let inst = decoder::decode(0x4F000400);
+        let inst = crate::pattern_decoder::decode(0x4F000400);
         match inst {
             decoder::Instruction::SimdModImm { q: true, .. } => {}
             other => panic!("Expected SimdModImm MOVI, got {:?}", other),
