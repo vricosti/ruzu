@@ -236,6 +236,37 @@ impl CpuState {
         self.v[reg as usize][0] = val as u64;
         self.v[reg as usize][1] = (val >> 64) as u64;
     }
+
+    // -- SIMD/FP element-level helpers -----------------------------------------
+
+    /// Read a lane from a V register. `esize` is element size in bits (8/16/32/64).
+    #[inline]
+    pub fn get_vreg_lane(&self, reg: u32, lane: u32, esize: u32) -> u64 {
+        let total_bit = lane * esize;
+        let word = (total_bit / 64) as usize;
+        let bit_in_word = total_bit % 64;
+        let mask = if esize >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << esize) - 1
+        };
+        (self.v[reg as usize][word] >> bit_in_word) & mask
+    }
+
+    /// Write a lane in a V register. `esize` is element size in bits (8/16/32/64).
+    #[inline]
+    pub fn set_vreg_lane(&mut self, reg: u32, lane: u32, esize: u32, val: u64) {
+        let total_bit = lane * esize;
+        let word = (total_bit / 64) as usize;
+        let bit_in_word = total_bit % 64;
+        let mask = if esize >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << esize) - 1
+        };
+        self.v[reg as usize][word] &= !(mask << bit_in_word);
+        self.v[reg as usize][word] |= (val & mask) << bit_in_word;
+    }
 }
 
 /// Trait for CPU execution backend.

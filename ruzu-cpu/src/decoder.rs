@@ -76,6 +76,10 @@ pub enum FpOp {
     Sub,
     Mul,
     Div,
+    Max,
+    Min,
+    MaxNum,
+    MinNum,
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +233,39 @@ pub enum Instruction {
     /// FRINTN/FRINTP/FRINTM/FRINTZ/FRINTA/FRINTX/FRINTI — FP rounding
     /// mode: 0=N(nearest), 1=P(+inf), 2=M(-inf), 3=Z(zero), 4=A(tie-away), 6=X(exact), 7=I(current)
     Frint { ftype: u8, rd: u8, rn: u8, mode: u8 },
+
+    // -- NEON/Advanced SIMD ---------------------------------------------------
+
+    /// Advanced SIMD three same: vector arithmetic (ADD, SUB, AND, ORR, MUL, FADD, etc.)
+    SimdThreeSame { q: bool, u: bool, size: u8, opcode: u8, rd: u8, rn: u8, rm: u8 },
+    /// Advanced SIMD two-register misc: unary ops (NOT, ABS, NEG, REV, CNT, etc.)
+    SimdTwoReg { q: bool, u: bool, size: u8, opcode: u8, rd: u8, rn: u8 },
+    /// Advanced SIMD copy: DUP, INS, UMOV, SMOV
+    SimdCopy { q: bool, op: u8, imm5: u8, imm4: u8, rd: u8, rn: u8 },
+    /// Advanced SIMD modified immediate: MOVI, MVNI, FMOV vector immediate
+    SimdModImm { q: bool, op: u8, cmode: u8, rd: u8, imm8: u8 },
+    /// Advanced SIMD shift by immediate: SHL, SSHR, USHR, SSHLL, etc.
+    SimdShiftImm { q: bool, u: bool, immh: u8, immb: u8, opcode: u8, rd: u8, rn: u8 },
+    /// Advanced SIMD permute: ZIP1/ZIP2, UZP1/UZP2, TRN1/TRN2
+    SimdPermute { q: bool, size: u8, opcode: u8, rd: u8, rn: u8, rm: u8 },
+    /// Advanced SIMD extract: EXT
+    SimdExtract { q: bool, imm4: u8, rd: u8, rn: u8, rm: u8 },
+    /// Advanced SIMD across lanes: ADDV, SADDLV, SMAXV, SMINV, etc.
+    SimdAcrossLanes { q: bool, u: bool, size: u8, opcode: u8, rd: u8, rn: u8 },
+    /// Advanced SIMD three different: widening/narrowing (SADDL, UADDL, SSUBL, etc.)
+    SimdThreeDiff { q: bool, u: bool, size: u8, opcode: u8, rd: u8, rn: u8, rm: u8 },
+    /// Advanced SIMD vector x indexed element: FMUL/FMLA by element
+    SimdVecIndexed { q: bool, u: bool, size: u8, opcode: u8, rd: u8, rn: u8, rm: u8, h: u8, l: u8, m: u8 },
+    /// SIMD load/store multiple structures: LD1/ST1/LD2/ST2/LD3/ST3/LD4/ST4
+    SimdLdStMulti { q: bool, load: bool, opcode: u8, size: u8, rn: u8, rt: u8, rm: Option<u8> },
+    /// SIMD load/store single structure: LD1/ST1 single element to/from lane
+    SimdLdStSingle { q: bool, load: bool, r: u8, opcode: u8, s: u8, size: u8, rn: u8, rt: u8, rm: Option<u8> },
+    /// Advanced SIMD scalar three same
+    SimdScalarThreeSame { u: bool, size: u8, opcode: u8, rd: u8, rn: u8, rm: u8 },
+    /// Advanced SIMD scalar two-reg misc
+    SimdScalarTwoReg { u: bool, size: u8, opcode: u8, rd: u8, rn: u8 },
+    /// Advanced SIMD scalar pairwise (FADDP scalar, FMAXP, FMINP)
+    SimdScalarPairwise { u: bool, size: u8, opcode: u8, rd: u8, rn: u8 },
 
     // -- Atomics ------------------------------------------------------------
 
@@ -606,6 +643,19 @@ fn decode_load_store(raw: u32) -> Instruction {
     let _op2 = bits(raw, 24, 23);
     let _op3 = bits(raw, 21, 16);
     let _op4 = bits(raw, 11, 10);
+
+    // SIMD load/store multiple structures: bit[31]=0, bits[29:23]=0011000 or 0011001
+    // Note: bit[26]=1 for this group (part of the 0011000 pattern)
+    if bit(raw, 31) == 0 && (bits(raw, 29, 23) == 0b0011000 || bits(raw, 29, 23) == 0b0011001)
+    {
+        return decode_simd_ldst_multi(raw);
+    }
+
+    // SIMD load/store single structure: bit[31]=0, bits[29:23]=0011010 or 0011011
+    if bit(raw, 31) == 0 && (bits(raw, 29, 23) == 0b0011010 || bits(raw, 29, 23) == 0b0011011)
+    {
+        return decode_simd_ldst_single(raw);
+    }
 
     // Load/store pair (LDP/STP/LDP SIMD/STP SIMD)
     // bits [29:27] = 101
@@ -1125,10 +1175,40 @@ fn decode_dp3_source(raw: u32) -> Instruction {
 // ---------------------------------------------------------------------------
 
 fn decode_simd_fp(raw: u32) -> Instruction {
+    // 1. Check for Advanced SIMD groups FIRST
+    //    These share the op0=0111/1111 space with scalar FP.
+
+    let b31_30 = bits(raw, 31, 30);
+    let b28_24 = bits(raw, 28, 24);
+
+    // Advanced SIMD vector: bits[31]=0, bits[28:24]=01110 (Q bit is [30])
+    // These are the main NEON vector instructions
+    if bit(raw, 31) == 0 && b28_24 == 0b01110 {
+        return decode_advsimd_01110(raw);
+    }
+
+    // Advanced SIMD: bits[31]=0, bits[28:24]=01111
+    // Modified immediate, shift by immediate, or vector x indexed element
+    if bit(raw, 31) == 0 && b28_24 == 0b01111 {
+        return decode_advsimd_01111(raw);
+    }
+
+    // Advanced SIMD scalar: bits[31:30]=01, bits[28:24]=11110
+    if b31_30 == 0b01 && b28_24 == 0b11110 {
+        return decode_advsimd_scalar(raw);
+    }
+
+    // Advanced SIMD scalar x indexed element: bits[31:30]=01, bits[28:24]=11111
+    if b31_30 == 0b01 && b28_24 == 0b11111 {
+        return decode_advsimd_scalar_indexed(raw);
+    }
+
+    // 2. Scalar FP (existing code)
+
     // Floating-point data-processing (3 source): FMADD/FMSUB/FNMADD/FNMSUB
     // [31]=0, [30]=0, [29]=0, [28:24]=11111, [23:22]=ftype, [21]=o1, [20:16]=Rm
     // [15]=o0, [14:10]=Ra, [9:5]=Rn, [4:0]=Rd
-    if bits(raw, 28, 24) == 0b11111 && bit(raw, 31) == 0 && bit(raw, 30) == 0 && bit(raw, 29) == 0
+    if b28_24 == 0b11111 && bit(raw, 31) == 0 && bit(raw, 30) == 0 && bit(raw, 29) == 0
     {
         let ftype = bits(raw, 23, 22) as u8;
         let o1 = bit(raw, 21);
@@ -1142,8 +1222,8 @@ fn decode_simd_fp(raw: u32) -> Instruction {
     }
 
     // Floating-point data-processing (2 source)
-    // 0 0 0 11110 xx 1 Rm 0000 10 Rn Rd
-    if bits(raw, 28, 24) == 0b11110 && bits(raw, 21, 21) == 1
+    // 0 0 0 11110 xx 1 Rm opcode 10 Rn Rd
+    if b28_24 == 0b11110 && bits(raw, 21, 21) == 1
         && bits(raw, 11, 10) == 0b10 && bit(raw, 31) == 0
     {
         let ftype = bits(raw, 23, 22) as u8;
@@ -1157,6 +1237,10 @@ fn decode_simd_fp(raw: u32) -> Instruction {
             0b0001 => Some(FpOp::Div),
             0b0010 => Some(FpOp::Add),
             0b0011 => Some(FpOp::Sub),
+            0b0100 => Some(FpOp::Max),
+            0b0101 => Some(FpOp::Min),
+            0b0110 => Some(FpOp::MaxNum),
+            0b0111 => Some(FpOp::MinNum),
             _ => None,
         };
 
@@ -1167,7 +1251,7 @@ fn decode_simd_fp(raw: u32) -> Instruction {
 
     // Floating-point data-processing (1 source)
     // 0 0 0 11110 xx 1 opcode 10000 Rn Rd
-    if bits(raw, 28, 24) == 0b11110 && bit(raw, 21) == 1
+    if b28_24 == 0b11110 && bit(raw, 21) == 1
         && bits(raw, 14, 10) == 0b10000 && bit(raw, 31) == 0
     {
         let ftype = bits(raw, 23, 22) as u8;
@@ -1185,8 +1269,6 @@ fn decode_simd_fp(raw: u32) -> Instruction {
             0b000101 => Instruction::Fcvt { rd, rn, src_type: ftype, dst_type: 1 },
             0b000111 => Instruction::Fcvt { rd, rn, src_type: ftype, dst_type: 3 },
             // FRINT*: opcode = 001xxx
-            // 001000=FRINTN, 001001=FRINTP, 001010=FRINTM, 001011=FRINTZ
-            // 001100=FRINTA, 001110=FRINTX, 001111=FRINTI
             _ if (opcode >> 3) == 0b001 => {
                 let mode = (opcode & 0x7) as u8;
                 Instruction::Frint { ftype, rd, rn, mode }
@@ -1197,7 +1279,7 @@ fn decode_simd_fp(raw: u32) -> Instruction {
 
     // Floating-point compare
     // 0 0 0 11110 xx 1 Rm 00 1000 Rn opcode2
-    if bits(raw, 28, 24) == 0b11110 && bit(raw, 21) == 1
+    if b28_24 == 0b11110 && bit(raw, 21) == 1
         && bits(raw, 13, 10) == 0b1000 && bits(raw, 15, 14) == 0b00
         && bit(raw, 31) == 0
     {
@@ -1211,7 +1293,7 @@ fn decode_simd_fp(raw: u32) -> Instruction {
 
     // Floating-point conditional select (FCSEL)
     // 0 0 0 11110 xx 1 Rm cond 11 Rn Rd
-    if bits(raw, 28, 24) == 0b11110 && bit(raw, 21) == 1
+    if b28_24 == 0b11110 && bit(raw, 21) == 1
         && bits(raw, 11, 10) == 0b11 && bit(raw, 31) == 0
     {
         let ftype = bits(raw, 23, 22) as u8;
@@ -1224,7 +1306,7 @@ fn decode_simd_fp(raw: u32) -> Instruction {
 
     // Conversion between FP and integer
     // sf 0 0 11110 xx 1 rmode opcode 000000 Rn Rd
-    if bits(raw, 28, 24) == 0b11110 && bit(raw, 21) == 1
+    if b28_24 == 0b11110 && bit(raw, 21) == 1
         && bits(raw, 15, 10) == 0b000000
     {
         let sf = bit(raw, 31) != 0;
@@ -1235,23 +1317,222 @@ fn decode_simd_fp(raw: u32) -> Instruction {
         let rd = bits(raw, 4, 0) as u8;
 
         return match (rmode, opcode) {
-            // FCVTZS (FP to signed int, round toward zero)
             (0b11, 0b000) => Instruction::FcvtzsInt { sf, rd, rn, ftype },
-            // FCVTZU (FP to unsigned int, round toward zero)
             (0b11, 0b001) => Instruction::FcvtzuInt { sf, rd, rn, ftype },
-            // SCVTF (signed int to FP)
             (0b00, 0b010) => Instruction::ScvtfInt { sf, rd, rn, ftype },
-            // UCVTF (unsigned int to FP)
             (0b00, 0b011) => Instruction::UcvtfInt { sf, rd, rn, ftype },
-            // FMOV to GP register
             (0b00, 0b110) => Instruction::FMovToGp { rd, rn, sf, ftype },
-            // FMOV from GP register
             (0b00, 0b111) => Instruction::FMovFromGp { rd, rn, sf, ftype },
             _ => Instruction::Unknown { raw },
         };
     }
 
     Instruction::Unknown { raw }
+}
+
+// ---------------------------------------------------------------------------
+// Advanced SIMD decoders
+// ---------------------------------------------------------------------------
+
+/// Decode Advanced SIMD instructions with bits[28:24] = 01110.
+/// Covers: three same, three different, two-reg misc, across lanes, copy, permute, extract.
+fn decode_advsimd_01110(raw: u32) -> Instruction {
+    let q = bit(raw, 30) != 0;
+    let u = bit(raw, 29) != 0;
+    let size = bits(raw, 23, 22) as u8;
+    let rd = bits(raw, 4, 0) as u8;
+    let rn = bits(raw, 9, 5) as u8;
+
+    // Three same: bit[21]=1, bit[10]=1
+    if bit(raw, 21) == 1 && bit(raw, 10) == 1 {
+        let rm = bits(raw, 20, 16) as u8;
+        let opcode = bits(raw, 15, 11) as u8;
+        return Instruction::SimdThreeSame { q, u, size, opcode, rd, rn, rm };
+    }
+
+    // Three different: bit[21]=1, bits[11:10]=00
+    if bit(raw, 21) == 1 && bits(raw, 11, 10) == 0b00 {
+        let rm = bits(raw, 20, 16) as u8;
+        let opcode = bits(raw, 15, 12) as u8;
+        return Instruction::SimdThreeDiff { q, u, size, opcode, rd, rn, rm };
+    }
+
+    // Two-register misc: bits[21:17]=10000, bits[11:10]=10
+    if bits(raw, 21, 17) == 0b10000 && bits(raw, 11, 10) == 0b10 {
+        let opcode = bits(raw, 16, 12) as u8;
+        return Instruction::SimdTwoReg { q, u, size, opcode, rd, rn };
+    }
+
+    // Across lanes: bits[21:17]=11000, bits[11:10]=10
+    if bits(raw, 21, 17) == 0b11000 && bits(raw, 11, 10) == 0b10 {
+        let opcode = bits(raw, 16, 12) as u8;
+        return Instruction::SimdAcrossLanes { q, u, size, opcode, rd, rn };
+    }
+
+    // Extract (EXT): u=1, bits[23:21]=000, bit[15]=0, bit[10]=0
+    if u && bits(raw, 23, 21) == 0b000 && bit(raw, 15) == 0 && bit(raw, 10) == 0 {
+        let rm = bits(raw, 20, 16) as u8;
+        let imm4 = bits(raw, 14, 11) as u8;
+        return Instruction::SimdExtract { q, imm4, rd, rn, rm };
+    }
+
+    // Copy (DUP, INS, UMOV, SMOV): !u, bits[23:21] varies, bit[10]=1
+    // Encoding: 0_Q_op_01110000_imm5_0_imm4_1_Rn_Rd
+    if !u && bits(raw, 23, 21) == 0b000 && bit(raw, 10) == 1 {
+        let op = bit(raw, 29) as u8;
+        let imm5 = bits(raw, 20, 16) as u8;
+        let imm4 = bits(raw, 14, 11) as u8;
+        return Instruction::SimdCopy { q, op, imm5, imm4, rd, rn };
+    }
+
+    // INS (general register): u=true, bits[23:21]=000, bit[10]=1
+    // 0_Q_1_01110000_imm5_0_0011_1_Rn_Rd
+    if u && bits(raw, 23, 21) == 0b000 && bit(raw, 10) == 1 {
+        let op = bit(raw, 29) as u8;
+        let imm5 = bits(raw, 20, 16) as u8;
+        let imm4 = bits(raw, 14, 11) as u8;
+        return Instruction::SimdCopy { q, op, imm5, imm4, rd, rn };
+    }
+
+    // Permute (ZIP, UZP, TRN): bit[21]=0, bits[11:10]=10
+    if bit(raw, 21) == 0 && bits(raw, 11, 10) == 0b10 {
+        let rm = bits(raw, 20, 16) as u8;
+        let opcode = bits(raw, 14, 12) as u8;
+        return Instruction::SimdPermute { q, size, opcode, rd, rn, rm };
+    }
+
+    Instruction::Unknown { raw }
+}
+
+/// Decode Advanced SIMD instructions with bits[28:24] = 01111.
+/// Covers: modified immediate, shift by immediate, vector x indexed element.
+fn decode_advsimd_01111(raw: u32) -> Instruction {
+    let immh = bits(raw, 22, 19);
+
+    // bit[10]=1 path: shift-by-immediate OR modified immediate
+    if bit(raw, 10) == 1 {
+        if immh == 0 {
+            // Modified immediate (MOVI/MVNI/FMOV vec imm)
+            return decode_simd_mod_imm(raw);
+        } else {
+            // Shift by immediate (SHL, SSHR, USHR, etc.)
+            return decode_simd_shift_imm(raw);
+        }
+    }
+
+    // bit[10]=0: Vector x indexed element (FMUL/FMLA by element)
+    decode_simd_vec_indexed(raw)
+}
+
+fn decode_simd_mod_imm(raw: u32) -> Instruction {
+    let q = bit(raw, 30) != 0;
+    let op = bit(raw, 29) as u8;
+    let rd = bits(raw, 4, 0) as u8;
+    let cmode = bits(raw, 15, 12) as u8;
+    let a = bit(raw, 18);
+    let b = bit(raw, 17);
+    let c = bit(raw, 16);
+    let d = bit(raw, 9);
+    let e = bit(raw, 8);
+    let f = bit(raw, 7);
+    let g = bit(raw, 6);
+    let h = bit(raw, 5);
+    let imm8 = ((a << 7) | (b << 6) | (c << 5) | (d << 4) | (e << 3) | (f << 2) | (g << 1) | h) as u8;
+    Instruction::SimdModImm { q, op, cmode, rd, imm8 }
+}
+
+fn decode_simd_shift_imm(raw: u32) -> Instruction {
+    let q = bit(raw, 30) != 0;
+    let u = bit(raw, 29) != 0;
+    let immh = bits(raw, 22, 19) as u8;
+    let immb = bits(raw, 18, 16) as u8;
+    let opcode = bits(raw, 15, 11) as u8;
+    let rn = bits(raw, 9, 5) as u8;
+    let rd = bits(raw, 4, 0) as u8;
+    Instruction::SimdShiftImm { q, u, immh, immb, opcode, rd, rn }
+}
+
+fn decode_simd_vec_indexed(raw: u32) -> Instruction {
+    let q = bit(raw, 30) != 0;
+    let u = bit(raw, 29) != 0;
+    let size = bits(raw, 23, 22) as u8;
+    let l = bit(raw, 21) as u8;
+    let m = bit(raw, 20) as u8;
+    let rm = bits(raw, 19, 16) as u8;
+    let opcode = bits(raw, 15, 12) as u8;
+    let h = bit(raw, 11) as u8;
+    let rn = bits(raw, 9, 5) as u8;
+    let rd = bits(raw, 4, 0) as u8;
+    Instruction::SimdVecIndexed { q, u, size, opcode, rd, rn, rm, h, l, m }
+}
+
+/// Decode Advanced SIMD scalar: bits[31:30]=01, bits[28:24]=11110
+fn decode_advsimd_scalar(raw: u32) -> Instruction {
+    let u = bit(raw, 29) != 0;
+    let size = bits(raw, 23, 22) as u8;
+    let rd = bits(raw, 4, 0) as u8;
+    let rn = bits(raw, 9, 5) as u8;
+
+    // Scalar three same: bit[21]=1, bit[10]=1
+    if bit(raw, 21) == 1 && bit(raw, 10) == 1 {
+        let rm = bits(raw, 20, 16) as u8;
+        let opcode = bits(raw, 15, 11) as u8;
+        return Instruction::SimdScalarThreeSame { u, size, opcode, rd, rn, rm };
+    }
+
+    // Scalar two-reg misc: bits[21:17]=10000, bits[11:10]=10
+    if bits(raw, 21, 17) == 0b10000 && bits(raw, 11, 10) == 0b10 {
+        let opcode = bits(raw, 16, 12) as u8;
+        return Instruction::SimdScalarTwoReg { u, size, opcode, rd, rn };
+    }
+
+    // Scalar pairwise: bits[21:17]=11000, bits[11:10]=10
+    if bits(raw, 21, 17) == 0b11000 && bits(raw, 11, 10) == 0b10 {
+        let opcode = bits(raw, 16, 12) as u8;
+        return Instruction::SimdScalarPairwise { u, size, opcode, rd, rn };
+    }
+
+    Instruction::Unknown { raw }
+}
+
+/// Decode Advanced SIMD scalar x indexed element: bits[31:30]=01, bits[28:24]=11111
+fn decode_advsimd_scalar_indexed(raw: u32) -> Instruction {
+    // For now, fall back to Unknown for scalar indexed — rare in initial game code
+    Instruction::Unknown { raw }
+}
+
+fn decode_simd_ldst_multi(raw: u32) -> Instruction {
+    let q = bit(raw, 30) != 0;
+    let load = bit(raw, 22) != 0;
+    let post_index = bit(raw, 23) != 0;
+    let rm = if post_index {
+        Some(bits(raw, 20, 16) as u8)
+    } else {
+        None
+    };
+    let opcode = bits(raw, 15, 12) as u8;
+    let size = bits(raw, 11, 10) as u8;
+    let rn = bits(raw, 9, 5) as u8;
+    let rt = bits(raw, 4, 0) as u8;
+    Instruction::SimdLdStMulti { q, load, opcode, size, rn, rt, rm }
+}
+
+fn decode_simd_ldst_single(raw: u32) -> Instruction {
+    let q = bit(raw, 30) != 0;
+    let load = bit(raw, 22) != 0;
+    let post_index = bit(raw, 23) != 0;
+    let rm = if post_index {
+        Some(bits(raw, 20, 16) as u8)
+    } else {
+        None
+    };
+    let r = bit(raw, 21) as u8;
+    let opcode = bits(raw, 15, 13) as u8;
+    let s = bit(raw, 12) as u8;
+    let size = bits(raw, 11, 10) as u8;
+    let rn = bits(raw, 9, 5) as u8;
+    let rt = bits(raw, 4, 0) as u8;
+    Instruction::SimdLdStSingle { q, load, r, opcode, s, size, rn, rt, rm }
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@
 pub mod alu;
 pub mod branch;
 pub mod mem;
+pub mod neon;
 pub mod simd;
 pub mod system;
 
@@ -257,6 +258,53 @@ impl Interpreter {
             }
             StpSimd { rt, rt2, rn, imm, size, mode } => {
                 simd::exec_stp_simd(state, mem_access, rt, rt2, rn, imm, size, mode)
+            }
+
+            // -- NEON/Advanced SIMD ------------------------------------------
+            SimdThreeSame { q, u, size, opcode, rd, rn, rm } => {
+                neon::exec_simd_three_same(state, q, u, size, opcode, rd, rn, rm)
+            }
+            SimdTwoReg { q, u, size, opcode, rd, rn } => {
+                neon::exec_simd_two_reg(state, q, u, size, opcode, rd, rn)
+            }
+            SimdCopy { q, op, imm5, imm4, rd, rn } => {
+                neon::exec_simd_copy(state, q, op, imm5, imm4, rd, rn)
+            }
+            SimdModImm { q, op, cmode, rd, imm8 } => {
+                neon::exec_simd_mod_imm(state, q, op, cmode, rd, imm8)
+            }
+            SimdShiftImm { q, u, immh, immb, opcode, rd, rn } => {
+                neon::exec_simd_shift_imm(state, q, u, immh, immb, opcode, rd, rn)
+            }
+            SimdPermute { q, size, opcode, rd, rn, rm } => {
+                neon::exec_simd_permute(state, q, size, opcode, rd, rn, rm)
+            }
+            SimdExtract { q, imm4, rd, rn, rm } => {
+                neon::exec_simd_extract(state, q, imm4, rd, rn, rm)
+            }
+            SimdAcrossLanes { q, u, size, opcode, rd, rn } => {
+                neon::exec_simd_across_lanes(state, q, u, size, opcode, rd, rn)
+            }
+            SimdThreeDiff { q, u, size, opcode, rd, rn, rm } => {
+                neon::exec_simd_three_diff(state, q, u, size, opcode, rd, rn, rm)
+            }
+            SimdVecIndexed { q, u, size, opcode, rd, rn, rm, h, l, m } => {
+                neon::exec_simd_vec_indexed(state, q, u, size, opcode, rd, rn, rm, h, l, m)
+            }
+            SimdLdStMulti { q, load, opcode, size, rn, rt, rm } => {
+                neon::exec_simd_ldst_multi(state, mem_access, q, load, opcode, size, rn, rt, rm)
+            }
+            SimdLdStSingle { q, load, r, opcode, s, size, rn, rt, rm } => {
+                neon::exec_simd_ldst_single(state, mem_access, q, load, r, opcode, s, size, rn, rt, rm)
+            }
+            SimdScalarThreeSame { u, size, opcode, rd, rn, rm } => {
+                neon::exec_simd_scalar_three_same(state, u, size, opcode, rd, rn, rm)
+            }
+            SimdScalarTwoReg { u, size, opcode, rd, rn } => {
+                neon::exec_simd_scalar_two_reg(state, u, size, opcode, rd, rn)
+            }
+            SimdScalarPairwise { u, size, opcode, rd, rn } => {
+                neon::exec_simd_scalar_pairwise(state, u, size, opcode, rd, rn)
             }
 
             // -- Fallback ---------------------------------------------------
