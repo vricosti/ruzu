@@ -267,6 +267,23 @@ pub enum Instruction {
     /// Advanced SIMD scalar pairwise (FADDP scalar, FMAXP, FMINP)
     SimdScalarPairwise { u: bool, size: u8, opcode: u8, rd: u8, rn: u8 },
 
+    // -- Crypto / CRC32 ------------------------------------------------------
+
+    /// CRC32B/H/W/X and CRC32CB/CH/CW/CX
+    /// sf: true for CRC32X/CRC32CX (64-bit source), sz: data size (0=B,1=H,2=W,3=X),
+    /// c: true for CRC32C variant (Castagnoli)
+    Crc32 { sf: bool, sz: u8, c: bool, rd: u8, rn: u8, rm: u8 },
+    /// AES instructions: AESE(0x04), AESD(0x05), AESMC(0x06), AESIMC(0x07)
+    CryptoAes { rd: u8, rn: u8, opcode: u8 },
+    /// SHA three-register: SHA1C/P/M, SHA256H/H2/SU1
+    CryptoSha3 { rd: u8, rn: u8, rm: u8, opcode: u8 },
+    /// SHA two-register: SHA1H, SHA256SU0
+    CryptoSha2 { rd: u8, rn: u8, opcode: u8 },
+    /// TBL/TBX: table lookup
+    /// q: true for 16-byte result, len: 0-3 = 1-4 consecutive registers,
+    /// op: 0=TBL, 1=TBX
+    SimdTbl { q: bool, rd: u8, rn: u8, rm: u8, len: u8, op: u8 },
+
     // -- Atomics ------------------------------------------------------------
 
     /// CAS/CASA/CASL/CASAL — Compare and Swap
@@ -995,38 +1012,9 @@ fn decode_ldst_simd(raw: u32) -> Instruction {
 
 fn decode_dp_reg(raw: u32) -> Instruction {
     let sf = bit(raw, 31) != 0;
-    let _op0 = bit(raw, 30);
-    let op1 = bit(raw, 28);
-    let op2 = bits(raw, 24, 21);
-
-    // op1 = 1: Data-processing (3-source), multiply
-    if op1 == 1 {
-        return decode_dp3_source(raw);
-    }
-
-    // op1 = 0: Various
-    match op2 {
-        // Add/subtract (shifted register): op2 = 0b1xx0 or 0bx000..0b0110
-        _ if bits(raw, 24, 21) & 0b1001 == 0b0000
-            && bit(raw, 24) == 0 =>
-        {
-            return decode_add_sub_shifted(raw);
-        }
-        _ => {}
-    }
-
-    // Add/subtract (extended register): bits [24:21] = 0b1001 area
-    // Format: sf op S 01011 opt(2) 1 Rm option(3) imm3(3) Rn Rd
-    if bits(raw, 28, 24) == 0b01011 && bit(raw, 21) == 1 {
-        return decode_add_sub_extended(raw);
-    }
-
-    // Logical (shifted register): bits [28:24] = 01010
-    if bits(raw, 28, 24) == 0b01010 {
-        return decode_logical_shifted(raw);
-    }
 
     // Data processing (2-source): bits [28:21] = 11010110
+    // Must check before op1==1 catch-all since these also have bit 28 = 1
     if bits(raw, 28, 21) == 0b11010110 {
         return decode_dp2_source(raw);
     }
@@ -1058,6 +1046,34 @@ fn decode_dp_reg(raw: u32) -> Instruction {
         return Instruction::Ccmp {
             sf, rn, rm_or_imm, nzcv, cond, is_imm, is_neg,
         };
+    }
+
+    // Data-processing (3-source) / multiply: op1 (bit 28) = 1
+    if bit(raw, 28) == 1 {
+        return decode_dp3_source(raw);
+    }
+
+    // op1 = 0: Various sub-groups
+    let op2 = bits(raw, 24, 21);
+    match op2 {
+        // Add/subtract (shifted register)
+        _ if bits(raw, 24, 21) & 0b1001 == 0b0000
+            && bit(raw, 24) == 0 =>
+        {
+            return decode_add_sub_shifted(raw);
+        }
+        _ => {}
+    }
+
+    // Add/subtract (extended register): bits [24:21] = 0b1001 area
+    // Format: sf op S 01011 opt(2) 1 Rm option(3) imm3(3) Rn Rd
+    if bits(raw, 28, 24) == 0b01011 && bit(raw, 21) == 1 {
+        return decode_add_sub_extended(raw);
+    }
+
+    // Logical (shifted register): bits [28:24] = 01010
+    if bits(raw, 28, 24) == 0b01010 {
+        return decode_logical_shifted(raw);
     }
 
     Instruction::Unknown { raw }
@@ -1127,6 +1143,13 @@ fn decode_dp2_source(raw: u32) -> Instruction {
     match opcode {
         0b000010 => Instruction::Udiv { sf, rd, rn, rm },
         0b000011 => Instruction::Sdiv { sf, rd, rn, rm },
+        // CRC32: sf=0, opcode=010_0xx (CRC32B/H/W) or sf=1, opcode=010_011 (CRC32X)
+        // CRC32C: sf=0, opcode=010_1xx (CRC32CB/CH/CW) or sf=1, opcode=010_111 (CRC32CX)
+        op if (op >> 3) == 0b010 => {
+            let sz = (op & 0b011) as u8;
+            let c = (op >> 2) & 1 != 0;
+            Instruction::Crc32 { sf, sz, c, rd, rn, rm }
+        }
         _ => Instruction::Unknown { raw },
     }
 }
@@ -1357,6 +1380,13 @@ fn decode_advsimd_01110(raw: u32) -> Instruction {
         return Instruction::SimdThreeDiff { q, u, size, opcode, rd, rn, rm };
     }
 
+    // Crypto AES: size=00, bits[21:17]=10100, bits[11:10]=10
+    // AESE(0b00100), AESD(0b00101), AESMC(0b00110), AESIMC(0b00111)
+    if size == 0 && bits(raw, 21, 17) == 0b10100 && bits(raw, 11, 10) == 0b10 {
+        let opcode = bits(raw, 16, 12) as u8;
+        return Instruction::CryptoAes { rd, rn, opcode };
+    }
+
     // Two-register misc: bits[21:17]=10000, bits[11:10]=10
     if bits(raw, 21, 17) == 0b10000 && bits(raw, 11, 10) == 0b10 {
         let opcode = bits(raw, 16, 12) as u8;
@@ -1374,6 +1404,15 @@ fn decode_advsimd_01110(raw: u32) -> Instruction {
         let rm = bits(raw, 20, 16) as u8;
         let imm4 = bits(raw, 14, 11) as u8;
         return Instruction::SimdExtract { q, imm4, rd, rn, rm };
+    }
+
+    // TBL/TBX: Q_0_001110_00_0_Rm_0_len(2)_op_00_Rn_Rd
+    // u=false, size=00, bit[21]=0, bit[15]=0, bits[11:10]=00
+    if !u && size == 0 && bit(raw, 21) == 0 && bit(raw, 15) == 0 && bits(raw, 11, 10) == 0b00 {
+        let rm = bits(raw, 20, 16) as u8;
+        let len = bits(raw, 14, 13) as u8;  // 0-3 = 1-4 registers
+        let op = bit(raw, 12) as u8;         // 0=TBL, 1=TBX
+        return Instruction::SimdTbl { q, rd, rn, rm, len, op };
     }
 
     // Copy (DUP, INS, UMOV, SMOV): !u, bits[23:21] varies, bit[10]=1
@@ -1472,6 +1511,21 @@ fn decode_advsimd_scalar(raw: u32) -> Instruction {
     let size = bits(raw, 23, 22) as u8;
     let rd = bits(raw, 4, 0) as u8;
     let rn = bits(raw, 9, 5) as u8;
+
+    // SHA three-register: u=false, size=00, bit[21]=0, bits[11:10]=00
+    // SHA1C/SHA1P/SHA1M/SHA256H/SHA256H2/SHA256SU1
+    if !u && size == 0 && bit(raw, 21) == 0 && bits(raw, 11, 10) == 0b00 {
+        let rm = bits(raw, 20, 16) as u8;
+        let opcode = bits(raw, 14, 12) as u8;
+        return Instruction::CryptoSha3 { rd, rn, rm, opcode };
+    }
+
+    // SHA two-register: u=false, size=00, bits[21:17]=10100, bits[11:10]=10
+    // SHA1H, SHA256SU0
+    if !u && size == 0 && bits(raw, 21, 17) == 0b10100 && bits(raw, 11, 10) == 0b10 {
+        let opcode = bits(raw, 16, 12) as u8;
+        return Instruction::CryptoSha2 { rd, rn, opcode };
+    }
 
     // Scalar three same: bit[21]=1, bit[10]=1
     if bit(raw, 21) == 1 && bit(raw, 10) == 1 {
@@ -1839,6 +1893,57 @@ mod tests {
         match inst {
             Instruction::AtomicOp { size: 2, rs: 0, rt: 1, rn: 2, op: 3 } => {}
             other => panic!("Expected LDSET, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_crc32w() {
+        // CRC32W W0, W1, W2: sf=0, opcode=010_010 (sz=2, c=false)
+        // Encoding: 0_0_0_11010110_Rm_010010_Rn_Rd
+        // = 0x1AC24820 for W0, W1, W2
+        let raw: u32 = 0b0_0_0_11010110_00010_010010_00001_00000;
+        let inst = decode(raw);
+        match inst {
+            Instruction::Crc32 { sf: false, sz: 2, c: false, rd: 0, rn: 1, rm: 2 } => {}
+            other => panic!("Expected CRC32W, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_aese() {
+        // AESE V0.16B, V1.16B
+        // 01001110_00_10100_00100_10_Rn_Rd
+        // = 0x4E284820 for V0, V1
+        let raw: u32 = 0b01001110_00_10100_00100_10_00001_00000;
+        let inst = decode(raw);
+        match inst {
+            Instruction::CryptoAes { rd: 0, rn: 1, opcode: 0b00100 } => {}
+            other => panic!("Expected AESE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_sha256h() {
+        // SHA256H Q0, Q1, V2.4S
+        // 01011110_00_0_Rm_0_100_00_Rn_Rd
+        let raw: u32 = 0b01011110_00_0_00010_0_100_00_00001_00000;
+        let inst = decode(raw);
+        match inst {
+            Instruction::CryptoSha3 { rd: 0, rn: 1, rm: 2, opcode: 0b100 } => {}
+            other => panic!("Expected SHA256H, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_tbl() {
+        // TBL V0.8B, {V1}, V2
+        // 0_Q_0_01110_00_0_Rm_0_len_op_00_Rn_Rd
+        // Q=0, len=0, op=0
+        let raw: u32 = 0b0_0_0_01110_00_0_00010_0_00_0_00_00001_00000;
+        let inst = decode(raw);
+        match inst {
+            Instruction::SimdTbl { q: false, rd: 0, rn: 1, rm: 2, len: 0, op: 0 } => {}
+            other => panic!("Expected TBL, got {:?}", other),
         }
     }
 }

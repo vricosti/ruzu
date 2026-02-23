@@ -34,6 +34,8 @@ pub enum WaitReason {
     AddressArbiter { addr: VAddr },
     /// SleepThread with a timeout.
     Sleep { wake_tick: u64 },
+    /// SetThreadActivity — thread is suspended.
+    Suspended,
 }
 
 /// Default thread priority (matching Switch defaults).
@@ -83,6 +85,8 @@ pub struct KThread {
     pub synced_index: i32,
     /// Tick count when the wait began (for timeout checking).
     pub wait_start_tick: u64,
+    /// If true, the next WaitSynchronization will immediately return CANCELLED.
+    pub cancel_pending: bool,
 }
 
 impl KThread {
@@ -116,6 +120,7 @@ impl KThread {
             wait_result: 0,
             synced_index: -1,
             wait_start_tick: 0,
+            cancel_pending: false,
         }
     }
 

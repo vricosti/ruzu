@@ -180,6 +180,40 @@ pub fn svc_map_shared_memory(
     ResultCode::SUCCESS
 }
 
+/// SVC 0x14: UnmapSharedMemory
+///
+/// Unmaps a shared memory region from the process address space.
+/// Zeroes the mapped region before unmapping.
+pub fn svc_unmap_shared_memory(
+    kernel: &mut KernelCore,
+    _handle: Handle,
+    addr: VAddr,
+    size: u64,
+) -> ResultCode {
+    debug!(
+        "UnmapSharedMemory: addr=0x{:X}, size=0x{:X}",
+        addr, size
+    );
+
+    if !is_page_aligned(addr) || !is_page_aligned(size) || size == 0 {
+        return error::INVALID_SIZE;
+    }
+
+    let process = match kernel.process_mut() {
+        Some(p) => p,
+        None => return error::INVALID_STATE,
+    };
+
+    // Zero the region before unmapping.
+    let zeros = vec![0u8; size as usize];
+    let _ = process.memory.write_bytes(addr, &zeros);
+
+    // Unmap the region.
+    let _ = process.memory.unmap(addr, size);
+
+    ResultCode::SUCCESS
+}
+
 /// SVC 0x02: SetMemoryPermission
 /// X0 = addr, X1 = size, X2 = permission
 /// Returns: X0 = result
