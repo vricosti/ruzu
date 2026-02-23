@@ -1716,6 +1716,77 @@ pub fn exec_simd_scalar_pairwise(
 }
 
 // ---------------------------------------------------------------------------
+// TBL / TBX
+// ---------------------------------------------------------------------------
+
+/// Execute TBL/TBX (table lookup).
+///
+/// Concatenates `len+1` consecutive V registers starting from `rn` into a
+/// lookup table. For each byte in the source (`rm`), uses it as an index
+/// into the table. Out-of-range indices: TBL writes 0, TBX keeps destination.
+pub fn exec_simd_tbl(
+    state: &mut CpuState,
+    q: bool,
+    rd: u8,
+    rn: u8,
+    rm: u8,
+    len: u8,
+    op: u8,
+) -> StepResult {
+    let num_regs = (len as usize) + 1; // 1-4 registers
+    let bytes = if q { 16 } else { 8 };
+
+    // Build the lookup table from consecutive registers.
+    let table_size = num_regs * 16;
+    let mut table = vec![0u8; table_size];
+    for r in 0..num_regs {
+        let reg_idx = ((rn as usize) + r) % 32;
+        let lo = state.v[reg_idx][0];
+        let hi = state.v[reg_idx][1];
+        let offset = r * 16;
+        table[offset..offset + 8].copy_from_slice(&lo.to_le_bytes());
+        table[offset + 8..offset + 16].copy_from_slice(&hi.to_le_bytes());
+    }
+
+    // Read source indices from Vm.
+    let src_lo = state.v[rm as usize][0];
+    let src_hi = state.v[rm as usize][1];
+    let mut src_bytes = [0u8; 16];
+    src_bytes[..8].copy_from_slice(&src_lo.to_le_bytes());
+    src_bytes[8..].copy_from_slice(&src_hi.to_le_bytes());
+
+    // Read current destination (for TBX).
+    let dst_lo = state.v[rd as usize][0];
+    let dst_hi = state.v[rd as usize][1];
+    let mut dst_bytes = [0u8; 16];
+    dst_bytes[..8].copy_from_slice(&dst_lo.to_le_bytes());
+    dst_bytes[8..].copy_from_slice(&dst_hi.to_le_bytes());
+
+    let mut result = [0u8; 16];
+    for i in 0..bytes {
+        let idx = src_bytes[i] as usize;
+        if idx < table_size {
+            result[i] = table[idx];
+        } else if op == 1 {
+            // TBX: keep destination byte
+            result[i] = dst_bytes[i];
+        }
+        // TBL: result[i] stays 0 for out-of-range
+    }
+
+    // Write result.
+    let lo = u64::from_le_bytes(result[..8].try_into().unwrap());
+    let hi = if q {
+        u64::from_le_bytes(result[8..16].try_into().unwrap())
+    } else {
+        0
+    };
+    state.v[rd as usize] = [lo, hi];
+
+    StepResult::Continue
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2080,5 +2151,55 @@ mod tests {
         // UMOV W0, V1.S[2]: op=0, imm4=0111, imm5=0b10100 (S[2])
         exec_simd_copy(&mut s, false, 0, 0b10100, 0b0111, 0, 1);
         assert_eq!(s.get_reg(0), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn test_tbl_basic() {
+        let mut s = CpuState::new();
+        // V1 = table: bytes 0..15 = [0x10, 0x11, ... 0x1F]
+        let mut table_bytes = [0u8; 16];
+        for i in 0..16 {
+            table_bytes[i] = 0x10 + i as u8;
+        }
+        let lo = u64::from_le_bytes(table_bytes[..8].try_into().unwrap());
+        let hi = u64::from_le_bytes(table_bytes[8..].try_into().unwrap());
+        s.v[1] = [lo, hi];
+
+        // V2 = indices: [0, 3, 15, 0xFF, 0, 0, 0, 0, ...]
+        s.v[2] = [
+            u64::from_le_bytes([0, 3, 15, 0xFF, 0, 0, 0, 0]),
+            0,
+        ];
+
+        // TBL V0, {V1}, V2 (q=false, len=0, op=0)
+        exec_simd_tbl(&mut s, false, 0, 1, 2, 0, 0);
+
+        let result_lo = s.v[0][0].to_le_bytes();
+        assert_eq!(result_lo[0], 0x10); // index 0 -> 0x10
+        assert_eq!(result_lo[1], 0x13); // index 3 -> 0x13
+        assert_eq!(result_lo[2], 0x1F); // index 15 -> 0x1F
+        assert_eq!(result_lo[3], 0x00); // index 0xFF -> out of range, TBL=0
+    }
+
+    #[test]
+    fn test_tbx_keeps_dest() {
+        let mut s = CpuState::new();
+        // V1 = table: all zeros
+        s.v[1] = [0, 0];
+
+        // V2 = indices: [0xFF, 0, ...]
+        s.v[2] = [0xFF, 0];
+
+        // V0 = destination with known byte pattern
+        s.v[0] = [0x42, 0];
+
+        // TBX V0, {V1}, V2 (q=false, len=0, op=1)
+        exec_simd_tbl(&mut s, false, 0, 1, 2, 0, 1);
+
+        let result_lo = s.v[0][0].to_le_bytes();
+        // index 0xFF is out of range -> TBX keeps destination byte
+        assert_eq!(result_lo[0], 0x42);
+        // index 0 is in range -> lookup table[0] = 0
+        assert_eq!(result_lo[1], 0x00);
     }
 }

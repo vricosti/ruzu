@@ -8,6 +8,7 @@
 
 pub mod alu;
 pub mod branch;
+pub mod crypto;
 pub mod mem;
 pub mod neon;
 pub mod simd;
@@ -305,6 +306,23 @@ impl Interpreter {
             }
             SimdScalarPairwise { u, size, opcode, rd, rn } => {
                 neon::exec_simd_scalar_pairwise(state, u, size, opcode, rd, rn)
+            }
+            SimdTbl { q, rd, rn, rm, len, op } => {
+                neon::exec_simd_tbl(state, q, rd, rn, rm, len, op)
+            }
+
+            // -- Crypto / CRC32 ---------------------------------------------
+            Crc32 { sf, sz, c, rd, rn, rm } => {
+                crypto::exec_crc32(state, sf, sz, c, rd, rn, rm)
+            }
+            CryptoAes { rd, rn, opcode } => {
+                crypto::exec_crypto_aes(state, rd, rn, opcode)
+            }
+            CryptoSha3 { rd, rn, rm, opcode } => {
+                crypto::exec_crypto_sha3(state, rd, rn, rm, opcode)
+            }
+            CryptoSha2 { rd, rn, opcode } => {
+                crypto::exec_crypto_sha2(state, rd, rn, opcode)
             }
 
             // -- Fallback ---------------------------------------------------

@@ -535,6 +535,21 @@ fn main() -> Result<()> {
     manager.register_service("lm", Box::new(ruzu_service::lm::LmService::new()));
     manager.register_service("ILogger", Box::new(ruzu_service::lm::LoggerService::new()));
 
+    // Stub services (accept all commands, return success)
+    manager.register_service("fatal:u", Box::new(ruzu_service::stubs::FatalService::new()));
+    manager.register_service("prepo:a", Box::new(ruzu_service::stubs::PrepoService::new()));
+    manager.register_service("caps:su", Box::new(ruzu_service::stubs::CapsService::new()));
+    manager.register_service("ns:am2", Box::new(ruzu_service::stubs::NsService::new()));
+    manager.register_service("bcat:a", Box::new(ruzu_service::stubs::BcatService::new()));
+    manager.register_service("aoc:u", Box::new(ruzu_service::stubs::AocService::new()));
+    manager.register_service("spl:", Box::new(ruzu_service::stubs::SplService::new()));
+    manager.register_service("mii:e", Box::new(ruzu_service::stubs::MiiService::new()));
+    manager.register_service("erpt:c", Box::new(ruzu_service::stubs::ErptService::new()));
+    manager.register_service("eupld:c", Box::new(ruzu_service::stubs::EupldService::new()));
+    manager.register_service("pm:shell", Box::new(ruzu_service::stubs::PmService::new()));
+    manager.register_service("ldr:ro", Box::new(ruzu_service::stubs::LdrService::new()));
+    manager.register_service("glue:u", Box::new(ruzu_service::stubs::GlueService::new()));
+
     // Wire IPC bridge.
     let manager_arc = Arc::new(RwLock::new(manager));
     let bridge = Arc::new(ServiceBridge::new(manager_arc));

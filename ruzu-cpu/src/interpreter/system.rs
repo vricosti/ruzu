@@ -39,6 +39,21 @@ mod sys_reg {
 
     // MIDR_EL1: op0=3, op1=0, CRn=0, CRm=0, op2=0
     pub const MIDR_EL1: u32 = (3 << 14) | (0 << 11) | (0 << 7) | (0 << 3) | 0;
+
+    // MPIDR_EL1: op0=3, op1=0, CRn=0, CRm=0, op2=5
+    pub const MPIDR_EL1: u32 = (3 << 14) | (0 << 11) | (0 << 7) | (0 << 3) | 5;
+
+    // ID_AA64ISAR0_EL1: op0=3, op1=0, CRn=0, CRm=6, op2=0
+    pub const ID_AA64ISAR0_EL1: u32 = (3 << 14) | (0 << 11) | (0 << 7) | (6 << 3) | 0;
+
+    // ID_AA64MMFR0_EL1: op0=3, op1=0, CRn=0, CRm=7, op2=0
+    pub const ID_AA64MMFR0_EL1: u32 = (3 << 14) | (0 << 11) | (0 << 7) | (7 << 3) | 0;
+
+    // ID_AA64PFR0_EL1: op0=3, op1=0, CRn=0, CRm=4, op2=0
+    pub const ID_AA64PFR0_EL1: u32 = (3 << 14) | (0 << 11) | (0 << 7) | (4 << 3) | 0;
+
+    // PMUSERENR_EL0: op0=3, op1=3, CRn=9, CRm=14, op2=0
+    pub const PMUSERENR_EL0: u32 = (3 << 14) | (3 << 11) | (9 << 7) | (14 << 3) | 0;
 }
 
 /// Monotonic counter for system ticks (approximation).
@@ -68,6 +83,26 @@ pub fn exec_mrs(state: &mut CpuState, rt: u8, sys_reg_enc: u32) -> StepResult {
         sys_reg::MIDR_EL1 => {
             // Fake CPU ID: Cortex-A57 like the Switch
             0x411F_D073
+        }
+        sys_reg::MPIDR_EL1 => {
+            // Single core, cluster 0
+            0x8000_0000
+        }
+        sys_reg::ID_AA64ISAR0_EL1 => {
+            // AES+SHA1+SHA256+CRC32 supported
+            0x0000_0000_0011_1112
+        }
+        sys_reg::ID_AA64MMFR0_EL1 => {
+            // 4KB granule, 48-bit PA
+            0x0000_0000_0000_0F10
+        }
+        sys_reg::ID_AA64PFR0_EL1 => {
+            // EL0-EL3 all AArch64
+            0x0000_0000_0000_1111
+        }
+        sys_reg::PMUSERENR_EL0 => {
+            // PMU not accessible from EL0
+            0
         }
         _ => {
             log::warn!(
@@ -178,5 +213,40 @@ mod tests {
         s.exclusive_addr = Some(0x1000);
         exec_clrex(&mut s);
         assert!(s.exclusive_addr.is_none());
+    }
+
+    #[test]
+    fn test_mrs_mpidr_el1() {
+        let mut s = CpuState::new();
+        exec_mrs(&mut s, 0, sys_reg::MPIDR_EL1);
+        assert_eq!(s.get_reg(0), 0x8000_0000);
+    }
+
+    #[test]
+    fn test_mrs_id_aa64isar0() {
+        let mut s = CpuState::new();
+        exec_mrs(&mut s, 0, sys_reg::ID_AA64ISAR0_EL1);
+        assert_eq!(s.get_reg(0), 0x0000_0000_0011_1112);
+    }
+
+    #[test]
+    fn test_mrs_id_aa64mmfr0() {
+        let mut s = CpuState::new();
+        exec_mrs(&mut s, 0, sys_reg::ID_AA64MMFR0_EL1);
+        assert_eq!(s.get_reg(0), 0x0000_0000_0000_0F10);
+    }
+
+    #[test]
+    fn test_mrs_id_aa64pfr0() {
+        let mut s = CpuState::new();
+        exec_mrs(&mut s, 0, sys_reg::ID_AA64PFR0_EL1);
+        assert_eq!(s.get_reg(0), 0x0000_0000_0000_1111);
+    }
+
+    #[test]
+    fn test_mrs_pmuserenr() {
+        let mut s = CpuState::new();
+        exec_mrs(&mut s, 0, sys_reg::PMUSERENR_EL0);
+        assert_eq!(s.get_reg(0), 0);
     }
 }

@@ -159,6 +159,136 @@ pub fn svc_send_sync_request(
     ResultCode::SUCCESS
 }
 
+/// SVC 0x22: SendSyncRequestWithUserBuffer
+/// X0 = buffer_addr, X1 = buffer_size, X2 = session handle
+/// Like SendSyncRequest but reads/writes IPC buffer from user-specified address
+/// instead of the thread's TLS.
+pub fn svc_send_sync_request_with_user_buffer(
+    kernel: &mut KernelCore,
+    _cpu: &mut CpuState,
+    buffer_addr: VAddr,
+    buffer_size: u64,
+    handle: Handle,
+) -> ResultCode {
+    debug!(
+        "SendSyncRequestWithUserBuffer: buffer=0x{:X}, size=0x{:X}, handle={}",
+        buffer_addr, buffer_size, handle
+    );
+
+    // 1. Read the service name from the session handle.
+    let service_name = {
+        let process = match kernel.process_mut() {
+            Some(p) => p,
+            None => return error::INVALID_STATE,
+        };
+        match process.handle_table.get(handle) {
+            Ok(KernelObject::ClientSession(session)) => session.service_name.clone(),
+            _ => {
+                warn!("SendSyncRequestWithUserBuffer: invalid handle {}", handle);
+                return error::INVALID_HANDLE;
+            }
+        }
+    };
+
+    // 2. Clone the IPC handler Arc.
+    let handler = match kernel.ipc_handler.clone() {
+        Some(h) => h,
+        None => {
+            debug!("SendSyncRequestWithUserBuffer: no IPC handler, writing stub response");
+            let process = kernel.process_mut().unwrap();
+            write_cmif_response_at(process, buffer_addr, ResultCode::SUCCESS, &[]);
+            return ResultCode::SUCCESS;
+        }
+    };
+
+    // 3. Read IPC buffer from user-specified address.
+    let read_size = (buffer_size as usize).min(0x100);
+    let ipc_data;
+    {
+        let process = match kernel.process_mut() {
+            Some(p) => p,
+            None => return error::INVALID_STATE,
+        };
+        let mut buf = vec![0u8; 0x100];
+        for i in 0..read_size as u64 {
+            buf[i as usize] = process.memory.read_u8(buffer_addr + i).unwrap_or(0);
+        }
+        ipc_data = buf;
+    }
+
+    // 4. Call the handler.
+    let result = handler.handle_ipc(&service_name, &ipc_data);
+
+    // 5. Handle sub-session creation and move handles.
+    let mut extra_move_handles: Vec<u32> = result.move_handles.clone();
+    if let Some(ref sub_service_name) = result.create_session_for {
+        let process = kernel.process_mut().unwrap();
+        let sub_session = KClientSession::new(sub_service_name.clone());
+        match process.handle_table.add(KernelObject::ClientSession(sub_session)) {
+            Ok(sub_handle) => {
+                debug!(
+                    "SendSyncRequestWithUserBuffer: created sub-session handle {} for \"{}\"",
+                    sub_handle, sub_service_name
+                );
+                extra_move_handles.push(sub_handle);
+            }
+            Err(_) => {
+                warn!(
+                    "SendSyncRequestWithUserBuffer: failed to create sub-session for \"{}\"",
+                    sub_service_name
+                );
+            }
+        }
+    }
+
+    // 6. Build final response bytes.
+    let copy_handles = &result.copy_handles;
+    let has_handles = !copy_handles.is_empty() || !extra_move_handles.is_empty();
+
+    let response_bytes = if has_handles {
+        let (result_code, data_words) = parse_cmif_from_response(&result.response_bytes);
+        build_response_with_handles(
+            result_code,
+            &data_words,
+            copy_handles,
+            &extra_move_handles,
+        )
+    } else {
+        result.response_bytes
+    };
+
+    // 7. Write response back to user buffer address.
+    let process = kernel.process_mut().unwrap();
+    let write_len = response_bytes.len().min(read_size);
+    for i in 0..write_len {
+        let _ = process.memory.write_u8(buffer_addr + i as u64, response_bytes[i]);
+    }
+
+    ResultCode::SUCCESS
+}
+
+/// Write a CMIF response to a specific address (for user buffer variant).
+fn write_cmif_response_at(
+    process: &mut crate::process::KProcess,
+    addr: VAddr,
+    result: ResultCode,
+    extra_data: &[u32],
+) {
+    let data_words = 4 + extra_data.len() as u32;
+    let _ = process.memory.write_u32(addr, 0); // type = 0 (response)
+    let _ = process.memory.write_u32(addr + 4, data_words); // data size
+
+    let cmif_offset = 16u64;
+    let _ = process.memory.write_u32(addr + cmif_offset, 0x4F434653); // "SFCO"
+    let _ = process.memory.write_u32(addr + cmif_offset + 4, 0); // version
+    let _ = process.memory.write_u32(addr + cmif_offset + 8, result.raw()); // result code
+    let _ = process.memory.write_u32(addr + cmif_offset + 12, 0); // token
+
+    for (i, &word) in extra_data.iter().enumerate() {
+        let _ = process.memory.write_u32(addr + cmif_offset + 16 + (i as u64 * 4), word);
+    }
+}
+
 /// SVC 0x16: CloseHandle
 pub fn svc_close_handle(kernel: &mut KernelCore, handle: Handle) -> ResultCode {
     debug!("CloseHandle: handle={}", handle);

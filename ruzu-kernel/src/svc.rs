@@ -133,6 +133,14 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
             cpu.x[0] = result.raw() as u64;
         }
 
+        svc_number::UNMAP_SHARED_MEMORY => {
+            let handle = cpu.x[0] as u32;
+            let addr = cpu.x[1];
+            let size = cpu.x[2];
+            let result = memory::svc_unmap_shared_memory(kernel, handle, addr, size);
+            cpu.x[0] = result.raw() as u64;
+        }
+
         svc_number::EXIT_PROCESS => {
             debug::svc_exit_process(kernel);
         }
@@ -246,6 +254,11 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
             svc_wait_synchronization(kernel, cpu, handles_ptr, handles_count, timeout_ns);
         }
 
+        svc_number::CANCEL_SYNCHRONIZATION => {
+            let thread_handle = cpu.x[0] as u32;
+            svc_cancel_synchronization(kernel, cpu, thread_handle);
+        }
+
         svc_number::ARBITRATE_LOCK => {
             let owner_handle = cpu.x[0] as u32;
             let mutex_addr = cpu.x[1];
@@ -298,6 +311,16 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
         svc_number::SEND_SYNC_REQUEST => {
             let handle = cpu.x[0] as u32;
             let result = ipc::svc_send_sync_request(kernel, cpu, handle);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::SEND_SYNC_REQUEST_WITH_USER_BUFFER => {
+            let buffer_addr = cpu.x[0];
+            let buffer_size = cpu.x[1];
+            let session_handle = cpu.x[2] as u32;
+            let result = ipc::svc_send_sync_request_with_user_buffer(
+                kernel, cpu, buffer_addr, buffer_size, session_handle,
+            );
             cpu.x[0] = result.raw() as u64;
         }
 
@@ -372,6 +395,20 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
             let value = cpu.x[2] as u32;
             let count = cpu.x[3] as i32;
             svc_signal_to_address(kernel, cpu, addr, signal_type, value, count);
+        }
+
+        svc_number::SET_THREAD_ACTIVITY => {
+            let thread_handle = cpu.x[0] as u32;
+            let activity = cpu.x[1] as u32;
+            let result = svc_set_thread_activity(kernel, thread_handle, activity);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::GET_THREAD_CONTEXT3 => {
+            let thread_handle = cpu.x[0] as u32;
+            let context_addr = cpu.x[1];
+            let result = svc_get_thread_context3(kernel, thread_handle, context_addr);
+            cpu.x[0] = result.raw() as u64;
         }
 
         svc_number::MAP_PHYSICAL_MEMORY => {
@@ -604,6 +641,14 @@ fn svc_wait_synchronization(
     if timeout_ns == 0 {
         cpu.x[0] = error::TIMEOUT.raw() as u64;
         cpu.x[1] = u64::MAX; // invalid index
+        return;
+    }
+
+    // Check cancel_pending flag before blocking.
+    if process.threads[thread_idx].cancel_pending {
+        process.threads[thread_idx].cancel_pending = false;
+        cpu.x[0] = error::CANCELLED.raw() as u64;
+        cpu.x[1] = u64::MAX;
         return;
     }
 
@@ -1036,4 +1081,169 @@ fn svc_sleep_thread(kernel: &mut KernelCore, cpu: &mut CpuState, ns: i64) {
         // ns == -1: sleep until explicitly woken (rare).
         cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
     }
+}
+
+// ---------------------------------------------------------------------------
+// SVC 0x19: CancelSynchronization
+// ---------------------------------------------------------------------------
+
+fn svc_cancel_synchronization(
+    kernel: &mut KernelCore,
+    cpu: &mut CpuState,
+    thread_handle: Handle,
+) {
+    debug!("CancelSynchronization: thread_handle={}", thread_handle);
+
+    let process = match kernel.process_mut() {
+        Some(p) => p,
+        None => {
+            cpu.x[0] = error::INVALID_STATE.raw() as u64;
+            return;
+        }
+    };
+
+    // Find the target thread by handle.
+    let target_idx = process
+        .threads
+        .iter()
+        .position(|t| t.handle == thread_handle);
+
+    match target_idx {
+        Some(idx) => {
+            if process.threads[idx].state == ThreadState::Waiting {
+                // Thread is waiting — wake it with CANCELLED.
+                process.threads[idx].wake(error::CANCELLED.raw(), -1);
+            } else {
+                // Thread is not waiting — set cancel_pending flag.
+                process.threads[idx].cancel_pending = true;
+            }
+            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+        }
+        None => {
+            cpu.x[0] = error::INVALID_HANDLE.raw() as u64;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SVC 0x32: SetThreadActivity
+// ---------------------------------------------------------------------------
+
+fn svc_set_thread_activity(
+    kernel: &mut KernelCore,
+    thread_handle: Handle,
+    activity: u32,
+) -> ResultCode {
+    debug!(
+        "SetThreadActivity: thread_handle={}, activity={}",
+        thread_handle, activity
+    );
+
+    let tick = kernel.tick_counter;
+    let process = match kernel.process_mut() {
+        Some(p) => p,
+        None => return error::INVALID_STATE,
+    };
+
+    let target_idx = process
+        .threads
+        .iter()
+        .position(|t| t.handle == thread_handle);
+
+    match target_idx {
+        Some(idx) => {
+            match activity {
+                1 => {
+                    // Suspend
+                    if process.threads[idx].state == ThreadState::Waiting
+                        && matches!(process.threads[idx].wait_reason, WaitReason::Suspended)
+                    {
+                        // Already suspended.
+                        return ResultCode::SUCCESS;
+                    }
+                    process.threads[idx].begin_wait(WaitReason::Suspended, tick);
+                }
+                0 => {
+                    // Resume
+                    if process.threads[idx].state == ThreadState::Waiting
+                        && matches!(process.threads[idx].wait_reason, WaitReason::Suspended)
+                    {
+                        process.threads[idx].wake(ResultCode::SUCCESS.raw(), -1);
+                    }
+                }
+                _ => return error::INVALID_ENUM_VALUE,
+            }
+            ResultCode::SUCCESS
+        }
+        None => error::INVALID_HANDLE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SVC 0x33: GetThreadContext3
+// ---------------------------------------------------------------------------
+
+fn svc_get_thread_context3(
+    kernel: &mut KernelCore,
+    thread_handle: Handle,
+    context_addr: VAddr,
+) -> ResultCode {
+    debug!(
+        "GetThreadContext3: thread_handle={}, context_addr=0x{:X}",
+        thread_handle, context_addr
+    );
+
+    let process = match kernel.process_mut() {
+        Some(p) => p,
+        None => return error::INVALID_STATE,
+    };
+
+    let target_idx = process
+        .threads
+        .iter()
+        .position(|t| t.handle == thread_handle);
+
+    let idx = match target_idx {
+        Some(i) => i,
+        None => return error::INVALID_HANDLE,
+    };
+
+    let thread = &process.threads[idx];
+    let cpu = &thread.cpu_state;
+
+    // Layout: X0-X30 (31*8=248 bytes), SP (8 bytes), PC (8 bytes),
+    //         NZCV (4 bytes), padding (4 bytes), V0-V31 (32*16=512 bytes)
+    // Total: 248 + 8 + 8 + 4 + 4 + 512 = 784 bytes
+    let mut offset = context_addr;
+
+    // X0-X30
+    for i in 0..31 {
+        let _ = process.memory.write_u64(offset, cpu.x[i]);
+        offset += 8;
+    }
+
+    // SP
+    let _ = process.memory.write_u64(offset, cpu.sp);
+    offset += 8;
+
+    // PC
+    let _ = process.memory.write_u64(offset, cpu.pc);
+    offset += 8;
+
+    // NZCV (4 bytes) + padding (4 bytes)
+    let _ = process.memory.write_u32(offset, cpu.nzcv);
+    offset += 4;
+    let _ = process.memory.write_u32(offset, 0); // padding
+    offset += 4;
+
+    // V0-V31 (128-bit each, stored as [lo, hi])
+    for i in 0..32 {
+        let lo = cpu.v[i][0];
+        let hi = cpu.v[i][1];
+        let _ = process.memory.write_u64(offset, lo);
+        let _ = process.memory.write_u64(offset + 8, hi);
+        offset += 16;
+    }
+
+    ResultCode::SUCCESS
 }
