@@ -101,6 +101,10 @@ pub fn exec_farith(state: &mut CpuState, op: FpOp, rd: u8, rn: u8, rm: u8,
         FpOp::Sub => a - b,
         FpOp::Mul => a * b,
         FpOp::Div => a / b,
+        FpOp::Max => a.max(b),
+        FpOp::Min => a.min(b),
+        FpOp::MaxNum => if a.is_nan() { b } else if b.is_nan() { a } else { a.max(b) },
+        FpOp::MinNum => if a.is_nan() { b } else if b.is_nan() { a } else { a.min(b) },
     };
 
     write_fp(state, rd, ftype, result);
