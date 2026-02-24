@@ -22,6 +22,18 @@ use crate::engines::maxwell_dma::MaxwellDMA;
 use crate::memory_manager::GpuMemoryManager;
 use crate::syncpoint::SyncpointManager;
 
+/// Output from a GPU flush — framebuffer data to write back to guest memory.
+pub struct FramebufferOutput {
+    /// GPU virtual address of the render target.
+    pub gpu_va: u64,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// RGBA8 pixel data, row-major.
+    pub pixels: Vec<u8>,
+}
+
 /// Central GPU state shared between the service layer and the main loop.
 pub struct GpuContext {
     pub memory_manager: RwLock<GpuMemoryManager>,
@@ -62,14 +74,16 @@ impl GpuContext {
     /// Process all queued GPFIFO entries (called by the main loop each frame).
     ///
     /// `read_mem` reads bytes from a guest physical address into a buffer.
-    pub fn flush(&self, read_mem: &dyn Fn(u64, &mut [u8])) {
+    /// Returns framebuffer output if the GPU produced rendered pixels (e.g. from
+    /// a clear operation).
+    pub fn flush(&self, read_mem: &dyn Fn(u64, &mut [u8])) -> Option<FramebufferOutput> {
         let entries: Vec<GpEntry> = {
             let mut queue = self.gpfifo_queue.lock();
             std::mem::take(&mut *queue)
         };
 
         if entries.is_empty() {
-            return;
+            return None;
         }
 
         log::debug!("GpuContext: flush {} GPFIFO entries", entries.len());
@@ -83,6 +97,15 @@ impl GpuContext {
         };
 
         proc.process_entries(&entries, &gpu_read);
+
+        // Collect framebuffer output from engines.
+        let framebuffers = proc.take_framebuffers();
+        framebuffers.into_iter().next().map(|fb| FramebufferOutput {
+            gpu_va: fb.gpu_va,
+            width: fb.width,
+            height: fb.height,
+            pixels: fb.pixels,
+        })
     }
 }
 
