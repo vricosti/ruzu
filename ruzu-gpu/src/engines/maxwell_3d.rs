@@ -145,6 +145,35 @@ const CULL_FACE: u32 = 0x1920;
 /// Program region base: addr_high at +0, addr_low at +1.
 const PROGRAM_REGION_BASE: u32 = 0x1608;
 
+// ── Vertex attribute registers ────────────────────────────────────────────
+
+/// Vertex attribute array base. 32 entries, 1 word each.
+/// Per entry: bits[4:0]=buffer, bit[6]=constant, bits[20:7]=offset,
+///            bits[26:21]=size, bits[29:27]=type, bit[31]=bgra.
+const VERTEX_ATTRIB_BASE: u32 = 0x1160;
+const NUM_VERTEX_ATTRIBS: u32 = 32;
+
+// ── Shader pipeline registers ─────────────────────────────────────────────
+
+/// Shader pipeline base. 6 stages, 0x10 words each.
+/// Per stage: +0 packed(enable|type), +1 offset, +3 register_count, +4 binding_group.
+const PIPELINE_BASE: u32 = 0x2000;
+const PIPELINE_STRIDE: u32 = 0x10;
+const NUM_SHADER_PROGRAMS: usize = 6;
+
+// ── Color write mask registers ────────────────────────────────────────────
+
+/// If nonzero, all RTs share color_mask[0].
+const COLOR_MASK_COMMON: u32 = 0x0F90;
+/// Per-RT color write mask array. 8 entries, 1 word each.
+/// Per RT: R=bit[0], G=bit[4], B=bit[8], A=bit[12].
+const COLOR_MASK_BASE: u32 = 0x1A00;
+
+// ── Render target control register ────────────────────────────────────────
+
+/// RT control: count in bits[3:0], target map in bits[6:4],[9:7],... (3 bits each).
+const RT_CONTROL: u32 = 0x121C;
+
 // ── Constant buffer registers ───────────────────────────────────────────────
 
 /// CB config: +0 size, +1 addr_high, +2 addr_low, +3 offset.
@@ -486,6 +515,149 @@ impl DepthMode {
     }
 }
 
+// ── Vertex attribute enums ────────────────────────────────────────────────
+
+/// Vertex attribute component size/layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexAttribSize {
+    R32G32B32A32,
+    R32G32B32,
+    R16G16B16A16,
+    R32G32,
+    R16G16B16,
+    R8G8B8A8,
+    R16G16,
+    R32,
+    R8G8B8,
+    R8G8,
+    R16,
+    R8,
+    A2B10G10R10,
+    B10G11R11,
+    G8R8,
+    X8B8G8R8,
+    A8,
+    Invalid,
+}
+
+impl VertexAttribSize {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0x01 => Self::R32G32B32A32,
+            0x02 => Self::R32G32B32,
+            0x03 => Self::R16G16B16A16,
+            0x04 => Self::R32G32,
+            0x05 => Self::R16G16B16,
+            0x0A => Self::R8G8B8A8,
+            0x0F => Self::R16G16,
+            0x12 => Self::R32,
+            0x13 => Self::R8G8B8,
+            0x18 => Self::R8G8,
+            0x1B => Self::R16,
+            0x1D => Self::R8,
+            0x30 => Self::A2B10G10R10,
+            0x31 => Self::B10G11R11,
+            0x32 => Self::G8R8,
+            0x33 => Self::X8B8G8R8,
+            0x34 => Self::A8,
+            _ => Self::Invalid,
+        }
+    }
+
+    /// Size in bytes of one vertex attribute element.
+    pub fn size_bytes(&self) -> u32 {
+        match self {
+            Self::R32G32B32A32 => 16,
+            Self::R32G32B32 => 12,
+            Self::R16G16B16A16 => 8,
+            Self::R32G32 => 8,
+            Self::R16G16B16 => 6,
+            Self::R8G8B8A8 => 4,
+            Self::R16G16 => 4,
+            Self::R32 => 4,
+            Self::R8G8B8 => 3,
+            Self::R8G8 => 2,
+            Self::R16 => 2,
+            Self::R8 => 1,
+            Self::A2B10G10R10 => 4,
+            Self::B10G11R11 => 4,
+            Self::G8R8 => 2,
+            Self::X8B8G8R8 => 4,
+            Self::A8 => 1,
+            Self::Invalid => 0,
+        }
+    }
+
+    /// Number of components.
+    pub fn component_count(&self) -> u32 {
+        match self {
+            Self::R32G32B32A32 | Self::R16G16B16A16 | Self::R8G8B8A8
+            | Self::A2B10G10R10 | Self::X8B8G8R8 => 4,
+            Self::R32G32B32 | Self::R16G16B16 | Self::R8G8B8
+            | Self::B10G11R11 => 3,
+            Self::R32G32 | Self::R16G16 | Self::R8G8 | Self::G8R8 => 2,
+            Self::R32 | Self::R16 | Self::R8 | Self::A8 => 1,
+            Self::Invalid => 0,
+        }
+    }
+}
+
+/// Vertex attribute numeric type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexAttribType {
+    SNorm,
+    UNorm,
+    SInt,
+    UInt,
+    UScaled,
+    SScaled,
+    Float,
+    Invalid,
+}
+
+impl VertexAttribType {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            1 => Self::SNorm,
+            2 => Self::UNorm,
+            3 => Self::SInt,
+            4 => Self::UInt,
+            5 => Self::UScaled,
+            6 => Self::SScaled,
+            7 => Self::Float,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+// ── Shader stage enum ─────────────────────────────────────────────────────
+
+/// Shader stage type in the pipeline program array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShaderStageType {
+    VertexA,
+    VertexB,
+    TessInit,
+    Tessellation,
+    Geometry,
+    Fragment,
+    Invalid,
+}
+
+impl ShaderStageType {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::VertexA,
+            1 => Self::VertexB,
+            2 => Self::TessInit,
+            3 => Self::Tessellation,
+            4 => Self::Geometry,
+            5 => Self::Fragment,
+            _ => Self::Invalid,
+        }
+    }
+}
+
 // ── Info structs ────────────────────────────────────────────────────────────
 
 /// Information about an active vertex stream.
@@ -594,6 +766,75 @@ pub struct DepthStencilInfo {
     pub back: StencilFaceInfo,
 }
 
+/// Vertex attribute info unpacked from a single register word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VertexAttribInfo {
+    pub buffer_index: u32,
+    pub constant: bool,
+    pub offset: u32,
+    pub size: VertexAttribSize,
+    pub attrib_type: VertexAttribType,
+    pub bgra: bool,
+}
+
+/// Shader stage info for one of the 6 pipeline program slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShaderStageInfo {
+    pub enabled: bool,
+    pub program_type: ShaderStageType,
+    pub offset: u32,
+    pub register_count: u32,
+    pub binding_group: u32,
+}
+
+impl Default for ShaderStageInfo {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            program_type: ShaderStageType::VertexA,
+            offset: 0,
+            register_count: 0,
+            binding_group: 0,
+        }
+    }
+}
+
+/// Per-render-target color write mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorMaskInfo {
+    pub r: bool,
+    pub g: bool,
+    pub b: bool,
+    pub a: bool,
+}
+
+impl Default for ColorMaskInfo {
+    fn default() -> Self {
+        Self {
+            r: true,
+            g: true,
+            b: true,
+            a: true,
+        }
+    }
+}
+
+/// Render target control: count and target mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtControlInfo {
+    pub count: u32,
+    pub map: [u32; 8],
+}
+
+impl Default for RtControlInfo {
+    fn default() -> Self {
+        Self {
+            count: 1,
+            map: [0, 1, 2, 3, 4, 5, 6, 7],
+        }
+    }
+}
+
 /// Rasterizer state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RasterizerInfo {
@@ -647,6 +888,10 @@ pub struct DrawCall {
     pub rasterizer: RasterizerInfo,
     pub program_base_address: u64,
     pub cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+    pub vertex_attribs: Vec<VertexAttribInfo>,
+    pub shader_stages: [ShaderStageInfo; NUM_SHADER_PROGRAMS],
+    pub color_masks: [ColorMaskInfo; 8],
+    pub rt_control: RtControlInfo,
 }
 
 // ── Engine struct ───────────────────────────────────────────────────────────
@@ -929,6 +1174,80 @@ impl Maxwell3D {
         (high << 32) | low
     }
 
+    // ── Vertex attribute accessors ────────────────────────────────────────
+
+    /// Read vertex attribute info for `index` (0..31).
+    pub fn vertex_attrib_info(&self, index: u32) -> VertexAttribInfo {
+        let raw = self.regs[(VERTEX_ATTRIB_BASE + index) as usize];
+        VertexAttribInfo {
+            buffer_index: raw & 0x1F,
+            constant: (raw & (1 << 6)) != 0,
+            offset: (raw >> 7) & 0x3FFF,
+            size: VertexAttribSize::from_raw((raw >> 21) & 0x3F),
+            attrib_type: VertexAttribType::from_raw((raw >> 27) & 0x7),
+            bgra: (raw & (1 << 31)) != 0,
+        }
+    }
+
+    // ── Shader pipeline accessors ────────────────────────────────────────
+
+    /// Read shader stage info for pipeline slot `index` (0..5).
+    pub fn shader_stage_info(&self, index: u32) -> ShaderStageInfo {
+        let base = (PIPELINE_BASE + index * PIPELINE_STRIDE) as usize;
+        let word0 = self.regs[base];
+        let enabled = (word0 & 1) != 0;
+        let program_type = ShaderStageType::from_raw((word0 >> 4) & 0xF);
+        ShaderStageInfo {
+            enabled,
+            program_type,
+            offset: self.regs[base + 1],
+            register_count: self.regs[base + 3],
+            binding_group: self.regs[base + 4],
+        }
+    }
+
+    /// Whether shader stage `index` is enabled.
+    /// VertexB (index 1) always returns true — the GPU requires it.
+    pub fn is_shader_stage_enabled(&self, index: u32) -> bool {
+        if index == 1 {
+            return true;
+        }
+        let base = (PIPELINE_BASE + index * PIPELINE_STRIDE) as usize;
+        (self.regs[base] & 1) != 0
+    }
+
+    // ── Color mask accessors ─────────────────────────────────────────────
+
+    /// Read color write mask for render target `rt` (0..7).
+    /// If COLOR_MASK_COMMON is set, all RTs share mask[0].
+    pub fn color_mask_info(&self, rt: usize) -> ColorMaskInfo {
+        let effective_rt = if self.regs[COLOR_MASK_COMMON as usize] != 0 {
+            0
+        } else {
+            rt
+        };
+        let raw = self.regs[(COLOR_MASK_BASE + effective_rt as u32) as usize];
+        ColorMaskInfo {
+            r: (raw & (1 << 0)) != 0,
+            g: (raw & (1 << 4)) != 0,
+            b: (raw & (1 << 8)) != 0,
+            a: (raw & (1 << 12)) != 0,
+        }
+    }
+
+    // ── Render target control accessors ──────────────────────────────────
+
+    /// Read render target control: count and per-RT target mapping.
+    pub fn rt_control_info(&self) -> RtControlInfo {
+        let raw = self.regs[RT_CONTROL as usize];
+        let count = raw & 0xF;
+        let mut map = [0u32; 8];
+        for i in 0..8 {
+            map[i] = (raw >> (4 + i * 3)) & 0x7;
+        }
+        RtControlInfo { count, map }
+    }
+
     // ── Constant buffer accessors ────────────────────────────────────────
 
     /// Read constant buffer bindings for a shader stage (0..4).
@@ -1048,6 +1367,30 @@ impl Maxwell3D {
             }
         }
 
+        // Collect active vertex attributes (non-zero raw word only).
+        let mut vertex_attribs = Vec::new();
+        for i in 0..NUM_VERTEX_ATTRIBS {
+            let raw = self.regs[(VERTEX_ATTRIB_BASE + i) as usize];
+            if raw != 0 {
+                vertex_attribs.push(self.vertex_attrib_info(i));
+            }
+        }
+
+        // Collect all 6 shader stages.
+        let mut shader_stages = [ShaderStageInfo::default(); NUM_SHADER_PROGRAMS];
+        for (i, stage) in shader_stages.iter_mut().enumerate() {
+            *stage = self.shader_stage_info(i as u32);
+        }
+
+        // Collect color masks for all 8 render targets.
+        let mut color_masks = [ColorMaskInfo::default(); 8];
+        for (i, mask) in color_masks.iter_mut().enumerate() {
+            *mask = self.color_mask_info(i);
+        }
+
+        // Collect render target control.
+        let rt_control = self.rt_control_info();
+
         // Collect blend info for all 8 render targets.
         let mut blend = [BlendInfo::default(); 8];
         for (i, b) in blend.iter_mut().enumerate() {
@@ -1072,6 +1415,10 @@ impl Maxwell3D {
             rasterizer: self.rasterizer_info(),
             program_base_address: self.program_base_address(),
             cb_bindings: self.cb_bindings,
+            vertex_attribs,
+            shader_stages,
+            color_masks,
+            rt_control,
         };
 
         log::debug!(
@@ -1999,5 +2346,323 @@ mod tests {
         assert_eq!(draws[0].blend[0].color_dst, BlendFactor::OneMinusSrcAlpha);
         // RT1 should not be enabled.
         assert!(!draws[0].blend[1].enabled);
+    }
+
+    // ── Vertex attribute enum tests ─────────────────────────────────────
+
+    #[test]
+    fn test_vertex_attrib_size_values() {
+        assert_eq!(VertexAttribSize::from_raw(0x01), VertexAttribSize::R32G32B32A32);
+        assert_eq!(VertexAttribSize::from_raw(0x02), VertexAttribSize::R32G32B32);
+        assert_eq!(VertexAttribSize::from_raw(0x03), VertexAttribSize::R16G16B16A16);
+        assert_eq!(VertexAttribSize::from_raw(0x04), VertexAttribSize::R32G32);
+        assert_eq!(VertexAttribSize::from_raw(0x0A), VertexAttribSize::R8G8B8A8);
+        assert_eq!(VertexAttribSize::from_raw(0x12), VertexAttribSize::R32);
+        assert_eq!(VertexAttribSize::from_raw(0x1D), VertexAttribSize::R8);
+        assert_eq!(VertexAttribSize::from_raw(0x30), VertexAttribSize::A2B10G10R10);
+        assert_eq!(VertexAttribSize::from_raw(0x31), VertexAttribSize::B10G11R11);
+        assert_eq!(VertexAttribSize::from_raw(0x34), VertexAttribSize::A8);
+        assert_eq!(VertexAttribSize::from_raw(0xFF), VertexAttribSize::Invalid);
+    }
+
+    #[test]
+    fn test_vertex_attrib_size_bytes() {
+        assert_eq!(VertexAttribSize::R32G32B32A32.size_bytes(), 16);
+        assert_eq!(VertexAttribSize::R32G32B32.size_bytes(), 12);
+        assert_eq!(VertexAttribSize::R16G16B16A16.size_bytes(), 8);
+        assert_eq!(VertexAttribSize::R32G32.size_bytes(), 8);
+        assert_eq!(VertexAttribSize::R8G8B8A8.size_bytes(), 4);
+        assert_eq!(VertexAttribSize::R32.size_bytes(), 4);
+        assert_eq!(VertexAttribSize::R8.size_bytes(), 1);
+        assert_eq!(VertexAttribSize::A2B10G10R10.size_bytes(), 4);
+        assert_eq!(VertexAttribSize::Invalid.size_bytes(), 0);
+    }
+
+    #[test]
+    fn test_vertex_attrib_size_component_count() {
+        assert_eq!(VertexAttribSize::R32G32B32A32.component_count(), 4);
+        assert_eq!(VertexAttribSize::R32G32B32.component_count(), 3);
+        assert_eq!(VertexAttribSize::R32G32.component_count(), 2);
+        assert_eq!(VertexAttribSize::R32.component_count(), 1);
+        assert_eq!(VertexAttribSize::R8G8B8A8.component_count(), 4);
+        assert_eq!(VertexAttribSize::B10G11R11.component_count(), 3);
+        assert_eq!(VertexAttribSize::G8R8.component_count(), 2);
+        assert_eq!(VertexAttribSize::A8.component_count(), 1);
+        assert_eq!(VertexAttribSize::Invalid.component_count(), 0);
+    }
+
+    #[test]
+    fn test_vertex_attrib_type_values() {
+        assert_eq!(VertexAttribType::from_raw(1), VertexAttribType::SNorm);
+        assert_eq!(VertexAttribType::from_raw(2), VertexAttribType::UNorm);
+        assert_eq!(VertexAttribType::from_raw(3), VertexAttribType::SInt);
+        assert_eq!(VertexAttribType::from_raw(4), VertexAttribType::UInt);
+        assert_eq!(VertexAttribType::from_raw(5), VertexAttribType::UScaled);
+        assert_eq!(VertexAttribType::from_raw(6), VertexAttribType::SScaled);
+        assert_eq!(VertexAttribType::from_raw(7), VertexAttribType::Float);
+        assert_eq!(VertexAttribType::from_raw(0), VertexAttribType::Invalid);
+        assert_eq!(VertexAttribType::from_raw(99), VertexAttribType::Invalid);
+    }
+
+    #[test]
+    fn test_shader_stage_type_values() {
+        assert_eq!(ShaderStageType::from_raw(0), ShaderStageType::VertexA);
+        assert_eq!(ShaderStageType::from_raw(1), ShaderStageType::VertexB);
+        assert_eq!(ShaderStageType::from_raw(2), ShaderStageType::TessInit);
+        assert_eq!(ShaderStageType::from_raw(3), ShaderStageType::Tessellation);
+        assert_eq!(ShaderStageType::from_raw(4), ShaderStageType::Geometry);
+        assert_eq!(ShaderStageType::from_raw(5), ShaderStageType::Fragment);
+        assert_eq!(ShaderStageType::from_raw(99), ShaderStageType::Invalid);
+    }
+
+    // ── Vertex attribute accessor tests ─────────────────────────────────
+
+    #[test]
+    fn test_vertex_attrib_info() {
+        let mut engine = Maxwell3D::new();
+
+        // Attrib 0: buffer=3, not constant, offset=16, size=R32G32B32A32(0x01),
+        // type=Float(7), no bgra.
+        // bits[4:0]=3, bit[6]=0, bits[20:7]=16, bits[26:21]=0x01, bits[29:27]=7, bit[31]=0
+        let raw = 3u32
+            | (16 << 7)
+            | (0x01 << 21)
+            | (7 << 27);
+        engine.regs[VERTEX_ATTRIB_BASE as usize] = raw;
+
+        let info = engine.vertex_attrib_info(0);
+        assert_eq!(info.buffer_index, 3);
+        assert!(!info.constant);
+        assert_eq!(info.offset, 16);
+        assert_eq!(info.size, VertexAttribSize::R32G32B32A32);
+        assert_eq!(info.attrib_type, VertexAttribType::Float);
+        assert!(!info.bgra);
+    }
+
+    #[test]
+    fn test_vertex_attrib_constant_bgra() {
+        let mut engine = Maxwell3D::new();
+
+        // Attrib 5: buffer=0, constant=true, offset=0, size=R8G8B8A8(0x0A),
+        // type=UNorm(2), bgra=true.
+        let raw = 0u32
+            | (1 << 6)       // constant
+            | (0x0A << 21)   // R8G8B8A8
+            | (2 << 27)      // UNorm
+            | (1 << 31);     // bgra
+        engine.regs[(VERTEX_ATTRIB_BASE + 5) as usize] = raw;
+
+        let info = engine.vertex_attrib_info(5);
+        assert_eq!(info.buffer_index, 0);
+        assert!(info.constant);
+        assert_eq!(info.offset, 0);
+        assert_eq!(info.size, VertexAttribSize::R8G8B8A8);
+        assert_eq!(info.attrib_type, VertexAttribType::UNorm);
+        assert!(info.bgra);
+    }
+
+    // ── Shader stage accessor tests ─────────────────────────────────────
+
+    #[test]
+    fn test_shader_stage_info() {
+        let mut engine = Maxwell3D::new();
+        let base = (PIPELINE_BASE + 1 * PIPELINE_STRIDE) as usize; // VertexB slot
+
+        // word0: enabled=1, type=VertexB(1) at bits[7:4]
+        engine.regs[base] = 1 | (1 << 4);
+        engine.regs[base + 1] = 0x100; // offset
+        engine.regs[base + 3] = 64;    // register_count
+        engine.regs[base + 4] = 0;     // binding_group
+
+        let info = engine.shader_stage_info(1);
+        assert!(info.enabled);
+        assert_eq!(info.program_type, ShaderStageType::VertexB);
+        assert_eq!(info.offset, 0x100);
+        assert_eq!(info.register_count, 64);
+        assert_eq!(info.binding_group, 0);
+    }
+
+    #[test]
+    fn test_shader_stage_fragment() {
+        let mut engine = Maxwell3D::new();
+        let base = (PIPELINE_BASE + 5 * PIPELINE_STRIDE) as usize; // Fragment slot
+
+        engine.regs[base] = 1 | (5 << 4); // enabled, Fragment
+        engine.regs[base + 1] = 0x500;
+        engine.regs[base + 3] = 32;
+        engine.regs[base + 4] = 2;
+
+        let info = engine.shader_stage_info(5);
+        assert!(info.enabled);
+        assert_eq!(info.program_type, ShaderStageType::Fragment);
+        assert_eq!(info.offset, 0x500);
+        assert_eq!(info.register_count, 32);
+        assert_eq!(info.binding_group, 2);
+    }
+
+    #[test]
+    fn test_shader_stage_vertexb_always_enabled() {
+        let engine = Maxwell3D::new();
+        // VertexB (index 1) always returns enabled even with zero registers.
+        assert!(engine.is_shader_stage_enabled(1));
+        // Other stages default to disabled.
+        assert!(!engine.is_shader_stage_enabled(0));
+        assert!(!engine.is_shader_stage_enabled(2));
+        assert!(!engine.is_shader_stage_enabled(5));
+    }
+
+    // ── Color mask tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_color_mask_info() {
+        let mut engine = Maxwell3D::new();
+        // RT0: R and A only. R=bit[0], G=bit[4], B=bit[8], A=bit[12].
+        engine.regs[COLOR_MASK_BASE as usize] = (1 << 0) | (1 << 12);
+
+        let mask = engine.color_mask_info(0);
+        assert!(mask.r);
+        assert!(!mask.g);
+        assert!(!mask.b);
+        assert!(mask.a);
+    }
+
+    #[test]
+    fn test_color_mask_common() {
+        let mut engine = Maxwell3D::new();
+        // Enable common mask mode.
+        engine.regs[COLOR_MASK_COMMON as usize] = 1;
+        // Set mask[0] to G+B only.
+        engine.regs[COLOR_MASK_BASE as usize] = (1 << 4) | (1 << 8);
+        // Set mask[3] differently (should be ignored in common mode).
+        engine.regs[(COLOR_MASK_BASE + 3) as usize] = 0xFFFF;
+
+        let mask3 = engine.color_mask_info(3);
+        // Should use mask[0], not mask[3].
+        assert!(!mask3.r);
+        assert!(mask3.g);
+        assert!(mask3.b);
+        assert!(!mask3.a);
+    }
+
+    #[test]
+    fn test_color_mask_per_rt() {
+        let mut engine = Maxwell3D::new();
+        // Common mode off (default).
+        // RT0: all channels.
+        engine.regs[COLOR_MASK_BASE as usize] = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 12);
+        // RT2: R only.
+        engine.regs[(COLOR_MASK_BASE + 2) as usize] = 1 << 0;
+
+        let mask0 = engine.color_mask_info(0);
+        assert!(mask0.r && mask0.g && mask0.b && mask0.a);
+
+        let mask2 = engine.color_mask_info(2);
+        assert!(mask2.r);
+        assert!(!mask2.g);
+        assert!(!mask2.b);
+        assert!(!mask2.a);
+    }
+
+    // ── RT control tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_rt_control_info() {
+        let mut engine = Maxwell3D::new();
+        // count=2, map[0]=0, map[1]=1 (identity).
+        // bits[3:0]=2, bits[6:4]=0, bits[9:7]=1
+        engine.regs[RT_CONTROL as usize] = 2 | (0 << 4) | (1 << 7);
+
+        let rtc = engine.rt_control_info();
+        assert_eq!(rtc.count, 2);
+        assert_eq!(rtc.map[0], 0);
+        assert_eq!(rtc.map[1], 1);
+    }
+
+    #[test]
+    fn test_rt_control_swizzled() {
+        let mut engine = Maxwell3D::new();
+        // count=3, map[0]=2, map[1]=0, map[2]=1 (swizzled).
+        // bits[3:0]=3, bits[6:4]=2, bits[9:7]=0, bits[12:10]=1
+        engine.regs[RT_CONTROL as usize] = 3 | (2 << 4) | (0 << 7) | (1 << 10);
+
+        let rtc = engine.rt_control_info();
+        assert_eq!(rtc.count, 3);
+        assert_eq!(rtc.map[0], 2);
+        assert_eq!(rtc.map[1], 0);
+        assert_eq!(rtc.map[2], 1);
+    }
+
+    // ── Draw integration tests for new state ────────────────────────────
+
+    #[test]
+    fn test_draw_captures_vertex_attribs() {
+        let mut engine = Maxwell3D::new();
+
+        // Set attrib 0: buffer=0, offset=0, R32G32B32(0x02), Float(7).
+        let raw0 = 0u32 | (0x02 << 21) | (7 << 27);
+        engine.write_reg(VERTEX_ATTRIB_BASE, raw0);
+
+        // Set attrib 1: buffer=0, offset=12, R8G8B8A8(0x0A), UNorm(2).
+        let raw1 = 0u32 | (12 << 7) | (0x0A << 21) | (2 << 27);
+        engine.write_reg(VERTEX_ATTRIB_BASE + 1, raw1);
+
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws[0].vertex_attribs.len(), 2);
+        assert_eq!(draws[0].vertex_attribs[0].size, VertexAttribSize::R32G32B32);
+        assert_eq!(draws[0].vertex_attribs[0].attrib_type, VertexAttribType::Float);
+        assert_eq!(draws[0].vertex_attribs[1].offset, 12);
+        assert_eq!(draws[0].vertex_attribs[1].size, VertexAttribSize::R8G8B8A8);
+    }
+
+    #[test]
+    fn test_draw_captures_shader_stages() {
+        let mut engine = Maxwell3D::new();
+
+        // Enable VertexB (slot 1) and Fragment (slot 5).
+        let vb_base = PIPELINE_BASE + 1 * PIPELINE_STRIDE;
+        engine.write_reg(vb_base, 1 | (1 << 4));
+        engine.write_reg(vb_base + 1, 0x100);
+        engine.write_reg(vb_base + 3, 64);
+
+        let frag_base = PIPELINE_BASE + 5 * PIPELINE_STRIDE;
+        engine.write_reg(frag_base, 1 | (5 << 4));
+        engine.write_reg(frag_base + 1, 0x500);
+        engine.write_reg(frag_base + 3, 32);
+
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert!(draws[0].shader_stages[1].enabled);
+        assert_eq!(draws[0].shader_stages[1].program_type, ShaderStageType::VertexB);
+        assert_eq!(draws[0].shader_stages[1].offset, 0x100);
+        assert!(draws[0].shader_stages[5].enabled);
+        assert_eq!(draws[0].shader_stages[5].program_type, ShaderStageType::Fragment);
+        // Slot 0 should be disabled.
+        assert!(!draws[0].shader_stages[0].enabled);
+    }
+
+    #[test]
+    fn test_draw_captures_color_masks_and_rt_control() {
+        let mut engine = Maxwell3D::new();
+
+        // Set RT0 mask: R+G only.
+        engine.write_reg(COLOR_MASK_BASE, (1 << 0) | (1 << 4));
+        // Set RT control: count=1, map[0]=0.
+        engine.write_reg(RT_CONTROL, 1 | (0 << 4));
+
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert!(draws[0].color_masks[0].r);
+        assert!(draws[0].color_masks[0].g);
+        assert!(!draws[0].color_masks[0].b);
+        assert!(!draws[0].color_masks[0].a);
+        assert_eq!(draws[0].rt_control.count, 1);
+        assert_eq!(draws[0].rt_control.map[0], 0);
     }
 }
