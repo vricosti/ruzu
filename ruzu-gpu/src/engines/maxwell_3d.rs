@@ -198,6 +198,14 @@ const NUM_SHADER_STAGES: usize = 5;
 /// Maximum constant buffer slots per stage.
 const MAX_CB_SLOTS: usize = 18;
 
+// ── Texture/Sampler pool registers ──────────────────────────────────────────
+
+/// Texture sampler pool base: +0 addr_high, +1 addr_low, +2 limit.
+const TEX_SAMPLER_POOL_BASE: u32 = 0x155C;
+
+/// Texture header pool base: +0 addr_high, +1 addr_low, +2 limit.
+const TEX_HEADER_POOL_BASE: u32 = 0x1574;
+
 // ── Common render target formats ────────────────────────────────────────────
 
 const RT_FORMAT_A8B8G8R8_UNORM: u32 = 0xD5;
@@ -658,6 +666,455 @@ impl ShaderStageType {
     }
 }
 
+// ── Texture/Sampler descriptor enums ─────────────────────────────────────────
+
+/// Texture image format (7-bit field from TIC word 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureFormat {
+    R32G32B32A32,
+    R32G32B32,
+    R16G16B16A16,
+    R32G32,
+    R32B24G8,
+    R16G16,
+    R32,
+    B5G6R5,
+    A1R5G5B5,
+    R8G8,
+    R16,
+    R8,
+    A8B8G8R8,
+    A2B10G10R10,
+    R16G16B16X16,
+    R32G32B32X32,
+    B10G11R11,
+    G8R24,
+    R32G8X24,
+    R8G8B8A8,
+    Bc1Rgba,
+    Bc2,
+    Bc3,
+    Bc4,
+    Bc5,
+    Bc7,
+    Bc6HSf16,
+    Bc6HUf16,
+    Etc2Rgb,
+    Etc2RgbA1,
+    Etc2RgbA8,
+    Eac,
+    EacX2,
+    Astc2d4x4,
+    Astc2d5x4,
+    Astc2d5x5,
+    Astc2d6x5,
+    Astc2d6x6,
+    Astc2d8x5,
+    Astc2d8x6,
+    Astc2d8x8,
+    Astc2d10x5,
+    Astc2d10x6,
+    Astc2d10x8,
+    Astc2d10x10,
+    Astc2d12x10,
+    Astc2d12x12,
+    Invalid,
+}
+
+impl TextureFormat {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0x7F {
+            0x01 => Self::R32G32B32A32,
+            0x02 => Self::R32G32B32,
+            0x03 => Self::R16G16B16A16,
+            0x04 => Self::R32G32,
+            0x05 => Self::R32B24G8,
+            0x08 => Self::R16G16,
+            0x09 => Self::R32,
+            0x0E => Self::B5G6R5,
+            0x0F => Self::A1R5G5B5,
+            0x10 => Self::R8G8,
+            0x11 => Self::R16,
+            0x12 => Self::R8,
+            0x1D => Self::A8B8G8R8,
+            0x1E => Self::A2B10G10R10,
+            0x1F => Self::R16G16B16X16,
+            0x20 => Self::R32G32B32X32,
+            0x21 => Self::B10G11R11,
+            0x22 => Self::G8R24,
+            0x23 => Self::R32G8X24,
+            0x24 => Self::R8G8B8A8,
+            0x25 => Self::Bc1Rgba,
+            0x26 => Self::Bc2,
+            0x27 => Self::Bc3,
+            0x28 => Self::Bc4,
+            0x29 => Self::Bc5,
+            0x2A => Self::Bc7,
+            0x2B => Self::Bc6HSf16,
+            0x2C => Self::Bc6HUf16,
+            0x2D => Self::Etc2Rgb,
+            0x2E => Self::Etc2RgbA1,
+            0x2F => Self::Etc2RgbA8,
+            0x30 => Self::Eac,
+            0x31 => Self::EacX2,
+            0x40 => Self::Astc2d4x4,
+            0x41 => Self::Astc2d5x4,
+            0x42 => Self::Astc2d5x5,
+            0x43 => Self::Astc2d6x5,
+            0x44 => Self::Astc2d6x6,
+            0x45 => Self::Astc2d8x5,
+            0x46 => Self::Astc2d8x6,
+            0x47 => Self::Astc2d8x8,
+            0x48 => Self::Astc2d10x5,
+            0x49 => Self::Astc2d10x6,
+            0x4A => Self::Astc2d10x8,
+            0x4B => Self::Astc2d10x10,
+            0x4C => Self::Astc2d12x10,
+            0x4D => Self::Astc2d12x12,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+/// Texture type (4-bit field from TIC word 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureType {
+    Texture1D,
+    Texture2D,
+    Texture3D,
+    Cubemap,
+    Array1D,
+    Array2D,
+    Buffer1D,
+    Texture2DNoMip,
+    CubemapArray,
+    Invalid,
+}
+
+impl TextureType {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0xF {
+            0 => Self::Texture1D,
+            1 => Self::Texture2D,
+            2 => Self::Texture3D,
+            3 => Self::Cubemap,
+            4 => Self::Array1D,
+            5 => Self::Array2D,
+            6 => Self::Buffer1D,
+            7 => Self::Texture2DNoMip,
+            8 => Self::CubemapArray,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+/// Texture component type (3-bit field, per-channel in TIC word 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentType {
+    SNorm,
+    UNorm,
+    SInt,
+    UInt,
+    SNormForceFp16,
+    UNormForceFp16,
+    Float,
+    Invalid,
+}
+
+impl ComponentType {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0x7 {
+            1 => Self::SNorm,
+            2 => Self::UNorm,
+            3 => Self::SInt,
+            4 => Self::UInt,
+            5 => Self::SNormForceFp16,
+            6 => Self::UNormForceFp16,
+            7 => Self::Float,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+/// Texture swizzle source (3-bit field, XYZW in TIC word 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwizzleSource {
+    Zero,
+    R,
+    G,
+    B,
+    A,
+    OneInt,
+    OneFloat,
+    Invalid,
+}
+
+impl SwizzleSource {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0x7 {
+            0 => Self::Zero,
+            2 => Self::R,
+            3 => Self::G,
+            4 => Self::B,
+            5 => Self::A,
+            6 => Self::OneInt,
+            7 => Self::OneFloat,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+/// TIC header version (3-bit field from TIC word 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicHeaderVersion {
+    OneDBuffer,
+    PitchColorKey,
+    Pitch,
+    BlockLinear,
+    BlockLinearColorKey,
+    Invalid,
+}
+
+impl TicHeaderVersion {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0x7 {
+            0 => Self::OneDBuffer,
+            1 => Self::PitchColorKey,
+            2 => Self::Pitch,
+            3 => Self::BlockLinear,
+            4 => Self::BlockLinearColorKey,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+/// Texture wrap/address mode (3-bit field in TSC word 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapMode {
+    Wrap,
+    Mirror,
+    ClampToEdge,
+    Border,
+    Clamp,
+    MirrorOnceClampToEdge,
+    MirrorOnceBorder,
+    MirrorOnceClampOgl,
+    Invalid,
+}
+
+impl WrapMode {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0x7 {
+            0 => Self::Wrap,
+            1 => Self::Mirror,
+            2 => Self::ClampToEdge,
+            3 => Self::Border,
+            4 => Self::Clamp,
+            5 => Self::MirrorOnceClampToEdge,
+            6 => Self::MirrorOnceBorder,
+            7 => Self::MirrorOnceClampOgl,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+/// Texture magnification/minification filter (2-bit field in TSC word 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureFilter {
+    Nearest,
+    Linear,
+    Invalid,
+}
+
+impl TextureFilter {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0x3 {
+            1 => Self::Nearest,
+            2 => Self::Linear,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+/// Mipmap filter mode (2-bit field in TSC word 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MipmapFilter {
+    None,
+    Nearest,
+    Linear,
+    Invalid,
+}
+
+impl MipmapFilter {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0x3 {
+            1 => Self::None,
+            2 => Self::Nearest,
+            3 => Self::Linear,
+            _ => Self::Invalid,
+        }
+    }
+}
+
+/// Depth compare function for sampler (3-bit field in TSC word 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthCompareFunc {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
+}
+
+impl DepthCompareFunc {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0x7 {
+            0 => Self::Never,
+            1 => Self::Less,
+            2 => Self::Equal,
+            3 => Self::LessEqual,
+            4 => Self::Greater,
+            5 => Self::NotEqual,
+            6 => Self::GreaterEqual,
+            7 => Self::Always,
+            _ => unreachable!(),
+        }
+    }
+}
+
+// ── Texture/Sampler descriptor structs ──────────────────────────────────────
+
+/// Parsed texture image control descriptor (TIC, 8 words = 32 bytes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextureDescriptor {
+    pub format: TextureFormat,
+    pub r_type: ComponentType,
+    pub g_type: ComponentType,
+    pub b_type: ComponentType,
+    pub a_type: ComponentType,
+    pub x_source: SwizzleSource,
+    pub y_source: SwizzleSource,
+    pub z_source: SwizzleSource,
+    pub w_source: SwizzleSource,
+    pub address: u64,
+    pub header_version: TicHeaderVersion,
+    pub texture_type: TextureType,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub max_mip_level: u32,
+    pub srgb_conversion: bool,
+    pub normalized_coords: bool,
+}
+
+impl TextureDescriptor {
+    /// Parse a TIC descriptor from 8 raw u32 words.
+    pub fn from_words(words: &[u32; 8]) -> Self {
+        let word0 = words[0];
+        let word1 = words[1];
+        let word2 = words[2];
+        let word3 = words[3];
+        let word4 = words[4];
+        let word5 = words[5];
+
+        let addr_low = word1 as u64;
+        let addr_high = (word2 & 0xFFFF) as u64;
+
+        Self {
+            format: TextureFormat::from_raw(word0 & 0x7F),
+            r_type: ComponentType::from_raw((word0 >> 7) & 0x7),
+            g_type: ComponentType::from_raw((word0 >> 10) & 0x7),
+            b_type: ComponentType::from_raw((word0 >> 13) & 0x7),
+            a_type: ComponentType::from_raw((word0 >> 16) & 0x7),
+            x_source: SwizzleSource::from_raw((word0 >> 19) & 0x7),
+            y_source: SwizzleSource::from_raw((word0 >> 22) & 0x7),
+            z_source: SwizzleSource::from_raw((word0 >> 25) & 0x7),
+            w_source: SwizzleSource::from_raw((word0 >> 28) & 0x7),
+            address: (addr_high << 32) | addr_low,
+            header_version: TicHeaderVersion::from_raw((word2 >> 21) & 0x7),
+            texture_type: TextureType::from_raw((word4 >> 23) & 0xF),
+            width: (word4 & 0xFFFF) + 1,
+            height: (word5 & 0xFFFF) + 1,
+            depth: ((word5 >> 16) & 0x3FFF) + 1,
+            max_mip_level: (word3 >> 28) & 0xF,
+            srgb_conversion: (word4 & (1 << 22)) != 0,
+            normalized_coords: (word5 & (1 << 31)) != 0,
+        }
+    }
+}
+
+/// Parsed texture sampler control descriptor (TSC, 8 words = 32 bytes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SamplerDescriptor {
+    pub wrap_u: WrapMode,
+    pub wrap_v: WrapMode,
+    pub wrap_p: WrapMode,
+    pub depth_compare_enabled: bool,
+    pub depth_compare_func: DepthCompareFunc,
+    pub max_anisotropy: u32,
+    pub mag_filter: TextureFilter,
+    pub min_filter: TextureFilter,
+    pub mipmap_filter: MipmapFilter,
+    pub min_lod: f32,
+    pub max_lod: f32,
+    pub mip_lod_bias: f32,
+    pub border_color: [f32; 4],
+}
+
+impl SamplerDescriptor {
+    /// Parse a TSC descriptor from 8 raw u32 words.
+    pub fn from_words(words: &[u32; 8]) -> Self {
+        let word0 = words[0];
+        let word1 = words[1];
+        let word2 = words[2];
+
+        // mip_lod_bias is a 13-bit sign-extended fixed-point value at word1[24:12].
+        let raw_bias = (word1 >> 12) & 0x1FFF;
+        let bias_signed = if raw_bias & 0x1000 != 0 {
+            // Sign-extend from 13 bits.
+            (raw_bias | 0xFFFF_E000) as i32
+        } else {
+            raw_bias as i32
+        };
+
+        Self {
+            wrap_u: WrapMode::from_raw(word0 & 0x7),
+            wrap_v: WrapMode::from_raw((word0 >> 3) & 0x7),
+            wrap_p: WrapMode::from_raw((word0 >> 6) & 0x7),
+            depth_compare_enabled: (word0 & (1 << 9)) != 0,
+            depth_compare_func: DepthCompareFunc::from_raw((word0 >> 10) & 0x7),
+            max_anisotropy: (word0 >> 20) & 0x7,
+            mag_filter: TextureFilter::from_raw(word1 & 0x3),
+            min_filter: TextureFilter::from_raw((word1 >> 4) & 0x3),
+            mipmap_filter: MipmapFilter::from_raw((word1 >> 6) & 0x3),
+            min_lod: (word2 & 0xFFF) as f32 / 256.0,
+            max_lod: ((word2 >> 12) & 0xFFF) as f32 / 256.0,
+            mip_lod_bias: bias_signed as f32 / 256.0,
+            border_color: [
+                f32::from_bits(words[4]),
+                f32::from_bits(words[5]),
+                f32::from_bits(words[6]),
+                f32::from_bits(words[7]),
+            ],
+        }
+    }
+
+    /// Convert the raw 3-bit max_anisotropy value to a multiplier (1/2/4/8/16).
+    pub fn anisotropy_multiplier(&self) -> u32 {
+        match self.max_anisotropy {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            4 => 16,
+            _ => 16, // clamp to max
+        }
+    }
+}
+
 // ── Info structs ────────────────────────────────────────────────────────────
 
 /// Information about an active vertex stream.
@@ -892,6 +1349,10 @@ pub struct DrawCall {
     pub shader_stages: [ShaderStageInfo; NUM_SHADER_PROGRAMS],
     pub color_masks: [ColorMaskInfo; 8],
     pub rt_control: RtControlInfo,
+    pub tex_header_pool_addr: u64,
+    pub tex_header_pool_limit: u32,
+    pub tex_sampler_pool_addr: u64,
+    pub tex_sampler_pool_limit: u32,
 }
 
 // ── Engine struct ───────────────────────────────────────────────────────────
@@ -1174,6 +1635,34 @@ impl Maxwell3D {
         (high << 32) | low
     }
 
+    // ── Texture/Sampler pool accessors ────────────────────────────────────
+
+    /// GPU address of the texture header (TIC) pool.
+    pub fn tex_header_pool_address(&self) -> u64 {
+        let base = TEX_HEADER_POOL_BASE as usize;
+        let high = self.regs[base] as u64;
+        let low = self.regs[base + 1] as u64;
+        (high << 32) | low
+    }
+
+    /// Maximum descriptor index in the texture header pool.
+    pub fn tex_header_pool_limit(&self) -> u32 {
+        self.regs[(TEX_HEADER_POOL_BASE + 2) as usize]
+    }
+
+    /// GPU address of the texture sampler (TSC) pool.
+    pub fn tex_sampler_pool_address(&self) -> u64 {
+        let base = TEX_SAMPLER_POOL_BASE as usize;
+        let high = self.regs[base] as u64;
+        let low = self.regs[base + 1] as u64;
+        (high << 32) | low
+    }
+
+    /// Maximum descriptor index in the texture sampler pool.
+    pub fn tex_sampler_pool_limit(&self) -> u32 {
+        self.regs[(TEX_SAMPLER_POOL_BASE + 2) as usize]
+    }
+
     // ── Vertex attribute accessors ────────────────────────────────────────
 
     /// Read vertex attribute info for `index` (0..31).
@@ -1419,6 +1908,10 @@ impl Maxwell3D {
             shader_stages,
             color_masks,
             rt_control,
+            tex_header_pool_addr: self.tex_header_pool_address(),
+            tex_header_pool_limit: self.tex_header_pool_limit(),
+            tex_sampler_pool_addr: self.tex_sampler_pool_address(),
+            tex_sampler_pool_limit: self.tex_sampler_pool_limit(),
         };
 
         log::debug!(
@@ -2664,5 +3157,308 @@ mod tests {
         assert!(!draws[0].color_masks[0].a);
         assert_eq!(draws[0].rt_control.count, 1);
         assert_eq!(draws[0].rt_control.map[0], 0);
+    }
+
+    // ── Texture/Sampler descriptor tests ─────────────────────────────────
+
+    #[test]
+    fn test_texture_format_values() {
+        assert_eq!(TextureFormat::from_raw(0x01), TextureFormat::R32G32B32A32);
+        assert_eq!(TextureFormat::from_raw(0x09), TextureFormat::R32);
+        assert_eq!(TextureFormat::from_raw(0x1D), TextureFormat::A8B8G8R8);
+        assert_eq!(TextureFormat::from_raw(0x24), TextureFormat::R8G8B8A8);
+        assert_eq!(TextureFormat::from_raw(0x12), TextureFormat::R8);
+        assert_eq!(TextureFormat::from_raw(0x7F), TextureFormat::Invalid);
+    }
+
+    #[test]
+    fn test_texture_format_compressed() {
+        assert_eq!(TextureFormat::from_raw(0x25), TextureFormat::Bc1Rgba);
+        assert_eq!(TextureFormat::from_raw(0x27), TextureFormat::Bc3);
+        assert_eq!(TextureFormat::from_raw(0x2A), TextureFormat::Bc7);
+        assert_eq!(TextureFormat::from_raw(0x40), TextureFormat::Astc2d4x4);
+        assert_eq!(TextureFormat::from_raw(0x4D), TextureFormat::Astc2d12x12);
+    }
+
+    #[test]
+    fn test_texture_type_values() {
+        assert_eq!(TextureType::from_raw(0), TextureType::Texture1D);
+        assert_eq!(TextureType::from_raw(1), TextureType::Texture2D);
+        assert_eq!(TextureType::from_raw(2), TextureType::Texture3D);
+        assert_eq!(TextureType::from_raw(3), TextureType::Cubemap);
+        assert_eq!(TextureType::from_raw(5), TextureType::Array2D);
+        assert_eq!(TextureType::from_raw(6), TextureType::Buffer1D);
+        assert_eq!(TextureType::from_raw(8), TextureType::CubemapArray);
+        assert_eq!(TextureType::from_raw(9), TextureType::Invalid);
+    }
+
+    #[test]
+    fn test_component_type_values() {
+        assert_eq!(ComponentType::from_raw(0), ComponentType::Invalid);
+        assert_eq!(ComponentType::from_raw(1), ComponentType::SNorm);
+        assert_eq!(ComponentType::from_raw(2), ComponentType::UNorm);
+        assert_eq!(ComponentType::from_raw(3), ComponentType::SInt);
+        assert_eq!(ComponentType::from_raw(4), ComponentType::UInt);
+        assert_eq!(ComponentType::from_raw(7), ComponentType::Float);
+    }
+
+    #[test]
+    fn test_swizzle_source_values() {
+        assert_eq!(SwizzleSource::from_raw(0), SwizzleSource::Zero);
+        assert_eq!(SwizzleSource::from_raw(2), SwizzleSource::R);
+        assert_eq!(SwizzleSource::from_raw(3), SwizzleSource::G);
+        assert_eq!(SwizzleSource::from_raw(4), SwizzleSource::B);
+        assert_eq!(SwizzleSource::from_raw(5), SwizzleSource::A);
+        assert_eq!(SwizzleSource::from_raw(7), SwizzleSource::OneFloat);
+        assert_eq!(SwizzleSource::from_raw(1), SwizzleSource::Invalid);
+    }
+
+    #[test]
+    fn test_tic_header_version_values() {
+        assert_eq!(TicHeaderVersion::from_raw(0), TicHeaderVersion::OneDBuffer);
+        assert_eq!(TicHeaderVersion::from_raw(2), TicHeaderVersion::Pitch);
+        assert_eq!(TicHeaderVersion::from_raw(3), TicHeaderVersion::BlockLinear);
+        assert_eq!(TicHeaderVersion::from_raw(5), TicHeaderVersion::Invalid);
+    }
+
+    #[test]
+    fn test_wrap_mode_values() {
+        assert_eq!(WrapMode::from_raw(0), WrapMode::Wrap);
+        assert_eq!(WrapMode::from_raw(1), WrapMode::Mirror);
+        assert_eq!(WrapMode::from_raw(2), WrapMode::ClampToEdge);
+        assert_eq!(WrapMode::from_raw(3), WrapMode::Border);
+        assert_eq!(WrapMode::from_raw(4), WrapMode::Clamp);
+        assert_eq!(WrapMode::from_raw(7), WrapMode::MirrorOnceClampOgl);
+    }
+
+    #[test]
+    fn test_texture_filter_values() {
+        assert_eq!(TextureFilter::from_raw(0), TextureFilter::Invalid);
+        assert_eq!(TextureFilter::from_raw(1), TextureFilter::Nearest);
+        assert_eq!(TextureFilter::from_raw(2), TextureFilter::Linear);
+        assert_eq!(TextureFilter::from_raw(3), TextureFilter::Invalid);
+    }
+
+    #[test]
+    fn test_mipmap_filter_values() {
+        assert_eq!(MipmapFilter::from_raw(0), MipmapFilter::Invalid);
+        assert_eq!(MipmapFilter::from_raw(1), MipmapFilter::None);
+        assert_eq!(MipmapFilter::from_raw(2), MipmapFilter::Nearest);
+        assert_eq!(MipmapFilter::from_raw(3), MipmapFilter::Linear);
+    }
+
+    #[test]
+    fn test_depth_compare_func_values() {
+        assert_eq!(DepthCompareFunc::from_raw(0), DepthCompareFunc::Never);
+        assert_eq!(DepthCompareFunc::from_raw(1), DepthCompareFunc::Less);
+        assert_eq!(DepthCompareFunc::from_raw(3), DepthCompareFunc::LessEqual);
+        assert_eq!(DepthCompareFunc::from_raw(7), DepthCompareFunc::Always);
+    }
+
+    #[test]
+    fn test_texture_descriptor_basic() {
+        // Build a basic 2D RGBA8 texture descriptor.
+        let mut words = [0u32; 8];
+        // word0: format=0x1D(A8B8G8R8), r_type=UNorm(2), g_type=UNorm(2), b_type=UNorm(2),
+        //        a_type=UNorm(2), xyzw swizzle = R(2),G(3),B(4),A(5)
+        words[0] = 0x1D
+            | (2 << 7)   // r_type = UNorm
+            | (2 << 10)  // g_type = UNorm
+            | (2 << 13)  // b_type = UNorm
+            | (2 << 16)  // a_type = UNorm
+            | (2 << 19)  // x_source = R
+            | (3 << 22)  // y_source = G
+            | (4 << 25)  // z_source = B
+            | (5 << 28); // w_source = A
+        // word1: addr_low
+        words[1] = 0x0010_0000;
+        // word2: addr_high[15:0]=0x0001, header_version=BlockLinear(3) at bits[23:21]
+        words[2] = 0x0001 | (3 << 21);
+        // word3: max_mip_level=5 at bits[31:28]
+        words[3] = 5 << 28;
+        // word4: width=1279(+1=1280) at [15:0], texture_type=Texture2D(1) at [26:23]
+        words[4] = 1279 | (1 << 23);
+        // word5: height=719(+1=720) at [15:0], depth=0(+1=1) at [29:16], normalized=1 at [31]
+        words[5] = 719 | (1 << 31);
+
+        let desc = TextureDescriptor::from_words(&words);
+        assert_eq!(desc.format, TextureFormat::A8B8G8R8);
+        assert_eq!(desc.r_type, ComponentType::UNorm);
+        assert_eq!(desc.g_type, ComponentType::UNorm);
+        assert_eq!(desc.x_source, SwizzleSource::R);
+        assert_eq!(desc.w_source, SwizzleSource::A);
+        assert_eq!(desc.address, 0x0001_0010_0000);
+        assert_eq!(desc.header_version, TicHeaderVersion::BlockLinear);
+        assert_eq!(desc.texture_type, TextureType::Texture2D);
+        assert_eq!(desc.width, 1280);
+        assert_eq!(desc.height, 720);
+        assert_eq!(desc.depth, 1);
+        assert_eq!(desc.max_mip_level, 5);
+        assert!(!desc.srgb_conversion);
+        assert!(desc.normalized_coords);
+    }
+
+    #[test]
+    fn test_texture_descriptor_srgb_3d() {
+        let mut words = [0u32; 8];
+        words[0] = 0x1D; // A8B8G8R8, all other fields zero
+        // word4: srgb_conversion=1 at bit[22], texture_type=Texture3D(2) at [26:23], width=63(+1=64)
+        words[4] = 63 | (1 << 22) | (2 << 23);
+        // word5: height=63(+1=64), depth=31(+1=32) at [29:16]
+        words[5] = 63 | (31 << 16);
+
+        let desc = TextureDescriptor::from_words(&words);
+        assert!(desc.srgb_conversion);
+        assert_eq!(desc.texture_type, TextureType::Texture3D);
+        assert_eq!(desc.width, 64);
+        assert_eq!(desc.height, 64);
+        assert_eq!(desc.depth, 32);
+        assert!(!desc.normalized_coords);
+    }
+
+    #[test]
+    fn test_texture_descriptor_buffer() {
+        let mut words = [0u32; 8];
+        words[0] = 0x09; // R32
+        // word2: header_version=OneDBuffer(0) — already zero
+        // word4: texture_type=Buffer1D(6) at [26:23], width=255(+1=256)
+        words[4] = 255 | (6 << 23);
+        words[5] = 0; // height=0+1=1, depth=0+1=1
+
+        let desc = TextureDescriptor::from_words(&words);
+        assert_eq!(desc.format, TextureFormat::R32);
+        assert_eq!(desc.header_version, TicHeaderVersion::OneDBuffer);
+        assert_eq!(desc.texture_type, TextureType::Buffer1D);
+        assert_eq!(desc.width, 256);
+        assert_eq!(desc.height, 1);
+        assert_eq!(desc.depth, 1);
+    }
+
+    #[test]
+    fn test_sampler_descriptor_basic() {
+        let mut words = [0u32; 8];
+        // word0: wrap_u=Wrap(0), wrap_v=ClampToEdge(2) at [5:3], wrap_p=Mirror(1) at [8:6]
+        words[0] = 0 | (2 << 3) | (1 << 6);
+        // word1: mag=Linear(2) at [1:0], min=Linear(2) at [5:4], mipmap=Linear(3) at [7:6]
+        //        mip_lod_bias=0 at [24:12]
+        words[1] = 2 | (2 << 4) | (3 << 6);
+        // word2: min_lod=0, max_lod=3072 (=12.0*256) at [23:12]
+        words[2] = 0 | (3072 << 12);
+        // border color = [1.0, 0.5, 0.0, 1.0]
+        words[4] = f32::to_bits(1.0);
+        words[5] = f32::to_bits(0.5);
+        words[6] = f32::to_bits(0.0);
+        words[7] = f32::to_bits(1.0);
+
+        let desc = SamplerDescriptor::from_words(&words);
+        assert_eq!(desc.wrap_u, WrapMode::Wrap);
+        assert_eq!(desc.wrap_v, WrapMode::ClampToEdge);
+        assert_eq!(desc.wrap_p, WrapMode::Mirror);
+        assert!(!desc.depth_compare_enabled);
+        assert_eq!(desc.mag_filter, TextureFilter::Linear);
+        assert_eq!(desc.min_filter, TextureFilter::Linear);
+        assert_eq!(desc.mipmap_filter, MipmapFilter::Linear);
+        assert!((desc.min_lod - 0.0).abs() < f32::EPSILON);
+        assert!((desc.max_lod - 12.0).abs() < 0.01);
+        assert!((desc.mip_lod_bias - 0.0).abs() < f32::EPSILON);
+        assert_eq!(desc.border_color[0], 1.0);
+        assert_eq!(desc.border_color[1], 0.5);
+    }
+
+    #[test]
+    fn test_sampler_descriptor_depth_compare() {
+        let mut words = [0u32; 8];
+        // word0: wrap_u=Border(3), depth_compare_enabled=1 at bit[9],
+        //        depth_compare_func=Less(1) at [12:10], max_anisotropy=3 at [22:20]
+        words[0] = 3 | (1 << 9) | (1 << 10) | (3 << 20);
+        // word1: mag=Nearest(1), min=Nearest(1) at [5:4], mipmap=None(1) at [7:6],
+        //        mip_lod_bias: -1.0 → -256 as 13-bit signed → 0x1F00 at [24:12]
+        let bias_raw = ((-256i32) as u32) & 0x1FFF; // 13-bit
+        words[1] = 1 | (1 << 4) | (1 << 6) | (bias_raw << 12);
+
+        let desc = SamplerDescriptor::from_words(&words);
+        assert!(desc.depth_compare_enabled);
+        assert_eq!(desc.depth_compare_func, DepthCompareFunc::Less);
+        assert_eq!(desc.max_anisotropy, 3);
+        assert_eq!(desc.mag_filter, TextureFilter::Nearest);
+        assert_eq!(desc.min_filter, TextureFilter::Nearest);
+        assert_eq!(desc.mipmap_filter, MipmapFilter::None);
+        assert!((desc.mip_lod_bias - (-1.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_sampler_anisotropy_multiplier() {
+        let mut words = [0u32; 8];
+
+        // anisotropy = 0 → 1x
+        words[0] = 0;
+        assert_eq!(SamplerDescriptor::from_words(&words).anisotropy_multiplier(), 1);
+
+        // anisotropy = 1 → 2x
+        words[0] = 1 << 20;
+        assert_eq!(SamplerDescriptor::from_words(&words).anisotropy_multiplier(), 2);
+
+        // anisotropy = 2 → 4x
+        words[0] = 2 << 20;
+        assert_eq!(SamplerDescriptor::from_words(&words).anisotropy_multiplier(), 4);
+
+        // anisotropy = 3 → 8x
+        words[0] = 3 << 20;
+        assert_eq!(SamplerDescriptor::from_words(&words).anisotropy_multiplier(), 8);
+
+        // anisotropy = 4 → 16x
+        words[0] = 4 << 20;
+        assert_eq!(SamplerDescriptor::from_words(&words).anisotropy_multiplier(), 16);
+    }
+
+    #[test]
+    fn test_tex_header_pool_address() {
+        let mut engine = Maxwell3D::new();
+        let base = TEX_HEADER_POOL_BASE as usize;
+        engine.regs[base] = 0x0002;       // addr_high
+        engine.regs[base + 1] = 0x4000;   // addr_low
+        engine.regs[base + 2] = 1024;     // limit
+
+        assert_eq!(engine.tex_header_pool_address(), 0x0002_0000_4000);
+        assert_eq!(engine.tex_header_pool_limit(), 1024);
+    }
+
+    #[test]
+    fn test_tex_sampler_pool_address() {
+        let mut engine = Maxwell3D::new();
+        let base = TEX_SAMPLER_POOL_BASE as usize;
+        engine.regs[base] = 0x0003;       // addr_high
+        engine.regs[base + 1] = 0x8000;   // addr_low
+        engine.regs[base + 2] = 512;      // limit
+
+        assert_eq!(engine.tex_sampler_pool_address(), 0x0003_0000_8000);
+        assert_eq!(engine.tex_sampler_pool_limit(), 512);
+    }
+
+    #[test]
+    fn test_draw_captures_tex_pools() {
+        let mut engine = Maxwell3D::new();
+
+        // Set up TIC pool.
+        let tic = TEX_HEADER_POOL_BASE as usize;
+        engine.regs[tic] = 0x0001;
+        engine.regs[tic + 1] = 0x2000;
+        engine.regs[tic + 2] = 256;
+
+        // Set up TSC pool.
+        let tsc = TEX_SAMPLER_POOL_BASE as usize;
+        engine.regs[tsc] = 0x0001;
+        engine.regs[tsc + 1] = 0x3000;
+        engine.regs[tsc + 2] = 128;
+
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].tex_header_pool_addr, 0x0001_0000_2000);
+        assert_eq!(draws[0].tex_header_pool_limit, 256);
+        assert_eq!(draws[0].tex_sampler_pool_addr, 0x0001_0000_3000);
+        assert_eq!(draws[0].tex_sampler_pool_limit, 128);
     }
 }
