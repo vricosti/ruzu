@@ -59,25 +59,24 @@ struct NvMapHandle {
 }
 
 /// `/dev/nvmap` — Memory handle allocation device.
+///
+/// Registers allocated handles in the shared `NvMapRegistry` so that other
+/// services (NvHostAsGpu, VI) can resolve handle → guest address.
 pub struct NvMap {
+    gpu: Arc<GpuContext>,
     handles: HashMap<u32, NvMapHandle>,
     next_handle: u32,
     next_id: u32,
 }
 
 impl NvMap {
-    pub fn new() -> Self {
+    pub fn new(gpu: Arc<GpuContext>) -> Self {
         Self {
+            gpu,
             handles: HashMap::new(),
             next_handle: 1,
             next_id: 1,
         }
-    }
-}
-
-impl Default for NvMap {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -144,6 +143,9 @@ impl NvDevice for NvMap {
                     }
                     h.address = addr;
                     h.allocated = true;
+                    // Publish to the shared registry so other services can resolve
+                    // this handle to a guest address.
+                    self.gpu.nvmap_registry.register(handle, addr, h.size);
                     log::debug!(
                         "nvmap: Alloc handle={}, align=0x{:X}, addr=0x{:X}",
                         handle,
@@ -254,9 +256,13 @@ impl NvDevice for NvHostAsGpu {
                 let is_fixed = (flags & 1) != 0;
                 let size = if mapping_size > 0 { mapping_size } else { 0x10000 };
 
-                // For now, use the buffer_offset as the CPU address hint.
-                // Real implementation would look up the nvmap handle's address.
-                let cpu_addr = buffer_offset;
+                // Look up the nvmap handle's guest address from the registry.
+                // Fall back to buffer_offset if the handle isn't registered.
+                let cpu_addr = self
+                    .gpu
+                    .nvmap_registry
+                    .get_address(nvmap_handle)
+                    .unwrap_or(buffer_offset);
 
                 let mut mm = self.gpu.memory_manager.write();
                 let gpu_va = if is_fixed && fixed_offset != 0 {
@@ -514,7 +520,7 @@ impl NvDevice for NvHostCtrl {
 /// Devices that need GPU access receive a shared reference to the GpuContext.
 pub fn create_device(path: &str, gpu: Arc<GpuContext>) -> Option<Box<dyn NvDevice>> {
     match path {
-        "/dev/nvmap" => Some(Box::new(NvMap::new())),
+        "/dev/nvmap" => Some(Box::new(NvMap::new(gpu.clone()))),
         "/dev/nvhost-as-gpu" => Some(Box::new(NvHostAsGpu::new(gpu))),
         "/dev/nvhost-gpu" => Some(Box::new(NvHostGpu::new(gpu.clone()))),
         "/dev/nvhost-ctrl" | "/dev/nvhost-ctrl-gpu" => Some(Box::new(NvHostCtrl::new(gpu))),
@@ -537,7 +543,7 @@ mod tests {
 
     #[test]
     fn test_nvmap_create_and_param() {
-        let mut dev = NvMap::new();
+        let mut dev = NvMap::new(test_gpu());
 
         // Create a handle with size 0x1000.
         let mut input = [0u8; 32];
@@ -561,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_nvmap_alloc() {
-        let mut dev = NvMap::new();
+        let mut dev = NvMap::new(test_gpu());
 
         // Create
         let mut input = [0u8; 32];
@@ -585,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_nvmap_get_id() {
-        let mut dev = NvMap::new();
+        let mut dev = NvMap::new(test_gpu());
 
         // Create
         let mut input = [0u8; 32];
@@ -691,5 +697,55 @@ mod tests {
 
         let rc = dev.ioctl(3, &input, &mut output);
         assert_eq!(rc, 0); // Should succeed immediately.
+    }
+
+    #[test]
+    fn test_nvmap_alloc_registers_in_registry() {
+        let gpu = test_gpu();
+        let mut dev = NvMap::new(gpu.clone());
+
+        // Create
+        let mut input = [0u8; 32];
+        input[0..4].copy_from_slice(&0x2000u32.to_le_bytes());
+        let mut output = [0u8; 32];
+        dev.ioctl(1, &input, &mut output);
+        let handle = u32::from_le_bytes(output[0..4].try_into().unwrap());
+
+        // Alloc with addr=0xBEEF_0000
+        let mut alloc_in = [0u8; 32];
+        alloc_in[0..4].copy_from_slice(&handle.to_le_bytes());
+        alloc_in[12..16].copy_from_slice(&0x1000u32.to_le_bytes()); // align
+        alloc_in[20..28].copy_from_slice(&0xBEEF_0000u64.to_le_bytes()); // addr
+        let mut alloc_out = [0u8; 32];
+        dev.ioctl(4, &alloc_in, &mut alloc_out);
+
+        // Verify the registry has the handle.
+        assert_eq!(gpu.nvmap_registry.get_address(handle), Some(0xBEEF_0000));
+        assert_eq!(gpu.nvmap_registry.get_size(handle), Some(0x2000));
+    }
+
+    #[test]
+    fn test_nvhost_as_gpu_map_uses_registry() {
+        let gpu = test_gpu();
+
+        // Pre-register an nvmap handle in the registry.
+        gpu.nvmap_registry.register(7, 0xCAFE_0000, 0x10000);
+
+        let mut dev = NvHostAsGpu::new(gpu);
+
+        // MapBufferEx with nvmap_handle=7 (at input offset 8).
+        let mut input = [0u8; 64];
+        write_u32(&mut input, 0, 0);   // flags: not fixed
+        write_u32(&mut input, 8, 7);   // nvmap_handle = 7
+        write_u64(&mut input, 24, 0x10000); // mapping_size
+        let mut output = [0u8; 32];
+
+        let rc = dev.ioctl(6, &input, &mut output);
+        assert_eq!(rc, 0);
+
+        // The GPU VA should have been mapped. Verify it translates to 0xCAFE_0000.
+        let gpu_va = u64::from_le_bytes(output[0..8].try_into().unwrap());
+        let mm = dev.gpu.memory_manager.read();
+        assert_eq!(mm.translate(gpu_va), Some(0xCAFE_0000));
     }
 }

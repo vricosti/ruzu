@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use ruzu_gpu::gpu_context::GpuContext;
 
 use crate::buffer_queue::{BufferQueue, GraphicBuffer};
 use crate::framework::ServiceHandler;
@@ -223,13 +224,17 @@ fn build_native_window_parcel(layer_id: u64) -> Vec<u8> {
 // ── IHOSBinderDriver (ViBinderService) ──────────────────────────────────────
 
 /// Binder driver sub-interface for buffer queue operations.
+///
+/// Uses the GPU context's NvMap registry to resolve nvmap handles to guest
+/// addresses when setting preallocated buffers.
 pub struct ViBinderService {
     buffer_queue: Arc<RwLock<BufferQueue>>,
+    gpu: Arc<GpuContext>,
 }
 
 impl ViBinderService {
-    pub fn new(buffer_queue: Arc<RwLock<BufferQueue>>) -> Self {
-        Self { buffer_queue }
+    pub fn new(buffer_queue: Arc<RwLock<BufferQueue>>, gpu: Arc<GpuContext>) -> Self {
+        Self { buffer_queue, gpu }
     }
 }
 
@@ -418,12 +423,19 @@ impl ViBinderService {
                 let _usage = _input.read_u32();
                 let nvmap_handle = _input.read_u32();
 
+                // Resolve the nvmap handle to a guest address via the registry.
+                let offset = self
+                    .gpu
+                    .nvmap_registry
+                    .get_address(nvmap_handle)
+                    .unwrap_or(0);
+
                 let buf = GraphicBuffer {
                     width,
                     height,
                     format,
                     nvmap_handle,
-                    offset: 0, // Will be resolved from nvmap handle later.
+                    offset,
                     stride,
                 };
 
@@ -449,6 +461,10 @@ impl ViBinderService {
 mod tests {
     use super::*;
     use crate::ipc::CommandType;
+
+    fn test_gpu() -> Arc<GpuContext> {
+        Arc::new(GpuContext::new())
+    }
 
     fn make_command(cmd_id: u32) -> IpcCommand {
         IpcCommand {
@@ -528,7 +544,7 @@ mod tests {
     #[test]
     fn test_vi_binder_connect() {
         let bq = Arc::new(RwLock::new(BufferQueue::new()));
-        let mut svc = ViBinderService::new(bq);
+        let mut svc = ViBinderService::new(bq, test_gpu());
         let cmd = make_command_with_data(
             0,
             vec![0, transact::CONNECT, 0], // binder_id=0, code=CONNECT, flags=0
@@ -555,7 +571,7 @@ mod tests {
             );
         }
 
-        let mut svc = ViBinderService::new(bq.clone());
+        let mut svc = ViBinderService::new(bq.clone(), test_gpu());
 
         // Dequeue
         let cmd = make_command_with_data(
@@ -582,5 +598,45 @@ mod tests {
         // Verify buffer is queued.
         let q = bq.read();
         assert!(q.get_buffer(0).is_some());
+    }
+
+    #[test]
+    fn test_set_preallocated_resolves_offset() {
+        let gpu = test_gpu();
+        // Pre-register nvmap handle 5 with address 0xCAFE_0000.
+        gpu.nvmap_registry.register(5, 0xCAFE_0000, 0x1000);
+
+        let bq = Arc::new(RwLock::new(BufferQueue::new()));
+        let mut svc = ViBinderService::new(bq.clone(), gpu);
+
+        // Build SET_PREALLOCATED_BUFFER parcel:
+        // slot=0, has_buffer=1, width=1280, height=720, stride=1280,
+        // format=1, usage=0, nvmap_handle=5
+        let mut parcel = Parcel::new();
+        parcel.write_i32(0);    // slot
+        parcel.write_i32(1);    // has_buffer
+        parcel.write_u32(1280); // width
+        parcel.write_u32(720);  // height
+        parcel.write_u32(1280); // stride
+        parcel.write_u32(1);    // format (RGBA8888)
+        parcel.write_u32(0);    // usage
+        parcel.write_u32(5);    // nvmap_handle
+        let parcel_bytes = parcel.serialize();
+        let mut words: Vec<u32> = vec![0, transact::SET_PREALLOCATED_BUFFER, 0];
+        for chunk in parcel_bytes.chunks(4) {
+            let mut wb = [0u8; 4];
+            wb[..chunk.len()].copy_from_slice(chunk);
+            words.push(u32::from_le_bytes(wb));
+        }
+
+        let cmd = make_command_with_data(0, words);
+        let resp = svc.handle_request(0, &cmd);
+        assert!(resp.result.is_success());
+
+        // Verify the buffer has the resolved offset.
+        let q = bq.read();
+        let buf = q.get_buffer(0).expect("buffer should be set");
+        assert_eq!(buf.offset, 0xCAFE_0000);
+        assert_eq!(buf.nvmap_handle, 5);
     }
 }
