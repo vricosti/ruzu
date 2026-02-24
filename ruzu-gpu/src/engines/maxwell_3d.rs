@@ -1126,8 +1126,11 @@ pub struct VertexStreamInfo {
     pub enabled: bool,
 }
 
+/// Number of hardware viewports/scissors.
+pub const NUM_VIEWPORTS: usize = 16;
+
 /// Viewport computed from scale/translate registers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ViewportInfo {
     pub x: f32,
     pub y: f32,
@@ -1138,7 +1141,7 @@ pub struct ViewportInfo {
 }
 
 /// Scissor rectangle.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScissorInfo {
     pub enabled: bool,
     pub min_x: u32,
@@ -1337,8 +1340,8 @@ pub struct DrawCall {
     pub index_buffer_first: u32,
     pub index_format: IndexFormat,
     pub vertex_streams: Vec<VertexStreamInfo>,
-    pub viewport: ViewportInfo,
-    pub scissor: ScissorInfo,
+    pub viewports: [ViewportInfo; NUM_VIEWPORTS],
+    pub scissors: [ScissorInfo; NUM_VIEWPORTS],
     pub blend: [BlendInfo; 8],
     pub blend_color: BlendColorInfo,
     pub depth_stencil: DepthStencilInfo,
@@ -1896,8 +1899,8 @@ impl Maxwell3D {
             index_buffer_first: self.index_buffer_first(),
             index_format: self.index_buffer_format(),
             vertex_streams,
-            viewport: self.viewport_info(0),
-            scissor: self.scissor_info(0),
+            viewports: std::array::from_fn(|i| self.viewport_info(i as u32)),
+            scissors: std::array::from_fn(|i| self.scissor_info(i as u32)),
             blend,
             blend_color: self.blend_color_info(),
             depth_stencil: self.depth_stencil_info(),
@@ -2397,7 +2400,7 @@ mod tests {
         assert!(!d.indexed);
         assert_eq!(d.vertex_streams.len(), 1);
         assert_eq!(d.vertex_streams[0].stride, 32);
-        assert_eq!(d.viewport.width, 1280.0);
+        assert_eq!(d.viewports[0].width, 1280.0);
     }
 
     #[test]
@@ -3460,5 +3463,157 @@ mod tests {
         assert_eq!(draws[0].tex_header_pool_limit, 256);
         assert_eq!(draws[0].tex_sampler_pool_addr, 0x0001_0000_3000);
         assert_eq!(draws[0].tex_sampler_pool_limit, 128);
+    }
+
+    // ── Multi-viewport / multi-scissor tests ────────────────────────────
+
+    #[test]
+    fn test_viewport_default() {
+        let vp = ViewportInfo::default();
+        assert_eq!(vp.x, 0.0);
+        assert_eq!(vp.y, 0.0);
+        assert_eq!(vp.width, 0.0);
+        assert_eq!(vp.height, 0.0);
+        assert_eq!(vp.depth_near, 0.0);
+        assert_eq!(vp.depth_far, 0.0);
+    }
+
+    #[test]
+    fn test_scissor_default() {
+        let sc = ScissorInfo::default();
+        assert!(!sc.enabled);
+        assert_eq!(sc.min_x, 0);
+        assert_eq!(sc.max_x, 0);
+        assert_eq!(sc.min_y, 0);
+        assert_eq!(sc.max_y, 0);
+    }
+
+    #[test]
+    fn test_viewport_info_nonzero_index() {
+        let mut engine = Maxwell3D::new();
+
+        // Set viewport 3 only.
+        let vp3_base = VP_TRANSFORM_BASE + 3 * VP_TRANSFORM_STRIDE;
+        engine.write_reg(vp3_base, f32::to_bits(400.0)); // scale_x
+        engine.write_reg(vp3_base + 1, f32::to_bits(-300.0)); // scale_y
+        engine.write_reg(vp3_base + 2, f32::to_bits(0.5)); // scale_z
+        engine.write_reg(vp3_base + 3, f32::to_bits(400.0)); // translate_x
+        engine.write_reg(vp3_base + 4, f32::to_bits(300.0)); // translate_y
+        engine.write_reg(vp3_base + 5, f32::to_bits(0.5)); // translate_z
+
+        let vp3 = engine.viewport_info(3);
+        assert_eq!(vp3.width, 800.0);
+        assert_eq!(vp3.height, 600.0);
+
+        // Viewport 0 should still be all zeros.
+        let vp0 = engine.viewport_info(0);
+        assert_eq!(vp0.width, 0.0);
+        assert_eq!(vp0.height, 0.0);
+    }
+
+    #[test]
+    fn test_scissor_info_nonzero_index() {
+        let mut engine = Maxwell3D::new();
+
+        // Set scissor 5 only.
+        let sc5_base = SCISSOR_BASE + 5 * SCISSOR_STRIDE;
+        engine.write_reg(sc5_base, 1); // enable
+        engine.write_reg(sc5_base + 1, 100 | (500 << 16)); // min_x=100, max_x=500
+        engine.write_reg(sc5_base + 2, 50 | (400 << 16)); // min_y=50, max_y=400
+
+        let sc5 = engine.scissor_info(5);
+        assert!(sc5.enabled);
+        assert_eq!(sc5.min_x, 100);
+        assert_eq!(sc5.max_x, 500);
+        assert_eq!(sc5.min_y, 50);
+        assert_eq!(sc5.max_y, 400);
+    }
+
+    #[test]
+    fn test_draw_captures_all_viewports() {
+        let mut engine = Maxwell3D::new();
+
+        // Set viewport 0.
+        let vp0_base = VP_TRANSFORM_BASE;
+        engine.write_reg(vp0_base, f32::to_bits(640.0));
+        engine.write_reg(vp0_base + 1, f32::to_bits(-360.0));
+        engine.write_reg(vp0_base + 2, f32::to_bits(0.5));
+        engine.write_reg(vp0_base + 3, f32::to_bits(640.0));
+        engine.write_reg(vp0_base + 4, f32::to_bits(360.0));
+        engine.write_reg(vp0_base + 5, f32::to_bits(0.5));
+
+        // Set viewport 5.
+        let vp5_base = VP_TRANSFORM_BASE + 5 * VP_TRANSFORM_STRIDE;
+        engine.write_reg(vp5_base, f32::to_bits(200.0));
+        engine.write_reg(vp5_base + 1, f32::to_bits(-100.0));
+        engine.write_reg(vp5_base + 2, f32::to_bits(1.0));
+        engine.write_reg(vp5_base + 3, f32::to_bits(200.0));
+        engine.write_reg(vp5_base + 4, f32::to_bits(100.0));
+        engine.write_reg(vp5_base + 5, f32::to_bits(1.0));
+
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws[0].viewports[0].width, 1280.0);
+        assert_eq!(draws[0].viewports[0].height, 720.0);
+        assert_eq!(draws[0].viewports[5].width, 400.0);
+        assert_eq!(draws[0].viewports[5].height, 200.0);
+        // Unset viewport should be zero.
+        assert_eq!(draws[0].viewports[10].width, 0.0);
+    }
+
+    #[test]
+    fn test_draw_captures_all_scissors() {
+        let mut engine = Maxwell3D::new();
+
+        // Enable scissor 0.
+        let sc0_base = SCISSOR_BASE;
+        engine.write_reg(sc0_base, 1);
+        engine.write_reg(sc0_base + 1, 0 | (1920 << 16));
+        engine.write_reg(sc0_base + 2, 0 | (1080 << 16));
+
+        // Enable scissor 7.
+        let sc7_base = SCISSOR_BASE + 7 * SCISSOR_STRIDE;
+        engine.write_reg(sc7_base, 1);
+        engine.write_reg(sc7_base + 1, 10 | (200 << 16));
+        engine.write_reg(sc7_base + 2, 20 | (300 << 16));
+
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert!(draws[0].scissors[0].enabled);
+        assert_eq!(draws[0].scissors[0].max_x, 1920);
+        assert!(draws[0].scissors[7].enabled);
+        assert_eq!(draws[0].scissors[7].min_x, 10);
+        // Unset scissor should be disabled.
+        assert!(!draws[0].scissors[3].enabled);
+    }
+
+    #[test]
+    fn test_draw_viewport_array_all_indices() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+        let draws = engine.take_draw_calls();
+        // All 16 viewports should be accessible.
+        assert_eq!(draws[0].viewports.len(), NUM_VIEWPORTS);
+        for vp in &draws[0].viewports {
+            assert_eq!(vp.width, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_draw_scissor_array_all_indices() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+        let draws = engine.take_draw_calls();
+        // All 16 scissors should be accessible.
+        assert_eq!(draws[0].scissors.len(), NUM_VIEWPORTS);
+        for sc in &draws[0].scissors {
+            assert!(!sc.enabled);
+        }
     }
 }
