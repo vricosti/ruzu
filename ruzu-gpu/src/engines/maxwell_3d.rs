@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Maxwell 3D engine — structured state tracking and clear operations.
+//! Maxwell 3D engine — structured state tracking, clear operations, and draw
+//! call recording.
 //!
 //! This is the main 3D rendering engine (NV class B197). It handles render
-//! target configuration, clear operations, and draw call logging. Register
-//! writes are stored in a flat array and side-effect methods (clear, draw)
-//! are triggered on specific register writes.
+//! target configuration, clear operations, and draw call state tracking.
+//! Register writes are stored in a flat array and side-effect methods (clear,
+//! draw begin/end) are triggered on specific register writes.
 
 use super::{ClassId, Engine, Framebuffer, ENGINE_REG_COUNT};
 
@@ -34,8 +35,58 @@ const CLEAR_DEPTH: u32 = 0x0D90;
 const CLEAR_STENCIL: u32 = 0x0DA0;
 /// Clear surface trigger register.
 const CLEAR_SURFACE: u32 = 0x19D0;
-/// Draw begin/end register.
-const DRAW_REG: u32 = 0x1614;
+
+// ── Viewport registers ──────────────────────────────────────────────────────
+
+/// Viewport transform base. 16 viewports, 8 words each.
+/// Words: scale_x, scale_y, scale_z, translate_x, translate_y, translate_z, swizzle, snap.
+const VP_TRANSFORM_BASE: u32 = 0x0A00;
+const VP_TRANSFORM_STRIDE: u32 = 8;
+
+// ── Scissor registers ───────────────────────────────────────────────────────
+
+/// Scissor base. 16 scissors, 4 words each.
+/// Words: enable, min_x|max_x(packed), min_y|max_y(packed), pad.
+const SCISSOR_BASE: u32 = 0x0E00;
+const SCISSOR_STRIDE: u32 = 4;
+
+// ── Vertex buffer registers ─────────────────────────────────────────────────
+
+/// Vertex buffer first vertex.
+const VB_FIRST: u32 = 0x0D74;
+/// Vertex buffer vertex count.
+const VB_COUNT: u32 = 0x0D75;
+
+/// Vertex stream array base. 32 streams, 4 words each.
+/// Words: stride|enable, addr_high, addr_low, frequency.
+const VERTEX_STREAM_BASE: u32 = 0x1C00;
+const VERTEX_STREAM_STRIDE: u32 = 4;
+
+/// Vertex stream limit array base. 32 streams, 2 words each.
+#[allow(dead_code)]
+const VERTEX_STREAM_LIMIT_BASE: u32 = 0x1F00;
+
+// ── Index buffer registers ──────────────────────────────────────────────────
+
+/// Index buffer base (7 words).
+/// Words: addr_high, addr_low, limit_high, limit_low, format, first, count.
+const IB_BASE: u32 = 0x17C8;
+const IB_OFF_ADDR_HIGH: u32 = 0;
+const IB_OFF_ADDR_LOW: u32 = 1;
+#[allow(dead_code)]
+const IB_OFF_LIMIT_HIGH: u32 = 2;
+#[allow(dead_code)]
+const IB_OFF_LIMIT_LOW: u32 = 3;
+const IB_OFF_FORMAT: u32 = 4;
+const IB_OFF_FIRST: u32 = 5;
+const IB_OFF_COUNT: u32 = 6;
+
+// ── Draw registers ──────────────────────────────────────────────────────────
+
+/// Draw end trigger (previously DRAW_REG).
+const DRAW_END: u32 = 0x1614;
+/// Draw begin: sets topology.
+const DRAW_BEGIN: u32 = 0x1615;
 
 // ── Common render target formats ────────────────────────────────────────────
 
@@ -44,10 +95,144 @@ const RT_FORMAT_A8B8G8R8_SRGB: u32 = 0xD6;
 #[allow(dead_code)]
 const RT_FORMAT_A8R8G8B8_UNORM: u32 = 0xCF;
 
+// ── Draw state types ────────────────────────────────────────────────────────
+
+/// GPU primitive topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PrimitiveTopology {
+    Points = 0,
+    Lines = 1,
+    LineLoop = 2,
+    LineStrip = 3,
+    Triangles = 4,
+    TriangleStrip = 5,
+    TriangleFan = 6,
+    Quads = 7,
+    QuadStrip = 8,
+    Polygon = 9,
+    LinesAdjacency = 10,
+    LineStripAdjacency = 11,
+    TrianglesAdjacency = 12,
+    TriangleStripAdjacency = 13,
+    Patches = 14,
+}
+
+impl PrimitiveTopology {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0xFFFF {
+            0 => Self::Points,
+            1 => Self::Lines,
+            2 => Self::LineLoop,
+            3 => Self::LineStrip,
+            4 => Self::Triangles,
+            5 => Self::TriangleStrip,
+            6 => Self::TriangleFan,
+            7 => Self::Quads,
+            8 => Self::QuadStrip,
+            9 => Self::Polygon,
+            10 => Self::LinesAdjacency,
+            11 => Self::LineStripAdjacency,
+            12 => Self::TrianglesAdjacency,
+            13 => Self::TriangleStripAdjacency,
+            14 => Self::Patches,
+            _ => {
+                log::warn!("Maxwell3D: unknown topology {}, defaulting to Triangles", value & 0xFFFF);
+                Self::Triangles
+            }
+        }
+    }
+}
+
+/// Index buffer element format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum IndexFormat {
+    UnsignedByte = 0,
+    UnsignedShort = 1,
+    UnsignedInt = 2,
+}
+
+impl IndexFormat {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::UnsignedByte,
+            1 => Self::UnsignedShort,
+            2 => Self::UnsignedInt,
+            _ => {
+                log::warn!("Maxwell3D: unknown index format {}, defaulting to UnsignedInt", value);
+                Self::UnsignedInt
+            }
+        }
+    }
+
+    pub fn size_bytes(&self) -> u32 {
+        match self {
+            Self::UnsignedByte => 1,
+            Self::UnsignedShort => 2,
+            Self::UnsignedInt => 4,
+        }
+    }
+}
+
+/// Information about an active vertex stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexStreamInfo {
+    pub index: u32,
+    pub address: u64,
+    pub stride: u32,
+    pub enabled: bool,
+}
+
+/// Viewport computed from scale/translate registers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewportInfo {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub depth_near: f32,
+    pub depth_far: f32,
+}
+
+/// Scissor rectangle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScissorInfo {
+    pub enabled: bool,
+    pub min_x: u32,
+    pub max_x: u32,
+    pub min_y: u32,
+    pub max_y: u32,
+}
+
+/// A recorded draw call with all relevant state at the time of DRAW_END.
+#[derive(Debug, Clone)]
+pub struct DrawCall {
+    pub topology: PrimitiveTopology,
+    pub vertex_first: u32,
+    pub vertex_count: u32,
+    pub indexed: bool,
+    pub index_buffer_addr: u64,
+    pub index_buffer_count: u32,
+    pub index_buffer_first: u32,
+    pub index_format: IndexFormat,
+    pub vertex_streams: Vec<VertexStreamInfo>,
+    pub viewport: ViewportInfo,
+    pub scissor: ScissorInfo,
+}
+
+// ── Engine struct ───────────────────────────────────────────────────────────
+
 pub struct Maxwell3D {
     regs: Box<[u32; ENGINE_REG_COUNT]>,
-    /// Pending framebuffer output from clear/draw operations.
+    /// Pending framebuffer output from clear operations.
     pending_framebuffer: Option<Framebuffer>,
+    /// Accumulated draw call records.
+    draw_calls: Vec<DrawCall>,
+    /// Current primitive topology (set on DRAW_BEGIN).
+    current_topology: PrimitiveTopology,
+    /// Whether the current draw is indexed (set when IB count is written).
+    draw_indexed: bool,
 }
 
 impl Maxwell3D {
@@ -55,10 +240,13 @@ impl Maxwell3D {
         Self {
             regs: Box::new([0u32; ENGINE_REG_COUNT]),
             pending_framebuffer: None,
+            draw_calls: Vec::new(),
+            current_topology: PrimitiveTopology::Triangles,
+            draw_indexed: false,
         }
     }
 
-    // ── Typed register accessors ────────────────────────────────────────
+    // ── Render target accessors ──────────────────────────────────────────
 
     /// GPU virtual address of render target `index` (0..7).
     fn rt_address(&self, index: usize) -> u64 {
@@ -97,7 +285,97 @@ impl Maxwell3D {
         ]
     }
 
-    // ── Side-effect handlers ────────────────────────────────────────────
+    // ── Vertex stream accessors ──────────────────────────────────────────
+
+    /// Read vertex stream `index` (0..31) info from registers.
+    pub fn vertex_stream_info(&self, index: u32) -> VertexStreamInfo {
+        let base = (VERTEX_STREAM_BASE + index * VERTEX_STREAM_STRIDE) as usize;
+        let word0 = self.regs[base]; // stride in bits[11:0], enable in bit 12
+        let addr_high = self.regs[base + 1] as u64;
+        let addr_low = self.regs[base + 2] as u64;
+        VertexStreamInfo {
+            index,
+            address: (addr_high << 32) | addr_low,
+            stride: word0 & 0xFFF,
+            enabled: (word0 & (1 << 12)) != 0,
+        }
+    }
+
+    // ── Index buffer accessors ───────────────────────────────────────────
+
+    /// Index buffer GPU address.
+    pub fn index_buffer_addr(&self) -> u64 {
+        let base = IB_BASE as usize;
+        let high = self.regs[base + IB_OFF_ADDR_HIGH as usize] as u64;
+        let low = self.regs[base + IB_OFF_ADDR_LOW as usize] as u64;
+        (high << 32) | low
+    }
+
+    /// Index buffer element format.
+    pub fn index_buffer_format(&self) -> IndexFormat {
+        IndexFormat::from_raw(self.regs[(IB_BASE + IB_OFF_FORMAT) as usize])
+    }
+
+    /// Index buffer first index.
+    pub fn index_buffer_first(&self) -> u32 {
+        self.regs[(IB_BASE + IB_OFF_FIRST) as usize]
+    }
+
+    /// Index buffer element count.
+    pub fn index_buffer_count(&self) -> u32 {
+        self.regs[(IB_BASE + IB_OFF_COUNT) as usize]
+    }
+
+    // ── Viewport accessors ───────────────────────────────────────────────
+
+    /// Compute viewport info for viewport `index` (0..15) from scale/translate.
+    pub fn viewport_info(&self, index: u32) -> ViewportInfo {
+        let base = (VP_TRANSFORM_BASE + index * VP_TRANSFORM_STRIDE) as usize;
+        let scale_x = f32::from_bits(self.regs[base]);
+        let scale_y = f32::from_bits(self.regs[base + 1]);
+        let scale_z = f32::from_bits(self.regs[base + 2]);
+        let translate_x = f32::from_bits(self.regs[base + 3]);
+        let translate_y = f32::from_bits(self.regs[base + 4]);
+        let translate_z = f32::from_bits(self.regs[base + 5]);
+
+        // Viewport transform: x = translate - |scale|, width = 2*|scale|
+        let width = scale_x.abs() * 2.0;
+        let height = scale_y.abs() * 2.0;
+        ViewportInfo {
+            x: translate_x - scale_x.abs(),
+            y: translate_y - scale_y.abs(),
+            width,
+            height,
+            depth_near: translate_z - scale_z.abs(),
+            depth_far: translate_z + scale_z.abs(),
+        }
+    }
+
+    // ── Scissor accessors ────────────────────────────────────────────────
+
+    /// Read scissor info for scissor `index` (0..15).
+    pub fn scissor_info(&self, index: u32) -> ScissorInfo {
+        let base = (SCISSOR_BASE + index * SCISSOR_STRIDE) as usize;
+        let enable = self.regs[base];
+        let x_packed = self.regs[base + 1]; // min_x[15:0] | max_x[31:16]
+        let y_packed = self.regs[base + 2]; // min_y[15:0] | max_y[31:16]
+        ScissorInfo {
+            enabled: (enable & 1) != 0,
+            min_x: x_packed & 0xFFFF,
+            max_x: (x_packed >> 16) & 0xFFFF,
+            min_y: y_packed & 0xFFFF,
+            max_y: (y_packed >> 16) & 0xFFFF,
+        }
+    }
+
+    // ── Draw call accessors ──────────────────────────────────────────────
+
+    /// Drain accumulated draw call records.
+    pub fn take_draw_calls(&mut self) -> Vec<DrawCall> {
+        std::mem::take(&mut self.draw_calls)
+    }
+
+    // ── Side-effect handlers ─────────────────────────────────────────────
 
     /// Handle clear_surface trigger.
     ///
@@ -179,11 +457,50 @@ impl Maxwell3D {
         });
     }
 
-    /// Handle draw register write. Logs the draw call but doesn't produce pixels.
-    fn handle_draw(&mut self, value: u32) {
-        // Draw begin has topology in bits 0..15 and vertex count info.
-        // For now just log it.
-        log::debug!("Maxwell3D: draw value=0x{:X}", value);
+    /// Handle DRAW_BEGIN: captures topology from bits[15:0].
+    fn handle_draw_begin(&mut self, value: u32) {
+        self.current_topology = PrimitiveTopology::from_raw(value);
+        log::debug!(
+            "Maxwell3D: DRAW_BEGIN topology={:?}",
+            self.current_topology
+        );
+    }
+
+    /// Handle DRAW_END: builds DrawCall record from current register state.
+    fn handle_draw_end(&mut self) {
+        // Collect active vertex streams (scan all 32 slots).
+        let mut vertex_streams = Vec::new();
+        for i in 0..32 {
+            let info = self.vertex_stream_info(i);
+            if info.enabled {
+                vertex_streams.push(info);
+            }
+        }
+
+        let draw = DrawCall {
+            topology: self.current_topology,
+            vertex_first: self.regs[VB_FIRST as usize],
+            vertex_count: self.regs[VB_COUNT as usize],
+            indexed: self.draw_indexed,
+            index_buffer_addr: self.index_buffer_addr(),
+            index_buffer_count: self.index_buffer_count(),
+            index_buffer_first: self.index_buffer_first(),
+            index_format: self.index_buffer_format(),
+            vertex_streams,
+            viewport: self.viewport_info(0),
+            scissor: self.scissor_info(0),
+        };
+
+        log::debug!(
+            "Maxwell3D: DRAW_END {:?} verts={}/{} indexed={} streams={}",
+            draw.topology,
+            draw.vertex_first,
+            draw.vertex_count,
+            draw.indexed,
+            draw.vertex_streams.len(),
+        );
+
+        self.draw_calls.push(draw);
     }
 }
 
@@ -254,10 +571,16 @@ impl Engine for Maxwell3D {
             self.regs[idx] = value;
         }
 
+        // Track draw_indexed flag when IB count register is written.
+        if method == IB_BASE + IB_OFF_COUNT && value > 0 {
+            self.draw_indexed = true;
+        }
+
         // Detect side-effect triggers.
         match method {
             CLEAR_SURFACE => self.handle_clear_surface(value),
-            DRAW_REG => self.handle_draw(value),
+            DRAW_BEGIN => self.handle_draw_begin(value),
+            DRAW_END => self.handle_draw_end(),
             _ => {}
         }
 
@@ -272,6 +595,8 @@ impl Engine for Maxwell3D {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Existing tests ───────────────────────────────────────────────────
 
     #[test]
     fn test_write_reg() {
@@ -390,9 +715,11 @@ mod tests {
     #[test]
     fn test_draw_logs_without_crash() {
         let mut engine = Maxwell3D::new();
-        // Just ensure draw doesn't panic.
-        engine.handle_draw(0x0001);
+        // Just ensure draw begin/end doesn't panic.
+        engine.handle_draw_begin(0x0004); // Triangles
+        engine.handle_draw_end();
         assert!(engine.take_framebuffer().is_none());
+        assert_eq!(engine.draw_calls.len(), 1);
     }
 
     #[test]
@@ -448,5 +775,184 @@ mod tests {
         for chunk in fb.pixels.chunks_exact(4) {
             assert_eq!(chunk, &[0, 0, 255, 255]);
         }
+    }
+
+    // ── New draw state tracking tests ────────────────────────────────────
+
+    #[test]
+    fn test_vertex_stream_accessors() {
+        let mut engine = Maxwell3D::new();
+        let base = VERTEX_STREAM_BASE as usize;
+
+        // Stream 0: stride=64, enabled, addr=0x0000_1000_2000.
+        engine.regs[base] = 64 | (1 << 12); // stride=64, enable bit 12
+        engine.regs[base + 1] = 0x0000_1000; // addr_high
+        engine.regs[base + 2] = 0x0000_2000; // addr_low
+
+        let info = engine.vertex_stream_info(0);
+        assert_eq!(info.index, 0);
+        assert_eq!(info.stride, 64);
+        assert!(info.enabled);
+        assert_eq!(info.address, 0x0000_1000_0000_2000);
+    }
+
+    #[test]
+    fn test_vertex_stream_disabled() {
+        let mut engine = Maxwell3D::new();
+        let base = VERTEX_STREAM_BASE as usize;
+
+        // Stream 0: stride=32, NOT enabled (bit 12 clear).
+        engine.regs[base] = 32;
+        engine.regs[base + 1] = 0;
+        engine.regs[base + 2] = 0x5000;
+
+        let info = engine.vertex_stream_info(0);
+        assert_eq!(info.stride, 32);
+        assert!(!info.enabled);
+    }
+
+    #[test]
+    fn test_index_buffer_accessors() {
+        let mut engine = Maxwell3D::new();
+        let base = IB_BASE as usize;
+
+        engine.regs[base + IB_OFF_ADDR_HIGH as usize] = 0x0000_00AB;
+        engine.regs[base + IB_OFF_ADDR_LOW as usize] = 0xCDEF_0000;
+        engine.regs[base + IB_OFF_FORMAT as usize] = 1; // UnsignedShort
+        engine.regs[base + IB_OFF_FIRST as usize] = 10;
+        engine.regs[base + IB_OFF_COUNT as usize] = 500;
+
+        assert_eq!(engine.index_buffer_addr(), 0xAB_CDEF_0000);
+        assert_eq!(engine.index_buffer_format(), IndexFormat::UnsignedShort);
+        assert_eq!(engine.index_buffer_format().size_bytes(), 2);
+        assert_eq!(engine.index_buffer_first(), 10);
+        assert_eq!(engine.index_buffer_count(), 500);
+    }
+
+    #[test]
+    fn test_viewport_info() {
+        let mut engine = Maxwell3D::new();
+        let base = VP_TRANSFORM_BASE as usize;
+
+        // VP0: scale=(640, -360, 0.5), translate=(640, 360, 0.5)
+        // => x=0, y=0, width=1280, height=720, near=0, far=1
+        engine.regs[base] = f32::to_bits(640.0); // scale_x
+        engine.regs[base + 1] = f32::to_bits(-360.0); // scale_y
+        engine.regs[base + 2] = f32::to_bits(0.5); // scale_z
+        engine.regs[base + 3] = f32::to_bits(640.0); // translate_x
+        engine.regs[base + 4] = f32::to_bits(360.0); // translate_y
+        engine.regs[base + 5] = f32::to_bits(0.5); // translate_z
+
+        let vp = engine.viewport_info(0);
+        assert_eq!(vp.x, 0.0);
+        assert_eq!(vp.y, 0.0);
+        assert_eq!(vp.width, 1280.0);
+        assert_eq!(vp.height, 720.0);
+        assert_eq!(vp.depth_near, 0.0);
+        assert_eq!(vp.depth_far, 1.0);
+    }
+
+    #[test]
+    fn test_scissor_info() {
+        let mut engine = Maxwell3D::new();
+        let base = SCISSOR_BASE as usize;
+
+        // Scissor 0: enabled, min_x=10, max_x=1270, min_y=20, max_y=700.
+        engine.regs[base] = 1; // enabled
+        engine.regs[base + 1] = 10 | (1270 << 16); // min_x | max_x
+        engine.regs[base + 2] = 20 | (700 << 16); // min_y | max_y
+
+        let sc = engine.scissor_info(0);
+        assert!(sc.enabled);
+        assert_eq!(sc.min_x, 10);
+        assert_eq!(sc.max_x, 1270);
+        assert_eq!(sc.min_y, 20);
+        assert_eq!(sc.max_y, 700);
+    }
+
+    #[test]
+    fn test_draw_begin_sets_topology() {
+        let mut engine = Maxwell3D::new();
+        engine.handle_draw_begin(4); // Triangles
+        assert_eq!(engine.current_topology, PrimitiveTopology::Triangles);
+
+        engine.handle_draw_begin(1); // Lines
+        assert_eq!(engine.current_topology, PrimitiveTopology::Lines);
+    }
+
+    #[test]
+    fn test_draw_end_creates_draw_call() {
+        let mut engine = Maxwell3D::new();
+
+        // Set up vertex stream 0.
+        let vs_base = VERTEX_STREAM_BASE;
+        engine.write_reg(vs_base, 32 | (1 << 12)); // stride=32, enabled
+        engine.write_reg(vs_base + 1, 0); // addr_high
+        engine.write_reg(vs_base + 2, 0x10000); // addr_low
+
+        // Set vertex buffer first/count.
+        engine.write_reg(VB_FIRST, 0);
+        engine.write_reg(VB_COUNT, 36);
+
+        // Set viewport 0.
+        let vp_base = VP_TRANSFORM_BASE;
+        engine.write_reg(vp_base, f32::to_bits(640.0));
+        engine.write_reg(vp_base + 1, f32::to_bits(-360.0));
+        engine.write_reg(vp_base + 2, f32::to_bits(0.5));
+        engine.write_reg(vp_base + 3, f32::to_bits(640.0));
+        engine.write_reg(vp_base + 4, f32::to_bits(360.0));
+        engine.write_reg(vp_base + 5, f32::to_bits(0.5));
+
+        // Draw: begin(Triangles) + end.
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        let d = &draws[0];
+        assert_eq!(d.topology, PrimitiveTopology::Triangles);
+        assert_eq!(d.vertex_first, 0);
+        assert_eq!(d.vertex_count, 36);
+        assert!(!d.indexed);
+        assert_eq!(d.vertex_streams.len(), 1);
+        assert_eq!(d.vertex_streams[0].stride, 32);
+        assert_eq!(d.viewport.width, 1280.0);
+    }
+
+    #[test]
+    fn test_multiple_draw_calls() {
+        let mut engine = Maxwell3D::new();
+
+        engine.write_reg(DRAW_BEGIN, 4); // Triangles
+        engine.write_reg(DRAW_END, 0);
+        engine.write_reg(DRAW_BEGIN, 1); // Lines
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].topology, PrimitiveTopology::Triangles);
+        assert_eq!(draws[1].topology, PrimitiveTopology::Lines);
+
+        // After take, should be empty.
+        let draws2 = engine.take_draw_calls();
+        assert!(draws2.is_empty());
+    }
+
+    #[test]
+    fn test_draw_indexed_flag() {
+        let mut engine = Maxwell3D::new();
+
+        // Write IB count > 0 → sets draw_indexed.
+        engine.write_reg(IB_BASE + IB_OFF_COUNT, 100);
+        engine.write_reg(IB_BASE + IB_OFF_FORMAT, 2); // UnsignedInt
+
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        assert!(draws[0].indexed);
+        assert_eq!(draws[0].index_format, IndexFormat::UnsignedInt);
+        assert_eq!(draws[0].index_buffer_count, 100);
     }
 }
