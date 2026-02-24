@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 ruzu-common.workspace = true
 ruzu-kernel.workspace = true
+ruzu-gpu.workspace = true
 log.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

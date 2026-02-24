@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Vulkan GPU renderer for ruzu.
+//! GPU subsystem for ruzu.
 //!
-//! Phase 1: Minimal renderer that clears the screen with a solid color.
-//! No guest GPU command processing yet.
+//! Provides GPU memory management, GPFIFO command processing, engine dispatch,
+//! syncpoint synchronization, and rendering backend abstraction.
 
+pub mod backend;
+pub mod command_processor;
+pub mod engines;
+pub mod gpu_context;
+pub mod memory_manager;
 pub mod renderer;
 pub mod surface;
 pub mod swapchain;
+pub mod syncpoint;

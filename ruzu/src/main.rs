@@ -23,6 +23,7 @@ use ruzu_loader::nro;
 use ruzu_loader::nsp;
 use ruzu_loader::vfs::RealFile;
 use ruzu_loader::xci;
+use ruzu_gpu::gpu_context::GpuContext;
 use ruzu_service::buffer_queue::BufferQueue;
 use ruzu_service::framework::ServiceManager;
 use ruzu_service::hid_shared_memory::HidSharedMemory;
@@ -371,6 +372,7 @@ fn main() -> Result<()> {
 
     // ── Create shared state and wire services ────────────────────────────
 
+    let gpu = Arc::new(GpuContext::new());
     let hid_shared_mem = Arc::new(RwLock::new(HidSharedMemory::new()));
     let buffer_queue = Arc::new(RwLock::new(BufferQueue::new()));
 
@@ -391,10 +393,10 @@ fn main() -> Result<()> {
         "hid",
         Box::new(ruzu_service::hid::HidService::new_with_shm_handle(hid_shm_handle)),
     );
-    manager.register_service("nvdrv", Box::new(ruzu_service::nvdrv::NvdrvService::new()));
-    manager.register_service("nvdrv:a", Box::new(ruzu_service::nvdrv::NvdrvService::new()));
-    manager.register_service("nvdrv:s", Box::new(ruzu_service::nvdrv::NvdrvService::new()));
-    manager.register_service("nvdrv:t", Box::new(ruzu_service::nvdrv::NvdrvService::new()));
+    manager.register_service("nvdrv", Box::new(ruzu_service::nvdrv::NvdrvService::new(gpu.clone())));
+    manager.register_service("nvdrv:a", Box::new(ruzu_service::nvdrv::NvdrvService::new(gpu.clone())));
+    manager.register_service("nvdrv:s", Box::new(ruzu_service::nvdrv::NvdrvService::new(gpu.clone())));
+    manager.register_service("nvdrv:t", Box::new(ruzu_service::nvdrv::NvdrvService::new(gpu.clone())));
     manager.register_service("vi:m", Box::new(ruzu_service::vi::ViManagerService::new()));
     manager.register_service(
         "vi:IApplicationDisplayService",
@@ -568,6 +570,7 @@ fn main() -> Result<()> {
             buffer_queue,
             hid_shm_handle,
             hid_guest_addr,
+            gpu,
         )?;
     }
 
@@ -763,6 +766,7 @@ fn run_with_window(
     buffer_queue: Arc<RwLock<BufferQueue>>,
     hid_shm_handle: u32,
     hid_guest_addr: Arc<AtomicU64>,
+    gpu: Arc<GpuContext>,
 ) -> Result<()> {
     use ruzu_cpu::interpreter::Interpreter;
     use ruzu_cpu::state::{CpuExecutor, HaltReason};
@@ -942,6 +946,19 @@ fn run_with_window(
         }
 
         kernel.current_thread_idx = None;
+
+        // ── Flush GPU command queue ─────────────────────────────────────
+        {
+            let process = kernel.process();
+            if let Some(p) = process {
+                let mem = &p.memory;
+                gpu.flush(&|addr, buf| {
+                    for (i, byte) in buf.iter_mut().enumerate() {
+                        *byte = mem.read_u8(addr + i as u64).unwrap_or(0);
+                    }
+                });
+            }
+        }
 
         // ── Present framebuffer ─────────────────────────────────────────
         {

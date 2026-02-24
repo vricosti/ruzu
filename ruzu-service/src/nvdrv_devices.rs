@@ -5,11 +5,46 @@
 //! `/dev/nvhost-gpu`, and `/dev/nvhost-ctrl`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ruzu_gpu::command_processor::GpEntry;
+use ruzu_gpu::gpu_context::GpuContext;
 
 /// Trait for an NVIDIA device that handles ioctl commands.
 pub trait NvDevice: Send + Sync {
     fn name(&self) -> &str;
     fn ioctl(&mut self, cmd: u32, input: &[u8], output: &mut [u8]) -> u32;
+}
+
+// ── Helper functions ────────────────────────────────────────────────────────
+
+fn read_u32(buf: &[u8], offset: usize) -> u32 {
+    if offset + 4 <= buf.len() {
+        u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    } else {
+        0
+    }
+}
+
+fn read_u64(buf: &[u8], offset: usize) -> u64 {
+    if offset + 8 <= buf.len() {
+        u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
+    } else {
+        0
+    }
+}
+
+fn write_u32(buf: &mut [u8], offset: usize, val: u32) {
+    if offset + 4 <= buf.len() {
+        buf[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+    }
+}
+
+fn write_u64(buf: &mut [u8], offset: usize, val: u64) {
+    if offset + 8 <= buf.len() {
+        buf[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
+    }
 }
 
 // ── NvMap device (/dev/nvmap) ───────────────────────────────────────────────
@@ -38,28 +73,6 @@ impl NvMap {
             next_id: 1,
         }
     }
-
-    fn read_u32(buf: &[u8], offset: usize) -> u32 {
-        if offset + 4 <= buf.len() {
-            u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
-        } else {
-            0
-        }
-    }
-
-    fn read_u64(buf: &[u8], offset: usize) -> u64 {
-        if offset + 8 <= buf.len() {
-            u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
-        } else {
-            0
-        }
-    }
-
-    fn write_u32(buf: &mut [u8], offset: usize, val: u32) {
-        if offset + 4 <= buf.len() {
-            buf[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
-        }
-    }
 }
 
 impl Default for NvMap {
@@ -74,13 +87,12 @@ impl NvDevice for NvMap {
     }
 
     fn ioctl(&mut self, cmd: u32, input: &[u8], output: &mut [u8]) -> u32 {
-        // Extract ioctl number from the command (bits [7:0] of the 3rd byte).
         let ioctl_nr = cmd & 0xFF;
 
         match ioctl_nr {
             // Create: input {size: u32}, output {handle: u32}
             1 => {
-                let size = Self::read_u32(input, 0);
+                let size = read_u32(input, 0);
                 let handle = self.next_handle;
                 self.next_handle += 1;
                 let id = self.next_id;
@@ -98,13 +110,13 @@ impl NvDevice for NvMap {
                 );
 
                 log::debug!("nvmap: Create size=0x{:X} -> handle={}", size, handle);
-                Self::write_u32(output, 0, handle);
+                write_u32(output, 0, handle);
                 0
             }
 
             // FromId: input {id: u32}, output {handle: u32}
             3 => {
-                let id = Self::read_u32(input, 0);
+                let id = read_u32(input, 0);
                 let handle = self
                     .handles
                     .iter()
@@ -112,19 +124,19 @@ impl NvDevice for NvMap {
                     .map(|(&k, _)| k);
                 if let Some(handle) = handle {
                     log::debug!("nvmap: FromId id={} -> handle={}", id, handle);
-                    Self::write_u32(output, 0, handle);
+                    write_u32(output, 0, handle);
                 } else {
                     log::warn!("nvmap: FromId id={} not found", id);
-                    Self::write_u32(output, 0, 0);
+                    write_u32(output, 0, 0);
                 }
                 0
             }
 
             // Alloc: input {handle, heap_mask, flags, align, kind, pad, addr}
             4 => {
-                let handle = Self::read_u32(input, 0);
-                let align = Self::read_u32(input, 12);
-                let addr = Self::read_u64(input, 20);
+                let handle = read_u32(input, 0);
+                let align = read_u32(input, 12);
+                let addr = read_u64(input, 20);
 
                 if let Some(h) = self.handles.get_mut(&handle) {
                     if align > 0 {
@@ -146,8 +158,8 @@ impl NvDevice for NvMap {
 
             // Param: input {handle, param_type}, output {value}
             9 => {
-                let handle = Self::read_u32(input, 0);
-                let param_type = Self::read_u32(input, 4);
+                let handle = read_u32(input, 0);
+                let param_type = read_u32(input, 4);
 
                 let value = if let Some(h) = self.handles.get(&handle) {
                     match param_type {
@@ -176,18 +188,18 @@ impl NvDevice for NvMap {
                     param_type,
                     value
                 );
-                Self::write_u32(output, 0, value);
+                write_u32(output, 0, value);
                 0
             }
 
             // GetId: input {handle}, output {id}
             14 => {
                 // Input layout: {pad: u32, handle: u32} — id goes in first word of output
-                let handle = Self::read_u32(input, 4);
+                let handle = read_u32(input, 4);
                 let id = self.handles.get(&handle).map(|h| h.id).unwrap_or(0);
                 log::debug!("nvmap: GetId handle={} -> id={}", handle, id);
-                Self::write_u32(output, 0, id);
-                Self::write_u32(output, 4, handle);
+                write_u32(output, 0, id);
+                write_u32(output, 4, handle);
                 0
             }
 
@@ -201,34 +213,16 @@ impl NvDevice for NvMap {
 
 // ── NvHostAsGpu device (/dev/nvhost-as-gpu) ─────────────────────────────────
 
-/// `/dev/nvhost-as-gpu` — GPU address space management (stubs).
+/// `/dev/nvhost-as-gpu` — GPU address space management.
+///
+/// Routes MapBufferEx to the GPU memory manager for real VA mapping.
 pub struct NvHostAsGpu {
-    next_offset: u64,
+    gpu: Arc<GpuContext>,
 }
 
 impl NvHostAsGpu {
-    pub fn new() -> Self {
-        Self {
-            next_offset: 0x0400_0000, // Start GPU VA allocations at 64 MB
-        }
-    }
-
-    fn write_u32(buf: &mut [u8], offset: usize, val: u32) {
-        if offset + 4 <= buf.len() {
-            buf[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
-        }
-    }
-
-    fn write_u64(buf: &mut [u8], offset: usize, val: u64) {
-        if offset + 8 <= buf.len() {
-            buf[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
-        }
-    }
-}
-
-impl Default for NvHostAsGpu {
-    fn default() -> Self {
-        Self::new()
+    pub fn new(gpu: Arc<GpuContext>) -> Self {
+        Self { gpu }
     }
 }
 
@@ -237,7 +231,7 @@ impl NvDevice for NvHostAsGpu {
         "/dev/nvhost-as-gpu"
     }
 
-    fn ioctl(&mut self, cmd: u32, _input: &[u8], output: &mut [u8]) -> u32 {
+    fn ioctl(&mut self, cmd: u32, input: &[u8], output: &mut [u8]) -> u32 {
         let ioctl_nr = cmd & 0xFF;
 
         match ioctl_nr {
@@ -248,20 +242,47 @@ impl NvDevice for NvHostAsGpu {
             }
 
             // MapBufferEx (6): Map nvmap handle to GPU VA.
+            // Input: {flags: u32, kind: u32, nvmap_handle: u32, page_size: u32,
+            //         buffer_offset: u64, mapping_size: u64, offset: u64}
             6 => {
-                let offset = self.next_offset;
-                self.next_offset += 0x10000; // Increment by 64 KB
+                let flags = read_u32(input, 0);
+                let nvmap_handle = read_u32(input, 8);
+                let buffer_offset = read_u64(input, 16);
+                let mapping_size = read_u64(input, 24);
+                let fixed_offset = read_u64(input, 32);
+
+                let is_fixed = (flags & 1) != 0;
+                let size = if mapping_size > 0 { mapping_size } else { 0x10000 };
+
+                // For now, use the buffer_offset as the CPU address hint.
+                // Real implementation would look up the nvmap handle's address.
+                let cpu_addr = buffer_offset;
+
+                let mut mm = self.gpu.memory_manager.write();
+                let gpu_va = if is_fixed && fixed_offset != 0 {
+                    mm.alloc_fixed(fixed_offset, cpu_addr, size);
+                    fixed_offset
+                } else {
+                    mm.alloc_any(cpu_addr, size)
+                };
+
                 log::debug!(
-                    "nvhost-as-gpu: MapBufferEx -> offset=0x{:X}",
-                    offset
+                    "nvhost-as-gpu: MapBufferEx handle={} size=0x{:X} -> gpu_va=0x{:X}",
+                    nvmap_handle,
+                    size,
+                    gpu_va
                 );
-                Self::write_u64(output, 0, offset);
+                write_u64(output, 0, gpu_va);
                 0
             }
 
             // UnmapBuffer (5)
             5 => {
-                log::debug!("nvhost-as-gpu: UnmapBuffer");
+                let offset = read_u64(input, 0);
+                log::debug!("nvhost-as-gpu: UnmapBuffer offset=0x{:X}", offset);
+                // Unmap a page — real implementation would track the mapping size.
+                let mut mm = self.gpu.memory_manager.write();
+                mm.unmap(offset, 0x10000);
                 0
             }
 
@@ -274,13 +295,13 @@ impl NvDevice for NvHostAsGpu {
             // GetVARegions (8)
             8 => {
                 log::debug!("nvhost-as-gpu: GetVARegions");
-                // Return two VA regions: small page + big page
-                Self::write_u64(output, 0, 0x0400_0000); // offset
-                Self::write_u32(output, 8, 0x1000);       // page_size (4 KB)
-                Self::write_u32(output, 12, 0x3800);      // pages
-                Self::write_u64(output, 16, 0x0400_0000); // offset2
-                Self::write_u32(output, 24, 0x10000);     // page_size (64 KB)
-                Self::write_u32(output, 28, 0x1);         // pages
+                // Return two VA regions: small page + big page.
+                write_u64(output, 0, 0x0400_0000);  // offset
+                write_u32(output, 8, 0x1000);         // page_size (4 KB)
+                write_u32(output, 12, 0x3800);        // pages
+                write_u64(output, 16, 0x0400_0000);  // offset2
+                write_u32(output, 24, 0x10000);       // page_size (64 KB)
+                write_u32(output, 28, 0x1);           // pages
                 0
             }
 
@@ -294,24 +315,16 @@ impl NvDevice for NvHostAsGpu {
 
 // ── NvHostGpu device (/dev/nvhost-gpu) ──────────────────────────────────────
 
-/// `/dev/nvhost-gpu` — GPU channel management (stubs).
-pub struct NvHostGpu;
-
-impl NvHostGpu {
-    pub fn new() -> Self {
-        Self
-    }
-
-    fn write_u32(buf: &mut [u8], offset: usize, val: u32) {
-        if offset + 4 <= buf.len() {
-            buf[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
-        }
-    }
+/// `/dev/nvhost-gpu` — GPU channel management.
+///
+/// Routes SubmitGpfifo to the GpuContext GPFIFO queue.
+pub struct NvHostGpu {
+    gpu: Arc<GpuContext>,
 }
 
-impl Default for NvHostGpu {
-    fn default() -> Self {
-        Self::new()
+impl NvHostGpu {
+    pub fn new(gpu: Arc<GpuContext>) -> Self {
+        Self { gpu }
     }
 }
 
@@ -320,7 +333,7 @@ impl NvDevice for NvHostGpu {
         "/dev/nvhost-gpu"
     }
 
-    fn ioctl(&mut self, cmd: u32, _input: &[u8], output: &mut [u8]) -> u32 {
+    fn ioctl(&mut self, cmd: u32, input: &[u8], output: &mut [u8]) -> u32 {
         let ioctl_nr = cmd & 0xFF;
 
         match ioctl_nr {
@@ -330,12 +343,50 @@ impl NvDevice for NvHostGpu {
                 0
             }
 
+            // SubmitGpfifo (8)
+            // Input: {gpfifo_addr: u64, num_entries: u32, flags: u32, fence: {id, value}}
+            // Each GPFIFO entry is 8 bytes (entry0: u32, entry1: u32).
+            8 => {
+                let num_entries = read_u32(input, 8) as usize;
+                let fence_id = read_u32(input, 16);
+
+                log::debug!(
+                    "nvhost-gpu: SubmitGpfifo entries={}, fence_id={}",
+                    num_entries,
+                    fence_id
+                );
+
+                // GPFIFO entries follow after the header (offset 24).
+                let entries_offset = 24;
+                let mut entries = Vec::with_capacity(num_entries);
+                for i in 0..num_entries {
+                    let off = entries_offset + i * 8;
+                    let entry0 = read_u32(input, off);
+                    let entry1 = read_u32(input, off + 4);
+                    entries.push(GpEntry { entry0, entry1 });
+                }
+
+                self.gpu.submit_gpfifo(entries);
+
+                // Increment the fence syncpoint and return the new value.
+                let new_value = if (fence_id as usize) < ruzu_gpu::syncpoint::NUM_SYNCPOINTS {
+                    self.gpu.syncpoints.increment(fence_id)
+                } else {
+                    0
+                };
+
+                // Output: fence {id, value}
+                write_u32(output, 0, fence_id);
+                write_u32(output, 4, new_value);
+                0
+            }
+
             // AllocGPFIFOEx2 (0x1A)
             0x1A => {
                 log::debug!("nvhost-gpu: AllocGPFIFOEx2");
                 // Return dummy fence: id=0, value=0
-                Self::write_u32(output, 0, 0); // fence id
-                Self::write_u32(output, 4, 0); // fence value
+                write_u32(output, 0, 0);
+                write_u32(output, 4, 0);
                 0
             }
 
@@ -351,8 +402,6 @@ impl NvDevice for NvHostGpu {
                 0
             }
 
-            // GetCharacteristics (0x1)
-            // Note: Some homebrew may call this with a different cmd encoding
             _ => {
                 log::warn!("nvhost-gpu: unknown ioctl_nr={}", ioctl_nr);
                 0
@@ -363,18 +412,16 @@ impl NvDevice for NvHostGpu {
 
 // ── NvHostCtrl device (/dev/nvhost-ctrl) ────────────────────────────────────
 
-/// `/dev/nvhost-ctrl` — Syncpoint management (stubs).
-pub struct NvHostCtrl;
-
-impl NvHostCtrl {
-    pub fn new() -> Self {
-        Self
-    }
+/// `/dev/nvhost-ctrl` — Syncpoint management.
+///
+/// Routes syncpoint queries and waits to the SyncpointManager.
+pub struct NvHostCtrl {
+    gpu: Arc<GpuContext>,
 }
 
-impl Default for NvHostCtrl {
-    fn default() -> Self {
-        Self::new()
+impl NvHostCtrl {
+    pub fn new(gpu: Arc<GpuContext>) -> Self {
+        Self { gpu }
     }
 }
 
@@ -383,23 +430,94 @@ impl NvDevice for NvHostCtrl {
         "/dev/nvhost-ctrl"
     }
 
-    fn ioctl(&mut self, cmd: u32, _input: &[u8], _output: &mut [u8]) -> u32 {
+    fn ioctl(&mut self, cmd: u32, input: &[u8], output: &mut [u8]) -> u32 {
         let ioctl_nr = cmd & 0xFF;
-        log::debug!("nvhost-ctrl: ioctl_nr={}", ioctl_nr);
-        0
+
+        match ioctl_nr {
+            // SyncpointRead (1): input {id: u32}, output {value: u32}
+            1 => {
+                let id = read_u32(input, 0);
+                let value = self.gpu.syncpoints.get_value(id);
+                log::debug!("nvhost-ctrl: SyncpointRead id={} -> value={}", id, value);
+                write_u32(output, 0, value);
+                0
+            }
+
+            // SyncpointIncr (2): input {id: u32}
+            2 => {
+                let id = read_u32(input, 0);
+                let new_val = self.gpu.syncpoints.increment(id);
+                log::debug!("nvhost-ctrl: SyncpointIncr id={} -> value={}", id, new_val);
+                0
+            }
+
+            // SyncpointWait (3): input {id: u32, threshold: u32, timeout_ms: i32}
+            3 => {
+                let id = read_u32(input, 0);
+                let threshold = read_u32(input, 4);
+                let timeout_ms = read_u32(input, 8) as i32;
+
+                let timeout = if timeout_ms < 0 {
+                    Duration::from_secs(3600) // "infinite" timeout
+                } else {
+                    Duration::from_millis(timeout_ms as u64)
+                };
+
+                log::debug!(
+                    "nvhost-ctrl: SyncpointWait id={}, threshold={}, timeout={}ms",
+                    id,
+                    threshold,
+                    timeout_ms
+                );
+
+                let reached = self.gpu.syncpoints.wait(id, threshold, timeout);
+                if reached {
+                    let value = self.gpu.syncpoints.get_value(id);
+                    write_u32(output, 0, value);
+                    0
+                } else {
+                    // Timeout — return EAGAIN-like error code.
+                    write_u32(output, 0, self.gpu.syncpoints.get_value(id));
+                    5 // NvError_Timeout
+                }
+            }
+
+            // EventWait (4) / EventWaitAsync (5) — simplified: just check syncpoint
+            4 | 5 => {
+                let id = read_u32(input, 0);
+                let threshold = read_u32(input, 4);
+                let value = self.gpu.syncpoints.get_value(id);
+
+                log::debug!(
+                    "nvhost-ctrl: EventWait id={}, threshold={}, current={}",
+                    id,
+                    threshold,
+                    value
+                );
+
+                write_u32(output, 0, value);
+                0
+            }
+
+            _ => {
+                log::debug!("nvhost-ctrl: ioctl_nr={}", ioctl_nr);
+                0
+            }
+        }
     }
 }
 
 // ── Factory function ────────────────────────────────────────────────────────
 
 /// Create an NvDevice from a device path name.
-pub fn create_device(path: &str) -> Option<Box<dyn NvDevice>> {
+///
+/// Devices that need GPU access receive a shared reference to the GpuContext.
+pub fn create_device(path: &str, gpu: Arc<GpuContext>) -> Option<Box<dyn NvDevice>> {
     match path {
         "/dev/nvmap" => Some(Box::new(NvMap::new())),
-        "/dev/nvhost-as-gpu" => Some(Box::new(NvHostAsGpu::new())),
-        "/dev/nvhost-gpu" => Some(Box::new(NvHostGpu::new())),
-        "/dev/nvhost-ctrl" => Some(Box::new(NvHostCtrl::new())),
-        "/dev/nvhost-ctrl-gpu" => Some(Box::new(NvHostCtrl::new())),
+        "/dev/nvhost-as-gpu" => Some(Box::new(NvHostAsGpu::new(gpu))),
+        "/dev/nvhost-gpu" => Some(Box::new(NvHostGpu::new(gpu.clone()))),
+        "/dev/nvhost-ctrl" | "/dev/nvhost-ctrl-gpu" => Some(Box::new(NvHostCtrl::new(gpu))),
         _ => {
             log::warn!("nvdrv: unknown device path \"{}\"", path);
             None
@@ -412,6 +530,10 @@ pub fn create_device(path: &str) -> Option<Box<dyn NvDevice>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_gpu() -> Arc<GpuContext> {
+        Arc::new(GpuContext::new())
+    }
 
     #[test]
     fn test_nvmap_create_and_param() {
@@ -484,8 +606,9 @@ mod tests {
 
     #[test]
     fn test_nvhost_as_gpu_map() {
-        let mut dev = NvHostAsGpu::new();
-        let input = [0u8; 32];
+        let gpu = test_gpu();
+        let mut dev = NvHostAsGpu::new(gpu);
+        let input = [0u8; 64];
         let mut output = [0u8; 32];
 
         // MapBufferEx should return a monotonically increasing offset.
@@ -502,11 +625,71 @@ mod tests {
 
     #[test]
     fn test_create_device_known_paths() {
-        assert!(create_device("/dev/nvmap").is_some());
-        assert!(create_device("/dev/nvhost-as-gpu").is_some());
-        assert!(create_device("/dev/nvhost-gpu").is_some());
-        assert!(create_device("/dev/nvhost-ctrl").is_some());
-        assert!(create_device("/dev/nvhost-ctrl-gpu").is_some());
-        assert!(create_device("/dev/unknown").is_none());
+        let gpu = test_gpu();
+        assert!(create_device("/dev/nvmap", gpu.clone()).is_some());
+        assert!(create_device("/dev/nvhost-as-gpu", gpu.clone()).is_some());
+        assert!(create_device("/dev/nvhost-gpu", gpu.clone()).is_some());
+        assert!(create_device("/dev/nvhost-ctrl", gpu.clone()).is_some());
+        assert!(create_device("/dev/nvhost-ctrl-gpu", gpu.clone()).is_some());
+        assert!(create_device("/dev/unknown", gpu).is_none());
+    }
+
+    #[test]
+    fn test_nvhost_gpu_submit_gpfifo() {
+        let gpu = test_gpu();
+        let mut dev = NvHostGpu::new(gpu.clone());
+
+        // Build SubmitGpfifo input: {gpfifo_addr: u64, num_entries: u32, flags: u32,
+        //                            fence: {id: u32, value: u32}, entries...}
+        let mut input = [0u8; 64];
+        write_u64(&mut input, 0, 0); // gpfifo_addr (unused, entries inline)
+        write_u32(&mut input, 8, 1); // num_entries = 1
+        write_u32(&mut input, 12, 0); // flags
+        write_u32(&mut input, 16, 0); // fence id = 0
+        write_u32(&mut input, 20, 0); // fence value
+        // Entry at offset 24
+        write_u32(&mut input, 24, 0x1000); // entry0
+        write_u32(&mut input, 28, 0); // entry1
+
+        let mut output = [0u8; 16];
+        let rc = dev.ioctl(8, &input, &mut output);
+        assert_eq!(rc, 0);
+
+        // Fence syncpoint should have been incremented.
+        assert_eq!(gpu.syncpoints.get_value(0), 1);
+    }
+
+    #[test]
+    fn test_nvhost_ctrl_syncpoint_read() {
+        let gpu = test_gpu();
+        gpu.syncpoints.increment(5);
+        gpu.syncpoints.increment(5);
+
+        let mut dev = NvHostCtrl::new(gpu);
+        let mut input = [0u8; 4];
+        write_u32(&mut input, 0, 5); // syncpoint id = 5
+        let mut output = [0u8; 4];
+
+        let rc = dev.ioctl(1, &input, &mut output);
+        assert_eq!(rc, 0);
+        let value = u32::from_le_bytes(output[0..4].try_into().unwrap());
+        assert_eq!(value, 2);
+    }
+
+    #[test]
+    fn test_nvhost_ctrl_syncpoint_wait_already_reached() {
+        let gpu = test_gpu();
+        gpu.syncpoints.increment(3);
+        gpu.syncpoints.increment(3);
+
+        let mut dev = NvHostCtrl::new(gpu);
+        let mut input = [0u8; 12];
+        write_u32(&mut input, 0, 3); // id
+        write_u32(&mut input, 4, 1); // threshold
+        write_u32(&mut input, 8, 100); // timeout_ms
+        let mut output = [0u8; 4];
+
+        let rc = dev.ioctl(3, &input, &mut output);
+        assert_eq!(rc, 0); // Should succeed immediately.
     }
 }

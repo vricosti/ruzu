@@ -897,6 +897,7 @@ dependencies = [
  "log",
  "parking_lot",
  "ruzu-common",
+ "ruzu-gpu",
  "ruzu-kernel",
  "thiserror",
 ]
