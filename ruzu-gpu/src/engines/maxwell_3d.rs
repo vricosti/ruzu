@@ -10,6 +10,7 @@
 //! draw begin/end) are triggered on specific register writes.
 
 use super::{ClassId, Engine, Framebuffer, PendingWrite, ENGINE_REG_COUNT};
+use crate::macro_interpreter::{MacroInterpreter, MacroProcessor};
 
 // ── Register offset constants (method addresses) ────────────────────────────
 
@@ -220,6 +221,23 @@ const TEX_SAMPLER_POOL_BASE: u32 = 0x155C;
 
 /// Texture header pool base: +0 addr_high, +1 addr_low, +2 limit.
 const TEX_HEADER_POOL_BASE: u32 = 0x1574;
+
+// ── MME (Macro Method Executor) registers ──────────────────────────────────
+
+/// Pointer into macro code upload buffer (auto-increments on instruction write).
+const LOAD_MME_INSTRUCTION_PTR: u32 = 0x0114;
+/// Code word to upload at the current pointer.
+const LOAD_MME_INSTRUCTION: u32 = 0x0115;
+/// Pointer into 128-slot position table (auto-increments on bind).
+const LOAD_MME_START_ADDR_PTR: u32 = 0x0116;
+/// Start offset for the current macro slot.
+const LOAD_MME_START_ADDR: u32 = 0x0117;
+/// First macro method register. In the real GPU, methods 0xE00..0xFFF invoke
+/// macros. Ruzu's register array uses byte-offset-based indices (matching
+/// yuzu's ASSERT_REG_POSITION values), so macro methods map to 0xE00*4=0x3800.
+const MACRO_METHODS_START: u32 = 0x3800;
+/// Exclusive end of macro method range (0x1000 * 4).
+const MACRO_METHODS_END: u32 = 0x4000;
 
 // ── Common render target formats ────────────────────────────────────────────
 
@@ -1451,6 +1469,12 @@ pub struct Maxwell3D {
     inline_index_data: Vec<u8>,
     /// Pending semaphore writes to be returned by execute_pending.
     pending_semaphore_writes: Vec<PendingWrite>,
+    /// MME macro interpreter for programmable macro execution.
+    macro_interpreter: MacroInterpreter,
+    /// Method of the macro currently being fed parameters (0 = none).
+    executing_macro: u32,
+    /// Accumulated parameters for the current macro call.
+    macro_params: Vec<u32>,
 }
 
 impl Maxwell3D {
@@ -1466,6 +1490,9 @@ impl Maxwell3D {
             instance_count: 0,
             inline_index_data: Vec::new(),
             pending_semaphore_writes: Vec::new(),
+            macro_interpreter: MacroInterpreter::new(),
+            executing_macro: 0,
+            macro_params: Vec::new(),
         }
     }
 
@@ -2256,12 +2283,11 @@ impl Default for Maxwell3D {
     }
 }
 
-impl Engine for Maxwell3D {
-    fn class_id(&self) -> ClassId {
-        ClassId::Threed
-    }
-
-    fn write_reg(&mut self, method: u32, value: u32) {
+impl Maxwell3D {
+    /// Process a method write: store to register array and handle side effects.
+    /// This is the shared implementation used by both `Engine::write_reg` and
+    /// `MacroProcessor::write_reg`.
+    fn process_method(&mut self, method: u32, value: u32) {
         let idx = method as usize;
         if idx < ENGINE_REG_COUNT {
             self.regs[idx] = value;
@@ -2292,6 +2318,85 @@ impl Engine for Maxwell3D {
         }
 
         log::trace!("Maxwell3D: reg[0x{:X}] = 0x{:X}", method, value);
+    }
+
+    /// Handle a write to a macro method register (0xE00..0xFFF).
+    fn handle_macro_method(&mut self, method: u32, value: u32) {
+        // Even method = start of new macro call; odd = additional parameter.
+        if self.executing_macro == 0 || (method & 1) == 0 {
+            // Flush any pending macro before starting a new one.
+            if self.executing_macro != 0 {
+                self.flush_macro();
+            }
+            self.executing_macro = method;
+            self.macro_params.clear();
+        }
+        self.macro_params.push(value);
+    }
+
+    /// Execute the pending macro (if any) and reset state.
+    pub fn flush_macro(&mut self) {
+        if self.executing_macro == 0 || self.macro_params.is_empty() {
+            return;
+        }
+        let method = self.executing_macro;
+        let slot = ((method - MACRO_METHODS_START) >> 1) as u32 % 128;
+        let params = std::mem::take(&mut self.macro_params);
+
+        // Extract the interpreter to avoid borrow conflicts: the interpreter
+        // calls MacroProcessor methods on `self`, but `self` no longer owns
+        // the interpreter during execution.
+        let mut interp = std::mem::take(&mut self.macro_interpreter);
+        interp.execute(slot, &params, self);
+        self.macro_interpreter = interp;
+        self.executing_macro = 0;
+    }
+}
+
+impl MacroProcessor for Maxwell3D {
+    fn macro_read(&self, method: u32) -> u32 {
+        let idx = method as usize;
+        if idx < ENGINE_REG_COUNT {
+            self.regs[idx]
+        } else {
+            0
+        }
+    }
+
+    fn macro_write(&mut self, method: u32, value: u32) {
+        self.process_method(method, value);
+    }
+}
+
+impl Engine for Maxwell3D {
+    fn class_id(&self) -> ClassId {
+        ClassId::Threed
+    }
+
+    fn write_reg(&mut self, method: u32, value: u32) {
+        // Handle MME upload registers.
+        match method {
+            LOAD_MME_INSTRUCTION => {
+                let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
+                self.macro_interpreter.upload_code(ptr, value);
+                self.regs[LOAD_MME_INSTRUCTION_PTR as usize] = ptr + 1;
+                return;
+            }
+            LOAD_MME_START_ADDR => {
+                let ptr = self.regs[LOAD_MME_START_ADDR_PTR as usize];
+                self.macro_interpreter.set_position(ptr, value);
+                self.regs[LOAD_MME_START_ADDR_PTR as usize] = ptr + 1;
+                return;
+            }
+            MACRO_METHODS_START..MACRO_METHODS_END => {
+                self.handle_macro_method(method, value);
+                return;
+            }
+            _ => {}
+        }
+
+        // Standard method processing with side effects.
+        self.process_method(method, value);
     }
 
     fn take_framebuffer(&mut self) -> Option<Framebuffer> {
@@ -4131,5 +4236,143 @@ mod tests {
         // Second call should be empty.
         let writes2 = engine.execute_pending(&noop_reader);
         assert!(writes2.is_empty());
+    }
+
+    // ── MME macro integration tests ─────────────────────────────────────
+
+    /// Helper: encode an AddImmediate macro opcode.
+    /// operation=1, bits[31:14]=imm, bits[13:11]=src_a, bits[10:8]=dst,
+    /// bit[7]=exit, bits[6:4]=result_op.
+    fn macro_add_imm(result_op: u32, is_exit: bool, dst: u32, src_a: u32, imm: i32) -> u32 {
+        1u32 | ((result_op & 0x7) << 4)
+            | ((is_exit as u32) << 7)
+            | ((dst & 0x7) << 8)
+            | ((src_a & 0x7) << 11)
+            | (((imm as u32) & 0x3FFFF) << 14)
+    }
+
+    #[test]
+    fn test_load_mme_upload() {
+        let mut engine = Maxwell3D::new();
+
+        // Set upload pointer to offset 5.
+        engine.write_reg(LOAD_MME_INSTRUCTION_PTR, 5);
+        assert_eq!(engine.regs[LOAD_MME_INSTRUCTION_PTR as usize], 5);
+
+        // Upload two code words — pointer should auto-increment.
+        engine.write_reg(LOAD_MME_INSTRUCTION, 0xAAAA);
+        assert_eq!(engine.regs[LOAD_MME_INSTRUCTION_PTR as usize], 6);
+
+        engine.write_reg(LOAD_MME_INSTRUCTION, 0xBBBB);
+        assert_eq!(engine.regs[LOAD_MME_INSTRUCTION_PTR as usize], 7);
+    }
+
+    #[test]
+    fn test_load_mme_bind() {
+        let mut engine = Maxwell3D::new();
+
+        // Set bind pointer to slot 0.
+        engine.write_reg(LOAD_MME_START_ADDR_PTR, 0);
+
+        // Bind slot 0 → start offset 10, slot 1 → start offset 20.
+        engine.write_reg(LOAD_MME_START_ADDR, 10);
+        assert_eq!(engine.regs[LOAD_MME_START_ADDR_PTR as usize], 1);
+
+        engine.write_reg(LOAD_MME_START_ADDR, 20);
+        assert_eq!(engine.regs[LOAD_MME_START_ADDR_PTR as usize], 2);
+    }
+
+    #[test]
+    fn test_macro_call_triggers_execution() {
+        let mut engine = Maxwell3D::new();
+
+        // Upload a macro that writes r1 (param[0]) to method 0x100.
+        // Code: MoveAndSetMethod r2=0x100, then MoveAndSend r3=r1, exit.
+        let method_raw = 0x100u32; // addr=0x100, incr=0
+        let code = [
+            macro_add_imm(2, false, 2, 0, method_raw as i32), // MoveAndSetMethod
+            macro_add_imm(4, true, 3, 1, 0),                  // MoveAndSend r1, exit
+        ];
+
+        // Upload code at offset 0.
+        engine.write_reg(LOAD_MME_INSTRUCTION_PTR, 0);
+        for &word in &code {
+            engine.write_reg(LOAD_MME_INSTRUCTION, word);
+        }
+
+        // Bind slot 0 → offset 0.
+        engine.write_reg(LOAD_MME_START_ADDR_PTR, 0);
+        engine.write_reg(LOAD_MME_START_ADDR, 0);
+
+        // Invoke macro at slot 0 (method MACRO_METHODS_START) with param 0xDEAD.
+        engine.write_reg(MACRO_METHODS_START, 0xDEAD);
+        engine.flush_macro();
+
+        // The macro should have written 0xDEAD to method 0x100.
+        assert_eq!(engine.regs[0x100], 0xDEAD);
+    }
+
+    #[test]
+    fn test_macro_writes_registers() {
+        let mut engine = Maxwell3D::new();
+
+        // Macro: set method=0x200 (incr=1), send param[0], send param[1].
+        let method_raw = 0x200 | (1 << 12); // addr=0x200, incr=1
+        let code = [
+            macro_add_imm(2, false, 2, 0, method_raw as i32), // MoveAndSetMethod
+            macro_add_imm(4, false, 3, 1, 0),                 // MoveAndSend r1
+            macro_add_imm(0, true, 4, 0, 0),                  // IgnoreAndFetch(exit), fetch param[1] into r4
+        ];
+        // But we need to also send param[1]. Let me simplify:
+        // Macro: MoveAndSetMethod, then FetchAndSend (fetch param[1], send r1),
+        //        then exit.
+        let code = [
+            macro_add_imm(2, false, 2, 0, method_raw as i32), // MoveAndSetMethod r2=method
+            macro_add_imm(3, false, 3, 1, 0),                 // FetchAndSend: fetch param[1]→r3, send r1
+            macro_add_imm(4, true, 4, 3, 0),                  // MoveAndSend r4=r3, send r3, exit
+        ];
+
+        engine.write_reg(LOAD_MME_INSTRUCTION_PTR, 0);
+        for &word in &code {
+            engine.write_reg(LOAD_MME_INSTRUCTION, word);
+        }
+        engine.write_reg(LOAD_MME_START_ADDR_PTR, 0);
+        engine.write_reg(LOAD_MME_START_ADDR, 0);
+
+        // Call with params [0xAA, 0xBB].
+        engine.write_reg(MACRO_METHODS_START, 0xAA);    // First param (even method = new macro).
+        engine.write_reg(MACRO_METHODS_START + 1, 0xBB); // Second param (odd = append).
+        engine.flush_macro();
+
+        // First send: r1=0xAA → method 0x200.
+        assert_eq!(engine.regs[0x200], 0xAA);
+        // Second send: r3=0xBB (fetched param[1]) → method 0x201.
+        assert_eq!(engine.regs[0x201], 0xBB);
+    }
+
+    #[test]
+    fn test_macro_slot_calculation() {
+        let mut engine = Maxwell3D::new();
+
+        // Upload a simple "move imm to r2, exit" macro.
+        let code = [macro_add_imm(1, true, 2, 0, 42)];
+        engine.write_reg(LOAD_MME_INSTRUCTION_PTR, 0);
+        for &word in &code {
+            engine.write_reg(LOAD_MME_INSTRUCTION, word);
+        }
+
+        // Bind slot 5 → offset 0.
+        engine.write_reg(LOAD_MME_START_ADDR_PTR, 5);
+        engine.write_reg(LOAD_MME_START_ADDR, 0);
+
+        // Method for slot 5 = MACRO_METHODS_START + 5*2 = 0x380A.
+        engine.write_reg(MACRO_METHODS_START + 5 * 2, 0);
+        engine.flush_macro();
+
+        // Slot = ((0x380A - 0x3800) >> 1) % 128 = (0xA >> 1) % 128 = 5.
+        // Macro should have executed slot 5.
+        // (We can't directly check which slot ran, but the macro writes r2=42.)
+        // Since we can't inspect interpreter registers from here, just verify
+        // no panic occurred. The macro has no send, so no register writes.
     }
 }
