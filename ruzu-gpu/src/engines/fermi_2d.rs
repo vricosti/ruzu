@@ -6,7 +6,7 @@
 //! Handles 2D blitting operations (surface copies, fills). Detects blit
 //! trigger writes and logs parameters; actual pixel copy is not yet implemented.
 
-use super::{ClassId, Engine, ENGINE_REG_COUNT};
+use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 
 // ── Register constants (method = byte_offset / 4) ──────────────────────────
 
@@ -129,6 +129,58 @@ impl Engine for Fermi2D {
             self.handle_blit();
         }
     }
+
+    fn execute_pending(
+        &mut self,
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+    ) -> Vec<PendingWrite> {
+        if !self.pending_blit {
+            return vec![];
+        }
+        self.pending_blit = false;
+
+        let src_h = self.src_height();
+        let dst_h = self.dst_height();
+        let height = src_h.min(dst_h);
+        if height == 0 {
+            return vec![];
+        }
+
+        let sp = self.src_pitch();
+        let dp = self.dst_pitch();
+        let copy_width = sp.min(dp);
+        if copy_width == 0 {
+            return vec![];
+        }
+
+        // Read source surface.
+        let src_size = (sp as u64 * src_h as u64) as usize;
+        let mut src_buf = vec![0u8; src_size];
+        read_gpu(self.src_addr(), &mut src_buf);
+
+        // Build destination buffer line-by-line.
+        let dst_size = (dp as u64 * dst_h as u64) as usize;
+        let mut dst_buf = vec![0u8; dst_size];
+        for line in 0..height {
+            let src_off = (line * sp) as usize;
+            let dst_off = (line * dp) as usize;
+            let w = copy_width as usize;
+            if src_off + w <= src_buf.len() && dst_off + w <= dst_buf.len() {
+                dst_buf[dst_off..dst_off + w].copy_from_slice(&src_buf[src_off..src_off + w]);
+            }
+        }
+
+        log::debug!(
+            "Fermi2D: blit executed {}x{} (sp={} dp={} cw={}) src=0x{:X} -> dst=0x{:X}",
+            copy_width, height, sp, dp, copy_width,
+            self.src_addr(), self.dst_addr()
+        );
+
+        vec![PendingWrite {
+            gpu_va: self.dst_addr(),
+            data: dst_buf,
+        }]
+    }
 }
 
 #[cfg(test)]
@@ -198,5 +250,84 @@ mod tests {
         let mut eng = Fermi2D::new();
         eng.write_reg(0x100, 42); // Random register
         assert!(!eng.pending_blit);
+    }
+
+    #[test]
+    fn test_blit_copies_pixels() {
+        let mut eng = Fermi2D::new();
+
+        // Set up matching src/dst: 4x2, pitch=16 (4 pixels * 4 bytes).
+        eng.write_reg(SRC_ADDR_HIGH, 0);
+        eng.write_reg(SRC_ADDR_LOW, 0x1000);
+        eng.write_reg(SRC_WIDTH, 4);
+        eng.write_reg(SRC_HEIGHT, 2);
+        eng.write_reg(SRC_PITCH, 16);
+
+        eng.write_reg(DST_ADDR_HIGH, 0);
+        eng.write_reg(DST_ADDR_LOW, 0x2000);
+        eng.write_reg(DST_WIDTH, 4);
+        eng.write_reg(DST_HEIGHT, 2);
+        eng.write_reg(DST_PITCH, 16);
+
+        // Trigger blit.
+        eng.write_reg(BLIT_TRIGGER, 1);
+        assert!(eng.pending_blit);
+
+        // Source data: 2 rows of 16 bytes each.
+        let src_data: Vec<u8> = (0..32).collect();
+
+        let writes = eng.execute_pending(&|addr, buf| {
+            assert_eq!(addr, 0x1000);
+            let len = buf.len().min(src_data.len());
+            buf[..len].copy_from_slice(&src_data[..len]);
+        });
+
+        assert!(!eng.pending_blit);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].gpu_va, 0x2000);
+        assert_eq!(writes[0].data, src_data);
+    }
+
+    #[test]
+    fn test_blit_different_pitches() {
+        let mut eng = Fermi2D::new();
+
+        // Source: pitch=8, 2 rows.
+        eng.write_reg(SRC_ADDR_HIGH, 0);
+        eng.write_reg(SRC_ADDR_LOW, 0x1000);
+        eng.write_reg(SRC_WIDTH, 2);
+        eng.write_reg(SRC_HEIGHT, 2);
+        eng.write_reg(SRC_PITCH, 8);
+
+        // Destination: pitch=16 (wider stride), 2 rows.
+        eng.write_reg(DST_ADDR_HIGH, 0);
+        eng.write_reg(DST_ADDR_LOW, 0x2000);
+        eng.write_reg(DST_WIDTH, 4);
+        eng.write_reg(DST_HEIGHT, 2);
+        eng.write_reg(DST_PITCH, 16);
+
+        eng.write_reg(BLIT_TRIGGER, 1);
+
+        // Source: 2 rows * 8 bytes = 16 bytes.
+        let src_data: Vec<u8> = vec![
+            1, 2, 3, 4, 5, 6, 7, 8, // row 0
+            9, 10, 11, 12, 13, 14, 15, 16, // row 1
+        ];
+
+        let writes = eng.execute_pending(&|addr, buf| {
+            assert_eq!(addr, 0x1000);
+            let len = buf.len().min(src_data.len());
+            buf[..len].copy_from_slice(&src_data[..len]);
+        });
+
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].gpu_va, 0x2000);
+        // copy_width = min(8, 16) = 8; each row copies 8 bytes into a 16-byte stride.
+        let dst = &writes[0].data;
+        assert_eq!(dst.len(), 32); // 2 rows * 16 bytes
+        assert_eq!(&dst[0..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&dst[8..16], &[0, 0, 0, 0, 0, 0, 0, 0]); // padding
+        assert_eq!(&dst[16..24], &[9, 10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(&dst[24..32], &[0, 0, 0, 0, 0, 0, 0, 0]); // padding
     }
 }

@@ -86,6 +86,18 @@ pub struct FramebufferOutput {
     pub pixels: Vec<u8>,
 }
 
+/// Write-back from a GPU engine to GPU VA space (blit, DMA copy, etc.).
+pub struct GpuWriteBack {
+    pub gpu_va: u64,
+    pub data: Vec<u8>,
+}
+
+/// Output from a GPU flush — framebuffer + pending write-backs.
+pub struct FlushOutput {
+    pub framebuffer: Option<FramebufferOutput>,
+    pub write_backs: Vec<GpuWriteBack>,
+}
+
 /// Central GPU state shared between the service layer and the main loop.
 pub struct GpuContext {
     pub memory_manager: RwLock<GpuMemoryManager>,
@@ -128,9 +140,9 @@ impl GpuContext {
     /// Process all queued GPFIFO entries (called by the main loop each frame).
     ///
     /// `read_mem` reads bytes from a guest physical address into a buffer.
-    /// Returns framebuffer output if the GPU produced rendered pixels (e.g. from
-    /// a clear operation).
-    pub fn flush(&self, read_mem: &dyn Fn(u64, &mut [u8])) -> Option<FramebufferOutput> {
+    /// Returns flush output containing framebuffer data and pending write-backs
+    /// from engine operations (blit, DMA copy, etc.).
+    pub fn flush(&self, read_mem: &dyn Fn(u64, &mut [u8])) -> Option<FlushOutput> {
         let entries: Vec<GpEntry> = {
             let mut queue = self.gpfifo_queue.lock();
             std::mem::take(&mut *queue)
@@ -152,13 +164,28 @@ impl GpuContext {
 
         proc.process_entries(&entries, &gpu_read);
 
+        // Execute pending memory operations (blit, DMA copy).
+        let pending = proc.execute_pending_ops(&gpu_read);
+        let write_backs: Vec<GpuWriteBack> = pending
+            .into_iter()
+            .map(|pw| GpuWriteBack {
+                gpu_va: pw.gpu_va,
+                data: pw.data,
+            })
+            .collect();
+
         // Collect framebuffer output from engines.
         let framebuffers = proc.take_framebuffers();
-        framebuffers.into_iter().next().map(|fb| FramebufferOutput {
+        let framebuffer = framebuffers.into_iter().next().map(|fb| FramebufferOutput {
             gpu_va: fb.gpu_va,
             width: fb.width,
             height: fb.height,
             pixels: fb.pixels,
+        });
+
+        Some(FlushOutput {
+            framebuffer,
+            write_backs,
         })
     }
 }

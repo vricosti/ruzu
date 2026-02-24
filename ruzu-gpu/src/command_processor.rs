@@ -27,7 +27,7 @@
 //! | 28:16   | Method count / Immd data |
 //! | 31:29   | SecOp             |
 
-use crate::engines::{Engine, Framebuffer};
+use crate::engines::{Engine, Framebuffer, PendingWrite};
 
 /// A 64-bit GPFIFO entry.
 #[derive(Debug, Clone, Copy, Default)]
@@ -233,6 +233,18 @@ impl CommandProcessor {
             .collect()
     }
 
+    /// Execute pending memory operations on all engines (blit, DMA copy, etc.).
+    pub fn execute_pending_ops(
+        &mut self,
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+    ) -> Vec<PendingWrite> {
+        self.engines
+            .iter_mut()
+            .filter_map(|e| e.as_mut())
+            .flat_map(|e| e.execute_pending(read_gpu))
+            .collect()
+    }
+
     /// Dispatch a single register write to the appropriate engine.
     fn dispatch(&mut self, subchannel: u32, method: u32, value: u32) {
         let idx = subchannel as usize;
@@ -254,16 +266,21 @@ impl CommandProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::{ClassId, Engine};
+    use crate::engines::{ClassId, Engine, PendingWrite};
 
     /// Test engine that records register writes.
     struct RecordingEngine {
         writes: Vec<(u32, u32)>,
+        /// Pending writes to return from execute_pending (for testing).
+        mock_pending: Vec<PendingWrite>,
     }
 
     impl RecordingEngine {
         fn new() -> Self {
-            Self { writes: Vec::new() }
+            Self {
+                writes: Vec::new(),
+                mock_pending: Vec::new(),
+            }
         }
     }
 
@@ -273,6 +290,12 @@ mod tests {
         }
         fn write_reg(&mut self, method: u32, value: u32) {
             self.writes.push((method, value));
+        }
+        fn execute_pending(
+            &mut self,
+            _read_gpu: &dyn Fn(u64, &mut [u8]),
+        ) -> Vec<PendingWrite> {
+            std::mem::take(&mut self.mock_pending)
         }
     }
 
@@ -410,5 +433,32 @@ mod tests {
         let engine = unsafe { &*engine_ptr };
         assert_eq!(engine.writes.len(), 1);
         assert_eq!(engine.writes[0], (0x10, 0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn test_execute_pending_ops() {
+        let mut engine = Box::new(RecordingEngine::new());
+        engine.mock_pending = vec![
+            PendingWrite {
+                gpu_va: 0x5000,
+                data: vec![1, 2, 3, 4],
+            },
+            PendingWrite {
+                gpu_va: 0x6000,
+                data: vec![5, 6],
+            },
+        ];
+        let mut proc = CommandProcessor::new(vec![Some(engine)]);
+
+        let writes = proc.execute_pending_ops(&|_addr, _buf| {});
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].gpu_va, 0x5000);
+        assert_eq!(writes[0].data, vec![1, 2, 3, 4]);
+        assert_eq!(writes[1].gpu_va, 0x6000);
+        assert_eq!(writes[1].data, vec![5, 6]);
+
+        // Second call should return empty (mock_pending was drained).
+        let writes2 = proc.execute_pending_ops(&|_addr, _buf| {});
+        assert!(writes2.is_empty());
     }
 }
