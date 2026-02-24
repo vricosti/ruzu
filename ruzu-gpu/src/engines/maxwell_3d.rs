@@ -88,6 +88,87 @@ const DRAW_END: u32 = 0x1614;
 /// Draw begin: sets topology.
 const DRAW_BEGIN: u32 = 0x1615;
 
+// ── Depth/Stencil registers ─────────────────────────────────────────────────
+
+const DEPTH_MODE: u32 = 0x0D7C;
+const DEPTH_TEST_ENABLE: u32 = 0x12CC;
+const DEPTH_WRITE_ENABLE: u32 = 0x12E8;
+const DEPTH_TEST_FUNC: u32 = 0x130C;
+
+const STENCIL_ENABLE: u32 = 0x1380;
+const STENCIL_FRONT_OP_BASE: u32 = 0x1384;
+const STENCIL_FRONT_REF: u32 = 0x1394;
+const STENCIL_FRONT_FUNC_MASK: u32 = 0x1398;
+const STENCIL_FRONT_MASK: u32 = 0x139C;
+
+const STENCIL_TWO_SIDE_ENABLE: u32 = 0x1594;
+const STENCIL_BACK_OP_BASE: u32 = 0x1598;
+const STENCIL_BACK_REF: u32 = 0x0F54;
+const STENCIL_BACK_MASK: u32 = 0x0F58;
+const STENCIL_BACK_FUNC_MASK: u32 = 0x0F5C;
+
+// ── Blend registers ─────────────────────────────────────────────────────────
+
+/// 4 consecutive f32 registers: R, G, B, A blend constant color.
+const BLEND_COLOR_BASE: u32 = 0x131C;
+
+/// Global blend struct base.
+/// +0 separate_alpha, +1 color_op, +2 color_src, +3 color_dst,
+/// +4 alpha_op, +5 alpha_src, +6 (color_key), +7 alpha_dst,
+/// +8 single_rop_ctrl, +9..+16 enable[0..7]
+const BLEND_BASE: u32 = 0x133C;
+
+/// Whether per-target blend overrides are active.
+const BLEND_PER_TARGET_ENABLED: u32 = 0x12E4;
+
+/// Per-target blend base. 8 entries, stride 8.
+/// +0 sep_alpha, +1 color_op, +2 color_src, +3 color_dst,
+/// +4 alpha_op, +5 alpha_src, +6 alpha_dst
+const BLEND_PER_TARGET_BASE: u32 = 0x1E00;
+const BLEND_PER_TARGET_STRIDE: u32 = 8;
+
+// ── Rasterizer registers ────────────────────────────────────────────────────
+
+const POLYGON_MODE_FRONT: u32 = 0x0DAC;
+const POLYGON_MODE_BACK: u32 = 0x0DB0;
+const LINE_WIDTH_SMOOTH: u32 = 0x13B0;
+const LINE_WIDTH_ALIASED: u32 = 0x13B4;
+const SLOPE_SCALE_DEPTH_BIAS: u32 = 0x156C;
+const DEPTH_BIAS: u32 = 0x15BC;
+const DEPTH_BIAS_CLAMP: u32 = 0x187C;
+const CULL_TEST_ENABLE: u32 = 0x1918;
+const FRONT_FACE: u32 = 0x191C;
+const CULL_FACE: u32 = 0x1920;
+
+// ── Shader program registers ────────────────────────────────────────────────
+
+/// Program region base: addr_high at +0, addr_low at +1.
+const PROGRAM_REGION_BASE: u32 = 0x1608;
+
+// ── Constant buffer registers ───────────────────────────────────────────────
+
+/// CB config: +0 size, +1 addr_high, +2 addr_low, +3 offset.
+const CB_CONFIG_BASE: u32 = 0x2380;
+
+/// CB data: 16 words of inline push (0x2384..0x2393).
+const CB_DATA_BASE: u32 = 0x2384;
+const CB_DATA_END: u32 = 0x2394; // exclusive
+
+/// CB bind base. 5 stages, stride 8, trigger at +4.
+const CB_BIND_BASE: u32 = 0x2400;
+const CB_BIND_STRIDE: u32 = 8;
+/// CB bind trigger registers (one per shader stage).
+const CB_BIND_TRIGGER_0: u32 = 0x2404;
+const CB_BIND_TRIGGER_1: u32 = 0x240C;
+const CB_BIND_TRIGGER_2: u32 = 0x2414;
+const CB_BIND_TRIGGER_3: u32 = 0x241C;
+const CB_BIND_TRIGGER_4: u32 = 0x2424;
+
+/// Number of shader stages (vertex, tess ctrl, tess eval, geometry, fragment).
+const NUM_SHADER_STAGES: usize = 5;
+/// Maximum constant buffer slots per stage.
+const MAX_CB_SLOTS: usize = 18;
+
 // ── Common render target formats ────────────────────────────────────────────
 
 const RT_FORMAT_A8B8G8R8_UNORM: u32 = 0xD5;
@@ -175,6 +256,238 @@ impl IndexFormat {
     }
 }
 
+// ── Pipeline state enums ────────────────────────────────────────────────────
+
+/// Depth/stencil comparison function. Supports both D3D (1-8) and GL (0x200-0x207) encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComparisonOp {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
+}
+
+impl ComparisonOp {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            1 | 0x200 => Self::Never,
+            2 | 0x201 => Self::Less,
+            3 | 0x202 => Self::Equal,
+            4 | 0x203 => Self::LessEqual,
+            5 | 0x204 => Self::Greater,
+            6 | 0x205 => Self::NotEqual,
+            7 | 0x206 => Self::GreaterEqual,
+            8 | 0x207 => Self::Always,
+            _ => {
+                log::warn!("Maxwell3D: unknown ComparisonOp 0x{:X}, defaulting to Always", value);
+                Self::Always
+            }
+        }
+    }
+}
+
+/// Blend equation. Supports both D3D (1-5) and GL (0x8006-0x800B) encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendEquation {
+    Add,
+    Subtract,
+    ReverseSubtract,
+    Min,
+    Max,
+}
+
+impl BlendEquation {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            1 | 0x8006 => Self::Add,
+            2 | 0x800A => Self::Subtract,
+            3 | 0x800B => Self::ReverseSubtract,
+            4 | 0x8007 => Self::Min,
+            5 | 0x8008 => Self::Max,
+            _ => {
+                log::warn!("Maxwell3D: unknown BlendEquation 0x{:X}, defaulting to Add", value);
+                Self::Add
+            }
+        }
+    }
+}
+
+/// Blend factor. Supports both D3D (0x1-0x13) and GL (0x4000+) encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendFactor {
+    Zero,
+    One,
+    SrcColor,
+    OneMinusSrcColor,
+    SrcAlpha,
+    OneMinusSrcAlpha,
+    DstAlpha,
+    OneMinusDstAlpha,
+    DstColor,
+    OneMinusDstColor,
+    SrcAlphaSaturate,
+    Src1Color,
+    OneMinusSrc1Color,
+    Src1Alpha,
+    OneMinusSrc1Alpha,
+    ConstantColor,
+    OneMinusConstantColor,
+    ConstantAlpha,
+    OneMinusConstantAlpha,
+}
+
+impl BlendFactor {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0x01 | 0x4000 => Self::Zero,
+            0x02 | 0x4001 => Self::One,
+            0x03 | 0x4300 => Self::SrcColor,
+            0x04 | 0x4301 => Self::OneMinusSrcColor,
+            0x05 | 0x4302 => Self::SrcAlpha,
+            0x06 | 0x4303 => Self::OneMinusSrcAlpha,
+            0x07 | 0x4304 => Self::DstAlpha,
+            0x08 | 0x4305 => Self::OneMinusDstAlpha,
+            0x09 | 0x4306 => Self::DstColor,
+            0x0A | 0x4307 => Self::OneMinusDstColor,
+            0x0B | 0x4308 => Self::SrcAlphaSaturate,
+            0x0D | 0xC900 => Self::Src1Color,
+            0x0E | 0xC901 => Self::OneMinusSrc1Color,
+            0x0F | 0xC902 => Self::Src1Alpha,
+            0x10 | 0xC903 => Self::OneMinusSrc1Alpha,
+            0x11 | 0xC001 => Self::ConstantColor,
+            0x12 | 0xC002 => Self::OneMinusConstantColor,
+            0x13 | 0xC003 => Self::ConstantAlpha,
+            0x14 | 0xC004 => Self::OneMinusConstantAlpha,
+            _ => {
+                log::warn!("Maxwell3D: unknown BlendFactor 0x{:X}, defaulting to One", value);
+                Self::One
+            }
+        }
+    }
+}
+
+/// Stencil operation. Supports both D3D (1-8) and GL (0x0-0x8508) encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StencilOp {
+    Keep,
+    Zero,
+    Replace,
+    IncrSat,
+    DecrSat,
+    Invert,
+    Incr,
+    Decr,
+}
+
+impl StencilOp {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            1 | 0x1E00 => Self::Keep,
+            2 | 0x0000 => Self::Zero,
+            3 | 0x1E01 => Self::Replace,
+            4 | 0x1E02 => Self::IncrSat,
+            5 | 0x1E03 => Self::DecrSat,
+            6 | 0x150A => Self::Invert,
+            7 | 0x8507 => Self::Incr,
+            8 | 0x8508 => Self::Decr,
+            _ => {
+                log::warn!("Maxwell3D: unknown StencilOp 0x{:X}, defaulting to Keep", value);
+                Self::Keep
+            }
+        }
+    }
+}
+
+/// Cull face mode (GL encoding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CullFace {
+    Front,
+    Back,
+    FrontAndBack,
+}
+
+impl CullFace {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0x0404 => Self::Front,
+            0x0405 => Self::Back,
+            0x0408 => Self::FrontAndBack,
+            _ => {
+                log::warn!("Maxwell3D: unknown CullFace 0x{:X}, defaulting to Back", value);
+                Self::Back
+            }
+        }
+    }
+}
+
+/// Front face winding order (GL encoding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontFace {
+    CW,
+    CCW,
+}
+
+impl FrontFace {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0x0900 => Self::CW,
+            0x0901 => Self::CCW,
+            _ => {
+                log::warn!("Maxwell3D: unknown FrontFace 0x{:X}, defaulting to CCW", value);
+                Self::CCW
+            }
+        }
+    }
+}
+
+/// Polygon rasterization mode (GL encoding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolygonMode {
+    Point,
+    Line,
+    Fill,
+}
+
+impl PolygonMode {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0x1B00 => Self::Point,
+            0x1B01 => Self::Line,
+            0x1B02 => Self::Fill,
+            _ => {
+                log::warn!("Maxwell3D: unknown PolygonMode 0x{:X}, defaulting to Fill", value);
+                Self::Fill
+            }
+        }
+    }
+}
+
+/// Depth range mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthMode {
+    MinusOneToOne,
+    ZeroToOne,
+}
+
+impl DepthMode {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::MinusOneToOne,
+            1 => Self::ZeroToOne,
+            _ => {
+                log::warn!("Maxwell3D: unknown DepthMode {}, defaulting to ZeroToOne", value);
+                Self::ZeroToOne
+            }
+        }
+    }
+}
+
+// ── Info structs ────────────────────────────────────────────────────────────
+
 /// Information about an active vertex stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VertexStreamInfo {
@@ -205,6 +518,115 @@ pub struct ScissorInfo {
     pub max_y: u32,
 }
 
+/// Blend state for a single render target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendInfo {
+    pub enabled: bool,
+    pub separate_alpha: bool,
+    pub color_op: BlendEquation,
+    pub color_src: BlendFactor,
+    pub color_dst: BlendFactor,
+    pub alpha_op: BlendEquation,
+    pub alpha_src: BlendFactor,
+    pub alpha_dst: BlendFactor,
+}
+
+impl Default for BlendInfo {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            separate_alpha: false,
+            color_op: BlendEquation::Add,
+            color_src: BlendFactor::One,
+            color_dst: BlendFactor::Zero,
+            alpha_op: BlendEquation::Add,
+            alpha_src: BlendFactor::One,
+            alpha_dst: BlendFactor::Zero,
+        }
+    }
+}
+
+/// Blend constant color.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlendColorInfo {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+/// Stencil state for one face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilFaceInfo {
+    pub fail_op: StencilOp,
+    pub zfail_op: StencilOp,
+    pub zpass_op: StencilOp,
+    pub func: ComparisonOp,
+    pub ref_value: u32,
+    pub func_mask: u32,
+    pub write_mask: u32,
+}
+
+impl Default for StencilFaceInfo {
+    fn default() -> Self {
+        Self {
+            fail_op: StencilOp::Keep,
+            zfail_op: StencilOp::Keep,
+            zpass_op: StencilOp::Keep,
+            func: ComparisonOp::Always,
+            ref_value: 0,
+            func_mask: 0xFFFF_FFFF,
+            write_mask: 0xFFFF_FFFF,
+        }
+    }
+}
+
+/// Combined depth and stencil state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthStencilInfo {
+    pub depth_test_enable: bool,
+    pub depth_write_enable: bool,
+    pub depth_func: ComparisonOp,
+    pub depth_mode: DepthMode,
+    pub stencil_enable: bool,
+    pub stencil_two_side: bool,
+    pub front: StencilFaceInfo,
+    pub back: StencilFaceInfo,
+}
+
+/// Rasterizer state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RasterizerInfo {
+    pub cull_enable: bool,
+    pub front_face: FrontFace,
+    pub cull_face: CullFace,
+    pub polygon_mode_front: PolygonMode,
+    pub polygon_mode_back: PolygonMode,
+    pub line_width_smooth: f32,
+    pub line_width_aliased: f32,
+    pub depth_bias: f32,
+    pub slope_scale_depth_bias: f32,
+    pub depth_bias_clamp: f32,
+}
+
+/// A constant buffer binding for one slot of one shader stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstBufferBinding {
+    pub enabled: bool,
+    pub address: u64,
+    pub size: u32,
+}
+
+impl Default for ConstBufferBinding {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            address: 0,
+            size: 0,
+        }
+    }
+}
+
 /// A recorded draw call with all relevant state at the time of DRAW_END.
 #[derive(Debug, Clone)]
 pub struct DrawCall {
@@ -219,6 +641,12 @@ pub struct DrawCall {
     pub vertex_streams: Vec<VertexStreamInfo>,
     pub viewport: ViewportInfo,
     pub scissor: ScissorInfo,
+    pub blend: [BlendInfo; 8],
+    pub blend_color: BlendColorInfo,
+    pub depth_stencil: DepthStencilInfo,
+    pub rasterizer: RasterizerInfo,
+    pub program_base_address: u64,
+    pub cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
 }
 
 // ── Engine struct ───────────────────────────────────────────────────────────
@@ -233,6 +661,8 @@ pub struct Maxwell3D {
     current_topology: PrimitiveTopology,
     /// Whether the current draw is indexed (set when IB count is written).
     draw_indexed: bool,
+    /// Constant buffer bindings: 5 shader stages x 18 slots.
+    cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
 }
 
 impl Maxwell3D {
@@ -243,6 +673,7 @@ impl Maxwell3D {
             draw_calls: Vec::new(),
             current_topology: PrimitiveTopology::Triangles,
             draw_indexed: false,
+            cb_bindings: [[ConstBufferBinding::default(); MAX_CB_SLOTS]; NUM_SHADER_STAGES],
         }
     }
 
@@ -368,6 +799,146 @@ impl Maxwell3D {
         }
     }
 
+    // ── Blend accessors ──────────────────────────────────────────────────
+
+    /// Read blend constant color.
+    pub fn blend_color_info(&self) -> BlendColorInfo {
+        let base = BLEND_COLOR_BASE as usize;
+        BlendColorInfo {
+            r: f32::from_bits(self.regs[base]),
+            g: f32::from_bits(self.regs[base + 1]),
+            b: f32::from_bits(self.regs[base + 2]),
+            a: f32::from_bits(self.regs[base + 3]),
+        }
+    }
+
+    /// Whether blend is enabled for render target `rt` (0..7).
+    pub fn blend_enable(&self, rt: usize) -> bool {
+        self.regs[(BLEND_BASE + 9 + rt as u32) as usize] != 0
+    }
+
+    /// Read global (non-per-target) blend info for render target `rt`.
+    pub fn global_blend_info(&self, rt: usize) -> BlendInfo {
+        let base = BLEND_BASE as usize;
+        BlendInfo {
+            enabled: self.blend_enable(rt),
+            separate_alpha: self.regs[base] != 0,
+            color_op: BlendEquation::from_raw(self.regs[base + 1]),
+            color_src: BlendFactor::from_raw(self.regs[base + 2]),
+            color_dst: BlendFactor::from_raw(self.regs[base + 3]),
+            alpha_op: BlendEquation::from_raw(self.regs[base + 4]),
+            alpha_src: BlendFactor::from_raw(self.regs[base + 5]),
+            alpha_dst: BlendFactor::from_raw(self.regs[base + 7]),
+        }
+    }
+
+    /// Read per-target blend info for render target `rt` (0..7).
+    pub fn blend_per_target_info(&self, rt: usize) -> BlendInfo {
+        let base = (BLEND_PER_TARGET_BASE + rt as u32 * BLEND_PER_TARGET_STRIDE) as usize;
+        BlendInfo {
+            enabled: self.blend_enable(rt),
+            separate_alpha: self.regs[base] != 0,
+            color_op: BlendEquation::from_raw(self.regs[base + 1]),
+            color_src: BlendFactor::from_raw(self.regs[base + 2]),
+            color_dst: BlendFactor::from_raw(self.regs[base + 3]),
+            alpha_op: BlendEquation::from_raw(self.regs[base + 4]),
+            alpha_src: BlendFactor::from_raw(self.regs[base + 5]),
+            alpha_dst: BlendFactor::from_raw(self.regs[base + 6]),
+        }
+    }
+
+    /// Effective blend info: per-target if enabled, otherwise global.
+    pub fn effective_blend_info(&self, rt: usize) -> BlendInfo {
+        if self.regs[BLEND_PER_TARGET_ENABLED as usize] != 0 {
+            self.blend_per_target_info(rt)
+        } else {
+            self.global_blend_info(rt)
+        }
+    }
+
+    // ── Depth/Stencil accessors ──────────────────────────────────────────
+
+    /// Read combined depth and stencil state.
+    pub fn depth_stencil_info(&self) -> DepthStencilInfo {
+        let front_base = STENCIL_FRONT_OP_BASE as usize;
+        let back_base = STENCIL_BACK_OP_BASE as usize;
+
+        let front = StencilFaceInfo {
+            fail_op: StencilOp::from_raw(self.regs[front_base]),
+            zfail_op: StencilOp::from_raw(self.regs[front_base + 1]),
+            zpass_op: StencilOp::from_raw(self.regs[front_base + 2]),
+            func: ComparisonOp::from_raw(self.regs[front_base + 3]),
+            ref_value: self.regs[STENCIL_FRONT_REF as usize],
+            func_mask: self.regs[STENCIL_FRONT_FUNC_MASK as usize],
+            write_mask: self.regs[STENCIL_FRONT_MASK as usize],
+        };
+
+        let back = StencilFaceInfo {
+            fail_op: StencilOp::from_raw(self.regs[back_base]),
+            zfail_op: StencilOp::from_raw(self.regs[back_base + 1]),
+            zpass_op: StencilOp::from_raw(self.regs[back_base + 2]),
+            func: ComparisonOp::from_raw(self.regs[back_base + 3]),
+            ref_value: self.regs[STENCIL_BACK_REF as usize],
+            func_mask: self.regs[STENCIL_BACK_FUNC_MASK as usize],
+            write_mask: self.regs[STENCIL_BACK_MASK as usize],
+        };
+
+        DepthStencilInfo {
+            depth_test_enable: self.regs[DEPTH_TEST_ENABLE as usize] != 0,
+            depth_write_enable: self.regs[DEPTH_WRITE_ENABLE as usize] != 0,
+            depth_func: ComparisonOp::from_raw(self.regs[DEPTH_TEST_FUNC as usize]),
+            depth_mode: DepthMode::from_raw(self.regs[DEPTH_MODE as usize]),
+            stencil_enable: self.regs[STENCIL_ENABLE as usize] != 0,
+            stencil_two_side: self.regs[STENCIL_TWO_SIDE_ENABLE as usize] != 0,
+            front,
+            back,
+        }
+    }
+
+    // ── Rasterizer accessors ─────────────────────────────────────────────
+
+    /// Read rasterizer state.
+    pub fn rasterizer_info(&self) -> RasterizerInfo {
+        RasterizerInfo {
+            cull_enable: self.regs[CULL_TEST_ENABLE as usize] != 0,
+            front_face: FrontFace::from_raw(self.regs[FRONT_FACE as usize]),
+            cull_face: CullFace::from_raw(self.regs[CULL_FACE as usize]),
+            polygon_mode_front: PolygonMode::from_raw(
+                self.regs[POLYGON_MODE_FRONT as usize],
+            ),
+            polygon_mode_back: PolygonMode::from_raw(
+                self.regs[POLYGON_MODE_BACK as usize],
+            ),
+            line_width_smooth: f32::from_bits(self.regs[LINE_WIDTH_SMOOTH as usize]),
+            line_width_aliased: f32::from_bits(self.regs[LINE_WIDTH_ALIASED as usize]),
+            depth_bias: f32::from_bits(self.regs[DEPTH_BIAS as usize]),
+            slope_scale_depth_bias: f32::from_bits(
+                self.regs[SLOPE_SCALE_DEPTH_BIAS as usize],
+            ),
+            depth_bias_clamp: f32::from_bits(self.regs[DEPTH_BIAS_CLAMP as usize]),
+        }
+    }
+
+    // ── Shader program accessors ─────────────────────────────────────────
+
+    /// Read the shader program region base address.
+    pub fn program_base_address(&self) -> u64 {
+        let base = PROGRAM_REGION_BASE as usize;
+        let high = self.regs[base] as u64;
+        let low = self.regs[base + 1] as u64;
+        (high << 32) | low
+    }
+
+    // ── Constant buffer accessors ────────────────────────────────────────
+
+    /// Read constant buffer bindings for a shader stage (0..4).
+    pub fn const_buffer_bindings(
+        &self,
+        stage: usize,
+    ) -> &[ConstBufferBinding; MAX_CB_SLOTS] {
+        &self.cb_bindings[stage]
+    }
+
     // ── Draw call accessors ──────────────────────────────────────────────
 
     /// Drain accumulated draw call records.
@@ -477,6 +1048,12 @@ impl Maxwell3D {
             }
         }
 
+        // Collect blend info for all 8 render targets.
+        let mut blend = [BlendInfo::default(); 8];
+        for (i, b) in blend.iter_mut().enumerate() {
+            *b = self.effective_blend_info(i);
+        }
+
         let draw = DrawCall {
             topology: self.current_topology,
             vertex_first: self.regs[VB_FIRST as usize],
@@ -489,6 +1066,12 @@ impl Maxwell3D {
             vertex_streams,
             viewport: self.viewport_info(0),
             scissor: self.scissor_info(0),
+            blend,
+            blend_color: self.blend_color_info(),
+            depth_stencil: self.depth_stencil_info(),
+            rasterizer: self.rasterizer_info(),
+            program_base_address: self.program_base_address(),
+            cb_bindings: self.cb_bindings,
         };
 
         log::debug!(
@@ -501,6 +1084,58 @@ impl Maxwell3D {
         );
 
         self.draw_calls.push(draw);
+    }
+
+    /// Handle CB_DATA write: auto-increment CB offset by 4.
+    fn handle_cb_data(&mut self, _value: u32) {
+        let offset_reg = (CB_CONFIG_BASE + 3) as usize;
+        self.regs[offset_reg] = self.regs[offset_reg].wrapping_add(4);
+    }
+
+    /// Handle CB_BIND trigger for a shader stage.
+    fn handle_cb_bind(&mut self, stage: usize) {
+        let bind_base = (CB_BIND_BASE + stage as u32 * CB_BIND_STRIDE) as usize;
+        let raw_config = self.regs[bind_base + 4];
+
+        let valid = (raw_config & 1) != 0;
+        let slot = ((raw_config >> 4) & 0x1F) as usize;
+
+        if slot >= MAX_CB_SLOTS {
+            log::warn!(
+                "Maxwell3D: CB_BIND stage {} slot {} out of range",
+                stage,
+                slot
+            );
+            return;
+        }
+
+        if valid {
+            let cb_base = CB_CONFIG_BASE as usize;
+            let size = self.regs[cb_base];
+            let addr_high = self.regs[cb_base + 1] as u64;
+            let addr_low = self.regs[cb_base + 2] as u64;
+            let address = (addr_high << 32) | addr_low;
+
+            self.cb_bindings[stage][slot] = ConstBufferBinding {
+                enabled: true,
+                address,
+                size,
+            };
+            log::trace!(
+                "Maxwell3D: CB_BIND stage={} slot={} addr=0x{:X} size={}",
+                stage,
+                slot,
+                address,
+                size
+            );
+        } else {
+            self.cb_bindings[stage][slot] = ConstBufferBinding::default();
+            log::trace!(
+                "Maxwell3D: CB_BIND stage={} slot={} disabled",
+                stage,
+                slot
+            );
+        }
     }
 }
 
@@ -581,6 +1216,12 @@ impl Engine for Maxwell3D {
             CLEAR_SURFACE => self.handle_clear_surface(value),
             DRAW_BEGIN => self.handle_draw_begin(value),
             DRAW_END => self.handle_draw_end(),
+            CB_DATA_BASE..CB_DATA_END => self.handle_cb_data(value),
+            CB_BIND_TRIGGER_0 => self.handle_cb_bind(0),
+            CB_BIND_TRIGGER_1 => self.handle_cb_bind(1),
+            CB_BIND_TRIGGER_2 => self.handle_cb_bind(2),
+            CB_BIND_TRIGGER_3 => self.handle_cb_bind(3),
+            CB_BIND_TRIGGER_4 => self.handle_cb_bind(4),
             _ => {}
         }
 
@@ -777,7 +1418,7 @@ mod tests {
         }
     }
 
-    // ── New draw state tracking tests ────────────────────────────────────
+    // ── Draw state tracking tests ────────────────────────────────────────
 
     #[test]
     fn test_vertex_stream_accessors() {
@@ -954,5 +1595,409 @@ mod tests {
         assert!(draws[0].indexed);
         assert_eq!(draws[0].index_format, IndexFormat::UnsignedInt);
         assert_eq!(draws[0].index_buffer_count, 100);
+    }
+
+    // ── Enum encoding tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_comparison_op_gl_encoding() {
+        // D3D encoding
+        assert_eq!(ComparisonOp::from_raw(1), ComparisonOp::Never);
+        assert_eq!(ComparisonOp::from_raw(2), ComparisonOp::Less);
+        assert_eq!(ComparisonOp::from_raw(8), ComparisonOp::Always);
+        // GL encoding
+        assert_eq!(ComparisonOp::from_raw(0x200), ComparisonOp::Never);
+        assert_eq!(ComparisonOp::from_raw(0x201), ComparisonOp::Less);
+        assert_eq!(ComparisonOp::from_raw(0x207), ComparisonOp::Always);
+        // Unknown defaults to Always
+        assert_eq!(ComparisonOp::from_raw(0xFFFF), ComparisonOp::Always);
+    }
+
+    #[test]
+    fn test_stencil_op_gl_encoding() {
+        // D3D encoding
+        assert_eq!(StencilOp::from_raw(1), StencilOp::Keep);
+        assert_eq!(StencilOp::from_raw(3), StencilOp::Replace);
+        assert_eq!(StencilOp::from_raw(6), StencilOp::Invert);
+        // GL encoding
+        assert_eq!(StencilOp::from_raw(0x1E00), StencilOp::Keep);
+        assert_eq!(StencilOp::from_raw(0x1E01), StencilOp::Replace);
+        assert_eq!(StencilOp::from_raw(0x150A), StencilOp::Invert);
+        assert_eq!(StencilOp::from_raw(0x8507), StencilOp::Incr);
+        assert_eq!(StencilOp::from_raw(0x8508), StencilOp::Decr);
+    }
+
+    #[test]
+    fn test_blend_equation_gl_encoding() {
+        // D3D encoding
+        assert_eq!(BlendEquation::from_raw(1), BlendEquation::Add);
+        assert_eq!(BlendEquation::from_raw(2), BlendEquation::Subtract);
+        assert_eq!(BlendEquation::from_raw(5), BlendEquation::Max);
+        // GL encoding
+        assert_eq!(BlendEquation::from_raw(0x8006), BlendEquation::Add);
+        assert_eq!(BlendEquation::from_raw(0x800A), BlendEquation::Subtract);
+        assert_eq!(BlendEquation::from_raw(0x800B), BlendEquation::ReverseSubtract);
+        assert_eq!(BlendEquation::from_raw(0x8007), BlendEquation::Min);
+        assert_eq!(BlendEquation::from_raw(0x8008), BlendEquation::Max);
+    }
+
+    #[test]
+    fn test_blend_factor_gl_encoding() {
+        // D3D encoding
+        assert_eq!(BlendFactor::from_raw(0x01), BlendFactor::Zero);
+        assert_eq!(BlendFactor::from_raw(0x02), BlendFactor::One);
+        assert_eq!(BlendFactor::from_raw(0x05), BlendFactor::SrcAlpha);
+        assert_eq!(BlendFactor::from_raw(0x06), BlendFactor::OneMinusSrcAlpha);
+        // GL encoding
+        assert_eq!(BlendFactor::from_raw(0x4000), BlendFactor::Zero);
+        assert_eq!(BlendFactor::from_raw(0x4001), BlendFactor::One);
+        assert_eq!(BlendFactor::from_raw(0x4302), BlendFactor::SrcAlpha);
+        assert_eq!(BlendFactor::from_raw(0xC001), BlendFactor::ConstantColor);
+        assert_eq!(BlendFactor::from_raw(0xC903), BlendFactor::OneMinusSrc1Alpha);
+    }
+
+    #[test]
+    fn test_cull_face_values() {
+        assert_eq!(CullFace::from_raw(0x0404), CullFace::Front);
+        assert_eq!(CullFace::from_raw(0x0405), CullFace::Back);
+        assert_eq!(CullFace::from_raw(0x0408), CullFace::FrontAndBack);
+        // Unknown defaults to Back
+        assert_eq!(CullFace::from_raw(0x0000), CullFace::Back);
+    }
+
+    #[test]
+    fn test_polygon_mode_values() {
+        assert_eq!(PolygonMode::from_raw(0x1B00), PolygonMode::Point);
+        assert_eq!(PolygonMode::from_raw(0x1B01), PolygonMode::Line);
+        assert_eq!(PolygonMode::from_raw(0x1B02), PolygonMode::Fill);
+        // Unknown defaults to Fill
+        assert_eq!(PolygonMode::from_raw(0x0000), PolygonMode::Fill);
+    }
+
+    // ── Blend tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_blend_color_accessor() {
+        let mut engine = Maxwell3D::new();
+        let base = BLEND_COLOR_BASE as usize;
+        engine.regs[base] = f32::to_bits(0.2);
+        engine.regs[base + 1] = f32::to_bits(0.4);
+        engine.regs[base + 2] = f32::to_bits(0.6);
+        engine.regs[base + 3] = f32::to_bits(0.8);
+
+        let bc = engine.blend_color_info();
+        assert_eq!(bc.r, 0.2);
+        assert_eq!(bc.g, 0.4);
+        assert_eq!(bc.b, 0.6);
+        assert_eq!(bc.a, 0.8);
+    }
+
+    #[test]
+    fn test_global_blend_info() {
+        let mut engine = Maxwell3D::new();
+        let base = BLEND_BASE as usize;
+
+        // Enable blend for RT0.
+        engine.regs[base + 9] = 1; // enable[0]
+        // Set separate alpha, color Add SrcAlpha/OneMinusSrcAlpha, alpha Add One/Zero.
+        engine.regs[base] = 1; // separate_alpha
+        engine.regs[base + 1] = 1; // color_op = Add (D3D)
+        engine.regs[base + 2] = 0x05; // color_src = SrcAlpha (D3D)
+        engine.regs[base + 3] = 0x06; // color_dst = OneMinusSrcAlpha (D3D)
+        engine.regs[base + 4] = 1; // alpha_op = Add
+        engine.regs[base + 5] = 0x02; // alpha_src = One
+        engine.regs[base + 7] = 0x01; // alpha_dst = Zero
+
+        let bi = engine.global_blend_info(0);
+        assert!(bi.enabled);
+        assert!(bi.separate_alpha);
+        assert_eq!(bi.color_op, BlendEquation::Add);
+        assert_eq!(bi.color_src, BlendFactor::SrcAlpha);
+        assert_eq!(bi.color_dst, BlendFactor::OneMinusSrcAlpha);
+        assert_eq!(bi.alpha_op, BlendEquation::Add);
+        assert_eq!(bi.alpha_src, BlendFactor::One);
+        assert_eq!(bi.alpha_dst, BlendFactor::Zero);
+    }
+
+    #[test]
+    fn test_blend_enable_per_rt() {
+        let mut engine = Maxwell3D::new();
+        let base = BLEND_BASE as usize;
+
+        // Enable RT0, RT3, RT7.
+        engine.regs[base + 9] = 1; // RT0
+        engine.regs[base + 12] = 1; // RT3
+        engine.regs[base + 16] = 1; // RT7
+
+        assert!(engine.blend_enable(0));
+        assert!(!engine.blend_enable(1));
+        assert!(!engine.blend_enable(2));
+        assert!(engine.blend_enable(3));
+        assert!(!engine.blend_enable(4));
+        assert!(!engine.blend_enable(5));
+        assert!(!engine.blend_enable(6));
+        assert!(engine.blend_enable(7));
+    }
+
+    #[test]
+    fn test_blend_per_target_info() {
+        let mut engine = Maxwell3D::new();
+
+        // Enable per-target blend override.
+        engine.regs[BLEND_PER_TARGET_ENABLED as usize] = 1;
+
+        // Set per-target blend for RT2.
+        let rt2_base = (BLEND_PER_TARGET_BASE + 2 * BLEND_PER_TARGET_STRIDE) as usize;
+        engine.regs[rt2_base] = 0; // no separate_alpha
+        engine.regs[rt2_base + 1] = 2; // color_op = Subtract
+        engine.regs[rt2_base + 2] = 0x09; // color_src = DstColor
+        engine.regs[rt2_base + 3] = 0x01; // color_dst = Zero
+        engine.regs[rt2_base + 4] = 1; // alpha_op = Add
+        engine.regs[rt2_base + 5] = 0x02; // alpha_src = One
+        engine.regs[rt2_base + 6] = 0x02; // alpha_dst = One
+
+        // Enable RT2 blend.
+        engine.regs[(BLEND_BASE + 11) as usize] = 1; // enable[2]
+
+        let bi = engine.effective_blend_info(2);
+        assert!(bi.enabled);
+        assert!(!bi.separate_alpha);
+        assert_eq!(bi.color_op, BlendEquation::Subtract);
+        assert_eq!(bi.color_src, BlendFactor::DstColor);
+        assert_eq!(bi.color_dst, BlendFactor::Zero);
+    }
+
+    // ── Depth/Stencil tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_depth_state() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[DEPTH_TEST_ENABLE as usize] = 1;
+        engine.regs[DEPTH_WRITE_ENABLE as usize] = 1;
+        engine.regs[DEPTH_TEST_FUNC as usize] = 2; // Less (D3D)
+        engine.regs[DEPTH_MODE as usize] = 1; // ZeroToOne
+
+        let ds = engine.depth_stencil_info();
+        assert!(ds.depth_test_enable);
+        assert!(ds.depth_write_enable);
+        assert_eq!(ds.depth_func, ComparisonOp::Less);
+        assert_eq!(ds.depth_mode, DepthMode::ZeroToOne);
+    }
+
+    #[test]
+    fn test_stencil_front_state() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[STENCIL_ENABLE as usize] = 1;
+
+        let front_base = STENCIL_FRONT_OP_BASE as usize;
+        engine.regs[front_base] = 1; // fail = Keep (D3D)
+        engine.regs[front_base + 1] = 1; // zfail = Keep
+        engine.regs[front_base + 2] = 3; // zpass = Replace
+        engine.regs[front_base + 3] = 8; // func = Always
+        engine.regs[STENCIL_FRONT_REF as usize] = 0xFF;
+        engine.regs[STENCIL_FRONT_FUNC_MASK as usize] = 0xFF;
+        engine.regs[STENCIL_FRONT_MASK as usize] = 0xFF;
+
+        let ds = engine.depth_stencil_info();
+        assert!(ds.stencil_enable);
+        assert_eq!(ds.front.fail_op, StencilOp::Keep);
+        assert_eq!(ds.front.zpass_op, StencilOp::Replace);
+        assert_eq!(ds.front.func, ComparisonOp::Always);
+        assert_eq!(ds.front.ref_value, 0xFF);
+        assert_eq!(ds.front.func_mask, 0xFF);
+        assert_eq!(ds.front.write_mask, 0xFF);
+    }
+
+    #[test]
+    fn test_stencil_two_side() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[STENCIL_ENABLE as usize] = 1;
+        engine.regs[STENCIL_TWO_SIDE_ENABLE as usize] = 1;
+
+        // Front: Replace on pass.
+        let front_base = STENCIL_FRONT_OP_BASE as usize;
+        engine.regs[front_base + 2] = 3; // zpass = Replace
+        engine.regs[front_base + 3] = 8; // func = Always
+
+        // Back: Invert on pass.
+        let back_base = STENCIL_BACK_OP_BASE as usize;
+        engine.regs[back_base + 2] = 6; // zpass = Invert
+        engine.regs[back_base + 3] = 2; // func = Less
+        engine.regs[STENCIL_BACK_REF as usize] = 0x80;
+
+        let ds = engine.depth_stencil_info();
+        assert!(ds.stencil_two_side);
+        assert_eq!(ds.front.zpass_op, StencilOp::Replace);
+        assert_eq!(ds.back.zpass_op, StencilOp::Invert);
+        assert_eq!(ds.back.func, ComparisonOp::Less);
+        assert_eq!(ds.back.ref_value, 0x80);
+    }
+
+    // ── Rasterizer tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_rasterizer_state() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[CULL_TEST_ENABLE as usize] = 1;
+        engine.regs[FRONT_FACE as usize] = 0x0901; // CCW
+        engine.regs[CULL_FACE as usize] = 0x0405; // Back
+        engine.regs[POLYGON_MODE_FRONT as usize] = 0x1B02; // Fill
+        engine.regs[POLYGON_MODE_BACK as usize] = 0x1B02; // Fill
+        engine.regs[LINE_WIDTH_SMOOTH as usize] = f32::to_bits(1.0);
+        engine.regs[LINE_WIDTH_ALIASED as usize] = f32::to_bits(1.0);
+
+        let ri = engine.rasterizer_info();
+        assert!(ri.cull_enable);
+        assert_eq!(ri.front_face, FrontFace::CCW);
+        assert_eq!(ri.cull_face, CullFace::Back);
+        assert_eq!(ri.polygon_mode_front, PolygonMode::Fill);
+        assert_eq!(ri.polygon_mode_back, PolygonMode::Fill);
+        assert_eq!(ri.line_width_smooth, 1.0);
+    }
+
+    #[test]
+    fn test_rasterizer_wireframe() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[POLYGON_MODE_FRONT as usize] = 0x1B01; // Line
+        engine.regs[POLYGON_MODE_BACK as usize] = 0x1B01; // Line
+        engine.regs[DEPTH_BIAS as usize] = f32::to_bits(0.5);
+        engine.regs[SLOPE_SCALE_DEPTH_BIAS as usize] = f32::to_bits(1.5);
+        engine.regs[DEPTH_BIAS_CLAMP as usize] = f32::to_bits(0.01);
+
+        let ri = engine.rasterizer_info();
+        assert_eq!(ri.polygon_mode_front, PolygonMode::Line);
+        assert_eq!(ri.polygon_mode_back, PolygonMode::Line);
+        assert_eq!(ri.depth_bias, 0.5);
+        assert_eq!(ri.slope_scale_depth_bias, 1.5);
+        assert_eq!(ri.depth_bias_clamp, 0.01);
+    }
+
+    // ── Constant buffer tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_cb_bind() {
+        let mut engine = Maxwell3D::new();
+
+        // Set CB config: size=0x10000, addr=0x0000_0001_0000_0000.
+        engine.write_reg(CB_CONFIG_BASE, 0x10000); // size
+        engine.write_reg(CB_CONFIG_BASE + 1, 0x0001); // addr_high
+        engine.write_reg(CB_CONFIG_BASE + 2, 0x0000_0000); // addr_low
+
+        // Bind to stage 0 (vertex), slot 3: raw_config = valid | (3 << 4).
+        let raw_config = 1 | (3 << 4);
+        engine.write_reg(CB_BIND_TRIGGER_0, raw_config);
+
+        let bindings = engine.const_buffer_bindings(0);
+        assert!(bindings[3].enabled);
+        assert_eq!(bindings[3].address, 0x0001_0000_0000);
+        assert_eq!(bindings[3].size, 0x10000);
+        // Other slots should be disabled.
+        assert!(!bindings[0].enabled);
+        assert!(!bindings[1].enabled);
+    }
+
+    #[test]
+    fn test_cb_data_increments_offset() {
+        let mut engine = Maxwell3D::new();
+
+        // Set initial offset.
+        engine.write_reg(CB_CONFIG_BASE + 3, 0x100); // offset = 0x100
+
+        // Write CB_DATA — should auto-increment offset by 4 each time.
+        engine.write_reg(CB_DATA_BASE, 0xAAAA);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 0x104);
+
+        engine.write_reg(CB_DATA_BASE, 0xBBBB);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 0x108);
+    }
+
+    #[test]
+    fn test_cb_bind_multiple_stages() {
+        let mut engine = Maxwell3D::new();
+
+        // Bind CB to stage 0 slot 0.
+        engine.write_reg(CB_CONFIG_BASE, 256);
+        engine.write_reg(CB_CONFIG_BASE + 1, 0);
+        engine.write_reg(CB_CONFIG_BASE + 2, 0x1000);
+        engine.write_reg(CB_BIND_TRIGGER_0, 1 | (0 << 4));
+
+        // Bind CB to stage 4 (fragment) slot 5.
+        engine.write_reg(CB_CONFIG_BASE, 512);
+        engine.write_reg(CB_CONFIG_BASE + 1, 0);
+        engine.write_reg(CB_CONFIG_BASE + 2, 0x2000);
+        engine.write_reg(CB_BIND_TRIGGER_4, 1 | (5 << 4));
+
+        assert!(engine.const_buffer_bindings(0)[0].enabled);
+        assert_eq!(engine.const_buffer_bindings(0)[0].address, 0x1000);
+        assert_eq!(engine.const_buffer_bindings(0)[0].size, 256);
+
+        assert!(engine.const_buffer_bindings(4)[5].enabled);
+        assert_eq!(engine.const_buffer_bindings(4)[5].address, 0x2000);
+        assert_eq!(engine.const_buffer_bindings(4)[5].size, 512);
+
+        // Other stages should be unaffected.
+        assert!(!engine.const_buffer_bindings(1)[0].enabled);
+        assert!(!engine.const_buffer_bindings(2)[0].enabled);
+    }
+
+    // ── Shader program test ──────────────────────────────────────────────
+
+    #[test]
+    fn test_program_base_address() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(PROGRAM_REGION_BASE, 0x0002); // addr_high
+        engine.write_reg(PROGRAM_REGION_BASE + 1, 0xABCD_0000); // addr_low
+
+        assert_eq!(engine.program_base_address(), 0x0002_ABCD_0000);
+    }
+
+    // ── Draw integration tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_draw_captures_depth_stencil() {
+        let mut engine = Maxwell3D::new();
+
+        // Set depth state.
+        engine.write_reg(DEPTH_TEST_ENABLE, 1);
+        engine.write_reg(DEPTH_WRITE_ENABLE, 1);
+        engine.write_reg(DEPTH_TEST_FUNC, 0x201); // Less (GL)
+        engine.write_reg(DEPTH_MODE, 1); // ZeroToOne
+
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        let ds = &draws[0].depth_stencil;
+        assert!(ds.depth_test_enable);
+        assert!(ds.depth_write_enable);
+        assert_eq!(ds.depth_func, ComparisonOp::Less);
+        assert_eq!(ds.depth_mode, DepthMode::ZeroToOne);
+    }
+
+    #[test]
+    fn test_draw_captures_blend() {
+        let mut engine = Maxwell3D::new();
+        let base = BLEND_BASE as usize;
+
+        // Enable blend for RT0 with SrcAlpha/OneMinusSrcAlpha.
+        engine.regs[base + 9] = 1; // enable[0]
+        engine.regs[base + 1] = 1; // color_op = Add
+        engine.regs[base + 2] = 0x05; // color_src = SrcAlpha
+        engine.regs[base + 3] = 0x06; // color_dst = OneMinusSrcAlpha
+        engine.regs[base + 4] = 1; // alpha_op = Add
+        engine.regs[base + 5] = 0x02; // alpha_src = One
+        engine.regs[base + 7] = 0x01; // alpha_dst = Zero
+
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        assert!(draws[0].blend[0].enabled);
+        assert_eq!(draws[0].blend[0].color_src, BlendFactor::SrcAlpha);
+        assert_eq!(draws[0].blend[0].color_dst, BlendFactor::OneMinusSrcAlpha);
+        // RT1 should not be enabled.
+        assert!(!draws[0].blend[1].enabled);
     }
 }

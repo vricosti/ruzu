@@ -79,8 +79,8 @@ pub trait Engine: Send {
 }
 
 /// Number of registers per engine.
-/// Maxwell3D methods go up to 0x19D0+, so 0x2000 covers the full space.
-pub const ENGINE_REG_COUNT: usize = 0x2000;
+/// CB_BIND registers reach 0x2424, so 0x4000 covers the full space.
+pub const ENGINE_REG_COUNT: usize = 0x4000;
 
 /// Rendered framebuffer output from an engine.
 pub struct Framebuffer {
