@@ -948,7 +948,7 @@ fn run_with_window(
         kernel.current_thread_idx = None;
 
         // ── Flush GPU command queue ─────────────────────────────────────
-        let fb_output = {
+        let flush_out = {
             let process = kernel.process();
             if let Some(p) = process {
                 let mem = &p.memory;
@@ -962,12 +962,25 @@ fn run_with_window(
             }
         };
 
-        // Write GPU framebuffer back to guest memory.
-        if let Some(fb) = fb_output {
+        // Write GPU engine outputs back to guest memory.
+        if let Some(flush) = flush_out {
             let mm = gpu.memory_manager.read();
-            if let Some(cpu_addr) = mm.translate(fb.gpu_va) {
+
+            // Write back blit/DMA results.
+            for wb in &flush.write_backs {
                 if let Some(process) = kernel.process_mut() {
-                    let _ = process.memory.write_bytes(cpu_addr, &fb.pixels);
+                    mm.write(wb.gpu_va, &wb.data, &mut |addr, data| {
+                        let _ = process.memory.write_bytes(addr, data);
+                    });
+                }
+            }
+
+            // Write back clear framebuffer.
+            if let Some(fb) = flush.framebuffer {
+                if let Some(cpu_addr) = mm.translate(fb.gpu_va) {
+                    if let Some(process) = kernel.process_mut() {
+                        let _ = process.memory.write_bytes(cpu_addr, &fb.pixels);
+                    }
                 }
             }
         }

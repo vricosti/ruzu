@@ -47,6 +47,14 @@ impl SubChannel {
     }
 }
 
+/// Describes a pending write from an engine to GPU VA space.
+pub struct PendingWrite {
+    /// Destination GPU virtual address.
+    pub gpu_va: u64,
+    /// Data to write.
+    pub data: Vec<u8>,
+}
+
 /// Trait for a GPU engine that accepts register writes.
 pub trait Engine: Send {
     /// The class ID of this engine.
@@ -58,6 +66,15 @@ pub trait Engine: Send {
     /// Collect any rendered framebuffer output. Returns `None` if nothing new.
     fn take_framebuffer(&mut self) -> Option<Framebuffer> {
         None
+    }
+
+    /// Execute pending operations that need memory access (blit, DMA copy).
+    /// Reads source data via `read_gpu`, returns writes to be applied.
+    fn execute_pending(
+        &mut self,
+        _read_gpu: &dyn Fn(u64, &mut [u8]),
+    ) -> Vec<PendingWrite> {
+        vec![]
     }
 }
 

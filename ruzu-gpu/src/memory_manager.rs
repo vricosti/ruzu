@@ -122,6 +122,26 @@ impl GpuMemoryManager {
         }
     }
 
+    /// Write bytes to GPU VA space using a CPU memory writer.
+    /// `write_cpu_mem` writes to a guest physical address.
+    pub fn write(
+        &self,
+        gpu_va: u64,
+        src: &[u8],
+        write_cpu_mem: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        let mut offset = 0usize;
+        while offset < src.len() {
+            let va = gpu_va + offset as u64;
+            let page_off = (va & (PAGE_SIZE - 1)) as usize;
+            let chunk_size = std::cmp::min(src.len() - offset, PAGE_SIZE as usize - page_off);
+            if let Some(cpu_addr) = self.translate(va) {
+                write_cpu_mem(cpu_addr, &src[offset..offset + chunk_size]);
+            }
+            offset += chunk_size;
+        }
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────
 
     fn l0_index(gpu_va: u64) -> usize {
@@ -239,5 +259,44 @@ mod tests {
 
         let val = u32::from_le_bytes(buf);
         assert_eq!(val, 0x8000_0000);
+    }
+
+    #[test]
+    fn test_write_via_callback() {
+        let mut mm = GpuMemoryManager::new();
+        mm.map(0x1000, 0x8000_0000, 0x1000);
+
+        let mut written: Vec<(u64, Vec<u8>)> = Vec::new();
+        let data = [0xDE, 0xAD, 0xBE, 0xEF];
+        mm.write(0x1000, &data, &mut |addr, src| {
+            written.push((addr, src.to_vec()));
+        });
+
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].0, 0x8000_0000);
+        assert_eq!(written[0].1, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn test_write_cross_page() {
+        let mut mm = GpuMemoryManager::new();
+        // Map two consecutive pages to different CPU addresses.
+        mm.map(0x1000, 0xA000_0000, 0x1000);
+        mm.map(0x2000, 0xB000_0000, 0x1000);
+
+        let mut written: Vec<(u64, Vec<u8>)> = Vec::new();
+        // Write 8 bytes starting at 0x1FFC (4 bytes in page 1, 4 bytes in page 2).
+        let data = [1, 2, 3, 4, 5, 6, 7, 8];
+        mm.write(0x1FFC, &data, &mut |addr, src| {
+            written.push((addr, src.to_vec()));
+        });
+
+        assert_eq!(written.len(), 2);
+        // First chunk: last 4 bytes of page 1.
+        assert_eq!(written[0].0, 0xA000_0FFC);
+        assert_eq!(written[0].1, vec![1, 2, 3, 4]);
+        // Second chunk: first 4 bytes of page 2.
+        assert_eq!(written[1].0, 0xB000_0000);
+        assert_eq!(written[1].1, vec![5, 6, 7, 8]);
     }
 }
