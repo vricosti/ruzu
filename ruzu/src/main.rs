@@ -948,7 +948,7 @@ fn run_with_window(
         kernel.current_thread_idx = None;
 
         // ── Flush GPU command queue ─────────────────────────────────────
-        {
+        let fb_output = {
             let process = kernel.process();
             if let Some(p) = process {
                 let mem = &p.memory;
@@ -956,7 +956,19 @@ fn run_with_window(
                     for (i, byte) in buf.iter_mut().enumerate() {
                         *byte = mem.read_u8(addr + i as u64).unwrap_or(0);
                     }
-                });
+                })
+            } else {
+                None
+            }
+        };
+
+        // Write GPU framebuffer back to guest memory.
+        if let Some(fb) = fb_output {
+            let mm = gpu.memory_manager.read();
+            if let Some(cpu_addr) = mm.translate(fb.gpu_va) {
+                if let Some(process) = kernel.process_mut() {
+                    let _ = process.memory.write_bytes(cpu_addr, &fb.pixels);
+                }
             }
         }
 

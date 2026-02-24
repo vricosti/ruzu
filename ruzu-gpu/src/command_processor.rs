@@ -27,7 +27,7 @@
 //! | 28:16   | Method count / Immd data |
 //! | 31:29   | SecOp             |
 
-use crate::engines::Engine;
+use crate::engines::{Engine, Framebuffer};
 
 /// A 64-bit GPFIFO entry.
 #[derive(Debug, Clone, Copy, Default)]
@@ -223,6 +223,14 @@ impl CommandProcessor {
                 }
             }
         }
+    }
+
+    /// Collect framebuffer output from all engines after processing.
+    pub fn take_framebuffers(&mut self) -> Vec<Framebuffer> {
+        self.engines
+            .iter_mut()
+            .filter_map(|e| e.as_mut()?.take_framebuffer())
+            .collect()
     }
 
     /// Dispatch a single register write to the appropriate engine.

@@ -54,10 +54,28 @@ pub trait Engine: Send {
 
     /// Write a value to a method register.
     fn write_reg(&mut self, method: u32, value: u32);
+
+    /// Collect any rendered framebuffer output. Returns `None` if nothing new.
+    fn take_framebuffer(&mut self) -> Option<Framebuffer> {
+        None
+    }
 }
 
-/// Number of registers per engine (covers Maxwell3D's full register space).
-pub const ENGINE_REG_COUNT: usize = 0x1000;
+/// Number of registers per engine.
+/// Maxwell3D methods go up to 0x19D0+, so 0x2000 covers the full space.
+pub const ENGINE_REG_COUNT: usize = 0x2000;
+
+/// Rendered framebuffer output from an engine.
+pub struct Framebuffer {
+    /// Render target GPU virtual address.
+    pub gpu_va: u64,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// RGBA8 pixel data, row-major, width*height*4 bytes.
+    pub pixels: Vec<u8>,
+}
 
 #[cfg(test)]
 mod tests {
