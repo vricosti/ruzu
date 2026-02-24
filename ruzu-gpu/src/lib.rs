@@ -10,6 +10,7 @@ pub mod backend;
 pub mod command_processor;
 pub mod engines;
 pub mod gpu_context;
+pub mod macro_interpreter;
 pub mod memory_manager;
 pub mod renderer;
 pub mod surface;
