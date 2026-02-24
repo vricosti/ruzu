@@ -7,6 +7,9 @@
 //! implementations in `nvdrv_devices`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use ruzu_gpu::gpu_context::GpuContext;
 
 use crate::framework::ServiceHandler;
 use crate::ipc::{IpcCommand, IpcResponse};
@@ -14,17 +17,20 @@ use crate::nvdrv_devices::{self, NvDevice};
 
 /// HLE implementation of the NVIDIA driver service family.
 pub struct NvdrvService {
-    /// Map of file descriptor → device instance.
+    /// Map of file descriptor -> device instance.
     devices: HashMap<u32, Box<dyn NvDevice>>,
     /// Next file descriptor to assign.
     next_fd: u32,
+    /// Shared GPU context for device creation.
+    gpu: Arc<GpuContext>,
 }
 
 impl NvdrvService {
-    pub fn new() -> Self {
+    pub fn new(gpu: Arc<GpuContext>) -> Self {
         Self {
             devices: HashMap::new(),
             next_fd: 1,
+            gpu,
         }
     }
 
@@ -44,12 +50,6 @@ impl NvdrvService {
     }
 }
 
-impl Default for NvdrvService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ServiceHandler for NvdrvService {
     fn service_name(&self) -> &str {
         "nvdrv"
@@ -60,13 +60,11 @@ impl ServiceHandler for NvdrvService {
 
         match cmd_id {
             // ── Open (0) ─────────────────────────────────────────────────
-            // raw_data contains the null-terminated device path.
-            // Returns: [fd, error_code]
             0 => {
                 let path = Self::read_device_path(&command.raw_data);
                 log::info!("nvdrv: Open(\"{}\")", path);
 
-                match nvdrv_devices::create_device(&path) {
+                match nvdrv_devices::create_device(&path, self.gpu.clone()) {
                     Some(device) => {
                         let fd = self.next_fd;
                         self.next_fd += 1;
@@ -76,15 +74,12 @@ impl ServiceHandler for NvdrvService {
                     }
                     None => {
                         log::warn!("nvdrv: Open unknown device \"{}\"", path);
-                        // Return fd=0 (invalid) with error code 0 to avoid crashes.
                         IpcResponse::success_with_data(vec![0, 0])
                     }
                 }
             }
 
             // ── Ioctl (1) ────────────────────────────────────────────────
-            // raw_data[0] = fd, raw_data[1] = ioctl_cmd, rest = ioctl input
-            // Returns: [error_code]
             1 => {
                 let fd = command.raw_data.first().copied().unwrap_or(0);
                 let ioctl_cmd = command.raw_data.get(1).copied().unwrap_or(0);
@@ -121,7 +116,6 @@ impl ServiceHandler for NvdrvService {
                     if chunk.len() == 4 {
                         let word = u32::from_le_bytes(chunk.try_into().unwrap());
                         data.push(word);
-                        // Limit response data size.
                         if data.len() >= 32 {
                             break;
                         }
@@ -173,6 +167,10 @@ mod tests {
     use super::*;
     use crate::ipc::CommandType;
 
+    fn test_gpu() -> Arc<GpuContext> {
+        Arc::new(GpuContext::new())
+    }
+
     fn make_command(cmd_id: u32, raw_data: Vec<u32>) -> IpcCommand {
         IpcCommand {
             command_type: CommandType::Request,
@@ -205,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_open_nvmap() {
-        let mut svc = NvdrvService::new();
+        let mut svc = NvdrvService::new(test_gpu());
         let cmd = make_command(0, path_to_words("/dev/nvmap"));
         let resp = svc.handle_request(0, &cmd);
         assert!(resp.result.is_success());
@@ -216,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_open_unknown_device() {
-        let mut svc = NvdrvService::new();
+        let mut svc = NvdrvService::new(test_gpu());
         let cmd = make_command(0, path_to_words("/dev/unknown"));
         let resp = svc.handle_request(0, &cmd);
         assert!(resp.result.is_success());
@@ -225,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_ioctl_on_opened_device() {
-        let mut svc = NvdrvService::new();
+        let mut svc = NvdrvService::new(test_gpu());
 
         // Open nvmap
         let open_cmd = make_command(0, path_to_words("/dev/nvmap"));
@@ -241,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_close() {
-        let mut svc = NvdrvService::new();
+        let mut svc = NvdrvService::new(test_gpu());
 
         // Open
         let open_cmd = make_command(0, path_to_words("/dev/nvmap"));
