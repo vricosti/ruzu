@@ -9,7 +9,7 @@
 //! Register writes are stored in a flat array and side-effect methods (clear,
 //! draw begin/end) are triggered on specific register writes.
 
-use super::{ClassId, Engine, Framebuffer, ENGINE_REG_COUNT};
+use super::{ClassId, Engine, Framebuffer, PendingWrite, ENGINE_REG_COUNT};
 
 // ── Register offset constants (method addresses) ────────────────────────────
 
@@ -85,8 +85,23 @@ const IB_OFF_COUNT: u32 = 6;
 
 /// Draw end trigger (previously DRAW_REG).
 const DRAW_END: u32 = 0x1614;
-/// Draw begin: sets topology.
+/// Draw begin: sets topology and instance mode.
 const DRAW_BEGIN: u32 = 0x1615;
+
+/// Signed base vertex offset for indexed draws (i32).
+const GLOBAL_BASE_VERTEX_INDEX: u32 = 0x1434;
+/// Base instance offset for instanced draws.
+const GLOBAL_BASE_INSTANCE_INDEX: u32 = 0x1438;
+/// Each write pushes 4 LE bytes of inline index data.
+const DRAW_INLINE_INDEX: u32 = 0x15E8;
+
+// ── Report semaphore registers ────────────────────────────────────────────────
+
+/// Report semaphore block: 4 words (addr_high, addr_low, payload, query).
+/// Writing to REPORT_SEMAPHORE_BASE + 3 triggers the operation.
+const REPORT_SEMAPHORE_BASE: u32 = 0x6C0;
+/// Trigger register for report semaphore (writing here fires the operation).
+const REPORT_SEMAPHORE_TRIGGER: u32 = REPORT_SEMAPHORE_BASE + 3;
 
 // ── Depth/Stencil registers ─────────────────────────────────────────────────
 
@@ -289,6 +304,54 @@ impl IndexFormat {
             Self::UnsignedByte => 1,
             Self::UnsignedShort => 2,
             Self::UnsignedInt => 4,
+        }
+    }
+}
+
+// ── Draw mode types ─────────────────────────────────────────────────────────
+
+/// Instance mode extracted from DRAW_BEGIN bits[27:26].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceId {
+    First = 0,
+    Subsequent = 1,
+    Unchanged = 2,
+}
+
+impl InstanceId {
+    pub fn from_raw(value: u32) -> Self {
+        match (value >> 26) & 0x3 {
+            0 => Self::First,
+            1 => Self::Subsequent,
+            _ => Self::Unchanged,
+        }
+    }
+}
+
+/// Internal draw mode state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawMode {
+    General,
+    Instance,
+    InlineIndex,
+}
+
+/// Report semaphore operation type from query word bits[1:0].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportOperation {
+    Release = 0,
+    Acquire = 1,
+    ReportOnly = 2,
+    Trap = 3,
+}
+
+impl ReportOperation {
+    pub fn from_raw(value: u32) -> Self {
+        match value & 0x3 {
+            0 => Self::Release,
+            1 => Self::Acquire,
+            2 => Self::ReportOnly,
+            _ => Self::Trap,
         }
     }
 }
@@ -1356,6 +1419,14 @@ pub struct DrawCall {
     pub tex_header_pool_limit: u32,
     pub tex_sampler_pool_addr: u64,
     pub tex_sampler_pool_limit: u32,
+    /// Instance count (1 for non-instanced, N for instanced batches).
+    pub instance_count: u32,
+    /// Base instance offset from GLOBAL_BASE_INSTANCE_INDEX.
+    pub base_instance: u32,
+    /// Base vertex offset from GLOBAL_BASE_VERTEX_INDEX (signed).
+    pub base_vertex: i32,
+    /// Non-empty only for InlineIndex draws.
+    pub inline_index_data: Vec<u8>,
 }
 
 // ── Engine struct ───────────────────────────────────────────────────────────
@@ -1372,6 +1443,14 @@ pub struct Maxwell3D {
     draw_indexed: bool,
     /// Constant buffer bindings: 5 shader stages x 18 slots.
     cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+    /// Draw mode state machine.
+    draw_mode: DrawMode,
+    /// Accumulated instance count in Instance mode.
+    instance_count: u32,
+    /// Accumulated inline index data bytes.
+    inline_index_data: Vec<u8>,
+    /// Pending semaphore writes to be returned by execute_pending.
+    pending_semaphore_writes: Vec<PendingWrite>,
 }
 
 impl Maxwell3D {
@@ -1383,6 +1462,10 @@ impl Maxwell3D {
             current_topology: PrimitiveTopology::Triangles,
             draw_indexed: false,
             cb_bindings: [[ConstBufferBinding::default(); MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+            draw_mode: DrawMode::General,
+            instance_count: 0,
+            inline_index_data: Vec::new(),
+            pending_semaphore_writes: Vec::new(),
         }
     }
 
@@ -1757,6 +1840,32 @@ impl Maxwell3D {
         std::mem::take(&mut self.draw_calls)
     }
 
+    // ── Instance / base vertex accessors ─────────────────────────────────
+
+    /// Base vertex index (signed) from GLOBAL_BASE_VERTEX_INDEX.
+    pub fn base_vertex(&self) -> i32 {
+        self.regs[GLOBAL_BASE_VERTEX_INDEX as usize] as i32
+    }
+
+    /// Base instance index from GLOBAL_BASE_INSTANCE_INDEX.
+    pub fn base_instance(&self) -> u32 {
+        self.regs[GLOBAL_BASE_INSTANCE_INDEX as usize]
+    }
+
+    // ── Report semaphore accessors ───────────────────────────────────────
+
+    /// Report semaphore GPU virtual address (high << 32 | low).
+    pub fn report_semaphore_address(&self) -> u64 {
+        let high = self.regs[REPORT_SEMAPHORE_BASE as usize] as u64;
+        let low = self.regs[(REPORT_SEMAPHORE_BASE + 1) as usize] as u64;
+        (high << 32) | low
+    }
+
+    /// Report semaphore payload value.
+    pub fn report_semaphore_payload(&self) -> u32 {
+        self.regs[(REPORT_SEMAPHORE_BASE + 2) as usize]
+    }
+
     // ── Side-effect handlers ─────────────────────────────────────────────
 
     /// Handle clear_surface trigger.
@@ -1839,17 +1948,92 @@ impl Maxwell3D {
         });
     }
 
-    /// Handle DRAW_BEGIN: captures topology from bits[15:0].
+    /// Handle DRAW_BEGIN: captures topology and instance mode from value.
     fn handle_draw_begin(&mut self, value: u32) {
         self.current_topology = PrimitiveTopology::from_raw(value);
+        let instance_id = InstanceId::from_raw(value);
+
         log::debug!(
-            "Maxwell3D: DRAW_BEGIN topology={:?}",
-            self.current_topology
+            "Maxwell3D: DRAW_BEGIN topology={:?} instance_id={:?}",
+            self.current_topology,
+            instance_id,
         );
+
+        match instance_id {
+            InstanceId::First => {
+                // Flush any pending instanced draw before resetting.
+                if self.draw_mode == DrawMode::Instance && self.instance_count > 0 {
+                    self.flush_deferred_draw();
+                }
+                self.instance_count = 0;
+                self.draw_mode = DrawMode::General;
+            }
+            InstanceId::Subsequent => {
+                self.draw_mode = DrawMode::Instance;
+            }
+            InstanceId::Unchanged => {}
+        }
     }
 
-    /// Handle DRAW_END: builds DrawCall record from current register state.
+    /// Handle DRAW_END: behaviour depends on current draw mode.
     fn handle_draw_end(&mut self) {
+        match self.draw_mode {
+            DrawMode::General => {
+                let draw = self.build_draw_call(1, Vec::new());
+                log::debug!(
+                    "Maxwell3D: DRAW_END {:?} verts={}/{} indexed={} streams={}",
+                    draw.topology,
+                    draw.vertex_first,
+                    draw.vertex_count,
+                    draw.indexed,
+                    draw.vertex_streams.len(),
+                );
+                self.draw_calls.push(draw);
+            }
+            DrawMode::Instance => {
+                // Accumulate; actual DrawCall is emitted on flush.
+                self.instance_count += 1;
+            }
+            DrawMode::InlineIndex => {
+                let inline_data = std::mem::take(&mut self.inline_index_data);
+                let mut draw = self.build_draw_call(1, inline_data);
+                // Override index fields for inline index draws.
+                draw.indexed = true;
+                draw.index_format = IndexFormat::UnsignedInt;
+                draw.index_buffer_count = draw.inline_index_data.len() as u32 / 4;
+                log::debug!(
+                    "Maxwell3D: DRAW_END InlineIndex {:?} indices={}",
+                    draw.topology,
+                    draw.index_buffer_count,
+                );
+                self.draw_calls.push(draw);
+                self.draw_mode = DrawMode::General;
+            }
+        }
+    }
+
+    /// Flush a deferred instanced draw batch. Called when a new First
+    /// instance_id is seen or when take_draw_calls needs to finalize.
+    fn flush_deferred_draw(&mut self) {
+        let count = self.instance_count;
+        let draw = self.build_draw_call(count, Vec::new());
+        log::debug!(
+            "Maxwell3D: flush_deferred_draw {:?} instance_count={}",
+            draw.topology,
+            count,
+        );
+        self.draw_calls.push(draw);
+        self.instance_count = 0;
+        self.draw_mode = DrawMode::General;
+    }
+
+    /// Build a DrawCall from current register state with the given instance
+    /// count and optional inline index data.
+    fn build_draw_call(
+        &self,
+        instance_count: u32,
+        inline_index_data: Vec<u8>,
+    ) -> DrawCall {
         // Collect active vertex streams (scan all 32 slots).
         let mut vertex_streams = Vec::new();
         for i in 0..32 {
@@ -1889,7 +2073,7 @@ impl Maxwell3D {
             *b = self.effective_blend_info(i);
         }
 
-        let draw = DrawCall {
+        DrawCall {
             topology: self.current_topology,
             vertex_first: self.regs[VB_FIRST as usize],
             vertex_count: self.regs[VB_COUNT as usize],
@@ -1915,18 +2099,52 @@ impl Maxwell3D {
             tex_header_pool_limit: self.tex_header_pool_limit(),
             tex_sampler_pool_addr: self.tex_sampler_pool_address(),
             tex_sampler_pool_limit: self.tex_sampler_pool_limit(),
-        };
+            instance_count,
+            base_instance: self.base_instance(),
+            base_vertex: self.base_vertex(),
+            inline_index_data,
+        }
+    }
 
-        log::debug!(
-            "Maxwell3D: DRAW_END {:?} verts={}/{} indexed={} streams={}",
-            draw.topology,
-            draw.vertex_first,
-            draw.vertex_count,
-            draw.indexed,
-            draw.vertex_streams.len(),
-        );
+    /// Handle report semaphore trigger (write to REPORT_SEMAPHORE_BASE + 3).
+    fn handle_report_semaphore(&mut self, value: u32) {
+        let operation = ReportOperation::from_raw(value);
+        match operation {
+            ReportOperation::Release | ReportOperation::ReportOnly => {
+                let gpu_va = self.report_semaphore_address();
+                let payload = self.report_semaphore_payload();
+                let short_query = (value >> 28) & 1 != 0;
 
-        self.draw_calls.push(draw);
+                let data = if short_query {
+                    payload.to_le_bytes().to_vec()
+                } else {
+                    let mut buf = Vec::with_capacity(16);
+                    buf.extend_from_slice(&(payload as u64).to_le_bytes());
+                    buf.extend_from_slice(&0u64.to_le_bytes());
+                    buf
+                };
+
+                log::debug!(
+                    "Maxwell3D: report_semaphore {:?} va=0x{:X} payload=0x{:X} short={} bytes={}",
+                    operation,
+                    gpu_va,
+                    payload,
+                    short_query,
+                    data.len(),
+                );
+
+                self.pending_semaphore_writes.push(PendingWrite {
+                    gpu_va,
+                    data,
+                });
+            }
+            ReportOperation::Acquire => {
+                log::debug!("Maxwell3D: report_semaphore Acquire (no-op)");
+            }
+            ReportOperation::Trap => {
+                log::debug!("Maxwell3D: report_semaphore Trap (no-op)");
+            }
+        }
     }
 
     /// Handle CB_DATA write: auto-increment CB offset by 4.
@@ -2059,6 +2277,11 @@ impl Engine for Maxwell3D {
             CLEAR_SURFACE => self.handle_clear_surface(value),
             DRAW_BEGIN => self.handle_draw_begin(value),
             DRAW_END => self.handle_draw_end(),
+            DRAW_INLINE_INDEX => {
+                self.inline_index_data.extend_from_slice(&value.to_le_bytes());
+                self.draw_mode = DrawMode::InlineIndex;
+            }
+            REPORT_SEMAPHORE_TRIGGER => self.handle_report_semaphore(value),
             CB_DATA_BASE..CB_DATA_END => self.handle_cb_data(value),
             CB_BIND_TRIGGER_0 => self.handle_cb_bind(0),
             CB_BIND_TRIGGER_1 => self.handle_cb_bind(1),
@@ -2073,6 +2296,13 @@ impl Engine for Maxwell3D {
 
     fn take_framebuffer(&mut self) -> Option<Framebuffer> {
         self.pending_framebuffer.take()
+    }
+
+    fn execute_pending(
+        &mut self,
+        _read_gpu: &dyn Fn(u64, &mut [u8]),
+    ) -> Vec<PendingWrite> {
+        std::mem::take(&mut self.pending_semaphore_writes)
     }
 }
 
@@ -3615,5 +3845,291 @@ mod tests {
         for sc in &draws[0].scissors {
             assert!(!sc.enabled);
         }
+    }
+
+    // ── Instance / DrawMode tests ────────────────────────────────────────
+
+    #[test]
+    fn test_instance_id_from_raw() {
+        // bits[27:26] = 0 → First
+        assert_eq!(InstanceId::from_raw(0x0000_0000), InstanceId::First);
+        // bits[27:26] = 1 → Subsequent
+        assert_eq!(InstanceId::from_raw(0x0400_0000), InstanceId::Subsequent);
+        // bits[27:26] = 2 → Unchanged
+        assert_eq!(InstanceId::from_raw(0x0800_0000), InstanceId::Unchanged);
+        // bits[27:26] = 3 → Unchanged (fallback)
+        assert_eq!(InstanceId::from_raw(0x0C00_0000), InstanceId::Unchanged);
+    }
+
+    #[test]
+    fn test_draw_begin_parses_instance_id() {
+        let mut engine = Maxwell3D::new();
+        // Topology = TriangleStrip(5), instance_id = Subsequent (bits[27:26]=1).
+        let value = 5 | (1 << 26);
+        engine.handle_draw_begin(value);
+        assert_eq!(engine.current_topology, PrimitiveTopology::TriangleStrip);
+        assert_eq!(engine.draw_mode, DrawMode::Instance);
+    }
+
+    #[test]
+    fn test_general_draw_has_instance_count_one() {
+        let mut engine = Maxwell3D::new();
+        // Plain draw: topology=Triangles(4), instance_id=First (bits[27:26]=0).
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].instance_count, 1);
+    }
+
+    #[test]
+    fn test_instanced_draw_accumulates() {
+        let mut engine = Maxwell3D::new();
+        let subsequent = 4 | (1 << 26); // Triangles + Subsequent
+
+        // 3 × Subsequent BEGIN+END → no DrawCalls yet.
+        for _ in 0..3 {
+            engine.write_reg(DRAW_BEGIN, subsequent);
+            engine.write_reg(DRAW_END, 0);
+        }
+
+        let draws = engine.take_draw_calls();
+        assert!(draws.is_empty());
+        assert_eq!(engine.instance_count, 3);
+    }
+
+    #[test]
+    fn test_instanced_draw_flushes_on_first() {
+        let mut engine = Maxwell3D::new();
+        let subsequent = 4 | (1 << 26);
+
+        // 3 Subsequent draws.
+        for _ in 0..3 {
+            engine.write_reg(DRAW_BEGIN, subsequent);
+            engine.write_reg(DRAW_END, 0);
+        }
+        assert!(engine.take_draw_calls().is_empty());
+
+        // BEGIN(First) flushes the previous batch.
+        engine.write_reg(DRAW_BEGIN, 4); // First (bits[27:26]=0)
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].instance_count, 3);
+    }
+
+    #[test]
+    fn test_instance_count_resets_after_flush() {
+        let mut engine = Maxwell3D::new();
+        let subsequent = 4 | (1 << 26);
+
+        // Accumulate 2 instances.
+        for _ in 0..2 {
+            engine.write_reg(DRAW_BEGIN, subsequent);
+            engine.write_reg(DRAW_END, 0);
+        }
+
+        // Flush via First.
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.take_draw_calls(); // discard flush
+
+        // Now a General draw should have instance_count=1.
+        engine.write_reg(DRAW_END, 0);
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].instance_count, 1);
+    }
+
+    #[test]
+    fn test_draw_captures_base_instance() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(GLOBAL_BASE_INSTANCE_INDEX, 42);
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws[0].base_instance, 42);
+    }
+
+    #[test]
+    fn test_draw_captures_base_vertex() {
+        let mut engine = Maxwell3D::new();
+        // Write a negative base vertex (-10 as u32).
+        engine.write_reg(GLOBAL_BASE_VERTEX_INDEX, (-10i32) as u32);
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws[0].base_vertex, -10);
+    }
+
+    #[test]
+    fn test_inline_index_accumulates() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(DRAW_BEGIN, 4);
+
+        // Push two inline index values.
+        engine.write_reg(DRAW_INLINE_INDEX, 0x0000_0001);
+        engine.write_reg(DRAW_INLINE_INDEX, 0x0000_0002);
+
+        assert_eq!(engine.inline_index_data.len(), 8);
+        assert_eq!(engine.draw_mode, DrawMode::InlineIndex);
+    }
+
+    #[test]
+    fn test_inline_index_draw_end() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_INLINE_INDEX, 0x0000_0000);
+        engine.write_reg(DRAW_INLINE_INDEX, 0x0000_0001);
+        engine.write_reg(DRAW_INLINE_INDEX, 0x0000_0002);
+        engine.write_reg(DRAW_END, 0);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        assert!(draws[0].indexed);
+        assert_eq!(draws[0].index_format, IndexFormat::UnsignedInt);
+        assert_eq!(draws[0].index_buffer_count, 3);
+        assert_eq!(draws[0].inline_index_data.len(), 12);
+    }
+
+    #[test]
+    fn test_inline_index_clears_after_draw() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_INLINE_INDEX, 0x0000_0001);
+        engine.write_reg(DRAW_END, 0);
+
+        // After draw, inline buffer should be empty.
+        assert!(engine.inline_index_data.is_empty());
+    }
+
+    #[test]
+    fn test_inline_index_resets_to_general() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(DRAW_BEGIN, 4);
+        engine.write_reg(DRAW_INLINE_INDEX, 0x0000_0001);
+        engine.write_reg(DRAW_END, 0);
+
+        assert_eq!(engine.draw_mode, DrawMode::General);
+    }
+
+    // ── Report Semaphore tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_report_operation_from_raw() {
+        assert_eq!(ReportOperation::from_raw(0), ReportOperation::Release);
+        assert_eq!(ReportOperation::from_raw(1), ReportOperation::Acquire);
+        assert_eq!(ReportOperation::from_raw(2), ReportOperation::ReportOnly);
+        assert_eq!(ReportOperation::from_raw(3), ReportOperation::Trap);
+        // Bits above [1:0] are ignored for operation extraction.
+        assert_eq!(ReportOperation::from_raw(0xFFFF_FF00), ReportOperation::Release);
+    }
+
+    #[test]
+    fn test_report_semaphore_address() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0x0000_0001); // addr_high
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0xABCD_0000); // addr_low
+
+        assert_eq!(engine.report_semaphore_address(), 0x0001_ABCD_0000);
+    }
+
+    #[test]
+    fn test_report_semaphore_short_query() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0); // addr_high
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x1000); // addr_low
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0xDEAD_BEEF); // payload
+
+        // Trigger: Release(0) + short_query=1 (bit 28).
+        let query = 0 | (1 << 28);
+        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, query);
+
+        assert_eq!(engine.pending_semaphore_writes.len(), 1);
+        let pw = &engine.pending_semaphore_writes[0];
+        assert_eq!(pw.gpu_va, 0x1000);
+        assert_eq!(pw.data.len(), 4);
+        assert_eq!(pw.data, 0xDEAD_BEEFu32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_report_semaphore_long_query() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x2000);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0x42);
+
+        // Trigger: Release(0) + short_query=0.
+        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 0);
+
+        assert_eq!(engine.pending_semaphore_writes.len(), 1);
+        let pw = &engine.pending_semaphore_writes[0];
+        assert_eq!(pw.gpu_va, 0x2000);
+        assert_eq!(pw.data.len(), 16);
+        // First 8 bytes: payload as u64.
+        assert_eq!(&pw.data[0..8], &(0x42u64).to_le_bytes());
+        // Last 8 bytes: zero timestamp.
+        assert_eq!(&pw.data[8..16], &0u64.to_le_bytes());
+    }
+
+    #[test]
+    fn test_report_semaphore_payload_value() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x3000);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0x1234_5678);
+
+        // Short query Release.
+        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 1 << 28);
+
+        let pw = &engine.pending_semaphore_writes[0];
+        let payload = u32::from_le_bytes(pw.data[0..4].try_into().unwrap());
+        assert_eq!(payload, 0x1234_5678);
+    }
+
+    #[test]
+    fn test_report_semaphore_acquire_no_write() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x4000);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0xFF);
+
+        // Acquire = operation 1.
+        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 1);
+
+        assert!(engine.pending_semaphore_writes.is_empty());
+    }
+
+    #[test]
+    fn test_report_semaphore_no_trigger_no_write() {
+        let mut engine = Maxwell3D::new();
+        // Write addr and payload but NOT the trigger word.
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x5000);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0xFF);
+
+        assert!(engine.pending_semaphore_writes.is_empty());
+    }
+
+    #[test]
+    fn test_report_semaphore_drains_on_execute() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x6000);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0xAA);
+
+        // Two short-query releases.
+        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 1 << 28);
+        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 1 << 28);
+        assert_eq!(engine.pending_semaphore_writes.len(), 2);
+
+        let noop_reader = |_addr: u64, _buf: &mut [u8]| {};
+        let writes = engine.execute_pending(&noop_reader);
+        assert_eq!(writes.len(), 2);
+
+        // Second call should be empty.
+        let writes2 = engine.execute_pending(&noop_reader);
+        assert!(writes2.is_empty());
     }
 }
