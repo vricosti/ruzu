@@ -7,6 +7,7 @@
 //! GPFIFO submission queue. Services push GPFIFO entries via `submit_gpfifo()`,
 //! and the main loop drains the queue via `flush()`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -21,6 +22,57 @@ use crate::engines::maxwell_3d::Maxwell3D;
 use crate::engines::maxwell_dma::MaxwellDMA;
 use crate::memory_manager::GpuMemoryManager;
 use crate::syncpoint::SyncpointManager;
+
+// ── NvMap registry ──────────────────────────────────────────────────────────
+
+/// Entry in the NvMap handle registry.
+pub struct NvMapEntry {
+    /// Guest CPU address of the allocation.
+    pub address: u64,
+    /// Size in bytes.
+    pub size: u32,
+}
+
+/// Shared NvMap handle registry — maps handle → (address, size).
+///
+/// Written by NvMap on `Alloc`, read by NvHostAsGpu (`MapBufferEx`) and
+/// ViBinderService (`SET_PREALLOCATED_BUFFER`) to resolve guest addresses.
+pub struct NvMapRegistry {
+    entries: RwLock<HashMap<u32, NvMapEntry>>,
+}
+
+impl NvMapRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register (or overwrite) a handle → address mapping.
+    pub fn register(&self, handle: u32, address: u64, size: u32) {
+        self.entries
+            .write()
+            .insert(handle, NvMapEntry { address, size });
+    }
+
+    /// Look up the guest address for a handle.
+    pub fn get_address(&self, handle: u32) -> Option<u64> {
+        self.entries.read().get(&handle).map(|e| e.address)
+    }
+
+    /// Look up the size for a handle.
+    pub fn get_size(&self, handle: u32) -> Option<u32> {
+        self.entries.read().get(&handle).map(|e| e.size)
+    }
+}
+
+impl Default for NvMapRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── GPU context ─────────────────────────────────────────────────────────────
 
 /// Output from a GPU flush — framebuffer data to write back to guest memory.
 pub struct FramebufferOutput {
@@ -38,6 +90,7 @@ pub struct FramebufferOutput {
 pub struct GpuContext {
     pub memory_manager: RwLock<GpuMemoryManager>,
     pub syncpoints: Arc<SyncpointManager>,
+    pub nvmap_registry: NvMapRegistry,
     command_processor: Mutex<CommandProcessor>,
     gpfifo_queue: Mutex<Vec<GpEntry>>,
     #[allow(dead_code)]
@@ -58,6 +111,7 @@ impl GpuContext {
         Self {
             memory_manager: RwLock::new(GpuMemoryManager::new()),
             syncpoints: Arc::new(SyncpointManager::new()),
+            nvmap_registry: NvMapRegistry::new(),
             command_processor: Mutex::new(CommandProcessor::new(engines)),
             gpfifo_queue: Mutex::new(Vec::new()),
             backend: Mutex::new(Box::new(NullBackend::new())),
@@ -144,6 +198,30 @@ mod tests {
         // Queue should have 2 entries.
         let queue = ctx.gpfifo_queue.lock();
         assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn test_registry_register_and_get() {
+        let reg = NvMapRegistry::new();
+        reg.register(1, 0xDEAD_0000, 0x1000);
+        assert_eq!(reg.get_address(1), Some(0xDEAD_0000));
+        assert_eq!(reg.get_size(1), Some(0x1000));
+    }
+
+    #[test]
+    fn test_registry_missing_handle() {
+        let reg = NvMapRegistry::new();
+        assert_eq!(reg.get_address(42), None);
+        assert_eq!(reg.get_size(42), None);
+    }
+
+    #[test]
+    fn test_registry_overwrite() {
+        let reg = NvMapRegistry::new();
+        reg.register(1, 0x1000, 0x100);
+        reg.register(1, 0x2000, 0x200);
+        assert_eq!(reg.get_address(1), Some(0x2000));
+        assert_eq!(reg.get_size(1), Some(0x200));
     }
 
     #[test]

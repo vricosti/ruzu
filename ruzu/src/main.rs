@@ -404,7 +404,7 @@ fn main() -> Result<()> {
     );
     manager.register_service(
         "vi:IHOSBinderDriver",
-        Box::new(ruzu_service::vi::ViBinderService::new(buffer_queue.clone())),
+        Box::new(ruzu_service::vi::ViBinderService::new(buffer_queue.clone(), gpu.clone())),
     );
     // APM service
     manager.register_service("apm", Box::new(ruzu_service::apm::ApmService::new()));
