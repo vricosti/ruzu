@@ -25,6 +25,8 @@ pub struct InputState {
     pub buttons: u64,
     pub l_stick: (i32, i32),
     pub r_stick: (i32, i32),
+    /// If the window was resized this frame, contains (width, height).
+    pub resized: Option<(u32, u32)>,
 }
 
 /// SDL2 window manager for the emulator.
@@ -32,13 +34,12 @@ pub struct EmulatorWindow {
     pub sdl_context: Sdl,
     pub window: Window,
     pub event_pump: EventPump,
+    /// Whether the window was created with Vulkan support.
+    pub vulkan_enabled: bool,
 }
 
 impl EmulatorWindow {
-    /// Create a new SDL2 window for software rendering.
-    ///
-    /// Note: `.vulkan()` is intentionally omitted for Phase 5 (software blit).
-    /// It will be re-added when actual Vulkan rendering is implemented.
+    /// Create a new SDL2 window with Vulkan support (fallback to software rendering).
     pub fn new(title: &str, width: u32, height: u32) -> Result<Self> {
         let sdl_context = sdl2::init().map_err(|e| anyhow::anyhow!("SDL2 init failed: {}", e))?;
 
@@ -46,23 +47,42 @@ impl EmulatorWindow {
             .video()
             .map_err(|e| anyhow::anyhow!("SDL2 video init failed: {}", e))?;
 
-        let window = video_subsystem
+        // Try creating a Vulkan-enabled window first; fall back to software rendering.
+        let (window, vulkan_enabled) = match video_subsystem
             .window(title, width, height)
             .position_centered()
             .resizable()
+            .vulkan()
             .build()
-            .context("Failed to create SDL2 window")?;
+        {
+            Ok(w) => {
+                info!("Created Vulkan-enabled SDL2 window: {}x{}", width, height);
+                (w, true)
+            }
+            Err(e) => {
+                info!(
+                    "Vulkan window not available ({}), falling back to software rendering",
+                    e
+                );
+                let w = video_subsystem
+                    .window(title, width, height)
+                    .position_centered()
+                    .resizable()
+                    .build()
+                    .context("Failed to create SDL2 window")?;
+                (w, false)
+            }
+        };
 
         let event_pump = sdl_context
             .event_pump()
             .map_err(|e| anyhow::anyhow!("SDL2 event pump failed: {}", e))?;
 
-        info!("Created SDL2 window: {}x{}", width, height);
-
         Ok(Self {
             sdl_context,
             window,
             event_pump,
+            vulkan_enabled,
         })
     }
 
@@ -90,6 +110,8 @@ impl EmulatorWindow {
     /// Poll SDL2 events and sample keyboard input state.
     /// Returns `None` if the window should close, or `Some(InputState)`.
     pub fn poll_events_with_input(&mut self) -> Option<InputState> {
+        let mut resized = None;
+
         // Drain events first (handles quit/resize).
         for event in self.event_pump.poll_iter() {
             match event {
@@ -103,6 +125,7 @@ impl EmulatorWindow {
                     ..
                 } => {
                     info!("Window resized: {}x{}", w, h);
+                    resized = Some((w as u32, h as u32));
                 }
                 _ => {}
             }
@@ -178,6 +201,7 @@ impl EmulatorWindow {
             buttons: btns,
             l_stick: (lx, ly),
             r_stick: (0, 0),
+            resized,
         })
     }
 
