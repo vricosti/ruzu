@@ -13,6 +13,7 @@ pub mod engines;
 pub mod gpu_context;
 pub mod macro_interpreter;
 pub mod memory_manager;
+pub mod rasterizer;
 pub mod renderer;
 pub mod surface;
 pub mod swapchain;
