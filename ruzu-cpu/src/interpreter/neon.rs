@@ -790,35 +790,74 @@ pub fn exec_simd_mod_imm(
 }
 
 /// Expand a SIMD modified immediate to 128 bits based on cmode and op.
+///
+/// Covers all AArch64 Advanced SIMD modified-immediate encodings:
+/// - cmode 0000-0111, op=0: MOVI 32-bit shifted (shift by 0/8/16/24)
+/// - cmode 0000-0111, op=1: MVNI 32-bit shifted (NOT of MOVI)
+/// - cmode 1000-1011, op=0: MOVI 16-bit shifted (shift by 0/8)
+/// - cmode 1000-1011, op=1: MVNI 16-bit shifted (NOT of MOVI)
+/// - cmode 1100, op=0: MOVI 32-bit MSL 8  (shifting ones)
+/// - cmode 1101, op=0: MOVI 32-bit MSL 16 (shifting ones)
+/// - cmode 1110, op=0: MOVI 8-bit replicate
+/// - cmode 1110, op=1: MOVI 64-bit (each bit of imm8 → byte)
+/// - cmode 1111, op=0: FMOV .2S/.4S (f32 immediate replicated)
+/// - cmode 1111, op=1: FMOV .2D     (f64 immediate replicated)
 fn expand_simd_imm(op: u8, cmode: u8, imm8: u8) -> u128 {
     let imm = imm8 as u64;
     let cmode_hi = cmode >> 1;
+    let cmode_lo = cmode & 1;
 
     match cmode_hi {
-        // 32-bit shifted immediate
-        0b000 => replicate_to_u128(imm, 32),
-        0b001 => replicate_to_u128(imm << 8, 32),
-        0b010 => replicate_to_u128(imm << 16, 32),
-        0b011 => replicate_to_u128(imm << 24, 32),
-        // 16-bit shifted immediate
-        0b100 => replicate_to_u128(imm, 16),
-        0b101 => replicate_to_u128(imm << 8, 16),
-        // 32-bit shifting ones
+        // 32-bit shifted immediate: MOVI (op=0) / MVNI (op=1)
+        0b000 => {
+            let base = replicate_to_u128(imm, 32);
+            if op == 1 { !base } else { base }
+        }
+        0b001 => {
+            let base = replicate_to_u128(imm << 8, 32);
+            if op == 1 { !base } else { base }
+        }
+        0b010 => {
+            let base = replicate_to_u128(imm << 16, 32);
+            if op == 1 { !base } else { base }
+        }
+        0b011 => {
+            let base = replicate_to_u128(imm << 24, 32);
+            if op == 1 { !base } else { base }
+        }
+        // 16-bit shifted immediate: MOVI (op=0) / MVNI (op=1)
+        0b100 => {
+            let base = replicate_to_u128(imm, 16);
+            if op == 1 { !base } else { base }
+        }
+        0b101 => {
+            let base = replicate_to_u128(imm << 8, 16);
+            if op == 1 { !base } else { base }
+        }
+        // 32-bit shifting ones (MSL) — no MVNI variant for MSL
         0b110 => {
-            if cmode & 1 == 0 {
+            if cmode_lo == 0 {
                 replicate_to_u128((imm << 8) | 0xFF, 32)
             } else {
                 replicate_to_u128((imm << 16) | 0xFFFF, 32)
             }
         }
-        // byte or FP immediate
+        // Byte, 64-bit scalar/vector, or FP immediate
         0b111 => {
-            if op == 0 && cmode & 1 == 0 {
-                // 8-bit replicate
+            if op == 0 && cmode_lo == 0 {
+                // MOVI .8B/.16B — 8-bit element replicated
                 replicate_to_u128(imm, 8)
-            } else if op == 0 && cmode & 1 == 1 {
-                // MOVI Dd, #imm — 64-bit scalar
-                // Each bit of imm8 expands to 8 bits
+            } else if op == 0 && cmode_lo == 1 {
+                // FMOV .2S/.4S — f32 immediate (abcdefgh → IEEE 754 single)
+                // f32 = a : ~b : bbbbbb : cdefgh : 000...0
+                let sign = (imm >> 7) & 1;
+                let b = (imm >> 6) & 1;
+                let exp8 = (((b ^ 1) & 1) << 7) | (if b != 0 { 0b0011111u64 } else { 0b1000000u64 });
+                let frac = (imm & 0x3F) << 17;
+                let f32_bits = (sign << 31) | (exp8 << 23) | frac;
+                replicate_to_u128(f32_bits, 32)
+            } else if op == 1 && cmode_lo == 0 {
+                // MOVI .1D/.2D — each bit of imm8 expands to a full byte
                 let mut val = 0u64;
                 for i in 0..8 {
                     if (imm >> i) & 1 != 0 {
@@ -826,17 +865,16 @@ fn expand_simd_imm(op: u8, cmode: u8, imm8: u8) -> u128 {
                     }
                 }
                 val as u128
-            } else if op == 1 && cmode & 1 == 0 {
-                // MVNI 32-bit
-                replicate_to_u128(!imm & 0xFFFF_FFFF, 32)
             } else {
-                // FMOV vector immediate (op=1, cmode=1111)
-                // Expand to f32 immediate replicated
+                // FMOV .2D — f64 immediate replicated to both 64-bit lanes
+                // f64 = a : ~b : bbbbbbbbbb : cdefgh : 000...0  (64 bits)
                 let sign = (imm >> 7) & 1;
-                let exp = ((!((imm >> 6) & 1) & 1) << 7) | (if (imm >> 6) & 1 != 0 { 0b0011111 } else { 0b1000000 }) << 0;
-                let frac = (imm & 0x3F) << 19;
-                let f32_bits = (sign << 31) | ((exp as u64) << 23) | frac;
-                replicate_to_u128(f32_bits, 32)
+                let b = (imm >> 6) & 1;
+                let exp11 = (((b ^ 1) & 1) << 10)
+                    | (if b != 0 { 0b01111111111u64 } else { 0b10000000000u64 });
+                let frac = (imm & 0x3F) << 46;
+                let f64_bits = (sign << 63) | (exp11 << 52) | frac;
+                (f64_bits as u128) | ((f64_bits as u128) << 64)
             }
         }
         _ => 0,
@@ -961,6 +999,97 @@ pub fn exec_simd_shift_imm(
             state.set_vreg_u128(rd as u32, 0);
             for i in 0..src_lanes {
                 state.set_vreg_lane(rd as u32, i, dst_esize, results[i as usize]);
+            }
+        }
+        // SRSHR (U=0, opcode=0b00100) — signed rounding shift right
+        (false, 0b00100) => {
+            let shift = (esize * 2) - immhb;
+            for_each_lane_unary(state, q, esize, rd, rn, |v| {
+                let sv = sign_extend_lane(v, esize);
+                let rounded = if shift == 0 {
+                    sv
+                } else {
+                    let round_bit = (sv >> (shift - 1)) & 1;
+                    (sv >> shift).wrapping_add(round_bit)
+                };
+                mask(rounded as u64, esize)
+            });
+        }
+        // URSHR (U=1, opcode=0b00100) — unsigned rounding shift right
+        (true, 0b00100) => {
+            let shift = (esize * 2) - immhb;
+            for_each_lane_unary(state, q, esize, rd, rn, |v| {
+                if shift == 0 {
+                    v
+                } else if shift >= esize {
+                    0
+                } else {
+                    let round_bit = (v >> (shift - 1)) & 1;
+                    (v >> shift).wrapping_add(round_bit)
+                }
+            });
+        }
+        // SRSRA (U=0, opcode=0b00110) — signed rounding shift right and accumulate
+        (false, 0b00110) => {
+            let shift = (esize * 2) - immhb;
+            let lanes = if q { 128 / esize } else { 64 / esize };
+            let mut results = [0u64; 16];
+            for i in 0..lanes {
+                let src = sign_extend_lane(state.get_vreg_lane(rn as u32, i, esize), esize);
+                let dst = state.get_vreg_lane(rd as u32, i, esize);
+                let shifted = if shift == 0 {
+                    src
+                } else {
+                    let round_bit = (src >> (shift - 1)) & 1;
+                    (src >> shift).wrapping_add(round_bit)
+                };
+                results[i as usize] = mask(dst.wrapping_add(shifted as u64), esize);
+            }
+            if !q { state.v[rd as usize][1] = 0; }
+            for i in 0..lanes {
+                state.set_vreg_lane(rd as u32, i, esize, results[i as usize]);
+            }
+        }
+        // URSRA (U=1, opcode=0b00110) — unsigned rounding shift right and accumulate
+        (true, 0b00110) => {
+            let shift = (esize * 2) - immhb;
+            let lanes = if q { 128 / esize } else { 64 / esize };
+            let mut results = [0u64; 16];
+            for i in 0..lanes {
+                let src = state.get_vreg_lane(rn as u32, i, esize);
+                let dst = state.get_vreg_lane(rd as u32, i, esize);
+                let shifted = if shift == 0 {
+                    src
+                } else if shift >= esize {
+                    0
+                } else {
+                    let round_bit = (src >> (shift - 1)) & 1;
+                    (src >> shift).wrapping_add(round_bit)
+                };
+                results[i as usize] = mask(dst.wrapping_add(shifted), esize);
+            }
+            if !q { state.v[rd as usize][1] = 0; }
+            for i in 0..lanes {
+                state.set_vreg_lane(rd as u32, i, esize, results[i as usize]);
+            }
+        }
+        // SRI (U=1, opcode=0b01000) — shift right and insert
+        // Upper `shift` bits from dst, lower (esize-shift) bits from src >> shift.
+        (true, 0b01000) => {
+            let shift = (esize * 2) - immhb;
+            let lanes = if q { 128 / esize } else { 64 / esize };
+            let insert_mask = if shift >= esize { 0 } else { all_ones(esize) >> shift };
+            let keep_mask = all_ones(esize) & !insert_mask;
+            let mut results = [0u64; 16];
+            for i in 0..lanes {
+                let src = state.get_vreg_lane(rn as u32, i, esize);
+                let dst = state.get_vreg_lane(rd as u32, i, esize);
+                let shifted = if shift >= esize { 0 } else { src >> shift };
+                results[i as usize] = (dst & keep_mask) | (shifted & insert_mask);
+            }
+            if !q { state.v[rd as usize][1] = 0; }
+            for i in 0..lanes {
+                state.set_vreg_lane(rd as u32, i, esize, results[i as usize]);
             }
         }
         // SHRN/SHRN2 (U=0, opcode=0b10000) — shift right narrow
