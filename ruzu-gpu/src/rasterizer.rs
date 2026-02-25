@@ -10,9 +10,9 @@
 use crate::engines::maxwell_3d::{
     BlendColorInfo, BlendEquation, BlendFactor, BlendInfo, ColorMaskInfo, ComponentType,
     ComparisonOp, CullFace, DepthStencilInfo, DrawCall, FrontFace, IndexFormat,
-    PrimitiveTopology, RasterizerInfo, SamplerDescriptor, ScissorInfo, SwizzleSource,
-    TextureDescriptor, TextureFormat, TextureType, TicHeaderVersion, VertexAttribSize,
-    VertexAttribType, WrapMode,
+    PrimitiveTopology, RasterizerInfo, SamplerDescriptor, ScissorInfo, StencilOp, SwizzleSource,
+    TextureDescriptor, TextureFilter, TextureFormat, TextureType, TicHeaderVersion,
+    VertexAttribSize, VertexAttribType, WrapMode,
 };
 use crate::engines::Framebuffer;
 
@@ -24,6 +24,7 @@ struct SampledTexture {
     wrap_u: WrapMode,
     wrap_v: WrapMode,
     normalized_coords: bool,
+    mag_filter: TextureFilter,
 }
 
 /// Return bytes per texel for supported uncompressed formats, or `None` for
@@ -210,8 +211,526 @@ fn align_up(value: u32, align: u32) -> u32 {
     (value + align - 1) / align * align
 }
 
+// ── Texture compression decompression ────────────────────────────────────────
+
+/// Return (block_width, block_height, bytes_per_block) for compressed formats.
+fn block_format_info(fmt: TextureFormat) -> Option<(u32, u32, u32)> {
+    match fmt {
+        TextureFormat::Bc1Rgba => Some((4, 4, 8)),
+        TextureFormat::Bc2 => Some((4, 4, 16)),
+        TextureFormat::Bc3 => Some((4, 4, 16)),
+        TextureFormat::Bc4 => Some((4, 4, 8)),
+        TextureFormat::Bc5 => Some((4, 4, 16)),
+        TextureFormat::Bc7 => Some((4, 4, 16)),
+        TextureFormat::Bc6HSf16 | TextureFormat::Bc6HUf16 => Some((4, 4, 16)),
+        TextureFormat::Astc2d4x4 => Some((4, 4, 16)),
+        TextureFormat::Astc2d5x4 => Some((5, 4, 16)),
+        TextureFormat::Astc2d5x5 => Some((5, 5, 16)),
+        TextureFormat::Astc2d6x5 => Some((6, 5, 16)),
+        TextureFormat::Astc2d6x6 => Some((6, 6, 16)),
+        TextureFormat::Astc2d8x5 => Some((8, 5, 16)),
+        TextureFormat::Astc2d8x6 => Some((8, 6, 16)),
+        TextureFormat::Astc2d8x8 => Some((8, 8, 16)),
+        TextureFormat::Astc2d10x5 => Some((10, 5, 16)),
+        TextureFormat::Astc2d10x6 => Some((10, 6, 16)),
+        TextureFormat::Astc2d10x8 => Some((10, 8, 16)),
+        TextureFormat::Astc2d10x10 => Some((10, 10, 16)),
+        TextureFormat::Astc2d12x10 => Some((12, 10, 16)),
+        TextureFormat::Astc2d12x12 => Some((12, 12, 16)),
+        _ => None,
+    }
+}
+
+/// Expand RGB565 to RGB888.
+fn rgb565_to_rgb888(c: u16) -> [u8; 3] {
+    let r5 = ((c >> 11) & 0x1F) as u8;
+    let g6 = ((c >> 5) & 0x3F) as u8;
+    let b5 = (c & 0x1F) as u8;
+    [
+        (r5 << 3) | (r5 >> 2),
+        (g6 << 2) | (g6 >> 4),
+        (b5 << 3) | (b5 >> 2),
+    ]
+}
+
+/// Decompress a single BC1 (DXT1) 8-byte block into 16 RGBA8 texels (4x4).
+fn decompress_bc1_block(block: &[u8; 8]) -> [[u8; 4]; 16] {
+    let c0_raw = u16::from_le_bytes([block[0], block[1]]);
+    let c1_raw = u16::from_le_bytes([block[2], block[3]]);
+    let c0 = rgb565_to_rgb888(c0_raw);
+    let c1 = rgb565_to_rgb888(c1_raw);
+
+    let mut palette = [[0u8; 4]; 4];
+    palette[0] = [c0[0], c0[1], c0[2], 255];
+    palette[1] = [c1[0], c1[1], c1[2], 255];
+
+    if c0_raw > c1_raw {
+        // 4-color mode: 1/3, 2/3 interpolation.
+        for i in 0..3 {
+            palette[2][i] = ((2 * c0[i] as u16 + c1[i] as u16 + 1) / 3) as u8;
+            palette[3][i] = ((c0[i] as u16 + 2 * c1[i] as u16 + 1) / 3) as u8;
+        }
+        palette[2][3] = 255;
+        palette[3][3] = 255;
+    } else {
+        // 3-color + transparent mode.
+        for i in 0..3 {
+            palette[2][i] = ((c0[i] as u16 + c1[i] as u16) / 2) as u8;
+        }
+        palette[2][3] = 255;
+        palette[3] = [0, 0, 0, 0]; // transparent black
+    }
+
+    let mut result = [[0u8; 4]; 16];
+    for row in 0..4u32 {
+        let bits = block[4 + row as usize];
+        for col in 0..4u32 {
+            let idx = ((bits >> (col * 2)) & 0x3) as usize;
+            result[(row * 4 + col) as usize] = palette[idx];
+        }
+    }
+    result
+}
+
+/// Decode BC3/BC4-style interpolated alpha block (8 bytes) into 16 alpha values.
+fn decode_alpha_block(block: &[u8; 8]) -> [u8; 16] {
+    let a0 = block[0];
+    let a1 = block[1];
+
+    let mut palette = [0u8; 8];
+    palette[0] = a0;
+    palette[1] = a1;
+
+    if a0 > a1 {
+        for i in 1..7u16 {
+            palette[(i + 1) as usize] =
+                (((7 - i) * a0 as u16 + i * a1 as u16 + 3) / 7) as u8;
+        }
+    } else {
+        for i in 1..5u16 {
+            palette[(i + 1) as usize] =
+                (((5 - i) * a0 as u16 + i * a1 as u16 + 2) / 5) as u8;
+        }
+        palette[6] = 0;
+        palette[7] = 255;
+    }
+
+    // Decode 48 bits of 3-bit indices from bytes 2..8.
+    let mut bits: u64 = 0;
+    for i in 0..6 {
+        bits |= (block[2 + i] as u64) << (i * 8);
+    }
+
+    let mut result = [0u8; 16];
+    for i in 0..16 {
+        let idx = ((bits >> (i * 3)) & 0x7) as usize;
+        result[i] = palette[idx];
+    }
+    result
+}
+
+/// Decompress a single BC2 (DXT3) 16-byte block into 16 RGBA8 texels.
+fn decompress_bc2_block(block: &[u8; 16]) -> [[u8; 4]; 16] {
+    // First 8 bytes: explicit 4-bit alpha per texel.
+    // Last 8 bytes: BC1 color block.
+    let color_block: [u8; 8] = block[8..16].try_into().unwrap();
+    let mut result = decompress_bc1_block(&color_block);
+
+    // Override alpha with explicit 4-bit values.
+    for i in 0..16 {
+        let byte_idx = i / 2;
+        let nibble = if i % 2 == 0 {
+            block[byte_idx] & 0x0F
+        } else {
+            (block[byte_idx] >> 4) & 0x0F
+        };
+        result[i][3] = nibble | (nibble << 4);
+    }
+    result
+}
+
+/// Decompress a single BC3 (DXT5) 16-byte block into 16 RGBA8 texels.
+fn decompress_bc3_block(block: &[u8; 16]) -> [[u8; 4]; 16] {
+    let alpha_block: [u8; 8] = block[0..8].try_into().unwrap();
+    let color_block: [u8; 8] = block[8..16].try_into().unwrap();
+    let alphas = decode_alpha_block(&alpha_block);
+    let mut result = decompress_bc1_block(&color_block);
+    for i in 0..16 {
+        result[i][3] = alphas[i];
+    }
+    result
+}
+
+/// Decompress a single BC4 (single-channel) 8-byte block into 16 RGBA8 texels.
+fn decompress_bc4_block(block: &[u8; 8]) -> [[u8; 4]; 16] {
+    let alpha_block: [u8; 8] = *block;
+    let values = decode_alpha_block(&alpha_block);
+    let mut result = [[0u8; 4]; 16];
+    for i in 0..16 {
+        result[i] = [values[i], 0, 0, 255];
+    }
+    result
+}
+
+/// Decompress a single BC5 (two-channel) 16-byte block into 16 RGBA8 texels.
+fn decompress_bc5_block(block: &[u8; 16]) -> [[u8; 4]; 16] {
+    let r_block: [u8; 8] = block[0..8].try_into().unwrap();
+    let g_block: [u8; 8] = block[8..16].try_into().unwrap();
+    let r_values = decode_alpha_block(&r_block);
+    let g_values = decode_alpha_block(&g_block);
+    let mut result = [[0u8; 4]; 16];
+    for i in 0..16 {
+        result[i] = [r_values[i], g_values[i], 0, 255];
+    }
+    result
+}
+
+/// Decompress a single BC7 16-byte block into 16 RGBA8 texels.
+/// Supports modes 1, 3, and 6. Other modes return magenta error color.
+fn decompress_bc7_block(block: &[u8; 16]) -> [[u8; 4]; 16] {
+    let magenta = [[255u8, 0, 255, 255]; 16];
+
+    // Read bits from block as a 128-bit value (little-endian).
+    let mut bits: u128 = 0;
+    for i in 0..16 {
+        bits |= (block[i] as u128) << (i * 8);
+    }
+
+    // Determine mode from leading bits.
+    let mode;
+    let mut bit_pos: u32;
+    if bits & 1 != 0 {
+        mode = 0;
+        bit_pos = 1;
+    } else if bits & 2 != 0 {
+        mode = 1;
+        bit_pos = 2;
+    } else if bits & 4 != 0 {
+        mode = 2;
+        bit_pos = 3;
+    } else if bits & 8 != 0 {
+        mode = 3;
+        bit_pos = 4;
+    } else if bits & 16 != 0 {
+        mode = 4;
+        bit_pos = 5;
+    } else if bits & 32 != 0 {
+        mode = 5;
+        bit_pos = 6;
+    } else if bits & 64 != 0 {
+        mode = 6;
+        bit_pos = 7;
+    } else if bits & 128 != 0 {
+        mode = 7;
+        bit_pos = 8;
+    } else {
+        return magenta; // reserved (void) block
+    }
+
+    let read_bits = |pos: &mut u32, count: u32| -> u32 {
+        if count == 0 {
+            return 0;
+        }
+        let val = ((bits >> *pos) & ((1u128 << count) - 1)) as u32;
+        *pos += count;
+        val
+    };
+
+    match mode {
+        1 => {
+            // Mode 1: 2 subsets, 6-bit color, 6-bit alpha, 1-bit partition
+            let partition = read_bits(&mut bit_pos, 6);
+
+            // 6 color endpoints (3 pairs for 2 subsets, but mode 1 has 2 subsets × 2 endpoints × RGB)
+            let mut ep_r = [0u32; 4];
+            let mut ep_g = [0u32; 4];
+            let mut ep_b = [0u32; 4];
+            for i in 0..4 {
+                ep_r[i] = read_bits(&mut bit_pos, 6);
+            }
+            for i in 0..4 {
+                ep_g[i] = read_bits(&mut bit_pos, 6);
+            }
+            for i in 0..4 {
+                ep_b[i] = read_bits(&mut bit_pos, 6);
+            }
+            // Shared P-bit per subset.
+            let p0 = read_bits(&mut bit_pos, 1);
+            let p1 = read_bits(&mut bit_pos, 1);
+
+            // Expand endpoints: 6 bits + p-bit = 7 bits, then replicate top bit.
+            let expand7 = |v: u32, p: u32| -> u8 {
+                let v7 = (v << 1) | p;
+                ((v7 << 1) | (v7 >> 6)) as u8
+            };
+
+            let mut endpoints = [[[0u8; 4]; 2]; 2];
+            for e in 0..2 {
+                let p = if e < 2 { [p0, p0] } else { [p1, p1] };
+                let _ = p; // both endpoints in a subset share the same p-bit
+            }
+            let ps = [p0, p0, p1, p1];
+            for i in 0..4 {
+                endpoints[i / 2][i % 2] = [
+                    expand7(ep_r[i], ps[i]),
+                    expand7(ep_g[i], ps[i]),
+                    expand7(ep_b[i], ps[i]),
+                    255,
+                ];
+            }
+
+            // Read 3-bit indices (46 bits total: anchor texels get 2 bits).
+            let partition_table = bc7_partition_table_2(partition as usize);
+            let anchors = bc7_anchor_indices_2(partition as usize);
+
+            let mut result = [[0u8; 4]; 16];
+            for i in 0..16 {
+                let subset = partition_table[i] as usize;
+                let is_anchor = i == 0 || i == anchors[subset];
+                let idx_bits = if is_anchor { 2 } else { 3 };
+                let idx = read_bits(&mut bit_pos, idx_bits);
+                let w = bc7_interpolation_weight(3, idx);
+                let ep0 = endpoints[subset][0];
+                let ep1 = endpoints[subset][1];
+                for c in 0..3 {
+                    result[i][c] =
+                        (((64 - w) * ep0[c] as u32 + w * ep1[c] as u32 + 32) / 64) as u8;
+                }
+                result[i][3] = 255;
+            }
+            result
+        }
+        3 => {
+            // Mode 3: 2 subsets, 7-bit color, no alpha, unique p-bits
+            let partition = read_bits(&mut bit_pos, 6);
+            let mut ep_r = [0u32; 4];
+            let mut ep_g = [0u32; 4];
+            let mut ep_b = [0u32; 4];
+            for i in 0..4 {
+                ep_r[i] = read_bits(&mut bit_pos, 7);
+            }
+            for i in 0..4 {
+                ep_g[i] = read_bits(&mut bit_pos, 7);
+            }
+            for i in 0..4 {
+                ep_b[i] = read_bits(&mut bit_pos, 7);
+            }
+            // 4 unique p-bits (one per endpoint).
+            let mut p_bits = [0u32; 4];
+            for i in 0..4 {
+                p_bits[i] = read_bits(&mut bit_pos, 1);
+            }
+
+            let expand8 = |v: u32, p: u32| -> u8 { ((v << 1) | p) as u8 };
+
+            let mut endpoints = [[[0u8; 4]; 2]; 2];
+            for i in 0..4 {
+                endpoints[i / 2][i % 2] = [
+                    expand8(ep_r[i], p_bits[i]),
+                    expand8(ep_g[i], p_bits[i]),
+                    expand8(ep_b[i], p_bits[i]),
+                    255,
+                ];
+            }
+
+            let partition_table = bc7_partition_table_2(partition as usize);
+            let anchors = bc7_anchor_indices_2(partition as usize);
+
+            let mut result = [[0u8; 4]; 16];
+            for i in 0..16 {
+                let subset = partition_table[i] as usize;
+                let is_anchor = i == 0 || i == anchors[subset];
+                let idx_bits = if is_anchor { 1 } else { 2 };
+                let idx = read_bits(&mut bit_pos, idx_bits);
+                let w = bc7_interpolation_weight(2, idx);
+                let ep0 = endpoints[subset][0];
+                let ep1 = endpoints[subset][1];
+                for c in 0..3 {
+                    result[i][c] =
+                        (((64 - w) * ep0[c] as u32 + w * ep1[c] as u32 + 32) / 64) as u8;
+                }
+                result[i][3] = 255;
+            }
+            result
+        }
+        6 => {
+            // Mode 6: 1 subset, 7+1 color bits, 7+1 alpha bits, 4-bit indices
+            // No partition bits.
+            let mut ep_r = [0u32; 2];
+            let mut ep_g = [0u32; 2];
+            let mut ep_b = [0u32; 2];
+            let mut ep_a = [0u32; 2];
+            for i in 0..2 {
+                ep_r[i] = read_bits(&mut bit_pos, 7);
+            }
+            for i in 0..2 {
+                ep_g[i] = read_bits(&mut bit_pos, 7);
+            }
+            for i in 0..2 {
+                ep_b[i] = read_bits(&mut bit_pos, 7);
+            }
+            for i in 0..2 {
+                ep_a[i] = read_bits(&mut bit_pos, 7);
+            }
+            // Unique p-bits per endpoint.
+            let p0 = read_bits(&mut bit_pos, 1);
+            let p1 = read_bits(&mut bit_pos, 1);
+
+            let expand8 = |v: u32, p: u32| -> u8 { ((v << 1) | p) as u8 };
+
+            let endpoints = [
+                [
+                    expand8(ep_r[0], p0),
+                    expand8(ep_g[0], p0),
+                    expand8(ep_b[0], p0),
+                    expand8(ep_a[0], p0),
+                ],
+                [
+                    expand8(ep_r[1], p1),
+                    expand8(ep_g[1], p1),
+                    expand8(ep_b[1], p1),
+                    expand8(ep_a[1], p1),
+                ],
+            ];
+
+            let mut result = [[0u8; 4]; 16];
+            for i in 0..16 {
+                let idx_bits = if i == 0 { 3 } else { 4 };
+                let idx = read_bits(&mut bit_pos, idx_bits);
+                let w = bc7_interpolation_weight(4, idx);
+                for c in 0..4 {
+                    result[i][c] = (((64 - w) * endpoints[0][c] as u32
+                        + w * endpoints[1][c] as u32
+                        + 32)
+                        / 64) as u8;
+                }
+            }
+            result
+        }
+        _ => magenta, // Unsupported mode
+    }
+}
+
+/// BC7 interpolation weight table.
+fn bc7_interpolation_weight(index_bits: u32, index: u32) -> u32 {
+    match index_bits {
+        2 => [0, 21, 43, 64][index as usize],
+        3 => [0, 9, 18, 27, 37, 46, 55, 64][index as usize],
+        4 => [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64][index as usize],
+        _ => 0,
+    }
+}
+
+/// BC7 2-subset partition table (64 partitions × 16 texels).
+/// Returns subset index (0 or 1) for each texel.
+fn bc7_partition_table_2(partition: usize) -> [u8; 16] {
+    // Standard BC7 2-subset partition table.
+    const TABLE: [[u8; 16]; 64] = [
+        [0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1],
+        [0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1],
+        [0,1,1,1,0,1,1,1,0,1,1,1,0,1,1,1],
+        [0,0,0,1,0,0,1,1,0,0,1,1,0,1,1,1],
+        [0,0,0,0,0,0,0,1,0,0,0,1,0,0,1,1],
+        [0,0,1,1,0,1,1,1,0,1,1,1,1,1,1,1],
+        [0,0,0,1,0,0,1,1,0,1,1,1,1,1,1,1],
+        [0,0,0,0,0,0,0,1,0,0,1,1,0,1,1,1],
+        [0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,1],
+        [0,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1],
+        [0,0,0,0,0,0,0,1,0,1,1,1,1,1,1,1],
+        [0,0,0,0,0,0,0,0,0,0,0,1,0,1,1,1],
+        [0,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1],
+        [0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1],
+        [0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1],
+        [0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1],
+        [0,0,0,0,1,0,0,0,1,1,1,0,1,1,1,1],
+        [0,1,1,1,0,0,0,1,0,0,0,0,0,0,0,0],
+        [0,0,0,0,0,0,0,0,1,0,0,0,1,1,1,0],
+        [0,1,1,1,0,0,1,1,0,0,0,1,0,0,0,0],
+        [0,0,1,1,0,0,0,1,0,0,0,0,0,0,0,0],
+        [0,0,0,0,1,0,0,0,1,1,0,0,1,1,1,0],
+        [0,0,0,0,0,0,0,0,1,0,0,0,1,1,0,0],
+        [0,1,1,1,0,0,1,1,0,0,1,1,0,0,0,1],
+        [0,0,1,1,0,0,0,1,0,0,0,1,0,0,0,0],
+        [0,0,0,0,1,0,0,0,1,0,0,0,1,1,0,0],
+        [0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0],
+        [0,0,1,1,0,1,1,0,0,1,1,0,1,1,0,0],
+        [0,0,0,1,0,1,1,1,1,1,1,0,1,0,0,0],
+        [0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0],
+        [0,1,1,1,0,0,0,1,1,0,0,0,1,1,1,0],
+        [0,0,1,1,1,0,0,1,1,0,0,1,1,1,0,0],
+        [0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1],
+        [0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1],
+        [0,1,0,1,1,0,1,0,0,1,0,1,1,0,1,0],
+        [0,0,1,1,0,0,1,1,1,1,0,0,1,1,0,0],
+        [0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0],
+        [0,1,0,1,0,1,0,1,1,0,1,0,1,0,1,0],
+        [0,1,1,0,1,0,0,1,0,1,1,0,1,0,0,1],
+        [0,1,0,1,1,0,1,0,1,0,1,0,0,1,0,1],
+        [0,1,1,1,0,0,1,1,1,1,0,0,1,1,1,0],
+        [0,0,0,1,0,0,1,1,1,1,0,0,1,0,0,0],
+        [0,0,1,1,0,0,1,0,0,1,0,0,1,1,0,0],
+        [0,0,1,1,1,0,1,1,1,1,0,1,1,1,0,0],
+        [0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0],
+        [0,0,1,1,1,1,0,0,1,1,0,0,0,0,1,1],
+        [0,1,1,0,0,1,1,0,1,0,0,1,1,0,0,1],
+        [0,0,0,0,0,1,1,0,0,1,1,0,0,0,0,0],
+        [0,1,0,0,1,1,1,0,0,1,0,0,0,0,0,0],
+        [0,0,1,0,0,1,1,1,0,0,1,0,0,0,0,0],
+        [0,0,0,0,0,0,1,0,0,1,1,1,0,0,1,0],
+        [0,0,0,0,0,1,0,0,1,1,1,0,0,1,0,0],
+        [0,1,1,0,1,1,0,0,1,0,0,1,0,0,1,1],
+        [0,0,1,1,0,1,1,0,1,1,0,0,1,0,0,1],
+        [0,1,1,0,0,0,1,1,1,0,0,1,1,1,0,0],
+        [0,0,1,1,1,0,0,1,1,1,0,0,0,1,1,0],
+        [0,1,1,0,1,1,0,0,1,1,0,0,1,0,0,1],
+        [0,1,1,0,0,0,1,1,0,0,1,1,1,0,0,1],
+        [0,1,1,1,1,1,1,0,1,0,0,0,0,0,0,1],
+        [0,0,0,1,1,0,0,0,1,1,1,0,0,1,1,1],
+        [0,0,0,0,1,1,1,1,0,0,1,1,0,0,1,1],
+        [0,0,1,1,0,0,1,1,1,1,1,1,0,0,0,0],
+        [0,0,1,0,0,0,1,0,1,1,1,0,1,1,1,0],
+        [0,1,0,0,0,1,0,0,0,1,1,1,0,1,1,1],
+    ];
+    TABLE[partition % 64]
+}
+
+/// Return second anchor index for 2-subset BC7 partitions.
+fn bc7_anchor_indices_2(partition: usize) -> [usize; 2] {
+    // First subset anchor is always 0. Second subset anchor:
+    const ANCHOR2: [usize; 64] = [
+        15,15,15,15,15,15,15,15,
+        15,15,15,15,15,15,15,15,
+        15, 2, 8, 2, 2, 8, 8,15,
+         2, 8, 2, 2, 8, 8, 2, 2,
+        15,15, 6, 8, 2, 8,15,15,
+         2, 8, 2, 2, 2,15,15, 6,
+         6, 2, 6, 8,15,15, 2, 2,
+        15,15,15,15,15, 2, 2,15,
+    ];
+    [0, ANCHOR2[partition % 64]]
+}
+
+/// Decompress ASTC block (void-extent only, other blocks return magenta).
+fn decompress_astc_block(block: &[u8; 16], block_w: u32, block_h: u32) -> Vec<[u8; 4]> {
+    let count = (block_w * block_h) as usize;
+
+    // Check for void-extent block: first 9 bits == 0x1FC (bits[8:0] = 111111100).
+    let first_bits = u16::from_le_bytes([block[0], block[1]]);
+    if (first_bits & 0x1FF) == 0x1FC {
+        // Void-extent: solid color stored at bytes 8..16 as RGBA16 (we take high bytes).
+        let r = block[9]; // high byte of R16
+        let g = block[11];
+        let b = block[13];
+        let a = block[15];
+        return vec![[r, g, b, a]; count];
+    }
+
+    // Non-void-extent: return magenta for now.
+    vec![[255, 0, 255, 255]; count]
+}
+
 /// Nearest-neighbor sample from a pre-decoded texture. Returns normalised RGBA.
-fn sample_texture(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
+fn sample_texture_nearest(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
     let (su, sv) = if tex.normalized_coords {
         (u * tex.width as f32, v * tex.height as f32)
     } else {
@@ -229,6 +748,62 @@ fn sample_texture(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
         tex.data[idx + 2] as f32 / 255.0,
         tex.data[idx + 3] as f32 / 255.0,
     ]
+}
+
+/// Read a single texel from pre-decoded RGBA8 data. Returns normalised RGBA.
+fn read_texel(tex: &SampledTexture, tx: u32, ty: u32) -> [f32; 4] {
+    let idx = (ty * tex.width + tx) as usize * 4;
+    if idx + 4 > tex.data.len() {
+        return [1.0, 1.0, 1.0, 1.0];
+    }
+    [
+        tex.data[idx] as f32 / 255.0,
+        tex.data[idx + 1] as f32 / 255.0,
+        tex.data[idx + 2] as f32 / 255.0,
+        tex.data[idx + 3] as f32 / 255.0,
+    ]
+}
+
+/// Bilinear sample from a pre-decoded texture. Returns normalised RGBA.
+fn sample_texture_bilinear(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
+    let (su, sv) = if tex.normalized_coords {
+        (u * tex.width as f32, v * tex.height as f32)
+    } else {
+        (u, v)
+    };
+    let fx = su - 0.5;
+    let fy = sv - 0.5;
+    let x0 = apply_wrap_mode(fx, tex.width, tex.wrap_u);
+    let y0 = apply_wrap_mode(fy, tex.height, tex.wrap_v);
+    let x1 = apply_wrap_mode(fx + 1.0, tex.width, tex.wrap_u);
+    let y1 = apply_wrap_mode(fy + 1.0, tex.height, tex.wrap_v);
+
+    let t00 = read_texel(tex, x0, y0);
+    let t10 = read_texel(tex, x1, y0);
+    let t01 = read_texel(tex, x0, y1);
+    let t11 = read_texel(tex, x1, y1);
+
+    let frac_x = fx.fract();
+    let frac_y = fy.fract();
+    // Handle negative fractions.
+    let frac_x = if frac_x < 0.0 { frac_x + 1.0 } else { frac_x };
+    let frac_y = if frac_y < 0.0 { frac_y + 1.0 } else { frac_y };
+
+    let mut result = [0.0f32; 4];
+    for i in 0..4 {
+        let top = t00[i] * (1.0 - frac_x) + t10[i] * frac_x;
+        let bot = t01[i] * (1.0 - frac_x) + t11[i] * frac_x;
+        result[i] = top * (1.0 - frac_y) + bot * frac_y;
+    }
+    result
+}
+
+/// Sample from a pre-decoded texture using the configured filter mode.
+fn sample_texture(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
+    match tex.mag_filter {
+        TextureFilter::Linear => sample_texture_bilinear(tex, u, v),
+        _ => sample_texture_nearest(tex, u, v),
+    }
 }
 
 /// Read UV (texture coordinate) attribute for all vertices of a draw call.
@@ -314,13 +889,12 @@ fn load_texture(
         _ => return None,
     }
 
-    let bpt = bytes_per_texel(tex_desc.format)?;
     if tex_desc.width == 0 || tex_desc.height == 0 || tex_desc.address == 0 {
         return None;
     }
 
     // Read TSC entry 0 (32 bytes) if sampler pool is available; otherwise use defaults.
-    let (wrap_u, wrap_v) = if draw.tex_sampler_pool_addr != 0 {
+    let (wrap_u, wrap_v, mag_filter) = if draw.tex_sampler_pool_addr != 0 {
         let mut tsc_buf = [0u8; 32];
         read_gpu(draw.tex_sampler_pool_addr, &mut tsc_buf);
         let mut tsc_words = [0u32; 8];
@@ -328,40 +902,11 @@ fn load_texture(
             tsc_words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
         let sam_desc = SamplerDescriptor::from_words(&tsc_words);
-        (sam_desc.wrap_u, sam_desc.wrap_v)
+        (sam_desc.wrap_u, sam_desc.wrap_v, sam_desc.mag_filter)
     } else {
-        (WrapMode::ClampToEdge, WrapMode::ClampToEdge)
+        (WrapMode::ClampToEdge, WrapMode::ClampToEdge, TextureFilter::Nearest)
     };
 
-    // Bulk-read raw texture data — layout depends on header version.
-    let raw = match tex_desc.header_version {
-        TicHeaderVersion::Pitch => {
-            let total_bytes = (tex_desc.width * tex_desc.height * bpt) as usize;
-            let mut buf = vec![0u8; total_bytes];
-            read_gpu(tex_desc.address, &mut buf);
-            buf
-        }
-        TicHeaderVersion::BlockLinear => {
-            let tiled_size = block_linear_size(
-                tex_desc.width,
-                tex_desc.height,
-                bpt,
-                tex_desc.block_height,
-            );
-            let mut tiled = vec![0u8; tiled_size];
-            read_gpu(tex_desc.address, &mut tiled);
-            deswizzle_block_linear(
-                &tiled,
-                tex_desc.width,
-                tex_desc.height,
-                bpt,
-                tex_desc.block_height,
-            )
-        }
-        _ => return None, // OneDBuffer, PitchColorKey, BlockLinearColorKey unsupported
-    };
-
-    // Pre-decode every texel to RGBA8.
     let texel_count = (tex_desc.width * tex_desc.height) as usize;
     let mut data = vec![0u8; texel_count * 4];
     let swizzle = [
@@ -371,32 +916,188 @@ fn load_texture(
         tex_desc.w_source,
     ];
 
-    for i in 0..texel_count {
-        let byte_off = i * bpt as usize;
-        let end = byte_off + bpt as usize;
-        if end > raw.len() {
-            break;
+    if let Some((bw, bh, bpb)) = block_format_info(tex_desc.format) {
+        // ── Compressed texture path ──
+        let blocks_x = (tex_desc.width + bw - 1) / bw;
+        let blocks_y = (tex_desc.height + bh - 1) / bh;
+        let total_block_bytes = (blocks_x * blocks_y * bpb) as usize;
+
+        let raw = match tex_desc.header_version {
+            TicHeaderVersion::Pitch => {
+                let mut buf = vec![0u8; total_block_bytes];
+                read_gpu(tex_desc.address, &mut buf);
+                buf
+            }
+            TicHeaderVersion::BlockLinear => {
+                // For BlockLinear compressed, treat each block as an element:
+                // effective width = blocks_x, effective height = blocks_y, bpt = bpb.
+                let tiled_size =
+                    block_linear_size(blocks_x, blocks_y, bpb, tex_desc.block_height);
+                let mut tiled = vec![0u8; tiled_size];
+                read_gpu(tex_desc.address, &mut tiled);
+                deswizzle_block_linear(
+                    &tiled,
+                    blocks_x,
+                    blocks_y,
+                    bpb,
+                    tex_desc.block_height,
+                )
+            }
+            _ => return None,
+        };
+
+        // Decompress each block into the RGBA8 output.
+        for by in 0..blocks_y {
+            for bx in 0..blocks_x {
+                let block_idx = (by * blocks_x + bx) as usize;
+                let block_off = block_idx * bpb as usize;
+                if block_off + bpb as usize > raw.len() {
+                    continue;
+                }
+                let block_data = &raw[block_off..block_off + bpb as usize];
+
+                let texels: Vec<[u8; 4]> = match tex_desc.format {
+                    TextureFormat::Bc1Rgba => {
+                        let b: [u8; 8] = block_data.try_into().unwrap();
+                        decompress_bc1_block(&b).to_vec()
+                    }
+                    TextureFormat::Bc2 => {
+                        let b: [u8; 16] = block_data.try_into().unwrap();
+                        decompress_bc2_block(&b).to_vec()
+                    }
+                    TextureFormat::Bc3 => {
+                        let b: [u8; 16] = block_data.try_into().unwrap();
+                        decompress_bc3_block(&b).to_vec()
+                    }
+                    TextureFormat::Bc4 => {
+                        let b: [u8; 8] = block_data.try_into().unwrap();
+                        decompress_bc4_block(&b).to_vec()
+                    }
+                    TextureFormat::Bc5 => {
+                        let b: [u8; 16] = block_data.try_into().unwrap();
+                        decompress_bc5_block(&b).to_vec()
+                    }
+                    TextureFormat::Bc7 => {
+                        let b: [u8; 16] = block_data.try_into().unwrap();
+                        decompress_bc7_block(&b).to_vec()
+                    }
+                    TextureFormat::Astc2d4x4
+                    | TextureFormat::Astc2d5x4
+                    | TextureFormat::Astc2d5x5
+                    | TextureFormat::Astc2d6x5
+                    | TextureFormat::Astc2d6x6
+                    | TextureFormat::Astc2d8x5
+                    | TextureFormat::Astc2d8x6
+                    | TextureFormat::Astc2d8x8
+                    | TextureFormat::Astc2d10x5
+                    | TextureFormat::Astc2d10x6
+                    | TextureFormat::Astc2d10x8
+                    | TextureFormat::Astc2d10x10
+                    | TextureFormat::Astc2d12x10
+                    | TextureFormat::Astc2d12x12 => {
+                        let b: [u8; 16] = block_data.try_into().unwrap();
+                        decompress_astc_block(&b, bw, bh)
+                    }
+                    _ => {
+                        // BC6H and other unsupported → magenta.
+                        vec![[255, 0, 255, 255]; (bw * bh) as usize]
+                    }
+                };
+
+                // Write decompressed texels into output, clipping to actual dimensions.
+                for ty in 0..bh {
+                    for tx in 0..bw {
+                        let px = bx * bw + tx;
+                        let py = by * bh + ty;
+                        if px >= tex_desc.width || py >= tex_desc.height {
+                            continue;
+                        }
+                        let texel_idx = (ty * bw + tx) as usize;
+                        if texel_idx >= texels.len() {
+                            continue;
+                        }
+                        let rgba = texels[texel_idx];
+                        let swizzled = apply_swizzle(rgba, &swizzle);
+                        let final_rgba = if tex_desc.srgb_conversion {
+                            [
+                                srgb_to_linear(swizzled[0]),
+                                srgb_to_linear(swizzled[1]),
+                                srgb_to_linear(swizzled[2]),
+                                swizzled[3],
+                            ]
+                        } else {
+                            swizzled
+                        };
+                        let out_idx = (py * tex_desc.width + px) as usize;
+                        data[out_idx * 4] = final_rgba[0];
+                        data[out_idx * 4 + 1] = final_rgba[1];
+                        data[out_idx * 4 + 2] = final_rgba[2];
+                        data[out_idx * 4 + 3] = final_rgba[3];
+                    }
+                }
+            }
         }
-        let texel_bytes = &raw[byte_off..end];
-        let rgba = match decode_texel(texel_bytes, tex_desc.format, tex_desc.r_type) {
-            Some(c) => c,
-            None => [255, 255, 255, 255],
+    } else {
+        // ── Uncompressed texture path ──
+        let bpt = match bytes_per_texel(tex_desc.format) {
+            Some(b) => b,
+            None => return None,
         };
-        let swizzled = apply_swizzle(rgba, &swizzle);
-        let final_rgba = if tex_desc.srgb_conversion {
-            [
-                srgb_to_linear(swizzled[0]),
-                srgb_to_linear(swizzled[1]),
-                srgb_to_linear(swizzled[2]),
-                swizzled[3], // alpha is never sRGB-converted
-            ]
-        } else {
-            swizzled
+
+        let raw = match tex_desc.header_version {
+            TicHeaderVersion::Pitch => {
+                let total_bytes = (tex_desc.width * tex_desc.height * bpt) as usize;
+                let mut buf = vec![0u8; total_bytes];
+                read_gpu(tex_desc.address, &mut buf);
+                buf
+            }
+            TicHeaderVersion::BlockLinear => {
+                let tiled_size = block_linear_size(
+                    tex_desc.width,
+                    tex_desc.height,
+                    bpt,
+                    tex_desc.block_height,
+                );
+                let mut tiled = vec![0u8; tiled_size];
+                read_gpu(tex_desc.address, &mut tiled);
+                deswizzle_block_linear(
+                    &tiled,
+                    tex_desc.width,
+                    tex_desc.height,
+                    bpt,
+                    tex_desc.block_height,
+                )
+            }
+            _ => return None,
         };
-        data[i * 4] = final_rgba[0];
-        data[i * 4 + 1] = final_rgba[1];
-        data[i * 4 + 2] = final_rgba[2];
-        data[i * 4 + 3] = final_rgba[3];
+
+        for i in 0..texel_count {
+            let byte_off = i * bpt as usize;
+            let end = byte_off + bpt as usize;
+            if end > raw.len() {
+                break;
+            }
+            let texel_bytes = &raw[byte_off..end];
+            let rgba = match decode_texel(texel_bytes, tex_desc.format, tex_desc.r_type) {
+                Some(c) => c,
+                None => [255, 255, 255, 255],
+            };
+            let swizzled = apply_swizzle(rgba, &swizzle);
+            let final_rgba = if tex_desc.srgb_conversion {
+                [
+                    srgb_to_linear(swizzled[0]),
+                    srgb_to_linear(swizzled[1]),
+                    srgb_to_linear(swizzled[2]),
+                    swizzled[3],
+                ]
+            } else {
+                swizzled
+            };
+            data[i * 4] = final_rgba[0];
+            data[i * 4 + 1] = final_rgba[1];
+            data[i * 4 + 2] = final_rgba[2];
+            data[i * 4 + 3] = final_rgba[3];
+        }
     }
 
     Some(SampledTexture {
@@ -406,6 +1107,7 @@ fn load_texture(
         wrap_u,
         wrap_v,
         normalized_coords: tex_desc.normalized_coords,
+        mag_filter,
     })
 }
 
@@ -448,6 +1150,7 @@ impl SoftwareRasterizer {
         }
 
         let mut depth_buf = vec![1.0f32; (fb_width * fb_height) as usize];
+        let mut stencil_buf = vec![0u8; (fb_width * fb_height) as usize];
 
         for draw in draws {
             let positions = fetch_positions(draw, read_gpu);
@@ -513,6 +1216,7 @@ impl SoftwareRasterizer {
                     texture.as_ref(),
                     &mut pixels,
                     &mut depth_buf,
+                    &mut stencil_buf,
                     fb_width,
                     fb_height,
                     &draw.scissors[0],
@@ -770,17 +1474,18 @@ fn parse_indices(data: &[u8], format: IndexFormat) -> Vec<u32> {
     }
 }
 
-/// Map clip-space position to screen pixel coordinates, preserving Z for depth.
+/// Map clip-space position to screen pixel coordinates, preserving Z and W.
 fn viewport_transform(
     pos: [f32; 4],
     vp_x: f32,
     vp_y: f32,
     vp_width: f32,
     vp_height: f32,
-) -> [f32; 3] {
+) -> [f32; 4] {
+    let w = if pos[3] != 0.0 { pos[3] } else { 1.0 };
     let x = (pos[0] * 0.5 + 0.5) * vp_width + vp_x;
     let y = (pos[1] * 0.5 + 0.5) * vp_height + vp_y;
-    [x, y, pos[2]]
+    [x, y, pos[2], w]
 }
 
 /// Convert a list of vertex positions into triangle index triples based on topology.
@@ -835,8 +1540,8 @@ fn process_topology(positions: &[[f32; 4]], topology: PrimitiveTopology) -> Vec<
 }
 
 /// Compute signed area of a triangle from screen-space vertices.
-/// Positive = CCW winding, negative = CW winding.
-fn signed_area(v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -> f32 {
+/// Positive = CCW winding, negative = CW winding. Uses only X,Y components.
+fn signed_area(v0: [f32; 4], v1: [f32; 4], v2: [f32; 4]) -> f32 {
     (v1[0] - v0[0]) * (v2[1] - v0[1]) - (v2[0] - v0[0]) * (v1[1] - v0[1])
 }
 
@@ -871,6 +1576,42 @@ fn depth_test_passes(func: ComparisonOp, frag_z: f32, stored_z: f32) -> bool {
         ComparisonOp::GreaterEqual => frag_z >= stored_z,
         ComparisonOp::Always => true,
     }
+}
+
+/// Evaluate a stencil comparison function on masked values.
+fn stencil_test_passes(func: ComparisonOp, ref_val: u32, mask: u32, stored: u8) -> bool {
+    let masked_ref = (ref_val & mask) as u8;
+    let masked_stored = stored & (mask as u8);
+    match func {
+        ComparisonOp::Never => false,
+        ComparisonOp::Less => masked_ref < masked_stored,
+        ComparisonOp::Equal => masked_ref == masked_stored,
+        ComparisonOp::LessEqual => masked_ref <= masked_stored,
+        ComparisonOp::Greater => masked_ref > masked_stored,
+        ComparisonOp::NotEqual => masked_ref != masked_stored,
+        ComparisonOp::GreaterEqual => masked_ref >= masked_stored,
+        ComparisonOp::Always => true,
+    }
+}
+
+/// Apply a stencil operation to produce a new stencil value.
+fn apply_stencil_op(op: StencilOp, ref_val: u32, current: u8) -> u8 {
+    match op {
+        StencilOp::Keep => current,
+        StencilOp::Zero => 0,
+        StencilOp::Replace => ref_val as u8,
+        StencilOp::IncrSat => current.saturating_add(1),
+        StencilOp::DecrSat => current.saturating_sub(1),
+        StencilOp::Invert => !current,
+        StencilOp::Incr => current.wrapping_add(1),
+        StencilOp::Decr => current.wrapping_sub(1),
+    }
+}
+
+/// Write a new stencil value applying the write mask.
+fn write_stencil(stencil_buf: &mut [u8], idx: usize, new_val: u8, write_mask: u32, old: u8) {
+    let wm = write_mask as u8;
+    stencil_buf[idx] = (new_val & wm) | (old & !wm);
 }
 
 /// Apply a blend factor to produce per-channel multipliers.
@@ -966,9 +1707,9 @@ fn blend_colors(
 
 /// Rasterize a single triangle with full per-pixel pipeline.
 fn rasterize_triangle(
-    v0: [f32; 3],
-    v1: [f32; 3],
-    v2: [f32; 3],
+    v0: [f32; 4],
+    v1: [f32; 4],
+    v2: [f32; 4],
     c0: [f32; 4],
     c1: [f32; 4],
     c2: [f32; 4],
@@ -978,6 +1719,7 @@ fn rasterize_triangle(
     texture: Option<&SampledTexture>,
     pixels: &mut [u8],
     depth_buf: &mut [f32],
+    stencil_buf: &mut [u8],
     fb_width: u32,
     fb_height: u32,
     scissor: &ScissorInfo,
@@ -1005,9 +1747,14 @@ fn rasterize_triangle(
     }
 
     // Edge function: positive when point is on the left side of the edge.
-    let edge = |a: [f32; 3], b: [f32; 3], p: [f32; 2]| -> f32 {
+    let edge = |a: [f32; 4], b: [f32; 4], p: [f32; 2]| -> f32 {
         (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
     };
+
+    // Perspective-correct interpolation weights (1/w per vertex).
+    let inv_w0 = 1.0 / v0[3];
+    let inv_w1 = 1.0 / v1[3];
+    let inv_w2 = 1.0 / v2[3];
 
     for y in min_y..=max_y {
         for x in min_x..=max_x {
@@ -1022,10 +1769,10 @@ fn rasterize_triangle(
                     continue; // degenerate triangle
                 }
 
-                let inv_w = 1.0 / w_sum;
-                let b0 = w0 * inv_w;
-                let b1 = w1 * inv_w;
-                let b2 = w2 * inv_w;
+                let inv_wsum = 1.0 / w_sum;
+                let b0 = w0 * inv_wsum;
+                let b1 = w1 * inv_wsum;
+                let b2 = w2 * inv_wsum;
 
                 let pixel_idx = (y * fb_width + x) as usize;
                 let offset = pixel_idx * 4;
@@ -1034,29 +1781,72 @@ fn rasterize_triangle(
                     continue;
                 }
 
-                // Depth test.
-                if depth_stencil.depth_test_enable {
-                    let frag_z = v0[2] * b0 + v1[2] * b1 + v2[2] * b2;
-                    if !depth_test_passes(depth_stencil.depth_func, frag_z, depth_buf[pixel_idx]) {
+                // Stencil test (before depth test).
+                if depth_stencil.stencil_enable {
+                    let face = &depth_stencil.front;
+                    let stored = stencil_buf[pixel_idx];
+                    if !stencil_test_passes(face.func, face.ref_value, face.func_mask, stored) {
+                        let new_val = apply_stencil_op(face.fail_op, face.ref_value, stored);
+                        write_stencil(stencil_buf, pixel_idx, new_val, face.write_mask, stored);
                         continue;
-                    }
-                    if depth_stencil.depth_write_enable {
-                        depth_buf[pixel_idx] = frag_z;
                     }
                 }
 
-                // Interpolate vertex color.
+                // Depth test.
+                let depth_passed = if depth_stencil.depth_test_enable {
+                    let frag_z = v0[2] * b0 + v1[2] * b1 + v2[2] * b2;
+                    let passed =
+                        depth_test_passes(depth_stencil.depth_func, frag_z, depth_buf[pixel_idx]);
+                    if passed && depth_stencil.depth_write_enable {
+                        depth_buf[pixel_idx] = frag_z;
+                    }
+                    passed
+                } else {
+                    true
+                };
+
+                if !depth_passed {
+                    // Stencil zfail_op.
+                    if depth_stencil.stencil_enable {
+                        let face = &depth_stencil.front;
+                        let stored = stencil_buf[pixel_idx];
+                        let new_val = apply_stencil_op(face.zfail_op, face.ref_value, stored);
+                        write_stencil(stencil_buf, pixel_idx, new_val, face.write_mask, stored);
+                    }
+                    continue;
+                }
+
+                // Stencil zpass_op.
+                if depth_stencil.stencil_enable {
+                    let face = &depth_stencil.front;
+                    let stored = stencil_buf[pixel_idx];
+                    let new_val = apply_stencil_op(face.zpass_op, face.ref_value, stored);
+                    write_stencil(stencil_buf, pixel_idx, new_val, face.write_mask, stored);
+                }
+
+                // Perspective-correct interpolation weights for attributes.
+                let interp_inv_w = inv_w0 * b0 + inv_w1 * b1 + inv_w2 * b2;
+                let persp_w = if interp_inv_w.abs() > f32::EPSILON {
+                    1.0 / interp_inv_w
+                } else {
+                    1.0
+                };
+                let pb0 = b0 * inv_w0 * persp_w;
+                let pb1 = b1 * inv_w1 * persp_w;
+                let pb2 = b2 * inv_w2 * persp_w;
+
+                // Interpolate vertex color using perspective-correct weights.
                 let mut src = [
-                    c0[0] * b0 + c1[0] * b1 + c2[0] * b2,
-                    c0[1] * b0 + c1[1] * b1 + c2[1] * b2,
-                    c0[2] * b0 + c1[2] * b1 + c2[2] * b2,
-                    c0[3] * b0 + c1[3] * b1 + c2[3] * b2,
+                    c0[0] * pb0 + c1[0] * pb1 + c2[0] * pb2,
+                    c0[1] * pb0 + c1[1] * pb1 + c2[1] * pb2,
+                    c0[2] * pb0 + c1[2] * pb1 + c2[2] * pb2,
+                    c0[3] * pb0 + c1[3] * pb1 + c2[3] * pb2,
                 ];
 
-                // Texture modulation.
+                // Texture modulation using perspective-correct UVs.
                 if let Some(tex) = texture {
-                    let u = uv0[0] * b0 + uv1[0] * b1 + uv2[0] * b2;
-                    let v = uv0[1] * b0 + uv1[1] * b1 + uv2[1] * b2;
+                    let u = uv0[0] * pb0 + uv1[0] * pb1 + uv2[0] * pb2;
+                    let v = uv0[1] * pb0 + uv1[1] * pb1 + uv2[1] * pb2;
                     let tex_color = sample_texture(tex, u, v);
                     src[0] *= tex_color[0];
                     src[1] *= tex_color[1];
@@ -1267,21 +2057,31 @@ mod tests {
     }
 
     #[test]
+    fn test_viewport_transform_preserves_w() {
+        let result = viewport_transform([0.0, 0.0, 0.5, 2.0], 0.0, 0.0, 100.0, 100.0);
+        assert!((result[3] - 2.0).abs() < f32::EPSILON);
+        // W=0 should default to 1.
+        let result = viewport_transform([0.0, 0.0, 0.5, 0.0], 0.0, 0.0, 100.0, 100.0);
+        assert!((result[3] - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn test_rasterize_triangle_fills_pixels() {
         let width = 10u32;
         let height = 10u32;
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
         let white = [1.0f32, 1.0, 1.0, 1.0];
 
         // A triangle covering the upper-left quadrant.
-        let v0 = [0.0, 0.0, 0.0];
-        let v1 = [5.0, 0.0, 0.0];
-        let v2 = [0.0, 5.0, 0.0];
+        let v0 = [0.0, 0.0, 0.0, 1.0];
+        let v1 = [5.0, 0.0, 0.0, 1.0];
+        let v2 = [0.0, 5.0, 0.0, 1.0];
         rasterize_triangle(
             v0, v1, v2, white, white, white,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &default_depth_stencil(),
+            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
 
@@ -1300,16 +2100,17 @@ mod tests {
         let height = 4u32;
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
         let white = [1.0f32, 1.0, 1.0, 1.0];
 
         // Triangle extending way past framebuffer edges.
-        let v0 = [-10.0, -10.0, 0.0];
-        let v1 = [100.0, -10.0, 0.0];
-        let v2 = [-10.0, 100.0, 0.0];
+        let v0 = [-10.0, -10.0, 0.0, 1.0];
+        let v1 = [100.0, -10.0, 0.0, 1.0];
+        let v2 = [-10.0, 100.0, 0.0, 1.0];
         rasterize_triangle(
             v0, v1, v2, white, white, white,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &default_depth_stencil(),
+            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
 
@@ -1477,10 +2278,11 @@ mod tests {
         let height = 10u32;
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
 
-        let v0 = [1.0, 1.0, 0.0f32];
-        let v1 = [9.0, 1.0, 0.0];
-        let v2 = [5.0, 9.0, 0.0];
+        let v0 = [1.0, 1.0, 0.0, 1.0];
+        let v1 = [9.0, 1.0, 0.0, 1.0];
+        let v2 = [5.0, 9.0, 0.0, 1.0];
 
         let c0 = [1.0, 0.0, 0.0, 1.0]; // red
         let c1 = [0.0, 1.0, 0.0, 1.0]; // green
@@ -1489,7 +2291,7 @@ mod tests {
         rasterize_triangle(
             v0, v1, v2, c0, c1, c2,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &default_depth_stencil(),
+            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
 
@@ -1514,6 +2316,7 @@ mod tests {
         let height = 4u32;
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
         let ds = DepthStencilInfo {
             depth_test_enable: true,
             depth_write_enable: true,
@@ -1526,14 +2329,14 @@ mod tests {
         };
 
         // First triangle at z=0.5, red.
-        let v0 = [-1.0, -1.0, 0.5f32];
-        let v1 = [20.0, -1.0, 0.5];
-        let v2 = [-1.0, 20.0, 0.5];
+        let v0 = [-1.0, -1.0, 0.5, 1.0];
+        let v1 = [20.0, -1.0, 0.5, 1.0];
+        let v2 = [-1.0, 20.0, 0.5, 1.0];
         let red = [1.0, 0.0, 0.0, 1.0];
         rasterize_triangle(
             v0, v1, v2, red, red, red,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &ds,
+            &mut stencil_buf, width, height, &default_scissor(), &ds,
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
 
@@ -1543,13 +2346,13 @@ mod tests {
 
         // Second triangle at z=0.3 (nearer), green — should win.
         let green = [0.0, 1.0, 0.0, 1.0];
-        let v0b = [-1.0, -1.0, 0.3f32];
-        let v1b = [20.0, -1.0, 0.3];
-        let v2b = [-1.0, 20.0, 0.3];
+        let v0b = [-1.0, -1.0, 0.3, 1.0];
+        let v1b = [20.0, -1.0, 0.3, 1.0];
+        let v2b = [-1.0, 20.0, 0.3, 1.0];
         rasterize_triangle(
             v0b, v1b, v2b, green, green, green,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &ds,
+            &mut stencil_buf, width, height, &default_scissor(), &ds,
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
 
@@ -1558,13 +2361,13 @@ mod tests {
 
         // Third triangle at z=0.8 (farther), blue — should be rejected.
         let blue = [0.0, 0.0, 1.0, 1.0];
-        let v0c = [-1.0, -1.0, 0.8f32];
-        let v1c = [20.0, -1.0, 0.8];
-        let v2c = [-1.0, 20.0, 0.8];
+        let v0c = [-1.0, -1.0, 0.8, 1.0];
+        let v1c = [20.0, -1.0, 0.8, 1.0];
+        let v2c = [-1.0, 20.0, 0.8, 1.0];
         rasterize_triangle(
             v0c, v1c, v2c, blue, blue, blue,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &ds,
+            &mut stencil_buf, width, height, &default_scissor(), &ds,
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
 
@@ -1579,25 +2382,26 @@ mod tests {
         let height = 4u32;
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
         let ds = default_depth_stencil(); // disabled
 
         // First triangle: red at z=0.3.
         let red = [1.0, 0.0, 0.0, 1.0];
         rasterize_triangle(
-            [-1.0, -1.0, 0.3], [20.0, -1.0, 0.3], [-1.0, 20.0, 0.3],
+            [-1.0, -1.0, 0.3, 1.0], [20.0, -1.0, 0.3, 1.0], [-1.0, 20.0, 0.3, 1.0],
             red, red, red,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &ds,
+            &mut stencil_buf, width, height, &default_scissor(), &ds,
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
 
         // Second triangle: blue at z=0.8 (farther). Should still overwrite because depth disabled.
         let blue = [0.0, 0.0, 1.0, 1.0];
         rasterize_triangle(
-            [-1.0, -1.0, 0.8], [20.0, -1.0, 0.8], [-1.0, 20.0, 0.8],
+            [-1.0, -1.0, 0.8, 1.0], [20.0, -1.0, 0.8, 1.0], [-1.0, 20.0, 0.8, 1.0],
             blue, blue, blue,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &ds,
+            &mut stencil_buf, width, height, &default_scissor(), &ds,
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
 
@@ -1612,14 +2416,15 @@ mod tests {
         let height = 4u32;
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
 
         // Fill background with solid red.
         let red = [1.0, 0.0, 0.0, 1.0];
         rasterize_triangle(
-            [-1.0, -1.0, 0.0], [20.0, -1.0, 0.0], [-1.0, 20.0, 0.0],
+            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
             red, red, red,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &default_depth_stencil(),
+            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
 
@@ -1636,10 +2441,10 @@ mod tests {
         };
         let green_half = [0.0, 1.0, 0.0, 0.5];
         rasterize_triangle(
-            [-1.0, -1.0, 0.0], [20.0, -1.0, 0.0], [-1.0, 20.0, 0.0],
+            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
             green_half, green_half, green_half,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &default_depth_stencil(),
+            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
             &blend, &default_blend_color(), &default_color_mask(),
         );
 
@@ -1657,6 +2462,7 @@ mod tests {
         let height = 10u32;
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
         let white = [1.0f32, 1.0, 1.0, 1.0];
 
         let scissor = ScissorInfo {
@@ -1669,10 +2475,10 @@ mod tests {
 
         // Big triangle covering entire framebuffer.
         rasterize_triangle(
-            [-1.0, -1.0, 0.0], [20.0, -1.0, 0.0], [-1.0, 20.0, 0.0],
+            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
             white, white, white,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &scissor, &default_depth_stencil(),
+            &mut stencil_buf, width, height, &scissor, &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
 
@@ -1702,6 +2508,7 @@ mod tests {
             pixels[i * 4 + 3] = 255;
         }
         let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
 
         // Write white but mask out green and alpha channels.
         let mask = ColorMaskInfo {
@@ -1713,10 +2520,10 @@ mod tests {
         let white = [1.0f32, 1.0, 1.0, 1.0];
 
         rasterize_triangle(
-            [-1.0, -1.0, 0.0], [20.0, -1.0, 0.0], [-1.0, 20.0, 0.0],
+            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
             white, white, white,
             [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            width, height, &default_scissor(), &default_depth_stencil(),
+            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &mask,
         );
 
@@ -1729,8 +2536,8 @@ mod tests {
 
     #[test]
     fn test_backface_culling() {
-        // signed_area([0,0,0], [1,0,0], [0,1,0]) = (1)*(1) - (0)*(0) = 1.0 (positive = CCW).
-        let area = signed_area([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        // signed_area([0,0,0,1], [1,0,0,1], [0,1,0,1]) = (1)*(1) - (0)*(0) = 1.0 (positive = CCW).
+        let area = signed_area([0.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]);
         assert!(area > 0.0); // Positive = CCW winding
 
         // CCW front_face + Back culling: positive area = CCW = front → NOT culled.
@@ -1875,12 +2682,12 @@ mod tests {
     #[test]
     fn test_signed_area_winding() {
         // CCW in math coords, but we're in screen space.
-        let area = signed_area([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]);
+        let area = signed_area([0.0, 0.0, 0.0, 1.0], [10.0, 0.0, 0.0, 1.0], [0.0, 10.0, 0.0, 1.0]);
         // (10-0)*(10-0) - (0-0)*(0-0) = 100 > 0
         assert!(area > 0.0);
 
         // Reversed winding.
-        let area_rev = signed_area([0.0, 0.0, 0.0], [0.0, 10.0, 0.0], [10.0, 0.0, 0.0]);
+        let area_rev = signed_area([0.0, 0.0, 0.0, 1.0], [0.0, 10.0, 0.0, 1.0], [10.0, 0.0, 0.0, 1.0]);
         assert!(area_rev < 0.0);
     }
 
@@ -2002,6 +2809,7 @@ mod tests {
             wrap_u: WrapMode::ClampToEdge,
             wrap_v: WrapMode::ClampToEdge,
             normalized_coords: false,
+            mag_filter: TextureFilter::Nearest,
         };
 
         // Sample at (0.5, 0.5) → texel (0, 0) = red.
@@ -2023,6 +2831,7 @@ mod tests {
         let height = 8u32;
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
         let white = [1.0f32, 1.0, 1.0, 1.0];
 
         // Solid red 2x2 texture.
@@ -2033,14 +2842,15 @@ mod tests {
             wrap_u: WrapMode::ClampToEdge,
             wrap_v: WrapMode::ClampToEdge,
             normalized_coords: true,
+            mag_filter: TextureFilter::Nearest,
         };
 
         // Large triangle covering the framebuffer, UVs spanning [0,1].
         rasterize_triangle(
-            [-1.0, -1.0, 0.0], [20.0, -1.0, 0.0], [-1.0, 20.0, 0.0],
+            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
             white, white, white,
             [0.0, 0.0], [1.0, 0.0], [0.0, 1.0], Some(&tex),
-            &mut pixels, &mut depth_buf,
+            &mut pixels, &mut depth_buf, &mut stencil_buf,
             width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -2379,5 +3189,466 @@ mod tests {
         );
         let writes = written.into_inner().unwrap();
         assert!(writes.is_empty(), "no writeback should occur when gpu_va=0");
+    }
+
+    // --- Phase 28 new tests ---
+
+    // Part A: Bilinear Filtering
+
+    #[test]
+    fn test_bilinear_center() {
+        // Sampling at exact texel center should match nearest.
+        let data = vec![
+            255, 0, 0, 255,    // (0,0) red
+            0, 255, 0, 255,    // (1,0) green
+            0, 0, 255, 255,    // (0,1) blue
+            255, 255, 0, 255,  // (1,1) yellow
+        ];
+        let tex = SampledTexture {
+            data: data.clone(),
+            width: 2,
+            height: 2,
+            wrap_u: WrapMode::ClampToEdge,
+            wrap_v: WrapMode::ClampToEdge,
+            normalized_coords: false,
+            mag_filter: TextureFilter::Linear,
+        };
+        // Center of texel (0,0) is at (0.5, 0.5).
+        let c = sample_texture_bilinear(&tex, 0.5, 0.5);
+        // Should be close to red.
+        assert!((c[0] - 1.0).abs() < 0.01, "R={}", c[0]);
+        assert!(c[1] < 0.01, "G={}", c[1]);
+        assert!(c[2] < 0.01, "B={}", c[2]);
+    }
+
+    #[test]
+    fn test_bilinear_midpoint() {
+        // Sampling between (0,0) red and (1,0) green → average.
+        let data = vec![
+            255, 0, 0, 255,    // (0,0) red
+            0, 255, 0, 255,    // (1,0) green
+            255, 0, 0, 255,    // (0,1) red
+            0, 255, 0, 255,    // (1,1) green
+        ];
+        let tex = SampledTexture {
+            data,
+            width: 2,
+            height: 2,
+            wrap_u: WrapMode::ClampToEdge,
+            wrap_v: WrapMode::ClampToEdge,
+            normalized_coords: false,
+            mag_filter: TextureFilter::Linear,
+        };
+        // Sample at x=1.0 (between texels 0 and 1), y=0.5 (center of row 0).
+        let c = sample_texture_bilinear(&tex, 1.0, 0.5);
+        // Should be ~50% red + ~50% green.
+        assert!((c[0] - 0.5).abs() < 0.15, "R={}", c[0]);
+        assert!((c[1] - 0.5).abs() < 0.15, "G={}", c[1]);
+    }
+
+    #[test]
+    fn test_bilinear_filter_mode_dispatch() {
+        let data = vec![
+            255, 0, 0, 255,
+            0, 255, 0, 255,
+            0, 0, 255, 255,
+            255, 255, 0, 255,
+        ];
+        let tex_nearest = SampledTexture {
+            data: data.clone(),
+            width: 2,
+            height: 2,
+            wrap_u: WrapMode::ClampToEdge,
+            wrap_v: WrapMode::ClampToEdge,
+            normalized_coords: false,
+            mag_filter: TextureFilter::Nearest,
+        };
+        let tex_linear = SampledTexture {
+            data,
+            width: 2,
+            height: 2,
+            wrap_u: WrapMode::ClampToEdge,
+            wrap_v: WrapMode::ClampToEdge,
+            normalized_coords: false,
+            mag_filter: TextureFilter::Linear,
+        };
+        // At texel center, both should give similar results.
+        let cn = sample_texture(&tex_nearest, 0.5, 0.5);
+        let cl = sample_texture(&tex_linear, 0.5, 0.5);
+        assert!((cn[0] - cl[0]).abs() < 0.02);
+    }
+
+    // Part B: Texture Compression
+
+    #[test]
+    fn test_block_format_info_values() {
+        assert_eq!(block_format_info(TextureFormat::Bc1Rgba), Some((4, 4, 8)));
+        assert_eq!(block_format_info(TextureFormat::Bc2), Some((4, 4, 16)));
+        assert_eq!(block_format_info(TextureFormat::Bc3), Some((4, 4, 16)));
+        assert_eq!(block_format_info(TextureFormat::Bc4), Some((4, 4, 8)));
+        assert_eq!(block_format_info(TextureFormat::Bc5), Some((4, 4, 16)));
+        assert_eq!(block_format_info(TextureFormat::Bc7), Some((4, 4, 16)));
+        assert_eq!(block_format_info(TextureFormat::Astc2d4x4), Some((4, 4, 16)));
+        assert_eq!(block_format_info(TextureFormat::Astc2d8x8), Some((8, 8, 16)));
+        assert_eq!(block_format_info(TextureFormat::Astc2d12x12), Some((12, 12, 16)));
+        // Uncompressed → None.
+        assert_eq!(block_format_info(TextureFormat::A8B8G8R8), None);
+    }
+
+    #[test]
+    fn test_decompress_bc1_solid() {
+        // BC1 block where both colors are the same → solid color.
+        let mut block = [0u8; 8];
+        // Both endpoints = RGB565 pure red (0xF800).
+        block[0..2].copy_from_slice(&0xF800u16.to_le_bytes());
+        block[2..4].copy_from_slice(&0xF800u16.to_le_bytes());
+        // All indices = 0 (use color 0).
+        block[4] = 0; block[5] = 0; block[6] = 0; block[7] = 0;
+
+        let result = decompress_bc1_block(&block);
+        for texel in &result {
+            assert!(texel[0] >= 248, "R={}", texel[0]);
+            assert_eq!(texel[1], 0);
+            assert_eq!(texel[2], 0);
+            assert_eq!(texel[3], 255);
+        }
+    }
+
+    #[test]
+    fn test_decompress_bc1_gradient() {
+        // BC1 with c0 > c1 (4-color mode), different colors.
+        let mut block = [0u8; 8];
+        // c0 = pure white (0xFFFF), c1 = pure black (0x0000).
+        block[0..2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        block[2..4].copy_from_slice(&0x0000u16.to_le_bytes());
+        // First row indices: 0,1,2,3 = 0b11_10_01_00 = 0xE4.
+        block[4] = 0xE4;
+        block[5] = 0; block[6] = 0; block[7] = 0;
+
+        let result = decompress_bc1_block(&block);
+        // Index 0 = c0 (white).
+        assert!(result[0][0] >= 248);
+        // Index 1 = c1 (black).
+        assert!(result[1][0] <= 7);
+        // Index 2 = 2/3 c0 + 1/3 c1 (light).
+        assert!(result[2][0] > 100);
+        // Index 3 = 1/3 c0 + 2/3 c1 (dark).
+        assert!(result[3][0] < 150);
+    }
+
+    #[test]
+    fn test_decompress_bc3_alpha() {
+        // BC3: first 8 bytes = alpha block, last 8 = BC1 color block.
+        let mut block = [0u8; 16];
+        // Alpha: a0=255, a1=0, all indices=0 (use a0=255).
+        block[0] = 255;
+        block[1] = 0;
+        // 48 bits of indices, all 0.
+        block[2..8].fill(0);
+        // Color block: solid white.
+        block[8..10].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        block[10..12].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        block[12..16].fill(0);
+
+        let result = decompress_bc3_block(&block);
+        for texel in &result {
+            assert_eq!(texel[3], 255, "alpha should be 255");
+            assert!(texel[0] >= 248, "should be white-ish");
+        }
+    }
+
+    #[test]
+    fn test_decompress_bc4_single_channel() {
+        // BC4: single-channel alpha block.
+        let mut block = [0u8; 8];
+        block[0] = 200; // a0
+        block[1] = 100; // a1
+        // All indices = 0 → use a0=200.
+        block[2..8].fill(0);
+
+        let result = decompress_bc4_block(&block);
+        for texel in &result {
+            assert_eq!(texel[0], 200, "R should be a0=200");
+            assert_eq!(texel[1], 0);
+            assert_eq!(texel[2], 0);
+            assert_eq!(texel[3], 255);
+        }
+    }
+
+    #[test]
+    fn test_decompress_bc5_two_channel() {
+        // BC5: two BC4 blocks concatenated.
+        let mut block = [0u8; 16];
+        // R block: a0=128, a1=64, all indices=0.
+        block[0] = 128;
+        block[1] = 64;
+        block[2..8].fill(0);
+        // G block: a0=200, a1=100, all indices=0.
+        block[8] = 200;
+        block[9] = 100;
+        block[10..16].fill(0);
+
+        let result = decompress_bc5_block(&block);
+        for texel in &result {
+            assert_eq!(texel[0], 128, "R should be 128");
+            assert_eq!(texel[1], 200, "G should be 200");
+            assert_eq!(texel[2], 0);
+            assert_eq!(texel[3], 255);
+        }
+    }
+
+    #[test]
+    fn test_load_texture_compressed() {
+        // Build a TIC with BC1 format, 4×4 texture (1 block).
+        let mut tic_words = [0u32; 8];
+        // word0: format=Bc1Rgba(0x25), types=UNorm(2), swizzle=RGBA(2,3,4,5)
+        tic_words[0] = 0x25
+            | (2 << 7) | (2 << 10) | (2 << 13) | (2 << 16)
+            | (2 << 19) | (3 << 22) | (4 << 25) | (5 << 28);
+        // word1: addr_low = 0x2000
+        tic_words[1] = 0x2000;
+        // word2: header_version = Pitch(2) at [23:21]
+        tic_words[2] = 2 << 21;
+        // word4: width=3(+1=4), texture_type=Texture2D(1)
+        tic_words[4] = 3 | (1 << 23);
+        // word5: height=3(+1=4), normalized=1
+        tic_words[5] = 3 | (1 << 31);
+
+        let mut tic_bytes = [0u8; 32];
+        for (i, &w) in tic_words.iter().enumerate() {
+            tic_bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+
+        // Build a BC1 block: solid red.
+        let mut bc1_block = [0u8; 8];
+        bc1_block[0..2].copy_from_slice(&0xF800u16.to_le_bytes());
+        bc1_block[2..4].copy_from_slice(&0xF800u16.to_le_bytes());
+
+        let tic_clone = tic_bytes;
+        let bc1_clone = bc1_block;
+        let read_gpu = move |addr: u64, buf: &mut [u8]| {
+            if addr == 0x1000 {
+                let len = buf.len().min(32);
+                buf[..len].copy_from_slice(&tic_clone[..len]);
+            } else if addr >= 0x2000 && addr < 0x2000 + 8 {
+                let off = (addr - 0x2000) as usize;
+                let len = buf.len().min(8 - off);
+                buf[..len].copy_from_slice(&bc1_clone[off..off + len]);
+            }
+        };
+
+        let mut draw = default_draw_call();
+        draw.tex_header_pool_addr = 0x1000;
+
+        let tex = load_texture(&draw, &read_gpu).expect("should load BC1 texture");
+        assert_eq!(tex.width, 4);
+        assert_eq!(tex.height, 4);
+        // All pixels should be red.
+        for i in 0..16 {
+            assert!(tex.data[i * 4] >= 248, "R at pixel {}: {}", i, tex.data[i * 4]);
+            assert_eq!(tex.data[i * 4 + 1], 0, "G at pixel {}", i);
+            assert_eq!(tex.data[i * 4 + 2], 0, "B at pixel {}", i);
+            assert_eq!(tex.data[i * 4 + 3], 255, "A at pixel {}", i);
+        }
+    }
+
+    // Part C: Stencil Testing
+
+    #[test]
+    fn test_stencil_test_passes_all_ops() {
+        // Always / Never.
+        assert!(stencil_test_passes(ComparisonOp::Always, 0, 0xFF, 0));
+        assert!(!stencil_test_passes(ComparisonOp::Never, 0, 0xFF, 0));
+        // Less: ref < stored.
+        assert!(stencil_test_passes(ComparisonOp::Less, 5, 0xFF, 10));
+        assert!(!stencil_test_passes(ComparisonOp::Less, 10, 0xFF, 5));
+        assert!(!stencil_test_passes(ComparisonOp::Less, 5, 0xFF, 5));
+        // Equal.
+        assert!(stencil_test_passes(ComparisonOp::Equal, 42, 0xFF, 42));
+        assert!(!stencil_test_passes(ComparisonOp::Equal, 42, 0xFF, 43));
+        // LessEqual.
+        assert!(stencil_test_passes(ComparisonOp::LessEqual, 5, 0xFF, 5));
+        assert!(stencil_test_passes(ComparisonOp::LessEqual, 4, 0xFF, 5));
+        assert!(!stencil_test_passes(ComparisonOp::LessEqual, 6, 0xFF, 5));
+        // Greater.
+        assert!(stencil_test_passes(ComparisonOp::Greater, 10, 0xFF, 5));
+        assert!(!stencil_test_passes(ComparisonOp::Greater, 5, 0xFF, 10));
+        // NotEqual.
+        assert!(stencil_test_passes(ComparisonOp::NotEqual, 5, 0xFF, 6));
+        assert!(!stencil_test_passes(ComparisonOp::NotEqual, 5, 0xFF, 5));
+        // GreaterEqual.
+        assert!(stencil_test_passes(ComparisonOp::GreaterEqual, 5, 0xFF, 5));
+        assert!(stencil_test_passes(ComparisonOp::GreaterEqual, 6, 0xFF, 5));
+        assert!(!stencil_test_passes(ComparisonOp::GreaterEqual, 4, 0xFF, 5));
+        // Mask: only compare lower 4 bits.
+        assert!(stencil_test_passes(ComparisonOp::Equal, 0x15, 0x0F, 0x25));
+    }
+
+    #[test]
+    fn test_apply_stencil_op_all() {
+        assert_eq!(apply_stencil_op(StencilOp::Keep, 0, 42), 42);
+        assert_eq!(apply_stencil_op(StencilOp::Zero, 0, 42), 0);
+        assert_eq!(apply_stencil_op(StencilOp::Replace, 100, 42), 100);
+        assert_eq!(apply_stencil_op(StencilOp::IncrSat, 0, 254), 255);
+        assert_eq!(apply_stencil_op(StencilOp::IncrSat, 0, 255), 255); // saturates
+        assert_eq!(apply_stencil_op(StencilOp::DecrSat, 0, 1), 0);
+        assert_eq!(apply_stencil_op(StencilOp::DecrSat, 0, 0), 0); // saturates
+        assert_eq!(apply_stencil_op(StencilOp::Invert, 0, 0x0F), 0xF0);
+        assert_eq!(apply_stencil_op(StencilOp::Incr, 0, 255), 0); // wraps
+        assert_eq!(apply_stencil_op(StencilOp::Decr, 0, 0), 255); // wraps
+    }
+
+    #[test]
+    fn test_stencil_reject_pixel() {
+        // Stencil test fails → pixel NOT written, fail_op applied.
+        let width = 4u32;
+        let height = 4u32;
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
+
+        let ds = DepthStencilInfo {
+            depth_test_enable: false,
+            depth_write_enable: false,
+            depth_func: ComparisonOp::Always,
+            depth_mode: DepthMode::ZeroToOne,
+            stencil_enable: true,
+            stencil_two_side: false,
+            front: StencilFaceInfo {
+                func: ComparisonOp::Never, // always fails
+                ref_value: 1,
+                func_mask: 0xFF,
+                write_mask: 0xFF,
+                fail_op: StencilOp::Replace, // write ref on fail
+                zfail_op: StencilOp::Keep,
+                zpass_op: StencilOp::Keep,
+            },
+            back: StencilFaceInfo::default(),
+        };
+
+        let white = [1.0f32, 1.0, 1.0, 1.0];
+        rasterize_triangle(
+            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
+            white, white, white,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
+            &mut stencil_buf, width, height, &default_scissor(), &ds,
+            &default_blend(), &default_blend_color(), &default_color_mask(),
+        );
+
+        // Pixels should remain black (stencil rejected all).
+        let off = ((1 * width + 1) * 4) as usize;
+        assert_eq!(pixels[off], 0);
+        // But stencil buffer should have ref_value=1 (fail_op = Replace).
+        let stencil_idx = (1 * width + 1) as usize;
+        assert_eq!(stencil_buf[stencil_idx], 1, "stencil should be written on fail");
+    }
+
+    #[test]
+    fn test_stencil_depth_fail() {
+        // Stencil passes, depth fails → zfail_op applied.
+        let width = 4u32;
+        let height = 4u32;
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let mut depth_buf = vec![0.0f32; (width * height) as usize]; // all z=0
+        let mut stencil_buf = vec![0u8; (width * height) as usize];
+
+        let ds = DepthStencilInfo {
+            depth_test_enable: true,
+            depth_write_enable: false,
+            depth_func: ComparisonOp::Less, // frag z=0.5 > stored z=0.0 → fails
+            depth_mode: DepthMode::ZeroToOne,
+            stencil_enable: true,
+            stencil_two_side: false,
+            front: StencilFaceInfo {
+                func: ComparisonOp::Always, // stencil passes
+                ref_value: 42,
+                func_mask: 0xFF,
+                write_mask: 0xFF,
+                fail_op: StencilOp::Keep,
+                zfail_op: StencilOp::Replace, // write ref on depth fail
+                zpass_op: StencilOp::Keep,
+            },
+            back: StencilFaceInfo::default(),
+        };
+
+        let white = [1.0f32, 1.0, 1.0, 1.0];
+        rasterize_triangle(
+            [-1.0, -1.0, 0.5, 1.0], [20.0, -1.0, 0.5, 1.0], [-1.0, 20.0, 0.5, 1.0],
+            white, white, white,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
+            &mut stencil_buf, width, height, &default_scissor(), &ds,
+            &default_blend(), &default_blend_color(), &default_color_mask(),
+        );
+
+        // Pixels should remain black (depth test failed).
+        let off = ((1 * width + 1) * 4) as usize;
+        assert_eq!(pixels[off], 0);
+        // Stencil should have zfail_op=Replace → ref_value=42.
+        let stencil_idx = (1 * width + 1) as usize;
+        assert_eq!(stencil_buf[stencil_idx], 42, "stencil should have zfail_op applied");
+    }
+
+    // Part D: Perspective Correction
+
+    #[test]
+    fn test_perspective_correct_uv() {
+        // A triangle with varying W should produce different UV interpolation
+        // than one with uniform W=1.0.
+        let width = 20u32;
+        let height = 20u32;
+        let mut pixels_uniform = vec![0u8; (width * height * 4) as usize];
+        let mut depth_uniform = vec![1.0f32; (width * height) as usize];
+        let mut stencil_uniform = vec![0u8; (width * height) as usize];
+        let mut pixels_persp = vec![0u8; (width * height * 4) as usize];
+        let mut depth_persp = vec![1.0f32; (width * height) as usize];
+        let mut stencil_persp = vec![0u8; (width * height) as usize];
+
+        // Gradient texture: left=black, right=white.
+        let tex = SampledTexture {
+            data: vec![
+                0, 0, 0, 255,      // (0,0) black
+                255, 255, 255, 255, // (1,0) white
+                0, 0, 0, 255,      // (0,1) black
+                255, 255, 255, 255, // (1,1) white
+            ],
+            width: 2,
+            height: 2,
+            wrap_u: WrapMode::ClampToEdge,
+            wrap_v: WrapMode::ClampToEdge,
+            normalized_coords: true,
+            mag_filter: TextureFilter::Nearest,
+        };
+
+        let white = [1.0f32, 1.0, 1.0, 1.0];
+
+        // Uniform W=1.0: standard screen-space interpolation.
+        rasterize_triangle(
+            [1.0, 1.0, 0.0, 1.0], [18.0, 1.0, 0.0, 1.0], [10.0, 18.0, 0.0, 1.0],
+            white, white, white,
+            [0.0, 0.5], [1.0, 0.5], [0.5, 0.5], Some(&tex),
+            &mut pixels_uniform, &mut depth_uniform, &mut stencil_uniform,
+            width, height, &default_scissor(), &default_depth_stencil(),
+            &default_blend(), &default_blend_color(), &default_color_mask(),
+        );
+
+        // Varying W: v0 closer (W=1), v1 farther (W=4).
+        rasterize_triangle(
+            [1.0, 1.0, 0.0, 1.0], [18.0, 1.0, 0.0, 4.0], [10.0, 18.0, 0.0, 2.0],
+            white, white, white,
+            [0.0, 0.5], [1.0, 0.5], [0.5, 0.5], Some(&tex),
+            &mut pixels_persp, &mut depth_persp, &mut stencil_persp,
+            width, height, &default_scissor(), &default_depth_stencil(),
+            &default_blend(), &default_blend_color(), &default_color_mask(),
+        );
+
+        // The two renderings should differ at some interior pixel due to perspective correction.
+        let mut differs = false;
+        for i in 0..pixels_uniform.len() {
+            if pixels_uniform[i] != pixels_persp[i] {
+                differs = true;
+                break;
+            }
+        }
+        assert!(differs, "perspective correction should produce different results with varying W");
     }
 }
