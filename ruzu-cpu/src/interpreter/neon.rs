@@ -405,6 +405,163 @@ pub fn exec_simd_three_same(
                 mask(shifted.clamp(min_val, max_val) as u64, esize)
             });
         }
+        // SHADD (signed halving add): (a + b) >> 1
+        (false, 0b00000) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let sa = sign_extend_lane(a, esize) as i128;
+                let sb = sign_extend_lane(b, esize) as i128;
+                mask((sa + sb).wrapping_shr(1) as u64, esize)
+            });
+        }
+        // UHADD (unsigned halving add): (a + b) >> 1
+        (true, 0b00000) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                (a >> 1) + (b >> 1) + (a & b & 1)
+            });
+        }
+        // SRHADD (signed rounding halving add): (a + b + 1) >> 1
+        (false, 0b00010) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let sa = sign_extend_lane(a, esize) as i128;
+                let sb = sign_extend_lane(b, esize) as i128;
+                mask((sa + sb + 1).wrapping_shr(1) as u64, esize)
+            });
+        }
+        // URHADD (unsigned rounding halving add): (a + b + 1) >> 1
+        (true, 0b00010) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                (a >> 1) + (b >> 1) + ((a | b) & 1)
+            });
+        }
+        // SHSUB (signed halving subtract): (a - b) >> 1
+        (false, 0b00100) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let sa = sign_extend_lane(a, esize) as i128;
+                let sb = sign_extend_lane(b, esize) as i128;
+                mask((sa - sb).wrapping_shr(1) as u64, esize)
+            });
+        }
+        // UHSUB (unsigned halving subtract): (a - b) >> 1
+        (true, 0b00100) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                a.wrapping_sub(b) >> 1
+            });
+        }
+        // SQSHL (signed saturating shift left by register)
+        (false, 0b01001) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let sa = sign_extend_lane(a, esize) as i128;
+                let shift = sign_extend_lane(b, esize) as i8;
+                let max_val = (1i128 << (esize - 1)) - 1;
+                let min_val = -(1i128 << (esize - 1));
+                if shift < 0 {
+                    let neg = (-shift as u32).min(esize - 1);
+                    mask((sa >> neg) as u64, esize)
+                } else if shift as u32 >= esize {
+                    mask(if sa > 0 { max_val } else if sa < 0 { min_val } else { 0 } as u64, esize)
+                } else {
+                    let shifted = sa << (shift as u32);
+                    mask(shifted.clamp(min_val, max_val) as u64, esize)
+                }
+            });
+        }
+        // UQSHL (unsigned saturating shift left by register)
+        (true, 0b01001) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let shift = sign_extend_lane(b, esize) as i8;
+                let max_val = all_ones(esize);
+                if shift < 0 {
+                    a >> ((-shift as u32).min(esize - 1))
+                } else if shift as u32 >= esize {
+                    if a == 0 { 0 } else { max_val }
+                } else {
+                    let shifted = (a as u128) << (shift as u32);
+                    if shifted > max_val as u128 { max_val } else { shifted as u64 }
+                }
+            });
+        }
+        // SRSHL (signed rounding shift left by register)
+        (false, 0b01010) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let sa = sign_extend_lane(a, esize);
+                let shift = sign_extend_lane(b, esize) as i8;
+                if shift >= 0 {
+                    mask(sa.wrapping_shl((shift as u32).min(esize - 1)) as u64, esize)
+                } else {
+                    let neg = (-shift as u32).min(63);
+                    if neg >= esize {
+                        mask((sa >> (esize - 1)) as u64, esize)
+                    } else {
+                        let round = if neg > 0 { ((sa >> (neg - 1)) & 1) as i64 } else { 0 };
+                        mask((sa >> neg).wrapping_add(round) as u64, esize)
+                    }
+                }
+            });
+        }
+        // URSHL (unsigned rounding shift left by register)
+        (true, 0b01010) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let shift = sign_extend_lane(b, esize) as i8;
+                if shift >= 0 {
+                    mask(a << ((shift as u32).min(esize - 1)), esize)
+                } else {
+                    let neg = (-shift as u32).min(63);
+                    if neg >= esize {
+                        0
+                    } else {
+                        let round = if neg > 0 { (a >> (neg - 1)) & 1 } else { 0 };
+                        (a >> neg).wrapping_add(round)
+                    }
+                }
+            });
+        }
+        // SQRSHL (signed saturating rounding shift left by register)
+        (false, 0b01011) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let sa = sign_extend_lane(a, esize) as i128;
+                let shift = sign_extend_lane(b, esize) as i8;
+                let max_val = (1i128 << (esize - 1)) - 1;
+                let min_val = -(1i128 << (esize - 1));
+                if shift >= 0 {
+                    let shifted = if shift as u32 >= esize {
+                        if sa > 0 { max_val } else if sa < 0 { min_val } else { 0 }
+                    } else {
+                        (sa << (shift as u32)).clamp(min_val, max_val)
+                    };
+                    mask(shifted as u64, esize)
+                } else {
+                    let neg = (-shift as u32).min(63);
+                    let (shifted, round) = if neg >= esize {
+                        (sa >> (esize - 1), 0i128)
+                    } else {
+                        let r = if neg > 0 { (sa >> (neg - 1)) & 1 } else { 0 };
+                        (sa >> neg, r)
+                    };
+                    mask(shifted.wrapping_add(round) as u64, esize)
+                }
+            });
+        }
+        // UQRSHL (unsigned saturating rounding shift left by register)
+        (true, 0b01011) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let shift = sign_extend_lane(b, esize) as i8;
+                let max_val = all_ones(esize);
+                if shift < 0 {
+                    let neg = (-shift as u32).min(63);
+                    if neg >= esize {
+                        0
+                    } else {
+                        let round = if neg > 0 { (a >> (neg - 1)) & 1 } else { 0 };
+                        (a >> neg).wrapping_add(round)
+                    }
+                } else if shift as u32 >= esize {
+                    if a == 0 { 0 } else { max_val }
+                } else {
+                    let shifted = (a as u128) << (shift as u32);
+                    if shifted > max_val as u128 { max_val } else { shifted as u64 }
+                }
+            });
+        }
         // Default: log and continue
         _ => {
             log::warn!("Unimplemented SimdThreeSame: u={}, opcode={:#07b}, size={}", u, opcode, size);
@@ -473,7 +630,6 @@ fn exec_simd_three_same_fp(
                 (true, 0b11010) => a - b,                   // FSUB
                 (false, 0b11011) => a * b,                  // FMULX
                 (true, 0b11011) => a * b,                   // FMUL
-                (true, 0b11111) => a / b,                   // FDIV
                 (false, 0b11110) => a.max(b),               // FMAX
                 (true, 0b11110) => a.min(b),                // FMIN
                 (false, 0b11001) => a.mul_add(b, d),        // FMLA: Rd += Rn*Rm
@@ -491,6 +647,10 @@ fn exec_simd_three_same_fp(
                     // This shouldn't normally be here; FADDP is pairwise
                     a + b
                 }
+                (false, 0b11000) => a.max(b).max(a),        // FMAXNM: NaN-suppressing max
+                (true,  0b11000) => a.min(b).min(a),        // FMINNM: NaN-suppressing min
+                (false, 0b11111) => 2.0 - a * b,            // FRECPS: Newton-Raphson step
+                (true,  0b11111) => (3.0 - a * b) / 2.0,   // FRSQRTS: Newton-Raphson sqrt step
                 _ => {
                     log::warn!("Unimpl FP three same: u={}, opcode={:#07b}", u, opcode);
                     0.0
@@ -514,7 +674,6 @@ fn exec_simd_three_same_fp(
                 (false, 0b11010) => a + b,
                 (true, 0b11010) => a - b,
                 (false, 0b11011) | (true, 0b11011) => a * b,
-                (true, 0b11111) => a / b,
                 (false, 0b11110) => a.max(b),
                 (true, 0b11110) => a.min(b),
                 (false, 0b11001) => a.mul_add(b, d),
@@ -528,6 +687,10 @@ fn exec_simd_three_same_fp(
                 (true, 0b11001) => {
                     return_val_u32(if a > b { u32::MAX } else { 0 })
                 }
+                (false, 0b11000) => a.max(b).max(a),        // FMAXNM: NaN-suppressing max
+                (true,  0b11000) => a.min(b).min(a),        // FMINNM: NaN-suppressing min
+                (false, 0b11111) => 2.0 - a * b,            // FRECPS
+                (true,  0b11111) => (3.0 - a * b) / 2.0,   // FRSQRTS
                 _ => {
                     log::warn!("Unimpl FP three same f32: u={}, opcode={:#07b}", u, opcode);
                     0.0
@@ -1743,6 +1906,122 @@ pub fn exec_simd_vec_indexed(
             for_each_lane_unary(state, q, int_esize, rd, rn, |a| {
                 mask(a.wrapping_mul(int_elem), int_esize)
             });
+        }
+        // MLA by element (opcode=0b0000): Rd += Rn * elem  (integer)
+        0b0000 if !u => {
+            let int_esize = esize_from_size(size);
+            let int_lanes = if q { 128 / int_esize } else { 64 / int_esize };
+            let (int_idx, int_rm) = if size == 1 {
+                ((h as u32) << 2 | (l as u32) << 1 | (m as u32), rm)
+            } else {
+                ((h as u32) << 1 | (l as u32), (m << 4) | rm)
+            };
+            let int_elem = state.get_vreg_lane(int_rm as u32, int_idx, int_esize);
+            for i in 0..int_lanes {
+                let a = state.get_vreg_lane(rn as u32, i, int_esize);
+                let d = state.get_vreg_lane(rd as u32, i, int_esize);
+                state.set_vreg_lane(rd as u32, i, int_esize,
+                    mask(d.wrapping_add(a.wrapping_mul(int_elem)), int_esize));
+            }
+        }
+        // MLS by element (opcode=0b0100): Rd -= Rn * elem  (integer)
+        0b0100 if !u => {
+            let int_esize = esize_from_size(size);
+            let int_lanes = if q { 128 / int_esize } else { 64 / int_esize };
+            let (int_idx, int_rm) = if size == 1 {
+                ((h as u32) << 2 | (l as u32) << 1 | (m as u32), rm)
+            } else {
+                ((h as u32) << 1 | (l as u32), (m << 4) | rm)
+            };
+            let int_elem = state.get_vreg_lane(int_rm as u32, int_idx, int_esize);
+            for i in 0..int_lanes {
+                let a = state.get_vreg_lane(rn as u32, i, int_esize);
+                let d = state.get_vreg_lane(rd as u32, i, int_esize);
+                state.set_vreg_lane(rd as u32, i, int_esize,
+                    mask(d.wrapping_sub(a.wrapping_mul(int_elem)), int_esize));
+            }
+        }
+        // SMLAL/SMLAL2 by element (opcode=0b0010): Rd(wide) += sign_ext(Rn) * sign_ext(elem)
+        0b0010 if !u => {
+            let src_esize = esize_from_size(size);
+            let dst_esize = src_esize * 2;
+            let dst_lanes = 64 / dst_esize; // always 64-bit output width
+            let (int_idx, int_rm) = if size == 1 {
+                ((h as u32) << 2 | (l as u32) << 1 | (m as u32), rm)
+            } else {
+                ((h as u32) << 1 | (l as u32), (m << 4) | rm)
+            };
+            let raw_elem = state.get_vreg_lane(int_rm as u32, int_idx, src_esize);
+            let se = sign_extend_lane(raw_elem, src_esize) as i128;
+            // q=false → lower half of Rn; q=true → upper half (SMLAL2)
+            let lane_base = if q { dst_lanes } else { 0 };
+            for i in 0..dst_lanes {
+                let src = sign_extend_lane(
+                    state.get_vreg_lane(rn as u32, lane_base + i, src_esize), src_esize) as i128;
+                let acc = sign_extend_lane(
+                    state.get_vreg_lane(rd as u32, i, dst_esize), dst_esize) as i128;
+                let result = acc.wrapping_add(src.wrapping_mul(se));
+                state.set_vreg_lane(rd as u32, i, dst_esize, mask(result as u64, dst_esize));
+            }
+        }
+        // UMLAL/UMLAL2 by element (opcode=0b0010, u=true): Rd(wide) += Rn * elem (unsigned)
+        0b0010 if u => {
+            let src_esize = esize_from_size(size);
+            let dst_esize = src_esize * 2;
+            let dst_lanes = 64 / dst_esize;
+            let (int_idx, int_rm) = if size == 1 {
+                ((h as u32) << 2 | (l as u32) << 1 | (m as u32), rm)
+            } else {
+                ((h as u32) << 1 | (l as u32), (m << 4) | rm)
+            };
+            let elem = state.get_vreg_lane(int_rm as u32, int_idx, src_esize);
+            let lane_base = if q { dst_lanes } else { 0 };
+            for i in 0..dst_lanes {
+                let src = state.get_vreg_lane(rn as u32, lane_base + i, src_esize) as u128;
+                let acc = state.get_vreg_lane(rd as u32, i, dst_esize) as u128;
+                let result = acc.wrapping_add(src.wrapping_mul(elem as u128));
+                state.set_vreg_lane(rd as u32, i, dst_esize, mask(result as u64, dst_esize));
+            }
+        }
+        // SMULL/SMULL2 by element (opcode=0b1010): Rd(wide) = sign_ext(Rn) * sign_ext(elem)
+        0b1010 if !u => {
+            let src_esize = esize_from_size(size);
+            let dst_esize = src_esize * 2;
+            let dst_lanes = 64 / dst_esize;
+            let (int_idx, int_rm) = if size == 1 {
+                ((h as u32) << 2 | (l as u32) << 1 | (m as u32), rm)
+            } else {
+                ((h as u32) << 1 | (l as u32), (m << 4) | rm)
+            };
+            let raw_elem = state.get_vreg_lane(int_rm as u32, int_idx, src_esize);
+            let se = sign_extend_lane(raw_elem, src_esize) as i128;
+            state.set_vreg_u128(rd as u32, 0);
+            let lane_base = if q { dst_lanes } else { 0 };
+            for i in 0..dst_lanes {
+                let src = sign_extend_lane(
+                    state.get_vreg_lane(rn as u32, lane_base + i, src_esize), src_esize) as i128;
+                let result = src.wrapping_mul(se);
+                state.set_vreg_lane(rd as u32, i, dst_esize, mask(result as u64, dst_esize));
+            }
+        }
+        // UMULL/UMULL2 by element (opcode=0b1010, u=true): unsigned widening multiply
+        0b1010 if u => {
+            let src_esize = esize_from_size(size);
+            let dst_esize = src_esize * 2;
+            let dst_lanes = 64 / dst_esize;
+            let (int_idx, int_rm) = if size == 1 {
+                ((h as u32) << 2 | (l as u32) << 1 | (m as u32), rm)
+            } else {
+                ((h as u32) << 1 | (l as u32), (m << 4) | rm)
+            };
+            let elem = state.get_vreg_lane(int_rm as u32, int_idx, src_esize) as u128;
+            state.set_vreg_u128(rd as u32, 0);
+            let lane_base = if q { dst_lanes } else { 0 };
+            for i in 0..dst_lanes {
+                let src = state.get_vreg_lane(rn as u32, lane_base + i, src_esize) as u128;
+                let result = src.wrapping_mul(elem);
+                state.set_vreg_lane(rd as u32, i, dst_esize, mask(result as u64, dst_esize));
+            }
         }
         _ => {
             log::warn!("Unimpl SimdVecIndexed u={} opcode={:#06b} size={}", u, opcode, size);
