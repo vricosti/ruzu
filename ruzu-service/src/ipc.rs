@@ -81,6 +81,9 @@ pub struct IpcCommand {
     pub command_id: u32,
     /// Remaining raw data words after the CMIF header.
     pub raw_data: Vec<u32>,
+    /// Guest virtual addresses of B-type (receive) output buffers.
+    /// Services write their output data to these addresses.
+    pub b_buf_addrs: Vec<u64>,
 }
 
 // ── Outgoing IPC response ────────────────────────────────────────────────────
@@ -90,12 +93,15 @@ pub struct IpcCommand {
 pub struct IpcResponse {
     /// Result code.
     pub result: ResultCode,
-    /// Extra data words to include after the result code.
+    /// Extra data words to include after the result code (inline CMIF payload).
     pub data: Vec<u32>,
     /// Handles to copy into the client.
     pub handles_to_copy: Vec<u32>,
     /// Handles to move into the client.
     pub handles_to_move: Vec<u32>,
+    /// Data to write into the caller's B-type output buffers.
+    /// `out_bufs[i]` is written to `command.b_buf_addrs[i]` in guest memory.
+    pub out_bufs: Vec<Vec<u8>>,
 }
 
 impl IpcResponse {
@@ -106,6 +112,7 @@ impl IpcResponse {
             data: Vec::new(),
             handles_to_copy: Vec::new(),
             handles_to_move: Vec::new(),
+            out_bufs: Vec::new(),
         }
     }
 
@@ -116,6 +123,7 @@ impl IpcResponse {
             data,
             handles_to_copy: Vec::new(),
             handles_to_move: Vec::new(),
+            out_bufs: Vec::new(),
         }
     }
 
@@ -126,6 +134,7 @@ impl IpcResponse {
             data: Vec::new(),
             handles_to_copy: Vec::new(),
             handles_to_move: Vec::new(),
+            out_bufs: Vec::new(),
         }
     }
 
@@ -138,6 +147,12 @@ impl IpcResponse {
     /// Attach a handle to move into the response.
     pub fn with_move_handle(mut self, handle: u32) -> Self {
         self.handles_to_move.push(handle);
+        self
+    }
+
+    /// Attach data to write to the i-th B-type output buffer in guest memory.
+    pub fn with_out_buf(mut self, data: Vec<u8>) -> Self {
+        self.out_bufs.push(data);
         self
     }
 }
@@ -197,11 +212,29 @@ pub fn parse_ipc_command(tls_data: &[u8]) -> Result<IpcCommand, anyhow::Error> {
         }
     }
 
-    // ── Skip buffer descriptors (X, A, B) ────────────────────────────────
-    // Each X descriptor is 2 words, A is 3 words, B is 3 words.
-    let skip_words = (num_x_bufs * 2 + num_a_bufs * 3 + num_b_bufs * 3) as usize;
-    for _ in 0..skip_words {
+    // ── Buffer descriptors (X, A, B) ─────────────────────────────────────
+    // X descriptors: 2 words each (skip)
+    for _ in 0..num_x_bufs {
         let _ = cur.read_u32::<LittleEndian>()?;
+        let _ = cur.read_u32::<LittleEndian>()?;
+    }
+    // A descriptors: 3 words each (skip — send buffers, not used by HLE)
+    for _ in 0..num_a_bufs {
+        let _ = cur.read_u32::<LittleEndian>()?;
+        let _ = cur.read_u32::<LittleEndian>()?;
+        let _ = cur.read_u32::<LittleEndian>()?;
+    }
+    // B descriptors: 3 words each — extract the guest address so services
+    // can write output data into the caller's buffer.
+    // Format (from Ryujinx/libnx): word0=addr[31:0], word1=size[31:0],
+    // word2 bits[31:28]=addr[35:32], bits[27:24]=size[35:32], bits[1:0]=flags.
+    let mut b_buf_addrs: Vec<u64> = Vec::new();
+    for _ in 0..num_b_bufs {
+        let word0 = cur.read_u32::<LittleEndian>()?;
+        let _word1 = cur.read_u32::<LittleEndian>()?;
+        let word2 = cur.read_u32::<LittleEndian>()?;
+        let addr = (word0 as u64) | (((word2 >> 28) & 0xF) as u64) << 32;
+        b_buf_addrs.push(addr);
     }
 
     // ── Align to 16 bytes for CMIF payload ───────────────────────────────
@@ -240,6 +273,7 @@ pub fn parse_ipc_command(tls_data: &[u8]) -> Result<IpcCommand, anyhow::Error> {
         cmif_magic,
         command_id,
         raw_data,
+        b_buf_addrs,
     })
 }
 

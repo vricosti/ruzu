@@ -131,6 +131,7 @@ mod tests {
             cmif_magic: 0x49434653,
             command_id: cmd_id,
             raw_data,
+            b_buf_addrs: Vec::new(),
         }
     }
 

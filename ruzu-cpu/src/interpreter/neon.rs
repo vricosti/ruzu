@@ -349,6 +349,62 @@ pub fn exec_simd_three_same(
                 mask((sa - sb).unsigned_abs(), esize)
             });
         }
+        // UABD (unsigned absolute difference)
+        (true, 0b01110) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                if a >= b { a - b } else { b - a }
+            });
+        }
+        // SABA (signed absolute difference and accumulate): Rd += |Rn - Rm|
+        (false, 0b01111) => {
+            let lanes = if q { 128 / esize } else { 64 / esize };
+            for i in 0..lanes {
+                let a = sign_extend_lane(state.get_vreg_lane(rn as u32, i, esize), esize);
+                let b = sign_extend_lane(state.get_vreg_lane(rm as u32, i, esize), esize);
+                let acc = state.get_vreg_lane(rd as u32, i, esize);
+                let diff = mask((a - b).unsigned_abs(), esize);
+                state.set_vreg_lane(rd as u32, i, esize, mask(acc.wrapping_add(diff), esize));
+            }
+        }
+        // UABA (unsigned absolute difference and accumulate): Rd += |Rn - Rm|
+        (true, 0b01111) => {
+            let lanes = if q { 128 / esize } else { 64 / esize };
+            for i in 0..lanes {
+                let a = state.get_vreg_lane(rn as u32, i, esize);
+                let b = state.get_vreg_lane(rm as u32, i, esize);
+                let acc = state.get_vreg_lane(rd as u32, i, esize);
+                let diff = if a >= b { a - b } else { b - a };
+                state.set_vreg_lane(rd as u32, i, esize, mask(acc.wrapping_add(diff), esize));
+            }
+        }
+        // SQDMULH (signed saturating doubling multiply high)
+        (false, 0b10110) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let sa = sign_extend_lane(a, esize);
+                let sb = sign_extend_lane(b, esize);
+                // Compute 2*sa*sb using i128 to avoid overflow.
+                let product2 = (sa as i128).wrapping_mul(sb as i128).wrapping_mul(2);
+                let shifted = product2 >> esize;
+                // Saturate to signed esize-bit range.
+                let max_val = (1i128 << (esize - 1)) - 1;
+                let min_val = -(1i128 << (esize - 1));
+                mask(shifted.clamp(min_val, max_val) as u64, esize)
+            });
+        }
+        // SQRDMULH (signed saturating rounding doubling multiply high)
+        (true, 0b10110) => {
+            for_each_lane(state, q, esize, rd, rn, rm, |a, b| {
+                let sa = sign_extend_lane(a, esize);
+                let sb = sign_extend_lane(b, esize);
+                let product2 = (sa as i128).wrapping_mul(sb as i128).wrapping_mul(2);
+                // Add rounding constant before shift.
+                let rounded = product2.wrapping_add(1i128 << (esize - 1));
+                let shifted = rounded >> esize;
+                let max_val = (1i128 << (esize - 1)) - 1;
+                let min_val = -(1i128 << (esize - 1));
+                mask(shifted.clamp(min_val, max_val) as u64, esize)
+            });
+        }
         // Default: log and continue
         _ => {
             log::warn!("Unimplemented SimdThreeSame: u={}, opcode={:#07b}, size={}", u, opcode, size);
@@ -1374,6 +1430,25 @@ pub fn exec_simd_three_diff(
                 let a = state.get_vreg_lane(rn as u32, i, dst_esize);
                 let b = state.get_vreg_lane(rm as u32, src_offset + i, src_esize);
                 state.set_vreg_lane(rd as u32, i, dst_esize, mask(a + b, dst_esize));
+            }
+        }
+        // SMLAL/SMLAL2 (U=0, opcode=0b1000): Rd += Rn * Rm (widening signed)
+        (false, 0b1000) => {
+            for i in 0..src_lanes {
+                let a = sign_extend_lane(state.get_vreg_lane(rn as u32, src_offset + i, src_esize), src_esize);
+                let b = sign_extend_lane(state.get_vreg_lane(rm as u32, src_offset + i, src_esize), src_esize);
+                let acc = state.get_vreg_lane(rd as u32, i, dst_esize);
+                let product = mask(a.wrapping_mul(b) as u64, dst_esize);
+                state.set_vreg_lane(rd as u32, i, dst_esize, mask(acc.wrapping_add(product), dst_esize));
+            }
+        }
+        // UMLAL/UMLAL2 (U=1, opcode=0b1000): Rd += Rn * Rm (widening unsigned)
+        (true, 0b1000) => {
+            for i in 0..src_lanes {
+                let a = state.get_vreg_lane(rn as u32, src_offset + i, src_esize);
+                let b = state.get_vreg_lane(rm as u32, src_offset + i, src_esize);
+                let acc = state.get_vreg_lane(rd as u32, i, dst_esize);
+                state.set_vreg_lane(rd as u32, i, dst_esize, mask(acc.wrapping_add(a.wrapping_mul(b)), dst_esize));
             }
         }
         _ => {

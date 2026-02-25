@@ -122,10 +122,14 @@ impl ServiceHandler for SetService {
         log::debug!("set: cmd_id={}", cmd_id);
         match cmd_id {
             // GetAvailableLanguageCodes / GetAvailableLanguageCodes2
+            // Output: [out] LanguageCode[] via B-buffer, [out] u32 total_entries (inline)
             1 | 5 => {
                 log::info!("set: GetAvailableLanguageCodes");
-                // Return a single language: AmericanEnglish (code = 0)
-                IpcResponse::success_with_data(vec![0, 0]) // u64(0) as two u32s
+                // AmericanEnglish LanguageCode = "en-US\0\0\0" as little-endian u64.
+                let lang_code: u64 = u64::from_le_bytes(*b"en-US\0\0\0");
+                let lang_bytes = lang_code.to_le_bytes().to_vec();
+                IpcResponse::success_with_data(vec![1]) // 1 language code written
+                    .with_out_buf(lang_bytes)
             }
             // MakeLanguageCode
             2 => {
@@ -171,6 +175,7 @@ mod tests {
             cmif_magic: 0x49434653,
             command_id: cmd_id,
             raw_data: Vec::new(),
+            b_buf_addrs: Vec::new(),
         }
     }
 
@@ -204,7 +209,11 @@ mod tests {
         let cmd = make_command(1);
         let resp = svc.handle_request(1, &cmd);
         assert!(resp.result.is_success());
-        assert_eq!(resp.data, vec![0, 0]); // AmericanEnglish as u64
+        // Inline data contains count=1.
+        assert_eq!(resp.data, vec![1]);
+        // out_bufs[0] contains "en-US\0\0\0" as bytes.
+        assert_eq!(resp.out_bufs.len(), 1);
+        assert_eq!(&resp.out_bufs[0], b"en-US\0\0\0");
     }
 
     #[test]

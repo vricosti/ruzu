@@ -20,6 +20,9 @@ pub struct IpcHandlerResult {
     pub copy_handles: Vec<u32>,
     /// Handles to move into the response handle descriptor.
     pub move_handles: Vec<u32>,
+    /// Data to write directly into guest memory B-type output buffers.
+    /// Each entry is `(guest_addr, data_bytes)`.
+    pub out_buf_writes: Vec<(u64, Vec<u8>)>,
 }
 
 /// Trait for handling IPC requests. Bridges the kernel SVC layer to the service framework

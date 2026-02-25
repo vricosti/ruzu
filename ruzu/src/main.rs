@@ -79,6 +79,11 @@ impl IpcHandler for ServiceBridge {
 
         let cmd_id = cmd.as_ref().map(|c| c.command_id).unwrap_or(0);
 
+        // Capture the B-buffer guest addresses before dispatching.
+        let b_buf_addrs: Vec<u64> = cmd.as_ref()
+            .map(|c| c.b_buf_addrs.clone())
+            .unwrap_or_default();
+
         // Dispatch to the service.
         let response = cmd.as_ref().and_then(|c| {
             self.manager.write().handle_request(service_name, c.command_id, c)
@@ -141,6 +146,13 @@ impl IpcHandler for ServiceBridge {
         // then create_sub_session (sub-interface), then None.
         let final_session = create_session_for.or(create_sub_session);
 
+        // Build out_buf_writes: zip response.out_bufs with the guest B-buffer addresses.
+        let out_buf_writes: Vec<(u64, Vec<u8>)> = b_buf_addrs
+            .into_iter()
+            .zip(response.out_bufs.into_iter())
+            .filter(|(addr, _)| *addr != 0)
+            .collect();
+
         IpcHandlerResult {
             response_bytes,
             create_session_for: final_session,
@@ -151,6 +163,7 @@ impl IpcHandler for ServiceBridge {
                 .filter(|&&h| h != 0) // Filter out placeholder handles.
                 .copied()
                 .collect(),
+            out_buf_writes,
         }
     }
 }
