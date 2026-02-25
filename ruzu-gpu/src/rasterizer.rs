@@ -137,6 +137,79 @@ fn apply_wrap_mode(coord: f32, size: u32, mode: WrapMode) -> u32 {
     }
 }
 
+// ── BlockLinear (GOB) deswizzle constants and functions ──────────────────────
+
+/// GOB width in bytes.
+const GOB_SIZE_X: u32 = 64;
+/// GOB height in pixels.
+const GOB_SIZE_Y: u32 = 8;
+/// Total bytes per GOB (64 × 8 = 512).
+const GOB_SIZE: u32 = 512;
+
+/// Compute intra-GOB byte offset using the Tegra X1 swizzle formula.
+/// `x` is the byte offset within the GOB row (0..63), `y` is the row (0..7).
+fn gob_offset(x: u32, y: u32) -> u32 {
+    ((x % 64) / 32) * 256
+        + ((y % 8) / 2) * 64
+        + ((x % 32) / 16) * 32
+        + (y % 2) * 16
+        + (x % 16)
+}
+
+/// Compute the memory size (in bytes) of a BlockLinear texture, aligned to
+/// block boundaries.
+fn block_linear_size(width: u32, height: u32, bpt: u32, block_height: u32) -> usize {
+    let aligned_width = align_up(width * bpt, GOB_SIZE_X);
+    let block_height_pixels = GOB_SIZE_Y << block_height;
+    let aligned_height = align_up(height, block_height_pixels);
+    (aligned_width * aligned_height) as usize
+}
+
+/// Convert BlockLinear-tiled data to a linear row-major pixel buffer.
+fn deswizzle_block_linear(
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    bpt: u32,
+    block_height: u32,
+) -> Vec<u8> {
+    let linear_size = (width * height * bpt) as usize;
+    let mut output = vec![0u8; linear_size];
+
+    let gobs_in_x = align_up(width * bpt, GOB_SIZE_X) / GOB_SIZE_X;
+    let block_height_gobs = 1u32 << block_height;
+    let block_size_bytes = gobs_in_x * GOB_SIZE * block_height_gobs;
+
+    for y in 0..height {
+        for x in 0..width {
+            let x_bytes = x * bpt;
+            let gob_x = x_bytes / GOB_SIZE_X;
+            let gob_y = y / GOB_SIZE_Y;
+            let block_y = gob_y / block_height_gobs;
+            let gob_in_block = gob_y % block_height_gobs;
+
+            let block_offset = block_y * block_size_bytes
+                + gob_x * GOB_SIZE * block_height_gobs
+                + gob_in_block * GOB_SIZE;
+            let intra = gob_offset(x_bytes % GOB_SIZE_X, y % GOB_SIZE_Y);
+
+            let src = (block_offset + intra) as usize;
+            let dst = (y * width * bpt + x * bpt) as usize;
+
+            if src + bpt as usize <= raw.len() && dst + bpt as usize <= output.len() {
+                output[dst..dst + bpt as usize].copy_from_slice(&raw[src..src + bpt as usize]);
+            }
+        }
+    }
+
+    output
+}
+
+/// Round `value` up to the next multiple of `align`.
+fn align_up(value: u32, align: u32) -> u32 {
+    (value + align - 1) / align * align
+}
+
 /// Nearest-neighbor sample from a pre-decoded texture. Returns normalised RGBA.
 fn sample_texture(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
     let (su, sv) = if tex.normalized_coords {
@@ -235,10 +308,7 @@ fn load_texture(
     }
     let tex_desc = TextureDescriptor::from_words(&tic_words);
 
-    // Only support Pitch + 2D textures.
-    if tex_desc.header_version != TicHeaderVersion::Pitch {
-        return None;
-    }
+    // Only support 2D textures with Pitch or BlockLinear layout.
     match tex_desc.texture_type {
         TextureType::Texture2D | TextureType::Texture2DNoMip => {}
         _ => return None,
@@ -263,10 +333,33 @@ fn load_texture(
         (WrapMode::ClampToEdge, WrapMode::ClampToEdge)
     };
 
-    // Bulk-read raw texture data.
-    let total_bytes = (tex_desc.width * tex_desc.height * bpt) as usize;
-    let mut raw = vec![0u8; total_bytes];
-    read_gpu(tex_desc.address, &mut raw);
+    // Bulk-read raw texture data — layout depends on header version.
+    let raw = match tex_desc.header_version {
+        TicHeaderVersion::Pitch => {
+            let total_bytes = (tex_desc.width * tex_desc.height * bpt) as usize;
+            let mut buf = vec![0u8; total_bytes];
+            read_gpu(tex_desc.address, &mut buf);
+            buf
+        }
+        TicHeaderVersion::BlockLinear => {
+            let tiled_size = block_linear_size(
+                tex_desc.width,
+                tex_desc.height,
+                bpt,
+                tex_desc.block_height,
+            );
+            let mut tiled = vec![0u8; tiled_size];
+            read_gpu(tex_desc.address, &mut tiled);
+            deswizzle_block_linear(
+                &tiled,
+                tex_desc.width,
+                tex_desc.height,
+                bpt,
+                tex_desc.block_height,
+            )
+        }
+        _ => return None, // OneDBuffer, PitchColorKey, BlockLinearColorKey unsupported
+    };
 
     // Pre-decode every texel to RGBA8.
     let texel_count = (tex_desc.width * tex_desc.height) as usize;
@@ -328,6 +421,7 @@ impl SoftwareRasterizer {
     pub fn render_draw_calls(
         draws: &[DrawCall],
         read_gpu: &dyn Fn(u64, &mut [u8]),
+        write_gpu: &dyn Fn(u64, &[u8]),
         base_framebuffer: Option<Framebuffer>,
     ) -> Option<Framebuffer> {
         if draws.is_empty() {
@@ -428,6 +522,11 @@ impl SoftwareRasterizer {
                     &draw.color_masks[0],
                 );
             }
+        }
+
+        // Write rendered pixels back to GPU memory.
+        if gpu_va != 0 {
+            write_gpu(gpu_va, &pixels);
         }
 
         Some(Framebuffer {
@@ -1238,7 +1337,7 @@ mod tests {
             pixels: vec![42u8; 64],
         };
         let result =
-            SoftwareRasterizer::render_draw_calls(&[], &|_, _| {}, Some(base_fb));
+            SoftwareRasterizer::render_draw_calls(&[], &|_, _| {}, &|_, _| {}, Some(base_fb));
         let fb = result.unwrap();
         assert_eq!(fb.width, 4);
         assert_eq!(fb.height, 4);
@@ -1303,7 +1402,7 @@ mod tests {
         };
 
         let result =
-            SoftwareRasterizer::render_draw_calls(&[draw], &read_gpu, Some(base_fb));
+            SoftwareRasterizer::render_draw_calls(&[draw], &read_gpu, &|_, _| {}, Some(base_fb));
         let fb = result.unwrap();
         assert_eq!(fb.width, 4);
         assert_eq!(fb.height, 4);
@@ -1763,7 +1862,7 @@ mod tests {
         };
 
         let result =
-            SoftwareRasterizer::render_draw_calls(&[draw], &read_gpu, Some(base_fb));
+            SoftwareRasterizer::render_draw_calls(&[draw], &read_gpu, &|_, _| {}, Some(base_fb));
         let fb = result.unwrap();
 
         // Filled pixels should be white (255, 255, 255, 255).
@@ -1961,5 +2060,324 @@ mod tests {
         assert_eq!(draw.tex_header_pool_addr, 0);
         let tex = load_texture(&draw, &|_, _| {});
         assert!(tex.is_none());
+    }
+
+    // --- Phase 27: BlockLinear Deswizzle + Framebuffer Writeback tests ---
+
+    #[test]
+    fn test_gob_offset_origin() {
+        assert_eq!(gob_offset(0, 0), 0);
+    }
+
+    #[test]
+    fn test_gob_offset_known_positions() {
+        // (16, 0): first 16-byte group in second half of first row pair → 32
+        assert_eq!(gob_offset(16, 0), 32);
+        // (0, 1): second row of first row-pair → 16
+        assert_eq!(gob_offset(0, 1), 16);
+        // (0, 2): second row-pair → 64
+        assert_eq!(gob_offset(0, 2), 64);
+        // (32, 0): second 32-byte half → 256
+        assert_eq!(gob_offset(32, 0), 256);
+    }
+
+    #[test]
+    fn test_gob_offset_range() {
+        // All 512 byte positions in a 64×8 GOB must be unique and < 512.
+        let mut seen = vec![false; 512];
+        for y in 0..8u32 {
+            for x in 0..64u32 {
+                let off = gob_offset(x, y) as usize;
+                assert!(off < 512, "gob_offset({}, {}) = {} >= 512", x, y, off);
+                assert!(!seen[off], "duplicate offset {} at ({}, {})", off, x, y);
+                seen[off] = true;
+            }
+        }
+        // All 512 positions should be covered.
+        assert!(seen.iter().all(|&s| s), "not all GOB offsets covered");
+    }
+
+    #[test]
+    fn test_align_up() {
+        assert_eq!(align_up(0, 64), 0);
+        assert_eq!(align_up(1, 64), 64);
+        assert_eq!(align_up(64, 64), 64);
+        assert_eq!(align_up(65, 64), 128);
+        assert_eq!(align_up(100, 8), 104);
+    }
+
+    #[test]
+    fn test_block_linear_size() {
+        // 16×8 RGBA8 (bpt=4): width_bytes=64=1 GOB wide, height=8=1 GOB tall
+        // block_height=0 → 1 GOB per block → 64×8 = 512 bytes
+        assert_eq!(block_linear_size(16, 8, 4, 0), 512);
+
+        // 32×8 RGBA8: width_bytes=128=2 GOBs wide, height=8=1 GOB tall
+        assert_eq!(block_linear_size(32, 8, 4, 0), 1024);
+
+        // 16×16 RGBA8, block_height=1 (2 GOBs/block): block_height_pixels=16
+        // aligned_width=64, aligned_height=16 → 64×16=1024
+        assert_eq!(block_linear_size(16, 16, 4, 1), 1024);
+
+        // 16×9 RGBA8, block_height=0: aligned_height=16 (rounds 9 up to 8-multiple=16)
+        assert_eq!(block_linear_size(16, 9, 4, 0), 1024);
+    }
+
+    #[test]
+    fn test_deswizzle_block_linear_1x1_gob() {
+        // 16×8 RGBA8 texture = exactly 1 GOB. Fill tiled buffer via gob_offset,
+        // then deswizzle should produce linear row-major order.
+        let width = 16u32;
+        let height = 8u32;
+        let bpt = 4u32;
+        let block_height = 0u32;
+        let mut tiled = vec![0u8; 512];
+
+        // Write a unique byte pattern for each pixel using the GOB formula.
+        for y in 0..height {
+            for x in 0..width {
+                let x_bytes = x * bpt;
+                let off = gob_offset(x_bytes, y) as usize;
+                // Store pixel ID = y * width + x as RGBA.
+                let id = (y * width + x) as u8;
+                tiled[off] = id;
+                tiled[off + 1] = id;
+                tiled[off + 2] = id;
+                tiled[off + 3] = 255;
+            }
+        }
+
+        let linear = deswizzle_block_linear(&tiled, width, height, bpt, block_height);
+        assert_eq!(linear.len(), (width * height * bpt) as usize);
+
+        // Verify each pixel in linear layout.
+        for y in 0..height {
+            for x in 0..width {
+                let lin_off = ((y * width + x) * bpt) as usize;
+                let id = (y * width + x) as u8;
+                assert_eq!(
+                    linear[lin_off], id,
+                    "pixel ({}, {}) R mismatch", x, y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_deswizzle_block_linear_multi_gob() {
+        // 32×8 RGBA8 = 2 GOB columns, 1 GOB row, block_height=0.
+        let width = 32u32;
+        let height = 8u32;
+        let bpt = 4u32;
+        let block_height = 0u32;
+        let size = block_linear_size(width, height, bpt, block_height);
+        let mut tiled = vec![0u8; size];
+
+        // Write via the full deswizzle address formula.
+        let gobs_in_x = align_up(width * bpt, GOB_SIZE_X) / GOB_SIZE_X;
+        let bh_gobs = 1u32 << block_height;
+        let block_size = gobs_in_x * GOB_SIZE * bh_gobs;
+
+        for y in 0..height {
+            for x in 0..width {
+                let x_bytes = x * bpt;
+                let gob_x = x_bytes / GOB_SIZE_X;
+                let gob_y = y / GOB_SIZE_Y;
+                let block_y = gob_y / bh_gobs;
+                let gob_in_block = gob_y % bh_gobs;
+                let base = block_y * block_size
+                    + gob_x * GOB_SIZE * bh_gobs
+                    + gob_in_block * GOB_SIZE;
+                let intra = gob_offset(x_bytes % GOB_SIZE_X, y % GOB_SIZE_Y);
+                let off = (base + intra) as usize;
+                let id = ((y * width + x) & 0xFF) as u8;
+                tiled[off] = id;
+                tiled[off + 1] = id;
+                tiled[off + 2] = id;
+                tiled[off + 3] = 255;
+            }
+        }
+
+        let linear = deswizzle_block_linear(&tiled, width, height, bpt, block_height);
+        for y in 0..height {
+            for x in 0..width {
+                let lin_off = ((y * width + x) * bpt) as usize;
+                let id = ((y * width + x) & 0xFF) as u8;
+                assert_eq!(linear[lin_off], id, "pixel ({}, {}) mismatch", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn test_deswizzle_block_linear_block_height_1() {
+        // 16×16 RGBA8, block_height=1 (2 GOBs per block = 16-pixel-tall blocks).
+        let width = 16u32;
+        let height = 16u32;
+        let bpt = 4u32;
+        let block_height = 1u32;
+        let size = block_linear_size(width, height, bpt, block_height);
+        let mut tiled = vec![0u8; size];
+
+        let gobs_in_x = align_up(width * bpt, GOB_SIZE_X) / GOB_SIZE_X;
+        let bh_gobs = 1u32 << block_height;
+        let block_size = gobs_in_x * GOB_SIZE * bh_gobs;
+
+        for y in 0..height {
+            for x in 0..width {
+                let x_bytes = x * bpt;
+                let gob_x = x_bytes / GOB_SIZE_X;
+                let gob_y = y / GOB_SIZE_Y;
+                let block_y = gob_y / bh_gobs;
+                let gob_in_block = gob_y % bh_gobs;
+                let base = block_y * block_size
+                    + gob_x * GOB_SIZE * bh_gobs
+                    + gob_in_block * GOB_SIZE;
+                let intra = gob_offset(x_bytes % GOB_SIZE_X, y % GOB_SIZE_Y);
+                let off = (base + intra) as usize;
+                let id = ((y * width + x) & 0xFF) as u8;
+                tiled[off] = id;
+                tiled[off + 1] = !id;
+                tiled[off + 2] = 0;
+                tiled[off + 3] = 255;
+            }
+        }
+
+        let linear = deswizzle_block_linear(&tiled, width, height, bpt, block_height);
+        for y in 0..height {
+            for x in 0..width {
+                let lin_off = ((y * width + x) * bpt) as usize;
+                let id = ((y * width + x) & 0xFF) as u8;
+                assert_eq!(linear[lin_off], id, "R mismatch at ({}, {})", x, y);
+                assert_eq!(linear[lin_off + 1], !id, "G mismatch at ({}, {})", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn test_load_texture_block_linear() {
+        // Build a BlockLinear 16×8 RGBA8 texture and verify load_texture deswizzles it.
+        let width = 16u32;
+        let height = 8u32;
+        let bpt = 4u32;
+        let block_height = 0u32;
+        let mut tiled = vec![0u8; 512];
+
+        // Fill tiled buffer: all pixels = solid green (0, 255, 0, 255).
+        for y in 0..height {
+            for x in 0..width {
+                let x_bytes = x * bpt;
+                let off = gob_offset(x_bytes, y) as usize;
+                tiled[off] = 0;
+                tiled[off + 1] = 255;
+                tiled[off + 2] = 0;
+                tiled[off + 3] = 255;
+            }
+        }
+
+        // Build TIC words for BlockLinear A8B8G8R8 16×8 texture.
+        let mut tic_words = [0u32; 8];
+        // word0: format=A8B8G8R8(0x1D), types=UNorm(2), swizzle=RGBA(2,3,4,5)
+        tic_words[0] = 0x1D
+            | (2 << 7) | (2 << 10) | (2 << 13) | (2 << 16)
+            | (2 << 19) | (3 << 22) | (4 << 25) | (5 << 28);
+        // word1: addr_low = 0x2000
+        tic_words[1] = 0x2000;
+        // word2: header_version = BlockLinear(3) at [23:21]
+        tic_words[2] = 3 << 21;
+        // word3: block_height=0, block_depth=0
+        tic_words[3] = 0;
+        // word4: width=15(+1=16), texture_type=Texture2D(1) at [26:23]
+        tic_words[4] = 15 | (1 << 23);
+        // word5: height=7(+1=8), normalized=1
+        tic_words[5] = 7 | (1 << 31);
+
+        let mut tic_bytes = [0u8; 32];
+        for (i, &w) in tic_words.iter().enumerate() {
+            tic_bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+
+        let tiled_clone = tiled.clone();
+        let tic_clone = tic_bytes;
+        let read_gpu = move |addr: u64, buf: &mut [u8]| {
+            if addr == 0x1000 {
+                // TIC read
+                let len = buf.len().min(32);
+                buf[..len].copy_from_slice(&tic_clone[..len]);
+            } else if addr >= 0x2000 && addr < 0x2000 + tiled_clone.len() as u64 {
+                let off = (addr - 0x2000) as usize;
+                let len = buf.len().min(tiled_clone.len() - off);
+                buf[..len].copy_from_slice(&tiled_clone[off..off + len]);
+            }
+        };
+
+        let mut draw = default_draw_call();
+        draw.tex_header_pool_addr = 0x1000;
+
+        let tex = load_texture(&draw, &read_gpu).expect("should load BlockLinear texture");
+        assert_eq!(tex.width, 16);
+        assert_eq!(tex.height, 8);
+        // All pixels should be green.
+        for i in 0..(width * height) as usize {
+            assert_eq!(tex.data[i * 4], 0, "R at pixel {}", i);
+            assert_eq!(tex.data[i * 4 + 1], 255, "G at pixel {}", i);
+            assert_eq!(tex.data[i * 4 + 2], 0, "B at pixel {}", i);
+            assert_eq!(tex.data[i * 4 + 3], 255, "A at pixel {}", i);
+        }
+    }
+
+    #[test]
+    fn test_framebuffer_writeback() {
+        // render_draw_calls should call write_gpu with framebuffer pixels when gpu_va != 0.
+        let base_fb = Framebuffer {
+            gpu_va: 0x1000,
+            width: 2,
+            height: 2,
+            pixels: vec![42u8; 16],
+        };
+
+        // Need at least one draw call (even with no vertices) to reach writeback.
+        let draw = default_draw_call();
+
+        let written = std::sync::Mutex::new(Vec::new());
+        let write_gpu = |addr: u64, data: &[u8]| {
+            written.lock().unwrap().push((addr, data.to_vec()));
+        };
+
+        let result = SoftwareRasterizer::render_draw_calls(
+            &[draw],
+            &|_, _| {},
+            &write_gpu,
+            Some(base_fb),
+        );
+        let fb = result.unwrap();
+        let writes = written.into_inner().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 0x1000);
+        assert_eq!(writes[0].1, fb.pixels);
+    }
+
+    #[test]
+    fn test_framebuffer_writeback_no_va() {
+        // gpu_va == 0 → no writeback.
+        let base_fb = Framebuffer {
+            gpu_va: 0,
+            width: 2,
+            height: 2,
+            pixels: vec![0u8; 16],
+        };
+
+        let written = std::sync::Mutex::new(Vec::new());
+        let write_gpu = |addr: u64, data: &[u8]| {
+            written.lock().unwrap().push((addr, data.to_vec()));
+        };
+
+        SoftwareRasterizer::render_draw_calls(
+            &[],
+            &|_, _| {},
+            &write_gpu,
+            Some(base_fb),
+        );
+        let writes = written.into_inner().unwrap();
+        assert!(writes.is_empty(), "no writeback should occur when gpu_va=0");
     }
 }
