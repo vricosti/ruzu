@@ -10,6 +10,7 @@
 //! draw begin/end) are triggered on specific register writes.
 
 use super::{ClassId, Engine, Framebuffer, PendingWrite, ENGINE_REG_COUNT};
+use crate::descriptor_table::{TicTable, TscTable};
 use crate::macro_interpreter::{MacroInterpreter, MacroProcessor};
 
 // ── Register offset constants (method addresses) ────────────────────────────
@@ -222,6 +223,11 @@ const TEX_SAMPLER_POOL_BASE: u32 = 0x155C;
 /// Texture header pool base: +0 addr_high, +1 addr_low, +2 limit.
 const TEX_HEADER_POOL_BASE: u32 = 0x1574;
 
+/// Sampler binding mode register.
+/// 0 = Independently (tic_id and tsc_id are separate in texture handle)
+/// 1 = ViaHeaderBinding (tic_id == tsc_id, linked)
+const SAMPLER_BINDING: u32 = 0x1234;
+
 // ── MME (Macro Method Executor) registers ──────────────────────────────────
 
 /// Pointer into macro code upload buffer (auto-increments on instruction write).
@@ -352,6 +358,17 @@ enum DrawMode {
     General,
     Instance,
     InlineIndex,
+}
+
+/// Sampler binding mode — how texture handles encode TIC/TSC indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SamplerBinding {
+    /// TIC and TSC indices are packed independently in the texture handle.
+    /// Handle: bits[19:0] = tic_id, bits[31:20] = tsc_id.
+    Independently = 0,
+    /// TIC and TSC share the same index (linked binding).
+    ViaHeaderBinding = 1,
 }
 
 /// Report semaphore operation type from query word bits[1:0].
@@ -1445,6 +1462,8 @@ pub struct DrawCall {
     pub base_vertex: i32,
     /// Non-empty only for InlineIndex draws.
     pub inline_index_data: Vec<u8>,
+    /// Sampler binding mode for this draw call.
+    pub sampler_binding: SamplerBinding,
 }
 
 // ── Engine struct ───────────────────────────────────────────────────────────
@@ -1475,6 +1494,10 @@ pub struct Maxwell3D {
     executing_macro: u32,
     /// Accumulated parameters for the current macro call.
     macro_params: Vec<u32>,
+    /// Graphics TIC descriptor table (texture image descriptors).
+    tic_table: TicTable,
+    /// Graphics TSC descriptor table (texture sampler descriptors).
+    tsc_table: TscTable,
 }
 
 impl Maxwell3D {
@@ -1493,6 +1516,8 @@ impl Maxwell3D {
             macro_interpreter: MacroInterpreter::new(),
             executing_macro: 0,
             macro_params: Vec::new(),
+            tic_table: TicTable::new(),
+            tsc_table: TscTable::new(),
         }
     }
 
@@ -1774,6 +1799,66 @@ impl Maxwell3D {
     /// Maximum descriptor index in the texture sampler pool.
     pub fn tex_sampler_pool_limit(&self) -> u32 {
         self.regs[(TEX_SAMPLER_POOL_BASE + 2) as usize]
+    }
+
+    // ── Descriptor table methods ─────────────────────────────────────────
+
+    /// Synchronize descriptor tables with current register state.
+    /// Call before accessing descriptors during draw dispatch.
+    pub fn sync_descriptor_tables(&mut self) {
+        let tic_addr = self.tex_header_pool_address();
+        let tic_limit = self.regs[(TEX_HEADER_POOL_BASE + 2) as usize];
+        self.tic_table.synchronize(tic_addr, tic_limit);
+
+        let linked =
+            self.regs[SAMPLER_BINDING as usize] == SamplerBinding::ViaHeaderBinding as u32;
+        let tsc_addr = self.tex_sampler_pool_address();
+        let tsc_limit = if linked {
+            tic_limit
+        } else {
+            self.regs[(TEX_SAMPLER_POOL_BASE + 2) as usize]
+        };
+        self.tsc_table.synchronize(tsc_addr, tsc_limit);
+    }
+
+    /// Read a TIC entry by index from the texture header pool.
+    /// Returns `(TextureDescriptor, changed)`.
+    pub fn get_tic_entry(
+        &mut self,
+        index: u32,
+        gpu_read: &dyn Fn(u64, &mut [u8]),
+    ) -> (TextureDescriptor, bool) {
+        let (raw, changed) = self.tic_table.read(index, gpu_read);
+        let words = words_from_bytes(&raw);
+        (TextureDescriptor::from_words(&words), changed)
+    }
+
+    /// Read a TSC entry by index from the texture sampler pool.
+    /// Returns `(SamplerDescriptor, changed)`.
+    pub fn get_tsc_entry(
+        &mut self,
+        index: u32,
+        gpu_read: &dyn Fn(u64, &mut [u8]),
+    ) -> (SamplerDescriptor, bool) {
+        let (raw, changed) = self.tsc_table.read(index, gpu_read);
+        let words = words_from_bytes(&raw);
+        (SamplerDescriptor::from_words(&words), changed)
+    }
+
+    /// Decode a texture handle into `(tic_id, tsc_id)` based on sampler
+    /// binding mode.
+    pub fn decode_texture_handle(&self, handle: u32) -> (u32, u32) {
+        let linked =
+            self.regs[SAMPLER_BINDING as usize] == SamplerBinding::ViaHeaderBinding as u32;
+        if linked {
+            // Same index for both TIC and TSC.
+            (handle, handle)
+        } else {
+            // Independent: bits[19:0] = tic_id, bits[31:20] = tsc_id.
+            let tic_id = handle & 0xF_FFFF; // 20 bits
+            let tsc_id = (handle >> 20) & 0xFFF; // 12 bits
+            (tic_id, tsc_id)
+        }
     }
 
     // ── Vertex attribute accessors ────────────────────────────────────────
@@ -2130,6 +2215,11 @@ impl Maxwell3D {
             base_instance: self.base_instance(),
             base_vertex: self.base_vertex(),
             inline_index_data,
+            sampler_binding: if self.regs[SAMPLER_BINDING as usize] == 1 {
+                SamplerBinding::ViaHeaderBinding
+            } else {
+                SamplerBinding::Independently
+            },
         }
     }
 
@@ -2351,6 +2441,20 @@ impl Maxwell3D {
         self.macro_interpreter = interp;
         self.executing_macro = 0;
     }
+}
+
+/// Convert 32 raw bytes to 8 u32 words (little-endian).
+fn words_from_bytes(bytes: &[u8; 32]) -> [u32; 8] {
+    let mut words = [0u32; 8];
+    for i in 0..8 {
+        words[i] = u32::from_le_bytes([
+            bytes[i * 4],
+            bytes[i * 4 + 1],
+            bytes[i * 4 + 2],
+            bytes[i * 4 + 3],
+        ]);
+    }
+    words
 }
 
 impl MacroProcessor for Maxwell3D {
@@ -4374,5 +4478,151 @@ mod tests {
         // (We can't directly check which slot ran, but the macro writes r2=42.)
         // Since we can't inspect interpreter registers from here, just verify
         // no panic occurred. The macro has no send, so no register writes.
+    }
+
+    // ── Descriptor table integration tests ───────────────────────────────
+
+    #[test]
+    fn test_sampler_binding_register() {
+        let mut engine = Maxwell3D::new();
+        assert_eq!(engine.regs[SAMPLER_BINDING as usize], 0);
+
+        engine.write_reg(SAMPLER_BINDING, 1);
+        assert_eq!(engine.regs[SAMPLER_BINDING as usize], 1);
+
+        engine.write_reg(SAMPLER_BINDING, 0);
+        assert_eq!(engine.regs[SAMPLER_BINDING as usize], 0);
+    }
+
+    #[test]
+    fn test_tex_header_pool_address_reconstruction() {
+        let mut engine = Maxwell3D::new();
+        let base = TEX_HEADER_POOL_BASE as usize;
+        engine.regs[base] = 0x0005;
+        engine.regs[base + 1] = 0xABCD_0000;
+        assert_eq!(engine.tex_header_pool_address(), 0x0005_ABCD_0000);
+    }
+
+    #[test]
+    fn test_tex_sampler_pool_address_reconstruction() {
+        let mut engine = Maxwell3D::new();
+        let base = TEX_SAMPLER_POOL_BASE as usize;
+        engine.regs[base] = 0x0003;
+        engine.regs[base + 1] = 0x1234_0000;
+        assert_eq!(engine.tex_sampler_pool_address(), 0x0003_1234_0000);
+    }
+
+    #[test]
+    fn test_decode_texture_handle_independent() {
+        let mut engine = Maxwell3D::new();
+        // Default is Independently (0).
+        let handle: u32 = (0x0AB << 20) | 0x1_2345;
+        let (tic_id, tsc_id) = engine.decode_texture_handle(handle);
+        assert_eq!(tic_id, 0x1_2345); // 20-bit
+        assert_eq!(tsc_id, 0x0AB); // 12-bit
+    }
+
+    #[test]
+    fn test_decode_texture_handle_linked() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[SAMPLER_BINDING as usize] = SamplerBinding::ViaHeaderBinding as u32;
+
+        let handle = 42u32;
+        let (tic_id, tsc_id) = engine.decode_texture_handle(handle);
+        assert_eq!(tic_id, 42);
+        assert_eq!(tsc_id, 42);
+    }
+
+    #[test]
+    fn test_get_tic_entry() {
+        let mut engine = Maxwell3D::new();
+
+        // Set up TIC pool: address = 0x1_0000, limit = 10.
+        let base = TEX_HEADER_POOL_BASE as usize;
+        engine.regs[base] = 0;
+        engine.regs[base + 1] = 0x1_0000;
+        engine.regs[base + 2] = 10;
+        engine.sync_descriptor_tables();
+
+        // Build a TIC entry for A8B8G8R8 UNorm at index 3.
+        // word0: format=0x1D(A8B8G8R8), component types UNorm(2), swizzle RGBA.
+        let mut raw = [0u8; 32];
+        let word0: u32 = 0x1D
+            | (2 << 7)   // r_type = UNorm
+            | (2 << 10)  // g_type = UNorm
+            | (2 << 13)  // b_type = UNorm
+            | (2 << 16)  // a_type = UNorm
+            | (2 << 19)  // x_source = R
+            | (3 << 22)  // y_source = G
+            | (4 << 25)  // z_source = B
+            | (5 << 28); // w_source = A
+        raw[0..4].copy_from_slice(&word0.to_le_bytes());
+
+        let reader = move |addr: u64, buf: &mut [u8]| {
+            let expected_addr = 0x1_0000u64 + 3 * 32;
+            if addr == expected_addr {
+                buf.copy_from_slice(&raw);
+            } else {
+                buf.fill(0);
+            }
+        };
+
+        let (desc, changed) = engine.get_tic_entry(3, &reader);
+        assert!(changed);
+        assert_eq!(desc.format, TextureFormat::A8B8G8R8);
+    }
+
+    #[test]
+    fn test_get_tsc_entry() {
+        let mut engine = Maxwell3D::new();
+
+        // Set up TSC pool: address = 0x2_0000, limit = 5.
+        let base = TEX_SAMPLER_POOL_BASE as usize;
+        engine.regs[base] = 0;
+        engine.regs[base + 1] = 0x2_0000;
+        engine.regs[base + 2] = 5;
+        engine.sync_descriptor_tables();
+
+        // Build a TSC entry at index 1.
+        // word0: wrap_u=Wrap(0), wrap_v=ClampToEdge(2), wrap_p=Mirror(1).
+        // word1: mag=Linear(2), min=Linear(2).
+        let mut raw = [0u8; 32];
+        let word0: u32 = 0 | (2 << 3) | (1 << 6);
+        raw[0..4].copy_from_slice(&word0.to_le_bytes());
+        let word1: u32 = 2 | (2 << 4); // mag=Linear(2), min=Linear(2)
+        raw[4..8].copy_from_slice(&word1.to_le_bytes());
+
+        let reader = move |addr: u64, buf: &mut [u8]| {
+            let expected_addr = 0x2_0000u64 + 1 * 32;
+            if addr == expected_addr {
+                buf.copy_from_slice(&raw);
+            } else {
+                buf.fill(0);
+            }
+        };
+
+        let (desc, changed) = engine.get_tsc_entry(1, &reader);
+        assert!(changed);
+        assert_eq!(desc.wrap_u, WrapMode::Wrap);
+        assert_eq!(desc.wrap_v, WrapMode::ClampToEdge);
+        assert_eq!(desc.wrap_p, WrapMode::Mirror);
+    }
+
+    #[test]
+    fn test_draw_call_captures_sampler_binding() {
+        let mut engine = Maxwell3D::new();
+
+        // Default → Independently.
+        engine.write_reg(DRAW_BEGIN, 0); // Topology = Points.
+        engine.write_reg(DRAW_END, 0);
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws[0].sampler_binding, SamplerBinding::Independently);
+
+        // Set ViaHeaderBinding.
+        engine.write_reg(SAMPLER_BINDING, 1);
+        engine.write_reg(DRAW_BEGIN, 0);
+        engine.write_reg(DRAW_END, 0);
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws[0].sampler_binding, SamplerBinding::ViaHeaderBinding);
     }
 }

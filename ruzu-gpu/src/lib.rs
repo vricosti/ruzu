@@ -8,6 +8,7 @@
 
 pub mod backend;
 pub mod command_processor;
+pub mod descriptor_table;
 pub mod engines;
 pub mod gpu_context;
 pub mod macro_interpreter;
