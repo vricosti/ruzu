@@ -89,6 +89,16 @@ impl ViDisplayService {
         }
     }
 
+    /// Create with a pre-allocated vsync kernel event handle.
+    pub fn new_with_vsync_event(buffer_queue: Arc<RwLock<BufferQueue>>, handle: u32) -> Self {
+        Self {
+            buffer_queue,
+            vsync_event_handle: Some(handle),
+            next_display_id: 1,
+            next_layer_id: 1,
+        }
+    }
+
     /// Set the vsync event handle (created by the main crate).
     pub fn set_vsync_event_handle(&mut self, handle: u32) {
         self.vsync_event_handle = Some(handle);
