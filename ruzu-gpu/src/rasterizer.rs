@@ -8,11 +8,313 @@
 //! alpha blending, scissor clipping, color write masks, and back-face culling.
 
 use crate::engines::maxwell_3d::{
-    BlendColorInfo, BlendEquation, BlendFactor, BlendInfo, ColorMaskInfo, ComparisonOp, CullFace,
-    DepthStencilInfo, DrawCall, FrontFace, IndexFormat, PrimitiveTopology, RasterizerInfo,
-    ScissorInfo, VertexAttribSize, VertexAttribType,
+    BlendColorInfo, BlendEquation, BlendFactor, BlendInfo, ColorMaskInfo, ComponentType,
+    ComparisonOp, CullFace, DepthStencilInfo, DrawCall, FrontFace, IndexFormat,
+    PrimitiveTopology, RasterizerInfo, SamplerDescriptor, ScissorInfo, SwizzleSource,
+    TextureDescriptor, TextureFormat, TextureType, TicHeaderVersion, VertexAttribSize,
+    VertexAttribType, WrapMode,
 };
 use crate::engines::Framebuffer;
+
+/// Cached pre-decoded RGBA8 texture data, loaded once per draw call.
+struct SampledTexture {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    wrap_u: WrapMode,
+    wrap_v: WrapMode,
+    normalized_coords: bool,
+}
+
+/// Return bytes per texel for supported uncompressed formats, or `None` for
+/// compressed / unsupported formats.
+fn bytes_per_texel(fmt: TextureFormat) -> Option<u32> {
+    match fmt {
+        TextureFormat::A8B8G8R8 | TextureFormat::R8G8B8A8 => Some(4),
+        TextureFormat::B5G6R5 => Some(2),
+        TextureFormat::R8G8 => Some(2),
+        TextureFormat::R8 => Some(1),
+        TextureFormat::R32G32B32A32 => Some(16),
+        _ => None,
+    }
+}
+
+/// Decode raw bytes of a single texel into RGBA8.
+fn decode_texel(bytes: &[u8], fmt: TextureFormat, _comp_type: ComponentType) -> Option<[u8; 4]> {
+    match fmt {
+        TextureFormat::A8B8G8R8 => {
+            // LE u32 layout: byte0=R, byte1=G, byte2=B, byte3=A
+            Some([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+        TextureFormat::R8G8B8A8 => {
+            // LE u32 layout: byte0=A, byte1=B, byte2=G, byte3=R → reverse
+            Some([bytes[3], bytes[2], bytes[1], bytes[0]])
+        }
+        TextureFormat::B5G6R5 => {
+            let val = u16::from_le_bytes([bytes[0], bytes[1]]);
+            let b = (val & 0x1F) as u8;
+            let g = ((val >> 5) & 0x3F) as u8;
+            let r = ((val >> 11) & 0x1F) as u8;
+            Some([
+                (r << 3) | (r >> 2),
+                (g << 2) | (g >> 4),
+                (b << 3) | (b >> 2),
+                255,
+            ])
+        }
+        TextureFormat::R8G8 => Some([bytes[0], bytes[1], 0, 255]),
+        TextureFormat::R8 => Some([bytes[0], 0, 0, 255]),
+        TextureFormat::R32G32B32A32 => {
+            let r = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let g = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            let b = f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+            let a = f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+            Some([
+                (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (a.clamp(0.0, 1.0) * 255.0).round() as u8,
+            ])
+        }
+        _ => None,
+    }
+}
+
+/// Apply TIC component swizzle to an RGBA8 texel.
+fn apply_swizzle(rgba: [u8; 4], swizzle: &[SwizzleSource; 4]) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for (i, src) in swizzle.iter().enumerate() {
+        out[i] = match src {
+            SwizzleSource::Zero => 0,
+            SwizzleSource::R => rgba[0],
+            SwizzleSource::G => rgba[1],
+            SwizzleSource::B => rgba[2],
+            SwizzleSource::A => rgba[3],
+            SwizzleSource::OneInt | SwizzleSource::OneFloat => 255,
+            SwizzleSource::Invalid => 0,
+        };
+    }
+    out
+}
+
+/// Convert an sRGB 8-bit value to linear (approximate). Alpha is never converted.
+fn srgb_to_linear(val: u8) -> u8 {
+    let f = val as f32 / 255.0;
+    let linear = if f <= 0.04045 {
+        f / 12.92
+    } else {
+        ((f + 0.055) / 1.055).powf(2.4)
+    };
+    (linear * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// Map a floating-point UV coordinate to a texel index given a wrap mode.
+fn apply_wrap_mode(coord: f32, size: u32, mode: WrapMode) -> u32 {
+    if size == 0 {
+        return 0;
+    }
+    let s = size as i32;
+    match mode {
+        WrapMode::Wrap => {
+            let i = coord.floor() as i32;
+            ((i % s + s) % s) as u32
+        }
+        WrapMode::ClampToEdge | WrapMode::Clamp => {
+            let i = coord.floor() as i32;
+            i.clamp(0, s - 1) as u32
+        }
+        WrapMode::Mirror => {
+            let period = s * 2;
+            let i = coord.floor() as i32;
+            let m = ((i % period) + period) % period;
+            if m < s { m as u32 } else { (period - 1 - m) as u32 }
+        }
+        _ => {
+            // Border, MirrorOnce variants — fall back to clamp.
+            let i = coord.floor() as i32;
+            i.clamp(0, s - 1) as u32
+        }
+    }
+}
+
+/// Nearest-neighbor sample from a pre-decoded texture. Returns normalised RGBA.
+fn sample_texture(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
+    let (su, sv) = if tex.normalized_coords {
+        (u * tex.width as f32, v * tex.height as f32)
+    } else {
+        (u, v)
+    };
+    let tx = apply_wrap_mode(su, tex.width, tex.wrap_u);
+    let ty = apply_wrap_mode(sv, tex.height, tex.wrap_v);
+    let idx = (ty * tex.width + tx) as usize * 4;
+    if idx + 4 > tex.data.len() {
+        return [1.0, 1.0, 1.0, 1.0];
+    }
+    [
+        tex.data[idx] as f32 / 255.0,
+        tex.data[idx + 1] as f32 / 255.0,
+        tex.data[idx + 2] as f32 / 255.0,
+        tex.data[idx + 3] as f32 / 255.0,
+    ]
+}
+
+/// Read UV (texture coordinate) attribute for all vertices of a draw call.
+fn fetch_texture_coords(
+    draw: &DrawCall,
+    read_gpu: &dyn Fn(u64, &mut [u8]),
+    vertex_count: usize,
+) -> Option<Vec<[f32; 2]>> {
+    // Heuristic: find a Float R32G32 attrib that is NOT the position attribute.
+    let uv_attrib = draw
+        .vertex_attribs
+        .iter()
+        .find(|a| {
+            a.attrib_type == VertexAttribType::Float
+                && a.size == VertexAttribSize::R32G32
+                && a.buffer_index != 0
+        })
+        .or_else(|| {
+            // Fallback: any Float attrib with 2 components, not the first attribute.
+            draw.vertex_attribs.iter().skip(1).find(|a| {
+                a.attrib_type == VertexAttribType::Float && a.size.component_count() == 2
+            })
+        })?;
+
+    let stream = draw
+        .vertex_streams
+        .iter()
+        .find(|s| s.index == uv_attrib.buffer_index)?;
+
+    if stream.stride == 0 || stream.address == 0 {
+        return None;
+    }
+
+    // Re-derive vertex indices (same as fetch_positions).
+    let indices: Vec<u32> = if draw.indexed {
+        fetch_indices(draw, read_gpu)
+    } else {
+        let first = draw.vertex_first;
+        let count = draw.vertex_count;
+        (first..first + count).collect()
+    };
+
+    let mut uvs = Vec::with_capacity(vertex_count);
+    for idx in indices.iter().take(vertex_count) {
+        let addr =
+            stream.address + (*idx as u64) * (stream.stride as u64) + (uv_attrib.offset as u64);
+        let mut buf = [0u8; 8];
+        read_gpu(addr, &mut buf);
+        let u = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let v = f32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        uvs.push([u, v]);
+    }
+
+    // Pad if needed.
+    while uvs.len() < vertex_count {
+        uvs.push([0.0, 0.0]);
+    }
+
+    Some(uvs)
+}
+
+/// Load TIC/TSC entry 0, bulk-decode the texture to RGBA8.
+fn load_texture(
+    draw: &DrawCall,
+    read_gpu: &dyn Fn(u64, &mut [u8]),
+) -> Option<SampledTexture> {
+    if draw.tex_header_pool_addr == 0 {
+        return None;
+    }
+
+    // Read TIC entry 0 (32 bytes = 8 × u32).
+    let mut tic_buf = [0u8; 32];
+    read_gpu(draw.tex_header_pool_addr, &mut tic_buf);
+    let mut tic_words = [0u32; 8];
+    for (i, chunk) in tic_buf.chunks_exact(4).enumerate() {
+        tic_words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    let tex_desc = TextureDescriptor::from_words(&tic_words);
+
+    // Only support Pitch + 2D textures.
+    if tex_desc.header_version != TicHeaderVersion::Pitch {
+        return None;
+    }
+    match tex_desc.texture_type {
+        TextureType::Texture2D | TextureType::Texture2DNoMip => {}
+        _ => return None,
+    }
+
+    let bpt = bytes_per_texel(tex_desc.format)?;
+    if tex_desc.width == 0 || tex_desc.height == 0 || tex_desc.address == 0 {
+        return None;
+    }
+
+    // Read TSC entry 0 (32 bytes) if sampler pool is available; otherwise use defaults.
+    let (wrap_u, wrap_v) = if draw.tex_sampler_pool_addr != 0 {
+        let mut tsc_buf = [0u8; 32];
+        read_gpu(draw.tex_sampler_pool_addr, &mut tsc_buf);
+        let mut tsc_words = [0u32; 8];
+        for (i, chunk) in tsc_buf.chunks_exact(4).enumerate() {
+            tsc_words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        let sam_desc = SamplerDescriptor::from_words(&tsc_words);
+        (sam_desc.wrap_u, sam_desc.wrap_v)
+    } else {
+        (WrapMode::ClampToEdge, WrapMode::ClampToEdge)
+    };
+
+    // Bulk-read raw texture data.
+    let total_bytes = (tex_desc.width * tex_desc.height * bpt) as usize;
+    let mut raw = vec![0u8; total_bytes];
+    read_gpu(tex_desc.address, &mut raw);
+
+    // Pre-decode every texel to RGBA8.
+    let texel_count = (tex_desc.width * tex_desc.height) as usize;
+    let mut data = vec![0u8; texel_count * 4];
+    let swizzle = [
+        tex_desc.x_source,
+        tex_desc.y_source,
+        tex_desc.z_source,
+        tex_desc.w_source,
+    ];
+
+    for i in 0..texel_count {
+        let byte_off = i * bpt as usize;
+        let end = byte_off + bpt as usize;
+        if end > raw.len() {
+            break;
+        }
+        let texel_bytes = &raw[byte_off..end];
+        let rgba = match decode_texel(texel_bytes, tex_desc.format, tex_desc.r_type) {
+            Some(c) => c,
+            None => [255, 255, 255, 255],
+        };
+        let swizzled = apply_swizzle(rgba, &swizzle);
+        let final_rgba = if tex_desc.srgb_conversion {
+            [
+                srgb_to_linear(swizzled[0]),
+                srgb_to_linear(swizzled[1]),
+                srgb_to_linear(swizzled[2]),
+                swizzled[3], // alpha is never sRGB-converted
+            ]
+        } else {
+            swizzled
+        };
+        data[i * 4] = final_rgba[0];
+        data[i * 4 + 1] = final_rgba[1];
+        data[i * 4 + 2] = final_rgba[2];
+        data[i * 4 + 3] = final_rgba[3];
+    }
+
+    Some(SampledTexture {
+        data,
+        width: tex_desc.width,
+        height: tex_desc.height,
+        wrap_u,
+        wrap_v,
+        normalized_coords: tex_desc.normalized_coords,
+    })
+}
 
 /// Stateless software rasterizer. All state comes from `DrawCall` parameters.
 pub struct SoftwareRasterizer;
@@ -59,7 +361,16 @@ impl SoftwareRasterizer {
                 continue;
             }
 
-            let colors = fetch_vertex_colors(draw, read_gpu, positions.len());
+            let vert_count = positions.len();
+            let colors = fetch_vertex_colors(draw, read_gpu, vert_count);
+            let texture = load_texture(draw, read_gpu);
+            let uvs = if texture.is_some() {
+                fetch_texture_coords(draw, read_gpu, vert_count)
+            } else {
+                None
+            };
+            let default_uv = [0.0f32, 0.0];
+
             let triangles = process_topology(&positions, draw.topology);
             let viewport = &draw.viewports[0];
 
@@ -91,6 +402,10 @@ impl SoftwareRasterizer {
                 let c1 = colors[tri[1]];
                 let c2 = colors[tri[2]];
 
+                let uv0 = uvs.as_ref().map_or(default_uv, |u| u[tri[0]]);
+                let uv1 = uvs.as_ref().map_or(default_uv, |u| u[tri[1]]);
+                let uv2 = uvs.as_ref().map_or(default_uv, |u| u[tri[2]]);
+
                 rasterize_triangle(
                     p0,
                     p1,
@@ -98,6 +413,10 @@ impl SoftwareRasterizer {
                     c0,
                     c1,
                     c2,
+                    uv0,
+                    uv1,
+                    uv2,
+                    texture.as_ref(),
                     &mut pixels,
                     &mut depth_buf,
                     fb_width,
@@ -554,6 +873,10 @@ fn rasterize_triangle(
     c0: [f32; 4],
     c1: [f32; 4],
     c2: [f32; 4],
+    uv0: [f32; 2],
+    uv1: [f32; 2],
+    uv2: [f32; 2],
+    texture: Option<&SampledTexture>,
     pixels: &mut [u8],
     depth_buf: &mut [f32],
     fb_width: u32,
@@ -624,12 +947,23 @@ fn rasterize_triangle(
                 }
 
                 // Interpolate vertex color.
-                let src = [
+                let mut src = [
                     c0[0] * b0 + c1[0] * b1 + c2[0] * b2,
                     c0[1] * b0 + c1[1] * b1 + c2[1] * b2,
                     c0[2] * b0 + c1[2] * b1 + c2[2] * b2,
                     c0[3] * b0 + c1[3] * b1 + c2[3] * b2,
                 ];
+
+                // Texture modulation.
+                if let Some(tex) = texture {
+                    let u = uv0[0] * b0 + uv1[0] * b1 + uv2[0] * b2;
+                    let v = uv0[1] * b0 + uv1[1] * b1 + uv2[1] * b2;
+                    let tex_color = sample_texture(tex, u, v);
+                    src[0] *= tex_color[0];
+                    src[1] *= tex_color[1];
+                    src[2] *= tex_color[2];
+                    src[3] *= tex_color[3];
+                }
 
                 // Read destination color for blending.
                 let dst = [
@@ -846,7 +1180,8 @@ mod tests {
         let v1 = [5.0, 0.0, 0.0];
         let v2 = [0.0, 5.0, 0.0];
         rasterize_triangle(
-            v0, v1, v2, white, white, white, &mut pixels, &mut depth_buf,
+            v0, v1, v2, white, white, white,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -873,7 +1208,8 @@ mod tests {
         let v1 = [100.0, -10.0, 0.0];
         let v2 = [-10.0, 100.0, 0.0];
         rasterize_triangle(
-            v0, v1, v2, white, white, white, &mut pixels, &mut depth_buf,
+            v0, v1, v2, white, white, white,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -1052,7 +1388,8 @@ mod tests {
         let c2 = [0.0, 0.0, 1.0, 1.0]; // blue
 
         rasterize_triangle(
-            v0, v1, v2, c0, c1, c2, &mut pixels, &mut depth_buf,
+            v0, v1, v2, c0, c1, c2,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -1095,7 +1432,8 @@ mod tests {
         let v2 = [-1.0, 20.0, 0.5];
         let red = [1.0, 0.0, 0.0, 1.0];
         rasterize_triangle(
-            v0, v1, v2, red, red, red, &mut pixels, &mut depth_buf,
+            v0, v1, v2, red, red, red,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &ds,
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -1110,7 +1448,8 @@ mod tests {
         let v1b = [20.0, -1.0, 0.3];
         let v2b = [-1.0, 20.0, 0.3];
         rasterize_triangle(
-            v0b, v1b, v2b, green, green, green, &mut pixels, &mut depth_buf,
+            v0b, v1b, v2b, green, green, green,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &ds,
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -1124,7 +1463,8 @@ mod tests {
         let v1c = [20.0, -1.0, 0.8];
         let v2c = [-1.0, 20.0, 0.8];
         rasterize_triangle(
-            v0c, v1c, v2c, blue, blue, blue, &mut pixels, &mut depth_buf,
+            v0c, v1c, v2c, blue, blue, blue,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &ds,
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -1146,7 +1486,8 @@ mod tests {
         let red = [1.0, 0.0, 0.0, 1.0];
         rasterize_triangle(
             [-1.0, -1.0, 0.3], [20.0, -1.0, 0.3], [-1.0, 20.0, 0.3],
-            red, red, red, &mut pixels, &mut depth_buf,
+            red, red, red,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &ds,
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -1155,7 +1496,8 @@ mod tests {
         let blue = [0.0, 0.0, 1.0, 1.0];
         rasterize_triangle(
             [-1.0, -1.0, 0.8], [20.0, -1.0, 0.8], [-1.0, 20.0, 0.8],
-            blue, blue, blue, &mut pixels, &mut depth_buf,
+            blue, blue, blue,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &ds,
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -1176,7 +1518,8 @@ mod tests {
         let red = [1.0, 0.0, 0.0, 1.0];
         rasterize_triangle(
             [-1.0, -1.0, 0.0], [20.0, -1.0, 0.0], [-1.0, 20.0, 0.0],
-            red, red, red, &mut pixels, &mut depth_buf,
+            red, red, red,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -1195,7 +1538,8 @@ mod tests {
         let green_half = [0.0, 1.0, 0.0, 0.5];
         rasterize_triangle(
             [-1.0, -1.0, 0.0], [20.0, -1.0, 0.0], [-1.0, 20.0, 0.0],
-            green_half, green_half, green_half, &mut pixels, &mut depth_buf,
+            green_half, green_half, green_half,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &default_depth_stencil(),
             &blend, &default_blend_color(), &default_color_mask(),
         );
@@ -1227,7 +1571,8 @@ mod tests {
         // Big triangle covering entire framebuffer.
         rasterize_triangle(
             [-1.0, -1.0, 0.0], [20.0, -1.0, 0.0], [-1.0, 20.0, 0.0],
-            white, white, white, &mut pixels, &mut depth_buf,
+            white, white, white,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &scissor, &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &default_color_mask(),
         );
@@ -1270,7 +1615,8 @@ mod tests {
 
         rasterize_triangle(
             [-1.0, -1.0, 0.0], [20.0, -1.0, 0.0], [-1.0, 20.0, 0.0],
-            white, white, white, &mut pixels, &mut depth_buf,
+            white, white, white,
+            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
             width, height, &default_scissor(), &default_depth_stencil(),
             &default_blend(), &default_blend_color(), &mask,
         );
@@ -1437,5 +1783,183 @@ mod tests {
         // Reversed winding.
         let area_rev = signed_area([0.0, 0.0, 0.0], [0.0, 10.0, 0.0], [10.0, 0.0, 0.0]);
         assert!(area_rev < 0.0);
+    }
+
+    // --- Phase 26: Texture Sampling tests ---
+
+    #[test]
+    fn test_bytes_per_texel() {
+        assert_eq!(bytes_per_texel(TextureFormat::A8B8G8R8), Some(4));
+        assert_eq!(bytes_per_texel(TextureFormat::R8G8B8A8), Some(4));
+        assert_eq!(bytes_per_texel(TextureFormat::B5G6R5), Some(2));
+        assert_eq!(bytes_per_texel(TextureFormat::R8G8), Some(2));
+        assert_eq!(bytes_per_texel(TextureFormat::R8), Some(1));
+        assert_eq!(bytes_per_texel(TextureFormat::R32G32B32A32), Some(16));
+        // Compressed formats return None.
+        assert_eq!(bytes_per_texel(TextureFormat::Bc1Rgba), None);
+        assert_eq!(bytes_per_texel(TextureFormat::Astc2d4x4), None);
+    }
+
+    #[test]
+    fn test_decode_texel_a8b8g8r8() {
+        // Bytes [R, G, B, A] in LE layout.
+        let bytes = [100u8, 150, 200, 255];
+        let rgba = decode_texel(&bytes, TextureFormat::A8B8G8R8, ComponentType::UNorm).unwrap();
+        assert_eq!(rgba, [100, 150, 200, 255]);
+    }
+
+    #[test]
+    fn test_decode_texel_b5g6r5() {
+        // Pure red: R=31, G=0, B=0 → u16 = 31 << 11 = 0xF800.
+        let val: u16 = 0xF800;
+        let bytes = val.to_le_bytes();
+        let rgba = decode_texel(&bytes, TextureFormat::B5G6R5, ComponentType::UNorm).unwrap();
+        assert!(rgba[0] >= 248, "red={}, expected >=248", rgba[0]);
+        assert_eq!(rgba[1], 0);
+        assert_eq!(rgba[2], 0);
+        assert_eq!(rgba[3], 255);
+    }
+
+    #[test]
+    fn test_decode_texel_r8() {
+        let bytes = [42u8];
+        let rgba = decode_texel(&bytes, TextureFormat::R8, ComponentType::UNorm).unwrap();
+        assert_eq!(rgba, [42, 0, 0, 255]);
+    }
+
+    #[test]
+    fn test_decode_texel_float() {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&(0.5f32).to_le_bytes());
+        bytes[4..8].copy_from_slice(&(0.25f32).to_le_bytes());
+        bytes[8..12].copy_from_slice(&(1.0f32).to_le_bytes());
+        bytes[12..16].copy_from_slice(&(0.75f32).to_le_bytes());
+        let rgba =
+            decode_texel(&bytes, TextureFormat::R32G32B32A32, ComponentType::Float).unwrap();
+        assert_eq!(rgba[0], 128); // 0.5 * 255 = 127.5 → 128
+        assert_eq!(rgba[1], 64);  // 0.25 * 255 = 63.75 → 64
+        assert_eq!(rgba[2], 255); // 1.0 * 255 = 255
+        assert_eq!(rgba[3], 191); // 0.75 * 255 = 191.25 → 191
+    }
+
+    #[test]
+    fn test_apply_swizzle() {
+        let rgba = [10, 20, 30, 40];
+        // Identity: RGBA → RGBA.
+        let identity = [SwizzleSource::R, SwizzleSource::G, SwizzleSource::B, SwizzleSource::A];
+        assert_eq!(apply_swizzle(rgba, &identity), [10, 20, 30, 40]);
+
+        // Swap R and B.
+        let swap_rb = [SwizzleSource::B, SwizzleSource::G, SwizzleSource::R, SwizzleSource::A];
+        assert_eq!(apply_swizzle(rgba, &swap_rb), [30, 20, 10, 40]);
+
+        // Zero and One.
+        let special = [SwizzleSource::Zero, SwizzleSource::OneFloat, SwizzleSource::R, SwizzleSource::Zero];
+        assert_eq!(apply_swizzle(rgba, &special), [0, 255, 10, 0]);
+    }
+
+    #[test]
+    fn test_apply_wrap_mode_repeat() {
+        // Positive wrap.
+        assert_eq!(apply_wrap_mode(4.5, 4, WrapMode::Wrap), 0);
+        assert_eq!(apply_wrap_mode(5.0, 4, WrapMode::Wrap), 1);
+        // Negative wrap.
+        assert_eq!(apply_wrap_mode(-1.0, 4, WrapMode::Wrap), 3);
+        assert_eq!(apply_wrap_mode(-0.5, 4, WrapMode::Wrap), 3);
+    }
+
+    #[test]
+    fn test_apply_wrap_mode_clamp() {
+        assert_eq!(apply_wrap_mode(-1.0, 4, WrapMode::ClampToEdge), 0);
+        assert_eq!(apply_wrap_mode(0.5, 4, WrapMode::ClampToEdge), 0);
+        assert_eq!(apply_wrap_mode(3.5, 4, WrapMode::ClampToEdge), 3);
+        assert_eq!(apply_wrap_mode(10.0, 4, WrapMode::ClampToEdge), 3);
+    }
+
+    #[test]
+    fn test_apply_wrap_mode_mirror() {
+        // Within first period (0..4): direct mapping.
+        assert_eq!(apply_wrap_mode(1.5, 4, WrapMode::Mirror), 1);
+        // In reflected region (4..8): mirrors back.
+        assert_eq!(apply_wrap_mode(5.0, 4, WrapMode::Mirror), 2);
+        // Negative: mirrors.
+        let result = apply_wrap_mode(-1.0, 4, WrapMode::Mirror);
+        assert!(result < 4, "mirrored result {} should be < 4", result);
+    }
+
+    #[test]
+    fn test_sample_texture_basic() {
+        // 2x2 texture: red, green, blue, white.
+        let data = vec![
+            255, 0, 0, 255,    // (0,0) red
+            0, 255, 0, 255,    // (1,0) green
+            0, 0, 255, 255,    // (0,1) blue
+            255, 255, 255, 255, // (1,1) white
+        ];
+        let tex = SampledTexture {
+            data,
+            width: 2,
+            height: 2,
+            wrap_u: WrapMode::ClampToEdge,
+            wrap_v: WrapMode::ClampToEdge,
+            normalized_coords: false,
+        };
+
+        // Sample at (0.5, 0.5) → texel (0, 0) = red.
+        let c = sample_texture(&tex, 0.5, 0.5);
+        assert!((c[0] - 1.0).abs() < 0.01, "R={}", c[0]);
+        assert!(c[1] < 0.01);
+        assert!(c[2] < 0.01);
+
+        // Sample at (1.5, 0.5) → texel (1, 0) = green.
+        let c = sample_texture(&tex, 1.5, 0.5);
+        assert!(c[0] < 0.01);
+        assert!((c[1] - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_textured_triangle() {
+        // Full pipeline: white vertices × solid red 2x2 texture → red pixels.
+        let width = 8u32;
+        let height = 8u32;
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let mut depth_buf = vec![1.0f32; (width * height) as usize];
+        let white = [1.0f32, 1.0, 1.0, 1.0];
+
+        // Solid red 2x2 texture.
+        let tex = SampledTexture {
+            data: vec![255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255],
+            width: 2,
+            height: 2,
+            wrap_u: WrapMode::ClampToEdge,
+            wrap_v: WrapMode::ClampToEdge,
+            normalized_coords: true,
+        };
+
+        // Large triangle covering the framebuffer, UVs spanning [0,1].
+        rasterize_triangle(
+            [-1.0, -1.0, 0.0], [20.0, -1.0, 0.0], [-1.0, 20.0, 0.0],
+            white, white, white,
+            [0.0, 0.0], [1.0, 0.0], [0.0, 1.0], Some(&tex),
+            &mut pixels, &mut depth_buf,
+            width, height, &default_scissor(), &default_depth_stencil(),
+            &default_blend(), &default_blend_color(), &default_color_mask(),
+        );
+
+        // Center pixel should be red.
+        let off = ((4 * width + 4) * 4) as usize;
+        assert_eq!(pixels[off], 255, "R should be 255");
+        assert_eq!(pixels[off + 1], 0, "G should be 0");
+        assert_eq!(pixels[off + 2], 0, "B should be 0");
+        assert_eq!(pixels[off + 3], 255, "A should be 255");
+    }
+
+    #[test]
+    fn test_no_texture_backwards_compat() {
+        // No TIC pool → load_texture returns None → identical to Phase 25.
+        let draw = default_draw_call();
+        assert_eq!(draw.tex_header_pool_addr, 0);
+        let tex = load_texture(&draw, &|_, _| {});
+        assert!(tex.is_none());
     }
 }
