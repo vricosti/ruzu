@@ -48,6 +48,7 @@ pub mod svc_number {
     pub const CONNECT_TO_NAMED_PORT: u32 = 0x1F;
     pub const SEND_SYNC_REQUEST: u32 = 0x21;
     pub const SEND_SYNC_REQUEST_WITH_USER_BUFFER: u32 = 0x22;
+    pub const GET_PROCESS_INFO: u32 = 0x23;
     pub const GET_PROCESS_ID: u32 = 0x24;
     pub const GET_THREAD_ID: u32 = 0x25;
     pub const BREAK: u32 = 0x26;
@@ -322,6 +323,25 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
                 kernel, cpu, buffer_addr, buffer_size, session_handle,
             );
             cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::GET_PROCESS_INFO => {
+            // X0 (in) = process handle (0xFFFF8001 = current process)
+            // X1 (in) = ProcessInfoType
+            // X0 (out) = result, X1 (out) = info value
+            let _handle = cpu.x[0] as u32;
+            let info_type = cpu.x[1] as u32;
+            let value = match info_type {
+                // ProcessState: 0=created, 1=attached, 2=running, 3=crashed, 4=terminated
+                0 => 2u64, // Running
+                // All other types: return 0 (sufficient to unblock init checks).
+                _ => {
+                    debug!("GetProcessInfo: unhandled info_type={}", info_type);
+                    0
+                }
+            };
+            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+            cpu.x[1] = value;
         }
 
         svc_number::GET_PROCESS_ID => {

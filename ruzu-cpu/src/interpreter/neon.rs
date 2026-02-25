@@ -2024,8 +2024,14 @@ pub fn exec_simd_scalar_shift_imm(
             let sh = shift_amount - esize;
             (src << sh) & emask
         }
-        // Default: pass through
-        _ => src & emask,
+        // Unimplemented: log warning and pass source through unchanged.
+        _ => {
+            log::warn!(
+                "Unimpl SimdScalarShiftImm: u={}, opcode={:#07b}, esize={}, shift={}",
+                u, opcode, esize, shift_amount
+            );
+            src & emask
+        }
     };
 
     state.set_vreg_u128(rd as u32, 0);
