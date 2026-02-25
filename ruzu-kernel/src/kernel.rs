@@ -3,11 +3,12 @@
 
 use std::sync::Arc;
 
-use ruzu_common::{Handle, ProcessId, VAddr, NRO_BASE_ADDRESS};
+use ruzu_common::{Handle, ProcessId, ResultCode, VAddr, NRO_BASE_ADDRESS};
 
+use crate::objects::{KEvent, KernelObject};
 use crate::process::KProcess;
 use crate::scheduler::Scheduler;
-use crate::thread::ThreadState;
+use crate::thread::{ThreadState, WaitReason};
 
 /// Result returned by an IPC handler after processing a request.
 pub struct IpcHandlerResult {
@@ -143,6 +144,43 @@ impl KernelCore {
     /// Get a mutable reference to the current process.
     pub fn process_mut(&mut self) -> Option<&mut KProcess> {
         self.process.as_mut()
+    }
+
+    /// Create a KEvent in the process handle table and return the handle.
+    ///
+    /// Returns `None` if there is no process or the handle table is full.
+    pub fn create_event_in_process(&mut self) -> Option<Handle> {
+        let process = self.process.as_mut()?;
+        let event = KernelObject::Event(KEvent::new());
+        process.handle_table.add(event).ok()
+    }
+
+    /// Signal a kernel event by handle and wake any threads waiting on it.
+    pub fn signal_event(&mut self, handle: Handle) {
+        let process = match self.process.as_mut() {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Mark the event as signaled.
+        if let Ok(KernelObject::Event(ev)) = process.handle_table.get_mut(handle) {
+            ev.signaled = true;
+        }
+
+        // Wake any threads blocked in WaitSynchronization on this handle.
+        for thread in process.threads.iter_mut() {
+            if thread.state != ThreadState::Waiting {
+                continue;
+            }
+            let wake_idx = if let WaitReason::Synchronization { ref handles, .. } = thread.wait_reason {
+                handles.iter().position(|&h| h == handle)
+            } else {
+                None
+            };
+            if let Some(idx) = wake_idx {
+                thread.wake(ResultCode::SUCCESS.raw(), idx as i32);
+            }
+        }
     }
 
     /// Signal that emulation should stop.

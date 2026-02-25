@@ -301,9 +301,22 @@ fn main() -> Result<()> {
         code_set.bss_size,
     );
 
-    // Create kernel and load code
+    // Create kernel and process (must exist before creating event handles).
     let mut kernel = KernelCore::new();
     kernel.create_process("main")?;
+
+    // ── Phase 2 init: create kernel event handles for services ────────────
+    // These must be created after the process exists but before services use them.
+    let audio_out_event_handle = kernel
+        .create_event_in_process()
+        .expect("failed to create audio out event handle");
+
+    let am_focus_event_handle = kernel
+        .create_event_in_process()
+        .expect("failed to create AM focus event handle");
+
+    // Pre-signal the AM focus event so games start in-focus immediately.
+    kernel.signal_event(am_focus_event_handle);
 
     let text_seg = &code_set.segments[0];
     let rodata_seg = &code_set.segments[1];
@@ -426,7 +439,7 @@ fn main() -> Result<()> {
     );
     manager.register_service(
         "am:ICommonStateGetter",
-        Box::new(ruzu_service::am::CommonStateGetterService::new()),
+        Box::new(ruzu_service::am::CommonStateGetterService::new_with_event(am_focus_event_handle)),
     );
     manager.register_service(
         "am:ISelfController",
@@ -487,7 +500,7 @@ fn main() -> Result<()> {
     manager.register_service("audout:u", Box::new(ruzu_service::audio::AudOutService::new()));
     manager.register_service(
         "audout:IAudioOut",
-        Box::new(ruzu_service::audio::AudioOutService::new()),
+        Box::new(ruzu_service::audio::AudioOutService::new_with_event(audio_out_event_handle)),
     );
 
     // Account
@@ -572,6 +585,7 @@ fn main() -> Result<()> {
             hid_shm_handle,
             hid_guest_addr,
             gpu,
+            audio_out_event_handle,
         )?;
     }
 
@@ -768,6 +782,7 @@ fn run_with_window(
     hid_shm_handle: u32,
     hid_guest_addr: Arc<AtomicU64>,
     gpu: Arc<GpuContext>,
+    audio_out_event_handle: u32,
 ) -> Result<()> {
     use ruzu_cpu::interpreter::Interpreter;
     use ruzu_cpu::state::{CpuExecutor, HaltReason};
@@ -821,6 +836,9 @@ fn run_with_window(
         if kernel.should_stop {
             break;
         }
+
+        // ── Signal audio event (~60fps) to unblock the audio thread ───────
+        kernel.signal_event(audio_out_event_handle);
 
         // ── Update HID shared memory ────────────────────────────────────
         {

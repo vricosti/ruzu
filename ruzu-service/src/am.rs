@@ -155,11 +155,21 @@ impl ServiceHandler for ApplicationProxyService {
 
 // ── ICommonStateGetter ───────────────────────────────────────────────────────
 
-pub struct CommonStateGetterService;
+pub struct CommonStateGetterService {
+    /// Kernel event handle returned for GetEventHandle.
+    /// Pre-signaled at startup so games see "in focus" immediately.
+    event_handle: u32,
+}
 
 impl CommonStateGetterService {
+    /// Create with a dummy handle (for tests / headless mode).
     pub fn new() -> Self {
-        Self
+        Self::new_with_event(0)
+    }
+
+    /// Create with a real kernel event handle allocated by the caller.
+    pub fn new_with_event(event_handle: u32) -> Self {
+        Self { event_handle }
     }
 }
 
@@ -177,10 +187,10 @@ impl ServiceHandler for CommonStateGetterService {
     fn handle_request(&mut self, cmd_id: u32, _command: &IpcCommand) -> IpcResponse {
         log::debug!("am:ICommonStateGetter: cmd_id={}", cmd_id);
         match cmd_id {
-            // GetEventHandle — focus state event (always signaled)
+            // GetEventHandle — focus state event
             0 => {
-                log::info!("am:ICommonStateGetter: GetEventHandle");
-                IpcResponse::success().with_copy_handle(0)
+                log::info!("am:ICommonStateGetter: GetEventHandle (handle={})", self.event_handle);
+                IpcResponse::success().with_copy_handle(self.event_handle)
             }
             // ReceiveMessage — no messages available
             1 => {

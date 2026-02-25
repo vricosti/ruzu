@@ -6,6 +6,8 @@
 //! These are "black hole" stubs — they accept all audio data but produce no
 //! output. This prevents games from crashing during audio initialization.
 
+use std::collections::VecDeque;
+
 use crate::framework::ServiceHandler;
 use crate::ipc::{IpcCommand, IpcResponse};
 
@@ -221,11 +223,26 @@ impl ServiceHandler for AudOutService {
 
 // ── audout:IAudioOut ─────────────────────────────────────────────────────────
 
-pub struct AudioOutService;
+pub struct AudioOutService {
+    /// Kernel event handle returned for RegisterBufferEvent.
+    /// When signaled (by the main loop), the audio thread wakes and drains pending_keys.
+    event_handle: u32,
+    /// Buffer keys queued by AppendAudioOutBuffer, drained by GetReleasedAudioOutBuffers.
+    pending_keys: VecDeque<u64>,
+}
 
 impl AudioOutService {
+    /// Create with a dummy handle (for tests / headless mode).
     pub fn new() -> Self {
-        Self
+        Self::new_with_event(0)
+    }
+
+    /// Create with a real kernel event handle allocated by the caller.
+    pub fn new_with_event(event_handle: u32) -> Self {
+        Self {
+            event_handle,
+            pending_keys: VecDeque::new(),
+        }
     }
 }
 
@@ -234,7 +251,7 @@ impl ServiceHandler for AudioOutService {
         "audout:IAudioOut"
     }
 
-    fn handle_request(&mut self, cmd_id: u32, _command: &IpcCommand) -> IpcResponse {
+    fn handle_request(&mut self, cmd_id: u32, command: &IpcCommand) -> IpcResponse {
         log::debug!("audout:IAudioOut: cmd_id={}", cmd_id);
         match cmd_id {
             // GetAudioOutState — stopped
@@ -252,30 +269,50 @@ impl ServiceHandler for AudioOutService {
                 log::info!("audout:IAudioOut: Stop");
                 IpcResponse::success()
             }
-            // AppendAudioOutBuffer — discard
+            // AppendAudioOutBuffer(buffer_ptr: u64, buffer_key: u64)
+            // raw_data[0..1] = buffer_ptr, raw_data[1..3] = buffer_key
             3 => {
-                log::debug!("audout:IAudioOut: AppendAudioOutBuffer (discard)");
+                let buffer_key = if command.raw_data.len() >= 4 {
+                    (command.raw_data[2] as u64) | ((command.raw_data[3] as u64) << 32)
+                } else if command.raw_data.len() >= 3 {
+                    (command.raw_data[1] as u64) | ((command.raw_data[2] as u64) << 32)
+                } else if command.raw_data.len() >= 2 {
+                    (command.raw_data[0] as u64) | ((command.raw_data[1] as u64) << 32)
+                } else {
+                    self.pending_keys.len() as u64 + 1
+                };
+                log::debug!("audout:IAudioOut: AppendAudioOutBuffer (key=0x{:X})", buffer_key);
+                self.pending_keys.push_back(buffer_key);
                 IpcResponse::success()
             }
-            // RegisterBufferEvent
+            // RegisterBufferEvent — return the real kernel event handle
             4 => {
-                log::info!("audout:IAudioOut: RegisterBufferEvent");
-                IpcResponse::success().with_copy_handle(0)
+                log::info!("audout:IAudioOut: RegisterBufferEvent (handle={})", self.event_handle);
+                IpcResponse::success().with_copy_handle(self.event_handle)
             }
-            // GetReleasedAudioOutBuffers — none
+            // GetReleasedAudioOutBuffers — drain pending keys (up to 8)
             5 => {
-                log::debug!("audout:IAudioOut: GetReleasedAudioOutBuffers (0)");
-                IpcResponse::success_with_data(vec![0])
+                let count = self.pending_keys.len().min(8) as u32;
+                let mut data = vec![count];
+                for _ in 0..count as usize {
+                    if let Some(key) = self.pending_keys.pop_front() {
+                        data.push(key as u32);
+                        data.push((key >> 32) as u32);
+                    }
+                }
+                log::debug!("audout:IAudioOut: GetReleasedAudioOutBuffers (count={})", count);
+                IpcResponse::success_with_data(data)
             }
             // ContainsAudioOutBuffer — false
             6 => {
                 log::debug!("audout:IAudioOut: ContainsAudioOutBuffer (false)");
                 IpcResponse::success_with_data(vec![0])
             }
-            // GetAudioOutBufferCount — 0
+            // GetAudioOutBufferCount
             7 => {
-                log::debug!("audout:IAudioOut: GetAudioOutBufferCount (0)");
-                IpcResponse::success_with_data(vec![0])
+                let count = self.pending_keys.len() as u32;
+                log::debug!("audout:IAudioOut: GetAudioOutBufferCount ({})", count);
+                IpcResponse::success_with_data(vec![count])
             }
             _ => {
                 log::warn!("audout:IAudioOut: unhandled cmd_id={}", cmd_id);
