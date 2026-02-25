@@ -1008,14 +1008,30 @@ fn run_with_window(
 
         // ── Present framebuffer ─────────────────────────────────────────
         if let Some(ref mut vk) = vulkan {
-            // Phase 22: clear to cornflower blue to prove Vulkan works.
-            // Later phases will upload the actual framebuffer texture.
-            let _ = vk.present_clear([0.39, 0.58, 0.93, 1.0]);
-
-            // Still consume buffers from the queue so the game doesn't stall.
             let mut bq = buffer_queue.write();
-            if let Some((slot, _buffer)) = bq.acquire() {
+            if let Some((slot, buffer)) = bq.acquire() {
+                let width = buffer.width;
+                let height = buffer.height;
+                let offset = buffer.offset;
+                let size = (width * height * 4) as usize;
+
+                if offset != 0 && size > 0 {
+                    let mut pixels = vec![0u8; size];
+                    if let Some(process) = kernel.process() {
+                        for (i, byte) in pixels.iter_mut().enumerate() {
+                            *byte = process
+                                .memory
+                                .read_u8(offset + i as u64)
+                                .unwrap_or(0);
+                        }
+                    }
+                    let _ = vk.present_framebuffer(&pixels, width, height);
+                } else {
+                    let _ = vk.present_clear([0.39, 0.58, 0.93, 1.0]);
+                }
                 bq.release(slot);
+            } else {
+                let _ = vk.present_clear([0.39, 0.58, 0.93, 1.0]);
             }
         } else {
             // Fallback: software blit (existing path).
