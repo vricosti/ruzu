@@ -763,6 +763,203 @@ pub fn exec_simd_two_reg(
                 }
             });
         }
+
+        // ── SHLL / SHLL2 (U=0, opcode=0b10011) ─────────────────────────
+        // Zero-extends each lane to twice the width and shifts left by esize.
+        (false, 0b10011) => {
+            let dst_esize = esize * 2;
+            let src_lanes = 64 / esize; // always 8 lanes max from one half
+            let src_offset = if q { src_lanes } else { 0 };
+            state.set_vreg_u128(rd as u32, 0);
+            for i in 0..src_lanes {
+                let val = mask(state.get_vreg_lane(rn as u32, src_offset + i, esize), esize);
+                state.set_vreg_lane(rd as u32, i, dst_esize, mask(val << esize, dst_esize));
+            }
+        }
+
+        // ── FCVTL / FCVTL2 (U=0, opcode=0b10100) ───────────────────────
+        // Float widen: f32 (lower or upper half) → f64.
+        (false, 0b10100) => {
+            let src_offset = if q { 2u32 } else { 0 };
+            state.set_vreg_u128(rd as u32, 0);
+            for i in 0..2u32 {
+                let bits = state.get_vreg_lane(rn as u32, src_offset + i, 32) as u32;
+                let f64_bits = (f32::from_bits(bits) as f64).to_bits();
+                state.set_vreg_lane(rd as u32, i, 64, f64_bits);
+            }
+        }
+
+        // ── FCVTN / FCVTN2 (U=0, opcode=0b10101) ───────────────────────
+        // Float narrow: f64 → f32, write to lower or upper half of Vd.
+        (false, 0b10101) => {
+            let dst_offset = if q { 2u32 } else { 0 };
+            if !q {
+                state.set_vreg_u128(rd as u32, 0);
+            }
+            for i in 0..2u32 {
+                let bits = state.get_vreg_lane(rn as u32, i, 64);
+                let f32_bits = (f64::from_bits(bits) as f32).to_bits() as u64;
+                state.set_vreg_lane(rd as u32, dst_offset + i, 32, f32_bits);
+            }
+        }
+
+        // ── Float rounding ───────────────────────────────────────────────
+        // FRINTN (U=0, opcode=0b01110): round to nearest, ties to even.
+        (false, 0b01110) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double { f64::from_bits(v).round_ties_even().to_bits() }
+                else { f32::from_bits(v as u32).round_ties_even().to_bits() as u64 }
+            });
+        }
+        // FRINTM (U=1, opcode=0b01110): round toward −∞.
+        (true, 0b01110) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double { f64::from_bits(v).floor().to_bits() }
+                else { f32::from_bits(v as u32).floor().to_bits() as u64 }
+            });
+        }
+        // FRINTP (U=0, opcode=0b10000): round toward +∞.
+        (false, 0b10000) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double { f64::from_bits(v).ceil().to_bits() }
+                else { f32::from_bits(v as u32).ceil().to_bits() as u64 }
+            });
+        }
+        // FRINTZ (U=1, opcode=0b10000): round toward zero.
+        (true, 0b10000) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double { f64::from_bits(v).trunc().to_bits() }
+                else { f32::from_bits(v as u32).trunc().to_bits() as u64 }
+            });
+        }
+        // FRINTA (U=0, opcode=0b10001): round to nearest, ties away from zero.
+        (false, 0b10001) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double { f64::from_bits(v).round().to_bits() }
+                else { f32::from_bits(v as u32).round().to_bits() as u64 }
+            });
+        }
+        // FRINTX (U=1, opcode=0b10001): round using current rounding mode (use nearest).
+        (true, 0b10001) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double { f64::from_bits(v).round_ties_even().to_bits() }
+                else { f32::from_bits(v as u32).round_ties_even().to_bits() as u64 }
+            });
+        }
+
+        // ── Float → int conversions (rounding variants) ──────────────────
+        // FCVTNS (U=0, opcode=0b11000): round to nearest signed.
+        (false, 0b11000) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double {
+                    f64::from_bits(v).round_ties_even()
+                        .clamp(i64::MIN as f64, i64::MAX as f64) as i64 as u64
+                } else {
+                    f32::from_bits(v as u32).round_ties_even()
+                        .clamp(i32::MIN as f32, i32::MAX as f32) as i32 as u64
+                }
+            });
+        }
+        // FCVTNU (U=1, opcode=0b11000): round to nearest unsigned.
+        (true, 0b11000) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double {
+                    f64::from_bits(v).round_ties_even()
+                        .clamp(0.0, u64::MAX as f64) as u64
+                } else {
+                    f32::from_bits(v as u32).round_ties_even()
+                        .clamp(0.0, u32::MAX as f32) as u32 as u64
+                }
+            });
+        }
+        // FCVTMS (U=0, opcode=0b11001): round toward −∞ signed.
+        (false, 0b11001) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double {
+                    f64::from_bits(v).floor()
+                        .clamp(i64::MIN as f64, i64::MAX as f64) as i64 as u64
+                } else {
+                    f32::from_bits(v as u32).floor()
+                        .clamp(i32::MIN as f32, i32::MAX as f32) as i32 as u64
+                }
+            });
+        }
+        // FCVTMU (U=1, opcode=0b11001): round toward −∞ unsigned.
+        (true, 0b11001) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double {
+                    f64::from_bits(v).floor().clamp(0.0, u64::MAX as f64) as u64
+                } else {
+                    f32::from_bits(v as u32).floor().clamp(0.0, u32::MAX as f32) as u32 as u64
+                }
+            });
+        }
+        // FCVTAS (U=0, opcode=0b11010): round ties-away signed.
+        (false, 0b11010) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double {
+                    f64::from_bits(v).round()
+                        .clamp(i64::MIN as f64, i64::MAX as f64) as i64 as u64
+                } else {
+                    f32::from_bits(v as u32).round()
+                        .clamp(i32::MIN as f32, i32::MAX as f32) as i32 as u64
+                }
+            });
+        }
+        // FCVTAU (U=1, opcode=0b11010): round ties-away unsigned.
+        (true, 0b11010) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double {
+                    f64::from_bits(v).round().clamp(0.0, u64::MAX as f64) as u64
+                } else {
+                    f32::from_bits(v as u32).round().clamp(0.0, u32::MAX as f32) as u32 as u64
+                }
+            });
+        }
+
+        // ── FRECPE (U=0, opcode=0b11100): reciprocal estimate ────────────
+        (false, 0b11100) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double { (1.0 / f64::from_bits(v)).to_bits() }
+                else { (1.0f32 / f32::from_bits(v as u32)).to_bits() as u64 }
+            });
+        }
+        // ── FRSQRTE (U=1, opcode=0b11100): reciprocal sqrt estimate ──────
+        (true, 0b11100) => {
+            let is_double = size & 1 != 0;
+            let fp_esize = if is_double { 64u32 } else { 32u32 };
+            for_each_lane_unary(state, q, fp_esize, rd, rn, |v| {
+                if is_double { (1.0 / f64::from_bits(v).sqrt()).to_bits() }
+                else { (1.0f32 / f32::from_bits(v as u32).sqrt()).to_bits() as u64 }
+            });
+        }
+
         _ => {
             log::warn!("Unimpl SimdTwoReg u={} opcode={:#07b} size={}", u, opcode, size);
         }

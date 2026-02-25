@@ -14,6 +14,7 @@
 //!   4 = GetRegionCode
 //!   5 = GetAvailableLanguageCodes2
 //!   6 = GetAvailableLanguageCodeCount2
+//!   7 = GetLanguageCode
 
 use crate::framework::ServiceHandler;
 use crate::ipc::{IpcCommand, IpcResponse};
@@ -136,6 +137,15 @@ impl ServiceHandler for SetService {
                 log::info!("set: GetRegionCode (USA)");
                 IpcResponse::success_with_data(vec![1])
             }
+            // GetLanguageCode → "en-US" as u64 LE
+            7 => {
+                log::info!("set: GetLanguageCode");
+                let lang_code: u64 = u64::from_le_bytes(*b"en-US\0\0\0");
+                IpcResponse::success_with_data(vec![
+                    lang_code as u32,
+                    (lang_code >> 32) as u32,
+                ])
+            }
             _ => {
                 log::warn!("set: unhandled cmd_id={}", cmd_id);
                 IpcResponse::success()
@@ -224,5 +234,19 @@ mod tests {
         let resp = svc.handle_request(4, &cmd);
         assert!(resp.result.is_success());
         assert_eq!(resp.data, vec![1]); // USA
+    }
+
+    #[test]
+    fn test_set_get_language_code() {
+        let mut svc = SetService::new();
+        let cmd = make_command(7);
+        let resp = svc.handle_request(7, &cmd);
+        assert!(resp.result.is_success());
+        // Inline data: two u32 words encoding "en-US\0\0\0" as little-endian u64.
+        assert_eq!(resp.data.len(), 2);
+        let lo = resp.data[0] as u64;
+        let hi = resp.data[1] as u64;
+        let code = lo | (hi << 32);
+        assert_eq!(code, u64::from_le_bytes(*b"en-US\0\0\0"));
     }
 }

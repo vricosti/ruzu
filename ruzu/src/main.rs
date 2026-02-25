@@ -331,6 +331,10 @@ fn main() -> Result<()> {
     // Pre-signal the AM focus event so games start in-focus immediately.
     kernel.signal_event(am_focus_event_handle);
 
+    let vsync_event_handle = kernel
+        .create_event_in_process()
+        .expect("failed to create vsync event handle");
+
     let text_seg = &code_set.segments[0];
     let rodata_seg = &code_set.segments[1];
     let data_seg = &code_set.segments[2];
@@ -427,7 +431,10 @@ fn main() -> Result<()> {
     manager.register_service("vi:m", Box::new(ruzu_service::vi::ViManagerService::new()));
     manager.register_service(
         "vi:IApplicationDisplayService",
-        Box::new(ruzu_service::vi::ViDisplayService::new(buffer_queue.clone())),
+        Box::new(ruzu_service::vi::ViDisplayService::new_with_vsync_event(
+            buffer_queue.clone(),
+            vsync_event_handle,
+        )),
     );
     manager.register_service(
         "vi:IHOSBinderDriver",
@@ -599,6 +606,7 @@ fn main() -> Result<()> {
             hid_guest_addr,
             gpu,
             audio_out_event_handle,
+            vsync_event_handle,
         )?;
     }
 
@@ -796,6 +804,7 @@ fn run_with_window(
     hid_guest_addr: Arc<AtomicU64>,
     gpu: Arc<GpuContext>,
     audio_out_event_handle: u32,
+    vsync_event_handle: u32,
 ) -> Result<()> {
     use ruzu_cpu::interpreter::Interpreter;
     use ruzu_cpu::state::{CpuExecutor, HaltReason};
@@ -850,8 +859,9 @@ fn run_with_window(
             break;
         }
 
-        // ── Signal audio event (~60fps) to unblock the audio thread ───────
+        // ── Signal audio + vsync events (~60fps) ────────────────────────
         kernel.signal_event(audio_out_event_handle);
+        kernel.signal_event(vsync_event_handle);
 
         // ── Update HID shared memory ────────────────────────────────────
         {
@@ -954,19 +964,30 @@ fn run_with_window(
                 HaltReason::Svc(n) => {
                     let mut cpu =
                         kernel.process().unwrap().threads[idx].cpu_state.clone();
+                    // Save input registers before dispatch: SVC overwrites x0
+                    // with the result code so we cannot read the handle after.
+                    let svc_in_x0 = cpu.x[0];
+                    let svc_in_x1 = cpu.x[1];
                     dispatch_svc(kernel, &mut cpu, n);
 
-                    // Track MapSharedMemory calls to detect HID mapping.
-                    if n == 0x13 {
-                        // SVC 0x13 = MapSharedMemory
-                        let map_handle = cpu.x[0] as u32;
-                        let map_addr = cpu.x[1];
+                    // Track MapSharedMemory (0x13) to learn where the game
+                    // maps the HID shared memory so we can sync input state.
+                    if n == 0x13 && cpu.x[0] == 0 {
+                        // SVC in: x0=handle, x1=guest_addr  out: x0=result
+                        let map_handle = svc_in_x0 as u32;
+                        let map_addr = svc_in_x1;
                         if map_handle == hid_shm_handle && map_addr != 0 {
                             log::info!(
                                 "HID shared memory mapped at guest addr 0x{:X}",
                                 map_addr
                             );
                             hid_guest_addr.store(map_addr, Ordering::Relaxed);
+                            // Immediately sync initialized HID headers so the
+                            // game sees a valid state on its first read.
+                            let hid = hid_shared_mem.read();
+                            if let Some(process) = kernel.process_mut() {
+                                let _ = process.memory.write_bytes(map_addr, &hid.data);
+                            }
                         }
                     }
 
