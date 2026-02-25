@@ -167,7 +167,7 @@ impl GpuContext {
 
         // Execute pending memory operations (blit, DMA copy).
         let pending = proc.execute_pending_ops(&gpu_read);
-        let write_backs: Vec<GpuWriteBack> = pending
+        let mut write_backs: Vec<GpuWriteBack> = pending
             .into_iter()
             .map(|pw| GpuWriteBack {
                 gpu_va: pw.gpu_va,
@@ -182,9 +182,22 @@ impl GpuContext {
         // Take draw calls from Maxwell3D and rasterize on top of cleared framebuffer.
         let draw_calls = proc.take_draw_calls();
         if !draw_calls.is_empty() {
-            let rasterized =
-                SoftwareRasterizer::render_draw_calls(&draw_calls, &gpu_read, framebuffer);
+            let raster_writes: std::sync::Mutex<Vec<GpuWriteBack>> =
+                std::sync::Mutex::new(Vec::new());
+            let gpu_write = |gpu_va: u64, data: &[u8]| {
+                raster_writes.lock().unwrap().push(GpuWriteBack {
+                    gpu_va,
+                    data: data.to_vec(),
+                });
+            };
+            let rasterized = SoftwareRasterizer::render_draw_calls(
+                &draw_calls,
+                &gpu_read,
+                &gpu_write,
+                framebuffer,
+            );
             framebuffer = rasterized;
+            write_backs.extend(raster_writes.into_inner().unwrap());
         }
 
         let framebuffer = framebuffer.map(|fb| FramebufferOutput {

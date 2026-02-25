@@ -1104,6 +1104,8 @@ pub struct TextureDescriptor {
     pub height: u32,
     pub depth: u32,
     pub max_mip_level: u32,
+    pub block_height: u32,
+    pub block_depth: u32,
     pub srgb_conversion: bool,
     pub normalized_coords: bool,
 }
@@ -1138,6 +1140,8 @@ impl TextureDescriptor {
             height: (word5 & 0xFFFF) + 1,
             depth: ((word5 >> 16) & 0x3FFF) + 1,
             max_mip_level: (word3 >> 28) & 0xF,
+            block_height: (word3 >> 3) & 0x7,
+            block_depth: (word3 >> 6) & 0x7,
             srgb_conversion: (word4 & (1 << 22)) != 0,
             normalized_coords: (word5 & (1 << 31)) != 0,
         }
@@ -3760,8 +3764,21 @@ mod tests {
         assert_eq!(desc.height, 720);
         assert_eq!(desc.depth, 1);
         assert_eq!(desc.max_mip_level, 5);
+        assert_eq!(desc.block_height, 0);
+        assert_eq!(desc.block_depth, 0);
         assert!(!desc.srgb_conversion);
         assert!(desc.normalized_coords);
+    }
+
+    #[test]
+    fn test_texture_descriptor_block_height_depth() {
+        let mut words = [0u32; 8];
+        words[0] = 0x1D; // A8B8G8R8
+        // word3: block_height=3 at bits[5:3], block_depth=2 at bits[8:6], max_mip=0
+        words[3] = (3 << 3) | (2 << 6);
+        let desc = TextureDescriptor::from_words(&words);
+        assert_eq!(desc.block_height, 3);
+        assert_eq!(desc.block_depth, 2);
     }
 
     #[test]
