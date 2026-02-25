@@ -1426,6 +1426,15 @@ impl Default for ConstBufferBinding {
     }
 }
 
+/// Render target configuration for one color target.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RenderTargetInfo {
+    pub address: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+}
+
 /// A recorded draw call with all relevant state at the time of DRAW_END.
 #[derive(Debug, Clone)]
 pub struct DrawCall {
@@ -1464,6 +1473,8 @@ pub struct DrawCall {
     pub inline_index_data: Vec<u8>,
     /// Sampler binding mode for this draw call.
     pub sampler_binding: SamplerBinding,
+    /// Render target configurations for up to 8 color targets.
+    pub render_targets: [RenderTargetInfo; 8],
 }
 
 // ── Engine struct ───────────────────────────────────────────────────────────
@@ -2179,6 +2190,14 @@ impl Maxwell3D {
         // Collect render target control.
         let rt_control = self.rt_control_info();
 
+        // Collect render target configurations.
+        let render_targets: [RenderTargetInfo; 8] = std::array::from_fn(|i| RenderTargetInfo {
+            address: self.rt_address(i),
+            width: self.rt_width(i),
+            height: self.rt_height(i),
+            format: self.rt_format(i),
+        });
+
         // Collect blend info for all 8 render targets.
         let mut blend = [BlendInfo::default(); 8];
         for (i, b) in blend.iter_mut().enumerate() {
@@ -2220,6 +2239,7 @@ impl Maxwell3D {
             } else {
                 SamplerBinding::Independently
             },
+            render_targets,
         }
     }
 
@@ -2512,6 +2532,10 @@ impl Engine for Maxwell3D {
         _read_gpu: &dyn Fn(u64, &mut [u8]),
     ) -> Vec<PendingWrite> {
         std::mem::take(&mut self.pending_semaphore_writes)
+    }
+
+    fn take_draw_calls(&mut self) -> Vec<DrawCall> {
+        self.take_draw_calls()
     }
 }
 

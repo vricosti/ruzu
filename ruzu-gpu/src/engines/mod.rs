@@ -76,6 +76,11 @@ pub trait Engine: Send {
     ) -> Vec<PendingWrite> {
         vec![]
     }
+
+    /// Drain accumulated draw calls. Only Maxwell3D produces draw calls.
+    fn take_draw_calls(&mut self) -> Vec<maxwell_3d::DrawCall> {
+        vec![]
+    }
 }
 
 /// Number of registers per engine.

@@ -27,6 +27,7 @@
 //! | 28:16   | Method count / Immd data |
 //! | 31:29   | SecOp             |
 
+use crate::engines::maxwell_3d::DrawCall;
 use crate::engines::{Engine, Framebuffer, PendingWrite};
 
 /// A 64-bit GPFIFO entry.
@@ -243,6 +244,15 @@ impl CommandProcessor {
             .filter_map(|e| e.as_mut())
             .flat_map(|e| e.execute_pending(read_gpu))
             .collect()
+    }
+
+    /// Drain accumulated draw calls from the Maxwell3D engine (subchannel 0).
+    pub fn take_draw_calls(&mut self) -> Vec<DrawCall> {
+        if let Some(ref mut engine) = self.engines[0] {
+            engine.take_draw_calls()
+        } else {
+            vec![]
+        }
     }
 
     /// Dispatch a single register write to the appropriate engine.

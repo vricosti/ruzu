@@ -16,6 +16,7 @@ use crate::backend::null_backend::NullBackend;
 use crate::backend::GpuBackend;
 use crate::command_processor::{CommandProcessor, GpEntry};
 use crate::engines::fermi_2d::Fermi2D;
+use crate::rasterizer::SoftwareRasterizer;
 use crate::engines::inline_to_memory::InlineToMemory;
 use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::maxwell_3d::Maxwell3D;
@@ -174,9 +175,19 @@ impl GpuContext {
             })
             .collect();
 
-        // Collect framebuffer output from engines.
+        // Collect framebuffer output from engines (CLEAR_SURFACE result).
         let framebuffers = proc.take_framebuffers();
-        let framebuffer = framebuffers.into_iter().next().map(|fb| FramebufferOutput {
+        let mut framebuffer = framebuffers.into_iter().next();
+
+        // Take draw calls from Maxwell3D and rasterize on top of cleared framebuffer.
+        let draw_calls = proc.take_draw_calls();
+        if !draw_calls.is_empty() {
+            let rasterized =
+                SoftwareRasterizer::render_draw_calls(&draw_calls, &gpu_read, framebuffer);
+            framebuffer = rasterized;
+        }
+
+        let framebuffer = framebuffer.map(|fb| FramebufferOutput {
             gpu_va: fb.gpu_va,
             width: fb.width,
             height: fb.height,
