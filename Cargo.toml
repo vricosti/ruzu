@@ -33,6 +33,7 @@ rust-ini = "0.21"
 
 # Window / Graphics
 sdl2 = { version = "0.37", features = ["raw-window-handle", "bundled", "static-link"] }
+ash = "0.37"
 vulkano = "0.34"
 raw-window-handle = "0.6"
 

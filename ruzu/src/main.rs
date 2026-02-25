@@ -3,6 +3,7 @@
 
 mod config;
 mod game_list_ui;
+mod vulkan_presenter;
 mod window;
 
 use anyhow::{Context, Result};
@@ -778,6 +779,19 @@ fn run_with_window(
     let mut emu_window =
         EmulatorWindow::new("ruzu - Nintendo Switch Emulator", DEFAULT_WIDTH, DEFAULT_HEIGHT)?;
 
+    // Try to initialize Vulkan presenter for hardware-accelerated presentation.
+    let mut vulkan = if emu_window.vulkan_enabled {
+        match vulkan_presenter::VulkanPresenter::new(&emu_window.window) {
+            Ok(vk) => Some(vk),
+            Err(e) => {
+                log::warn!("Vulkan init failed, using software blit: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     info!("Window created, entering main loop");
     info!("Press ESC or close window to exit");
     info!("Controls: Z=A, X=B, C=X, V=Y, Arrows=D-Pad, Enter=+, RShift=-, Q/E=L/R, A/D=ZL/ZR, IJKL=LStick");
@@ -796,6 +810,13 @@ fn run_with_window(
                 break;
             }
         };
+
+        // Handle window resize for Vulkan swapchain recreation.
+        if let Some((w, h)) = input.resized {
+            if let Some(ref mut vk) = vulkan {
+                let _ = vk.resize(w, h);
+            }
+        }
 
         if kernel.should_stop {
             break;
@@ -986,7 +1007,18 @@ fn run_with_window(
         }
 
         // ── Present framebuffer ─────────────────────────────────────────
-        {
+        if let Some(ref mut vk) = vulkan {
+            // Phase 22: clear to cornflower blue to prove Vulkan works.
+            // Later phases will upload the actual framebuffer texture.
+            let _ = vk.present_clear([0.39, 0.58, 0.93, 1.0]);
+
+            // Still consume buffers from the queue so the game doesn't stall.
+            let mut bq = buffer_queue.write();
+            if let Some((slot, _buffer)) = bq.acquire() {
+                bq.release(slot);
+            }
+        } else {
+            // Fallback: software blit (existing path).
             let mut bq = buffer_queue.write();
             if let Some((slot, buffer)) = bq.acquire() {
                 let width = buffer.width;
@@ -995,7 +1027,6 @@ fn run_with_window(
                 let size = (width * height * 4) as usize;
 
                 if offset != 0 && size > 0 {
-                    // Read pixel data from guest memory.
                     let mut pixels = vec![0u8; size];
                     if let Some(process) = kernel.process() {
                         for (i, byte) in pixels.iter_mut().enumerate() {

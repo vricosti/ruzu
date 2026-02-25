@@ -791,6 +791,7 @@ name = "ruzu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "clap",
  "env_logger",
  "log",
@@ -804,6 +805,7 @@ dependencies = [
  "ruzu-loader",
  "ruzu-service",
  "sdl2",
+ "thiserror",
 ]
 
 [[package]]
