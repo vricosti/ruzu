@@ -150,10 +150,22 @@ pub fn svc_send_sync_request(
     };
 
     // 7. Write response bytes back to TLS.
-    let process = kernel.process_mut().unwrap();
-    let write_len = response_bytes.len().min(0x100);
-    for i in 0..write_len {
-        let _ = process.memory.write_u8(tls_addr + i as u64, response_bytes[i]);
+    {
+        let process = kernel.process_mut().unwrap();
+        let write_len = response_bytes.len().min(0x100);
+        for i in 0..write_len {
+            let _ = process.memory.write_u8(tls_addr + i as u64, response_bytes[i]);
+        }
+    }
+
+    // 8. Write B-buffer outputs to guest memory.
+    if !result.out_buf_writes.is_empty() {
+        let process = kernel.process_mut().unwrap();
+        for (addr, data) in &result.out_buf_writes {
+            for (i, &byte) in data.iter().enumerate() {
+                let _ = process.memory.write_u8(addr + i as u64, byte);
+            }
+        }
     }
 
     ResultCode::SUCCESS
@@ -258,10 +270,22 @@ pub fn svc_send_sync_request_with_user_buffer(
     };
 
     // 7. Write response back to user buffer address.
-    let process = kernel.process_mut().unwrap();
-    let write_len = response_bytes.len().min(read_size);
-    for i in 0..write_len {
-        let _ = process.memory.write_u8(buffer_addr + i as u64, response_bytes[i]);
+    {
+        let process = kernel.process_mut().unwrap();
+        let write_len = response_bytes.len().min(read_size);
+        for i in 0..write_len {
+            let _ = process.memory.write_u8(buffer_addr + i as u64, response_bytes[i]);
+        }
+    }
+
+    // 8. Write B-buffer outputs to guest memory.
+    if !result.out_buf_writes.is_empty() {
+        let process = kernel.process_mut().unwrap();
+        for (addr, data) in &result.out_buf_writes {
+            for (i, &byte) in data.iter().enumerate() {
+                let _ = process.memory.write_u8(addr + i as u64, byte);
+            }
+        }
     }
 
     ResultCode::SUCCESS
