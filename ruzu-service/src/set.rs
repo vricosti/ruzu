@@ -43,49 +43,39 @@ impl ServiceHandler for SetSysService {
 
         match cmd_id {
             // ── GetFirmwareVersion ───────────────────────────────────────
+            // Per the Switch IPC ABI the caller provides a B-type output
+            // buffer (0x100 bytes) and the service writes the firmware
+            // version struct into it.  The inline response carries only
+            // the result code.
             0 => {
                 log::info!("set:sys: GetFirmwareVersion -> 17.0.0");
 
-                // The firmware version struct is 0x100 bytes.  The fields
-                // that games actually check are:
-                //   offset 0x00: u8 major
-                //   offset 0x01: u8 minor
-                //   offset 0x02: u8 micro
-                //   offset 0x04: u8 revision_major
-                //   offset 0x08: char[0x20] platform  ("NX")
-                //   offset 0x28: char[0x40] version_hash
-                //   offset 0x68: char[0x18] display_version ("17.0.0")
-                //   offset 0x80: char[0x80] display_title ("NintendoSDK ...")
-                //
-                // We return the important fields packed into u32 words.
-                let mut version_bytes = [0u8; 0x100];
-
-                // Major / minor / micro.
+                // Build the 0x100-byte firmware version struct.
+                //   0x00: u8  major
+                //   0x01: u8  minor
+                //   0x02: u8  micro
+                //   0x04: u8  revision_major
+                //   0x08: char[0x20] platform  ("NX")
+                //   0x28: char[0x40] version_hash (left as zeros)
+                //   0x68: char[0x18] display_version ("17.0.0")
+                //   0x80: char[0x80] display_title
+                let mut version_bytes = vec![0u8; 0x100];
                 version_bytes[0x00] = 17; // major
-                version_bytes[0x01] = 0; // minor
-                version_bytes[0x02] = 0; // micro
+                version_bytes[0x01] = 0;  // minor
+                version_bytes[0x02] = 0;  // micro
 
-                // Platform string "NX".
                 version_bytes[0x08] = b'N';
                 version_bytes[0x09] = b'X';
 
-                // Display version "17.0.0".
                 let display = b"17.0.0";
                 version_bytes[0x68..0x68 + display.len()].copy_from_slice(display);
 
-                // Display title.
                 let title = b"NintendoSDK Firmware for NX 17.0.0";
                 let title_end = (0x80 + title.len()).min(0x100);
-                version_bytes[0x80..title_end]
-                    .copy_from_slice(&title[..title_end - 0x80]);
+                version_bytes[0x80..title_end].copy_from_slice(&title[..title_end - 0x80]);
 
-                // Convert to u32 words for the response data.
-                let words: Vec<u32> = version_bytes
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-
-                IpcResponse::success_with_data(words)
+                // Write the struct via B-buffer; the inline payload is empty.
+                IpcResponse::success().with_out_buf(version_bytes)
             }
 
             // ── Everything else: stub success ────────────────────────────
@@ -185,14 +175,16 @@ mod tests {
         let cmd = make_command(0);
         let resp = svc.handle_request(0, &cmd);
         assert!(resp.result.is_success());
-        assert!(!resp.data.is_empty());
-
-        // Reconstruct bytes to verify major version.
-        let first_word = resp.data[0];
-        let bytes = first_word.to_le_bytes();
-        assert_eq!(bytes[0], 17); // major
-        assert_eq!(bytes[1], 0); // minor
-        assert_eq!(bytes[2], 0); // micro
+        // Inline data is empty — struct goes via B-buffer.
+        assert!(resp.data.is_empty());
+        // out_bufs[0] is the 0x100-byte firmware version struct.
+        assert_eq!(resp.out_bufs.len(), 1);
+        let bytes = &resp.out_bufs[0];
+        assert_eq!(bytes.len(), 0x100);
+        assert_eq!(bytes[0x00], 17); // major
+        assert_eq!(bytes[0x01], 0);  // minor
+        assert_eq!(bytes[0x02], 0);  // micro
+        assert_eq!(&bytes[0x68..0x68 + 6], b"17.0.0");
     }
 
     #[test]
