@@ -10,7 +10,42 @@
 use ash::vk::{self, Handle};
 use log::info;
 use std::ffi::{CStr, CString};
+use std::ptr;
 use thiserror::Error;
+
+/// Swizzle pixels from RGBA byte order to BGRA byte order (swap R and B channels).
+/// Both slices must have the same length and be a multiple of 4 bytes.
+fn swizzle_rgba_to_bgra(src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(src.len() % 4, 0);
+
+    for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+        d[0] = s[2]; // B <- src R position is actually B in ABGR8888? No.
+        d[1] = s[1]; // G
+        d[2] = s[0]; // R
+        d[3] = s[3]; // A
+    }
+}
+
+/// Find a memory type index matching the given type filter bits and required properties.
+fn find_memory_type(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    type_filter: u32,
+    properties: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    for i in 0..mem_props.memory_type_count {
+        if (type_filter & (1 << i)) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(properties)
+        {
+            return Some(i);
+        }
+    }
+    None
+}
 
 #[derive(Debug, Error)]
 pub enum VulkanError {
@@ -45,6 +80,18 @@ pub struct VulkanPresenter {
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
     in_flight_fence: vk::Fence,
+
+    // Staging buffer (CPU-visible, for pixel upload)
+    staging_buffer: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+    staging_size: u64,
+    staging_mapped: *mut u8,
+
+    // Intermediate image (device-local, guest FB dimensions)
+    framebuffer_image: vk::Image,
+    framebuffer_memory: vk::DeviceMemory,
+    fb_width: u32,
+    fb_height: u32,
 }
 
 impl VulkanPresenter {
@@ -205,6 +252,14 @@ impl VulkanPresenter {
             image_available_semaphore,
             render_finished_semaphore,
             in_flight_fence,
+            staging_buffer: vk::Buffer::null(),
+            staging_memory: vk::DeviceMemory::null(),
+            staging_size: 0,
+            staging_mapped: ptr::null_mut(),
+            framebuffer_image: vk::Image::null(),
+            framebuffer_memory: vk::DeviceMemory::null(),
+            fb_width: 0,
+            fb_height: 0,
         })
     }
 
@@ -362,6 +417,275 @@ impl VulkanPresenter {
         }
     }
 
+    /// Upload guest framebuffer pixels and present via the swapchain.
+    /// `pixels` is in RGBA byte order, dimensions are the guest framebuffer size.
+    pub fn present_framebuffer(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(), VulkanError> {
+        let required_size = (width as u64) * (height as u64) * 4;
+        if pixels.len() < required_size as usize {
+            return Err(VulkanError::PresentFailed(
+                "Pixel buffer too small".to_string(),
+            ));
+        }
+
+        unsafe {
+            // Wait for previous frame
+            self.device
+                .wait_for_fences(&[self.in_flight_fence], true, u64::MAX)
+                .map_err(|e| VulkanError::PresentFailed(format!("Wait fence: {}", e)))?;
+            self.device
+                .reset_fences(&[self.in_flight_fence])
+                .map_err(|e| VulkanError::PresentFailed(format!("Reset fence: {}", e)))?;
+
+            // Ensure resources exist
+            self.ensure_staging_buffer(required_size)?;
+            self.ensure_framebuffer_image(width, height)?;
+
+            // Swizzle RGBA → BGRA into the mapped staging buffer
+            let dst_slice =
+                std::slice::from_raw_parts_mut(self.staging_mapped, required_size as usize);
+            swizzle_rgba_to_bgra(&pixels[..required_size as usize], dst_slice);
+
+            // Acquire swapchain image
+            let (image_index, _suboptimal) = match self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                self.image_available_semaphore,
+                vk::Fence::null(),
+            ) {
+                Ok(result) => result,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate_swapchain(
+                        self.swapchain_extent.width,
+                        self.swapchain_extent.height,
+                    )?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(VulkanError::PresentFailed(format!("Acquire image: {}", e)));
+                }
+            };
+
+            let cmd = self.command_buffers[image_index as usize];
+            let swapchain_image = self.swapchain_images[image_index as usize];
+
+            // Record command buffer
+            self.device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| VulkanError::PresentFailed(format!("Reset cmd: {}", e)))?;
+
+            let begin_info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .begin_command_buffer(cmd, &begin_info)
+                .map_err(|e| VulkanError::PresentFailed(format!("Begin cmd: {}", e)))?;
+
+            let subresource_range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+
+            let subresource_layers = vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+
+            // Barrier: framebuffer_image UNDEFINED → TRANSFER_DST_OPTIMAL
+            let barrier_fb_to_dst = vk::ImageMemoryBarrier::builder()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.framebuffer_image)
+                .subresource_range(subresource_range)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier_fb_to_dst),
+            );
+
+            // Copy staging buffer → framebuffer image
+            let region = vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: subresource_layers,
+                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                image_extent: vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                },
+            };
+
+            self.device.cmd_copy_buffer_to_image(
+                cmd,
+                self.staging_buffer,
+                self.framebuffer_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+
+            // Barrier: framebuffer_image TRANSFER_DST → TRANSFER_SRC_OPTIMAL
+            let barrier_fb_to_src = vk::ImageMemoryBarrier::builder()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.framebuffer_image)
+                .subresource_range(subresource_range)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier_fb_to_src),
+            );
+
+            // Barrier: swapchain_image UNDEFINED → TRANSFER_DST_OPTIMAL
+            let barrier_sc_to_dst = vk::ImageMemoryBarrier::builder()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(swapchain_image)
+                .subresource_range(subresource_range)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier_sc_to_dst),
+            );
+
+            // Blit framebuffer_image → swapchain_image (with scaling)
+            let blit_region = vk::ImageBlit {
+                src_subresource: subresource_layers,
+                src_offsets: [
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: width as i32,
+                        y: height as i32,
+                        z: 1,
+                    },
+                ],
+                dst_subresource: subresource_layers,
+                dst_offsets: [
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: self.swapchain_extent.width as i32,
+                        y: self.swapchain_extent.height as i32,
+                        z: 1,
+                    },
+                ],
+            };
+
+            self.device.cmd_blit_image(
+                cmd,
+                self.framebuffer_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                swapchain_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[blit_region],
+                vk::Filter::LINEAR,
+            );
+
+            // Barrier: swapchain_image TRANSFER_DST → PRESENT_SRC_KHR
+            let barrier_sc_to_present = vk::ImageMemoryBarrier::builder()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(swapchain_image)
+                .subresource_range(subresource_range)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::empty());
+
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier_sc_to_present),
+            );
+
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(|e| VulkanError::PresentFailed(format!("End cmd: {}", e)))?;
+
+            // Submit
+            let wait_semaphores = [self.image_available_semaphore];
+            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+            let signal_semaphores = [self.render_finished_semaphore];
+            let cmd_buffers = [cmd];
+
+            let submit_info = vk::SubmitInfo::builder()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&cmd_buffers)
+                .signal_semaphores(&signal_semaphores);
+
+            self.device
+                .queue_submit(
+                    self.graphics_queue,
+                    std::slice::from_ref(&submit_info),
+                    self.in_flight_fence,
+                )
+                .map_err(|e| VulkanError::PresentFailed(format!("Submit: {}", e)))?;
+
+            // Present
+            let swapchains = [self.swapchain];
+            let image_indices = [image_index];
+            let present_info = vk::PresentInfoKHR::builder()
+                .wait_semaphores(&signal_semaphores)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+
+            match self
+                .swapchain_loader
+                .queue_present(self.graphics_queue, &present_info)
+            {
+                Ok(false) => Ok(()),
+                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate_swapchain(
+                        self.swapchain_extent.width,
+                        self.swapchain_extent.height,
+                    )?;
+                    Ok(())
+                }
+                Err(e) => Err(VulkanError::PresentFailed(format!("Present: {}", e))),
+            }
+        }
+    }
+
     /// Recreate the swapchain (e.g. after window resize).
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), VulkanError> {
         self.recreate_swapchain(width, height)
@@ -419,6 +743,179 @@ impl VulkanPresenter {
         }
 
         Ok(())
+    }
+
+    /// Ensure the staging buffer is large enough. Creates or recreates as needed.
+    fn ensure_staging_buffer(&mut self, required_size: u64) -> Result<(), VulkanError> {
+        if self.staging_buffer != vk::Buffer::null() && self.staging_size >= required_size {
+            return Ok(());
+        }
+
+        // Destroy old resources
+        self.destroy_staging_resources();
+
+        unsafe {
+            let buffer_info = vk::BufferCreateInfo::builder()
+                .size(required_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            let buffer = self
+                .device
+                .create_buffer(&buffer_info, None)
+                .map_err(|e| VulkanError::PresentFailed(format!("Create staging buffer: {}", e)))?;
+
+            let mem_reqs = self.device.get_buffer_memory_requirements(buffer);
+            let mem_type = find_memory_type(
+                &self.instance,
+                self.physical_device,
+                mem_reqs.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .ok_or_else(|| {
+                self.device.destroy_buffer(buffer, None);
+                VulkanError::PresentFailed("No suitable memory type for staging buffer".to_string())
+            })?;
+
+            let alloc_info = vk::MemoryAllocateInfo::builder()
+                .allocation_size(mem_reqs.size)
+                .memory_type_index(mem_type);
+
+            let memory = self.device.allocate_memory(&alloc_info, None).map_err(|e| {
+                self.device.destroy_buffer(buffer, None);
+                VulkanError::PresentFailed(format!("Allocate staging memory: {}", e))
+            })?;
+
+            self.device
+                .bind_buffer_memory(buffer, memory, 0)
+                .map_err(|e| {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_buffer(buffer, None);
+                    VulkanError::PresentFailed(format!("Bind staging memory: {}", e))
+                })?;
+
+            // Persistently map
+            let mapped = self
+                .device
+                .map_memory(memory, 0, required_size, vk::MemoryMapFlags::empty())
+                .map_err(|e| {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_buffer(buffer, None);
+                    VulkanError::PresentFailed(format!("Map staging memory: {}", e))
+                })?;
+
+            self.staging_buffer = buffer;
+            self.staging_memory = memory;
+            self.staging_size = required_size;
+            self.staging_mapped = mapped as *mut u8;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure the intermediate framebuffer image matches the given dimensions.
+    fn ensure_framebuffer_image(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<(), VulkanError> {
+        if self.framebuffer_image != vk::Image::null()
+            && self.fb_width == width
+            && self.fb_height == height
+        {
+            return Ok(());
+        }
+
+        self.destroy_framebuffer_image();
+
+        unsafe {
+            let image_info = vk::ImageCreateInfo::builder()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+
+            let image = self.device.create_image(&image_info, None).map_err(|e| {
+                VulkanError::PresentFailed(format!("Create framebuffer image: {}", e))
+            })?;
+
+            let mem_reqs = self.device.get_image_memory_requirements(image);
+            let mem_type = find_memory_type(
+                &self.instance,
+                self.physical_device,
+                mem_reqs.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .ok_or_else(|| {
+                self.device.destroy_image(image, None);
+                VulkanError::PresentFailed(
+                    "No suitable memory type for framebuffer image".to_string(),
+                )
+            })?;
+
+            let alloc_info = vk::MemoryAllocateInfo::builder()
+                .allocation_size(mem_reqs.size)
+                .memory_type_index(mem_type);
+
+            let memory = self.device.allocate_memory(&alloc_info, None).map_err(|e| {
+                self.device.destroy_image(image, None);
+                VulkanError::PresentFailed(format!("Allocate framebuffer memory: {}", e))
+            })?;
+
+            self.device
+                .bind_image_memory(image, memory, 0)
+                .map_err(|e| {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                    VulkanError::PresentFailed(format!("Bind framebuffer memory: {}", e))
+                })?;
+
+            self.framebuffer_image = image;
+            self.framebuffer_memory = memory;
+            self.fb_width = width;
+            self.fb_height = height;
+        }
+
+        Ok(())
+    }
+
+    /// Destroy staging buffer and memory if they exist.
+    fn destroy_staging_resources(&mut self) {
+        unsafe {
+            if self.staging_buffer != vk::Buffer::null() {
+                self.device.unmap_memory(self.staging_memory);
+                self.device.destroy_buffer(self.staging_buffer, None);
+                self.device.free_memory(self.staging_memory, None);
+                self.staging_buffer = vk::Buffer::null();
+                self.staging_memory = vk::DeviceMemory::null();
+                self.staging_size = 0;
+                self.staging_mapped = ptr::null_mut();
+            }
+        }
+    }
+
+    /// Destroy framebuffer image and memory if they exist.
+    fn destroy_framebuffer_image(&mut self) {
+        unsafe {
+            if self.framebuffer_image != vk::Image::null() {
+                self.device.destroy_image(self.framebuffer_image, None);
+                self.device.free_memory(self.framebuffer_memory, None);
+                self.framebuffer_image = vk::Image::null();
+                self.framebuffer_memory = vk::DeviceMemory::null();
+                self.fb_width = 0;
+                self.fb_height = 0;
+            }
+        }
     }
 
     unsafe fn select_physical_device(
@@ -553,6 +1050,10 @@ impl Drop for VulkanPresenter {
         unsafe {
             let _ = self.device.device_wait_idle();
 
+            // Destroy Phase 23 resources first
+            self.destroy_staging_resources();
+            self.destroy_framebuffer_image();
+
             self.device.destroy_fence(self.in_flight_fence, None);
             self.device
                 .destroy_semaphore(self.render_finished_semaphore, None);
@@ -604,5 +1105,39 @@ mod tests {
             Ok(_) => log::info!("Vulkan entry loaded successfully"),
             Err(e) => log::info!("Vulkan not available (expected on CI): {}", e),
         }
+    }
+
+    #[test]
+    fn test_swizzle_rgba_to_bgra() {
+        // RGBA -> BGRA: R↔B swap
+        let src = [255, 0, 128, 200, 10, 20, 30, 40];
+        let mut dst = [0u8; 8];
+        swizzle_rgba_to_bgra(&src, &mut dst);
+        // Pixel 0: R=255,G=0,B=128,A=200 -> B=128,G=0,R=255,A=200
+        assert_eq!(dst[0], 128); // B
+        assert_eq!(dst[1], 0); // G
+        assert_eq!(dst[2], 255); // R
+        assert_eq!(dst[3], 200); // A
+        // Pixel 1: R=10,G=20,B=30,A=40 -> B=30,G=20,R=10,A=40
+        assert_eq!(dst[4], 30);
+        assert_eq!(dst[5], 20);
+        assert_eq!(dst[6], 10);
+        assert_eq!(dst[7], 40);
+    }
+
+    #[test]
+    fn test_swizzle_empty() {
+        let src: &[u8] = &[];
+        let mut dst: Vec<u8> = vec![];
+        swizzle_rgba_to_bgra(src, &mut dst);
+        assert!(dst.is_empty());
+    }
+
+    #[test]
+    fn test_swizzle_single_pixel() {
+        let src = [100, 150, 200, 255];
+        let mut dst = [0u8; 4];
+        swizzle_rgba_to_bgra(&src, &mut dst);
+        assert_eq!(dst, [200, 150, 100, 255]);
     }
 }
