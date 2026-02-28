@@ -62,10 +62,10 @@ impl ServiceHandler for FspSrvService {
                 IpcResponse::success().with_move_handle(0)
             }
 
-            // OpenSaveDataFileSystem
+            // OpenSaveDataFileSystem → ISaveDataFileSystem
             51 => {
-                log::info!("fsp-srv: OpenSaveDataFileSystem (NOT_FOUND)");
-                IpcResponse::error(error::NOT_FOUND)
+                log::info!("fsp-srv: OpenSaveDataFileSystem");
+                IpcResponse::success().with_move_handle(0)
             }
 
             // OpenDataStorageByCurrentProcess → IStorage
@@ -136,16 +136,21 @@ impl ServiceHandler for StorageService {
                 );
 
                 if offset as usize >= self.data.len() {
-                    return IpcResponse::success_with_data(vec![]);
+                    return IpcResponse::success().with_out_buf(vec![]);
                 }
 
                 let start = offset as usize;
                 let end = (start + size as usize).min(self.data.len());
                 let slice = &self.data[start..end];
 
-                // Convert bytes to u32 words (pad last word if needed).
-                let words = bytes_to_words(slice);
-                IpcResponse::success_with_data(words)
+                // Use B-buffer output for large reads (written to guest memory).
+                // Fall back to inline data only if no B-buffer is available.
+                if !command.b_buf_addrs.is_empty() {
+                    IpcResponse::success().with_out_buf(slice.to_vec())
+                } else {
+                    let words = bytes_to_words(slice);
+                    IpcResponse::success_with_data(words)
+                }
             }
 
             // GetSize — total size as u64
@@ -264,6 +269,162 @@ impl ServiceHandler for FileSystemService {
     }
 }
 
+// ── fsp:ISaveDataFileSystem ──────────────────────────────────────────────────
+
+/// In-memory save data filesystem stub.
+pub struct SaveDataFileSystem {
+    files: std::collections::HashMap<String, Vec<u8>>,
+}
+
+impl SaveDataFileSystem {
+    pub fn new() -> Self {
+        Self {
+            files: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Default for SaveDataFileSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServiceHandler for SaveDataFileSystem {
+    fn service_name(&self) -> &str {
+        "fsp:ISaveDataFileSystem"
+    }
+
+    fn handle_request(&mut self, cmd_id: u32, command: &IpcCommand) -> IpcResponse {
+        log::debug!("fsp:ISaveDataFileSystem: cmd_id={}", cmd_id);
+        match cmd_id {
+            // CreateFile
+            0 => {
+                let name = extract_path_from_raw(&command.raw_data);
+                log::info!("fsp:ISaveDataFileSystem: CreateFile({})", name);
+                self.files.entry(name).or_insert_with(Vec::new);
+                IpcResponse::success()
+            }
+            // DeleteFile
+            1 => {
+                let name = extract_path_from_raw(&command.raw_data);
+                log::info!("fsp:ISaveDataFileSystem: DeleteFile({})", name);
+                self.files.remove(&name);
+                IpcResponse::success()
+            }
+            // CreateDirectory
+            2 => {
+                log::info!("fsp:ISaveDataFileSystem: CreateDirectory");
+                IpcResponse::success()
+            }
+            // GetEntryType
+            7 => {
+                let name = extract_path_from_raw(&command.raw_data);
+                if self.files.contains_key(&name) {
+                    log::info!("fsp:ISaveDataFileSystem: GetEntryType({}) = File", name);
+                    IpcResponse::success_with_data(vec![1]) // 1 = File
+                } else {
+                    log::info!("fsp:ISaveDataFileSystem: GetEntryType({}) = Dir", name);
+                    IpcResponse::success_with_data(vec![0]) // 0 = Directory
+                }
+            }
+            // OpenFile → ISaveDataFile
+            8 => {
+                log::info!("fsp:ISaveDataFileSystem: OpenFile");
+                IpcResponse::success().with_move_handle(0)
+            }
+            // Commit
+            10 => {
+                log::info!("fsp:ISaveDataFileSystem: Commit");
+                IpcResponse::success()
+            }
+            // GetFreeSpaceSize
+            12 => {
+                log::info!("fsp:ISaveDataFileSystem: GetFreeSpaceSize (256MB)");
+                IpcResponse::success_with_data(vec![0x10000000, 0])
+            }
+            // GetTotalSpaceSize
+            13 => {
+                log::info!("fsp:ISaveDataFileSystem: GetTotalSpaceSize (1GB)");
+                IpcResponse::success_with_data(vec![0x40000000, 0])
+            }
+            _ => {
+                log::warn!("fsp:ISaveDataFileSystem: unhandled cmd_id={}", cmd_id);
+                IpcResponse::success()
+            }
+        }
+    }
+}
+
+// ── fsp:ISaveDataFile ───────────────────────────────────────────────────────
+
+/// In-memory save data file stub.
+pub struct SaveDataFile {
+    data: Vec<u8>,
+}
+
+impl SaveDataFile {
+    pub fn new() -> Self {
+        Self { data: Vec::new() }
+    }
+}
+
+impl Default for SaveDataFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServiceHandler for SaveDataFile {
+    fn service_name(&self) -> &str {
+        "fsp:ISaveDataFile"
+    }
+
+    fn handle_request(&mut self, cmd_id: u32, command: &IpcCommand) -> IpcResponse {
+        log::debug!("fsp:ISaveDataFile: cmd_id={}", cmd_id);
+        match cmd_id {
+            // Read
+            0 => {
+                let (offset, size) = parse_read_params(&command.raw_data);
+                log::info!("fsp:ISaveDataFile: Read(offset=0x{:X}, size=0x{:X})", offset, size);
+                let start = (offset as usize).min(self.data.len());
+                let end = (start + size as usize).min(self.data.len());
+                let slice = &self.data[start..end];
+                if !command.b_buf_addrs.is_empty() {
+                    IpcResponse::success().with_out_buf(slice.to_vec())
+                } else {
+                    IpcResponse::success_with_data(bytes_to_words(slice))
+                }
+            }
+            // Write
+            1 => {
+                log::info!("fsp:ISaveDataFile: Write");
+                // Stub: accept but don't persist
+                IpcResponse::success()
+            }
+            // GetSize
+            4 => {
+                let total = self.data.len() as u64;
+                log::info!("fsp:ISaveDataFile: GetSize (0x{:X})", total);
+                IpcResponse::success_with_data(vec![total as u32, (total >> 32) as u32])
+            }
+            _ => {
+                log::warn!("fsp:ISaveDataFile: unhandled cmd_id={}", cmd_id);
+                IpcResponse::success()
+            }
+        }
+    }
+}
+
+/// Extract a path string from IPC raw data words (null-terminated bytes).
+fn extract_path_from_raw(raw_data: &[u32]) -> String {
+    let bytes: Vec<u8> = raw_data.iter()
+        .flat_map(|w| w.to_le_bytes())
+        .take_while(|&b| b != 0)
+        .collect();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -316,12 +477,12 @@ mod tests {
     }
 
     #[test]
-    fn test_open_save_data_returns_not_found() {
+    fn test_open_save_data_returns_success_with_handle() {
         let mut svc = FspSrvService::new();
         let cmd = make_command(51);
         let resp = svc.handle_request(51, &cmd);
-        assert!(resp.result.is_error());
-        assert_eq!(resp.result, error::NOT_FOUND);
+        assert!(resp.result.is_success());
+        assert_eq!(resp.handles_to_move, vec![0]);
     }
 
     #[test]

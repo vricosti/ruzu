@@ -61,6 +61,8 @@ pub struct NspLoadResult {
     pub developer: Option<String>,
     /// Version string (from Control NCA NACP, if available).
     pub version: Option<String>,
+    /// Raw RomFS data from the Program NCA (section 1), if available.
+    pub romfs_data: Option<Vec<u8>>,
 }
 
 /// Parsed NCA info for an NSP.
@@ -186,6 +188,22 @@ pub fn load_nsp(
         }
     }
 
+    // Open RomFS from Program NCA
+    let romfs_data = match nca::open_romfs(program_nca.file.as_ref(), &program_nca.header, keys) {
+        Ok(Some(data)) => {
+            log::info!("Extracted RomFS: {} bytes", data.len());
+            Some(data)
+        }
+        Ok(None) => {
+            log::info!("No RomFS section found in Program NCA");
+            None
+        }
+        Err(e) => {
+            log::warn!("Failed to extract RomFS from Program NCA: {}", e);
+            None
+        }
+    };
+
     // Open ExeFS from Program NCA
     let (exefs_pfs, exefs_data) = nca::open_exefs(program_nca.file.as_ref(), &program_nca.header, keys)?
         .ok_or(NspError::NoExeFs)?;
@@ -205,6 +223,7 @@ pub fn load_nsp(
         title,
         developer,
         version,
+        romfs_data,
     })
 }
 

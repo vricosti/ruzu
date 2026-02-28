@@ -5,7 +5,5 @@ edition.workspace = true
 
 [dependencies]
 ruzu-common.workspace = true
+rdynarmic.workspace = true
 log.workspace = true
-thiserror.workspace = true
-bytemuck.workspace = true
-parking_lot.workspace = true

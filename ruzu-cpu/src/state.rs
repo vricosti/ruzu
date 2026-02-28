@@ -3,8 +3,6 @@
 
 use ruzu_common::VAddr;
 
-use crate::memory::MemoryAccess;
-
 /// ARM64 CPU state: general-purpose registers, SIMD/FP registers, flags.
 #[derive(Debug, Clone)]
 pub struct CpuState {
@@ -267,39 +265,4 @@ impl CpuState {
         self.v[reg as usize][word] &= !(mask << bit_in_word);
         self.v[reg as usize][word] |= (val & mask) << bit_in_word;
     }
-}
-
-/// Trait for CPU execution backend.
-pub trait CpuExecutor: Send {
-    /// Run the CPU until a halt condition (SVC, exception, or step count).
-    fn run(
-        &mut self,
-        state: &mut CpuState,
-        mem: &mut dyn MemoryAccess,
-    ) -> HaltReason;
-
-    /// Halt CPU execution.
-    fn halt(&mut self);
-
-    /// Invalidate cached JIT code for the given address range.
-    fn invalidate_cache_range(&mut self, addr: VAddr, size: u64);
-}
-
-/// Reason the CPU halted execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HaltReason {
-    /// Supervisor call (SVC instruction). The SVC number is stored.
-    Svc(u32),
-    /// Breakpoint or software breakpoint.
-    Breakpoint,
-    /// Data abort (invalid memory access).
-    DataAbort { addr: VAddr },
-    /// Instruction abort (invalid fetch).
-    InstructionAbort { addr: VAddr },
-    /// Step completed (single-step mode).
-    Step,
-    /// CPU was externally halted.
-    ExternalHalt,
-    /// Instruction budget exhausted (time slice done).
-    BudgetExhausted,
 }

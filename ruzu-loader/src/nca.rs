@@ -387,6 +387,30 @@ pub fn open_exefs(
     Ok(Some((pfs, decrypted)))
 }
 
+/// Open the RomFS from a Program NCA's RomFS section.
+///
+/// Returns the raw decrypted RomFS data, or `None` if no RomFS section is found.
+pub fn open_romfs(
+    file: &dyn VfsFile,
+    header: &NcaHeader,
+    keys: &KeyManager,
+) -> Result<Option<Vec<u8>>, NcaError> {
+    // RomFS is typically in section 1 of a Program NCA (section 0 is ExeFS/PFS0)
+    let section = header
+        .sections
+        .iter()
+        .find(|s| s.fs_type == NcaSectionFsType::RomFs);
+
+    let section = match section {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    let decrypted = decrypt_nca_section(file, section, header, keys)?;
+    log::info!("Decrypted RomFS section: {} bytes", decrypted.len());
+    Ok(Some(decrypted))
+}
+
 /// Open the Control data (NACP + icon) from a Control NCA.
 ///
 /// Returns raw decrypted section data (the RomFS or PFS0 containing control.nacp).
