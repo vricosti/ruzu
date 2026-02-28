@@ -197,7 +197,9 @@ fn get_sub_interface(service_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("audout:u", 1) => Some("audout:IAudioOut"),
         // Filesystem
         ("fsp-srv", 18) => Some("fsp:IFileSystem"),
+        ("fsp-srv", 51) => Some("fsp:ISaveDataFileSystem"),
         ("fsp-srv", 200) => Some("fsp:IStorage"),
+        ("fsp:ISaveDataFileSystem", 8) => Some("fsp:ISaveDataFile"),
         // Account
         ("acc:u0", 5) => Some("acc:IProfile"),
         ("acc:u0", 101) => Some("acc:IBaas"),
@@ -287,19 +289,20 @@ fn main() -> Result<()> {
         format.label()
     );
 
-    let (code_set, title_id, rom_data) = match format {
+    let (code_set, title_id, rom_data, nsp_romfs) = match format {
         GameFormat::Nro => {
             let raw = std::fs::read(&game_path).context("Failed to read NRO file")?;
             let (cs, tid) = load_nro_game_from_data(&raw)?;
-            (cs, tid, Some(raw))
+            (cs, tid, Some(raw), None)
         }
         GameFormat::Nsp => {
-            let (cs, tid) = load_nsp_game(&game_path, &mut keys)?;
-            (cs, tid, None)
+            let (cs, tid, nsp_romfs) = load_nsp_game(&game_path, &mut keys)?;
+            // For NSP, rom_data is None (no raw NRO), but we pass romfs separately
+            (cs, tid, None, nsp_romfs)
         }
         GameFormat::Xci => {
             let (cs, tid) = load_xci_game(&game_path, &mut keys)?;
-            (cs, tid, None)
+            (cs, tid, None, None)
         }
     };
 
@@ -371,35 +374,39 @@ fn main() -> Result<()> {
         };
     }
 
-    // ── Extract romfs data from NRO asset header ──────────────────────────
-    let romfs_data: Option<Arc<Vec<u8>>> = code_set.asset_header.as_ref().and_then(|asset| {
-        if asset.romfs.size == 0 {
-            info!("No romfs section in NRO asset header");
-            return None;
-        }
-        // romfs offset is relative to the asset header start (= NRO file_size).
-        // We need the raw NRO data to extract romfs bytes.
-        let raw = rom_data.as_ref()?;
-        // Find the NRO file_size from the header (at offset 0x18).
-        let nro_file_size = if raw.len() >= 0x1C {
-            u32::from_le_bytes([raw[0x18], raw[0x19], raw[0x1A], raw[0x1B]]) as usize
-        } else {
-            return None;
-        };
-        let romfs_start = nro_file_size + asset.romfs.offset as usize;
-        let romfs_end = romfs_start + asset.romfs.size as usize;
-        if romfs_end <= raw.len() {
-            let data = raw[romfs_start..romfs_end].to_vec();
-            info!("Extracted romfs: {} bytes", data.len());
-            Some(Arc::new(data))
-        } else {
-            log::warn!(
-                "romfs extends past file end: offset=0x{:X}, size=0x{:X}, file_len=0x{:X}",
-                romfs_start, asset.romfs.size, raw.len()
-            );
-            None
-        }
-    });
+    // ── Extract romfs data ─────────────────────────────────────────────────
+    // For NRO: extract from asset header in the raw NRO file.
+    // For NSP: use the RomFS extracted from the Program NCA.
+    let romfs_data: Option<Arc<Vec<u8>>> = if let Some(nsp_romfs_data) = nsp_romfs {
+        info!("Using NSP RomFS: {} bytes", nsp_romfs_data.len());
+        Some(Arc::new(nsp_romfs_data))
+    } else {
+        code_set.asset_header.as_ref().and_then(|asset| {
+            if asset.romfs.size == 0 {
+                info!("No romfs section in NRO asset header");
+                return None;
+            }
+            let raw = rom_data.as_ref()?;
+            let nro_file_size = if raw.len() >= 0x1C {
+                u32::from_le_bytes([raw[0x18], raw[0x19], raw[0x1A], raw[0x1B]]) as usize
+            } else {
+                return None;
+            };
+            let romfs_start = nro_file_size + asset.romfs.offset as usize;
+            let romfs_end = romfs_start + asset.romfs.size as usize;
+            if romfs_end <= raw.len() {
+                let data = raw[romfs_start..romfs_end].to_vec();
+                info!("Extracted NRO romfs: {} bytes", data.len());
+                Some(Arc::new(data))
+            } else {
+                log::warn!(
+                    "romfs extends past file end: offset=0x{:X}, size=0x{:X}, file_len=0x{:X}",
+                    romfs_start, asset.romfs.size, raw.len()
+                );
+                None
+            }
+        })
+    };
 
     // ── Create shared state and wire services ────────────────────────────
 
@@ -505,6 +512,14 @@ fn main() -> Result<()> {
     manager.register_service(
         "fsp:IFileSystem",
         Box::new(ruzu_service::fs::FileSystemService::new()),
+    );
+    manager.register_service(
+        "fsp:ISaveDataFileSystem",
+        Box::new(ruzu_service::fs::SaveDataFileSystem::new()),
+    );
+    manager.register_service(
+        "fsp:ISaveDataFile",
+        Box::new(ruzu_service::fs::SaveDataFile::new()),
     );
 
     // Audio
@@ -625,8 +640,8 @@ fn load_nro_game_from_data(rom_data: &[u8]) -> Result<(nro::CodeSet, u64)> {
     Ok((code_set, 0))
 }
 
-/// Load an NSP game file.
-fn load_nsp_game(path: &PathBuf, keys: &mut KeyManager) -> Result<(nro::CodeSet, u64)> {
+/// Load an NSP game file. Returns (CodeSet, title_id, optional romfs data).
+fn load_nsp_game(path: &PathBuf, keys: &mut KeyManager) -> Result<(nro::CodeSet, u64, Option<Vec<u8>>)> {
     let file: Arc<dyn ruzu_loader::vfs::VfsFile> =
         Arc::new(RealFile::open(path).context("Failed to open NSP file")?);
 
@@ -643,7 +658,7 @@ fn load_nsp_game(path: &PathBuf, keys: &mut KeyManager) -> Result<(nro::CodeSet,
     }
     info!("Title ID: 0x{:016X}", result.title_id);
 
-    Ok((result.code_set, result.title_id))
+    Ok((result.code_set, result.title_id, result.romfs_data))
 }
 
 /// Load an XCI game file.
@@ -675,15 +690,59 @@ fn run_headless(kernel: &mut KernelCore) -> Result<()> {
 /// Instructions per time slice for each thread.
 const INSTRUCTIONS_PER_SLICE: u64 = 50_000;
 
+/// Create a `MemoryVtable` for forwarding JIT memory callbacks to `MemoryManager`.
+fn make_memory_vtable() -> ruzu_cpu::arm_dynarmic_64::MemoryVtable {
+    use ruzu_kernel::memory_manager::MemoryManager;
+
+    unsafe fn read_u8(ctx: *const u8, addr: u64) -> u8 {
+        let mm = &*(ctx as *const MemoryManager);
+        mm.read_u8(addr).unwrap_or(0)
+    }
+    unsafe fn read_u16(ctx: *const u8, addr: u64) -> u16 {
+        let mm = &*(ctx as *const MemoryManager);
+        mm.read_u16(addr).unwrap_or(0)
+    }
+    unsafe fn read_u32(ctx: *const u8, addr: u64) -> u32 {
+        let mm = &*(ctx as *const MemoryManager);
+        mm.read_u32(addr).unwrap_or(0)
+    }
+    unsafe fn read_u64(ctx: *const u8, addr: u64) -> u64 {
+        let mm = &*(ctx as *const MemoryManager);
+        mm.read_u64(addr).unwrap_or(0)
+    }
+    unsafe fn write_u8(ctx: *mut u8, addr: u64, val: u8) {
+        let mm = &mut *(ctx as *mut MemoryManager);
+        let _ = mm.write_u8(addr, val);
+    }
+    unsafe fn write_u16(ctx: *mut u8, addr: u64, val: u16) {
+        let mm = &mut *(ctx as *mut MemoryManager);
+        let _ = mm.write_u16(addr, val);
+    }
+    unsafe fn write_u32(ctx: *mut u8, addr: u64, val: u32) {
+        let mm = &mut *(ctx as *mut MemoryManager);
+        let _ = mm.write_u32(addr, val);
+    }
+    unsafe fn write_u64(ctx: *mut u8, addr: u64, val: u64) {
+        let mm = &mut *(ctx as *mut MemoryManager);
+        let _ = mm.write_u64(addr, val);
+    }
+
+    ruzu_cpu::arm_dynarmic_64::MemoryVtable {
+        read_u8, read_u16, read_u32, read_u64,
+        write_u8, write_u16, write_u32, write_u64,
+    }
+}
+
 /// Core CPU execution loop with multi-thread scheduling.
 fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
-    use ruzu_cpu::interpreter::Interpreter;
-    use ruzu_cpu::state::{CpuExecutor, HaltReason};
+    use ruzu_cpu::{ArmDynarmic64, HaltReason};
     use ruzu_kernel::scheduler::Scheduler;
     use ruzu_kernel::svc::dispatch_svc;
     use ruzu_kernel::thread::ThreadState;
 
-    let mut interp = Interpreter::new();
+    let vtable = make_memory_vtable();
+    let mem_ptr = &mut kernel.process_mut().unwrap().memory as *mut _ as *mut u8;
+    let mut jit = ArmDynarmic64::new(mem_ptr, vtable).expect("JIT init failed");
 
     loop {
         if kernel.should_stop {
@@ -738,57 +797,38 @@ fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
         // Store current thread index for SVC dispatch.
         kernel.current_thread_idx = Some(idx);
 
-        // Run interpreter with budget.
-        interp.set_budget(INSTRUCTIONS_PER_SLICE);
-        let process = kernel.process_mut().unwrap();
-        let reason = interp.run(
-            &mut process.threads[idx].cpu_state,
-            &mut process.memory,
-        );
+        // Load thread context into JIT and run with budget.
+        jit.load_context(&kernel.process().unwrap().threads[idx].cpu_state);
+        jit.set_ticks_remaining(INSTRUCTIONS_PER_SLICE);
+        let reason = jit.run();
+        jit.save_context(&mut kernel.process_mut().unwrap().threads[idx].cpu_state);
         kernel.tick_counter += INSTRUCTIONS_PER_SLICE;
 
-        match reason {
-            HaltReason::Svc(n) => {
-                // Clone CPU state for SVC dispatch, then write back.
+        if reason.contains(HaltReason::SVC) {
+            if let Some(n) = jit.get_svc_number() {
                 let mut cpu = kernel.process().unwrap().threads[idx].cpu_state.clone();
                 dispatch_svc(kernel, &mut cpu, n);
                 if let Some(process) = kernel.process_mut() {
-                    // Only write back if thread is still runnable (not blocked by the SVC).
                     if process.threads[idx].state != ThreadState::Waiting {
                         process.threads[idx].cpu_state = cpu;
                     }
                 }
             }
-            HaltReason::BudgetExhausted => {
-                // Time slice done, loop to reschedule.
-            }
-            HaltReason::ExternalHalt => {
-                info!("CPU externally halted");
-                break;
-            }
-            HaltReason::DataAbort { addr } => {
-                let pc = kernel
-                    .process()
-                    .map(|p| p.threads[idx].cpu_state.pc)
-                    .unwrap_or(0);
-                log::error!(
-                    "Data abort at 0x{:016X} (PC=0x{:016X})",
-                    addr, pc
-                );
-                break;
-            }
-            HaltReason::InstructionAbort { addr } => {
-                log::error!("Instruction abort at 0x{:016X}", addr);
-                break;
-            }
-            HaltReason::Breakpoint => {
-                info!("Breakpoint hit");
-                break;
-            }
-            HaltReason::Step => {
-                // Single step complete, continue.
-            }
+        } else if reason.contains(HaltReason::EXTERNAL_HALT) {
+            info!("CPU externally halted");
+            break;
+        } else if reason.contains(HaltReason::EXCEPTION_RAISED) {
+            let pc = kernel
+                .process()
+                .map(|p| p.threads[idx].cpu_state.pc)
+                .unwrap_or(0);
+            log::error!("Exception at PC=0x{:016X}", pc);
+            break;
+        } else if reason.contains(HaltReason::BREAKPOINT) {
+            info!("Breakpoint hit");
+            break;
         }
+        // else: ticks exhausted or step — just reschedule.
     }
 
     kernel.current_thread_idx = None;
@@ -806,8 +846,7 @@ fn run_with_window(
     audio_out_event_handle: u32,
     vsync_event_handle: u32,
 ) -> Result<()> {
-    use ruzu_cpu::interpreter::Interpreter;
-    use ruzu_cpu::state::{CpuExecutor, HaltReason};
+    use ruzu_cpu::{ArmDynarmic64, HaltReason};
     use ruzu_kernel::scheduler::Scheduler;
     use ruzu_kernel::svc::dispatch_svc;
     use ruzu_kernel::thread::ThreadState;
@@ -833,7 +872,9 @@ fn run_with_window(
     info!("Press ESC or close window to exit");
     info!("Controls: Z=A, X=B, C=X, V=Y, Arrows=D-Pad, Enter=+, RShift=-, Q/E=L/R, A/D=ZL/ZR, IJKL=LStick");
 
-    let mut interp = Interpreter::new();
+    let vtable = make_memory_vtable();
+    let mem_ptr = &mut kernel.process_mut().unwrap().memory as *mut _ as *mut u8;
+    let mut jit = ArmDynarmic64::new(mem_ptr, vtable).expect("JIT init failed");
 
     // Number of time slices to run per frame (~60 FPS ~ 16ms).
     const SLICES_PER_FRAME: usize = 10;
@@ -952,16 +993,15 @@ fn run_with_window(
 
             kernel.current_thread_idx = Some(idx);
 
-            interp.set_budget(INSTRUCTIONS_PER_SLICE);
-            let process = kernel.process_mut().unwrap();
-            let reason = interp.run(
-                &mut process.threads[idx].cpu_state,
-                &mut process.memory,
-            );
+            // Load thread context into JIT and run with budget.
+            jit.load_context(&kernel.process().unwrap().threads[idx].cpu_state);
+            jit.set_ticks_remaining(INSTRUCTIONS_PER_SLICE);
+            let reason = jit.run();
+            jit.save_context(&mut kernel.process_mut().unwrap().threads[idx].cpu_state);
             kernel.tick_counter += INSTRUCTIONS_PER_SLICE;
 
-            match reason {
-                HaltReason::Svc(n) => {
+            if reason.contains(HaltReason::SVC) {
+                if let Some(n) = jit.get_svc_number() {
                     let mut cpu =
                         kernel.process().unwrap().threads[idx].cpu_state.clone();
                     // Save input registers before dispatch: SVC overwrites x0
@@ -997,24 +1037,17 @@ fn run_with_window(
                         }
                     }
                 }
-                HaltReason::BudgetExhausted => {
-                    // Time slice done, continue to next slice.
-                }
-                HaltReason::ExternalHalt => {
-                    kernel.should_stop = true;
-                    break;
-                }
-                HaltReason::DataAbort { addr } => {
-                    log::error!("Data abort at 0x{:016X}", addr);
-                    kernel.should_stop = true;
-                    break;
-                }
-                HaltReason::InstructionAbort { addr } => {
-                    log::error!("Instruction abort at 0x{:016X}", addr);
-                    kernel.should_stop = true;
-                    break;
-                }
-                _ => {}
+            } else if reason.contains(HaltReason::EXTERNAL_HALT) {
+                kernel.should_stop = true;
+                break;
+            } else if reason.contains(HaltReason::EXCEPTION_RAISED) {
+                let pc = kernel
+                    .process()
+                    .map(|p| p.threads[idx].cpu_state.pc)
+                    .unwrap_or(0);
+                log::error!("Exception at PC=0x{:016X}", pc);
+                kernel.should_stop = true;
+                break;
             }
         }
 

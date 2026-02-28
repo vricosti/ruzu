@@ -30,6 +30,8 @@ pub mod svc_number {
     pub const SLEEP_THREAD: u32 = 0x0B;
     pub const GET_THREAD_PRIORITY: u32 = 0x0C;
     pub const SET_THREAD_PRIORITY: u32 = 0x0D;
+    pub const SET_THREAD_CORE_MASK: u32 = 0x0E;
+    pub const GET_THREAD_CORE_MASK: u32 = 0x0F;
     pub const GET_CURRENT_PROCESSOR_NUMBER: u32 = 0x10;
     pub const SIGNAL_EVENT: u32 = 0x11;
     pub const CLEAR_EVENT: u32 = 0x12;
@@ -201,6 +203,21 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
             let priority = cpu.x[1] as u32;
             let result = thread::svc_set_thread_priority(kernel, handle, priority);
             cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::SET_THREAD_CORE_MASK => {
+            let _handle = cpu.x[0] as u32;
+            let _ideal_core = cpu.x[1] as u32;
+            let _affinity_mask = cpu.x[2];
+            debug!("SetThreadCoreMask: accept and ignore (single-core emulation)");
+            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+        }
+
+        svc_number::GET_THREAD_CORE_MASK => {
+            debug!("GetThreadCoreMask: returning ideal_core=0, mask=0xF");
+            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+            cpu.x[1] = 0; // ideal_core
+            cpu.x[2] = 0xF; // affinity_mask (4 cores)
         }
 
         svc_number::GET_CURRENT_PROCESSOR_NUMBER => {
@@ -434,8 +451,15 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
         svc_number::MAP_PHYSICAL_MEMORY => {
             let addr = cpu.x[0];
             let size = cpu.x[1];
-            debug!("MapPhysicalMemory: addr=0x{:X}, size=0x{:X}", addr, size);
-            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+            let result = memory::svc_map_physical_memory(kernel, addr, size);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::UNMAP_PHYSICAL_MEMORY => {
+            let addr = cpu.x[0];
+            let size = cpu.x[1];
+            let result = memory::svc_unmap_physical_memory(kernel, addr, size);
+            cpu.x[0] = result.raw() as u64;
         }
 
         _ => {

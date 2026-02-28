@@ -27,6 +27,9 @@ ruzu-kernel = { path = "ruzu-kernel" }
 ruzu-service = { path = "ruzu-service" }
 ruzu-gpu = { path = "ruzu-gpu" }
 
+# JIT recompiler
+rdynarmic = { path = "../rdynarmic" }
+
 # CLI / Config
 clap = { version = "4", features = ["derive"] }
 rust-ini = "0.21"

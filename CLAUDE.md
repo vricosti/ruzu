@@ -89,3 +89,16 @@ Games submit GPFIFO entries via nvdrv ioctl → `CommandProcessor` dispatches to
 2. Implement `service_name()` and `handle_request(cmd_id, command) -> IpcResponse`
 3. Register in `ServiceManager` setup in `ruzu/src/main.rs`
 4. For sub-interfaces, add routing entry in `get_sub_interface()`
+
+
+### Implementation
+  
+https://github.com/vricosti/zuyu is available at /home/vricosti/Dev/emulators/zuyu as reference and the 
+goal is to implement the equivalent of yuzu_cmd in order to test the launch of Mario Kart
+./yuzu -g '/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp'
+
+
+So at the end I want a ./ruzu_cmd -g '/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp' that start Mario Kart.
+rdynarmic is locally available at [/home/vricosti/Dev/emulators/rdynarmic](../rdynarmic).
+So design a plan that allow to implement all necessary steps to obtain a working emulator in rust based on
+zuyu.
