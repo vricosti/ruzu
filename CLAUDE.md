@@ -10,7 +10,7 @@ ruzu is a Nintendo Switch emulator written in Rust, ported from yuzu. It uses rd
 
 - **zuyu** (https://github.com/vricosti/zuyu) — Fork of yuzu used as the C++ reference implementation for porting.
 - **rxbyak** (https://github.com/vricosti/rxbyak) — Rust port of xbyak (x86-64 runtime assembler), used by rdynarmic for JIT code emission.
-- **rdynarmic** (https://github.com/vricosti/rdynarmic) — Rust port of dynarmic (ARM64 dynamic recompiler). x64 backend is feature-complete: all ~650 IR opcodes wired, ~130 native SSE vector ops, ~220 stack-fallback vector ops. See rdynarmic/CLAUDE.md for details.
+- **rdynarmic** (https://github.com/vricosti/rdynarmic) — Rust port of dynarmic (ARM64 dynamic recompiler). Public `A64Jit` API with `run()`/`step()`, block cache, dispatcher loop, all ~650 IR opcodes emitted as native x86-64. See rdynarmic/CLAUDE.md for details.
 
 ## Toolchain
 
@@ -71,7 +71,7 @@ IPC protocol: HIPC header in TLS word 0-1, CMIF payload with magic SFCI (request
 
 ### CPU Emulation
 
-ARM64 JIT recompilation via rdynarmic. ARM64 instructions are translated to an SSA IR (~650 opcodes), optimized, then emitted as native x86-64 code using rxbyak. `A64JitState` holds x0-x30, sp, pc, NZCV flags, v0-v31 (128-bit SIMD), tpidr_el0. The JIT returns `HaltReason::Svc(n)` or `BudgetExhausted` to yield control.
+ARM64 JIT recompilation via rdynarmic. Create an `A64Jit` with a `JitCallbacks` impl (memory read/write, SVC, ticks), set PC/SP/registers, call `jit.run()`. The JIT translates ARM64 → SSA IR (~650 opcodes) → optimized → native x86-64 via rxbyak, caches compiled blocks, and runs them in a dispatcher loop. Returns `HaltReason` (Svc, Step, ExternalHalt, etc.) to yield control. `A64JitState` holds x0-x30, sp, pc, NZCV flags, v0-v31 (128-bit SIMD), FPCR/FPSR, tpidr_el0.
 
 A fallback interpreter is also available in ruzu-cpu. `CpuState` with two-stage decoder (pattern decoder fast path → full decoder fallback). Instruction execution split across: `alu.rs`, `mem.rs`, `branch.rs`, `simd.rs`, `neon.rs`, `crypto.rs`, `system.rs`.
 
