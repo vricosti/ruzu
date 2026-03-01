@@ -301,26 +301,31 @@ fn main() -> Result<()> {
         Multi(Vec<(String, nro::CodeSet)>),
     }
 
-    let (loaded, title_id, nsp_romfs) = match format {
+    let (loaded, title_id, nsp_romfs, is_64bit) = match format {
         GameFormat::Nro => {
             let raw = std::fs::read(&game_path).context("Failed to read NRO file")?;
             let (cs, tid) = load_nro_game_from_data(&raw)?;
             nro_asset_header = cs.asset_header.clone();
             nro_raw_data = Some(raw);
-            (LoadedModules::Single(cs), tid, None)
+            // NRO games are always AArch64
+            (LoadedModules::Single(cs), tid, None, true)
         }
         GameFormat::Nsp => {
-            let (modules, tid, nsp_romfs) = load_nsp_game(&game_path, &mut keys)?;
-            (LoadedModules::Multi(modules), tid, nsp_romfs)
+            let (modules, tid, nsp_romfs, is_64bit) = load_nsp_game(&game_path, &mut keys)?;
+            (LoadedModules::Multi(modules), tid, nsp_romfs, is_64bit)
         }
         GameFormat::Xci => {
-            let (modules, tid) = load_xci_game(&game_path, &mut keys)?;
-            (LoadedModules::Multi(modules), tid, None)
+            let (modules, tid, is_64bit) = load_xci_game(&game_path, &mut keys)?;
+            (LoadedModules::Multi(modules), tid, None, is_64bit)
         }
     };
 
     // Create kernel and process (must exist before creating event handles).
     let mut kernel = KernelCore::new();
+    kernel.is_64bit = is_64bit;
+    if !is_64bit {
+        info!("Process is AArch32 (ARM32) — using A32 JIT");
+    }
     kernel.create_process("main")?;
 
     // ── Phase 2 init: create kernel event handles for services ────────────
@@ -731,11 +736,11 @@ fn load_multi_modules(
     Ok(entry_point)
 }
 
-/// Load an NSP game file. Returns (modules, title_id, optional romfs data).
+/// Load an NSP game file. Returns (modules, title_id, optional romfs data, is_64bit).
 fn load_nsp_game(
     path: &PathBuf,
     keys: &mut KeyManager,
-) -> Result<(Vec<(String, nro::CodeSet)>, u64, Option<Vec<u8>>)> {
+) -> Result<(Vec<(String, nro::CodeSet)>, u64, Option<Vec<u8>>, bool)> {
     let file: Arc<dyn ruzu_loader::vfs::VfsFile> =
         Arc::new(RealFile::open(path).context("Failed to open NSP file")?);
 
@@ -752,14 +757,14 @@ fn load_nsp_game(
     }
     info!("Title ID: 0x{:016X}", result.title_id);
 
-    Ok((result.modules, result.title_id, result.romfs_data))
+    Ok((result.modules, result.title_id, result.romfs_data, result.is_64bit))
 }
 
-/// Load an XCI game file. Returns (modules, title_id).
+/// Load an XCI game file. Returns (modules, title_id, is_64bit).
 fn load_xci_game(
     path: &PathBuf,
     keys: &mut KeyManager,
-) -> Result<(Vec<(String, nro::CodeSet)>, u64)> {
+) -> Result<(Vec<(String, nro::CodeSet)>, u64, bool)> {
     let file: Arc<dyn ruzu_loader::vfs::VfsFile> =
         Arc::new(RealFile::open(path).context("Failed to open XCI file")?);
 
@@ -774,7 +779,7 @@ fn load_xci_game(
     }
     info!("Title ID: 0x{:016X}", result.title_id);
 
-    Ok((result.modules, result.title_id))
+    Ok((result.modules, result.title_id, result.is_64bit))
 }
 
 /// Run in headless mode (no window, CPU only).
@@ -832,14 +837,18 @@ fn make_memory_vtable() -> ruzu_cpu::arm_dynarmic_64::MemoryVtable {
 
 /// Core CPU execution loop with multi-thread scheduling.
 fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
-    use ruzu_cpu::{ArmDynarmic64, HaltReason};
+    use ruzu_cpu::{ArmDynarmic32, ArmDynarmic64, ArmJit, HaltReason};
     use ruzu_kernel::scheduler::Scheduler;
     use ruzu_kernel::svc::dispatch_svc;
     use ruzu_kernel::thread::ThreadState;
 
     let vtable = make_memory_vtable();
     let mem_ptr = &mut kernel.process_mut().unwrap().memory as *mut _ as *mut u8;
-    let mut jit = ArmDynarmic64::new(mem_ptr, vtable).expect("JIT init failed");
+    let mut jit: Box<dyn ArmJit> = if kernel.is_64bit {
+        Box::new(ArmDynarmic64::new(mem_ptr, vtable).expect("A64 JIT init failed"))
+    } else {
+        Box::new(ArmDynarmic32::new(mem_ptr, vtable).expect("A32 JIT init failed"))
+    };
 
     // Diagnostic: verify we can read code at entry point
     {
@@ -976,7 +985,7 @@ fn run_with_window(
     audio_out_event_handle: u32,
     vsync_event_handle: u32,
 ) -> Result<()> {
-    use ruzu_cpu::{ArmDynarmic64, HaltReason};
+    use ruzu_cpu::{ArmDynarmic32, ArmDynarmic64, ArmJit, HaltReason};
     use ruzu_kernel::scheduler::Scheduler;
     use ruzu_kernel::svc::dispatch_svc;
     use ruzu_kernel::thread::ThreadState;
@@ -1027,7 +1036,11 @@ fn run_with_window(
 
     let vtable = make_memory_vtable();
     let mem_ptr = &mut kernel.process_mut().unwrap().memory as *mut _ as *mut u8;
-    let mut jit = ArmDynarmic64::new(mem_ptr, vtable).expect("JIT init failed");
+    let mut jit: Box<dyn ArmJit> = if kernel.is_64bit {
+        Box::new(ArmDynarmic64::new(mem_ptr, vtable).expect("A64 JIT init failed"))
+    } else {
+        Box::new(ArmDynarmic32::new(mem_ptr, vtable).expect("A32 JIT init failed"))
+    };
 
     // Number of time slices to run per frame (~60 FPS ~ 16ms).
     const SLICES_PER_FRAME: usize = 10;

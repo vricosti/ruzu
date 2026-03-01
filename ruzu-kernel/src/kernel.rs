@@ -49,6 +49,8 @@ pub struct KernelCore {
     pub shared_memory_pool: Vec<u8>,
     /// IPC handler bridge: dispatches SendSyncRequest to the service framework.
     pub ipc_handler: Option<Arc<dyn IpcHandler>>,
+    /// Whether the current process is 64-bit (AArch64) or 32-bit (AArch32).
+    pub is_64bit: bool,
 }
 
 impl KernelCore {
@@ -62,6 +64,7 @@ impl KernelCore {
             current_thread_idx: None,
             shared_memory_pool: Vec::new(),
             ipc_handler: None,
+            is_64bit: true,
         }
     }
 
