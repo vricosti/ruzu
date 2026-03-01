@@ -1099,56 +1099,70 @@ fn run_with_window(
         }
 
         // ── Present framebuffer ─────────────────────────────────────────
-        if let Some(ref mut vk) = vulkan {
+        // Read framebuffer pixels from guest memory, detile if block-linear.
+        let present_pixels = {
             let mut bq = buffer_queue.write();
             if let Some((slot, buffer)) = bq.acquire() {
                 let width = buffer.width;
                 let height = buffer.height;
                 let offset = buffer.offset;
-                let size = (width * height * 4) as usize;
+                let bpp = 4u32; // RGBA8888
+                let stride_bytes = buffer.stride.max(width * bpp);
 
-                if offset != 0 && size > 0 {
-                    let mut pixels = vec![0u8; size];
-                    if let Some(process) = kernel.process() {
-                        for (i, byte) in pixels.iter_mut().enumerate() {
-                            *byte = process
-                                .memory
-                                .read_u8(offset + i as u64)
-                                .unwrap_or(0);
+                let result = if offset != 0 && width > 0 && height > 0 {
+                    // Calculate tiled buffer size (may be larger than linear due to GOB alignment).
+                    let block_height_log2 = ruzu_gpu::swizzle::guess_block_height_log2(height);
+                    let block_height = 1usize << block_height_log2;
+                    let gob_size_y = 8usize;
+                    let gob_size_x = 64usize;
+                    let gob_size = 512usize;
+                    let block_height_pixels = block_height * gob_size_y;
+                    let gobs_x = (stride_bytes as usize + gob_size_x - 1) / gob_size_x;
+                    let block_rows = (height as usize + block_height_pixels - 1) / block_height_pixels;
+                    let tiled_size = block_rows * gobs_x * block_height * gob_size;
+
+                    // Read the tiled framebuffer data in bulk.
+                    let tiled_data = kernel.process().and_then(|p| {
+                        p.memory.read_bytes(offset, tiled_size).ok()
+                    });
+
+                    if let Some(tiled) = tiled_data {
+                        // Check if data looks tiled (non-zero content).
+                        let has_content = tiled.iter().any(|&b| b != 0);
+                        if has_content {
+                            let linear = ruzu_gpu::swizzle::detile_block_linear(
+                                &tiled, width, height, bpp, block_height_log2,
+                            );
+                            Some((linear, width, height))
+                        } else {
+                            // All zeros — try reading as linear (may not be tiled).
+                            let linear_size = (width * height * bpp) as usize;
+                            let linear_data = kernel.process().and_then(|p| {
+                                p.memory.read_bytes(offset, linear_size).ok()
+                            });
+                            linear_data.map(|px| (px, width, height))
                         }
+                    } else {
+                        None
                     }
-                    let _ = vk.present_framebuffer(&pixels, width, height);
                 } else {
-                    let _ = vk.present_clear([0.39, 0.58, 0.93, 1.0]);
-                }
+                    None
+                };
                 bq.release(slot);
+                result
             } else {
-                let _ = vk.present_clear([0.39, 0.58, 0.93, 1.0]);
+                None
             }
-        } else {
-            // Fallback: software blit (existing path).
-            let mut bq = buffer_queue.write();
-            if let Some((slot, buffer)) = bq.acquire() {
-                let width = buffer.width;
-                let height = buffer.height;
-                let offset = buffer.offset;
-                let size = (width * height * 4) as usize;
+        };
 
-                if offset != 0 && size > 0 {
-                    let mut pixels = vec![0u8; size];
-                    if let Some(process) = kernel.process() {
-                        for (i, byte) in pixels.iter_mut().enumerate() {
-                            *byte = process
-                                .memory
-                                .read_u8(offset + i as u64)
-                                .unwrap_or(0);
-                        }
-                    }
-                    emu_window.present_framebuffer(&pixels, width, height);
-                }
-
-                bq.release(slot);
+        if let Some((pixels, width, height)) = present_pixels {
+            if let Some(ref mut vk) = vulkan {
+                let _ = vk.present_framebuffer(&pixels, width, height);
+            } else {
+                emu_window.present_framebuffer(&pixels, width, height);
             }
+        } else if let Some(ref mut vk) = vulkan {
+            let _ = vk.present_clear([0.39, 0.58, 0.93, 1.0]);
         }
     }
 

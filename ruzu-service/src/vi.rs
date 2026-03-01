@@ -424,33 +424,74 @@ impl ViBinderService {
                 let slot = _input.read_i32() as usize;
                 log::debug!("vi:binder: SetPreallocatedBuffer slot={}", slot);
 
-                // Read GraphicBuffer from the parcel.
-                let _has_buffer = _input.read_i32();
-                let width = _input.read_u32();
-                let height = _input.read_u32();
-                let stride = _input.read_u32();
-                let format = _input.read_u32();
-                let _usage = _input.read_u32();
-                let nvmap_handle = _input.read_u32();
+                // Read NvGraphicBuffer from the parcel.
+                // Format: has_buffer (bool/i32), then if true:
+                //   flattened_size (i64), then the 0x16C-byte NvGraphicBuffer struct.
+                let has_buffer = _input.read_i32();
+                if has_buffer != 0 {
+                    // Read flattened size (s64) — should be 0x16C (364).
+                    let _flat_size = _input.read_i64();
 
-                // Resolve the nvmap handle to a guest address via the registry.
-                let offset = self
-                    .gpu
-                    .nvmap_registry
-                    .get_address(nvmap_handle)
-                    .unwrap_or(0);
+                    // NvGraphicBuffer layout (0x16C bytes):
+                    //   0x00: magic (u32)
+                    //   0x04: width (s32)
+                    //   0x08: height (s32)
+                    //   0x0C: stride (s32) — in bytes
+                    //   0x10: format (u32)
+                    //   0x14: usage (s32)
+                    //   0x18: padding
+                    //   0x1C: index (u32)
+                    //   0x20..0x2B: padding (3 words)
+                    //   0x2C: buffer_id (u32) — nvmap handle
+                    //   0x30..0x53: padding
+                    //   0x54: external_format (u32)
+                    //   0x58..0x7B: padding
+                    //   0x7C: handle (u32)
+                    //   0x80: offset (u32) — byte offset into nvmap buffer
+                    //   0x84..0x16B: padding
 
-                let buf = GraphicBuffer {
-                    width,
-                    height,
-                    format,
-                    nvmap_handle,
-                    offset,
-                    stride,
-                };
+                    // Read the full struct as bytes via sequential u32 reads.
+                    let num_words = 0x16C / 4; // 91 words
+                    let mut buf_data = Vec::with_capacity(num_words);
+                    for _ in 0..num_words {
+                        buf_data.push(_input.read_u32());
+                    }
 
-                let mut bq = self.buffer_queue.write();
-                bq.set_buffer(slot, buf);
+                    // Extract fields at their correct offsets (word index = byte_offset / 4).
+                    let width = buf_data.get(0x04 / 4).copied().unwrap_or(1280);
+                    let height = buf_data.get(0x08 / 4).copied().unwrap_or(720);
+                    let stride = buf_data.get(0x0C / 4).copied().unwrap_or(5120);
+                    let format = buf_data.get(0x10 / 4).copied().unwrap_or(1);
+                    let buffer_id = buf_data.get(0x2C / 4).copied().unwrap_or(0);
+                    let buffer_offset = buf_data.get(0x80 / 4).copied().unwrap_or(0);
+
+                    log::info!(
+                        "vi:binder: SetPreallocatedBuffer slot={}, {}x{}, stride={}, fmt={}, \
+                         buffer_id={}, buf_offset=0x{:X}",
+                        slot, width, height, stride, format, buffer_id, buffer_offset
+                    );
+
+                    // Resolve the nvmap handle to a guest base address, then add
+                    // the buffer offset to get the final framebuffer address.
+                    let base_addr = self
+                        .gpu
+                        .nvmap_registry
+                        .get_address(buffer_id)
+                        .unwrap_or(0);
+                    let offset = base_addr + buffer_offset as u64;
+
+                    let buf = GraphicBuffer {
+                        width,
+                        height,
+                        format,
+                        nvmap_handle: buffer_id,
+                        offset,
+                        stride,
+                    };
+
+                    let mut bq = self.buffer_queue.write();
+                    bq.set_buffer(slot, buf);
+                }
 
                 response.write_u32(0); // status = OK
             }
@@ -616,23 +657,29 @@ mod tests {
     fn test_set_preallocated_resolves_offset() {
         let gpu = test_gpu();
         // Pre-register nvmap handle 5 with address 0xCAFE_0000.
-        gpu.nvmap_registry.register(5, 0xCAFE_0000, 0x1000);
+        gpu.nvmap_registry.register(5, 0xCAFE_0000, 0x400000);
 
         let bq = Arc::new(RwLock::new(BufferQueue::new()));
         let mut svc = ViBinderService::new(bq.clone(), gpu);
 
-        // Build SET_PREALLOCATED_BUFFER parcel:
-        // slot=0, has_buffer=1, width=1280, height=720, stride=1280,
-        // format=1, usage=0, nvmap_handle=5
+        // Build SET_PREALLOCATED_BUFFER parcel with full NvGraphicBuffer (0x16C bytes).
         let mut parcel = Parcel::new();
         parcel.write_i32(0);    // slot
-        parcel.write_i32(1);    // has_buffer
-        parcel.write_u32(1280); // width
-        parcel.write_u32(720);  // height
-        parcel.write_u32(1280); // stride
-        parcel.write_u32(1);    // format (RGBA8888)
-        parcel.write_u32(0);    // usage
-        parcel.write_u32(5);    // nvmap_handle
+        parcel.write_i32(1);    // has_buffer = true
+        parcel.write_i64(0x16C); // flattened_size
+
+        // NvGraphicBuffer struct (0x16C = 364 bytes = 91 u32 words)
+        let mut gfx_buf = vec![0u32; 91];
+        gfx_buf[0x04 / 4] = 1280;      // width
+        gfx_buf[0x08 / 4] = 720;       // height
+        gfx_buf[0x0C / 4] = 5120;      // stride (bytes)
+        gfx_buf[0x10 / 4] = 1;         // format (RGBA8888)
+        gfx_buf[0x2C / 4] = 5;         // buffer_id (nvmap handle)
+        gfx_buf[0x80 / 4] = 0x1000;    // offset into nvmap buffer
+        for &w in &gfx_buf {
+            parcel.write_u32(w);
+        }
+
         let parcel_bytes = parcel.serialize();
         let mut words: Vec<u32> = vec![0, transact::SET_PREALLOCATED_BUFFER, 0];
         for chunk in parcel_bytes.chunks(4) {
@@ -645,10 +692,13 @@ mod tests {
         let resp = svc.handle_request(0, &cmd);
         assert!(resp.result.is_success());
 
-        // Verify the buffer has the resolved offset.
+        // Verify the buffer has the resolved offset (base + buffer_offset).
         let q = bq.read();
         let buf = q.get_buffer(0).expect("buffer should be set");
-        assert_eq!(buf.offset, 0xCAFE_0000);
+        assert_eq!(buf.offset, 0xCAFE_0000 + 0x1000); // base_addr + buffer_offset
         assert_eq!(buf.nvmap_handle, 5);
+        assert_eq!(buf.width, 1280);
+        assert_eq!(buf.height, 720);
+        assert_eq!(buf.stride, 5120);
     }
 }
