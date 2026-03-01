@@ -6,6 +6,11 @@
 //! Owns the GPU memory manager, syncpoint manager, command processor, and
 //! GPFIFO submission queue. Services push GPFIFO entries via `submit_gpfifo()`,
 //! and the main loop drains the queue via `flush()`.
+//!
+//! Supports two rendering backends:
+//! - **Software** (default): Uses `SoftwareRasterizer` for CPU-based rendering.
+//! - **Vulkan**: Uses `RasterizerVulkan` with the Maxwell shader recompiler
+//!   to compile shaders to SPIR-V and render on the GPU.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,12 +21,13 @@ use crate::backend::null_backend::NullBackend;
 use crate::backend::GpuBackend;
 use crate::command_processor::{CommandProcessor, GpEntry};
 use crate::engines::fermi_2d::Fermi2D;
-use crate::rasterizer::SoftwareRasterizer;
 use crate::engines::inline_to_memory::InlineToMemory;
 use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::maxwell_3d::Maxwell3D;
 use crate::engines::maxwell_dma::MaxwellDMA;
 use crate::memory_manager::GpuMemoryManager;
+use crate::rasterizer::SoftwareRasterizer;
+use crate::renderer::RasterizerVulkan;
 use crate::syncpoint::SyncpointManager;
 
 // ── NvMap registry ──────────────────────────────────────────────────────────
@@ -73,6 +79,17 @@ impl Default for NvMapRegistry {
     }
 }
 
+// ── Rendering mode ──────────────────────────────────────────────────────────
+
+/// GPU rendering backend selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderMode {
+    /// Software rasterizer (CPU-based, default fallback).
+    Software,
+    /// Vulkan GPU renderer using the Maxwell shader recompiler.
+    Vulkan,
+}
+
 // ── GPU context ─────────────────────────────────────────────────────────────
 
 /// Output from a GPU flush — framebuffer data to write back to guest memory.
@@ -108,6 +125,10 @@ pub struct GpuContext {
     gpfifo_queue: Mutex<Vec<GpEntry>>,
     #[allow(dead_code)]
     backend: Mutex<Box<dyn GpuBackend>>,
+    /// Active rendering mode.
+    render_mode: Mutex<RenderMode>,
+    /// Vulkan GPU renderer (initialized lazily via `set_vulkan_renderer`).
+    vulkan_renderer: Mutex<Option<RasterizerVulkan>>,
 }
 
 impl GpuContext {
@@ -128,7 +149,35 @@ impl GpuContext {
             command_processor: Mutex::new(CommandProcessor::new(engines)),
             gpfifo_queue: Mutex::new(Vec::new()),
             backend: Mutex::new(Box::new(NullBackend::new())),
+            render_mode: Mutex::new(RenderMode::Software),
+            vulkan_renderer: Mutex::new(None),
         }
+    }
+
+    /// Set the Vulkan GPU renderer and switch to Vulkan rendering mode.
+    ///
+    /// Called from the main binary after the VulkanPresenter has been created
+    /// and its Vulkan device handles are available.
+    pub fn set_vulkan_renderer(&self, renderer: RasterizerVulkan) {
+        log::info!("GpuContext: Vulkan renderer installed, switching to GPU rendering");
+        *self.vulkan_renderer.lock() = Some(renderer);
+        *self.render_mode.lock() = RenderMode::Vulkan;
+    }
+
+    /// Get the current rendering mode.
+    pub fn render_mode(&self) -> RenderMode {
+        *self.render_mode.lock()
+    }
+
+    /// Set the rendering mode (Software or Vulkan).
+    ///
+    /// If switching to Vulkan and no renderer is installed, falls back to Software.
+    pub fn set_render_mode(&self, mode: RenderMode) {
+        if mode == RenderMode::Vulkan && self.vulkan_renderer.lock().is_none() {
+            log::warn!("GpuContext: cannot switch to Vulkan mode — no renderer installed");
+            return;
+        }
+        *self.render_mode.lock() = mode;
     }
 
     /// Queue GPFIFO entries for processing (called by NvHostGpu SubmitGpfifo).
@@ -179,25 +228,40 @@ impl GpuContext {
         let framebuffers = proc.take_framebuffers();
         let mut framebuffer = framebuffers.into_iter().next();
 
-        // Take draw calls from Maxwell3D and rasterize on top of cleared framebuffer.
+        // Take draw calls from Maxwell3D and render.
         let draw_calls = proc.take_draw_calls();
         if !draw_calls.is_empty() {
-            let raster_writes: std::sync::Mutex<Vec<GpuWriteBack>> =
-                std::sync::Mutex::new(Vec::new());
-            let gpu_write = |gpu_va: u64, data: &[u8]| {
-                raster_writes.lock().unwrap().push(GpuWriteBack {
-                    gpu_va,
-                    data: data.to_vec(),
-                });
-            };
-            let rasterized = SoftwareRasterizer::render_draw_calls(
-                &draw_calls,
-                &gpu_read,
-                &gpu_write,
-                framebuffer,
-            );
-            framebuffer = rasterized;
-            write_backs.extend(raster_writes.into_inner().unwrap());
+            let mode = *self.render_mode.lock();
+            match mode {
+                RenderMode::Vulkan => {
+                    // Try Vulkan rendering, fall back to software on failure.
+                    let mut vk_renderer = self.vulkan_renderer.lock();
+                    if let Some(ref mut renderer) = *vk_renderer {
+                        let result = renderer.render_draw_calls(
+                            &draw_calls,
+                            &gpu_read,
+                            framebuffer,
+                        );
+                        framebuffer = result;
+                    } else {
+                        log::warn!("GpuContext: Vulkan mode but no renderer — falling back to software");
+                        framebuffer = self.render_software(
+                            &draw_calls,
+                            &gpu_read,
+                            framebuffer,
+                            &mut write_backs,
+                        );
+                    }
+                }
+                RenderMode::Software => {
+                    framebuffer = self.render_software(
+                        &draw_calls,
+                        &gpu_read,
+                        framebuffer,
+                        &mut write_backs,
+                    );
+                }
+            }
         }
 
         let framebuffer = framebuffer.map(|fb| FramebufferOutput {
@@ -211,6 +275,32 @@ impl GpuContext {
             framebuffer,
             write_backs,
         })
+    }
+
+    /// Software rasterizer rendering path.
+    fn render_software(
+        &self,
+        draw_calls: &[crate::engines::maxwell_3d::DrawCall],
+        gpu_read: &dyn Fn(u64, &mut [u8]),
+        framebuffer: Option<crate::engines::Framebuffer>,
+        write_backs: &mut Vec<GpuWriteBack>,
+    ) -> Option<crate::engines::Framebuffer> {
+        let raster_writes: std::sync::Mutex<Vec<GpuWriteBack>> =
+            std::sync::Mutex::new(Vec::new());
+        let gpu_write = |gpu_va: u64, data: &[u8]| {
+            raster_writes.lock().unwrap().push(GpuWriteBack {
+                gpu_va,
+                data: data.to_vec(),
+            });
+        };
+        let rasterized = SoftwareRasterizer::render_draw_calls(
+            draw_calls,
+            gpu_read,
+            &gpu_write,
+            framebuffer,
+        );
+        write_backs.extend(raster_writes.into_inner().unwrap());
+        rasterized
     }
 }
 
@@ -289,5 +379,19 @@ mod tests {
         // Queue should be empty after flush.
         let queue = ctx.gpfifo_queue.lock();
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_render_mode_default() {
+        let ctx = GpuContext::new();
+        assert_eq!(ctx.render_mode(), RenderMode::Software);
+    }
+
+    #[test]
+    fn test_render_mode_no_vulkan_fallback() {
+        let ctx = GpuContext::new();
+        // Cannot switch to Vulkan without a renderer installed.
+        ctx.set_render_mode(RenderMode::Vulkan);
+        assert_eq!(ctx.render_mode(), RenderMode::Software);
     }
 }

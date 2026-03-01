@@ -1043,6 +1043,33 @@ impl VulkanPresenter {
 
         Ok((swapchain, images, format.format, extent))
     }
+
+    // ── Vulkan handle accessors for VulkanRenderer ──────────────────────
+
+    /// Get a clone of the Vulkan instance.
+    pub fn instance(&self) -> ash::Instance {
+        self.instance.clone()
+    }
+
+    /// Get the physical device handle.
+    pub fn physical_device(&self) -> ash::vk::PhysicalDevice {
+        self.physical_device
+    }
+
+    /// Get a clone of the Vulkan logical device.
+    pub fn device(&self) -> ash::Device {
+        self.device.clone()
+    }
+
+    /// Get the graphics queue handle.
+    pub fn graphics_queue(&self) -> ash::vk::Queue {
+        self.graphics_queue
+    }
+
+    /// Get the graphics queue family index.
+    pub fn queue_family_index(&self) -> u32 {
+        self.queue_family_index
+    }
 }
 
 impl Drop for VulkanPresenter {
