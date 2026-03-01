@@ -54,11 +54,80 @@ impl ServiceHandler for AudRendererService {
 
 // ── audren:IAudioRenderer ────────────────────────────────────────────────────
 
-pub struct AudioRendererService;
+/// Memory pool output state: Attached.
+const MEMPOOL_STATE_ATTACHED: u32 = 5;
+
+/// Default renderer parameters (matches typical MK8 configuration).
+struct RendererParams {
+    voice_count: u32,
+    effect_count: u32,
+    sink_count: u32,
+    mempool_count: u32,
+}
+
+impl Default for RendererParams {
+    fn default() -> Self {
+        Self {
+            voice_count: 24,
+            effect_count: 0,
+            sink_count: 2,
+            mempool_count: 4,
+        }
+    }
+}
+
+pub struct AudioRendererService {
+    params: RendererParams,
+}
 
 impl AudioRendererService {
     pub fn new() -> Self {
-        Self
+        Self {
+            params: RendererParams::default(),
+        }
+    }
+
+    /// Build the RequestUpdate output buffer.
+    ///
+    /// Output layout (per zuyu):
+    ///   0x40: UpdateDataHeader
+    ///   voice_count * 0x10: VoiceOutStatus (zeroed = stopped)
+    ///   effect_count * 0x10: EffectOutStatus
+    ///   sink_count * 0x20: SinkOutStatus
+    ///   mempool_count * 0x10: MemPoolOutStatus (state = Attached)
+    ///   0x10: PerformanceOutStatus
+    ///   0x10: BehaviorOutStatus
+    ///   0x10: RenderInfoOut
+    fn build_request_update_output(&self) -> Vec<u8> {
+        let p = &self.params;
+
+        let voice_out_size = p.voice_count as usize * 0x10;
+        let effect_out_size = p.effect_count as usize * 0x10;
+        let sink_out_size = p.sink_count as usize * 0x20;
+        let mempool_out_size = p.mempool_count as usize * 0x10;
+        let perf_out_size = 0x10;
+        let behavior_out_size = 0x10;
+        let render_info_size = 0x10;
+
+        let total = 0x40 + voice_out_size + effect_out_size + sink_out_size
+            + mempool_out_size + perf_out_size + behavior_out_size + render_info_size;
+
+        let mut buf = vec![0u8; total];
+
+        // Write output header size field at offset 0x3C.
+        let total_u32 = total as u32;
+        buf[0x3C..0x40].copy_from_slice(&total_u32.to_le_bytes());
+
+        // Set all memory pool output entries to Attached (state = 5).
+        let mempool_offset = 0x40 + voice_out_size + effect_out_size + sink_out_size;
+        for i in 0..p.mempool_count as usize {
+            let entry = mempool_offset + i * 0x10;
+            if entry + 4 <= buf.len() {
+                buf[entry..entry + 4].copy_from_slice(&MEMPOOL_STATE_ATTACHED.to_le_bytes());
+            }
+        }
+
+        buf
     }
 }
 
@@ -80,10 +149,11 @@ impl ServiceHandler for AudioRendererService {
                 log::info!("audren:IAudioRenderer: GetSampleCount (240)");
                 IpcResponse::success_with_data(vec![240])
             }
-            // RequestUpdate
+            // RequestUpdate — return properly-sized output with mempool states
             4 => {
                 log::debug!("audren:IAudioRenderer: RequestUpdate");
-                IpcResponse::success()
+                let output = self.build_request_update_output();
+                IpcResponse::success().with_out_buf(output)
             }
             // Start
             5 => {

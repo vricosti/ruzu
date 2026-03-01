@@ -23,6 +23,8 @@ pub struct NvdrvService {
     next_fd: u32,
     /// Shared GPU context for device creation.
     gpu: Arc<GpuContext>,
+    /// Kernel event handle for GPU channel completion, returned by QueryEvent.
+    gpu_event_handle: Option<u32>,
 }
 
 impl NvdrvService {
@@ -31,6 +33,17 @@ impl NvdrvService {
             devices: HashMap::new(),
             next_fd: 1,
             gpu,
+            gpu_event_handle: None,
+        }
+    }
+
+    /// Create with a pre-assigned GPU event handle for QueryEvent responses.
+    pub fn new_with_event(gpu: Arc<GpuContext>, event_handle: u32) -> Self {
+        Self {
+            devices: HashMap::new(),
+            next_fd: 1,
+            gpu,
+            gpu_event_handle: Some(event_handle),
         }
     }
 
@@ -141,8 +154,14 @@ impl ServiceHandler for NvdrvService {
 
             // ── QueryEvent (4) ───────────────────────────────────────────
             4 => {
-                log::info!("nvdrv: QueryEvent");
-                IpcResponse::success()
+                let fd = command.raw_data.first().copied().unwrap_or(0);
+                let event_id = command.raw_data.get(1).copied().unwrap_or(0);
+                log::info!("nvdrv: QueryEvent fd={}, event_id={}", fd, event_id);
+                let mut resp = IpcResponse::success_with_data(vec![0]); // nv_result = 0
+                if let Some(handle) = self.gpu_event_handle {
+                    resp = resp.with_copy_handle(handle);
+                }
+                resp
             }
 
             // ── SetAruid (8) ─────────────────────────────────────────────
