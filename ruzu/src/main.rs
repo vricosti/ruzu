@@ -915,6 +915,7 @@ fn run_with_window(
         {
             let mut hid = hid_shared_mem.write();
             hid.update_input(input.buttons, input.l_stick, input.r_stick);
+            hid.update_touch(input.touch);
 
             // Sync HID data to guest memory if the game has mapped it.
             let guest_addr = hid_guest_addr.load(Ordering::Relaxed);

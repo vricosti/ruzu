@@ -10,6 +10,13 @@
 /// Total size of the HID shared memory region.
 pub const HID_SHARED_MEMORY_SIZE: usize = 0x40000;
 
+/// Offset of the touch screen section within HID shared memory.
+const TOUCHSCREEN_OFFSET: usize = 0x400;
+
+/// Size of one touch screen LIFO entry (AtomicStorage<TouchScreenState>).
+/// 8-byte sampling_number + 0x290-byte TouchScreenState = 0x298.
+const TOUCH_LIFO_ENTRY_SIZE: usize = 0x298;
+
 /// Offset of the first Npad entry within HID shared memory.
 const NPAD_OFFSET: usize = 0x9A00;
 
@@ -128,6 +135,16 @@ impl HidSharedMemory {
         shm.write_i64(lifo_base + 16, 0); // tail
         shm.write_i64(lifo_base + 24, LIFO_ENTRY_COUNT as i64); // count (ring capacity)
 
+        // Initialize touch screen LIFO header.
+        let touch_base = TOUCHSCREEN_OFFSET;
+        shm.write_i64(touch_base, 0); // timestamp
+        shm.write_i64(touch_base + 8, 0); // total_count
+        shm.write_i64(touch_base + 16, 0); // tail
+        shm.write_i64(touch_base + 24, LIFO_ENTRY_COUNT as i64); // count
+
+        // Write an initial entry so games see a connected controller on first read.
+        shm.update_input(0, (0, 0), (0, 0));
+
         shm
     }
 
@@ -179,6 +196,60 @@ impl HidSharedMemory {
         self.write_i64(lifo_base, self.sampling_number);
         self.write_i64(lifo_base + 8, total_count + 1);
         self.write_i64(lifo_base + 16, tail);
+    }
+
+    /// Update the touch screen state.
+    ///
+    /// If `touch` is `Some((x, y))`, writes a single active touch point.
+    /// If `None`, writes zero touch points (no touch).
+    pub fn update_touch(&mut self, touch: Option<(u32, u32)>) {
+        let touch_base = TOUCHSCREEN_OFFSET;
+
+        let total_count = self.read_i64(touch_base + 8);
+        let tail = total_count % LIFO_ENTRY_COUNT as i64;
+        let entry_offset =
+            touch_base + LIFO_HEADER_SIZE + (tail as usize) * TOUCH_LIFO_ENTRY_SIZE;
+
+        // AtomicStorage<TouchScreenState>:
+        //   +0x00: sampling_number (i64)
+        //   +0x08: TouchScreenState.sampling_number (i64)
+        //   +0x10: TouchScreenState.entry_count (i32)
+        //   +0x14: padding (4 bytes)
+        //   +0x18: TouchState[0] (0x28 bytes)
+        self.write_i64(entry_offset, self.sampling_number);
+
+        // TouchScreenState
+        self.write_i64(entry_offset + 0x08, self.sampling_number);
+
+        if let Some((x, y)) = touch {
+            self.write_i32(entry_offset + 0x10, 1); // entry_count = 1 touch
+
+            // TouchState[0]:
+            //   +0x00: delta_time (u64)
+            //   +0x08: attribute (u32) — bit 0 = start_touch
+            //   +0x0C: finger (u32)
+            //   +0x10: position_x (u32)
+            //   +0x14: position_y (u32)
+            //   +0x18: diameter_x (u32)
+            //   +0x1C: diameter_y (u32)
+            //   +0x20: rotation_angle (i32)
+            let ts_offset = entry_offset + 0x18;
+            self.write_u64(ts_offset, 0); // delta_time
+            self.write_u32(ts_offset + 0x08, 1); // attribute: start_touch
+            self.write_u32(ts_offset + 0x0C, 0); // finger 0
+            self.write_u32(ts_offset + 0x10, x); // position_x
+            self.write_u32(ts_offset + 0x14, y); // position_y
+            self.write_u32(ts_offset + 0x18, 10); // diameter_x
+            self.write_u32(ts_offset + 0x1C, 10); // diameter_y
+            self.write_i32(ts_offset + 0x20, 0); // rotation_angle
+        } else {
+            self.write_i32(entry_offset + 0x10, 0); // entry_count = 0 (no touch)
+        }
+
+        // Update LIFO header.
+        self.write_i64(touch_base, self.sampling_number);
+        self.write_i64(touch_base + 8, total_count + 1);
+        self.write_i64(touch_base + 16, tail);
     }
 
     // ── Byte-level helpers ─────────────────────────────────────────────────
@@ -243,20 +314,23 @@ mod tests {
     #[test]
     fn test_update_input_increments_sampling_number() {
         let mut shm = HidSharedMemory::new();
+        // new() calls update_input once, so sampling_number starts at 1.
+        let base = shm.sampling_number;
         shm.update_input(buttons::A, (0, 0), (0, 0));
-        assert_eq!(shm.sampling_number, 1);
+        assert_eq!(shm.sampling_number, base + 1);
 
         shm.update_input(buttons::B, (100, -100), (0, 0));
-        assert_eq!(shm.sampling_number, 2);
+        assert_eq!(shm.sampling_number, base + 2);
     }
 
     #[test]
     fn test_update_input_writes_buttons() {
         let mut shm = HidSharedMemory::new();
+        // new() wrote an initial entry at slot 0. Next update goes to slot 1.
         shm.update_input(buttons::A | buttons::DPAD_UP, (0, 0), (0, 0));
 
         let lifo_base = NPAD_OFFSET + HANDHELD_LIFO_OFFSET;
-        let entry_offset = lifo_base + LIFO_HEADER_SIZE;
+        let entry_offset = lifo_base + LIFO_HEADER_SIZE + LIFO_ENTRY_SIZE; // slot 1
 
         let btns = u64::from_le_bytes(
             shm.data[entry_offset + 8..entry_offset + 16]
@@ -269,9 +343,8 @@ mod tests {
     #[test]
     fn test_ring_buffer_wraps() {
         let mut shm = HidSharedMemory::new();
-
-        // Fill 17 entries (one full ring).
-        for i in 0..LIFO_ENTRY_COUNT {
+        // new() already wrote 1 entry. Write 16 more to fill the ring (17 total).
+        for i in 0..LIFO_ENTRY_COUNT - 1 {
             shm.update_input(i as u64, (0, 0), (0, 0));
         }
 
@@ -283,6 +356,56 @@ mod tests {
         shm.update_input(0xFF, (0, 0), (0, 0));
         let tail = shm.read_i64(lifo_base + 16);
         assert_eq!(tail, 0);
+    }
+
+    #[test]
+    fn test_update_touch_writes_position() {
+        let mut shm = HidSharedMemory::new();
+        // Touch LIFO total_count starts at 0. First update_touch goes to slot 0.
+        shm.update_touch(Some((640, 360)));
+
+        let touch_base = TOUCHSCREEN_OFFSET;
+        let entry_offset = touch_base + LIFO_HEADER_SIZE; // slot 0
+
+        // entry_count at +0x10
+        let count = i32::from_le_bytes(
+            shm.data[entry_offset + 0x10..entry_offset + 0x14]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(count, 1);
+
+        // TouchState[0].position_x at +0x18 + 0x10
+        let ts_offset = entry_offset + 0x18;
+        let x = u32::from_le_bytes(
+            shm.data[ts_offset + 0x10..ts_offset + 0x14]
+                .try_into()
+                .unwrap(),
+        );
+        let y = u32::from_le_bytes(
+            shm.data[ts_offset + 0x14..ts_offset + 0x18]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(x, 640);
+        assert_eq!(y, 360);
+    }
+
+    #[test]
+    fn test_update_touch_none_clears() {
+        let mut shm = HidSharedMemory::new();
+        shm.update_touch(Some((100, 200)));
+        shm.update_touch(None);
+
+        let touch_base = TOUCHSCREEN_OFFSET;
+        // First update_touch wrote slot 0, second wrote slot 1.
+        let entry_offset = touch_base + LIFO_HEADER_SIZE + TOUCH_LIFO_ENTRY_SIZE; // slot 1
+        let count = i32::from_le_bytes(
+            shm.data[entry_offset + 0x10..entry_offset + 0x14]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(count, 0); // no touch
     }
 
     #[test]
