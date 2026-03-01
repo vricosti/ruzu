@@ -14,7 +14,7 @@
 use crate::state::CpuState;
 use rdynarmic::halt_reason::HaltReason;
 use rdynarmic::jit::A64Jit;
-use rdynarmic::jit_config::{JitCallbacks, JitConfig};
+use rdynarmic::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
 
 // ---------------------------------------------------------------------------
 // Memory access vtable (avoids circular crate dependency)
@@ -233,7 +233,8 @@ impl ArmDynarmic64 {
             callbacks: Box::new(callbacks),
             enable_cycle_counting: true,
             code_cache_size: JitConfig::DEFAULT_CODE_CACHE_SIZE,
-            enable_optimizations: true,
+            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+            unsafe_optimizations: false,
         };
 
         let jit = A64Jit::new(config)?;
