@@ -188,23 +188,7 @@ pub fn load_nsp(
         }
     }
 
-    // Open RomFS from Program NCA
-    let romfs_data = match nca::open_romfs(program_nca.file.as_ref(), &program_nca.header, keys) {
-        Ok(Some(data)) => {
-            log::info!("Extracted RomFS: {} bytes", data.len());
-            Some(data)
-        }
-        Ok(None) => {
-            log::info!("No RomFS section found in Program NCA");
-            None
-        }
-        Err(e) => {
-            log::warn!("Failed to extract RomFS from Program NCA: {}", e);
-            None
-        }
-    };
-
-    // Open ExeFS from Program NCA
+    // Open ExeFS from Program NCA (small, needed for boot)
     let (exefs_pfs, exefs_data) = nca::open_exefs(program_nca.file.as_ref(), &program_nca.header, keys)?
         .ok_or(NspError::NoExeFs)?;
 
@@ -216,6 +200,24 @@ pub fn load_nsp(
 
     let nso_data = main_file.read_all().map_err(NspError::Io)?;
     let code_set = nso::load_nso(&nso_data)?;
+
+    // Skip eager RomFS loading — it can be GBs and should be accessed lazily.
+    // TODO: implement lazy VFS-based RomFS access instead of loading into memory.
+    let romfs_data = None;
+    if let Some(romfs_section) = program_nca
+        .header
+        .sections
+        .iter()
+        .find(|s| s.fs_type == nca::NcaSectionFsType::RomFs)
+    {
+        let size = romfs_section.end_offset - romfs_section.start_offset;
+        log::info!(
+            "RomFS section found: {} bytes (deferred, not loaded into memory)",
+            size
+        );
+    } else {
+        log::info!("No RomFS section found in Program NCA");
+    }
 
     Ok(NspLoadResult {
         code_set,

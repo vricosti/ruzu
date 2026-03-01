@@ -111,26 +111,27 @@ pub fn load_nso(data: &[u8]) -> Result<CodeSet, NsoError> {
     let flags = cur.read_u32::<LittleEndian>()?;
 
     // Segment headers: [text, rodata, data]
-    // Each is: memory_offset(4) + file_offset(4) + decompressed_size(4) = 12 bytes
+    // Each is: file_offset(4) + memory_offset(4) + decompressed_size(4) = 12 bytes
+    // (zuyu NSOSegmentHeader: offset, location, size)
     // [0x10] text segment header
-    let text_mem_offset = cur.read_u32::<LittleEndian>()?;
     let text_file_offset = cur.read_u32::<LittleEndian>()?;
+    let text_mem_offset = cur.read_u32::<LittleEndian>()?;
     let text_decompressed_size = cur.read_u32::<LittleEndian>()?;
 
     // [0x1C] module_name_offset
     let _module_name_offset = cur.read_u32::<LittleEndian>()?;
 
     // [0x20] rodata segment header
-    let rodata_mem_offset = cur.read_u32::<LittleEndian>()?;
     let rodata_file_offset = cur.read_u32::<LittleEndian>()?;
+    let rodata_mem_offset = cur.read_u32::<LittleEndian>()?;
     let rodata_decompressed_size = cur.read_u32::<LittleEndian>()?;
 
     // [0x2C] module_name_size
     let _module_name_size = cur.read_u32::<LittleEndian>()?;
 
     // [0x30] data segment header
-    let data_mem_offset = cur.read_u32::<LittleEndian>()?;
     let data_file_offset = cur.read_u32::<LittleEndian>()?;
+    let data_mem_offset = cur.read_u32::<LittleEndian>()?;
     let data_decompressed_size = cur.read_u32::<LittleEndian>()?;
 
     // [0x3C] BSS size
@@ -378,23 +379,23 @@ mod tests {
         put_u32(&mut buf, 0x08, 0); // reserved
         put_u32(&mut buf, 0x0C, flags);
 
-        // text segment header
-        put_u32(&mut buf, 0x10, text_mem_offset);
-        put_u32(&mut buf, 0x14, text_file_offset);
+        // text segment header (file_offset, mem_offset, decompressed_size)
+        put_u32(&mut buf, 0x10, text_file_offset);
+        put_u32(&mut buf, 0x14, text_mem_offset);
         put_u32(&mut buf, 0x18, text.len() as u32);
 
         put_u32(&mut buf, 0x1C, 0); // module_name_offset
 
-        // rodata segment header
-        put_u32(&mut buf, 0x20, rodata_mem_offset);
-        put_u32(&mut buf, 0x24, rodata_file_offset);
+        // rodata segment header (file_offset, mem_offset, decompressed_size)
+        put_u32(&mut buf, 0x20, rodata_file_offset);
+        put_u32(&mut buf, 0x24, rodata_mem_offset);
         put_u32(&mut buf, 0x28, rodata.len() as u32);
 
         put_u32(&mut buf, 0x2C, 0); // module_name_size
 
-        // data segment header
-        put_u32(&mut buf, 0x30, data_mem_offset);
-        put_u32(&mut buf, 0x34, data_file_offset);
+        // data segment header (file_offset, mem_offset, decompressed_size)
+        put_u32(&mut buf, 0x30, data_file_offset);
+        put_u32(&mut buf, 0x34, data_mem_offset);
         put_u32(&mut buf, 0x38, data_seg.len() as u32);
 
         // BSS size
