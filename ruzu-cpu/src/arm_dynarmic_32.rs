@@ -15,7 +15,7 @@ use crate::arm_dynarmic_64::MemoryVtable;
 use crate::state::CpuState;
 use rdynarmic::halt_reason::HaltReason;
 use rdynarmic::jit::A32Jit;
-use rdynarmic::jit_config::{JitCallbacks, JitConfig};
+use rdynarmic::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
 
 // ---------------------------------------------------------------------------
 // Shared callback state
@@ -176,7 +176,8 @@ impl ArmDynarmic32 {
             callbacks: Box::new(callbacks),
             enable_cycle_counting: true,
             code_cache_size: JitConfig::DEFAULT_CODE_CACHE_SIZE,
-            enable_optimizations: true,
+            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+            unsafe_optimizations: false,
         };
 
         let jit = A32Jit::new(config)?;
