@@ -338,6 +338,13 @@ fn main() -> Result<()> {
         .create_event_in_process()
         .expect("failed to create vsync event handle");
 
+    let gpu_event_handle = kernel
+        .create_event_in_process()
+        .expect("failed to create GPU event handle");
+
+    // Pre-signal the GPU event so nvdrv QueryEvent callers don't block.
+    kernel.signal_event(gpu_event_handle);
+
     let text_seg = &code_set.segments[0];
     let rodata_seg = &code_set.segments[1];
     let data_seg = &code_set.segments[2];
@@ -431,10 +438,10 @@ fn main() -> Result<()> {
         "hid",
         Box::new(ruzu_service::hid::HidService::new_with_shm_handle(hid_shm_handle)),
     );
-    manager.register_service("nvdrv", Box::new(ruzu_service::nvdrv::NvdrvService::new(gpu.clone())));
-    manager.register_service("nvdrv:a", Box::new(ruzu_service::nvdrv::NvdrvService::new(gpu.clone())));
-    manager.register_service("nvdrv:s", Box::new(ruzu_service::nvdrv::NvdrvService::new(gpu.clone())));
-    manager.register_service("nvdrv:t", Box::new(ruzu_service::nvdrv::NvdrvService::new(gpu.clone())));
+    manager.register_service("nvdrv", Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(gpu.clone(), gpu_event_handle)));
+    manager.register_service("nvdrv:a", Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(gpu.clone(), gpu_event_handle)));
+    manager.register_service("nvdrv:s", Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(gpu.clone(), gpu_event_handle)));
+    manager.register_service("nvdrv:t", Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(gpu.clone(), gpu_event_handle)));
     manager.register_service("vi:m", Box::new(ruzu_service::vi::ViManagerService::new()));
     manager.register_service(
         "vi:IApplicationDisplayService",

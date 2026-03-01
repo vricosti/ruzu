@@ -28,6 +28,9 @@ const LIFO_ENTRY_COUNT: usize = 17;
 //   +0x378: handheld_lifo (0x350 bytes)
 //   ...
 
+/// Offset of the fullkey (Pro Controller) LIFO within an Npad entry.
+const FULLKEY_LIFO_OFFSET: usize = 0x28;
+
 /// Offset of the handheld LIFO within an Npad entry.
 const HANDHELD_LIFO_OFFSET: usize = 0x378;
 
@@ -80,6 +83,10 @@ const CONNECTED: u32 = 0x1;
 const HANDHELD: u32 = 0x2;
 const USING_BODY: u32 = 0x4;
 
+/// Npad style bits.
+const STYLE_FULLKEY: u32 = 0x01; // Pro Controller
+const STYLE_HANDHELD: u32 = 0x20; // Handheld
+
 /// HID shared memory buffer with ring buffer management.
 pub struct HidSharedMemory {
     /// The raw 256 KB buffer.
@@ -99,8 +106,20 @@ impl HidSharedMemory {
         // Initialize the first Npad entry (player 1 / handheld).
         let entry_base = NPAD_OFFSET;
 
-        // Style tag: 0x20 = NpadHandheld
-        shm.write_u32(entry_base, 0x20);
+        // Style tag: support both Handheld and Pro Controller.
+        shm.write_u32(entry_base, STYLE_HANDHELD | STYLE_FULLKEY);
+
+        // Fullkey color data (offset +0x08): body=0x2D2D2D (dark gray), buttons=0xE6E6E6 (light gray)
+        shm.write_u32(entry_base + 0x08, 1); // single_colors_count = 1
+        shm.write_u32(entry_base + 0x0C, 0x2D2D2D); // body color
+        shm.write_u32(entry_base + 0x10, 0xE6E6E6); // button color
+
+        // Initialize fullkey LIFO header.
+        let fullkey_base = entry_base + FULLKEY_LIFO_OFFSET;
+        shm.write_i64(fullkey_base, 0); // timestamp
+        shm.write_i64(fullkey_base + 8, 0); // total_count
+        shm.write_i64(fullkey_base + 16, 0); // tail
+        shm.write_i64(fullkey_base + 24, LIFO_ENTRY_COUNT as i64); // count
 
         // Initialize handheld LIFO header.
         let lifo_base = entry_base + HANDHELD_LIFO_OFFSET;
@@ -112,32 +131,54 @@ impl HidSharedMemory {
         shm
     }
 
-    /// Update the handheld controller state in the ring buffer.
+    /// Update the handheld and fullkey controller state in both ring buffers.
     pub fn update_input(&mut self, btns: u64, l_stick: (i32, i32), r_stick: (i32, i32)) {
         let entry_base = NPAD_OFFSET;
-        let lifo_base = entry_base + HANDHELD_LIFO_OFFSET;
+        self.sampling_number += 1;
 
-        // Read current total_count to compute tail.
+        // Update handheld LIFO.
+        self.write_lifo_entry(
+            entry_base + HANDHELD_LIFO_OFFSET,
+            btns,
+            l_stick,
+            r_stick,
+            CONNECTED | HANDHELD | USING_BODY,
+        );
+
+        // Update fullkey (Pro Controller) LIFO with same input.
+        self.write_lifo_entry(
+            entry_base + FULLKEY_LIFO_OFFSET,
+            btns,
+            l_stick,
+            r_stick,
+            CONNECTED | USING_BODY,
+        );
+    }
+
+    /// Write a single entry to a LIFO ring buffer and update its header.
+    fn write_lifo_entry(
+        &mut self,
+        lifo_base: usize,
+        btns: u64,
+        l_stick: (i32, i32),
+        r_stick: (i32, i32),
+        connection_status: u32,
+    ) {
         let total_count = self.read_i64(lifo_base + 8);
         let tail = total_count % LIFO_ENTRY_COUNT as i64;
-
-        // Compute entry offset within the LIFO.
         let entry_offset = lifo_base + LIFO_HEADER_SIZE + (tail as usize) * LIFO_ENTRY_SIZE;
 
-        // Write NpadGenericState.
-        self.sampling_number += 1;
-        self.write_i64(entry_offset, self.sampling_number); // sampling_number
-        self.write_u64(entry_offset + 8, btns); // buttons
-        self.write_i32(entry_offset + 0x10, l_stick.0); // l_stick_x
-        self.write_i32(entry_offset + 0x14, l_stick.1); // l_stick_y
-        self.write_i32(entry_offset + 0x18, r_stick.0); // r_stick_x
-        self.write_i32(entry_offset + 0x1C, r_stick.1); // r_stick_y
-        self.write_u32(entry_offset + 0x20, CONNECTED | HANDHELD | USING_BODY); // connection_status
+        self.write_i64(entry_offset, self.sampling_number);
+        self.write_u64(entry_offset + 8, btns);
+        self.write_i32(entry_offset + 0x10, l_stick.0);
+        self.write_i32(entry_offset + 0x14, l_stick.1);
+        self.write_i32(entry_offset + 0x18, r_stick.0);
+        self.write_i32(entry_offset + 0x1C, r_stick.1);
+        self.write_u32(entry_offset + 0x20, connection_status);
 
-        // Update LIFO header.
-        self.write_i64(lifo_base, self.sampling_number); // timestamp
-        self.write_i64(lifo_base + 8, total_count + 1); // total_count
-        self.write_i64(lifo_base + 16, tail); // tail index
+        self.write_i64(lifo_base, self.sampling_number);
+        self.write_i64(lifo_base + 8, total_count + 1);
+        self.write_i64(lifo_base + 16, tail);
     }
 
     // ── Byte-level helpers ─────────────────────────────────────────────────
@@ -192,11 +233,11 @@ mod tests {
         let shm = HidSharedMemory::new();
         assert_eq!(shm.data.len(), HID_SHARED_MEMORY_SIZE);
 
-        // Check style tag is set to NpadHandheld (0x20).
+        // Check style tag is set to NpadHandheld | NpadFullKey (0x21).
         let style_tag = u32::from_le_bytes(
             shm.data[NPAD_OFFSET..NPAD_OFFSET + 4].try_into().unwrap(),
         );
-        assert_eq!(style_tag, 0x20);
+        assert_eq!(style_tag, STYLE_HANDHELD | STYLE_FULLKEY);
     }
 
     #[test]

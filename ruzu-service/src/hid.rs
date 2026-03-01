@@ -76,7 +76,8 @@ impl ServiceHandler for HidService {
 
             // ── SetSupportedNpadStyleSet (100) ───────────────────────────
             100 => {
-                log::info!("hid: SetSupportedNpadStyleSet");
+                let style_tag = _command.raw_data.first().copied().unwrap_or(0);
+                log::info!("hid: SetSupportedNpadStyleSet style_tag=0x{:X}", style_tag);
                 IpcResponse::success()
             }
 

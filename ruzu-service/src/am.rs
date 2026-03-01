@@ -12,6 +12,8 @@
 //!                                 -> ILibraryAppletCreator
 //!                                 -> IApplicationFunctions
 
+use std::collections::VecDeque;
+
 use crate::framework::ServiceHandler;
 use crate::ipc::{IpcCommand, IpcResponse};
 use ruzu_common::ResultCode;
@@ -155,10 +157,15 @@ impl ServiceHandler for ApplicationProxyService {
 
 // ── ICommonStateGetter ───────────────────────────────────────────────────────
 
+/// AM message types.
+const MSG_FOCUS_STATE_CHANGED: u32 = 15;
+
 pub struct CommonStateGetterService {
     /// Kernel event handle returned for GetEventHandle.
     /// Pre-signaled at startup so games see "in focus" immediately.
     event_handle: u32,
+    /// Message queue. Populated with initial messages at creation.
+    message_queue: VecDeque<u32>,
 }
 
 impl CommonStateGetterService {
@@ -169,7 +176,13 @@ impl CommonStateGetterService {
 
     /// Create with a real kernel event handle allocated by the caller.
     pub fn new_with_event(event_handle: u32) -> Self {
-        Self { event_handle }
+        let mut queue = VecDeque::new();
+        // Games expect a FocusStateChanged message on first ReceiveMessage call.
+        queue.push_back(MSG_FOCUS_STATE_CHANGED);
+        Self {
+            event_handle,
+            message_queue: queue,
+        }
     }
 }
 
@@ -192,10 +205,15 @@ impl ServiceHandler for CommonStateGetterService {
                 log::info!("am:ICommonStateGetter: GetEventHandle (handle={})", self.event_handle);
                 IpcResponse::success().with_copy_handle(self.event_handle)
             }
-            // ReceiveMessage — no messages available
+            // ReceiveMessage — pop from message queue
             1 => {
-                log::info!("am:ICommonStateGetter: ReceiveMessage (no messages)");
-                IpcResponse::error(AM_NO_MESSAGES)
+                if let Some(msg) = self.message_queue.pop_front() {
+                    log::info!("am:ICommonStateGetter: ReceiveMessage -> msg={}", msg);
+                    IpcResponse::success_with_data(vec![msg])
+                } else {
+                    log::info!("am:ICommonStateGetter: ReceiveMessage (no messages)");
+                    IpcResponse::error(AM_NO_MESSAGES)
+                }
             }
             // GetOperationMode — handheld
             5 => {
@@ -545,6 +563,13 @@ mod tests {
     fn test_common_state_getter_receive_message() {
         let mut svc = CommonStateGetterService::new();
         let cmd = make_command(1);
+
+        // First call returns FocusStateChanged (msg 15).
+        let resp = svc.handle_request(1, &cmd);
+        assert!(resp.result.is_success());
+        assert_eq!(resp.data, vec![MSG_FOCUS_STATE_CHANGED]);
+
+        // Second call returns no messages.
         let resp = svc.handle_request(1, &cmd);
         assert!(resp.result.is_error());
         assert_eq!(resp.result, AM_NO_MESSAGES);
