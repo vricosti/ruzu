@@ -10,11 +10,12 @@
 use crate::engines::maxwell_3d::{
     BlendColorInfo, BlendEquation, BlendFactor, BlendInfo, ColorMaskInfo, ComponentType,
     ComparisonOp, CullFace, DepthStencilInfo, DrawCall, FrontFace, IndexFormat,
-    PrimitiveTopology, RasterizerInfo, SamplerDescriptor, ScissorInfo, StencilOp, SwizzleSource,
-    TextureDescriptor, TextureFilter, TextureFormat, TextureType, TicHeaderVersion,
+    PrimitiveTopology, RasterizerInfo, SamplerDescriptor, ScissorInfo, ShaderStageType, StencilOp,
+    SwizzleSource, TextureDescriptor, TextureFilter, TextureFormat, TextureType, TicHeaderVersion,
     VertexAttribSize, VertexAttribType, WrapMode,
 };
 use crate::engines::Framebuffer;
+use crate::shader;
 
 /// Cached pre-decoded RGBA8 texture data, loaded once per draw call.
 struct SampledTexture {
@@ -1153,77 +1154,34 @@ impl SoftwareRasterizer {
         let mut stencil_buf = vec![0u8; (fb_width * fb_height) as usize];
 
         for draw in draws {
-            let positions = fetch_positions(draw, read_gpu);
-            if positions.is_empty() {
-                continue;
-            }
+            // Check if vertex shader (slot 1 = VertexB) is enabled.
+            let has_vs = draw.shader_stages[1].enabled
+                && draw.shader_stages[1].program_type == ShaderStageType::VertexB;
+            let has_fs = draw.shader_stages[5].enabled
+                && draw.shader_stages[5].program_type == ShaderStageType::Fragment;
 
-            let vert_count = positions.len();
-            let colors = fetch_vertex_colors(draw, read_gpu, vert_count);
-            let texture = load_texture(draw, read_gpu);
-            let uvs = if texture.is_some() {
-                fetch_texture_coords(draw, read_gpu, vert_count)
-            } else {
-                None
-            };
-            let default_uv = [0.0f32, 0.0];
-
-            let triangles = process_topology(&positions, draw.topology);
-            let viewport = &draw.viewports[0];
-
-            // Determine effective viewport dimensions (fall back to RT size).
-            let vp_width = if viewport.width > 0.0 {
-                viewport.width
-            } else {
-                fb_width as f32
-            };
-            let vp_height = if viewport.height > 0.0 {
-                viewport.height
-            } else {
-                fb_height as f32
-            };
-            let vp_x = viewport.x;
-            let vp_y = viewport.y;
-
-            for tri in &triangles {
-                let p0 = viewport_transform(positions[tri[0]], vp_x, vp_y, vp_width, vp_height);
-                let p1 = viewport_transform(positions[tri[1]], vp_x, vp_y, vp_width, vp_height);
-                let p2 = viewport_transform(positions[tri[2]], vp_x, vp_y, vp_width, vp_height);
-
-                let area = signed_area(p0, p1, p2);
-                if should_cull(area, &draw.rasterizer) {
-                    continue;
-                }
-
-                let c0 = colors[tri[0]];
-                let c1 = colors[tri[1]];
-                let c2 = colors[tri[2]];
-
-                let uv0 = uvs.as_ref().map_or(default_uv, |u| u[tri[0]]);
-                let uv1 = uvs.as_ref().map_or(default_uv, |u| u[tri[1]]);
-                let uv2 = uvs.as_ref().map_or(default_uv, |u| u[tri[2]]);
-
-                rasterize_triangle(
-                    p0,
-                    p1,
-                    p2,
-                    c0,
-                    c1,
-                    c2,
-                    uv0,
-                    uv1,
-                    uv2,
-                    texture.as_ref(),
+            if has_vs {
+                // ── Shader-driven rendering path ─────────────────────
+                render_draw_shader(
+                    draw,
+                    read_gpu,
+                    has_fs,
                     &mut pixels,
                     &mut depth_buf,
                     &mut stencil_buf,
                     fb_width,
                     fb_height,
-                    &draw.scissors[0],
-                    &draw.depth_stencil,
-                    &draw.blend[0],
-                    &draw.blend_color,
-                    &draw.color_masks[0],
+                );
+            } else {
+                // ── Fixed-function fallback path ─────────────────────
+                render_draw_fixed_function(
+                    draw,
+                    read_gpu,
+                    &mut pixels,
+                    &mut depth_buf,
+                    &mut stencil_buf,
+                    fb_width,
+                    fb_height,
                 );
             }
         }
@@ -1239,6 +1197,480 @@ impl SoftwareRasterizer {
             height: fb_height,
             pixels,
         })
+    }
+}
+
+/// Shader-driven rendering for a single draw call.
+///
+/// Runs the vertex shader for each vertex, then rasterizes triangles and runs
+/// the fragment shader per pixel. Falls back to fixed-function fragment shading
+/// if no fragment shader is enabled.
+#[allow(clippy::too_many_arguments)]
+fn render_draw_shader(
+    draw: &DrawCall,
+    read_gpu: &dyn Fn(u64, &mut [u8]),
+    has_fs: bool,
+    pixels: &mut [u8],
+    depth_buf: &mut [f32],
+    stencil_buf: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+) {
+    // Load vertex shader program.
+    let vs_stage = &draw.shader_stages[1];
+    let vs_addr = draw.program_base_address + vs_stage.offset as u64;
+    let vs_program = shader::load_shader_program(vs_addr, read_gpu, 4096);
+
+    if vs_program.instructions.is_empty() {
+        return;
+    }
+
+    // Optionally load fragment shader program.
+    let fs_program = if has_fs {
+        let fs_stage = &draw.shader_stages[5];
+        let fs_addr = draw.program_base_address + fs_stage.offset as u64;
+        let prog = shader::load_shader_program(fs_addr, read_gpu, 4096);
+        if prog.instructions.is_empty() {
+            None
+        } else {
+            Some(prog)
+        }
+    } else {
+        None
+    };
+
+    // Load texture for fragment shader sampling.
+    let texture = load_texture(draw, read_gpu);
+
+    // Fetch all vertex attributes for all vertices.
+    let all_attribs = fetch_all_vertex_attribs(draw, read_gpu);
+    if all_attribs.is_empty() {
+        return;
+    }
+
+    // Prepare constant buffer bindings for vertex shader stage (stage index 1).
+    let vs_cb = build_cb_bindings(draw, 1);
+
+    // Texture sampler closure.
+    let tex_ref = &texture;
+    let sample_tex = |_idx: u32, u: f32, v: f32| -> shader::interpreter::TexSample {
+        if let Some(tex) = tex_ref {
+            let rgba = sample_texture(tex, u, v);
+            shader::interpreter::TexSample {
+                r: rgba[0],
+                g: rgba[1],
+                b: rgba[2],
+                a: rgba[3],
+            }
+        } else {
+            shader::interpreter::TexSample::default()
+        }
+    };
+
+    // Run vertex shader for each vertex.
+    let vert_count = all_attribs.len();
+    let mut vs_outputs: Vec<shader::VertexShaderOutput> = Vec::with_capacity(vert_count);
+
+    for (vi, attribs) in all_attribs.iter().enumerate() {
+        let mut ctx = shader::interpreter::ShaderExecContext::new(read_gpu, &sample_tex);
+        ctx.cb_bindings = vs_cb.clone();
+        ctx.input_attribs = attribs.clone();
+        ctx.vertex_id = vi as u32;
+        ctx.instance_id = 0;
+
+        ctx.run(&vs_program);
+        vs_outputs.push(ctx.collect_vertex_output());
+    }
+
+    // Extract positions from vertex shader outputs.
+    let positions: Vec<[f32; 4]> = vs_outputs.iter().map(|o| o.position).collect();
+    if positions.is_empty() {
+        return;
+    }
+
+    // Process topology.
+    let triangles = process_topology(&positions, draw.topology);
+    let viewport = &draw.viewports[0];
+    let vp_width = if viewport.width > 0.0 {
+        viewport.width
+    } else {
+        fb_width as f32
+    };
+    let vp_height = if viewport.height > 0.0 {
+        viewport.height
+    } else {
+        fb_height as f32
+    };
+    let vp_x = viewport.x;
+    let vp_y = viewport.y;
+
+    // Prepare fragment shader constant buffer bindings (stage index 4 for fragment).
+    let fs_cb = if fs_program.is_some() {
+        build_cb_bindings(draw, 4)
+    } else {
+        Vec::new()
+    };
+
+    for tri in &triangles {
+        // Viewport transform on positions.
+        let p0 = viewport_transform(positions[tri[0]], vp_x, vp_y, vp_width, vp_height);
+        let p1 = viewport_transform(positions[tri[1]], vp_x, vp_y, vp_width, vp_height);
+        let p2 = viewport_transform(positions[tri[2]], vp_x, vp_y, vp_width, vp_height);
+
+        let area = signed_area(p0, p1, p2);
+        if should_cull(area, &draw.rasterizer) {
+            continue;
+        }
+        if area.abs() < 0.5 {
+            continue; // Degenerate triangle.
+        }
+
+        // Collect all generic varyings from vertex shader outputs for this triangle.
+        let out0 = &vs_outputs[tri[0]];
+        let out1 = &vs_outputs[tri[1]];
+        let out2 = &vs_outputs[tri[2]];
+
+        if let Some(ref fs_prog) = fs_program {
+            // Shader-driven fragment processing.
+            rasterize_triangle_shader(
+                p0,
+                p1,
+                p2,
+                out0,
+                out1,
+                out2,
+                fs_prog,
+                &fs_cb,
+                read_gpu,
+                &sample_tex,
+                pixels,
+                depth_buf,
+                stencil_buf,
+                fb_width,
+                fb_height,
+                &draw.scissors[0],
+                &draw.depth_stencil,
+                &draw.blend[0],
+                &draw.blend_color,
+                &draw.color_masks[0],
+            );
+        } else {
+            // Fall back to fixed-function fragment shading with vertex shader output.
+            // Use generic 0 as color if present, else white.
+            let c0 = out0.generics.get(&0).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let c1 = out1.generics.get(&0).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let c2 = out2.generics.get(&0).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let uv0 = extract_uv_from_generics(out0);
+            let uv1 = extract_uv_from_generics(out1);
+            let uv2 = extract_uv_from_generics(out2);
+
+            rasterize_triangle(
+                p0,
+                p1,
+                p2,
+                c0,
+                c1,
+                c2,
+                uv0,
+                uv1,
+                uv2,
+                texture.as_ref(),
+                pixels,
+                depth_buf,
+                stencil_buf,
+                fb_width,
+                fb_height,
+                &draw.scissors[0],
+                &draw.depth_stencil,
+                &draw.blend[0],
+                &draw.blend_color,
+                &draw.color_masks[0],
+            );
+        }
+    }
+}
+
+/// Fixed-function rendering for a single draw call (pre-shader fallback).
+#[allow(clippy::too_many_arguments)]
+fn render_draw_fixed_function(
+    draw: &DrawCall,
+    read_gpu: &dyn Fn(u64, &mut [u8]),
+    pixels: &mut [u8],
+    depth_buf: &mut [f32],
+    stencil_buf: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+) {
+    let positions = fetch_positions(draw, read_gpu);
+    if positions.is_empty() {
+        return;
+    }
+
+    let vert_count = positions.len();
+    let colors = fetch_vertex_colors(draw, read_gpu, vert_count);
+    let texture = load_texture(draw, read_gpu);
+    let uvs = if texture.is_some() {
+        fetch_texture_coords(draw, read_gpu, vert_count)
+    } else {
+        None
+    };
+    let default_uv = [0.0f32, 0.0];
+
+    let triangles = process_topology(&positions, draw.topology);
+    let viewport = &draw.viewports[0];
+    let vp_width = if viewport.width > 0.0 {
+        viewport.width
+    } else {
+        fb_width as f32
+    };
+    let vp_height = if viewport.height > 0.0 {
+        viewport.height
+    } else {
+        fb_height as f32
+    };
+    let vp_x = viewport.x;
+    let vp_y = viewport.y;
+
+    for tri in &triangles {
+        let p0 = viewport_transform(positions[tri[0]], vp_x, vp_y, vp_width, vp_height);
+        let p1 = viewport_transform(positions[tri[1]], vp_x, vp_y, vp_width, vp_height);
+        let p2 = viewport_transform(positions[tri[2]], vp_x, vp_y, vp_width, vp_height);
+
+        let area = signed_area(p0, p1, p2);
+        if should_cull(area, &draw.rasterizer) {
+            continue;
+        }
+
+        let c0 = colors[tri[0]];
+        let c1 = colors[tri[1]];
+        let c2 = colors[tri[2]];
+
+        let uv0 = uvs.as_ref().map_or(default_uv, |u| u[tri[0]]);
+        let uv1 = uvs.as_ref().map_or(default_uv, |u| u[tri[1]]);
+        let uv2 = uvs.as_ref().map_or(default_uv, |u| u[tri[2]]);
+
+        rasterize_triangle(
+            p0,
+            p1,
+            p2,
+            c0,
+            c1,
+            c2,
+            uv0,
+            uv1,
+            uv2,
+            texture.as_ref(),
+            pixels,
+            depth_buf,
+            stencil_buf,
+            fb_width,
+            fb_height,
+            &draw.scissors[0],
+            &draw.depth_stencil,
+            &draw.blend[0],
+            &draw.blend_color,
+            &draw.color_masks[0],
+        );
+    }
+}
+
+/// Build constant buffer bindings vector for a shader stage from a draw call.
+fn build_cb_bindings(draw: &DrawCall, stage_idx: usize) -> Vec<shader::interpreter::CbBinding> {
+    let cb_row = &draw.cb_bindings[stage_idx.min(draw.cb_bindings.len().saturating_sub(1))];
+    cb_row
+        .iter()
+        .map(|cb| shader::interpreter::CbBinding {
+            address: cb.address,
+            size: cb.size,
+        })
+        .collect()
+}
+
+/// Extract UV coordinates from vertex shader generic outputs.
+/// Looks for generic 1 (typical texcoord slot) x,y components.
+fn extract_uv_from_generics(output: &shader::VertexShaderOutput) -> [f32; 2] {
+    // Try generic 1 first (common texcoord slot), then generic 0.
+    if let Some(g) = output.generics.get(&1) {
+        [g[0], g[1]]
+    } else if let Some(g) = output.generics.get(&0) {
+        [g[0], g[1]]
+    } else {
+        [0.0, 0.0]
+    }
+}
+
+/// Rasterize a triangle with per-pixel fragment shader execution.
+#[allow(clippy::too_many_arguments)]
+fn rasterize_triangle_shader(
+    v0: [f32; 4],
+    v1: [f32; 4],
+    v2: [f32; 4],
+    vs_out0: &shader::VertexShaderOutput,
+    vs_out1: &shader::VertexShaderOutput,
+    vs_out2: &shader::VertexShaderOutput,
+    fs_program: &shader::ShaderProgram,
+    fs_cb: &[shader::interpreter::CbBinding],
+    read_gpu: &dyn Fn(u64, &mut [u8]),
+    sample_tex: &dyn Fn(u32, f32, f32) -> shader::interpreter::TexSample,
+    pixels: &mut [u8],
+    depth_buf: &mut [f32],
+    _stencil_buf: &mut [u8],
+    fb_width: u32,
+    fb_height: u32,
+    scissor: &ScissorInfo,
+    depth_stencil: &DepthStencilInfo,
+    blend: &BlendInfo,
+    blend_color: &BlendColorInfo,
+    color_mask: &ColorMaskInfo,
+) {
+    // Compute bounding box.
+    let mut min_x = v0[0].min(v1[0]).min(v2[0]).max(0.0) as u32;
+    let mut max_x = (v0[0].max(v1[0]).max(v2[0]).ceil() as u32).min(fb_width.saturating_sub(1));
+    let mut min_y = v0[1].min(v1[1]).min(v2[1]).max(0.0) as u32;
+    let mut max_y = (v0[1].max(v1[1]).max(v2[1]).ceil() as u32).min(fb_height.saturating_sub(1));
+
+    if scissor.enabled {
+        min_x = min_x.max(scissor.min_x);
+        max_x = max_x.min(scissor.max_x.saturating_sub(1));
+        min_y = min_y.max(scissor.min_y);
+        max_y = max_y.min(scissor.max_y.saturating_sub(1));
+    }
+
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+
+    let area = signed_area(v0, v1, v2);
+    if area.abs() < 0.5 {
+        return;
+    }
+    let inv_area = 1.0 / area;
+
+    // Collect all generic attribute indices present across the three vertices.
+    let mut generic_keys: Vec<u32> = Vec::new();
+    for key in vs_out0.generics.keys() {
+        if !generic_keys.contains(key) {
+            generic_keys.push(*key);
+        }
+    }
+    for key in vs_out1.generics.keys() {
+        if !generic_keys.contains(key) {
+            generic_keys.push(*key);
+        }
+    }
+    for key in vs_out2.generics.keys() {
+        if !generic_keys.contains(key) {
+            generic_keys.push(*key);
+        }
+    }
+    generic_keys.sort_unstable();
+
+    let default_generic = [0.0f32; 4];
+
+    for py in min_y..=max_y {
+        for px in min_x..=max_x {
+            let fx = px as f32 + 0.5;
+            let fy = py as f32 + 0.5;
+
+            // Barycentric coordinates.
+            let w0 = ((v1[0] - v2[0]) * (fy - v2[1]) - (v1[1] - v2[1]) * (fx - v2[0])) * inv_area;
+            let w1 = ((v2[0] - v0[0]) * (fy - v0[1]) - (v2[1] - v0[1]) * (fx - v0[0])) * inv_area;
+            let w2 = 1.0 - w0 - w1;
+
+            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                continue;
+            }
+
+            // Perspective-correct interpolation weights.
+            let inv_w0 = if v0[3] != 0.0 { 1.0 / v0[3] } else { 1.0 };
+            let inv_w1 = if v1[3] != 0.0 { 1.0 / v1[3] } else { 1.0 };
+            let inv_w2 = if v2[3] != 0.0 { 1.0 / v2[3] } else { 1.0 };
+            let denom = w0 * inv_w0 + w1 * inv_w1 + w2 * inv_w2;
+            let (pb0, pb1, pb2) = if denom != 0.0 {
+                (
+                    w0 * inv_w0 / denom,
+                    w1 * inv_w1 / denom,
+                    w2 * inv_w2 / denom,
+                )
+            } else {
+                (w0, w1, w2)
+            };
+
+            // Interpolate depth.
+            let z = v0[2] * w0 + v1[2] * w1 + v2[2] * w2;
+
+            let fb_idx = (py * fb_width + px) as usize;
+
+            // Depth test.
+            if depth_stencil.depth_test_enable {
+                if !depth_test_passes(depth_stencil.depth_func, z, depth_buf[fb_idx]) {
+                    continue;
+                }
+            }
+
+            // Interpolate all generic varyings for fragment shader.
+            let mut varyings: Vec<[f32; 4]> = Vec::new();
+            let max_generic = generic_keys.last().map_or(0, |k| *k as usize + 1);
+            varyings.resize(max_generic, [0.0; 4]);
+            for &key in &generic_keys {
+                let g0 = vs_out0.generics.get(&key).unwrap_or(&default_generic);
+                let g1 = vs_out1.generics.get(&key).unwrap_or(&default_generic);
+                let g2 = vs_out2.generics.get(&key).unwrap_or(&default_generic);
+                let idx = key as usize;
+                for c in 0..4 {
+                    varyings[idx][c] = g0[c] * pb0 + g1[c] * pb1 + g2[c] * pb2;
+                }
+            }
+
+            // Run fragment shader.
+            let mut fs_ctx = shader::interpreter::ShaderExecContext::new(read_gpu, sample_tex);
+            fs_ctx.cb_bindings = fs_cb.to_vec();
+            fs_ctx.input_varyings = varyings;
+
+            fs_ctx.run(fs_program);
+            let frag_out = fs_ctx.collect_fragment_output();
+
+            if frag_out.killed {
+                continue;
+            }
+
+            let src_color = frag_out.color;
+
+            // Depth write.
+            if depth_stencil.depth_test_enable && depth_stencil.depth_write_enable {
+                depth_buf[fb_idx] = frag_out.depth.unwrap_or(z);
+            }
+
+            // Read existing pixel for blending.
+            let pixel_offset = fb_idx * 4;
+            let dst_color = [
+                pixels[pixel_offset] as f32 / 255.0,
+                pixels[pixel_offset + 1] as f32 / 255.0,
+                pixels[pixel_offset + 2] as f32 / 255.0,
+                pixels[pixel_offset + 3] as f32 / 255.0,
+            ];
+
+            // Blend.
+            let final_color = if blend.enabled {
+                blend_colors(src_color, dst_color, blend, blend_color)
+            } else {
+                src_color
+            };
+
+            // Write pixel with color mask.
+            if color_mask.r {
+                pixels[pixel_offset] = (final_color[0].clamp(0.0, 1.0) * 255.0) as u8;
+            }
+            if color_mask.g {
+                pixels[pixel_offset + 1] = (final_color[1].clamp(0.0, 1.0) * 255.0) as u8;
+            }
+            if color_mask.b {
+                pixels[pixel_offset + 2] = (final_color[2].clamp(0.0, 1.0) * 255.0) as u8;
+            }
+            if color_mask.a {
+                pixels[pixel_offset + 3] = (final_color[3].clamp(0.0, 1.0) * 255.0) as u8;
+            }
+        }
     }
 }
 
@@ -1323,6 +1755,126 @@ fn fetch_positions(
     }
 
     positions
+}
+
+/// Fetch ALL vertex attributes for each vertex, returning a Vec (per-vertex) of
+/// Vec<[f32; 4]> indexed by hardware attribute slot (0..31). Used by the shader
+/// execution path to provide input attributes to the vertex shader.
+fn fetch_all_vertex_attribs(
+    draw: &DrawCall,
+    read_gpu: &dyn Fn(u64, &mut [u8]),
+) -> Vec<Vec<[f32; 4]>> {
+    // Determine vertex indices.
+    let indices: Vec<u32> = if draw.indexed {
+        fetch_indices(draw, read_gpu)
+    } else {
+        let first = draw.vertex_first;
+        let count = draw.vertex_count;
+        (first..first + count).collect()
+    };
+
+    let num_verts = indices.len();
+    // Each vertex gets up to 32 attribute slots, initially zero.
+    let mut result: Vec<Vec<[f32; 4]>> = Vec::with_capacity(num_verts);
+    for _ in 0..num_verts {
+        result.push(vec![[0.0, 0.0, 0.0, 0.0]; 32]);
+    }
+
+    for attrib in &draw.vertex_attribs {
+        let stream = draw
+            .vertex_streams
+            .iter()
+            .find(|s| s.index == attrib.buffer_index);
+        let stream = match stream {
+            Some(s) if s.stride > 0 && s.address > 0 => s,
+            _ => continue,
+        };
+
+        // Determine the hardware attribute slot. The slot is the index of this
+        // attribute in the vertex_attribs array. Maxwell uses explicit slot
+        // assignment via the attrib index register, but since we store them in
+        // order from the engine, use the position in the list.
+        let slot = draw
+            .vertex_attribs
+            .iter()
+            .position(|a| std::ptr::eq(a, attrib))
+            .unwrap_or(0);
+        if slot >= 32 {
+            continue;
+        }
+
+        let comp_count = attrib.size.component_count() as usize;
+        if comp_count == 0 {
+            continue;
+        }
+
+        for (vi, idx) in indices.iter().enumerate() {
+            let addr =
+                stream.address + (*idx as u64) * (stream.stride as u64) + (attrib.offset as u64);
+
+            let mut val = [0.0f32; 4];
+            val[3] = if comp_count < 4 { 1.0 } else { 0.0 }; // Default w=1 for 3-comp
+
+            match (attrib.size, attrib.attrib_type) {
+                // Float formats
+                (
+                    VertexAttribSize::R32
+                    | VertexAttribSize::R32G32
+                    | VertexAttribSize::R32G32B32
+                    | VertexAttribSize::R32G32B32A32,
+                    VertexAttribType::Float,
+                ) => {
+                    let byte_count = comp_count * 4;
+                    let mut buf = vec![0u8; byte_count];
+                    read_gpu(addr, &mut buf);
+                    for (i, chunk) in buf.chunks_exact(4).enumerate().take(comp_count) {
+                        val[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    }
+                }
+                // UNorm R8G8B8A8 / R8G8B8
+                (
+                    VertexAttribSize::R8G8B8A8 | VertexAttribSize::R8G8B8,
+                    VertexAttribType::UNorm,
+                ) => {
+                    let byte_count = comp_count;
+                    let mut buf = vec![0u8; byte_count];
+                    read_gpu(addr, &mut buf);
+                    for (i, &b) in buf.iter().enumerate().take(comp_count.min(4)) {
+                        val[i] = b as f32 / 255.0;
+                    }
+                }
+                // UNorm R16G16 / R16G16B16A16
+                (
+                    VertexAttribSize::R16G16 | VertexAttribSize::R16G16B16A16,
+                    VertexAttribType::UNorm,
+                ) => {
+                    let byte_count = comp_count * 2;
+                    let mut buf = vec![0u8; byte_count];
+                    read_gpu(addr, &mut buf);
+                    for (i, chunk) in buf.chunks_exact(2).enumerate().take(comp_count) {
+                        let v = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        val[i] = v as f32 / 65535.0;
+                    }
+                }
+                // SNorm R16G16
+                (VertexAttribSize::R16G16, VertexAttribType::SNorm) => {
+                    let mut buf = [0u8; 4];
+                    read_gpu(addr, &mut buf);
+                    for i in 0..2 {
+                        let v = i16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
+                        val[i] = (v as f32 / 32767.0).clamp(-1.0, 1.0);
+                    }
+                }
+                _ => {
+                    // Unsupported format — leave as zeros.
+                }
+            }
+
+            result[vi][slot] = val;
+        }
+    }
+
+    result
 }
 
 /// Fetch per-vertex RGBA colors from GPU memory.
