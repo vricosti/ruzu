@@ -17,4 +17,5 @@ pub mod rasterizer;
 pub mod renderer;
 pub mod surface;
 pub mod swapchain;
+pub mod swizzle;
 pub mod syncpoint;
