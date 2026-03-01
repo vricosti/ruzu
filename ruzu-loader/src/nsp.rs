@@ -51,8 +51,9 @@ pub enum NspError {
 
 /// Result of loading an NSP.
 pub struct NspLoadResult {
-    /// Loaded executable code.
-    pub code_set: CodeSet,
+    /// Loaded executable modules (name, code_set) in load order.
+    /// Matches zuyu: rtld, main, subsdk0-9, sdk.
+    pub modules: Vec<(String, CodeSet)>,
     /// Title ID from the NCA header.
     pub title_id: u64,
     /// Application name (from Control NCA NACP, if available).
@@ -64,6 +65,12 @@ pub struct NspLoadResult {
     /// Raw RomFS data from the Program NCA (section 1), if available.
     pub romfs_data: Option<Vec<u8>>,
 }
+
+/// Module names in zuyu's loading order (deconstructed_rom_directory.cpp).
+const STATIC_MODULES: &[&str] = &[
+    "rtld", "main", "subsdk0", "subsdk1", "subsdk2", "subsdk3", "subsdk4",
+    "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9", "sdk",
+];
 
 /// Parsed NCA info for an NSP.
 pub struct NspNcaInfo {
@@ -192,14 +199,62 @@ pub fn load_nsp(
     let (exefs_pfs, exefs_data) = nca::open_exefs(program_nca.file.as_ref(), &program_nca.header, keys)?
         .ok_or(NspError::NoExeFs)?;
 
-    // Find 'main' NSO in ExeFS
+    // Log ExeFS file listing for diagnostics.
     let exefs_vfs = Arc::new(crate::vfs::VecFile::new("exefs".to_string(), exefs_data));
-    let main_file = exefs_pfs
-        .open_file(exefs_vfs, "main")
-        .ok_or(NspError::NoMainNso)?;
+    log::info!("ExeFS PFS0 contains {} files:", exefs_pfs.entries.len());
+    for entry in &exefs_pfs.entries {
+        log::info!("  '{}' (offset=0x{:X}, size=0x{:X})", entry.name, entry.data_offset, entry.data_size);
+    }
 
-    let nso_data = main_file.read_all().map_err(NspError::Io)?;
-    let code_set = nso::load_nso(&nso_data)?;
+    // Check for main.npdm (architecture metadata).
+    if let Some(npdm_file) = exefs_pfs.open_file(exefs_vfs.clone(), "main.npdm") {
+        let npdm_data = npdm_file.read_all().map_err(NspError::Io)?;
+        if npdm_data.len() >= 0x10 {
+            let magic = &npdm_data[0..4];
+            let flags = npdm_data[0x0C];
+            let is_64bit = flags & 1 != 0;
+            log::info!(
+                "NPDM: magic={:?}, flags=0x{:02X}, is_64bit={}",
+                std::str::from_utf8(magic).unwrap_or("????"),
+                flags,
+                is_64bit,
+            );
+        } else {
+            log::warn!("NPDM file too small ({} bytes)", npdm_data.len());
+        }
+    } else {
+        log::warn!("No 'main.npdm' found in ExeFS");
+    }
+
+    // Load all NSO modules from ExeFS in zuyu's order.
+    let mut modules: Vec<(String, CodeSet)> = Vec::new();
+
+    for &module_name in STATIC_MODULES {
+        if let Some(module_file) = exefs_pfs.open_file(exefs_vfs.clone(), module_name) {
+            let nso_data = module_file.read_all().map_err(NspError::Io)?;
+            match nso::load_nso(&nso_data) {
+                Ok(code_set) => {
+                    log::info!(
+                        "Loaded ExeFS module '{}': text=0x{:X}+0x{:X}, rodata=0x{:X}+0x{:X}, data=0x{:X}+0x{:X}, bss=0x{:X}",
+                        module_name,
+                        code_set.segments[0].offset, code_set.segments[0].size,
+                        code_set.segments[1].offset, code_set.segments[1].size,
+                        code_set.segments[2].offset, code_set.segments[2].size,
+                        code_set.bss_size,
+                    );
+                    modules.push((module_name.to_string(), code_set));
+                }
+                Err(e) => {
+                    log::warn!("Failed to load NSO '{}': {}", module_name, e);
+                }
+            }
+        }
+    }
+
+    if modules.is_empty() {
+        return Err(NspError::NoMainNso);
+    }
+    log::info!("Loaded {} ExeFS modules", modules.len());
 
     // Skip eager RomFS loading — it can be GBs and should be accessed lazily.
     // TODO: implement lazy VFS-based RomFS access instead of loading into memory.
@@ -220,7 +275,7 @@ pub fn load_nsp(
     }
 
     Ok(NspLoadResult {
-        code_set,
+        modules,
         title_id: program_nca.header.title_id,
         title,
         developer,

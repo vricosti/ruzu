@@ -289,40 +289,41 @@ fn main() -> Result<()> {
         format.label()
     );
 
-    let (code_set, title_id, rom_data, nsp_romfs) = match format {
+    // Track NRO-specific data for romfs extraction.
+    let mut nro_raw_data: Option<Vec<u8>> = None;
+    let mut nro_asset_header: Option<nro::AssetHeader> = None;
+
+    // Load modules based on format.
+    // For NRO: single module (direct code set).
+    // For NSP/XCI: multiple modules from ExeFS (rtld, main, subsdk*, sdk).
+    enum LoadedModules {
+        Single(nro::CodeSet),
+        Multi(Vec<(String, nro::CodeSet)>),
+    }
+
+    let (loaded, title_id, nsp_romfs) = match format {
         GameFormat::Nro => {
             let raw = std::fs::read(&game_path).context("Failed to read NRO file")?;
             let (cs, tid) = load_nro_game_from_data(&raw)?;
-            (cs, tid, Some(raw), None)
+            nro_asset_header = cs.asset_header.clone();
+            nro_raw_data = Some(raw);
+            (LoadedModules::Single(cs), tid, None)
         }
         GameFormat::Nsp => {
-            let (cs, tid, nsp_romfs) = load_nsp_game(&game_path, &mut keys)?;
-            // For NSP, rom_data is None (no raw NRO), but we pass romfs separately
-            (cs, tid, None, nsp_romfs)
+            let (modules, tid, nsp_romfs) = load_nsp_game(&game_path, &mut keys)?;
+            (LoadedModules::Multi(modules), tid, nsp_romfs)
         }
         GameFormat::Xci => {
-            let (cs, tid) = load_xci_game(&game_path, &mut keys)?;
-            (cs, tid, None, None)
+            let (modules, tid) = load_xci_game(&game_path, &mut keys)?;
+            (LoadedModules::Multi(modules), tid, None)
         }
     };
-
-    info!(
-        "Code loaded: text=0x{:X}+0x{:X}, rodata=0x{:X}+0x{:X}, data=0x{:X}+0x{:X}, bss=0x{:X}",
-        code_set.segments[0].offset,
-        code_set.segments[0].size,
-        code_set.segments[1].offset,
-        code_set.segments[1].size,
-        code_set.segments[2].offset,
-        code_set.segments[2].size,
-        code_set.bss_size,
-    );
 
     // Create kernel and process (must exist before creating event handles).
     let mut kernel = KernelCore::new();
     kernel.create_process("main")?;
 
     // ── Phase 2 init: create kernel event handles for services ────────────
-    // These must be created after the process exists but before services use them.
     let audio_out_event_handle = kernel
         .create_event_in_process()
         .expect("failed to create audio out event handle");
@@ -345,28 +346,24 @@ fn main() -> Result<()> {
     // Pre-signal the GPU event so nvdrv QueryEvent callers don't block.
     kernel.signal_event(gpu_event_handle);
 
-    let text_seg = &code_set.segments[0];
-    let rodata_seg = &code_set.segments[1];
-    let data_seg = &code_set.segments[2];
+    // ── Load code into process ────────────────────────────────────────────
+    let entry_point = match &loaded {
+        LoadedModules::Single(code_set) => {
+            info!(
+                "Code loaded: text=0x{:X}+0x{:X}, rodata=0x{:X}+0x{:X}, data=0x{:X}+0x{:X}, bss=0x{:X}",
+                code_set.segments[0].offset, code_set.segments[0].size,
+                code_set.segments[1].offset, code_set.segments[1].size,
+                code_set.segments[2].offset, code_set.segments[2].size,
+                code_set.bss_size,
+            );
+            load_single_module(&mut kernel, code_set)?
+        }
+        LoadedModules::Multi(modules) => {
+            load_multi_modules(&mut kernel, modules)?
+        }
+    };
 
-    let text_data = &code_set.memory
-        [text_seg.offset as usize..(text_seg.offset + text_seg.size) as usize];
-    let rodata_data = &code_set.memory
-        [rodata_seg.offset as usize..(rodata_seg.offset + rodata_seg.size) as usize];
-    let data_data =
-        &code_set.memory[data_seg.offset as usize..(data_seg.offset + data_seg.size) as usize];
-
-    let entry_point = kernel.load_nro(
-        text_data,
-        rodata_data,
-        data_data,
-        code_set.bss_size as usize,
-        text_seg.offset,
-        rodata_seg.offset,
-        data_seg.offset,
-    )?;
-
-    info!("Code loaded at base 0x{:X}", entry_point);
+    info!("Entry point: 0x{:X}", entry_point);
 
     // Create main thread
     let thread_handle = kernel.create_main_thread(entry_point)?;
@@ -382,18 +379,16 @@ fn main() -> Result<()> {
     }
 
     // ── Extract romfs data ─────────────────────────────────────────────────
-    // For NRO: extract from asset header in the raw NRO file.
-    // For NSP: use the RomFS extracted from the Program NCA.
     let romfs_data: Option<Arc<Vec<u8>>> = if let Some(nsp_romfs_data) = nsp_romfs {
         info!("Using NSP RomFS: {} bytes", nsp_romfs_data.len());
         Some(Arc::new(nsp_romfs_data))
     } else {
-        code_set.asset_header.as_ref().and_then(|asset| {
+        nro_asset_header.as_ref().and_then(|asset| {
             if asset.romfs.size == 0 {
                 info!("No romfs section in NRO asset header");
                 return None;
             }
-            let raw = rom_data.as_ref()?;
+            let raw = nro_raw_data.as_ref()?;
             let nro_file_size = if raw.len() >= 0x1C {
                 u32::from_le_bytes([raw[0x18], raw[0x19], raw[0x1A], raw[0x1B]]) as usize
             } else {
@@ -647,8 +642,100 @@ fn load_nro_game_from_data(rom_data: &[u8]) -> Result<(nro::CodeSet, u64)> {
     Ok((code_set, 0))
 }
 
-/// Load an NSP game file. Returns (CodeSet, title_id, optional romfs data).
-fn load_nsp_game(path: &PathBuf, keys: &mut KeyManager) -> Result<(nro::CodeSet, u64, Option<Vec<u8>>)> {
+/// Load a single module (NRO/XCI) into the kernel at NRO_BASE_ADDRESS.
+fn load_single_module(
+    kernel: &mut KernelCore,
+    code_set: &nro::CodeSet,
+) -> Result<ruzu_common::VAddr> {
+    let text_seg = &code_set.segments[0];
+    let rodata_seg = &code_set.segments[1];
+    let data_seg = &code_set.segments[2];
+
+    let text_data = &code_set.memory
+        [text_seg.offset as usize..(text_seg.offset + text_seg.size) as usize];
+    let rodata_data = &code_set.memory
+        [rodata_seg.offset as usize..(rodata_seg.offset + rodata_seg.size) as usize];
+    let data_data = &code_set.memory
+        [data_seg.offset as usize..(data_seg.offset + data_seg.size) as usize];
+
+    let entry_point = kernel.load_nro(
+        text_data,
+        rodata_data,
+        data_data,
+        code_set.bss_size as usize,
+        text_seg.offset,
+        rodata_seg.offset,
+        data_seg.offset,
+    )?;
+
+    Ok(entry_point)
+}
+
+/// Load multiple NSO modules (from ExeFS) contiguously into the kernel.
+///
+/// Matches zuyu's deconstructed_rom_directory.cpp: modules are loaded in order
+/// at sequential page-aligned addresses. Entry point is the base of the first
+/// module (typically rtld).
+fn load_multi_modules(
+    kernel: &mut KernelCore,
+    modules: &[(String, nro::CodeSet)],
+) -> Result<ruzu_common::VAddr> {
+    use ruzu_common::NRO_BASE_ADDRESS;
+
+    let entry_point = NRO_BASE_ADDRESS;
+    let mut next_addr = NRO_BASE_ADDRESS;
+
+    for (name, code_set) in modules {
+        let text_seg = &code_set.segments[0];
+        let rodata_seg = &code_set.segments[1];
+        let data_seg = &code_set.segments[2];
+
+        let text_data = &code_set.memory
+            [text_seg.offset as usize..(text_seg.offset + text_seg.size) as usize];
+        let rodata_data = &code_set.memory
+            [rodata_seg.offset as usize..(rodata_seg.offset + rodata_seg.size) as usize];
+        let data_data = &code_set.memory
+            [data_seg.offset as usize..(data_seg.offset + data_seg.size) as usize];
+
+        // Diagnostic: dump first 32 bytes of each module's text segment
+        if text_data.len() >= 32 {
+            info!(
+                "  text first 32 bytes: {:02X?}",
+                &text_data[..32]
+            );
+        }
+
+        info!(
+            "Loading module '{}' at 0x{:X}: text=0x{:X}+0x{:X}, rodata=0x{:X}+0x{:X}, data=0x{:X}+0x{:X}, bss=0x{:X}",
+            name, next_addr,
+            text_seg.offset, text_seg.size,
+            rodata_seg.offset, rodata_seg.size,
+            data_seg.offset, data_seg.size,
+            code_set.bss_size,
+        );
+
+        next_addr = kernel.load_module(
+            next_addr,
+            text_data,
+            rodata_data,
+            data_data,
+            code_set.bss_size as usize,
+            text_seg.offset,
+            rodata_seg.offset,
+            data_seg.offset,
+        )?;
+
+        info!("  -> next module at 0x{:X}", next_addr);
+    }
+
+    Ok(entry_point)
+}
+
+/// Load an NSP game file. Returns (modules, title_id, optional romfs data).
+fn load_nsp_game(
+    path: &PathBuf,
+    keys: &mut KeyManager,
+) -> Result<(Vec<(String, nro::CodeSet)>, u64, Option<Vec<u8>>)> {
     let file: Arc<dyn ruzu_loader::vfs::VfsFile> =
         Arc::new(RealFile::open(path).context("Failed to open NSP file")?);
 
@@ -665,11 +752,14 @@ fn load_nsp_game(path: &PathBuf, keys: &mut KeyManager) -> Result<(nro::CodeSet,
     }
     info!("Title ID: 0x{:016X}", result.title_id);
 
-    Ok((result.code_set, result.title_id, result.romfs_data))
+    Ok((result.modules, result.title_id, result.romfs_data))
 }
 
-/// Load an XCI game file.
-fn load_xci_game(path: &PathBuf, keys: &mut KeyManager) -> Result<(nro::CodeSet, u64)> {
+/// Load an XCI game file. Returns (modules, title_id).
+fn load_xci_game(
+    path: &PathBuf,
+    keys: &mut KeyManager,
+) -> Result<(Vec<(String, nro::CodeSet)>, u64)> {
     let file: Arc<dyn ruzu_loader::vfs::VfsFile> =
         Arc::new(RealFile::open(path).context("Failed to open XCI file")?);
 
@@ -684,7 +774,7 @@ fn load_xci_game(path: &PathBuf, keys: &mut KeyManager) -> Result<(nro::CodeSet,
     }
     info!("Title ID: 0x{:016X}", result.title_id);
 
-    Ok((result.code_set, result.title_id))
+    Ok((result.modules, result.title_id))
 }
 
 /// Run in headless mode (no window, CPU only).
@@ -751,6 +841,21 @@ fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
     let mem_ptr = &mut kernel.process_mut().unwrap().memory as *mut _ as *mut u8;
     let mut jit = ArmDynarmic64::new(mem_ptr, vtable).expect("JIT init failed");
 
+    // Diagnostic: verify we can read code at entry point
+    {
+        let process = kernel.process().unwrap();
+        let entry_pc = process.threads[0].cpu_state.pc;
+        let first_instr = process.memory.read_u32(entry_pc);
+        let second_instr = process.memory.read_u32(entry_pc + 4);
+        log::info!(
+            "Entry point PC=0x{:X}, first instr=0x{:08X?}, second=0x{:08X?}",
+            entry_pc, first_instr, second_instr
+        );
+        // Also check via vtable to ensure JIT callback path works
+        let vtable_read = unsafe { (vtable.read_u32)(mem_ptr as *const u8, entry_pc) };
+        log::info!("Vtable read at 0x{:X} = 0x{:08X}", entry_pc, vtable_read);
+    }
+
     loop {
         if kernel.should_stop {
             break;
@@ -805,11 +910,25 @@ fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
         kernel.current_thread_idx = Some(idx);
 
         // Load thread context into JIT and run with budget.
+        let pc_before = kernel.process().unwrap().threads[idx].cpu_state.pc;
         jit.load_context(&kernel.process().unwrap().threads[idx].cpu_state);
         jit.set_ticks_remaining(INSTRUCTIONS_PER_SLICE);
         let reason = jit.run();
+        let jit_pc = jit.get_pc(); // PC directly from JIT state (before save_context)
         jit.save_context(&mut kernel.process_mut().unwrap().threads[idx].cpu_state);
         kernel.tick_counter += INSTRUCTIONS_PER_SLICE;
+
+        // Diagnostic logging for first slices.
+        {
+            let pc_after = kernel.process().unwrap().threads[idx].cpu_state.pc;
+            let slice = kernel.tick_counter / INSTRUCTIONS_PER_SLICE;
+            if slice <= 10 || reason.bits() != 0 {
+                log::debug!(
+                    "[slice {}] halt={:?} (0x{:X}) PC: 0x{:X} -> jit:0x{:X} -> saved:0x{:X}",
+                    slice, reason, reason.bits(), pc_before, jit_pc, pc_after
+                );
+            }
+        }
 
         if reason.contains(HaltReason::SVC) {
             if let Some(n) = jit.get_svc_number() {
@@ -825,12 +944,16 @@ fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
             info!("CPU externally halted");
             break;
         } else if reason.contains(HaltReason::EXCEPTION_RAISED) {
-            let pc = kernel
-                .process()
-                .map(|p| p.threads[idx].cpu_state.pc)
-                .unwrap_or(0);
-            log::error!("Exception at PC=0x{:016X}", pc);
-            break;
+            // Undecodable instruction (e.g. MOD0 offset data word in code section).
+            // Advance PC past the faulting instruction and continue, matching how
+            // yuzu's InterpreterFallback handles unimplemented instructions.
+            let pc = jit.get_pc();
+            log::warn!("Exception at PC=0x{:016X}, skipping instruction", pc);
+            jit.set_pc(pc + 4);
+            jit.clear_halt(HaltReason::EXCEPTION_RAISED);
+            if let Some(process) = kernel.process_mut() {
+                process.threads[idx].cpu_state.pc = pc + 4;
+            }
         } else if reason.contains(HaltReason::BREAKPOINT) {
             info!("Breakpoint hit");
             break;
@@ -1072,13 +1195,14 @@ fn run_with_window(
                 kernel.should_stop = true;
                 break;
             } else if reason.contains(HaltReason::EXCEPTION_RAISED) {
-                let pc = kernel
-                    .process()
-                    .map(|p| p.threads[idx].cpu_state.pc)
-                    .unwrap_or(0);
-                log::error!("Exception at PC=0x{:016X}", pc);
-                kernel.should_stop = true;
-                break;
+                // Undecodable instruction — skip and continue.
+                let pc = jit.get_pc();
+                log::warn!("Exception at PC=0x{:016X}, skipping instruction", pc);
+                jit.set_pc(pc + 4);
+                jit.clear_halt(HaltReason::EXCEPTION_RAISED);
+                if let Some(process) = kernel.process_mut() {
+                    process.threads[idx].cpu_state.pc = pc + 4;
+                }
             }
         }
 
