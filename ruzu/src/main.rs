@@ -875,6 +875,29 @@ fn run_with_window(
         None
     };
 
+    // Try to create a RasterizerVulkan for GPU-accelerated shader rendering.
+    // This uses the same Vulkan device as the presenter and compiles
+    // Maxwell shaders to SPIR-V for execution on the GPU.
+    if let Some(ref vk) = vulkan {
+        match ruzu_gpu::renderer::RasterizerVulkan::new(
+            vk.instance(),
+            vk.physical_device(),
+            vk.device(),
+            vk.graphics_queue(),
+            vk.queue_family_index(),
+            1280,
+            720,
+        ) {
+            Ok(renderer) => {
+                gpu.set_vulkan_renderer(renderer);
+                info!("RasterizerVulkan: GPU shader rendering enabled");
+            }
+            Err(e) => {
+                log::warn!("RasterizerVulkan init failed, using software rasterizer: {}", e);
+            }
+        }
+    }
+
     info!("Window created, entering main loop");
     info!("Press ESC or close window to exit");
     info!("Controls: Z=A, X=B, C=X, V=Y, Arrows=D-Pad, Enter=+, RShift=-, Q/E=L/R, A/D=ZL/ZR, IJKL=LStick");

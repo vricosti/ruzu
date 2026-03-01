@@ -102,3 +102,6 @@ So at the end I want a ./ruzu_cmd -g '/home/vricosti/Games/Emulators/Switch/comm
 rdynarmic is locally available at [/home/vricosti/Dev/emulators/rdynarmic](../rdynarmic).
 So design a plan that allow to implement all necessary steps to obtain a working emulator in rust based on
 zuyu.
+
+Everything that implemented should have yuzu as reference and follow yuzu architecture. Since we have started 
+to port using yuzu approach each components should be consistent with yuzu architecture.

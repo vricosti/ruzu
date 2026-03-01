@@ -255,6 +255,22 @@ pub fn load_shader_program(
     }
 }
 
+/// Load raw Maxwell instruction words from GPU memory for the shader recompiler.
+///
+/// This is similar to `load_shader_program` but returns just the instruction
+/// words (scheduling control words stripped), suitable for passing directly to
+/// `shader_recompiler::compile_shader()`.
+///
+/// Returns `(instructions, header)` where instructions are the u64 words.
+pub fn load_shader_code(
+    shader_addr: u64,
+    read_gpu: &dyn Fn(u64, &mut [u8]),
+    max_insns: usize,
+) -> (Vec<u64>, ShaderProgramHeader) {
+    let prog = load_shader_program(shader_addr, read_gpu, max_insns);
+    (prog.instructions, prog.header)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

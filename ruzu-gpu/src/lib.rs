@@ -16,6 +16,7 @@ pub mod memory_manager;
 pub mod rasterizer;
 pub mod renderer;
 pub mod shader;
+pub mod shader_recompiler;
 pub mod surface;
 pub mod swapchain;
 pub mod swizzle;
