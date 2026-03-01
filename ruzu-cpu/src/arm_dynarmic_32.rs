@@ -1,54 +1,29 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! ARM64 JIT wrapper using rdynarmic (Rust port of dynarmic).
+//! ARM32 JIT wrapper using rdynarmic (Rust port of dynarmic).
 //!
-//! This is the Rust equivalent of zuyu's `arm_dynarmic_64.cpp`.
-//! Wraps `A64Jit` and provides context transfer between `CpuState`
+//! This is the Rust equivalent of zuyu's `arm_dynarmic_32.cpp`.
+//! Wraps `A32Jit` and provides context transfer between `CpuState`
 //! (used by the kernel for thread switching) and the JIT's register file.
 //!
 //! Memory access is performed through a raw pointer to an opaque type and
 //! a vtable of function pointers, avoiding a circular dependency between
 //! ruzu-cpu and ruzu-kernel.
 
+use crate::arm_dynarmic_64::MemoryVtable;
 use crate::state::CpuState;
 use rdynarmic::halt_reason::HaltReason;
-use rdynarmic::jit::A64Jit;
+use rdynarmic::jit::A32Jit;
 use rdynarmic::jit_config::{JitCallbacks, JitConfig};
-
-// ---------------------------------------------------------------------------
-// Memory access vtable (avoids circular crate dependency)
-// ---------------------------------------------------------------------------
-
-/// Function-pointer table for guest memory access.
-///
-/// The caller (e.g. `main.rs`) fills this in with closures that forward to
-/// `MemoryManager`.  All functions take a raw context pointer as the first
-/// argument and return a default value on unmapped access.
-#[derive(Clone, Copy)]
-pub struct MemoryVtable {
-    pub read_u8:   unsafe fn(*const u8, u64) -> u8,
-    pub read_u16:  unsafe fn(*const u8, u64) -> u16,
-    pub read_u32:  unsafe fn(*const u8, u64) -> u32,
-    pub read_u64:  unsafe fn(*const u8, u64) -> u64,
-    pub write_u8:  unsafe fn(*mut u8, u64, u8),
-    pub write_u16: unsafe fn(*mut u8, u64, u16),
-    pub write_u32: unsafe fn(*mut u8, u64, u32),
-    pub write_u64: unsafe fn(*mut u8, u64, u64),
-}
 
 // ---------------------------------------------------------------------------
 // Shared callback state
 // ---------------------------------------------------------------------------
 
-/// Mutable state shared between `DynarmicCallbacks` (owned by the JIT) and
-/// `ArmDynarmic64` (the public wrapper).  Heap-allocated for pointer stability.
 struct CallbackState {
-    /// Opaque memory context pointer (points to MemoryManager).
     memory_ctx: *mut u8,
-    /// Function-pointer table for memory access.
     vtable: MemoryVtable,
-    /// Remaining ticks in the current time slice.
     ticks_remaining: u64,
 }
 
@@ -56,14 +31,10 @@ struct CallbackState {
 // JIT callbacks
 // ---------------------------------------------------------------------------
 
-/// Implements `rdynarmic::JitCallbacks` by delegating memory operations
-/// through the vtable and managing the cycle budget.
 struct DynarmicCallbacks {
     state: *mut CallbackState,
 }
 
-// SAFETY: Single-threaded emulation — the JIT, callbacks, and memory manager
-// are never accessed from multiple threads simultaneously.
 unsafe impl Send for DynarmicCallbacks {}
 
 impl DynarmicCallbacks {
@@ -79,35 +50,27 @@ impl DynarmicCallbacks {
 }
 
 impl JitCallbacks for DynarmicCallbacks {
-    // -- Code read -----------------------------------------------------------
-
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
         let s = self.s();
         Some(unsafe { (s.vtable.read_u32)(s.memory_ctx as *const u8, vaddr) })
     }
 
-    // -- Data reads ----------------------------------------------------------
-
     fn memory_read_8(&self, vaddr: u64) -> u8 {
         let s = self.s();
         unsafe { (s.vtable.read_u8)(s.memory_ctx as *const u8, vaddr) }
     }
-
     fn memory_read_16(&self, vaddr: u64) -> u16 {
         let s = self.s();
         unsafe { (s.vtable.read_u16)(s.memory_ctx as *const u8, vaddr) }
     }
-
     fn memory_read_32(&self, vaddr: u64) -> u32 {
         let s = self.s();
         unsafe { (s.vtable.read_u32)(s.memory_ctx as *const u8, vaddr) }
     }
-
     fn memory_read_64(&self, vaddr: u64) -> u64 {
         let s = self.s();
         unsafe { (s.vtable.read_u64)(s.memory_ctx as *const u8, vaddr) }
     }
-
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
         let s = self.s();
         let lo = unsafe { (s.vtable.read_u64)(s.memory_ctx as *const u8, vaddr) };
@@ -115,28 +78,22 @@ impl JitCallbacks for DynarmicCallbacks {
         (lo, hi)
     }
 
-    // -- Data writes ---------------------------------------------------------
-
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
         let s = self.s();
         unsafe { (s.vtable.write_u8)(s.memory_ctx, vaddr, value) };
     }
-
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
         let s = self.s();
         unsafe { (s.vtable.write_u16)(s.memory_ctx, vaddr, value) };
     }
-
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
         let s = self.s();
         unsafe { (s.vtable.write_u32)(s.memory_ctx, vaddr, value) };
     }
-
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
         let s = self.s();
         unsafe { (s.vtable.write_u64)(s.memory_ctx, vaddr, value) };
     }
-
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
         let s = self.s();
         unsafe {
@@ -144,8 +101,6 @@ impl JitCallbacks for DynarmicCallbacks {
             (s.vtable.write_u64)(s.memory_ctx, vaddr + 8, value_hi);
         }
     }
-
-    // -- Exclusive memory (single-core: always succeed) ----------------------
 
     fn exclusive_read_8(&self, vaddr: u64) -> u8 { self.memory_read_8(vaddr) }
     fn exclusive_read_16(&self, vaddr: u64) -> u16 { self.memory_read_16(vaddr) }
@@ -170,20 +125,14 @@ impl JitCallbacks for DynarmicCallbacks {
     }
     fn exclusive_clear(&mut self) {}
 
-    // -- System callbacks ----------------------------------------------------
-
     fn call_supervisor(&mut self, _svc_num: u32) {
-        // The JIT-generated code already sets halt_reason = SVC before
-        // calling this callback. The SVC number is extracted from the
-        // instruction at PC-4 after run() returns.
+        // The JIT sets halt_reason = SVC. The SVC number is extracted from
+        // the instruction at PC-4 (ARM) or PC-2 (Thumb) after run() returns.
     }
 
     fn exception_raised(&mut self, pc: u64, exception: u64) {
-        log::error!("JIT exception_raised callback: PC=0x{:016X}, exception=0x{:X}", pc, exception);
+        log::error!("A32 JIT exception: PC=0x{:08X}, exception=0x{:X}", pc, exception);
     }
-
-
-    // -- Tick management -----------------------------------------------------
 
     fn add_ticks(&mut self, ticks: u64) {
         let s = self.s_mut();
@@ -199,26 +148,20 @@ impl JitCallbacks for DynarmicCallbacks {
 // Public JIT wrapper
 // ---------------------------------------------------------------------------
 
-/// ARM64 JIT executor wrapping `rdynarmic::A64Jit`.
+/// ARM32 JIT executor wrapping `rdynarmic::A32Jit`.
 ///
-/// Matches zuyu's `ArmDynarmic64` class.  Provides context transfer between
+/// Matches zuyu's `ArmDynarmic32` class. Provides context transfer between
 /// the kernel's `CpuState` and the JIT register file.
-pub struct ArmDynarmic64 {
-    jit: A64Jit,
-    /// Heap-allocated shared state. The callbacks hold a raw pointer to this.
-    /// Must outlive the JIT (dropped after `jit` since fields drop in order).
+pub struct ArmDynarmic32 {
+    jit: A32Jit,
     _callback_state: Box<CallbackState>,
 }
 
-impl ArmDynarmic64 {
-    /// Create a new JIT instance.
-    ///
-    /// `memory_ctx` is an opaque pointer forwarded to every vtable function
-    /// (typically `&mut MemoryManager as *mut _ as *mut u8`).
+impl ArmDynarmic32 {
+    /// Create a new A32 JIT instance.
     ///
     /// # Safety
-    /// `memory_ctx` must remain valid for the lifetime of this struct, and the
-    /// vtable functions must be safe to call with it.
+    /// `memory_ctx` must remain valid for the lifetime of this struct.
     pub fn new(memory_ctx: *mut u8, vtable: MemoryVtable) -> Result<Self, String> {
         let mut callback_state = Box::new(CallbackState {
             memory_ctx,
@@ -236,7 +179,7 @@ impl ArmDynarmic64 {
             enable_optimizations: true,
         };
 
-        let jit = A64Jit::new(config)?;
+        let jit = A32Jit::new(config)?;
 
         Ok(Self {
             jit,
@@ -259,48 +202,64 @@ impl ArmDynarmic64 {
         self.jit.halt_execution(HaltReason::EXTERNAL_HALT);
     }
 
-    /// Set the remaining tick budget for the current time slice.
+    /// Set the remaining tick budget.
     pub fn set_ticks_remaining(&mut self, ticks: u64) {
         self._callback_state.ticks_remaining = ticks;
     }
 
     /// Get the SVC number after the JIT halted with `HaltReason::SVC`.
     ///
-    /// Extracts the immediate from the SVC instruction at PC-4 (the frontend
-    /// advances PC past the SVC before halting).
+    /// ARM32: SVC instruction at PC-4, encoding `0xEF000000 | imm24`.
+    /// Thumb: SVC instruction at PC-2, encoding `0xDF00 | imm8`.
+    /// The CPSR T flag determines the instruction set.
     pub fn get_svc_number(&self) -> Option<u32> {
-        let pc = self.jit.get_pc();
-        if pc < 4 {
-            return None;
-        }
-        // Read the SVC instruction at PC-4.
+        let pc = self.jit.get_pc() as u64;
+        let cpsr = self.jit.get_cpsr();
+        let thumb = cpsr & (1 << 5) != 0;
         let s = &*self._callback_state;
-        let instr = unsafe { (s.vtable.read_u32)(s.memory_ctx as *const u8, pc - 4) };
-        // ARM64 SVC encoding: 1101_0100_000 imm16 000_01
-        if instr & 0xFFE0_001F != 0xD400_0001 {
-            log::warn!(
-                "Expected SVC at 0x{:016X} but got 0x{:08X}",
-                pc - 4, instr
-            );
-            return None;
+
+        if thumb {
+            if pc < 2 { return None; }
+            let instr = unsafe { (s.vtable.read_u16)(s.memory_ctx as *const u8, pc - 2) };
+            // Thumb SVC: 1101_1111 imm8
+            if instr & 0xFF00 != 0xDF00 {
+                log::warn!("Expected Thumb SVC at 0x{:08X} but got 0x{:04X}", pc - 2, instr);
+                return None;
+            }
+            Some((instr & 0xFF) as u32)
+        } else {
+            if pc < 4 { return None; }
+            let instr = unsafe { (s.vtable.read_u32)(s.memory_ctx as *const u8, pc - 4) };
+            // ARM SVC: cond 1111 imm24
+            if instr & 0x0F00_0000 != 0x0F00_0000 {
+                log::warn!("Expected ARM SVC at 0x{:08X} but got 0x{:08X}", pc - 4, instr);
+                return None;
+            }
+            Some(instr & 0x00FF_FFFF)
         }
-        Some((instr >> 5) & 0xFFFF)
     }
 
     /// Load CPU state into the JIT register file (thread switch-in).
+    ///
+    /// CpuState uses u64 for registers; A32 truncates to u32.
     pub fn load_context(&mut self, state: &CpuState) {
-        for i in 0..31 {
-            self.jit.set_register(i, state.x[i]);
+        // R0-R14 from x[0..15], R15 (PC) from state.pc
+        for i in 0..15 {
+            self.jit.set_register(i, state.x[i] as u32);
         }
-        self.jit.set_sp(state.sp);
-        self.jit.set_pc(state.pc);
-        self.jit.set_pstate(state.nzcv);
-        for i in 0..32 {
-            self.jit.set_vector(i, state.v[i][0], state.v[i][1]);
-        }
-        self.jit.set_tpidr_el0(state.tpidr_el0);
+        self.jit.set_pc(state.pc as u32);
 
-        // Clear any stale halt reason from previous execution.
+        // CPSR from nzcv (in ARM format: bits [31:28] = NZCV)
+        self.jit.set_cpsr(state.nzcv);
+
+        // Extension registers from SIMD/FP v[] array (S regs = low 32 bits)
+        for i in 0..32 {
+            let lo = state.v[i][0];
+            // Each D register = 2 consecutive S registers in ext_reg backing store
+            self.jit.set_ext_reg(i * 2, lo as u32);
+            self.jit.set_ext_reg(i * 2 + 1, (lo >> 32) as u32);
+        }
+
         self.jit.clear_halt(
             HaltReason::SVC
                 | HaltReason::STEP
@@ -311,34 +270,35 @@ impl ArmDynarmic64 {
         );
     }
 
-    /// Get the JIT's current PC directly (for diagnostics).
+    /// Get the JIT's current PC (as u64 for compatibility).
     pub fn get_pc(&self) -> u64 {
-        self.jit.get_pc()
+        self.jit.get_pc() as u64
     }
 
-    /// Set the JIT's PC directly (e.g. to skip a faulting instruction).
+    /// Set the JIT's PC.
     pub fn set_pc(&mut self, pc: u64) {
-        self.jit.set_pc(pc);
+        self.jit.set_pc(pc as u32);
     }
 
-    /// Clear specific halt reason bits so the JIT can resume.
+    /// Clear specific halt reason bits.
     pub fn clear_halt(&self, reason: HaltReason) {
         self.jit.clear_halt(reason);
     }
 
     /// Save JIT register file into CPU state (thread switch-out).
     pub fn save_context(&self, state: &mut CpuState) {
-        for i in 0..31 {
-            state.x[i] = self.jit.get_register(i);
+        for i in 0..15 {
+            state.x[i] = self.jit.get_register(i) as u64;
         }
-        state.sp = self.jit.get_sp();
-        state.pc = self.jit.get_pc();
-        state.nzcv = self.jit.get_pstate();
+        state.sp = self.jit.get_register(13) as u64;
+        state.pc = self.jit.get_pc() as u64;
+        state.nzcv = self.jit.get_cpsr();
+
         for i in 0..32 {
-            let (lo, hi) = self.jit.get_vector(i);
-            state.v[i] = [lo, hi];
+            let lo = self.jit.get_ext_reg(i * 2) as u64;
+            let hi = self.jit.get_ext_reg(i * 2 + 1) as u64;
+            state.v[i] = [lo | (hi << 32), 0];
         }
-        state.tpidr_el0 = self.jit.get_tpidr_el0();
     }
 
     /// Invalidate JIT-compiled blocks in a memory range.
@@ -347,7 +307,7 @@ impl ArmDynarmic64 {
     }
 }
 
-impl crate::ArmJit for ArmDynarmic64 {
+impl crate::ArmJit for ArmDynarmic32 {
     fn run(&mut self) -> HaltReason { self.run() }
     fn step(&mut self) -> HaltReason { self.step() }
     fn halt(&self) { self.halt() }

@@ -56,6 +56,9 @@ pub struct NspLoadResult {
     pub modules: Vec<(String, CodeSet)>,
     /// Title ID from the NCA header.
     pub title_id: u64,
+    /// Whether the program targets AArch64 (true) or AArch32 (false).
+    /// Determined from the NPDM flags byte (bit 0).
+    pub is_64bit: bool,
     /// Application name (from Control NCA NACP, if available).
     pub title: Option<String>,
     /// Developer name (from Control NCA NACP, if available).
@@ -207,12 +210,14 @@ pub fn load_nsp(
     }
 
     // Check for main.npdm (architecture metadata).
+    // Default to 64-bit if NPDM is missing (most Switch titles are AArch64).
+    let mut is_64bit = true;
     if let Some(npdm_file) = exefs_pfs.open_file(exefs_vfs.clone(), "main.npdm") {
         let npdm_data = npdm_file.read_all().map_err(NspError::Io)?;
         if npdm_data.len() >= 0x10 {
             let magic = &npdm_data[0..4];
             let flags = npdm_data[0x0C];
-            let is_64bit = flags & 1 != 0;
+            is_64bit = flags & 1 != 0;
             log::info!(
                 "NPDM: magic={:?}, flags=0x{:02X}, is_64bit={}",
                 std::str::from_utf8(magic).unwrap_or("????"),
@@ -277,6 +282,7 @@ pub fn load_nsp(
     Ok(NspLoadResult {
         modules,
         title_id: program_nca.header.title_id,
+        is_64bit,
         title,
         developer,
         version,
