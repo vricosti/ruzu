@@ -11,6 +11,7 @@ use crate::pfs::{Pfs, PfsError};
 use crate::vfs::{VecFile, VfsFile};
 use byteorder::{LittleEndian, ReadBytesExt};
 use ruzu_crypto::aes_ctr;
+use ruzu_crypto::aes_ecb;
 use ruzu_crypto::aes_xts::{self, NCA_SECTOR_SIZE};
 use ruzu_crypto::key_manager::{Key128, KeyManager};
 use std::io::Cursor;
@@ -105,6 +106,15 @@ pub enum NcaCryptoType {
     BktrCtr = 4,
 }
 
+/// Hash type for section data verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NcaHashType {
+    Auto = 0,
+    None = 1,
+    HierarchicalSha256 = 2,
+    HierarchicalIntegrity = 3,
+}
+
 /// A section within the NCA.
 #[derive(Debug, Clone)]
 pub struct NcaSection {
@@ -114,10 +124,17 @@ pub struct NcaSection {
     pub end_offset: u64,
     /// Filesystem type (PFS0 or RomFS).
     pub fs_type: NcaSectionFsType,
+    /// Hash type for data verification.
+    pub hash_type: NcaHashType,
     /// Encryption type.
     pub crypto_type: NcaCryptoType,
     /// Section CTR counter (upper 64 bits of the IV).
     pub ctr: u64,
+    /// Offset of the actual data within the decrypted section (after hash layers).
+    /// For HierarchicalSha256, this is level[1].offset.
+    pub data_offset: u64,
+    /// Size of the actual data region.
+    pub data_size: u64,
 }
 
 /// Parsed NCA header.
@@ -127,8 +144,10 @@ pub struct NcaHeader {
     pub version: u8,
     /// Content type.
     pub content_type: NcaContentType,
-    /// Crypto type (key generation).
+    /// Crypto type (key generation) from header offset 0x06.
     pub crypto_type: u8,
+    /// Crypto type 2 from header offset 0x20 (used for master key revision).
+    pub crypto_type_2: u8,
     /// Key area encryption key index (0=Application, 1=Ocean, 2=System).
     pub key_area_type: u8,
     /// Title ID.
@@ -152,6 +171,15 @@ impl NcaHeader {
     /// Get the rights ID as a hex string.
     pub fn rights_id_hex(&self) -> String {
         hex::encode(self.rights_id)
+    }
+
+    /// Compute the master key revision for titlekek lookup.
+    ///
+    /// zuyu: `std::max(crypto_type, crypto_type_2)` then subtract 1 (clamped to 0).
+    /// The revision indexes into titlekek_XX in prod.keys.
+    pub fn master_key_revision(&self) -> u8 {
+        let raw = std::cmp::max(self.crypto_type, self.crypto_type_2);
+        raw.saturating_sub(1)
     }
 }
 
@@ -204,8 +232,8 @@ pub fn parse_nca_header(data: &[u8], keys: &KeyManager) -> Result<NcaHeader, Nca
     // [0x1C] sdk addon version (4 bytes)
     let _sdk_version = cur.read_u32::<LittleEndian>()?;
 
-    // [0x20] crypto type 2
-    let _crypto_type2 = cur.read_u8()?;
+    // [0x20] crypto type 2 (used for master key revision)
+    let crypto_type_2 = cur.read_u8()?;
 
     // Skip to rights ID at offset 0x30 in the fixed header (0x230 absolute)
     // Current position is 0x21, need to skip to 0x30
@@ -251,8 +279,38 @@ pub fn parse_nca_header(data: &[u8], keys: &KeyManager) -> Result<NcaHeader, Nca
             let mut fcur = Cursor::new(fs_hdr);
 
             let _fs_version = fcur.read_u16::<LittleEndian>()?;
-            let fs_type = fcur.read_u8()?;
-            let crypto = fcur.read_u8()?;
+            let fs_type = fcur.read_u8()?;        // offset 0x02
+            let hash_type_raw = fcur.read_u8()?;  // offset 0x03
+            let crypto = fcur.read_u8()?;          // offset 0x04 (encryption_type)
+
+            let hash_type = match hash_type_raw {
+                0 => NcaHashType::Auto,
+                1 => NcaHashType::None,
+                2 => NcaHashType::HierarchicalSha256,
+                3 => NcaHashType::HierarchicalIntegrity,
+                _ => NcaHashType::None,
+            };
+
+            // Parse hash data to find the actual data offset within the section.
+            // For HierarchicalSha256 (PFS0 sections): hash data at FS header
+            // offset 0x08, data level = level[1] at offset 0x40.
+            // For HierarchicalIntegrity (RomFS sections): data level is the
+            // last level in the integrity info.
+            let (data_offset, data_size) = match hash_type {
+                NcaHashType::HierarchicalSha256 if fs_hdr.len() >= 0x50 => {
+                    // Hash data layout (offset from FS header start):
+                    //   0x08: master_hash (32 bytes)
+                    //   0x28: hash_block_size (i32)
+                    //   0x2C: hash_layer_count (i32)
+                    //   0x30: level[0] = { offset: i64, size: i64 }  (hash tree)
+                    //   0x40: level[1] = { offset: i64, size: i64 }  (actual data)
+                    let mut lcur = Cursor::new(&fs_hdr[0x40..0x50]);
+                    let off = lcur.read_u64::<LittleEndian>().unwrap_or(0);
+                    let sz = lcur.read_u64::<LittleEndian>().unwrap_or(0);
+                    (off, sz)
+                }
+                _ => (0, (end_offset - start_offset)),
+            };
 
             // Skip to CTR at offset 0x140 in FS header
             let ctr = if fs_hdr.len() >= 0x148 {
@@ -262,6 +320,11 @@ pub fn parse_nca_header(data: &[u8], keys: &KeyManager) -> Result<NcaHeader, Nca
                 0
             };
 
+            log::debug!(
+                "NCA section {}: fs_type={}, hash_type={:?}, crypto={}, data_offset=0x{:X}, data_size=0x{:X}",
+                i, fs_type, hash_type, crypto, data_offset, data_size
+            );
+
             sections.push(NcaSection {
                 start_offset,
                 end_offset,
@@ -270,6 +333,7 @@ pub fn parse_nca_header(data: &[u8], keys: &KeyManager) -> Result<NcaHeader, Nca
                 } else {
                     NcaSectionFsType::RomFs
                 },
+                hash_type,
                 crypto_type: match crypto {
                     1 => NcaCryptoType::None,
                     2 => NcaCryptoType::Xts,
@@ -278,6 +342,8 @@ pub fn parse_nca_header(data: &[u8], keys: &KeyManager) -> Result<NcaHeader, Nca
                     _ => NcaCryptoType::None,
                 },
                 ctr,
+                data_offset,
+                data_size,
             });
         }
     }
@@ -294,6 +360,7 @@ pub fn parse_nca_header(data: &[u8], keys: &KeyManager) -> Result<NcaHeader, Nca
         version,
         content_type,
         crypto_type,
+        crypto_type_2,
         key_area_type,
         title_id,
         rights_id,
@@ -324,7 +391,31 @@ pub fn decrypt_nca_section(
         NcaCryptoType::Ctr | NcaCryptoType::BktrCtr => {
             let body_key = get_body_key(header, keys)?;
             let iv = aes_ctr::make_nca_ctr(section.ctr, section.start_offset);
+            log::debug!(
+                "CTR decrypt: section=[0x{:X}..0x{:X}], ctr=0x{:016X}, iv={:02X?}, key={:02X?}",
+                section.start_offset,
+                section.end_offset,
+                section.ctr,
+                iv,
+                body_key
+            );
             aes_ctr::decrypt_aes_ctr(&body_key, &iv, &mut data);
+            // Log first bytes of decrypted data and at data_offset
+            if data.len() >= 16 {
+                log::debug!(
+                    "Decrypted[0..16]: {:02X?}",
+                    &data[..16]
+                );
+            }
+            if section.data_offset > 0 && (section.data_offset as usize) + 16 <= data.len() {
+                let off = section.data_offset as usize;
+                log::debug!(
+                    "Decrypted[0x{:X}..0x{:X}]: {:02X?}",
+                    off,
+                    off + 16,
+                    &data[off..off + 16]
+                );
+            }
         }
         NcaCryptoType::Xts => {
             // XTS for body sections is rare but supported
@@ -336,16 +427,40 @@ pub fn decrypt_nca_section(
 }
 
 /// Get the body decryption key for an NCA.
+///
+/// For rights-ID NCAs: the title key (from title.keys or ticket) is encrypted
+/// with the titlekek. We decrypt it with AES-128-ECB, matching zuyu's
+/// `content_archive.cpp` NCA::ReadHeader().
 fn get_body_key(header: &NcaHeader, keys: &KeyManager) -> Result<Key128, NcaError> {
     if header.has_rights_id() {
-        // Use title key from the key manager
-        keys.title_key(&header.rights_id_hex())
+        // Get the encrypted title key from the key manager
+        let mut title_key = keys.title_key(&header.rights_id_hex())
             .ok_or_else(|| {
                 NcaError::MissingBodyKey(format!(
                     "title key for rights_id={}",
                     header.rights_id_hex()
                 ))
-            })
+            })?;
+
+        // Decrypt title key with titlekek (zuyu: AESCipher(titlekek, ECB).Decrypt(titlekey))
+        let revision = header.master_key_revision();
+        let titlekek = keys.titlekek(revision)
+            .ok_or_else(|| {
+                NcaError::MissingBodyKey(format!(
+                    "titlekek_{:02x} for rights_id={}",
+                    revision,
+                    header.rights_id_hex()
+                ))
+            })?;
+
+        log::debug!(
+            "Decrypting title key with titlekek_{:02x}: key={:02X?} titlekek={:02X?}",
+            revision, title_key, titlekek
+        );
+        aes_ecb::decrypt_aes_128_ecb(&titlekek, &mut title_key);
+        log::debug!("Decrypted title key: {:02X?}", title_key);
+
+        Ok(title_key)
     } else {
         // Decrypt key area entry with the key-area-key
         let kak = keys
@@ -357,10 +472,9 @@ fn get_body_key(header: &NcaHeader, keys: &KeyManager) -> Result<Key128, NcaErro
                 ))
             })?;
 
-        // Decrypt the first key area entry with AES-128-ECB (= CTR with zero IV)
+        // Decrypt the first key area entry with AES-128-ECB
         let mut decrypted_key = header.key_area[0];
-        let iv = [0u8; 16];
-        aes_ctr::decrypt_aes_ctr(&kak, &iv, &mut decrypted_key);
+        aes_ecb::decrypt_aes_128_ecb(&kak, &mut decrypted_key);
 
         Ok(decrypted_key)
     }
@@ -382,7 +496,16 @@ pub fn open_exefs(
 
     let decrypted = decrypt_nca_section(file, section, header, keys)?;
     let vec_file = Arc::new(VecFile::new("exefs".to_string(), decrypted.clone()));
-    let pfs = Pfs::parse(vec_file.as_ref(), 0)?;
+
+    // The PFS0 data starts at section.data_offset within the decrypted data
+    // (after the hash verification layer).
+    log::debug!(
+        "ExeFS: decrypted {} bytes, PFS0 at offset 0x{:X} (size 0x{:X})",
+        decrypted.len(),
+        section.data_offset,
+        section.data_size
+    );
+    let pfs = Pfs::parse(vec_file.as_ref(), section.data_offset)?;
 
     Ok(Some((pfs, decrypted)))
 }
@@ -453,6 +576,7 @@ mod tests {
             version: 3,
             content_type: NcaContentType::Program,
             crypto_type: 0,
+            crypto_type_2: 0,
             key_area_type: 0,
             title_id: 0,
             rights_id: [0; 16],

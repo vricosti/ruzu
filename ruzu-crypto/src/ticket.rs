@@ -8,7 +8,6 @@
 //! is encrypted with a titlekek derived from the master key at the ticket's
 //! crypto revision.
 
-use crate::aes_ctr;
 use crate::key_manager::{Key128, KeyManager};
 use thiserror::Error;
 
@@ -32,9 +31,6 @@ const RIGHTS_ID_OFFSET: usize = 0x2A0;
 pub enum TicketError {
     #[error("ticket too small: need at least {MIN_TICKET_SIZE} bytes, got {0}")]
     TooSmall(usize),
-
-    #[error("missing titlekek for revision {0}")]
-    MissingTitlekek(u8),
 }
 
 /// Title key type in ticket.
@@ -95,35 +91,40 @@ impl Ticket {
         })
     }
 
-    /// Decrypt the title key and register it in the key manager.
+    /// Register the title key (encrypted) in the key manager.
     ///
-    /// For common tickets, the title key block is encrypted with the titlekek
-    /// at the ticket's key revision. We decrypt it with AES-128-ECB (which is
-    /// equivalent to CTR with a zero IV for a single block).
+    /// The title key block from the ticket is stored as-is (still encrypted
+    /// with the titlekek). Decryption happens later at NCA open time in
+    /// `get_body_key()`, matching zuyu's architecture where
+    /// `content_archive.cpp` decrypts with `AESCipher(titlekek, ECB)`.
+    ///
+    /// If a title key is already present in the key manager (e.g., from
+    /// title.keys), it is kept since both sources store the same encrypted key.
     pub fn register_title_key(&self, keys: &mut KeyManager) -> Result<Key128, TicketError> {
-        let title_key = if self.title_key_type == TitleKeyType::Common {
-            // Decrypt title key with titlekek
-            let titlekek = keys
-                .titlekek(self.key_revision)
-                .ok_or(TicketError::MissingTitlekek(self.key_revision))?;
+        // If title.keys already has this key, keep it
+        if let Some(existing) = keys.title_key(&self.rights_id_hex) {
+            log::info!(
+                "Title key for rights_id={} already present (from title.keys), keeping it",
+                self.rights_id_hex
+            );
+            return Ok(existing);
+        }
 
-            let mut decrypted = self.title_key_block;
-            // ECB decryption of a single block = CTR with zero IV for one block
-            let iv = [0u8; 16];
-            aes_ctr::decrypt_aes_ctr(&titlekek, &iv, &mut decrypted);
-            decrypted
-        } else {
-            // Personalized tickets: use the key block as-is (not fully supported)
+        // Store the raw title key block (encrypted with titlekek).
+        // For common tickets, this is the titlekek-encrypted key.
+        // For personalized tickets, this is the raw key block.
+        let title_key = self.title_key_block;
+
+        if self.title_key_type == TitleKeyType::Personalized {
             log::warn!(
                 "Personalized ticket for rights_id={}, using raw key block",
                 self.rights_id_hex
             );
-            self.title_key_block
-        };
+        }
 
         keys.add_title_key(&self.rights_id_hex, title_key);
         log::info!(
-            "Registered title key for rights_id={}",
+            "Registered title key (encrypted) for rights_id={}",
             self.rights_id_hex
         );
 

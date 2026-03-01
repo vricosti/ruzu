@@ -7,6 +7,10 @@
 //! split: first 16 bytes = data key, last 16 bytes = tweak key.
 //!
 //! Each 0x200-byte sector is decrypted independently with a sector-number tweak.
+//!
+//! **Important:** Nintendo encodes the sector number as big-endian in the 16-byte
+//! tweak (zuyu: `CalculateNintendoTweak`), unlike IEEE P1619 which uses
+//! little-endian. This implementation uses Nintendo's convention.
 
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
@@ -48,9 +52,10 @@ fn decrypt_xts_sector(data_key: &Aes128, tweak_key: &Aes128, sector_num: u64, da
         return;
     }
 
-    // Compute initial tweak: encrypt the sector number with the tweak key
+    // Compute initial tweak: encrypt the sector number with the tweak key.
+    // Nintendo uses big-endian encoding (zuyu: CalculateNintendoTweak).
     let mut tweak = [0u8; 16];
-    tweak[..8].copy_from_slice(&sector_num.to_le_bytes());
+    tweak[8..16].copy_from_slice(&sector_num.to_be_bytes());
     let mut tweak_block = GenericArray::clone_from_slice(&tweak);
     tweak_key.encrypt_block(&mut tweak_block);
     tweak.copy_from_slice(&tweak_block);
@@ -163,6 +168,39 @@ mod tests {
         assert_eq!(data, plaintext);
     }
 
+    #[test]
+    fn test_xts_nonzero_sector_round_trip() {
+        // Verify round-trip works for non-zero sectors (where endianness matters)
+        let key: Key256 = [0x42; 32];
+        let plaintext = vec![0xABu8; NCA_SECTOR_SIZE * 4];
+        let mut data = plaintext.clone();
+
+        encrypt_aes_xts(&key, 5, NCA_SECTOR_SIZE, &mut data);
+        assert_ne!(data, plaintext);
+
+        decrypt_aes_xts(&key, 5, NCA_SECTOR_SIZE, &mut data);
+        assert_eq!(data, plaintext);
+    }
+
+    #[test]
+    fn test_xts_ieee_vector_0() {
+        // IEEE P1619 XTS-AES-128 Test Vector 0 (sector 0, all-zero key and plaintext).
+        // At sector 0, the Nintendo big-endian tweak matches the IEEE little-endian
+        // tweak (both are all zeros), so this verifies the core XTS cipher logic.
+        let key: Key256 = [0u8; 32];
+        let expected_ciphertext = hex::decode(
+            "917cf69ebd68b2ec9b9fe9a3eadda692cd43d2f59598ed858c02c2652fbf922e",
+        )
+        .unwrap();
+
+        let mut data = vec![0u8; 32];
+        encrypt_aes_xts(&key, 0, 32, &mut data);
+        assert_eq!(data, expected_ciphertext, "encrypt mismatch vs IEEE vector 0");
+
+        decrypt_aes_xts(&key, 0, 32, &mut data);
+        assert_eq!(data, vec![0u8; 32], "decrypt mismatch vs IEEE vector 0");
+    }
+
     /// Helper: XTS encrypt (for testing round-trip only).
     fn encrypt_aes_xts(key: &Key256, sector: u64, sector_size: usize, data: &mut [u8]) {
         let data_key = Aes128::new(GenericArray::from_slice(&key[..16]));
@@ -189,7 +227,7 @@ mod tests {
         }
 
         let mut tweak = [0u8; 16];
-        tweak[..8].copy_from_slice(&sector_num.to_le_bytes());
+        tweak[8..16].copy_from_slice(&sector_num.to_be_bytes());
         let mut tweak_block = GenericArray::clone_from_slice(&tweak);
         tweak_key.encrypt_block(&mut tweak_block);
         tweak.copy_from_slice(&tweak_block);

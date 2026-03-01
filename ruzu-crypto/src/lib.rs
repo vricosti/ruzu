@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub mod aes_ctr;
+pub mod aes_ecb;
 pub mod aes_xts;
 pub mod key_manager;
 pub mod ticket;
