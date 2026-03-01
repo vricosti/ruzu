@@ -97,20 +97,34 @@ impl KernelCore {
         // Map text segment (executable)
         process.load_code(base + text_offset as u64, text)?;
 
-        // Map rodata segment (read-only)
+        // Map rodata segment — map RW, write, reprotect to R (like zuyu LoadModule)
         let rodata_addr = base + rodata_offset as u64;
         let rodata_size = ruzu_common::align_up(rodata.len() as u64, ruzu_common::PAGE_SIZE_U64);
         process.memory.map(
             rodata_addr,
             rodata_size,
-            crate::memory_manager::MemoryPermission::READ,
+            crate::memory_manager::MemoryPermission::READ | crate::memory_manager::MemoryPermission::WRITE,
             crate::memory_manager::MemoryState::Code,
         )?;
         process.memory.write_bytes(rodata_addr, rodata)?;
+        process.memory.set_permissions(
+            rodata_addr,
+            rodata_size,
+            crate::memory_manager::MemoryPermission::READ,
+        )?;
 
         // Map data + BSS segment (read-write)
         let data_total_size = data.len() + bss_size;
         process.map_data(base + data_offset as u64, data, data_total_size)?;
+
+        // Update code_end to be past ALL segments (text + rodata + data + bss).
+        // load_code only sets code_end to the end of text, but TLS allocation
+        // uses code_end to find a free region, so it must be past everything.
+        let data_end = base + data_offset as u64
+            + ruzu_common::align_up(data_total_size as u64, ruzu_common::PAGE_SIZE_U64);
+        if data_end > process.layout.code_end {
+            process.layout.code_end = data_end;
+        }
 
         Ok(base)
     }
@@ -128,10 +142,11 @@ impl KernelCore {
         // Create main thread
         let thread_handle = process.create_main_thread(entry_point, stack_top, 44)?;
 
-        // Start the thread
+        // Mark the thread as runnable so the scheduler picks it up.
+        // The scheduler will transition it to Running when it actually executes.
         if let Some(thread) = process.main_thread_mut() {
             thread.start();
-            thread.state = ThreadState::Running;
+            thread.state = ThreadState::Runnable;
         }
 
         process.is_running = true;

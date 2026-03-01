@@ -94,19 +94,26 @@ impl KProcess {
     }
 
     /// Load code segments into the process address space.
+    ///
+    /// Maps as RW first to allow writing, then reprotects to RX.
+    /// This matches zuyu's LoadModule pattern (write first, reprotect after).
     pub fn load_code(&mut self, base_addr: VAddr, code: &[u8]) -> anyhow::Result<()> {
         let size = ruzu_common::align_up(code.len() as u64, PAGE_SIZE_U64);
 
-        // Map the code region
+        // Map as RW initially so we can write the code
         self.memory.map(
             base_addr,
             size,
-            MemoryPermission::READ | MemoryPermission::EXECUTE,
+            MemoryPermission::READ | MemoryPermission::WRITE,
             MemoryState::Code,
         )?;
 
         // Write the code
         self.memory.write_bytes(base_addr, code)?;
+
+        // Reprotect to RX (zuyu: SetProcessMemoryPermission → ReadExecute)
+        self.memory
+            .set_permissions(base_addr, size, MemoryPermission::READ | MemoryPermission::EXECUTE)?;
 
         // Update layout
         self.layout.code_end = base_addr + size;
