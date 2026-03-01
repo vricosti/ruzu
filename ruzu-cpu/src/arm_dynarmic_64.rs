@@ -179,8 +179,9 @@ impl JitCallbacks for DynarmicCallbacks {
     }
 
     fn exception_raised(&mut self, pc: u64, exception: u64) {
-        log::error!("Exception raised at PC=0x{:016X}, exception=0x{:X}", pc, exception);
+        log::error!("JIT exception_raised callback: PC=0x{:016X}, exception=0x{:X}", pc, exception);
     }
+
 
     // -- Tick management -----------------------------------------------------
 
@@ -308,6 +309,21 @@ impl ArmDynarmic64 {
                 | HaltReason::EXTERNAL_HALT
                 | HaltReason::CACHE_INVALIDATION,
         );
+    }
+
+    /// Get the JIT's current PC directly (for diagnostics).
+    pub fn get_pc(&self) -> u64 {
+        self.jit.get_pc()
+    }
+
+    /// Set the JIT's PC directly (e.g. to skip a faulting instruction).
+    pub fn set_pc(&mut self, pc: u64) {
+        self.jit.set_pc(pc);
+    }
+
+    /// Clear specific halt reason bits so the JIT can resume.
+    pub fn clear_halt(&self, reason: HaltReason) {
+        self.jit.clear_halt(reason);
     }
 
     /// Save JIT register file into CPU state (thread switch-out).

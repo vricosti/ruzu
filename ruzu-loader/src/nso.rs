@@ -208,6 +208,16 @@ pub fn load_nso(data: &[u8]) -> Result<CodeSet, NsoError> {
         },
     ];
 
+    // Log segment info for diagnostics
+    for (i, seg) in segments_info.iter().enumerate() {
+        let label = ["text", "rodata", "data"][i];
+        log::debug!(
+            "NSO segment {}: file_off=0x{:X}, mem_off=0x{:X}, decomp_size=0x{:X}, comp_size=0x{:X}, compressed={}, check_hash={}",
+            label, seg.file_offset, seg.memory_offset, seg.decompressed_size,
+            seg.compressed_size, seg.is_compressed, seg.check_hash
+        );
+    }
+
     // Decompress each segment
     let mut decompressed = [Vec::new(), Vec::new(), Vec::new()];
     for (i, seg) in segments_info.iter().enumerate() {
@@ -248,6 +258,15 @@ pub fn load_nso(data: &[u8]) -> Result<CodeSet, NsoError> {
             if computed.as_slice() != seg.hash {
                 return Err(NsoError::HashMismatch { index: i });
             }
+        }
+
+        // Log first bytes after decompression for diagnostics
+        if i == 0 && segment_data.len() >= 16 {
+            log::debug!(
+                "NSO text segment first 16 bytes ({}): {:02X?}",
+                if seg.is_compressed { "decompressed" } else { "raw" },
+                &segment_data[..16]
+            );
         }
 
         decompressed[i] = segment_data;
