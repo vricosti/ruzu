@@ -27,6 +27,9 @@ pub struct InputState {
     pub r_stick: (i32, i32),
     /// If the window was resized this frame, contains (width, height).
     pub resized: Option<(u32, u32)>,
+    /// Touch point from mouse click, scaled to Switch touch screen coords (1280x720).
+    /// `None` if mouse button is not pressed.
+    pub touch: Option<(u32, u32)>,
 }
 
 /// SDL2 window manager for the emulator.
@@ -197,11 +200,32 @@ impl EmulatorWindow {
             ly -= STICK_MAX;
         }
 
+        // Sample mouse state for touch input.
+        let mouse = self.event_pump.mouse_state();
+        let touch = if mouse.left() {
+            // Scale mouse position from window coordinates to Switch touch screen (1280x720).
+            let (win_w, win_h) = self.window.size();
+            let tx = if win_w > 0 {
+                (mouse.x() as u32).min(win_w - 1) * DEFAULT_WIDTH / win_w
+            } else {
+                0
+            };
+            let ty = if win_h > 0 {
+                (mouse.y() as u32).min(win_h - 1) * DEFAULT_HEIGHT / win_h
+            } else {
+                0
+            };
+            Some((tx, ty))
+        } else {
+            None
+        };
+
         Some(InputState {
             buttons: btns,
             l_stick: (lx, ly),
             r_stick: (0, 0),
             resized,
+            touch,
         })
     }
 
