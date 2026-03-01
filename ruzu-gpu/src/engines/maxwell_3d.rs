@@ -251,6 +251,26 @@ const RT_FORMAT_A8B8G8R8_UNORM: u32 = 0xD5;
 const RT_FORMAT_A8B8G8R8_SRGB: u32 = 0xD6;
 #[allow(dead_code)]
 const RT_FORMAT_A8R8G8B8_UNORM: u32 = 0xCF;
+#[allow(dead_code)]
+const RT_FORMAT_R16G16B16A16_FLOAT: u32 = 0xCA;
+#[allow(dead_code)]
+const RT_FORMAT_R32_FLOAT: u32 = 0xE5;
+#[allow(dead_code)]
+const RT_FORMAT_R16G16_FLOAT: u32 = 0xDE;
+#[allow(dead_code)]
+const RT_FORMAT_R32G32_FLOAT: u32 = 0xCB;
+#[allow(dead_code)]
+const RT_FORMAT_R16_FLOAT: u32 = 0xF2;
+#[allow(dead_code)]
+const RT_FORMAT_R8_UNORM: u32 = 0xF3;
+#[allow(dead_code)]
+const RT_FORMAT_R16G16_UNORM: u32 = 0xDA;
+#[allow(dead_code)]
+const RT_FORMAT_B5G6R5_UNORM: u32 = 0xE8;
+#[allow(dead_code)]
+const RT_FORMAT_A2B10G10R10_UNORM: u32 = 0xD1;
+#[allow(dead_code)]
+const RT_FORMAT_R11G11B10_FLOAT: u32 = 0xE0;
 
 // ── Draw state types ────────────────────────────────────────────────────────
 
@@ -2377,13 +2397,16 @@ fn format_clear_color(
 
     match format {
         // A8B8G8R8: memory layout is [R, G, B, A] when read as bytes in LE.
-        // The Switch GPU stores pixels as ABGR in u32 LE, which means
-        // byte[0]=R, byte[1]=G, byte[2]=B, byte[3]=A in memory.
         RT_FORMAT_A8B8G8R8_UNORM | RT_FORMAT_A8B8G8R8_SRGB => [r, g, b, a],
-        // Unknown format: default to RGBA layout.
+        // R8: single-channel 8-bit
+        RT_FORMAT_R8_UNORM => [r, 0, 0, 255],
+        // B5G6R5: 16-bit packed, convert to RGBA8
+        RT_FORMAT_B5G6R5_UNORM => [r, g, b, 255],
+        // All other formats: default to RGBA8 layout (float/HDR formats are
+        // quantized to 8-bit for the internal framebuffer representation).
         _ => {
             log::trace!(
-                "Maxwell3D: unknown RT format 0x{:X}, using RGBA8 layout",
+                "Maxwell3D: RT format 0x{:X}, using RGBA8 layout for clear",
                 format
             );
             [r, g, b, a]

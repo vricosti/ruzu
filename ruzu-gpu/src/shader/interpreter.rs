@@ -58,6 +58,8 @@ pub struct ShaderExecContext<'a> {
     pub output_attrs: HashMap<u32, f32>,
     /// GPU memory read callback.
     pub read_gpu: &'a dyn Fn(u64, &mut [u8]),
+    /// GPU memory write callback (for STG instruction).
+    pub write_gpu: Option<&'a dyn Fn(u64, &[u8])>,
     /// Constant buffer bindings (indexed by cbuf slot).
     pub cb_bindings: Vec<CbBinding>,
     /// Input vertex attributes (indexed by hw attribute index).
@@ -89,6 +91,7 @@ impl<'a> ShaderExecContext<'a> {
             budget: 65536,
             output_attrs: HashMap::new(),
             read_gpu,
+            write_gpu: None,
             cb_bindings: Vec::new(),
             input_attribs: Vec::new(),
             input_varyings: Vec::new(),
@@ -681,6 +684,536 @@ impl<'a> ShaderExecContext<'a> {
                 self.write_reg(*dst, val);
             }
 
+            // ── Extended multiply-add (XMAD) ──────────────────────────
+            Instruction::Xmad {
+                dst,
+                src_a,
+                src_b,
+                src_c,
+                mode,
+                hi_a,
+                hi_b,
+                psl,
+            } => {
+                let a_raw = self.read_reg(*src_a);
+                let a = if *hi_a {
+                    (a_raw >> 16) & 0xFFFF
+                } else {
+                    a_raw & 0xFFFF
+                };
+                let b_raw = self.resolve_src_b(src_b);
+                let b = if *hi_b {
+                    (b_raw >> 16) & 0xFFFF
+                } else {
+                    b_raw & 0xFFFF
+                };
+                let c = self.resolve_src_c(src_c);
+
+                let product = a.wrapping_mul(b);
+                let product = if *psl { product << 16 } else { product };
+
+                let result = match mode {
+                    0 => product.wrapping_add(c),           // CLO
+                    1 => product.wrapping_add(c & 0xFFFF0000), // CHI: add only high 16 of C
+                    2 => {
+                        // CSFU: sign extend product, add C
+                        let sign_ext = if product & 0x8000 != 0 {
+                            product | 0xFFFF_0000
+                        } else {
+                            product
+                        };
+                        sign_ext.wrapping_add(c)
+                    }
+                    3 => {
+                        // CBCC: carry-based combine (product + C with carry)
+                        product.wrapping_add(c)
+                    }
+                    _ => product.wrapping_add(c),
+                };
+                self.write_reg(*dst, result);
+            }
+
+            // ── Integer min/max ─────────────────────────────────────────
+            Instruction::Imnmx {
+                dst,
+                src_a,
+                src_b,
+                pred,
+                neg_pred,
+                is_signed,
+            } => {
+                let p = self.read_pred(*pred);
+                let p = if *neg_pred { !p } else { p };
+                let a = self.read_reg(*src_a);
+                let b = self.resolve_src_b(src_b);
+                let result = if *is_signed {
+                    let (a_s, b_s) = (a as i32, b as i32);
+                    (if p { a_s.min(b_s) } else { a_s.max(b_s) }) as u32
+                } else {
+                    if p { a.min(b) } else { a.max(b) }
+                };
+                self.write_reg(*dst, result);
+            }
+
+            // ── Float min/max ───────────────────────────────────────────
+            Instruction::Fmnmx {
+                dst,
+                src_a,
+                src_b,
+                pred,
+                neg_pred,
+                abs_a,
+                abs_b,
+                neg_a,
+                neg_b,
+            } => {
+                let p = self.read_pred(*pred);
+                let p = if *neg_pred { !p } else { p };
+                let a = Self::apply_f32_mods(self.read_reg_f32(*src_a), *abs_a, *neg_a);
+                let b = Self::apply_f32_mods(self.resolve_src_b_f32(src_b), *abs_b, *neg_b);
+                let result = if p { a.min(b) } else { a.max(b) };
+                self.write_reg_f32(*dst, result);
+            }
+
+            // ── Bit field extract ───────────────────────────────────────
+            Instruction::Bfe {
+                dst,
+                src_a,
+                src_b,
+                is_signed,
+            } => {
+                let pack = self.resolve_src_b(src_b);
+                let offset = (pack & 0xFF) as u32;
+                let count = ((pack >> 8) & 0xFF) as u32;
+                let val = self.read_reg(*src_a);
+                let result = if count == 0 || offset >= 32 {
+                    0
+                } else if *is_signed {
+                    let count = count.min(32 - offset);
+                    let shifted = (val as i32) << (32 - offset - count);
+                    (shifted >> (32 - count)) as u32
+                } else {
+                    let count = count.min(32 - offset);
+                    let mask = if count >= 32 {
+                        u32::MAX
+                    } else {
+                        (1u32 << count) - 1
+                    };
+                    (val >> offset) & mask
+                };
+                self.write_reg(*dst, result);
+            }
+
+            // ── Bit field insert ────────────────────────────────────────
+            Instruction::Bfi {
+                dst,
+                src_a,
+                src_b,
+                src_c,
+            } => {
+                let pack = self.resolve_src_b(src_b);
+                let offset = (pack & 0xFF) as u32;
+                let count = ((pack >> 8) & 0xFF) as u32;
+                let insert_val = self.read_reg(*src_a);
+                let base = self.resolve_src_c(src_c);
+                let result = if count == 0 || offset >= 32 {
+                    base
+                } else {
+                    let count = count.min(32 - offset);
+                    let mask = if count >= 32 {
+                        u32::MAX
+                    } else {
+                        (1u32 << count) - 1
+                    };
+                    (base & !(mask << offset)) | ((insert_val & mask) << offset)
+                };
+                self.write_reg(*dst, result);
+            }
+
+            // ── Population count ────────────────────────────────────────
+            Instruction::Popc { dst, src_b } => {
+                let val = self.resolve_src_b(src_b);
+                self.write_reg(*dst, val.count_ones());
+            }
+
+            // ── Find leading one ────────────────────────────────────────
+            Instruction::Flo {
+                dst,
+                src_b,
+                is_signed: _,
+                invert,
+            } => {
+                let mut val = self.resolve_src_b(src_b);
+                if *invert {
+                    val = !val;
+                }
+                let result = if val == 0 {
+                    0xFFFF_FFFFu32 // -1 to indicate not found
+                } else {
+                    31 - val.leading_zeros()
+                };
+                self.write_reg(*dst, result);
+            }
+
+            // ── Funnel shift ────────────────────────────────────────────
+            Instruction::Shf {
+                dst,
+                src_a,
+                src_b,
+                src_c,
+                direction_right,
+                data_type_u64: _,
+                hi,
+            } => {
+                let low = self.read_reg(*src_a);
+                let shift = self.resolve_src_b(src_b);
+                let high = self.resolve_src_c(src_c);
+                let shift = if *hi { shift.min(63) } else { shift & 31 };
+
+                let result = if *direction_right {
+                    // (high:low) >> shift
+                    let combined = ((high as u64) << 32) | (low as u64);
+                    (combined >> shift) as u32
+                } else {
+                    // (high:low) << shift
+                    let combined = ((high as u64) << 32) | (low as u64);
+                    ((combined << shift) >> 32) as u32
+                };
+                self.write_reg(*dst, result);
+            }
+
+            // ── Integer set ─────────────────────────────────────────────
+            Instruction::Iset {
+                dst,
+                src_a,
+                src_b,
+                compare,
+                bop,
+                bop_pred,
+                neg_bop_pred,
+                is_signed,
+                bf,
+            } => {
+                let a = self.read_reg(*src_a);
+                let b = self.resolve_src_b(src_b);
+                let cmp_result = if *is_signed {
+                    compare.eval_signed(a as i32, b as i32)
+                } else {
+                    compare.eval_unsigned(a, b)
+                };
+                let bop_p = self.read_pred(*bop_pred);
+                let bop_p = if *neg_bop_pred { !bop_p } else { bop_p };
+                let result = bop.eval(cmp_result, bop_p);
+                if *bf {
+                    // Boolean float: 1.0f or 0.0f
+                    self.write_reg_f32(*dst, if result { 1.0 } else { 0.0 });
+                } else {
+                    self.write_reg(*dst, if result { 0xFFFF_FFFF } else { 0 });
+                }
+            }
+
+            // ── Float set ───────────────────────────────────────────────
+            Instruction::Fset {
+                dst,
+                src_a,
+                src_b,
+                compare,
+                bop,
+                bop_pred,
+                neg_bop_pred,
+                bf,
+            } => {
+                let a = self.read_reg_f32(*src_a);
+                let b = self.resolve_src_b_f32(src_b);
+                let cmp_result = compare.eval(a, b);
+                let bop_p = self.read_pred(*bop_pred);
+                let bop_p = if *neg_bop_pred { !bop_p } else { bop_p };
+                let result = bop.eval(cmp_result, bop_p);
+                if *bf {
+                    self.write_reg_f32(*dst, if result { 1.0 } else { 0.0 });
+                } else {
+                    self.write_reg(*dst, if result { 0xFFFF_FFFF } else { 0 });
+                }
+            }
+
+            // ── 3-input logic (LOP3) ────────────────────────────────────
+            Instruction::Lop3 {
+                dst,
+                src_a,
+                src_b,
+                src_c,
+                lut,
+                pred_out: _,
+            } => {
+                let a = self.read_reg(*src_a);
+                let b = self.resolve_src_b(src_b);
+                let c = self.resolve_src_c(src_c);
+                // Apply the 8-bit LUT to each bit position independently.
+                let mut result = 0u32;
+                for bit in 0..32 {
+                    let a_bit = ((a >> bit) & 1) as u8;
+                    let b_bit = ((b >> bit) & 1) as u8;
+                    let c_bit = ((c >> bit) & 1) as u8;
+                    let lut_idx = (a_bit << 2) | (b_bit << 1) | c_bit;
+                    let out_bit = ((*lut >> lut_idx) & 1) as u32;
+                    result |= out_bit << bit;
+                }
+                self.write_reg(*dst, result);
+            }
+
+            // ── Predicate to register ───────────────────────────────────
+            Instruction::P2r {
+                dst,
+                src_a,
+                src_b,
+            } => {
+                let mask = self.resolve_src_b(src_b) as u8;
+                let base = self.read_reg(*src_a);
+                let mut pred_bits = 0u32;
+                for i in 0..7u8 {
+                    if self.preds[i as usize] {
+                        pred_bits |= 1 << i;
+                    }
+                }
+                let result = (base & !(mask as u32)) | (pred_bits & mask as u32);
+                self.write_reg(*dst, result);
+            }
+
+            // ── Register to predicate ───────────────────────────────────
+            Instruction::R2p {
+                src_a,
+                src_b,
+                src_c: _,
+            } => {
+                let mask = self.resolve_src_b(src_b) as u8;
+                let val = self.read_reg(*src_a);
+                for i in 0..7u8 {
+                    if (mask >> i) & 1 != 0 {
+                        self.preds[i as usize] = (val >> i) & 1 != 0;
+                    }
+                }
+            }
+
+            // ── Range reduction (pass-through) ──────────────────────────
+            Instruction::Rro { dst, src_b } => {
+                // Pass through the value — RRO is a hardware optimization hint.
+                let val = self.resolve_src_b(src_b);
+                self.write_reg(*dst, val);
+            }
+
+            // ── Float-to-float conversion ───────────────────────────────
+            Instruction::F2f {
+                dst,
+                src_b,
+                abs_b,
+                neg_b,
+                sat,
+                dst_size: _,
+                src_size: _,
+                rounding: _,
+            } => {
+                // Simplified: treat all sizes as f32 (most common case).
+                let val = Self::apply_f32_mods(self.resolve_src_b_f32(src_b), *abs_b, *neg_b);
+                let val = if *sat { Self::saturate(val) } else { val };
+                self.write_reg_f32(*dst, val);
+            }
+
+            // ── Integer-to-integer conversion ───────────────────────────
+            Instruction::I2i {
+                dst,
+                src_b,
+                abs_b,
+                sat,
+                dst_signed,
+                src_signed,
+                dst_size,
+                src_size,
+            } => {
+                let raw = self.resolve_src_b(src_b);
+                // Extract source value based on source size.
+                let val: i64 = match src_size {
+                    0 => {
+                        if *src_signed {
+                            (raw as u8 as i8) as i64
+                        } else {
+                            (raw as u8) as i64
+                        }
+                    }
+                    1 => {
+                        if *src_signed {
+                            (raw as u16 as i16) as i64
+                        } else {
+                            (raw as u16) as i64
+                        }
+                    }
+                    _ => {
+                        if *src_signed {
+                            (raw as i32) as i64
+                        } else {
+                            raw as i64
+                        }
+                    }
+                };
+                let val = if *abs_b { val.abs() } else { val };
+                // Clamp to destination range if saturating.
+                let result = if *sat {
+                    match (*dst_signed, dst_size) {
+                        (true, 0) => val.clamp(i8::MIN as i64, i8::MAX as i64) as u32,
+                        (true, 1) => val.clamp(i16::MIN as i64, i16::MAX as i64) as u32,
+                        (true, _) => val.clamp(i32::MIN as i64, i32::MAX as i64) as u32,
+                        (false, 0) => val.clamp(0, u8::MAX as i64) as u32,
+                        (false, 1) => val.clamp(0, u16::MAX as i64) as u32,
+                        (false, _) => val.clamp(0, u32::MAX as i64) as u32,
+                    }
+                } else {
+                    val as u32
+                };
+                self.write_reg(*dst, result);
+            }
+
+            // ── Global memory load ──────────────────────────────────────
+            Instruction::Ldg {
+                dst,
+                src_a,
+                offset,
+                size,
+            } => {
+                let base_lo = self.read_reg(*src_a) as u64;
+                let base_hi = self.read_reg(src_a.wrapping_add(1)) as u64;
+                let addr = ((base_hi << 32) | base_lo).wrapping_add(*offset as u64);
+                match size {
+                    0 | 1 => {
+                        // U8/S8
+                        let mut buf = [0u8; 1];
+                        (self.read_gpu)(addr, &mut buf);
+                        let val = if *size == 1 {
+                            buf[0] as i8 as i32 as u32
+                        } else {
+                            buf[0] as u32
+                        };
+                        self.write_reg(*dst, val);
+                    }
+                    2 | 3 => {
+                        // U16/S16
+                        let mut buf = [0u8; 2];
+                        (self.read_gpu)(addr, &mut buf);
+                        let val = u16::from_le_bytes(buf);
+                        let val = if *size == 3 {
+                            val as i16 as i32 as u32
+                        } else {
+                            val as u32
+                        };
+                        self.write_reg(*dst, val);
+                    }
+                    4 => {
+                        // 32-bit
+                        let mut buf = [0u8; 4];
+                        (self.read_gpu)(addr, &mut buf);
+                        self.write_reg(*dst, u32::from_le_bytes(buf));
+                    }
+                    5 => {
+                        // 64-bit: load into dst and dst+1
+                        let mut buf = [0u8; 8];
+                        (self.read_gpu)(addr, &mut buf);
+                        self.write_reg(*dst, u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
+                        self.write_reg(
+                            dst.wrapping_add(1),
+                            u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+                        );
+                    }
+                    6 => {
+                        // 128-bit: load into dst..dst+3
+                        let mut buf = [0u8; 16];
+                        (self.read_gpu)(addr, &mut buf);
+                        for i in 0..4u8 {
+                            let off = (i as usize) * 4;
+                            let val = u32::from_le_bytes([
+                                buf[off],
+                                buf[off + 1],
+                                buf[off + 2],
+                                buf[off + 3],
+                            ]);
+                            self.write_reg(dst.wrapping_add(i), val);
+                        }
+                    }
+                    _ => {
+                        // Unknown size — load as 32-bit.
+                        let mut buf = [0u8; 4];
+                        (self.read_gpu)(addr, &mut buf);
+                        self.write_reg(*dst, u32::from_le_bytes(buf));
+                    }
+                }
+            }
+
+            // ── Global memory store ─────────────────────────────────────
+            Instruction::Stg {
+                src,
+                src_a,
+                offset,
+                size,
+            } => {
+                let base_lo = self.read_reg(*src_a) as u64;
+                let base_hi = self.read_reg(src_a.wrapping_add(1)) as u64;
+                let addr = ((base_hi << 32) | base_lo).wrapping_add(*offset as u64);
+                if let Some(write_fn) = &self.write_gpu {
+                    match size {
+                        0 | 1 => {
+                            let val = self.read_reg(*src) as u8;
+                            write_fn(addr, &[val]);
+                        }
+                        2 | 3 => {
+                            let val = self.read_reg(*src) as u16;
+                            write_fn(addr, &val.to_le_bytes());
+                        }
+                        4 => {
+                            let val = self.read_reg(*src);
+                            write_fn(addr, &val.to_le_bytes());
+                        }
+                        5 => {
+                            let lo = self.read_reg(*src);
+                            let hi = self.read_reg(src.wrapping_add(1));
+                            let mut buf = [0u8; 8];
+                            buf[0..4].copy_from_slice(&lo.to_le_bytes());
+                            buf[4..8].copy_from_slice(&hi.to_le_bytes());
+                            write_fn(addr, &buf);
+                        }
+                        6 => {
+                            let mut buf = [0u8; 16];
+                            for i in 0..4u8 {
+                                let val = self.read_reg(src.wrapping_add(i));
+                                let off = (i as usize) * 4;
+                                buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+                            }
+                            write_fn(addr, &buf);
+                        }
+                        _ => {
+                            let val = self.read_reg(*src);
+                            write_fn(addr, &val.to_le_bytes());
+                        }
+                    }
+                }
+                // If no write_gpu callback, silently ignore (NOP).
+            }
+
+            // ── 3-operand integer add ───────────────────────────────────
+            Instruction::Iadd3 {
+                dst,
+                src_a,
+                src_b,
+                src_c,
+                neg_a,
+                neg_b,
+                neg_c,
+            } => {
+                let a = self.read_reg(*src_a) as i32;
+                let a = if *neg_a { -a } else { a };
+                let b = self.resolve_src_b(src_b) as i32;
+                let b = if *neg_b { -b } else { b };
+                let c = self.resolve_src_c(src_c) as i32;
+                let c = if *neg_c { -c } else { c };
+                self.write_reg(*dst, a.wrapping_add(b).wrapping_add(c) as u32);
+            }
+
             // ── Control flow ─────────────────────────────────────────
             Instruction::Bra { offset } => {
                 // Offset is in instruction units (not bytes).
@@ -987,5 +1520,386 @@ mod tests {
         assert!((output.color[3] - 1.0).abs() < 1e-6);
         assert!(!output.killed);
         assert!(output.depth.is_none());
+    }
+
+    // ── Tests for new Phase 7 instructions ──────────────────────────
+
+    #[test]
+    fn test_xmad() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        // R1 = 0x0003, R2 = 0x0004, R3 = 10
+        ctx.write_reg(1, 3);
+        ctx.write_reg(2, 4);
+        ctx.write_reg(3, 10);
+
+        // XMAD: dst = (lo16(R1) * lo16(R2)) + R3 = 3*4 + 10 = 22
+        ctx.execute(&Instruction::Xmad {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            src_c: SrcC::Reg(3),
+            mode: 0, // CLO
+            hi_a: false,
+            hi_b: false,
+            psl: false,
+        });
+        assert_eq!(ctx.read_reg(0), 22);
+    }
+
+    #[test]
+    fn test_imnmx() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg(1, 10);
+        ctx.write_reg(2, 20);
+        ctx.preds[0] = true;
+
+        // When pred is true, result = min(10, 20) = 10
+        ctx.execute(&Instruction::Imnmx {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            pred: 0,
+            neg_pred: false,
+            is_signed: false,
+        });
+        assert_eq!(ctx.read_reg(0), 10);
+
+        // When pred is false, result = max(10, 20) = 20
+        ctx.preds[0] = false;
+        ctx.execute(&Instruction::Imnmx {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            pred: 0,
+            neg_pred: false,
+            is_signed: false,
+        });
+        assert_eq!(ctx.read_reg(0), 20);
+    }
+
+    #[test]
+    fn test_fmnmx() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg_f32(1, 3.0);
+        ctx.write_reg_f32(2, 7.0);
+        ctx.preds[0] = true;
+
+        ctx.execute(&Instruction::Fmnmx {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            pred: 0,
+            neg_pred: false,
+            abs_a: false,
+            abs_b: false,
+            neg_a: false,
+            neg_b: false,
+        });
+        assert!((ctx.read_reg_f32(0) - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_bfe() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        // Extract 3 bits starting at offset 2 from 0xFC (0b11111100)
+        // bits [4:2] = 111 = 7
+        ctx.write_reg(1, 0xFC);
+        // Pack: offset=2, count=3 → pack = (3 << 8) | 2 = 0x302
+        ctx.write_reg(2, 0x0302);
+
+        ctx.execute(&Instruction::Bfe {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            is_signed: false,
+        });
+        assert_eq!(ctx.read_reg(0), 7); // (0xFC >> 2) & 7 = 0x3F & 7 = 7
+    }
+
+    #[test]
+    fn test_bfe_unsigned() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg(1, 0xABCD_1234);
+        // Extract 8 bits starting at bit 8
+        ctx.write_reg(2, (8 << 8) | 8); // count=8, offset=8
+
+        ctx.execute(&Instruction::Bfe {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            is_signed: false,
+        });
+        assert_eq!(ctx.read_reg(0), 0x12); // byte 1 of 0xABCD1234
+    }
+
+    #[test]
+    fn test_bfi() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        // Insert 0xFF at bits [15:8] into 0x00000000
+        ctx.write_reg(1, 0xFF); // insert value
+        ctx.write_reg(2, (8 << 8) | 8); // pack: count=8, offset=8
+        ctx.write_reg(3, 0); // base
+
+        ctx.execute(&Instruction::Bfi {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            src_c: SrcC::Reg(3),
+        });
+        assert_eq!(ctx.read_reg(0), 0xFF00);
+    }
+
+    #[test]
+    fn test_popc() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg(1, 0xFF); // 8 bits set
+
+        ctx.execute(&Instruction::Popc {
+            dst: 0,
+            src_b: SrcB::Reg(1),
+        });
+        assert_eq!(ctx.read_reg(0), 8);
+    }
+
+    #[test]
+    fn test_flo() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg(1, 0x80); // bit 7 set (128)
+
+        ctx.execute(&Instruction::Flo {
+            dst: 0,
+            src_b: SrcB::Reg(1),
+            is_signed: false,
+            invert: false,
+        });
+        assert_eq!(ctx.read_reg(0), 7); // Leading one at bit 7
+    }
+
+    #[test]
+    fn test_lop3() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg(1, 0xFF00);
+        ctx.write_reg(2, 0x0FF0);
+        ctx.write_reg(3, 0x00FF);
+
+        // LUT = 0x80 = AND of all three: (a & b & c)
+        ctx.execute(&Instruction::Lop3 {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            src_c: SrcC::Reg(3),
+            lut: 0x80, // a AND b AND c truth table
+            pred_out: 7,
+        });
+        assert_eq!(ctx.read_reg(0), 0xFF00 & 0x0FF0 & 0x00FF); // = 0x0000
+
+        // LUT = 0xFE = OR of all three: a | b | c
+        ctx.execute(&Instruction::Lop3 {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            src_c: SrcC::Reg(3),
+            lut: 0xFE, // a OR b OR c
+            pred_out: 7,
+        });
+        assert_eq!(ctx.read_reg(0), 0xFF00 | 0x0FF0 | 0x00FF); // = 0xFFFF
+    }
+
+    #[test]
+    fn test_iset() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg(1, 5);
+        ctx.write_reg(2, 10);
+
+        // ISET: dst = (5 < 10) ? 0xFFFFFFFF : 0
+        ctx.execute(&Instruction::Iset {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            compare: IntCompareOp::LT,
+            bop: BoolOp::And,
+            bop_pred: 7, // PT
+            neg_bop_pred: false,
+            is_signed: false,
+            bf: false,
+        });
+        assert_eq!(ctx.read_reg(0), 0xFFFF_FFFF);
+
+        // ISET bf mode: dst = (5 < 10) ? 1.0 : 0.0
+        ctx.execute(&Instruction::Iset {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            compare: IntCompareOp::LT,
+            bop: BoolOp::And,
+            bop_pred: 7,
+            neg_bop_pred: false,
+            is_signed: false,
+            bf: true,
+        });
+        assert_eq!(ctx.read_reg_f32(0), 1.0);
+    }
+
+    #[test]
+    fn test_fset() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg_f32(1, 3.0);
+        ctx.write_reg_f32(2, 5.0);
+
+        ctx.execute(&Instruction::Fset {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            compare: FpCompareOp::LT,
+            bop: BoolOp::And,
+            bop_pred: 7,
+            neg_bop_pred: false,
+            bf: false,
+        });
+        assert_eq!(ctx.read_reg(0), 0xFFFF_FFFF); // 3.0 < 5.0 = true
+    }
+
+    #[test]
+    fn test_shf_right() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        // Funnel shift right: (high:low) >> shift
+        ctx.write_reg(1, 0x0000_0010); // low
+        ctx.write_reg(3, 0xABCD_0000); // high
+        // shift = 4
+
+        ctx.execute(&Instruction::Shf {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Imm20(4),
+            src_c: SrcC::Reg(3),
+            direction_right: true,
+            data_type_u64: false,
+            hi: false,
+        });
+        // (0xABCD_0000_0000_0010 >> 4) = 0x0ABCD_0000_0000_001 → low 32 bits = 0x00000001
+        assert_eq!(ctx.read_reg(0), 0x0000_0001);
+    }
+
+    #[test]
+    fn test_iadd3() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg(1, 10);
+        ctx.write_reg(2, 20);
+        ctx.write_reg(3, 30);
+
+        ctx.execute(&Instruction::Iadd3 {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            src_c: SrcC::Reg(3),
+            neg_a: false,
+            neg_b: false,
+            neg_c: false,
+        });
+        assert_eq!(ctx.read_reg(0), 60); // 10 + 20 + 30
+    }
+
+    #[test]
+    fn test_iadd3_negate() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg(1, 100);
+        ctx.write_reg(2, 30);
+        ctx.write_reg(3, 20);
+
+        ctx.execute(&Instruction::Iadd3 {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Reg(2),
+            src_c: SrcC::Reg(3),
+            neg_a: false,
+            neg_b: true,
+            neg_c: true,
+        });
+        assert_eq!(ctx.read_reg(0), 50); // 100 - 30 - 20
+    }
+
+    #[test]
+    fn test_p2r_r2p() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.preds[0] = true;
+        ctx.preds[1] = false;
+        ctx.preds[2] = true;
+        ctx.write_reg(1, 0);
+
+        // P2R: pack predicates into register
+        ctx.execute(&Instruction::P2r {
+            dst: 0,
+            src_a: 1,
+            src_b: SrcB::Imm20(0x7F), // mask = all 7 predicates
+        });
+        // P0=1, P1=0, P2=1 → bits = 0b101 = 5
+        assert_eq!(ctx.read_reg(0) & 0x7, 5);
+
+        // R2P: unpack register bits back into predicates
+        ctx.preds = [false; 8];
+        ctx.preds[7] = true;
+        ctx.write_reg(5, 0b1010); // P1=1, P3=1
+        ctx.execute(&Instruction::R2p {
+            src_a: 5,
+            src_b: SrcB::Imm20(0x0F), // mask = lower 4 predicates
+            src_c: 0,
+        });
+        assert!(!ctx.preds[0]);
+        assert!(ctx.preds[1]);
+        assert!(!ctx.preds[2]);
+        assert!(ctx.preds[3]);
+    }
+
+    #[test]
+    fn test_f2f_passthrough() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg_f32(1, 42.5);
+
+        ctx.execute(&Instruction::F2f {
+            dst: 0,
+            src_b: SrcB::Reg(1),
+            abs_b: false,
+            neg_b: false,
+            sat: false,
+            dst_size: 1,
+            src_size: 1,
+            rounding: 0,
+        });
+        assert_eq!(ctx.read_reg_f32(0), 42.5);
+    }
+
+    #[test]
+    fn test_i2i_sign_extend() {
+        use crate::shader::decoder::Instruction;
+        let mut ctx = ShaderExecContext::new(&dummy_read_gpu, &dummy_sample);
+        ctx.write_reg(1, 0x80); // -128 as S8
+
+        ctx.execute(&Instruction::I2i {
+            dst: 0,
+            src_b: SrcB::Reg(1),
+            abs_b: false,
+            sat: false,
+            dst_signed: true,
+            src_signed: true,
+            dst_size: 2, // S32
+            src_size: 0, // S8
+        });
+        assert_eq!(ctx.read_reg(0) as i32, -128);
     }
 }

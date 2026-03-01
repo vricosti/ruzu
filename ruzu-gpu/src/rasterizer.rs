@@ -17,6 +17,13 @@ use crate::engines::maxwell_3d::{
 use crate::engines::Framebuffer;
 use crate::shader;
 
+/// Pre-decoded RGBA8 data for a single mip level.
+struct MipLevel {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
 /// Cached pre-decoded RGBA8 texture data, loaded once per draw call.
 struct SampledTexture {
     data: Vec<u8>,
@@ -26,30 +33,117 @@ struct SampledTexture {
     wrap_v: WrapMode,
     normalized_coords: bool,
     mag_filter: TextureFilter,
+    /// Additional mip levels (level 1+). Level 0 is `data`/`width`/`height`.
+    mip_levels: Vec<MipLevel>,
 }
 
 /// Return bytes per texel for supported uncompressed formats, or `None` for
 /// compressed / unsupported formats.
 fn bytes_per_texel(fmt: TextureFormat) -> Option<u32> {
     match fmt {
-        TextureFormat::A8B8G8R8 | TextureFormat::R8G8B8A8 => Some(4),
+        TextureFormat::A8B8G8R8 | TextureFormat::R8G8B8A8 | TextureFormat::A2B10G10R10 => Some(4),
         TextureFormat::B5G6R5 => Some(2),
         TextureFormat::R8G8 => Some(2),
         TextureFormat::R8 => Some(1),
+        TextureFormat::R16 => Some(2),
+        TextureFormat::R16G16 => Some(4),
+        TextureFormat::R16G16B16A16 => Some(8),
+        TextureFormat::R32 => Some(4),
+        TextureFormat::R32G32 => Some(8),
         TextureFormat::R32G32B32A32 => Some(16),
+        TextureFormat::B10G11R11 => Some(4),
+        TextureFormat::R16G16B16X16 => Some(8),
+        TextureFormat::R32G32B32 => Some(12),
         _ => None,
     }
 }
 
+/// Convert a half-precision f16 (u16) to f32.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let mant = (h & 0x3FF) as u32;
+    if exp == 0 {
+        if mant == 0 {
+            f32::from_bits(sign << 31)
+        } else {
+            // Denormalized
+            let mut m = mant;
+            let mut e = 0i32;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x3FF;
+            let f_exp = (127 - 15 + 1 + e) as u32;
+            f32::from_bits((sign << 31) | (f_exp << 23) | (m << 13))
+        }
+    } else if exp == 31 {
+        if mant == 0 {
+            f32::from_bits((sign << 31) | (0xFF << 23))
+        } else {
+            f32::NAN
+        }
+    } else {
+        let f_exp = exp + 127 - 15;
+        f32::from_bits((sign << 31) | (f_exp << 23) | (mant << 13))
+    }
+}
+
+/// Decode a R11G11B10 packed float value to [f32; 3].
+fn decode_r11g11b10_float(val: u32) -> [f32; 3] {
+    // R11: bits[10:0] — 5-bit exp, 6-bit mant
+    let r_bits = val & 0x7FF;
+    let r_exp = (r_bits >> 6) & 0x1F;
+    let r_mant = r_bits & 0x3F;
+    let r = if r_exp == 0 {
+        (r_mant as f32) / 64.0 / 16384.0
+    } else if r_exp == 31 {
+        f32::INFINITY
+    } else {
+        (1.0 + r_mant as f32 / 64.0) * 2.0f32.powi(r_exp as i32 - 15)
+    };
+    // G11: bits[21:11]
+    let g_bits = (val >> 11) & 0x7FF;
+    let g_exp = (g_bits >> 6) & 0x1F;
+    let g_mant = g_bits & 0x3F;
+    let g = if g_exp == 0 {
+        (g_mant as f32) / 64.0 / 16384.0
+    } else if g_exp == 31 {
+        f32::INFINITY
+    } else {
+        (1.0 + g_mant as f32 / 64.0) * 2.0f32.powi(g_exp as i32 - 15)
+    };
+    // B10: bits[31:22] — 5-bit exp, 5-bit mant
+    let b_bits = (val >> 22) & 0x3FF;
+    let b_exp = (b_bits >> 5) & 0x1F;
+    let b_mant = b_bits & 0x1F;
+    let b = if b_exp == 0 {
+        (b_mant as f32) / 32.0 / 16384.0
+    } else if b_exp == 31 {
+        f32::INFINITY
+    } else {
+        (1.0 + b_mant as f32 / 32.0) * 2.0f32.powi(b_exp as i32 - 15)
+    };
+    [r, g, b]
+}
+
 /// Decode raw bytes of a single texel into RGBA8.
-fn decode_texel(bytes: &[u8], fmt: TextureFormat, _comp_type: ComponentType) -> Option<[u8; 4]> {
+fn decode_texel(bytes: &[u8], fmt: TextureFormat, comp_type: ComponentType) -> Option<[u8; 4]> {
     match fmt {
         TextureFormat::A8B8G8R8 => {
-            // LE u32 layout: byte0=R, byte1=G, byte2=B, byte3=A
-            Some([bytes[0], bytes[1], bytes[2], bytes[3]])
+            if comp_type == ComponentType::SNorm {
+                // SNorm: interpret as signed and map [-128..127] to [0..255]
+                let r = ((bytes[0] as i8 as f32 / 127.0).clamp(-1.0, 1.0) * 0.5 + 0.5) * 255.0;
+                let g = ((bytes[1] as i8 as f32 / 127.0).clamp(-1.0, 1.0) * 0.5 + 0.5) * 255.0;
+                let b = ((bytes[2] as i8 as f32 / 127.0).clamp(-1.0, 1.0) * 0.5 + 0.5) * 255.0;
+                let a = ((bytes[3] as i8 as f32 / 127.0).clamp(-1.0, 1.0) * 0.5 + 0.5) * 255.0;
+                Some([r as u8, g as u8, b as u8, a as u8])
+            } else {
+                Some([bytes[0], bytes[1], bytes[2], bytes[3]])
+            }
         }
         TextureFormat::R8G8B8A8 => {
-            // LE u32 layout: byte0=A, byte1=B, byte2=G, byte3=R → reverse
             Some([bytes[3], bytes[2], bytes[1], bytes[0]])
         }
         TextureFormat::B5G6R5 => {
@@ -66,6 +160,86 @@ fn decode_texel(bytes: &[u8], fmt: TextureFormat, _comp_type: ComponentType) -> 
         }
         TextureFormat::R8G8 => Some([bytes[0], bytes[1], 0, 255]),
         TextureFormat::R8 => Some([bytes[0], 0, 0, 255]),
+        TextureFormat::R16 => {
+            let val = u16::from_le_bytes([bytes[0], bytes[1]]);
+            match comp_type {
+                ComponentType::Float => {
+                    let f = f16_to_f32(val);
+                    Some([(f.clamp(0.0, 1.0) * 255.0).round() as u8, 0, 0, 255])
+                }
+                _ => {
+                    // UNorm: 16-bit → 8-bit
+                    Some([(val >> 8) as u8, 0, 0, 255])
+                }
+            }
+        }
+        TextureFormat::R16G16 => {
+            let r = u16::from_le_bytes([bytes[0], bytes[1]]);
+            let g = u16::from_le_bytes([bytes[2], bytes[3]]);
+            match comp_type {
+                ComponentType::Float => {
+                    let rf = f16_to_f32(r);
+                    let gf = f16_to_f32(g);
+                    Some([
+                        (rf.clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (gf.clamp(0.0, 1.0) * 255.0).round() as u8,
+                        0,
+                        255,
+                    ])
+                }
+                _ => Some([(r >> 8) as u8, (g >> 8) as u8, 0, 255]),
+            }
+        }
+        TextureFormat::R16G16B16A16 | TextureFormat::R16G16B16X16 => {
+            let r = u16::from_le_bytes([bytes[0], bytes[1]]);
+            let g = u16::from_le_bytes([bytes[2], bytes[3]]);
+            let b = u16::from_le_bytes([bytes[4], bytes[5]]);
+            let a = if bytes.len() >= 8 {
+                u16::from_le_bytes([bytes[6], bytes[7]])
+            } else {
+                0xFFFF
+            };
+            match comp_type {
+                ComponentType::Float => {
+                    let rf = f16_to_f32(r);
+                    let gf = f16_to_f32(g);
+                    let bf = f16_to_f32(b);
+                    let af = f16_to_f32(a);
+                    Some([
+                        (rf.clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (gf.clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (bf.clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (af.clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ])
+                }
+                _ => Some([(r >> 8) as u8, (g >> 8) as u8, (b >> 8) as u8, (a >> 8) as u8]),
+            }
+        }
+        TextureFormat::R32 => {
+            let val = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            Some([(val.clamp(0.0, 1.0) * 255.0).round() as u8, 0, 0, 255])
+        }
+        TextureFormat::R32G32 => {
+            let r = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let g = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            Some([
+                (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                0,
+                255,
+            ])
+        }
+        TextureFormat::R32G32B32 => {
+            let r = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let g = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            let b = f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+            Some([
+                (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                255,
+            ])
+        }
         TextureFormat::R32G32B32A32 => {
             let r = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             let g = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
@@ -76,6 +250,27 @@ fn decode_texel(bytes: &[u8], fmt: TextureFormat, _comp_type: ComponentType) -> 
                 (g.clamp(0.0, 1.0) * 255.0).round() as u8,
                 (b.clamp(0.0, 1.0) * 255.0).round() as u8,
                 (a.clamp(0.0, 1.0) * 255.0).round() as u8,
+            ])
+        }
+        TextureFormat::A2B10G10R10 => {
+            let val = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let a = ((val >> 30) & 0x3) as u8;
+            // Map 10-bit to 8-bit, 2-bit to 8-bit
+            Some([
+                ((val & 0x3FF) >> 2) as u8,
+                (((val >> 10) & 0x3FF) >> 2) as u8,
+                (((val >> 20) & 0x3FF) >> 2) as u8,
+                (a << 6) | (a << 4) | (a << 2) | a,
+            ])
+        }
+        TextureFormat::B10G11R11 => {
+            let val = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let rgb = decode_r11g11b10_float(val);
+            Some([
+                (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                255,
             ])
         }
         _ => None,
@@ -730,59 +925,75 @@ fn decompress_astc_block(block: &[u8; 16], block_w: u32, block_h: u32) -> Vec<[u
     vec![[255, 0, 255, 255]; count]
 }
 
-/// Nearest-neighbor sample from a pre-decoded texture. Returns normalised RGBA.
-fn sample_texture_nearest(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
+/// Get the RGBA8 data, width, and height for a specific mip level.
+/// Level 0 returns the base texture; higher levels return from `mip_levels`.
+fn mip_data(tex: &SampledTexture, level: u32) -> (&[u8], u32, u32) {
+    if level == 0 || tex.mip_levels.is_empty() {
+        (&tex.data, tex.width, tex.height)
+    } else {
+        let idx = (level as usize - 1).min(tex.mip_levels.len() - 1);
+        let m = &tex.mip_levels[idx];
+        (&m.data, m.width, m.height)
+    }
+}
+
+/// Nearest-neighbor sample from a pre-decoded texture at a given mip level.
+/// Returns normalised RGBA.
+fn sample_texture_nearest_lod(tex: &SampledTexture, u: f32, v: f32, lod: u32) -> [f32; 4] {
+    let (data, width, height) = mip_data(tex, lod);
     let (su, sv) = if tex.normalized_coords {
-        (u * tex.width as f32, v * tex.height as f32)
+        (u * width as f32, v * height as f32)
     } else {
         (u, v)
     };
-    let tx = apply_wrap_mode(su, tex.width, tex.wrap_u);
-    let ty = apply_wrap_mode(sv, tex.height, tex.wrap_v);
-    let idx = (ty * tex.width + tx) as usize * 4;
-    if idx + 4 > tex.data.len() {
+    let tx = apply_wrap_mode(su, width, tex.wrap_u);
+    let ty = apply_wrap_mode(sv, height, tex.wrap_v);
+    let idx = (ty * width + tx) as usize * 4;
+    if idx + 4 > data.len() {
         return [1.0, 1.0, 1.0, 1.0];
     }
     [
-        tex.data[idx] as f32 / 255.0,
-        tex.data[idx + 1] as f32 / 255.0,
-        tex.data[idx + 2] as f32 / 255.0,
-        tex.data[idx + 3] as f32 / 255.0,
+        data[idx] as f32 / 255.0,
+        data[idx + 1] as f32 / 255.0,
+        data[idx + 2] as f32 / 255.0,
+        data[idx + 3] as f32 / 255.0,
     ]
 }
 
-/// Read a single texel from pre-decoded RGBA8 data. Returns normalised RGBA.
-fn read_texel(tex: &SampledTexture, tx: u32, ty: u32) -> [f32; 4] {
-    let idx = (ty * tex.width + tx) as usize * 4;
-    if idx + 4 > tex.data.len() {
+/// Read a single texel from pre-decoded RGBA8 data at a given mip level.
+fn read_texel_lod(tex: &SampledTexture, tx: u32, ty: u32, lod: u32) -> [f32; 4] {
+    let (data, width, _height) = mip_data(tex, lod);
+    let idx = (ty * width + tx) as usize * 4;
+    if idx + 4 > data.len() {
         return [1.0, 1.0, 1.0, 1.0];
     }
     [
-        tex.data[idx] as f32 / 255.0,
-        tex.data[idx + 1] as f32 / 255.0,
-        tex.data[idx + 2] as f32 / 255.0,
-        tex.data[idx + 3] as f32 / 255.0,
+        data[idx] as f32 / 255.0,
+        data[idx + 1] as f32 / 255.0,
+        data[idx + 2] as f32 / 255.0,
+        data[idx + 3] as f32 / 255.0,
     ]
 }
 
-/// Bilinear sample from a pre-decoded texture. Returns normalised RGBA.
-fn sample_texture_bilinear(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
+/// Bilinear sample from a pre-decoded texture at a given mip level.
+fn sample_texture_bilinear_lod(tex: &SampledTexture, u: f32, v: f32, lod: u32) -> [f32; 4] {
+    let (_data, width, height) = mip_data(tex, lod);
     let (su, sv) = if tex.normalized_coords {
-        (u * tex.width as f32, v * tex.height as f32)
+        (u * width as f32, v * height as f32)
     } else {
         (u, v)
     };
     let fx = su - 0.5;
     let fy = sv - 0.5;
-    let x0 = apply_wrap_mode(fx, tex.width, tex.wrap_u);
-    let y0 = apply_wrap_mode(fy, tex.height, tex.wrap_v);
-    let x1 = apply_wrap_mode(fx + 1.0, tex.width, tex.wrap_u);
-    let y1 = apply_wrap_mode(fy + 1.0, tex.height, tex.wrap_v);
+    let x0 = apply_wrap_mode(fx, width, tex.wrap_u);
+    let y0 = apply_wrap_mode(fy, height, tex.wrap_v);
+    let x1 = apply_wrap_mode(fx + 1.0, width, tex.wrap_u);
+    let y1 = apply_wrap_mode(fy + 1.0, height, tex.wrap_v);
 
-    let t00 = read_texel(tex, x0, y0);
-    let t10 = read_texel(tex, x1, y0);
-    let t01 = read_texel(tex, x0, y1);
-    let t11 = read_texel(tex, x1, y1);
+    let t00 = read_texel_lod(tex, x0, y0, lod);
+    let t10 = read_texel_lod(tex, x1, y0, lod);
+    let t01 = read_texel_lod(tex, x0, y1, lod);
+    let t11 = read_texel_lod(tex, x1, y1, lod);
 
     let frac_x = fx.fract();
     let frac_y = fy.fract();
@@ -799,12 +1010,31 @@ fn sample_texture_bilinear(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
     result
 }
 
+/// Bilinear sample from a pre-decoded texture (level 0). Returns normalised RGBA.
+#[cfg(test)]
+fn sample_texture_bilinear(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
+    sample_texture_bilinear_lod(tex, u, v, 0)
+}
+
+/// Sample from a pre-decoded texture using the configured filter mode and LOD.
+fn sample_texture_lod(tex: &SampledTexture, u: f32, v: f32, lod: u32) -> [f32; 4] {
+    match tex.mag_filter {
+        TextureFilter::Linear => sample_texture_bilinear_lod(tex, u, v, lod),
+        _ => sample_texture_nearest_lod(tex, u, v, lod),
+    }
+}
+
 /// Sample from a pre-decoded texture using the configured filter mode.
 fn sample_texture(tex: &SampledTexture, u: f32, v: f32) -> [f32; 4] {
-    match tex.mag_filter {
-        TextureFilter::Linear => sample_texture_bilinear(tex, u, v),
-        _ => sample_texture_nearest(tex, u, v),
+    sample_texture_lod(tex, u, v, 0)
+}
+
+/// Compute the maximum number of mip levels for a texture of given dimensions.
+fn max_mip_count(width: u32, height: u32) -> u32 {
+    if width == 0 || height == 0 {
+        return 1;
     }
+    (width.max(height) as f32).log2().floor() as u32 + 1
 }
 
 /// Read UV (texture coordinate) attribute for all vertices of a draw call.
@@ -1101,6 +1331,73 @@ fn load_texture(
         }
     }
 
+    // Load additional mip levels (up to 8) for uncompressed pitch textures.
+    let mut mip_levels = Vec::new();
+    if tex_desc.max_mip_level > 0 && tex_desc.header_version == TicHeaderVersion::Pitch {
+        if let Some(bpt) = bytes_per_texel(tex_desc.format) {
+            let level_count = tex_desc
+                .max_mip_level
+                .min(7)
+                .min(max_mip_count(tex_desc.width, tex_desc.height).saturating_sub(1));
+            // Compute base level byte size to find the start of level 1.
+            let mut mip_addr =
+                tex_desc.address + (tex_desc.width * tex_desc.height * bpt) as u64;
+            let mut mip_w = tex_desc.width / 2;
+            let mut mip_h = tex_desc.height / 2;
+            for _ in 0..level_count {
+                if mip_w == 0 {
+                    mip_w = 1;
+                }
+                if mip_h == 0 {
+                    mip_h = 1;
+                }
+                let texel_count = (mip_w * mip_h) as usize;
+                let byte_count = texel_count * bpt as usize;
+                let mut raw = vec![0u8; byte_count];
+                read_gpu(mip_addr, &mut raw);
+                let mut mip_data = vec![0u8; texel_count * 4];
+                for i in 0..texel_count {
+                    let off = i * bpt as usize;
+                    let end = off + bpt as usize;
+                    if end > raw.len() {
+                        break;
+                    }
+                    let rgba = match decode_texel(
+                        &raw[off..end],
+                        tex_desc.format,
+                        tex_desc.r_type,
+                    ) {
+                        Some(c) => c,
+                        None => [255, 255, 255, 255],
+                    };
+                    let swizzled = apply_swizzle(rgba, &swizzle);
+                    let final_rgba = if tex_desc.srgb_conversion {
+                        [
+                            srgb_to_linear(swizzled[0]),
+                            srgb_to_linear(swizzled[1]),
+                            srgb_to_linear(swizzled[2]),
+                            swizzled[3],
+                        ]
+                    } else {
+                        swizzled
+                    };
+                    mip_data[i * 4] = final_rgba[0];
+                    mip_data[i * 4 + 1] = final_rgba[1];
+                    mip_data[i * 4 + 2] = final_rgba[2];
+                    mip_data[i * 4 + 3] = final_rgba[3];
+                }
+                mip_levels.push(MipLevel {
+                    data: mip_data,
+                    width: mip_w,
+                    height: mip_h,
+                });
+                mip_addr += byte_count as u64;
+                mip_w /= 2;
+                mip_h /= 2;
+            }
+        }
+    }
+
     Some(SampledTexture {
         data,
         width: tex_desc.width,
@@ -1109,6 +1406,7 @@ fn load_texture(
         wrap_v,
         normalized_coords: tex_desc.normalized_coords,
         mag_filter,
+        mip_levels,
     })
 }
 
@@ -1353,6 +1651,7 @@ fn render_draw_shader(
                 &draw.blend[0],
                 &draw.blend_color,
                 &draw.color_masks[0],
+                &draw.rasterizer,
             );
         } else {
             // Fall back to fixed-function fragment shading with vertex shader output.
@@ -1522,6 +1821,7 @@ fn rasterize_triangle_shader(
     blend: &BlendInfo,
     blend_color: &BlendColorInfo,
     color_mask: &ColorMaskInfo,
+    rasterizer_info: &RasterizerInfo,
 ) {
     // Compute bounding box.
     let mut min_x = v0[0].min(v1[0]).min(v2[0]).max(0.0) as u32;
@@ -1596,8 +1896,30 @@ fn rasterize_triangle_shader(
                 (w0, w1, w2)
             };
 
-            // Interpolate depth.
-            let z = v0[2] * w0 + v1[2] * w1 + v2[2] * w2;
+            // Interpolate depth and apply depth bias.
+            let mut z = v0[2] * w0 + v1[2] * w1 + v2[2] * w2;
+            if rasterizer_info.depth_bias != 0.0
+                || rasterizer_info.slope_scale_depth_bias != 0.0
+            {
+                // Compute depth gradients (triangle is planar, so constant per-triangle).
+                let dzdx = (v1[2] - v0[2]) * (v2[1] - v0[1])
+                    - (v2[2] - v0[2]) * (v1[1] - v0[1]);
+                let dzdy = (v2[2] - v0[2]) * (v1[0] - v0[0])
+                    - (v1[2] - v0[2]) * (v2[0] - v0[0]);
+                let max_slope = dzdx.abs().max(dzdy.abs()) / area.abs();
+                let min_resolvable = 1.0 / (1u32 << 24) as f32;
+                let bias = rasterizer_info.slope_scale_depth_bias * max_slope
+                    + rasterizer_info.depth_bias * min_resolvable;
+                let bias = if rasterizer_info.depth_bias_clamp != 0.0 {
+                    bias.clamp(
+                        -rasterizer_info.depth_bias_clamp.abs(),
+                        rasterizer_info.depth_bias_clamp.abs(),
+                    )
+                } else {
+                    bias
+                };
+                z += bias;
+            }
 
             let fb_idx = (py * fb_width + px) as usize;
 
@@ -2308,6 +2630,30 @@ fn rasterize_triangle(
     let inv_w1 = 1.0 / v1[3];
     let inv_w2 = 1.0 / v2[3];
 
+    // Compute per-triangle mipmap LOD from screen-space vs texture-space area ratio.
+    let tri_lod = if let Some(tex) = texture {
+        if !tex.mip_levels.is_empty() && tex.normalized_coords {
+            let screen_area = 0.5
+                * ((v1[0] - v0[0]) * (v2[1] - v0[1]) - (v2[0] - v0[0]) * (v1[1] - v0[1])).abs();
+            let tex_area_uv = 0.5
+                * ((uv1[0] - uv0[0]) * (uv2[1] - uv0[1])
+                    - (uv2[0] - uv0[0]) * (uv1[1] - uv0[1]))
+                .abs();
+            let texel_area = tex_area_uv * tex.width as f32 * tex.height as f32;
+            if screen_area > 0.0 && texel_area > 0.0 {
+                let lod = 0.5 * (texel_area / screen_area).log2();
+                let max_level = tex.mip_levels.len() as u32;
+                (lod.round() as u32).min(max_level)
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             let p = [x as f32 + 0.5, y as f32 + 0.5];
@@ -2399,7 +2745,7 @@ fn rasterize_triangle(
                 if let Some(tex) = texture {
                     let u = uv0[0] * pb0 + uv1[0] * pb1 + uv2[0] * pb2;
                     let v = uv0[1] * pb0 + uv1[1] * pb1 + uv2[1] * pb2;
-                    let tex_color = sample_texture(tex, u, v);
+                    let tex_color = sample_texture_lod(tex, u, v, tri_lod);
                     src[0] *= tex_color[0];
                     src[1] *= tex_color[1];
                     src[2] *= tex_color[2];
@@ -3362,6 +3708,7 @@ mod tests {
             wrap_v: WrapMode::ClampToEdge,
             normalized_coords: false,
             mag_filter: TextureFilter::Nearest,
+            mip_levels: Vec::new(),
         };
 
         // Sample at (0.5, 0.5) → texel (0, 0) = red.
@@ -3395,6 +3742,7 @@ mod tests {
             wrap_v: WrapMode::ClampToEdge,
             normalized_coords: true,
             mag_filter: TextureFilter::Nearest,
+            mip_levels: Vec::new(),
         };
 
         // Large triangle covering the framebuffer, UVs spanning [0,1].
@@ -3764,6 +4112,7 @@ mod tests {
             wrap_v: WrapMode::ClampToEdge,
             normalized_coords: false,
             mag_filter: TextureFilter::Linear,
+            mip_levels: Vec::new(),
         };
         // Center of texel (0,0) is at (0.5, 0.5).
         let c = sample_texture_bilinear(&tex, 0.5, 0.5);
@@ -3790,6 +4139,7 @@ mod tests {
             wrap_v: WrapMode::ClampToEdge,
             normalized_coords: false,
             mag_filter: TextureFilter::Linear,
+            mip_levels: Vec::new(),
         };
         // Sample at x=1.0 (between texels 0 and 1), y=0.5 (center of row 0).
         let c = sample_texture_bilinear(&tex, 1.0, 0.5);
@@ -3814,6 +4164,7 @@ mod tests {
             wrap_v: WrapMode::ClampToEdge,
             normalized_coords: false,
             mag_filter: TextureFilter::Nearest,
+            mip_levels: Vec::new(),
         };
         let tex_linear = SampledTexture {
             data,
@@ -3823,6 +4174,7 @@ mod tests {
             wrap_v: WrapMode::ClampToEdge,
             normalized_coords: false,
             mag_filter: TextureFilter::Linear,
+            mip_levels: Vec::new(),
         };
         // At texel center, both should give similar results.
         let cn = sample_texture(&tex_nearest, 0.5, 0.5);
@@ -4169,6 +4521,7 @@ mod tests {
             wrap_v: WrapMode::ClampToEdge,
             normalized_coords: true,
             mag_filter: TextureFilter::Nearest,
+            mip_levels: Vec::new(),
         };
 
         let white = [1.0f32, 1.0, 1.0, 1.0];
@@ -4202,5 +4555,63 @@ mod tests {
             }
         }
         assert!(differs, "perspective correction should produce different results with varying W");
+    }
+
+    #[test]
+    fn test_mipmap_lod_selection() {
+        // Level 0: 4×4 red texture.
+        let data_l0 = vec![[255u8, 0, 0, 255]; 16].into_iter().flatten().collect::<Vec<_>>();
+        // Level 1: 2×2 green texture.
+        let data_l1 = vec![[0u8, 255, 0, 255]; 4].into_iter().flatten().collect::<Vec<_>>();
+        // Level 2: 1×1 blue texture.
+        let data_l2 = vec![0u8, 0, 255, 255];
+
+        let tex = SampledTexture {
+            data: data_l0,
+            width: 4,
+            height: 4,
+            wrap_u: WrapMode::ClampToEdge,
+            wrap_v: WrapMode::ClampToEdge,
+            normalized_coords: true,
+            mag_filter: TextureFilter::Nearest,
+            mip_levels: vec![
+                MipLevel {
+                    data: data_l1,
+                    width: 2,
+                    height: 2,
+                },
+                MipLevel {
+                    data: data_l2,
+                    width: 1,
+                    height: 1,
+                },
+            ],
+        };
+
+        // LOD 0 → red (level 0).
+        let c0 = sample_texture_lod(&tex, 0.5, 0.5, 0);
+        assert!(c0[0] > 0.9 && c0[1] < 0.1 && c0[2] < 0.1, "LOD 0 should be red");
+
+        // LOD 1 → green (level 1).
+        let c1 = sample_texture_lod(&tex, 0.5, 0.5, 1);
+        assert!(c1[0] < 0.1 && c1[1] > 0.9 && c1[2] < 0.1, "LOD 1 should be green");
+
+        // LOD 2 → blue (level 2).
+        let c2 = sample_texture_lod(&tex, 0.5, 0.5, 2);
+        assert!(c2[0] < 0.1 && c2[1] < 0.1 && c2[2] > 0.9, "LOD 2 should be blue");
+
+        // LOD beyond max → clamped to highest level (blue).
+        let c3 = sample_texture_lod(&tex, 0.5, 0.5, 5);
+        assert!(c3[0] < 0.1 && c3[1] < 0.1 && c3[2] > 0.9, "LOD >max should clamp to last level");
+    }
+
+    #[test]
+    fn test_max_mip_count() {
+        assert_eq!(max_mip_count(1, 1), 1);
+        assert_eq!(max_mip_count(2, 2), 2);
+        assert_eq!(max_mip_count(4, 4), 3);
+        assert_eq!(max_mip_count(256, 256), 9);
+        assert_eq!(max_mip_count(1024, 1024), 11);
+        assert_eq!(max_mip_count(1, 512), 10);
     }
 }
