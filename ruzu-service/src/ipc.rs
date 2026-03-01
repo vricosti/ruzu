@@ -54,6 +54,28 @@ impl CommandType {
 
 // ── Parsed IPC command ───────────────────────────────────────────────────────
 
+/// Parsed X-type (pointer) buffer descriptor.
+#[derive(Debug, Clone)]
+pub struct XBufferDescriptor {
+    /// Guest virtual address.
+    pub address: u64,
+    /// Size in bytes.
+    pub size: u32,
+    /// Counter index for matching C descriptors.
+    pub counter: u8,
+}
+
+/// Parsed A-type (send) buffer descriptor.
+#[derive(Debug, Clone)]
+pub struct ABufferDescriptor {
+    /// Guest virtual address.
+    pub address: u64,
+    /// Size in bytes.
+    pub size: u64,
+    /// Flags (permission bits).
+    pub flags: u8,
+}
+
 /// A parsed HIPC + CMIF IPC command.
 #[derive(Debug, Clone)]
 pub struct IpcCommand {
@@ -84,6 +106,10 @@ pub struct IpcCommand {
     /// Guest virtual addresses of B-type (receive) output buffers.
     /// Services write their output data to these addresses.
     pub b_buf_addrs: Vec<u64>,
+    /// Parsed X-type (pointer) input buffer descriptors.
+    pub x_bufs: Vec<XBufferDescriptor>,
+    /// Parsed A-type (send) input buffer descriptors.
+    pub a_bufs: Vec<ABufferDescriptor>,
 }
 
 // ── Outgoing IPC response ────────────────────────────────────────────────────
@@ -213,16 +239,43 @@ pub fn parse_ipc_command(tls_data: &[u8]) -> Result<IpcCommand, anyhow::Error> {
     }
 
     // ── Buffer descriptors (X, A, B) ─────────────────────────────────────
-    // X descriptors: 2 words each (skip)
+    // X descriptors: 2 words each.
+    // word0: bits[5:0]=counter|reserved, bits[15:6]=size_hi(unused), bits[15:0]=size_lo, bits[31:16]=addr[31:16]
+    // Actually: word0 bits[5:0]=counter/idx, bits[15:6]= addr_hi bits, bits[31:16]=addr bits [31:16]
+    // word1: addr[31:0]
+    // Simplified: word0[6:2]=addr[38:36], word0[31:16]=addr[35:32]..., word1=addr_lo
+    let mut x_bufs = Vec::new();
     for _ in 0..num_x_bufs {
-        let _ = cur.read_u32::<LittleEndian>()?;
-        let _ = cur.read_u32::<LittleEndian>()?;
+        let word0 = cur.read_u32::<LittleEndian>()?;
+        let word1 = cur.read_u32::<LittleEndian>()?;
+        let counter = (word0 & 0x3F) as u8;
+        let size = ((word0 >> 16) & 0xFFFF) as u32;
+        let addr_hi = ((word0 >> 6) & 0x7) as u64; // bits [8:6] → addr[38:36]
+        let addr_mid = ((word0 >> 12) & 0xF) as u64; // bits [15:12] → addr[35:32]
+        let addr = (addr_hi << 36) | (addr_mid << 32) | (word1 as u64);
+        x_bufs.push(XBufferDescriptor {
+            address: addr,
+            size,
+            counter,
+        });
     }
-    // A descriptors: 3 words each (skip — send buffers, not used by HLE)
+    // A descriptors: 3 words each.
+    // word0: addr_lo[31:0]
+    // word1: size[31:0]
+    // word2: flags in bits[1:0], addr_hi in bits[31:28], size_hi in bits[27:24]
+    let mut a_bufs = Vec::new();
     for _ in 0..num_a_bufs {
-        let _ = cur.read_u32::<LittleEndian>()?;
-        let _ = cur.read_u32::<LittleEndian>()?;
-        let _ = cur.read_u32::<LittleEndian>()?;
+        let word0 = cur.read_u32::<LittleEndian>()?;
+        let word1 = cur.read_u32::<LittleEndian>()?;
+        let word2 = cur.read_u32::<LittleEndian>()?;
+        let flags = (word2 & 0x3) as u8;
+        let addr = (word0 as u64) | (((word2 >> 28) & 0xF) as u64) << 32;
+        let size = (word1 as u64) | (((word2 >> 24) & 0xF) as u64) << 32;
+        a_bufs.push(ABufferDescriptor {
+            address: addr,
+            size,
+            flags,
+        });
     }
     // B descriptors: 3 words each — extract the guest address so services
     // can write output data into the caller's buffer.
@@ -274,6 +327,8 @@ pub fn parse_ipc_command(tls_data: &[u8]) -> Result<IpcCommand, anyhow::Error> {
         command_id,
         raw_data,
         b_buf_addrs,
+        x_bufs,
+        a_bufs,
     })
 }
 

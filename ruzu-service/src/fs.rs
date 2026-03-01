@@ -447,6 +447,8 @@ mod tests {
             command_id: cmd_id,
             raw_data: Vec::new(),
             b_buf_addrs: Vec::new(),
+            x_bufs: Vec::new(),
+            a_bufs: Vec::new(),
         }
     }
 
@@ -465,6 +467,8 @@ mod tests {
             command_id: cmd_id,
             raw_data,
             b_buf_addrs: Vec::new(),
+            x_bufs: Vec::new(),
+            a_bufs: Vec::new(),
         }
     }
 

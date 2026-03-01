@@ -498,6 +498,185 @@ pub enum Instruction {
         sys_reg: SystemReg,
     },
 
+    // ── Integer multiply ──────────────────────────────────────────────
+    Xmad {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+        src_c: SrcC,
+        /// XMAD mode: 0=CLO, 1=CHI, 2=CSFU, 3=CBCC
+        mode: u8,
+        /// Whether to use high 16 bits of src_a
+        hi_a: bool,
+        /// Whether to use high 16 bits of src_b
+        hi_b: bool,
+        /// Product shift left 16 (PSL)
+        psl: bool,
+    },
+
+    // ── Integer/Float min-max ───────────────────────────────────────
+    Imnmx {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+        pred: u8,
+        neg_pred: bool,
+        is_signed: bool,
+    },
+    Fmnmx {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+        pred: u8,
+        neg_pred: bool,
+        abs_a: bool,
+        abs_b: bool,
+        neg_a: bool,
+        neg_b: bool,
+    },
+
+    // ── Bit field operations ────────────────────────────────────────
+    Bfe {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+        is_signed: bool,
+    },
+    Bfi {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+        src_c: SrcC,
+    },
+    Popc {
+        dst: u8,
+        src_b: SrcB,
+    },
+    Flo {
+        dst: u8,
+        src_b: SrcB,
+        is_signed: bool,
+        invert: bool,
+    },
+
+    // ── Funnel shift ────────────────────────────────────────────────
+    Shf {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+        src_c: SrcC,
+        direction_right: bool,
+        data_type_u64: bool,
+        /// Max shift clamp flag
+        hi: bool,
+    },
+
+    // ── Integer/Float set ───────────────────────────────────────────
+    Iset {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+        compare: IntCompareOp,
+        bop: BoolOp,
+        bop_pred: u8,
+        neg_bop_pred: bool,
+        is_signed: bool,
+        bf: bool,
+    },
+    Fset {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+        compare: FpCompareOp,
+        bop: BoolOp,
+        bop_pred: u8,
+        neg_bop_pred: bool,
+        bf: bool,
+    },
+
+    // ── 3-input logic ───────────────────────────────────────────────
+    Lop3 {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+        src_c: SrcC,
+        lut: u8,
+        pred_out: u8,
+    },
+
+    // ── Predicate ↔ register ────────────────────────────────────────
+    P2r {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+    },
+    R2p {
+        src_a: u8,
+        src_b: SrcB,
+        src_c: u8,
+    },
+
+    // ── Range reduction ─────────────────────────────────────────────
+    Rro {
+        dst: u8,
+        src_b: SrcB,
+    },
+
+    // ── Float-to-float conversion ───────────────────────────────────
+    F2f {
+        dst: u8,
+        src_b: SrcB,
+        abs_b: bool,
+        neg_b: bool,
+        sat: bool,
+        /// Destination size: 0=F16, 1=F32, 2=F64
+        dst_size: u8,
+        /// Source size: 0=F16, 1=F32, 2=F64
+        src_size: u8,
+        /// Rounding mode: 0=RN, 1=RM, 2=RP, 3=RZ
+        rounding: u8,
+    },
+    /// Integer-to-integer conversion.
+    I2i {
+        dst: u8,
+        src_b: SrcB,
+        abs_b: bool,
+        sat: bool,
+        dst_signed: bool,
+        src_signed: bool,
+        /// Destination size: 0=U8/S8, 1=U16/S16, 2=U32/S32
+        dst_size: u8,
+        /// Source size: 0=U8/S8, 1=U16/S16, 2=U32/S32
+        src_size: u8,
+    },
+
+    // ── Global memory ───────────────────────────────────────────────
+    Ldg {
+        dst: u8,
+        src_a: u8,
+        offset: i32,
+        /// Data size: 0=U8, 1=S8, 2=U16, 3=S16, 4=32, 5=64, 6=128
+        size: u8,
+    },
+    Stg {
+        src: u8,
+        src_a: u8,
+        offset: i32,
+        /// Data size: same encoding as LDG
+        size: u8,
+    },
+
+    // ── 3-operand integer add ───────────────────────────────────────
+    Iadd3 {
+        dst: u8,
+        src_a: u8,
+        src_b: SrcB,
+        src_c: SrcC,
+        neg_a: bool,
+        neg_b: bool,
+        neg_c: bool,
+    },
+
     // ── Control flow ─────────────────────────────────────────────────
     Bra {
         offset: i32,
@@ -1080,6 +1259,362 @@ fn decode_opcode(insn: u64, top16: u16) -> Instruction {
         return Instruction::Nop;
     }
 
+    // ── BAR: "1111 0000 1010 1---" — treat as NOP (barrier sync) ──
+    if top16 & 0xFFF8 == 0xF0A8 {
+        return Instruction::Nop;
+    }
+
+    // ── RRO: range reduction (pass-through for interpreter) ───────
+    // RRO_reg: "0101 1001 0000 ----"
+    if top16 & 0xFFF0 == 0x5900 {
+        return Instruction::Rro {
+            dst: dst_reg(insn),
+            src_b: SrcB::Reg(src_b_reg(insn)),
+        };
+    }
+    // RRO_cbuf: "0100 1001 0000 ----"
+    if top16 & 0xFFF0 == 0x4900 {
+        return Instruction::Rro {
+            dst: dst_reg(insn),
+            src_b: cbuf_operand(insn),
+        };
+    }
+    // RRO_imm: "0011 001- 0000 ----"
+    if top16 & 0xFEF0 == 0x3200 {
+        return Instruction::Rro {
+            dst: dst_reg(insn),
+            src_b: imm20_operand(insn),
+        };
+    }
+
+    // ── P2R: "0011 1000 1100 1---" ────────────────────────────────
+    if top16 & 0xFFF8 == 0x38C8 {
+        return Instruction::P2r {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            src_b: imm20_operand(insn),
+        };
+    }
+
+    // ── R2P: "0011 1000 1100 0---" ────────────────────────────────
+    if top16 & 0xFFF8 == 0x38C0 {
+        return Instruction::R2p {
+            src_a: src_a_reg(insn),
+            src_b: imm20_operand(insn),
+            src_c: dst_reg(insn),
+        };
+    }
+
+    // ── LDG: "1110 1110 1101 ----" ────────────────────────────────
+    if top16 & 0xFFF0 == 0xEED0 {
+        let raw_offset = bits(insn, 20, 43) as u32;
+        let offset = if raw_offset & (1 << 23) != 0 {
+            (raw_offset | 0xFF00_0000) as i32
+        } else {
+            raw_offset as i32
+        };
+        return Instruction::Ldg {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            offset,
+            size: bits(insn, 48, 50) as u8,
+        };
+    }
+
+    // ── STG: "1110 1110 1111 ----" ────────────────────────────────
+    if top16 & 0xFFF0 == 0xEEF0 {
+        let raw_offset = bits(insn, 20, 43) as u32;
+        let offset = if raw_offset & (1 << 23) != 0 {
+            (raw_offset | 0xFF00_0000) as i32
+        } else {
+            raw_offset as i32
+        };
+        return Instruction::Stg {
+            src: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            offset,
+            size: bits(insn, 48, 50) as u8,
+        };
+    }
+
+    // ── XMAD variants ────────────────────────────────────────────
+    // XMAD_reg: "0101 1011 0000 ----"
+    if top16 & 0xFFF0 == 0x5B00 {
+        return decode_xmad(insn, SrcB::Reg(src_b_reg(insn)), SrcC::Reg(src_c_reg(insn)));
+    }
+    // XMAD_rc: "0101 0001 0000 ----" (reg + cbuf_c)
+    if top16 & 0xFFF0 == 0x5100 {
+        return decode_xmad(insn, SrcB::Reg(src_b_reg(insn)), cbuf_src_c(insn));
+    }
+    // XMAD_cr: "0100 1110 0000 ----" (cbuf + reg_c)
+    if top16 & 0xFFF0 == 0x4E00 {
+        return decode_xmad(insn, cbuf_operand(insn), SrcC::Reg(src_c_reg(insn)));
+    }
+    // XMAD_imm: "0011 011- 0000 ----"
+    if top16 & 0xFEF0 == 0x3600 {
+        return decode_xmad(insn, imm20_operand(insn), SrcC::Reg(src_c_reg(insn)));
+    }
+
+    // ── IMNMX variants ──────────────────────────────────────────
+    // IMNMX_reg: "0101 1100 0010 0---"
+    if top16 & 0xFFF8 == 0x5C20 {
+        return decode_imnmx(insn, SrcB::Reg(src_b_reg(insn)));
+    }
+    // IMNMX_cbuf: "0100 1100 0010 0---"
+    if top16 & 0xFFF8 == 0x4C20 {
+        return decode_imnmx(insn, cbuf_operand(insn));
+    }
+    // IMNMX_imm: "0011 100- 0010 0---"
+    if top16 & 0xFEF8 == 0x3820 {
+        return decode_imnmx(insn, imm20_operand(insn));
+    }
+
+    // ── FMNMX variants ──────────────────────────────────────────
+    // FMNMX_reg: "0101 1100 0110 0---"
+    if top16 & 0xFFF8 == 0x5C60 {
+        return decode_fmnmx(insn, SrcB::Reg(src_b_reg(insn)));
+    }
+    // FMNMX_cbuf: "0100 1100 0110 0---"
+    if top16 & 0xFFF8 == 0x4C60 {
+        return decode_fmnmx(insn, cbuf_operand(insn));
+    }
+    // FMNMX_imm: "0011 100- 0110 0---"
+    if top16 & 0xFEF8 == 0x3860 {
+        return decode_fmnmx(insn, imm20_operand(insn));
+    }
+
+    // ── BFE variants ────────────────────────────────────────────
+    // BFE_reg: "0101 1100 0000 0---"
+    if top16 & 0xFFF8 == 0x5C00 {
+        return Instruction::Bfe {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            src_b: SrcB::Reg(src_b_reg(insn)),
+            is_signed: bits(insn, 48, 48) != 0,
+        };
+    }
+    // BFE_cbuf: "0100 1100 0000 0---"
+    if top16 & 0xFFF8 == 0x4C00 {
+        return Instruction::Bfe {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            src_b: cbuf_operand(insn),
+            is_signed: bits(insn, 48, 48) != 0,
+        };
+    }
+    // BFE_imm: "0011 100- 0000 0---"
+    if top16 & 0xFEF8 == 0x3800 {
+        return Instruction::Bfe {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            src_b: imm20_operand(insn),
+            is_signed: bits(insn, 48, 48) != 0,
+        };
+    }
+
+    // ── BFI variants ────────────────────────────────────────────
+    // BFI_reg: "0101 1011 1111 ----"
+    if top16 & 0xFFF0 == 0x5BF0 {
+        return Instruction::Bfi {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            src_b: SrcB::Reg(src_b_reg(insn)),
+            src_c: SrcC::Reg(src_c_reg(insn)),
+        };
+    }
+    // BFI_rc: "0011 0110 1111 ----"
+    if top16 & 0xFFF0 == 0x36F0 {
+        return Instruction::Bfi {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            src_b: imm20_operand(insn),
+            src_c: SrcC::Reg(src_c_reg(insn)),
+        };
+    }
+    // BFI_cr: "0100 1011 1111 ----"
+    if top16 & 0xFFF0 == 0x4BF0 {
+        return Instruction::Bfi {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            src_b: cbuf_operand(insn),
+            src_c: SrcC::Reg(src_c_reg(insn)),
+        };
+    }
+
+    // ── POPC variants ───────────────────────────────────────────
+    // POPC_reg: "0101 1100 0000 1---"
+    if top16 & 0xFFF8 == 0x5C08 {
+        return Instruction::Popc {
+            dst: dst_reg(insn),
+            src_b: SrcB::Reg(src_b_reg(insn)),
+        };
+    }
+    // POPC_cbuf: "0100 1100 0000 1---"
+    if top16 & 0xFFF8 == 0x4C08 {
+        return Instruction::Popc {
+            dst: dst_reg(insn),
+            src_b: cbuf_operand(insn),
+        };
+    }
+    // POPC_imm: "0011 100- 0000 1---"
+    if top16 & 0xFEF8 == 0x3808 {
+        return Instruction::Popc {
+            dst: dst_reg(insn),
+            src_b: imm20_operand(insn),
+        };
+    }
+
+    // ── FLO variants ────────────────────────────────────────────
+    // FLO_reg: "0101 1100 0011 0---"
+    if top16 & 0xFFF8 == 0x5C30 {
+        return Instruction::Flo {
+            dst: dst_reg(insn),
+            src_b: SrcB::Reg(src_b_reg(insn)),
+            is_signed: bits(insn, 48, 48) != 0,
+            invert: bits(insn, 40, 40) != 0,
+        };
+    }
+    // FLO_cbuf: "0100 1100 0011 0---"
+    if top16 & 0xFFF8 == 0x4C30 {
+        return Instruction::Flo {
+            dst: dst_reg(insn),
+            src_b: cbuf_operand(insn),
+            is_signed: bits(insn, 48, 48) != 0,
+            invert: bits(insn, 40, 40) != 0,
+        };
+    }
+    // FLO_imm: "0011 100- 0011 0---"
+    if top16 & 0xFEF8 == 0x3830 {
+        return Instruction::Flo {
+            dst: dst_reg(insn),
+            src_b: imm20_operand(insn),
+            is_signed: bits(insn, 48, 48) != 0,
+            invert: bits(insn, 40, 40) != 0,
+        };
+    }
+
+    // ── SHF variants (funnel shift) ─────────────────────────────
+    // SHF_right_reg: "0101 1100 1111 1---"
+    if top16 & 0xFFF8 == 0x5CF8 {
+        return decode_shf(insn, SrcB::Reg(src_b_reg(insn)), true);
+    }
+    // SHF_right_imm: "0011 100- 1111 1---"
+    if top16 & 0xFEF8 == 0x38F8 {
+        return decode_shf(insn, imm20_operand(insn), true);
+    }
+    // SHF_left_reg: "0101 1011 1111 1---"
+    if top16 & 0xFFF8 == 0x5BF8 {
+        return decode_shf(insn, SrcB::Reg(src_b_reg(insn)), false);
+    }
+    // SHF_left_imm: "0011 011- 1111 1---"
+    if top16 & 0xFEF8 == 0x36F8 {
+        return decode_shf(insn, imm20_operand(insn), false);
+    }
+
+    // ── ISET variants ───────────────────────────────────────────
+    // ISET_reg: "0101 1011 0101 0---"
+    if top16 & 0xFFF8 == 0x5B50 {
+        return decode_iset(insn, SrcB::Reg(src_b_reg(insn)));
+    }
+    // ISET_cbuf: "0100 1011 0101 0---"
+    if top16 & 0xFFF8 == 0x4B50 {
+        return decode_iset(insn, cbuf_operand(insn));
+    }
+    // ISET_imm: "0011 011- 0101 0---"
+    if top16 & 0xFEF8 == 0x3650 {
+        return decode_iset(insn, imm20_operand(insn));
+    }
+
+    // ── FSET variants ───────────────────────────────────────────
+    // FSET_reg: "0101 1000 0000 ----"
+    if top16 & 0xFFF0 == 0x5800 {
+        return decode_fset(insn, SrcB::Reg(src_b_reg(insn)));
+    }
+    // FSET_cbuf: "0100 1000 0000 ----"
+    if top16 & 0xFFF0 == 0x4800 {
+        return decode_fset(insn, cbuf_operand(insn));
+    }
+    // FSET_imm: "0011 000- 0000 ----"
+    if top16 & 0xFEF0 == 0x3000 {
+        return decode_fset(insn, imm20_operand(insn));
+    }
+
+    // ── LOP3: "0101 1011 1110 0---" (imm LUT) ────────────────────
+    if top16 & 0xFFF8 == 0x5BE0 {
+        return Instruction::Lop3 {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            src_b: SrcB::Reg(src_b_reg(insn)),
+            src_c: SrcC::Reg(src_c_reg(insn)),
+            lut: bits(insn, 28, 35) as u8,
+            pred_out: bits(insn, 48, 50) as u8,
+        };
+    }
+    // LOP3_cbuf: "0100 1011 1110 0---"
+    if top16 & 0xFFF8 == 0x4BE0 {
+        return Instruction::Lop3 {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            src_b: cbuf_operand(insn),
+            src_c: SrcC::Reg(src_c_reg(insn)),
+            lut: bits(insn, 28, 35) as u8,
+            pred_out: bits(insn, 48, 50) as u8,
+        };
+    }
+    // LOP3_imm: "0011 011- 1110 0---"
+    if top16 & 0xFEF8 == 0x36E0 {
+        return Instruction::Lop3 {
+            dst: dst_reg(insn),
+            src_a: src_a_reg(insn),
+            src_b: imm20_operand(insn),
+            src_c: SrcC::Reg(src_c_reg(insn)),
+            lut: bits(insn, 28, 35) as u8,
+            pred_out: bits(insn, 48, 50) as u8,
+        };
+    }
+
+    // ── F2F variants ────────────────────────────────────────────
+    // F2F_reg: "0101 1100 1010 1---"
+    if top16 & 0xFFF8 == 0x5CA8 {
+        return decode_f2f(insn, SrcB::Reg(src_b_reg(insn)));
+    }
+    // F2F_cbuf: "0100 1100 1010 1---"
+    if top16 & 0xFFF8 == 0x4CA8 {
+        return decode_f2f(insn, cbuf_operand(insn));
+    }
+    // F2F_imm: "0011 100- 1010 1---"
+    if top16 & 0xFEF8 == 0x38A8 {
+        return decode_f2f(insn, imm20_operand(insn));
+    }
+
+    // ── I2I variants ────────────────────────────────────────────
+    // I2I_reg: "0101 1100 1110 0---"
+    if top16 & 0xFFF8 == 0x5CE0 {
+        return decode_i2i(insn, SrcB::Reg(src_b_reg(insn)));
+    }
+    // I2I_cbuf: "0100 1100 1110 0---"
+    if top16 & 0xFFF8 == 0x4CE0 {
+        return decode_i2i(insn, cbuf_operand(insn));
+    }
+    // I2I_imm: "0011 100- 1110 0---"
+    if top16 & 0xFEF8 == 0x38E0 {
+        return decode_i2i(insn, imm20_operand(insn));
+    }
+
+    // ── IADD3 variants ──────────────────────────────────────────
+    // IADD3_reg: "0101 1100 1100 0---"
+    if top16 & 0xFFF8 == 0x5CC0 {
+        return decode_iadd3(insn, SrcB::Reg(src_b_reg(insn)));
+    }
+    // IADD3_cbuf: "0100 1100 1100 0---"
+    if top16 & 0xFFF8 == 0x4CC0 {
+        return decode_iadd3(insn, cbuf_operand(insn));
+    }
+    // IADD3_imm: "0011 100- 1100 0---"
+    if top16 & 0xFEF8 == 0x38C0 {
+        return decode_iadd3(insn, imm20_operand(insn));
+    }
+
     // ── Unknown instruction ─────────────────────────────────────────
     Instruction::Unknown { raw: insn }
 }
@@ -1178,6 +1713,121 @@ fn cbuf_src_c(insn: u64) -> SrcC {
     let index = bits(insn, 34, 38) as u8;
     let offset = bits(insn, 20, 33) as u16;
     SrcC::Cbuf { index, offset }
+}
+
+fn decode_xmad(insn: u64, src_b: SrcB, src_c: SrcC) -> Instruction {
+    Instruction::Xmad {
+        dst: dst_reg(insn),
+        src_a: src_a_reg(insn),
+        src_b,
+        src_c,
+        mode: bits(insn, 50, 51) as u8,
+        hi_a: bits(insn, 53, 53) != 0,
+        hi_b: bits(insn, 52, 52) != 0,
+        psl: bits(insn, 36, 36) != 0,
+    }
+}
+
+fn decode_imnmx(insn: u64, src_b: SrcB) -> Instruction {
+    Instruction::Imnmx {
+        dst: dst_reg(insn),
+        src_a: src_a_reg(insn),
+        src_b,
+        pred: bits(insn, 39, 41) as u8,
+        neg_pred: bits(insn, 42, 42) != 0,
+        is_signed: bits(insn, 48, 48) != 0,
+    }
+}
+
+fn decode_fmnmx(insn: u64, src_b: SrcB) -> Instruction {
+    Instruction::Fmnmx {
+        dst: dst_reg(insn),
+        src_a: src_a_reg(insn),
+        src_b,
+        pred: bits(insn, 39, 41) as u8,
+        neg_pred: bits(insn, 42, 42) != 0,
+        abs_a: bits(insn, 46, 46) != 0,
+        abs_b: bits(insn, 49, 49) != 0,
+        neg_a: bits(insn, 48, 48) != 0,
+        neg_b: bits(insn, 45, 45) != 0,
+    }
+}
+
+fn decode_shf(insn: u64, src_b: SrcB, direction_right: bool) -> Instruction {
+    Instruction::Shf {
+        dst: dst_reg(insn),
+        src_a: src_a_reg(insn),
+        src_b,
+        src_c: SrcC::Reg(src_c_reg(insn)),
+        direction_right,
+        data_type_u64: bits(insn, 48, 48) != 0,
+        hi: bits(insn, 49, 49) != 0,
+    }
+}
+
+fn decode_iset(insn: u64, src_b: SrcB) -> Instruction {
+    Instruction::Iset {
+        dst: dst_reg(insn),
+        src_a: src_a_reg(insn),
+        src_b,
+        compare: IntCompareOp::from_bits(bits(insn, 49, 51) as u8),
+        bop: BoolOp::from_bits(bits(insn, 45, 46) as u8),
+        bop_pred: bits(insn, 39, 41) as u8,
+        neg_bop_pred: bits(insn, 42, 42) != 0,
+        is_signed: bits(insn, 48, 48) != 0,
+        bf: bits(insn, 44, 44) != 0,
+    }
+}
+
+fn decode_fset(insn: u64, src_b: SrcB) -> Instruction {
+    Instruction::Fset {
+        dst: dst_reg(insn),
+        src_a: src_a_reg(insn),
+        src_b,
+        compare: FpCompareOp::from_bits(bits(insn, 48, 51) as u8),
+        bop: BoolOp::from_bits(bits(insn, 45, 46) as u8),
+        bop_pred: bits(insn, 39, 41) as u8,
+        neg_bop_pred: bits(insn, 42, 42) != 0,
+        bf: bits(insn, 52, 52) != 0,
+    }
+}
+
+fn decode_f2f(insn: u64, src_b: SrcB) -> Instruction {
+    Instruction::F2f {
+        dst: dst_reg(insn),
+        src_b,
+        abs_b: bits(insn, 49, 49) != 0,
+        neg_b: bits(insn, 45, 45) != 0,
+        sat: bits(insn, 50, 50) != 0,
+        dst_size: bits(insn, 8, 9) as u8,
+        src_size: bits(insn, 10, 11) as u8,
+        rounding: bits(insn, 39, 40) as u8,
+    }
+}
+
+fn decode_i2i(insn: u64, src_b: SrcB) -> Instruction {
+    Instruction::I2i {
+        dst: dst_reg(insn),
+        src_b,
+        abs_b: bits(insn, 49, 49) != 0,
+        sat: bits(insn, 50, 50) != 0,
+        dst_signed: bits(insn, 12, 12) != 0,
+        src_signed: bits(insn, 13, 13) != 0,
+        dst_size: bits(insn, 8, 9) as u8,
+        src_size: bits(insn, 10, 11) as u8,
+    }
+}
+
+fn decode_iadd3(insn: u64, src_b: SrcB) -> Instruction {
+    Instruction::Iadd3 {
+        dst: dst_reg(insn),
+        src_a: src_a_reg(insn),
+        src_b,
+        src_c: SrcC::Reg(src_c_reg(insn)),
+        neg_a: bits(insn, 51, 51) != 0,
+        neg_b: bits(insn, 50, 50) != 0,
+        neg_c: bits(insn, 49, 49) != 0,
+    }
 }
 
 #[cfg(test)]
@@ -1329,5 +1979,109 @@ mod tests {
         assert!(IntCompareOp::EQ.eval_unsigned(5, 5));
         assert!(IntCompareOp::LT.eval_signed(-1, 0));
         assert!(!IntCompareOp::LT.eval_signed(0, -1));
+    }
+
+    #[test]
+    fn test_decode_xmad_reg() {
+        // XMAD_reg: top16 pattern 0x5B00
+        let insn: u64 = (0x5B00u64 << 48) | (3u64 << 39) | (2u64 << 20) | 0x0007_0100;
+        let (decoded, _) = decode(insn);
+        match decoded {
+            Instruction::Xmad { dst, src_a, src_b: SrcB::Reg(_), .. } => {
+                assert_eq!(dst, 0);
+                assert_eq!(src_a, 1);
+            }
+            _ => panic!("Expected Xmad, got {:?}", decoded),
+        }
+    }
+
+    #[test]
+    fn test_decode_imnmx_reg() {
+        // IMNMX_reg: top16 pattern 0x5C20
+        let insn: u64 = (0x5C20u64 << 48) | (2u64 << 20) | 0x0007_0100;
+        let (decoded, _) = decode(insn);
+        assert!(matches!(decoded, Instruction::Imnmx { .. }));
+    }
+
+    #[test]
+    fn test_decode_fmnmx_reg() {
+        // FMNMX_reg: top16 pattern 0x5C60
+        let insn: u64 = (0x5C60u64 << 48) | (2u64 << 20) | 0x0007_0100;
+        let (decoded, _) = decode(insn);
+        assert!(matches!(decoded, Instruction::Fmnmx { .. }));
+    }
+
+    #[test]
+    fn test_decode_bfe_reg() {
+        // BFE_reg: top16 pattern 0x5C00
+        let insn: u64 = (0x5C00u64 << 48) | (2u64 << 20) | 0x0007_0100;
+        let (decoded, _) = decode(insn);
+        assert!(matches!(decoded, Instruction::Bfe { .. }));
+    }
+
+    #[test]
+    fn test_decode_popc_reg() {
+        // POPC_reg: top16 pattern 0x5C08
+        let insn: u64 = (0x5C08u64 << 48) | (2u64 << 20) | 0x0007_0000;
+        let (decoded, _) = decode(insn);
+        assert!(matches!(decoded, Instruction::Popc { .. }));
+    }
+
+    #[test]
+    fn test_decode_flo_reg() {
+        // FLO_reg: top16 pattern 0x5C30
+        let insn: u64 = (0x5C30u64 << 48) | (2u64 << 20) | 0x0007_0000;
+        let (decoded, _) = decode(insn);
+        assert!(matches!(decoded, Instruction::Flo { .. }));
+    }
+
+    #[test]
+    fn test_decode_lop3_reg() {
+        // LOP3_reg: top16 pattern 0x5BE0
+        let lut: u64 = 0xC0; // AND operation LUT
+        let insn: u64 = (0x5BE0u64 << 48) | (3u64 << 39) | (lut << 28) | (2u64 << 20) | 0x0007_0100;
+        let (decoded, _) = decode(insn);
+        match decoded {
+            Instruction::Lop3 { lut, .. } => {
+                assert_eq!(lut, 0xC0u8);
+            }
+            _ => panic!("Expected Lop3, got {:?}", decoded),
+        }
+    }
+
+    #[test]
+    fn test_decode_ldg() {
+        // LDG: top16 pattern 0xEED0
+        let insn: u64 = (0xEED0u64 << 48) | (4u64 << 48) | (0u64 << 20) | 0x0007_0100;
+        let top16 = ((insn >> 48) & 0xFFFF) as u16;
+        // Verify the top bits match
+        if top16 & 0xFFF0 == 0xEED0 {
+            let (decoded, _) = decode(insn);
+            assert!(matches!(decoded, Instruction::Ldg { .. }));
+        }
+    }
+
+    #[test]
+    fn test_decode_stg() {
+        // STG: top16 pattern 0xEEF0
+        let insn: u64 = (0xEEF0u64 << 48) | 0x0007_0100;
+        let (decoded, _) = decode(insn);
+        assert!(matches!(decoded, Instruction::Stg { .. }));
+    }
+
+    #[test]
+    fn test_decode_iadd3_reg() {
+        // IADD3_reg: top16 pattern 0x5CC0
+        let insn: u64 = (0x5CC0u64 << 48) | (3u64 << 39) | (2u64 << 20) | 0x0007_0100;
+        let (decoded, _) = decode(insn);
+        assert!(matches!(decoded, Instruction::Iadd3 { .. }));
+    }
+
+    #[test]
+    fn test_decode_depbar() {
+        // DEPBAR: top16 pattern 0xF0F0 → NOP
+        let insn: u64 = (0xF0F0u64 << 48) | 0x0007_0000;
+        let (decoded, _) = decode(insn);
+        assert!(matches!(decoded, Instruction::Nop));
     }
 }
