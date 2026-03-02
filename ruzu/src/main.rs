@@ -937,6 +937,38 @@ fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
                     slice, reason, reason.bits(), pc_before, jit_pc, pc_after
                 );
             }
+            // One-shot instruction dump around current PC
+            if slice == 3 {
+                if let Some(p) = kernel.process() {
+                    let base_pc = jit_pc & !3; // align
+                    use std::io::Write;
+                    let mut f = std::fs::File::create("/tmp/ruzu_dump.txt").unwrap();
+                    writeln!(f, "=== Instruction dump around PC=0x{:08X} ===", jit_pc).ok();
+                    for off in (-16i64..=32).step_by(4) {
+                        let addr = (base_pc as i64 + off) as u64;
+                        let word = p.memory.read_u32(addr).unwrap_or(0);
+                        let marker = if addr == jit_pc as u64 { " <-- PC" } else { "" };
+                        writeln!(f, "  0x{:08X}: 0x{:08X}{}", addr, word, marker).ok();
+                    }
+                    // Also dump registers
+                    let regs = &kernel.process().unwrap().threads[idx].cpu_state;
+                    writeln!(f, "Registers: r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X}",
+                        regs.x[0] as u32, regs.x[1] as u32, regs.x[2] as u32, regs.x[3] as u32).ok();
+                    writeln!(f, "  r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
+                        regs.x[4] as u32, regs.x[5] as u32, regs.x[6] as u32, regs.x[7] as u32).ok();
+                    writeln!(f, "  r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X}",
+                        regs.x[8] as u32, regs.x[9] as u32, regs.x[10] as u32, regs.x[11] as u32, regs.x[12] as u32).ok();
+                    writeln!(f, "  SP=0x{:08X} LR=0x{:08X} PC=0x{:08X}",
+                        regs.sp as u32, regs.x[14] as u32, regs.pc as u32).ok();
+                    // Wider dump of key areas
+                    writeln!(f, "\n=== Wider dump of rtld 0x1100-0x1300 ===").ok();
+                    for off in (0x1100u64..=0x1300).step_by(4) {
+                        let addr = 0x08000000 + off;
+                        let word = p.memory.read_u32(addr).unwrap_or(0);
+                        writeln!(f, "  0x{:08X}: 0x{:08X}", addr, word).ok();
+                    }
+                }
+            }
         }
 
         if reason.contains(HaltReason::SVC) {
@@ -1034,6 +1066,12 @@ fn run_with_window(
     info!("Press ESC or close window to exit");
     info!("Controls: Z=A, X=B, C=X, V=Y, Arrows=D-Pad, Enter=+, RShift=-, Q/E=L/R, A/D=ZL/ZR, IJKL=LStick");
 
+    // Diagnostic counters
+    let mut diag_frame_count: u64 = 0;
+    let mut diag_total_slices: u64 = 0;
+    let mut diag_total_svcs: u64 = 0;
+    let diag_start = std::time::Instant::now();
+
     let vtable = make_memory_vtable();
     let mem_ptr = &mut kernel.process_mut().unwrap().memory as *mut _ as *mut u8;
     let mut jit: Box<dyn ArmJit> = if kernel.is_64bit {
@@ -1045,8 +1083,21 @@ fn run_with_window(
     // Number of time slices to run per frame (~60 FPS ~ 16ms).
     const SLICES_PER_FRAME: usize = 10;
 
+    log::info!("[DIAG] About to enter main loop, is_64bit={}", kernel.is_64bit);
+    if let Some(p) = kernel.process() {
+        log::info!("[DIAG] Thread count: {}", p.threads.len());
+        for (i, t) in p.threads.iter().enumerate() {
+            log::info!("[DIAG]   thread[{}]: state={:?} pc=0x{:08X} sp=0x{:08X} priority={}", i, t.state, t.cpu_state.pc, t.cpu_state.sp, t.priority);
+        }
+    }
+
     loop {
+        let frame_start = std::time::Instant::now();
+
         // ── Poll SDL2 events and read input ─────────────────────────────
+        if diag_frame_count < 3 {
+            log::info!("[DIAG] frame={} polling events...", diag_frame_count);
+        }
         let input = match emu_window.poll_events_with_input() {
             Some(input) => input,
             None => {
@@ -1105,7 +1156,7 @@ fn run_with_window(
         }
 
         // ── Run CPU slices ──────────────────────────────────────────────
-        for _ in 0..SLICES_PER_FRAME {
+        for slice_i in 0..SLICES_PER_FRAME {
             if kernel.should_stop {
                 break;
             }
@@ -1135,6 +1186,9 @@ fn run_with_window(
                     .iter()
                     .map(|t| (t.handle, t.state, t.priority))
                     .collect();
+                if diag_frame_count < 3 {
+                    log::info!("[DIAG] frame={} slice={} scheduling: {:?}", diag_frame_count, slice_i, thread_states);
+                }
                 kernel.scheduler.schedule_next(&thread_states)
             };
 
@@ -1150,6 +1204,9 @@ fn run_with_window(
                         })
                         .unwrap_or(false);
 
+                    if diag_frame_count < 3 {
+                        log::info!("[DIAG] frame={} slice={} no runnable thread, has_waiting={}", diag_frame_count, slice_i, has_waiting);
+                    }
                     if has_waiting {
                         kernel.tick_counter += INSTRUCTIONS_PER_SLICE;
                         continue;
@@ -1162,15 +1219,73 @@ fn run_with_window(
 
             // Load thread context into JIT and run with budget.
             jit.load_context(&kernel.process().unwrap().threads[idx].cpu_state);
+            if diag_total_slices < 50 {
+                log::info!("[DIAG] slice={} STARTING pc=0x{:08X}", diag_total_slices + 1, jit.get_pc());
+            }
             jit.set_ticks_remaining(INSTRUCTIONS_PER_SLICE);
+            let run_start = std::time::Instant::now();
             let reason = jit.run();
+            let run_elapsed = run_start.elapsed();
             jit.save_context(&mut kernel.process_mut().unwrap().threads[idx].cpu_state);
             kernel.tick_counter += INSTRUCTIONS_PER_SLICE;
+            diag_total_slices += 1;
+
+            // Log first 50 slices, every 1000th, and long-running slices
+            let is_long = run_elapsed > std::time::Duration::from_millis(100);
+            if diag_total_slices <= 50 || diag_total_slices % 1000 == 0 || is_long {
+                let pc = jit.get_pc();
+                log::info!(
+                    "[DIAG] slice={} thread={} reason={:?} pc=0x{:08X} elapsed={:?}{}",
+                    diag_total_slices, idx, reason, pc, run_elapsed,
+                    if is_long { " *** LONG ***" } else { "" }
+                );
+            }
+
+            // Dump memory at exception PCs on first slice
+            if diag_total_slices == 1 {
+                if let Some(p) = kernel.process() {
+                    use std::io::Write;
+                    let mut f = std::fs::File::create("/tmp/ruzu_dump.txt").unwrap();
+                    // Dump rtld 0xB80-0xC00 (where exceptions happen)
+                    writeln!(f, "=== rtld code 0xB80-0xC00 ===").ok();
+                    for off in (0xB80u64..=0xC00).step_by(4) {
+                        let addr = 0x08000000 + off;
+                        let word = p.memory.read_u32(addr).unwrap_or(0xDEADBEEF);
+                        writeln!(f, "  0x{:08X}: 0x{:08X}", addr, word).ok();
+                    }
+                    // Dump registers
+                    let pc = jit.get_pc();
+                    let regs = &p.threads[idx].cpu_state;
+                    writeln!(f, "\nSlice {} PC=0x{:08X} reason={:?}", diag_total_slices, pc, reason).ok();
+                    writeln!(f, "r0-r3: {:08X} {:08X} {:08X} {:08X}",
+                        regs.x[0] as u32, regs.x[1] as u32, regs.x[2] as u32, regs.x[3] as u32).ok();
+                    writeln!(f, "r4-r7: {:08X} {:08X} {:08X} {:08X}",
+                        regs.x[4] as u32, regs.x[5] as u32, regs.x[6] as u32, regs.x[7] as u32).ok();
+                    writeln!(f, "r8-r12: {:08X} {:08X} {:08X} {:08X} {:08X}",
+                        regs.x[8] as u32, regs.x[9] as u32, regs.x[10] as u32, regs.x[11] as u32, regs.x[12] as u32).ok();
+                    writeln!(f, "SP={:08X} LR={:08X} PC={:08X}",
+                        regs.sp as u32, regs.x[14] as u32, regs.pc as u32).ok();
+                    // Also dump the entire rtld code 0x800-0xC00 for context
+                    writeln!(f, "\n=== rtld code 0x800-0xC00 ===").ok();
+                    for off in (0x800u64..=0xC00).step_by(4) {
+                        let addr = 0x08000000 + off;
+                        let word = p.memory.read_u32(addr).unwrap_or(0xDEADBEEF);
+                        writeln!(f, "  0x{:08X}: 0x{:08X}", addr, word).ok();
+                    }
+                }
+            }
 
             if reason.contains(HaltReason::SVC) {
+                diag_total_svcs += 1;
                 if let Some(n) = jit.get_svc_number() {
                     let mut cpu =
                         kernel.process().unwrap().threads[idx].cpu_state.clone();
+                    if diag_total_svcs <= 100 || diag_total_svcs % 1000 == 0 {
+                        log::info!(
+                            "[SVC] #{} svc=0x{:02X} pc=0x{:08X} x0=0x{:X} x1=0x{:X} x2=0x{:X} x3=0x{:X}",
+                            diag_total_svcs, n, jit.get_pc(), cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3]
+                        );
+                    }
                     // Save input registers before dispatch: SVC overwrites x0
                     // with the result code so we cannot read the handle after.
                     let svc_in_x0 = cpu.x[0];
@@ -1210,7 +1325,9 @@ fn run_with_window(
             } else if reason.contains(HaltReason::EXCEPTION_RAISED) {
                 // Undecodable instruction — skip and continue.
                 let pc = jit.get_pc();
-                log::warn!("Exception at PC=0x{:016X}, skipping instruction", pc);
+                // Read the faulting instruction to diagnose what's unhandled
+                let word = kernel.process().and_then(|p| p.memory.read_u32(pc).ok()).unwrap_or(0);
+                log::warn!("Exception at PC=0x{:08X}, instr=0x{:08X}, skipping", pc, word);
                 jit.set_pc(pc + 4);
                 jit.clear_halt(HaltReason::EXCEPTION_RAISED);
                 if let Some(process) = kernel.process_mut() {
@@ -1220,6 +1337,16 @@ fn run_with_window(
         }
 
         kernel.current_thread_idx = None;
+
+        diag_frame_count += 1;
+        let frame_elapsed = frame_start.elapsed();
+        if diag_frame_count <= 5 || diag_frame_count % 100 == 0 {
+            log::info!(
+                "[DIAG] frame={} slices={} svcs={} frame_time={:?} total_time={:?}",
+                diag_frame_count, diag_total_slices, diag_total_svcs,
+                frame_elapsed, diag_start.elapsed()
+            );
+        }
 
         // ── Flush GPU command queue ─────────────────────────────────────
         let flush_out = {
