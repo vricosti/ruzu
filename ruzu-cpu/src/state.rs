@@ -22,6 +22,9 @@ pub struct CpuState {
     pub fpcr: u32,
     /// TPIDR_EL0 (thread pointer, used for TLS).
     pub tpidr_el0: u64,
+    /// TPIDRRO_EL0 (read-only thread pointer, set by kernel).
+    /// Maps to ARM32 CP15 TPIDR_URO (C13 C0 opc2=3).
+    pub tpidr_ro: u64,
     /// Exclusive monitor address (for LDXR/STXR).
     pub exclusive_addr: Option<VAddr>,
     /// Exclusive monitor value.
@@ -39,6 +42,7 @@ impl Default for CpuState {
             fpsr: 0,
             fpcr: 0,
             tpidr_el0: 0,
+            tpidr_ro: 0,
             exclusive_addr: None,
             exclusive_value: 0,
         }
