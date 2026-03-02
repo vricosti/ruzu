@@ -1,30 +1,10 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use log::{info, warn};
-use ruzu_common::error;
-use ruzu_common::{ResultCode, VAddr};
+use log::{debug, warn};
+use ruzu_common::{error, Handle, ResultCode, VAddr};
 
 use crate::kernel::KernelCore;
-
-/// SVC 0x27: OutputDebugString
-/// X0 = pointer to string, X1 = length
-pub fn svc_output_debug_string(kernel: &mut KernelCore, addr: VAddr, len: usize) -> ResultCode {
-    let process = match kernel.process() {
-        Some(p) => p,
-        None => return error::INVALID_STATE,
-    };
-
-    // Read string from guest memory
-    match process.memory.read_bytes(addr, len) {
-        Ok(bytes) => {
-            let msg = String::from_utf8_lossy(&bytes);
-            info!("[Guest Debug] {}", msg.trim_end());
-            ResultCode::SUCCESS
-        }
-        Err(_) => error::INVALID_ADDRESS,
-    }
-}
 
 /// SVC 0x26: Break
 pub fn svc_break(kernel: &mut KernelCore, reason: u64, info1: u64, info2: u64) {
@@ -45,11 +25,68 @@ pub fn svc_break(kernel: &mut KernelCore, reason: u64, info1: u64, info2: u64) {
     kernel.stop();
 }
 
-/// SVC 0x07: ExitProcess
-pub fn svc_exit_process(kernel: &mut KernelCore) {
-    info!("ExitProcess called");
-    if let Some(process) = kernel.process_mut() {
-        process.is_running = false;
+/// SVC 0x33: GetThreadContext3
+pub fn svc_get_thread_context3(
+    kernel: &mut KernelCore,
+    thread_handle: Handle,
+    context_addr: VAddr,
+) -> ResultCode {
+    debug!(
+        "GetThreadContext3: thread_handle={}, context_addr=0x{:X}",
+        thread_handle, context_addr
+    );
+
+    let process = match kernel.process_mut() {
+        Some(p) => p,
+        None => return error::INVALID_STATE,
+    };
+
+    let target_idx = process
+        .threads
+        .iter()
+        .position(|t| t.handle == thread_handle);
+
+    let idx = match target_idx {
+        Some(i) => i,
+        None => return error::INVALID_HANDLE,
+    };
+
+    let thread = &process.threads[idx];
+    let cpu = &thread.cpu_state;
+
+    // Layout: X0-X30 (31*8=248 bytes), SP (8 bytes), PC (8 bytes),
+    //         NZCV (4 bytes), padding (4 bytes), V0-V31 (32*16=512 bytes)
+    // Total: 248 + 8 + 8 + 4 + 4 + 512 = 784 bytes
+    let mut offset = context_addr;
+
+    // X0-X30
+    for i in 0..31 {
+        let _ = process.memory.write_u64(offset, cpu.x[i]);
+        offset += 8;
     }
-    kernel.stop();
+
+    // SP
+    let _ = process.memory.write_u64(offset, cpu.sp);
+    offset += 8;
+
+    // PC
+    let _ = process.memory.write_u64(offset, cpu.pc);
+    offset += 8;
+
+    // NZCV (4 bytes) + padding (4 bytes)
+    let _ = process.memory.write_u32(offset, cpu.nzcv);
+    offset += 4;
+    let _ = process.memory.write_u32(offset, 0); // padding
+    offset += 4;
+
+    // V0-V31 (128-bit each, stored as [lo, hi])
+    for i in 0..32 {
+        let lo = cpu.v[i][0];
+        let hi = cpu.v[i][1];
+        let _ = process.memory.write_u64(offset, lo);
+        let _ = process.memory.write_u64(offset + 8, hi);
+        offset += 16;
+    }
+
+    ResultCode::SUCCESS
 }
