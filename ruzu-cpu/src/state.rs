@@ -16,6 +16,10 @@ pub struct CpuState {
     pub nzcv: u32,
     /// SIMD/FP registers V0-V31 (128-bit each, stored as two u64s).
     pub v: [[u64; 2]; 32],
+    /// FPSR (Floating-Point Status Register).
+    pub fpsr: u32,
+    /// FPCR (Floating-Point Control Register).
+    pub fpcr: u32,
     /// TPIDR_EL0 (thread pointer, used for TLS).
     pub tpidr_el0: u64,
     /// Exclusive monitor address (for LDXR/STXR).
@@ -32,6 +36,8 @@ impl Default for CpuState {
             pc: 0,
             nzcv: 0,
             v: [[0; 2]; 32],
+            fpsr: 0,
+            fpcr: 0,
             tpidr_el0: 0,
             exclusive_addr: None,
             exclusive_value: 0,
