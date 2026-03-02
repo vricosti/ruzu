@@ -56,6 +56,9 @@ struct CallbackState {
     memory_ctx: *mut u8,
     vtable: MemoryVtable,
     ticks_remaining: u64,
+    /// Total ticks consumed since creation (monotonically increasing).
+    /// Used to provide CNTPCT (Physical Count Timer) value.
+    total_ticks: u64,
     /// SVC number stored by the CallSVC callback.
     /// Matching zuyu's `m_svc_swi` in ArmDynarmic32.
     svc_swi: u32,
@@ -173,6 +176,7 @@ impl JitCallbacks for DynarmicCallbacks {
     fn add_ticks(&mut self, ticks: u64) {
         let s = self.s_mut();
         s.ticks_remaining = s.ticks_remaining.saturating_sub(ticks);
+        s.total_ticks = s.total_ticks.wrapping_add(ticks);
     }
 
     fn get_ticks_remaining(&self) -> u64 {
@@ -203,6 +207,7 @@ impl ArmDynarmic32 {
             memory_ctx,
             vtable,
             ticks_remaining: 0,
+            total_ticks: 0,
             svc_swi: 0,
         });
 
@@ -229,6 +234,9 @@ impl ArmDynarmic32 {
     /// Matching zuyu's `ArmDynarmic32::RunThread()`: clear exclusive state, then run.
     pub fn run(&mut self) -> HaltReason {
         self.jit.clear_exclusive_state();
+        // Set CNTPCT for MRRC p15 c14 (Physical Count Timer).
+        // Matching zuyu's CoreTiming().GetClockTicks() callback.
+        self.jit.set_cntpct(self._callback_state.total_ticks);
         self.jit.run()
     }
 
@@ -236,6 +244,7 @@ impl ArmDynarmic32 {
     /// Matching zuyu's `ArmDynarmic32::StepThread()`: clear exclusive state, then step.
     pub fn step(&mut self) -> HaltReason {
         self.jit.clear_exclusive_state();
+        self.jit.set_cntpct(self._callback_state.total_ticks);
         self.jit.step()
     }
 
@@ -296,6 +305,10 @@ impl ArmDynarmic32 {
         // CP15 TPIDR_UPRW from CpuState.tpidr_el0
         // Matching zuyu's `m_cp15->uprw = static_cast<u32>(ctx.tpidr)`
         self.jit.set_cp15_uprw(state.tpidr_el0 as u32);
+
+        // CP15 TPIDR_URO from CpuState.tpidr_ro
+        // Matching zuyu's `m_cp15->uro` set via SetTpidrroEl0()
+        self.jit.set_cp15_uro(state.tpidr_ro as u32);
 
         self.jit.clear_halt(
             HaltReason::SVC
@@ -361,6 +374,9 @@ impl ArmDynarmic32 {
         // CP15 TPIDR_UPRW → CpuState.tpidr_el0
         // Matching zuyu's `ctx.tpidr = m_cp15->uprw`
         state.tpidr_el0 = self.jit.get_cp15_uprw() as u64;
+
+        // CP15 TPIDR_URO → CpuState.tpidr_ro
+        state.tpidr_ro = self.jit.get_cp15_uro() as u64;
     }
 
     /// Invalidate JIT-compiled blocks in a memory range.
