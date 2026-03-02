@@ -52,6 +52,13 @@ impl DynarmicCallbacks {
 impl JitCallbacks for DynarmicCallbacks {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
         let s = self.s();
+        if vaddr < 0x0800_0000 || vaddr > 0x1000_0000 {
+            static CODE_DIAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = CODE_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 {
+                log::warn!("[CODE] reading code from suspicious addr 0x{:08X}", vaddr);
+            }
+        }
         Some(unsafe { (s.vtable.read_u32)(s.memory_ctx as *const u8, vaddr) })
     }
 
@@ -65,7 +72,13 @@ impl JitCallbacks for DynarmicCallbacks {
     }
     fn memory_read_32(&self, vaddr: u64) -> u32 {
         let s = self.s();
-        unsafe { (s.vtable.read_u32)(s.memory_ctx as *const u8, vaddr) }
+        let val = unsafe { (s.vtable.read_u32)(s.memory_ctx as *const u8, vaddr) };
+        static DIAG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 200 {
+            log::info!("[MEM32-R] #{} read32(0x{:016X}) = 0x{:08X}", n, vaddr, val);
+        }
+        val
     }
     fn memory_read_64(&self, vaddr: u64) -> u64 {
         let s = self.s();
@@ -88,6 +101,11 @@ impl JitCallbacks for DynarmicCallbacks {
     }
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
         let s = self.s();
+        static DIAG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 50 {
+            log::info!("[MEM32-W] write32(0x{:08X}, 0x{:08X})", vaddr, value);
+        }
         unsafe { (s.vtable.write_u32)(s.memory_ctx, vaddr, value) };
     }
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
@@ -248,6 +266,8 @@ impl ArmDynarmic32 {
         for i in 0..15 {
             self.jit.set_register(i, state.x[i] as u32);
         }
+        // SP is stored separately in CpuState; load it into R13
+        self.jit.set_register(13, state.sp as u32);
         self.jit.set_pc(state.pc as u32);
 
         // CPSR from nzcv (in ARM format: bits [31:28] = NZCV)
