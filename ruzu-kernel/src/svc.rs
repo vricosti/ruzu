@@ -1,18 +1,39 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// --- SVC module organization (matching zuyu's svc/ directory) ---
+pub mod activity;
+pub mod address_arbiter;
+pub mod cache;
+pub mod code_memory;
+pub mod condition_variable;
 pub mod debug;
+pub mod debug_string;
+pub mod event;
+pub mod exception;
 pub mod info;
 pub mod ipc;
+pub mod light_ipc;
+pub mod lock;
 pub mod memory;
+pub mod physical_memory;
+pub mod port;
+pub mod process;
+pub mod processor;
+pub mod query_memory;
+pub mod resource_limit;
+pub mod secure_monitor_call;
+pub mod session;
+pub mod shared_memory;
+pub mod synchronization;
 pub mod thread;
+pub mod tick;
+pub mod transfer_memory;
 
 use log::{debug, warn};
-use ruzu_common::{error, Handle, ResultCode, VAddr};
+use ruzu_common::ResultCode;
 
 use crate::kernel::KernelCore;
-use crate::objects::{KEvent, KernelObject};
-use crate::thread::{ThreadState, WaitReason};
 use ruzu_cpu::CpuState;
 
 /// SVC numbers (from Switch kernel).
@@ -48,6 +69,7 @@ pub mod svc_number {
     pub const SIGNAL_PROCESS_WIDE_KEY: u32 = 0x1D;
     pub const GET_SYSTEM_TICK: u32 = 0x1E;
     pub const CONNECT_TO_NAMED_PORT: u32 = 0x1F;
+    pub const SEND_SYNC_REQUEST_LIGHT: u32 = 0x20;
     pub const SEND_SYNC_REQUEST: u32 = 0x21;
     pub const SEND_SYNC_REQUEST_WITH_USER_BUFFER: u32 = 0x22;
     pub const GET_PROCESS_INFO: u32 = 0x23;
@@ -57,26 +79,69 @@ pub mod svc_number {
     pub const OUTPUT_DEBUG_STRING: u32 = 0x27;
     pub const RETURN_FROM_EXCEPTION: u32 = 0x28;
     pub const GET_INFO: u32 = 0x29;
+    pub const FLUSH_ENTIRE_DATA_CACHE: u32 = 0x2A;
+    pub const FLUSH_DATA_CACHE: u32 = 0x2B;
     pub const MAP_PHYSICAL_MEMORY: u32 = 0x2C;
     pub const UNMAP_PHYSICAL_MEMORY: u32 = 0x2D;
+    pub const GET_RESOURCE_LIMIT_LIMIT_VALUE: u32 = 0x30;
+    pub const GET_RESOURCE_LIMIT_CURRENT_VALUE: u32 = 0x31;
     pub const SET_THREAD_ACTIVITY: u32 = 0x32;
     pub const GET_THREAD_CONTEXT3: u32 = 0x33;
     pub const WAIT_FOR_ADDRESS: u32 = 0x34;
     pub const SIGNAL_TO_ADDRESS: u32 = 0x35;
     pub const CREATE_SESSION: u32 = 0x40;
     pub const ACCEPT_SESSION: u32 = 0x41;
+    pub const REPLY_AND_RECEIVE_LIGHT: u32 = 0x42;
     pub const REPLY_AND_RECEIVE: u32 = 0x43;
     pub const CREATE_EVENT: u32 = 0x45;
+    pub const CREATE_CODE_MEMORY: u32 = 0x4B;
+    pub const CONTROL_CODE_MEMORY: u32 = 0x4C;
+    pub const CREATE_RESOURCE_LIMIT: u32 = 0x7D;
+    pub const SET_RESOURCE_LIMIT_LIMIT_VALUE: u32 = 0x7E;
+    pub const CALL_SECURE_MONITOR: u32 = 0x7F;
+}
+
+// ---------------------------------------------------------------------------
+// 32-bit register-pair helpers (matching zuyu's Convert<int64_t> gather/scatter)
+// ---------------------------------------------------------------------------
+
+/// Gather two 32-bit register values into a 64-bit value (little-endian).
+/// Matching zuyu's `Convert<int64_t>({GetArg32(lo), GetArg32(hi)})`.
+#[inline]
+fn gather64(cpu: &CpuState, lo_reg: usize, hi_reg: usize) -> u64 {
+    (cpu.x[lo_reg] as u32 as u64) | ((cpu.x[hi_reg] as u32 as u64) << 32)
+}
+
+/// Scatter a 64-bit value into two 32-bit register slots.
+/// Matching zuyu's `Convert<std::array<uint32_t,2>>(val)` + SetArg32.
+#[inline]
+fn scatter64(cpu: &mut CpuState, lo_reg: usize, hi_reg: usize, val: u64) {
+    cpu.x[lo_reg] = val as u32 as u64;
+    cpu.x[hi_reg] = (val >> 32) as u32 as u64;
 }
 
 /// Dispatch an SVC call. Reads arguments from CPU state, writes results back.
 ///
-/// `thread_idx` is the index of the calling thread in the process's `threads` vec.
-/// For SVCs that block the calling thread, the thread state is modified directly
-/// on `kernel.process.threads[thread_idx]` rather than through the cloned `cpu`.
-pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
-    debug!("SVC 0x{:02X} called (PC=0x{:016X})", svc_num, cpu.pc);
+/// `is_64bit`: true for AArch64 processes, false for AArch32.
+/// When false, 64-bit SVC arguments are gathered from register pairs matching
+/// zuyu's `Call32()` wrapper layout.
+pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32, is_64bit: bool) {
+    debug!(
+        "SVC 0x{:02X} called (PC=0x{:016X}, {})",
+        svc_num,
+        cpu.pc,
+        if is_64bit { "A64" } else { "A32" }
+    );
 
+    if is_64bit {
+        dispatch_svc_64(kernel, cpu, svc_num);
+    } else {
+        dispatch_svc_32(kernel, cpu, svc_num);
+    }
+}
+
+/// 64-bit SVC dispatch — arguments map 1:1 from x0-x7.
+fn dispatch_svc_64(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
     match svc_num {
         svc_number::SET_HEAP_SIZE => {
             let size = cpu.x[1];
@@ -97,12 +162,17 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
             let addr = cpu.x[0];
             let size = cpu.x[1];
             let perm = cpu.x[2] as u32;
-            cpu.x[0] = memory::svc_set_memory_permission(kernel, addr, size, perm).raw() as u64;
+            cpu.x[0] =
+                memory::svc_set_memory_permission(kernel, addr, size, perm).raw() as u64;
         }
 
         svc_number::SET_MEMORY_ATTRIBUTE => {
-            debug!("SetMemoryAttribute: addr=0x{:X}, size=0x{:X}", cpu.x[0], cpu.x[1]);
-            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+            let addr = cpu.x[0];
+            let size = cpu.x[1];
+            let mask = cpu.x[2] as u32;
+            let attr = cpu.x[3] as u32;
+            cpu.x[0] =
+                memory::svc_set_memory_attribute(kernel, addr, size, mask, attr).raw() as u64;
         }
 
         svc_number::MAP_MEMORY => {
@@ -122,30 +192,13 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
         svc_number::QUERY_MEMORY => {
             let info_addr = cpu.x[0];
             let query_addr = cpu.x[2];
-            let result = memory::svc_query_memory(kernel, cpu, info_addr, query_addr);
+            let result = query_memory::svc_query_memory(kernel, cpu, info_addr, query_addr);
             cpu.x[0] = result.raw() as u64;
             cpu.x[1] = 0; // page_info
         }
 
-        svc_number::MAP_SHARED_MEMORY => {
-            let handle = cpu.x[0] as u32;
-            let addr = cpu.x[1];
-            let size = cpu.x[2];
-            let perm = cpu.x[3] as u32;
-            let result = memory::svc_map_shared_memory(kernel, handle, addr, size, perm);
-            cpu.x[0] = result.raw() as u64;
-        }
-
-        svc_number::UNMAP_SHARED_MEMORY => {
-            let handle = cpu.x[0] as u32;
-            let addr = cpu.x[1];
-            let size = cpu.x[2];
-            let result = memory::svc_unmap_shared_memory(kernel, handle, addr, size);
-            cpu.x[0] = result.raw() as u64;
-        }
-
         svc_number::EXIT_PROCESS => {
-            debug::svc_exit_process(kernel);
+            process::svc_exit_process(kernel);
         }
 
         svc_number::CREATE_THREAD => {
@@ -181,7 +234,7 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
 
         svc_number::SLEEP_THREAD => {
             let ns = cpu.x[0] as i64;
-            svc_sleep_thread(kernel, cpu, ns);
+            thread::svc_sleep_thread(kernel, cpu, ns);
         }
 
         svc_number::GET_THREAD_PRIORITY => {
@@ -206,29 +259,63 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
         }
 
         svc_number::SET_THREAD_CORE_MASK => {
-            let _handle = cpu.x[0] as u32;
-            let _ideal_core = cpu.x[1] as u32;
-            let _affinity_mask = cpu.x[2];
-            debug!("SetThreadCoreMask: accept and ignore (single-core emulation)");
-            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+            let handle = cpu.x[0] as u32;
+            let ideal_core = cpu.x[1] as u32;
+            let affinity_mask = cpu.x[2];
+            cpu.x[0] =
+                thread::svc_set_thread_core_mask(handle, ideal_core, affinity_mask).raw() as u64;
         }
 
         svc_number::GET_THREAD_CORE_MASK => {
-            debug!("GetThreadCoreMask: returning ideal_core=0, mask=0xF");
-            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-            cpu.x[1] = 0; // ideal_core
-            cpu.x[2] = 0xF; // affinity_mask (4 cores)
+            let handle = cpu.x[2] as u32;
+            match thread::svc_get_thread_core_mask(handle) {
+                Ok((ideal_core, affinity_mask)) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    cpu.x[1] = ideal_core as u64;
+                    cpu.x[2] = affinity_mask;
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                }
+            }
         }
 
         svc_number::GET_CURRENT_PROCESSOR_NUMBER => {
-            cpu.x[0] = 0; // Always core 0
+            cpu.x[0] = processor::svc_get_current_processor_number() as u64;
+        }
+
+        svc_number::SIGNAL_EVENT => {
+            let handle = cpu.x[0] as u32;
+            event::svc_signal_event(kernel, cpu, handle);
+        }
+
+        svc_number::CLEAR_EVENT => {
+            let handle = cpu.x[0] as u32;
+            event::svc_clear_event(kernel, cpu, handle);
+        }
+
+        svc_number::MAP_SHARED_MEMORY => {
+            let handle = cpu.x[0] as u32;
+            let addr = cpu.x[1];
+            let size = cpu.x[2];
+            let perm = cpu.x[3] as u32;
+            let result = shared_memory::svc_map_shared_memory(kernel, handle, addr, size, perm);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::UNMAP_SHARED_MEMORY => {
+            let handle = cpu.x[0] as u32;
+            let addr = cpu.x[1];
+            let size = cpu.x[2];
+            let result = shared_memory::svc_unmap_shared_memory(kernel, handle, addr, size);
+            cpu.x[0] = result.raw() as u64;
         }
 
         svc_number::CREATE_TRANSFER_MEMORY => {
             let addr = cpu.x[1];
             let size = cpu.x[2];
             let perm = cpu.x[3] as u32;
-            match memory::svc_create_transfer_memory(kernel, addr, size, perm) {
+            match transfer_memory::svc_create_transfer_memory(kernel, addr, size, perm) {
                 Ok(handle) => {
                     cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
                     cpu.x[1] = handle as u64;
@@ -242,51 +329,43 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
 
         svc_number::CLOSE_HANDLE => {
             let handle = cpu.x[0] as u32;
-            let result = ipc::svc_close_handle(kernel, handle);
+            let result = synchronization::svc_close_handle(kernel, handle);
             cpu.x[0] = result.raw() as u64;
-        }
-
-        svc_number::CREATE_EVENT => {
-            svc_create_event(kernel, cpu);
-        }
-
-        svc_number::SIGNAL_EVENT => {
-            let handle = cpu.x[0] as u32;
-            svc_signal_event(kernel, cpu, handle);
-        }
-
-        svc_number::CLEAR_EVENT => {
-            let handle = cpu.x[0] as u32;
-            svc_clear_event(kernel, cpu, handle);
         }
 
         svc_number::RESET_SIGNAL => {
             let handle = cpu.x[0] as u32;
-            svc_clear_event(kernel, cpu, handle);
+            event::svc_clear_event(kernel, cpu, handle);
         }
 
         svc_number::WAIT_SYNCHRONIZATION => {
             let handles_ptr = cpu.x[1];
             let handles_count = cpu.x[2] as usize;
             let timeout_ns = cpu.x[3] as i64;
-            svc_wait_synchronization(kernel, cpu, handles_ptr, handles_count, timeout_ns);
+            synchronization::svc_wait_synchronization(
+                kernel,
+                cpu,
+                handles_ptr,
+                handles_count,
+                timeout_ns,
+            );
         }
 
         svc_number::CANCEL_SYNCHRONIZATION => {
             let thread_handle = cpu.x[0] as u32;
-            svc_cancel_synchronization(kernel, cpu, thread_handle);
+            synchronization::svc_cancel_synchronization(kernel, cpu, thread_handle);
         }
 
         svc_number::ARBITRATE_LOCK => {
             let owner_handle = cpu.x[0] as u32;
             let mutex_addr = cpu.x[1];
             let requester_handle = cpu.x[2] as u32;
-            svc_arbitrate_lock(kernel, cpu, owner_handle, mutex_addr, requester_handle);
+            lock::svc_arbitrate_lock(kernel, cpu, owner_handle, mutex_addr, requester_handle);
         }
 
         svc_number::ARBITRATE_UNLOCK => {
             let mutex_addr = cpu.x[0];
-            svc_arbitrate_unlock(kernel, cpu, mutex_addr);
+            lock::svc_arbitrate_unlock(kernel, cpu, mutex_addr);
         }
 
         svc_number::WAIT_PROCESS_WIDE_KEY_ATOMIC => {
@@ -294,15 +373,20 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
             let condvar_addr = cpu.x[1];
             let tag = cpu.x[2] as u32;
             let timeout_ns = cpu.x[3] as i64;
-            svc_wait_process_wide_key_atomic(
-                kernel, cpu, mutex_addr, condvar_addr, tag, timeout_ns,
+            condition_variable::svc_wait_process_wide_key_atomic(
+                kernel,
+                cpu,
+                mutex_addr,
+                condvar_addr,
+                tag,
+                timeout_ns,
             );
         }
 
         svc_number::SIGNAL_PROCESS_WIDE_KEY => {
             let condvar_addr = cpu.x[0];
             let count = cpu.x[1] as i32;
-            svc_signal_process_wide_key(kernel, cpu, condvar_addr, count);
+            condition_variable::svc_signal_process_wide_key(kernel, cpu, condvar_addr, count);
         }
 
         svc_number::GET_SYSTEM_TICK => {
@@ -313,7 +397,7 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
 
         svc_number::CONNECT_TO_NAMED_PORT => {
             let name_addr = cpu.x[1];
-            let result = ipc::svc_connect_to_named_port(kernel, cpu, name_addr);
+            let result = port::svc_connect_to_named_port(kernel, cpu, name_addr);
             match result {
                 Ok(handle) => {
                     cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
@@ -324,6 +408,10 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
                     cpu.x[1] = 0;
                 }
             }
+        }
+
+        svc_number::SEND_SYNC_REQUEST_LIGHT => {
+            cpu.x[0] = light_ipc::svc_send_sync_request_light().raw() as u64;
         }
 
         svc_number::SEND_SYNC_REQUEST => {
@@ -337,32 +425,25 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
             let buffer_size = cpu.x[1];
             let session_handle = cpu.x[2] as u32;
             let result = ipc::svc_send_sync_request_with_user_buffer(
-                kernel, cpu, buffer_addr, buffer_size, session_handle,
+                kernel,
+                cpu,
+                buffer_addr,
+                buffer_size,
+                session_handle,
             );
             cpu.x[0] = result.raw() as u64;
         }
 
         svc_number::GET_PROCESS_INFO => {
-            // X0 (in) = process handle (0xFFFF8001 = current process)
-            // X1 (in) = ProcessInfoType
-            // X0 (out) = result, X1 (out) = info value
             let _handle = cpu.x[0] as u32;
             let info_type = cpu.x[1] as u32;
-            let value = match info_type {
-                // ProcessState: 0=created, 1=attached, 2=running, 3=crashed, 4=terminated
-                0 => 2u64, // Running
-                // All other types: return 0 (sufficient to unblock init checks).
-                _ => {
-                    debug!("GetProcessInfo: unhandled info_type={}", info_type);
-                    0
-                }
-            };
+            let value = process::svc_get_process_info(info_type);
             cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
             cpu.x[1] = value;
         }
 
         svc_number::GET_PROCESS_ID => {
-            let result = info::svc_get_process_id(kernel);
+            let result = process::svc_get_process_id(kernel);
             match result {
                 Ok(pid) => {
                     cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
@@ -375,7 +456,7 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
         }
 
         svc_number::GET_THREAD_ID => {
-            let result = info::svc_get_thread_id(kernel);
+            let result = thread::svc_get_thread_id(kernel);
             match result {
                 Ok(tid) => {
                     cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
@@ -397,8 +478,13 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
         svc_number::OUTPUT_DEBUG_STRING => {
             let addr = cpu.x[0];
             let len = cpu.x[1] as usize;
-            let result = debug::svc_output_debug_string(kernel, addr, len);
+            let result = debug_string::svc_output_debug_string(kernel, addr, len);
             cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::RETURN_FROM_EXCEPTION => {
+            let result_val = cpu.x[0];
+            cpu.x[0] = exception::svc_return_from_exception(result_val).raw() as u64;
         }
 
         svc_number::GET_INFO => {
@@ -418,12 +504,78 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
             }
         }
 
+        svc_number::FLUSH_ENTIRE_DATA_CACHE => {
+            cpu.x[0] = cache::svc_flush_entire_data_cache().raw() as u64;
+        }
+
+        svc_number::FLUSH_DATA_CACHE => {
+            let addr = cpu.x[0];
+            let size = cpu.x[1];
+            cpu.x[0] = cache::svc_flush_data_cache(addr, size).raw() as u64;
+        }
+
+        svc_number::MAP_PHYSICAL_MEMORY => {
+            let addr = cpu.x[0];
+            let size = cpu.x[1];
+            let result = physical_memory::svc_map_physical_memory(kernel, addr, size);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::UNMAP_PHYSICAL_MEMORY => {
+            let addr = cpu.x[0];
+            let size = cpu.x[1];
+            let result = physical_memory::svc_unmap_physical_memory(kernel, addr, size);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::GET_RESOURCE_LIMIT_LIMIT_VALUE => {
+            let handle = cpu.x[1] as u32;
+            let resource_type = cpu.x[2] as u32;
+            match resource_limit::svc_get_resource_limit_limit_value(handle, resource_type) {
+                Ok(value) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    cpu.x[1] = value;
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                }
+            }
+        }
+
+        svc_number::GET_RESOURCE_LIMIT_CURRENT_VALUE => {
+            let handle = cpu.x[1] as u32;
+            let resource_type = cpu.x[2] as u32;
+            match resource_limit::svc_get_resource_limit_current_value(handle, resource_type) {
+                Ok(value) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    cpu.x[1] = value;
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                }
+            }
+        }
+
+        svc_number::SET_THREAD_ACTIVITY => {
+            let thread_handle = cpu.x[0] as u32;
+            let act = cpu.x[1] as u32;
+            let result = activity::svc_set_thread_activity(kernel, thread_handle, act);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::GET_THREAD_CONTEXT3 => {
+            let thread_handle = cpu.x[0] as u32;
+            let context_addr = cpu.x[1];
+            let result = debug::svc_get_thread_context3(kernel, thread_handle, context_addr);
+            cpu.x[0] = result.raw() as u64;
+        }
+
         svc_number::WAIT_FOR_ADDRESS => {
             let addr = cpu.x[0];
             let arb_type = cpu.x[1] as u32;
             let value = cpu.x[2] as u32;
             let timeout_ns = cpu.x[3] as i64;
-            svc_wait_for_address(kernel, cpu, addr, arb_type, value, timeout_ns);
+            address_arbiter::svc_wait_for_address(kernel, cpu, addr, arb_type, value, timeout_ns);
         }
 
         svc_number::SIGNAL_TO_ADDRESS => {
@@ -431,35 +583,15 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
             let signal_type = cpu.x[1] as u32;
             let value = cpu.x[2] as u32;
             let count = cpu.x[3] as i32;
-            svc_signal_to_address(kernel, cpu, addr, signal_type, value, count);
+            address_arbiter::svc_signal_to_address(kernel, cpu, addr, signal_type, value, count);
         }
 
-        svc_number::SET_THREAD_ACTIVITY => {
-            let thread_handle = cpu.x[0] as u32;
-            let activity = cpu.x[1] as u32;
-            let result = svc_set_thread_activity(kernel, thread_handle, activity);
-            cpu.x[0] = result.raw() as u64;
+        svc_number::CREATE_EVENT => {
+            event::svc_create_event(kernel, cpu);
         }
 
-        svc_number::GET_THREAD_CONTEXT3 => {
-            let thread_handle = cpu.x[0] as u32;
-            let context_addr = cpu.x[1];
-            let result = svc_get_thread_context3(kernel, thread_handle, context_addr);
-            cpu.x[0] = result.raw() as u64;
-        }
-
-        svc_number::MAP_PHYSICAL_MEMORY => {
-            let addr = cpu.x[0];
-            let size = cpu.x[1];
-            let result = memory::svc_map_physical_memory(kernel, addr, size);
-            cpu.x[0] = result.raw() as u64;
-        }
-
-        svc_number::UNMAP_PHYSICAL_MEMORY => {
-            let addr = cpu.x[0];
-            let size = cpu.x[1];
-            let result = memory::svc_unmap_physical_memory(kernel, addr, size);
-            cpu.x[0] = result.raw() as u64;
+        svc_number::CALL_SECURE_MONITOR => {
+            secure_monitor_call::svc_call_secure_monitor(cpu);
         }
 
         _ => {
@@ -472,822 +604,490 @@ pub fn dispatch_svc(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SVC 0x45: CreateEvent
-// ---------------------------------------------------------------------------
+/// 32-bit SVC dispatch — arguments use ARM32 register layout.
+///
+/// Matching zuyu's `Call32()` in `svc.cpp`. Key differences from 64-bit:
+/// - 64-bit arguments are gathered from register pairs (e.g., r0:r1 = lo:hi)
+/// - Register assignments may differ (e.g., CreateThread: priority in r0, not r4)
+/// - 64-bit results are scattered into register pairs
+fn dispatch_svc_32(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
+    match svc_num {
+        // ---- SVCs with IDENTICAL register layout in 32-bit and 64-bit ----
 
-fn svc_create_event(kernel: &mut KernelCore, cpu: &mut CpuState) {
-    debug!("CreateEvent");
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
+        svc_number::SET_MEMORY_PERMISSION => {
+            let addr = cpu.x[0];
+            let size = cpu.x[1];
+            let perm = cpu.x[2] as u32;
+            cpu.x[0] =
+                memory::svc_set_memory_permission(kernel, addr, size, perm).raw() as u64;
         }
-    };
 
-    // Create the event and add writable + readable handles.
-    let event = KEvent::new();
-    let writable_handle = match process.handle_table.add(KernelObject::Event(event.clone())) {
-        Ok(h) => h,
-        Err(rc) => {
-            cpu.x[0] = rc.raw() as u64;
-            return;
+        svc_number::SET_MEMORY_ATTRIBUTE => {
+            let addr = cpu.x[0];
+            let size = cpu.x[1];
+            let mask = cpu.x[2] as u32;
+            let attr = cpu.x[3] as u32;
+            cpu.x[0] =
+                memory::svc_set_memory_attribute(kernel, addr, size, mask, attr).raw() as u64;
         }
-    };
 
-    let mut readable_event = KEvent::new();
-    readable_event.writable_handle = Some(writable_handle);
-    let readable_handle = match process
-        .handle_table
-        .add(KernelObject::Event(readable_event))
-    {
-        Ok(h) => h,
-        Err(rc) => {
-            let _ = process.handle_table.close(writable_handle);
-            cpu.x[0] = rc.raw() as u64;
-            return;
+        svc_number::MAP_MEMORY => {
+            let dst = cpu.x[0];
+            let src = cpu.x[1];
+            let size = cpu.x[2];
+            cpu.x[0] = memory::svc_map_memory(kernel, dst, src, size).raw() as u64;
         }
-    };
 
-    // Update writable event with cross-reference.
-    if let Ok(KernelObject::Event(ev)) = process.handle_table.get_mut(writable_handle) {
-        ev.readable_handle = Some(readable_handle);
-        ev.writable_handle = Some(writable_handle);
-    }
-
-    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-    cpu.x[1] = writable_handle as u64;
-    cpu.x[2] = readable_handle as u64;
-    debug!(
-        "CreateEvent: writable={}, readable={}",
-        writable_handle, readable_handle
-    );
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x11: SignalEvent
-// ---------------------------------------------------------------------------
-
-fn svc_signal_event(kernel: &mut KernelCore, cpu: &mut CpuState, handle: Handle) {
-    debug!("SignalEvent: handle={}", handle);
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
+        svc_number::UNMAP_MEMORY => {
+            let dst = cpu.x[0];
+            let src = cpu.x[1];
+            let size = cpu.x[2];
+            cpu.x[0] = memory::svc_unmap_memory(kernel, dst, src, size).raw() as u64;
         }
-    };
 
-    // Look up the event and get its readable handle, then signal it.
-    let readable_handle = match process.handle_table.get_mut(handle) {
-        Ok(KernelObject::Event(ev)) => {
-            ev.signaled = true;
-            ev.readable_handle
+        svc_number::EXIT_PROCESS => {
+            process::svc_exit_process(kernel);
         }
-        _ => {
-            cpu.x[0] = error::INVALID_HANDLE.raw() as u64;
-            return;
-        }
-    };
 
-    // Also mark the readable event as signaled.
-    if let Some(rh) = readable_handle {
-        if rh != handle {
-            if let Ok(KernelObject::Event(rev)) = process.handle_table.get_mut(rh) {
-                rev.signaled = true;
-            }
+        svc_number::START_THREAD => {
+            let handle = cpu.x[0] as u32;
+            let result = thread::svc_start_thread(kernel, handle);
+            cpu.x[0] = result.raw() as u64;
         }
-    }
 
-    // Wake any threads waiting on the readable handle (or writable handle).
-    let handles_to_check: Vec<Handle> = [Some(handle), readable_handle]
-        .iter()
-        .filter_map(|h| *h)
-        .collect();
-
-    for thread in process.threads.iter_mut() {
-        if thread.state != ThreadState::Waiting {
-            continue;
+        svc_number::EXIT_THREAD => {
+            thread::svc_exit_thread(kernel);
+            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
         }
-        if let WaitReason::Synchronization { ref handles, .. } = thread.wait_reason {
-            for (idx, h) in handles.iter().enumerate() {
-                if handles_to_check.contains(h) {
-                    // wake() sets state to Runnable and writes x[0]/x[1].
-                    thread.wake(ResultCode::SUCCESS.raw(), idx as i32);
-                    break;
+
+        svc_number::SET_THREAD_PRIORITY => {
+            let handle = cpu.x[0] as u32;
+            let priority = cpu.x[1] as u32;
+            let result = thread::svc_set_thread_priority(kernel, handle, priority);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::GET_CURRENT_PROCESSOR_NUMBER => {
+            cpu.x[0] = processor::svc_get_current_processor_number() as u64;
+        }
+
+        svc_number::SIGNAL_EVENT => {
+            let handle = cpu.x[0] as u32;
+            event::svc_signal_event(kernel, cpu, handle);
+        }
+
+        svc_number::CLEAR_EVENT => {
+            let handle = cpu.x[0] as u32;
+            event::svc_clear_event(kernel, cpu, handle);
+        }
+
+        svc_number::RESET_SIGNAL => {
+            let handle = cpu.x[0] as u32;
+            event::svc_clear_event(kernel, cpu, handle);
+        }
+
+        svc_number::CLOSE_HANDLE => {
+            let handle = cpu.x[0] as u32;
+            let result = synchronization::svc_close_handle(kernel, handle);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::CANCEL_SYNCHRONIZATION => {
+            let thread_handle = cpu.x[0] as u32;
+            synchronization::svc_cancel_synchronization(kernel, cpu, thread_handle);
+        }
+
+        svc_number::ARBITRATE_LOCK => {
+            let owner_handle = cpu.x[0] as u32;
+            let mutex_addr = cpu.x[1];
+            let requester_handle = cpu.x[2] as u32;
+            lock::svc_arbitrate_lock(kernel, cpu, owner_handle, mutex_addr, requester_handle);
+        }
+
+        svc_number::ARBITRATE_UNLOCK => {
+            let mutex_addr = cpu.x[0];
+            lock::svc_arbitrate_unlock(kernel, cpu, mutex_addr);
+        }
+
+        svc_number::SIGNAL_PROCESS_WIDE_KEY => {
+            let condvar_addr = cpu.x[0];
+            let count = cpu.x[1] as i32;
+            condition_variable::svc_signal_process_wide_key(kernel, cpu, condvar_addr, count);
+        }
+
+        svc_number::SEND_SYNC_REQUEST => {
+            let handle = cpu.x[0] as u32;
+            let result = ipc::svc_send_sync_request(kernel, cpu, handle);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::OUTPUT_DEBUG_STRING => {
+            let addr = cpu.x[0];
+            let len = cpu.x[1] as usize;
+            let result = debug_string::svc_output_debug_string(kernel, addr, len);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::BREAK => {
+            let reason = cpu.x[0];
+            let info1 = cpu.x[1];
+            let info2 = cpu.x[2];
+            debug::svc_break(kernel, reason, info1, info2);
+        }
+
+        svc_number::MAP_PHYSICAL_MEMORY => {
+            let addr = cpu.x[0];
+            let size = cpu.x[1];
+            let result = physical_memory::svc_map_physical_memory(kernel, addr, size);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::UNMAP_PHYSICAL_MEMORY => {
+            let addr = cpu.x[0];
+            let size = cpu.x[1];
+            let result = physical_memory::svc_unmap_physical_memory(kernel, addr, size);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::SET_THREAD_ACTIVITY => {
+            let thread_handle = cpu.x[0] as u32;
+            let act = cpu.x[1] as u32;
+            let result = activity::svc_set_thread_activity(kernel, thread_handle, act);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::GET_THREAD_CONTEXT3 => {
+            let thread_handle = cpu.x[0] as u32;
+            let context_addr = cpu.x[1];
+            let result = debug::svc_get_thread_context3(kernel, thread_handle, context_addr);
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::FLUSH_ENTIRE_DATA_CACHE => {
+            cpu.x[0] = cache::svc_flush_entire_data_cache().raw() as u64;
+        }
+
+        svc_number::FLUSH_DATA_CACHE => {
+            let addr = cpu.x[0];
+            let size = cpu.x[1];
+            cpu.x[0] = cache::svc_flush_data_cache(addr, size).raw() as u64;
+        }
+
+        svc_number::RETURN_FROM_EXCEPTION => {
+            let result_val = cpu.x[0];
+            cpu.x[0] = exception::svc_return_from_exception(result_val).raw() as u64;
+        }
+
+        svc_number::SEND_SYNC_REQUEST_LIGHT => {
+            cpu.x[0] = light_ipc::svc_send_sync_request_light().raw() as u64;
+        }
+
+        svc_number::CALL_SECURE_MONITOR => {
+            secure_monitor_call::svc_call_secure_monitor(cpu);
+        }
+
+        // ---- SVCs with DIFFERENT register layout in 32-bit ----
+
+        svc_number::SET_HEAP_SIZE => {
+            // 32-bit: r1=size (u32), out: r0=Result, r1=out_address (u32)
+            let size = cpu.x[1];
+            let result = memory::svc_set_heap_size(kernel, size);
+            match result {
+                Ok(addr) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    cpu.x[1] = addr as u32 as u64; // truncate to 32-bit
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                    cpu.x[1] = 0;
                 }
             }
         }
-    }
 
-    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x12: ClearEvent / SVC 0x17: ResetSignal
-// ---------------------------------------------------------------------------
-
-fn svc_clear_event(kernel: &mut KernelCore, cpu: &mut CpuState, handle: Handle) {
-    debug!("ClearEvent/ResetSignal: handle={}", handle);
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
+        svc_number::QUERY_MEMORY => {
+            // 32-bit: r0=out_memory_info, r2=address, out: r0=Result, r1=page_info
+            let info_addr = cpu.x[0];
+            let query_addr = cpu.x[2];
+            let result = query_memory::svc_query_memory(kernel, cpu, info_addr, query_addr);
+            cpu.x[0] = result.raw() as u64;
+            cpu.x[1] = 0; // page_info
         }
-    };
 
-    match process.handle_table.get_mut(handle) {
-        Ok(KernelObject::Event(ev)) => {
-            ev.signaled = false;
-            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+        svc_number::MAP_SHARED_MEMORY => {
+            let handle = cpu.x[0] as u32;
+            let addr = cpu.x[1];
+            let size = cpu.x[2];
+            let perm = cpu.x[3] as u32;
+            let result = shared_memory::svc_map_shared_memory(kernel, handle, addr, size, perm);
+            cpu.x[0] = result.raw() as u64;
         }
-        _ => {
-            cpu.x[0] = error::INVALID_HANDLE.raw() as u64;
+
+        svc_number::UNMAP_SHARED_MEMORY => {
+            let handle = cpu.x[0] as u32;
+            let addr = cpu.x[1];
+            let size = cpu.x[2];
+            let result = shared_memory::svc_unmap_shared_memory(kernel, handle, addr, size);
+            cpu.x[0] = result.raw() as u64;
         }
-    }
-}
 
-// ---------------------------------------------------------------------------
-// SVC 0x18: WaitSynchronization
-// ---------------------------------------------------------------------------
-
-fn svc_wait_synchronization(
-    kernel: &mut KernelCore,
-    cpu: &mut CpuState,
-    handles_ptr: VAddr,
-    handles_count: usize,
-    timeout_ns: i64,
-) {
-    debug!(
-        "WaitSynchronization: ptr=0x{:X}, count={}, timeout={}",
-        handles_ptr, handles_count, timeout_ns
-    );
-
-    if handles_count == 0 || handles_count > 64 {
-        cpu.x[0] = error::OUT_OF_RANGE.raw() as u64;
-        return;
-    }
-
-    let thread_idx = match kernel.current_thread_idx {
-        Some(idx) => idx,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
-        }
-    };
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
-        }
-    };
-
-    // Read handle array from guest memory.
-    let mut handles = Vec::with_capacity(handles_count);
-    for i in 0..handles_count {
-        let addr = handles_ptr + (i as u64) * 4;
-        match process.memory.read_u32(addr) {
-            Ok(h) => handles.push(h),
-            Err(_) => {
-                cpu.x[0] = error::INVALID_ADDRESS.raw() as u64;
-                return;
+        svc_number::CREATE_THREAD => {
+            // 32-bit layout (zuyu Call32): r1=func, r2=arg, r3=stack_bottom,
+            //   r0=priority, r4=core_id
+            let entry = cpu.x[1];
+            let arg = cpu.x[2];
+            let stack_top = cpu.x[3];
+            let priority = cpu.x[0] as u32; // r0, not r4
+            let core_id = cpu.x[4] as i32;
+            let result =
+                thread::svc_create_thread(kernel, entry, arg, stack_top, priority, core_id);
+            match result {
+                Ok(handle) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    cpu.x[1] = handle as u64;
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                    cpu.x[1] = 0;
+                }
             }
         }
-    }
 
-    // Check if any handle is already signaled.
-    for (idx, &handle) in handles.iter().enumerate() {
-        let is_signaled = match process.handle_table.get(handle) {
-            Ok(KernelObject::Event(ev)) => ev.signaled,
-            _ => false,
-        };
+        svc_number::SLEEP_THREAD => {
+            // 32-bit: gather r0(lo):r1(hi) → ns (i64)
+            let ns = gather64(cpu, 0, 1) as i64;
+            thread::svc_sleep_thread(kernel, cpu, ns);
+        }
 
-        if is_signaled {
-            // Auto-clear the event.
-            if let Ok(KernelObject::Event(ev)) = process.handle_table.get_mut(handle) {
-                ev.signaled = false;
+        svc_number::GET_THREAD_PRIORITY => {
+            let handle = cpu.x[1] as u32;
+            let result = thread::svc_get_thread_priority(kernel, handle);
+            match result {
+                Ok(priority) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    cpu.x[1] = priority as u64;
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                }
             }
-            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-            cpu.x[1] = idx as u64;
-            debug!("WaitSynchronization: handle {} already signaled (idx={})", handle, idx);
-            return;
         }
-    }
 
-    // None signaled.
-    if timeout_ns == 0 {
-        cpu.x[0] = error::TIMEOUT.raw() as u64;
-        cpu.x[1] = u64::MAX; // invalid index
-        return;
-    }
-
-    // Check cancel_pending flag before blocking.
-    if process.threads[thread_idx].cancel_pending {
-        process.threads[thread_idx].cancel_pending = false;
-        cpu.x[0] = error::CANCELLED.raw() as u64;
-        cpu.x[1] = u64::MAX;
-        return;
-    }
-
-    // Block the calling thread.
-    let tick = kernel.tick_counter;
-    let process = kernel.process_mut().unwrap();
-    process.threads[thread_idx].begin_wait(
-        WaitReason::Synchronization {
-            handles,
-            timeout_ns,
-        },
-        tick,
-    );
-    // Don't set cpu.x[0] yet — will be set when woken by SignalEvent or timeout.
-    debug!(
-        "WaitSynchronization: thread {} blocked (timeout_ns={})",
-        thread_idx, timeout_ns
-    );
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x1A: ArbitrateLock
-// ---------------------------------------------------------------------------
-
-fn svc_arbitrate_lock(
-    kernel: &mut KernelCore,
-    cpu: &mut CpuState,
-    _owner_handle: Handle,
-    mutex_addr: VAddr,
-    requester_handle: Handle,
-) {
-    debug!(
-        "ArbitrateLock: mutex_addr=0x{:X}, requester={}",
-        mutex_addr, requester_handle
-    );
-
-    let thread_idx = match kernel.current_thread_idx {
-        Some(idx) => idx,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
+        svc_number::GET_THREAD_CORE_MASK => {
+            // 32-bit: r2=handle, out: r0=Result, r1=core_id, scatter r2(lo):r3(hi)=affinity
+            let handle = cpu.x[2] as u32;
+            match thread::svc_get_thread_core_mask(handle) {
+                Ok((ideal_core, affinity_mask)) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    cpu.x[1] = ideal_core as u64;
+                    scatter64(cpu, 2, 3, affinity_mask);
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                }
+            }
         }
-    };
 
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
+        svc_number::SET_THREAD_CORE_MASK => {
+            // 32-bit: r0=handle, r1=core_id, gather r2(lo):r3(hi)=affinity_mask
+            let handle = cpu.x[0] as u32;
+            let ideal_core = cpu.x[1] as u32;
+            let affinity_mask = gather64(cpu, 2, 3);
+            cpu.x[0] =
+                thread::svc_set_thread_core_mask(handle, ideal_core, affinity_mask).raw() as u64;
         }
-    };
 
-    // Read the mutex word from guest memory.
-    let mutex_word = match process.memory.read_u32(mutex_addr) {
-        Ok(v) => v,
-        Err(_) => {
-            cpu.x[0] = error::INVALID_ADDRESS.raw() as u64;
-            return;
+        svc_number::CREATE_TRANSFER_MEMORY => {
+            let addr = cpu.x[1];
+            let size = cpu.x[2];
+            let perm = cpu.x[3] as u32;
+            match transfer_memory::svc_create_transfer_memory(kernel, addr, size, perm) {
+                Ok(handle) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    cpu.x[1] = handle as u64;
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                    cpu.x[1] = 0;
+                }
+            }
         }
-    };
 
-    let tag = mutex_word & 0x3FFF_FFFF; // Lower 30 bits: owner thread handle
+        svc_number::CREATE_EVENT => {
+            event::svc_create_event(kernel, cpu);
+        }
 
-    if tag == 0 || tag == requester_handle {
-        // Unowned or already owned by requester: acquire.
-        let _ = process
-            .memory
-            .write_u32(mutex_addr, requester_handle & 0x3FFF_FFFF);
-        cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-    } else {
-        // Owned by another thread: set has-waiters bit and block.
-        let new_word = mutex_word | (1 << 30); // Set bit 30 (has waiters)
-        let _ = process.memory.write_u32(mutex_addr, new_word);
+        svc_number::WAIT_SYNCHRONIZATION => {
+            // 32-bit: r1=handles_ptr, r2=num_handles, gather r0(lo):r3(hi)=timeout_ns
+            let handles_ptr = cpu.x[1];
+            let handles_count = cpu.x[2] as usize;
+            let timeout_ns = gather64(cpu, 0, 3) as i64;
+            synchronization::svc_wait_synchronization(
+                kernel,
+                cpu,
+                handles_ptr,
+                handles_count,
+                timeout_ns,
+            );
+        }
 
-        let tick = kernel.tick_counter;
-        let process = kernel.process_mut().unwrap();
-        process.threads[thread_idx].begin_wait(
-            WaitReason::ArbitrateLock {
+        svc_number::WAIT_PROCESS_WIDE_KEY_ATOMIC => {
+            // 32-bit: r0=address, r1=cv_key, r2=tag, gather r3(lo):r4(hi)=timeout_ns
+            let mutex_addr = cpu.x[0];
+            let condvar_addr = cpu.x[1];
+            let tag = cpu.x[2] as u32;
+            let timeout_ns = gather64(cpu, 3, 4) as i64;
+            condition_variable::svc_wait_process_wide_key_atomic(
+                kernel,
+                cpu,
                 mutex_addr,
-                tag: requester_handle,
-            },
-            tick,
-        );
-        // Result will be set when woken.
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x1B: ArbitrateUnlock
-// ---------------------------------------------------------------------------
-
-fn svc_arbitrate_unlock(kernel: &mut KernelCore, cpu: &mut CpuState, mutex_addr: VAddr) {
-    debug!("ArbitrateUnlock: mutex_addr=0x{:X}", mutex_addr);
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
+                condvar_addr,
+                tag,
+                timeout_ns,
+            );
         }
-    };
 
-    // Find the highest-priority waiting thread for this mutex.
-    let best_waiter = process
-        .threads
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| {
-            t.state == ThreadState::Waiting
-                && matches!(t.wait_reason, WaitReason::ArbitrateLock { mutex_addr: addr, .. } if addr == mutex_addr)
-        })
-        .min_by_key(|(_, t)| t.priority)
-        .map(|(i, t)| (i, t.handle));
-
-    if let Some((waiter_idx, waiter_handle)) = best_waiter {
-        // Check if there are more waiters.
-        let more_waiters = process
-            .threads
-            .iter()
-            .enumerate()
-            .filter(|(i, t)| {
-                *i != waiter_idx
-                    && t.state == ThreadState::Waiting
-                    && matches!(t.wait_reason, WaitReason::ArbitrateLock { mutex_addr: addr, .. } if addr == mutex_addr)
-            })
-            .count()
-            > 0;
-
-        let new_word = (waiter_handle & 0x3FFF_FFFF)
-            | if more_waiters { 1 << 30 } else { 0 };
-        let _ = process.memory.write_u32(mutex_addr, new_word);
-
-        // Wake the waiter — wake() sets x[0] to SUCCESS.
-        process.threads[waiter_idx].wake(ResultCode::SUCCESS.raw(), -1);
-    } else {
-        // No waiters: clear the mutex word.
-        let _ = process.memory.write_u32(mutex_addr, 0);
-    }
-
-    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x1C: WaitProcessWideKeyAtomic (condition variable wait)
-// ---------------------------------------------------------------------------
-
-fn svc_wait_process_wide_key_atomic(
-    kernel: &mut KernelCore,
-    cpu: &mut CpuState,
-    mutex_addr: VAddr,
-    condvar_addr: VAddr,
-    _tag: u32,
-    timeout_ns: i64,
-) {
-    debug!(
-        "WaitProcessWideKeyAtomic: mutex=0x{:X}, condvar=0x{:X}, timeout={}",
-        mutex_addr, condvar_addr, timeout_ns
-    );
-
-    let thread_idx = match kernel.current_thread_idx {
-        Some(idx) => idx,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
+        svc_number::GET_SYSTEM_TICK => {
+            // 32-bit: out: scatter r0(lo):r1(hi)=tick (i64)
+            let ticks = kernel.tick_counter;
+            scatter64(cpu, 0, 1, ticks);
         }
-    };
 
-    // Step 1: Unlock the mutex (same logic as ArbitrateUnlock).
-    svc_arbitrate_unlock(kernel, cpu, mutex_addr);
-
-    // Step 2: Block the calling thread on the condvar.
-    let tick = kernel.tick_counter;
-    let process = kernel.process_mut().unwrap();
-    process.threads[thread_idx].begin_wait(
-        WaitReason::CondVar {
-            condvar_addr,
-            mutex_addr,
-        },
-        tick,
-    );
-    // Result will be set when woken by SignalProcessWideKey.
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x1D: SignalProcessWideKey (condition variable signal)
-// ---------------------------------------------------------------------------
-
-fn svc_signal_process_wide_key(
-    kernel: &mut KernelCore,
-    cpu: &mut CpuState,
-    condvar_addr: VAddr,
-    count: i32,
-) {
-    debug!(
-        "SignalProcessWideKey: condvar=0x{:X}, count={}",
-        condvar_addr, count
-    );
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => {
-            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-            return;
-        }
-    };
-
-    // Collect indices of threads waiting on this condvar, sorted by priority.
-    let mut waiters: Vec<usize> = process
-        .threads
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| {
-            t.state == ThreadState::Waiting
-                && matches!(t.wait_reason, WaitReason::CondVar { condvar_addr: addr, .. } if addr == condvar_addr)
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    waiters.sort_by_key(|&i| process.threads[i].priority);
-
-    let wake_count = if count < 0 {
-        waiters.len()
-    } else {
-        (count as usize).min(waiters.len())
-    };
-
-    for &idx in waiters.iter().take(wake_count) {
-        // wake() sets state to Runnable and writes x[0] = SUCCESS.
-        process.threads[idx].wake(ResultCode::SUCCESS.raw(), -1);
-    }
-
-    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x0B: SleepThread (improved)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// SVC 0x34: WaitForAddress (address arbiter)
-// ---------------------------------------------------------------------------
-
-fn svc_wait_for_address(
-    kernel: &mut KernelCore,
-    cpu: &mut CpuState,
-    addr: VAddr,
-    arb_type: u32,
-    value: u32,
-    timeout_ns: i64,
-) {
-    debug!(
-        "WaitForAddress: addr=0x{:X}, type={}, value={}, timeout={}",
-        addr, arb_type, value, timeout_ns
-    );
-
-    let thread_idx = match kernel.current_thread_idx {
-        Some(i) => i,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
-        }
-    };
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
-        }
-    };
-
-    let mem_val = process.memory.read_u32(addr).unwrap_or(0);
-
-    let should_wait = match arb_type {
-        // WaitIfLessThan
-        0 => mem_val < value,
-        // DecrementAndWaitIfLessThan
-        1 => {
-            if mem_val > 0 && mem_val <= value {
-                let _ = process.memory.write_u32(addr, mem_val.wrapping_sub(1));
-                true
-            } else {
-                false
-            }
-        }
-        // WaitIfEqual
-        2 => mem_val == value,
-        _ => {
-            cpu.x[0] = error::INVALID_ENUM_VALUE.raw() as u64;
-            return;
-        }
-    };
-
-    if should_wait {
-        if timeout_ns == 0 {
-            cpu.x[0] = error::TIMEOUT.raw() as u64;
-            return;
-        }
-        let tick = kernel.tick_counter;
-        let process = kernel.process_mut().unwrap();
-        process.threads[thread_idx].begin_wait(WaitReason::AddressArbiter { addr }, tick);
-        // Result will be set when woken.
-    } else {
-        cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x35: SignalToAddress (address arbiter)
-// ---------------------------------------------------------------------------
-
-fn svc_signal_to_address(
-    kernel: &mut KernelCore,
-    cpu: &mut CpuState,
-    addr: VAddr,
-    signal_type: u32,
-    value: u32,
-    count: i32,
-) {
-    debug!(
-        "SignalToAddress: addr=0x{:X}, type={}, value={}, count={}",
-        addr, signal_type, value, count
-    );
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
-        }
-    };
-
-    match signal_type {
-        // Signal: just wake waiters
-        0 => {}
-        // SignalAndIncrementIfEqual
-        1 => {
-            let mem_val = process.memory.read_u32(addr).unwrap_or(0);
-            if mem_val != value {
-                cpu.x[0] = error::INVALID_STATE.raw() as u64;
-                return;
-            }
-            let _ = process.memory.write_u32(addr, value.wrapping_add(1));
-        }
-        // SignalAndModifyByWaitingCountIfEqual
-        2 => {
-            let mem_val = process.memory.read_u32(addr).unwrap_or(0);
-            if mem_val != value {
-                cpu.x[0] = error::INVALID_STATE.raw() as u64;
-                return;
-            }
-            // Count waiters on this address.
-            let waiter_count = process
-                .threads
-                .iter()
-                .filter(|t| {
-                    t.state == ThreadState::Waiting
-                        && matches!(t.wait_reason, WaitReason::AddressArbiter { addr: a } if a == addr)
-                })
-                .count() as u32;
-            let new_val = if waiter_count > 0 {
-                value.wrapping_add(1)
-            } else {
-                value.wrapping_sub(1)
-            };
-            let _ = process.memory.write_u32(addr, new_val);
-        }
-        _ => {
-            cpu.x[0] = error::INVALID_ENUM_VALUE.raw() as u64;
-            return;
-        }
-    }
-
-    // Wake waiters sorted by priority.
-    let mut waiters: Vec<usize> = process
-        .threads
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| {
-            t.state == ThreadState::Waiting
-                && matches!(t.wait_reason, WaitReason::AddressArbiter { addr: a } if a == addr)
-        })
-        .map(|(i, _)| i)
-        .collect();
-    waiters.sort_by_key(|&i| process.threads[i].priority);
-
-    let wake_count = if count < 0 {
-        waiters.len()
-    } else {
-        (count as usize).min(waiters.len())
-    };
-
-    for &idx in waiters.iter().take(wake_count) {
-        process.threads[idx].wake(ResultCode::SUCCESS.raw(), -1);
-    }
-
-    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x0B: SleepThread (improved)
-// ---------------------------------------------------------------------------
-
-fn svc_sleep_thread(kernel: &mut KernelCore, cpu: &mut CpuState, ns: i64) {
-    debug!("SleepThread: ns={}", ns);
-
-    let thread_idx = match kernel.current_thread_idx {
-        Some(idx) => idx,
-        None => {
-            // No thread context — fallback to success.
-            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-            return;
-        }
-    };
-
-    if ns == 0 || ns == -2 {
-        // Yield: set thread to Runnable and let scheduler pick another.
-        // The thread stays Runnable so it can be re-scheduled immediately.
-        cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-    } else if ns > 0 {
-        // Timed sleep: convert ns to ticks and block.
-        let current_tick = kernel.tick_counter;
-        let timeout_ticks = (ns as u128 * 19_200_000 / 1_000_000_000) as u64;
-        let wake_tick = current_tick + timeout_ticks;
-
-        let process = kernel.process_mut().unwrap();
-        process.threads[thread_idx].begin_wait(WaitReason::Sleep { wake_tick }, current_tick);
-        // Result will be set when woken by timeout check.
-    } else {
-        // ns == -1: sleep until explicitly woken (rare).
-        cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x19: CancelSynchronization
-// ---------------------------------------------------------------------------
-
-fn svc_cancel_synchronization(
-    kernel: &mut KernelCore,
-    cpu: &mut CpuState,
-    thread_handle: Handle,
-) {
-    debug!("CancelSynchronization: thread_handle={}", thread_handle);
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => {
-            cpu.x[0] = error::INVALID_STATE.raw() as u64;
-            return;
-        }
-    };
-
-    // Find the target thread by handle.
-    let target_idx = process
-        .threads
-        .iter()
-        .position(|t| t.handle == thread_handle);
-
-    match target_idx {
-        Some(idx) => {
-            if process.threads[idx].state == ThreadState::Waiting {
-                // Thread is waiting — wake it with CANCELLED.
-                process.threads[idx].wake(error::CANCELLED.raw(), -1);
-            } else {
-                // Thread is not waiting — set cancel_pending flag.
-                process.threads[idx].cancel_pending = true;
-            }
-            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
-        }
-        None => {
-            cpu.x[0] = error::INVALID_HANDLE.raw() as u64;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x32: SetThreadActivity
-// ---------------------------------------------------------------------------
-
-fn svc_set_thread_activity(
-    kernel: &mut KernelCore,
-    thread_handle: Handle,
-    activity: u32,
-) -> ResultCode {
-    debug!(
-        "SetThreadActivity: thread_handle={}, activity={}",
-        thread_handle, activity
-    );
-
-    let tick = kernel.tick_counter;
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => return error::INVALID_STATE,
-    };
-
-    let target_idx = process
-        .threads
-        .iter()
-        .position(|t| t.handle == thread_handle);
-
-    match target_idx {
-        Some(idx) => {
-            match activity {
-                1 => {
-                    // Suspend
-                    if process.threads[idx].state == ThreadState::Waiting
-                        && matches!(process.threads[idx].wait_reason, WaitReason::Suspended)
-                    {
-                        // Already suspended.
-                        return ResultCode::SUCCESS;
-                    }
-                    process.threads[idx].begin_wait(WaitReason::Suspended, tick);
+        svc_number::CONNECT_TO_NAMED_PORT => {
+            let name_addr = cpu.x[1];
+            let result = port::svc_connect_to_named_port(kernel, cpu, name_addr);
+            match result {
+                Ok(handle) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    cpu.x[1] = handle as u64;
                 }
-                0 => {
-                    // Resume
-                    if process.threads[idx].state == ThreadState::Waiting
-                        && matches!(process.threads[idx].wait_reason, WaitReason::Suspended)
-                    {
-                        process.threads[idx].wake(ResultCode::SUCCESS.raw(), -1);
-                    }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                    cpu.x[1] = 0;
                 }
-                _ => return error::INVALID_ENUM_VALUE,
             }
-            ResultCode::SUCCESS
         }
-        None => error::INVALID_HANDLE,
+
+        svc_number::SEND_SYNC_REQUEST_WITH_USER_BUFFER => {
+            let buffer_addr = cpu.x[0];
+            let buffer_size = cpu.x[1];
+            let session_handle = cpu.x[2] as u32;
+            let result = ipc::svc_send_sync_request_with_user_buffer(
+                kernel,
+                cpu,
+                buffer_addr,
+                buffer_size,
+                session_handle,
+            );
+            cpu.x[0] = result.raw() as u64;
+        }
+
+        svc_number::GET_PROCESS_INFO => {
+            // 32-bit: r1=process_handle, r2=info_type
+            // out: r0=Result, scatter r1(lo):r2(hi)=info (i64)
+            let info_type = cpu.x[2] as u32;
+            let value = process::svc_get_process_info(info_type);
+            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+            scatter64(cpu, 1, 2, value);
+        }
+
+        svc_number::GET_PROCESS_ID => {
+            // 32-bit: r1=process_handle, out: r0=Result, scatter r1(lo):r2(hi)=pid
+            let result = process::svc_get_process_id(kernel);
+            match result {
+                Ok(pid) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    scatter64(cpu, 1, 2, pid);
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                }
+            }
+        }
+
+        svc_number::GET_THREAD_ID => {
+            // 32-bit: r1=thread_handle, out: r0=Result, scatter r1(lo):r2(hi)=tid
+            let result = thread::svc_get_thread_id(kernel);
+            match result {
+                Ok(tid) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    scatter64(cpu, 1, 2, tid);
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                }
+            }
+        }
+
+        svc_number::GET_INFO => {
+            // 32-bit: r1=info_type, r2=handle, gather r0(lo):r3(hi)=info_subtype
+            // out: r0=Result, scatter r1(lo):r2(hi)=out (u64)
+            let info_id = cpu.x[1] as u32;
+            let handle = cpu.x[2] as u32;
+            let info_sub_id = gather64(cpu, 0, 3);
+            let result = info::svc_get_info(kernel, info_id, handle, info_sub_id);
+            match result {
+                Ok(value) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    scatter64(cpu, 1, 2, value);
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                    scatter64(cpu, 1, 2, 0);
+                }
+            }
+        }
+
+        svc_number::WAIT_FOR_ADDRESS => {
+            // 32-bit: r0=address, r1=arb_type, r2=value, gather r3(lo):r4(hi)=timeout_ns
+            let addr = cpu.x[0];
+            let arb_type = cpu.x[1] as u32;
+            let value = cpu.x[2] as u32;
+            let timeout_ns = gather64(cpu, 3, 4) as i64;
+            address_arbiter::svc_wait_for_address(kernel, cpu, addr, arb_type, value, timeout_ns);
+        }
+
+        svc_number::SIGNAL_TO_ADDRESS => {
+            let addr = cpu.x[0];
+            let signal_type = cpu.x[1] as u32;
+            let value = cpu.x[2] as u32;
+            let count = cpu.x[3] as i32;
+            address_arbiter::svc_signal_to_address(kernel, cpu, addr, signal_type, value, count);
+        }
+
+        svc_number::GET_RESOURCE_LIMIT_LIMIT_VALUE => {
+            let handle = cpu.x[1] as u32;
+            let resource_type = cpu.x[2] as u32;
+            match resource_limit::svc_get_resource_limit_limit_value(handle, resource_type) {
+                Ok(value) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    scatter64(cpu, 1, 2, value);
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                }
+            }
+        }
+
+        svc_number::GET_RESOURCE_LIMIT_CURRENT_VALUE => {
+            let handle = cpu.x[1] as u32;
+            let resource_type = cpu.x[2] as u32;
+            match resource_limit::svc_get_resource_limit_current_value(handle, resource_type) {
+                Ok(value) => {
+                    cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+                    scatter64(cpu, 1, 2, value);
+                }
+                Err(rc) => {
+                    cpu.x[0] = rc.raw() as u64;
+                }
+            }
+        }
+
+        _ => {
+            warn!(
+                "Unimplemented SVC 0x{:02X} (PC=0x{:08X}, A32)",
+                svc_num, cpu.pc as u32
+            );
+            cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
+        }
     }
-}
-
-// ---------------------------------------------------------------------------
-// SVC 0x33: GetThreadContext3
-// ---------------------------------------------------------------------------
-
-fn svc_get_thread_context3(
-    kernel: &mut KernelCore,
-    thread_handle: Handle,
-    context_addr: VAddr,
-) -> ResultCode {
-    debug!(
-        "GetThreadContext3: thread_handle={}, context_addr=0x{:X}",
-        thread_handle, context_addr
-    );
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => return error::INVALID_STATE,
-    };
-
-    let target_idx = process
-        .threads
-        .iter()
-        .position(|t| t.handle == thread_handle);
-
-    let idx = match target_idx {
-        Some(i) => i,
-        None => return error::INVALID_HANDLE,
-    };
-
-    let thread = &process.threads[idx];
-    let cpu = &thread.cpu_state;
-
-    // Layout: X0-X30 (31*8=248 bytes), SP (8 bytes), PC (8 bytes),
-    //         NZCV (4 bytes), padding (4 bytes), V0-V31 (32*16=512 bytes)
-    // Total: 248 + 8 + 8 + 4 + 4 + 512 = 784 bytes
-    let mut offset = context_addr;
-
-    // X0-X30
-    for i in 0..31 {
-        let _ = process.memory.write_u64(offset, cpu.x[i]);
-        offset += 8;
-    }
-
-    // SP
-    let _ = process.memory.write_u64(offset, cpu.sp);
-    offset += 8;
-
-    // PC
-    let _ = process.memory.write_u64(offset, cpu.pc);
-    offset += 8;
-
-    // NZCV (4 bytes) + padding (4 bytes)
-    let _ = process.memory.write_u32(offset, cpu.nzcv);
-    offset += 4;
-    let _ = process.memory.write_u32(offset, 0); // padding
-    offset += 4;
-
-    // V0-V31 (128-bit each, stored as [lo, hi])
-    for i in 0..32 {
-        let lo = cpu.v[i][0];
-        let hi = cpu.v[i][1];
-        let _ = process.memory.write_u64(offset, lo);
-        let _ = process.memory.write_u64(offset + 8, hi);
-        offset += 16;
-    }
-
-    ResultCode::SUCCESS
 }

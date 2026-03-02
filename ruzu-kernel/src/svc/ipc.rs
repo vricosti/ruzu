@@ -9,43 +9,6 @@ use crate::kernel::KernelCore;
 use crate::objects::{KClientSession, KernelObject};
 use ruzu_cpu::CpuState;
 
-/// SVC 0x1F: ConnectToNamedPort
-/// X1 = pointer to port name string in guest memory
-/// Returns: X0 = result, X1 = session handle
-pub fn svc_connect_to_named_port(
-    kernel: &mut KernelCore,
-    _cpu: &CpuState,
-    name_addr: VAddr,
-) -> Result<Handle, ResultCode> {
-    let process = kernel.process_mut().ok_or(error::INVALID_STATE)?;
-
-    // Read port name from guest memory (null-terminated, max 12 bytes)
-    let mut name_bytes = Vec::new();
-    for i in 0..12u64 {
-        let byte = process
-            .memory
-            .read_u8(name_addr + i)
-            .map_err(|_| error::INVALID_ADDRESS)?;
-        if byte == 0 {
-            break;
-        }
-        name_bytes.push(byte);
-    }
-
-    let port_name = String::from_utf8_lossy(&name_bytes).to_string();
-    debug!("ConnectToNamedPort: \"{}\"", port_name);
-
-    // Create a client session for this port
-    let session = KClientSession::new(port_name.clone());
-    let handle = process
-        .handle_table
-        .add(KernelObject::ClientSession(session))
-        .map_err(|_| error::HANDLE_TABLE_FULL)?;
-
-    debug!("ConnectToNamedPort: created session handle {} for \"{}\"", handle, port_name);
-    Ok(handle)
-}
-
 /// SVC 0x21: SendSyncRequest
 /// X0 = session handle
 /// IPC message is in the current thread's TLS (first 0x100 bytes)
@@ -115,7 +78,10 @@ pub fn svc_send_sync_request(
     if let Some(ref sub_service_name) = result.create_session_for {
         let process = kernel.process_mut().unwrap();
         let sub_session = KClientSession::new(sub_service_name.clone());
-        match process.handle_table.add(KernelObject::ClientSession(sub_session)) {
+        match process
+            .handle_table
+            .add(KernelObject::ClientSession(sub_session))
+        {
             Ok(sub_handle) => {
                 debug!(
                     "SendSyncRequest: created sub-session handle {} for \"{}\"",
@@ -124,7 +90,10 @@ pub fn svc_send_sync_request(
                 extra_move_handles.push(sub_handle);
             }
             Err(_) => {
-                warn!("SendSyncRequest: failed to create sub-session for \"{}\"", sub_service_name);
+                warn!(
+                    "SendSyncRequest: failed to create sub-session for \"{}\"",
+                    sub_service_name
+                );
             }
         }
     }
@@ -154,7 +123,9 @@ pub fn svc_send_sync_request(
         let process = kernel.process_mut().unwrap();
         let write_len = response_bytes.len().min(0x100);
         for i in 0..write_len {
-            let _ = process.memory.write_u8(tls_addr + i as u64, response_bytes[i]);
+            let _ = process
+                .memory
+                .write_u8(tls_addr + i as u64, response_bytes[i]);
         }
     }
 
@@ -196,7 +167,10 @@ pub fn svc_send_sync_request_with_user_buffer(
         match process.handle_table.get(handle) {
             Ok(KernelObject::ClientSession(session)) => session.service_name.clone(),
             _ => {
-                warn!("SendSyncRequestWithUserBuffer: invalid handle {}", handle);
+                warn!(
+                    "SendSyncRequestWithUserBuffer: invalid handle {}",
+                    handle
+                );
                 return error::INVALID_HANDLE;
             }
         }
@@ -236,7 +210,10 @@ pub fn svc_send_sync_request_with_user_buffer(
     if let Some(ref sub_service_name) = result.create_session_for {
         let process = kernel.process_mut().unwrap();
         let sub_session = KClientSession::new(sub_service_name.clone());
-        match process.handle_table.add(KernelObject::ClientSession(sub_session)) {
+        match process
+            .handle_table
+            .add(KernelObject::ClientSession(sub_session))
+        {
             Ok(sub_handle) => {
                 debug!(
                     "SendSyncRequestWithUserBuffer: created sub-session handle {} for \"{}\"",
@@ -274,7 +251,9 @@ pub fn svc_send_sync_request_with_user_buffer(
         let process = kernel.process_mut().unwrap();
         let write_len = response_bytes.len().min(read_size);
         for i in 0..write_len {
-            let _ = process.memory.write_u8(buffer_addr + i as u64, response_bytes[i]);
+            let _ = process
+                .memory
+                .write_u8(buffer_addr + i as u64, response_bytes[i]);
         }
     }
 
@@ -303,28 +282,19 @@ fn write_cmif_response_at(
     let _ = process.memory.write_u32(addr + 4, data_words); // data size
 
     let cmif_offset = 16u64;
-    let _ = process.memory.write_u32(addr + cmif_offset, 0x4F434653); // "SFCO"
+    let _ = process
+        .memory
+        .write_u32(addr + cmif_offset, 0x4F434653); // "SFCO"
     let _ = process.memory.write_u32(addr + cmif_offset + 4, 0); // version
-    let _ = process.memory.write_u32(addr + cmif_offset + 8, result.raw()); // result code
+    let _ = process
+        .memory
+        .write_u32(addr + cmif_offset + 8, result.raw()); // result code
     let _ = process.memory.write_u32(addr + cmif_offset + 12, 0); // token
 
     for (i, &word) in extra_data.iter().enumerate() {
-        let _ = process.memory.write_u32(addr + cmif_offset + 16 + (i as u64 * 4), word);
-    }
-}
-
-/// SVC 0x16: CloseHandle
-pub fn svc_close_handle(kernel: &mut KernelCore, handle: Handle) -> ResultCode {
-    debug!("CloseHandle: handle={}", handle);
-
-    let process = match kernel.process_mut() {
-        Some(p) => p,
-        None => return error::INVALID_STATE,
-    };
-
-    match process.handle_table.close(handle) {
-        Ok(_) => ResultCode::SUCCESS,
-        Err(rc) => rc,
+        let _ = process
+            .memory
+            .write_u32(addr + cmif_offset + 16 + (i as u64 * 4), word);
     }
 }
 
@@ -357,7 +327,9 @@ fn parse_cmif_from_response(response: &[u8]) -> (u32, Vec<u32>) {
         return (0, Vec::new());
     }
     let result_code = u32::from_le_bytes(
-        response[offset + 8..offset + 12].try_into().unwrap_or([0; 4]),
+        response[offset + 8..offset + 12]
+            .try_into()
+            .unwrap_or([0; 4]),
     );
 
     // Read data words after CMIF header (16 bytes)

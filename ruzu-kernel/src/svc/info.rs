@@ -3,7 +3,7 @@
 
 use log::debug;
 use ruzu_common::error;
-use ruzu_common::{Handle, ResultCode, CNTFRQ_HZ};
+use ruzu_common::{Handle, ResultCode};
 
 use crate::kernel::KernelCore;
 
@@ -40,33 +40,6 @@ mod info_id {
     pub const TRANSFER_MEMORY_SIZE: u32 = 28;
 }
 
-/// SVC 0x1E: GetSystemTick
-/// Returns the host monotonic time converted to Switch tick frequency (19.2 MHz).
-pub fn svc_get_system_tick() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-
-    // Convert to Switch ticks: nanoseconds * 19.2MHz / 1GHz = ns * 19.2 / 1000
-    let ns = elapsed.as_nanos() as u64;
-    (ns as u128 * CNTFRQ_HZ as u128 / 1_000_000_000u128) as u64
-}
-
-/// SVC 0x24: GetProcessId
-pub fn svc_get_process_id(kernel: &KernelCore) -> Result<u64, ResultCode> {
-    let process = kernel.process().ok_or(error::INVALID_STATE)?;
-    Ok(process.pid)
-}
-
-/// SVC 0x25: GetThreadId
-pub fn svc_get_thread_id(kernel: &KernelCore) -> Result<u64, ResultCode> {
-    let process = kernel.process().ok_or(error::INVALID_STATE)?;
-    let thread = process.current_thread().ok_or(error::INVALID_STATE)?;
-    Ok(thread.thread_id)
-}
-
 /// SVC 0x29: GetInfo
 /// Returns various system information based on info_id and info_sub_id.
 pub fn svc_get_info(
@@ -93,9 +66,7 @@ pub fn svc_get_info(
             Ok(0xFFFF_FFFF_FFFF_FFFF)
         }
         info_id::ALIAS_REGION_BASE => Ok(layout.map_region_base),
-        info_id::ALIAS_REGION_SIZE => {
-            Ok(layout.map_region_end - layout.map_region_base)
-        }
+        info_id::ALIAS_REGION_SIZE => Ok(layout.map_region_end - layout.map_region_base),
         info_id::HEAP_REGION_BASE => Ok(layout.heap_base),
         info_id::HEAP_REGION_SIZE => {
             // Max heap size: 4 GiB
@@ -140,17 +111,13 @@ pub fn svc_get_info(
         }
         info_id::USER_EXCEPTION_CONTEXT => Ok(0),
         info_id::TOTAL_NON_SYSTEM_MEMORY_SIZE => Ok(0x1_0000_0000),
-        info_id::USED_NON_SYSTEM_MEMORY_SIZE => {
-            Ok(layout.heap_end - layout.heap_base)
-        }
+        info_id::USED_NON_SYSTEM_MEMORY_SIZE => Ok(layout.heap_end - layout.heap_base),
         info_id::IS_APPLICATION => Ok(1), // Always application for homebrew
         info_id::FREE_THREAD_COUNT => Ok(256),
-        info_id::THREAD_TICK_COUNT => Ok(svc_get_system_tick()),
+        info_id::THREAD_TICK_COUNT => Ok(super::tick::svc_get_system_tick()),
         info_id::IS_SAFE_MODE => Ok(0),
         info_id::TRANSFER_MEMORY_BASE => Ok(layout.map_region_base),
-        info_id::TRANSFER_MEMORY_SIZE => {
-            Ok(layout.map_region_end - layout.map_region_base)
-        }
+        info_id::TRANSFER_MEMORY_SIZE => Ok(layout.map_region_end - layout.map_region_base),
         _ => {
             debug!("GetInfo: unknown info_id {}", info_id);
             Err(error::INVALID_ENUM_VALUE)
