@@ -246,12 +246,16 @@ impl ArmDynarmic64 {
     }
 
     /// Run the JIT until a halt condition.
+    /// Matching zuyu's `ArmDynarmic64::RunThread()`: clear exclusive state, then run.
     pub fn run(&mut self) -> HaltReason {
+        self.jit.clear_exclusive_state();
         self.jit.run()
     }
 
     /// Single-step one instruction.
+    /// Matching zuyu's `ArmDynarmic64::StepThread()`: clear exclusive state, then step.
     pub fn step(&mut self) -> HaltReason {
+        self.jit.clear_exclusive_state();
         self.jit.step()
     }
 
@@ -300,6 +304,8 @@ impl ArmDynarmic64 {
             self.jit.set_vector(i, state.v[i][0], state.v[i][1]);
         }
         self.jit.set_tpidr_el0(state.tpidr_el0);
+        self.jit.set_fpcr(state.fpcr);
+        self.jit.set_fpsr(state.fpsr);
 
         // Clear any stale halt reason from previous execution.
         self.jit.clear_halt(
@@ -340,6 +346,8 @@ impl ArmDynarmic64 {
             state.v[i] = [lo, hi];
         }
         state.tpidr_el0 = self.jit.get_tpidr_el0();
+        state.fpcr = self.jit.get_fpcr();
+        state.fpsr = self.jit.get_fpsr();
     }
 
     /// Invalidate JIT-compiled blocks in a memory range.

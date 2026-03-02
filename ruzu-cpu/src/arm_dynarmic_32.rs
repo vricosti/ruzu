@@ -18,6 +18,37 @@ use rdynarmic::jit::A32Jit;
 use rdynarmic::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
 
 // ---------------------------------------------------------------------------
+// FPSCR ↔ FPSR/FPCR conversion (matching zuyu's arm_dynarmic_32.cpp)
+// ---------------------------------------------------------------------------
+
+/// Split ARM32 FPSCR into FPSR and FPCR components.
+/// Matching zuyu's `FpscrToFpsrFpcr()`.
+fn fpscr_to_fpsr_fpcr(fpscr: u32) -> (u32, u32) {
+    // FPSCR bits [31:27] → FPSR[31:27] (NZCV + QC)
+    let nzcv = fpscr & 0xF800_0000;
+    // FPSCR bit [7] → FPSR[7] (IDC)
+    let idc = fpscr & 0x80;
+    // FPSCR bits [4:0] → FPSR[4:0] (IXC, UFC, OFC, DZC, IOC)
+    let fiq = fpscr & 0x1F;
+    let fpsr = nzcv | idc | fiq;
+
+    // FPSCR bits [26:15] → FPCR[26:15] (rounding mode, etc.)
+    let round = fpscr & 0x07FF_8000;
+    // FPSCR bits [12:8] → FPCR[12:8] (exception trap enables)
+    let trap = fpscr & 0x1F00;
+    let fpcr = round | trap;
+
+    (fpsr, fpcr)
+}
+
+/// Combine FPSR and FPCR into ARM32 FPSCR.
+/// Matching zuyu's `FpsrFpcrToFpscr()`.
+fn fpsr_fpcr_to_fpscr(fpsr: u32, fpcr: u32) -> u32 {
+    let (s, c) = fpscr_to_fpsr_fpcr(fpsr | fpcr);
+    s | c
+}
+
+// ---------------------------------------------------------------------------
 // Shared callback state
 // ---------------------------------------------------------------------------
 
@@ -195,12 +226,16 @@ impl ArmDynarmic32 {
     }
 
     /// Run the JIT until a halt condition.
+    /// Matching zuyu's `ArmDynarmic32::RunThread()`: clear exclusive state, then run.
     pub fn run(&mut self) -> HaltReason {
+        self.jit.clear_exclusive_state();
         self.jit.run()
     }
 
     /// Single-step one instruction.
+    /// Matching zuyu's `ArmDynarmic32::StepThread()`: clear exclusive state, then step.
     pub fn step(&mut self) -> HaltReason {
+        self.jit.clear_exclusive_state();
         self.jit.step()
     }
 
@@ -254,6 +289,9 @@ impl ArmDynarmic32 {
             self.jit.set_ext_reg(i * 2, lo as u32);
             self.jit.set_ext_reg(i * 2 + 1, (lo >> 32) as u32);
         }
+
+        // FPSCR from FPSR/FPCR (matching zuyu's j.SetFpscr(FpsrFpcrToFpscr(ctx.fpsr, ctx.fpcr)))
+        self.jit.set_fpscr(fpsr_fpcr_to_fpscr(state.fpsr, state.fpcr));
 
         // CP15 TPIDR_UPRW from CpuState.tpidr_el0
         // Matching zuyu's `m_cp15->uprw = static_cast<u32>(ctx.tpidr)`
@@ -314,6 +352,11 @@ impl ArmDynarmic32 {
             let hi = self.jit.get_ext_reg(i * 2 + 1) as u64;
             state.v[i] = [lo | (hi << 32), 0];
         }
+
+        // FPSCR → FPSR/FPCR (matching zuyu's FpscrToFpsrFpcr(j.Fpscr()))
+        let (fpsr, fpcr) = fpscr_to_fpsr_fpcr(self.jit.get_fpscr());
+        state.fpsr = fpsr;
+        state.fpcr = fpcr;
 
         // CP15 TPIDR_UPRW → CpuState.tpidr_el0
         // Matching zuyu's `ctx.tpidr = m_cp15->uprw`
