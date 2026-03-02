@@ -974,7 +974,7 @@ fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
         if reason.contains(HaltReason::SVC) {
             if let Some(n) = jit.get_svc_number() {
                 let mut cpu = kernel.process().unwrap().threads[idx].cpu_state.clone();
-                dispatch_svc(kernel, &mut cpu, n);
+                dispatch_svc(kernel, &mut cpu, n, kernel.is_64bit);
                 if let Some(process) = kernel.process_mut() {
                     if process.threads[idx].state != ThreadState::Waiting {
                         process.threads[idx].cpu_state = cpu;
@@ -1290,7 +1290,7 @@ fn run_with_window(
                     // with the result code so we cannot read the handle after.
                     let svc_in_x0 = cpu.x[0];
                     let svc_in_x1 = cpu.x[1];
-                    dispatch_svc(kernel, &mut cpu, n);
+                    dispatch_svc(kernel, &mut cpu, n, kernel.is_64bit);
 
                     // Track MapSharedMemory (0x13) to learn where the game
                     // maps the HID shared memory so we can sync input state.

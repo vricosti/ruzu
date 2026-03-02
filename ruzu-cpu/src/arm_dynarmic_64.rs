@@ -50,6 +50,9 @@ struct CallbackState {
     vtable: MemoryVtable,
     /// Remaining ticks in the current time slice.
     ticks_remaining: u64,
+    /// SVC number stored by the CallSVC callback.
+    /// Matching zuyu's `m_svc` in ArmDynarmic64.
+    svc_swi: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,10 +175,11 @@ impl JitCallbacks for DynarmicCallbacks {
 
     // -- System callbacks ----------------------------------------------------
 
-    fn call_supervisor(&mut self, _svc_num: u32) {
-        // The JIT-generated code already sets halt_reason = SVC before
-        // calling this callback. The SVC number is extracted from the
-        // instruction at PC-4 after run() returns.
+    fn call_supervisor(&mut self, svc_num: u32) {
+        // Store SVC number matching zuyu's DynarmicCallbacks64::CallSVC.
+        // The JIT halts with HaltReason::SVC and the host reads the number
+        // via get_svc_number().
+        self.s_mut().svc_swi = svc_num;
     }
 
     fn exception_raised(&mut self, pc: u64, exception: u64) {
@@ -224,6 +228,7 @@ impl ArmDynarmic64 {
             memory_ctx,
             vtable,
             ticks_remaining: 0,
+            svc_swi: 0,
         });
 
         let state_ptr: *mut CallbackState = &mut *callback_state;
@@ -271,25 +276,10 @@ impl ArmDynarmic64 {
 
     /// Get the SVC number after the JIT halted with `HaltReason::SVC`.
     ///
-    /// Extracts the immediate from the SVC instruction at PC-4 (the frontend
-    /// advances PC past the SVC before halting).
+    /// Matching zuyu: returns the number stored by the CallSVC callback,
+    /// not read from memory.
     pub fn get_svc_number(&self) -> Option<u32> {
-        let pc = self.jit.get_pc();
-        if pc < 4 {
-            return None;
-        }
-        // Read the SVC instruction at PC-4.
-        let s = &*self._callback_state;
-        let instr = unsafe { (s.vtable.read_u32)(s.memory_ctx as *const u8, pc - 4) };
-        // ARM64 SVC encoding: 1101_0100_000 imm16 000_01
-        if instr & 0xFFE0_001F != 0xD400_0001 {
-            log::warn!(
-                "Expected SVC at 0x{:016X} but got 0x{:08X}",
-                pc - 4, instr
-            );
-            return None;
-        }
-        Some((instr >> 5) & 0xFFFF)
+        Some(self._callback_state.svc_swi)
     }
 
     /// Load CPU state into the JIT register file (thread switch-in).
