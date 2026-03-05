@@ -3,8 +3,14 @@
 
 use ini::Ini;
 use log::{debug, info, warn};
-use ruzu_common::settings::{RendererBackend, Settings, SystemLanguage, SystemRegion};
+use ruzu_common::settings::{
+    Language, Region, RendererBackend, Values,
+};
 use std::path::PathBuf;
+
+// Re-export for backward compat
+pub use ruzu_common::settings::Language as SystemLanguage;
+pub use ruzu_common::settings::Region as SystemRegion;
 
 /// Locate the yuzu sdl2-config.ini file.
 pub fn find_config_path() -> Option<PathBuf> {
@@ -39,12 +45,6 @@ pub fn find_config_path() -> Option<PathBuf> {
 }
 
 /// Find the keys directory (containing prod.keys / title.keys).
-///
-/// Search order:
-/// 1. Explicit path (from --keys-dir CLI flag)
-/// 2. Windows: %APPDATA%\yuzu\keys\
-/// 3. Linux: ~/.local/share/yuzu/keys/
-/// 4. XDG_DATA_HOME/yuzu/keys/
 pub fn find_keys_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
     if let Some(path) = explicit {
         if path.exists() {
@@ -53,7 +53,6 @@ pub fn find_keys_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
         warn!("Specified keys directory not found: {}", path.display());
     }
 
-    // Windows
     if let Ok(appdata) = std::env::var("APPDATA") {
         let path = PathBuf::from(&appdata).join("yuzu").join("keys");
         if path.exists() {
@@ -61,7 +60,6 @@ pub fn find_keys_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
         }
     }
 
-    // Linux
     if let Ok(home) = std::env::var("HOME") {
         let path = PathBuf::from(&home)
             .join(".local")
@@ -73,7 +71,6 @@ pub fn find_keys_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
         }
     }
 
-    // XDG_DATA_HOME
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         let path = PathBuf::from(&xdg).join("yuzu").join("keys");
         if path.exists() {
@@ -85,11 +82,6 @@ pub fn find_keys_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
 }
 
 /// Find the games directory.
-///
-/// Search order:
-/// 1. Explicit path (from --games-dir CLI flag)
-/// 2. Config file setting
-/// 3. Default paths
 pub fn find_games_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
     if let Some(path) = explicit {
         if path.exists() {
@@ -98,7 +90,6 @@ pub fn find_games_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
         warn!("Specified games directory not found: {}", path.display());
     }
 
-    // Check common default paths
     if let Ok(home) = std::env::var("HOME") {
         let paths = [
             PathBuf::from(&home).join("Games").join("Switch"),
@@ -112,7 +103,6 @@ pub fn find_games_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
         }
     }
 
-    // Windows-specific paths
     if let Ok(userprofile) = std::env::var("USERPROFILE") {
         let paths = [
             PathBuf::from(&userprofile).join("Games").join("Switch"),
@@ -129,8 +119,8 @@ pub fn find_games_dir(explicit: Option<&PathBuf>) -> Option<PathBuf> {
 }
 
 /// Load settings from yuzu's sdl2-config.ini file.
-pub fn load_config(path: Option<&PathBuf>) -> Settings {
-    let mut settings = Settings::default();
+pub fn load_config(path: Option<&PathBuf>) -> Values {
+    let mut settings = Values::default();
 
     let config_path = match path {
         Some(p) => {
@@ -162,24 +152,28 @@ pub fn load_config(path: Option<&PathBuf>) -> Settings {
     // [Renderer]
     if let Some(section) = conf.section(Some("Renderer")) {
         if let Some(backend) = section.get("renderer_backend") {
-            settings.renderer_backend = RendererBackend::from_str_or_default(backend);
-            debug!("Renderer backend: {:?}", settings.renderer_backend);
+            if let Some(rb) = RendererBackend::from_string(backend.trim()) {
+                settings.renderer_backend.set_value(rb);
+            }
+            debug!("Renderer backend: {:?}", settings.renderer_backend.get_value());
         }
         if let Some(vsync) = section.get("use_vsync") {
-            settings.vsync_enabled = vsync.trim() == "true" || vsync.trim() == "1";
-        }
-        if let Some(fullscreen) = section.get("fullscreen_mode") {
-            settings.fullscreen = fullscreen.trim() == "1" || fullscreen.trim() == "true";
+            if let Some(mode) = ruzu_common::settings::VSyncMode::from_string(vsync.trim()) {
+                settings.vsync_mode.set_value(mode);
+            }
         }
         if let Some(res) = section.get("resolution_setup") {
-            settings.resolution_factor = res.trim().parse().unwrap_or(1);
+            if let Some(setup) = ruzu_common::settings::ResolutionSetup::from_string(res.trim()) {
+                settings.resolution_setup.set_value(setup);
+            }
         }
     }
 
     // [Core]
     if let Some(section) = conf.section(Some("Core")) {
         if let Some(multi) = section.get("use_multi_core") {
-            settings.use_multi_core = multi.trim() == "true" || multi.trim() == "1";
+            let val = multi.trim() == "true" || multi.trim() == "1";
+            settings.use_multi_core.set_value(val);
         }
     }
 
@@ -187,24 +181,24 @@ pub fn load_config(path: Option<&PathBuf>) -> Settings {
     if let Some(section) = conf.section(Some("System")) {
         if let Some(lang) = section.get("language_index") {
             let idx: u32 = lang.trim().parse().unwrap_or(1);
-            settings.language = SystemLanguage::from_index(idx);
-            debug!("Language: {:?}", settings.language);
+            settings.language_index.set_value(Language::from_index(idx));
+            debug!("Language: {:?}", settings.language_index.get_value());
         }
         if let Some(region) = section.get("region_index") {
             let idx: u32 = region.trim().parse().unwrap_or(1);
-            settings.region = SystemRegion::from_index(idx);
-            debug!("Region: {:?}", settings.region);
+            settings.region_index.set_value(Region::from_index(idx));
+            debug!("Region: {:?}", settings.region_index.get_value());
         }
     }
 
     // [Debugging]
     if let Some(section) = conf.section(Some("Debugging")) {
-        if let Some(debug_log) = section.get("use_debug_asserts") {
-            settings.use_debug_logging =
-                debug_log.trim() == "true" || debug_log.trim() == "1";
+        if let Some(debug_asserts) = section.get("use_debug_asserts") {
+            let val = debug_asserts.trim() == "true" || debug_asserts.trim() == "1";
+            settings.use_debug_asserts.set_value(val);
         }
         if let Some(args) = section.get("program_args") {
-            settings.program_args = args.to_string();
+            settings.program_args.set_value(args.to_string());
         }
     }
 

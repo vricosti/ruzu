@@ -235,7 +235,7 @@ fn main() -> Result<()> {
 
     // Load config
     let settings = config::load_config(args.config.as_ref());
-    info!("Renderer backend: {:?}", settings.renderer_backend);
+    info!("Renderer backend: {:?}", settings.renderer_backend.get_value());
 
     // Initialize key manager
     let mut keys = KeyManager::new();
