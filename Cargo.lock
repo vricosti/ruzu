@@ -866,6 +866,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzu-core"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "parking_lot",
+ "ruzu-common",
+]
+
+[[package]]
 name = "ruzu-cpu"
 version = "0.1.0"
 dependencies = [

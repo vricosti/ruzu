@@ -2,6 +2,7 @@
 members = [
     "ruzu",
     "ruzu-common",
+    "ruzu-core",
     "ruzu-crypto",
     "ruzu-loader",
     "ruzu-cpu",
@@ -20,6 +21,7 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 # Internal crates
 ruzu-common = { path = "ruzu-common" }
+ruzu-core = { path = "ruzu-core" }
 ruzu-crypto = { path = "ruzu-crypto" }
 ruzu-loader = { path = "ruzu-loader" }
 ruzu-cpu = { path = "ruzu-cpu" }
