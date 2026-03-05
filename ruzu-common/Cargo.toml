@@ -8,3 +8,6 @@ log.workspace = true
 thiserror.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
+lz4_flex.workspace = true
+zstd = "0.13"
+libc = "0.2"
