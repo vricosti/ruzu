@@ -50,25 +50,67 @@ impl ServiceHandler for FspSrvService {
         log::debug!("fsp-srv: cmd_id={}", cmd_id);
 
         match cmd_id {
-            // SetCurrentProcess
+            // SetCurrentProcess (1)
             1 => {
                 log::info!("fsp-srv: SetCurrentProcess");
                 IpcResponse::success()
             }
 
-            // OpenSdCardFileSystem → IFileSystem
+            // OpenBisFileSystem (12) -> IFileSystem
+            12 => {
+                log::info!("fsp-srv: OpenBisFileSystem");
+                IpcResponse::success().with_move_handle(0)
+            }
+
+            // OpenBisStorage (13) -> IStorage
+            13 => {
+                log::info!("fsp-srv: OpenBisStorage");
+                IpcResponse::success().with_move_handle(0)
+            }
+
+            // OpenSdCardFileSystem (18) -> IFileSystem
             18 => {
                 log::info!("fsp-srv: OpenSdCardFileSystem");
                 IpcResponse::success().with_move_handle(0)
             }
 
-            // OpenSaveDataFileSystem → ISaveDataFileSystem
+            // CreateSaveDataFileSystem (22)
+            22 => {
+                log::info!("fsp-srv: CreateSaveDataFileSystem");
+                IpcResponse::success()
+            }
+
+            // OpenSaveDataFileSystem (51) -> ISaveDataFileSystem
             51 => {
                 log::info!("fsp-srv: OpenSaveDataFileSystem");
                 IpcResponse::success().with_move_handle(0)
             }
 
-            // OpenDataStorageByCurrentProcess → IStorage
+            // OpenSaveDataFileSystemBySystemSaveDataId (52)
+            52 => {
+                log::info!("fsp-srv: OpenSaveDataFileSystemBySystemSaveDataId");
+                IpcResponse::success().with_move_handle(0)
+            }
+
+            // OpenReadOnlySaveDataFileSystem (53) -> ISaveDataFileSystem
+            53 => {
+                log::info!("fsp-srv: OpenReadOnlySaveDataFileSystem");
+                IpcResponse::success().with_move_handle(0)
+            }
+
+            // OpenSaveDataInfoReaderBySaveDataSpaceId (61)
+            61 => {
+                log::info!("fsp-srv: OpenSaveDataInfoReaderBySaveDataSpaceId");
+                IpcResponse::success().with_move_handle(0)
+            }
+
+            // OpenContentStorageFileSystem (110) -> IFileSystem
+            110 => {
+                log::info!("fsp-srv: OpenContentStorageFileSystem");
+                IpcResponse::success().with_move_handle(0)
+            }
+
+            // OpenDataStorageByCurrentProcess (200) -> IStorage
             200 => {
                 if self.romfs_data.is_some() {
                     log::info!("fsp-srv: OpenDataStorageByCurrentProcess (romfs available)");
@@ -79,16 +121,40 @@ impl ServiceHandler for FspSrvService {
                 }
             }
 
-            // OpenDataStorageByDataId
+            // OpenDataStorageByProgramId (201) -> IStorage
+            201 => {
+                log::info!("fsp-srv: OpenDataStorageByProgramId (NOT_FOUND)");
+                IpcResponse::error(error::NOT_FOUND)
+            }
+
+            // OpenDataStorageByDataId (202)
             202 => {
                 log::info!("fsp-srv: OpenDataStorageByDataId (NOT_FOUND)");
                 IpcResponse::error(error::NOT_FOUND)
             }
 
-            // GetGlobalAccessLogMode
+            // OpenPatchDataStorageByCurrentProcess (203)
+            203 => {
+                log::info!("fsp-srv: OpenPatchDataStorageByCurrentProcess (NOT_FOUND)");
+                IpcResponse::error(error::NOT_FOUND)
+            }
+
+            // DisableAutoSaveDataCreation (1003)
+            1003 => {
+                log::info!("fsp-srv: DisableAutoSaveDataCreation");
+                IpcResponse::success()
+            }
+
+            // GetGlobalAccessLogMode (1006)
             1006 => {
                 log::info!("fsp-srv: GetGlobalAccessLogMode (disabled)");
                 IpcResponse::success_with_data(vec![0])
+            }
+
+            // OutputAccessLogToSdCard (1007)
+            1007 => {
+                log::info!("fsp-srv: OutputAccessLogToSdCard");
+                IpcResponse::success()
             }
 
             _ => {

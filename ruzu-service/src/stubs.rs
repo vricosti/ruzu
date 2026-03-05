@@ -40,17 +40,52 @@ macro_rules! stub_service {
 
 stub_service!(FatalService, "fatal:u");
 stub_service!(PrepoService, "prepo:a");
+stub_service!(PrepoService2, "prepo:a2");
 stub_service!(CapsService, "caps:su");
+stub_service!(CapsScService, "caps:sc");
+stub_service!(CapsSSService, "caps:ss");
 stub_service!(NsService, "ns:am2");
+stub_service!(NsEcService, "ns:ec");
+stub_service!(NsSuService, "ns:su");
 stub_service!(BcatService, "bcat:a");
+stub_service!(BcatMService, "bcat:m");
 stub_service!(AocService, "aoc:u");
 stub_service!(SplService, "spl:");
 stub_service!(MiiService, "mii:e");
 stub_service!(ErptService, "erpt:c");
+stub_service!(ErptRService, "erpt:r");
 stub_service!(EupldService, "eupld:c");
+stub_service!(EupldRService, "eupld:r");
 stub_service!(PmService, "pm:shell");
+stub_service!(PmInfoService, "pm:info");
+stub_service!(PmDmntService, "pm:dmnt");
 stub_service!(LdrService, "ldr:ro");
+stub_service!(LdrShellService, "ldr:shel");
+stub_service!(LdrDmntService, "ldr:dmnt");
 stub_service!(GlueService, "glue:u");
+stub_service!(BtService, "bt");
+stub_service!(BtDrvService, "btdrv");
+stub_service!(BtmService, "btm");
+stub_service!(BtmDbgService, "btm:dbg");
+stub_service!(NfcService, "nfc:user");
+stub_service!(NfpService, "nfp:user");
+stub_service!(PscmService, "psc:m");
+stub_service!(PscCService, "psc:c");
+stub_service!(LblService, "lbl");
+stub_service!(NimService, "nim");
+stub_service!(NimEcaService, "nim:eca");
+stub_service!(NimShpService, "nim:shp");
+stub_service!(PtmService, "ptm");
+stub_service!(TsService, "ts");
+stub_service!(PcvService, "pcv");
+stub_service!(FgmService, "fgm:0");
+stub_service!(ClkrstService, "clkrst");
+stub_service!(PdmService, "pdm:ntfy");
+stub_service!(PdmQryService, "pdm:qry");
+stub_service!(OlscService, "olsc:u");
+stub_service!(CapsAlService, "caps:al");
+stub_service!(NgctService, "ngct:u");
+stub_service!(NtcService, "ntc");
 
 #[cfg(test)]
 mod tests {
@@ -102,4 +137,7 @@ mod tests {
     test_stub!(test_pm_stub, PmService);
     test_stub!(test_ldr_stub, LdrService);
     test_stub!(test_glue_stub, GlueService);
+    test_stub!(test_lbl_stub, LblService);
+    test_stub!(test_nim_stub, NimService);
+    test_stub!(test_olsc_stub, OlscService);
 }
