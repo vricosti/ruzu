@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use log::info;
 use common::{error, ResultCode, VAddr};
+use log::info;
 
 use crate::kernel::KernelCore;
 

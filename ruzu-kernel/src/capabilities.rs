@@ -57,19 +57,19 @@ fn convert_virtual_core_mask_to_physical(mut v_core_mask: u64) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 enum CapabilityType {
-    CorePriority  = (1 << 3) - 1,   // 0x07
-    SyscallMask   = (1 << 4) - 1,   // 0x0F
-    MapRange      = (1 << 6) - 1,   // 0x3F
-    MapIoPage     = (1 << 7) - 1,   // 0x7F
-    MapRegion     = (1 << 10) - 1,  // 0x3FF
-    InterruptPair = (1 << 11) - 1,  // 0x7FF
-    ProgramType   = (1 << 13) - 1,  // 0x1FFF
-    KernelVersion = (1 << 14) - 1,  // 0x3FFF
-    HandleTable   = (1 << 15) - 1,  // 0x7FFF
-    DebugFlags    = (1 << 16) - 1,  // 0xFFFF
+    CorePriority = (1 << 3) - 1,   // 0x07
+    SyscallMask = (1 << 4) - 1,    // 0x0F
+    MapRange = (1 << 6) - 1,       // 0x3F
+    MapIoPage = (1 << 7) - 1,      // 0x7F
+    MapRegion = (1 << 10) - 1,     // 0x3FF
+    InterruptPair = (1 << 11) - 1, // 0x7FF
+    ProgramType = (1 << 13) - 1,   // 0x1FFF
+    KernelVersion = (1 << 14) - 1, // 0x3FFF
+    HandleTable = (1 << 15) - 1,   // 0x7FFF
+    DebugFlags = (1 << 16) - 1,    // 0xFFFF
 
-    Invalid       = 0,
-    Padding       = 0xFFFF_FFFF,
+    Invalid = 0,
+    Padding = 0xFFFF_FFFF,
 }
 
 /// Determine the capability type from a raw value.
@@ -97,8 +97,7 @@ fn get_capability_flag(cap_type: CapabilityType) -> u32 {
 }
 
 /// Flags for capabilities that can only be set once.
-const INITIALIZE_ONCE_FLAGS: u32 =
-    get_capability_flag_const(CapabilityType::CorePriority)
+const INITIALIZE_ONCE_FLAGS: u32 = get_capability_flag_const(CapabilityType::CorePriority)
     | get_capability_flag_const(CapabilityType::ProgramType)
     | get_capability_flag_const(CapabilityType::KernelVersion)
     | get_capability_flag_const(CapabilityType::HandleTable)
@@ -306,7 +305,11 @@ impl KCapabilities {
         Ok(())
     }
 
-    fn set_syscall_mask_capability(&mut self, cap: u32, set_svc: &mut u32) -> Result<(), ResultCode> {
+    fn set_syscall_mask_capability(
+        &mut self,
+        cap: u32,
+        set_svc: &mut u32,
+    ) -> Result<(), ResultCode> {
         let mask = extract_bits(cap, 5, 24);
         let index = extract_bits(cap, 29, 3);
 
@@ -396,7 +399,12 @@ impl KCapabilities {
         Ok(())
     }
 
-    fn set_capability(&mut self, cap: u32, set_flags: &mut u32, set_svc: &mut u32) -> Result<(), ResultCode> {
+    fn set_capability(
+        &mut self,
+        cap: u32,
+        set_flags: &mut u32,
+        set_svc: &mut u32,
+    ) -> Result<(), ResultCode> {
         let cap_type = get_capability_type(cap);
 
         if cap_type == CapabilityType::Invalid {
@@ -526,7 +534,10 @@ mod tests {
         // Hmm, the pattern is: (!v & (v+1)) - 1
         // For CorePriority (type = 7): the raw value must have lowest bits ...0111
         // (!0b0111 & 0b1000) - 1 = (0b1000) - 1 = 0b0111 = 7
-        assert_eq!(get_capability_type(core_prio_cap), CapabilityType::CorePriority);
+        assert_eq!(
+            get_capability_type(core_prio_cap),
+            CapabilityType::CorePriority
+        );
     }
 
     #[test]
@@ -537,7 +548,10 @@ mod tests {
         assert_ne!(caps.priority_mask, 0);
         // Kernel priorities (0-3) should be excluded.
         assert_eq!(caps.priority_mask & 0xF, 0);
-        assert_eq!(caps.intended_kernel_major_version(), SUPPORTED_KERNEL_MAJOR_VERSION);
+        assert_eq!(
+            caps.intended_kernel_major_version(),
+            SUPPORTED_KERNEL_MAJOR_VERSION
+        );
     }
 
     #[test]

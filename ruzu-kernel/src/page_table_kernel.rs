@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 
 use crate::address_space_info::{self, AddressSpaceType};
 use crate::memory_block::{
-    KMemoryAttribute, KMemoryBlock, KMemoryInfo, KMemoryPermission, KMemoryState,
-    PAGE_SIZE, PAGE_SIZE_U64,
+    KMemoryAttribute, KMemoryBlock, KMemoryInfo, KMemoryPermission, KMemoryState, PAGE_SIZE,
+    PAGE_SIZE_U64,
 };
 
 /// Errors from kernel page table operations.
@@ -153,12 +153,18 @@ impl KPageTable {
 
         match width {
             32 => {
-                let map_small_start = address_space_info::get_address_space_start(32, AddressSpaceType::MapSmall);
-                let map_small_size = address_space_info::get_address_space_size(32, AddressSpaceType::MapSmall);
-                let map_large_start = address_space_info::get_address_space_start(32, AddressSpaceType::MapLarge);
-                let map_large_size = address_space_info::get_address_space_size(32, AddressSpaceType::MapLarge);
-                let alias_size = address_space_info::get_address_space_size(32, AddressSpaceType::Alias);
-                let heap_size = address_space_info::get_address_space_size(32, AddressSpaceType::Heap);
+                let map_small_start =
+                    address_space_info::get_address_space_start(32, AddressSpaceType::MapSmall);
+                let map_small_size =
+                    address_space_info::get_address_space_size(32, AddressSpaceType::MapSmall);
+                let map_large_start =
+                    address_space_info::get_address_space_start(32, AddressSpaceType::MapLarge);
+                let map_large_size =
+                    address_space_info::get_address_space_size(32, AddressSpaceType::MapLarge);
+                let alias_size =
+                    address_space_info::get_address_space_size(32, AddressSpaceType::Alias);
+                let heap_size =
+                    address_space_info::get_address_space_size(32, AddressSpaceType::Heap);
 
                 self.address_space_start = 0;
                 self.address_space_end = 1u64 << 32;
@@ -175,12 +181,18 @@ impl KPageTable {
                 self.kernel_map_region_end = map_large_start + map_large_size;
             }
             36 => {
-                let map_small_start = address_space_info::get_address_space_start(36, AddressSpaceType::MapSmall);
-                let map_small_size = address_space_info::get_address_space_size(36, AddressSpaceType::MapSmall);
-                let map_large_start = address_space_info::get_address_space_start(36, AddressSpaceType::MapLarge);
-                let map_large_size = address_space_info::get_address_space_size(36, AddressSpaceType::MapLarge);
-                let alias_size = address_space_info::get_address_space_size(36, AddressSpaceType::Alias);
-                let heap_size = address_space_info::get_address_space_size(36, AddressSpaceType::Heap);
+                let map_small_start =
+                    address_space_info::get_address_space_start(36, AddressSpaceType::MapSmall);
+                let map_small_size =
+                    address_space_info::get_address_space_size(36, AddressSpaceType::MapSmall);
+                let map_large_start =
+                    address_space_info::get_address_space_start(36, AddressSpaceType::MapLarge);
+                let map_large_size =
+                    address_space_info::get_address_space_size(36, AddressSpaceType::MapLarge);
+                let alias_size =
+                    address_space_info::get_address_space_size(36, AddressSpaceType::Alias);
+                let heap_size =
+                    address_space_info::get_address_space_size(36, AddressSpaceType::Heap);
 
                 self.address_space_start = 0;
                 self.address_space_end = 1u64 << 36;
@@ -197,12 +209,18 @@ impl KPageTable {
                 self.kernel_map_region_end = map_large_start + map_large_size;
             }
             39 => {
-                let map39_start = address_space_info::get_address_space_start(39, AddressSpaceType::Map39Bit);
-                let map39_size = address_space_info::get_address_space_size(39, AddressSpaceType::Map39Bit);
-                let small_size = address_space_info::get_address_space_size(39, AddressSpaceType::MapSmall);
-                let heap_size = address_space_info::get_address_space_size(39, AddressSpaceType::Heap);
-                let alias_size = address_space_info::get_address_space_size(39, AddressSpaceType::Alias);
-                let stack_size = address_space_info::get_address_space_size(39, AddressSpaceType::Stack);
+                let map39_start =
+                    address_space_info::get_address_space_start(39, AddressSpaceType::Map39Bit);
+                let map39_size =
+                    address_space_info::get_address_space_size(39, AddressSpaceType::Map39Bit);
+                let small_size =
+                    address_space_info::get_address_space_size(39, AddressSpaceType::MapSmall);
+                let heap_size =
+                    address_space_info::get_address_space_size(39, AddressSpaceType::Heap);
+                let alias_size =
+                    address_space_info::get_address_space_size(39, AddressSpaceType::Alias);
+                let stack_size =
+                    address_space_info::get_address_space_size(39, AddressSpaceType::Stack);
 
                 self.address_space_start = 0;
                 self.address_space_end = 1u64 << 39;
@@ -268,30 +286,64 @@ impl KPageTable {
 
     // -- Region accessors --
 
-    pub fn address_space_start(&self) -> u64 { self.address_space_start }
-    pub fn address_space_end(&self) -> u64 { self.address_space_end }
-    pub fn address_space_width(&self) -> usize { self.address_space_width }
+    pub fn address_space_start(&self) -> u64 {
+        self.address_space_start
+    }
+    pub fn address_space_end(&self) -> u64 {
+        self.address_space_end
+    }
+    pub fn address_space_width(&self) -> usize {
+        self.address_space_width
+    }
 
-    pub fn code_region_start(&self) -> u64 { self.code_region_start }
-    pub fn code_region_end(&self) -> u64 { self.code_region_end }
+    pub fn code_region_start(&self) -> u64 {
+        self.code_region_start
+    }
+    pub fn code_region_end(&self) -> u64 {
+        self.code_region_end
+    }
 
-    pub fn alias_region_start(&self) -> u64 { self.alias_region_start }
-    pub fn alias_region_end(&self) -> u64 { self.alias_region_end }
+    pub fn alias_region_start(&self) -> u64 {
+        self.alias_region_start
+    }
+    pub fn alias_region_end(&self) -> u64 {
+        self.alias_region_end
+    }
 
-    pub fn heap_region_start(&self) -> u64 { self.heap_region_start }
-    pub fn heap_region_end(&self) -> u64 { self.heap_region_end }
-    pub fn current_heap_end(&self) -> u64 { self.current_heap_end }
+    pub fn heap_region_start(&self) -> u64 {
+        self.heap_region_start
+    }
+    pub fn heap_region_end(&self) -> u64 {
+        self.heap_region_end
+    }
+    pub fn current_heap_end(&self) -> u64 {
+        self.current_heap_end
+    }
 
-    pub fn stack_region_start(&self) -> u64 { self.stack_region_start }
-    pub fn stack_region_end(&self) -> u64 { self.stack_region_end }
+    pub fn stack_region_start(&self) -> u64 {
+        self.stack_region_start
+    }
+    pub fn stack_region_end(&self) -> u64 {
+        self.stack_region_end
+    }
 
-    pub fn kernel_map_region_start(&self) -> u64 { self.kernel_map_region_start }
-    pub fn kernel_map_region_end(&self) -> u64 { self.kernel_map_region_end }
+    pub fn kernel_map_region_start(&self) -> u64 {
+        self.kernel_map_region_start
+    }
+    pub fn kernel_map_region_end(&self) -> u64 {
+        self.kernel_map_region_end
+    }
 
-    pub fn is_initialized(&self) -> bool { self.is_initialized }
+    pub fn is_initialized(&self) -> bool {
+        self.is_initialized
+    }
 
-    pub fn allocate_option(&self) -> u32 { self.allocate_option }
-    pub fn set_allocate_option(&mut self, opt: u32) { self.allocate_option = opt; }
+    pub fn allocate_option(&self) -> u32 {
+        self.allocate_option
+    }
+    pub fn set_allocate_option(&mut self, opt: u32) {
+        self.allocate_option = opt;
+    }
 
     // -- Memory block operations --
 
@@ -366,12 +418,15 @@ impl KPageTable {
         self.validate_range(addr, size)?;
 
         // Find the block and verify state.
-        let block = self.find_block(addr)
+        let block = self
+            .find_block(addr)
             .ok_or(PageTableError::NotMapped(addr))?;
 
         let state = block.state;
-        if state != KMemoryState::CODE && state != KMemoryState::CODE_DATA
-            && state != KMemoryState::ALIAS_CODE && state != KMemoryState::ALIAS_CODE_DATA
+        if state != KMemoryState::CODE
+            && state != KMemoryState::CODE_DATA
+            && state != KMemoryState::ALIAS_CODE
+            && state != KMemoryState::ALIAS_CODE_DATA
         {
             return Err(PageTableError::InvalidState {
                 addr,
@@ -382,9 +437,17 @@ impl KPageTable {
 
         // Determine the new state based on permission.
         let new_state = if perm.contains(KMemoryPermission::USER_EXECUTE) {
-            if state == KMemoryState::ALIAS_CODE_DATA { KMemoryState::ALIAS_CODE } else { KMemoryState::CODE }
+            if state == KMemoryState::ALIAS_CODE_DATA {
+                KMemoryState::ALIAS_CODE
+            } else {
+                KMemoryState::CODE
+            }
         } else {
-            if state == KMemoryState::ALIAS_CODE { KMemoryState::ALIAS_CODE_DATA } else { KMemoryState::CODE_DATA }
+            if state == KMemoryState::ALIAS_CODE {
+                KMemoryState::ALIAS_CODE_DATA
+            } else {
+                KMemoryState::CODE_DATA
+            }
         };
 
         self.set_memory_state(addr, size, new_state, perm, KMemoryAttribute::NONE)
@@ -429,11 +492,7 @@ impl KPageTable {
     }
 
     /// Map a stack region.
-    pub fn map_stack(
-        &mut self,
-        addr: u64,
-        size: u64,
-    ) -> PageTableResult<()> {
+    pub fn map_stack(&mut self, addr: u64, size: u64) -> PageTableResult<()> {
         self.validate_range(addr, size)?;
         self.set_memory_state(
             addr,
@@ -445,11 +504,7 @@ impl KPageTable {
     }
 
     /// Map a thread local storage page.
-    pub fn map_thread_local(
-        &mut self,
-        addr: u64,
-        size: u64,
-    ) -> PageTableResult<()> {
+    pub fn map_thread_local(&mut self, addr: u64, size: u64) -> PageTableResult<()> {
         self.validate_range(addr, size)?;
         self.set_memory_state(
             addr,
@@ -478,11 +533,7 @@ impl KPageTable {
     }
 
     /// Unmap shared memory.
-    pub fn unmap_shared_memory(
-        &mut self,
-        addr: u64,
-        size: u64,
-    ) -> PageTableResult<()> {
+    pub fn unmap_shared_memory(&mut self, addr: u64, size: u64) -> PageTableResult<()> {
         self.validate_range(addr, size)?;
         self.set_memory_state(
             addr,
@@ -556,7 +607,8 @@ impl KPageTable {
         if size % PAGE_SIZE_U64 != 0 {
             return Err(PageTableError::InvalidSize(size));
         }
-        let end = addr.checked_add(size)
+        let end = addr
+            .checked_add(size)
             .ok_or(PageTableError::InvalidAddress(addr))?;
         if end > self.address_space_end {
             return Err(PageTableError::InvalidAddress(addr));
@@ -595,13 +647,16 @@ impl KPageTable {
 
         // If no blocks were found, the region is implicitly free.
         if affected.is_empty() {
-            self.blocks.insert(addr, KMemoryBlock::new(
+            self.blocks.insert(
                 addr,
-                (size / PAGE_SIZE_U64) as usize,
-                new_state,
-                new_perm,
-                new_attr,
-            ));
+                KMemoryBlock::new(
+                    addr,
+                    (size / PAGE_SIZE_U64) as usize,
+                    new_state,
+                    new_perm,
+                    new_attr,
+                ),
+            );
             return Ok(());
         }
 
@@ -609,35 +664,38 @@ impl KPageTable {
         let first = &affected[0];
         if first.address < addr {
             let pre_pages = ((addr - first.address) / PAGE_SIZE_U64) as usize;
-            self.blocks.insert(first.address, KMemoryBlock::new(
+            self.blocks.insert(
                 first.address,
-                pre_pages,
-                first.state,
-                first.permission,
-                first.attribute,
-            ));
+                KMemoryBlock::new(
+                    first.address,
+                    pre_pages,
+                    first.state,
+                    first.permission,
+                    first.attribute,
+                ),
+            );
         }
 
         // Insert the new block for [addr, end).
-        self.blocks.insert(addr, KMemoryBlock::new(
+        self.blocks.insert(
             addr,
-            (size / PAGE_SIZE_U64) as usize,
-            new_state,
-            new_perm,
-            new_attr,
-        ));
+            KMemoryBlock::new(
+                addr,
+                (size / PAGE_SIZE_U64) as usize,
+                new_state,
+                new_perm,
+                new_attr,
+            ),
+        );
 
         // Re-insert any portion of the last block that falls after end.
         let last = &affected[affected.len() - 1];
         if last.end_address() > end {
             let post_pages = ((last.end_address() - end) / PAGE_SIZE_U64) as usize;
-            self.blocks.insert(end, KMemoryBlock::new(
+            self.blocks.insert(
                 end,
-                post_pages,
-                last.state,
-                last.permission,
-                last.attribute,
-            ));
+                KMemoryBlock::new(end, post_pages, last.state, last.permission, last.attribute),
+            );
         }
 
         Ok(())
@@ -717,7 +775,8 @@ mod tests {
             0x8000000,
             0x1000,
             0x8000000,
-        ).unwrap();
+        )
+        .unwrap();
         pt
     }
 
@@ -808,11 +867,8 @@ mod tests {
         pt.map_code_memory(addr, addr, PAGE_SIZE_U64).unwrap();
 
         // Change to CodeData (read-write, no execute)
-        pt.set_process_memory_permission(
-            addr,
-            PAGE_SIZE_U64,
-            KMemoryPermission::USER_READ_WRITE,
-        ).unwrap();
+        pt.set_process_memory_permission(addr, PAGE_SIZE_U64, KMemoryPermission::USER_READ_WRITE)
+            .unwrap();
 
         let info = pt.query_memory(addr);
         assert_eq!(info.state, KMemoryState::CODE_DATA);
@@ -830,7 +886,8 @@ mod tests {
             KMemoryState::CODE,
             KMemoryPermission::USER_READ_EXECUTE,
             KMemoryAttribute::NONE,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Map a smaller region in the middle with different state
         pt.set_memory_state(
@@ -839,7 +896,8 @@ mod tests {
             KMemoryState::CODE_DATA,
             KMemoryPermission::USER_READ_WRITE,
             KMemoryAttribute::NONE,
-        ).unwrap();
+        )
+        .unwrap();
 
         // First page should still be CODE
         let info0 = pt.query_memory(base);

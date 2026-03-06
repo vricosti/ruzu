@@ -222,6 +222,8 @@ mod tests {
             b_buf_addrs: Vec::new(),
             x_bufs: Vec::new(),
             a_bufs: Vec::new(),
+            a_buf_data: Vec::new(),
+            b_buf_sizes: Vec::new(),
         }
     }
 
@@ -243,7 +245,7 @@ mod tests {
         let resp = svc.handle_request(0, &cmd);
         assert!(resp.result.is_success());
         assert_eq!(resp.data.len(), 2); // u64 as two u32s
-        // Timestamp should be reasonable (> year 2020)
+                                        // Timestamp should be reasonable (> year 2020)
         let ts = resp.data[0] as u64 | ((resp.data[1] as u64) << 32);
         assert!(ts > 1_577_836_800); // 2020-01-01
     }

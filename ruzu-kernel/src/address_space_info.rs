@@ -37,29 +37,102 @@ const GIB: u64 = 1024 * MIB;
 /// The address space info table, matching zuyu's AddressSpaceInfos array.
 static ADDRESS_SPACE_INFOS: &[AddressSpaceInfo] = &[
     // 32-bit address space
-    AddressSpaceInfo { bit_width: 32, address: 2 * MIB,       size: 1 * GIB - 2 * MIB,  region_type: AddressSpaceType::MapSmall },
-    AddressSpaceInfo { bit_width: 32, address: 1 * GIB,       size: 4 * GIB - 1 * GIB,  region_type: AddressSpaceType::MapLarge },
-    AddressSpaceInfo { bit_width: 32, address: SIZE_INVALID,   size: 1 * GIB,             region_type: AddressSpaceType::Alias },
-    AddressSpaceInfo { bit_width: 32, address: SIZE_INVALID,   size: 1 * GIB,             region_type: AddressSpaceType::Heap },
+    AddressSpaceInfo {
+        bit_width: 32,
+        address: 2 * MIB,
+        size: 1 * GIB - 2 * MIB,
+        region_type: AddressSpaceType::MapSmall,
+    },
+    AddressSpaceInfo {
+        bit_width: 32,
+        address: 1 * GIB,
+        size: 4 * GIB - 1 * GIB,
+        region_type: AddressSpaceType::MapLarge,
+    },
+    AddressSpaceInfo {
+        bit_width: 32,
+        address: SIZE_INVALID,
+        size: 1 * GIB,
+        region_type: AddressSpaceType::Alias,
+    },
+    AddressSpaceInfo {
+        bit_width: 32,
+        address: SIZE_INVALID,
+        size: 1 * GIB,
+        region_type: AddressSpaceType::Heap,
+    },
     // 36-bit address space
-    AddressSpaceInfo { bit_width: 36, address: 128 * MIB,      size: 2 * GIB - 128 * MIB, region_type: AddressSpaceType::MapSmall },
-    AddressSpaceInfo { bit_width: 36, address: 2 * GIB,        size: 64 * GIB - 2 * GIB,  region_type: AddressSpaceType::MapLarge },
-    AddressSpaceInfo { bit_width: 36, address: SIZE_INVALID,    size: 8 * GIB,              region_type: AddressSpaceType::Heap },
-    AddressSpaceInfo { bit_width: 36, address: SIZE_INVALID,    size: 6 * GIB,              region_type: AddressSpaceType::Alias },
+    AddressSpaceInfo {
+        bit_width: 36,
+        address: 128 * MIB,
+        size: 2 * GIB - 128 * MIB,
+        region_type: AddressSpaceType::MapSmall,
+    },
+    AddressSpaceInfo {
+        bit_width: 36,
+        address: 2 * GIB,
+        size: 64 * GIB - 2 * GIB,
+        region_type: AddressSpaceType::MapLarge,
+    },
+    AddressSpaceInfo {
+        bit_width: 36,
+        address: SIZE_INVALID,
+        size: 8 * GIB,
+        region_type: AddressSpaceType::Heap,
+    },
+    AddressSpaceInfo {
+        bit_width: 36,
+        address: SIZE_INVALID,
+        size: 6 * GIB,
+        region_type: AddressSpaceType::Alias,
+    },
     // 39-bit address space
-    AddressSpaceInfo { bit_width: 39, address: 128 * MIB,      size: 512 * GIB - 128 * MIB, region_type: AddressSpaceType::Map39Bit },
-    AddressSpaceInfo { bit_width: 39, address: SIZE_INVALID,    size: 64 * GIB,               region_type: AddressSpaceType::MapSmall },
-    AddressSpaceInfo { bit_width: 39, address: SIZE_INVALID,    size: 8 * GIB,                region_type: AddressSpaceType::Heap },
-    AddressSpaceInfo { bit_width: 39, address: SIZE_INVALID,    size: 64 * GIB,               region_type: AddressSpaceType::Alias },
-    AddressSpaceInfo { bit_width: 39, address: SIZE_INVALID,    size: 2 * GIB,                region_type: AddressSpaceType::Stack },
+    AddressSpaceInfo {
+        bit_width: 39,
+        address: 128 * MIB,
+        size: 512 * GIB - 128 * MIB,
+        region_type: AddressSpaceType::Map39Bit,
+    },
+    AddressSpaceInfo {
+        bit_width: 39,
+        address: SIZE_INVALID,
+        size: 64 * GIB,
+        region_type: AddressSpaceType::MapSmall,
+    },
+    AddressSpaceInfo {
+        bit_width: 39,
+        address: SIZE_INVALID,
+        size: 8 * GIB,
+        region_type: AddressSpaceType::Heap,
+    },
+    AddressSpaceInfo {
+        bit_width: 39,
+        address: SIZE_INVALID,
+        size: 64 * GIB,
+        region_type: AddressSpaceType::Alias,
+    },
+    AddressSpaceInfo {
+        bit_width: 39,
+        address: SIZE_INVALID,
+        size: 2 * GIB,
+        region_type: AddressSpaceType::Stack,
+    },
 ];
 
 /// Look up the address space info entry for a given bit width and region type.
-fn get_address_space_info(width: usize, region_type: AddressSpaceType) -> &'static AddressSpaceInfo {
+fn get_address_space_info(
+    width: usize,
+    region_type: AddressSpaceType,
+) -> &'static AddressSpaceInfo {
     ADDRESS_SPACE_INFOS
         .iter()
         .find(|info| info.bit_width == width && info.region_type == region_type)
-        .unwrap_or_else(|| panic!("Could not find AddressSpaceInfo for width={}, type={:?}", width, region_type))
+        .unwrap_or_else(|| {
+            panic!(
+                "Could not find AddressSpaceInfo for width={}, type={:?}",
+                width, region_type
+            )
+        })
 }
 
 /// Get the start address for a given address space width and region type.

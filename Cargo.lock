@@ -101,6 +101,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio_core"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "core",
+ "log",
+ "parking_lot",
+ "ruzu-kernel",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -980,8 +991,10 @@ name = "ruzu-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "audio_core",
  "byteorder",
  "common",
+ "core",
  "log",
  "parking_lot",
  "ruzu-gpu",

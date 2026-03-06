@@ -97,13 +97,10 @@ impl Parcel {
         let data_size = u32::from_le_bytes(raw[0..4].try_into().unwrap_or([0; 4])) as usize;
         let data_offset = u32::from_le_bytes(raw[4..8].try_into().unwrap_or([0; 4])) as usize;
         let objects_size = u32::from_le_bytes(raw[8..12].try_into().unwrap_or([0; 4])) as usize;
-        let objects_offset =
-            u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0; 4])) as usize;
+        let objects_offset = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0; 4])) as usize;
 
         let data_end = data_offset.saturating_add(data_size).min(raw.len());
-        let objects_end = objects_offset
-            .saturating_add(objects_size)
-            .min(raw.len());
+        let objects_end = objects_offset.saturating_add(objects_size).min(raw.len());
 
         let data = if data_offset <= raw.len() {
             raw[data_offset..data_end].to_vec()

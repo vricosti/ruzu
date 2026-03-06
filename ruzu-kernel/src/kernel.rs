@@ -28,7 +28,12 @@ pub struct IpcHandlerResult {
 /// Trait for handling IPC requests. Bridges the kernel SVC layer to the service framework
 /// without creating a circular dependency between `ruzu-kernel` and `ruzu-service`.
 pub trait IpcHandler: Send + Sync {
-    fn handle_ipc(&self, service_name: &str, tls_data: &[u8]) -> IpcHandlerResult;
+    fn handle_ipc(
+        &self,
+        service_name: &str,
+        tls_data: &[u8],
+        guest_read: &dyn Fn(u64, usize) -> Vec<u8>,
+    ) -> IpcHandlerResult;
 }
 
 /// KernelCore: orchestrates all kernel subsystems.
@@ -91,7 +96,16 @@ impl KernelCore {
         data_offset: u32,
     ) -> anyhow::Result<VAddr> {
         let base = NRO_BASE_ADDRESS;
-        self.load_module(base, text, rodata, data, bss_size, text_offset, rodata_offset, data_offset)?;
+        self.load_module(
+            base,
+            text,
+            rodata,
+            data,
+            bss_size,
+            text_offset,
+            rodata_offset,
+            data_offset,
+        )?;
         Ok(base)
     }
 
@@ -129,7 +143,10 @@ impl KernelCore {
             text_offset as u64 + text_size,
             rodata_offset as u64 + rodata_size,
             data_offset as u64 + data_size_aligned,
-        ].into_iter().max().unwrap_or(0);
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
         let total_size = common::align_up(image_end, common::PAGE_SIZE_U64);
 
         // 1. Map entire image as RW Code (like zuyu's MapPageGroup + WriteBlock)
@@ -141,9 +158,15 @@ impl KernelCore {
         )?;
 
         // 2. Write all segments
-        process.memory.write_bytes(base + text_offset as u64, text)?;
-        process.memory.write_bytes(base + rodata_offset as u64, rodata)?;
-        process.memory.write_bytes(base + data_offset as u64, data)?;
+        process
+            .memory
+            .write_bytes(base + text_offset as u64, text)?;
+        process
+            .memory
+            .write_bytes(base + rodata_offset as u64, rodata)?;
+        process
+            .memory
+            .write_bytes(base + data_offset as u64, data)?;
 
         // 3. Reprotect each segment (splits the single region as needed)
         process.memory.set_permissions(
@@ -232,11 +255,12 @@ impl KernelCore {
             if thread.state != ThreadState::Waiting {
                 continue;
             }
-            let wake_idx = if let WaitReason::Synchronization { ref handles, .. } = thread.wait_reason {
-                handles.iter().position(|&h| h == handle)
-            } else {
-                None
-            };
+            let wake_idx =
+                if let WaitReason::Synchronization { ref handles, .. } = thread.wait_reason {
+                    handles.iter().position(|&h| h == handle)
+                } else {
+                    None
+                };
             if let Some(idx) = wake_idx {
                 thread.wake(ResultCode::SUCCESS.raw(), idx as i32);
             }

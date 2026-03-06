@@ -110,6 +110,10 @@ pub struct IpcCommand {
     pub x_bufs: Vec<XBufferDescriptor>,
     /// Parsed A-type (send) input buffer descriptors.
     pub a_bufs: Vec<ABufferDescriptor>,
+    /// Bytes read from each A-type input buffer.
+    pub a_buf_data: Vec<Vec<u8>>,
+    /// Sizes of each B-type output buffer.
+    pub b_buf_sizes: Vec<u64>,
 }
 
 // ── Outgoing IPC response ────────────────────────────────────────────────────
@@ -210,7 +214,7 @@ pub fn parse_ipc_command(tls_data: &[u8]) -> Result<IpcCommand, anyhow::Error> {
     // ── HIPC header: word 1 ──────────────────────────────────────────────
     let word1 = cur.read_u32::<LittleEndian>()?;
     let data_size = word1 & 0x3FF; // bits [9:0]
-    // bits [13:10]: C descriptor flags (unused)
+                                   // bits [13:10]: C descriptor flags (unused)
     let has_handle_descriptor = (word1 & (1 << 31)) != 0;
 
     // ── Handle descriptor (optional) ─────────────────────────────────────
@@ -282,12 +286,15 @@ pub fn parse_ipc_command(tls_data: &[u8]) -> Result<IpcCommand, anyhow::Error> {
     // Format (from Ryujinx/libnx): word0=addr[31:0], word1=size[31:0],
     // word2 bits[31:28]=addr[35:32], bits[27:24]=size[35:32], bits[1:0]=flags.
     let mut b_buf_addrs: Vec<u64> = Vec::new();
+    let mut b_buf_sizes: Vec<u64> = Vec::new();
     for _ in 0..num_b_bufs {
         let word0 = cur.read_u32::<LittleEndian>()?;
-        let _word1 = cur.read_u32::<LittleEndian>()?;
+        let word1 = cur.read_u32::<LittleEndian>()?;
         let word2 = cur.read_u32::<LittleEndian>()?;
         let addr = (word0 as u64) | (((word2 >> 28) & 0xF) as u64) << 32;
+        let size = (word1 as u64) | (((word2 >> 24) & 0xF) as u64) << 32;
         b_buf_addrs.push(addr);
+        b_buf_sizes.push(size);
     }
 
     // ── Align to 16 bytes for CMIF payload ───────────────────────────────
@@ -303,7 +310,9 @@ pub fn parse_ipc_command(tls_data: &[u8]) -> Result<IpcCommand, anyhow::Error> {
 
     // ── Remaining raw data ───────────────────────────────────────────────
     let raw_start = cur.position() as usize;
-    let raw_end = tls_data.len().min(raw_start + (data_size as usize).saturating_sub(4) * 4);
+    let raw_end = tls_data
+        .len()
+        .min(raw_start + (data_size as usize).saturating_sub(4) * 4);
     let mut raw_data = Vec::new();
     let mut raw_cur = Cursor::new(&tls_data[raw_start..raw_end]);
     while raw_cur.position() < (raw_end - raw_start) as u64 {
@@ -329,6 +338,8 @@ pub fn parse_ipc_command(tls_data: &[u8]) -> Result<IpcCommand, anyhow::Error> {
         b_buf_addrs,
         x_bufs,
         a_bufs,
+        a_buf_data: Vec::new(),
+        b_buf_sizes,
     })
 }
 

@@ -103,10 +103,7 @@ impl ServiceHandler for NvdrvService {
                 } else {
                     &[]
                 };
-                let input: Vec<u8> = input_words
-                    .iter()
-                    .flat_map(|w| w.to_le_bytes())
-                    .collect();
+                let input: Vec<u8> = input_words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
                 let mut output = vec![0u8; 256];
 
@@ -207,6 +204,8 @@ mod tests {
             b_buf_addrs: Vec::new(),
             x_bufs: Vec::new(),
             a_bufs: Vec::new(),
+            a_buf_data: Vec::new(),
+            b_buf_sizes: Vec::new(),
         }
     }
 

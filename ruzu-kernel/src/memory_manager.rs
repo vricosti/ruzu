@@ -15,8 +15,8 @@ use memmap2::MmapMut;
 use thiserror::Error;
 
 use common::{
-    VAddr, ADDRESS_SPACE_PAGES, ADDRESS_SPACE_SIZE, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE,
-    is_page_aligned,
+    is_page_aligned, VAddr, ADDRESS_SPACE_PAGES, ADDRESS_SPACE_SIZE, PAGE_MASK, PAGE_SHIFT,
+    PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,7 +94,11 @@ impl std::fmt::Display for MemoryPermission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let r = if self.contains(Self::READ) { 'R' } else { '-' };
         let w = if self.contains(Self::WRITE) { 'W' } else { '-' };
-        let x = if self.contains(Self::EXECUTE) { 'X' } else { '-' };
+        let x = if self.contains(Self::EXECUTE) {
+            'X'
+        } else {
+            '-'
+        };
         write!(f, "{r}{w}{x}")
     }
 }
@@ -493,8 +497,7 @@ impl MemoryManager {
             let chunk = remaining.min(PAGE_SIZE - page_offset);
 
             let off = self.resolve_write(current_addr, chunk)?;
-            self.backing[off..off + chunk]
-                .copy_from_slice(&data[src_offset..src_offset + chunk]);
+            self.backing[off..off + chunk].copy_from_slice(&data[src_offset..src_offset + chunk]);
 
             current_addr += chunk as u64;
             src_offset += chunk;
@@ -562,7 +565,9 @@ impl MemoryManager {
             .next_back()
             .ok_or(MemoryError::NotMapped(vaddr))?;
 
-        let region = self.regions.get(&region_base)
+        let region = self
+            .regions
+            .get(&region_base)
             .ok_or(MemoryError::NotMapped(vaddr))?;
         let region_end = region_base + region.size;
 
@@ -576,11 +581,12 @@ impl MemoryManager {
         let old_name = region.name.clone();
 
         // Determine new state (zuyu: Code+RW → CodeData, Code+RX → Code)
-        let new_state = if new_perm.contains(MemoryPermission::WRITE) && old_state == MemoryState::Code {
-            MemoryState::CodeData
-        } else {
-            old_state
-        };
+        let new_state =
+            if new_perm.contains(MemoryPermission::WRITE) && old_state == MemoryState::Code {
+                MemoryState::CodeData
+            } else {
+                old_state
+            };
 
         // If the range is the exact region, just update in place.
         if vaddr == region_base && size == region.size {
@@ -594,33 +600,42 @@ impl MemoryManager {
 
             // 1) Before-part: [region_base, vaddr) — keeps old permissions
             if vaddr > region_base {
-                self.regions.insert(region_base, MemoryRegion {
-                    base_addr: region_base,
-                    size: vaddr - region_base,
-                    permission: old_perm,
-                    state: old_state,
-                    name: old_name.clone(),
-                });
+                self.regions.insert(
+                    region_base,
+                    MemoryRegion {
+                        base_addr: region_base,
+                        size: vaddr - region_base,
+                        permission: old_perm,
+                        state: old_state,
+                        name: old_name.clone(),
+                    },
+                );
             }
 
             // 2) Target part: [vaddr, end) — gets new permissions
-            self.regions.insert(vaddr, MemoryRegion {
-                base_addr: vaddr,
-                size,
-                permission: new_perm,
-                state: new_state,
-                name: old_name.clone(),
-            });
+            self.regions.insert(
+                vaddr,
+                MemoryRegion {
+                    base_addr: vaddr,
+                    size,
+                    permission: new_perm,
+                    state: new_state,
+                    name: old_name.clone(),
+                },
+            );
 
             // 3) After-part: [end, region_end) — keeps old permissions
             if end < region_end {
-                self.regions.insert(end, MemoryRegion {
-                    base_addr: end,
-                    size: region_end - end,
-                    permission: old_perm,
-                    state: old_state,
-                    name: old_name,
-                });
+                self.regions.insert(
+                    end,
+                    MemoryRegion {
+                        base_addr: end,
+                        size: region_end - end,
+                        permission: old_perm,
+                        state: old_state,
+                        name: old_name,
+                    },
+                );
             }
 
             let _ = old_size; // suppress unused warning
@@ -690,7 +705,9 @@ impl MemoryManager {
         if !is_page_aligned(size) {
             return Err(MemoryError::MisalignedSize(size));
         }
-        let end = vaddr.checked_add(size).ok_or(MemoryError::OutOfRange(vaddr))?;
+        let end = vaddr
+            .checked_add(size)
+            .ok_or(MemoryError::OutOfRange(vaddr))?;
         if end > ADDRESS_SPACE_SIZE {
             return Err(MemoryError::OutOfRange(vaddr));
         }
@@ -861,15 +878,23 @@ mod tests {
         let mut mm = make_mm();
         let base: VAddr = 0x8_0000;
         let size: u64 = PAGE_SIZE_U64 * 4;
-        mm.map(base, size, MemoryPermission::READ_WRITE, MemoryState::Normal)
-            .expect("map should succeed");
+        mm.map(
+            base,
+            size,
+            MemoryPermission::READ_WRITE,
+            MemoryState::Normal,
+        )
+        .expect("map should succeed");
 
         // Verify all four pages are mapped.
         for i in 0..4 {
             let addr = base + (i as u64) * PAGE_SIZE_U64;
             let page_idx = (addr >> PAGE_SHIFT) as usize;
             assert!(mm.page_table[page_idx].is_mapped());
-            assert_eq!(mm.page_table[page_idx].permission, MemoryPermission::READ_WRITE);
+            assert_eq!(
+                mm.page_table[page_idx].permission,
+                MemoryPermission::READ_WRITE
+            );
         }
     }
 
@@ -878,8 +903,13 @@ mod tests {
         let mut mm = make_mm();
         let base: VAddr = 0x10_0000;
         let size: u64 = PAGE_SIZE_U64 * 4;
-        mm.map(base, size, MemoryPermission::READ_WRITE, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            size,
+            MemoryPermission::READ_WRITE,
+            MemoryState::Normal,
+        )
+        .unwrap();
 
         // Overlapping at the end.
         let result = mm.map(
@@ -896,8 +926,13 @@ mod tests {
         let mut mm = make_mm();
         let base: VAddr = 0x20_0000;
         let size: u64 = PAGE_SIZE_U64 * 2;
-        mm.map(base, size, MemoryPermission::READ_WRITE, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            size,
+            MemoryPermission::READ_WRITE,
+            MemoryState::Normal,
+        )
+        .unwrap();
         mm.unmap(base, size).expect("unmap should succeed");
 
         // Pages should no longer be mapped.
@@ -919,7 +954,12 @@ mod tests {
     #[test]
     fn test_misaligned_address() {
         let mut mm = make_mm();
-        let result = mm.map(0x1001, PAGE_SIZE_U64, MemoryPermission::READ, MemoryState::Code);
+        let result = mm.map(
+            0x1001,
+            PAGE_SIZE_U64,
+            MemoryPermission::READ,
+            MemoryState::Code,
+        );
         assert!(matches!(result, Err(MemoryError::MisalignedAddress(_))));
     }
 
@@ -956,8 +996,13 @@ mod tests {
     fn test_read_write_u8() {
         let mut mm = make_mm();
         let base: VAddr = 0x4_0000;
-        mm.map(base, PAGE_SIZE_U64, MemoryPermission::READ_WRITE, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            PAGE_SIZE_U64,
+            MemoryPermission::READ_WRITE,
+            MemoryState::Normal,
+        )
+        .unwrap();
 
         mm.write_u8(base, 0xAB).unwrap();
         assert_eq!(mm.read_u8(base).unwrap(), 0xAB);
@@ -967,8 +1012,13 @@ mod tests {
     fn test_read_write_u16() {
         let mut mm = make_mm();
         let base: VAddr = 0x5_0000;
-        mm.map(base, PAGE_SIZE_U64, MemoryPermission::READ_WRITE, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            PAGE_SIZE_U64,
+            MemoryPermission::READ_WRITE,
+            MemoryState::Normal,
+        )
+        .unwrap();
 
         mm.write_u16(base, 0xBEEF).unwrap();
         assert_eq!(mm.read_u16(base).unwrap(), 0xBEEF);
@@ -978,8 +1028,13 @@ mod tests {
     fn test_read_write_u32() {
         let mut mm = make_mm();
         let base: VAddr = 0x6_0000;
-        mm.map(base, PAGE_SIZE_U64, MemoryPermission::READ_WRITE, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            PAGE_SIZE_U64,
+            MemoryPermission::READ_WRITE,
+            MemoryState::Normal,
+        )
+        .unwrap();
 
         mm.write_u32(base + 4, 0xDEAD_BEEF).unwrap();
         assert_eq!(mm.read_u32(base + 4).unwrap(), 0xDEAD_BEEF);
@@ -989,8 +1044,13 @@ mod tests {
     fn test_read_write_u64() {
         let mut mm = make_mm();
         let base: VAddr = 0x7_0000;
-        mm.map(base, PAGE_SIZE_U64, MemoryPermission::READ_WRITE, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            PAGE_SIZE_U64,
+            MemoryPermission::READ_WRITE,
+            MemoryState::Normal,
+        )
+        .unwrap();
 
         let val: u64 = 0x0123_4567_89AB_CDEF;
         mm.write_u64(base, val).unwrap();
@@ -1003,8 +1063,13 @@ mod tests {
     fn test_read_write_bytes() {
         let mut mm = make_mm();
         let base: VAddr = 0xA_0000;
-        mm.map(base, PAGE_SIZE_U64, MemoryPermission::READ_WRITE, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            PAGE_SIZE_U64,
+            MemoryPermission::READ_WRITE,
+            MemoryState::Normal,
+        )
+        .unwrap();
 
         let data = b"Hello, Switch!";
         mm.write_bytes(base, data).unwrap();
@@ -1042,8 +1107,13 @@ mod tests {
         let mut mm = make_mm();
         let base: VAddr = 0xC_0000;
         // Map with write-only (no read).
-        mm.map(base, PAGE_SIZE_U64, MemoryPermission::WRITE, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            PAGE_SIZE_U64,
+            MemoryPermission::WRITE,
+            MemoryState::Normal,
+        )
+        .unwrap();
 
         let result = mm.read_u8(base);
         assert!(matches!(result, Err(MemoryError::PermissionDenied { .. })));
@@ -1054,8 +1124,13 @@ mod tests {
         let mut mm = make_mm();
         let base: VAddr = 0xD_0000;
         // Map with read-only.
-        mm.map(base, PAGE_SIZE_U64, MemoryPermission::READ, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            PAGE_SIZE_U64,
+            MemoryPermission::READ,
+            MemoryState::Normal,
+        )
+        .unwrap();
 
         let result = mm.write_u8(base, 0xFF);
         assert!(matches!(result, Err(MemoryError::PermissionDenied { .. })));
@@ -1082,8 +1157,13 @@ mod tests {
         let mut mm = make_mm();
         let base: VAddr = 0xE_0000;
         let size = PAGE_SIZE_U64 * 4;
-        mm.map(base, size, MemoryPermission::READ_EXECUTE, MemoryState::Code)
-            .unwrap();
+        mm.map(
+            base,
+            size,
+            MemoryPermission::READ_EXECUTE,
+            MemoryState::Code,
+        )
+        .unwrap();
 
         let info = mm.query_memory(base + PAGE_SIZE_U64);
         assert_eq!(info.base_addr, base);
@@ -1127,8 +1207,13 @@ mod tests {
     fn test_query_memory_before_first_region() {
         let mut mm = make_mm();
         let base: VAddr = 0x10_0000;
-        mm.map(base, PAGE_SIZE_U64, MemoryPermission::READ, MemoryState::Code)
-            .unwrap();
+        mm.map(
+            base,
+            PAGE_SIZE_U64,
+            MemoryPermission::READ,
+            MemoryState::Code,
+        )
+        .unwrap();
 
         let info = mm.query_memory(0x1000);
         assert_eq!(info.state, MemoryState::Unmapped);
@@ -1163,16 +1248,19 @@ mod tests {
     fn test_backing_offset() {
         let mut mm = make_mm();
         let base: VAddr = 0x8_0000;
-        mm.map(base, PAGE_SIZE_U64, MemoryPermission::READ_WRITE, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            PAGE_SIZE_U64,
+            MemoryPermission::READ_WRITE,
+            MemoryState::Normal,
+        )
+        .unwrap();
 
         let off = mm.backing_offset(base).expect("should have offset");
         // First mapping should start at offset 0 in the backing.
         assert_eq!(off, 0);
 
-        let off_mid = mm
-            .backing_offset(base + 0x100)
-            .expect("should have offset");
+        let off_mid = mm.backing_offset(base + 0x100).expect("should have offset");
         assert_eq!(off_mid, 0x100);
     }
 
@@ -1240,8 +1328,13 @@ mod tests {
         let base: VAddr = 0x10_0000;
         let size = PAGE_SIZE_U64 * 2;
 
-        mm.map(base, size, MemoryPermission::READ_WRITE, MemoryState::Normal)
-            .unwrap();
+        mm.map(
+            base,
+            size,
+            MemoryPermission::READ_WRITE,
+            MemoryState::Normal,
+        )
+        .unwrap();
         mm.write_u32(base, 0xAAAA_BBBB).unwrap();
         mm.unmap(base, size).unwrap();
 

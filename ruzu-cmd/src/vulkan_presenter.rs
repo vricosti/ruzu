@@ -289,9 +289,7 @@ impl VulkanPresenter {
                     )?;
                     return Ok(());
                 }
-                Err(e) => {
-                    return Err(VulkanError::PresentFailed(format!("Acquire image: {}", e)))
-                }
+                Err(e) => return Err(VulkanError::PresentFailed(format!("Acquire image: {}", e))),
             };
 
             let cmd = self.command_buffers[image_index as usize];
@@ -710,8 +708,7 @@ impl VulkanPresenter {
             )?;
 
             // Destroy old swapchain
-            self.swapchain_loader
-                .destroy_swapchain(old_swapchain, None);
+            self.swapchain_loader.destroy_swapchain(old_swapchain, None);
 
             self.swapchain = new_swapchain;
             self.swapchain_images = new_images;
@@ -728,12 +725,12 @@ impl VulkanPresenter {
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(self.swapchain_images.len() as u32);
 
-                self.command_buffers = self
-                    .device
-                    .allocate_command_buffers(&alloc_info)
-                    .map_err(|e| {
-                        VulkanError::SwapchainCreation(format!("Reallocate cmd bufs: {}", e))
-                    })?;
+                self.command_buffers =
+                    self.device
+                        .allocate_command_buffers(&alloc_info)
+                        .map_err(|e| {
+                            VulkanError::SwapchainCreation(format!("Reallocate cmd bufs: {}", e))
+                        })?;
             }
 
             info!(
@@ -781,10 +778,13 @@ impl VulkanPresenter {
                 .allocation_size(mem_reqs.size)
                 .memory_type_index(mem_type);
 
-            let memory = self.device.allocate_memory(&alloc_info, None).map_err(|e| {
-                self.device.destroy_buffer(buffer, None);
-                VulkanError::PresentFailed(format!("Allocate staging memory: {}", e))
-            })?;
+            let memory = self
+                .device
+                .allocate_memory(&alloc_info, None)
+                .map_err(|e| {
+                    self.device.destroy_buffer(buffer, None);
+                    VulkanError::PresentFailed(format!("Allocate staging memory: {}", e))
+                })?;
 
             self.device
                 .bind_buffer_memory(buffer, memory, 0)
@@ -814,11 +814,7 @@ impl VulkanPresenter {
     }
 
     /// Ensure the intermediate framebuffer image matches the given dimensions.
-    fn ensure_framebuffer_image(
-        &mut self,
-        width: u32,
-        height: u32,
-    ) -> Result<(), VulkanError> {
+    fn ensure_framebuffer_image(&mut self, width: u32, height: u32) -> Result<(), VulkanError> {
         if self.framebuffer_image != vk::Image::null()
             && self.fb_width == width
             && self.fb_height == height
@@ -867,10 +863,13 @@ impl VulkanPresenter {
                 .allocation_size(mem_reqs.size)
                 .memory_type_index(mem_type);
 
-            let memory = self.device.allocate_memory(&alloc_info, None).map_err(|e| {
-                self.device.destroy_image(image, None);
-                VulkanError::PresentFailed(format!("Allocate framebuffer memory: {}", e))
-            })?;
+            let memory = self
+                .device
+                .allocate_memory(&alloc_info, None)
+                .map_err(|e| {
+                    self.device.destroy_image(image, None);
+                    VulkanError::PresentFailed(format!("Allocate framebuffer memory: {}", e))
+                })?;
 
             self.device
                 .bind_image_memory(image, memory, 0)
@@ -1086,8 +1085,7 @@ impl Drop for VulkanPresenter {
                 .destroy_semaphore(self.render_finished_semaphore, None);
             self.device
                 .destroy_semaphore(self.image_available_semaphore, None);
-            self.device
-                .destroy_command_pool(self.command_pool, None);
+            self.device.destroy_command_pool(self.command_pool, None);
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
             self.device.destroy_device(None);
@@ -1145,7 +1143,7 @@ mod tests {
         assert_eq!(dst[1], 0); // G
         assert_eq!(dst[2], 255); // R
         assert_eq!(dst[3], 200); // A
-        // Pixel 1: R=10,G=20,B=30,A=40 -> B=30,G=20,R=10,A=40
+                                 // Pixel 1: R=10,G=20,B=30,A=40 -> B=30,G=20,R=10,A=40
         assert_eq!(dst[4], 30);
         assert_eq!(dst[5], 20);
         assert_eq!(dst[6], 10);

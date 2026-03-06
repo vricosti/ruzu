@@ -203,8 +203,7 @@ impl<T: Copy + Default> GuestMemory<T> {
             return;
         }
 
-        let bytes =
-            unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_size) };
+        let bytes = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_size) };
 
         if self.flags.contains(GuestMemoryFlags::SAFE) {
             memory.write_block(self.addr, bytes);

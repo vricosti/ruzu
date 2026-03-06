@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use log::debug;
 use common::error;
-use common::{ResultCode, VAddr, is_page_aligned};
+use common::{is_page_aligned, ResultCode, VAddr};
+use log::debug;
 
 use crate::kernel::KernelCore;
 use crate::memory_manager::MemoryPermission;
@@ -80,12 +80,7 @@ pub fn svc_set_memory_attribute(
 /// Creates a mirror mapping: maps dst as Stack with RW, copies data from src.
 /// Used by games to set up thread stacks.
 /// Returns: X0 = result
-pub fn svc_map_memory(
-    kernel: &mut KernelCore,
-    dst: VAddr,
-    src: VAddr,
-    size: u64,
-) -> ResultCode {
+pub fn svc_map_memory(kernel: &mut KernelCore, dst: VAddr, src: VAddr, size: u64) -> ResultCode {
     debug!(
         "MapMemory: dst=0x{:X}, src=0x{:X}, size=0x{:X}",
         dst, src, size
@@ -131,12 +126,7 @@ pub fn svc_map_memory(
 /// X0 = dst_addr, X1 = src_addr, X2 = size
 /// Copies data back from dst to src, then unmaps dst.
 /// Returns: X0 = result
-pub fn svc_unmap_memory(
-    kernel: &mut KernelCore,
-    dst: VAddr,
-    src: VAddr,
-    size: u64,
-) -> ResultCode {
+pub fn svc_unmap_memory(kernel: &mut KernelCore, dst: VAddr, src: VAddr, size: u64) -> ResultCode {
     debug!(
         "UnmapMemory: dst=0x{:X}, src=0x{:X}, size=0x{:X}",
         dst, src, size

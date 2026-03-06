@@ -152,7 +152,13 @@ impl Memory {
             "non-page aligned base: {:#018X}",
             base
         );
-        self.map_pages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, 0, PageType::Unmapped);
+        self.map_pages(
+            page_table,
+            base / YUZU_PAGESIZE,
+            size / YUZU_PAGESIZE,
+            0,
+            PageType::Unmapped,
+        );
     }
 
     /// Protects a region of the emulated process address space with the new permissions.
@@ -177,9 +183,7 @@ impl Memory {
             return false;
         }
         let (pointer, ptype) = page_table.pointers[page].pointer_type();
-        pointer != 0
-            || ptype == PageType::RasterizerCachedMemory
-            || ptype == PageType::DebugMemory
+        pointer != 0 || ptype == PageType::RasterizerCachedMemory || ptype == PageType::DebugMemory
     }
 
     /// Checks whether the supplied range of addresses are all valid virtual addresses.
@@ -550,10 +554,7 @@ impl Memory {
                 None
             }
             PageType::Memory => {
-                log::error!(
-                    "Mapped memory page without a pointer @ {:#018X}",
-                    vaddr
-                );
+                log::error!("Mapped memory page without a pointer @ {:#018X}", vaddr);
                 None
             }
             PageType::DebugMemory => {
@@ -643,8 +644,7 @@ impl Memory {
                             .is_ok()
                     }
                     2 => {
-                        let atomic =
-                            &*(ptr as *const std::sync::atomic::AtomicU16);
+                        let atomic = &*(ptr as *const std::sync::atomic::AtomicU16);
                         let exp_bytes = std::mem::transmute_copy::<T, u16>(&expected);
                         let data_bytes = std::mem::transmute_copy::<T, u16>(&data);
                         atomic
@@ -657,8 +657,7 @@ impl Memory {
                             .is_ok()
                     }
                     4 => {
-                        let atomic =
-                            &*(ptr as *const std::sync::atomic::AtomicU32);
+                        let atomic = &*(ptr as *const std::sync::atomic::AtomicU32);
                         let exp_bytes = std::mem::transmute_copy::<T, u32>(&expected);
                         let data_bytes = std::mem::transmute_copy::<T, u32>(&data);
                         atomic
@@ -671,8 +670,7 @@ impl Memory {
                             .is_ok()
                     }
                     8 => {
-                        let atomic =
-                            &*(ptr as *const std::sync::atomic::AtomicU64);
+                        let atomic = &*(ptr as *const std::sync::atomic::AtomicU64);
                         let exp_bytes = std::mem::transmute_copy::<T, u64>(&expected);
                         let data_bytes = std::mem::transmute_copy::<T, u64>(&data);
                         atomic
@@ -687,11 +685,7 @@ impl Memory {
                     _ => {
                         // Fallback: non-atomic compare and swap
                         let mut current = std::mem::zeroed::<T>();
-                        std::ptr::copy_nonoverlapping(
-                            ptr,
-                            &mut current as *mut T as *mut u8,
-                            size,
-                        );
+                        std::ptr::copy_nonoverlapping(ptr, &mut current as *mut T as *mut u8, size);
                         if current == expected {
                             std::ptr::copy_nonoverlapping(
                                 &data as *const T as *const u8,
@@ -725,11 +719,7 @@ impl Memory {
         };
 
         if !address_space_contains(page_table, src_addr, size) {
-            log::error!(
-                "Unmapped ReadBlock @ {:#018X} (size = {})",
-                src_addr,
-                size
-            );
+            log::error!("Unmapped ReadBlock @ {:#018X} (size = {})", src_addr, size);
             dest.fill(0);
             return false;
         }
@@ -755,7 +745,8 @@ impl Memory {
                 }
                 PageType::Memory => {
                     if pointer != 0 {
-                        let host_addr = pointer + page_offset + (page_index << YUZU_PAGEBITS as usize);
+                        let host_addr =
+                            pointer + page_offset + (page_index << YUZU_PAGEBITS as usize);
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 host_addr as *const u8,
@@ -836,7 +827,8 @@ impl Memory {
                 }
                 PageType::Memory => {
                     if pointer != 0 {
-                        let host_addr = pointer + page_offset + (page_index << YUZU_PAGEBITS as usize);
+                        let host_addr =
+                            pointer + page_offset + (page_index << YUZU_PAGEBITS as usize);
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 src.as_ptr().add(src_offset),

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crypto::KeyManager;
+use ruzu_gpu::gpu_context::GpuContext;
 use ruzu_kernel::kernel::{IpcHandler, IpcHandlerResult};
 use ruzu_kernel::objects::{KSharedMemory, KernelObject};
 use ruzu_kernel::KernelCore;
@@ -25,7 +26,6 @@ use ruzu_loader::nro;
 use ruzu_loader::nsp;
 use ruzu_loader::vfs::RealFile;
 use ruzu_loader::xci;
-use ruzu_gpu::gpu_context::GpuContext;
 use ruzu_service::buffer_queue::BufferQueue;
 use ruzu_service::framework::ServiceManager;
 use ruzu_service::hid_shared_memory::HidSharedMemory;
@@ -33,7 +33,11 @@ use ruzu_service::ipc::{self as svc_ipc, IpcResponse};
 
 /// ruzu - Nintendo Switch Emulator
 #[derive(Parser, Debug)]
-#[command(name = "ruzu", version, about = "Nintendo Switch Emulator written in Rust")]
+#[command(
+    name = "ruzu",
+    version,
+    about = "Nintendo Switch Emulator written in Rust"
+)]
 struct Args {
     /// Path to the game file (NRO/NSP/XCI). If omitted, shows the game library.
     #[arg(short, long)]
@@ -74,20 +78,35 @@ impl ServiceBridge {
 }
 
 impl IpcHandler for ServiceBridge {
-    fn handle_ipc(&self, service_name: &str, tls_data: &[u8]) -> IpcHandlerResult {
+    fn handle_ipc(
+        &self,
+        service_name: &str,
+        tls_data: &[u8],
+        guest_read: &dyn Fn(u64, usize) -> Vec<u8>,
+    ) -> IpcHandlerResult {
         // Parse the IPC command from TLS data.
-        let cmd = svc_ipc::parse_ipc_command(tls_data).ok();
+        let mut cmd = svc_ipc::parse_ipc_command(tls_data).ok();
+        if let Some(command) = cmd.as_mut() {
+            command.a_buf_data = command
+                .a_bufs
+                .iter()
+                .map(|descriptor| guest_read(descriptor.address, descriptor.size as usize))
+                .collect();
+        }
 
         let cmd_id = cmd.as_ref().map(|c| c.command_id).unwrap_or(0);
 
         // Capture the B-buffer guest addresses before dispatching.
-        let b_buf_addrs: Vec<u64> = cmd.as_ref()
+        let b_buf_addrs: Vec<u64> = cmd
+            .as_ref()
             .map(|c| c.b_buf_addrs.clone())
             .unwrap_or_default();
 
         // Dispatch to the service.
         let response = cmd.as_ref().and_then(|c| {
-            self.manager.write().handle_request(service_name, c.command_id, c)
+            self.manager
+                .write()
+                .handle_request(service_name, c.command_id, c)
         });
         let response = response.unwrap_or_else(IpcResponse::success);
 
@@ -189,9 +208,7 @@ fn get_sub_interface(service_name: &str, cmd_id: u32) -> Option<&'static str> {
         // VI chain
         ("vi:m", 2) => Some("vi:IApplicationDisplayService"),
         ("vi:IApplicationDisplayService", 100) => Some("vi:IHOSBinderDriver"),
-        ("vi:IApplicationDisplayService", 101..=103) => {
-            Some("vi:IApplicationDisplayService")
-        }
+        ("vi:IApplicationDisplayService", 101..=103) => Some("vi:IApplicationDisplayService"),
         // Audio
         ("audren:u", 0) => Some("audren:IAudioRenderer"),
         ("audren:u", 2) => Some("audren:IAudioDevice"),
@@ -236,7 +253,10 @@ fn main() -> Result<()> {
 
     // Load config
     let settings = config::load_config(args.config.as_ref());
-    info!("Renderer backend: {:?}", settings.renderer_backend.get_value());
+    info!(
+        "Renderer backend: {:?}",
+        settings.renderer_backend.get_value()
+    );
 
     // Initialize key manager
     let mut keys = KeyManager::new();
@@ -334,6 +354,14 @@ fn main() -> Result<()> {
         .create_event_in_process()
         .expect("failed to create audio out event handle");
 
+    let audio_renderer_event_handle = kernel
+        .create_event_in_process()
+        .expect("failed to create audio renderer event handle");
+
+    let audio_device_event_handle = kernel
+        .create_event_in_process()
+        .expect("failed to create audio device event handle");
+
     let am_focus_event_handle = kernel
         .create_event_in_process()
         .expect("failed to create AM focus event handle");
@@ -352,6 +380,10 @@ fn main() -> Result<()> {
     // Pre-signal the GPU event so nvdrv QueryEvent callers don't block.
     kernel.signal_event(gpu_event_handle);
 
+    // Keep audren waiters from stalling before the first render loop tick.
+    kernel.signal_event(audio_renderer_event_handle);
+    kernel.signal_event(audio_device_event_handle);
+
     // ── Load code into process ────────────────────────────────────────────
     let entry_point = match &loaded {
         LoadedModules::Single(code_set) => {
@@ -364,9 +396,7 @@ fn main() -> Result<()> {
             );
             load_single_module(&mut kernel, code_set)?
         }
-        LoadedModules::Multi(modules) => {
-            load_multi_modules(&mut kernel, modules)?
-        }
+        LoadedModules::Multi(modules) => load_multi_modules(&mut kernel, modules)?,
     };
 
     info!("Entry point: 0x{:X}", entry_point);
@@ -409,7 +439,9 @@ fn main() -> Result<()> {
             } else {
                 log::warn!(
                     "romfs extends past file end: offset=0x{:X}, size=0x{:X}, file_len=0x{:X}",
-                    romfs_start, asset.romfs.size, raw.len()
+                    romfs_start,
+                    asset.romfs.size,
+                    raw.len()
                 );
                 None
             }
@@ -437,12 +469,38 @@ fn main() -> Result<()> {
     manager.register_service("sm:", Box::new(ruzu_service::sm::SmService::new()));
     manager.register_service(
         "hid",
-        Box::new(ruzu_service::hid::HidService::new_with_shm_handle(hid_shm_handle)),
+        Box::new(ruzu_service::hid::HidService::new_with_shm_handle(
+            hid_shm_handle,
+        )),
     );
-    manager.register_service("nvdrv", Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(gpu.clone(), gpu_event_handle)));
-    manager.register_service("nvdrv:a", Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(gpu.clone(), gpu_event_handle)));
-    manager.register_service("nvdrv:s", Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(gpu.clone(), gpu_event_handle)));
-    manager.register_service("nvdrv:t", Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(gpu.clone(), gpu_event_handle)));
+    manager.register_service(
+        "nvdrv",
+        Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(
+            gpu.clone(),
+            gpu_event_handle,
+        )),
+    );
+    manager.register_service(
+        "nvdrv:a",
+        Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(
+            gpu.clone(),
+            gpu_event_handle,
+        )),
+    );
+    manager.register_service(
+        "nvdrv:s",
+        Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(
+            gpu.clone(),
+            gpu_event_handle,
+        )),
+    );
+    manager.register_service(
+        "nvdrv:t",
+        Box::new(ruzu_service::nvdrv::NvdrvService::new_with_event(
+            gpu.clone(),
+            gpu_event_handle,
+        )),
+    );
     manager.register_service("vi:m", Box::new(ruzu_service::vi::ViManagerService::new()));
     manager.register_service(
         "vi:IApplicationDisplayService",
@@ -453,7 +511,10 @@ fn main() -> Result<()> {
     );
     manager.register_service(
         "vi:IHOSBinderDriver",
-        Box::new(ruzu_service::vi::ViBinderService::new(buffer_queue.clone(), gpu.clone())),
+        Box::new(ruzu_service::vi::ViBinderService::new(
+            buffer_queue.clone(),
+            gpu.clone(),
+        )),
     );
     // APM service
     manager.register_service("apm", Box::new(ruzu_service::apm::ApmService::new()));
@@ -474,7 +535,9 @@ fn main() -> Result<()> {
     );
     manager.register_service(
         "am:ICommonStateGetter",
-        Box::new(ruzu_service::am::CommonStateGetterService::new_with_event(am_focus_event_handle)),
+        Box::new(ruzu_service::am::CommonStateGetterService::new_with_event(
+            am_focus_event_handle,
+        )),
     );
     manager.register_service(
         "am:ISelfController",
@@ -504,7 +567,9 @@ fn main() -> Result<()> {
     // Filesystem
     manager.register_service(
         "fsp-srv",
-        Box::new(ruzu_service::fs::FspSrvService::new_with_romfs(romfs_data.clone())),
+        Box::new(ruzu_service::fs::FspSrvService::new_with_romfs(
+            romfs_data.clone(),
+        )),
     );
     if let Some(ref romfs) = romfs_data {
         manager.register_service(
@@ -531,28 +596,52 @@ fn main() -> Result<()> {
     );
 
     // Audio
-    manager.register_service("audren:u", Box::new(ruzu_service::audio::AudRendererService::new()));
+    let audio_context = ruzu_service::audio::new_audio_context();
+    manager.register_service(
+        "audren:u",
+        Box::new(ruzu_service::audio::AudRendererService::new_with_context(
+            audio_context.clone(),
+        )),
+    );
     manager.register_service(
         "audren:IAudioRenderer",
-        Box::new(ruzu_service::audio::AudioRendererService::new()),
+        Box::new(
+            ruzu_service::audio::AudioRendererService::new_with_context_and_event(
+                audio_context,
+                audio_renderer_event_handle,
+            ),
+        ),
     );
     manager.register_service(
         "audren:IAudioDevice",
-        Box::new(ruzu_service::audio::AudioDeviceService::new()),
+        Box::new(ruzu_service::audio::AudioDeviceService::new_with_event(
+            audio_device_event_handle,
+        )),
     );
-    manager.register_service("audout:u", Box::new(ruzu_service::audio::AudOutService::new()));
+    manager.register_service(
+        "audout:u",
+        Box::new(ruzu_service::audio::AudOutService::new()),
+    );
     manager.register_service(
         "audout:IAudioOut",
-        Box::new(ruzu_service::audio::AudioOutService::new_with_event(audio_out_event_handle)),
+        Box::new(ruzu_service::audio::AudioOutService::new_with_event(
+            audio_out_event_handle,
+        )),
     );
 
     // Account
-    manager.register_service("acc:u0", Box::new(ruzu_service::account::AccountService::new()));
+    manager.register_service(
+        "acc:u0",
+        Box::new(ruzu_service::account::AccountService::new()),
+    );
     manager.register_service(
         "acc:IProfile",
         Box::new(ruzu_service::account::ProfileService::new()),
     );
-    manager.register_service("acc:IBaas", Box::new(ruzu_service::account::BaasService::new()));
+    manager.register_service(
+        "acc:IBaas",
+        Box::new(ruzu_service::account::BaasService::new()),
+    );
 
     // Time
     manager.register_service("time:u", Box::new(ruzu_service::time::TimeService::new()));
@@ -582,7 +671,10 @@ fn main() -> Result<()> {
     );
     manager.register_service("ssl", Box::new(ruzu_service::ssl::SslService::new()));
     manager.register_service("nsd:u", Box::new(ruzu_service::nsd::NsdService::new()));
-    manager.register_service("friend:u", Box::new(ruzu_service::friends::FriendsService::new()));
+    manager.register_service(
+        "friend:u",
+        Box::new(ruzu_service::friends::FriendsService::new()),
+    );
     manager.register_service(
         "friend:IFriendService",
         Box::new(ruzu_service::friends::FriendInterfaceService::new()),
@@ -595,8 +687,14 @@ fn main() -> Result<()> {
     manager.register_service("ILogger", Box::new(ruzu_service::lm::LoggerService::new()));
 
     // Stub services (accept all commands, return success)
-    manager.register_service("fatal:u", Box::new(ruzu_service::stubs::FatalService::new()));
-    manager.register_service("prepo:a", Box::new(ruzu_service::stubs::PrepoService::new()));
+    manager.register_service(
+        "fatal:u",
+        Box::new(ruzu_service::stubs::FatalService::new()),
+    );
+    manager.register_service(
+        "prepo:a",
+        Box::new(ruzu_service::stubs::PrepoService::new()),
+    );
     manager.register_service("caps:su", Box::new(ruzu_service::stubs::CapsService::new()));
     manager.register_service("ns:am2", Box::new(ruzu_service::stubs::NsService::new()));
     manager.register_service("bcat:a", Box::new(ruzu_service::stubs::BcatService::new()));
@@ -604,7 +702,10 @@ fn main() -> Result<()> {
     manager.register_service("spl:", Box::new(ruzu_service::stubs::SplService::new()));
     manager.register_service("mii:e", Box::new(ruzu_service::stubs::MiiService::new()));
     manager.register_service("erpt:c", Box::new(ruzu_service::stubs::ErptService::new()));
-    manager.register_service("eupld:c", Box::new(ruzu_service::stubs::EupldService::new()));
+    manager.register_service(
+        "eupld:c",
+        Box::new(ruzu_service::stubs::EupldService::new()),
+    );
     manager.register_service("pm:shell", Box::new(ruzu_service::stubs::PmService::new()));
     manager.register_service("ldr:ro", Box::new(ruzu_service::stubs::LdrService::new()));
     manager.register_service("glue:u", Box::new(ruzu_service::stubs::GlueService::new()));
@@ -619,7 +720,14 @@ fn main() -> Result<()> {
 
     if args.headless {
         info!("Running in headless mode");
-        run_headless(&mut kernel, &settings)?;
+        run_headless(
+            &mut kernel,
+            &settings,
+            audio_out_event_handle,
+            audio_renderer_event_handle,
+            audio_device_event_handle,
+            vsync_event_handle,
+        )?;
     } else {
         run_with_window(
             &mut kernel,
@@ -630,6 +738,8 @@ fn main() -> Result<()> {
             hid_guest_addr,
             gpu,
             audio_out_event_handle,
+            audio_renderer_event_handle,
+            audio_device_event_handle,
             vsync_event_handle,
         )?;
     }
@@ -650,20 +760,17 @@ fn load_nro_game_from_data(rom_data: &[u8]) -> Result<(nro::CodeSet, u64)> {
 }
 
 /// Load a single module (NRO/XCI) into the kernel at NRO_BASE_ADDRESS.
-fn load_single_module(
-    kernel: &mut KernelCore,
-    code_set: &nro::CodeSet,
-) -> Result<common::VAddr> {
+fn load_single_module(kernel: &mut KernelCore, code_set: &nro::CodeSet) -> Result<common::VAddr> {
     let text_seg = &code_set.segments[0];
     let rodata_seg = &code_set.segments[1];
     let data_seg = &code_set.segments[2];
 
-    let text_data = &code_set.memory
-        [text_seg.offset as usize..(text_seg.offset + text_seg.size) as usize];
+    let text_data =
+        &code_set.memory[text_seg.offset as usize..(text_seg.offset + text_seg.size) as usize];
     let rodata_data = &code_set.memory
         [rodata_seg.offset as usize..(rodata_seg.offset + rodata_seg.size) as usize];
-    let data_data = &code_set.memory
-        [data_seg.offset as usize..(data_seg.offset + data_seg.size) as usize];
+    let data_data =
+        &code_set.memory[data_seg.offset as usize..(data_seg.offset + data_seg.size) as usize];
 
     let entry_point = kernel.load_nro(
         text_data,
@@ -697,19 +804,16 @@ fn load_multi_modules(
         let rodata_seg = &code_set.segments[1];
         let data_seg = &code_set.segments[2];
 
-        let text_data = &code_set.memory
-            [text_seg.offset as usize..(text_seg.offset + text_seg.size) as usize];
+        let text_data =
+            &code_set.memory[text_seg.offset as usize..(text_seg.offset + text_seg.size) as usize];
         let rodata_data = &code_set.memory
             [rodata_seg.offset as usize..(rodata_seg.offset + rodata_seg.size) as usize];
-        let data_data = &code_set.memory
-            [data_seg.offset as usize..(data_seg.offset + data_seg.size) as usize];
+        let data_data =
+            &code_set.memory[data_seg.offset as usize..(data_seg.offset + data_seg.size) as usize];
 
         // Diagnostic: dump first 32 bytes of each module's text segment
         if text_data.len() >= 32 {
-            info!(
-                "  text first 32 bytes: {:02X?}",
-                &text_data[..32]
-            );
+            info!("  text first 32 bytes: {:02X?}", &text_data[..32]);
         }
 
         info!(
@@ -759,7 +863,12 @@ fn load_nsp_game(
     }
     info!("Title ID: 0x{:016X}", result.title_id);
 
-    Ok((result.modules, result.title_id, result.romfs_data, result.is_64bit))
+    Ok((
+        result.modules,
+        result.title_id,
+        result.romfs_data,
+        result.is_64bit,
+    ))
 }
 
 /// Load an XCI game file. Returns (modules, title_id, is_64bit).
@@ -770,8 +879,7 @@ fn load_xci_game(
     let file: Arc<dyn ruzu_loader::vfs::VfsFile> =
         Arc::new(RealFile::open(path).context("Failed to open XCI file")?);
 
-    let result = xci::load_xci(file, keys)
-        .map_err(|e| anyhow::anyhow!("XCI load error: {}", e))?;
+    let result = xci::load_xci(file, keys).map_err(|e| anyhow::anyhow!("XCI load error: {}", e))?;
 
     if let Some(ref title) = result.title {
         info!("Title: {}", title);
@@ -785,10 +893,26 @@ fn load_xci_game(
 }
 
 /// Run in headless mode (no window, CPU only).
-fn run_headless(kernel: &mut KernelCore, settings: &common::settings::Values) -> Result<()> {
+fn run_headless(
+    kernel: &mut KernelCore,
+    settings: &common::settings::Values,
+    audio_out_event_handle: u32,
+    audio_renderer_event_handle: u32,
+    audio_device_event_handle: u32,
+    vsync_event_handle: u32,
+) -> Result<()> {
     info!("Starting CPU execution (headless)...");
 
-    run_cpu_loop(kernel, settings)
+    run_cpu_loop(
+        kernel,
+        settings,
+        &[
+            audio_out_event_handle,
+            audio_renderer_event_handle,
+            audio_device_event_handle,
+            vsync_event_handle,
+        ],
+    )
 }
 
 /// Instructions per time slice for each thread.
@@ -829,18 +953,33 @@ fn make_memory_vtable() -> ruzu_cpu::arm_dynarmic_64::MemoryVtable {
     unsafe fn write_u64(ctx: *mut u8, addr: u64, val: u64) {
         let mm = &mut *(ctx as *mut MemoryManager);
         if let Err(e) = mm.write_u64(addr, val) {
-            log::error!("JIT write_u64 failed @ {:#010X} val={:#018X}: {}", addr, val, e);
+            log::error!(
+                "JIT write_u64 failed @ {:#010X} val={:#018X}: {}",
+                addr,
+                val,
+                e
+            );
         }
     }
 
     ruzu_cpu::arm_dynarmic_64::MemoryVtable {
-        read_u8, read_u16, read_u32, read_u64,
-        write_u8, write_u16, write_u32, write_u64,
+        read_u8,
+        read_u16,
+        read_u32,
+        read_u64,
+        write_u8,
+        write_u16,
+        write_u32,
+        write_u64,
     }
 }
 
 /// Core CPU execution loop with multi-thread scheduling.
-fn run_cpu_loop(kernel: &mut KernelCore, settings: &common::settings::Values) -> Result<()> {
+fn run_cpu_loop(
+    kernel: &mut KernelCore,
+    settings: &common::settings::Values,
+    periodic_event_handles: &[u32],
+) -> Result<()> {
     use ruzu_cpu::{ArmDynarmic32, ArmDynarmic64, ArmJit, CpuSettings, HaltReason};
     use ruzu_kernel::scheduler::Scheduler;
     use ruzu_kernel::svc::dispatch_svc;
@@ -864,7 +1003,9 @@ fn run_cpu_loop(kernel: &mut KernelCore, settings: &common::settings::Values) ->
         let second_instr = process.memory.read_u32(entry_pc + 4);
         log::info!(
             "Entry point PC=0x{:X}, first instr=0x{:08X?}, second=0x{:08X?}",
-            entry_pc, first_instr, second_instr
+            entry_pc,
+            first_instr,
+            second_instr
         );
         // Also check via vtable to ensure JIT callback path works
         let vtable_read = unsafe { (vtable.read_u32)(mem_ptr as *const u8, entry_pc) };
@@ -874,6 +1015,10 @@ fn run_cpu_loop(kernel: &mut KernelCore, settings: &common::settings::Values) ->
     loop {
         if kernel.should_stop {
             break;
+        }
+
+        for &handle in periodic_event_handles {
+            kernel.signal_event(handle);
         }
 
         // Check timeouts on waiting threads.
@@ -904,11 +1049,7 @@ fn run_cpu_loop(kernel: &mut KernelCore, settings: &common::settings::Values) ->
                 // No runnable threads — check if any are still waiting.
                 let has_waiting = kernel
                     .process()
-                    .map(|p| {
-                        p.threads
-                            .iter()
-                            .any(|t| t.state == ThreadState::Waiting)
-                    })
+                    .map(|p| p.threads.iter().any(|t| t.state == ThreadState::Waiting))
                     .unwrap_or(false);
 
                 if has_waiting {
@@ -940,7 +1081,12 @@ fn run_cpu_loop(kernel: &mut KernelCore, settings: &common::settings::Values) ->
             if slice <= 10 || reason.bits() != 0 {
                 log::debug!(
                     "[slice {}] halt={:?} (0x{:X}) PC: 0x{:X} -> jit:0x{:X} -> saved:0x{:X}",
-                    slice, reason, reason.bits(), pc_before, jit_pc, pc_after
+                    slice,
+                    reason,
+                    reason.bits(),
+                    pc_before,
+                    jit_pc,
+                    pc_after
                 );
             }
             // One-shot instruction dump around current PC
@@ -958,14 +1104,34 @@ fn run_cpu_loop(kernel: &mut KernelCore, settings: &common::settings::Values) ->
                     }
                     // Also dump registers
                     let regs = &kernel.process().unwrap().threads[idx].cpu_state;
-                    writeln!(f, "Registers: r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X}",
-                        regs.x[0] as u32, regs.x[1] as u32, regs.x[2] as u32, regs.x[3] as u32).ok();
-                    writeln!(f, "  r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
-                        regs.x[4] as u32, regs.x[5] as u32, regs.x[6] as u32, regs.x[7] as u32).ok();
-                    writeln!(f, "  r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X}",
-                        regs.x[8] as u32, regs.x[9] as u32, regs.x[10] as u32, regs.x[11] as u32, regs.x[12] as u32).ok();
-                    writeln!(f, "  SP=0x{:08X} LR=0x{:08X} PC=0x{:08X}",
-                        regs.sp as u32, regs.x[14] as u32, regs.pc as u32).ok();
+                    writeln!(
+                        f,
+                        "Registers: r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X}",
+                        regs.x[0] as u32, regs.x[1] as u32, regs.x[2] as u32, regs.x[3] as u32
+                    )
+                    .ok();
+                    writeln!(
+                        f,
+                        "  r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
+                        regs.x[4] as u32, regs.x[5] as u32, regs.x[6] as u32, regs.x[7] as u32
+                    )
+                    .ok();
+                    writeln!(
+                        f,
+                        "  r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X}",
+                        regs.x[8] as u32,
+                        regs.x[9] as u32,
+                        regs.x[10] as u32,
+                        regs.x[11] as u32,
+                        regs.x[12] as u32
+                    )
+                    .ok();
+                    writeln!(
+                        f,
+                        "  SP=0x{:08X} LR=0x{:08X} PC=0x{:08X}",
+                        regs.sp as u32, regs.x[14] as u32, regs.pc as u32
+                    )
+                    .ok();
                     // Wider dump of key areas
                     writeln!(f, "\n=== Wider dump of rtld 0x1100-0x1300 ===").ok();
                     for off in (0x1100u64..=0x1300).step_by(4) {
@@ -1022,6 +1188,8 @@ fn run_with_window(
     hid_guest_addr: Arc<AtomicU64>,
     gpu: Arc<GpuContext>,
     audio_out_event_handle: u32,
+    audio_renderer_event_handle: u32,
+    audio_device_event_handle: u32,
     vsync_event_handle: u32,
 ) -> Result<()> {
     use common::settings_enums::RendererBackend;
@@ -1094,9 +1262,13 @@ fn run_with_window(
         }
         WindowBackend::OpenGL => {
             // Initialize OpenGL presenter.
-            match opengl_presenter::OpenGLPresenter::new(&emu_window.window, gpu.syncpoints.clone()) {
+            match opengl_presenter::OpenGLPresenter::new(&emu_window.window, gpu.syncpoints.clone())
+            {
                 Ok(gl) => {
-                    info!("OpenGL presenter initialized: {}", gl.renderer().device_vendor());
+                    info!(
+                        "OpenGL presenter initialized: {}",
+                        gl.renderer().device_vendor()
+                    );
                     gpu.set_opengl_renderer_active();
                     opengl = Some(gl);
                 }
@@ -1133,11 +1305,21 @@ fn run_with_window(
     // Number of time slices to run per frame (~60 FPS ~ 16ms).
     const SLICES_PER_FRAME: usize = 10;
 
-    log::info!("[DIAG] About to enter main loop, is_64bit={}", kernel.is_64bit);
+    log::info!(
+        "[DIAG] About to enter main loop, is_64bit={}",
+        kernel.is_64bit
+    );
     if let Some(p) = kernel.process() {
         log::info!("[DIAG] Thread count: {}", p.threads.len());
         for (i, t) in p.threads.iter().enumerate() {
-            log::info!("[DIAG]   thread[{}]: state={:?} pc=0x{:08X} sp=0x{:08X} priority={}", i, t.state, t.cpu_state.pc, t.cpu_state.sp, t.priority);
+            log::info!(
+                "[DIAG]   thread[{}]: state={:?} pc=0x{:08X} sp=0x{:08X} priority={}",
+                i,
+                t.state,
+                t.cpu_state.pc,
+                t.cpu_state.sp,
+                t.priority
+            );
         }
     }
 
@@ -1172,6 +1354,8 @@ fn run_with_window(
 
         // ── Signal audio + vsync events (~60fps) ────────────────────────
         kernel.signal_event(audio_out_event_handle);
+        kernel.signal_event(audio_renderer_event_handle);
+        kernel.signal_event(audio_device_event_handle);
         kernel.signal_event(vsync_event_handle);
 
         // ── Update HID shared memory ────────────────────────────────────
@@ -1240,7 +1424,12 @@ fn run_with_window(
                     .map(|t| (t.handle, t.state, t.priority))
                     .collect();
                 if diag_frame_count < 3 {
-                    log::info!("[DIAG] frame={} slice={} scheduling: {:?}", diag_frame_count, slice_i, thread_states);
+                    log::info!(
+                        "[DIAG] frame={} slice={} scheduling: {:?}",
+                        diag_frame_count,
+                        slice_i,
+                        thread_states
+                    );
                 }
                 kernel.scheduler.schedule_next(&thread_states)
             };
@@ -1250,15 +1439,16 @@ fn run_with_window(
                 None => {
                     let has_waiting = kernel
                         .process()
-                        .map(|p| {
-                            p.threads
-                                .iter()
-                                .any(|t| t.state == ThreadState::Waiting)
-                        })
+                        .map(|p| p.threads.iter().any(|t| t.state == ThreadState::Waiting))
                         .unwrap_or(false);
 
                     if diag_frame_count < 3 {
-                        log::info!("[DIAG] frame={} slice={} no runnable thread, has_waiting={}", diag_frame_count, slice_i, has_waiting);
+                        log::info!(
+                            "[DIAG] frame={} slice={} no runnable thread, has_waiting={}",
+                            diag_frame_count,
+                            slice_i,
+                            has_waiting
+                        );
                     }
                     if has_waiting {
                         kernel.tick_counter += INSTRUCTIONS_PER_SLICE;
@@ -1273,7 +1463,11 @@ fn run_with_window(
             // Load thread context into JIT and run with budget.
             jit.load_context(&kernel.process().unwrap().threads[idx].cpu_state);
             if diag_total_slices < 50 {
-                log::info!("[DIAG] slice={} STARTING pc=0x{:08X}", diag_total_slices + 1, jit.get_pc());
+                log::info!(
+                    "[DIAG] slice={} STARTING pc=0x{:08X}",
+                    diag_total_slices + 1,
+                    jit.get_pc()
+                );
             }
             jit.set_ticks_remaining(INSTRUCTIONS_PER_SLICE);
             let run_start = std::time::Instant::now();
@@ -1289,7 +1483,11 @@ fn run_with_window(
             if diag_total_slices <= 50 || diag_total_slices % 1000 == 0 || is_long {
                 log::info!(
                     "[DIAG] slice={} thread={} reason={:?} pc=0x{:08X} elapsed={:?}{}",
-                    diag_total_slices, idx, reason, pc, run_elapsed,
+                    diag_total_slices,
+                    idx,
+                    reason,
+                    pc,
+                    run_elapsed,
                     if is_long { " *** LONG ***" } else { "" }
                 );
             }
@@ -1311,9 +1509,15 @@ fn run_with_window(
                 if let Some(p) = kernel.process() {
                     let lr = regs.x[14] as u64;
                     log::error!("[WILD PC] Code around LR=0x{:08X}:", lr);
-                    for off in (lr.saturating_sub(16)..=lr+16).step_by(4) {
+                    for off in (lr.saturating_sub(16)..=lr + 16).step_by(4) {
                         let w = p.memory.read_u32(off).unwrap_or(0xDEADBEEF);
-                        let marker = if off == lr { " <-- LR" } else if off == lr - 4 { " <-- call site" } else { "" };
+                        let marker = if off == lr {
+                            " <-- LR"
+                        } else if off == lr - 4 {
+                            " <-- call site"
+                        } else {
+                            ""
+                        };
                         log::error!("  0x{:08X}: 0x{:08X}{}", off, w, marker);
                     }
                     // Dump MOD0 header at rtld base
@@ -1340,7 +1544,11 @@ fn run_with_window(
                     // Dump the indirect jump target at 0x08003798 (PLT GOT entry)
                     let got_addr = 0x08003798u64;
                     let got_val = p.memory.read_u32(got_addr).unwrap_or(0xDEADBEEF);
-                    log::error!("[WILD PC] PLT GOT at 0x{:08X} = 0x{:08X} (should be 0x08031640?)", got_addr, got_val);
+                    log::error!(
+                        "[WILD PC] PLT GOT at 0x{:08X} = 0x{:08X} (should be 0x08031640?)",
+                        got_addr,
+                        got_val
+                    );
                     // Dump nearby GOT entries
                     log::error!("[WILD PC] GOT entries 0x08003780-0x080037C0:");
                     for off in (0x3780u64..=0x37C0).step_by(4) {
@@ -1356,8 +1564,20 @@ fn run_with_window(
                         let r_info = p.memory.read_u32(addr + 4).unwrap_or(0);
                         let r_type = r_info & 0xFF;
                         let r_sym = r_info >> 8;
-                        let type_name = match r_type { 2 => "ABS32", 22 => "JUMP_SLOT", 23 => "RELATIVE", _ => "?" };
-                        log::error!("  REL[{:2}] offset=0x{:04X} type={}({}) sym={}", i, r_offset, r_type, type_name, r_sym);
+                        let type_name = match r_type {
+                            2 => "ABS32",
+                            22 => "JUMP_SLOT",
+                            23 => "RELATIVE",
+                            _ => "?",
+                        };
+                        log::error!(
+                            "  REL[{:2}] offset=0x{:04X} type={}({}) sym={}",
+                            i,
+                            r_offset,
+                            r_type,
+                            type_name,
+                            r_sym
+                        );
                     }
                     // Dump DT_JMPREL entries (offset 0x4120, 14 entries × 8 bytes)
                     log::error!("[WILD PC] DT_JMPREL entries (at base+0x4120):");
@@ -1367,8 +1587,20 @@ fn run_with_window(
                         let r_info = p.memory.read_u32(addr + 4).unwrap_or(0);
                         let r_type = r_info & 0xFF;
                         let r_sym = r_info >> 8;
-                        let type_name = match r_type { 2 => "ABS32", 22 => "JUMP_SLOT", 23 => "RELATIVE", _ => "?" };
-                        log::error!("  JMPREL[{:2}] offset=0x{:04X} type={}({}) sym={}", i, r_offset, r_type, type_name, r_sym);
+                        let type_name = match r_type {
+                            2 => "ABS32",
+                            22 => "JUMP_SLOT",
+                            23 => "RELATIVE",
+                            _ => "?",
+                        };
+                        log::error!(
+                            "  JMPREL[{:2}] offset=0x{:04X} type={}({}) sym={}",
+                            i,
+                            r_offset,
+                            r_type,
+                            type_name,
+                            r_sym
+                        );
                     }
                 }
                 kernel.should_stop = true;
@@ -1390,15 +1622,40 @@ fn run_with_window(
                     // Dump registers
                     let pc = jit.get_pc();
                     let regs = &p.threads[idx].cpu_state;
-                    writeln!(f, "\nSlice {} PC=0x{:08X} reason={:?}", diag_total_slices, pc, reason).ok();
-                    writeln!(f, "r0-r3: {:08X} {:08X} {:08X} {:08X}",
-                        regs.x[0] as u32, regs.x[1] as u32, regs.x[2] as u32, regs.x[3] as u32).ok();
-                    writeln!(f, "r4-r7: {:08X} {:08X} {:08X} {:08X}",
-                        regs.x[4] as u32, regs.x[5] as u32, regs.x[6] as u32, regs.x[7] as u32).ok();
-                    writeln!(f, "r8-r12: {:08X} {:08X} {:08X} {:08X} {:08X}",
-                        regs.x[8] as u32, regs.x[9] as u32, regs.x[10] as u32, regs.x[11] as u32, regs.x[12] as u32).ok();
-                    writeln!(f, "SP={:08X} LR={:08X} PC={:08X}",
-                        regs.sp as u32, regs.x[14] as u32, regs.pc as u32).ok();
+                    writeln!(
+                        f,
+                        "\nSlice {} PC=0x{:08X} reason={:?}",
+                        diag_total_slices, pc, reason
+                    )
+                    .ok();
+                    writeln!(
+                        f,
+                        "r0-r3: {:08X} {:08X} {:08X} {:08X}",
+                        regs.x[0] as u32, regs.x[1] as u32, regs.x[2] as u32, regs.x[3] as u32
+                    )
+                    .ok();
+                    writeln!(
+                        f,
+                        "r4-r7: {:08X} {:08X} {:08X} {:08X}",
+                        regs.x[4] as u32, regs.x[5] as u32, regs.x[6] as u32, regs.x[7] as u32
+                    )
+                    .ok();
+                    writeln!(
+                        f,
+                        "r8-r12: {:08X} {:08X} {:08X} {:08X} {:08X}",
+                        regs.x[8] as u32,
+                        regs.x[9] as u32,
+                        regs.x[10] as u32,
+                        regs.x[11] as u32,
+                        regs.x[12] as u32
+                    )
+                    .ok();
+                    writeln!(
+                        f,
+                        "SP={:08X} LR={:08X} PC={:08X}",
+                        regs.sp as u32, regs.x[14] as u32, regs.pc as u32
+                    )
+                    .ok();
                     // Also dump the entire rtld code 0x800-0xC00 for context
                     writeln!(f, "\n=== rtld code 0x800-0xC00 ===").ok();
                     for off in (0x800u64..=0xC00).step_by(4) {
@@ -1412,8 +1669,7 @@ fn run_with_window(
             if reason.contains(HaltReason::SVC) {
                 diag_total_svcs += 1;
                 if let Some(n) = jit.get_svc_number() {
-                    let mut cpu =
-                        kernel.process().unwrap().threads[idx].cpu_state.clone();
+                    let mut cpu = kernel.process().unwrap().threads[idx].cpu_state.clone();
                     if diag_total_svcs <= 100 || diag_total_svcs % 1000 == 0 {
                         log::info!(
                             "[SVC] #{} svc=0x{:02X} pc=0x{:08X} x0=0x{:X} x1=0x{:X} x2=0x{:X} x3=0x{:X}",
@@ -1433,10 +1689,7 @@ fn run_with_window(
                         let map_handle = svc_in_x0 as u32;
                         let map_addr = svc_in_x1;
                         if map_handle == hid_shm_handle && map_addr != 0 {
-                            log::info!(
-                                "HID shared memory mapped at guest addr 0x{:X}",
-                                map_addr
-                            );
+                            log::info!("HID shared memory mapped at guest addr 0x{:X}", map_addr);
                             hid_guest_addr.store(map_addr, Ordering::Relaxed);
                             // Immediately sync initialized HID headers so the
                             // game sees a valid state on its first read.
@@ -1460,8 +1713,15 @@ fn run_with_window(
                 // Undecodable instruction — skip and continue.
                 let pc = jit.get_pc();
                 // Read the faulting instruction to diagnose what's unhandled
-                let word = kernel.process().and_then(|p| p.memory.read_u32(pc).ok()).unwrap_or(0);
-                log::warn!("Exception at PC=0x{:08X}, instr=0x{:08X}, skipping", pc, word);
+                let word = kernel
+                    .process()
+                    .and_then(|p| p.memory.read_u32(pc).ok())
+                    .unwrap_or(0);
+                log::warn!(
+                    "Exception at PC=0x{:08X}, instr=0x{:08X}, skipping",
+                    pc,
+                    word
+                );
                 jit.set_pc(pc + 4);
                 jit.clear_halt(HaltReason::EXCEPTION_RAISED);
                 if let Some(process) = kernel.process_mut() {
@@ -1477,8 +1737,11 @@ fn run_with_window(
         if diag_frame_count <= 5 || diag_frame_count % 100 == 0 {
             log::info!(
                 "[DIAG] frame={} slices={} svcs={} frame_time={:?} total_time={:?}",
-                diag_frame_count, diag_total_slices, diag_total_svcs,
-                frame_elapsed, diag_start.elapsed()
+                diag_frame_count,
+                diag_total_slices,
+                diag_total_svcs,
+                frame_elapsed,
+                diag_start.elapsed()
             );
         }
 
@@ -1540,28 +1803,33 @@ fn run_with_window(
                     let gob_size = 512usize;
                     let block_height_pixels = block_height * gob_size_y;
                     let gobs_x = (stride_bytes as usize + gob_size_x - 1) / gob_size_x;
-                    let block_rows = (height as usize + block_height_pixels - 1) / block_height_pixels;
+                    let block_rows =
+                        (height as usize + block_height_pixels - 1) / block_height_pixels;
                     let tiled_size = block_rows * gobs_x * block_height * gob_size;
 
                     // Read the tiled framebuffer data in bulk.
-                    let tiled_data = kernel.process().and_then(|p| {
-                        p.memory.read_bytes(offset, tiled_size).ok()
-                    });
+                    let tiled_data = kernel
+                        .process()
+                        .and_then(|p| p.memory.read_bytes(offset, tiled_size).ok());
 
                     if let Some(tiled) = tiled_data {
                         // Check if data looks tiled (non-zero content).
                         let has_content = tiled.iter().any(|&b| b != 0);
                         if has_content {
                             let linear = ruzu_gpu::swizzle::detile_block_linear(
-                                &tiled, width, height, bpp, block_height_log2,
+                                &tiled,
+                                width,
+                                height,
+                                bpp,
+                                block_height_log2,
                             );
                             Some((linear, width, height))
                         } else {
                             // All zeros — try reading as linear (may not be tiled).
                             let linear_size = (width * height * bpp) as usize;
-                            let linear_data = kernel.process().and_then(|p| {
-                                p.memory.read_bytes(offset, linear_size).ok()
-                            });
+                            let linear_data = kernel
+                                .process()
+                                .and_then(|p| p.memory.read_bytes(offset, linear_size).ok());
                             linear_data.map(|px| (px, width, height))
                         }
                     } else {

@@ -304,7 +304,10 @@ impl ServiceHandler for CommonStateGetterService {
         match cmd_id {
             // GetEventHandle (0) — focus state event
             0 => {
-                log::info!("am:ICommonStateGetter: GetEventHandle (handle={})", self.event_handle);
+                log::info!(
+                    "am:ICommonStateGetter: GetEventHandle (handle={})",
+                    self.event_handle
+                );
                 IpcResponse::success().with_copy_handle(self.event_handle)
             }
             // ReceiveMessage (1)
@@ -359,7 +362,10 @@ impl ServiceHandler for CommonStateGetterService {
             }
             // IsVrModeEnabled (50)
             50 => {
-                log::info!("am:ICommonStateGetter: IsVrModeEnabled -> {}", self.vr_mode_enabled);
+                log::info!(
+                    "am:ICommonStateGetter: IsVrModeEnabled -> {}",
+                    self.vr_mode_enabled
+                );
                 IpcResponse::success_with_data(vec![self.vr_mode_enabled as u32])
             }
             // SetVrModeEnabled (51)
@@ -506,7 +512,10 @@ impl ServiceHandler for SelfControllerService {
             // EnterFatalSection (3)
             3 => {
                 self.fatal_section_count += 1;
-                log::info!("am:ISelfController: EnterFatalSection (count={})", self.fatal_section_count);
+                log::info!(
+                    "am:ISelfController: EnterFatalSection (count={})",
+                    self.fatal_section_count
+                );
                 IpcResponse::success()
             }
             // LeaveFatalSection (4)
@@ -516,7 +525,10 @@ impl ServiceHandler for SelfControllerService {
                     return IpcResponse::error(AM_FATAL_SECTION_COUNT_IMBALANCE);
                 }
                 self.fatal_section_count -= 1;
-                log::info!("am:ISelfController: LeaveFatalSection (count={})", self.fatal_section_count);
+                log::info!(
+                    "am:ISelfController: LeaveFatalSection (count={})",
+                    self.fatal_section_count
+                );
                 IpcResponse::success()
             }
             // GetLibraryAppletLaunchableEvent (9)
@@ -570,7 +582,10 @@ impl ServiceHandler for SelfControllerService {
             40 => {
                 let layer_id = self.next_layer_id;
                 self.next_layer_id += 1;
-                log::info!("am:ISelfController: CreateManagedDisplayLayer (layer_id={})", layer_id);
+                log::info!(
+                    "am:ISelfController: CreateManagedDisplayLayer (layer_id={})",
+                    layer_id
+                );
                 IpcResponse::success_with_data(vec![layer_id as u32, (layer_id >> 32) as u32])
             }
             // IsSystemBufferSharingEnabled (41)
@@ -599,8 +614,10 @@ impl ServiceHandler for SelfControllerService {
                     layer_id, recording_layer_id
                 );
                 IpcResponse::success_with_data(vec![
-                    layer_id as u32, (layer_id >> 32) as u32,
-                    recording_layer_id as u32, (recording_layer_id >> 32) as u32,
+                    layer_id as u32,
+                    (layer_id >> 32) as u32,
+                    recording_layer_id as u32,
+                    (recording_layer_id >> 32) as u32,
                 ])
             }
             // SetHandlesRequestToDisplay (50)
@@ -632,7 +649,10 @@ impl ServiceHandler for SelfControllerService {
             }
             // GetIdleTimeDetectionExtension (63)
             63 => {
-                log::info!("am:ISelfController: GetIdleTimeDetectionExtension -> {}", self.idle_time_detection_extension);
+                log::info!(
+                    "am:ISelfController: GetIdleTimeDetectionExtension -> {}",
+                    self.idle_time_detection_extension
+                );
                 IpcResponse::success_with_data(vec![self.idle_time_detection_extension])
             }
             // ReportUserIsActive (65)
@@ -649,7 +669,10 @@ impl ServiceHandler for SelfControllerService {
             }
             // IsAutoSleepDisabled (69)
             69 => {
-                log::info!("am:ISelfController: IsAutoSleepDisabled -> {}", self.auto_sleep_disabled);
+                log::info!(
+                    "am:ISelfController: IsAutoSleepDisabled -> {}",
+                    self.auto_sleep_disabled
+                );
                 IpcResponse::success_with_data(vec![self.auto_sleep_disabled as u32])
             }
             // SetInputDetectionPolicy (72)
@@ -798,11 +821,11 @@ impl ServiceHandler for ApplicationFunctionsService {
             21 => {
                 // C++ returns language code via ns service. We return en-US directly.
                 let lang_code: u64 = u64::from_le_bytes(*b"en-US\0\0\0");
-                log::info!("am:IApplicationFunctions: GetDesiredLanguage -> 0x{:016X}", lang_code);
-                IpcResponse::success_with_data(vec![
-                    lang_code as u32,
-                    (lang_code >> 32) as u32,
-                ])
+                log::info!(
+                    "am:IApplicationFunctions: GetDesiredLanguage -> 0x{:016X}",
+                    lang_code
+                );
+                IpcResponse::success_with_data(vec![lang_code as u32, (lang_code >> 32) as u32])
             }
             // SetTerminateResult (22)
             22 => {
@@ -920,7 +943,9 @@ impl ServiceHandler for ApplicationFunctionsService {
             }
             // QueryApplicationPlayStatisticsByUid (111)
             111 => {
-                log::info!("am:IApplicationFunctions: QueryApplicationPlayStatisticsByUid -> 0 entries");
+                log::info!(
+                    "am:IApplicationFunctions: QueryApplicationPlayStatisticsByUid -> 0 entries"
+                );
                 IpcResponse::success_with_data(vec![0])
             }
             // ExecuteProgram (120)
@@ -940,7 +965,10 @@ impl ServiceHandler for ApplicationFunctionsService {
             }
             // GetPreviousProgramIndex (123)
             123 => {
-                log::info!("am:IApplicationFunctions: GetPreviousProgramIndex -> {}", self.previous_program_index);
+                log::info!(
+                    "am:IApplicationFunctions: GetPreviousProgramIndex -> {}",
+                    self.previous_program_index
+                );
                 IpcResponse::success_with_data(vec![self.previous_program_index as u32])
             }
             // GetGpuErrorDetectedSystemEvent (130)
@@ -1144,6 +1172,8 @@ mod tests {
             b_buf_addrs: Vec::new(),
             x_bufs: Vec::new(),
             a_bufs: Vec::new(),
+            a_buf_data: Vec::new(),
+            b_buf_sizes: Vec::new(),
         }
     }
 
@@ -1163,7 +1193,11 @@ mod tests {
             let cmd = make_command(cmd_id);
             let resp = proxy.handle_request(cmd_id, &cmd);
             assert!(resp.result.is_success());
-            assert_eq!(resp.handles_to_move, vec![0], "cmd_id={cmd_id} should return move_handle(0)");
+            assert_eq!(
+                resp.handles_to_move,
+                vec![0],
+                "cmd_id={cmd_id} should return move_handle(0)"
+            );
         }
     }
 
@@ -1270,7 +1304,11 @@ mod tests {
             let cmd = make_command(cmd_id);
             let resp = svc.handle_request(cmd_id, &cmd);
             assert!(resp.result.is_success());
-            assert_eq!(resp.handles_to_move, vec![0], "cmd_id={cmd_id} should return move_handle(0)");
+            assert_eq!(
+                resp.handles_to_move,
+                vec![0],
+                "cmd_id={cmd_id} should return move_handle(0)"
+            );
         }
     }
 

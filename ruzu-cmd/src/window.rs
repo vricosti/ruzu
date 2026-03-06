@@ -93,17 +93,9 @@ impl EmulatorWindow {
                         (w, true, false, WindowBackend::Vulkan)
                     }
                     Err(e) => {
-                        info!(
-                            "Vulkan window not available ({}), trying OpenGL",
-                            e
-                        );
+                        info!("Vulkan window not available ({}), trying OpenGL", e);
                         // Fall back to OpenGL
-                        Self::try_opengl_or_software(
-                            &video_subsystem,
-                            title,
-                            width,
-                            height,
-                        )?
+                        Self::try_opengl_or_software(&video_subsystem, title, width, height)?
                     }
                 }
             }
@@ -335,9 +327,7 @@ impl EmulatorWindow {
         let surface = sdl2::surface::Surface::from_data(
             // SAFETY: The pixel data lives for the duration of this function call.
             // We need a mutable reference for SDL2 but won't actually modify the data.
-            unsafe {
-                std::slice::from_raw_parts_mut(pixels.as_ptr() as *mut u8, pixels.len())
-            },
+            unsafe { std::slice::from_raw_parts_mut(pixels.as_ptr() as *mut u8, pixels.len()) },
             width,
             height,
             pitch,

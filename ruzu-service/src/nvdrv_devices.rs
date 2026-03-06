@@ -254,7 +254,11 @@ impl NvDevice for NvHostAsGpu {
                 let fixed_offset = read_u64(input, 32);
 
                 let is_fixed = (flags & 1) != 0;
-                let size = if mapping_size > 0 { mapping_size } else { 0x10000 };
+                let size = if mapping_size > 0 {
+                    mapping_size
+                } else {
+                    0x10000
+                };
 
                 // Look up the nvmap handle's guest address from the registry.
                 // Fall back to buffer_offset if the handle isn't registered.
@@ -302,12 +306,12 @@ impl NvDevice for NvHostAsGpu {
             8 => {
                 log::debug!("nvhost-as-gpu: GetVARegions");
                 // Return two VA regions: small page + big page.
-                write_u64(output, 0, 0x0400_0000);  // offset
-                write_u32(output, 8, 0x1000);         // page_size (4 KB)
-                write_u32(output, 12, 0x3800);        // pages
-                write_u64(output, 16, 0x0400_0000);  // offset2
-                write_u32(output, 24, 0x10000);       // page_size (64 KB)
-                write_u32(output, 28, 0x1);           // pages
+                write_u64(output, 0, 0x0400_0000); // offset
+                write_u32(output, 8, 0x1000); // page_size (4 KB)
+                write_u32(output, 12, 0x3800); // pages
+                write_u64(output, 16, 0x0400_0000); // offset2
+                write_u32(output, 24, 0x10000); // page_size (64 KB)
+                write_u32(output, 28, 0x1); // pages
                 0
             }
 
@@ -653,7 +657,7 @@ mod tests {
         write_u32(&mut input, 12, 0); // flags
         write_u32(&mut input, 16, 0); // fence id = 0
         write_u32(&mut input, 20, 0); // fence value
-        // Entry at offset 24
+                                      // Entry at offset 24
         write_u32(&mut input, 24, 0x1000); // entry0
         write_u32(&mut input, 28, 0); // entry1
 
@@ -735,8 +739,8 @@ mod tests {
 
         // MapBufferEx with nvmap_handle=7 (at input offset 8).
         let mut input = [0u8; 64];
-        write_u32(&mut input, 0, 0);   // flags: not fixed
-        write_u32(&mut input, 8, 7);   // nvmap_handle = 7
+        write_u32(&mut input, 0, 0); // flags: not fixed
+        write_u32(&mut input, 8, 7); // nvmap_handle = 7
         write_u64(&mut input, 24, 0x10000); // mapping_size
         let mut output = [0u8; 32];
 

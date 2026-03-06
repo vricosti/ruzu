@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use log::debug;
 use common::error;
 use common::{Handle, ResultCode, VAddr};
+use log::debug;
 
 use crate::kernel::KernelCore;
 use crate::thread::{ThreadState, WaitReason, THREAD_PRIORITY_LOWEST};

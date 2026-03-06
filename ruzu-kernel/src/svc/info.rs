@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use log::debug;
 use common::error;
 use common::{Handle, ResultCode};
+use log::debug;
 
 use crate::kernel::KernelCore;
 

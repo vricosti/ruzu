@@ -72,8 +72,15 @@ impl BufferQueue {
             self.queued_slot = Some(slot);
             log::debug!("buffer_queue: queue slot={}", slot);
         } else {
-            log::warn!("buffer_queue: cannot queue slot={} (state={:?})", slot,
-                       if slot < NUM_SLOTS { self.slots[slot] } else { SlotState::Free });
+            log::warn!(
+                "buffer_queue: cannot queue slot={} (state={:?})",
+                slot,
+                if slot < NUM_SLOTS {
+                    self.slots[slot]
+                } else {
+                    SlotState::Free
+                }
+            );
         }
     }
 
