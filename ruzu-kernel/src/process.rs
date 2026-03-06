@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use common::{
-    Handle, ProcessId, ThreadId, VAddr, HEAP_REGION_BASE, NRO_BASE_ADDRESS,
-    PAGE_SIZE, PAGE_SIZE_U64, STACK_REGION_BASE, TLS_ENTRY_SIZE,
+    Handle, ProcessId, ThreadId, VAddr, HEAP_REGION_BASE, NRO_BASE_ADDRESS, PAGE_SIZE,
+    PAGE_SIZE_U64, STACK_REGION_BASE, TLS_ENTRY_SIZE,
 };
 
 use crate::handle_table::HandleTable;
@@ -112,8 +112,11 @@ impl KProcess {
         self.memory.write_bytes(base_addr, code)?;
 
         // Reprotect to RX (zuyu: SetProcessMemoryPermission → ReadExecute)
-        self.memory
-            .set_permissions(base_addr, size, MemoryPermission::READ | MemoryPermission::EXECUTE)?;
+        self.memory.set_permissions(
+            base_addr,
+            size,
+            MemoryPermission::READ | MemoryPermission::EXECUTE,
+        )?;
 
         // Update layout
         self.layout.code_end = base_addr + size;
@@ -165,8 +168,7 @@ impl KProcess {
     pub fn allocate_tls(&mut self) -> anyhow::Result<VAddr> {
         // If we don't have a TLS page yet, or current page is full, allocate a new one
         if self.layout.tls_base == 0
-            || (self.layout.next_tls_addr - self.layout.tls_base) as usize
-                >= PAGE_SIZE
+            || (self.layout.next_tls_addr - self.layout.tls_base) as usize >= PAGE_SIZE
         {
             // Allocate a new TLS page after the code region
             let tls_page = if self.layout.tls_base == 0 {

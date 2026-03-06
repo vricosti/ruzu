@@ -25,11 +25,17 @@ pub enum WaitReason {
     /// Not waiting.
     None,
     /// WaitSynchronization on one or more handles.
-    Synchronization { handles: Vec<Handle>, timeout_ns: i64 },
+    Synchronization {
+        handles: Vec<Handle>,
+        timeout_ns: i64,
+    },
     /// ArbitrateLock — waiting for a mutex.
     ArbitrateLock { mutex_addr: VAddr, tag: u32 },
     /// WaitProcessWideKeyAtomic — waiting on a condvar.
-    CondVar { condvar_addr: VAddr, mutex_addr: VAddr },
+    CondVar {
+        condvar_addr: VAddr,
+        mutex_addr: VAddr,
+    },
     /// WaitForAddress — waiting on an address arbiter.
     AddressArbiter { addr: VAddr },
     /// SleepThread with a timeout.
@@ -174,7 +180,10 @@ mod tests {
         assert_eq!(thread.state, ThreadState::Runnable);
 
         thread.begin_wait(
-            WaitReason::Synchronization { handles: vec![1, 2], timeout_ns: 1000 },
+            WaitReason::Synchronization {
+                handles: vec![1, 2],
+                timeout_ns: 1000,
+            },
             100,
         );
         assert_eq!(thread.state, ThreadState::Waiting);

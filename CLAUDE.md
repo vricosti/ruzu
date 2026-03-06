@@ -38,14 +38,14 @@ Pour les trois dépôts Rust suivants, **toujours créer une branche** avant de 
 
 ```bash
 cd /home/vricosti/shared/<depot>
-git checkout -b claude/autonomous-porting    # Créer la branche de travail
+git checkout -b claude/opengl-renderer-and-restructure    # Créer la branche de travail
 # ... faire les modifications ...
 git add -A
 git commit -m "<message descriptif>"         # Commiter en local
 ```
 
 **Règles strictes :**
-- **Utiliser une seule branche `claude/autonomous-porting`** sur chaque dépôt — pas de branche par feature
+- **Utiliser une seule branche `claude/opengl-renderer-and-restructure`** sur chaque dépôt — pas de branche par feature
 - **Commiter régulièrement** en local avec des messages descriptifs
 - **Ne JAMAIS pousser** (`git push`) — il n'y a pas de clés SSH configurées, et de toute façon on ne veut pas pousser sans review
 - **Ne JAMAIS modifier la branche `main`** directement

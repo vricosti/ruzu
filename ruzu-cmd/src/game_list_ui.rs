@@ -46,7 +46,9 @@ const SCROLLBAR_FG: Color = Color::RGB(100, 100, 120);
 /// Returns the index of the selected game, or `None` if the user quit.
 pub fn show_game_list(games: &[GameInfo]) -> Result<Option<usize>> {
     let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL2 init: {}", e))?;
-    let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL2 video: {}", e))?;
+    let video = sdl
+        .video()
+        .map_err(|e| anyhow::anyhow!("SDL2 video: {}", e))?;
 
     let window = video
         .window("ruzu - Game Library", WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -87,7 +89,9 @@ pub fn show_game_list(games: &[GameInfo]) -> Result<Option<usize>> {
             canvas.set_draw_color(BG_COLOR);
             canvas.clear();
 
-            let (w, h) = canvas.output_size().unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
+            let (w, h) = canvas
+                .output_size()
+                .unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
             draw_centered_text(
                 &mut canvas,
                 "No games found. Add games to your games directory.",
@@ -102,7 +106,9 @@ pub fn show_game_list(games: &[GameInfo]) -> Result<Option<usize>> {
     }
 
     loop {
-        let (win_w, win_h) = canvas.output_size().unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
+        let (win_w, win_h) = canvas
+            .output_size()
+            .unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
         let visible_rows = ((win_h - HEADER_HEIGHT) / ROW_HEIGHT) as usize;
 
         for event in event_pump.poll_iter() {
@@ -146,8 +152,7 @@ pub fn show_game_list(games: &[GameInfo]) -> Result<Option<usize>> {
                     }
                     Some(Keycode::End) => {
                         selected = games.len().saturating_sub(1);
-                        scroll_offset =
-                            games.len().saturating_sub(visible_rows);
+                        scroll_offset = games.len().saturating_sub(visible_rows);
                     }
                     _ => {}
                 },
@@ -282,7 +287,12 @@ pub fn show_game_list(games: &[GameInfo]) -> Result<Option<usize>> {
 
             canvas.set_draw_color(SCROLLBAR_BG);
             canvas
-                .fill_rect(Rect::new(scrollbar_x, HEADER_HEIGHT as i32, 8, scrollbar_area_h))
+                .fill_rect(Rect::new(
+                    scrollbar_x,
+                    HEADER_HEIGHT as i32,
+                    8,
+                    scrollbar_area_h,
+                ))
                 .ok();
 
             canvas.set_draw_color(SCROLLBAR_FG);
@@ -300,7 +310,13 @@ pub fn show_game_list(games: &[GameInfo]) -> Result<Option<usize>> {
 ///
 /// Each character is rendered as a 6x10 bitmap. This is intentionally minimal —
 /// just enough to display game titles legibly.
-fn draw_text(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>, text: &str, x: i32, y: i32, color: Color) {
+fn draw_text(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    text: &str,
+    x: i32,
+    y: i32,
+    color: Color,
+) {
     canvas.set_draw_color(color);
     let mut cx = x;
     for ch in text.chars() {

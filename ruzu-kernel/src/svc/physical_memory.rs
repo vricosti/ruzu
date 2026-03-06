@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use common::{error, is_page_aligned, ResultCode, VAddr};
 use log::debug;
-use common::{error, ResultCode, VAddr, is_page_aligned};
 
 use crate::kernel::KernelCore;
 use crate::memory_manager::MemoryPermission;
@@ -11,11 +11,7 @@ use crate::memory_manager::MemoryPermission;
 ///
 /// Maps physical memory at the given address with READ_WRITE permissions.
 /// Used by games for GPU buffer allocations and large data regions.
-pub fn svc_map_physical_memory(
-    kernel: &mut KernelCore,
-    addr: VAddr,
-    size: u64,
-) -> ResultCode {
+pub fn svc_map_physical_memory(kernel: &mut KernelCore, addr: VAddr, size: u64) -> ResultCode {
     debug!("MapPhysicalMemory: addr=0x{:X}, size=0x{:X}", addr, size);
 
     if !is_page_aligned(addr) || !is_page_aligned(size) || size == 0 {
@@ -55,11 +51,7 @@ pub fn svc_map_physical_memory(
 /// SVC 0x2D: UnmapPhysicalMemory
 ///
 /// Unmaps physical memory at the given address.
-pub fn svc_unmap_physical_memory(
-    kernel: &mut KernelCore,
-    addr: VAddr,
-    size: u64,
-) -> ResultCode {
+pub fn svc_unmap_physical_memory(kernel: &mut KernelCore, addr: VAddr, size: u64) -> ResultCode {
     debug!("UnmapPhysicalMemory: addr=0x{:X}, size=0x{:X}", addr, size);
 
     if !is_page_aligned(addr) || !is_page_aligned(size) || size == 0 {

@@ -30,8 +30,8 @@ pub mod thread;
 pub mod tick;
 pub mod transfer_memory;
 
-use log::{debug, warn};
 use common::ResultCode;
+use log::{debug, warn};
 
 use crate::kernel::KernelCore;
 use ruzu_cpu::CpuState;
@@ -162,8 +162,7 @@ fn dispatch_svc_64(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
             let addr = cpu.x[0];
             let size = cpu.x[1];
             let perm = cpu.x[2] as u32;
-            cpu.x[0] =
-                memory::svc_set_memory_permission(kernel, addr, size, perm).raw() as u64;
+            cpu.x[0] = memory::svc_set_memory_permission(kernel, addr, size, perm).raw() as u64;
         }
 
         svc_number::SET_MEMORY_ATTRIBUTE => {
@@ -595,10 +594,7 @@ fn dispatch_svc_64(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
         }
 
         _ => {
-            warn!(
-                "Unimplemented SVC 0x{:02X} (PC=0x{:016X})",
-                svc_num, cpu.pc
-            );
+            warn!("Unimplemented SVC 0x{:02X} (PC=0x{:016X})", svc_num, cpu.pc);
             cpu.x[0] = ResultCode::SUCCESS.raw() as u64;
         }
     }
@@ -613,13 +609,11 @@ fn dispatch_svc_64(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
 fn dispatch_svc_32(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
     match svc_num {
         // ---- SVCs with IDENTICAL register layout in 32-bit and 64-bit ----
-
         svc_number::SET_MEMORY_PERMISSION => {
             let addr = cpu.x[0];
             let size = cpu.x[1];
             let perm = cpu.x[2] as u32;
-            cpu.x[0] =
-                memory::svc_set_memory_permission(kernel, addr, size, perm).raw() as u64;
+            cpu.x[0] = memory::svc_set_memory_permission(kernel, addr, size, perm).raw() as u64;
         }
 
         svc_number::SET_MEMORY_ATTRIBUTE => {
@@ -787,7 +781,6 @@ fn dispatch_svc_32(kernel: &mut KernelCore, cpu: &mut CpuState, svc_num: u32) {
         }
 
         // ---- SVCs with DIFFERENT register layout in 32-bit ----
-
         svc_number::SET_HEAP_SIZE => {
             // 32-bit: r1=size (u32), out: r0=Result, r1=out_address (u32)
             let size = cpu.x[1];

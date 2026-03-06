@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "audio_core",
     "ruzu-cmd",
     "common",
     "core",
@@ -68,5 +69,6 @@ bitflags = "2"
 byteorder = "1"
 bytemuck = { version = "1", features = ["derive"] }
 memmap2 = "0.9"
+cubeb = "0.34"
 parking_lot = "0.12"
 tempfile = "3"

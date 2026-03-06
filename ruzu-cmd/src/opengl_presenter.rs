@@ -36,7 +36,10 @@ impl OpenGLPresenter {
     /// Create a new OpenGL presenter from an SDL2 window.
     ///
     /// The window must have been created with the `.opengl()` flag.
-    pub fn new(window: &Window, syncpoints: Arc<SyncpointManager>) -> Result<Self, OpenGLPresenterError> {
+    pub fn new(
+        window: &Window,
+        syncpoints: Arc<SyncpointManager>,
+    ) -> Result<Self, OpenGLPresenterError> {
         // Create GL context
         let gl_context = window
             .gl_create_context()

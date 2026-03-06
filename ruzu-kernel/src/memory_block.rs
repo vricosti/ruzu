@@ -378,9 +378,8 @@ mod tests {
 
     #[test]
     fn test_convert_permission() {
-        let perm = convert_to_k_memory_permission(
-            SvcMemoryPermission::READ | SvcMemoryPermission::WRITE,
-        );
+        let perm =
+            convert_to_k_memory_permission(SvcMemoryPermission::READ | SvcMemoryPermission::WRITE);
         assert!(perm.contains(KMemoryPermission::USER_READ));
         assert!(perm.contains(KMemoryPermission::USER_WRITE));
         assert!(perm.contains(KMemoryPermission::KERNEL_READ));

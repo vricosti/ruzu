@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use common::{error, is_page_aligned, Handle, ResultCode, VAddr};
 use log::debug;
-use common::{error, Handle, ResultCode, VAddr, is_page_aligned};
 
 use crate::kernel::KernelCore;
 use crate::memory_manager::{MemoryPermission, MemoryState};
@@ -44,9 +44,7 @@ pub fn svc_map_shared_memory(
                 if shm.backing_offset.is_none() {
                     // Allocate from the kernel's shared memory pool.
                     let offset = kernel.shared_memory_pool.len();
-                    kernel
-                        .shared_memory_pool
-                        .resize(offset + backing_size, 0);
+                    kernel.shared_memory_pool.resize(offset + backing_size, 0);
                     // Re-borrow after pool resize.
                     let process = kernel.process_mut().unwrap();
                     if let Ok(KernelObject::SharedMemory(shm)) =
@@ -58,9 +56,7 @@ pub fn svc_map_shared_memory(
 
                 // Re-fetch the offset after potential mutation.
                 let process = kernel.process_mut().unwrap();
-                if let Ok(KernelObject::SharedMemory(shm)) =
-                    process.handle_table.get(handle)
-                {
+                if let Ok(KernelObject::SharedMemory(shm)) = process.handle_table.get(handle) {
                     backing_offset = shm.backing_offset;
                 } else {
                     return error::INVALID_HANDLE;
@@ -69,12 +65,10 @@ pub fn svc_map_shared_memory(
             Ok(_) => {
                 // Not a shared memory object — just map the region (legacy behavior).
                 let permission = MemoryPermission::from_bits_truncate(perm);
-                return match process.memory.map(
-                    addr,
-                    size,
-                    permission,
-                    MemoryState::SharedMemory,
-                ) {
+                return match process
+                    .memory
+                    .map(addr, size, permission, MemoryState::SharedMemory)
+                {
                     Ok(_) => ResultCode::SUCCESS,
                     Err(_) => error::INVALID_MEMORY_STATE,
                 };
@@ -82,12 +76,10 @@ pub fn svc_map_shared_memory(
             Err(_) => {
                 // Handle not found — map the region anyway (for stubs/dummy handles).
                 let permission = MemoryPermission::from_bits_truncate(perm);
-                return match process.memory.map(
-                    addr,
-                    size,
-                    permission,
-                    MemoryState::SharedMemory,
-                ) {
+                return match process
+                    .memory
+                    .map(addr, size, permission, MemoryState::SharedMemory)
+                {
                     Ok(_) => ResultCode::SUCCESS,
                     Err(_) => error::INVALID_MEMORY_STATE,
                 };
@@ -126,10 +118,7 @@ pub fn svc_unmap_shared_memory(
     addr: VAddr,
     size: u64,
 ) -> ResultCode {
-    debug!(
-        "UnmapSharedMemory: addr=0x{:X}, size=0x{:X}",
-        addr, size
-    );
+    debug!("UnmapSharedMemory: addr=0x{:X}, size=0x{:X}", addr, size);
 
     if !is_page_aligned(addr) || !is_page_aligned(size) || size == 0 {
         return error::INVALID_SIZE;

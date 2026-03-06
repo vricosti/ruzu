@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use log::debug;
 use common::{error, Handle, ResultCode, VAddr};
+use log::debug;
 
 use crate::kernel::KernelCore;
 use crate::thread::{ThreadState, WaitReason};
@@ -110,8 +110,7 @@ pub fn svc_arbitrate_unlock(kernel: &mut KernelCore, cpu: &mut CpuState, mutex_a
             .count()
             > 0;
 
-        let new_word = (waiter_handle & 0x3FFF_FFFF)
-            | if more_waiters { 1 << 30 } else { 0 };
+        let new_word = (waiter_handle & 0x3FFF_FFFF) | if more_waiters { 1 << 30 } else { 0 };
         let _ = process.memory.write_u32(mutex_addr, new_word);
 
         // Wake the waiter — wake() sets x[0] to SUCCESS.

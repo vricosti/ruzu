@@ -180,7 +180,7 @@ impl ServiceHandler for ViDisplayService {
                 let parcel_bytes = build_native_window_parcel(layer_id);
                 // Response: layer_id (u64 = 2 words) + parcel_size (u32) + parcel data
                 let mut data = vec![layer_id as u32, 0]; // layer_id as u64
-                data.push(parcel_bytes.len() as u32);    // parcel size
+                data.push(parcel_bytes.len() as u32); // parcel size
                 for chunk in parcel_bytes.chunks(4) {
                     let mut word_bytes = [0u8; 4];
                     word_bytes[..chunk.len()].copy_from_slice(chunk);
@@ -224,10 +224,10 @@ fn build_native_window_parcel(layer_id: u64) -> Vec<u8> {
     let mut parcel = Parcel::new();
     // Binder native window structure (simplified):
     // flat_binder_object: type(u32)=2, flags(u32)=0, binder_id(u64)=layer_id, cookie(u64)=0
-    parcel.write_u32(2);              // type: BINDER_TYPE_HANDLE
-    parcel.write_u32(0);              // flags
-    parcel.write_u64(layer_id);       // binder id
-    parcel.write_u64(0);              // cookie
+    parcel.write_u32(2); // type: BINDER_TYPE_HANDLE
+    parcel.write_u32(0); // flags
+    parcel.write_u64(layer_id); // binder id
+    parcel.write_u64(0); // cookie
     parcel.serialize()
 }
 
@@ -281,10 +281,8 @@ impl ServiceHandler for ViBinderService {
                 } else {
                     &[]
                 };
-                let parcel_bytes: Vec<u8> = parcel_words
-                    .iter()
-                    .flat_map(|w| w.to_le_bytes())
-                    .collect();
+                let parcel_bytes: Vec<u8> =
+                    parcel_words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
                 log::debug!(
                     "vi:binder: TransactParcel binder={}, code={}, data_len={}",
@@ -293,8 +291,7 @@ impl ServiceHandler for ViBinderService {
                     parcel_bytes.len()
                 );
 
-                let response_parcel =
-                    self.handle_transact(transact_code, &parcel_bytes);
+                let response_parcel = self.handle_transact(transact_code, &parcel_bytes);
 
                 // Pack response parcel into u32 words.
                 let serialized = response_parcel.serialize();
@@ -361,13 +358,13 @@ impl ViBinderService {
                 match bq.dequeue() {
                     Some(slot) => {
                         response.write_i32(slot as i32); // slot
-                        response.write_i32(0);           // fence (none)
-                        response.write_u32(0);           // status = OK
+                        response.write_i32(0); // fence (none)
+                        response.write_u32(0); // status = OK
                     }
                     None => {
                         response.write_i32(-1); // no slot
                         response.write_i32(0);
-                        response.write_u32(0);  // still "OK" to avoid game crash
+                        response.write_u32(0); // still "OK" to avoid game crash
                     }
                 }
             }
@@ -379,10 +376,10 @@ impl ViBinderService {
                 bq.queue(slot);
                 // Return QueueBufferOutput.
                 response.write_u32(1280); // width
-                response.write_u32(720);  // height
-                response.write_u32(0);    // transform_hint
-                response.write_u32(1);    // num_pending_buffers
-                response.write_u32(0);    // status = OK
+                response.write_u32(720); // height
+                response.write_u32(0); // transform_hint
+                response.write_u32(1); // num_pending_buffers
+                response.write_u32(0); // status = OK
             }
 
             transact::CANCEL_BUFFER => {
@@ -395,10 +392,10 @@ impl ViBinderService {
                 log::debug!("vi:binder: Query what={}", what);
                 // Common queries: 1=width, 2=height, 3=format
                 let value = match what {
-                    1 => 1280,           // DEFAULT_WIDTH
-                    2 => 720,            // DEFAULT_HEIGHT
-                    3 => 1,              // PIXEL_FORMAT_RGBA_8888
-                    6 => 0,              // CONSUMER_USAGE
+                    1 => 1280, // DEFAULT_WIDTH
+                    2 => 720,  // DEFAULT_HEIGHT
+                    3 => 1,    // PIXEL_FORMAT_RGBA_8888
+                    6 => 0,    // CONSUMER_USAGE
                     _ => 0,
                 };
                 response.write_i32(value);
@@ -409,10 +406,10 @@ impl ViBinderService {
                 log::debug!("vi:binder: Connect");
                 // Return QueueBufferOutput.
                 response.write_u32(1280); // width
-                response.write_u32(720);  // height
-                response.write_u32(0);    // transform_hint
-                response.write_u32(1);    // num_pending_buffers
-                response.write_u32(0);    // status = OK
+                response.write_u32(720); // height
+                response.write_u32(0); // transform_hint
+                response.write_u32(1); // num_pending_buffers
+                response.write_u32(0); // status = OK
             }
 
             transact::DISCONNECT => {
@@ -468,16 +465,18 @@ impl ViBinderService {
                     log::info!(
                         "vi:binder: SetPreallocatedBuffer slot={}, {}x{}, stride={}, fmt={}, \
                          buffer_id={}, buf_offset=0x{:X}",
-                        slot, width, height, stride, format, buffer_id, buffer_offset
+                        slot,
+                        width,
+                        height,
+                        stride,
+                        format,
+                        buffer_id,
+                        buffer_offset
                     );
 
                     // Resolve the nvmap handle to a guest base address, then add
                     // the buffer offset to get the final framebuffer address.
-                    let base_addr = self
-                        .gpu
-                        .nvmap_registry
-                        .get_address(buffer_id)
-                        .unwrap_or(0);
+                    let base_addr = self.gpu.nvmap_registry.get_address(buffer_id).unwrap_or(0);
                     let offset = base_addr + buffer_offset as u64;
 
                     let buf = GraphicBuffer {
@@ -534,6 +533,8 @@ mod tests {
             b_buf_addrs: Vec::new(),
             x_bufs: Vec::new(),
             a_bufs: Vec::new(),
+            a_buf_data: Vec::new(),
+            b_buf_sizes: Vec::new(),
         }
     }
 
@@ -554,6 +555,8 @@ mod tests {
             b_buf_addrs: Vec::new(),
             x_bufs: Vec::new(),
             a_bufs: Vec::new(),
+            a_buf_data: Vec::new(),
+            b_buf_sizes: Vec::new(),
         }
     }
 
@@ -631,10 +634,7 @@ mod tests {
         let mut svc = ViBinderService::new(bq.clone(), test_gpu());
 
         // Dequeue
-        let cmd = make_command_with_data(
-            0,
-            vec![0, transact::DEQUEUE_BUFFER, 0],
-        );
+        let cmd = make_command_with_data(0, vec![0, transact::DEQUEUE_BUFFER, 0]);
         let resp = svc.handle_request(0, &cmd);
         assert!(resp.result.is_success());
 
@@ -668,18 +668,18 @@ mod tests {
 
         // Build SET_PREALLOCATED_BUFFER parcel with full NvGraphicBuffer (0x16C bytes).
         let mut parcel = Parcel::new();
-        parcel.write_i32(0);    // slot
-        parcel.write_i32(1);    // has_buffer = true
+        parcel.write_i32(0); // slot
+        parcel.write_i32(1); // has_buffer = true
         parcel.write_i64(0x16C); // flattened_size
 
         // NvGraphicBuffer struct (0x16C = 364 bytes = 91 u32 words)
         let mut gfx_buf = vec![0u32; 91];
-        gfx_buf[0x04 / 4] = 1280;      // width
-        gfx_buf[0x08 / 4] = 720;       // height
-        gfx_buf[0x0C / 4] = 5120;      // stride (bytes)
-        gfx_buf[0x10 / 4] = 1;         // format (RGBA8888)
-        gfx_buf[0x2C / 4] = 5;         // buffer_id (nvmap handle)
-        gfx_buf[0x80 / 4] = 0x1000;    // offset into nvmap buffer
+        gfx_buf[0x04 / 4] = 1280; // width
+        gfx_buf[0x08 / 4] = 720; // height
+        gfx_buf[0x0C / 4] = 5120; // stride (bytes)
+        gfx_buf[0x10 / 4] = 1; // format (RGBA8888)
+        gfx_buf[0x2C / 4] = 5; // buffer_id (nvmap handle)
+        gfx_buf[0x80 / 4] = 0x1000; // offset into nvmap buffer
         for &w in &gfx_buf {
             parcel.write_u32(w);
         }

@@ -198,7 +198,9 @@ impl ServiceHandler for StorageService {
                 let (offset, size) = parse_read_params(&command.raw_data);
                 log::info!(
                     "fsp:IStorage: Read(offset=0x{:X}, size=0x{:X}, total=0x{:X})",
-                    offset, size, self.data.len()
+                    offset,
+                    size,
+                    self.data.len()
                 );
 
                 if offset as usize >= self.data.len() {
@@ -452,7 +454,11 @@ impl ServiceHandler for SaveDataFile {
             // Read
             0 => {
                 let (offset, size) = parse_read_params(&command.raw_data);
-                log::info!("fsp:ISaveDataFile: Read(offset=0x{:X}, size=0x{:X})", offset, size);
+                log::info!(
+                    "fsp:ISaveDataFile: Read(offset=0x{:X}, size=0x{:X})",
+                    offset,
+                    size
+                );
                 let start = (offset as usize).min(self.data.len());
                 let end = (start + size as usize).min(self.data.len());
                 let slice = &self.data[start..end];
@@ -484,7 +490,8 @@ impl ServiceHandler for SaveDataFile {
 
 /// Extract a path string from IPC raw data words (null-terminated bytes).
 fn extract_path_from_raw(raw_data: &[u32]) -> String {
-    let bytes: Vec<u8> = raw_data.iter()
+    let bytes: Vec<u8> = raw_data
+        .iter()
         .flat_map(|w| w.to_le_bytes())
         .take_while(|&b| b != 0)
         .collect();
@@ -515,6 +522,8 @@ mod tests {
             b_buf_addrs: Vec::new(),
             x_bufs: Vec::new(),
             a_bufs: Vec::new(),
+            a_buf_data: Vec::new(),
+            b_buf_sizes: Vec::new(),
         }
     }
 
@@ -535,6 +544,8 @@ mod tests {
             b_buf_addrs: Vec::new(),
             x_bufs: Vec::new(),
             a_bufs: Vec::new(),
+            a_buf_data: Vec::new(),
+            b_buf_sizes: Vec::new(),
         }
     }
 
@@ -591,7 +602,10 @@ mod tests {
         let cmd = make_command_with_data(0, vec![0, 0, 4, 0]);
         let resp = svc.handle_request(0, &cmd);
         assert!(resp.result.is_success());
-        assert_eq!(resp.data, vec![u32::from_le_bytes([0x11, 0x22, 0x33, 0x44])]);
+        assert_eq!(
+            resp.data,
+            vec![u32::from_le_bytes([0x11, 0x22, 0x33, 0x44])]
+        );
     }
 
     #[test]

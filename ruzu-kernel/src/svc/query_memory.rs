@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use common::{error, ResultCode, VAddr};
 use log::debug;
-use common::{ResultCode, VAddr, error};
 
 use crate::kernel::KernelCore;
 use ruzu_cpu::CpuState;

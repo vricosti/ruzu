@@ -1,11 +1,9 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use common::settings::{Language, Region, RendererBackend, Values};
 use ini::Ini;
 use log::{debug, info, warn};
-use common::settings::{
-    Language, Region, RendererBackend, Values,
-};
 use std::path::PathBuf;
 
 // Re-export for backward compat
@@ -155,7 +153,10 @@ pub fn load_config(path: Option<&PathBuf>) -> Values {
             if let Some(rb) = RendererBackend::from_string(backend.trim()) {
                 settings.renderer_backend.set_value(rb);
             }
-            debug!("Renderer backend: {:?}", settings.renderer_backend.get_value());
+            debug!(
+                "Renderer backend: {:?}",
+                settings.renderer_backend.get_value()
+            );
         }
         if let Some(vsync) = section.get("use_vsync") {
             if let Some(mode) = common::settings::VSyncMode::from_string(vsync.trim()) {
@@ -218,7 +219,9 @@ pub fn load_config(path: Option<&PathBuf>) -> Values {
     {
         let section = conf.section(Some("Cpu"));
         let read_bool = |key: &str| -> Option<bool> {
-            section?.get(key).map(|v| v.trim() == "true" || v.trim() == "1")
+            section?
+                .get(key)
+                .map(|v| v.trim() == "true" || v.trim() == "1")
         };
         if let Some(v) = read_bool("cpuopt_page_tables") {
             settings.cpuopt_page_tables.set_value(v);

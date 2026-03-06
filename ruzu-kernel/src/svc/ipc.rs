@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use log::{debug, warn};
 use common::error;
 use common::{Handle, ResultCode, VAddr};
+use log::{debug, warn};
 
 use crate::kernel::KernelCore;
 use crate::objects::{KClientSession, KernelObject};
@@ -70,7 +70,17 @@ pub fn svc_send_sync_request(
     }
 
     // 4. Call the handler.
-    let result = handler.handle_ipc(&service_name, &tls_data);
+    let result = {
+        let process = kernel.process_mut().unwrap();
+        let guest_read = |addr: u64, size: usize| -> Vec<u8> {
+            let mut data = vec![0u8; size];
+            for (index, byte) in data.iter_mut().enumerate() {
+                *byte = process.memory.read_u8(addr + index as u64).unwrap_or(0);
+            }
+            data
+        };
+        handler.handle_ipc(&service_name, &tls_data, &guest_read)
+    };
 
     // 5. If create_session_for is Some, create a new KClientSession and record its handle.
     //    This handle will be placed into the response's move-handle descriptor.
@@ -108,12 +118,7 @@ pub fn svc_send_sync_request(
         // Re-build the response with handle descriptor.
         // Parse the CMIF result code and data from the handler's response.
         let (result_code, data_words) = parse_cmif_from_response(&result.response_bytes);
-        build_response_with_handles(
-            result_code,
-            &data_words,
-            copy_handles,
-            &extra_move_handles,
-        )
+        build_response_with_handles(result_code, &data_words, copy_handles, &extra_move_handles)
     } else {
         result.response_bytes
     };
@@ -167,10 +172,7 @@ pub fn svc_send_sync_request_with_user_buffer(
         match process.handle_table.get(handle) {
             Ok(KernelObject::ClientSession(session)) => session.service_name.clone(),
             _ => {
-                warn!(
-                    "SendSyncRequestWithUserBuffer: invalid handle {}",
-                    handle
-                );
+                warn!("SendSyncRequestWithUserBuffer: invalid handle {}", handle);
                 return error::INVALID_HANDLE;
             }
         }
@@ -203,7 +205,17 @@ pub fn svc_send_sync_request_with_user_buffer(
     }
 
     // 4. Call the handler.
-    let result = handler.handle_ipc(&service_name, &ipc_data);
+    let result = {
+        let process = kernel.process_mut().unwrap();
+        let guest_read = |addr: u64, size: usize| -> Vec<u8> {
+            let mut data = vec![0u8; size];
+            for (index, byte) in data.iter_mut().enumerate() {
+                *byte = process.memory.read_u8(addr + index as u64).unwrap_or(0);
+            }
+            data
+        };
+        handler.handle_ipc(&service_name, &ipc_data, &guest_read)
+    };
 
     // 5. Handle sub-session creation and move handles.
     let mut extra_move_handles: Vec<u32> = result.move_handles.clone();
@@ -236,12 +248,7 @@ pub fn svc_send_sync_request_with_user_buffer(
 
     let response_bytes = if has_handles {
         let (result_code, data_words) = parse_cmif_from_response(&result.response_bytes);
-        build_response_with_handles(
-            result_code,
-            &data_words,
-            copy_handles,
-            &extra_move_handles,
-        )
+        build_response_with_handles(result_code, &data_words, copy_handles, &extra_move_handles)
     } else {
         result.response_bytes
     };
@@ -282,9 +289,7 @@ fn write_cmif_response_at(
     let _ = process.memory.write_u32(addr + 4, data_words); // data size
 
     let cmif_offset = 16u64;
-    let _ = process
-        .memory
-        .write_u32(addr + cmif_offset, 0x4F434653); // "SFCO"
+    let _ = process.memory.write_u32(addr + cmif_offset, 0x4F434653); // "SFCO"
     let _ = process.memory.write_u32(addr + cmif_offset + 4, 0); // version
     let _ = process
         .memory
@@ -310,9 +315,8 @@ fn parse_cmif_from_response(response: &[u8]) -> (u32, Vec<u32>) {
 
     let mut offset = 8usize;
     if has_handle_desc != 0 {
-        let handle_desc = u32::from_le_bytes(
-            response[offset..offset + 4].try_into().unwrap_or([0; 4]),
-        );
+        let handle_desc =
+            u32::from_le_bytes(response[offset..offset + 4].try_into().unwrap_or([0; 4]));
         let num_copy = (handle_desc >> 1) & 0xF;
         let num_move = (handle_desc >> 5) & 0xF;
         offset += 4;
@@ -430,9 +434,7 @@ fn write_cmif_response(
     let cmif_offset = 16u64;
 
     // CMIF response header
-    let _ = process
-        .memory
-        .write_u32(tls_addr + cmif_offset, 0x4F434653); // "SFCO"
+    let _ = process.memory.write_u32(tls_addr + cmif_offset, 0x4F434653); // "SFCO"
     let _ = process.memory.write_u32(tls_addr + cmif_offset + 4, 0); // version
     let _ = process
         .memory

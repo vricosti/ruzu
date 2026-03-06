@@ -19,24 +19,24 @@ use crate::ipc::{IpcCommand, IpcResponse};
 /// nn::settings::LanguageCode values (8-byte null-padded strings as u64 LE).
 /// These match zuyu's available_language_codes array.
 const AVAILABLE_LANGUAGE_CODES: &[u64] = &[
-    u64::from_le_bytes(*b"ja\0\0\0\0\0\0"),       // Japanese
-    u64::from_le_bytes(*b"en-US\0\0\0"),           // AmericanEnglish
-    u64::from_le_bytes(*b"fr\0\0\0\0\0\0"),        // French
-    u64::from_le_bytes(*b"de\0\0\0\0\0\0"),        // German
-    u64::from_le_bytes(*b"it\0\0\0\0\0\0"),        // Italian
-    u64::from_le_bytes(*b"es\0\0\0\0\0\0"),        // Spanish
-    u64::from_le_bytes(*b"zh-CN\0\0\0"),           // Chinese
-    u64::from_le_bytes(*b"ko\0\0\0\0\0\0"),        // Korean
-    u64::from_le_bytes(*b"nl\0\0\0\0\0\0"),        // Dutch
-    u64::from_le_bytes(*b"pt\0\0\0\0\0\0"),        // Portuguese
-    u64::from_le_bytes(*b"ru\0\0\0\0\0\0"),        // Russian
-    u64::from_le_bytes(*b"zh-TW\0\0\0"),           // Taiwanese
-    u64::from_le_bytes(*b"en-GB\0\0\0"),           // BritishEnglish
-    u64::from_le_bytes(*b"fr-CA\0\0\0"),           // CanadianFrench
-    u64::from_le_bytes(*b"es-419\0\0"),            // LatinAmericanSpanish
-    u64::from_le_bytes(*b"zh-Hans\0"),             // SimplifiedChinese
-    u64::from_le_bytes(*b"zh-Hant\0"),             // TraditionalChinese
-    u64::from_le_bytes(*b"pt-BR\0\0\0"),           // BrazilianPortuguese
+    u64::from_le_bytes(*b"ja\0\0\0\0\0\0"), // Japanese
+    u64::from_le_bytes(*b"en-US\0\0\0"),    // AmericanEnglish
+    u64::from_le_bytes(*b"fr\0\0\0\0\0\0"), // French
+    u64::from_le_bytes(*b"de\0\0\0\0\0\0"), // German
+    u64::from_le_bytes(*b"it\0\0\0\0\0\0"), // Italian
+    u64::from_le_bytes(*b"es\0\0\0\0\0\0"), // Spanish
+    u64::from_le_bytes(*b"zh-CN\0\0\0"),    // Chinese
+    u64::from_le_bytes(*b"ko\0\0\0\0\0\0"), // Korean
+    u64::from_le_bytes(*b"nl\0\0\0\0\0\0"), // Dutch
+    u64::from_le_bytes(*b"pt\0\0\0\0\0\0"), // Portuguese
+    u64::from_le_bytes(*b"ru\0\0\0\0\0\0"), // Russian
+    u64::from_le_bytes(*b"zh-TW\0\0\0"),    // Taiwanese
+    u64::from_le_bytes(*b"en-GB\0\0\0"),    // BritishEnglish
+    u64::from_le_bytes(*b"fr-CA\0\0\0"),    // CanadianFrench
+    u64::from_le_bytes(*b"es-419\0\0"),     // LatinAmericanSpanish
+    u64::from_le_bytes(*b"zh-Hans\0"),      // SimplifiedChinese
+    u64::from_le_bytes(*b"zh-Hant\0"),      // TraditionalChinese
+    u64::from_le_bytes(*b"pt-BR\0\0\0"),    // BrazilianPortuguese
 ];
 
 /// Pre-4.0.0 max entries for GetAvailableLanguageCodes
@@ -205,8 +205,8 @@ impl ServiceHandler for SetSysService {
 fn build_firmware_version_struct() -> Vec<u8> {
     let mut version_bytes = vec![0u8; 0x100];
     version_bytes[0x00] = 17; // major
-    version_bytes[0x01] = 0;  // minor
-    version_bytes[0x02] = 0;  // micro
+    version_bytes[0x01] = 0; // minor
+    version_bytes[0x02] = 0; // micro
 
     version_bytes[0x08] = b'N';
     version_bytes[0x09] = b'X';
@@ -438,6 +438,8 @@ mod tests {
             b_buf_addrs: Vec::new(),
             x_bufs: Vec::new(),
             a_bufs: Vec::new(),
+            a_buf_data: Vec::new(),
+            b_buf_sizes: Vec::new(),
         }
     }
 
@@ -452,8 +454,8 @@ mod tests {
         let bytes = &resp.out_bufs[0];
         assert_eq!(bytes.len(), 0x100);
         assert_eq!(bytes[0x00], 17); // major
-        assert_eq!(bytes[0x01], 0);  // minor
-        assert_eq!(bytes[0x02], 0);  // micro
+        assert_eq!(bytes[0x01], 0); // minor
+        assert_eq!(bytes[0x02], 0); // micro
         assert_eq!(&bytes[0x68..0x68 + 6], b"17.0.0");
     }
 

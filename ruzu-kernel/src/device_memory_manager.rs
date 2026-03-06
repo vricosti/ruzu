@@ -358,8 +358,8 @@ impl DeviceMemoryManager {
         // Note: In C++ this takes mapping_guard via scoped_lock. Since we have &mut self,
         // we already have exclusive access in Rust's ownership model.
         let start_page_d = (address >> self.page_bits) as usize;
-        let num_pages = common::align_up(size as u64, self.page_size as u64) as usize
-            >> self.page_bits;
+        let num_pages =
+            common::align_up(size as u64, self.page_size as u64) as usize >> self.page_bits;
 
         for i in 0..num_pages {
             let new_vaddress = virtual_address + (i as u64) * (self.page_size as u64);
@@ -373,8 +373,8 @@ impl DeviceMemoryManager {
     /// Unmap a device virtual address range.
     pub fn unmap(&mut self, address: DAddr, size: usize) {
         let start_page_d = (address >> self.page_bits) as usize;
-        let num_pages = common::align_up(size as u64, self.page_size as u64) as usize
-            >> self.page_bits;
+        let num_pages =
+            common::align_up(size as u64, self.page_size as u64) as usize >> self.page_bits;
 
         if let Some(ref dev) = self.device_inter {
             dev.invalidate_region(address, size);
@@ -463,7 +463,8 @@ impl DeviceMemoryManager {
             self.registered_processes[id] = Some(id);
             Asid { id }
         } else {
-            self.registered_processes.push_back(Some(self.registered_processes.len()));
+            self.registered_processes
+                .push_back(Some(self.registered_processes.len()));
             Asid {
                 id: self.registered_processes.len() - 1,
             }
@@ -480,7 +481,11 @@ impl DeviceMemoryManager {
     pub fn get_physical_raw_address_from_daddr(&self, address: DAddr) -> PAddr {
         let subbits = address as usize & self.page_mask;
         let index = (address >> self.page_bits) as usize;
-        let paddr = self.compressed_physical_ptr.get(index).copied().unwrap_or(0);
+        let paddr = self
+            .compressed_physical_ptr
+            .get(index)
+            .copied()
+            .unwrap_or(0);
         if paddr == 0 {
             return 0;
         }
@@ -498,11 +503,19 @@ impl DeviceMemoryManager {
         let mut dest_offset = 0usize;
 
         while remaining > 0 {
-            let next_pages = self.continuity_tracker.get(page_index).copied().unwrap_or(1) as usize;
+            let next_pages = self
+                .continuity_tracker
+                .get(page_index)
+                .copied()
+                .unwrap_or(1) as usize;
             let copy_amount = ((next_pages << self.page_bits) - page_offset).min(remaining);
             let current_vaddr = ((page_index << self.page_bits) + page_offset) as u64;
 
-            let phys_addr = self.compressed_physical_ptr.get(page_index).copied().unwrap_or(0);
+            let phys_addr = self
+                .compressed_physical_ptr
+                .get(page_index)
+                .copied()
+                .unwrap_or(0);
             if phys_addr == 0 {
                 log::error!("Unmapped Device ReadBlock @ {:#018X}", current_vaddr);
                 dest[dest_offset..dest_offset + copy_amount].fill(0);
@@ -547,16 +560,21 @@ impl DeviceMemoryManager {
         let mut src_offset = 0usize;
 
         while remaining > 0 {
-            let next_pages = self.continuity_tracker.get(page_index).copied().unwrap_or(1) as usize;
+            let next_pages = self
+                .continuity_tracker
+                .get(page_index)
+                .copied()
+                .unwrap_or(1) as usize;
             let copy_amount = ((next_pages << self.page_bits) - page_offset).min(remaining);
             let current_vaddr = ((page_index << self.page_bits) + page_offset) as u64;
 
-            let phys_addr = self.compressed_physical_ptr.get(page_index).copied().unwrap_or(0);
+            let phys_addr = self
+                .compressed_physical_ptr
+                .get(page_index)
+                .copied()
+                .unwrap_or(0);
             if phys_addr == 0 {
-                log::error!(
-                    "Unmapped Device WriteBlock @ {:#018X}",
-                    current_vaddr,
-                );
+                log::error!("Unmapped Device WriteBlock @ {:#018X}", current_vaddr,);
             } else {
                 let raw_addr = ((phys_addr as usize - 1) << self.page_bits) + page_offset;
                 let mem_ptr = (self.physical_base + raw_addr) as *mut u8;

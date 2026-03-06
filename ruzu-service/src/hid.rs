@@ -132,6 +132,8 @@ mod tests {
             b_buf_addrs: Vec::new(),
             x_bufs: Vec::new(),
             a_bufs: Vec::new(),
+            a_buf_data: Vec::new(),
+            b_buf_sizes: Vec::new(),
         }
     }
 

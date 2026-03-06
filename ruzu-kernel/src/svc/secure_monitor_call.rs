@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use log::warn;
 use common::ResultCode;
+use log::warn;
 use ruzu_cpu::CpuState;
 
 /// SVC 0x7F: CallSecureMonitor

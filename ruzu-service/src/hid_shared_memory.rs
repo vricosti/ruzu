@@ -207,8 +207,7 @@ impl HidSharedMemory {
 
         let total_count = self.read_i64(touch_base + 8);
         let tail = total_count % LIFO_ENTRY_COUNT as i64;
-        let entry_offset =
-            touch_base + LIFO_HEADER_SIZE + (tail as usize) * TOUCH_LIFO_ENTRY_SIZE;
+        let entry_offset = touch_base + LIFO_HEADER_SIZE + (tail as usize) * TOUCH_LIFO_ENTRY_SIZE;
 
         // AtomicStorage<TouchScreenState>:
         //   +0x00: sampling_number (i64)
@@ -305,9 +304,8 @@ mod tests {
         assert_eq!(shm.data.len(), HID_SHARED_MEMORY_SIZE);
 
         // Check style tag is set to NpadHandheld | NpadFullKey (0x21).
-        let style_tag = u32::from_le_bytes(
-            shm.data[NPAD_OFFSET..NPAD_OFFSET + 4].try_into().unwrap(),
-        );
+        let style_tag =
+            u32::from_le_bytes(shm.data[NPAD_OFFSET..NPAD_OFFSET + 4].try_into().unwrap());
         assert_eq!(style_tag, STYLE_HANDHELD | STYLE_FULLKEY);
     }
 
