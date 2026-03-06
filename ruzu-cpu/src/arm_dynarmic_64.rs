@@ -11,6 +11,7 @@
 //! a vtable of function pointers, avoiding a circular dependency between
 //! ruzu-cpu and ruzu-kernel.
 
+use crate::cpu_settings::CpuSettings;
 use crate::state::CpuState;
 use rdynarmic::halt_reason::HaltReason;
 use rdynarmic::jit::A64Jit;
@@ -223,7 +224,7 @@ impl ArmDynarmic64 {
     /// # Safety
     /// `memory_ctx` must remain valid for the lifetime of this struct, and the
     /// vtable functions must be safe to call with it.
-    pub fn new(memory_ctx: *mut u8, vtable: MemoryVtable) -> Result<Self, String> {
+    pub fn new(memory_ctx: *mut u8, vtable: MemoryVtable, settings: &CpuSettings) -> Result<Self, String> {
         let mut callback_state = Box::new(CallbackState {
             memory_ctx,
             vtable,
@@ -234,13 +235,18 @@ impl ArmDynarmic64 {
         let state_ptr: *mut CallbackState = &mut *callback_state;
         let callbacks = DynarmicCallbacks { state: state_ptr };
 
+        let (optimizations, unsafe_optimizations) = settings.build_optimization_flags();
+
         let config = JitConfig {
             callbacks: Box::new(callbacks),
             enable_cycle_counting: true,
             code_cache_size: JitConfig::DEFAULT_CODE_CACHE_SIZE,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
+            optimizations,
+            unsafe_optimizations,
         };
+
+        log::info!("A64 JIT: accuracy={:?}, optimizations=0x{:08X}, unsafe={}",
+            settings.cpu_accuracy, optimizations.bits(), unsafe_optimizations);
 
         let jit = A64Jit::new(config)?;
 

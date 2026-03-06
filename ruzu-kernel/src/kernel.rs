@@ -97,8 +97,11 @@ impl KernelCore {
 
     /// Load a single NSO/NRO module at a given base address.
     ///
-    /// Returns the next page-aligned address after this module (for loading
-    /// the next module contiguously). Matches zuyu's `AppLoader_NSO::LoadModule`.
+    /// Matches zuyu's `KProcess::LoadModule`:
+    /// 1. Map the entire image region as RW (Code state)
+    /// 2. Write all segments (text, rodata, data) contiguously
+    /// 3. Reprotect: text→RX, rodata→R, data→RW
+    /// No relocation processing — the game's rtld handles all relocations.
     pub fn load_module(
         &mut self,
         base: VAddr,
@@ -110,48 +113,60 @@ impl KernelCore {
         rodata_offset: u32,
         data_offset: u32,
     ) -> anyhow::Result<VAddr> {
+        use crate::memory_manager::{MemoryPermission, MemoryState};
+
         let process = self
             .process
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("No process created"))?;
 
-        // Map text segment (executable)
-        process.load_code(base + text_offset as u64, text)?;
-
-        // Map rodata segment — map RW, write, reprotect to R (like zuyu LoadModule)
-        let rodata_addr = base + rodata_offset as u64;
+        let text_size = ruzu_common::align_up(text.len() as u64, ruzu_common::PAGE_SIZE_U64);
         let rodata_size = ruzu_common::align_up(rodata.len() as u64, ruzu_common::PAGE_SIZE_U64);
-        process.memory.map(
-            rodata_addr,
-            rodata_size,
-            crate::memory_manager::MemoryPermission::READ | crate::memory_manager::MemoryPermission::WRITE,
-            crate::memory_manager::MemoryState::Code,
-        )?;
-        process.memory.write_bytes(rodata_addr, rodata)?;
-        process.memory.set_permissions(
-            rodata_addr,
-            rodata_size,
-            crate::memory_manager::MemoryPermission::READ,
-        )?;
-
-        // Map data + BSS segment (read-write)
         let data_total_size = data.len() + bss_size;
-        process.map_data(base + data_offset as u64, data, data_total_size)?;
+        let data_size_aligned = ruzu_common::align_up(data_total_size as u64, ruzu_common::PAGE_SIZE_U64);
 
-        // Update code_end to be past ALL segments.
-        let data_end = base + data_offset as u64
-            + ruzu_common::align_up(data_total_size as u64, ruzu_common::PAGE_SIZE_U64);
-        if data_end > process.layout.code_end {
-            process.layout.code_end = data_end;
-        }
-
-        // Return next page-aligned address after this module's image.
-        // The image size is the max extent of any segment (data+bss is typically last).
         let image_end = [
-            text_offset as u64 + ruzu_common::align_up(text.len() as u64, ruzu_common::PAGE_SIZE_U64),
+            text_offset as u64 + text_size,
             rodata_offset as u64 + rodata_size,
-            data_offset as u64 + ruzu_common::align_up(data_total_size as u64, ruzu_common::PAGE_SIZE_U64),
+            data_offset as u64 + data_size_aligned,
         ].into_iter().max().unwrap_or(0);
+        let total_size = ruzu_common::align_up(image_end, ruzu_common::PAGE_SIZE_U64);
+
+        // 1. Map entire image as RW Code (like zuyu's MapPageGroup + WriteBlock)
+        process.memory.map(
+            base,
+            total_size,
+            MemoryPermission::READ | MemoryPermission::WRITE,
+            MemoryState::Code,
+        )?;
+
+        // 2. Write all segments
+        process.memory.write_bytes(base + text_offset as u64, text)?;
+        process.memory.write_bytes(base + rodata_offset as u64, rodata)?;
+        process.memory.write_bytes(base + data_offset as u64, data)?;
+
+        // 3. Reprotect each segment (splits the single region as needed)
+        process.memory.set_permissions(
+            base + text_offset as u64,
+            text_size,
+            MemoryPermission::READ | MemoryPermission::EXECUTE,
+        )?;
+        process.memory.set_permissions(
+            base + rodata_offset as u64,
+            rodata_size,
+            MemoryPermission::READ,
+        )?;
+        process.memory.set_permissions(
+            base + data_offset as u64,
+            data_size_aligned,
+            MemoryPermission::READ | MemoryPermission::WRITE,
+        )?;
+
+        // Update code_end
+        let end = base + image_end;
+        if end > process.layout.code_end {
+            process.layout.code_end = end;
+        }
 
         Ok(base + image_end)
     }

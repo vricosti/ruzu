@@ -831,7 +831,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruzu"
+name = "ruzu-cmd"
 version = "0.1.0"
 dependencies = [
  "anyhow",

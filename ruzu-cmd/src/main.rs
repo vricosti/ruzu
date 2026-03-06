@@ -618,10 +618,11 @@ fn main() -> Result<()> {
 
     if args.headless {
         info!("Running in headless mode");
-        run_headless(&mut kernel)?;
+        run_headless(&mut kernel, &settings)?;
     } else {
         run_with_window(
             &mut kernel,
+            &settings,
             hid_shared_mem,
             buffer_queue,
             hid_shm_handle,
@@ -783,10 +784,10 @@ fn load_xci_game(
 }
 
 /// Run in headless mode (no window, CPU only).
-fn run_headless(kernel: &mut KernelCore) -> Result<()> {
+fn run_headless(kernel: &mut KernelCore, settings: &ruzu_common::settings::Values) -> Result<()> {
     info!("Starting CPU execution (headless)...");
 
-    run_cpu_loop(kernel)
+    run_cpu_loop(kernel, settings)
 }
 
 /// Instructions per time slice for each thread.
@@ -826,7 +827,9 @@ fn make_memory_vtable() -> ruzu_cpu::arm_dynarmic_64::MemoryVtable {
     }
     unsafe fn write_u64(ctx: *mut u8, addr: u64, val: u64) {
         let mm = &mut *(ctx as *mut MemoryManager);
-        let _ = mm.write_u64(addr, val);
+        if let Err(e) = mm.write_u64(addr, val) {
+            log::error!("JIT write_u64 failed @ {:#010X} val={:#018X}: {}", addr, val, e);
+        }
     }
 
     ruzu_cpu::arm_dynarmic_64::MemoryVtable {
@@ -836,18 +839,20 @@ fn make_memory_vtable() -> ruzu_cpu::arm_dynarmic_64::MemoryVtable {
 }
 
 /// Core CPU execution loop with multi-thread scheduling.
-fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
-    use ruzu_cpu::{ArmDynarmic32, ArmDynarmic64, ArmJit, HaltReason};
+fn run_cpu_loop(kernel: &mut KernelCore, settings: &ruzu_common::settings::Values) -> Result<()> {
+    use ruzu_cpu::{ArmDynarmic32, ArmDynarmic64, ArmJit, CpuSettings, HaltReason};
     use ruzu_kernel::scheduler::Scheduler;
     use ruzu_kernel::svc::dispatch_svc;
     use ruzu_kernel::thread::ThreadState;
 
+    let cpu_settings = CpuSettings::from_values(settings);
+
     let vtable = make_memory_vtable();
     let mem_ptr = &mut kernel.process_mut().unwrap().memory as *mut _ as *mut u8;
     let mut jit: Box<dyn ArmJit> = if kernel.is_64bit {
-        Box::new(ArmDynarmic64::new(mem_ptr, vtable).expect("A64 JIT init failed"))
+        Box::new(ArmDynarmic64::new(mem_ptr, vtable, &cpu_settings).expect("A64 JIT init failed"))
     } else {
-        Box::new(ArmDynarmic32::new(mem_ptr, vtable).expect("A32 JIT init failed"))
+        Box::new(ArmDynarmic32::new(mem_ptr, vtable, &cpu_settings).expect("A32 JIT init failed"))
     };
 
     // Diagnostic: verify we can read code at entry point
@@ -1009,6 +1014,7 @@ fn run_cpu_loop(kernel: &mut KernelCore) -> Result<()> {
 /// Run with SDL2 window, input polling, and framebuffer presentation.
 fn run_with_window(
     kernel: &mut KernelCore,
+    settings: &ruzu_common::settings::Values,
     hid_shared_mem: Arc<RwLock<HidSharedMemory>>,
     buffer_queue: Arc<RwLock<BufferQueue>>,
     hid_shm_handle: u32,
@@ -1072,12 +1078,14 @@ fn run_with_window(
     let mut diag_total_svcs: u64 = 0;
     let diag_start = std::time::Instant::now();
 
+    let cpu_settings = ruzu_cpu::CpuSettings::from_values(settings);
+
     let vtable = make_memory_vtable();
     let mem_ptr = &mut kernel.process_mut().unwrap().memory as *mut _ as *mut u8;
     let mut jit: Box<dyn ArmJit> = if kernel.is_64bit {
-        Box::new(ArmDynarmic64::new(mem_ptr, vtable).expect("A64 JIT init failed"))
+        Box::new(ArmDynarmic64::new(mem_ptr, vtable, &cpu_settings).expect("A64 JIT init failed"))
     } else {
-        Box::new(ArmDynarmic32::new(mem_ptr, vtable).expect("A32 JIT init failed"))
+        Box::new(ArmDynarmic32::new(mem_ptr, vtable, &cpu_settings).expect("A32 JIT init failed"))
     };
 
     // Number of time slices to run per frame (~60 FPS ~ 16ms).
@@ -1232,13 +1240,94 @@ fn run_with_window(
 
             // Log first 50 slices, every 1000th, and long-running slices
             let is_long = run_elapsed > std::time::Duration::from_millis(100);
+            let pc = jit.get_pc();
             if diag_total_slices <= 50 || diag_total_slices % 1000 == 0 || is_long {
-                let pc = jit.get_pc();
                 log::info!(
                     "[DIAG] slice={} thread={} reason={:?} pc=0x{:08X} elapsed={:?}{}",
                     diag_total_slices, idx, reason, pc, run_elapsed,
                     if is_long { " *** LONG ***" } else { "" }
                 );
+            }
+            // Detect wild PC jumps to unmapped memory
+            if pc < 0x08000000 || pc > 0xC0000000 {
+                let regs = &kernel.process().unwrap().threads[idx].cpu_state;
+                log::error!(
+                    "[WILD PC] slice={} pc=0x{:08X} sp=0x{:08X} lr=0x{:08X} r0-r3=[{:08X},{:08X},{:08X},{:08X}]",
+                    diag_total_slices, pc, regs.sp as u32, regs.x[14] as u32,
+                    regs.x[0] as u32, regs.x[1] as u32, regs.x[2] as u32, regs.x[3] as u32
+                );
+                log::error!(
+                    "[WILD PC] r4-r12=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]",
+                    regs.x[4] as u32, regs.x[5] as u32, regs.x[6] as u32, regs.x[7] as u32,
+                    regs.x[8] as u32, regs.x[9] as u32, regs.x[10] as u32, regs.x[11] as u32,
+                    regs.x[12] as u32
+                );
+                // Dump code around the call site (LR)
+                if let Some(p) = kernel.process() {
+                    let lr = regs.x[14] as u64;
+                    log::error!("[WILD PC] Code around LR=0x{:08X}:", lr);
+                    for off in (lr.saturating_sub(16)..=lr+16).step_by(4) {
+                        let w = p.memory.read_u32(off).unwrap_or(0xDEADBEEF);
+                        let marker = if off == lr { " <-- LR" } else if off == lr - 4 { " <-- call site" } else { "" };
+                        log::error!("  0x{:08X}: 0x{:08X}{}", off, w, marker);
+                    }
+                    // Dump MOD0 header at rtld base
+                    log::error!("[WILD PC] rtld MOD0 at 0x08000000:");
+                    for off in (0u64..=0x20).step_by(4) {
+                        let addr = 0x08000000 + off;
+                        let w = p.memory.read_u32(addr).unwrap_or(0xDEADBEEF);
+                        log::error!("  0x{:08X}: 0x{:08X}", addr, w);
+                    }
+                    // Dump data at R0 (0x08005114) and R12 (0x08005140)
+                    log::error!("[WILD PC] Data at R0=0x{:08X}:", regs.x[0] as u32);
+                    for off in (0u64..=0x30).step_by(4) {
+                        let addr = regs.x[0] + off;
+                        let w = p.memory.read_u32(addr).unwrap_or(0xDEADBEEF);
+                        log::error!("  0x{:08X}: 0x{:08X}", addr as u32, w);
+                    }
+                    // Dump code at 0x08003464 (BL target)
+                    log::error!("[WILD PC] Code at BL target 0x08003464:");
+                    for off in (0u64..=0x30).step_by(4) {
+                        let addr = 0x08003464 + off;
+                        let w = p.memory.read_u32(addr).unwrap_or(0xDEADBEEF);
+                        log::error!("  0x{:08X}: 0x{:08X}", addr, w);
+                    }
+                    // Dump the indirect jump target at 0x08003798 (PLT GOT entry)
+                    let got_addr = 0x08003798u64;
+                    let got_val = p.memory.read_u32(got_addr).unwrap_or(0xDEADBEEF);
+                    log::error!("[WILD PC] PLT GOT at 0x{:08X} = 0x{:08X} (should be 0x08031640?)", got_addr, got_val);
+                    // Dump nearby GOT entries
+                    log::error!("[WILD PC] GOT entries 0x08003780-0x080037C0:");
+                    for off in (0x3780u64..=0x37C0).step_by(4) {
+                        let addr = 0x08000000 + off;
+                        let w = p.memory.read_u32(addr).unwrap_or(0xDEADBEEF);
+                        log::error!("  0x{:08X}: 0x{:08X}", addr, w);
+                    }
+                    // Dump DT_REL entries (offset 0x4010, 34 entries × 8 bytes)
+                    log::error!("[WILD PC] DT_REL entries (at base+0x4010):");
+                    for i in 0..34u64 {
+                        let addr = 0x08000000 + 0x4010 + i * 8;
+                        let r_offset = p.memory.read_u32(addr).unwrap_or(0);
+                        let r_info = p.memory.read_u32(addr + 4).unwrap_or(0);
+                        let r_type = r_info & 0xFF;
+                        let r_sym = r_info >> 8;
+                        let type_name = match r_type { 2 => "ABS32", 22 => "JUMP_SLOT", 23 => "RELATIVE", _ => "?" };
+                        log::error!("  REL[{:2}] offset=0x{:04X} type={}({}) sym={}", i, r_offset, r_type, type_name, r_sym);
+                    }
+                    // Dump DT_JMPREL entries (offset 0x4120, 14 entries × 8 bytes)
+                    log::error!("[WILD PC] DT_JMPREL entries (at base+0x4120):");
+                    for i in 0..14u64 {
+                        let addr = 0x08000000 + 0x4120 + i * 8;
+                        let r_offset = p.memory.read_u32(addr).unwrap_or(0);
+                        let r_info = p.memory.read_u32(addr + 4).unwrap_or(0);
+                        let r_type = r_info & 0xFF;
+                        let r_sym = r_info >> 8;
+                        let type_name = match r_type { 2 => "ABS32", 22 => "JUMP_SLOT", 23 => "RELATIVE", _ => "?" };
+                        log::error!("  JMPREL[{:2}] offset=0x{:04X} type={}({}) sym={}", i, r_offset, r_type, type_name, r_sym);
+                    }
+                }
+                kernel.should_stop = true;
+                break;
             }
 
             // Dump memory at exception PCs on first slice
@@ -1443,14 +1532,15 @@ fn run_with_window(
             }
         };
 
+        // Skip Vulkan presentation during early boot — focus on JIT execution.
+        // The present_clear hangs on the second frame in some VM Vulkan drivers.
+        // TODO: re-enable once the game actually produces framebuffer content.
         if let Some((pixels, width, height)) = present_pixels {
             if let Some(ref mut vk) = vulkan {
                 let _ = vk.present_framebuffer(&pixels, width, height);
             } else {
                 emu_window.present_framebuffer(&pixels, width, height);
             }
-        } else if let Some(ref mut vk) = vulkan {
-            let _ = vk.present_clear([0.39, 0.58, 0.93, 1.0]);
         }
     }
 
