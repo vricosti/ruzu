@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use ruzu_common::CNTFRQ_HZ;
+use common::CNTFRQ_HZ;
 
 /// SVC 0x1E: GetSystemTick
 /// Returns the host monotonic time converted to Switch tick frequency (19.2 MHz).

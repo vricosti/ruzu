@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ruzu-common.workspace = true
-ruzu-crypto.workspace = true
+common.workspace = true
+crypto.workspace = true
 log.workspace = true
 thiserror.workspace = true
 byteorder.workspace = true

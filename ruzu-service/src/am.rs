@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 
 use crate::framework::ServiceHandler;
 use crate::ipc::{IpcCommand, IpcResponse};
-use ruzu_common::ResultCode;
+use common::ResultCode;
 
 // ── AM result codes (from am_results.h) ─────────────────────────────────────
 

@@ -8,8 +8,8 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use ruzu_common::page_table::{PageInfo, PageTable, PageType};
-use ruzu_common::{PAGE_MASK, PAGE_SHIFT, PAGE_SIZE, PAGE_SIZE_U64};
+use common::page_table::{PageInfo, PageTable, PageType};
+use common::{PAGE_MASK, PAGE_SHIFT, PAGE_SIZE, PAGE_SIZE_U64};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -185,7 +185,7 @@ impl Memory {
     /// Checks whether the supplied range of addresses are all valid virtual addresses.
     pub fn is_valid_virtual_address_range(&self, base: u64, size: u64) -> bool {
         let end = base + size;
-        let mut page = ruzu_common::align_down(base, YUZU_PAGESIZE);
+        let mut page = common::align_down(base, YUZU_PAGESIZE);
         while page < end {
             if !self.is_valid_virtual_address(page) {
                 return false;

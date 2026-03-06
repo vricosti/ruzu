@@ -8,8 +8,8 @@ name = "ruzu-cmd"
 path = "src/main.rs"
 
 [dependencies]
-ruzu-common.workspace = true
-ruzu-crypto.workspace = true
+common.workspace = true
+crypto.workspace = true
 ruzu-loader.workspace = true
 ruzu-cpu.workspace = true
 ruzu-kernel.workspace = true
@@ -19,6 +19,7 @@ clap.workspace = true
 rust-ini.workspace = true
 sdl2.workspace = true
 ash.workspace = true
+gl.workspace = true
 parking_lot.workspace = true
 log.workspace = true
 env_logger.workspace = true

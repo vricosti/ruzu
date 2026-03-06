@@ -3,9 +3,9 @@
 //! Derniere synchro: 2026-03-05
 //!
 //! Device memory allocation. Allocates a large block of host memory for the
-//! emulated Switch DRAM, using ruzu_common::host_memory::HostMemory.
+//! emulated Switch DRAM, using common::host_memory::HostMemory.
 
-use ruzu_common::host_memory::HostMemory;
+use common::host_memory::HostMemory;
 
 /// DRAM memory map constants, matching C++ Core::DramMemoryMap.
 pub mod dram_memory_map {

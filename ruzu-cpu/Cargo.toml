@@ -4,6 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ruzu-common.workspace = true
+common.workspace = true
 rdynarmic.workspace = true
 log.workspace = true

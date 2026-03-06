@@ -7,7 +7,7 @@
 //! added once the kernel scheduler and physical core abstractions are in place.
 
 use crate::hardware_properties;
-use ruzu_common::thread::Barrier;
+use common::thread::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 

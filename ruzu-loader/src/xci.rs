@@ -12,7 +12,7 @@ use crate::nsp::{self, NspError, NspLoadResult};
 use crate::pfs::{Pfs, PfsError};
 use crate::vfs::{OffsetFile, VfsFile};
 use byteorder::{LittleEndian, ReadBytesExt};
-use ruzu_crypto::key_manager::KeyManager;
+use crypto::key_manager::KeyManager;
 use std::io::Cursor;
 use std::sync::Arc;
 use thiserror::Error;

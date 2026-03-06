@@ -96,7 +96,7 @@ impl Default for ServiceManager {
 mod tests {
     use super::*;
     use crate::ipc::{CommandType, IpcCommand, IpcResponse};
-    use ruzu_common::ResultCode;
+    use common::ResultCode;
 
     /// Trivial test service that always returns success.
     struct DummyService;

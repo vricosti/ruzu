@@ -7,8 +7,8 @@
 //! schedule/unschedule events and advance time. This is CRITICAL for emulation.
 
 use parking_lot::Mutex;
-use ruzu_common::thread::Event;
-use ruzu_common::wall_clock::{self, WallClock};
+use common::thread::Event;
+use common::wall_clock::{self, WallClock};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicU8;
 use std::sync::Mutex;
 
-use ruzu_common::{PAddr, VAddr};
+use common::{PAddr, VAddr};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -358,7 +358,7 @@ impl DeviceMemoryManager {
         // Note: In C++ this takes mapping_guard via scoped_lock. Since we have &mut self,
         // we already have exclusive access in Rust's ownership model.
         let start_page_d = (address >> self.page_bits) as usize;
-        let num_pages = ruzu_common::align_up(size as u64, self.page_size as u64) as usize
+        let num_pages = common::align_up(size as u64, self.page_size as u64) as usize
             >> self.page_bits;
 
         for i in 0..num_pages {
@@ -373,7 +373,7 @@ impl DeviceMemoryManager {
     /// Unmap a device virtual address range.
     pub fn unmap(&mut self, address: DAddr, size: usize) {
         let start_page_d = (address >> self.page_bits) as usize;
-        let num_pages = ruzu_common::align_up(size as u64, self.page_size as u64) as usize
+        let num_pages = common::align_up(size as u64, self.page_size as u64) as usize
             >> self.page_bits;
 
         if let Some(ref dev) = self.device_inter {

@@ -152,12 +152,12 @@ impl CpuSettings {
     ///
     /// Reads `cpu_accuracy`, `cpu_debug_mode`, and all `cpuopt_*` settings,
     /// matching zuyu's `MakeJit()` configuration flow.
-    pub fn from_values(values: &ruzu_common::settings::Values) -> Self {
+    pub fn from_values(values: &common::settings::Values) -> Self {
         let cpu_accuracy = match *values.cpu_accuracy.get_value() {
-            ruzu_common::settings_enums::CpuAccuracy::Auto => CpuAccuracy::Auto,
-            ruzu_common::settings_enums::CpuAccuracy::Accurate => CpuAccuracy::Accurate,
-            ruzu_common::settings_enums::CpuAccuracy::Unsafe => CpuAccuracy::Unsafe,
-            ruzu_common::settings_enums::CpuAccuracy::Paranoid => CpuAccuracy::Paranoid,
+            common::settings_enums::CpuAccuracy::Auto => CpuAccuracy::Auto,
+            common::settings_enums::CpuAccuracy::Accurate => CpuAccuracy::Accurate,
+            common::settings_enums::CpuAccuracy::Unsafe => CpuAccuracy::Unsafe,
+            common::settings_enums::CpuAccuracy::Paranoid => CpuAccuracy::Paranoid,
         };
 
         Self {

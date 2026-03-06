@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use log::warn;
-use ruzu_common::ResultCode;
+use common::ResultCode;
 use ruzu_cpu::CpuState;
 
 /// SVC 0x7F: CallSecureMonitor

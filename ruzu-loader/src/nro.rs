@@ -11,7 +11,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::Cursor;
 use thiserror::Error;
 
-use ruzu_common::{align_up, PAGE_SIZE_U64};
+use common::{align_up, PAGE_SIZE_U64};
 
 // ---------------------------------------------------------------------------
 // Magic constants

@@ -8,7 +8,7 @@
 //!   - A read-only data segment (rodata) containing constants
 //!   - A data segment containing mutable variables (+ BSS)
 
-use ruzu_common::VAddr;
+use common::VAddr;
 
 /// A single segment within a code set.
 #[derive(Debug, Clone, Default)]

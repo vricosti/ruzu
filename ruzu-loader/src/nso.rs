@@ -12,7 +12,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::Cursor;
 use thiserror::Error;
 
-use ruzu_common::{align_up, PAGE_SIZE_U64};
+use common::{align_up, PAGE_SIZE_U64};
 
 /// NSO0 magic.
 const NSO_MAGIC: u32 = u32::from_le_bytes([b'N', b'S', b'O', b'0']);

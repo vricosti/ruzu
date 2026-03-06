@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::framework::ServiceHandler;
 use crate::ipc::{IpcCommand, IpcResponse};
-use ruzu_common::error;
+use common::error;
 
 // ── fsp-srv ──────────────────────────────────────────────────────────────────
 

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use ruzu_common::error;
-use ruzu_common::{Handle, ResultCode, INVALID_HANDLE};
+use common::error;
+use common::{Handle, ResultCode, INVALID_HANDLE};
 use std::collections::HashMap;
 
 use crate::objects::KernelObject;

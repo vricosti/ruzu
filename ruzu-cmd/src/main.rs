@@ -3,6 +3,7 @@
 
 mod config;
 mod game_list_ui;
+mod opengl_presenter;
 mod vulkan_presenter;
 mod window;
 
@@ -15,7 +16,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use ruzu_crypto::KeyManager;
+use crypto::KeyManager;
 use ruzu_kernel::kernel::{IpcHandler, IpcHandlerResult};
 use ruzu_kernel::objects::{KSharedMemory, KernelObject};
 use ruzu_kernel::KernelCore;
@@ -652,7 +653,7 @@ fn load_nro_game_from_data(rom_data: &[u8]) -> Result<(nro::CodeSet, u64)> {
 fn load_single_module(
     kernel: &mut KernelCore,
     code_set: &nro::CodeSet,
-) -> Result<ruzu_common::VAddr> {
+) -> Result<common::VAddr> {
     let text_seg = &code_set.segments[0];
     let rodata_seg = &code_set.segments[1];
     let data_seg = &code_set.segments[2];
@@ -685,8 +686,8 @@ fn load_single_module(
 fn load_multi_modules(
     kernel: &mut KernelCore,
     modules: &[(String, nro::CodeSet)],
-) -> Result<ruzu_common::VAddr> {
-    use ruzu_common::NRO_BASE_ADDRESS;
+) -> Result<common::VAddr> {
+    use common::NRO_BASE_ADDRESS;
 
     let entry_point = NRO_BASE_ADDRESS;
     let mut next_addr = NRO_BASE_ADDRESS;
@@ -784,7 +785,7 @@ fn load_xci_game(
 }
 
 /// Run in headless mode (no window, CPU only).
-fn run_headless(kernel: &mut KernelCore, settings: &ruzu_common::settings::Values) -> Result<()> {
+fn run_headless(kernel: &mut KernelCore, settings: &common::settings::Values) -> Result<()> {
     info!("Starting CPU execution (headless)...");
 
     run_cpu_loop(kernel, settings)
@@ -839,7 +840,7 @@ fn make_memory_vtable() -> ruzu_cpu::arm_dynarmic_64::MemoryVtable {
 }
 
 /// Core CPU execution loop with multi-thread scheduling.
-fn run_cpu_loop(kernel: &mut KernelCore, settings: &ruzu_common::settings::Values) -> Result<()> {
+fn run_cpu_loop(kernel: &mut KernelCore, settings: &common::settings::Values) -> Result<()> {
     use ruzu_cpu::{ArmDynarmic32, ArmDynarmic64, ArmJit, CpuSettings, HaltReason};
     use ruzu_kernel::scheduler::Scheduler;
     use ruzu_kernel::svc::dispatch_svc;
@@ -1014,7 +1015,7 @@ fn run_cpu_loop(kernel: &mut KernelCore, settings: &ruzu_common::settings::Value
 /// Run with SDL2 window, input polling, and framebuffer presentation.
 fn run_with_window(
     kernel: &mut KernelCore,
-    settings: &ruzu_common::settings::Values,
+    settings: &common::settings::Values,
     hid_shared_mem: Arc<RwLock<HidSharedMemory>>,
     buffer_queue: Arc<RwLock<BufferQueue>>,
     hid_shm_handle: u32,
@@ -1023,48 +1024,89 @@ fn run_with_window(
     audio_out_event_handle: u32,
     vsync_event_handle: u32,
 ) -> Result<()> {
+    use common::settings_enums::RendererBackend;
     use ruzu_cpu::{ArmDynarmic32, ArmDynarmic64, ArmJit, HaltReason};
     use ruzu_kernel::scheduler::Scheduler;
     use ruzu_kernel::svc::dispatch_svc;
     use ruzu_kernel::thread::ThreadState;
-    use window::{EmulatorWindow, DEFAULT_HEIGHT, DEFAULT_WIDTH};
+    use window::{EmulatorWindow, WindowBackend, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 
-    let mut emu_window =
-        EmulatorWindow::new("ruzu - Nintendo Switch Emulator", DEFAULT_WIDTH, DEFAULT_HEIGHT)?;
-
-    // Try to initialize Vulkan presenter for hardware-accelerated presentation.
-    let mut vulkan = if emu_window.vulkan_enabled {
-        match vulkan_presenter::VulkanPresenter::new(&emu_window.window) {
-            Ok(vk) => Some(vk),
-            Err(e) => {
-                log::warn!("Vulkan init failed, using software blit: {}", e);
-                None
-            }
+    // Select window backend based on renderer_backend setting.
+    let preferred_backend = match settings.renderer_backend.get_value() {
+        RendererBackend::OpenGL => {
+            info!("Renderer backend: OpenGL (from settings)");
+            WindowBackend::OpenGL
         }
-    } else {
-        None
+        RendererBackend::Vulkan => {
+            info!("Renderer backend: Vulkan (from settings)");
+            WindowBackend::Vulkan
+        }
+        RendererBackend::Null => {
+            info!("Renderer backend: Null (software)");
+            WindowBackend::Software
+        }
     };
 
-    // Try to create a RasterizerVulkan for GPU-accelerated shader rendering.
-    // This uses the same Vulkan device as the presenter and compiles
-    // Maxwell shaders to SPIR-V for execution on the GPU.
-    if let Some(ref vk) = vulkan {
-        match ruzu_gpu::renderer::RasterizerVulkan::new(
-            vk.instance(),
-            vk.physical_device(),
-            vk.device(),
-            vk.graphics_queue(),
-            vk.queue_family_index(),
-            1280,
-            720,
-        ) {
-            Ok(renderer) => {
-                gpu.set_vulkan_renderer(renderer);
-                info!("RasterizerVulkan: GPU shader rendering enabled");
+    let mut emu_window = EmulatorWindow::new(
+        "ruzu - Nintendo Switch Emulator",
+        DEFAULT_WIDTH,
+        DEFAULT_HEIGHT,
+        preferred_backend,
+    )?;
+
+    // Initialize the appropriate presenter based on what the window actually supports.
+    let mut vulkan: Option<vulkan_presenter::VulkanPresenter> = None;
+    let mut opengl: Option<opengl_presenter::OpenGLPresenter> = None;
+
+    match emu_window.backend {
+        WindowBackend::Vulkan => {
+            // Try to initialize Vulkan presenter for hardware-accelerated presentation.
+            match vulkan_presenter::VulkanPresenter::new(&emu_window.window) {
+                Ok(vk) => {
+                    // Try to create a RasterizerVulkan for GPU-accelerated shader rendering.
+                    match ruzu_gpu::renderer_vulkan::RasterizerVulkan::new(
+                        vk.instance(),
+                        vk.physical_device(),
+                        vk.device(),
+                        vk.graphics_queue(),
+                        vk.queue_family_index(),
+                        1280,
+                        720,
+                        gpu.syncpoints.clone(),
+                    ) {
+                        Ok(renderer) => {
+                            gpu.set_vulkan_renderer(renderer);
+                            info!("RasterizerVulkan: GPU shader rendering enabled");
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "RasterizerVulkan init failed, using software rasterizer: {}",
+                                e
+                            );
+                        }
+                    }
+                    vulkan = Some(vk);
+                }
+                Err(e) => {
+                    log::warn!("Vulkan init failed, using software blit: {}", e);
+                }
             }
-            Err(e) => {
-                log::warn!("RasterizerVulkan init failed, using software rasterizer: {}", e);
+        }
+        WindowBackend::OpenGL => {
+            // Initialize OpenGL presenter.
+            match opengl_presenter::OpenGLPresenter::new(&emu_window.window, gpu.syncpoints.clone()) {
+                Ok(gl) => {
+                    info!("OpenGL presenter initialized: {}", gl.renderer().device_vendor());
+                    gpu.set_opengl_renderer_active();
+                    opengl = Some(gl);
+                }
+                Err(e) => {
+                    log::warn!("OpenGL init failed, using software blit: {}", e);
+                }
             }
+        }
+        WindowBackend::Software => {
+            info!("Using software rendering (no GPU backend)");
         }
     }
 
@@ -1114,10 +1156,13 @@ fn run_with_window(
             }
         };
 
-        // Handle window resize for Vulkan swapchain recreation.
+        // Handle window resize for Vulkan swapchain / OpenGL viewport.
         if let Some((w, h)) = input.resized {
             if let Some(ref mut vk) = vulkan {
                 let _ = vk.resize(w, h);
+            }
+            if let Some(ref mut gl) = opengl {
+                let _ = gl.resize(w, h);
             }
         }
 
@@ -1532,12 +1577,12 @@ fn run_with_window(
             }
         };
 
-        // Skip Vulkan presentation during early boot — focus on JIT execution.
-        // The present_clear hangs on the second frame in some VM Vulkan drivers.
-        // TODO: re-enable once the game actually produces framebuffer content.
+        // Present framebuffer using the active rendering backend.
         if let Some((pixels, width, height)) = present_pixels {
             if let Some(ref mut vk) = vulkan {
                 let _ = vk.present_framebuffer(&pixels, width, height);
+            } else if let Some(ref mut gl) = opengl {
+                let _ = gl.present_framebuffer(&emu_window.window, &pixels, width, height);
             } else {
                 emu_window.present_framebuffer(&pixels, width, height);
             }

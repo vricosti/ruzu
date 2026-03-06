@@ -31,7 +31,7 @@ pub mod tick;
 pub mod transfer_memory;
 
 use log::{debug, warn};
-use ruzu_common::ResultCode;
+use common::ResultCode;
 
 use crate::kernel::KernelCore;
 use ruzu_cpu::CpuState;

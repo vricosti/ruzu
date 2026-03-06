@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use ruzu_common::{
+use common::{
     Handle, ProcessId, ThreadId, VAddr, HEAP_REGION_BASE, NRO_BASE_ADDRESS,
     PAGE_SIZE, PAGE_SIZE_U64, STACK_REGION_BASE, TLS_ENTRY_SIZE,
 };
@@ -98,7 +98,7 @@ impl KProcess {
     /// Maps as RW first to allow writing, then reprotects to RX.
     /// This matches zuyu's LoadModule pattern (write first, reprotect after).
     pub fn load_code(&mut self, base_addr: VAddr, code: &[u8]) -> anyhow::Result<()> {
-        let size = ruzu_common::align_up(code.len() as u64, PAGE_SIZE_U64);
+        let size = common::align_up(code.len() as u64, PAGE_SIZE_U64);
 
         // Map as RW initially so we can write the code
         self.memory.map(
@@ -128,7 +128,7 @@ impl KProcess {
         data: &[u8],
         total_size: usize,
     ) -> anyhow::Result<()> {
-        let size = ruzu_common::align_up(total_size as u64, PAGE_SIZE_U64);
+        let size = common::align_up(total_size as u64, PAGE_SIZE_U64);
 
         self.memory.map(
             base_addr,
@@ -147,7 +147,7 @@ impl KProcess {
 
     /// Allocate main thread stack.
     pub fn allocate_stack(&mut self, size: usize) -> anyhow::Result<VAddr> {
-        let stack_size = ruzu_common::align_up(size as u64, PAGE_SIZE_U64);
+        let stack_size = common::align_up(size as u64, PAGE_SIZE_U64);
         let stack_base = self.layout.stack_base;
 
         self.memory.map(
@@ -175,7 +175,7 @@ impl KProcess {
                 self.layout.next_tls_addr
             };
 
-            let tls_page = ruzu_common::align_up(tls_page, PAGE_SIZE_U64);
+            let tls_page = common::align_up(tls_page, PAGE_SIZE_U64);
 
             self.memory.map(
                 tls_page,
