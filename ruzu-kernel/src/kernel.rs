@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use ruzu_common::{Handle, ProcessId, ResultCode, VAddr, NRO_BASE_ADDRESS};
+use common::{Handle, ProcessId, ResultCode, VAddr, NRO_BASE_ADDRESS};
 
 use crate::objects::{KEvent, KernelObject};
 use crate::process::KProcess;
@@ -120,17 +120,17 @@ impl KernelCore {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("No process created"))?;
 
-        let text_size = ruzu_common::align_up(text.len() as u64, ruzu_common::PAGE_SIZE_U64);
-        let rodata_size = ruzu_common::align_up(rodata.len() as u64, ruzu_common::PAGE_SIZE_U64);
+        let text_size = common::align_up(text.len() as u64, common::PAGE_SIZE_U64);
+        let rodata_size = common::align_up(rodata.len() as u64, common::PAGE_SIZE_U64);
         let data_total_size = data.len() + bss_size;
-        let data_size_aligned = ruzu_common::align_up(data_total_size as u64, ruzu_common::PAGE_SIZE_U64);
+        let data_size_aligned = common::align_up(data_total_size as u64, common::PAGE_SIZE_U64);
 
         let image_end = [
             text_offset as u64 + text_size,
             rodata_offset as u64 + rodata_size,
             data_offset as u64 + data_size_aligned,
         ].into_iter().max().unwrap_or(0);
-        let total_size = ruzu_common::align_up(image_end, ruzu_common::PAGE_SIZE_U64);
+        let total_size = common::align_up(image_end, common::PAGE_SIZE_U64);
 
         // 1. Map entire image as RW Code (like zuyu's MapPageGroup + WriteBlock)
         process.memory.map(
@@ -179,7 +179,7 @@ impl KernelCore {
             .ok_or_else(|| anyhow::anyhow!("No process created"))?;
 
         // Allocate stack
-        let stack_top = process.allocate_stack(ruzu_common::DEFAULT_STACK_SIZE)?;
+        let stack_top = process.allocate_stack(common::DEFAULT_STACK_SIZE)?;
 
         // Create main thread
         let thread_handle = process.create_main_thread(entry_point, stack_top, 44)?;

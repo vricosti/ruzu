@@ -1,10 +1,10 @@
 [package]
-name = "ruzu-crypto"
+name = "crypto"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ruzu-common.workspace = true
+common.workspace = true
 aes.workspace = true
 ctr.workspace = true
 cipher.workspace = true

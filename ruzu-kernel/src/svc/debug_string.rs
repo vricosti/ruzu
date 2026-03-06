@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use log::info;
-use ruzu_common::{error, ResultCode, VAddr};
+use common::{error, ResultCode, VAddr};
 
 use crate::kernel::KernelCore;
 

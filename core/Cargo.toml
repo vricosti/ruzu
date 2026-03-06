@@ -1,10 +1,10 @@
 [package]
-name = "ruzu-core"
+name = "core"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ruzu-common = { path = "../ruzu-common" }
+common = { path = "../common" }
 # Dependencies below are commented out until their compilation issues are resolved.
 # They will be needed when wiring up subsystems (kernel, GPU, services, etc.)
 # ruzu-cpu = { path = "../ruzu-cpu" }

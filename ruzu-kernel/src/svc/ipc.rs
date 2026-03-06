@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use log::{debug, warn};
-use ruzu_common::error;
-use ruzu_common::{Handle, ResultCode, VAddr};
+use common::error;
+use common::{Handle, ResultCode, VAddr};
 
 use crate::kernel::KernelCore;
 use crate::objects::{KClientSession, KernelObject};

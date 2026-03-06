@@ -16,8 +16,8 @@ use crate::nro::CodeSet;
 use crate::nso::{self, NsoError};
 use crate::pfs::{Pfs, PfsError};
 use crate::vfs::VfsFile;
-use ruzu_crypto::key_manager::KeyManager;
-use ruzu_crypto::ticket::{Ticket, TicketError};
+use crypto::key_manager::KeyManager;
+use crypto::ticket::{Ticket, TicketError};
 use std::sync::Arc;
 use thiserror::Error;
 

@@ -31,6 +31,8 @@ pub mod state_tracker;
 pub mod texture_cache;
 pub mod update_descriptor;
 
+use std::sync::Arc;
+
 use ash::vk;
 use log::{debug, info, trace, warn};
 use thiserror::Error;
@@ -39,7 +41,9 @@ use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DrawCall, FrontFace, PrimitiveTopology,
 };
 use crate::engines::Framebuffer;
+use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use crate::shader_recompiler::{PipelineCache, Profile};
+use crate::syncpoint::SyncpointManager;
 
 use buffer_cache::BufferCache;
 use descriptor_pool::DescriptorPool;
@@ -82,6 +86,7 @@ pub struct RasterizerVulkan {
     device: ash::Device,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
+    syncpoints: Arc<SyncpointManager>,
 
     // Sub-components (matching zuyu's architecture)
     scheduler: Scheduler,
@@ -139,6 +144,7 @@ impl RasterizerVulkan {
         queue_family_index: u32,
         width: u32,
         height: u32,
+        syncpoints: Arc<SyncpointManager>,
     ) -> Result<Self, RendererError> {
         info!(
             "RasterizerVulkan: initializing {}x{} renderer",
@@ -225,6 +231,7 @@ impl RasterizerVulkan {
             device,
             instance,
             physical_device,
+            syncpoints,
             scheduler,
             state_tracker,
             staging_pool,
@@ -737,6 +744,142 @@ impl RasterizerVulkan {
         );
         Ok(())
     }
+}
+
+impl RasterizerInterface for RasterizerVulkan {
+    fn draw(&mut self, is_indexed: bool, instance_count: u32) {
+        debug!(
+            "RasterizerVulkan::draw indexed={} instances={}",
+            is_indexed, instance_count
+        );
+        // Actual draw dispatch is done through render_draw_calls() which
+        // calls self.draw(draw_call, read_gpu) with full DrawCall context.
+        // This trait method is for the generic interface.
+    }
+
+    fn draw_texture(&mut self) {
+        debug!("RasterizerVulkan::draw_texture");
+    }
+
+    fn clear(&mut self, layer_count: u32) {
+        trace!("RasterizerVulkan::clear layers={}", layer_count);
+    }
+
+    fn dispatch_compute(&mut self) {
+        debug!("RasterizerVulkan::dispatch_compute");
+    }
+
+    fn reset_counter(&mut self, _query_type: u32) {}
+
+    fn query(
+        &mut self,
+        gpu_addr: u64,
+        _query_type: u32,
+        has_timeout: bool,
+        payload: u32,
+        _subreport: u32,
+        gpu_write: &dyn Fn(u64, &[u8]),
+    ) {
+        if has_timeout {
+            let ticks: u64 = 0;
+            gpu_write(gpu_addr + 8, &ticks.to_le_bytes());
+            gpu_write(gpu_addr, &(payload as u64).to_le_bytes());
+        } else {
+            gpu_write(gpu_addr, &payload.to_le_bytes());
+        }
+    }
+
+    fn bind_graphics_uniform_buffer(
+        &mut self,
+        _stage: usize,
+        _index: u32,
+        _gpu_addr: u64,
+        _size: u32,
+    ) {
+    }
+
+    fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
+
+    fn signal_fence(&mut self, func: Box<dyn FnOnce()>) {
+        self.finish();
+        func();
+    }
+
+    fn sync_operation(&mut self, func: Box<dyn FnOnce()>) {
+        func();
+    }
+
+    fn signal_sync_point(&mut self, id: u32) {
+        self.syncpoints.increment(id);
+    }
+
+    fn signal_reference(&mut self) {}
+
+    fn release_fences(&mut self, _force: bool) {}
+
+    fn flush_all(&mut self) {
+        self.scheduler.flush();
+    }
+
+    fn flush_region(&mut self, _addr: u64, _size: u64) {}
+
+    fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+        false
+    }
+
+    fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
+        const PAGE: u64 = 4096;
+        RasterizerDownloadArea {
+            start_address: addr & !(PAGE - 1),
+            end_address: (addr + size + PAGE - 1) & !(PAGE - 1),
+            preemptive: true,
+        }
+    }
+
+    fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+
+    fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
+
+    fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
+        false
+    }
+
+    fn invalidate_gpu_cache(&mut self) {}
+
+    fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
+
+    fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
+
+    fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+
+    fn wait_for_idle(&mut self) {
+        self.finish();
+    }
+
+    fn fragment_barrier(&mut self) {
+        self.scheduler.dispatch_work();
+    }
+
+    fn tiled_cache_barrier(&mut self) {
+        self.scheduler.dispatch_work();
+    }
+
+    fn flush_commands(&mut self) {
+        self.scheduler.flush();
+    }
+
+    fn tick_frame(&mut self) {
+        self.draw_counter = 0;
+        self.state_tracker.invalidate_command_buffer_state();
+        self.staging_pool.new_frame();
+        self.descriptor_pool.reset_pools();
+    }
+
+    fn accelerate_surface_copy(&mut self) -> bool {
+        false
+    }
+
+    fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
 }
 
 impl Drop for RasterizerVulkan {

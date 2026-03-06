@@ -10,10 +10,10 @@
 use crate::pfs::{Pfs, PfsError};
 use crate::vfs::{VecFile, VfsFile};
 use byteorder::{LittleEndian, ReadBytesExt};
-use ruzu_crypto::aes_ctr;
-use ruzu_crypto::aes_ecb;
-use ruzu_crypto::aes_xts::{self, NCA_SECTOR_SIZE};
-use ruzu_crypto::key_manager::{Key128, KeyManager};
+use crypto::aes_ctr;
+use crypto::aes_ecb;
+use crypto::aes_xts::{self, NCA_SECTOR_SIZE};
+use crypto::key_manager::{Key128, KeyManager};
 use std::io::Cursor;
 use std::sync::Arc;
 use thiserror::Error;

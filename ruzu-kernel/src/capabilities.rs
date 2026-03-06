@@ -6,7 +6,7 @@
 //! Parses the capability descriptors that define what SVCs, interrupts,
 //! cores, priorities, and other resources a process is allowed to use.
 
-use ruzu_common::ResultCode;
+use common::ResultCode;
 
 /// Number of SVC IDs (0..0xFF).
 const SVC_COUNT: usize = 0x100;

@@ -5,7 +5,7 @@
 //! Selects the highest-priority runnable thread, round-robining among
 //! threads of equal priority. Also handles timeout-based wakeups.
 
-use ruzu_common::{error, Handle, ResultCode};
+use common::{error, Handle, ResultCode};
 
 use crate::thread::{KThread, ThreadState, WaitReason};
 

@@ -14,7 +14,7 @@ use bitflags::bitflags;
 use memmap2::MmapMut;
 use thiserror::Error;
 
-use ruzu_common::{
+use common::{
     VAddr, ADDRESS_SPACE_PAGES, ADDRESS_SPACE_SIZE, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE,
     is_page_aligned,
 };
@@ -841,7 +841,7 @@ impl MemoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ruzu_common::PAGE_SIZE_U64;
+    use common::PAGE_SIZE_U64;
 
     /// Test backing size: 16 MiB (enough for tests, small for parallel execution).
     const TEST_BACKING_SIZE: usize = 16 * 1024 * 1024;

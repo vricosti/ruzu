@@ -32,48 +32,93 @@ pub struct InputState {
     pub touch: Option<(u32, u32)>,
 }
 
+/// Rendering backend the window was created for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowBackend {
+    /// Window created with Vulkan support.
+    Vulkan,
+    /// Window created with OpenGL support.
+    OpenGL,
+    /// Plain window (software rendering only).
+    Software,
+}
+
 /// SDL2 window manager for the emulator.
 pub struct EmulatorWindow {
+    #[allow(dead_code)]
     pub sdl_context: Sdl,
     pub window: Window,
     pub event_pump: EventPump,
     /// Whether the window was created with Vulkan support.
+    #[allow(dead_code)]
     pub vulkan_enabled: bool,
+    /// Whether the window was created with OpenGL support.
+    #[allow(dead_code)]
+    pub opengl_enabled: bool,
+    /// Active rendering backend for this window.
+    pub backend: WindowBackend,
 }
 
 impl EmulatorWindow {
-    /// Create a new SDL2 window with Vulkan support (fallback to software rendering).
-    pub fn new(title: &str, width: u32, height: u32) -> Result<Self> {
+    /// Create a new SDL2 window with the specified rendering backend.
+    ///
+    /// `preferred_backend` determines what kind of window to create:
+    /// - `Vulkan` — try Vulkan first, fall back to OpenGL, then software
+    /// - `OpenGL` — try OpenGL first, fall back to software
+    /// - `Software` — plain window, no GPU API
+    pub fn new(
+        title: &str,
+        width: u32,
+        height: u32,
+        preferred_backend: WindowBackend,
+    ) -> Result<Self> {
         let sdl_context = sdl2::init().map_err(|e| anyhow::anyhow!("SDL2 init failed: {}", e))?;
 
         let video_subsystem = sdl_context
             .video()
             .map_err(|e| anyhow::anyhow!("SDL2 video init failed: {}", e))?;
 
-        // Try creating a Vulkan-enabled window first; fall back to software rendering.
-        let (window, vulkan_enabled) = match video_subsystem
-            .window(title, width, height)
-            .position_centered()
-            .resizable()
-            .vulkan()
-            .build()
-        {
-            Ok(w) => {
-                info!("Created Vulkan-enabled SDL2 window: {}x{}", width, height);
-                (w, true)
+        let (window, vulkan_enabled, opengl_enabled, backend) = match preferred_backend {
+            WindowBackend::Vulkan => {
+                // Try Vulkan first
+                match video_subsystem
+                    .window(title, width, height)
+                    .position_centered()
+                    .resizable()
+                    .vulkan()
+                    .build()
+                {
+                    Ok(w) => {
+                        info!("Created Vulkan-enabled SDL2 window: {}x{}", width, height);
+                        (w, true, false, WindowBackend::Vulkan)
+                    }
+                    Err(e) => {
+                        info!(
+                            "Vulkan window not available ({}), trying OpenGL",
+                            e
+                        );
+                        // Fall back to OpenGL
+                        Self::try_opengl_or_software(
+                            &video_subsystem,
+                            title,
+                            width,
+                            height,
+                        )?
+                    }
+                }
             }
-            Err(e) => {
-                info!(
-                    "Vulkan window not available ({}), falling back to software rendering",
-                    e
-                );
+            WindowBackend::OpenGL => {
+                Self::try_opengl_or_software(&video_subsystem, title, width, height)?
+            }
+            WindowBackend::Software => {
                 let w = video_subsystem
                     .window(title, width, height)
                     .position_centered()
                     .resizable()
                     .build()
                     .context("Failed to create SDL2 window")?;
-                (w, false)
+                info!("Created software-only SDL2 window: {}x{}", width, height);
+                (w, false, false, WindowBackend::Software)
             }
         };
 
@@ -86,7 +131,55 @@ impl EmulatorWindow {
             window,
             event_pump,
             vulkan_enabled,
+            opengl_enabled,
+            backend,
         })
+    }
+
+    /// Try to create an OpenGL window, falling back to software.
+    fn try_opengl_or_software(
+        video: &sdl2::VideoSubsystem,
+        title: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<(Window, bool, bool, WindowBackend)> {
+        // Set GL attributes (matching zuyu's EmuWindow_SDL2_GL)
+        let gl_attr = video.gl_attr();
+        gl_attr.set_context_major_version(4);
+        gl_attr.set_context_minor_version(6);
+        gl_attr.set_context_profile(sdl2::video::GLProfile::Compatibility);
+        gl_attr.set_double_buffer(true);
+        gl_attr.set_red_size(8);
+        gl_attr.set_green_size(8);
+        gl_attr.set_blue_size(8);
+        gl_attr.set_alpha_size(0);
+        gl_attr.set_share_with_current_context(true);
+
+        match video
+            .window(title, width, height)
+            .position_centered()
+            .resizable()
+            .opengl()
+            .build()
+        {
+            Ok(w) => {
+                info!("Created OpenGL-enabled SDL2 window: {}x{}", width, height);
+                Ok((w, false, true, WindowBackend::OpenGL))
+            }
+            Err(e) => {
+                info!(
+                    "OpenGL window not available ({}), falling back to software rendering",
+                    e
+                );
+                let w = video
+                    .window(title, width, height)
+                    .position_centered()
+                    .resizable()
+                    .build()
+                    .context("Failed to create SDL2 window")?;
+                Ok((w, false, false, WindowBackend::Software))
+            }
+        }
     }
 
     /// Poll SDL2 events. Returns false if the window should close.

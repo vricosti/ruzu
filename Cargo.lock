@@ -231,6 +231,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
+name = "common"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "bytemuck",
+ "libc",
+ "log",
+ "lz4_flex",
+ "thiserror",
+ "zstd",
+]
+
+[[package]]
 name = "const-random"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -248,6 +261,15 @@ dependencies = [
  "getrandom 0.2.17",
  "once_cell",
  "tiny-keccak",
+]
+
+[[package]]
+name = "core"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "log",
+ "parking_lot",
 ]
 
 [[package]]
@@ -306,6 +328,21 @@ name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
+name = "crypto"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "cipher",
+ "common",
+ "ctr",
+ "hex",
+ "log",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "crypto-common"
@@ -430,6 +467,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "gl"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a94edab108827d67608095e269cf862e60d920f144a5026d3dbcfd8b877fb404"
+dependencies = [
+ "gl_generator",
+]
+
+[[package]]
+name = "gl_generator"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a95dfc23a2b4a9a2f5ab41d194f8bfda3cabec42af4e39f08c339eb2a0c124d"
+dependencies = [
+ "khronos_api",
+ "log",
+ "xml-rs",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -535,6 +592,12 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
 ]
+
+[[package]]
+name = "khronos_api"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "lazy_static"
@@ -837,13 +900,14 @@ dependencies = [
  "anyhow",
  "ash",
  "clap",
+ "common",
+ "crypto",
  "env_logger",
+ "gl",
  "log",
  "parking_lot",
  "rust-ini",
- "ruzu-common",
  "ruzu-cpu",
- "ruzu-crypto",
  "ruzu-gpu",
  "ruzu-kernel",
  "ruzu-loader",
@@ -853,49 +917,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruzu-common"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.11.0",
- "bytemuck",
- "libc",
- "log",
- "lz4_flex",
- "thiserror",
- "zstd",
-]
-
-[[package]]
-name = "ruzu-core"
-version = "0.1.0"
-dependencies = [
- "log",
- "parking_lot",
- "ruzu-common",
-]
-
-[[package]]
 name = "ruzu-cpu"
 version = "0.1.0"
 dependencies = [
+ "common",
  "log",
  "rdynarmic",
- "ruzu-common",
-]
-
-[[package]]
-name = "ruzu-crypto"
-version = "0.1.0"
-dependencies = [
- "aes",
- "cipher",
- "ctr",
- "hex",
- "log",
- "ruzu-common",
- "sha2",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]
@@ -904,11 +931,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ash",
+ "common",
+ "gl",
  "log",
  "parking_lot",
  "raw-window-handle 0.6.2",
  "rspirv",
- "ruzu-common",
  "spirv",
  "thiserror",
  "vulkano",
@@ -922,10 +950,10 @@ dependencies = [
  "bitflags 2.11.0",
  "bytemuck",
  "byteorder",
+ "common",
  "log",
  "memmap2",
  "parking_lot",
- "ruzu-common",
  "ruzu-cpu",
  "ruzu-loader",
  "thiserror",
@@ -937,11 +965,11 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "byteorder",
+ "common",
+ "crypto",
  "hex",
  "log",
  "lz4_flex",
- "ruzu-common",
- "ruzu-crypto",
  "sha2",
  "tempfile",
  "thiserror",
@@ -953,9 +981,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "byteorder",
+ "common",
  "log",
  "parking_lot",
- "ruzu-common",
  "ruzu-gpu",
  "ruzu-kernel",
  "thiserror",

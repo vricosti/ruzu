@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use log::debug;
-use ruzu_common::{error, ResultCode, VAddr, is_page_aligned};
+use common::{error, ResultCode, VAddr, is_page_aligned};
 
 use crate::kernel::KernelCore;
 use crate::memory_manager::MemoryPermission;

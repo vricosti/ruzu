@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use log::debug;
-use ruzu_common::{ResultCode, VAddr};
+use common::{ResultCode, VAddr};
 
 /// SVC 0x2A: FlushEntireDataCache
 ///

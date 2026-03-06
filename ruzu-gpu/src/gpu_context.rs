@@ -17,8 +17,6 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::backend::null_backend::NullBackend;
-use crate::backend::GpuBackend;
 use crate::command_processor::{CommandProcessor, GpEntry};
 use crate::engines::fermi_2d::Fermi2D;
 use crate::engines::inline_to_memory::InlineToMemory;
@@ -27,7 +25,8 @@ use crate::engines::maxwell_3d::Maxwell3D;
 use crate::engines::maxwell_dma::MaxwellDMA;
 use crate::memory_manager::GpuMemoryManager;
 use crate::rasterizer::SoftwareRasterizer;
-use crate::renderer::RasterizerVulkan;
+use crate::rasterizer_interface::RasterizerInterface;
+use crate::renderer_vulkan::RasterizerVulkan;
 use crate::syncpoint::SyncpointManager;
 
 // ── NvMap registry ──────────────────────────────────────────────────────────
@@ -88,6 +87,8 @@ pub enum RenderMode {
     Software,
     /// Vulkan GPU renderer using the Maxwell shader recompiler.
     Vulkan,
+    /// OpenGL GPU renderer.
+    OpenGL,
 }
 
 // ── GPU context ─────────────────────────────────────────────────────────────
@@ -123,11 +124,13 @@ pub struct GpuContext {
     pub nvmap_registry: NvMapRegistry,
     command_processor: Mutex<CommandProcessor>,
     gpfifo_queue: Mutex<Vec<GpEntry>>,
-    #[allow(dead_code)]
-    backend: Mutex<Box<dyn GpuBackend>>,
     /// Active rendering mode.
     render_mode: Mutex<RenderMode>,
-    /// Vulkan GPU renderer (initialized lazily via `set_vulkan_renderer`).
+    /// GPU rasterizer (Null, OpenGL, or Vulkan).
+    /// Initialized lazily via `set_rasterizer` or `set_vulkan_renderer`.
+    rasterizer: Mutex<Option<Box<dyn RasterizerInterface + Send>>>,
+    /// Vulkan-specific renderer (kept for `render_draw_calls` which needs
+    /// the full `RasterizerVulkan` API, not just the trait).
     vulkan_renderer: Mutex<Option<RasterizerVulkan>>,
 }
 
@@ -148,8 +151,8 @@ impl GpuContext {
             nvmap_registry: NvMapRegistry::new(),
             command_processor: Mutex::new(CommandProcessor::new(engines)),
             gpfifo_queue: Mutex::new(Vec::new()),
-            backend: Mutex::new(Box::new(NullBackend::new())),
             render_mode: Mutex::new(RenderMode::Software),
+            rasterizer: Mutex::new(None),
             vulkan_renderer: Mutex::new(None),
         }
     }
@@ -164,12 +167,32 @@ impl GpuContext {
         *self.render_mode.lock() = RenderMode::Vulkan;
     }
 
+    /// Set a generic rasterizer (implements `RasterizerInterface`).
+    ///
+    /// Used for OpenGL and Null rasterizers. For Vulkan, use
+    /// `set_vulkan_renderer` instead (needs the concrete type for
+    /// `render_draw_calls`).
+    pub fn set_rasterizer(&self, rasterizer: Box<dyn RasterizerInterface + Send>, mode: RenderMode) {
+        log::info!("GpuContext: rasterizer installed, mode={:?}", mode);
+        *self.rasterizer.lock() = Some(rasterizer);
+        *self.render_mode.lock() = mode;
+    }
+
+    /// Mark the OpenGL renderer as active.
+    ///
+    /// Called from the main binary after the OpenGL context and RendererOpenGL
+    /// have been successfully created.
+    pub fn set_opengl_renderer_active(&self) {
+        log::info!("GpuContext: OpenGL renderer active, switching to OpenGL mode");
+        *self.render_mode.lock() = RenderMode::OpenGL;
+    }
+
     /// Get the current rendering mode.
     pub fn render_mode(&self) -> RenderMode {
         *self.render_mode.lock()
     }
 
-    /// Set the rendering mode (Software or Vulkan).
+    /// Set the rendering mode (Software, Vulkan, or OpenGL).
     ///
     /// If switching to Vulkan and no renderer is installed, falls back to Software.
     pub fn set_render_mode(&self, mode: RenderMode) {
@@ -253,7 +276,9 @@ impl GpuContext {
                         );
                     }
                 }
-                RenderMode::Software => {
+                RenderMode::Software | RenderMode::OpenGL => {
+                    // OpenGL rasterizer lives in the presenter; GPU context
+                    // falls back to software for draw call processing.
                     framebuffer = self.render_software(
                         &draw_calls,
                         &gpu_read,

@@ -1,9 +1,9 @@
 [workspace]
 members = [
     "ruzu-cmd",
-    "ruzu-common",
-    "ruzu-core",
-    "ruzu-crypto",
+    "common",
+    "core",
+    "core/crypto",
     "ruzu-loader",
     "ruzu-cpu",
     "ruzu-kernel",
@@ -20,9 +20,9 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 # Internal crates
-ruzu-common = { path = "ruzu-common" }
-ruzu-core = { path = "ruzu-core" }
-ruzu-crypto = { path = "ruzu-crypto" }
+common = { path = "common" }
+core = { path = "core" }
+crypto = { path = "core/crypto" }
 ruzu-loader = { path = "ruzu-loader" }
 ruzu-cpu = { path = "ruzu-cpu" }
 ruzu-kernel = { path = "ruzu-kernel" }
@@ -51,6 +51,9 @@ hex = "0.4"
 
 # Compression
 lz4_flex = "0.11"
+
+# OpenGL
+gl = "0.14"
 
 # SPIR-V
 rspirv = "0.12"

@@ -3,14 +3,14 @@
 
 use ini::Ini;
 use log::{debug, info, warn};
-use ruzu_common::settings::{
+use common::settings::{
     Language, Region, RendererBackend, Values,
 };
 use std::path::PathBuf;
 
 // Re-export for backward compat
-pub use ruzu_common::settings::Language as SystemLanguage;
-pub use ruzu_common::settings::Region as SystemRegion;
+pub use common::settings::Language as SystemLanguage;
+pub use common::settings::Region as SystemRegion;
 
 /// Locate the yuzu sdl2-config.ini file.
 pub fn find_config_path() -> Option<PathBuf> {
@@ -158,12 +158,12 @@ pub fn load_config(path: Option<&PathBuf>) -> Values {
             debug!("Renderer backend: {:?}", settings.renderer_backend.get_value());
         }
         if let Some(vsync) = section.get("use_vsync") {
-            if let Some(mode) = ruzu_common::settings::VSyncMode::from_string(vsync.trim()) {
+            if let Some(mode) = common::settings::VSyncMode::from_string(vsync.trim()) {
                 settings.vsync_mode.set_value(mode);
             }
         }
         if let Some(res) = section.get("resolution_setup") {
-            if let Some(setup) = ruzu_common::settings::ResolutionSetup::from_string(res.trim()) {
+            if let Some(setup) = common::settings::ResolutionSetup::from_string(res.trim()) {
                 settings.resolution_setup.set_value(setup);
             }
         }
@@ -196,7 +196,7 @@ pub fn load_config(path: Option<&PathBuf>) -> Values {
         // cpu_accuracy: numeric (0=Auto, 1=Accurate, 2=Unsafe, 3=Paranoid)
         if let Some(val) = section.get("cpu_accuracy") {
             let idx: u32 = val.trim().parse().unwrap_or(0);
-            use ruzu_common::settings_enums::CpuAccuracy;
+            use common::settings_enums::CpuAccuracy;
             let accuracy = match idx {
                 0 => CpuAccuracy::Auto,
                 1 => CpuAccuracy::Accurate,

@@ -23,7 +23,7 @@
 
 use crate::framework::ServiceHandler;
 use crate::ipc::{IpcCommand, IpcResponse};
-use ruzu_common::ResultCode;
+use common::ResultCode;
 
 // ── SM result codes ──────────────────────────────────────────────────────────
 /// Module 21 = SM

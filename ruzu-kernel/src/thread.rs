@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use ruzu_common::{Handle, ThreadId, VAddr, DEFAULT_STACK_SIZE};
+use common::{Handle, ThreadId, VAddr, DEFAULT_STACK_SIZE};
 use ruzu_cpu::CpuState;
 
 /// Thread states.
@@ -165,7 +165,7 @@ impl KThread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ruzu_common::ResultCode;
+    use common::ResultCode;
 
     #[test]
     fn test_begin_wait_and_wake() {
@@ -194,9 +194,9 @@ mod tests {
         thread.start();
         thread.begin_wait(WaitReason::Sleep { wake_tick: 200 }, 100);
 
-        thread.wake(ruzu_common::error::TIMEOUT.raw(), -1);
+        thread.wake(common::error::TIMEOUT.raw(), -1);
         assert_eq!(thread.state, ThreadState::Runnable);
-        assert_eq!(thread.wait_result, ruzu_common::error::TIMEOUT.raw());
+        assert_eq!(thread.wait_result, common::error::TIMEOUT.raw());
         assert_eq!(thread.synced_index, -1);
     }
 }

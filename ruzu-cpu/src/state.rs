@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use ruzu_common::VAddr;
+use common::VAddr;
 
 /// ARM64 CPU state: general-purpose registers, SIMD/FP registers, flags.
 #[derive(Debug, Clone)]

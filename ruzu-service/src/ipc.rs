@@ -9,7 +9,7 @@
 //! (responses).
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use ruzu_common::ResultCode;
+use common::ResultCode;
 use std::io::Cursor;
 
 /// CMIF request magic: "SFCI" in little-endian.

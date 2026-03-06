@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use log::warn;
-use ruzu_common::{error, Handle, ResultCode, VAddr};
+use common::{error, Handle, ResultCode, VAddr};
 
 /// SVC 0x4B: CreateCodeMemory
 ///
