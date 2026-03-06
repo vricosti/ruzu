@@ -3,11 +3,13 @@
 
 pub mod arm_dynarmic_32;
 pub mod arm_dynarmic_64;
+pub mod cpu_settings;
 pub mod state;
 
 pub use arm_dynarmic_32::ArmDynarmic32;
 pub use arm_dynarmic_64::ArmDynarmic64;
 pub use arm_dynarmic_64::MemoryVtable;
+pub use cpu_settings::{CpuAccuracy, CpuSettings};
 pub use rdynarmic::halt_reason::HaltReason;
 pub use state::CpuState;
 

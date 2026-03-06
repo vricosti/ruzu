@@ -541,6 +541,11 @@ impl MemoryManager {
     // -- Permission management ----------------------------------------------
 
     /// Update the permissions for an existing mapped region.
+    /// Change permissions on `[vaddr, vaddr+size)`.
+    ///
+    /// Unlike the previous implementation, this supports sub-region operations
+    /// by splitting the containing region as needed (matching zuyu's
+    /// `KPageTableBase::SetProcessMemoryPermission`).
     pub fn set_permissions(
         &mut self,
         vaddr: VAddr,
@@ -548,22 +553,82 @@ impl MemoryManager {
         new_perm: MemoryPermission,
     ) -> MemoryResult<()> {
         self.validate_range(vaddr, size)?;
+        let end = vaddr + size;
 
-        let region = self
+        // Find the region that contains vaddr.
+        let (&region_base, _) = self
             .regions
-            .get_mut(&vaddr)
+            .range(..=vaddr)
+            .next_back()
             .ok_or(MemoryError::NotMapped(vaddr))?;
 
-        if region.size != size {
-            return Err(MemoryError::NotFullyMapped(vaddr, vaddr + size));
+        let region = self.regions.get(&region_base)
+            .ok_or(MemoryError::NotMapped(vaddr))?;
+        let region_end = region_base + region.size;
+
+        // The requested range must be fully within this region.
+        if vaddr < region_base || end > region_end {
+            return Err(MemoryError::NotFullyMapped(vaddr, end));
         }
 
-        region.permission = new_perm;
+        let old_state = region.state;
+        let old_perm = region.permission;
+        let old_name = region.name.clone();
+
+        // Determine new state (zuyu: Code+RW → CodeData, Code+RX → Code)
+        let new_state = if new_perm.contains(MemoryPermission::WRITE) && old_state == MemoryState::Code {
+            MemoryState::CodeData
+        } else {
+            old_state
+        };
+
+        // If the range is the exact region, just update in place.
+        if vaddr == region_base && size == region.size {
+            let region = self.regions.get_mut(&region_base).unwrap();
+            region.permission = new_perm;
+            region.state = new_state;
+        } else {
+            // Need to split: remove old region, insert up to 3 sub-regions.
+            let old_size = region.size;
+            self.regions.remove(&region_base);
+
+            // 1) Before-part: [region_base, vaddr) — keeps old permissions
+            if vaddr > region_base {
+                self.regions.insert(region_base, MemoryRegion {
+                    base_addr: region_base,
+                    size: vaddr - region_base,
+                    permission: old_perm,
+                    state: old_state,
+                    name: old_name.clone(),
+                });
+            }
+
+            // 2) Target part: [vaddr, end) — gets new permissions
+            self.regions.insert(vaddr, MemoryRegion {
+                base_addr: vaddr,
+                size,
+                permission: new_perm,
+                state: new_state,
+                name: old_name.clone(),
+            });
+
+            // 3) After-part: [end, region_end) — keeps old permissions
+            if end < region_end {
+                self.regions.insert(end, MemoryRegion {
+                    base_addr: end,
+                    size: region_end - end,
+                    permission: old_perm,
+                    state: old_state,
+                    name: old_name,
+                });
+            }
+
+            let _ = old_size; // suppress unused warning
+        }
 
         // Update page table entries.
         let num_pages = (size as usize) / PAGE_SIZE;
         let base_page = (vaddr >> PAGE_SHIFT) as usize;
-
         for i in 0..num_pages {
             self.page_table[base_page + i].permission = new_perm;
         }

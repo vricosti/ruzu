@@ -191,6 +191,76 @@ pub fn load_config(path: Option<&PathBuf>) -> Values {
         }
     }
 
+    // [Cpu] — matching zuyu's sdl2-config.ini format
+    if let Some(section) = conf.section(Some("Cpu")) {
+        // cpu_accuracy: numeric (0=Auto, 1=Accurate, 2=Unsafe, 3=Paranoid)
+        if let Some(val) = section.get("cpu_accuracy") {
+            let idx: u32 = val.trim().parse().unwrap_or(0);
+            use ruzu_common::settings_enums::CpuAccuracy;
+            let accuracy = match idx {
+                0 => CpuAccuracy::Auto,
+                1 => CpuAccuracy::Accurate,
+                2 => CpuAccuracy::Unsafe,
+                3 => CpuAccuracy::Paranoid,
+                _ => CpuAccuracy::Auto,
+            };
+            settings.cpu_accuracy.set_value(accuracy);
+            debug!("CPU accuracy: {:?}", accuracy);
+        }
+        if let Some(val) = section.get("cpu_debug_mode") {
+            let v = val.trim() == "true" || val.trim() == "1";
+            settings.cpu_debug_mode.set_value(v);
+        }
+    }
+
+    // [CpuDebug] — individual optimization toggles (read from [Cpu] section
+    // since zuyu stores them all together)
+    {
+        let section = conf.section(Some("Cpu"));
+        let read_bool = |key: &str| -> Option<bool> {
+            section?.get(key).map(|v| v.trim() == "true" || v.trim() == "1")
+        };
+        if let Some(v) = read_bool("cpuopt_page_tables") {
+            settings.cpuopt_page_tables.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_block_linking") {
+            settings.cpuopt_block_linking.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_return_stack_buffer") {
+            settings.cpuopt_return_stack_buffer.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_fast_dispatcher") {
+            settings.cpuopt_fast_dispatcher.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_context_elimination") {
+            settings.cpuopt_context_elimination.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_const_prop") {
+            settings.cpuopt_const_prop.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_misc_ir") {
+            settings.cpuopt_misc_ir.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_reduce_misalign_checks") {
+            settings.cpuopt_reduce_misalign_checks.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_unsafe_unfuse_fma") {
+            settings.cpuopt_unsafe_unfuse_fma.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_unsafe_reduce_fp_error") {
+            settings.cpuopt_unsafe_reduce_fp_error.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_unsafe_ignore_standard_fpcr") {
+            settings.cpuopt_unsafe_ignore_standard_fpcr.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_unsafe_inaccurate_nan") {
+            settings.cpuopt_unsafe_inaccurate_nan.set_value(v);
+        }
+        if let Some(v) = read_bool("cpuopt_unsafe_ignore_global_monitor") {
+            settings.cpuopt_unsafe_ignore_global_monitor.set_value(v);
+        }
+    }
+
     // [Debugging]
     if let Some(section) = conf.section(Some("Debugging")) {
         if let Some(debug_asserts) = section.get("use_debug_asserts") {

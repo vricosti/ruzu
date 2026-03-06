@@ -1,10 +1,10 @@
 [package]
-name = "ruzu"
+name = "ruzu-cmd"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "ruzu"
+name = "ruzu-cmd"
 path = "src/main.rs"
 
 [dependencies]

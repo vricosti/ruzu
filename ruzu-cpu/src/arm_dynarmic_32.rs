@@ -12,6 +12,7 @@
 //! ruzu-cpu and ruzu-kernel.
 
 use crate::arm_dynarmic_64::MemoryVtable;
+use crate::cpu_settings::CpuSettings;
 use crate::state::CpuState;
 use rdynarmic::halt_reason::HaltReason;
 use rdynarmic::jit::A32Jit;
@@ -200,9 +201,16 @@ pub struct ArmDynarmic32 {
 impl ArmDynarmic32 {
     /// Create a new A32 JIT instance.
     ///
+    /// Matches zuyu's `ArmDynarmic32::MakeJit()` optimization configuration:
+    /// - `CpuAccuracy::Auto`: safe + curated unsafe optimizations
+    /// - `CpuAccuracy::Accurate`: safe optimizations only
+    /// - `CpuAccuracy::Unsafe`: safe + all unsafe optimizations
+    /// - `CpuAccuracy::Paranoid`: no optimizations at all
+    /// - `cpu_debug_mode`: individually toggle each safe optimization
+    ///
     /// # Safety
     /// `memory_ctx` must remain valid for the lifetime of this struct.
-    pub fn new(memory_ctx: *mut u8, vtable: MemoryVtable) -> Result<Self, String> {
+    pub fn new(memory_ctx: *mut u8, vtable: MemoryVtable, settings: &CpuSettings) -> Result<Self, String> {
         let mut callback_state = Box::new(CallbackState {
             memory_ctx,
             vtable,
@@ -214,13 +222,18 @@ impl ArmDynarmic32 {
         let state_ptr: *mut CallbackState = &mut *callback_state;
         let callbacks = DynarmicCallbacks { state: state_ptr };
 
+        let (optimizations, unsafe_optimizations) = settings.build_optimization_flags();
+
         let config = JitConfig {
             callbacks: Box::new(callbacks),
             enable_cycle_counting: true,
             code_cache_size: JitConfig::DEFAULT_CODE_CACHE_SIZE,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-            unsafe_optimizations: false,
+            optimizations,
+            unsafe_optimizations,
         };
+
+        log::info!("A32 JIT: accuracy={:?}, optimizations=0x{:08X}, unsafe={}",
+            settings.cpu_accuracy, optimizations.bits(), unsafe_optimizations);
 
         let jit = A32Jit::new(config)?;
 

@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "ruzu",
+    "ruzu-cmd",
     "ruzu-common",
     "ruzu-core",
     "ruzu-crypto",
