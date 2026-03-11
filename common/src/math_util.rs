@@ -95,7 +95,7 @@ impl Rectangle<u32> {
     /// Check if the rectangle is empty (zero or negative area).
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.get_width() == 0 || self.get_height() == 0
+        self.right <= self.left || self.bottom <= self.top
     }
 
     /// Compute the intersection of two rectangles.

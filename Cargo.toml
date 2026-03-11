@@ -71,4 +71,6 @@ bytemuck = { version = "1", features = ["derive"] }
 memmap2 = "0.9"
 cubeb = "0.34"
 parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tempfile = "3"

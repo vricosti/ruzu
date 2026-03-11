@@ -34,10 +34,12 @@ pub trait BitFieldStorage:
     fn as_i64(self) -> i64;
     /// Create from i64 (for sign-extended results).
     fn from_i64(v: i64) -> Self;
+    /// Arithmetic (signed) right shift within the type's own width.
+    fn signed_shr(self, rhs: u32) -> Self;
 }
 
 macro_rules! impl_bitfield_storage {
-    ($($t:ty),*) => {
+    ($($t:ty, $signed:ty);*) => {
         $(
             impl BitFieldStorage for $t {
                 const ZERO: Self = 0;
@@ -59,12 +61,17 @@ macro_rules! impl_bitfield_storage {
                 fn from_i64(v: i64) -> Self {
                     v as $t
                 }
+                #[inline]
+                fn signed_shr(self, rhs: u32) -> Self {
+                    // Cast to signed type of same width, arithmetic shift, cast back.
+                    ((self as $signed).wrapping_shr(rhs)) as $t
+                }
             }
         )*
     };
 }
 
-impl_bitfield_storage!(u8, u16, u32, u64);
+impl_bitfield_storage!(u8, i8; u16, i16; u32, i32; u64, i64);
 
 /// Compute mask for u8.
 #[inline]
@@ -103,9 +110,10 @@ pub fn extract_unsigned<T: BitFieldStorage>(storage: T, position: usize, bits: u
 pub fn extract_signed<T: BitFieldStorage>(storage: T, position: usize, bits: usize) -> T {
     let shift = (T::BITS - bits) as u32;
     let shifted = storage.wrapping_shl(shift - position as u32);
-    // Arithmetic right shift for sign extension
-    let as_signed = shifted.as_i64() >> shift as i64;
-    T::from_i64(as_signed)
+    // Arithmetic right shift for sign extension.
+    // Must use signed_shr to get sign extension within the type's own width,
+    // since as_i64() on u32 zero-extends (0xF0000000u32 -> 0x00000000F0000000i64).
+    shifted.signed_shr(shift)
 }
 
 /// Format (pack) a value into a bitfield position.

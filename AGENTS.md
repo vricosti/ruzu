@@ -1,4 +1,4 @@
-# CHATGPT.md — Porting Philosophy And Execution Contract For `audio_core`
+# AGENTS.md — Porting Philosophy And Execution Contract For `audio_core`
 
 ## Purpose
 
