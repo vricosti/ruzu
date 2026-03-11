@@ -12,5 +12,13 @@ common = { path = "../common" }
 # ruzu-service = { path = "../ruzu-service" }
 # ruzu-loader = { path = "../ruzu-loader" }
 # ruzu-gpu = { path = "../ruzu-gpu" }
+aes.workspace = true
+bitflags.workspace = true
+cipher.workspace = true
+ctr.workspace = true
+hex.workspace = true
+libc = "0.2"
 log.workspace = true
 parking_lot.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

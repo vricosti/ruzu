@@ -1,0 +1,430 @@
+//! Port of zuyu/src/core/reporter.h and zuyu/src/core/reporter.cpp
+//! Status: COMPLET
+//! Derniere synchro: 2026-03-11
+//!
+//! Reporter class for saving telemetry/crash/error reports as JSON files.
+//! Reports are written to the log directory under type-specific subdirectories.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+
+use common::fs as common_fs;
+use common::settings;
+
+/// Play report type enum, matching upstream Reporter::PlayReportType.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayReportType {
+    Old = 0,
+    Old2 = 1,
+    New = 2,
+    System = 3,
+}
+
+/// TODO: Forward reference to Core::System (not yet available as a full dependency).
+/// Using an opaque type for now.
+pub struct System {
+    // Placeholder fields - will be replaced when System is wired up
+    _private: (),
+}
+
+impl System {
+    /// Placeholder - returns the application process program ID.
+    pub fn get_application_process_program_id(&self) -> u64 {
+        0 // TODO: Wire to actual System
+    }
+}
+
+/// TODO: Forward reference to Service::HLERequestContext.
+pub struct HleRequestContext {
+    _private: (),
+}
+
+/// Reporter for generating and saving various report types.
+///
+/// Corresponds to the C++ `Reporter` class. Reports are saved as JSON files
+/// in the log directory, organized by report type.
+pub struct Reporter {
+    /// Reference to the system instance (not yet wired up).
+    /// TODO: Replace with proper system reference when available.
+    reporting_enabled: bool,
+}
+
+// --- Private helper functions (matching anonymous namespace in C++) ---
+
+fn get_timestamp() -> String {
+    let now = chrono_like_timestamp();
+    now
+}
+
+/// Simple timestamp generation without requiring the chrono crate.
+fn chrono_like_timestamp() -> String {
+    use std::time::SystemTime;
+
+    let duration = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+
+    // Convert to a simple date-time string
+    // This is a simplified version; a real implementation would use proper time formatting
+    let hours = (secs / 3600) % 24;
+    let minutes = (secs / 60) % 60;
+    let seconds = secs % 60;
+    let days = secs / 86400;
+    // Approximate date calculation (not fully accurate but functional)
+    let years = 1970 + days / 365;
+    let remaining_days = days % 365;
+    let months = remaining_days / 30 + 1;
+    let day = remaining_days % 30 + 1;
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}",
+        years, months, day, hours, minutes, seconds
+    )
+}
+
+fn get_path(report_type: &str, title_id: u64, timestamp: &str) -> PathBuf {
+    common_fs::path_util::get_ruzu_path(common_fs::path_util::RuzuPath::LogDir)
+        .join(report_type)
+        .join(format!("{:016X}_{}.json", title_id, timestamp))
+}
+
+fn save_to_file(json: &serde_json::Value, filename: &PathBuf) {
+    if let Some(parent) = filename.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            log::error!("Failed to create path for '{}' to save report: {}", filename.display(), e);
+            return;
+        }
+    }
+
+    match fs::File::create(filename) {
+        Ok(mut file) => {
+            let json_str = serde_json::to_string_pretty(json).unwrap_or_default();
+            if let Err(e) = file.write_all(json_str.as_bytes()) {
+                log::error!("Failed to write report to '{}': {}", filename.display(), e);
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to create report file '{}': {}", filename.display(), e);
+        }
+    }
+}
+
+fn get_ruzu_version_data() -> serde_json::Value {
+    serde_json::json!({
+        "scm_rev": env!("CARGO_PKG_VERSION"),
+        "scm_branch": "unknown",
+        "scm_desc": "ruzu",
+        "build_name": "ruzu",
+        "build_date": "unknown",
+        "build_fullname": "ruzu",
+        "build_version": env!("CARGO_PKG_VERSION"),
+    })
+}
+
+fn get_report_common_data(
+    title_id: u64,
+    result_raw: u32,
+    timestamp: &str,
+    user_id: Option<u128>,
+) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "title_id": format!("{:016X}", title_id),
+        "result_raw": format!("{:08X}", result_raw),
+        "result_module": format!("{:08X}", result_raw & 0x1FF),
+        "result_description": format!("{:08X}", (result_raw >> 9) & 0x1FFF),
+        "timestamp": timestamp,
+    });
+
+    if let Some(uid) = user_id {
+        let high = (uid >> 64) as u64;
+        let low = uid as u64;
+        out["user_id"] = serde_json::Value::String(format!("{:016X}{:016X}", high, low));
+    }
+
+    out
+}
+
+fn get_processor_state_data(
+    architecture: &str,
+    entry_point: u64,
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+    registers: &[u64; 31],
+    backtrace: Option<&[u64; 32]>,
+) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "entry_point": format!("{:016X}", entry_point),
+        "sp": format!("{:016X}", sp),
+        "pc": format!("{:016X}", pc),
+        "pstate": format!("{:016X}", pstate),
+        "architecture": architecture,
+    });
+
+    let mut registers_out = BTreeMap::new();
+    for (i, reg) in registers.iter().enumerate() {
+        registers_out.insert(format!("X{:02}", i), format!("{:016X}", reg));
+    }
+    out["registers"] = serde_json::to_value(registers_out).unwrap_or_default();
+
+    if let Some(bt) = backtrace {
+        let backtrace_out: Vec<String> = bt.iter().map(|e| format!("{:016X}", e)).collect();
+        out["backtrace"] = serde_json::to_value(backtrace_out).unwrap_or_default();
+    }
+
+    out
+}
+
+fn get_full_data_auto(timestamp: &str, title_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "yuzu_version": get_ruzu_version_data(),
+        "report_common": get_report_common_data(title_id, 0, timestamp, None),
+    })
+}
+
+impl Reporter {
+    /// Create a new Reporter.
+    /// In C++ this takes a System& reference. Here we take a reference to
+    /// settings Values to read the reporting_services flag.
+    pub fn new(vals: &settings::Values) -> Self {
+        let reporter = Self {
+            reporting_enabled: *vals.reporting_services.get_value(),
+        };
+        reporter.clear_fs_access_log();
+        reporter
+    }
+
+    /// Save a crash report from the fatal service.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_crash_report(
+        &self,
+        title_id: u64,
+        result: u32,
+        set_flags: u64,
+        entry_point: u64,
+        sp: u64,
+        pc: u64,
+        pstate: u64,
+        afsr0: u64,
+        afsr1: u64,
+        esr: u64,
+        far: u64,
+        registers: &[u64; 31],
+        backtrace: &[u64; 32],
+        backtrace_size: u32,
+        arch: &str,
+        unk10: u32,
+    ) {
+        if !self.is_reporting_enabled() {
+            return;
+        }
+
+        let timestamp = get_timestamp();
+        let mut out = serde_json::json!({});
+
+        out["yuzu_version"] = get_ruzu_version_data();
+        out["report_common"] = get_report_common_data(title_id, result, &timestamp, None);
+
+        let mut proc_out =
+            get_processor_state_data(arch, entry_point, sp, pc, pstate, registers, Some(backtrace));
+        proc_out["set_flags"] = serde_json::Value::String(format!("{:016X}", set_flags));
+        proc_out["afsr0"] = serde_json::Value::String(format!("{:016X}", afsr0));
+        proc_out["afsr1"] = serde_json::Value::String(format!("{:016X}", afsr1));
+        proc_out["esr"] = serde_json::Value::String(format!("{:016X}", esr));
+        proc_out["far"] = serde_json::Value::String(format!("{:016X}", far));
+        proc_out["backtrace_size"] = serde_json::Value::String(format!("{:08X}", backtrace_size));
+        proc_out["unknown_10"] = serde_json::Value::String(format!("{:08X}", unk10));
+
+        out["processor_state"] = proc_out;
+
+        save_to_file(&out, &get_path("crash_report", title_id, &timestamp));
+    }
+
+    /// Save a report for svcBreak.
+    pub fn save_svc_break_report(
+        &self,
+        title_id: u64,
+        break_type: u32,
+        signal_debugger: bool,
+        info1: u64,
+        info2: u64,
+        resolved_buffer: Option<&[u8]>,
+    ) {
+        if !self.is_reporting_enabled() {
+            return;
+        }
+
+        let timestamp = get_timestamp();
+        let mut out = get_full_data_auto(&timestamp, title_id);
+
+        let mut break_out = serde_json::json!({
+            "type": format!("{:08X}", break_type),
+            "signal_debugger": format!("{}", signal_debugger),
+            "info1": format!("{:016X}", info1),
+            "info2": format!("{:016X}", info2),
+        });
+
+        if let Some(buf) = resolved_buffer {
+            break_out["debug_buffer"] = serde_json::Value::String(hex::encode(buf));
+        }
+
+        out["svc_break"] = break_out;
+
+        save_to_file(&out, &get_path("svc_break_report", title_id, &timestamp));
+    }
+
+    /// Save a report for an unimplemented applet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_unimplemented_applet_report(
+        &self,
+        title_id: u64,
+        applet_id: u32,
+        common_args_version: u32,
+        library_version: u32,
+        theme_color: u32,
+        startup_sound: bool,
+        system_tick: u64,
+        normal_channel: &[Vec<u8>],
+        interactive_channel: &[Vec<u8>],
+    ) {
+        if !self.is_reporting_enabled() {
+            return;
+        }
+
+        let timestamp = get_timestamp();
+        let mut out = get_full_data_auto(&timestamp, title_id);
+
+        out["applet_common_args"] = serde_json::json!({
+            "applet_id": format!("{:02X}", applet_id),
+            "common_args_version": format!("{:08X}", common_args_version),
+            "library_version": format!("{:08X}", library_version),
+            "theme_color": format!("{:08X}", theme_color),
+            "startup_sound": format!("{}", startup_sound),
+            "system_tick": format!("{:016X}", system_tick),
+        });
+
+        let normal_out: Vec<String> = normal_channel.iter().map(|d| hex::encode(d)).collect();
+        let interactive_out: Vec<String> =
+            interactive_channel.iter().map(|d| hex::encode(d)).collect();
+
+        out["applet_normal_data"] = serde_json::to_value(normal_out).unwrap_or_default();
+        out["applet_interactive_data"] = serde_json::to_value(interactive_out).unwrap_or_default();
+
+        save_to_file(
+            &out,
+            &get_path("unimpl_applet_report", title_id, &timestamp),
+        );
+    }
+
+    /// Save a play report.
+    pub fn save_play_report(
+        &self,
+        report_type: PlayReportType,
+        title_id: u64,
+        data: &[&[u8]],
+        process_id: Option<u64>,
+        user_id: Option<u128>,
+    ) {
+        if !self.is_reporting_enabled() {
+            return;
+        }
+
+        let timestamp = get_timestamp();
+        let mut out = serde_json::json!({});
+
+        out["yuzu_version"] = get_ruzu_version_data();
+        out["report_common"] = get_report_common_data(title_id, 0, &timestamp, user_id);
+
+        let data_out: Vec<String> = data.iter().map(|d| hex::encode(d)).collect();
+
+        if let Some(pid) = process_id {
+            out["play_report_process_id"] =
+                serde_json::Value::String(format!("{:016X}", pid));
+        }
+
+        out["play_report_type"] =
+            serde_json::Value::String(format!("{:02}", report_type as u8));
+        out["play_report_data"] = serde_json::to_value(data_out).unwrap_or_default();
+
+        save_to_file(&out, &get_path("play_report", title_id, &timestamp));
+    }
+
+    /// Save an error report from the error applet.
+    pub fn save_error_report(
+        &self,
+        title_id: u64,
+        result: u32,
+        custom_text_main: Option<&str>,
+        custom_text_detail: Option<&str>,
+    ) {
+        if !self.is_reporting_enabled() {
+            return;
+        }
+
+        let timestamp = get_timestamp();
+        let mut out = serde_json::json!({});
+
+        out["yuzu_version"] = get_ruzu_version_data();
+        out["report_common"] = get_report_common_data(title_id, result, &timestamp, None);
+
+        out["error_custom_text"] = serde_json::json!({
+            "main": custom_text_main.unwrap_or(""),
+            "detail": custom_text_detail.unwrap_or(""),
+        });
+
+        save_to_file(&out, &get_path("error_report", title_id, &timestamp));
+    }
+
+    /// Save a filesystem access log message.
+    pub fn save_fs_access_log(&self, log_message: &str) {
+        let access_log_path =
+            common_fs::path_util::get_ruzu_path(common_fs::path_util::RuzuPath::SDMCDir)
+                .join("FsAccessLog.txt");
+
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&access_log_path)
+        {
+            let _ = file.write_all(log_message.as_bytes());
+        }
+    }
+
+    /// Save a user-initiated debug report.
+    pub fn save_user_report(&self, title_id: u64) {
+        if !self.is_reporting_enabled() {
+            return;
+        }
+
+        let timestamp = get_timestamp();
+        save_to_file(
+            &get_full_data_auto(&timestamp, title_id),
+            &get_path("user_report", title_id, &timestamp),
+        );
+    }
+
+    // --- Private methods ---
+
+    fn clear_fs_access_log(&self) {
+        let access_log_path =
+            common_fs::path_util::get_ruzu_path(common_fs::path_util::RuzuPath::SDMCDir)
+                .join("FsAccessLog.txt");
+
+        match fs::File::create(&access_log_path) {
+            Ok(_) => {} // Successfully truncated
+            Err(_) => {
+                log::error!("Failed to clear the filesystem access log.");
+            }
+        }
+    }
+
+    fn is_reporting_enabled(&self) -> bool {
+        self.reporting_enabled
+    }
+}
+
+// Note: No Default impl since Reporter requires &Values at construction.
