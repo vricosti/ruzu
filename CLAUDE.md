@@ -493,9 +493,16 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 
 **Rust crate:** `core` at `/home/vricosti/shared/ruzu/core`
 
-**Status:** In progress.
+**Status:** Ported.
 
-**Exceptions:** *(to be filled as the port progresses)*
+**Exceptions:**
+
+- `precompiled_headers.h` — C++ build optimization; no Rust equivalent.
+- `memory.h/cpp` — ported as `guest_memory.rs` (upstream `Memory::Memory` class maps to `GuestMemory`); the top-level `memory.h` is a thin wrapper around page table access that is integrated into `guest_memory.rs`.
+- `file_sys/fssystem_bucket_tree_template_impl.h`, `file_sys/fssystem_bucket_tree_utils.h` — C++ template implementation headers; logic folded into `fssystem/bucket_tree.rs`.
+- `arm/nce/arm_nce.s` — ARM64 assembly source file; would need a separate `.s` file or inline assembly in Rust.
+- `arm/dynarmic/` — JIT backend files are ported as stubs; full implementation depends on `rdynarmic` integration.
+- `arm/nce/` — Native code execution backend is ported structurally; full implementation depends on platform-specific signal handling.
 
 ### `video_core` — `/home/vricosti/shared/zuyu/src/video_core`
 

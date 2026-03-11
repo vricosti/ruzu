@@ -4,6 +4,7 @@
 // Ported from: core/file_sys/system_archive/
 // Synthesized system archive data.
 
+pub mod data;
 pub mod mii_model;
 pub mod ng_word;
 pub mod shared_font;
