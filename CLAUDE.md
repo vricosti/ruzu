@@ -1,356 +1,506 @@
-# CLAUDE.md — Ruzu: Port de l'émulateur Zuyu (C++) vers Rust
+# CLAUDE.md — Porting Philosophy And Execution Contract
 
-## Objectif du projet
+## Purpose
 
-Porter l'émulateur Nintendo Switch **zuyu** (fork de yuzu, écrit en C++) vers **ruzu** (Rust), en respectant fidèlement l'architecture et l'implémentation originale C++. Le but final est de pouvoir exécuter :
+This document defines how a ChatGPT/Codex-style agent must port C++ code from `/home/vricosti/shared/zuyu/src/` into `/home/vricosti/shared/ruzu/`.
 
-```bash
-./ruzu-cmd -g '/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp'
-```
+It is written as a handoff contract for another instance.
 
-avec rendu OpenGL et sortie audio fonctionnels.
+The goal is not merely:
 
-Pour comparer le comportement attendu, lancer la version C++ :
+- "make it compile"
+- "make tests pass"
+- "approximate the behavior"
 
-```bash
-/home/vricosti/shared/zuyu/build/bin/zuyu-cmd -g '/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp'
-```
+The goal is:
+
+- strict file-structure parity where technically possible
+- strict method ownership parity where technically possible
+- strict constant placement parity where technically possible
+- strict behavioral parity with the C++ source
+- explicit, reviewable traceability from each Rust file/method/constant back to the upstream C++ file/method/constant
+
+This document exists because earlier progress proved that a crate can be "substantial" while still drifting structurally from upstream in ways that make review and future porting harder.
+
+## Source Of Truth
+
+### Upstream reference
+
+The C++ source of truth is:
+
+- `/home/vricosti/shared/zuyu/src/`
+
+That tree is read-only.
+
+Never edit it.
+
+Always treat it as authoritative for:
+
+- file layout
+- class/module boundaries
+- constants
+- method names and responsibilities
+- state ownership
+- control flow
+- validation behavior
+- data structure invariants
+
+### Rust target
+
+The Rust destination is:
+
+- `/home/vricosti/shared/ruzu/`
+
+The Rust port should be judged against the C++ tree, not against whether the Rust design looks idiomatic in isolation.
+
+## Core Philosophy
+
+### 1. Fidelity beats elegance
+
+If there is tension between:
+
+- a cleaner Rust architecture
+- a more faithful C++ port
+
+pick the faithful port.
+
+Rust idioms are allowed only when they preserve the same ownership boundaries and behavior.
+
+Examples of acceptable Rust adaptations:
+
+- `Result` instead of exceptions
+- `Arc<Mutex<T>>` instead of `shared_ptr` + mutex
+- `enum` instead of tagged unions / `std::variant`
+- `Drop` instead of destructors
+
+Examples of unacceptable adaptations:
+
+- merging several upstream files into one large Rust file "for convenience"
+- moving constants away from their upstream module
+- centralizing behavior in a generic dispatcher when upstream behavior belongs to per-file modules
+- inventing a new architecture because the upstream one looks awkward in Rust
+
+### 2. Auditability is a feature
+
+A good port is easy to compare line-by-line against upstream.
+
+When reviewing a Rust file, a maintainer should be able to answer:
+
+- which C++ file does this map to?
+- which upstream constants live here?
+- which upstream methods live here?
+- what is still missing?
+
+If the answer is unclear, the port is not structured well enough.
+
+### 3. Intermediate progress is allowed, but temporary shortcuts must be unwound
+
+During the port, temporary shortcuts may be used to unblock progress.
+
+Examples:
+
+- stubbing out a complex platform-specific function
+- using a simplified implementation while other crates depend on the interface
+- keeping a placeholder module with `todo!()` bodies
+
+But these shortcuts must be treated as debt, not design.
+
+Before calling a subsystem "ported", unwind the shortcut and restore parity.
+
+### 4. Tests are necessary but not sufficient
+
+Passing tests only proves:
+
+- current exercised behavior works
+
+It does not prove:
+
+- structural parity
+- ownership parity
+- exact data-structure layout parity
+- exact lifecycle parity
+
+Never conclude "finished" purely from green tests.
+
+### 5. The correct default is suspicion
+
+When something is "close enough", assume it is still wrong until verified against upstream.
+
+Examples of common false confidence:
+
+- same output in one test
+- same field names but different file ownership
+- logically equivalent control flow but different edge-case handling
+
+For this port, "probably equivalent" is not good enough.
+
+## Non-Negotiable Rules
+
+### Rule A: Preserve file structure whenever technically possible
+
+If upstream has a `.cpp` and `.h` pair, Rust should have a corresponding `.rs` file at the same relative path within its crate.
+
+Do not hide several upstream files behind one Rust file unless there is a strong technical reason.
+
+If you must diverge, document the reason in code comments and in the final summary.
+
+Exceptions are listed per-folder at the end of this document. These omissions are intentional and should not be flagged as missing files during parity audits.
+
+### Rule B: Preserve method ownership whenever technically possible
+
+If an upstream method belongs to a specific `.cpp` file, then its Rust equivalent should live in the corresponding `.rs` file with Rust naming conventions (snake_case).
+
+Do not leave such logic in:
+
+- `lib.rs` or `mod.rs`
+- some unrelated shared helper
+- a "utils" catch-all
+
+unless upstream itself centralizes it.
+
+### Rule C: Preserve constant placement
+
+If constants live in a specific upstream file, they belong in the corresponding Rust file.
+
+Do not centralize them into unrelated utility modules unless the upstream does the same.
+
+### Rule D: Preserve behavior before abstraction
+
+Never extract a helper unless:
+
+- the upstream has the same helper concept
+- or the extraction is purely mechanical and does not change ownership semantics
+
+Avoid "helpful" generic abstractions that make the port less traceable.
+
+### Rule E: Preserve binary layout exactly where raw serialization exists
+
+Anywhere structs are copied as raw bytes, all of these matter:
+
+- field order
+- alignment
+- explicit padding
+- implicit padding
+- zero-initialization of reserved bytes
+
+`repr(C)` is necessary but not sufficient.
+
+If a payload is serialized by raw memory copy, initialize the entire payload deterministically before writing fields.
+
+### Rule F: Preserve signed/unsigned bit patterns
+
+Upstream often forwards raw values through integer casts.
+
+Do not replace that with "friendlier" Rust logic like:
+
+- clamping negatives to zero
+- turning invalid values into `None`
+
+unless upstream truly does that.
+
+### Rule G: Preserve update and lifecycle ordering
+
+Many bugs come from doing the right work in the wrong order.
+
+When in doubt, port the ordering literally.
+
+## What "Finished" Means
+
+Do not call a folder finished until all of the following are true.
+
+### Structural completion
+
+- The Rust module/file tree mirrors the upstream C++ folder as closely as reasonably possible.
+- Major missing files are identified and either ported or documented as exceptions.
+- No upstream files are silently merged into unrelated Rust files.
+
+### Ownership completion
+
+- Methods and constants live in the same conceptual modules as upstream.
+- No "catch-all" utility files that absorb logic from multiple upstream sources.
+
+### Behavioral completion
+
+- Critical subsystems follow upstream behavior closely enough that remaining differences are minor and identified.
+
+### Binary completion
+
+- Data structure layouts match upstream where shared across components.
+- Serialized payloads are bit-accurate.
+
+### Validation completion
+
+- Tests exist for nontrivial parity-sensitive behavior.
+- Full `cargo test -p <crate>` passes.
+- No known major "still structurally wrong" caveat remains.
+
+If major caveats remain, it is not finished.
+
+## Practical Workflow For Each File
+
+For every upstream file, use this process.
+
+### Step 1: Identify the exact Rust counterpart
+
+Before writing code, answer:
+
+- what is the upstream file path?
+- where is the Rust counterpart supposed to live?
+- does that file already exist?
+- if it exists, is it the right owner for this logic?
+
+If the logic currently lives elsewhere, fix ownership first or during the change.
+
+### Step 2: Read the upstream header and implementation
+
+For each C++ file:
+
+- inspect its header for interface and state
+- inspect its `.cpp` for behavior
+
+Capture:
+
+- constants
+- structs/classes
+- public methods
+- private helpers
+- static helpers
+- validation rules
+
+### Step 3: Port names with Rust conventions, not new semantics
+
+Do not rename at the semantic level. Convert to snake_case and Rust naming conventions only.
+
+### Step 4: Keep upstream helper boundaries visible
+
+If upstream uses several helpers inside a file, keep corresponding Rust helpers in the same file rather than flattening them into one large function.
+
+### Step 5: Add focused regression tests
+
+After each meaningful parity fix, add targeted tests for:
+
+- the bug being fixed
+- the upstream-specific edge case
+- any binary-layout or ordering contract involved
+
+### Step 6: Run the smallest useful test set first, then full crate tests
+
+Use focused module tests while iterating, then `cargo test -p <crate>` before concluding the pass.
+
+## Anti-Patterns To Avoid
+
+These are all mistakes that already occurred or are easy to repeat.
+
+### Anti-pattern 1: "Flatten now, split later" without actually splitting later
+
+This leads to giant central files, hidden ownership, and difficult review. Only flatten temporarily if you are committed to unwinding it.
+
+### Anti-pattern 2: Treating dispatcher files as owners
+
+Central dispatch files (`mod.rs`, `lib.rs`, processor files) should coordinate, not own every module's real logic.
+
+### Anti-pattern 3: Central constant dumps
+
+If constants belong to a specific upstream file, keep them in the corresponding Rust file. Do not make one convenience constants file unless upstream does.
+
+### Anti-pattern 4: Replacing upstream lifecycle with a Rust convenience lifecycle
+
+Examples: eager initialization where upstream initializes lazily, preemptive cleanup that upstream performs later. If you diverge for temporary practicality, mark it and come back.
+
+### Anti-pattern 5: Using "tests pass" to justify structural divergence
+
+A structurally wrong port can still pass current tests.
+
+### Anti-pattern 6: Replacing platform-specific code with pure-Rust alternatives without documenting it
+
+If upstream uses platform-specific APIs and Rust uses a different approach, document the divergence.
+
+## How To Treat Rust Idioms
+
+Rust idioms are tools, not goals.
+
+Use them when they preserve parity.
+
+### Preferred Rust adaptations
+
+- `enum` for tagged unions and mode flags
+- `Drop` for cleanup matching destructor behavior
+- `Option` for optional ownership
+- `Arc`, `Weak`, `Mutex` for shared lifecycle
+- module-level functions replacing C++ `static` helpers
+- `bitflags` crate for flag enums that use `DECLARE_ENUM_FLAG_OPERATORS` in C++
+
+### Rust adaptations to use carefully
+
+- traits replacing inheritance
+- generic helpers replacing duplicated code
+- borrow-driven refactors that alter access patterns
+
+### Rust adaptations to avoid in this port
+
+- architecture redesigns
+- replacing C++ data structures with different Rust ones that have different performance characteristics
+- helper layers that erase file ownership
+
+## Testing Philosophy
+
+### Required testing style
+
+Add focused tests for:
+
+- parity-sensitive edge cases
+- previous bugs
+- binary-layout expectations
+- hash function output matching
+- data structure invariants
+
+### Preferred test granularity
+
+- unit tests near the module being ported
+- regression tests for specific upstream contracts
+
+### What to avoid
+
+- only broad integration tests
+- only "does not crash" tests
+- tests that assert Rust-specific behavior not derived from upstream
+
+## How To Decide What To Work On Next
+
+When choosing the next task, prefer this order:
+
+1. structural mismatches that make review harder
+2. ownership mismatches that keep logic in the wrong file
+3. missing files that other crates depend on
+4. behavioral mismatches in critical infrastructure
+5. test coverage for newly fixed parity-sensitive behavior
+
+Do not spend time polishing low-value style details while major ownership or behavior mismatches remain.
+
+## Completion Checklist For A Subtree
+
+Before calling any subtree "ported", check all of these.
+
+### File structure
+
+- Do corresponding Rust files exist?
+- Are there any remaining flattened upstream files?
+
+### Ownership
+
+- Are constants in the right file?
+- Are methods/helpers in the right file?
+
+### Behavior
+
+- Does sequencing match upstream?
+- Are sentinel values preserved?
+- Are validation and failure paths aligned?
+
+### Serialization
+
+- Is binary layout correct where shared across components?
+
+### Tests
+
+- Is there a focused regression test for the nontrivial behavior?
+
+## How To Communicate Progress
+
+When reporting progress:
+
+- state exactly what ownership/parity slice was improved
+- name the affected files
+- say what is still missing
+- do not over-claim completion
+
+Good progress statement:
+
+- "Ported `fs/path_util.rs` from `fs/path_util.cpp`; all path resolution methods match upstream. `cargo test -p common` passes."
+
+Bad progress statement:
+
+- "Improved the crate significantly."
+
+## Final Standard
+
+If another instance uses this file correctly, it should keep asking:
+
+- "Where does this logic belong upstream?"
+- "Why is this method not in the matching file?"
+- "Why is this constant not next to its upstream equivalent?"
+- "Is this behavior literally the same, or merely plausible?"
+
+That is the right mindset for finishing this port.
 
 ---
 
-## Règles de gestion des dépôts Git
-
-### Code source C++ : LECTURE SEULE
-
-**Ne JAMAIS modifier les fichiers dans `/home/vricosti/shared/zuyu/`.** Ce répertoire est la référence C++ et doit rester intact. Il sert uniquement à lire et comprendre l'implémentation originale.
-
-### Dépôts Rust : travailler sur une branche
+## Per-Folder Exceptions
 
-Pour les trois dépôts Rust suivants, **toujours créer une branche** avant de faire des modifications :
+Each section below lists C++ files that have no meaningful Rust counterpart for a specific upstream folder. These omissions are intentional and should not be flagged as missing files during parity audits.
 
-| Dépôt | Chemin |
-|-------|--------|
-| ruzu (émulateur) | `/home/vricosti/shared/ruzu/` |
-| rdynarmic (port de dynarmic) | `/home/vricosti/shared/rdynarmic/` |
-| rxbyak (port de xbyak) | `/home/vricosti/shared/rxbyak/` |
+### `audio_core` — `/home/vricosti/shared/zuyu/src/audio_core`
 
-**Workflow Git obligatoire :**
+**Rust crate:** `audio_core` at `/home/vricosti/shared/ruzu/audio_core`
 
-```bash
-cd /home/vricosti/shared/<depot>
-git checkout -b claude/opengl-renderer-and-restructure    # Créer la branche de travail
-# ... faire les modifications ...
-git add -A
-git commit -m "<message descriptif>"         # Commiter en local
-```
+**Status:** Ported.
 
-**Règles strictes :**
-- **Utiliser une seule branche `claude/opengl-renderer-and-restructure`** sur chaque dépôt — pas de branche par feature
-- **Commiter régulièrement** en local avec des messages descriptifs
-- **Ne JAMAIS pousser** (`git push`) — il n'y a pas de clés SSH configurées, et de toute façon on ne veut pas pousser sans review
-- **Ne JAMAIS modifier la branche `main`** directement
-- **Ne JAMAIS force-push ou rebase** des branches existantes
+**Exceptions:**
 
----
+- `precompiled_headers.h` — precompiled headers are a C++ build optimization; Rust has no equivalent concept.
 
-## Chemins du projet
+### `common` — `/home/vricosti/shared/zuyu/src/common`
 
-| Élément | Chemin |
-|---------|--------|
-| Source C++ originale (lecture seule, référence) | `/home/vricosti/shared/zuyu/src/` |
-| Destination Rust (implémentation) | `/home/vricosti/shared/ruzu/` |
-| Binaire C++ de référence | `/home/vricosti/shared/zuyu/build/bin/zuyu-cmd` |
-| ROM de test | `/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp` |
+**Rust crate:** `common` at `/home/vricosti/shared/ruzu/common`
 
----
+**Status:** Ported.
 
-## Règle fondamentale
+**Exceptions:**
 
-**Respecter l'implémentation C++ originale.** Chaque fichier C++ de zuyu doit avoir un équivalent Rust dans ruzu, avec la même logique, les mêmes structures, les mêmes algorithmes. Les adaptations idiomatiques Rust sont acceptées (Result au lieu d'exceptions, traits au lieu de classes abstraites, enums au lieu de switch/case, etc.) mais la structure globale et le découpage en modules doivent refléter le code C++.
+- `precompiled_headers.h`, `common_precompiled_headers.h` — C++ build optimization; no Rust equivalent.
+- `common_types.h` — defines `u8`, `u16`, `u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, `f64`; Rust has these as built-in primitive types.
+- `common_funcs.h` — C++ utility macros (`DECLARE_ENUM_FLAG_OPERATORS`, `ZUYU_NON_COPYABLE`, etc.); Rust handles these via `bitflags`, `Clone`/`Copy` derives, etc.
+- `concepts.h` — C++ concepts; Rust uses trait bounds natively.
+- `polyfill_ranges.h`, `polyfill_thread.h` — C++ standard library polyfills; Rust stdlib provides these features natively.
+- `expected.h` — C++ `std::expected` polyfill; Rust has `Result` built in.
+- `scope_exit.h` — Rust uses `Drop` for deterministic cleanup.
+- `bit_cast.h` — Rust uses `bytemuck` or `transmute`.
+- `make_unique_for_overwrite.h` — C++ memory allocation detail with no Rust equivalent.
+- `parent_of_member.h` — C++ `container_of` macro pattern; Rust does not use this pattern.
+- `microprofile.h`, `microprofile.cpp`, `microprofileui.h` — profiling framework integration; a separate concern.
+- `stb.h`, `stb.cpp` — stb_image C library bindings; Rust would use an image crate instead.
+- `scm_rev.h` — build-time source control revision; handled differently in Rust builds.
+- `assert.h` — C++ macro-based assertion system; Rust has built-in `assert!`, `debug_assert!`, `panic!`.
+- `atomic_helpers.h` — C++ TSAN annotation macros for atomic fences; Rust `std::sync::atomic` handles this natively.
+- `atomic_ops.h` — MSVC/GCC specific compare-and-swap operations; Rust `std::sync::atomic` provides these.
+- `demangle.h` — C++ symbol demangling; Rust has different name mangling and its own demangling support.
+- `logging/formatter.h` — fmt library formatter specialization for enums; Rust `Display`/`Debug` traits handle this.
+- `logging/log.h` — C++ fmt-based logging macros (`LOG_DEBUG`, `LOG_INFO`, etc.); Rust uses the `log` crate macros.
+- `unique_function.h` — C++ move-only `std::function`; Rust has `Box<dyn FnOnce()>` and closures natively.
+- `literals.h` — C++ user-defined literals (`_KiB`, `_MiB`, etc.); Rust uses `const` values or plain arithmetic.
+- `android/android_common.*`, `android/applets/software_keyboard.*`, `android/id_cache.*` — Android JNI integration; platform-specific frontend code with no Rust JNI equivalent in this project.
+- `fs/fs_android.*` — Android-specific filesystem via JNI; same as above.
+- `linux/gamemode.*` — Linux Feral Interactive gamemode integration; thin platform glue.
+- `signal_chain.*` — POSIX signal handler wrapping (Android-specific); platform-specific.
+- `nvidia_flags.*` — Environment variable configuration for Nvidia driver quirks; thin platform glue.
+- `windows/timer_resolution.*` — Windows-specific timer resolution API; platform-specific.
+- `x64/xbyak_abi.h`, `x64/xbyak_util.h` — Xbyak JIT assembly library integration; JIT-specific, handled by `rdynarmic`.
+- `reader_writer_queue.h` — third-party lock-free queue (`moodycamel::ReaderWriterQueue`); Rust would use a dedicated crate.
+- `algorithm.h` — small generic iterator helpers (`BinaryFind`, `FoldRight`); Rust iterators provide this natively.
+- `socket_types.h` — C++ network socket type aliases; Rust `std::net` handles this.
 
-**Ne PAS réinventer l'architecture.** Ne pas fusionner plusieurs fichiers C++ dans un seul fichier Rust. Ne pas découper un fichier C++ en plusieurs fichiers Rust sans raison technique. Le mapping doit être 1:1 autant que possible.
+### `core` — `/home/vricosti/shared/zuyu/src/core`
 
----
+**Rust crate:** `core` at `/home/vricosti/shared/ruzu/core`
 
-## Répertoires à porter (dans l'ordre de priorité)
+**Status:** In progress.
 
-Les répertoires suivants de `/home/vricosti/shared/zuyu/src/` doivent être portés. Les répertoires **exclus** sont `android/` et `yuzu/` (GUI Qt).
-
-### Ordre de travail recommandé
-
-1. **`common/`** → `ruzu-common/` — Types de base, utilitaires, settings, logging, compression, mémoire
-2. **`core/`** → `ruzu-core/` (à créer si besoin, ou répartir dans les crates existantes selon le mapping ci-dessous)
-3. **`shader_recompiler/`** → `ruzu-gpu/src/shader_recompiler/`
-4. **`video_core/`** → `ruzu-gpu/`
-5. **`audio_core/`** → `ruzu-audio/` (à créer)
-6. **`hid_core/`** → `ruzu-hid/` (à créer)
-7. **`input_common/`** → `ruzu-input/` (à créer)
-8. **`network/`** → `ruzu-network/` (à créer)
-9. **`web_service/`** → `ruzu-web-service/` (à créer)
-10. **`frontend_common/`** → `ruzu-frontend-common/` (à créer)
-11. **`dedicated_room/`** → `ruzu-dedicated-room/` (à créer)
-12. **`yuzu_cmd/`** → `ruzu-cmd/` (à créer — point d'entrée CLI avec SDL)
-13. **`tests/`** → tests unitaires intégrés dans chaque crate (`#[cfg(test)]`)
-
----
+**Exceptions:** *(to be filled as the port progresses)*
 
-## Mapping détaillé zuyu → ruzu
+### `video_core` — `/home/vricosti/shared/zuyu/src/video_core`
 
-### Mapping des répertoires C++ vers crates Rust
+**Rust crate:** `ruzu-gpu` at `/home/vricosti/shared/ruzu/ruzu-gpu`
 
-| Répertoire C++ (`zuyu/src/`) | Crate Rust (`ruzu/`) | Notes |
-|------------------------------|----------------------|-------|
-| `common/` | `ruzu-common/` | Types, utilitaires, settings, logging |
-| `core/arm/` | `ruzu-cpu/` | CPU ARM (dynarmic bindings) |
-| `core/crypto/` | `ruzu-crypto/` | Gestion des clés, AES, tickets |
-| `core/hle/` | `ruzu-kernel/` + `ruzu-service/` | Kernel = kernel HLE, Service = services HOS |
-| `core/loader/` | `ruzu-loader/` | Chargement NCA/NSP/NRO/NSO/XCI |
-| `core/file_sys/` | `ruzu-loader/` (sous-module `vfs`) | VFS, partitions, content provider |
-| `core/memory/` + `core/memory.cpp` | `ruzu-kernel/` (memory_manager) | Gestion mémoire du processus |
-| `core/frontend/` | `ruzu-frontend-common/` | Interface frontend abstraite |
-| `core/` (reste: core.cpp, core_timing, cpu_manager, etc.) | `ruzu-core/` (à créer) | Orchestrateur principal, timing, perf_stats |
-| `video_core/` | `ruzu-gpu/` | GPU, renderers, texture/buffer cache |
-| `shader_recompiler/` | `ruzu-gpu/src/shader_recompiler/` | Recompilation shaders |
-| `audio_core/` | `ruzu-audio/` (à créer) | Audio DSP, input/output, rendering |
-| `hid_core/` | `ruzu-hid/` (à créer) | Contrôleurs, capteurs, NFC/IR |
-| `input_common/` | `ruzu-input/` (à créer) | Drivers input (SDL, etc.) |
-| `network/` | `ruzu-network/` (à créer) | Multiplayer, rooms |
-| `web_service/` | `ruzu-web-service/` (à créer) | Telemetry, annonces réseau |
-| `frontend_common/` | `ruzu-frontend-common/` | Config frontend commune |
-| `dedicated_room/` | `ruzu-dedicated-room/` (à créer) | Serveur room dédié |
-| `yuzu_cmd/` | `ruzu-cmd/` (à créer) | Point d'entrée CLI SDL |
+**Status:** In progress.
 
-### Mapping des fichiers existants à vérifier/réorganiser
-
-L'implémentation Rust existante dans `ruzu/` ne respecte pas toujours le mapping 1:1 avec le C++. **Avant d'implémenter de nouvelles fonctionnalités, vérifier que chaque fichier Rust existant correspond bien à son équivalent C++.** Si un fichier Rust mélange du code provenant de plusieurs fichiers C++, le découper pour restaurer le mapping 1:1.
-
----
-
-## Méthodologie de portage — Par fichier
-
-Pour chaque fichier C++ à porter, suivre cette procédure :
-
-### Étape 1 : Analyser le fichier C++
-
-```bash
-# Lire le header C++ pour comprendre l'interface
-cat /home/vricosti/shared/zuyu/src/<module>/<fichier>.h
-
-# Lire l'implémentation
-cat /home/vricosti/shared/zuyu/src/<module>/<fichier>.cpp
-```
-
-Identifier :
-- Les classes, structs, enums
-- Les méthodes publiques/privées
-- Les dépendances (#include)
-- Les patterns utilisés (RAII, observer, singleton, etc.)
-
-### Étape 2 : Vérifier si un équivalent Rust existe déjà
-
-```bash
-# Chercher dans le code Rust existant
-grep -r "NomDeLaClasse\|nom_de_la_fonction" /home/vricosti/shared/ruzu/
-```
-
-Si un fichier existe déjà, le comparer avec le C++ et le compléter/corriger.
-
-### Étape 3 : Implémenter en Rust
-
-- Créer le fichier au bon emplacement dans la crate Rust correspondante
-- Respecter la logique et les structures du C++
-- Adapter idiomatiquement pour Rust :
-
-| C++ | Rust |
-|-----|------|
-| `class` avec héritage | `struct` + `trait` |
-| `virtual` méthodes | `trait` objects (`dyn Trait`) ou generics |
-| `std::shared_ptr<T>` | `Arc<T>` |
-| `std::unique_ptr<T>` | `Box<T>` |
-| `std::weak_ptr<T>` | `Weak<T>` |
-| `std::optional<T>` | `Option<T>` |
-| `std::variant<A,B>` | `enum` |
-| `std::mutex` + lock | `Mutex<T>` (données dans le mutex) |
-| Exceptions | `Result<T, E>` |
-| `enum class` | `#[repr(u32)] enum` |
-| `#define` / `constexpr` | `const` / `const fn` |
-| Callbacks (`std::function`) | `Box<dyn Fn(...)>` ou closures génériques |
-| RAII (destructeur) | `Drop` trait |
-| Templates | Generics `<T>` |
-| `namespace` | `mod` |
-| `#include` | `use` |
-
-### Étape 4 : Compiler et vérifier
-
-```bash
-cd /home/vricosti/shared/ruzu
-cargo check 2>&1 | head -50
-cargo build 2>&1 | head -50
-```
-
-Corriger les erreurs avant de passer au fichier suivant.
-
----
-
-## Conventions Rust à suivre
-
-### Nommage
-
-- Noms de fichiers : `snake_case.rs` (un fichier par module C++)
-- Structs/Enums : `PascalCase`
-- Fonctions/méthodes : `snake_case`
-- Constantes : `SCREAMING_SNAKE_CASE`
-- Crates : `ruzu-*` (avec tiret dans Cargo.toml, underscore dans le code: `ruzu_common`)
-
-### Structure d'une crate
-
-```
-ruzu-<nom>/
-├── Cargo.toml
-└── src/
-    ├── lib.rs          # Racine du module, pub mod declarations
-    ├── <fichier>.rs    # Un fichier par .h/.cpp C++ correspondant
-    └── <sous-module>/  # Un sous-répertoire par sous-répertoire C++
-        ├── mod.rs
-        └── <fichier>.rs
-```
-
-### Gestion des erreurs
-
-Chaque crate définit son propre type d'erreur :
-
-```rust
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum AudioError {
-    #[error("Device not found: {0}")]
-    DeviceNotFound(String),
-    // ...
-}
-
-pub type Result<T> = std::result::Result<T, AudioError>;
-```
-
-### Logging
-
-Utiliser le crate `log` avec `env_logger` :
-
-```rust
-use log::{info, warn, error, debug, trace};
-```
-
-Le C++ utilise `LOG_INFO`, `LOG_WARNING`, etc. — mapper directement vers les macros `log`.
-
----
-
-## Dépendances Rust recommandées
-
-| Besoin | Crate Rust | Équivalent C++ |
-|--------|-----------|----------------|
-| Logging | `log` + `env_logger` | Common::Log |
-| Sérialisation | `serde` + `serde_json` | nlohmann/json |
-| Vulkan | `ash` | Vulkan C API |
-| Fenêtrage/SDL | `sdl2` | SDL2 |
-| Audio | `cpal` ou `sdl2::audio` | cubeb/SDL2 |
-| Compression LZ4 | `lz4_flex` ou `lz4` | lz4 |
-| Compression Zstd | `zstd` | zstd |
-| Crypto AES | `aes`, `ctr`, `xts-mode` | mbedtls/openssl |
-| Threading | `std::thread`, `crossbeam` | std::thread |
-| Async | `tokio` (si nécessaire) | — |
-| CLI args | `clap` | getopt |
-| Bitfields | `bitflags` | — |
-| CPU ARM JIT | `rdynarmic` | dynarmic |
-| FFI (si besoin) | `bindgen` | — |
-| Tests | `#[cfg(test)]` intégré | Catch2 |
-
----
-
-## Points d'attention spécifiques
-
-### 1. Dynarmic (CPU ARM) — Dépendance la plus critique
-
-Le CPU ARM utilise dynarmic, qui a déjà été porté en Rust sous le nom **rdynarmic**. C'est la dépendance la plus importante du projet.
-
-**Vérifications obligatoires :**
-- L'implémentation de `rdynarmic` doit correspondre fidèlement à celle de dynarmic en C++. Avant d'avancer sur le reste du portage, comparer les interfaces et le comportement de rdynarmic avec le dynarmic C++ original.
-- Les fichiers `ruzu-cpu/src/arm_dynarmic_32.rs` et `ruzu-cpu/src/arm_dynarmic_64.rs` doivent utiliser rdynarmic et reproduire exactement le même wiring que `zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp` et `arm_dynarmic_64.cpp` (callbacks mémoire, configuration des coprocesseurs, gestion des exceptions, etc.).
-- Toute divergence constatée entre rdynarmic et dynarmic C++ doit être signalée et corrigée dans rdynarmic avant de continuer.
-
-### 2. Services HLE
-
-Le répertoire `core/hle/service/` contient des dizaines de services Nintendo. Chaque service C++ (`core/hle/service/<nom>/`) doit avoir un fichier ou module correspondant dans `ruzu-service/src/`. Le framework IPC (`core/hle/ipc.h`, `core/hle/service/service.h`) est critique — le porter en premier.
-
-### 3. GPU / Video Core
-
-C'est le module le plus complexe. Ordre de portage recommandé :
-1. `memory_manager.cpp` — Gestion mémoire GPU
-2. `gpu.cpp` / `gpu_thread.cpp` — Thread GPU et command processing
-3. `engines/` — Maxwell engines (3D, compute, DMA, etc.)
-4. `renderer_vulkan/` — Renderer Vulkan (le plus important)
-5. `buffer_cache/` et `texture_cache/` — Caches
-6. `shader_cache.cpp` — Cache de shaders compilés
-
-### 4. Shader Recompiler
-
-Très complexe. Porter dans l'ordre :
-1. `frontend/` — Décodage des instructions GPU Maxwell/Turing
-2. `ir_opt/` — Passes d'optimisation IR
-3. `backend/spirv/` — Génération SPIR-V pour Vulkan
-
-### 5. File System / VFS
-
-`core/file_sys/` implémente un VFS (Virtual File System) avec de nombreux formats Nintendo (NCA, NSP, XCI, PFS, RomFS, etc.). C'est critique pour le chargement des jeux. Vérifier que `ruzu-loader/` couvre bien tous les fichiers de `core/file_sys/` et `core/loader/`.
-
----
-
-## Workflow de développement
-
-### Avant de commencer un module
-
-1. Lister les fichiers C++ du module : `ls /home/vricosti/shared/zuyu/src/<module>/`
-2. Lister les fichiers Rust existants : `ls /home/vricosti/shared/ruzu/<crate>/src/`
-3. Établir le mapping fichier par fichier
-4. Identifier les fichiers manquants
-5. Commencer par les fichiers sans dépendances internes, puis remonter
-
-### Après chaque fichier porté
-
-1. `cargo check` — doit compiler
-2. Vérifier que le module `lib.rs` ou `mod.rs` exporte correctement le nouveau fichier
-3. Si des tests existent dans `zuyu/src/tests/`, les porter aussi
-
-### Progression
-
-Maintenir un commentaire en tête de chaque fichier Rust indiquant :
-
-```rust
-//! Port de zuyu/src/<module>/<fichier>.h et zuyu/src/<module>/<fichier>.cpp
-//! Status: [COMPLET | EN COURS | STUB]
-//! Dernière synchro: <date>
-```
-
----
-
-## Ce qu'il ne faut PAS faire
-
-- **Ne pas inventer de nouvelles abstractions** qui n'existent pas dans le C++
-- **Ne pas fusionner des fichiers C++ distincts** dans un seul fichier Rust
-- **Ne pas ignorer les fichiers "ennuyeux"** (constantes, types, enums) — ils sont nécessaires
-- **Ne pas utiliser `todo!()` ou `unimplemented!()` partout** — implémenter réellement la logique
-- **Ne pas skipper les méthodes** même si elles semblent mineures — elles peuvent être appelées ailleurs
-- **Ne pas changer les algorithmes** sauf si le C++ utilise un pattern qui n'existe pas en Rust
-- **Ne pas oublier `pub`** sur les items qui doivent être accessibles par d'autres crates
-- **Ne pas oublier de déclarer les modules** dans `lib.rs` / `mod.rs`
-
----
-
-## Vérification finale
-
-Le projet est considéré fonctionnel quand :
-
-1. `cargo build --release` compile sans erreur
-2. `./target/release/ruzu-cmd -g '<chemin_rom>'` lance le jeu
-3. Le rendu OpenGL affiche les frames correctement
-4. Le son est audible
-5. Le comportement est comparable à `zuyu-cmd` sur la même ROM
+**Exceptions:** *(to be filled as the port progresses)*
