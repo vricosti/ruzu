@@ -8,3 +8,4 @@ pub mod api_version;
 pub mod ipc;
 pub mod kernel;
 pub mod result;
+pub mod service;
