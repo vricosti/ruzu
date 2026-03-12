@@ -699,7 +699,8 @@ pub fn convert_image(
         copy.buffer_offset = output_offset as usize;
 
         let astc = surface::is_pixel_format_astc(
-            crate::surface::PixelFormat::from_u32(info.format as u32),
+            // SAFETY: info.format is a valid PixelFormat discriminant from the texture cache
+            unsafe { std::mem::transmute::<u32, surface::PixelFormat>(info.format as u32) },
         );
 
         if astc {
@@ -723,11 +724,7 @@ pub fn convert_image(
             output_offset += copy.image_extent.width
                 * copy.image_extent.height
                 * copy.image_subresource.num_layers as u32
-                * surface::bytes_per_block(
-                    surface::PixelFormat::from_u32(
-                        PixelFormat::A8b8g8r8Unorm as u32,
-                    ),
-                );
+                * surface::bytes_per_block(surface::PixelFormat::A8B8G8R8Unorm);
         } else {
             // BCn decompression path
             // Stubbed: requires BCn decoder crate (equivalent of bc_decoder.h)

@@ -810,6 +810,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shader_recompiler"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "common",
+ "log",
+ "rspirv",
+ "spirv",
+ "thiserror",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -954,6 +966,7 @@ dependencies = [
  "parking_lot",
  "raw-window-handle 0.6.2",
  "rspirv",
+ "shader_recompiler",
  "spirv",
  "thiserror",
  "vulkano",

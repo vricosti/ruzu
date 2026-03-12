@@ -12,7 +12,7 @@ use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, FrontFace, IndexFormat, PolygonMode,
     PrimitiveTopology, StencilOp, VertexAttribSize, VertexAttribType,
 };
-use crate::shader_recompiler::stage::Stage;
+use shader_recompiler::stage::Stage;
 use crate::texture_cache::format_lookup_table::PixelFormat;
 use crate::textures::texture::{
     DepthCompareFunc, MsaaMode, SamplerReduction, SwizzleSource, TextureFilter,
