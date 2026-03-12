@@ -258,6 +258,89 @@ impl BucketTree {
         Ok(())
     }
 
+    /// Find an entry in the bucket tree for the given virtual address.
+    ///
+    /// Corresponds to upstream `BucketTree::Find`.
+    pub fn find(&self, virtual_address: i64) -> Result<Visitor, ResultCode> {
+        assert!(self.is_initialized());
+
+        if virtual_address < 0 {
+            return Err(RESULT_INVALID_OFFSET);
+        }
+        if self.is_empty() {
+            return Err(RESULT_OUT_OF_RANGE);
+        }
+
+        let offsets = self.get_offsets()?;
+        let mut visitor = Visitor::new();
+        visitor.initialize(self, offsets)?;
+        visitor.find(virtual_address)?;
+        Ok(visitor)
+    }
+
+    fn is_exist_l2(&self) -> bool {
+        self.offset_count < self.entry_set_count
+    }
+
+    fn is_exist_offset_l2_on_l1(&self) -> bool {
+        if !self.is_exist_l2() {
+            return false;
+        }
+        if self.node_l1.len() < std::mem::size_of::<NodeHeader>() {
+            return false;
+        }
+        let header: &NodeHeader = unsafe { &*(self.node_l1.as_ptr() as *const NodeHeader) };
+        header.count < self.offset_count
+    }
+
+    fn get_entry_set_index(&self, node_index: i32, offset_index: i32) -> i64 {
+        let header: &NodeHeader = unsafe { &*(self.node_l1.as_ptr() as *const NodeHeader) };
+        (self.offset_count - header.count) as i64
+            + (self.offset_count as i64 * node_index as i64)
+            + offset_index as i64
+    }
+
+    /// Get the begin offset from the L1 node (offset of the first entry in node body).
+    fn get_l1_begin_offset(&self) -> i64 {
+        if self.node_l1.len() < std::mem::size_of::<NodeHeader>() {
+            return 0;
+        }
+        let header: &NodeHeader = unsafe { &*(self.node_l1.as_ptr() as *const NodeHeader) };
+        header.offset
+    }
+
+    /// Get the end offset from the L1 node (last i64 in the node body).
+    fn get_l1_end_offset(&self) -> i64 {
+        if self.node_l1.len() < std::mem::size_of::<NodeHeader>() {
+            return 0;
+        }
+        let header: &NodeHeader = unsafe { &*(self.node_l1.as_ptr() as *const NodeHeader) };
+        // The end offset is stored at the position after all count entries.
+        // In the node, after NodeHeader, there are `count` i64 offsets, followed by more.
+        // The end offset is the i64 at NodeHeader + count * sizeof(i64).
+        let end_pos = std::mem::size_of::<NodeHeader>() + header.count as usize * std::mem::size_of::<i64>();
+        if end_pos + 8 <= self.node_l1.len() {
+            i64::from_le_bytes(self.node_l1[end_pos..end_pos + 8].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    /// Read i64 offsets from the L1 node body (after NodeHeader).
+    fn read_l1_offsets(&self, start_idx: usize, count: usize) -> Vec<i64> {
+        let header_size = std::mem::size_of::<NodeHeader>();
+        let mut result = Vec::with_capacity(count);
+        for i in start_idx..start_idx + count {
+            let pos = header_size + i * std::mem::size_of::<i64>();
+            if pos + 8 <= self.node_l1.len() {
+                result.push(i64::from_le_bytes(
+                    self.node_l1[pos..pos + 8].try_into().unwrap(),
+                ));
+            }
+        }
+        result
+    }
+
     pub const fn query_header_storage_size() -> i64 {
         std::mem::size_of::<BucketTreeHeader>() as i64
     }
@@ -285,6 +368,453 @@ pub struct EntrySetHeader {
     pub count: i32,
     pub end: i64,
     pub start: i64,
+}
+
+/// Compute the byte offset of an entry within an entry set.
+///
+/// Corresponds to upstream `impl::GetBucketTreeEntryOffset`.
+pub fn get_bucket_tree_entry_offset(
+    entry_set_offset: i64,
+    entry_size: usize,
+    entry_index: i32,
+) -> usize {
+    let node_header_size = std::mem::size_of::<NodeHeader>();
+    (entry_set_offset as usize) + node_header_size + entry_index as usize * entry_size
+}
+
+/// Compute entry offset within an entry set at a given entry_set_index.
+///
+/// Corresponds to upstream `impl::GetBucketTreeEntryOffset(entry_set_index, node_size, entry_size, entry_index)`.
+pub fn get_bucket_tree_entry_offset_by_set(
+    entry_set_index: i32,
+    node_size: usize,
+    entry_size: usize,
+    entry_index: i32,
+) -> usize {
+    let entry_set_offset = entry_set_index as usize * node_size;
+    get_bucket_tree_entry_offset(entry_set_offset as i64, entry_size, entry_index)
+}
+
+/// Binary search within a buffer of i64 offsets to find the entry containing `virtual_address`.
+///
+/// Corresponds to upstream `StorageNode::Find(buffer, virtual_address)`.
+fn storage_node_find_in_buffer(
+    buffer: &[u8],
+    stride: usize,
+    count: i32,
+    base_offset: usize,
+    virtual_address: i64,
+) -> i32 {
+    let mut end = count;
+    let mut pos: i64 = 0;
+
+    while end > 0 {
+        let half = end / 2;
+        let mid = pos + half as i64;
+        let byte_offset = base_offset + mid as usize * stride;
+
+        if byte_offset + 8 <= buffer.len() {
+            let offset =
+                i64::from_le_bytes(buffer[byte_offset..byte_offset + 8].try_into().unwrap());
+            if offset <= virtual_address {
+                pos = mid + 1;
+                end -= half + 1;
+            } else {
+                end = half;
+            }
+        } else {
+            break;
+        }
+    }
+
+    pos as i32 - 1
+}
+
+/// Visitor for traversing a BucketTree.
+///
+/// Corresponds to upstream `BucketTree::Visitor`.
+pub struct Visitor<'a> {
+    tree: Option<&'a BucketTree>,
+    offsets: Offsets,
+    entry: Vec<u8>,
+    entry_index: i32,
+    entry_set_count: i32,
+    entry_set: EntrySetHeader,
+}
+
+impl<'a> Visitor<'a> {
+    pub fn new() -> Self {
+        Self {
+            tree: None,
+            offsets: Offsets::default(),
+            entry: Vec::new(),
+            entry_index: -1,
+            entry_set_count: 0,
+            entry_set: EntrySetHeader::default(),
+        }
+    }
+
+    /// Check if the visitor points to a valid entry.
+    pub fn is_valid(&self) -> bool {
+        self.entry_index >= 0
+    }
+
+    /// Check if the visitor can move to the next entry.
+    ///
+    /// Corresponds to upstream `Visitor::CanMoveNext`.
+    pub fn can_move_next(&self) -> bool {
+        self.is_valid()
+            && (self.entry_index + 1 < self.entry_set.count
+                || self.entry_set.index + 1 < self.entry_set_count)
+    }
+
+    /// Check if the visitor can move to the previous entry.
+    ///
+    /// Corresponds to upstream `Visitor::CanMovePrevious`.
+    pub fn can_move_previous(&self) -> bool {
+        self.is_valid() && (self.entry_index > 0 || self.entry_set.index > 0)
+    }
+
+    /// Get the raw entry data as a byte slice.
+    pub fn get_raw(&self) -> &[u8] {
+        assert!(self.is_valid());
+        &self.entry
+    }
+
+    /// Get the entry interpreted as type T.
+    ///
+    /// # Safety
+    /// T must be a valid repr(C) type that matches the entry size.
+    pub unsafe fn get<T>(&self) -> &T {
+        assert!(self.is_valid());
+        assert!(self.entry.len() >= std::mem::size_of::<T>());
+        &*(self.entry.as_ptr() as *const T)
+    }
+
+    /// Initialize the visitor with a tree and offsets.
+    ///
+    /// Corresponds to upstream `Visitor::Initialize`.
+    fn initialize(
+        &mut self,
+        tree: &'a BucketTree,
+        offsets: Offsets,
+    ) -> Result<(), ResultCode> {
+        if self.entry.is_empty() {
+            self.entry = vec![0u8; tree.entry_size];
+            self.tree = Some(tree);
+            self.offsets = offsets;
+        }
+        Ok(())
+    }
+
+    /// Find the entry containing the given virtual address.
+    ///
+    /// Corresponds to upstream `Visitor::Find`.
+    fn find(&mut self, virtual_address: i64) -> Result<(), ResultCode> {
+        let tree = self.tree.unwrap();
+
+        // Check that the virtual address is within the L1 node's end offset.
+        let l1_end = tree.get_l1_end_offset();
+        if virtual_address >= l1_end {
+            return Err(RESULT_OUT_OF_RANGE);
+        }
+
+        // Get the entry set index.
+        let mut entry_set_index: i32;
+
+        if tree.is_exist_offset_l2_on_l1() && virtual_address < tree.get_l1_begin_offset() {
+            // Search in the L2 offset area on L1.
+            let header: &NodeHeader =
+                unsafe { &*(tree.node_l1.as_ptr() as *const NodeHeader) };
+            let l2_start = header.count as usize;
+            let l2_count = tree.offset_count as usize - l2_start;
+            let offsets = tree.read_l1_offsets(l2_start, l2_count);
+
+            // upper_bound: find first element > virtual_address, then go back one
+            let pos = offsets
+                .partition_point(|&o| o <= virtual_address);
+            if pos == 0 {
+                return Err(RESULT_OUT_OF_RANGE);
+            }
+            entry_set_index = (pos - 1) as i32;
+        } else {
+            // Search in the main offset area on L1.
+            let header: &NodeHeader =
+                unsafe { &*(tree.node_l1.as_ptr() as *const NodeHeader) };
+            let count = header.count as usize;
+            let offsets = tree.read_l1_offsets(0, count);
+
+            let pos = offsets
+                .partition_point(|&o| o <= virtual_address);
+            if pos == 0 {
+                return Err(RESULT_OUT_OF_RANGE);
+            }
+            let index = (pos - 1) as i32;
+
+            if tree.is_exist_l2() {
+                // Need to descend into L2 node.
+                if index < 0 || index >= tree.offset_count {
+                    return Err(RESULT_INVALID_BUCKET_TREE_NODE_OFFSET);
+                }
+                entry_set_index = self.find_entry_set(virtual_address, index)?;
+            } else {
+                entry_set_index = index;
+            }
+        }
+
+        // Validate.
+        if entry_set_index < 0 || entry_set_index >= tree.entry_set_count {
+            return Err(RESULT_INVALID_BUCKET_TREE_NODE_OFFSET);
+        }
+
+        // Find the entry within the entry set.
+        self.find_entry(virtual_address, entry_set_index)?;
+
+        // Set count.
+        self.entry_set_count = tree.entry_set_count;
+        Ok(())
+    }
+
+    /// Find the entry set index by descending into an L2 node.
+    ///
+    /// Corresponds to upstream `Visitor::FindEntrySet`.
+    fn find_entry_set(
+        &self,
+        virtual_address: i64,
+        node_index: i32,
+    ) -> Result<i32, ResultCode> {
+        let tree = self.tree.unwrap();
+        let node_size = tree.node_size;
+        let node_offset = (node_index as usize + 1) * node_size;
+
+        // Read the L2 node.
+        let node_storage = tree
+            .node_storage
+            .as_ref()
+            .ok_or(RESULT_OUT_OF_RANGE)?;
+        let mut buf = vec![0u8; node_size];
+        node_storage.read(&mut buf, node_size, node_offset);
+
+        // Validate header.
+        let header: &NodeHeader = unsafe { &*(buf.as_ptr() as *const NodeHeader) };
+        header.verify(node_index, node_size, std::mem::size_of::<i64>())?;
+
+        // Binary search within the node.
+        let node_header_size = std::mem::size_of::<NodeHeader>();
+        let index = storage_node_find_in_buffer(
+            &buf,
+            std::mem::size_of::<i64>(),
+            header.count,
+            node_header_size,
+            virtual_address,
+        );
+        if index < 0 {
+            return Err(RESULT_INVALID_BUCKET_TREE_VIRTUAL_OFFSET);
+        }
+
+        Ok(tree.get_entry_set_index(header.index, index) as i32)
+    }
+
+    /// Find the entry within an entry set.
+    ///
+    /// Corresponds to upstream `Visitor::FindEntry`.
+    fn find_entry(
+        &mut self,
+        virtual_address: i64,
+        entry_set_index: i32,
+    ) -> Result<(), ResultCode> {
+        let tree = self.tree.unwrap();
+        let entry_size = tree.entry_size;
+        let entry_set_size = tree.node_size;
+        let entry_set_offset = entry_set_index as usize * entry_set_size;
+
+        let entry_storage = tree
+            .entry_storage
+            .as_ref()
+            .ok_or(RESULT_OUT_OF_RANGE)?;
+
+        // Read the entry set.
+        let mut buf = vec![0u8; entry_set_size];
+        entry_storage.read(&mut buf, entry_set_size, entry_set_offset);
+
+        // Parse and validate the entry set header.
+        let entry_set = unsafe { *(buf.as_ptr() as *const EntrySetHeader) };
+        // Verify as a NodeHeader.
+        let header = NodeHeader {
+            index: entry_set.index,
+            count: entry_set.count,
+            offset: entry_set.end,
+        };
+        header.verify(entry_set_index, entry_set_size, entry_size)?;
+
+        // Binary search for the virtual address in entry offsets.
+        let node_header_size = std::mem::size_of::<NodeHeader>();
+        let index = storage_node_find_in_buffer(
+            &buf,
+            entry_size,
+            entry_set.count,
+            node_header_size,
+            virtual_address,
+        );
+        if index < 0 {
+            return Err(RESULT_OUT_OF_RANGE);
+        }
+
+        // Copy the entry data.
+        let entry_offset = get_bucket_tree_entry_offset(0, entry_size, index);
+        if entry_offset + entry_size <= buf.len() {
+            self.entry[..entry_size]
+                .copy_from_slice(&buf[entry_offset..entry_offset + entry_size]);
+        }
+
+        self.entry_set = entry_set;
+        self.entry_index = index;
+        Ok(())
+    }
+
+    /// Move to the next entry.
+    ///
+    /// Corresponds to upstream `Visitor::MoveNext`.
+    pub fn move_next(&mut self) -> Result<(), ResultCode> {
+        if !self.is_valid() {
+            return Err(RESULT_OUT_OF_RANGE);
+        }
+
+        let tree = self.tree.unwrap();
+        let mut entry_index = self.entry_index + 1;
+
+        if entry_index == self.entry_set.count {
+            let entry_set_index = self.entry_set.index + 1;
+            if entry_set_index >= self.entry_set_count {
+                return Err(RESULT_OUT_OF_RANGE);
+            }
+
+            self.entry_index = -1;
+            let end = self.entry_set.end;
+
+            let entry_set_size = tree.node_size;
+            let entry_set_offset = entry_set_index as usize * entry_set_size;
+
+            let entry_storage = tree
+                .entry_storage
+                .as_ref()
+                .ok_or(RESULT_OUT_OF_RANGE)?;
+
+            // Read entry set header.
+            let mut header_buf = [0u8; std::mem::size_of::<EntrySetHeader>()];
+            entry_storage.read(
+                &mut header_buf,
+                std::mem::size_of::<EntrySetHeader>(),
+                entry_set_offset,
+            );
+            self.entry_set = unsafe { *(header_buf.as_ptr() as *const EntrySetHeader) };
+
+            // Verify.
+            let header = NodeHeader {
+                index: self.entry_set.index,
+                count: self.entry_set.count,
+                offset: self.entry_set.end,
+            };
+            header.verify(entry_set_index, entry_set_size, tree.entry_size)?;
+
+            if self.entry_set.start != end || self.entry_set.start >= self.entry_set.end {
+                return Err(RESULT_INVALID_BUCKET_TREE_ENTRY_SET_OFFSET);
+            }
+
+            entry_index = 0;
+        } else {
+            self.entry_index = -1;
+        }
+
+        // Read the new entry.
+        let entry_size = tree.entry_size;
+        let entry_offset = get_bucket_tree_entry_offset_by_set(
+            self.entry_set.index,
+            tree.node_size,
+            entry_size,
+            entry_index,
+        );
+        let entry_storage = tree
+            .entry_storage
+            .as_ref()
+            .ok_or(RESULT_OUT_OF_RANGE)?;
+        entry_storage.read(&mut self.entry, entry_size, entry_offset);
+
+        self.entry_index = entry_index;
+        Ok(())
+    }
+
+    /// Move to the previous entry.
+    ///
+    /// Corresponds to upstream `Visitor::MovePrevious`.
+    pub fn move_previous(&mut self) -> Result<(), ResultCode> {
+        if !self.is_valid() {
+            return Err(RESULT_OUT_OF_RANGE);
+        }
+
+        let tree = self.tree.unwrap();
+        let mut entry_index = self.entry_index;
+
+        if entry_index == 0 {
+            if self.entry_set.index <= 0 {
+                return Err(RESULT_OUT_OF_RANGE);
+            }
+
+            self.entry_index = -1;
+            let start = self.entry_set.start;
+
+            let entry_set_size = tree.node_size;
+            let entry_set_index = self.entry_set.index - 1;
+            let entry_set_offset = entry_set_index as usize * entry_set_size;
+
+            let entry_storage = tree
+                .entry_storage
+                .as_ref()
+                .ok_or(RESULT_OUT_OF_RANGE)?;
+
+            let mut header_buf = [0u8; std::mem::size_of::<EntrySetHeader>()];
+            entry_storage.read(
+                &mut header_buf,
+                std::mem::size_of::<EntrySetHeader>(),
+                entry_set_offset,
+            );
+            self.entry_set = unsafe { *(header_buf.as_ptr() as *const EntrySetHeader) };
+
+            let header = NodeHeader {
+                index: self.entry_set.index,
+                count: self.entry_set.count,
+                offset: self.entry_set.end,
+            };
+            header.verify(entry_set_index, entry_set_size, tree.entry_size)?;
+
+            if self.entry_set.end != start || self.entry_set.start >= self.entry_set.end {
+                return Err(RESULT_INVALID_BUCKET_TREE_ENTRY_SET_OFFSET);
+            }
+
+            entry_index = self.entry_set.count;
+        } else {
+            self.entry_index = -1;
+        }
+
+        entry_index -= 1;
+
+        // Read the new entry.
+        let entry_size = tree.entry_size;
+        let entry_offset = get_bucket_tree_entry_offset_by_set(
+            self.entry_set.index,
+            tree.node_size,
+            entry_size,
+            entry_index,
+        );
+        let entry_storage = tree
+            .entry_storage
+            .as_ref()
+            .ok_or(RESULT_OUT_OF_RANGE)?;
+        entry_storage.read(&mut self.entry, entry_size, entry_offset);
+
+        self.entry_index = entry_index;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

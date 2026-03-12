@@ -5,8 +5,124 @@
 
 use std::collections::BTreeMap;
 
-use super::nca_metadata::{ContentRecordType, TitleType};
+use super::nca_metadata::{ContentRecordType, TitleType, CNMT, ContentRecord};
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
+
+// ============================================================================
+// Private helpers (correspond to anonymous helpers in registered_cache.cpp)
+// ============================================================================
+
+/// The size of blocks to use when VFS raw copying into NAND.
+/// Corresponds to upstream `VFS_RC_LARGE_COPY_BLOCK`.
+const VFS_RC_LARGE_COPY_BLOCK: usize = 0x400000;
+
+/// Check if a directory name follows the two-digit dir format: 000000XX.
+/// Corresponds to upstream `FollowsTwoDigitDirFormat`.
+fn follows_two_digit_dir_format(name: &str) -> bool {
+    name.len() == 8
+        && name.starts_with("000000")
+        && name[6..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Check if a filename follows the NCA ID format: XXXXXXXX...32hex.nca or .cnmt.nca.
+/// Corresponds to upstream `FollowsNcaIdFormat`.
+fn follows_nca_id_format(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if lower.len() == 36 && lower.ends_with(".nca") {
+        lower[..32].chars().all(|c| c.is_ascii_hexdigit())
+    } else if lower.len() == 41 && lower.ends_with(".cnmt.nca") {
+        lower[..32].chars().all(|c| c.is_ascii_hexdigit())
+    } else {
+        false
+    }
+}
+
+/// Convert a hex string to a 16-byte array (NcaId).
+/// Parses the first 32 hex chars of the input.
+fn hex_string_to_nca_id(hex: &str) -> NcaId {
+    let mut id = [0u8; 0x10];
+    let hex_bytes = hex.as_bytes();
+    for i in 0..0x10 {
+        let hi = hex_char_to_nibble(hex_bytes.get(i * 2).copied().unwrap_or(b'0'));
+        let lo = hex_char_to_nibble(hex_bytes.get(i * 2 + 1).copied().unwrap_or(b'0'));
+        id[i] = (hi << 4) | lo;
+    }
+    id
+}
+
+fn hex_char_to_nibble(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// Convert a NcaId to a hex string.
+fn nca_id_to_hex(id: &NcaId, uppercase: bool) -> String {
+    if uppercase {
+        id.iter().map(|b| format!("{:02X}", b)).collect()
+    } else {
+        id.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+}
+
+/// Get the relative path from an NCA ID for storage in the registered cache.
+/// Corresponds to upstream `GetRelativePathFromNcaID`.
+fn get_relative_path_from_nca_id(
+    nca_id: &NcaId,
+    second_hex_upper: bool,
+    within_two_digit: bool,
+    cnmt_suffix: bool,
+) -> String {
+    let hex_str = nca_id_to_hex(nca_id, second_hex_upper);
+    if !within_two_digit {
+        if cnmt_suffix {
+            format!("{}.cnmt.nca", hex_str)
+        } else {
+            format!("/{}.nca", hex_str)
+        }
+    } else {
+        // Hash the NCA ID with SHA-256 to get the two-digit dir component
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(nca_id);
+        let hash = hasher.finalize();
+
+        if cnmt_suffix {
+            format!("/000000{:02X}/{}.cnmt.nca", hash[0], hex_str)
+        } else {
+            format!("/000000{:02X}/{}.nca", hash[0], hex_str)
+        }
+    }
+}
+
+/// Title type names for CNMT naming.
+/// Corresponds to upstream `TITLE_TYPE_NAMES` in registered_cache.cpp.
+const TITLE_TYPE_NAMES: &[&str] = &[
+    "SystemProgram",
+    "SystemData",
+    "SystemUpdate",
+    "BootImagePackage",
+    "BootImagePackageSafe",
+    "Application",
+    "Patch",
+    "AddOnContent",
+    "", // DeltaTitle
+];
+
+/// Get the CNMT filename for a given title type and title ID.
+/// Corresponds to upstream `GetCNMTName`.
+fn get_cnmt_name(title_type: TitleType, title_id: u64) -> String {
+    let mut index = title_type as usize;
+    // If the index is after the jump in TitleType, subtract it out.
+    if index >= TitleType::Application as usize {
+        index -= TitleType::Application as usize - TitleType::FirmwarePackageB as usize;
+    }
+    let type_name = TITLE_TYPE_NAMES.get(index).copied().unwrap_or("");
+    format!("{}_{:016x}.cnmt", type_name, title_id)
+}
 
 /// NCA ID — first 16 bytes of SHA-256 over the entire file.
 pub type NcaId = [u8; 0x10];
@@ -48,10 +164,26 @@ pub fn get_update_title_id(base_title_id: u64) -> u64 {
 
 /// Convert NCA content type to content record type.
 /// Corresponds to upstream `GetCRTypeFromNCAType`.
-/// Stub: returns Meta as default.
-pub fn get_cr_type_from_nca_type(_nca_type: u8) -> ContentRecordType {
-    // TODO: implement proper mapping.
-    ContentRecordType::Meta
+pub fn get_cr_type_from_nca_type(nca_type: u8) -> ContentRecordType {
+    use super::content_archive::NCAContentType;
+    match nca_type {
+        x if x == NCAContentType::Program as u8 => ContentRecordType::Program,
+        x if x == NCAContentType::Meta as u8 => ContentRecordType::Meta,
+        x if x == NCAContentType::Control as u8 => ContentRecordType::Control,
+        x if x == NCAContentType::Data as u8 => ContentRecordType::Data,
+        x if x == NCAContentType::PublicData as u8 => ContentRecordType::Data,
+        x if x == NCAContentType::Manual as u8 => ContentRecordType::HtmlDocument,
+        _ => {
+            log::error!("Invalid NCAContentType={:02X}", nca_type);
+            ContentRecordType::Meta
+        }
+    }
+}
+
+/// Get the base title ID from a title ID.
+/// Corresponds to upstream `GetBaseTitleID`.
+pub fn get_base_title_id(title_id: u64) -> u64 {
+    super::common_funcs::get_base_title_id(title_id)
 }
 
 // ============================================================================
@@ -105,24 +237,140 @@ impl PlaceholderCache {
         Self { dir }
     }
 
-    pub fn create(&self, _id: &NcaId, _size: u64) -> bool {
-        todo!("PlaceholderCache::create")
+    /// Create a placeholder file with the given NCA ID and size.
+    /// Corresponds to upstream `PlaceholderCache::Create`.
+    pub fn create(&self, id: &NcaId, size: u64) -> bool {
+        let path = get_relative_path_from_nca_id(id, false, true, false);
+        if self.dir.get_file_relative(&path).is_some() {
+            return false;
+        }
+
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(id);
+        let hash = hasher.finalize();
+        let dirname = format!("000000{:02X}", hash[0]);
+
+        let dir2 = match super::vfs::vfs::get_or_create_directory_relative(self.dir.as_ref(), &dirname) {
+            Some(d) => d,
+            None => return false,
+        };
+
+        let filename = format!("{}.nca", nca_id_to_hex(id, false));
+        let file = match dir2.create_file(&filename) {
+            Some(f) => f,
+            None => return false,
+        };
+
+        file.resize(size as usize)
     }
 
-    pub fn delete(&self, _id: &NcaId) -> bool {
-        todo!("PlaceholderCache::delete")
+    /// Delete a placeholder file with the given NCA ID.
+    /// Corresponds to upstream `PlaceholderCache::Delete`.
+    pub fn delete_placeholder(&self, id: &NcaId) -> bool {
+        let path = get_relative_path_from_nca_id(id, false, true, false);
+        if self.dir.get_file_relative(&path).is_none() {
+            return false;
+        }
+
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(id);
+        let hash = hasher.finalize();
+        let dirname = format!("000000{:02X}", hash[0]);
+
+        let dir2 = match super::vfs::vfs::get_or_create_directory_relative(self.dir.as_ref(), &dirname) {
+            Some(d) => d,
+            None => return false,
+        };
+
+        dir2.delete_file(&format!("{}.nca", nca_id_to_hex(id, false)))
     }
 
-    pub fn exists(&self, _id: &NcaId) -> bool {
-        false
+    /// Check if a placeholder file exists for the given NCA ID.
+    /// Corresponds to upstream `PlaceholderCache::Exists`.
+    pub fn exists(&self, id: &NcaId) -> bool {
+        let path = get_relative_path_from_nca_id(id, false, true, false);
+        self.dir.get_file_relative(&path).is_some()
     }
 
+    /// Write data to a placeholder file at the given offset.
+    /// Corresponds to upstream `PlaceholderCache::Write`.
+    pub fn write(&self, id: &NcaId, offset: u64, data: &[u8]) -> bool {
+        let path = get_relative_path_from_nca_id(id, false, true, false);
+        let file = match self.dir.get_file_relative(&path) {
+            Some(f) => f,
+            None => return false,
+        };
+        file.write(data, data.len(), offset as usize) == data.len()
+    }
+
+    /// Get the size of a placeholder file.
+    /// Corresponds to upstream `PlaceholderCache::Size`.
+    pub fn size(&self, id: &NcaId) -> u64 {
+        let path = get_relative_path_from_nca_id(id, false, true, false);
+        match self.dir.get_file_relative(&path) {
+            Some(f) => f.get_size() as u64,
+            None => 0,
+        }
+    }
+
+    /// Set the size of a placeholder file.
+    /// Corresponds to upstream `PlaceholderCache::SetSize`.
+    pub fn set_size(&self, id: &NcaId, new_size: u64) -> bool {
+        let path = get_relative_path_from_nca_id(id, false, true, false);
+        match self.dir.get_file_relative(&path) {
+            Some(f) => f.resize(new_size as usize),
+            None => false,
+        }
+    }
+
+    /// Clean all placeholder files.
+    /// Corresponds to upstream `PlaceholderCache::CleanAll`.
+    pub fn clean_all(&self) -> bool {
+        match self.dir.get_parent_directory() {
+            Some(parent) => parent.clean_subdirectory_recursive(&self.dir.get_name()),
+            None => false,
+        }
+    }
+
+    /// List all NCA IDs in the placeholder cache.
+    /// Corresponds to upstream `PlaceholderCache::List`.
     pub fn list(&self) -> Vec<NcaId> {
-        Vec::new()
+        let mut out = Vec::new();
+        for sdir in self.dir.get_subdirectories() {
+            for file in sdir.get_files() {
+                let name = file.get_name();
+                if name.len() == 36 && name.ends_with(".nca") {
+                    let hex_part = &name[..32];
+                    if hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                        out.push(hex_string_to_nca_id(hex_part));
+                    }
+                }
+            }
+        }
+        out
     }
 
+    /// Generate a random NCA ID.
+    /// Corresponds to upstream `PlaceholderCache::Generate`.
     pub fn generate() -> NcaId {
-        [0u8; 0x10]
+        use std::time::SystemTime;
+        // Simple pseudo-random generation using system time.
+        // Not cryptographically secure, but matches upstream intent
+        // (which uses std::random_device).
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut id = [0u8; 0x10];
+        let bytes = now.to_le_bytes();
+        id[..8].copy_from_slice(&bytes[..8]);
+        // Mix in another value for the second half
+        let v2 = now.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let bytes2 = v2.to_le_bytes();
+        id[8..].copy_from_slice(&bytes2[..8]);
+        id
     }
 }
 
@@ -131,10 +379,25 @@ impl PlaceholderCache {
 // ============================================================================
 
 /// Registered cache — catalogues NCAs in the registered directory structure.
+///
+/// Nintendo's registered format follows this structure:
+/// ```text
+/// Root
+///   | 000000XX  <- XX is derived from SHA-256 of the NcaID
+///       | <hash>.nca <- hash is the NcaID (first half of SHA256 over entire file)
+///         | 00
+///         | 01    <- Actual content split along 4GB boundaries (optional)
+/// ```
+///
 /// Corresponds to upstream `RegisteredCache`.
 pub struct RegisteredCache {
     dir: VirtualDir,
+    /// maps tid -> NcaID of meta
     meta_id: BTreeMap<u64, NcaId>,
+    /// maps tid -> CNMT parsed from meta NCAs
+    meta: BTreeMap<u64, CNMT>,
+    /// maps tid -> CNMT from yuzu_meta directory
+    yuzu_meta: BTreeMap<u64, CNMT>,
 }
 
 impl RegisteredCache {
@@ -142,53 +405,374 @@ impl RegisteredCache {
         let mut cache = Self {
             dir,
             meta_id: BTreeMap::new(),
+            meta: BTreeMap::new(),
+            yuzu_meta: BTreeMap::new(),
         };
         cache.refresh();
         cache
     }
 
-    pub fn remove_existing_entry(&self, _title_id: u64) -> bool {
-        // TODO: implement.
-        false
+    /// Accumulate all NCA file IDs from the directory structure.
+    /// Corresponds to upstream `RegisteredCache::AccumulateFiles`.
+    fn accumulate_files(&self) -> Vec<NcaId> {
+        let mut ids = Vec::new();
+        for d2_dir in self.dir.get_subdirectories() {
+            let name = d2_dir.get_name();
+            if follows_nca_id_format(&name) {
+                ids.push(hex_string_to_nca_id(&name[..32]));
+                continue;
+            }
+
+            if !follows_two_digit_dir_format(&name) {
+                continue;
+            }
+
+            for nca_dir in d2_dir.get_subdirectories() {
+                let nca_name = nca_dir.get_name();
+                if follows_nca_id_format(&nca_name) {
+                    ids.push(hex_string_to_nca_id(&nca_name[..32]));
+                }
+            }
+
+            for nca_file in d2_dir.get_files() {
+                let nca_name = nca_file.get_name();
+                if follows_nca_id_format(&nca_name) {
+                    ids.push(hex_string_to_nca_id(&nca_name[..32]));
+                }
+            }
+        }
+
+        for d2_file in self.dir.get_files() {
+            let name = d2_file.get_name();
+            if follows_nca_id_format(&name) {
+                ids.push(hex_string_to_nca_id(&name[..32]));
+            }
+        }
+
+        ids
+    }
+
+    /// Open a file or directory-concatenated file at a given path.
+    /// Corresponds to upstream `RegisteredCache::OpenFileOrDirectoryConcat`.
+    fn open_file_or_directory_concat(&self, path: &str) -> Option<VirtualFile> {
+        // Try as a file first
+        if let Some(file) = self.dir.get_file_relative(path) {
+            return Some(file);
+        }
+
+        // Try as a directory (split NCA)
+        let nca_dir = self.dir.get_directory_relative(path)?;
+        let files = nca_dir.get_files();
+
+        if files.len() == 1 && files[0].get_name() == "00" {
+            return Some(files[0].clone());
+        }
+
+        // Concatenate split files
+        let mut concat = Vec::new();
+        for i in 0..0x100usize {
+            let upper_name = format!("{:02X}", i);
+            let lower_name = format!("{:02x}", i);
+            if let Some(next) = nca_dir.get_file(&upper_name) {
+                concat.push(next);
+            } else if let Some(next) = nca_dir.get_file(&lower_name) {
+                concat.push(next);
+            } else {
+                break;
+            }
+        }
+
+        if concat.is_empty() {
+            return None;
+        }
+
+        // For now, return the first file. Full implementation would use
+        // ConcatenatedVfsFile::MakeConcatenatedFile.
+        // TODO: use vfs_concat when available
+        Some(concat.into_iter().next().unwrap())
+    }
+
+    /// Get the file for a given NCA ID, trying all storage modes.
+    /// Corresponds to upstream `RegisteredCache::GetFileAtID`.
+    fn get_file_at_id(&self, id: &NcaId) -> Option<VirtualFile> {
+        // Try all five relevant modes of file storage:
+        // (bit 2 = uppercase/lower, bit 1 = within a two-digit dir, bit 0 = .cnmt suffix)
+        for i in 0u8..8 {
+            if (i % 2) == 1 && i != 7 {
+                continue;
+            }
+            let path = get_relative_path_from_nca_id(
+                id,
+                (i & 0b100) == 0,
+                (i & 0b010) == 0,
+                (i & 0b001) == 0b001,
+            );
+            if let Some(file) = self.open_file_or_directory_concat(&path) {
+                return Some(file);
+            }
+        }
+        None
+    }
+
+    /// Look up an NCA ID from the metadata maps.
+    /// Corresponds to upstream `RegisteredCache::GetNcaIDFromMetadata`.
+    fn get_nca_id_from_metadata(
+        &self,
+        title_id: u64,
+        record_type: ContentRecordType,
+    ) -> Option<NcaId> {
+        if record_type == ContentRecordType::Meta {
+            if let Some(id) = self.meta_id.get(&title_id) {
+                return Some(*id);
+            }
+        }
+
+        // Check yuzu_meta first, then regular meta
+        if let Some(id) = check_map_for_content_record(&self.yuzu_meta, title_id, record_type) {
+            return Some(id);
+        }
+        check_map_for_content_record(&self.meta, title_id, record_type)
+    }
+
+    /// Accumulate CNMTs from the yuzu_meta directory.
+    /// Corresponds to upstream `RegisteredCache::AccumulateYuzuMeta`.
+    fn accumulate_yuzu_meta(&mut self) {
+        let meta_dir = match self.dir.get_subdirectory("yuzu_meta") {
+            Some(d) => d,
+            None => return,
+        };
+
+        for file in meta_dir.get_files() {
+            if file.get_extension() != "cnmt" {
+                continue;
+            }
+            let cnmt = CNMT::from_file(&file);
+            self.yuzu_meta.insert(cnmt.get_title_id(), cnmt);
+        }
+    }
+
+    /// Remove an existing entry by title ID.
+    /// Corresponds to upstream `RegisteredCache::RemoveExistingEntry`.
+    pub fn remove_existing_entry(&self, title_id: u64) -> bool {
+        let mut removed_data = false;
+
+        let delete_nca = |id: &NcaId| -> bool {
+            let path = get_relative_path_from_nca_id(id, false, true, false);
+            if self.dir.get_file_relative(&path).is_some() {
+                return self.dir.delete_file(&path);
+            }
+            if self.dir.get_directory_relative(&path).is_some() {
+                return self.dir.delete_subdirectory_recursive(&path);
+            }
+            false
+        };
+
+        // If entry exists, remove all associated NCAs
+        if self.has_entry(title_id, ContentRecordType::Meta) {
+            log::info!(
+                "Previously installed entry for title_id={:016X} detected! Attempting to remove...",
+                title_id
+            );
+
+            let meta_old_id = self
+                .get_nca_id_from_metadata(title_id, ContentRecordType::Meta)
+                .unwrap_or([0u8; 0x10]);
+            let program_id = self
+                .get_nca_id_from_metadata(title_id, ContentRecordType::Program)
+                .unwrap_or([0u8; 0x10]);
+            let data_id = self
+                .get_nca_id_from_metadata(title_id, ContentRecordType::Data)
+                .unwrap_or([0u8; 0x10]);
+            let control_id = self
+                .get_nca_id_from_metadata(title_id, ContentRecordType::Control)
+                .unwrap_or([0u8; 0x10]);
+            let html_id = self
+                .get_nca_id_from_metadata(title_id, ContentRecordType::HtmlDocument)
+                .unwrap_or([0u8; 0x10]);
+            let legal_id = self
+                .get_nca_id_from_metadata(title_id, ContentRecordType::LegalInformation)
+                .unwrap_or([0u8; 0x10]);
+
+            removed_data |= delete_nca(&meta_old_id)
+                || delete_nca(&program_id)
+                || delete_nca(&data_id)
+                || delete_nca(&control_id)
+                || delete_nca(&html_id)
+                || delete_nca(&legal_id);
+        }
+
+        // Remove yuzu_meta entries for patch programs
+        for i in 0u8..0x10 {
+            if let Some(meta_dir) = self.dir.create_subdirectory("yuzu_meta") {
+                let filename = get_cnmt_name(TitleType::Update, title_id + i as u64);
+                if meta_dir.get_file(&filename).is_some() {
+                    removed_data |= meta_dir.delete_file(&filename);
+                }
+            }
+        }
+
+        removed_data
+    }
+
+    /// Install a raw CNMT into the yuzu_meta directory.
+    /// Corresponds to upstream `RegisteredCache::RawInstallYuzuMeta`.
+    pub fn raw_install_yuzu_meta(&mut self, cnmt: &CNMT) -> bool {
+        let meta_dir = match self.dir.create_subdirectory("yuzu_meta") {
+            Some(d) => d,
+            None => return false,
+        };
+        let filename = get_cnmt_name(cnmt.get_type(), cnmt.get_title_id());
+
+        if meta_dir.get_file(&filename).is_none() {
+            let out = match meta_dir.create_file(&filename) {
+                Some(f) => f,
+                None => return false,
+            };
+            let buffer = cnmt.serialize();
+            out.resize(buffer.len());
+            out.write_bytes(&buffer, 0);
+        } else {
+            let out = match meta_dir.get_file(&filename) {
+                Some(f) => f,
+                None => return false,
+            };
+            let mut old_cnmt = CNMT::from_file(&out);
+            if old_cnmt.union_records(cnmt) {
+                out.resize(0);
+                let buffer = old_cnmt.serialize();
+                out.resize(buffer.len());
+                out.write_bytes(&buffer, 0);
+            }
+        }
+
+        self.refresh();
+        self.yuzu_meta.values().any(|c| {
+            c.get_type() == cnmt.get_type() && c.get_title_id() == cnmt.get_title_id()
+        })
     }
 }
 
+/// Check a map of CNMTs for a content record matching the given title ID and type.
+fn check_map_for_content_record(
+    map: &BTreeMap<u64, CNMT>,
+    title_id: u64,
+    record_type: ContentRecordType,
+) -> Option<NcaId> {
+    let cnmt = map.get(&title_id)?;
+    cnmt.get_content_records()
+        .iter()
+        .find(|rec| rec.record_type == record_type)
+        .map(|rec| rec.nca_id)
+}
+
 impl ContentProvider for RegisteredCache {
+    /// Scan the directory structure and build the metadata index.
+    /// Corresponds to upstream `RegisteredCache::Refresh`.
     fn refresh(&mut self) {
-        // TODO: scan directory for NCAs and build metadata index.
+        self.meta_id.clear();
+        self.meta.clear();
+        self.yuzu_meta.clear();
+
+        let ids = self.accumulate_files();
+
+        // Process files: look for Meta-type NCAs and parse their CNMTs.
+        // NOTE: Full implementation requires NCA parsing which depends on crypto.
+        // For now, we scan the directory structure but cannot parse NCA content
+        // without the crypto pipeline. The yuzu_meta path works since those are
+        // raw CNMT files.
+        // TODO: Process NCA files when crypto pipeline is available.
+        let _ = ids; // ids would be used with full NCA parsing
+
+        self.accumulate_yuzu_meta();
     }
 
-    fn has_entry(&self, _title_id: u64, _record_type: ContentRecordType) -> bool {
-        false
+    fn has_entry(&self, title_id: u64, record_type: ContentRecordType) -> bool {
+        self.get_entry_raw(title_id, record_type).is_some()
     }
 
-    fn get_entry_version(&self, _title_id: u64) -> Option<u32> {
+    fn get_entry_version(&self, title_id: u64) -> Option<u32> {
+        if let Some(cnmt) = self.meta.get(&title_id) {
+            return Some(cnmt.get_title_version());
+        }
+        if let Some(cnmt) = self.yuzu_meta.get(&title_id) {
+            return Some(cnmt.get_title_version());
+        }
         None
     }
 
     fn get_entry_unparsed(
         &self,
-        _title_id: u64,
-        _record_type: ContentRecordType,
+        title_id: u64,
+        record_type: ContentRecordType,
     ) -> Option<VirtualFile> {
-        None
+        let id = self.get_nca_id_from_metadata(title_id, record_type)?;
+        self.get_file_at_id(&id)
     }
 
     fn get_entry_raw(
         &self,
-        _title_id: u64,
-        _record_type: ContentRecordType,
+        title_id: u64,
+        record_type: ContentRecordType,
     ) -> Option<VirtualFile> {
-        None
+        let id = self.get_nca_id_from_metadata(title_id, record_type)?;
+        // In full implementation, this would apply the parsing function.
+        // For now, return the raw file.
+        self.get_file_at_id(&id)
     }
 
     fn list_entries_filter(
         &self,
-        _title_type: Option<TitleType>,
-        _record_type: Option<ContentRecordType>,
-        _title_id: Option<u64>,
+        title_type: Option<TitleType>,
+        record_type: Option<ContentRecordType>,
+        title_id: Option<u64>,
     ) -> Vec<ContentProviderEntry> {
-        Vec::new()
+        let mut out = Vec::new();
+
+        // Iterate over all metadata
+        let iterate = |map: &BTreeMap<u64, CNMT>, out: &mut Vec<ContentProviderEntry>| {
+            for cnmt in map.values() {
+                if let Some(tt) = title_type {
+                    if tt != cnmt.get_type() {
+                        continue;
+                    }
+                }
+                if let Some(tid) = title_id {
+                    if tid != cnmt.get_title_id() {
+                        continue;
+                    }
+                }
+
+                // Add meta record itself
+                if record_type.is_none()
+                    || record_type == Some(ContentRecordType::Meta)
+                {
+                    out.push(ContentProviderEntry {
+                        title_id: cnmt.get_title_id(),
+                        record_type: ContentRecordType::Meta,
+                    });
+                }
+
+                // Add content records
+                for rec in cnmt.get_content_records() {
+                    if let Some(rt) = record_type {
+                        if rt != rec.record_type {
+                            continue;
+                        }
+                    }
+                    out.push(ContentProviderEntry {
+                        title_id: cnmt.get_title_id(),
+                        record_type: rec.record_type,
+                    });
+                }
+            }
+        };
+
+        iterate(&self.meta, &mut out);
+        iterate(&self.yuzu_meta, &mut out);
+
+        out.sort();
+        out.dedup();
+        out
     }
 }
 
@@ -301,6 +885,51 @@ impl ContentProvider for ContentProviderUnion {
         result.sort();
         result.dedup();
         result
+    }
+}
+
+impl ContentProviderUnion {
+    /// List entries with their origin slot.
+    /// Corresponds to upstream `ContentProviderUnion::ListEntriesFilterOrigin`.
+    pub fn list_entries_filter_origin(
+        &self,
+        origin: Option<ContentProviderUnionSlot>,
+        title_type: Option<TitleType>,
+        record_type: Option<ContentRecordType>,
+        title_id: Option<u64>,
+    ) -> Vec<(ContentProviderUnionSlot, ContentProviderEntry)> {
+        let mut result = Vec::new();
+        for (&slot, &ptr) in &self.providers {
+            if let Some(o) = origin {
+                if o != slot {
+                    continue;
+                }
+            }
+            let vec = unsafe {
+                (*ptr).list_entries_filter(title_type, record_type, title_id)
+            };
+            for entry in vec {
+                result.push((slot, entry));
+            }
+        }
+        result.sort();
+        result.dedup();
+        result
+    }
+
+    /// Find which slot contains a given entry.
+    /// Corresponds to upstream `ContentProviderUnion::GetSlotForEntry`.
+    pub fn get_slot_for_entry(
+        &self,
+        title_id: u64,
+        record_type: ContentRecordType,
+    ) -> Option<ContentProviderUnionSlot> {
+        for (&slot, &ptr) in &self.providers {
+            if unsafe { (*ptr).has_entry(title_id, record_type) } {
+                return Some(slot);
+            }
+        }
+        None
     }
 }
 

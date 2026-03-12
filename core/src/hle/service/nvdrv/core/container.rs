@@ -19,6 +19,8 @@ pub struct SessionId {
 
 pub struct Session {
     pub id: SessionId,
+    /// In the C++ code, this holds a pointer to the KProcess.
+    /// We omit this since we don't have kernel integration yet.
     pub has_preallocated_area: bool,
     pub mapper: Option<HeapMapper>,
     pub is_active: bool,
@@ -49,14 +51,11 @@ impl Default for Host1xDeviceFileData {
     }
 }
 
-struct ContainerImpl {
-    file: NvMap,
-    manager: SyncpointManager,
-    device_file_data: Host1xDeviceFileData,
+/// Inner state protected by a single mutex, matching the C++ ContainerImpl pattern.
+struct ContainerInner {
     sessions: Vec<Session>,
     new_ids: usize,
     id_pool: VecDeque<usize>,
-    session_guard: Mutex<()>,
 }
 
 /// Container manages syncpoints on the host and provides access to NvMap and SyncpointManager.
@@ -64,9 +63,7 @@ pub struct Container {
     file: NvMap,
     manager: SyncpointManager,
     device_file_data: Host1xDeviceFileData,
-    sessions: Mutex<Vec<Session>>,
-    new_ids: Mutex<usize>,
-    id_pool: Mutex<VecDeque<usize>>,
+    inner: Mutex<ContainerInner>,
 }
 
 impl Container {
@@ -75,54 +72,94 @@ impl Container {
             file: NvMap::new(),
             manager: SyncpointManager::new(),
             device_file_data: Host1xDeviceFileData::default(),
-            sessions: Mutex::new(Vec::new()),
-            new_ids: Mutex::new(0),
-            id_pool: Mutex::new(VecDeque::new()),
+            inner: Mutex::new(ContainerInner {
+                sessions: Vec::new(),
+                new_ids: 0,
+                id_pool: VecDeque::new(),
+            }),
         }
     }
 
+    /// Opens a session. If the same process already has an active session,
+    /// increments its ref count and returns the existing session ID.
+    ///
+    /// In the C++ code, this takes a KProcess* and checks process identity.
+    /// Since we don't have kernel integration yet, each call creates a new session.
+    /// The heap preallocation optimization is also omitted (requires page table queries).
     pub fn open_session(&self) -> SessionId {
-        let mut sessions = self.sessions.lock().unwrap();
-        let mut new_ids = self.new_ids.lock().unwrap();
-        let mut id_pool = self.id_pool.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+
+        // In the C++ code, we'd check for an existing active session for the same process.
+        // Without KProcess*, we always create a new session.
 
         let new_id;
-        if let Some(recycled_id) = id_pool.pop_front() {
+        if let Some(recycled_id) = inner.id_pool.pop_front() {
             new_id = recycled_id;
-            if new_id < sessions.len() {
-                sessions[new_id] = Session::new(SessionId { id: new_id });
+            if new_id < inner.sessions.len() {
+                inner.sessions[new_id] = Session::new(SessionId { id: new_id });
             }
         } else {
-            new_id = *new_ids;
-            *new_ids += 1;
-            sessions.push(Session::new(SessionId { id: new_id }));
+            new_id = inner.new_ids;
+            inner.new_ids += 1;
+            inner.sessions.push(Session::new(SessionId { id: new_id }));
         }
 
-        let session = &mut sessions[new_id];
+        let session = &mut inner.sessions[new_id];
         session.is_active = true;
         session.ref_count = 1;
+
+        // NOTE: In the C++ code, if the process is an application, it performs heap preallocation
+        // by scanning the process page table for the largest contiguous heap region and
+        // preallocating SMMU space. This is omitted here as it requires kernel page table access.
 
         SessionId { id: new_id }
     }
 
+    /// Closes a session by decrementing its ref count.
+    /// When the ref count reaches zero, unmaps all handles and cleans up.
     pub fn close_session(&self, session_id: SessionId) {
-        let mut sessions = self.sessions.lock().unwrap();
-        let mut id_pool = self.id_pool.lock().unwrap();
+        // First, handle ref counting and session cleanup under the lock
+        let should_unmap = {
+            let mut inner = self.inner.lock().unwrap();
 
-        if session_id.id < sessions.len() {
-            let session = &mut sessions[session_id.id];
+            if session_id.id >= inner.sessions.len() {
+                return;
+            }
+
+            let session = &mut inner.sessions[session_id.id];
             session.ref_count -= 1;
             if session.ref_count > 0 {
                 return;
             }
+
+            // Session is being fully closed
             session.is_active = false;
             session.has_preallocated_area = false;
             session.mapper = None;
-            id_pool.push_front(session_id.id);
-        }
 
-        drop(sessions);
-        self.file.unmap_all_handles(session_id);
+            // In the C++ code:
+            // smmu.UnregisterProcess(sessions[session_id.id].asid);
+            inner.id_pool.push_front(session_id.id);
+
+            true
+        };
+
+        // Unmap all handles outside the inner lock to avoid deadlock
+        // (unmap_all_handles needs to lock NvMap's handles)
+        if should_unmap {
+            self.file.unmap_all_handles(session_id);
+        }
+    }
+
+    /// Gets a reference to a session by ID.
+    /// In the C++ code, this uses an atomic_thread_fence(acquire) before returning.
+    pub fn get_session(&self, session_id: SessionId) -> Option<SessionId> {
+        let inner = self.inner.lock().unwrap();
+        if session_id.id < inner.sessions.len() && inner.sessions[session_id.id].is_active {
+            Some(session_id)
+        } else {
+            None
+        }
     }
 
     pub fn get_nv_map_file(&self) -> &NvMap {

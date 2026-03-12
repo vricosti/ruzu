@@ -3,6 +3,7 @@
 
 pub mod factory_settings_server;
 pub mod firmware_debug_settings_server;
+pub mod key_code_map;
 pub mod setting_formats;
 pub mod settings;
 pub mod settings_server;

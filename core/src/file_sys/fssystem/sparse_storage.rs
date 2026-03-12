@@ -150,6 +150,51 @@ impl SparseStorage {
     }
 }
 
+/// Implement VfsFile so SparseStorage can be used as a VirtualFile.
+impl VfsFile for SparseStorage {
+    fn get_name(&self) -> String {
+        String::from("SparseStorage")
+    }
+
+    fn get_size(&self) -> usize {
+        self.inner.get_size()
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false
+    }
+
+    fn get_containing_directory(
+        &self,
+    ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        false
+    }
+
+    fn is_readable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let actual = length.min(data.len());
+        if actual == 0 {
+            return 0;
+        }
+        self.read(&mut data[..actual], offset)
+    }
+
+    fn write(&self, _data: &[u8], _length: usize, _offset: usize) -> usize {
+        0
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
+    }
+}
+
 impl Default for SparseStorage {
     fn default() -> Self {
         Self::new()

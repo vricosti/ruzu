@@ -7,3 +7,5 @@ pub mod core;
 pub mod devices;
 pub mod nvdata;
 pub mod nvdrv;
+pub mod nvdrv_interface;
+pub mod nvmemp;

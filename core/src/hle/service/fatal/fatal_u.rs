@@ -4,45 +4,34 @@
 //! Port of zuyu/src/core/hle/service/fatal/fatal_u.h
 //! Port of zuyu/src/core/hle/service/fatal/fatal_u.cpp
 //!
-//! IService for "fatal:u" — user-facing fatal error interface.
+//! Fatal_U -- "fatal:u" service interface.
+//! Provides user-facing fatal error reporting (ThrowFatal, ThrowFatalWithPolicy,
+//! ThrowFatalWithCpuContext).
 
-/// IPC command table for fatal:u IService.
+use std::sync::Arc;
+
+/// IPC command table for fatal:u.
+///
+/// Corresponds to the function table in `Fatal_U` constructor (upstream fatal_u.cpp).
 pub mod commands {
     pub const THROW_FATAL: u32 = 0;
     pub const THROW_FATAL_WITH_POLICY: u32 = 1;
     pub const THROW_FATAL_WITH_CPU_CONTEXT: u32 = 2;
 }
 
-/// IService for "fatal:u".
+/// Fatal_U service.
 ///
-/// Corresponds to `IService` in upstream fatal_u.h / fatal_u.cpp.
-pub struct IService;
+/// Corresponds to `Fatal_U` in upstream fatal_u.h / fatal_u.cpp.
+/// Commands delegate to Module::Interface methods in fatal.rs.
+pub struct FatalU {
+    pub interface: super::fatal::Interface,
+}
 
-impl IService {
-    pub fn new() -> Self {
-        log::debug!("fatal:u IService created");
-        Self
-    }
-
-    /// ThrowFatalWithPolicy (cmd 1).
-    ///
-    /// Upstream logs the fatal error but does not crash the emulator.
-    pub fn throw_fatal_with_policy(&self, result_code: u32, policy: u32) {
-        log::error!(
-            "fatal:u ThrowFatalWithPolicy called, result_code=0x{:08X}, policy={}",
-            result_code,
-            policy
-        );
-        // TODO: propagate to fatal error reporter
-    }
-
-    /// ThrowFatalWithCpuContext (cmd 2).
-    pub fn throw_fatal_with_cpu_context(&self, result_code: u32, policy: u32) {
-        log::error!(
-            "fatal:u ThrowFatalWithCpuContext called, result_code=0x{:08X}, policy={}",
-            result_code,
-            policy
-        );
-        // TODO: propagate to fatal error reporter
+impl FatalU {
+    pub fn new(module: Arc<super::fatal::Module>) -> Self {
+        log::debug!("fatal:u created");
+        Self {
+            interface: super::fatal::Interface::new(module, "fatal:u"),
+        }
     }
 }

@@ -4,22 +4,30 @@
 //! Port of zuyu/src/core/hle/service/fatal/fatal_p.h
 //! Port of zuyu/src/core/hle/service/fatal/fatal_p.cpp
 //!
-//! IService for "fatal:p" — private fatal error interface.
+//! Fatal_P -- "fatal:p" service interface.
+//! This service provides private fatal error query interface.
 
-/// IPC command table for fatal:p IService (all stubs, upstream has no implemented handlers).
+use std::sync::Arc;
+
+/// IPC command table for fatal:p.
+///
+/// Corresponds to the function table in `Fatal_P` constructor (upstream fatal_p.cpp).
 pub mod commands {
     pub const GET_FATAL_EVENT: u32 = 0;
     pub const GET_FATAL_CONTEXT: u32 = 1;
 }
 
-/// IService for "fatal:p".
+/// Fatal_P service.
 ///
-/// Corresponds to `IService` in upstream fatal_p.h / fatal_p.cpp.
-pub struct IService;
+/// Corresponds to `Fatal_P` in upstream fatal_p.h / fatal_p.cpp.
+/// Both commands are nullptr (unimplemented) in upstream.
+pub struct FatalP {
+    pub module: Arc<super::fatal::Module>,
+}
 
-impl IService {
-    pub fn new() -> Self {
-        log::debug!("fatal:p IService created");
-        Self
+impl FatalP {
+    pub fn new(module: Arc<super::fatal::Module>) -> Self {
+        log::debug!("fatal:p created");
+        Self { module }
     }
 }

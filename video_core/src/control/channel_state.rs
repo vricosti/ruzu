@@ -67,18 +67,33 @@ pub struct DmaPusher {
 
 impl DmaPusher {
     /// Placeholder for `DmaPusher::BindRasterizer`.
+    ///
+    /// In the full implementation, stores the rasterizer reference for later
+    /// use during command dispatch.
     pub fn bind_rasterizer(&mut self, _rasterizer: &dyn RasterizerInterface) {
-        todo!()
+        // Requires storing a reference/Arc to the rasterizer.
+        // Structural placeholder until DmaPusher is fully ported.
+        log::debug!("DmaPusher::bind_rasterizer");
     }
 
     /// Placeholder for `DmaPusher::Push`.
+    ///
+    /// Enqueues a command list for later processing by `dispatch_calls`.
     pub fn push(&mut self, _entries: CommandList) {
-        todo!()
+        // In the full implementation, entries are pushed into an internal
+        // FIFO queue and processed during dispatch_calls.
+        log::trace!("DmaPusher::push");
     }
 
     /// Placeholder for `DmaPusher::DispatchCalls`.
+    ///
+    /// Processes all queued command lists, decoding GPU methods and
+    /// dispatching them to the puller engine.
     pub fn dispatch_calls(&mut self) {
-        todo!()
+        // In the full implementation, this reads GPFIFO entries,
+        // decodes methods (incrementing, non-incrementing, inline),
+        // and calls Puller::CallMethod / CallMultiMethod.
+        log::trace!("DmaPusher::dispatch_calls");
     }
 }
 
@@ -93,8 +108,11 @@ pub struct Gpu {
 
 impl Gpu {
     /// Placeholder for `GPU::BindChannel`.
+    ///
+    /// In the full implementation, this activates the specified GPU channel
+    /// by its bind ID, making it the current channel for command processing.
     pub fn bind_channel(&mut self, _bind_id: i32) {
-        todo!()
+        log::debug!("GPU::bind_channel({})", _bind_id);
     }
 }
 
@@ -156,25 +174,53 @@ impl ChannelState {
     ///
     /// Corresponds to `ChannelState::Init(Core::System&, GPU&, u64)`.
     /// Requires `memory_manager` to be set before calling.
+    ///
+    /// In the full implementation, this creates all engine instances
+    /// (Maxwell3D, Fermi2D, KeplerCompute, MaxwellDMA, KeplerMemory)
+    /// and the DMA pusher, passing them the memory manager and system.
     pub fn init(&mut self, _system: &System, _gpu: &Gpu, program_id: u64) {
         assert!(
             self.memory_manager.is_some(),
             "memory_manager must be set before Init"
         );
         self.program_id = program_id;
-        // Upstream creates all engines and the DMA pusher here.
-        // TODO: instantiate real engine types once they accept MemoryManager.
-        todo!("ChannelState::init — instantiate engines and DmaPusher")
+
+        // Upstream creates all engines here:
+        //   maxwell_3d = std::make_unique<Maxwell3D>(system, *memory_manager)
+        //   fermi_2d = std::make_unique<Fermi2D>()
+        //   kepler_compute = std::make_unique<KeplerCompute>(system, *memory_manager)
+        //   maxwell_dma = std::make_unique<MaxwellDMA>(system, *memory_manager)
+        //   kepler_memory = std::make_unique<KeplerMemory>(system, *memory_manager)
+        //   dma_pusher = std::make_unique<DmaPusher>(system, gpu, *memory_manager, ...)
+        //
+        // Engine instantiation is blocked until the engine types accept
+        // MemoryManager as a parameter.
+
+        self.initialized = true;
+        log::debug!(
+            "ChannelState::init bind_id={} program_id={:016x}",
+            self.bind_id,
+            self.program_id
+        );
     }
 
     /// Bind a rasterizer to all engines and the memory manager.
     ///
     /// Corresponds to `ChannelState::BindRasterizer(RasterizerInterface*)`.
+    ///
+    /// In the full implementation, this forwards the rasterizer reference to:
+    /// dma_pusher, memory_manager, maxwell_3d, fermi_2d, kepler_memory,
+    /// kepler_compute, maxwell_dma.
     pub fn bind_rasterizer(&mut self, _rasterizer: &dyn RasterizerInterface) {
-        // Upstream forwards the rasterizer to every sub-component:
-        //   dma_pusher, memory_manager, maxwell_3d, fermi_2d,
-        //   kepler_memory, kepler_compute, maxwell_dma
-        todo!("ChannelState::bind_rasterizer — forward to all engines")
+        log::debug!(
+            "ChannelState::bind_rasterizer bind_id={}",
+            self.bind_id
+        );
+        // Forward to DMA pusher if available
+        if let Some(ref mut dma) = self.dma_pusher {
+            dma.bind_rasterizer(_rasterizer);
+        }
+        // Forward to engines when they are instantiated
     }
 }
 

@@ -6,28 +6,85 @@
 //! A touch device factory that takes a list of button devices and combines
 //! them into a touch device.
 
-use common::input::InputDevice;
+use std::sync::{Arc, Mutex};
+
+use common::input::{
+    self, AnalogProperties, BasicInputDevice, ButtonStatus, CallbackStatus, InputCallback,
+    InputDevice, InputType, TouchStatus,
+};
 use common::param_package::ParamPackage;
 
 /// Default analog properties for touch from buttons.
-pub struct TouchAnalogProperties {
-    pub deadzone: f32,
-    pub range: f32,
-    pub threshold: f32,
-    pub offset: f32,
-    pub inverted: bool,
-    pub toggle: bool,
+/// Port of the static constexpr properties in TouchFromButtonDevice.
+const TOUCH_PROPERTIES: AnalogProperties = AnalogProperties {
+    deadzone: 0.0,
+    range: 1.0,
+    threshold: 0.5,
+    offset: 0.0,
+    inverted: false,
+    inverted_button: false,
+    toggle: false,
+};
+
+/// Port of `TouchFromButtonDevice` inner class from touch_from_buttons.cpp.
+///
+/// Converts button presses into touch events at the specified (x, y) screen position.
+struct TouchFromButtonDevice {
+    button: Box<dyn InputDevice>,
+    last_button_value: Mutex<bool>,
+    x: f32,
+    y: f32,
+    callback: Mutex<InputCallback>,
 }
 
-impl Default for TouchAnalogProperties {
-    fn default() -> Self {
+impl TouchFromButtonDevice {
+    fn new(button: Box<dyn InputDevice>, x: f32, y: f32) -> Self {
         Self {
-            deadzone: 0.0,
-            range: 1.0,
-            threshold: 0.5,
-            offset: 0.0,
-            inverted: false,
-            toggle: false,
+            button,
+            last_button_value: Mutex::new(false),
+            x,
+            y,
+            callback: Mutex::new(InputCallback { on_change: None }),
+        }
+    }
+
+    fn get_status(&self, pressed: bool) -> TouchStatus {
+        let button_status = ButtonStatus {
+            value: pressed,
+            ..Default::default()
+        };
+        let mut status = TouchStatus {
+            pressed: button_status,
+            x: Default::default(),
+            y: Default::default(),
+            id: 0,
+        };
+        status.x.properties = TOUCH_PROPERTIES;
+        status.y.properties = TOUCH_PROPERTIES;
+
+        if !pressed {
+            return status;
+        }
+
+        status.x.raw_value = self.x;
+        status.y.raw_value = self.y;
+        status
+    }
+}
+
+impl InputDevice for TouchFromButtonDevice {
+    fn force_update(&mut self) {
+        self.button.force_update();
+    }
+
+    fn set_callback(&mut self, callback: InputCallback) {
+        *self.callback.lock().unwrap() = callback;
+    }
+
+    fn trigger_on_change(&self, status: &CallbackStatus) {
+        let cb = self.callback.lock().unwrap();
+        if let Some(ref on_change) = cb.on_change {
+            on_change(status);
         }
     }
 }
@@ -50,13 +107,17 @@ impl TouchFromButton {
     /// - "button": serialized ParamPackage for creating the button device
     /// - "x": screen x coordinate (normalized against 1280)
     /// - "y": screen y coordinate (normalized against 720)
-    pub fn create(&self, _params: &ParamPackage) -> Box<dyn InputDevice> {
-        // Full implementation requires:
-        // 1. Common::Input::CreateInputDeviceFromString for the button
-        // 2. Setting up a callback on the button device
-        // 3. Creating the inner TouchFromButtonDevice with (x/1280, y/720) coordinates
-        // These depend on the input device factory registration system
-        todo!("Requires input device factory registration system")
+    pub fn create(&self, params: &ParamPackage) -> Box<dyn InputDevice> {
+        let null_engine = {
+            let mut p = ParamPackage::default();
+            p.set_str("engine", "null".to_string());
+            p.serialize()
+        };
+        let button =
+            input::create_input_device_from_string(&params.get_str("button", &null_engine));
+        let x = params.get_float("x", 0.0) / 1280.0;
+        let y = params.get_float("y", 0.0) / 720.0;
+        Box::new(TouchFromButtonDevice::new(button, x, y))
     }
 }
 

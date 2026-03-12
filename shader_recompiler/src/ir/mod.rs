@@ -19,6 +19,7 @@
 //! if/loop/break regions for direct SPIR-V emission.
 
 pub mod abstract_syntax_list;
+pub mod attribute;
 pub mod basic_block;
 pub mod breadth_first_search;
 pub mod condition;
@@ -29,7 +30,9 @@ pub mod modifiers;
 pub mod opcodes;
 pub mod patch;
 pub mod post_order;
+pub mod pred;
 pub mod program;
+pub mod reg;
 pub mod types;
 pub mod value;
 

@@ -21,11 +21,52 @@ use super::devices::nvhost_vic::NvHostVic;
 use super::devices::nvmap::NvMapDevice;
 use super::nvdata::*;
 
+/// EventInterface manages kernel event creation and destruction for nvdrv.
+///
+/// Port of EventInterface from nvdrv.h/nvdrv.cpp.
+/// In the C++ code, this manages KEvent creation/destruction via ServiceContext.
+/// Since we don't have a full kernel event system, this is a lightweight placeholder
+/// that tracks event allocations.
+pub struct EventInterface {
+    guard: Mutex<()>,
+    next_event_id: Mutex<u32>,
+}
+
+impl EventInterface {
+    pub fn new() -> Self {
+        Self {
+            guard: Mutex::new(()),
+            next_event_id: Mutex::new(0),
+        }
+    }
+
+    /// Creates a new event with the given name.
+    /// In the C++ code: module.service_context.CreateEvent(name)
+    /// Returns an opaque event identifier.
+    pub fn create_event(&self, name: &str) -> u32 {
+        let _lock = self.guard.lock().unwrap();
+        let mut next_id = self.next_event_id.lock().unwrap();
+        let id = *next_id;
+        *next_id += 1;
+        log::debug!("EventInterface::create_event('{}') -> {}", name, id);
+        id
+    }
+
+    /// Frees a previously created event.
+    /// In the C++ code: module.service_context.CloseEvent(event)
+    pub fn free_event(&self, _event_id: u32) {
+        let _lock = self.guard.lock().unwrap();
+        // In the C++ code, this calls service_context.CloseEvent(event)
+        // Since we don't have kernel events yet, this is a no-op.
+    }
+}
+
 /// The main nvdrv module, managing device file descriptors and dispatching ioctls.
 pub struct Module {
     container: Container,
     next_fd: Mutex<DeviceFD>,
     open_files: Mutex<HashMap<DeviceFD, Arc<dyn NvDevice + Send + Sync>>>,
+    events_interface: EventInterface,
 }
 
 impl Module {
@@ -34,6 +75,7 @@ impl Module {
             container: Container::new(),
             next_fd: Mutex::new(1),
             open_files: Mutex::new(HashMap::new()),
+            events_interface: EventInterface::new(),
         })
     }
 
@@ -165,7 +207,37 @@ impl Module {
         }
     }
 
+    /// Queries an event for a given device fd and event_id.
+    ///
+    /// Port of Module::QueryEvent from nvdrv.cpp.
+    /// Returns (NvResult, Option<event_token>) where event_token is an opaque identifier.
+    pub fn query_event(&self, fd: DeviceFD, event_id: u32) -> (NvResult, Option<u32>) {
+        if fd < 0 {
+            log::error!("Invalid DeviceFD={}!", fd);
+            return (NvResult::InvalidState, None);
+        }
+
+        let files = self.open_files.lock().unwrap();
+        let device = match files.get(&fd) {
+            Some(d) => Arc::clone(d),
+            None => {
+                log::error!("Could not find DeviceFD={}!", fd);
+                return (NvResult::NotImplemented, None);
+            }
+        };
+        drop(files);
+
+        match device.query_event(event_id) {
+            Some(event) => (NvResult::Success, Some(event)),
+            None => (NvResult::BadParameter, None),
+        }
+    }
+
     pub fn get_container(&self) -> &Container {
         &self.container
+    }
+
+    pub fn get_events_interface(&self) -> &EventInterface {
+        &self.events_interface
     }
 }

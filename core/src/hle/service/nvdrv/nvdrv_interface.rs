@@ -41,7 +41,7 @@ impl NvdrvInterface {
             nvdrv,
             pid: 0,
             is_initialized: false,
-            session_id: SessionId(0),
+            session_id: SessionId { id: 0 },
             output_buffer: Vec::new(),
             inline_output_buffer: Vec::new(),
         }
@@ -145,6 +145,16 @@ impl NvdrvInterface {
         self.session_id = container.open_session();
         self.is_initialized = true;
         NvResult::Success
+    }
+
+    /// Port of NVDRV::QueryEvent
+    pub fn query_event(&self, fd: DeviceFD, event_id: u32) -> (NvResult, Option<u32>) {
+        if !self.is_initialized {
+            log::error!("NvServices is not initialized!");
+            return (NvResult::NotInitialized, None);
+        }
+
+        self.nvdrv.query_event(fd, event_id)
     }
 
     /// Port of NVDRV::SetAruid

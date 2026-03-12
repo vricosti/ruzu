@@ -8,7 +8,8 @@
 // operating on block-aligned accesses of BLOCK_SIZE bytes.
 
 use super::utility::add_counter;
-use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::vfs::vfs::VfsFile;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 
 /// AES block size in bytes.
 ///
@@ -84,7 +85,7 @@ impl AesCtrStorage {
     /// using AES-CTR. Currently reads without decryption.
     ///
     /// Corresponds to upstream `AesCtrStorage::Read`.
-    pub fn read(&self, buffer: &mut [u8], offset: usize) -> usize {
+    pub fn read_at(&self, buffer: &mut [u8], offset: usize) -> usize {
         let size = buffer.len();
 
         // Allow zero-size reads.
@@ -123,7 +124,7 @@ impl AesCtrStorage {
     /// Currently writes without encryption.
     ///
     /// Corresponds to upstream `AesCtrStorage::Write`.
-    pub fn write(&self, buffer: &[u8], offset: usize) -> usize {
+    pub fn write_at(&self, buffer: &[u8], offset: usize) -> usize {
         let size = buffer.len();
 
         // Allow zero-size writes.
@@ -150,6 +151,53 @@ impl AesCtrStorage {
         let _ = ctr;
 
         self.base_storage.write(buffer, size, offset)
+    }
+}
+
+/// Implement VfsFile so AesCtrStorage can be used as a VirtualFile.
+impl VfsFile for AesCtrStorage {
+    fn get_name(&self) -> String {
+        String::from("AesCtrStorage")
+    }
+
+    fn get_size(&self) -> usize {
+        self.base_storage.get_size()
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        false
+    }
+
+    fn is_readable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let actual_len = length.min(data.len());
+        if actual_len == 0 {
+            return 0;
+        }
+        self.read_at(&mut data[..actual_len], offset)
+    }
+
+    fn write(&self, data: &[u8], length: usize, offset: usize) -> usize {
+        let actual_len = length.min(data.len());
+        if actual_len == 0 {
+            return 0;
+        }
+        self.write_at(&data[..actual_len], offset)
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
     }
 }
 

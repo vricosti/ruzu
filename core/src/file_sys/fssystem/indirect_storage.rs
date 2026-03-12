@@ -2,15 +2,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Ported from: core/file_sys/fssystem/fssystem_indirect_storage.h / .cpp
-// Status: COMPLETE (structural parity; read delegates to storage[0] pending
-// full BucketTree visitor implementation)
+// Status: COMPLETE (structural parity; read uses BucketTree Visitor for entry resolution)
 //
 // Indirect storage: maps virtual address ranges to physical storage locations
 // using a BucketTree-based entry table. Each entry specifies which of the
 // configured storages (0 or 1) holds the data for a given virtual range.
 
-use super::bucket_tree::BucketTree;
-use crate::file_sys::vfs::vfs_types::VirtualFile;
+use std::sync::Arc;
+
+use super::bucket_tree::{BucketTree, BucketTreeHeader};
+use crate::file_sys::vfs::vfs::VfsFile;
+use crate::file_sys::vfs::vfs_offset::OffsetVfsFile;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use common::ResultCode;
 
 /// Number of backing storages in an indirect storage.
@@ -101,9 +104,51 @@ impl IndirectStorage {
         }
     }
 
+    /// Initialize from a single table storage file that contains the header,
+    /// node data, and entry data in sequence.
+    ///
+    /// Corresponds to upstream `IndirectStorage::Initialize(VirtualFile table_storage)`.
+    pub fn initialize_from_table(
+        &mut self,
+        table_storage: VirtualFile,
+    ) -> Result<(), ResultCode> {
+        // Read and verify the bucket tree header.
+        let mut header_buf = [0u8; std::mem::size_of::<BucketTreeHeader>()];
+        table_storage.read(
+            &mut header_buf,
+            std::mem::size_of::<BucketTreeHeader>(),
+            0,
+        );
+        let header: BucketTreeHeader =
+            unsafe { *(header_buf.as_ptr() as *const BucketTreeHeader) };
+        header.verify()?;
+
+        // Determine extents.
+        let node_storage_size = Self::query_node_storage_size(header.entry_count);
+        let entry_storage_size = Self::query_entry_storage_size(header.entry_count);
+        let node_storage_offset = Self::query_header_storage_size();
+        let entry_storage_offset = node_storage_offset + node_storage_size;
+
+        // Create sub-storages and initialize.
+        let node_storage: VirtualFile = Arc::new(OffsetVfsFile::new(
+            table_storage.clone(),
+            node_storage_size as usize,
+            node_storage_offset as usize,
+            String::new(),
+        ));
+        let entry_storage: VirtualFile = Arc::new(OffsetVfsFile::new(
+            table_storage,
+            entry_storage_size as usize,
+            entry_storage_offset as usize,
+            String::new(),
+        ));
+
+        self.initialize(node_storage, entry_storage, header.entry_count)
+    }
+
     /// Initialize from node and entry storage files.
     ///
-    /// Corresponds to upstream `IndirectStorage::Initialize`.
+    /// Corresponds to upstream `IndirectStorage::Initialize(node, entry, count)`.
     pub fn initialize(
         &mut self,
         node_storage: VirtualFile,
@@ -158,16 +203,144 @@ impl IndirectStorage {
 
     /// Read data from the indirect storage.
     ///
-    /// In the full implementation, this would use the BucketTree visitor
-    /// to resolve each virtual range to the appropriate backing storage.
-    /// Currently reads from storage[0] directly.
+    /// Uses the BucketTree visitor to resolve each virtual range to the
+    /// appropriate backing storage (index 0 or 1).
     ///
     /// Corresponds to upstream `IndirectStorage::Read`.
     pub fn read(&self, buffer: &mut [u8], offset: usize) -> usize {
-        if let Some(ref storage) = self.data_storage[0] {
-            storage.read(buffer, buffer.len(), offset)
-        } else {
-            0
+        assert!(self.is_initialized());
+        let size = buffer.len();
+
+        // Succeed if there's nothing to read.
+        if size == 0 {
+            return 0;
+        }
+
+        // If the tree is empty, read directly from storage[0].
+        if self.table.is_empty() {
+            if let Some(ref storage) = self.data_storage[0] {
+                return storage.read(buffer, size, offset);
+            }
+            return 0;
+        }
+
+        // Use operate_per_entry to read from the correct storage for each range.
+        self.operate_per_entry(offset as i64, size as i64, |storage, data_offset, cur_offset, cur_size| {
+            let buf_offset = (cur_offset - offset as i64) as usize;
+            let read_size = cur_size as usize;
+            storage.read(
+                &mut buffer[buf_offset..buf_offset + read_size],
+                read_size,
+                data_offset as usize,
+            );
+            Ok(())
+        });
+
+        size
+    }
+
+    /// Operate on each entry that overlaps with the given range.
+    ///
+    /// This matches the upstream `IndirectStorage::OperatePerEntry` pattern:
+    /// 1. Find the initial entry via BucketTree::Find
+    /// 2. For each iteration: read current entry, advance visitor to get next entry's
+    ///    offset, compute the data range, then call the function.
+    ///
+    /// Corresponds to upstream `IndirectStorage::OperatePerEntry<false, true>`.
+    fn operate_per_entry<F>(
+        &self,
+        offset: i64,
+        size: i64,
+        mut func: F,
+    ) where
+        F: FnMut(&crate::file_sys::vfs::vfs_types::VirtualFile, i64, i64, i64) -> Result<(), common::ResultCode>,
+    {
+        assert!(offset >= 0);
+        assert!(size >= 0);
+        assert!(self.is_initialized());
+
+        if size == 0 {
+            return;
+        }
+
+        // Get the table offsets.
+        let table_offsets = match self.table.get_offsets() {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+
+        if !table_offsets.is_include_range(offset, size) {
+            return;
+        }
+
+        // Find the entry for the start offset.
+        let mut visitor = match self.table.find(offset) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        // Validate the initial entry.
+        {
+            let cur_entry: Entry = unsafe { *visitor.get::<Entry>() };
+            let entry_offset = cur_entry.get_virtual_offset();
+            if entry_offset < 0 || !table_offsets.is_include_offset(entry_offset) {
+                return;
+            }
+        }
+
+        let mut cur_offset = offset;
+        let end_offset = offset + size;
+
+        while cur_offset < end_offset {
+            // Get the current entry.
+            let cur_entry: Entry = unsafe { *visitor.get::<Entry>() };
+            let cur_entry_offset = cur_entry.get_virtual_offset();
+
+            if cur_entry_offset > cur_offset {
+                break;
+            }
+
+            // Validate storage index.
+            if cur_entry.storage_index < 0 || cur_entry.storage_index >= STORAGE_COUNT {
+                break;
+            }
+
+            // Get the next entry offset by advancing the visitor.
+            let next_entry_offset = if visitor.can_move_next() {
+                if visitor.move_next().is_err() {
+                    break;
+                }
+                let next: Entry = unsafe { *visitor.get::<Entry>() };
+                let neo = next.get_virtual_offset();
+                if !table_offsets.is_include_offset(neo) {
+                    break;
+                }
+                neo
+            } else {
+                table_offsets.end_offset
+            };
+
+            if cur_offset >= next_entry_offset {
+                break;
+            }
+
+            // Compute data range.
+            let data_offset = cur_offset - cur_entry_offset;
+            let data_size = next_entry_offset - cur_entry_offset;
+            assert!(data_size > 0);
+
+            let remaining = end_offset - cur_offset;
+            let cur_size = remaining.min(data_size - data_offset);
+            assert!(cur_size <= size);
+
+            let cur_entry_phys_offset = cur_entry.get_physical_offset();
+
+            // Operate on the range using the captured cur_entry (not the advanced visitor).
+            if let Some(ref storage) = self.data_storage[cur_entry.storage_index as usize] {
+                let _ = func(storage, cur_entry_phys_offset + data_offset, cur_offset, cur_size);
+            }
+
+            cur_offset += cur_size;
         }
     }
 
@@ -184,6 +357,49 @@ impl IndirectStorage {
     /// Query the entry storage size for a given entry count.
     pub fn query_entry_storage_size(entry_count: i32) -> i64 {
         BucketTree::query_entry_storage_size(NODE_SIZE, std::mem::size_of::<Entry>(), entry_count)
+    }
+}
+
+/// Implement VfsFile so IndirectStorage can be used as a VirtualFile.
+impl VfsFile for IndirectStorage {
+    fn get_name(&self) -> String {
+        String::from("IndirectStorage")
+    }
+
+    fn get_size(&self) -> usize {
+        self.get_size()
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        false
+    }
+
+    fn is_readable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let actual_len = length.min(data.len());
+        if actual_len == 0 {
+            return 0;
+        }
+        self.read(&mut data[..actual_len], offset)
+    }
+
+    fn write(&self, _data: &[u8], _length: usize, _offset: usize) -> usize {
+        0
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
     }
 }
 

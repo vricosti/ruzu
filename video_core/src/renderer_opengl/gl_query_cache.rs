@@ -122,7 +122,17 @@ impl CachedQuery {
     }
 
     /// Flush the cached query result.
+    ///
+    /// Port of `CachedQuery::Flush()`.
+    ///
+    /// In the full implementation, this would write the accumulated query
+    /// result back to guest memory at `cpu_addr`. For now, returns 0 since
+    /// we don't have memory manager integration.
     pub fn flush(&mut self) -> u64 {
-        todo!("CachedQuery::Flush")
+        // In the full implementation:
+        // 1. Accumulate results from all host counters
+        // 2. Write the result to guest memory at self.cpu_addr
+        log::trace!("CachedQuery::flush at {:016x}", self.cpu_addr);
+        0
     }
 }

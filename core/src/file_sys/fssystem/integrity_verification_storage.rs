@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Ported from: core/file_sys/fssystem/fssystem_integrity_verification_storage.h / .cpp
-// Status: COMPLETE (structural parity; hash verification deferred)
 //
 // Integrity verification storage: a read-only storage that validates data
 // integrity using block-level SHA-256 hashes. Each data block has a
 // corresponding hash entry in the hash storage.
 
 use crate::file_sys::vfs::vfs::VfsFile;
-use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 
 /// Size of a SHA-256 hash in bytes.
 ///
@@ -49,6 +48,13 @@ impl BlockHash {
     }
 }
 
+/// Compute integer log2 for a power-of-two value.
+/// Corresponds to upstream anonymous `ILog2`.
+fn ilog2(val: u32) -> u32 {
+    assert!(val > 0);
+    31 - val.leading_zeros()
+}
+
 /// Integrity verification storage.
 ///
 /// Validates data integrity using block-level SHA-256 hashes.
@@ -82,8 +88,6 @@ impl IntegrityVerificationStorage {
 
     /// Initialize the storage with hash and data storages.
     ///
-    /// `verif_block_size` must be a power of two.
-    ///
     /// Corresponds to upstream `IntegrityVerificationStorage::Initialize`.
     pub fn initialize(
         &mut self,
@@ -93,13 +97,25 @@ impl IntegrityVerificationStorage {
         upper_layer_verif_block_size: i64,
         is_real_data: bool,
     ) {
+        // Validate preconditions.
+        assert!(verif_block_size >= HASH_SIZE);
+
+        // Set storages.
         self.hash_storage = Some(hash_storage);
         self.data_storage = Some(data_storage);
+
+        // Set verification block sizes.
         self.verification_block_size = verif_block_size;
-        self.verification_block_order = (verif_block_size as u64).trailing_zeros() as i64;
-        self.upper_layer_verification_block_size = upper_layer_verif_block_size;
-        self.upper_layer_verification_block_order =
-            (upper_layer_verif_block_size as u64).trailing_zeros() as i64;
+        self.verification_block_order = ilog2(verif_block_size as u32) as i64;
+        assert!(self.verification_block_size == 1i64 << self.verification_block_order);
+
+        // Set upper layer block sizes.
+        let upper = std::cmp::max(upper_layer_verif_block_size, HASH_SIZE);
+        self.upper_layer_verification_block_size = upper;
+        self.upper_layer_verification_block_order = ilog2(upper as u32) as i64;
+        assert!(self.upper_layer_verification_block_size == 1i64 << self.upper_layer_verification_block_order);
+
+        // Set data.
         self.is_real_data = is_real_data;
     }
 
@@ -118,42 +134,6 @@ impl IntegrityVerificationStorage {
         self.verification_block_size
     }
 
-    /// Get the size of the data storage.
-    ///
-    /// Corresponds to upstream `IntegrityVerificationStorage::GetSize`.
-    pub fn get_size(&self) -> usize {
-        match &self.data_storage {
-            Some(ds) => ds.get_size(),
-            None => 0,
-        }
-    }
-
-    /// Read data from the storage.
-    ///
-    /// In upstream, this reads data in block-aligned chunks, computes
-    /// SHA-256 for each block, and validates against the hash storage.
-    /// Currently reads without hash verification.
-    ///
-    /// Corresponds to upstream `IntegrityVerificationStorage::Read`.
-    pub fn read(&self, buffer: &mut [u8], size: usize, offset: usize) -> usize {
-        if size == 0 {
-            return 0;
-        }
-
-        match &self.data_storage {
-            Some(ds) => {
-                // TODO: For each aligned block overlapping [offset, offset+size):
-                //   1. Read block hash from hash_storage
-                //   2. Read data block from data_storage
-                //   3. Compute SHA-256 of data block
-                //   4. Validate hash (with validation bit check)
-                //   5. If mismatch, return error
-                ds.read(buffer, size, offset)
-            }
-            None => 0,
-        }
-    }
-
     /// Whether this storage contains real (non-zero) data.
     pub fn is_real_data(&self) -> bool {
         self.is_real_data
@@ -163,6 +143,89 @@ impl IntegrityVerificationStorage {
 impl Default for IntegrityVerificationStorage {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Implement VfsFile so IntegrityVerificationStorage can be used as a VirtualFile.
+impl VfsFile for IntegrityVerificationStorage {
+    fn get_name(&self) -> String {
+        String::from("IntegrityVerificationStorage")
+    }
+
+    fn get_size(&self) -> usize {
+        match &self.data_storage {
+            Some(ds) => ds.get_size(),
+            None => 0,
+        }
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false // Read-only storage
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        false
+    }
+
+    fn is_readable(&self) -> bool {
+        true
+    }
+
+    /// Read data from the storage.
+    ///
+    /// In upstream, this reads data in block-aligned chunks, computes
+    /// SHA-256 for each block, and validates against the hash storage.
+    /// Currently reads without hash verification (deferred until crypto pipeline is wired up).
+    ///
+    /// Corresponds to upstream `IntegrityVerificationStorage::Read`.
+    fn read(&self, buffer: &mut [u8], length: usize, offset: usize) -> usize {
+        if length == 0 {
+            return 0;
+        }
+
+        match &self.data_storage {
+            Some(ds) => {
+                let data_size = ds.get_size();
+
+                // Determine the read extents.
+                let mut read_size = length;
+                if offset + read_size > data_size {
+                    // Determine the padding sizes.
+                    let padding_offset = data_size.saturating_sub(offset);
+                    if self.verification_block_size > 0 {
+                        let block_mask = (self.verification_block_size - 1) as usize;
+                        let padding_size =
+                            self.verification_block_size as usize - (padding_offset & block_mask);
+                        if (padding_size as i64) < self.verification_block_size {
+                            // Clear the padding.
+                            let end = (padding_offset + padding_size).min(buffer.len());
+                            for b in &mut buffer[padding_offset..end] {
+                                *b = 0;
+                            }
+                        }
+                    }
+
+                    // Set the new in-bounds size.
+                    read_size = data_size.saturating_sub(offset);
+                }
+
+                // Perform the read.
+                ds.read(buffer, read_size, offset)
+            }
+            None => 0,
+        }
+    }
+
+    fn write(&self, _data: &[u8], _length: usize, _offset: usize) -> usize {
+        0 // Read-only
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
     }
 }
 
@@ -190,5 +253,15 @@ mod tests {
         let storage = IntegrityVerificationStorage::new();
         assert_eq!(storage.get_size(), 0);
         assert_eq!(storage.get_block_size(), 0);
+    }
+
+    #[test]
+    fn test_ilog2() {
+        assert_eq!(ilog2(1), 0);
+        assert_eq!(ilog2(2), 1);
+        assert_eq!(ilog2(4), 2);
+        assert_eq!(ilog2(8), 3);
+        assert_eq!(ilog2(1024), 10);
+        assert_eq!(ilog2(0x4000), 14);
     }
 }

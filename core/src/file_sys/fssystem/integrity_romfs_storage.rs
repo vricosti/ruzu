@@ -111,7 +111,7 @@ impl IntegrityRomFsStorage {
     ///
     /// Corresponds to upstream `IntegrityRomFsStorage::Read`.
     pub fn read(&self, buffer: &mut [u8], offset: usize) -> usize {
-        self.integrity_storage.read(buffer, offset)
+        self.integrity_storage.read(buffer, buffer.len(), offset)
     }
 }
 

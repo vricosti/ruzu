@@ -7,6 +7,7 @@
 //! ISettingsServer service ("set").
 
 use crate::hle::result::{ErrorModule, ResultCode};
+use super::key_code_map::*;
 use super::settings_types::{
     KeyboardLayout, Language, LanguageCode, SystemRegionCode, AVAILABLE_LANGUAGE_CODES,
     LANGUAGE_TO_LAYOUT,
@@ -22,7 +23,7 @@ const RESULT_INVALID_LANGUAGE: ResultCode =
 const RESULT_NULL_POINTER: ResultCode =
     ResultCode::from_module_description(ErrorModule::Settings, 1261);
 
-/// Key code map type — 0x1000 bytes.
+/// Key code map type -- 0x1000 bytes.
 ///
 /// Corresponds to `KeyCodeMap` in upstream settings_server.h.
 pub type KeyCodeMap = [u8; 0x1000];
@@ -30,6 +31,48 @@ pub type KeyCodeMap = [u8; 0x1000];
 /// Port of Set::GetLanguageCodeFromIndex.
 pub fn get_language_code_from_index(index: usize) -> LanguageCode {
     AVAILABLE_LANGUAGE_CODES[index]
+}
+
+/// Copy a key code map slice into a fixed-size 0x1000-byte array, zero-padding as needed.
+fn copy_key_code_map(src: &[u8]) -> KeyCodeMap {
+    let mut out = [0u8; 0x1000];
+    let len = src.len().min(0x1000);
+    out[..len].copy_from_slice(&src[..len]);
+    out
+}
+
+/// Internal key code map lookup by keyboard layout and language code.
+///
+/// Corresponds to `GetKeyCodeMapImpl` in upstream settings_server.cpp.
+fn get_key_code_map_impl(keyboard_layout: KeyboardLayout, language_code: LanguageCode) -> KeyCodeMap {
+    let src = match keyboard_layout {
+        KeyboardLayout::Japanese => KEY_CODE_MAP_JAPANESE,
+        KeyboardLayout::EnglishUs => {
+            if language_code == LanguageCode::Ko {
+                KEY_CODE_MAP_KOREAN
+            } else if language_code == LanguageCode::ZhHans {
+                KEY_CODE_MAP_CHINESE_SIMPLIFIED
+            } else if language_code == LanguageCode::ZhHant {
+                KEY_CODE_MAP_CHINESE_TRADITIONAL
+            } else {
+                KEY_CODE_MAP_ENGLISH_US_INTERNATIONAL
+            }
+        }
+        KeyboardLayout::EnglishUk => KEY_CODE_MAP_ENGLISH_UK,
+        KeyboardLayout::French => KEY_CODE_MAP_FRENCH,
+        KeyboardLayout::FrenchCa => KEY_CODE_MAP_FRENCH_CA,
+        KeyboardLayout::Spanish => KEY_CODE_MAP_SPANISH,
+        KeyboardLayout::SpanishLatin => KEY_CODE_MAP_SPANISH_LATIN,
+        KeyboardLayout::German => KEY_CODE_MAP_GERMAN,
+        KeyboardLayout::Italian => KEY_CODE_MAP_ITALIAN,
+        KeyboardLayout::Portuguese => KEY_CODE_MAP_PORTUGUESE,
+        KeyboardLayout::Russian => KEY_CODE_MAP_RUSSIAN,
+        KeyboardLayout::Korean => KEY_CODE_MAP_KOREAN,
+        KeyboardLayout::ChineseSimplified => KEY_CODE_MAP_CHINESE_SIMPLIFIED,
+        KeyboardLayout::ChineseTraditional => KEY_CODE_MAP_CHINESE_TRADITIONAL,
+        _ => KEY_CODE_MAP_ENGLISH_US_INTERNATIONAL,
+    };
+    copy_key_code_map(src)
 }
 
 /// IPC command table for ISettingsServer ("set").
@@ -50,7 +93,7 @@ pub mod commands {
     pub const GET_DEVICE_NICK_NAME: u32 = 11;
 }
 
-/// ISettingsServer — "set" service.
+/// ISettingsServer -- "set" service.
 ///
 /// Corresponds to `ISettingsServer` in upstream settings_server.h.
 pub struct ISettingsServer {
@@ -156,10 +199,41 @@ impl ISettingsServer {
         POST_4_0_0_MAX_ENTRIES as i32
     }
 
+    /// GetKeyCodeMap (cmd 7).
+    ///
+    /// Corresponds to `ISettingsServer::GetKeyCodeMap` in upstream.
+    pub fn get_key_code_map(&self) -> KeyCodeMap {
+        log::debug!("ISettingsServer::get_key_code_map called");
+        let language_code = AVAILABLE_LANGUAGE_CODES[self.language_index];
+        let key_code = LANGUAGE_TO_LAYOUT
+            .iter()
+            .find(|(lc, _)| *lc == language_code);
+
+        match key_code {
+            Some((lc, layout)) => get_key_code_map_impl(*layout, *lc),
+            None => {
+                log::error!(
+                    "Could not find keyboard layout for language index {}, defaulting to English us",
+                    self.language_index
+                );
+                copy_key_code_map(KEY_CODE_MAP_ENGLISH_US_INTERNATIONAL)
+            }
+        }
+    }
+
     /// GetQuestFlag (cmd 8).
     pub fn get_quest_flag(&self) -> bool {
         log::debug!("ISettingsServer::get_quest_flag called");
         self.quest_flag
+    }
+
+    /// GetKeyCodeMap2 (cmd 9).
+    ///
+    /// Corresponds to `ISettingsServer::GetKeyCodeMap2` in upstream.
+    /// Same implementation as GetKeyCodeMap.
+    pub fn get_key_code_map2(&self) -> KeyCodeMap {
+        log::debug!("ISettingsServer::get_key_code_map2 called");
+        self.get_key_code_map()
     }
 
     /// GetDeviceNickName (cmd 11).
@@ -170,5 +244,53 @@ impl ISettingsServer {
         let len = bytes.len().min(out.len());
         out[..len].copy_from_slice(&bytes[..len]);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_language_code() {
+        let server = ISettingsServer::new();
+        assert_eq!(server.get_language_code(), LanguageCode::EnUs);
+    }
+
+    #[test]
+    fn test_make_language_code() {
+        let server = ISettingsServer::new();
+        assert_eq!(server.make_language_code(0), Ok(LanguageCode::Ja));
+        assert_eq!(server.make_language_code(1), Ok(LanguageCode::EnUs));
+        assert!(server.make_language_code(99).is_err());
+    }
+
+    #[test]
+    fn test_available_language_codes() {
+        let server = ISettingsServer::new();
+        let (count, codes) = server.get_available_language_codes(100);
+        assert_eq!(count, PRE_4_0_0_MAX_ENTRIES as i32);
+        assert_eq!(codes.len(), PRE_4_0_0_MAX_ENTRIES);
+
+        let (count2, codes2) = server.get_available_language_codes2(100);
+        assert_eq!(count2, AVAILABLE_LANGUAGE_CODES.len() as i32);
+        assert_eq!(codes2.len(), AVAILABLE_LANGUAGE_CODES.len());
+    }
+
+    #[test]
+    fn test_get_key_code_map() {
+        let server = ISettingsServer::new(); // language_index=1 => EnUs
+        let map = server.get_key_code_map();
+        // Should be EnglishUs map (which for EnUs goes through the EnglishUs branch)
+        // Just verify it doesn't panic and returns a valid 0x1000-byte array
+        assert_eq!(map.len(), 0x1000);
+    }
+
+    #[test]
+    fn test_get_device_nick_name() {
+        let server = ISettingsServer::new();
+        let name = server.get_device_nick_name();
+        assert_eq!(&name[..4], b"yuzu");
+        assert_eq!(name[4], 0);
     }
 }

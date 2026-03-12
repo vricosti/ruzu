@@ -3,8 +3,17 @@
 
 //! Port of hid_core/resources/debug_pad/debug_pad.h and debug_pad.cpp
 
-use super::debug_pad_types::DebugPadState;
+use super::debug_pad_types::{DebugPadAttribute, DebugPadState};
+use crate::hid_types::{AnalogStickState, DebugPadButton};
 use crate::resources::controller_base::ControllerActivation;
+use crate::resources::shared_memory_format::DebugPadSharedMemoryFormat;
+
+/// Stick state pair for left/right analog sticks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StickState {
+    pub left: AnalogStickState,
+    pub right: AnalogStickState,
+}
 
 /// DebugPad controller — reads debug pad input from emulated controller (Other)
 /// and writes into shared memory.
@@ -40,8 +49,33 @@ impl DebugPad {
     ///       next_state.l_stick = sticks.left
     ///       next_state.r_stick = sticks.right
     ///   debug_pad_lifo.WriteNextEntry(next_state)
-    pub fn on_update(&mut self) {
-        let _ = &self.next_state;
+    pub fn on_update(
+        &mut self,
+        shared_memory: &mut DebugPadSharedMemoryFormat,
+        debug_pad_enabled: bool,
+        button_state: &DebugPadButton,
+        stick_state: &StickState,
+    ) {
+        if !self.activation.is_controller_activated() {
+            shared_memory.debug_pad_lifo.buffer_count = 0;
+            shared_memory.debug_pad_lifo.buffer_tail = 0;
+            return;
+        }
+
+        let last_entry = shared_memory.debug_pad_lifo.read_current_entry();
+        self.next_state.sampling_number = last_entry.state.sampling_number + 1;
+
+        if debug_pad_enabled {
+            let mut attr = DebugPadAttribute::default();
+            attr.set_connected(true);
+            self.next_state.attribute = attr;
+
+            self.next_state.pad_state = *button_state;
+            self.next_state.l_stick = stick_state.left;
+            self.next_state.r_stick = stick_state.right;
+        }
+
+        shared_memory.debug_pad_lifo.write_next_entry(self.next_state);
     }
 }
 

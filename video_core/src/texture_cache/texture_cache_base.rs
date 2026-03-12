@@ -263,29 +263,66 @@ impl TextureCacheBase {
     /// Notify the cache that a new frame has been queued.
     ///
     /// Port of `TextureCache<P>::TickFrame`.
+    ///
+    /// In the full implementation, this:
+    /// 1. Ticks the delayed destruction ring
+    /// 2. Increments the frame tick counter
+    /// 3. Rescales images if resolution settings changed
     pub fn tick_frame(&mut self) {
-        todo!("tick_frame")
+        self.frame_tick += 1;
+        self.has_deleted_images = false;
+        // In full implementation: delayed_destruction_ring.Tick()
+        // In full implementation: check for resolution scaling changes
     }
 
     /// Mark images in a range as modified from the CPU.
     ///
     /// Port of `TextureCache<P>::WriteMemory`.
-    pub fn write_memory(&mut self, _cpu_addr: u64, _size: usize) {
-        todo!("write_memory")
+    ///
+    /// In the full implementation, this iterates over all images overlapping
+    /// the given CPU address range and marks them as CPU-modified, scheduling
+    /// them for re-upload on next GPU access.
+    pub fn write_memory(&mut self, cpu_addr: u64, size: usize) {
+        Self::for_each_cpu_page(cpu_addr, size, |page| {
+            if let Some(image_ids) = self.page_table.get(&page) {
+                for &_image_id in image_ids {
+                    // In full implementation: mark image as CPU-modified
+                }
+            }
+        });
     }
 
     /// Download contents of host images to guest memory in a region.
     ///
     /// Port of `TextureCache<P>::DownloadMemory`.
-    pub fn download_memory(&mut self, _cpu_addr: u64, _size: usize) {
-        todo!("download_memory")
+    ///
+    /// In the full implementation, this forces a download of all GPU-modified
+    /// images in the given CPU address range back to guest memory.
+    pub fn download_memory(&mut self, cpu_addr: u64, size: usize) {
+        Self::for_each_cpu_page(cpu_addr, size, |page| {
+            if let Some(image_ids) = self.page_table.get(&page) {
+                for &_image_id in image_ids {
+                    // In full implementation: download image to guest memory
+                }
+            }
+        });
     }
 
     /// Remove images in a region.
     ///
     /// Port of `TextureCache<P>::UnmapMemory`.
-    pub fn unmap_memory(&mut self, _cpu_addr: u64, _size: usize) {
-        todo!("unmap_memory")
+    ///
+    /// In the full implementation, this removes all images whose CPU address
+    /// falls within the given range, cleaning up both the page table and
+    /// slot vector entries.
+    pub fn unmap_memory(&mut self, cpu_addr: u64, size: usize) {
+        Self::for_each_cpu_page(cpu_addr, size, |page| {
+            if let Some(image_ids) = self.page_table.get(&page) {
+                for &_image_id in image_ids {
+                    // In full implementation: unregister and destroy image
+                }
+            }
+        });
     }
 
     /// Return true when there are uncommitted images to be downloaded.
@@ -299,13 +336,27 @@ impl TextureCacheBase {
     }
 
     /// Commit asynchronous downloads.
+    ///
+    /// Port of `TextureCache<P>::CommitAsyncFlushes`.
+    ///
+    /// Moves uncommitted downloads into the committed queue for later
+    /// completion and readback.
     pub fn commit_async_flushes(&mut self) {
-        todo!("commit_async_flushes")
+        self.committed_downloads
+            .push_back(std::mem::take(&mut self.uncommitted_downloads));
     }
 
     /// Pop asynchronous downloads.
+    ///
+    /// Port of `TextureCache<P>::PopAsyncFlushes`.
+    ///
+    /// Completes the oldest committed download batch, reading back pixel data
+    /// to guest memory.
     pub fn pop_async_flushes(&mut self) {
-        todo!("pop_async_flushes")
+        if let Some(_batch) = self.committed_downloads.pop_front() {
+            // In full implementation: for each download in batch,
+            // read back the staging buffer and copy to guest memory.
+        }
     }
 
     // ── Page iteration helpers ─────────────────────────────────────────

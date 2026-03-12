@@ -92,6 +92,27 @@ impl Default for CommonInfo {
     }
 }
 
+/// Break type for debug operations.
+///
+/// Corresponds to `BreakType` in upstream nfp_types.h.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakType {
+    Type0 = 0,
+    Type1 = 1,
+    Type2 = 2,
+}
+
+/// Write type for NTF operations.
+///
+/// Corresponds to `WriteType` in upstream nfp_types.h.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteType {
+    Type0 = 0,
+    Type1 = 1,
+}
+
 /// Amiibo register info.
 ///
 /// Corresponds to `RegisterInfo` in upstream nfp_types.h.
