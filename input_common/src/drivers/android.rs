@@ -13,7 +13,7 @@ use common::input::{ButtonNames, DriverResult, VibrationStatus};
 use common::param_package::ParamPackage;
 use common::uuid::UUID;
 
-use crate::input_engine::{InputEngine, PadIdentifier, VibrationRequest};
+use crate::input_engine::{BasicMotion, InputEngine, PadIdentifier, VibrationRequest};
 use crate::main_common::{AnalogMapping, ButtonMapping};
 
 // ---- Constants from android.h ----
@@ -74,82 +74,104 @@ impl Android {
     /// Port of Android::SetButtonState
     pub fn set_button_state(
         &mut self,
-        _guid: &str,
-        _port: usize,
-        _button_id: i32,
-        _value: bool,
+        guid: &str,
+        port: usize,
+        button_id: i32,
+        value: bool,
     ) {
-        todo!()
+        let identifier = self.get_identifier(guid, port);
+        self.engine.set_button(&identifier, button_id, value);
     }
 
     /// Sets the status of an axis on a specific controller.
     /// Port of Android::SetAxisPosition
     pub fn set_axis_position(
         &mut self,
-        _guid: &str,
-        _port: usize,
-        _axis_id: i32,
-        _value: f32,
+        guid: &str,
+        port: usize,
+        axis_id: i32,
+        value: f32,
     ) {
-        todo!()
+        let identifier = self.get_identifier(guid, port);
+        self.engine.set_axis(&identifier, axis_id, value);
     }
 
     /// Sets the status of the motion sensor on a specific controller.
     /// Port of Android::SetMotionState
     pub fn set_motion_state(
         &mut self,
-        _guid: &str,
-        _port: usize,
-        _delta_timestamp: u64,
-        _gyro_x: f32,
-        _gyro_y: f32,
-        _gyro_z: f32,
-        _accel_x: f32,
-        _accel_y: f32,
-        _accel_z: f32,
+        guid: &str,
+        port: usize,
+        delta_timestamp: u64,
+        gyro_x: f32,
+        gyro_y: f32,
+        gyro_z: f32,
+        accel_x: f32,
+        accel_y: f32,
+        accel_z: f32,
     ) {
-        todo!()
+        let identifier = self.get_identifier(guid, port);
+        let motion_data = BasicMotion {
+            gyro_x,
+            gyro_y,
+            gyro_z,
+            accel_x,
+            accel_y,
+            accel_z,
+            delta_timestamp,
+        };
+        self.engine.set_motion(&identifier, 0, &motion_data);
     }
 
     /// Port of Android::SetVibration (override)
+    /// Android vibration requires JNI; returns Success as a no-op on non-Android platforms.
     pub fn set_vibration(
         &mut self,
         _identifier: &PadIdentifier,
         _vibration: &VibrationStatus,
     ) -> DriverResult {
-        todo!()
+        // JNI vibration is platform-specific; no-op here
+        DriverResult::Success
     }
 
     /// Port of Android::IsVibrationEnabled (override)
+    /// Returns false on non-Android platforms.
     pub fn is_vibration_enabled(&self, _identifier: &PadIdentifier) -> bool {
-        todo!()
+        false
     }
 
     /// Port of Android::GetInputDevices (override)
+    /// Returns empty on non-Android platforms.
     pub fn get_input_devices(&self) -> Vec<ParamPackage> {
-        todo!()
+        Vec::new()
     }
 
     /// Port of Android::GetAnalogMappingForDevice (override)
     pub fn get_analog_mapping_for_device(&self, _params: &ParamPackage) -> AnalogMapping {
-        todo!()
+        // TODO: Port analog mapping logic (involves Settings::NativeAnalog values)
+        HashMap::new()
     }
 
     /// Port of Android::GetButtonMappingForDevice (override)
     pub fn get_button_mapping_for_device(&self, _params: &ParamPackage) -> ButtonMapping {
-        todo!()
+        // TODO: Port button mapping logic (involves Settings::NativeButton values)
+        HashMap::new()
     }
 
     /// Port of Android::GetUIName (override)
     pub fn get_ui_name(&self, _params: &ParamPackage) -> ButtonNames {
-        todo!()
+        ButtonNames::Undefined
     }
 
     // ---- Private methods ----
 
     /// Returns the correct identifier corresponding to the player index.
     /// Port of Android::GetIdentifier
-    fn get_identifier(&self, _guid: &str, _port: usize) -> PadIdentifier {
-        todo!()
+    fn get_identifier(&self, guid: &str, port: usize) -> PadIdentifier {
+        PadIdentifier {
+            guid: UUID::from_string(guid),
+            port,
+            pad: 0,
+        }
     }
 }

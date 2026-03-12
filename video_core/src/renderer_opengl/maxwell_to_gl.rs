@@ -222,3 +222,230 @@ pub fn polygon_mode(mode: u32) -> u32 {
         }
     }
 }
+
+/// Map a Maxwell stencil operation to GL stencil operation.
+///
+/// Corresponds to `OpenGL::MaxwellToGL::StencilOp()`.
+pub fn stencil_op(op: u32) -> u32 {
+    match op {
+        // D3D / GL pairs
+        1 | 0x1E00 => gl::KEEP,
+        2 | 0x0000 => gl::ZERO,
+        3 | 0x1E01 => gl::REPLACE,
+        4 | 0x1E02 => gl::INCR,
+        5 | 0x1E03 => gl::DECR,
+        6 | 0x150A => gl::INVERT,
+        7 | 0x8507 => gl::INCR_WRAP,
+        8 | 0x8508 => gl::DECR_WRAP,
+        _ => {
+            log::warn!("Unimplemented stencil op: {:#x}", op);
+            gl::KEEP
+        }
+    }
+}
+
+/// Map a Maxwell blend factor to GL blend factor.
+///
+/// Corresponds to `OpenGL::MaxwellToGL::BlendFunc()`.
+pub fn blend_func(factor: u32) -> u32 {
+    match factor {
+        0x01 | 0x4000 => gl::ZERO,
+        0x02 | 0x4001 => gl::ONE,
+        0x03 | 0x4300 => gl::SRC_COLOR,
+        0x04 | 0x4301 => gl::ONE_MINUS_SRC_COLOR,
+        0x05 | 0x4302 => gl::SRC_ALPHA,
+        0x06 | 0x4303 => gl::ONE_MINUS_SRC_ALPHA,
+        0x07 | 0x4304 => gl::DST_ALPHA,
+        0x08 | 0x4305 => gl::ONE_MINUS_DST_ALPHA,
+        0x09 | 0x4306 => gl::DST_COLOR,
+        0x0A | 0x4307 => gl::ONE_MINUS_DST_COLOR,
+        0x0B | 0x4308 => gl::SRC_ALPHA_SATURATE,
+        0x0D | 0xC900 => gl::SRC1_COLOR,
+        0x0E | 0xC901 => gl::ONE_MINUS_SRC1_COLOR,
+        0x0F | 0xC902 => gl::SRC1_ALPHA,
+        0x10 | 0xC903 => gl::ONE_MINUS_SRC1_ALPHA,
+        0x11 | 0xC001 => gl::CONSTANT_COLOR,
+        0x12 | 0xC002 => gl::ONE_MINUS_CONSTANT_COLOR,
+        0x13 | 0xC003 => gl::CONSTANT_ALPHA,
+        0x14 | 0xC004 => gl::ONE_MINUS_CONSTANT_ALPHA,
+        _ => {
+            log::warn!("Unimplemented blend factor: {:#x}", factor);
+            gl::ZERO
+        }
+    }
+}
+
+/// Map texture filter + mipmap filter to a combined GL filter mode.
+///
+/// Corresponds to `OpenGL::MaxwellToGL::TextureFilterMode()`.
+pub fn texture_filter_mode(filter: u32, mipmap_filter: u32) -> u32 {
+    match filter {
+        // Nearest
+        1 => match mipmap_filter {
+            1 => gl::NEAREST, // None
+            2 => gl::NEAREST_MIPMAP_NEAREST,
+            3 => gl::NEAREST_MIPMAP_LINEAR,
+            _ => {
+                log::warn!("Invalid mipmap filter mode: {}", mipmap_filter);
+                gl::NEAREST
+            }
+        },
+        // Linear
+        2 => match mipmap_filter {
+            1 => gl::LINEAR, // None
+            2 => gl::LINEAR_MIPMAP_NEAREST,
+            3 => gl::LINEAR_MIPMAP_LINEAR,
+            _ => {
+                log::warn!("Invalid mipmap filter mode: {}", mipmap_filter);
+                gl::LINEAR
+            }
+        },
+        _ => {
+            log::warn!("Invalid texture filter mode: {}", filter);
+            gl::NEAREST
+        }
+    }
+}
+
+/// Map a Maxwell wrap mode to GL wrap mode.
+///
+/// Corresponds to `OpenGL::MaxwellToGL::WrapMode()`.
+pub fn wrap_mode(mode: u32) -> u32 {
+    match mode {
+        0 => gl::REPEAT,
+        1 => gl::MIRRORED_REPEAT,
+        2 => gl::CLAMP_TO_EDGE,
+        3 => gl::CLAMP_TO_BORDER,
+        4 => gl::CLAMP_TO_EDGE, // GL_CLAMP (deprecated) — fallback
+        5 => gl::MIRROR_CLAMP_TO_EDGE,
+        6 => gl::MIRROR_CLAMP_TO_EDGE, // MirrorOnceBorder — fallback
+        7 => gl::MIRROR_CLAMP_TO_EDGE, // MirrorOnceClampOgl — fallback
+        _ => {
+            log::warn!("Unimplemented texture wrap mode: {}", mode);
+            gl::REPEAT
+        }
+    }
+}
+
+/// Map a depth compare function to GL compare function.
+///
+/// Corresponds to `OpenGL::MaxwellToGL::DepthCompareFunc()`.
+pub fn depth_compare_func(func: u32) -> u32 {
+    match func {
+        0 => gl::NEVER,
+        1 => gl::LESS,
+        2 => gl::EQUAL,
+        3 => gl::LEQUAL,
+        4 => gl::GREATER,
+        5 => gl::NOTEQUAL,
+        6 => gl::GEQUAL,
+        7 => gl::ALWAYS,
+        _ => {
+            log::warn!("Unimplemented depth compare func: {}", func);
+            gl::GREATER
+        }
+    }
+}
+
+/// Map a Maxwell vertex attribute type + size to GL type.
+///
+/// Corresponds to `OpenGL::MaxwellToGL::VertexFormat()`.
+/// Returns the GL type constant (e.g. GL_FLOAT, GL_UNSIGNED_BYTE).
+pub fn vertex_format(attrib_type: u32, size: u32) -> u32 {
+    match attrib_type {
+        // UNorm, UScaled, UInt
+        2 | 5 | 4 => match size {
+            0x01 | 0x02 | 0x03 | 0x05 | 0x0A | 0x13 | 0x18 | 0x1D | 0x32 | 0x33 | 0x34 => {
+                gl::UNSIGNED_BYTE
+            }
+            0x0F | 0x1B => gl::UNSIGNED_SHORT,
+            0x04 | 0x12 => gl::UNSIGNED_INT,
+            0x30 => gl::UNSIGNED_INT_2_10_10_10_REV,
+            _ => {
+                log::warn!("Unknown unsigned vertex size: {:#x}", size);
+                gl::UNSIGNED_BYTE
+            }
+        },
+        // SNorm, SScaled, SInt
+        1 | 6 | 3 => match size {
+            0x01 | 0x02 | 0x03 | 0x05 | 0x0A | 0x13 | 0x18 | 0x1D | 0x32 | 0x33 | 0x34 => {
+                gl::BYTE
+            }
+            0x0F | 0x1B => gl::SHORT,
+            0x04 | 0x12 => gl::INT,
+            0x30 => gl::INT_2_10_10_10_REV,
+            _ => {
+                log::warn!("Unknown signed vertex size: {:#x}", size);
+                gl::BYTE
+            }
+        },
+        // Float
+        7 => match size {
+            0x0F | 0x03 | 0x1B => gl::HALF_FLOAT,
+            0x01 | 0x02 | 0x04 | 0x12 => gl::FLOAT,
+            0x31 => gl::UNSIGNED_INT_10F_11F_11F_REV,
+            _ => {
+                log::warn!("Unknown float vertex size: {:#x}", size);
+                gl::FLOAT
+            }
+        },
+        _ => {
+            log::warn!("Invalid vertex attribute type: {}", attrib_type);
+            gl::FLOAT
+        }
+    }
+}
+
+/// Map a reduction filter mode to GL reduction mode.
+///
+/// Corresponds to `OpenGL::MaxwellToGL::ReductionFilter()`.
+const GL_WEIGHTED_AVERAGE_ARB: u32 = 0x9367;
+
+pub fn reduction_filter(filter: u32) -> u32 {
+    match filter {
+        0 => GL_WEIGHTED_AVERAGE_ARB,
+        1 => gl::MIN,
+        2 => gl::MAX,
+        _ => {
+            log::warn!("Invalid reduction filter: {}", filter);
+            GL_WEIGHTED_AVERAGE_ARB
+        }
+    }
+}
+
+/// Map a viewport swizzle to GL viewport swizzle (NV extension).
+///
+/// Corresponds to `OpenGL::MaxwellToGL::ViewportSwizzle()`.
+const GL_VIEWPORT_SWIZZLE_POSITIVE_X_NV: u32 = 0x9350;
+
+pub fn viewport_swizzle(swizzle: u32) -> u32 {
+    GL_VIEWPORT_SWIZZLE_POSITIVE_X_NV + swizzle
+}
+
+/// Map a logic operation to GL logic op.
+///
+/// Corresponds to `OpenGL::MaxwellToGL::LogicOp()`.
+pub fn logic_op(op: u32) -> u32 {
+    match op {
+        0x1500 => gl::CLEAR,
+        0x1501 => gl::AND,
+        0x1502 => gl::AND_REVERSE,
+        0x1503 => gl::COPY,
+        0x1504 => gl::AND_INVERTED,
+        0x1505 => gl::NOOP,
+        0x1506 => gl::XOR,
+        0x1507 => gl::OR,
+        0x1508 => gl::NOR,
+        0x1509 => gl::EQUIV,
+        0x150A => gl::INVERT,
+        0x150B => gl::OR_REVERSE,
+        0x150C => gl::COPY_INVERTED,
+        0x150D => gl::OR_INVERTED,
+        0x150E => gl::NAND,
+        0x150F => gl::SET,
+        _ => {
+            log::warn!("Unimplemented logic op: {:#x}", op);
+            gl::COPY
+        }
+    }
+}

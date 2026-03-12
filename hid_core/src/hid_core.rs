@@ -115,7 +115,16 @@ impl HIDCore {
 
     pub fn set_supported_style_tag(&mut self, style_tag: NpadStyleTag) {
         self.supported_style_tag.raw = style_tag.raw;
-        // TODO: propagate to all controllers via SetSupportedNpadStyleTag
+        self.player_1.set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_2.set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_3.set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_4.set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_5.set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_6.set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_7.set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_8.set_supported_npad_style_tag(self.supported_style_tag);
+        self.other.set_supported_npad_style_tag(self.supported_style_tag);
+        self.handheld.set_supported_npad_style_tag(self.supported_style_tag);
     }
 
     pub fn get_supported_style_tag(&self) -> NpadStyleTag {
@@ -165,23 +174,59 @@ impl HIDCore {
     }
 
     pub fn enable_all_controller_configuration(&mut self) {
-        // TODO: call EnableConfiguration on all controllers
-        todo!()
+        self.player_1.enable_configuration();
+        self.player_2.enable_configuration();
+        self.player_3.enable_configuration();
+        self.player_4.enable_configuration();
+        self.player_5.enable_configuration();
+        self.player_6.enable_configuration();
+        self.player_7.enable_configuration();
+        self.player_8.enable_configuration();
+        self.other.enable_configuration();
+        self.handheld.enable_configuration();
     }
 
     pub fn disable_all_controller_configuration(&mut self) {
-        // TODO: call DisableConfiguration on all controllers
-        todo!()
+        self.player_1.disable_configuration();
+        self.player_2.disable_configuration();
+        self.player_3.disable_configuration();
+        self.player_4.disable_configuration();
+        self.player_5.disable_configuration();
+        self.player_6.disable_configuration();
+        self.player_7.disable_configuration();
+        self.player_8.disable_configuration();
+        self.other.disable_configuration();
+        self.handheld.disable_configuration();
     }
 
     pub fn reload_input_devices(&mut self) {
-        // TODO: call ReloadFromSettings on all controllers, console, and devices
-        todo!()
+        self.player_1.reload_from_settings();
+        self.player_2.reload_from_settings();
+        self.player_3.reload_from_settings();
+        self.player_4.reload_from_settings();
+        self.player_5.reload_from_settings();
+        self.player_6.reload_from_settings();
+        self.player_7.reload_from_settings();
+        self.player_8.reload_from_settings();
+        self.other.reload_from_settings();
+        self.handheld.reload_from_settings();
+        self.console.reload_from_settings();
+        self.devices.reload_from_settings();
     }
 
     pub fn unload_input_devices(&mut self) {
-        // TODO: call UnloadInput on all controllers, console, and devices
-        todo!()
+        self.player_1.unload_input();
+        self.player_2.unload_input();
+        self.player_3.unload_input();
+        self.player_4.unload_input();
+        self.player_5.unload_input();
+        self.player_6.unload_input();
+        self.player_7.unload_input();
+        self.player_8.unload_input();
+        self.other.unload_input();
+        self.handheld.unload_input();
+        self.console.unload_input();
+        self.devices.unload_input();
     }
 }
 

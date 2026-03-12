@@ -9,6 +9,8 @@
 use super::image_info::ImageInfo;
 use super::image_view_info::ImageViewInfo;
 use super::types::*;
+use super::util;
+use crate::surface;
 
 // ── Type aliases matching upstream ─────────────────────────────────────
 
@@ -107,13 +109,24 @@ impl ImageBase {
     ///
     /// Port of `ImageBase::ImageBase(const ImageInfo&, GPUVAddr, VAddr)`.
     pub fn new(info: ImageInfo, gpu_addr: GPUVAddr, cpu_addr: VAddr) -> Self {
-        // TODO: call calculate_guest_size_in_bytes, calculate_unswizzled_size_bytes,
-        // calculate_converted_size_bytes, calculate_mip_level_offsets, etc.
-        let guest_size_bytes = 0_u32; // placeholder
+        let guest_size_bytes = util::calculate_guest_size_in_bytes(&info);
+        let unswizzled_size_bytes = util::calculate_unswizzled_size_bytes(&info);
+        let converted_size_bytes = util::calculate_converted_size_bytes(&info);
+        let mip_level_offsets = util::calculate_mip_level_offsets(&info);
+        let slice_offsets = if info.image_type == ImageType::E3D {
+            util::calculate_slice_offsets(&info)
+        } else {
+            Vec::new()
+        };
+        let slice_subresources = if info.image_type == ImageType::E3D {
+            util::calculate_slice_subresources(&info)
+        } else {
+            Vec::new()
+        };
         Self {
             guest_size_bytes,
-            unswizzled_size_bytes: 0,
-            converted_size_bytes: 0,
+            unswizzled_size_bytes,
+            converted_size_bytes,
             scale_rating: 0,
             scale_tick: 0,
             has_scaled: false,
@@ -124,19 +137,11 @@ impl ImageBase {
             cpu_addr_end: cpu_addr + guest_size_bytes as u64,
             modification_tick: 0,
             lru_index: usize::MAX,
-            mip_level_offsets: [0; MAX_MIP_LEVELS],
+            mip_level_offsets,
             image_view_infos: Vec::new(),
             image_view_ids: Vec::new(),
-            slice_offsets: if info.image_type == ImageType::E3D {
-                Vec::new() // TODO: calculate_slice_offsets
-            } else {
-                Vec::new()
-            },
-            slice_subresources: if info.image_type == ImageType::E3D {
-                Vec::new() // TODO: calculate_slice_subresources
-            } else {
-                Vec::new()
-            },
+            slice_offsets,
+            slice_subresources,
             aliased_images: Vec::new(),
             overlapping_images: Vec::new(),
             map_view_id: ImageMapId::default(),
@@ -337,16 +342,179 @@ fn layer_mip_offset(diff: i32, layer_stride: u32) -> (i32, i32) {
 
 // ── add_image_alias ────────────────────────────────────────────────────
 
+/// Validate subresource layers against image info.
+fn validate_layers(layers: &SubresourceLayers, info: &ImageInfo) -> bool {
+    layers.base_level < info.resources.levels
+        && layers.base_layer + layers.num_layers <= info.resources.layers
+}
+
+/// Validate a copy against source and destination image info.
+fn validate_copy(copy: &ImageCopy, dst: &ImageInfo, src: &ImageInfo) -> bool {
+    let src_size = util::mip_size(src.size, copy.src_subresource.base_level as u32);
+    let dst_size = util::mip_size(dst.size, copy.dst_subresource.base_level as u32);
+    if !validate_layers(&copy.src_subresource, src) {
+        return false;
+    }
+    if !validate_layers(&copy.dst_subresource, dst) {
+        return false;
+    }
+    if copy.src_offset.x as u32 + copy.extent.width > src_size.width
+        || copy.src_offset.y as u32 + copy.extent.height > src_size.height
+        || copy.src_offset.z as u32 + copy.extent.depth > src_size.depth
+    {
+        return false;
+    }
+    if copy.dst_offset.x as u32 + copy.extent.width > dst_size.width
+        || copy.dst_offset.y as u32 + copy.extent.height > dst_size.height
+        || copy.dst_offset.z as u32 + copy.extent.depth > dst_size.depth
+    {
+        return false;
+    }
+    true
+}
+
+fn div_ceil(a: u32, b: u32) -> u32 {
+    (a + b - 1) / b
+}
+
 /// Create bidirectional alias records between two images.
 ///
 /// Port of `VideoCommon::AddImageAlias`.
-/// TODO: Full implementation requires MipSize, FindSubresource,
-/// DefaultBlockWidth/Height, DivCeil, ValidateCopy helpers.
 pub fn add_image_alias(
-    _lhs: &mut ImageBase,
-    _rhs: &mut ImageBase,
-    _lhs_id: ImageId,
-    _rhs_id: ImageId,
+    lhs: &mut ImageBase,
+    rhs: &mut ImageBase,
+    lhs_id: ImageId,
+    rhs_id: ImageId,
 ) -> bool {
-    todo!("add_image_alias — needs MipSize, FindSubresource, block helpers")
+    let options = RelaxedOptions::SIZE | RelaxedOptions::FORMAT;
+    assert!(lhs.info.image_type == rhs.info.image_type);
+
+    let base = if lhs.info.image_type == ImageType::Linear {
+        Some(SubresourceBase { level: 0, layer: 0 })
+    } else {
+        // Relaxed formats as option, broken_views/bgr won't matter
+        util::find_subresource(&rhs.info, lhs, rhs.gpu_addr, options, false, true)
+    };
+
+    let base = match base {
+        Some(b) => b,
+        None => {
+            log::error!("Image alias should have been flipped");
+            return false;
+        }
+    };
+
+    let lhs_format = lhs.info.format;
+    let rhs_format = rhs.info.format;
+    let lhs_block = Extent2D {
+        width: surface::default_block_width(lhs_format),
+        height: surface::default_block_height(lhs_format),
+    };
+    let rhs_block = Extent2D {
+        width: surface::default_block_width(rhs_format),
+        height: surface::default_block_height(rhs_format),
+    };
+    let is_lhs_compressed = lhs_block.width > 1 || lhs_block.height > 1;
+    let is_rhs_compressed = rhs_block.width > 1 || rhs_block.height > 1;
+    let lhs_mips = lhs.info.resources.levels;
+    let rhs_mips = rhs.info.resources.levels;
+    let num_mips = (lhs_mips - base.level).min(rhs_mips);
+
+    let mut lhs_alias = AliasedImage {
+        id: rhs_id,
+        copies: Vec::with_capacity(num_mips as usize),
+    };
+    let mut rhs_alias = AliasedImage {
+        id: lhs_id,
+        copies: Vec::with_capacity(num_mips as usize),
+    };
+
+    for mip_level in 0..num_mips {
+        let mut lhs_size = util::mip_size(lhs.info.size, (base.level + mip_level) as u32);
+        let mut rhs_size = util::mip_size(rhs.info.size, mip_level as u32);
+        if is_lhs_compressed {
+            lhs_size.width = div_ceil(lhs_size.width, lhs_block.width);
+            lhs_size.height = div_ceil(lhs_size.height, lhs_block.height);
+        }
+        if is_rhs_compressed {
+            rhs_size.width = div_ceil(rhs_size.width, rhs_block.width);
+            rhs_size.height = div_ceil(rhs_size.height, rhs_block.height);
+        }
+        let copy_size = Extent3D {
+            width: lhs_size.width.min(rhs_size.width),
+            height: lhs_size.height.min(rhs_size.height),
+            depth: lhs_size.depth.min(rhs_size.depth),
+        };
+        if copy_size.width == 0 || copy_size.height == 0 {
+            log::warn!("Copy size is smaller than block size. Mip cannot be aliased.");
+            continue;
+        }
+        let is_lhs_3d = lhs.info.image_type == ImageType::E3D;
+        let is_rhs_3d = rhs.info.image_type == ImageType::E3D;
+        let lhs_offset = Offset3D { x: 0, y: 0, z: 0 };
+        let rhs_offset = Offset3D {
+            x: 0,
+            y: 0,
+            z: if is_rhs_3d { base.layer } else { 0 },
+        };
+        let lhs_layers = if is_lhs_3d {
+            1
+        } else {
+            lhs.info.resources.layers - base.layer
+        };
+        let rhs_layers = if is_rhs_3d {
+            1
+        } else {
+            rhs.info.resources.layers
+        };
+        let num_layers = lhs_layers.min(rhs_layers);
+
+        let lhs_subresource = SubresourceLayers {
+            base_level: mip_level,
+            base_layer: 0,
+            num_layers,
+        };
+        let rhs_subresource = SubresourceLayers {
+            base_level: base.level + mip_level,
+            base_layer: if is_rhs_3d { 0 } else { base.layer },
+            num_layers,
+        };
+
+        let to_lhs_copy = ImageCopy {
+            src_subresource: lhs_subresource,
+            dst_subresource: rhs_subresource,
+            src_offset: lhs_offset,
+            dst_offset: rhs_offset,
+            extent: copy_size,
+        };
+        let to_rhs_copy = ImageCopy {
+            src_subresource: rhs_subresource,
+            dst_subresource: lhs_subresource,
+            src_offset: rhs_offset,
+            dst_offset: lhs_offset,
+            extent: copy_size,
+        };
+
+        debug_assert!(
+            validate_copy(&to_lhs_copy, &lhs.info, &rhs.info),
+            "Invalid RHS to LHS copy"
+        );
+        debug_assert!(
+            validate_copy(&to_rhs_copy, &rhs.info, &lhs.info),
+            "Invalid LHS to RHS copy"
+        );
+
+        lhs_alias.copies.push(to_lhs_copy);
+        rhs_alias.copies.push(to_rhs_copy);
+    }
+
+    debug_assert!(lhs_alias.copies.is_empty() == rhs_alias.copies.is_empty());
+    if lhs_alias.copies.is_empty() {
+        return false;
+    }
+    lhs.aliased_images.push(lhs_alias);
+    rhs.aliased_images.push(rhs_alias);
+    lhs.flags.remove(ImageFlagBits::IS_RESCALABLE);
+    rhs.flags.remove(ImageFlagBits::IS_RESCALABLE);
+    true
 }

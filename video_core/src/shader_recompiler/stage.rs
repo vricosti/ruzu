@@ -43,6 +43,19 @@ impl Stage {
     }
 }
 
+impl From<super::ir::types::ShaderStage> for Stage {
+    fn from(stage: super::ir::types::ShaderStage) -> Self {
+        match stage {
+            super::ir::types::ShaderStage::Vertex => Stage::VertexB,
+            super::ir::types::ShaderStage::TessellationControl => Stage::TessellationControl,
+            super::ir::types::ShaderStage::TessellationEval => Stage::TessellationEval,
+            super::ir::types::ShaderStage::Geometry => Stage::Geometry,
+            super::ir::types::ShaderStage::Fragment => Stage::Fragment,
+            super::ir::types::ShaderStage::Compute => Stage::Compute,
+        }
+    }
+}
+
 impl fmt::Display for Stage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

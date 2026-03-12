@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of `present/util.h` / `present/util.cpp`.
 //!
@@ -10,186 +10,793 @@
 
 use ash::vk;
 
-/// Port of `CreateWrappedBuffer`.
-pub fn create_wrapped_buffer(
-    _size: vk::DeviceSize,
-    _usage: u32,
-) -> vk::Buffer {
-    todo!("create_wrapped_buffer")
-}
+// ---------------------------------------------------------------------------
+// Buffer / Image creation
+// ---------------------------------------------------------------------------
 
 /// Port of `CreateWrappedImage`.
+///
+/// Creates a 2D image suitable for presentation (transfer dst + storage +
+/// sampled + color attachment).
 pub fn create_wrapped_image(
-    _dimensions: vk::Extent2D,
-    _format: vk::Format,
+    device: &ash::Device,
+    allocator: &vk::DeviceMemory, // placeholder — real impl needs MemoryAllocator
+    dimensions: vk::Extent2D,
+    format: vk::Format,
 ) -> vk::Image {
-    todo!("create_wrapped_image")
+    let image_ci = vk::ImageCreateInfo::builder()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width: dimensions.width,
+            height: dimensions.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(
+            vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .build();
+
+    unsafe { device.create_image(&image_ci, None).expect("Failed to create wrapped image") }
 }
 
 /// Port of `TransitionImageLayout`.
+///
+/// Inserts a pipeline barrier to transition `image` from `source_layout` to
+/// `target_layout` using ALL_COMMANDS stages.
 pub fn transition_image_layout(
-    _cmdbuf: vk::CommandBuffer,
-    _image: vk::Image,
-    _target_layout: vk::ImageLayout,
-    _source_layout: vk::ImageLayout,
+    device: &ash::Device,
+    cmdbuf: vk::CommandBuffer,
+    image: vk::Image,
+    target_layout: vk::ImageLayout,
+    source_layout: vk::ImageLayout,
 ) {
-    todo!("transition_image_layout")
-}
+    let flags = vk::AccessFlags::COLOR_ATTACHMENT_READ
+        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+        | vk::AccessFlags::SHADER_READ;
 
-/// Port of `UploadImage`.
-pub fn upload_image(
-    _image: vk::Image,
-    _dimensions: vk::Extent2D,
-    _format: vk::Format,
-    _initial_contents: &[u8],
-) {
-    todo!("upload_image")
+    let barrier = vk::ImageMemoryBarrier::builder()
+        .src_access_mask(flags)
+        .dst_access_mask(flags)
+        .old_layout(source_layout)
+        .new_layout(target_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .build();
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmdbuf,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+    }
 }
 
 /// Port of `DownloadColorImage`.
+///
+/// Transitions the image to TRANSFER_SRC_OPTIMAL, copies to buffer, then
+/// transitions back to GENERAL.
 pub fn download_color_image(
-    _cmdbuf: vk::CommandBuffer,
-    _image: vk::Image,
-    _buffer: vk::Buffer,
-    _extent: vk::Extent3D,
+    device: &ash::Device,
+    cmdbuf: vk::CommandBuffer,
+    image: vk::Image,
+    buffer: vk::Buffer,
+    extent: vk::Extent3D,
 ) {
-    todo!("download_color_image")
+    let read_barrier = vk::ImageMemoryBarrier::builder()
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::GENERAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: vk::REMAINING_MIP_LEVELS,
+            base_array_layer: 0,
+            layer_count: vk::REMAINING_ARRAY_LAYERS,
+        })
+        .build();
+
+    let image_write_barrier = vk::ImageMemoryBarrier::builder()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: vk::REMAINING_MIP_LEVELS,
+            base_array_layer: 0,
+            layer_count: vk::REMAINING_ARRAY_LAYERS,
+        })
+        .build();
+
+    let memory_write_barrier = vk::MemoryBarrier::builder()
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .build();
+
+    let copy = vk::BufferImageCopy::builder()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+        .image_extent(extent)
+        .build();
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmdbuf,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[read_barrier],
+        );
+
+        device.cmd_copy_image_to_buffer(
+            cmdbuf,
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer,
+            &[copy],
+        );
+
+        device.cmd_pipeline_barrier(
+            cmdbuf,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[memory_write_barrier],
+            &[],
+            &[image_write_barrier],
+        );
+    }
 }
 
 /// Port of `ClearColorImage`.
+///
+/// Transitions image to GENERAL from UNDEFINED, then clears it.
 pub fn clear_color_image(
-    _cmdbuf: vk::CommandBuffer,
-    _image: vk::Image,
+    device: &ash::Device,
+    cmdbuf: vk::CommandBuffer,
+    image: vk::Image,
 ) {
-    todo!("clear_color_image")
+    transition_image_layout(
+        device,
+        cmdbuf,
+        image,
+        vk::ImageLayout::GENERAL,
+        vk::ImageLayout::UNDEFINED,
+    );
+
+    let subresource_range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+
+    let clear_value = vk::ClearColorValue {
+        float32: [0.0, 0.0, 0.0, 0.0],
+    };
+
+    unsafe {
+        device.cmd_clear_color_image(
+            cmdbuf,
+            image,
+            vk::ImageLayout::GENERAL,
+            &clear_value,
+            &[subresource_range],
+        );
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Image view / Render pass / Framebuffer creation
+// ---------------------------------------------------------------------------
 
 /// Port of `CreateWrappedImageView`.
 pub fn create_wrapped_image_view(
-    _image: vk::Image,
-    _format: vk::Format,
+    device: &ash::Device,
+    image: vk::Image,
+    format: vk::Format,
 ) -> vk::ImageView {
-    todo!("create_wrapped_image_view")
+    let view_ci = vk::ImageViewCreateInfo::builder()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .components(vk::ComponentMapping::default())
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .build();
+
+    unsafe {
+        device
+            .create_image_view(&view_ci, None)
+            .expect("Failed to create wrapped image view")
+    }
 }
 
 /// Port of `CreateWrappedRenderPass`.
 pub fn create_wrapped_render_pass(
-    _format: vk::Format,
-    _initial_layout: vk::ImageLayout,
+    device: &ash::Device,
+    format: vk::Format,
+    initial_layout: vk::ImageLayout,
 ) -> vk::RenderPass {
-    todo!("create_wrapped_render_pass")
+    let load_op = if initial_layout == vk::ImageLayout::UNDEFINED {
+        vk::AttachmentLoadOp::DONT_CARE
+    } else {
+        vk::AttachmentLoadOp::LOAD
+    };
+
+    let attachment = vk::AttachmentDescription {
+        flags: vk::AttachmentDescriptionFlags::MAY_ALIAS,
+        format,
+        samples: vk::SampleCountFlags::TYPE_1,
+        load_op,
+        store_op: vk::AttachmentStoreOp::STORE,
+        stencil_load_op: vk::AttachmentLoadOp::LOAD,
+        stencil_store_op: vk::AttachmentStoreOp::STORE,
+        initial_layout,
+        final_layout: vk::ImageLayout::GENERAL,
+    };
+
+    let color_attachment_ref = vk::AttachmentReference {
+        attachment: 0,
+        layout: vk::ImageLayout::GENERAL,
+    };
+
+    let subpass = vk::SubpassDescription::builder()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(std::slice::from_ref(&color_attachment_ref))
+        .build();
+
+    let dependency = vk::SubpassDependency {
+        src_subpass: vk::SUBPASS_EXTERNAL,
+        dst_subpass: 0,
+        src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        src_access_mask: vk::AccessFlags::empty(),
+        dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_READ
+            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        dependency_flags: vk::DependencyFlags::empty(),
+    };
+
+    let render_pass_ci = vk::RenderPassCreateInfo::builder()
+        .attachments(std::slice::from_ref(&attachment))
+        .subpasses(std::slice::from_ref(&subpass))
+        .dependencies(std::slice::from_ref(&dependency))
+        .build();
+
+    unsafe {
+        device
+            .create_render_pass(&render_pass_ci, None)
+            .expect("Failed to create wrapped render pass")
+    }
 }
 
 /// Port of `CreateWrappedFramebuffer`.
 pub fn create_wrapped_framebuffer(
-    _render_pass: vk::RenderPass,
-    _dest_image: vk::ImageView,
-    _extent: vk::Extent2D,
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    dest_image_view: vk::ImageView,
+    extent: vk::Extent2D,
 ) -> vk::Framebuffer {
-    todo!("create_wrapped_framebuffer")
+    let attachments = [dest_image_view];
+    let framebuffer_ci = vk::FramebufferCreateInfo::builder()
+        .render_pass(render_pass)
+        .attachments(&attachments)
+        .width(extent.width)
+        .height(extent.height)
+        .layers(1)
+        .build();
+
+    unsafe {
+        device
+            .create_framebuffer(&framebuffer_ci, None)
+            .expect("Failed to create wrapped framebuffer")
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Sampler creation
+// ---------------------------------------------------------------------------
 
 /// Port of `CreateWrappedSampler`.
 pub fn create_wrapped_sampler(
-    _filter: vk::Filter,
+    device: &ash::Device,
+    filter: vk::Filter,
 ) -> vk::Sampler {
-    todo!("create_wrapped_sampler")
+    let sampler_ci = vk::SamplerCreateInfo::builder()
+        .mag_filter(filter)
+        .min_filter(filter)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .mip_lod_bias(0.0)
+        .anisotropy_enable(false)
+        .max_anisotropy(0.0)
+        .compare_enable(false)
+        .compare_op(vk::CompareOp::NEVER)
+        .min_lod(0.0)
+        .max_lod(0.0)
+        .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
+        .unnormalized_coordinates(false)
+        .build();
+
+    unsafe {
+        device
+            .create_sampler(&sampler_ci, None)
+            .expect("Failed to create wrapped sampler")
+    }
 }
+
+/// Port of `CreateBilinearSampler`.
+pub fn create_bilinear_sampler(device: &ash::Device) -> vk::Sampler {
+    let sampler_ci = vk::SamplerCreateInfo::builder()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .mip_lod_bias(0.0)
+        .anisotropy_enable(false)
+        .max_anisotropy(0.0)
+        .compare_enable(false)
+        .compare_op(vk::CompareOp::NEVER)
+        .min_lod(0.0)
+        .max_lod(0.0)
+        .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
+        .unnormalized_coordinates(false)
+        .build();
+
+    unsafe {
+        device
+            .create_sampler(&sampler_ci, None)
+            .expect("Failed to create bilinear sampler")
+    }
+}
+
+/// Port of `CreateNearestNeighborSampler`.
+pub fn create_nearest_neighbor_sampler(device: &ash::Device) -> vk::Sampler {
+    let sampler_ci = vk::SamplerCreateInfo::builder()
+        .mag_filter(vk::Filter::NEAREST)
+        .min_filter(vk::Filter::NEAREST)
+        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .mip_lod_bias(0.0)
+        .anisotropy_enable(false)
+        .max_anisotropy(0.0)
+        .compare_enable(false)
+        .compare_op(vk::CompareOp::NEVER)
+        .min_lod(0.0)
+        .max_lod(0.0)
+        .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
+        .unnormalized_coordinates(false)
+        .build();
+
+    unsafe {
+        device
+            .create_sampler(&sampler_ci, None)
+            .expect("Failed to create nearest neighbor sampler")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shader module creation
+// ---------------------------------------------------------------------------
 
 /// Port of `CreateWrappedShaderModule`.
 pub fn create_wrapped_shader_module(
-    _code: &[u32],
+    device: &ash::Device,
+    code: &[u32],
 ) -> vk::ShaderModule {
-    todo!("create_wrapped_shader_module")
+    let shader_ci = vk::ShaderModuleCreateInfo::builder()
+        .code(code)
+        .build();
+
+    unsafe {
+        device
+            .create_shader_module(&shader_ci, None)
+            .expect("Failed to create wrapped shader module")
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Descriptor pool / set / layout creation
+// ---------------------------------------------------------------------------
 
 /// Port of `CreateWrappedDescriptorPool`.
 pub fn create_wrapped_descriptor_pool(
-    _max_descriptors: usize,
-    _max_sets: usize,
-    _types: &[vk::DescriptorType],
+    device: &ash::Device,
+    max_descriptors: u32,
+    max_sets: u32,
+    types: &[vk::DescriptorType],
 ) -> vk::DescriptorPool {
-    todo!("create_wrapped_descriptor_pool")
+    let pool_sizes: Vec<vk::DescriptorPoolSize> = types
+        .iter()
+        .map(|&ty| vk::DescriptorPoolSize {
+            ty,
+            descriptor_count: max_descriptors,
+        })
+        .collect();
+
+    let effective_pool_sizes = if pool_sizes.is_empty() {
+        vec![vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: max_descriptors,
+        }]
+    } else {
+        pool_sizes
+    };
+
+    let pool_ci = vk::DescriptorPoolCreateInfo::builder()
+        .max_sets(max_sets)
+        .pool_sizes(&effective_pool_sizes)
+        .build();
+
+    unsafe {
+        device
+            .create_descriptor_pool(&pool_ci, None)
+            .expect("Failed to create wrapped descriptor pool")
+    }
 }
 
 /// Port of `CreateWrappedDescriptorSetLayout`.
 pub fn create_wrapped_descriptor_set_layout(
-    _types: &[vk::DescriptorType],
+    device: &ash::Device,
+    types: &[vk::DescriptorType],
 ) -> vk::DescriptorSetLayout {
-    todo!("create_wrapped_descriptor_set_layout")
+    let bindings: Vec<vk::DescriptorSetLayoutBinding> = types
+        .iter()
+        .enumerate()
+        .map(|(i, &ty)| vk::DescriptorSetLayoutBinding {
+            binding: i as u32,
+            descriptor_type: ty,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            p_immutable_samplers: std::ptr::null(),
+        })
+        .collect();
+
+    let layout_ci = vk::DescriptorSetLayoutCreateInfo::builder()
+        .bindings(&bindings)
+        .build();
+
+    unsafe {
+        device
+            .create_descriptor_set_layout(&layout_ci, None)
+            .expect("Failed to create wrapped descriptor set layout")
+    }
 }
 
 /// Port of `CreateWrappedDescriptorSets`.
 pub fn create_wrapped_descriptor_sets(
-    _pool: vk::DescriptorPool,
-    _layouts: &[vk::DescriptorSetLayout],
+    device: &ash::Device,
+    pool: vk::DescriptorPool,
+    layouts: &[vk::DescriptorSetLayout],
 ) -> Vec<vk::DescriptorSet> {
-    todo!("create_wrapped_descriptor_sets")
+    let alloc_info = vk::DescriptorSetAllocateInfo::builder()
+        .descriptor_pool(pool)
+        .set_layouts(layouts)
+        .build();
+
+    unsafe {
+        device
+            .allocate_descriptor_sets(&alloc_info)
+            .expect("Failed to create wrapped descriptor sets")
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Pipeline layout creation
+// ---------------------------------------------------------------------------
 
 /// Port of `CreateWrappedPipelineLayout`.
 pub fn create_wrapped_pipeline_layout(
-    _layout: vk::DescriptorSetLayout,
+    device: &ash::Device,
+    layout: vk::DescriptorSetLayout,
 ) -> vk::PipelineLayout {
-    todo!("create_wrapped_pipeline_layout")
+    let layouts = [layout];
+    let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::builder()
+        .set_layouts(&layouts)
+        .build();
+
+    unsafe {
+        device
+            .create_pipeline_layout(&pipeline_layout_ci, None)
+            .expect("Failed to create wrapped pipeline layout")
+    }
 }
 
-/// Port of `CreateWrappedPipeline`.
-pub fn create_wrapped_pipeline(
-    _renderpass: vk::RenderPass,
-    _layout: vk::PipelineLayout,
-    _vert_shader: vk::ShaderModule,
-    _frag_shader: vk::ShaderModule,
+// ---------------------------------------------------------------------------
+// Pipeline creation helpers (internal)
+// ---------------------------------------------------------------------------
+
+/// Internal helper: creates a graphics pipeline with the given blending state.
+///
+/// Port of the file-static `CreateWrappedPipelineImpl`.
+fn create_wrapped_pipeline_impl(
+    device: &ash::Device,
+    renderpass: vk::RenderPass,
+    layout: vk::PipelineLayout,
+    vert_shader: vk::ShaderModule,
+    frag_shader: vk::ShaderModule,
+    blending: vk::PipelineColorBlendAttachmentState,
 ) -> vk::Pipeline {
-    todo!("create_wrapped_pipeline")
+    let main_name = std::ffi::CString::new("main").unwrap();
+
+    let shader_stages = [
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_shader)
+            .name(&main_name)
+            .build(),
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_shader)
+            .name(&main_name)
+            .build(),
+    ];
+
+    let vertex_input_ci = vk::PipelineVertexInputStateCreateInfo::builder().build();
+
+    let input_assembly_ci = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        .topology(vk::PrimitiveTopology::TRIANGLE_STRIP)
+        .primitive_restart_enable(false)
+        .build();
+
+    let viewport_state_ci = vk::PipelineViewportStateCreateInfo::builder()
+        .viewport_count(1)
+        .scissor_count(1)
+        .build();
+
+    let rasterization_ci = vk::PipelineRasterizationStateCreateInfo::builder()
+        .depth_clamp_enable(false)
+        .rasterizer_discard_enable(false)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .depth_bias_enable(false)
+        .line_width(1.0)
+        .build();
+
+    let multisampling_ci = vk::PipelineMultisampleStateCreateInfo::builder()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+        .sample_shading_enable(false)
+        .min_sample_shading(0.0)
+        .build();
+
+    let blend_attachments = [blending];
+    let color_blend_ci = vk::PipelineColorBlendStateCreateInfo::builder()
+        .logic_op_enable(false)
+        .logic_op(vk::LogicOp::COPY)
+        .attachments(&blend_attachments)
+        .blend_constants([0.0, 0.0, 0.0, 0.0])
+        .build();
+
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state_ci = vk::PipelineDynamicStateCreateInfo::builder()
+        .dynamic_states(&dynamic_states)
+        .build();
+
+    let pipeline_ci = vk::GraphicsPipelineCreateInfo::builder()
+        .stages(&shader_stages)
+        .vertex_input_state(&vertex_input_ci)
+        .input_assembly_state(&input_assembly_ci)
+        .viewport_state(&viewport_state_ci)
+        .rasterization_state(&rasterization_ci)
+        .multisample_state(&multisampling_ci)
+        .color_blend_state(&color_blend_ci)
+        .dynamic_state(&dynamic_state_ci)
+        .layout(layout)
+        .render_pass(renderpass)
+        .subpass(0)
+        .build();
+
+    let pipelines = unsafe {
+        device
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
+            .expect("Failed to create wrapped pipeline")
+    };
+    pipelines[0]
+}
+
+/// Port of `CreateWrappedPipeline` — no blending.
+pub fn create_wrapped_pipeline(
+    device: &ash::Device,
+    renderpass: vk::RenderPass,
+    layout: vk::PipelineLayout,
+    vert_shader: vk::ShaderModule,
+    frag_shader: vk::ShaderModule,
+) -> vk::Pipeline {
+    let blending = vk::PipelineColorBlendAttachmentState {
+        blend_enable: vk::FALSE,
+        src_color_blend_factor: vk::BlendFactor::ZERO,
+        dst_color_blend_factor: vk::BlendFactor::ZERO,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::ZERO,
+        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+        alpha_blend_op: vk::BlendOp::ADD,
+        color_write_mask: vk::ColorComponentFlags::R
+            | vk::ColorComponentFlags::G
+            | vk::ColorComponentFlags::B
+            | vk::ColorComponentFlags::A,
+    };
+    create_wrapped_pipeline_impl(device, renderpass, layout, vert_shader, frag_shader, blending)
 }
 
 /// Port of `CreateWrappedPremultipliedBlendingPipeline`.
 pub fn create_wrapped_premultiplied_blending_pipeline(
-    _renderpass: vk::RenderPass,
-    _layout: vk::PipelineLayout,
-    _vert_shader: vk::ShaderModule,
-    _frag_shader: vk::ShaderModule,
+    device: &ash::Device,
+    renderpass: vk::RenderPass,
+    layout: vk::PipelineLayout,
+    vert_shader: vk::ShaderModule,
+    frag_shader: vk::ShaderModule,
 ) -> vk::Pipeline {
-    todo!("create_wrapped_premultiplied_blending_pipeline")
+    let blending = vk::PipelineColorBlendAttachmentState {
+        blend_enable: vk::TRUE,
+        src_color_blend_factor: vk::BlendFactor::ONE,
+        dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::ONE,
+        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+        alpha_blend_op: vk::BlendOp::ADD,
+        color_write_mask: vk::ColorComponentFlags::R
+            | vk::ColorComponentFlags::G
+            | vk::ColorComponentFlags::B
+            | vk::ColorComponentFlags::A,
+    };
+    create_wrapped_pipeline_impl(device, renderpass, layout, vert_shader, frag_shader, blending)
 }
 
 /// Port of `CreateWrappedCoverageBlendingPipeline`.
 pub fn create_wrapped_coverage_blending_pipeline(
-    _renderpass: vk::RenderPass,
-    _layout: vk::PipelineLayout,
-    _vert_shader: vk::ShaderModule,
-    _frag_shader: vk::ShaderModule,
+    device: &ash::Device,
+    renderpass: vk::RenderPass,
+    layout: vk::PipelineLayout,
+    vert_shader: vk::ShaderModule,
+    frag_shader: vk::ShaderModule,
 ) -> vk::Pipeline {
-    todo!("create_wrapped_coverage_blending_pipeline")
+    let blending = vk::PipelineColorBlendAttachmentState {
+        blend_enable: vk::TRUE,
+        src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
+        dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::ONE,
+        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+        alpha_blend_op: vk::BlendOp::ADD,
+        color_write_mask: vk::ColorComponentFlags::R
+            | vk::ColorComponentFlags::G
+            | vk::ColorComponentFlags::B
+            | vk::ColorComponentFlags::A,
+    };
+    create_wrapped_pipeline_impl(device, renderpass, layout, vert_shader, frag_shader, blending)
 }
+
+// ---------------------------------------------------------------------------
+// Descriptor set write helper
+// ---------------------------------------------------------------------------
 
 /// Port of `CreateWriteDescriptorSet`.
-pub fn create_write_descriptor_set(
-    _sampler: vk::Sampler,
-    _view: vk::ImageView,
-    _set: vk::DescriptorSet,
-    _binding: u32,
+///
+/// Pushes a new `VkDescriptorImageInfo` into `images` and returns a
+/// `VkWriteDescriptorSet` pointing at it. The caller must keep `images` alive
+/// until after `vkUpdateDescriptorSets`.
+pub fn create_write_descriptor_set<'a>(
+    images: &'a mut Vec<vk::DescriptorImageInfo>,
+    sampler: vk::Sampler,
+    view: vk::ImageView,
+    set: vk::DescriptorSet,
+    binding: u32,
 ) -> vk::WriteDescriptorSet {
-    todo!("create_write_descriptor_set")
+    images.push(vk::DescriptorImageInfo {
+        sampler,
+        image_view: view,
+        image_layout: vk::ImageLayout::GENERAL,
+    });
+    let last = images.last().unwrap();
+    vk::WriteDescriptorSet {
+        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+        p_next: std::ptr::null(),
+        dst_set: set,
+        dst_binding: binding,
+        dst_array_element: 0,
+        descriptor_count: 1,
+        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        p_image_info: last as *const _,
+        p_buffer_info: std::ptr::null(),
+        p_texel_buffer_view: std::ptr::null(),
+    }
 }
 
-/// Port of `CreateBilinearSampler`.
-pub fn create_bilinear_sampler() -> vk::Sampler {
-    todo!("create_bilinear_sampler")
-}
-
-/// Port of `CreateNearestNeighborSampler`.
-pub fn create_nearest_neighbor_sampler() -> vk::Sampler {
-    todo!("create_nearest_neighbor_sampler")
-}
+// ---------------------------------------------------------------------------
+// Render pass begin helper
+// ---------------------------------------------------------------------------
 
 /// Port of `BeginRenderPass`.
+///
+/// Begins a render pass and sets the viewport and scissor to cover the full
+/// extent.
 pub fn begin_render_pass(
-    _cmdbuf: vk::CommandBuffer,
-    _render_pass: vk::RenderPass,
-    _framebuffer: vk::Framebuffer,
-    _extent: vk::Extent2D,
+    device: &ash::Device,
+    cmdbuf: vk::CommandBuffer,
+    render_pass: vk::RenderPass,
+    framebuffer: vk::Framebuffer,
+    extent: vk::Extent2D,
 ) {
-    todo!("begin_render_pass")
+    let renderpass_bi = vk::RenderPassBeginInfo::builder()
+        .render_pass(render_pass)
+        .framebuffer(framebuffer)
+        .render_area(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        })
+        .build();
+
+    let viewport = vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: extent.width as f32,
+        height: extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+
+    let scissor = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent,
+    };
+
+    unsafe {
+        device.cmd_begin_render_pass(cmdbuf, &renderpass_bi, vk::SubpassContents::INLINE);
+        device.cmd_set_viewport(cmdbuf, 0, &[viewport]);
+        device.cmd_set_scissor(cmdbuf, 0, &[scissor]);
+    }
 }

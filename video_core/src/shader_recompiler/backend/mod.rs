@@ -7,6 +7,8 @@
 //! `Profile` and returns a `Vec<u32>` of SPIR-V words.
 
 pub mod bindings;
+pub mod glasm;
+pub mod glsl;
 pub mod spirv_context;
 pub mod emit_atomic;
 pub mod emit_barriers;

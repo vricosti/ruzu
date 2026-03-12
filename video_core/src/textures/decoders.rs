@@ -273,46 +273,173 @@ pub fn swizzle_texture(
     );
 }
 
+/// Core subrect swizzle/unswizzle implementation for a given bytes-per-pixel.
+///
+/// Port of `SwizzleSubrectImpl<TO_LINEAR, BYTES_PER_PIXEL>` from `decoders.cpp`.
+fn swizzle_subrect_impl(
+    output: &mut [u8],
+    input: &[u8],
+    bytes_per_pixel: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    origin_x: u32,
+    origin_y: u32,
+    extent_x: u32,
+    num_lines: u32,
+    block_height: u32,
+    block_depth: u32,
+    pitch_linear: u32,
+    to_linear: bool,
+) {
+    let origin_z: u32 = 0;
+    let pitch = pitch_linear;
+    let stride = align_up_log2(width * bytes_per_pixel, GOB_SIZE_X_SHIFT);
+
+    let gobs_in_x = div_ceil_log2(stride, GOB_SIZE_X_SHIFT);
+    let block_size = gobs_in_x << (GOB_SIZE_SHIFT + block_height + block_depth);
+    let slice_size = div_ceil_log2(height, block_height + GOB_SIZE_Y_SHIFT) * block_size;
+
+    let block_height_mask = (1u32 << block_height) - 1;
+    let block_depth_mask = (1u32 << block_depth) - 1;
+    let x_shift = GOB_SIZE_SHIFT + block_height + block_depth;
+
+    let swizzled_incr = pdep(SWIZZLE_X_BITS, bytes_per_pixel);
+
+    let mut unprocessed_lines = num_lines;
+    let extent_y = std::cmp::min(num_lines, height - origin_y);
+
+    for slice in 0..depth {
+        let z = slice + origin_z;
+        let offset_z = (z >> block_depth) * slice_size
+            + ((z & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
+        let lines_in_y = std::cmp::min(unprocessed_lines, extent_y);
+
+        for line in 0..lines_in_y {
+            let y = line + origin_y;
+            let swizzled_y = pdep(SWIZZLE_Y_BITS, y);
+            let block_y = y >> GOB_SIZE_Y_SHIFT;
+            let offset_y = (block_y >> block_height) * block_size
+                + ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
+
+            let mut swizzled_x = pdep(SWIZZLE_X_BITS, origin_x * bytes_per_pixel);
+
+            for column in 0..extent_x {
+                let x = (column + origin_x) * bytes_per_pixel;
+                let offset_x = (x >> GOB_SIZE_X_SHIFT) << x_shift;
+
+                let base_swizzled_offset = offset_z + offset_y + offset_x;
+                let swizzled_offset = (base_swizzled_offset + (swizzled_x | swizzled_y)) as usize;
+                let unswizzled_offset =
+                    (slice * pitch * height + line * pitch + column * bytes_per_pixel) as usize;
+
+                let bpp = bytes_per_pixel as usize;
+                if to_linear {
+                    if swizzled_offset + bpp <= output.len()
+                        && unswizzled_offset + bpp <= input.len()
+                    {
+                        output[swizzled_offset..swizzled_offset + bpp]
+                            .copy_from_slice(&input[unswizzled_offset..unswizzled_offset + bpp]);
+                    }
+                } else {
+                    if unswizzled_offset + bpp <= output.len()
+                        && swizzled_offset + bpp <= input.len()
+                    {
+                        output[unswizzled_offset..unswizzled_offset + bpp]
+                            .copy_from_slice(&input[swizzled_offset..swizzled_offset + bpp]);
+                    }
+                }
+
+                incrpdep(&mut swizzled_x, SWIZZLE_X_BITS, swizzled_incr);
+            }
+        }
+        unprocessed_lines -= lines_in_y;
+        if unprocessed_lines == 0 {
+            return;
+        }
+    }
+}
+
 /// Copies an untiled subrectangle into a tiled surface.
 ///
 /// Port of `Tegra::Texture::SwizzleSubrect`.
 pub fn swizzle_subrect(
-    _output: &mut [u8],
-    _input: &[u8],
-    _bytes_per_pixel: u32,
-    _width: u32,
-    _height: u32,
-    _depth: u32,
-    _origin_x: u32,
-    _origin_y: u32,
-    _extent_x: u32,
-    _extent_y: u32,
-    _block_height: u32,
-    _block_depth: u32,
-    _pitch_linear: u32,
+    output: &mut [u8],
+    input: &[u8],
+    bytes_per_pixel: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    origin_x: u32,
+    origin_y: u32,
+    extent_x: u32,
+    extent_y: u32,
+    block_height: u32,
+    block_depth: u32,
+    pitch_linear: u32,
 ) {
-    todo!("SwizzleSubrect not yet implemented")
+    match bytes_per_pixel {
+        1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 => {
+            swizzle_subrect_impl(
+                output,
+                input,
+                bytes_per_pixel,
+                width,
+                height,
+                depth,
+                origin_x,
+                origin_y,
+                extent_x,
+                extent_y,
+                block_height,
+                block_depth,
+                pitch_linear,
+                true,
+            );
+        }
+        _ => panic!("Invalid bytes_per_pixel={}", bytes_per_pixel),
+    }
 }
 
 /// Copies a tiled subrectangle into a linear surface.
 ///
 /// Port of `Tegra::Texture::UnswizzleSubrect`.
 pub fn unswizzle_subrect(
-    _output: &mut [u8],
-    _input: &[u8],
-    _bytes_per_pixel: u32,
-    _width: u32,
-    _height: u32,
-    _depth: u32,
-    _origin_x: u32,
-    _origin_y: u32,
-    _extent_x: u32,
-    _extent_y: u32,
-    _block_height: u32,
-    _block_depth: u32,
-    _pitch_linear: u32,
+    output: &mut [u8],
+    input: &[u8],
+    bytes_per_pixel: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    origin_x: u32,
+    origin_y: u32,
+    extent_x: u32,
+    extent_y: u32,
+    block_height: u32,
+    block_depth: u32,
+    pitch_linear: u32,
 ) {
-    todo!("UnswizzleSubrect not yet implemented")
+    match bytes_per_pixel {
+        1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 => {
+            swizzle_subrect_impl(
+                output,
+                input,
+                bytes_per_pixel,
+                width,
+                height,
+                depth,
+                origin_x,
+                origin_y,
+                extent_x,
+                extent_y,
+                block_height,
+                block_depth,
+                pitch_linear,
+                false,
+            );
+        }
+        _ => panic!("Invalid bytes_per_pixel={}", bytes_per_pixel),
+    }
 }
 
 /// Calculates the correct size of a texture depending on whether it's tiled or not.
@@ -401,5 +528,32 @@ mod tests {
         assert_eq!(pdep(0b1111, 0b1010), 0b1010);
         // pdep with mask 0b10101 and value 0b111 = deposit bits at positions 0, 2, 4
         assert_eq!(pdep(0b10101, 0b111), 0b10101);
+    }
+
+    #[test]
+    fn swizzle_subrect_does_not_panic() {
+        // Basic smoke test: swizzle a small subrect
+        let mut output = vec![0u8; 4096];
+        let input = vec![0xABu8; 256];
+        // 16x16 surface, 1 bpp, subrect at (0,0) extent 4x4
+        swizzle_subrect(
+            &mut output, &input, 1, 16, 16, 1, 0, 0, 4, 4, 0, 0, 4,
+        );
+    }
+
+    #[test]
+    fn unswizzle_subrect_does_not_panic() {
+        let mut output = vec![0u8; 256];
+        let input = vec![0xCDu8; 4096];
+        unswizzle_subrect(
+            &mut output, &input, 1, 16, 16, 1, 0, 0, 4, 4, 0, 0, 4,
+        );
+    }
+
+    #[test]
+    fn get_gob_offset_basic() {
+        // For a simple case with block_height=0, the offset should be deterministic
+        let offset = get_gob_offset(64, 8, 0, 0, 0, 4);
+        assert_eq!(offset, 0);
     }
 }

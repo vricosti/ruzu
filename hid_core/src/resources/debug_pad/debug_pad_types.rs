@@ -17,6 +17,13 @@ impl DebugPadAttribute {
     pub fn connected(&self) -> bool {
         (self.raw & (1 << 0)) != 0
     }
+    pub fn set_connected(&mut self, val: bool) {
+        if val {
+            self.raw |= 1 << 0;
+        } else {
+            self.raw &= !(1 << 0);
+        }
+    }
 }
 
 /// This is nn::hid::DebugPadState

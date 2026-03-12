@@ -7,7 +7,7 @@ use crate::hle::result::{ErrorModule, ResultCode};
 
 pub const RESULT_NO_FREE_COMMUNICATION: ResultCode =
     ResultCode::from_module_description(ErrorModule::PCTL, 101);
-pub const RESULT_STEREO_VISION_RESTRICTION_CONFIGURED: ResultCode =
+pub const RESULT_STEREO_VISION_RESTRICTED: ResultCode =
     ResultCode::from_module_description(ErrorModule::PCTL, 104);
 pub const RESULT_NO_CAPABILITY: ResultCode =
     ResultCode::from_module_description(ErrorModule::PCTL, 131);

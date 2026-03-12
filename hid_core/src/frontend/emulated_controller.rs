@@ -110,11 +110,16 @@ pub struct EmulatedController {
     last_callback_key: i32,
 
     // Stores the current status of all controller input
+    home_button_state: HomeButtonState,
+    capture_button_state: CaptureButtonState,
     npad_button_state: NpadButtonState,
+    debug_pad_button_state: DebugPadButton,
     analog_stick_state: AnalogSticks,
     motion_state: MotionState,
+    gc_trigger_state: NpadGcTriggerState,
     colors_state: ControllerColors,
     battery_state: BatteryLevelState,
+    ring_analog_state: RingSensorForce,
 }
 
 impl EmulatedController {
@@ -140,11 +145,16 @@ impl EmulatedController {
             callback_mutex: Mutex::new(()),
             callback_list: HashMap::new(),
             last_callback_key: 0,
+            home_button_state: HomeButtonState::default(),
+            capture_button_state: CaptureButtonState::default(),
             npad_button_state: NpadButtonState::default(),
+            debug_pad_button_state: DebugPadButton::default(),
             analog_stick_state: AnalogSticks::default(),
             motion_state: [ControllerMotion::default(); 2],
+            gc_trigger_state: NpadGcTriggerState::default(),
             colors_state: ControllerColors::default(),
             battery_state: BatteryLevelState::default(),
+            ring_analog_state: RingSensorForce::default(),
         }
     }
 
@@ -221,36 +231,230 @@ impl EmulatedController {
     }
 
     pub fn reload_input(&mut self) {
-        todo!()
+        // TODO: In the upstream C++, this creates Common::Input devices from parameters,
+        // sets up callbacks, and restores motion/button/stick state.
+        // Requires Common::Input::CreateInputDevice and Settings integration.
+        log::debug!("EmulatedController::reload_input called for {:?}", self.npad_id_type);
     }
 
     pub fn reload_from_settings(&mut self) {
-        todo!()
+        // TODO: In the upstream C++, this reads player settings, maps controller type,
+        // builds parameter packages for buttons/sticks/motions, and calls reload_input.
+        // Requires Settings::values.players integration.
+        log::debug!("EmulatedController::reload_from_settings called for {:?}", self.npad_id_type);
     }
 
+    /// Port of EmulatedController::SaveCurrentConfig.
+    pub fn save_current_config(&self) {
+        // Upstream saves current parameters to Settings::values.players[player_index].
+        // Requires Settings integration.
+        log::debug!("EmulatedController::save_current_config called for {:?}", self.npad_id_type);
+    }
+
+    /// Port of EmulatedController::RestoreConfig.
+    pub fn restore_config(&mut self) {
+        // Upstream reloads from settings and reconnects if needed.
+        log::debug!("EmulatedController::restore_config called for {:?}", self.npad_id_type);
+    }
+
+    /// Port of EmulatedController::ReloadColorsFromSettings.
+    pub fn reload_colors_from_settings(&mut self) {
+        // Upstream reads body_color_left/right from player settings.
+        log::debug!("EmulatedController::reload_colors_from_settings called for {:?}", self.npad_id_type);
+    }
+
+    /// Port of EmulatedController::IsControllerFullkey.
+    fn is_controller_fullkey(&self, use_temporary_value: bool) -> bool {
+        let npad = if self.is_configuring && use_temporary_value {
+            self.tmp_npad_type
+        } else {
+            self.npad_type
+        };
+        matches!(
+            npad,
+            NpadStyleIndex::Fullkey
+                | NpadStyleIndex::GameCube
+                | NpadStyleIndex::Pokeball
+                | NpadStyleIndex::NES
+                | NpadStyleIndex::SNES
+                | NpadStyleIndex::N64
+                | NpadStyleIndex::SegaGenesis
+        )
+    }
+
+    /// Port of EmulatedController::IsControllerSupported.
+    fn is_controller_supported(&self, use_temporary_value: bool) -> bool {
+        let npad = if self.is_configuring && use_temporary_value {
+            self.tmp_npad_type
+        } else {
+            self.npad_type
+        };
+        let styles = self.supported_style_tag.raw;
+        match npad {
+            NpadStyleIndex::Fullkey => styles.contains(NpadStyleSet::FULLKEY),
+            NpadStyleIndex::Handheld => styles.contains(NpadStyleSet::HANDHELD),
+            NpadStyleIndex::JoyconDual => styles.contains(NpadStyleSet::JOY_DUAL),
+            NpadStyleIndex::JoyconLeft => styles.contains(NpadStyleSet::JOY_LEFT),
+            NpadStyleIndex::JoyconRight => styles.contains(NpadStyleSet::JOY_RIGHT),
+            NpadStyleIndex::GameCube => styles.contains(NpadStyleSet::GC),
+            NpadStyleIndex::Pokeball => styles.contains(NpadStyleSet::PALMA),
+            NpadStyleIndex::NES => styles.contains(NpadStyleSet::LARK),
+            NpadStyleIndex::SNES => styles.contains(NpadStyleSet::LUCIA),
+            NpadStyleIndex::N64 => styles.contains(NpadStyleSet::LAGOON),
+            NpadStyleIndex::SegaGenesis => styles.contains(NpadStyleSet::LAGER),
+            _ => false,
+        }
+    }
+
+    /// Port of EmulatedController::GetHomeButtons.
+    pub fn get_home_buttons(&self) -> HomeButtonState {
+        let _lock = self.mutex.lock();
+        if self.is_configuring {
+            return HomeButtonState::default();
+        }
+        self.home_button_state
+    }
+
+    /// Port of EmulatedController::GetCaptureButtons.
+    pub fn get_capture_buttons(&self) -> CaptureButtonState {
+        let _lock = self.mutex.lock();
+        if self.is_configuring {
+            return CaptureButtonState::default();
+        }
+        self.capture_button_state
+    }
+
+    /// Port of EmulatedController::GetNpadButtons.
     pub fn get_npad_buttons(&self) -> NpadButtonState {
         let _lock = self.mutex.lock();
-        self.npad_button_state
+        if self.is_configuring {
+            return NpadButtonState::default();
+        }
+        let turbo_mask = self.get_turbo_button_mask();
+        NpadButtonState {
+            raw: self.npad_button_state.raw & NpadButton::from_bits_truncate(turbo_mask),
+        }
     }
 
+    /// Port of EmulatedController::GetDebugPadButtons.
+    pub fn get_debug_pad_buttons(&self) -> DebugPadButton {
+        let _lock = self.mutex.lock();
+        if self.is_configuring {
+            return DebugPadButton::default();
+        }
+        self.debug_pad_button_state
+    }
+
+    /// Port of EmulatedController::GetSticks.
     pub fn get_sticks(&self) -> AnalogSticks {
         let _lock = self.mutex.lock();
+        if self.is_configuring {
+            return AnalogSticks::default();
+        }
         self.analog_stick_state
     }
 
+    /// Port of EmulatedController::GetTriggers.
+    pub fn get_triggers(&self) -> NpadGcTriggerState {
+        let _lock = self.mutex.lock();
+        if self.is_configuring {
+            return NpadGcTriggerState::default();
+        }
+        self.gc_trigger_state
+    }
+
+    /// Port of EmulatedController::GetMotions.
     pub fn get_motions(&self) -> MotionState {
         let _lock = self.mutex.lock();
         self.motion_state
     }
 
+    /// Port of EmulatedController::GetColors.
     pub fn get_colors(&self) -> ControllerColors {
         let _lock = self.mutex.lock();
         self.colors_state
     }
 
+    /// Port of EmulatedController::GetBattery.
     pub fn get_battery(&self) -> BatteryLevelState {
         let _lock = self.mutex.lock();
         self.battery_state
+    }
+
+    /// Port of EmulatedController::GetRingSensorForce.
+    pub fn get_ring_sensor_force(&self) -> RingSensorForce {
+        self.ring_analog_state
+    }
+
+    /// Port of EmulatedController::GetNpadColor.
+    pub fn get_npad_color(color: u32) -> NpadColor {
+        NpadColor {
+            r: ((color >> 16) & 0xFF) as u8,
+            g: ((color >> 8) & 0xFF) as u8,
+            b: (color & 0xFF) as u8,
+            a: 0xFF,
+        }
+    }
+
+    /// Port of EmulatedController::SetVibration (simple on/off version).
+    pub fn set_vibration_simple(&mut self, _should_vibrate: bool) -> bool {
+        // Upstream sends vibration command to output device
+        // Requires output device infrastructure
+        true
+    }
+
+    /// Port of EmulatedController::GetActualVibrationValue.
+    pub fn get_actual_vibration_value(&self, device_index: DeviceIndex) -> VibrationValue {
+        let _lock = self.mutex.lock();
+        match device_index {
+            DeviceIndex::Left => self.last_vibration_value[0],
+            DeviceIndex::Right => self.last_vibration_value[1],
+            _ => DEFAULT_VIBRATION_VALUE,
+        }
+    }
+
+    /// Port of EmulatedController::HasNfc.
+    pub fn has_nfc(&self) -> bool {
+        // Upstream checks nfc_devices[1] for NFC support
+        false
+    }
+
+    /// Port of EmulatedController::AddNfcHandle.
+    pub fn add_nfc_handle(&mut self) -> bool {
+        self.nfc_handles += 1;
+        true
+    }
+
+    /// Port of EmulatedController::RemoveNfcHandle.
+    pub fn remove_nfc_handle(&mut self) -> bool {
+        if self.nfc_handles == 0 {
+            return false;
+        }
+        self.nfc_handles -= 1;
+        true
+    }
+
+    /// Port of EmulatedController::SetGyroscopeZeroDriftMode.
+    pub fn set_gyroscope_zero_drift_mode(&mut self, _mode: GyroscopeZeroDriftMode) {
+        // Upstream iterates over motion_values and sets zero drift mode on each MotionInput.
+        // Requires MotionInput integration.
+    }
+
+    /// Port of EmulatedController::StatusUpdate.
+    pub fn status_update(&mut self) {
+        self.turbo_button_state = (self.turbo_button_state + 1) % (TURBO_BUTTON_DELAY * 2);
+        // Upstream also force-updates motion devices that need constant refreshing.
+    }
+
+    /// Port of EmulatedController::GetTurboButtonMask.
+    fn get_turbo_button_mask(&self) -> u64 {
+        // Apply no mask when disabled
+        if self.turbo_button_state < TURBO_BUTTON_DELAY {
+            return u64::MAX; // NpadButton::All
+        }
+        // Upstream builds a mask from button_values[index].turbo for each button.
+        // Without the full button_values infrastructure, return all-ones (no masking).
+        u64::MAX
     }
 
     pub fn get_led_pattern(&self) -> LedPattern {

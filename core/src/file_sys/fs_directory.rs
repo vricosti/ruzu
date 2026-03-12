@@ -69,3 +69,46 @@ const _: () = {
 pub struct DirectoryHandle {
     pub handle: *mut std::ffi::c_void,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_directory_entry_size() {
+        assert_eq!(std::mem::size_of::<DirectoryEntry>(), 0x310);
+    }
+
+    #[test]
+    fn test_directory_entry_offsets() {
+        assert_eq!(std::mem::offset_of!(DirectoryEntry, entry_type), 0x304);
+        assert_eq!(std::mem::offset_of!(DirectoryEntry, file_size), 0x308);
+    }
+
+    #[test]
+    fn test_directory_entry_new() {
+        let entry = DirectoryEntry::new("test.txt", 1, 42);
+        assert_eq!(entry.name_str(), "test.txt");
+        assert_eq!(entry.entry_type, 1);
+        assert_eq!(entry.file_size, 42);
+    }
+
+    #[test]
+    fn test_directory_entry_truncation() {
+        // Name exceeding ENTRY_NAME_LENGTH_MAX should be truncated.
+        let long_name = "a".repeat(ENTRY_NAME_LENGTH_MAX + 100);
+        let entry = DirectoryEntry::new(&long_name, 0, 0);
+        assert_eq!(entry.name_str().len(), ENTRY_NAME_LENGTH_MAX);
+    }
+
+    #[test]
+    fn test_directory_entry_empty_name() {
+        let entry = DirectoryEntry::new("", 0, 0);
+        assert_eq!(entry.name_str(), "");
+    }
+
+    #[test]
+    fn test_entry_name_length_max() {
+        assert_eq!(ENTRY_NAME_LENGTH_MAX, 0x300);
+    }
+}

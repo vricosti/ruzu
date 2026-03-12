@@ -1,6 +1,177 @@
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Port of hid_core/resources/touch_screen/touch_screen_driver.h and touch_screen_driver.cpp
+//!
+//! The touch screen driver handles reading raw touch input from the emulated
+//! console and converting it into TouchState entries.
 
-// TODO: Port full implementation from upstream
+use common::ResultCode;
+
+use crate::hid_types::{TouchAttribute, TouchScreenModeForNx};
+use super::touch_types::*;
+
+/// Maximum number of fingers tracked by the touch driver.
+/// Matches upstream `Core::HID::TouchFingerState` array size.
+const MAX_TOUCH_FINGERS: usize = MAX_FINGERS;
+
+/// Per-finger tracking state used internally by the driver.
+#[derive(Debug, Clone, Copy, Default)]
+struct TouchFinger {
+    id: u32,
+    pressed: bool,
+    attribute: TouchAttribute,
+    position_x: f32,
+    position_y: f32,
+}
+
+/// This handles all requests to Ftm3bd56(TouchPanel) hardware.
+/// Port of upstream `TouchDriver`.
+pub struct TouchScreenDriver {
+    is_running: bool,
+    touch_status: TouchScreenState,
+    fingers: [TouchFinger; MAX_TOUCH_FINGERS],
+    touch_mode: TouchScreenModeForNx,
+    // In upstream, this holds a pointer to EmulatedConsole.
+    // Touch input is injected via process_touch_input instead.
+}
+
+impl TouchScreenDriver {
+    pub fn new() -> Self {
+        Self {
+            is_running: false,
+            touch_status: TouchScreenState::default(),
+            fingers: [TouchFinger::default(); MAX_TOUCH_FINGERS],
+            touch_mode: TouchScreenModeForNx::UseSystemSetting,
+        }
+    }
+
+    /// Port of TouchDriver::StartTouchSensor.
+    pub fn start_touch_sensor(&mut self) -> ResultCode {
+        self.is_running = true;
+        ResultCode::SUCCESS
+    }
+
+    /// Port of TouchDriver::StopTouchSensor.
+    pub fn stop_touch_sensor(&mut self) -> ResultCode {
+        self.is_running = false;
+        ResultCode::SUCCESS
+    }
+
+    /// Port of TouchDriver::IsRunning.
+    pub fn is_running(&self) -> bool {
+        self.is_running
+    }
+
+    /// Port of TouchDriver::ProcessTouchScreenAutoTune.
+    pub fn process_touch_screen_auto_tune(&self) {
+        // TODO: upstream is also empty
+    }
+
+    /// Port of TouchDriver::WaitForDummyInput.
+    pub fn wait_for_dummy_input(&mut self) -> ResultCode {
+        self.touch_status = TouchScreenState::default();
+        ResultCode::SUCCESS
+    }
+
+    /// Port of TouchDriver::WaitForInput.
+    /// In upstream, this reads from EmulatedConsole::GetTouch().
+    /// Here, touch input must be provided via `process_touch_input` first.
+    pub fn wait_for_input(&mut self) -> ResultCode {
+        // Upstream processes console touch input here.
+        // The actual touch reading from EmulatedConsole would go here,
+        // but since we don't hold a direct reference to EmulatedConsole
+        // in the Rust port, this is handled by the caller providing
+        // touch data through process_touch_input.
+        ResultCode::SUCCESS
+    }
+
+    /// Processes raw touch finger input from the emulated console.
+    /// This corresponds to the body of upstream WaitForInput() that reads
+    /// from EmulatedConsole::GetTouch() and processes finger state transitions.
+    pub fn process_touch_input(&mut self, touch_input: &[(u32, bool, f32, f32); MAX_TOUCH_FINGERS]) {
+        self.touch_status = TouchScreenState::default();
+
+        for id in 0..self.touch_status.states.len() {
+            let (current_id, current_pressed, current_x, current_y) = touch_input[id];
+            let finger = &mut self.fingers[id];
+            finger.id = current_id;
+
+            if finger.attribute.start_touch() {
+                finger.attribute = TouchAttribute::default();
+                continue;
+            }
+
+            if finger.attribute.end_touch() {
+                finger.attribute = TouchAttribute::default();
+                finger.pressed = false;
+                continue;
+            }
+
+            if !finger.pressed && current_pressed {
+                finger.attribute = TouchAttribute::default();
+                finger.attribute.set_start_touch(true);
+                finger.pressed = true;
+                finger.position_x = current_x;
+                finger.position_y = current_y;
+                continue;
+            }
+
+            if finger.pressed && !current_pressed {
+                finger.attribute = TouchAttribute::default();
+                finger.attribute.set_end_touch(true);
+                continue;
+            }
+
+            // Only update position if touch is not on a special frame
+            finger.position_x = current_x;
+            finger.position_y = current_y;
+        }
+
+        // Collect active (pressed) fingers
+        let mut active_fingers = [TouchFinger::default(); MAX_TOUCH_FINGERS];
+        let mut active_count = 0usize;
+        for finger in &self.fingers {
+            if finger.pressed {
+                active_fingers[active_count] = *finger;
+                active_count += 1;
+            }
+        }
+
+        self.touch_status.entry_count = active_count as i32;
+        for id in 0..MAX_TOUCH_FINGERS {
+            if id < active_count {
+                let touch_entry = &mut self.touch_status.states[id];
+                touch_entry.position_x = (active_fingers[id].position_x * TOUCH_SENSOR_WIDTH as f32) as u32;
+                touch_entry.position_y = (active_fingers[id].position_y * TOUCH_SENSOR_HEIGHT as f32) as u32;
+                // Upstream reads diameter and rotation from Settings::values.touchscreen
+                touch_entry.diameter_x = 15;
+                touch_entry.diameter_y = 15;
+                touch_entry.rotation_angle = 0;
+                touch_entry.finger = active_fingers[id].id;
+                touch_entry.attribute = active_fingers[id].attribute;
+            }
+        }
+    }
+
+    /// Port of TouchDriver::GetNextTouchState.
+    pub fn get_next_touch_state(&self, out_state: &mut TouchScreenState) {
+        *out_state = self.touch_status;
+    }
+
+    /// Port of TouchDriver::SetTouchMode.
+    pub fn set_touch_mode(&mut self, mode: TouchScreenModeForNx) {
+        self.touch_mode = mode;
+    }
+
+    /// Port of TouchDriver::GetTouchMode.
+    pub fn get_touch_mode(&self) -> TouchScreenModeForNx {
+        self.touch_mode
+    }
+}
+
+impl Default for TouchScreenDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -68,6 +68,12 @@ pub mod svc_version;
 // SVC handler implementations
 pub mod svc;
 
+// SVC dispatch table (port of svc.h/svc.cpp)
+pub mod svc_dispatch;
+
+// Board-selected KSystemControl re-export (port of k_system_control.h)
+pub mod k_system_control;
+
 // Previously ported kernel modules
 pub mod k_capabilities;
 pub mod k_client_port;

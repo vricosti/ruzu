@@ -191,3 +191,67 @@ impl Default for HierarchicalIntegrityVerificationStorage {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_level_information_size() {
+        assert_eq!(
+            std::mem::size_of::<HierarchicalIntegrityVerificationLevelInformation>(),
+            0x18
+        );
+    }
+
+    #[test]
+    fn test_hierarchical_storage_information_new() {
+        let info = HierarchicalStorageInformation::new();
+        for s in &info.storages {
+            assert!(s.is_none());
+        }
+    }
+
+    #[test]
+    fn test_hierarchical_storage_information_constants() {
+        assert_eq!(HierarchicalStorageInformation::MASTER_STORAGE, 0);
+        assert_eq!(HierarchicalStorageInformation::DATA_STORAGE, 6);
+    }
+
+    #[test]
+    fn test_hierarchical_integrity_constants() {
+        assert_eq!(HierarchicalIntegrityVerificationStorage::HASH_SIZE, 32);
+        assert_eq!(HierarchicalIntegrityVerificationStorage::MAX_LAYERS, 7);
+    }
+
+    #[test]
+    fn test_new_not_initialized() {
+        let storage = HierarchicalIntegrityVerificationStorage::new();
+        assert!(!storage.is_initialized());
+    }
+
+    #[test]
+    fn test_initialize_and_finalize() {
+        let mut storage = HierarchicalIntegrityVerificationStorage::new();
+        let info = HierarchicalIntegrityVerificationInformation {
+            max_layers: 0,
+            info: Default::default(),
+            seed: HashSalt::default(),
+        };
+        let storage_info = HierarchicalStorageInformation::new();
+        assert!(storage.initialize(&info, storage_info, 0, 0, 0).is_ok());
+        assert!(storage.is_initialized());
+
+        storage.finalize();
+        assert!(!storage.is_initialized());
+    }
+
+    #[test]
+    fn test_get_default_data_cache_buffer_level() {
+        // max_layers = 7: 16 + 7 - 2 = 21
+        assert_eq!(
+            HierarchicalIntegrityVerificationStorage::get_default_data_cache_buffer_level(7),
+            21
+        );
+    }
+}

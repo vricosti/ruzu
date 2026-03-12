@@ -6,6 +6,11 @@
 //!
 //! IScreenShotService — "caps:ss".
 
+use crate::hle::result::ResultCode;
+use super::caps_types::{
+    AlbumFileId, AlbumReportOption, ApplicationAlbumEntry, ScreenShotAttribute,
+};
+
 /// IPC command table for IScreenShotService.
 pub mod commands {
     pub const SAVE_SCREEN_SHOT: u32 = 201;
@@ -27,5 +32,64 @@ pub struct IScreenShotService {
 impl IScreenShotService {
     pub fn new() -> Self {
         Self {}
+    }
+
+    /// SaveScreenShotEx0 (cmd 203).
+    ///
+    /// Corresponds to upstream `IScreenShotService::SaveScreenShotEx0`.
+    pub fn save_screen_shot_ex0(
+        &self,
+        _attribute: &ScreenShotAttribute,
+        report_option: AlbumReportOption,
+        aruid: u64,
+        image_data_buffer: &[u8],
+    ) -> Result<ApplicationAlbumEntry, ResultCode> {
+        log::info!(
+            "SaveScreenShotEx0 called, report_option={:?}, image_data_buffer_size={}, applet_resource_user_id={}",
+            report_option,
+            image_data_buffer.len(),
+            aruid,
+        );
+
+        // TODO: manager.flip_vertically_on_write(false);
+        // TODO: manager.save_screen_shot(...)
+        let entry = ApplicationAlbumEntry::default();
+        Ok(entry)
+    }
+
+    /// SaveEditedScreenShotEx1 (cmd 206).
+    ///
+    /// Corresponds to upstream `IScreenShotService::SaveEditedScreenShotEx1`.
+    pub fn save_edited_screen_shot_ex1(
+        &self,
+        _attribute: &ScreenShotAttribute,
+        width: u64,
+        height: u64,
+        thumbnail_width: u64,
+        thumbnail_height: u64,
+        file_id: &AlbumFileId,
+        _application_data_buffer: &[u8; 0x400],
+        image_data_buffer: &[u8],
+        thumbnail_image_data_buffer: &[u8],
+    ) -> Result<ApplicationAlbumEntry, ResultCode> {
+        log::info!(
+            "SaveEditedScreenShotEx1 called, width={}, height={}, thumbnail_width={}, thumbnail_height={}, \
+             application_id={:#018x}, storage={:?}, type={:?}, \
+             image_data_buffer_size={}, thumbnail_image_buffer_size={}",
+            width,
+            height,
+            thumbnail_width,
+            thumbnail_height,
+            file_id.application_id,
+            file_id.storage,
+            file_id.content_type,
+            image_data_buffer.len(),
+            thumbnail_image_data_buffer.len(),
+        );
+
+        // TODO: manager.flip_vertically_on_write(false);
+        // TODO: manager.save_edited_screen_shot(...)
+        let entry = ApplicationAlbumEntry::default();
+        Ok(entry)
     }
 }

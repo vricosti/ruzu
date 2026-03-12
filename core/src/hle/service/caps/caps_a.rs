@@ -6,7 +6,15 @@
 //!
 //! IAlbumAccessorService — "caps:a".
 
+use crate::hle::result::{ErrorModule, ResultCode};
+use super::caps_result::*;
+use super::caps_types::{
+    AlbumEntry, AlbumFileId, AlbumStorage, LoadAlbumScreenShotImageOutput, ScreenShotDecodeOption,
+};
+
 /// IPC command table for IAlbumAccessorService.
+///
+/// Corresponds to the function table in upstream caps_a.cpp.
 pub mod commands {
     pub const GET_ALBUM_FILE_COUNT: u32 = 0;
     pub const GET_ALBUM_FILE_LIST: u32 = 1;
@@ -20,11 +28,33 @@ pub mod commands {
     pub const LOAD_ALBUM_SCREEN_SHOT_IMAGE: u32 = 9;
     pub const LOAD_ALBUM_SCREEN_SHOT_THUMBNAIL_IMAGE: u32 = 10;
     pub const GET_ALBUM_ENTRY_FROM_APPLICATION_ALBUM_ENTRY: u32 = 11;
+    pub const LOAD_ALBUM_SCREEN_SHOT_IMAGE_EX: u32 = 12;
+    pub const LOAD_ALBUM_SCREEN_SHOT_THUMBNAIL_IMAGE_EX: u32 = 13;
+    pub const LOAD_ALBUM_SCREEN_SHOT_IMAGE_EX0: u32 = 14;
+    pub const GET_ALBUM_USAGE3: u32 = 15;
+    pub const GET_ALBUM_MOUNT_RESULT: u32 = 16;
+    pub const GET_ALBUM_USAGE16: u32 = 17;
+    pub const UNKNOWN_18: u32 = 18;
+    pub const UNKNOWN_19: u32 = 19;
+    pub const GET_ALBUM_FILE_COUNT_EX0: u32 = 100;
     pub const GET_ALBUM_FILE_LIST_EX0: u32 = 101;
+    pub const SAVE_EDITED_SCREEN_SHOT: u32 = 202;
+    pub const GET_LAST_THUMBNAIL: u32 = 301;
+    pub const GET_LAST_OVERLAY_MOVIE_THUMBNAIL: u32 = 302;
     pub const GET_AUTO_SAVING_STORAGE: u32 = 401;
+    pub const GET_REQUIRED_STORAGE_SPACE_SIZE_TO_COPY_ALL: u32 = 501;
+    pub const LOAD_ALBUM_SCREEN_SHOT_THUMBNAIL_IMAGE_EX0: u32 = 1001;
     pub const LOAD_ALBUM_SCREEN_SHOT_IMAGE_EX1: u32 = 1002;
     pub const LOAD_ALBUM_SCREEN_SHOT_THUMBNAIL_IMAGE_EX1: u32 = 1003;
-    pub const UNKNOWN_18: u32 = 18;
+    pub const FORCE_ALBUM_UNMOUNTED: u32 = 8001;
+    pub const RESET_ALBUM_MOUNT_STATUS: u32 = 8002;
+    pub const REFRESH_ALBUM_CACHE: u32 = 8011;
+    pub const GET_ALBUM_CACHE: u32 = 8012;
+    pub const GET_ALBUM_CACHE_EX: u32 = 8013;
+    pub const GET_ALBUM_ENTRY_FROM_APPLICATION_ALBUM_ENTRY_ARUID: u32 = 8021;
+    pub const SET_INTERNAL_ERROR_CONVERSION_ENABLED: u32 = 10011;
+    pub const LOAD_MAKER_NOTE_INFO_FOR_DEBUG: u32 = 50000;
+    pub const OPEN_ACCESSOR_SESSION: u32 = 60002;
 }
 
 /// IAlbumAccessorService.
@@ -37,5 +67,195 @@ pub struct IAlbumAccessorService {
 impl IAlbumAccessorService {
     pub fn new() -> Self {
         Self {}
+    }
+
+    /// GetAlbumFileList (cmd 1).
+    ///
+    /// Corresponds to upstream `IAlbumAccessorService::GetAlbumFileList`.
+    pub fn get_album_file_list(
+        &self,
+        storage: AlbumStorage,
+        out_entries: &mut [AlbumEntry],
+    ) -> Result<u64, ResultCode> {
+        log::info!("GetAlbumFileList called, storage={:?}", storage);
+
+        // TODO: manager.get_album_file_list(out_entries, storage, 0)
+        // For now return 0 entries.
+        Ok(0)
+    }
+
+    /// DeleteAlbumFile (cmd 3).
+    ///
+    /// Corresponds to upstream `IAlbumAccessorService::DeleteAlbumFile`.
+    pub fn delete_album_file(&self, file_id: AlbumFileId) -> Result<(), ResultCode> {
+        log::info!(
+            "DeleteAlbumFile called, application_id={:#018x}, storage={:?}, type={:?}",
+            file_id.application_id,
+            file_id.storage,
+            file_id.content_type,
+        );
+
+        // TODO: manager.delete_album_file(file_id)
+        Ok(())
+    }
+
+    /// IsAlbumMounted (cmd 5).
+    ///
+    /// Corresponds to upstream `IAlbumAccessorService::IsAlbumMounted`.
+    pub fn is_album_mounted(&self, storage: AlbumStorage) -> Result<bool, ResultCode> {
+        log::info!("IsAlbumMounted called, storage={:?}", storage);
+
+        // TODO: manager.is_album_mounted(storage)
+        // For now, always return true.
+        Ok(true)
+    }
+
+    /// Unknown18 (cmd 18).
+    ///
+    /// Corresponds to upstream `IAlbumAccessorService::Unknown18`.
+    pub fn unknown18(&self, out_buffer: &mut [u8]) -> Result<u32, ResultCode> {
+        log::warn!("(STUBBED) Unknown18 called");
+        let _ = out_buffer;
+        Ok(0)
+    }
+
+    /// GetAlbumFileListEx0 (cmd 101).
+    ///
+    /// Corresponds to upstream `IAlbumAccessorService::GetAlbumFileListEx0`.
+    pub fn get_album_file_list_ex0(
+        &self,
+        storage: AlbumStorage,
+        flags: u8,
+        out_entries: &mut [AlbumEntry],
+    ) -> Result<u64, ResultCode> {
+        log::info!(
+            "GetAlbumFileListEx0 called, storage={:?}, flags={}",
+            storage,
+            flags,
+        );
+
+        // TODO: manager.get_album_file_list(out_entries, storage, flags)
+        Ok(0)
+    }
+
+    /// GetAutoSavingStorage (cmd 401).
+    ///
+    /// Corresponds to upstream `IAlbumAccessorService::GetAutoSavingStorage`.
+    pub fn get_auto_saving_storage(&self) -> Result<bool, ResultCode> {
+        log::warn!("(STUBBED) GetAutoSavingStorage called");
+
+        // TODO: manager.get_auto_saving_storage()
+        Ok(false)
+    }
+
+    /// LoadAlbumScreenShotImageEx1 (cmd 1002).
+    ///
+    /// Corresponds to upstream `IAlbumAccessorService::LoadAlbumScreenShotImageEx1`.
+    pub fn load_album_screen_shot_image_ex1(
+        &self,
+        file_id: &AlbumFileId,
+        decoder_options: &ScreenShotDecodeOption,
+        out_image_output: &mut LoadAlbumScreenShotImageOutput,
+        out_image: &mut [u8],
+    ) -> Result<(), ResultCode> {
+        log::info!(
+            "LoadAlbumScreenShotImageEx1 called, application_id={:#018x}, storage={:?}, type={:?}, flags={:?}",
+            file_id.application_id,
+            file_id.storage,
+            file_id.content_type,
+            decoder_options.flags,
+        );
+
+        // TODO: manager.load_album_screen_shot_image(out_image_output, out_image, file_id, decoder_options)
+        let _ = (out_image_output, out_image);
+        Ok(())
+    }
+
+    /// LoadAlbumScreenShotThumbnailImageEx1 (cmd 1003).
+    ///
+    /// Corresponds to upstream `IAlbumAccessorService::LoadAlbumScreenShotThumbnailImageEx1`.
+    pub fn load_album_screen_shot_thumbnail_image_ex1(
+        &self,
+        file_id: &AlbumFileId,
+        decoder_options: &ScreenShotDecodeOption,
+        out_image_output: &mut LoadAlbumScreenShotImageOutput,
+        out_image: &mut [u8],
+    ) -> Result<(), ResultCode> {
+        log::info!(
+            "LoadAlbumScreenShotThumbnailImageEx1 called, application_id={:#018x}, storage={:?}, type={:?}, flags={:?}",
+            file_id.application_id,
+            file_id.storage,
+            file_id.content_type,
+            decoder_options.flags,
+        );
+
+        // TODO: manager.load_album_screen_shot_thumbnail(out_image_output, out_image, file_id, decoder_options)
+        let _ = (out_image_output, out_image);
+        Ok(())
+    }
+
+    /// TranslateResult — translates internal capture result codes to public ones.
+    ///
+    /// Corresponds to upstream `IAlbumAccessorService::TranslateResult`.
+    pub fn translate_result(&self, in_result: ResultCode) -> ResultCode {
+        if in_result.is_success() {
+            return in_result;
+        }
+
+        let raw = in_result.get_inner_value();
+        let desc = in_result.get_description();
+
+        if (raw & 0x3801ff) == RESULT_UNKNOWN_1024.get_inner_value() {
+            if desc.wrapping_sub(0x514) < 100 {
+                return RESULT_INVALID_FILE_DATA;
+            }
+            if desc.wrapping_sub(0x5dc) < 100 {
+                return RESULT_INVALID_FILE_DATA;
+            }
+            if desc.wrapping_sub(0x578) < 100 {
+                if in_result == RESULT_FILE_COUNT_LIMIT {
+                    return RESULT_UNKNOWN_22;
+                }
+                return RESULT_UNKNOWN_25;
+            }
+            if raw < RESULT_UNKNOWN_1801.get_inner_value() {
+                if in_result == RESULT_UNKNOWN_1202 {
+                    return RESULT_UNKNOWN_810;
+                }
+                if in_result == RESULT_UNKNOWN_1203 {
+                    return RESULT_UNKNOWN_810;
+                }
+                if in_result == RESULT_UNKNOWN_1701 {
+                    return RESULT_UNKNOWN_5;
+                }
+            } else if raw < RESULT_UNKNOWN_1803.get_inner_value() {
+                if in_result == RESULT_UNKNOWN_1801 {
+                    return RESULT_UNKNOWN_5;
+                }
+                if in_result == RESULT_UNKNOWN_1802 {
+                    return RESULT_UNKNOWN_6;
+                }
+            } else {
+                if in_result == RESULT_UNKNOWN_1803 {
+                    return RESULT_UNKNOWN_7;
+                }
+                if in_result == RESULT_UNKNOWN_1804 {
+                    return RESULT_OUT_OF_RANGE;
+                }
+            }
+            return RESULT_UNKNOWN_1024;
+        }
+
+        if in_result.get_module_raw() == ErrorModule::FS as u32 {
+            if (desc >> 0xc < 0x7d)
+                || (desc.wrapping_sub(1000) < 2000)
+                || ((desc.wrapping_sub(3000) >> 3) < 0x271)
+            {
+                // TODO: Translate FS error
+                return in_result;
+            }
+        }
+
+        in_result
     }
 }

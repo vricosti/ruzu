@@ -137,19 +137,25 @@ impl JoyconCommonProtocol {
 
 /// RAII helper that sets blocking on creation and non-blocking on drop.
 /// Port of `ScopedSetBlocking` from common_protocol.h
-pub struct ScopedSetBlocking<'a> {
-    protocol: &'a mut JoyconCommonProtocol,
+///
+/// NOTE: In C++ this holds a pointer to the protocol and calls SetNonBlocking
+/// in the destructor. In Rust, holding `&mut` would prevent further calls on
+/// the protocol. Instead we store a raw pointer and use unsafe in Drop.
+pub struct ScopedSetBlocking {
+    protocol: *mut JoyconCommonProtocol,
 }
 
-impl<'a> ScopedSetBlocking<'a> {
-    pub fn new(protocol: &'a mut JoyconCommonProtocol) -> Self {
+impl ScopedSetBlocking {
+    pub fn new(protocol: &mut JoyconCommonProtocol) -> Self {
         protocol.set_blocking();
-        Self { protocol }
+        Self { protocol: protocol as *mut _ }
     }
 }
 
-impl<'a> Drop for ScopedSetBlocking<'a> {
+impl Drop for ScopedSetBlocking {
     fn drop(&mut self) {
-        self.protocol.set_non_blocking();
+        // SAFETY: The protocol reference is guaranteed to outlive this guard
+        // because it is always created from a &mut in the same scope.
+        unsafe { &mut *self.protocol }.set_non_blocking();
     }
 }

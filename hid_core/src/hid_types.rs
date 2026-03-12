@@ -357,8 +357,22 @@ impl TouchAttribute {
     pub fn start_touch(&self) -> bool {
         (self.raw & (1 << 0)) != 0
     }
+    pub fn set_start_touch(&mut self, value: bool) {
+        if value {
+            self.raw |= 1 << 0;
+        } else {
+            self.raw &= !(1 << 0);
+        }
+    }
     pub fn end_touch(&self) -> bool {
         (self.raw & (1 << 1)) != 0
+    }
+    pub fn set_end_touch(&mut self, value: bool) {
+        if value {
+            self.raw |= 1 << 1;
+        } else {
+            self.raw &= !(1 << 1);
+        }
     }
 }
 
@@ -630,6 +644,90 @@ pub struct Vec3f {
     pub x: f32,
     pub y: f32,
     pub z: f32,
+}
+
+impl Vec3f {
+    pub fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    /// Returns the length (magnitude) of the vector.
+    pub fn length(&self) -> f32 {
+        (self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
+    }
+
+    /// Returns a normalized copy of the vector. If length is zero, returns zero vector.
+    pub fn normalized(&self) -> Self {
+        let len = self.length();
+        if len == 0.0 {
+            return Self::default();
+        }
+        Self {
+            x: self.x / len,
+            y: self.y / len,
+            z: self.z / len,
+        }
+    }
+}
+
+impl std::ops::Add for Vec3f {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            x: self.x + rhs.x,
+            y: self.y + rhs.y,
+            z: self.z + rhs.z,
+        }
+    }
+}
+
+impl std::ops::AddAssign for Vec3f {
+    fn add_assign(&mut self, rhs: Self) {
+        self.x += rhs.x;
+        self.y += rhs.y;
+        self.z += rhs.z;
+    }
+}
+
+impl std::ops::Sub for Vec3f {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+            z: self.z - rhs.z,
+        }
+    }
+}
+
+impl std::ops::Mul<f32> for Vec3f {
+    type Output = Self;
+    fn mul(self, rhs: f32) -> Self {
+        Self {
+            x: self.x * rhs,
+            y: self.y * rhs,
+            z: self.z * rhs,
+        }
+    }
+}
+
+impl std::ops::Mul<Vec3f> for f32 {
+    type Output = Vec3f;
+    fn mul(self, rhs: Vec3f) -> Vec3f {
+        Vec3f {
+            x: self * rhs.x,
+            y: self * rhs.y,
+            z: self * rhs.z,
+        }
+    }
+}
+
+impl std::ops::MulAssign<f32> for Vec3f {
+    fn mul_assign(&mut self, rhs: f32) {
+        self.x *= rhs;
+        self.y *= rhs;
+        self.z *= rhs;
+    }
 }
 
 /// This is nn::hid::SixAxisSensorState

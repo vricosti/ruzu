@@ -1,12 +1,25 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/ns/account_proxy_interface.cpp/.h
+//! Port of zuyu/src/core/hle/service/ns/account_proxy_interface.h
+//! Port of zuyu/src/core/hle/service/ns/account_proxy_interface.cpp
 //!
-//! IAccountProxyInterface - stub service with command table.
+//! IAccountProxyInterface — account proxy operations for NS.
 
-/// IPC command table for IAccountProxyInterface ("IAccountProxyInterface").
-/// All commands are stubbed (nullptr in upstream).
-pub const IACCOUNT_PROXY_INTERFACE_COMMANDS: &[(u32, &str)] = &[
-    (0, "CreateUserAccount"),
-];
+/// IPC command table for IAccountProxyInterface.
+///
+/// Corresponds to the function table in upstream account_proxy_interface.cpp.
+pub mod commands {
+    pub const CREATE_USER_ACCOUNT: u32 = 0;
+}
+
+/// IAccountProxyInterface.
+///
+/// Corresponds to `IAccountProxyInterface` in upstream.
+pub struct IAccountProxyInterface;
+
+impl IAccountProxyInterface {
+    pub fn new() -> Self {
+        Self
+    }
+}

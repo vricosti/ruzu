@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/hle/service/sockets/sockets.h
 //! Port of zuyu/src/core/hle/service/sockets/sockets.cpp
 //!
-//! Socket service registration.
+//! Socket service registration and common types.
 
 /// Errno values matching upstream.
 ///
@@ -17,14 +17,18 @@ pub enum Errno {
     AGAIN = 11,
     INVAL = 22,
     MFILE = 24,
+    PIPE = 32,
+    CONNABORTED = 103,
+    CONNRESET = 104,
     NOTCONN = 107,
     TIMEDOUT = 110,
-    CONNRESET = 104,
     CONNREFUSED = 111,
     INPROGRESS = 115,
 }
 
 /// Domain (address family).
+///
+/// Corresponds to `Domain` in upstream sockets.h.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Domain {
@@ -33,9 +37,12 @@ pub enum Domain {
 }
 
 /// Type (socket type).
+///
+/// Corresponds to `Type` in upstream sockets.h.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
+    Unspecified = 0,
     STREAM = 1,
     DGRAM = 2,
     RAW = 3,
@@ -43,6 +50,8 @@ pub enum Type {
 }
 
 /// Protocol.
+///
+/// Corresponds to `Protocol` in upstream sockets.h.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {

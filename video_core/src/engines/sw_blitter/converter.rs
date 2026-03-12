@@ -199,13 +199,22 @@ struct FormatTraits {
 struct GenericConverter {
     traits: FormatTraits,
     total_bytes_per_pixel: usize,
+    /// Which u32 word each component lives in.
+    bound_words: Vec<usize>,
+    /// Bit offset within that word for each component.
+    bound_offsets: Vec<usize>,
+    /// Bitmask for each component (shifted to position).
+    component_mask: Vec<u32>,
 }
 
 impl GenericConverter {
     fn new(traits: FormatTraits) -> Self {
         let total_bits: usize = traits.component_sizes.iter().sum();
         // Round up to next power of two, then divide by 8.
-        let total_bytes = {
+        // Port of ConverterImpl::CalculateByteSize().
+        let total_bytes = if total_bits == 0 {
+            0
+        } else {
             let power = (usize::BITS - total_bits.leading_zeros() - 1) as usize;
             let base_size = 1usize << power;
             let mask = base_size - 1;
@@ -215,9 +224,215 @@ impl GenericConverter {
                 base_size / 8
             }
         };
+
+        // Pre-compute bound_words and bound_offsets.
+        // Port of ConverterImpl::GetBoundWordsOffsets<>.
+        let num_components = traits.num_components;
+        let mut bound_words = vec![0usize; num_components];
+        let mut bound_offsets = vec![0usize; num_components];
+        {
+            let total_bits_per_word: usize = 32;
+            let mut accumulated_size: usize = 0;
+            let mut word_index: usize = 0;
+            for i in 0..num_components {
+                bound_offsets[i] = accumulated_size;
+                bound_words[i] = word_index;
+                accumulated_size += traits.component_sizes[i];
+                if accumulated_size > total_bits_per_word {
+                    // Component spans word boundary; move to next word.
+                    bound_offsets[i] = 0;
+                    word_index += 1;
+                    bound_words[i] = word_index;
+                    accumulated_size = traits.component_sizes[i];
+                }
+            }
+        }
+
+        // Pre-compute component masks.
+        let mut component_mask = vec![0u32; num_components];
+        for i in 0..num_components {
+            let size = traits.component_sizes[i];
+            if size >= 32 {
+                component_mask[i] = u32::MAX;
+            } else {
+                component_mask[i] = ((1u64 << size) - 1) as u32;
+            }
+            component_mask[i] <<= bound_offsets[i];
+        }
+
         Self {
             traits,
             total_bytes_per_pixel: total_bytes,
+            bound_words,
+            bound_offsets,
+            component_mask,
+        }
+    }
+
+    /// Port of ConverterImpl::ConvertToComponent<which_component>.
+    ///
+    /// Extracts a component from packed word data and converts to f32.
+    #[inline]
+    fn convert_to_component(&self, which_component: usize, which_word: u32) -> f32 {
+        let size = self.traits.component_sizes[which_component];
+        let offset = self.bound_offsets[which_component];
+        let comp_type = self.traits.component_types[which_component];
+        let swizzle = self.traits.component_swizzle[which_component];
+
+        // Extract raw bits.
+        let value = if size >= 32 {
+            which_word
+        } else {
+            (which_word >> offset) & ((1u64 << size) - 1) as u32
+        };
+
+        let sign_extend = |base_value: u32, bits: usize| -> i32 {
+            let shift_amount = 32 - bits;
+            ((base_value << shift_amount) as i32) >> shift_amount
+        };
+
+        let force_to_fp16 = |base_value: f32| -> f32 {
+            let tmp = base_value.to_bits();
+            let mantissa_mask: u32 = !((1u32 << (23 - 10)) - 1);
+            f32::from_bits(tmp & mantissa_mask)
+        };
+
+        let from_fp_n = |base_value: u32, bits: usize, mantissa: usize| -> f32 {
+            let shift_towards = 23 - mantissa;
+            let new_value =
+                ((sign_extend(base_value, bits) << shift_towards) as u32) & !(1u32 << 31);
+            f32::from_bits(new_value)
+        };
+
+        let calculate_snorm = || -> f32 {
+            let signed_val = sign_extend(value, size);
+            let max_val = ((1u64 << (size - 1)) - 1) as f32;
+            signed_val as f32 / max_val
+        };
+
+        let calculate_unorm = || -> f32 {
+            let max_val = ((1u64 << size) - 1) as f32;
+            value as f32 / max_val
+        };
+
+        match comp_type {
+            ComponentType::Snorm => calculate_snorm(),
+            ComponentType::Unorm => calculate_unorm(),
+            ComponentType::Sint => sign_extend(value, size) as f32,
+            ComponentType::Uint => sign_extend(value, size) as f32,
+            ComponentType::SnormForceFp16 => force_to_fp16(calculate_snorm()),
+            ComponentType::UnormForceFp16 => force_to_fp16(calculate_unorm()),
+            ComponentType::Float => {
+                if size == 32 {
+                    f32::from_bits(value)
+                } else if size == 16 {
+                    // FP16 to FP32 conversion.
+                    let sign_mask: u32 = 0x8000;
+                    let mantissa_mask: u32 = 0x03FF;
+                    f32::from_bits(
+                        ((value & sign_mask) << 16)
+                            | (((value & 0x7C00).wrapping_add(0x1C000)) << 13)
+                            | ((value & mantissa_mask) << 13),
+                    )
+                } else {
+                    from_fp_n(value, size, size.saturating_sub(5))
+                }
+            }
+            ComponentType::Srgb => {
+                if swizzle == Swizzle::A {
+                    calculate_unorm()
+                } else if size == 8 {
+                    SRGB_TO_RGB_LUT[value as usize]
+                } else {
+                    // Fallback for non-8-bit sRGB (upstream logs UNIMPLEMENTED).
+                    calculate_unorm()
+                }
+            }
+        }
+    }
+
+    /// Port of ConverterImpl::ConvertFromComponent<which_component>.
+    ///
+    /// Converts an f32 component value and inserts it into packed word data.
+    #[inline]
+    fn convert_from_component(
+        &self,
+        which_component: usize,
+        which_word: &mut u32,
+        in_component: f32,
+    ) {
+        let size = self.traits.component_sizes[which_component];
+        let offset = self.bound_offsets[which_component];
+        let comp_type = self.traits.component_types[which_component];
+        let swizzle = self.traits.component_swizzle[which_component];
+        let mask = self.component_mask[which_component];
+
+        let insert_to_word = |word: &mut u32, new_val: u32| {
+            *word |= (new_val << offset) & mask;
+        };
+
+        let to_fp_n = |base_value: f32, _bits: usize, mantissa: usize| -> u32 {
+            let tmp_value = base_value.max(0.0).to_bits();
+            let shift_towards = 23 - mantissa;
+            tmp_value >> shift_towards
+        };
+
+        let calculate_unorm = || -> u32 {
+            let max_val = ((1u64 << size) - 1) as f32;
+            (in_component * max_val) as u32
+        };
+
+        match comp_type {
+            ComponentType::Snorm | ComponentType::SnormForceFp16 => {
+                let max_val = ((1u64 << (size - 1)) - 1) as f32;
+                let tmp_word = (in_component * max_val) as i32;
+                insert_to_word(which_word, tmp_word as u32);
+            }
+            ComponentType::Unorm | ComponentType::UnormForceFp16 => {
+                let tmp_word = calculate_unorm();
+                insert_to_word(which_word, tmp_word);
+            }
+            ComponentType::Sint => {
+                let tmp_word = in_component as i32;
+                insert_to_word(which_word, tmp_word as u32);
+            }
+            ComponentType::Uint => {
+                let tmp_word = in_component as u32;
+                insert_to_word(which_word, tmp_word);
+            }
+            ComponentType::Float => {
+                if size == 32 {
+                    insert_to_word(which_word, in_component.to_bits());
+                } else if size == 16 {
+                    // FP32 to FP16 conversion.
+                    let sign_mask: u32 = 0x8000;
+                    let mantissa_mask_16: u32 = 0x03FF;
+                    let exponent_mask_16: u32 = 0x7C00;
+                    let tmp_word = in_component.to_bits();
+                    let half = ((tmp_word >> 16) & sign_mask)
+                        | ((((tmp_word & 0x7F80_0000).wrapping_sub(0x3800_0000)) >> 13)
+                            & exponent_mask_16)
+                        | ((tmp_word >> 13) & mantissa_mask_16);
+                    insert_to_word(which_word, half);
+                } else {
+                    insert_to_word(
+                        which_word,
+                        to_fp_n(in_component, size, size.saturating_sub(5)),
+                    );
+                }
+            }
+            ComponentType::Srgb => {
+                let mut comp = in_component;
+                if swizzle != Swizzle::A && size == 8 {
+                    let index = calculate_unorm() as usize;
+                    if index < RGB_TO_SRGB_LUT.len() {
+                        comp = RGB_TO_SRGB_LUT[index];
+                    }
+                }
+                let max_val = ((1u64 << size) - 1) as f32;
+                let tmp_word = (comp * max_val) as u32;
+                insert_to_word(which_word, tmp_word);
+            }
         }
     }
 }
@@ -226,58 +441,86 @@ impl Converter for GenericConverter {
     fn convert_to(&self, input: &[u8], output: &mut [f32]) {
         let components_per_ir = 4usize;
         let num_pixels = output.len() / components_per_ir;
-        let _t = &self.traits;
+        let t = &self.traits;
 
         for pixel in 0..num_pixels {
             let src_start = pixel * self.total_bytes_per_pixel;
             let dst_start = pixel * components_per_ir;
 
-            // Read raw words from input
-            let words_per_pixel =
-                (self.total_bytes_per_pixel + 3) / 4;
+            // Read raw words from input.
+            let words_per_pixel = (self.total_bytes_per_pixel + 3) / 4;
             let mut words = vec![0u32; words_per_pixel];
-            let copy_len = self.total_bytes_per_pixel.min(
-                input.len().saturating_sub(src_start),
-            );
+            let copy_len = self
+                .total_bytes_per_pixel
+                .min(input.len().saturating_sub(src_start));
             let src_bytes = &input[src_start..src_start + copy_len];
-            // Safe: we copy byte-by-byte into the word array.
-            // Safe: reinterpret &mut [u32] as &mut [u8] for byte-level access.
             let words_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    words.as_mut_ptr() as *mut u8,
-                    words.len() * 4,
-                )
+                std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 4)
             };
             words_bytes[..copy_len].copy_from_slice(src_bytes);
 
-            // Initialize output components to zero
+            // Initialize output components to zero.
             for i in 0..components_per_ir {
                 output[dst_start + i] = 0.0;
             }
 
-            // TODO: implement per-component extraction matching the C++ ConvertToComponent logic.
-            // This requires computing bound_words, bound_offsets, and component_mask
-            // from the traits, then applying the appropriate conversion (SNORM, UNORM,
-            // SINT, UINT, FLOAT, SRGB) per component. The full logic is complex and
-            // will be ported in a follow-up pass.
-            let _ = words;
+            // Extract each component and place in the correct IR slot.
+            for comp in 0..t.num_components {
+                let swizzle = t.component_swizzle[comp];
+                if swizzle == Swizzle::None {
+                    continue;
+                }
+                let ir_index = swizzle as usize;
+                if ir_index >= components_per_ir {
+                    continue;
+                }
+                let word_idx = self.bound_words[comp];
+                let word = if word_idx < words.len() {
+                    words[word_idx]
+                } else {
+                    0
+                };
+                output[dst_start + ir_index] = self.convert_to_component(comp, word);
+            }
         }
     }
 
     fn convert_from(&self, input: &[f32], output: &mut [u8]) {
         let components_per_ir = 4usize;
         let num_pixels = output.len() / self.total_bytes_per_pixel;
+        let t = &self.traits;
 
         for pixel in 0..num_pixels {
             let src_start = pixel * components_per_ir;
             let dst_start = pixel * self.total_bytes_per_pixel;
 
-            let _ = &input[src_start..src_start + components_per_ir];
+            let old_components = &input[src_start..src_start + components_per_ir];
+            let words_per_pixel = (self.total_bytes_per_pixel + 3) / 4;
+            let mut words = vec![0u32; words_per_pixel];
 
-            // TODO: implement per-component insertion matching the C++ ConvertFromComponent logic.
-            // Zero-fill output for now.
+            // Insert each component from the IR slot into packed words.
+            for comp in 0..t.num_components {
+                let swizzle = t.component_swizzle[comp];
+                if swizzle == Swizzle::None {
+                    continue;
+                }
+                let ir_index = swizzle as usize;
+                if ir_index >= components_per_ir {
+                    continue;
+                }
+                let word_idx = self.bound_words[comp];
+                if word_idx < words.len() {
+                    self.convert_from_component(comp, &mut words[word_idx], old_components[ir_index]);
+                }
+            }
+
+            // Write words back to output bytes.
+            let words_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
+            };
             let end = (dst_start + self.total_bytes_per_pixel).min(output.len());
-            output[dst_start..end].fill(0);
+            let copy_len = end - dst_start;
+            output[dst_start..end].copy_from_slice(&words_bytes[..copy_len]);
         }
     }
 }
@@ -741,11 +984,19 @@ mod tests {
         let mut factory = ConverterFactory::new();
         // A8B8G8R8_UNORM = 0xD5
         let converter = factory.get_format_converter(0xD5);
-        let input = [0xFF, 0x00, 0x80, 0x40]; // ABGR
+        // Input: A=0xFF, B=0x00, G=0x80, R=0x40  (byte order in memory)
+        let input = [0xFF, 0x00, 0x80, 0x40];
         let mut output = [0.0f32; 4];
         converter.convert_to(&input, &mut output);
-        // The converter's convert_to is currently a TODO stub, so output will be zeros.
-        // This test just verifies no panics.
+        // Swizzle is A,B,G,R so: component 0 -> A slot, component 1 -> B slot, etc.
+        // R (index 0) = component with swizzle R = 0x40/255
+        // G (index 1) = component with swizzle G = 0x80/255
+        // B (index 2) = component with swizzle B = 0x00/255
+        // A (index 3) = component with swizzle A = 0xFF/255
+        assert!((output[0] - (0x40 as f32 / 255.0)).abs() < 0.01, "R mismatch: {}", output[0]);
+        assert!((output[1] - (0x80 as f32 / 255.0)).abs() < 0.01, "G mismatch: {}", output[1]);
+        assert!((output[2] - (0x00 as f32 / 255.0)).abs() < 0.01, "B mismatch: {}", output[2]);
+        assert!((output[3] - (0xFF as f32 / 255.0)).abs() < 0.01, "A mismatch: {}", output[3]);
     }
 
     #[test]
@@ -756,5 +1007,68 @@ mod tests {
         let mut output = [1.0f32; 4];
         converter.convert_to(&input, &mut output);
         assert!(output.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_r32_float_roundtrip() {
+        let mut factory = ConverterFactory::new();
+        // R32_FLOAT = 0xE5
+        let converter = factory.get_format_converter(0xE5);
+        let val: f32 = 3.14159;
+        let input = val.to_le_bytes();
+        let mut ir = [0.0f32; 4];
+        converter.convert_to(&input, &mut ir);
+        assert!((ir[0] - val).abs() < 1e-6, "R mismatch: {} vs {}", ir[0], val);
+        assert_eq!(ir[1], 0.0);
+        assert_eq!(ir[2], 0.0);
+        assert_eq!(ir[3], 0.0);
+
+        // Roundtrip back.
+        let mut output = [0u8; 4];
+        converter.convert_from(&ir, &mut output);
+        let result = f32::from_le_bytes(output);
+        assert!((result - val).abs() < 1e-6, "Roundtrip mismatch: {} vs {}", result, val);
+    }
+
+    #[test]
+    fn test_r8_unorm_roundtrip() {
+        let mut factory = ConverterFactory::new();
+        // R8_UNORM = 0xF3
+        let converter = factory.get_format_converter(0xF3);
+        let input = [128u8];
+        let mut ir = [0.0f32; 4];
+        converter.convert_to(&input, &mut ir);
+        assert!((ir[0] - (128.0 / 255.0)).abs() < 0.01);
+
+        let mut output = [0u8; 1];
+        converter.convert_from(&ir, &mut output);
+        assert_eq!(output[0], 128);
+    }
+
+    #[test]
+    fn test_r16g16_float_convert() {
+        let mut factory = ConverterFactory::new();
+        // R16G16_FLOAT = 0xDE
+        let converter = factory.get_format_converter(0xDE);
+        // FP16 for 1.0 = 0x3C00
+        let input: [u8; 4] = [0x00, 0x3C, 0x00, 0x40]; // R=1.0, G=2.0 in FP16
+        let mut ir = [0.0f32; 4];
+        converter.convert_to(&input, &mut ir);
+        assert!((ir[0] - 1.0).abs() < 0.01, "R mismatch: {}", ir[0]);
+        assert!((ir[1] - 2.0).abs() < 0.01, "G mismatch: {}", ir[1]);
+    }
+
+    #[test]
+    fn test_r32g32_uint_convert() {
+        let mut factory = ConverterFactory::new();
+        // R32G32_UINT = 0xCD
+        let converter = factory.get_format_converter(0xCD);
+        let mut input = [0u8; 8];
+        input[0..4].copy_from_slice(&42u32.to_le_bytes());
+        input[4..8].copy_from_slice(&99u32.to_le_bytes());
+        let mut ir = [0.0f32; 4];
+        converter.convert_to(&input, &mut ir);
+        assert_eq!(ir[0] as u32, 42);
+        assert_eq!(ir[1] as u32, 99);
     }
 }

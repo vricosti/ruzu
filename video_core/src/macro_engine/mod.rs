@@ -8,4 +8,5 @@
 
 pub mod macro_engine;
 pub mod macro_hle;
+pub mod macro_interpreter;
 pub mod macro_jit_x64;

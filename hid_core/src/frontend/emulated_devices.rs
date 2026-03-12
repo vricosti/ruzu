@@ -76,11 +76,17 @@ impl EmulatedDevices {
     }
 
     pub fn reload_input(&mut self) {
-        todo!()
+        // TODO: In upstream C++, this creates input devices for keyboard, mouse and ring controller
+        // from Common::Input::CreateInputDevice and sets up callbacks.
+        // Requires Common::Input integration.
+        log::debug!("EmulatedDevices::reload_input called");
     }
 
     pub fn reload_from_settings(&mut self) {
-        todo!()
+        // TODO: In upstream C++, this reads keyboard/mouse mappings from Settings::values
+        // and calls reload_input.
+        // Requires Settings integration.
+        log::debug!("EmulatedDevices::reload_from_settings called");
     }
 
     pub fn save_current_config(&mut self) {
