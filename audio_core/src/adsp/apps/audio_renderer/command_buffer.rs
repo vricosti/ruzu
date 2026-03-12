@@ -1,16 +1,19 @@
 use crate::common::common::CpuAddr;
-use ruzu_kernel::KProcess;
+
+// Stub: KProcess lived in ruzu_kernel which has been removed.
+// ProcessHandle stores the raw pointer as an opaque usize.
+// When ruzu_kernel is restored, replace `*mut ()` with `*mut KProcess`.
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProcessHandle(usize);
 
 impl ProcessHandle {
-    pub fn from_ptr(process: *mut KProcess) -> Self {
+    pub fn from_ptr(process: *mut ()) -> Self {
         Self(process as usize)
     }
 
-    pub fn as_ptr(self) -> *mut KProcess {
-        self.0 as *mut KProcess
+    pub fn as_ptr(self) -> *mut () {
+        self.0 as *mut ()
     }
 }
 

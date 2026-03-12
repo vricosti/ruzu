@@ -135,7 +135,7 @@ pub struct RuntimeInfo {
     pub glasm_use_storage_buffers: bool,
 
     /// Transform feedback state for each varying.
-    pub xfb_varyings: [TransformFeedbackVarying; 256],
+    pub xfb_varyings: Vec<TransformFeedbackVarying>,
     /// Number of transform feedback varyings.
     pub xfb_count: u32,
 }

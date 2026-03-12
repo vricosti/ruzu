@@ -9,3 +9,4 @@
 pub mod cheat_engine;
 pub mod dmnt_cheat_types;
 pub mod dmnt_cheat_vm;
+pub mod memory_manager;

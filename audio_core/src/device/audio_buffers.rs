@@ -230,7 +230,7 @@ mod tests {
     use crate::sink::{NullSink, StreamType};
     use crate::SharedSystem;
     use parking_lot::Mutex;
-    use ruzu_kernel::memory_manager::{MemoryManager, MemoryPermission, MemoryState};
+    use ruzu_core::memory::memory_manager::{MemoryManager, MemoryPermission, MemoryState};
     use std::sync::Arc;
 
     fn make_system() -> SharedSystem {

@@ -1,0 +1,10 @@
+[package]
+name = "input_common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common.workspace = true
+log.workspace = true
+bitflags.workspace = true
+parking_lot.workspace = true

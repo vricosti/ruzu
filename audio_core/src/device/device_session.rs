@@ -294,7 +294,7 @@ mod tests {
     use crate::sink::NullSink;
     use crate::AudioManager;
     use parking_lot::Mutex;
-    use ruzu_kernel::memory_manager::{MemoryManager, MemoryPermission, MemoryState};
+    use ruzu_core::memory::memory_manager::{MemoryManager, MemoryPermission, MemoryState};
 
     fn make_system() -> SharedSystem {
         Arc::new(Mutex::new(ruzu_core::core::System::new()))

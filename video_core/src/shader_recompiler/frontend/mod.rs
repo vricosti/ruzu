@@ -6,8 +6,13 @@
 
 pub mod maxwell_opcodes;
 pub mod control_flow;
+pub mod decode;
+pub mod indirect_branch_table_track;
+pub mod instruction;
+pub mod location;
 pub mod structured_control_flow;
 pub mod translate;
+pub mod translate_program;
 
 #[cfg(test)]
 mod tests {

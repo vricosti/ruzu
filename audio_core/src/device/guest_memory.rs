@@ -1,6 +1,6 @@
 use common::VAddr;
 use parking_lot::Mutex;
-use ruzu_kernel::memory_manager::MemoryManager;
+use ruzu_core::memory::memory_manager::MemoryManager;
 use std::sync::Arc;
 
 pub trait GuestMemoryProvider: Send + Sync {

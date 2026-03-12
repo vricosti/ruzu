@@ -8,8 +8,8 @@ use crate::renderer::effect::light_limiter::StatisticsInternal;
 use crate::sink::sink_stream::SinkStreamHandle;
 use crate::SharedSystem;
 use log::error;
-use ruzu_kernel::memory_manager::MemoryManager;
-use ruzu_kernel::KProcess;
+// Stub: ruzu_kernel has been removed. MemoryManager and KProcess are replaced
+// with opaque pointers (*mut ()). Restore when ruzu_kernel is brought back.
 use std::fmt::Write;
 use std::mem::size_of;
 
@@ -17,12 +17,12 @@ use std::mem::size_of;
 struct MemoryHandle(usize);
 
 impl MemoryHandle {
-    fn from_ptr(ptr: *mut MemoryManager) -> Self {
+    fn from_ptr(ptr: *mut ()) -> Self {
         Self(ptr as usize)
     }
 
-    fn as_ptr(self) -> *mut MemoryManager {
-        self.0 as *mut MemoryManager
+    fn as_ptr(self) -> *mut () {
+        self.0 as *mut ()
     }
 }
 
@@ -54,7 +54,7 @@ impl CommandListProcessor {
     pub fn initialize(
         &mut self,
         system: SharedSystem,
-        process: *mut KProcess,
+        process: *mut (),
         buffer: CpuAddr,
         size: u64,
         stream: SinkStreamHandle,
@@ -72,11 +72,9 @@ impl CommandListProcessor {
 
         self.system = Some(system);
         self.process = ProcessHandle::from_ptr(process);
-        self.memory = if process.is_null() {
-            MemoryHandle::default()
-        } else {
-            MemoryHandle::from_ptr(unsafe { &mut (*process).memory as *mut MemoryManager })
-        };
+        // Stub: previously extracted MemoryManager from KProcess.
+        // With ruzu_kernel removed, memory handle is left as null.
+        self.memory = MemoryHandle::default();
         self.stream = Some(stream);
         self.header = header;
         self.commands = buffer.saturating_add(COMMAND_LIST_HEADER_SIZE);
@@ -112,11 +110,11 @@ impl CommandListProcessor {
         self.dump_audio_commands = enabled;
     }
 
-    pub fn get_process(&self) -> *mut KProcess {
+    pub fn get_process(&self) -> *mut () {
         self.process.as_ptr()
     }
 
-    pub fn get_memory(&self) -> *mut MemoryManager {
+    pub fn get_memory(&self) -> *mut () {
         self.memory.as_ptr()
     }
 
@@ -439,26 +437,22 @@ mod tests {
             4,
         );
 
-        let process = Box::into_raw(Box::new(ruzu_kernel::KProcess::new(1, "test".to_string())));
+        // Stub: KProcess removed. Use an opaque non-null pointer for testing.
+        let fake_process = 0xDEAD_BEEF as *mut ();
         let mut processor = CommandListProcessor::default();
         assert!(processor.initialize(
             system,
-            process,
+            fake_process,
             bytes.as_ptr() as CpuAddr,
             bytes.len() as u64,
             stream,
         ));
 
-        assert_eq!(processor.get_process(), process);
-        let expected_memory =
-            unsafe { &mut (*process).memory as *mut ruzu_kernel::memory_manager::MemoryManager };
-        assert_eq!(processor.get_memory(), expected_memory);
+        assert_eq!(processor.get_process(), fake_process);
+        // Memory handle is null since we can't extract MemoryManager without KProcess.
+        assert_eq!(processor.get_memory(), std::ptr::null_mut());
         assert_eq!(processor.get_mix_buffer_count(), 2);
         assert_eq!(processor.get_mix_buffer_len(), 8);
-
-        unsafe {
-            drop(Box::from_raw(process));
-        }
     }
 
     #[test]

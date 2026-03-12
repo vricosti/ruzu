@@ -22,7 +22,7 @@ use crate::renderer::voice::{VoiceChannelResource, VoiceContext, VoiceInfo, Voic
 use crate::{Result, SharedSystem};
 use common::ResultCode;
 use parking_lot::{Condvar, Mutex};
-use ruzu_kernel::KProcess;
+use ruzu_core::hle::kernel::k_process::KProcess;
 use std::mem::{size_of, size_of_val};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -819,11 +819,11 @@ impl System {
     }
 
     pub fn set_process(&mut self, process: *mut KProcess) {
-        self.process = ProcessHandle::from_ptr(process);
+        self.process = ProcessHandle::from_ptr(process as *mut ());
     }
 
     pub fn get_process(&self) -> *mut KProcess {
-        self.process.as_ptr()
+        self.process.as_ptr() as *mut KProcess
     }
 
     fn generate_command_workbuffer(&mut self) -> u64 {
@@ -1527,12 +1527,12 @@ mod tests {
             ResultCode::SUCCESS
         );
 
-        let process = Box::into_raw(Box::new(ruzu_kernel::KProcess::new(1, "test".to_string())));
+        let process = Box::into_raw(Box::new(ruzu_core::hle::kernel::k_process::KProcess::new()));
         system.set_process(process);
         system.start();
         system.send_command_to_dsp();
 
-        assert_eq!(audio_renderer.lock().get_command_buffer_process(0), process);
+        assert_eq!(audio_renderer.lock().get_command_buffer_process(0), process as *mut ());
 
         unsafe {
             drop(Box::from_raw(process));

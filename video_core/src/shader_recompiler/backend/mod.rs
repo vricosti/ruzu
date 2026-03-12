@@ -6,15 +6,28 @@
 //! The entry point is `emit_spirv()`, which takes an `IR::Program` and a
 //! `Profile` and returns a `Vec<u32>` of SPIR-V words.
 
+pub mod bindings;
 pub mod spirv_context;
-pub mod emit_integer;
-pub mod emit_float;
-pub mod emit_memory;
-pub mod emit_texture;
-pub mod emit_convert;
+pub mod emit_atomic;
+pub mod emit_barriers;
+pub mod emit_bitwise_conversion;
 pub mod emit_composite;
 pub mod emit_context;
+pub mod emit_context_get_set;
 pub mod emit_control;
+pub mod emit_convert;
+pub mod emit_float;
+pub mod emit_image;
+pub mod emit_image_atomic;
+pub mod emit_integer;
+pub mod emit_logical;
+pub mod emit_memory;
+pub mod emit_select;
+pub mod emit_shared_memory;
+pub mod emit_special;
+pub mod emit_texture;
+pub mod emit_undefined;
+pub mod emit_warp;
 
 use crate::shader_recompiler::ir;
 

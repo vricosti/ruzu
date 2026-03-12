@@ -1,9 +1,0 @@
-[package]
-name = "ruzu-cpu"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-common.workspace = true
-rdynarmic.workspace = true
-log.workspace = true

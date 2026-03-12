@@ -7,7 +7,7 @@ use crate::SharedSystem;
 use common::thread::{set_current_thread_name, set_current_thread_priority, ThreadPriority};
 use log::{error, warn};
 use parking_lot::Mutex;
-use ruzu_kernel::KProcess;
+// Stub: ruzu_kernel removed. KProcess replaced with opaque *mut ().
 use std::array;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -167,7 +167,7 @@ impl AudioRenderer {
         size: u64,
         time_limit: u64,
         applet_resource_user_id: u64,
-        process: *mut KProcess,
+        process: *mut (),
         reset: bool,
     ) {
         let mut shared = self.shared.lock();
@@ -198,7 +198,7 @@ impl AudioRenderer {
     }
 
     #[cfg(test)]
-    pub(crate) fn get_command_buffer_process(&self, session_id: usize) -> *mut KProcess {
+    pub(crate) fn get_command_buffer_process(&self, session_id: usize) -> *mut () {
         self.shared.lock().command_buffers[session_id]
             .process
             .as_ptr()

@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 common = { path = "../common" }
 ruzu_core = { package = "core", path = "../core" }
-ruzu-kernel = { path = "../ruzu-kernel" }
 cubeb.workspace = true
 sdl2.workspace = true
 log.workspace = true
