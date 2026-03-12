@@ -5,6 +5,7 @@
 
 use super::hidbus_base::HidbusBase;
 
+// These values are obtained from a real ring controller
 const IDLE_VALUE: i16 = 2280;
 const IDLE_DEADZONE: i16 = 120;
 const RANGE: i16 = 2500;
@@ -34,6 +35,35 @@ enum RingConCommands {
     Unknown10 = 0x04011304,
     SaveCalData = 0x10011A04,
     Error = 0xFFFFFFFF,
+}
+
+impl RingConCommands {
+    fn from_u32(v: u32) -> Self {
+        match v {
+            0x00020000 => Self::GetFirmwareVersion,
+            0x00020100 => Self::ReadId,
+            0x00020101 => Self::JoyPolling,
+            0x00020104 => Self::Unknown1,
+            0x00020105 => Self::C020105,
+            0x00020204 => Self::Unknown2,
+            0x00020304 => Self::Unknown3,
+            0x00020404 => Self::Unknown4,
+            0x00020504 => Self::ReadUnkCal,
+            0x00020A04 => Self::ReadFactoryCal,
+            0x00021104 => Self::Unknown5,
+            0x00021204 => Self::Unknown6,
+            0x00021304 => Self::Unknown7,
+            0x00021A04 => Self::ReadUserCal,
+            0x00023104 => Self::ReadRepCount,
+            0x00023204 => Self::ReadTotalPushCount,
+            0x04013104 => Self::ResetRepCount,
+            0x04011104 => Self::Unknown8,
+            0x04011204 => Self::Unknown9,
+            0x04011304 => Self::Unknown10,
+            0x10011A04 => Self::SaveCalData,
+            _ => Self::Error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,9 +105,89 @@ struct UserCalibration {
     zero: CalibrationValue,
 }
 
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct RingConData {
+    status: u32, // DataValid
+    data: i16,
+    _padding: [u8; 2],
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct FirmwareVersionReply {
+    status: u32,
+    firmware: RingConFirmwareVersion,
+    _padding: [u8; 2],
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct ReadIdReply {
+    status: u32,
+    id_l_x0: u16,
+    id_l_x0_2: u16,
+    id_l_x4: u16,
+    id_h_x0: u16,
+    id_h_x0_2: u16,
+    id_h_x4: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct Cmd020105Reply {
+    status: u32,
+    data: u8,
+    _padding: [u8; 3],
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct ReadUnkCalReply {
+    status: u32,
+    data: u16,
+    _padding: [u8; 2],
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct ReadFactoryCalReply {
+    status: u32,
+    calibration: FactoryCalibration,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct ReadUserCalReply {
+    status: u32,
+    calibration: UserCalibration,
+    _padding: [u8; 4],
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct GetThreeByteReply {
+    status: u32,
+    data: [u8; 3],
+    crc: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct StatusReply {
+    status: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct ErrorReply {
+    status: u32,
+    _padding: [u8; 3],
+}
+
 pub struct RingController {
     base: HidbusBase,
-    command: u32,
+    command: RingConCommands,
     total_rep_count: u8,
     total_push_count: u8,
     device_id: u8,
@@ -90,7 +200,7 @@ impl RingController {
     pub fn new() -> Self {
         Self {
             base: HidbusBase::new(),
-            command: RingConCommands::Error as u32,
+            command: RingConCommands::Error,
             total_rep_count: 0,
             total_push_count: 0,
             device_id: 0x20,
@@ -122,27 +232,242 @@ impl RingController {
     }
 
     pub fn on_init(&mut self) {
-        // TODO
+        // TODO: input->SetPollingMode(RightIndex, Ring)
     }
 
     pub fn on_release(&mut self) {
-        // TODO
+        // TODO: input->SetPollingMode(RightIndex, Active)
     }
 
     pub fn on_update(&mut self) {
-        todo!()
+        if !self.base.is_activated {
+            return;
+        }
+        if !self.base.device_enabled {
+            return;
+        }
+        if !self.base.polling_mode_enabled || self.base.transfer_memory == 0 {
+            return;
+        }
+
+        // TODO: Increment multitasking counters from motion and sensor data
+        // TODO: Handle JoyPollingMode::SixAxisSensorEnable with ring lifo data
+        log::error!("Polling mode not fully supported {:?}", self.base.polling_mode);
     }
 
     pub fn get_device_id(&self) -> u8 {
         self.device_id
     }
 
-    pub fn set_command(&mut self, _data: &[u8]) -> bool {
-        todo!()
+    pub fn set_command(&mut self, data: &[u8]) -> bool {
+        if data.len() < 4 {
+            log::error!("Command size not supported {}", data.len());
+            self.command = RingConCommands::Error;
+            return false;
+        }
+
+        let cmd_raw = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        self.command = RingConCommands::from_u32(cmd_raw);
+
+        match self.command {
+            RingConCommands::GetFirmwareVersion
+            | RingConCommands::ReadId
+            | RingConCommands::C020105
+            | RingConCommands::ReadUnkCal
+            | RingConCommands::ReadFactoryCal
+            | RingConCommands::ReadUserCal
+            | RingConCommands::ReadRepCount
+            | RingConCommands::ReadTotalPushCount => {
+                assert!(data.len() == 0x4, "data.size is not 0x4 bytes");
+                // TODO: send_command_async_event->Signal()
+                true
+            }
+            RingConCommands::ResetRepCount => {
+                assert!(data.len() == 0x4, "data.size is not 0x4 bytes");
+                self.total_rep_count = 0;
+                // TODO: send_command_async_event->Signal()
+                true
+            }
+            RingConCommands::SaveCalData => {
+                assert!(data.len() == 0x14, "data.size is not 0x14 bytes");
+                // Parse SaveCalData: skip 4 bytes of command, read UserCalibration
+                if data.len() >= 0x14 {
+                    self.user_calibration.os_max.value =
+                        i16::from_le_bytes([data[4], data[5]]);
+                    self.user_calibration.os_max.crc =
+                        u16::from_le_bytes([data[6], data[7]]);
+                    self.user_calibration.hk_max.value =
+                        i16::from_le_bytes([data[8], data[9]]);
+                    self.user_calibration.hk_max.crc =
+                        u16::from_le_bytes([data[10], data[11]]);
+                    self.user_calibration.zero.value =
+                        i16::from_le_bytes([data[12], data[13]]);
+                    self.user_calibration.zero.crc =
+                        u16::from_le_bytes([data[14], data[15]]);
+                }
+                // TODO: send_command_async_event->Signal()
+                true
+            }
+            _ => {
+                log::error!("Command not implemented {:?}", self.command);
+                self.command = RingConCommands::Error;
+                // Signal a reply to avoid softlocking the game
+                // TODO: send_command_async_event->Signal()
+                false
+            }
+        }
     }
 
-    pub fn get_reply(&self, _out_data: &mut [u8]) -> u64 {
-        todo!()
+    pub fn get_reply(&self, out_data: &mut [u8]) -> u64 {
+        match self.command {
+            RingConCommands::GetFirmwareVersion => self.get_firmware_version_reply(out_data),
+            RingConCommands::ReadId => self.get_read_id_reply(out_data),
+            RingConCommands::C020105 => self.get_c020105_reply(out_data),
+            RingConCommands::ReadUnkCal => self.get_read_unk_cal_reply(out_data),
+            RingConCommands::ReadFactoryCal => self.get_read_factory_cal_reply(out_data),
+            RingConCommands::ReadUserCal => self.get_read_user_cal_reply(out_data),
+            RingConCommands::ReadRepCount => self.get_read_rep_count_reply(out_data),
+            RingConCommands::ReadTotalPushCount => self.get_read_total_push_count_reply(out_data),
+            RingConCommands::ResetRepCount => self.get_reset_rep_count_reply(out_data),
+            RingConCommands::SaveCalData => self.get_save_data_reply(out_data),
+            _ => self.get_error_reply(out_data),
+        }
+    }
+
+    fn get_firmware_version_reply(&self, out_data: &mut [u8]) -> u64 {
+        let reply = FirmwareVersionReply {
+            status: DataValid::Valid as u32,
+            firmware: self.version,
+            _padding: [0; 2],
+        };
+        Self::get_data(&reply, out_data)
+    }
+
+    fn get_read_id_reply(&self, out_data: &mut [u8]) -> u64 {
+        // The values are hardcoded from a real joycon
+        let reply = ReadIdReply {
+            status: DataValid::Valid as u32,
+            id_l_x0: 8,
+            id_l_x0_2: 41,
+            id_l_x4: 22294,
+            id_h_x0: 19777,
+            id_h_x0_2: 13621,
+            id_h_x4: 8245,
+        };
+        Self::get_data(&reply, out_data)
+    }
+
+    fn get_c020105_reply(&self, out_data: &mut [u8]) -> u64 {
+        let reply = Cmd020105Reply {
+            status: DataValid::Valid as u32,
+            data: 1,
+            _padding: [0; 3],
+        };
+        Self::get_data(&reply, out_data)
+    }
+
+    fn get_read_unk_cal_reply(&self, out_data: &mut [u8]) -> u64 {
+        let reply = ReadUnkCalReply {
+            status: DataValid::Valid as u32,
+            data: 0,
+            _padding: [0; 2],
+        };
+        Self::get_data(&reply, out_data)
+    }
+
+    fn get_read_factory_cal_reply(&self, out_data: &mut [u8]) -> u64 {
+        let reply = ReadFactoryCalReply {
+            status: DataValid::Valid as u32,
+            calibration: self.factory_calibration,
+        };
+        Self::get_data(&reply, out_data)
+    }
+
+    fn get_read_user_cal_reply(&self, out_data: &mut [u8]) -> u64 {
+        let reply = ReadUserCalReply {
+            status: DataValid::Valid as u32,
+            calibration: self.user_calibration,
+            _padding: [0; 4],
+        };
+        Self::get_data(&reply, out_data)
+    }
+
+    fn get_read_rep_count_reply(&self, out_data: &mut [u8]) -> u64 {
+        let crc = Self::get_crc_value(&[self.total_rep_count, 0, 0, 0]);
+        let reply = GetThreeByteReply {
+            status: DataValid::Valid as u32,
+            data: [self.total_rep_count, 0, 0],
+            crc,
+        };
+        Self::get_data(&reply, out_data)
+    }
+
+    fn get_read_total_push_count_reply(&self, out_data: &mut [u8]) -> u64 {
+        let crc = Self::get_crc_value(&[self.total_push_count, 0, 0, 0]);
+        let reply = GetThreeByteReply {
+            status: DataValid::Valid as u32,
+            data: [self.total_push_count, 0, 0],
+            crc,
+        };
+        Self::get_data(&reply, out_data)
+    }
+
+    fn get_reset_rep_count_reply(&self, out_data: &mut [u8]) -> u64 {
+        self.get_read_rep_count_reply(out_data)
+    }
+
+    fn get_save_data_reply(&self, out_data: &mut [u8]) -> u64 {
+        let reply = StatusReply {
+            status: DataValid::Valid as u32,
+        };
+        Self::get_data(&reply, out_data)
+    }
+
+    fn get_error_reply(&self, out_data: &mut [u8]) -> u64 {
+        let reply = ErrorReply {
+            status: DataValid::BadCRC as u32,
+            _padding: [0; 3],
+        };
+        Self::get_data(&reply, out_data)
+    }
+
+    /// Returns 8 bit redundancy check from provided data
+    fn get_crc_value(data: &[u8]) -> u8 {
+        let mut crc: u8 = 0;
+        for &byte in data {
+            let mut i: u8 = 0x80;
+            while i > 0 {
+                let mut bit = (crc & 0x80) != 0;
+                if (byte & i) != 0 {
+                    bit = !bit;
+                }
+                crc <<= 1;
+                if bit {
+                    crc ^= 0x8d;
+                }
+                i >>= 1;
+            }
+        }
+        crc
+    }
+
+    /// Converts a struct to bytes and copies into out_data.
+    fn get_data<T: Sized>(reply: &T, out_data: &mut [u8]) -> u64 {
+        let reply_size = std::mem::size_of::<T>();
+        let data_size = reply_size.min(out_data.len());
+        let src = unsafe {
+            std::slice::from_raw_parts(reply as *const T as *const u8, reply_size)
+        };
+        out_data[..data_size].copy_from_slice(&src[..data_size]);
+        data_size as u64
+    }
+
+    pub fn base(&self) -> &HidbusBase {
+        &self.base
+    }
+
+    pub fn base_mut(&mut self) -> &mut HidbusBase {
+        &mut self.base
     }
 }
 

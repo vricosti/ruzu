@@ -145,3 +145,54 @@ impl Default for AesCtrCounterExtendedStorage {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(BLOCK_SIZE, 16);
+        assert_eq!(KEY_SIZE, 16);
+        assert_eq!(IV_SIZE, 16);
+        assert_eq!(NODE_SIZE, 16384);
+    }
+
+    #[test]
+    fn test_entry_size() {
+        assert_eq!(std::mem::size_of::<Entry>(), 0x10);
+    }
+
+    #[test]
+    fn test_entry_offset_round_trip() {
+        let mut entry = Entry {
+            offset: [0u8; 8],
+            encryption_value: 0,
+            reserved: [0u8; 3],
+            generation: 0,
+        };
+        entry.set_offset(0xDEAD_BEEF);
+        assert_eq!(entry.get_offset(), 0xDEAD_BEEF);
+
+        entry.set_offset(-42);
+        assert_eq!(entry.get_offset(), -42);
+    }
+
+    #[test]
+    fn test_entry_encryption() {
+        assert_eq!(EntryEncryption::Encrypted as u8, 0);
+        assert_eq!(EntryEncryption::NotEncrypted as u8, 1);
+    }
+
+    #[test]
+    fn test_new() {
+        let storage = AesCtrCounterExtendedStorage::new();
+        assert!(!storage.is_initialized());
+    }
+
+    #[test]
+    fn test_default() {
+        let storage = AesCtrCounterExtendedStorage::default();
+        assert!(!storage.is_initialized());
+    }
+}

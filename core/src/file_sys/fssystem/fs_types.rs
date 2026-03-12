@@ -68,3 +68,67 @@ pub const INTEGRITY_MIN_LAYER_COUNT: usize = 2;
 pub const INTEGRITY_MAX_LAYER_COUNT: usize = 7;
 pub const INTEGRITY_LAYER_COUNT_SAVE: usize = 5;
 pub const INTEGRITY_LAYER_COUNT_SAVE_DATA_META: usize = 4;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_int64_set_get() {
+        let mut v = Int64::default();
+        v.set(0x1234_5678_9ABC_DEF0);
+        assert_eq!(v.get(), 0x1234_5678_9ABC_DEF0);
+    }
+
+    #[test]
+    fn test_int64_negative() {
+        let mut v = Int64::default();
+        v.set(-1);
+        assert_eq!(v.get(), -1);
+    }
+
+    #[test]
+    fn test_int64_zero() {
+        let v = Int64::default();
+        assert_eq!(v.get(), 0);
+    }
+
+    #[test]
+    fn test_int64_from_i64() {
+        let v = Int64::from_i64(42);
+        assert_eq!(v.get(), 42);
+    }
+
+    #[test]
+    fn test_int64_from_trait() {
+        let v: Int64 = 100i64.into();
+        assert_eq!(v.get(), 100);
+    }
+
+    #[test]
+    fn test_int64_into_i64() {
+        let v = Int64::from_i64(200);
+        let x: i64 = v.into();
+        assert_eq!(x, 200);
+    }
+
+    #[test]
+    fn test_hash_salt_size() {
+        assert_eq!(HashSalt::SIZE, 32);
+        assert_eq!(std::mem::size_of::<HashSalt>(), 32);
+    }
+
+    #[test]
+    fn test_hash_salt_default() {
+        let salt = HashSalt::default();
+        assert!(salt.value.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_integrity_constants() {
+        assert_eq!(INTEGRITY_MIN_LAYER_COUNT, 2);
+        assert_eq!(INTEGRITY_MAX_LAYER_COUNT, 7);
+        assert_eq!(INTEGRITY_LAYER_COUNT_SAVE, 5);
+        assert_eq!(INTEGRITY_LAYER_COUNT_SAVE_DATA_META, 4);
+    }
+}

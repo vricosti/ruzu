@@ -29,12 +29,25 @@ impl InputInterpreter {
 
     /// Gets a button state from HID and inserts it into the array of button states.
     pub fn poll_input(&mut self) {
-        todo!()
+        // TODO: In the upstream C++, this calls npad->GetAndResetPressState()
+        // to get the current button state from the NPad resource.
+        // Requires NPad integration.
+        // For now, just advance the indices (no actual input).
+        self.previous_index = self.current_index;
+        self.current_index = (self.current_index + 1) % self.button_states.len();
+        self.button_states[self.current_index] = NpadButton::empty();
     }
 
     /// Resets all the button states to their defaults.
     pub fn reset_button_states(&mut self) {
-        self.button_states = [NpadButton::empty(); 9];
+        self.previous_index = 0;
+        self.current_index = 0;
+
+        // First entry is set to All (matching upstream ResetButtonStates)
+        self.button_states[0] = NpadButton::all();
+        for i in 1..self.button_states.len() {
+            self.button_states[i] = NpadButton::empty();
+        }
     }
 
     /// Checks whether the button is pressed.

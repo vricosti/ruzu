@@ -49,3 +49,43 @@ pub mod compression_type_utility {
         (ct as u8) >= (CompressionType::Unknown as u8)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use compression_type_utility::*;
+
+    #[test]
+    fn test_is_block_alignment_required() {
+        assert!(!is_block_alignment_required(CompressionType::None));
+        assert!(!is_block_alignment_required(CompressionType::Zeros));
+        assert!(is_block_alignment_required(CompressionType::Two));
+        assert!(is_block_alignment_required(CompressionType::Lz4));
+    }
+
+    #[test]
+    fn test_is_data_storage_access_required() {
+        assert!(is_data_storage_access_required(CompressionType::None));
+        assert!(!is_data_storage_access_required(CompressionType::Zeros));
+        assert!(is_data_storage_access_required(CompressionType::Lz4));
+    }
+
+    #[test]
+    fn test_is_random_accessible() {
+        assert!(is_random_accessible(CompressionType::None));
+        assert!(!is_random_accessible(CompressionType::Zeros));
+        assert!(!is_random_accessible(CompressionType::Lz4));
+    }
+
+    #[test]
+    fn test_is_unknown_type() {
+        assert!(!is_unknown_type(CompressionType::None));
+        assert!(!is_unknown_type(CompressionType::Lz4));
+        assert!(is_unknown_type(CompressionType::Unknown));
+    }
+
+    #[test]
+    fn test_compression_block_alignment() {
+        assert_eq!(COMPRESSION_BLOCK_ALIGNMENT, 0x10);
+    }
+}

@@ -80,11 +80,27 @@ impl EmulatedConsole {
     }
 
     pub fn reload_input(&mut self) {
-        todo!()
+        // TODO: In upstream C++, this calls SetTouchParams(), creates motion devices,
+        // restores motion state, and creates touch devices with callbacks.
+        // Requires Common::Input::CreateInputDevice and Settings integration.
+        log::debug!("EmulatedConsole::reload_input called");
     }
 
     pub fn reload_from_settings(&mut self) {
-        todo!()
+        // TODO: In upstream C++, this reads motion params from Settings::values.players[0]
+        // and calls reload_input.
+        // Requires Settings integration.
+        log::debug!("EmulatedConsole::reload_from_settings called");
+    }
+
+    fn get_index_from_finger_id(&self, _finger_id: usize) -> Option<usize> {
+        // TODO: iterate touch_values to find matching finger_id
+        None
+    }
+
+    fn get_next_free_index(&self) -> Option<usize> {
+        // TODO: iterate touch_values to find first unpressed slot
+        None
     }
 
     pub fn save_current_config(&mut self) {

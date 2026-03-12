@@ -63,3 +63,35 @@ const _: () = assert!(std::mem::size_of::<WriteOption>() == std::mem::size_of::<
 pub struct FileHandle {
     pub handle: *mut std::ffi::c_void,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_option_size() {
+        assert_eq!(std::mem::size_of::<ReadOption>(), 4);
+    }
+
+    #[test]
+    fn test_write_option_size() {
+        assert_eq!(std::mem::size_of::<WriteOption>(), 4);
+    }
+
+    #[test]
+    fn test_write_option_none() {
+        assert_eq!(WriteOption::NONE.value, 0);
+        assert!(!WriteOption::NONE.has_flush_flag());
+    }
+
+    #[test]
+    fn test_write_option_flush() {
+        assert_eq!(WriteOption::FLUSH.value, 1);
+        assert!(WriteOption::FLUSH.has_flush_flag());
+    }
+
+    #[test]
+    fn test_read_option_none() {
+        assert_eq!(ReadOption::NONE.value, 0);
+    }
+}

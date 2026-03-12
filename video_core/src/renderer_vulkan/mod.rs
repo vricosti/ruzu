@@ -73,7 +73,7 @@ use graphics_pipeline::GraphicsPipelineCache;
 use render_pass_cache::RenderPassCache;
 use scheduler::Scheduler;
 use staging_buffer_pool::StagingBufferPool;
-use state_tracker::{DirtyFlag, StateTracker};
+use state_tracker::StateTracker;
 use texture_cache::TextureCache;
 use update_descriptor::UpdateDescriptorQueue;
 
@@ -196,11 +196,10 @@ impl RasterizerVulkan {
             StagingBufferPool::new(device.clone(), instance.clone(), physical_device);
 
         // Create descriptor pool
-        let descriptor_pool = DescriptorPool::new(device.clone())
-            .map_err(|e| RendererError::InitFailed(format!("descriptor pool: {:?}", e)))?;
+        let descriptor_pool = DescriptorPool::new(device.clone(), 64);
 
         // Create descriptor update queue
-        let desc_queue = UpdateDescriptorQueue::new(device.clone());
+        let desc_queue = UpdateDescriptorQueue::new();
 
         // Create render pass cache
         let render_pass_cache = RenderPassCache::new(device.clone());
@@ -371,7 +370,7 @@ impl RasterizerVulkan {
 
         self.draw_counter += 1;
         // Mark state dirty for next draw (conservative — real tracking per-register later)
-        self.state_tracker.set_all_dirty();
+        self.state_tracker.invalidate_state();
     }
 
     /// Clear framebuffer.
@@ -528,7 +527,7 @@ impl RasterizerVulkan {
     }
 
     fn update_viewports(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
-        if !self.state_tracker.touch(DirtyFlag::Viewports) {
+        if !self.state_tracker.touch_viewports() {
             return;
         }
         let viewport = vk::Viewport {
@@ -545,7 +544,7 @@ impl RasterizerVulkan {
     }
 
     fn update_scissors(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
-        if !self.state_tracker.touch(DirtyFlag::Scissors) {
+        if !self.state_tracker.touch_scissors() {
             return;
         }
         let scissor = if draw.scissors[0].enabled {
@@ -574,7 +573,7 @@ impl RasterizerVulkan {
     }
 
     fn update_depth_bias(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
-        if !self.state_tracker.touch(DirtyFlag::DepthBias) {
+        if !self.state_tracker.touch_depth_bias() {
             return;
         }
         if draw.rasterizer.depth_bias != 0.0 {
@@ -590,7 +589,7 @@ impl RasterizerVulkan {
     }
 
     fn update_blend_constants(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
-        if !self.state_tracker.touch(DirtyFlag::BlendConstants) {
+        if !self.state_tracker.touch_blend_constants() {
             return;
         }
         unsafe {
@@ -607,7 +606,7 @@ impl RasterizerVulkan {
     }
 
     fn update_depth_bounds(&mut self, cmd: vk::CommandBuffer, _draw: &DrawCall) {
-        if !self.state_tracker.touch(DirtyFlag::DepthBounds) {
+        if !self.state_tracker.touch_depth_bounds() {
             return;
         }
         // Depth bounds test not currently used, but set safe defaults
@@ -617,7 +616,7 @@ impl RasterizerVulkan {
     }
 
     fn update_line_width(&mut self, cmd: vk::CommandBuffer, draw: &DrawCall) {
-        if !self.state_tracker.touch(DirtyFlag::LineWidth) {
+        if !self.state_tracker.touch_line_width() {
             return;
         }
         unsafe {

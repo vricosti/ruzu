@@ -31,6 +31,27 @@ impl<State: Copy + Default, const MAX_BUFFER_SIZE: usize> Default for Lifo<State
     }
 }
 
+impl<State: Copy + Default + std::fmt::Debug, const MAX_BUFFER_SIZE: usize> std::fmt::Debug
+    for Lifo<State, MAX_BUFFER_SIZE>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lifo")
+            .field("timestamp", &self.timestamp)
+            .field("total_buffer_count", &self.total_buffer_count)
+            .field("buffer_tail", &self.buffer_tail)
+            .field("buffer_count", &self.buffer_count)
+            .finish()
+    }
+}
+
+impl<State: Copy + Default, const MAX_BUFFER_SIZE: usize> Clone for Lifo<State, MAX_BUFFER_SIZE> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<State: Copy + Default, const MAX_BUFFER_SIZE: usize> Copy for Lifo<State, MAX_BUFFER_SIZE> {}
+
 impl<State: Copy + Default, const MAX_BUFFER_SIZE: usize> Lifo<State, MAX_BUFFER_SIZE> {
     pub fn read_current_entry(&self) -> &AtomicStorage<State> {
         &self.entries[self.buffer_tail as usize]

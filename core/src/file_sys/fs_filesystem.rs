@@ -83,3 +83,63 @@ const _: () = assert!(
     std::mem::size_of::<FileSystemAttribute>() == 0xC0,
     "FileSystemAttribute has incorrect size"
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_open_mode_flags() {
+        assert_eq!(OpenMode::READ.bits(), 1);
+        assert_eq!(OpenMode::WRITE.bits(), 2);
+        assert_eq!(OpenMode::ALLOW_APPEND.bits(), 4);
+        assert_eq!(OpenMode::READ_WRITE.bits(), 3);
+        assert_eq!(OpenMode::ALL.bits(), 7);
+    }
+
+    #[test]
+    fn test_open_mode_contains() {
+        let rw = OpenMode::READ_WRITE;
+        assert!(rw.contains(OpenMode::READ));
+        assert!(rw.contains(OpenMode::WRITE));
+        assert!(!rw.contains(OpenMode::ALLOW_APPEND));
+
+        let all = OpenMode::ALL;
+        assert!(all.contains(OpenMode::READ));
+        assert!(all.contains(OpenMode::WRITE));
+        assert!(all.contains(OpenMode::ALLOW_APPEND));
+    }
+
+    #[test]
+    fn test_open_directory_mode_flags() {
+        assert_eq!(OpenDirectoryMode::DIRECTORY.bits(), 1);
+        assert_eq!(OpenDirectoryMode::FILE.bits(), 2);
+        assert_eq!(OpenDirectoryMode::ALL.bits(), 3);
+        assert_eq!(OpenDirectoryMode::NOT_REQUIRE_FILE_SIZE.bits(), 1u64 << 31);
+    }
+
+    #[test]
+    fn test_open_directory_mode_contains() {
+        let all = OpenDirectoryMode::ALL;
+        assert!(all.contains(OpenDirectoryMode::DIRECTORY));
+        assert!(all.contains(OpenDirectoryMode::FILE));
+        assert!(!all.contains(OpenDirectoryMode::NOT_REQUIRE_FILE_SIZE));
+    }
+
+    #[test]
+    fn test_directory_entry_type() {
+        assert_eq!(DirectoryEntryType::Directory as u8, 0);
+        assert_eq!(DirectoryEntryType::File as u8, 1);
+    }
+
+    #[test]
+    fn test_create_option() {
+        assert_eq!(CreateOption::None as u8, 0);
+        assert_eq!(CreateOption::BigFile as u8, 1);
+    }
+
+    #[test]
+    fn test_filesystem_attribute_size() {
+        assert_eq!(std::mem::size_of::<FileSystemAttribute>(), 0xC0);
+    }
+}

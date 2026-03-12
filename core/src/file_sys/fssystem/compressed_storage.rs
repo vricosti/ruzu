@@ -66,4 +66,58 @@ impl CompressedStorage {
     pub fn query_entry_storage_size(entry_count: i32) -> i64 { BucketTree::query_entry_storage_size(NODE_SIZE, std::mem::size_of::<Entry>(), entry_count) }
 }
 
-impl Default for CompressedStorage { fn default() -> Self { Self::new() } }
+impl Default for CompressedStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_entry_size() {
+        assert_eq!(std::mem::size_of::<Entry>(), 0x18);
+    }
+
+    #[test]
+    fn test_node_size() {
+        assert_eq!(NODE_SIZE, 16 * 1024);
+    }
+
+    #[test]
+    fn test_new() {
+        let storage = CompressedStorage::new();
+        assert!(storage.get_data_storage().is_none());
+    }
+
+    #[test]
+    fn test_default() {
+        let _storage = CompressedStorage::default();
+    }
+
+    #[test]
+    fn test_entry_get_physical_size() {
+        let entry = Entry {
+            virt_offset: 0,
+            phys_offset: 0,
+            compression_type: CompressionType::None,
+            _padding: [0u8; 3],
+            phys_size: 0x1000,
+        };
+        assert_eq!(entry.get_physical_size(), 0x1000);
+    }
+
+    #[test]
+    fn test_entry_negative_physical_size() {
+        let entry = Entry {
+            virt_offset: 0,
+            phys_offset: 0,
+            compression_type: CompressionType::None,
+            _padding: [0u8; 3],
+            phys_size: -1,
+        };
+        assert_eq!(entry.get_physical_size(), -1);
+    }
+}

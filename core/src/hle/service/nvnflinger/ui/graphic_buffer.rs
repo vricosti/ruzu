@@ -1,6 +1,148 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: Copyright 2007 The Android Open Source Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Parts of this implementation were based on:
+// https://cs.android.com/android/platform/superproject/+/android-5.1.1_r38:frameworks/native/include/ui/GraphicBuffer.h
 
 //! Port of zuyu/src/core/hle/service/nvnflinger/ui/graphic_buffer.h
 //! Port of zuyu/src/core/hle/service/nvnflinger/ui/graphic_buffer.cpp
-// TODO: Port from upstream
+
+use super::super::pixel_format::PixelFormat;
+
+/// Raw NV graphic buffer data structure.
+///
+/// This struct has a specific binary layout that must match upstream exactly
+/// for serialization purposes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NvGraphicBuffer {
+    pub magic: u32,
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+    pub format: PixelFormat,
+    pub usage: i32,
+    _padding0: u32,
+    pub index: u32,
+    _padding1: [u32; 3],
+    pub buffer_id: u32,
+    _padding2: [u32; 6],
+    pub external_format: PixelFormat,
+    _padding3: [u32; 10],
+    pub handle: u32,
+    pub offset: u32,
+    _padding4: [u32; 60],
+}
+const _: () = assert!(std::mem::size_of::<NvGraphicBuffer>() == 0x16C);
+
+impl Default for NvGraphicBuffer {
+    fn default() -> Self {
+        // Safety: All fields are integer/enum types where zero is valid.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+impl NvGraphicBuffer {
+    pub fn new(width: u32, height: u32, format: PixelFormat, usage: u32) -> Self {
+        let mut buf = Self::default();
+        buf.width = width as i32;
+        buf.height = height as i32;
+        buf.format = format;
+        buf.usage = usage as i32;
+        buf
+    }
+
+    pub fn get_width(&self) -> u32 {
+        self.width as u32
+    }
+
+    pub fn get_height(&self) -> u32 {
+        self.height as u32
+    }
+
+    pub fn get_stride(&self) -> u32 {
+        self.stride as u32
+    }
+
+    pub fn get_usage(&self) -> u32 {
+        self.usage as u32
+    }
+
+    pub fn get_format(&self) -> PixelFormat {
+        self.format
+    }
+
+    pub fn get_buffer_id(&self) -> u32 {
+        self.buffer_id
+    }
+
+    pub fn get_external_format(&self) -> PixelFormat {
+        self.external_format
+    }
+
+    pub fn get_handle(&self) -> u32 {
+        self.handle
+    }
+
+    pub fn get_offset(&self) -> u32 {
+        self.offset
+    }
+
+    pub fn needs_reallocation(&self, width: u32, height: u32, format: PixelFormat, usage: u32) -> bool {
+        if width as i32 != self.width {
+            return true;
+        }
+        if height as i32 != self.height {
+            return true;
+        }
+        if format != self.format {
+            return true;
+        }
+        if (self.usage as u32 & usage) != usage {
+            return true;
+        }
+        false
+    }
+}
+
+/// A GraphicBuffer wraps an NvGraphicBuffer and optionally tracks NvMap ownership.
+///
+/// In upstream C++, GraphicBuffer inherits from NvGraphicBuffer and holds an optional
+/// NvMap pointer for cleanup. Here we use composition.
+pub struct GraphicBuffer {
+    pub buffer: NvGraphicBuffer,
+    // In upstream, m_nvmap is used for cleanup via NvMap. We track whether we have
+    // an nvmap reference but the actual cleanup depends on NvMap infrastructure.
+    has_nvmap: bool,
+}
+
+impl GraphicBuffer {
+    pub fn new(width: u32, height: u32, format: PixelFormat, usage: u32) -> Self {
+        Self {
+            buffer: NvGraphicBuffer::new(width, height, format, usage),
+            has_nvmap: false,
+        }
+    }
+
+    pub fn from_nv_buffer(buffer: NvGraphicBuffer, _has_nvmap: bool) -> Self {
+        Self {
+            buffer,
+            has_nvmap: _has_nvmap,
+        }
+    }
+
+    // Delegate accessors to inner buffer
+    pub fn get_width(&self) -> u32 { self.buffer.get_width() }
+    pub fn get_height(&self) -> u32 { self.buffer.get_height() }
+    pub fn get_stride(&self) -> u32 { self.buffer.get_stride() }
+    pub fn get_usage(&self) -> u32 { self.buffer.get_usage() }
+    pub fn get_format(&self) -> PixelFormat { self.buffer.get_format() }
+    pub fn get_buffer_id(&self) -> u32 { self.buffer.get_buffer_id() }
+    pub fn get_external_format(&self) -> PixelFormat { self.buffer.get_external_format() }
+    pub fn get_handle(&self) -> u32 { self.buffer.get_handle() }
+    pub fn get_offset(&self) -> u32 { self.buffer.get_offset() }
+
+    pub fn needs_reallocation(&self, width: u32, height: u32, format: PixelFormat, usage: u32) -> bool {
+        self.buffer.needs_reallocation(width, height, format, usage)
+    }
+}

@@ -286,3 +286,220 @@ pub struct EntrySetHeader {
     pub end: i64,
     pub start: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(BUCKET_TREE_MAGIC, u32::from_le_bytes(*b"BKTR"));
+        assert_eq!(BUCKET_TREE_VERSION, 1);
+        assert_eq!(NODE_SIZE_MIN, 1024);
+        assert_eq!(NODE_SIZE_MAX, 512 * 1024);
+    }
+
+    #[test]
+    fn test_bucket_tree_header_size() {
+        assert_eq!(std::mem::size_of::<BucketTreeHeader>(), 0x10);
+    }
+
+    #[test]
+    fn test_bucket_tree_header_format_and_verify() {
+        let mut header = BucketTreeHeader::default();
+        header.format(42);
+        assert_eq!(header.magic, BUCKET_TREE_MAGIC);
+        assert_eq!(header.version, BUCKET_TREE_VERSION);
+        assert_eq!(header.entry_count, 42);
+        assert_eq!(header.reserved, 0);
+        assert!(header.verify().is_ok());
+    }
+
+    #[test]
+    fn test_bucket_tree_header_verify_bad_magic() {
+        let header = BucketTreeHeader {
+            magic: 0xDEADBEEF,
+            version: BUCKET_TREE_VERSION,
+            entry_count: 0,
+            reserved: 0,
+        };
+        assert!(header.verify().is_err());
+    }
+
+    #[test]
+    fn test_bucket_tree_header_verify_bad_version() {
+        let header = BucketTreeHeader {
+            magic: BUCKET_TREE_MAGIC,
+            version: 99,
+            entry_count: 0,
+            reserved: 0,
+        };
+        assert!(header.verify().is_err());
+    }
+
+    #[test]
+    fn test_bucket_tree_header_verify_negative_entry_count() {
+        let header = BucketTreeHeader {
+            magic: BUCKET_TREE_MAGIC,
+            version: BUCKET_TREE_VERSION,
+            entry_count: -1,
+            reserved: 0,
+        };
+        assert!(header.verify().is_err());
+    }
+
+    #[test]
+    fn test_node_header_size() {
+        assert_eq!(std::mem::size_of::<NodeHeader>(), 0x10);
+    }
+
+    #[test]
+    fn test_offsets_size() {
+        assert_eq!(std::mem::size_of::<Offsets>(), 0x10);
+    }
+
+    #[test]
+    fn test_offsets_is_include_offset() {
+        let offsets = Offsets {
+            start_offset: 10,
+            end_offset: 100,
+        };
+        assert!(offsets.is_include_offset(10));
+        assert!(offsets.is_include_offset(50));
+        assert!(offsets.is_include_offset(99));
+        assert!(!offsets.is_include_offset(9));
+        assert!(!offsets.is_include_offset(100));
+    }
+
+    #[test]
+    fn test_offsets_is_include_range() {
+        let offsets = Offsets {
+            start_offset: 0,
+            end_offset: 100,
+        };
+        assert!(offsets.is_include_range(0, 100));
+        assert!(offsets.is_include_range(0, 50));
+        assert!(offsets.is_include_range(50, 50));
+        assert!(!offsets.is_include_range(50, 51));
+        assert!(!offsets.is_include_range(0, 0));
+        assert!(!offsets.is_include_range(-1, 10));
+    }
+
+    #[test]
+    fn test_continuous_reading_info() {
+        let mut info = ContinuousReadingInfo::new();
+        assert!(!info.is_done());
+        assert!(!info.can_do());
+        assert_eq!(info.get_read_size(), 0);
+        assert_eq!(info.get_skip_count(), 0);
+
+        info.set_read_size(1024);
+        assert!(info.can_do());
+        assert_eq!(info.get_read_size(), 1024);
+
+        info.set_skip_count(3);
+        assert_eq!(info.get_skip_count(), 3);
+        assert!(!info.check_need_scan()); // skip_count = 2
+        assert!(!info.check_need_scan()); // skip_count = 1
+        assert!(info.check_need_scan());  // skip_count = 0
+
+        info.done();
+        assert!(info.is_done());
+        assert!(!info.can_do()); // read_size reset to 0
+
+        info.reset();
+        assert!(!info.is_done());
+        assert_eq!(info.get_read_size(), 0);
+        assert_eq!(info.get_skip_count(), 0);
+    }
+
+    #[test]
+    fn test_get_entry_count_helper() {
+        // node_size=1024, entry_size=16 -> (1024-16)/16 = 63
+        assert_eq!(get_entry_count(1024, 16), 63);
+    }
+
+    #[test]
+    fn test_get_offset_count_helper() {
+        // node_size=1024 -> (1024-16)/8 = 126
+        assert_eq!(get_offset_count(1024), 126);
+    }
+
+    #[test]
+    fn test_get_entry_set_count_helper() {
+        // 100 entries, 63 per node -> ceil(100/63) = 2
+        assert_eq!(get_entry_set_count(1024, 16, 100), 2);
+        // 63 entries exactly -> 1
+        assert_eq!(get_entry_set_count(1024, 16, 63), 1);
+    }
+
+    #[test]
+    fn test_bucket_tree_new() {
+        let tree = BucketTree::new();
+        assert!(!tree.is_initialized());
+        assert!(tree.is_empty());
+        assert_eq!(tree.get_entry_count(), 0);
+    }
+
+    #[test]
+    fn test_bucket_tree_default() {
+        let tree = BucketTree::default();
+        assert!(!tree.is_initialized());
+    }
+
+    #[test]
+    fn test_bucket_tree_initialize_empty() {
+        let mut tree = BucketTree::new();
+        tree.initialize_empty(1024, 0x10000);
+        assert!(tree.is_initialized());
+        let offsets = tree.get_offsets().unwrap();
+        assert_eq!(offsets.start_offset, 0);
+        assert_eq!(offsets.end_offset, 0x10000);
+    }
+
+    #[test]
+    fn test_query_header_storage_size() {
+        assert_eq!(BucketTree::query_header_storage_size(), 0x10);
+    }
+
+    #[test]
+    fn test_query_node_storage_size_zero_entries() {
+        assert_eq!(BucketTree::query_node_storage_size(1024, 16, 0), 0);
+        assert_eq!(BucketTree::query_node_storage_size(1024, 16, -1), 0);
+    }
+
+    #[test]
+    fn test_query_entry_storage_size_zero_entries() {
+        assert_eq!(BucketTree::query_entry_storage_size(1024, 16, 0), 0);
+        assert_eq!(BucketTree::query_entry_storage_size(1024, 16, -1), 0);
+    }
+
+    #[test]
+    fn test_query_node_storage_size_small() {
+        // 1 entry, node_size=1024, entry_size=16
+        // entry_set_count = 1, offset_count = 126, 1 <= 126 so l2=0
+        // result = (1 + 0) * 1024 = 1024
+        assert_eq!(BucketTree::query_node_storage_size(1024, 16, 1), 1024);
+    }
+
+    #[test]
+    fn test_query_entry_storage_size_small() {
+        // 1 entry -> entry_set_count = 1 -> 1 * 1024 = 1024
+        assert_eq!(BucketTree::query_entry_storage_size(1024, 16, 1), 1024);
+    }
+
+    #[test]
+    fn test_entry_set_header_size() {
+        assert_eq!(std::mem::size_of::<EntrySetHeader>(), 0x18);
+    }
+
+    #[test]
+    fn test_finalize() {
+        let mut tree = BucketTree::new();
+        tree.initialize_empty(1024, 0x10000);
+        assert!(tree.is_initialized());
+        tree.finalize();
+        assert!(!tree.is_initialized());
+        assert_eq!(tree.get_entry_count(), 0);
+    }
+}

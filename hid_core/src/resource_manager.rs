@@ -8,11 +8,17 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+use common::ResultCode;
+
 use crate::hid_types::*;
-use crate::resources::applet_resource::AppletResource;
+use crate::hid_result;
+use crate::hid_util;
+use crate::resources::applet_resource::{AppletResource, SYSTEM_ARUID};
 use crate::resources::hid_firmware_settings::HidFirmwareSettings;
 
 /// Updating period for each HID device.
+/// Period time is obtained by measuring the number of samples in a second on HW using a homebrew
+/// Correct npad_update_ns is 4ms this is overclocked to lower input lag
 pub const NPAD_UPDATE_NS: Duration = Duration::from_nanos(1_000_000); // 1ms, 1000Hz
 pub const DEFAULT_UPDATE_NS: Duration = Duration::from_nanos(4_000_000); // 4ms, 250Hz
 pub const MOUSE_KEYBOARD_UPDATE_NS: Duration = Duration::from_nanos(8_000_000); // 8ms, 125Hz
@@ -66,41 +72,201 @@ impl ResourceManager {
 
     // TODO: Add all getter methods for resources (get_capture_button, get_npad, etc.)
 
-    pub fn enable_input(&self, _aruid: u64, _is_enabled: bool) {
-        let _lock = self.shared_mutex.read();
-        // TODO: applet_resource.enable_input(aruid, is_enabled)
-        todo!()
+    pub fn create_applet_resource(&self, aruid: u64) -> ResultCode {
+        if aruid == SYSTEM_ARUID {
+            let result = self.register_core_applet_resource();
+            if result.is_error() {
+                return result;
+            }
+            // TODO: GetNpad()->ActivateNpadResource()
+            return ResultCode::SUCCESS;
+        }
+
+        let result = self.create_applet_resource_impl(aruid);
+        if result.is_error() {
+            return result;
+        }
+
+        // Homebrew doesn't try to activate some controllers, so we activate them by default
+        // TODO: npad->Activate(); six_axis->Activate(); touch_screen->Activate(); gesture->Activate();
+
+        // TODO: GetNpad()->ActivateNpadResource(aruid)
+        ResultCode::SUCCESS
     }
 
-    pub fn enable_six_axis_sensor(&self, _aruid: u64, _is_enabled: bool) {
-        let _lock = self.shared_mutex.read();
-        todo!()
+    fn create_applet_resource_impl(&self, aruid: u64) -> ResultCode {
+        let _lock = self.shared_mutex.write();
+        if let Some(ref resource) = self.applet_resource {
+            resource.lock().create_applet_resource(aruid)
+        } else {
+            ResultCode::SUCCESS
+        }
     }
 
-    pub fn enable_pad_input(&self, _aruid: u64, _is_enabled: bool) {
-        let _lock = self.shared_mutex.read();
-        todo!()
+    pub fn register_core_applet_resource(&self) -> ResultCode {
+        let _lock = self.shared_mutex.write();
+        if let Some(ref resource) = self.applet_resource {
+            resource.lock().register_core_applet_resource()
+        } else {
+            ResultCode::SUCCESS
+        }
     }
 
-    pub fn enable_touch_screen(&self, _aruid: u64, _is_enabled: bool) {
+    pub fn unregister_core_applet_resource(&self) -> ResultCode {
+        let _lock = self.shared_mutex.write();
+        if let Some(ref resource) = self.applet_resource {
+            resource.lock().unregister_core_applet_resource()
+        } else {
+            ResultCode::SUCCESS
+        }
+    }
+
+    pub fn register_applet_resource_user_id(&self, aruid: u64, enable_input: bool) -> ResultCode {
+        let _lock = self.shared_mutex.write();
+        if let Some(ref resource) = self.applet_resource {
+            let result = resource.lock().register_applet_resource_user_id(aruid, enable_input);
+            if result.is_error() {
+                return result;
+            }
+            // TODO: npad->RegisterAppletResourceUserId(aruid)
+        }
+        ResultCode::SUCCESS
+    }
+
+    pub fn unregister_applet_resource_user_id(&self, aruid: u64) {
+        let _lock = self.shared_mutex.write();
+        if let Some(ref resource) = self.applet_resource {
+            resource.lock().unregister_applet_resource_user_id(aruid);
+        }
+        // TODO: npad->UnregisterAppletResourceUserId(aruid)
+    }
+
+    pub fn free_applet_resource_id(&self, aruid: u64) {
+        let _lock = self.shared_mutex.write();
+        if let Some(ref resource) = self.applet_resource {
+            resource.lock().free_applet_resource_id(aruid);
+        }
+        // TODO: npad->FreeAppletResourceId(aruid)
+    }
+
+    pub fn enable_input(&self, aruid: u64, is_enabled: bool) {
         let _lock = self.shared_mutex.read();
-        todo!()
+        if let Some(ref resource) = self.applet_resource {
+            resource.lock().enable_input(aruid, is_enabled);
+        }
+    }
+
+    pub fn enable_six_axis_sensor(&self, aruid: u64, is_enabled: bool) {
+        let _lock = self.shared_mutex.read();
+        if let Some(ref resource) = self.applet_resource {
+            resource.lock().enable_six_axis_sensor(aruid, is_enabled);
+        }
+    }
+
+    pub fn enable_pad_input(&self, aruid: u64, is_enabled: bool) {
+        let _lock = self.shared_mutex.read();
+        if let Some(ref resource) = self.applet_resource {
+            resource.lock().enable_pad_input(aruid, is_enabled);
+        }
+    }
+
+    pub fn enable_touch_screen(&self, aruid: u64, is_enabled: bool) {
+        let _lock = self.shared_mutex.read();
+        if let Some(ref resource) = self.applet_resource {
+            resource.lock().enable_touch_screen(aruid, is_enabled);
+        }
+    }
+
+    pub fn set_aruid_valid_for_vibration(&self, aruid: u64, is_enabled: bool) -> ResultCode {
+        let _lock = self.shared_mutex.write();
+        if let Some(ref resource) = self.applet_resource {
+            let _has_changed = resource.lock().set_aruid_valid_for_vibration(aruid, is_enabled);
+            // TODO: if has_changed, update vibration devices
+        }
+        ResultCode::SUCCESS
+    }
+
+    pub fn set_force_handheld_style_vibration(&self, is_forced: bool) {
+        if let Some(ref config) = self.handheld_config {
+            config.lock().is_force_handheld_style_vibration = is_forced;
+        }
+    }
+
+    pub fn is_vibration_aruid_active(&self, aruid: u64) -> Result<bool, ResultCode> {
+        let _lock = self.shared_mutex.read();
+        if let Some(ref resource) = self.applet_resource {
+            Ok(resource.lock().is_vibration_aruid_active(aruid))
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Port of ResourceManager::GetVibrationDeviceInfo.
+    pub fn get_vibration_device_info(
+        &self,
+        handle: &VibrationDeviceHandle,
+    ) -> Result<VibrationDeviceInfo, ResultCode> {
+        let is_valid = hid_util::is_vibration_handle_valid(handle);
+        if is_valid.is_error() {
+            return Err(is_valid);
+        }
+
+        let mut check_device_index = false;
+
+        let device_type = match handle.npad_type {
+            NpadStyleIndex::Fullkey
+            | NpadStyleIndex::Handheld
+            | NpadStyleIndex::JoyconDual
+            | NpadStyleIndex::JoyconLeft
+            | NpadStyleIndex::JoyconRight => {
+                check_device_index = true;
+                VibrationDeviceType::LinearResonantActuator
+            }
+            NpadStyleIndex::GameCube => VibrationDeviceType::GcErm,
+            NpadStyleIndex::N64 => VibrationDeviceType::N64,
+            _ => VibrationDeviceType::Unknown,
+        };
+
+        let position = if check_device_index {
+            match handle.device_index {
+                DeviceIndex::Left => VibrationDevicePosition::Left,
+                DeviceIndex::Right => VibrationDevicePosition::Right,
+                _ => {
+                    log::error!("DeviceIndex should never be None!");
+                    VibrationDevicePosition::None
+                }
+            }
+        } else {
+            VibrationDevicePosition::None
+        };
+
+        Ok(VibrationDeviceInfo {
+            device_type,
+            position,
+        })
+    }
+
+    /// Port of ResourceManager::GetTouchScreenFirmwareVersion.
+    pub fn get_touch_screen_firmware_version(&self) -> Result<FirmwareVersion, ResultCode> {
+        Ok(FirmwareVersion::default())
     }
 
     pub fn update_controllers(&self, _ns_late: Duration) {
-        todo!()
+        // TODO: debug_pad->OnUpdate, digitizer->OnUpdate, unique_pad->OnUpdate,
+        //       palma->OnUpdate, home_button->OnUpdate, sleep_button->OnUpdate,
+        //       capture_button->OnUpdate
     }
 
     pub fn update_npad(&self, _ns_late: Duration) {
-        todo!()
+        // TODO: npad->OnUpdate
     }
 
     pub fn update_mouse_keyboard(&self, _ns_late: Duration) {
-        todo!()
+        // TODO: mouse->OnUpdate, debug_mouse->OnUpdate, keyboard->OnUpdate
     }
 
     pub fn update_motion(&self, _ns_late: Duration) {
-        todo!()
+        // TODO: six_axis->OnUpdate, seven_six_axis->OnUpdate, console_six_axis->OnUpdate
     }
 
     fn initialize_handheld_config(&mut self) {

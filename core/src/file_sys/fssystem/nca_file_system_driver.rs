@@ -82,12 +82,26 @@ pub const KEY_AREA_ENCRYPTION_KEY_COUNT: i32 =
 
 /// Key type.
 /// Corresponds to upstream `KeyType`.
+///
+/// Note: NcaHeaderKey1, NcaHeaderKey2, NcaExternalKey, etc. are defined
+/// as constants because their values depend on KEY_AREA_ENCRYPTION_KEY_COUNT
+/// which is a runtime-computable expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum KeyType {
     ZeroKey = -2,
     InvalidKey = -1,
-    // Dynamic values for NCA keys follow.
+    // Dynamic values start at KEY_AREA_ENCRYPTION_KEY_COUNT.
+    // Use the associated constants below.
+}
+
+impl KeyType {
+    pub const NCA_HEADER_KEY1: i32 = KEY_AREA_ENCRYPTION_KEY_COUNT;
+    pub const NCA_HEADER_KEY2: i32 = KEY_AREA_ENCRYPTION_KEY_COUNT + 1;
+    pub const NCA_EXTERNAL_KEY: i32 = KEY_AREA_ENCRYPTION_KEY_COUNT + 2;
+    pub const SAVE_DATA_DEVICE_UNIQUE_MAC: i32 = KEY_AREA_ENCRYPTION_KEY_COUNT + 3;
+    pub const SAVE_DATA_SEED_UNIQUE_MAC: i32 = KEY_AREA_ENCRYPTION_KEY_COUNT + 4;
+    pub const SAVE_DATA_TRANSFER_MAC: i32 = KEY_AREA_ENCRYPTION_KEY_COUNT + 5;
 }
 
 pub fn is_invalid_key_type_value(key_type: i32) -> bool {
@@ -154,5 +168,81 @@ impl NcaFileSystemDriver {
     ) -> Result<VirtualFile, ResultCode> {
         // TODO: implement proper storage opening with context.
         todo!("NcaFileSystemDriver::open_storage not yet implemented")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nca_crypto_configuration_default() {
+        let config = NcaCryptoConfiguration::default();
+        assert!(config.generate_key.is_none());
+        assert!(config.verify_sign1.is_none());
+        assert!(!config.is_plaintext_header_available);
+        assert!(!config.is_available_sw_key);
+    }
+
+    #[test]
+    fn test_nca_compression_configuration_default() {
+        let config = NcaCompressionConfiguration::default();
+        assert!(config.get_decompressor.is_none());
+    }
+
+    #[test]
+    fn test_nca_crypto_configuration_constants() {
+        assert_eq!(NcaCryptoConfiguration::AES_128_KEY_SIZE, 16);
+        assert_eq!(NcaCryptoConfiguration::RSA_2048_KEY_MODULUS_SIZE, 256);
+        assert_eq!(NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT, 3);
+        assert_eq!(NcaCryptoConfiguration::HEADER_ENCRYPTION_KEY_COUNT, 2);
+        assert_eq!(NcaCryptoConfiguration::KEY_GENERATION_MAX, 32);
+    }
+
+    #[test]
+    fn test_key_type_constants() {
+        assert_eq!(KeyType::ZeroKey as i32, -2);
+        assert_eq!(KeyType::InvalidKey as i32, -1);
+        assert!(KeyType::NCA_HEADER_KEY1 > 0);
+        assert!(KeyType::NCA_EXTERNAL_KEY > KeyType::NCA_HEADER_KEY2);
+    }
+
+    #[test]
+    fn test_is_invalid_key_type_value() {
+        assert!(is_invalid_key_type_value(-1));
+        assert!(is_invalid_key_type_value(-2));
+        assert!(!is_invalid_key_type_value(0));
+        assert!(!is_invalid_key_type_value(10));
+    }
+
+    #[test]
+    fn test_get_key_type_value_zero_key() {
+        let result = get_key_type_value(
+            NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_ZERO_KEY,
+            0,
+        );
+        assert_eq!(result, KeyType::ZeroKey as i32);
+    }
+
+    #[test]
+    fn test_get_key_type_value_invalid() {
+        // key_index >= KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT should be InvalidKey.
+        let result = get_key_type_value(3, 0);
+        assert_eq!(result, KeyType::InvalidKey as i32);
+    }
+
+    #[test]
+    fn test_get_key_type_value_normal() {
+        let result = get_key_type_value(1, 2);
+        // Should be KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT * key_generation + key_index
+        assert_eq!(result, 3 * 2 + 1);
+    }
+
+    #[test]
+    fn test_storage_context_default() {
+        let ctx = StorageContext::default();
+        assert!(!ctx.open_raw_storage);
+        assert!(ctx.body_substorage.is_none());
+        assert!(ctx.fs_data_storage.is_none());
     }
 }

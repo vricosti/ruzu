@@ -169,6 +169,23 @@ impl InputSubsystemImpl {
             mapping_factory.register_input(data);
         }
     }
+
+    /// Port of Impl::GetInputEngine
+    /// Returns the engine name matching the params, or None if not found.
+    fn get_input_engine(&self, params: &ParamPackage) -> Option<&str> {
+        if !params.has("engine") || params.get_str("engine", "") == "any" {
+            return None;
+        }
+        let engine = params.get_str("engine", "");
+        // Check against registered engines
+        if self.keyboard.as_ref().map_or(false, |k| k.engine().get_engine_name() == engine)
+            || self.mouse.as_ref().map_or(false, |m| m.engine().get_engine_name() == engine)
+        {
+            Some("found")
+        } else {
+            None
+        }
+    }
 }
 
 /// Port of `InputSubsystem` class from main.h / main.cpp
@@ -281,45 +298,76 @@ impl InputSubsystem {
 
     /// Retrieves the analog mappings for the given device.
     /// Port of InputSubsystem::GetAnalogMappingForDevice
-    pub fn get_analog_mapping_for_device(&self, _device: &ParamPackage) -> AnalogMapping {
-        todo!()
+    pub fn get_analog_mapping_for_device(&self, device: &ParamPackage) -> AnalogMapping {
+        let engine = self.imp.get_input_engine(device);
+        if engine.is_none() {
+            return HashMap::new();
+        }
+        // TODO: call engine.get_analog_mapping_for_device(device)
+        HashMap::new()
     }
 
     /// Retrieves the button mappings for the given device.
     /// Port of InputSubsystem::GetButtonMappingForDevice
-    pub fn get_button_mapping_for_device(&self, _device: &ParamPackage) -> ButtonMapping {
-        todo!()
+    pub fn get_button_mapping_for_device(&self, device: &ParamPackage) -> ButtonMapping {
+        let engine = self.imp.get_input_engine(device);
+        if engine.is_none() {
+            return HashMap::new();
+        }
+        // TODO: call engine.get_button_mapping_for_device(device)
+        HashMap::new()
     }
 
     /// Retrieves the motion mappings for the given device.
     /// Port of InputSubsystem::GetMotionMappingForDevice
-    pub fn get_motion_mapping_for_device(&self, _device: &ParamPackage) -> MotionMapping {
-        todo!()
+    pub fn get_motion_mapping_for_device(&self, device: &ParamPackage) -> MotionMapping {
+        let engine = self.imp.get_input_engine(device);
+        if engine.is_none() {
+            return HashMap::new();
+        }
+        // TODO: call engine.get_motion_mapping_for_device(device)
+        HashMap::new()
     }
 
     /// Returns an enum containing the name to be displayed from the input engine.
     /// Port of InputSubsystem::GetButtonName
-    pub fn get_button_name(&self, _params: &ParamPackage) -> ButtonNames {
-        todo!()
+    pub fn get_button_name(&self, params: &ParamPackage) -> ButtonNames {
+        if !params.has("engine") || params.get_str("engine", "") == "any" {
+            return ButtonNames::Undefined;
+        }
+        let engine = self.imp.get_input_engine(params);
+        if engine.is_none() {
+            return ButtonNames::Invalid;
+        }
+        // TODO: call engine.get_ui_name(params)
+        ButtonNames::Undefined
     }
 
     /// Returns true if device is a controller.
     /// Port of InputSubsystem::IsController
-    pub fn is_controller(&self, _params: &ParamPackage) -> bool {
-        todo!()
+    pub fn is_controller(&self, params: &ParamPackage) -> bool {
+        let engine_name = params.get_str("engine", "");
+        matches!(
+            engine_name.as_str(),
+            "mouse" | "gcpad" | "cemuhookudp" | "tas" | "virtual_gamepad" | "sdl" | "joycon" | "android"
+        )
     }
 
     /// Returns true if axis of a stick aren't mapped in the correct direction.
     /// Port of InputSubsystem::IsStickInverted
-    pub fn is_stick_inverted(&self, _device: &ParamPackage) -> bool {
-        todo!()
+    pub fn is_stick_inverted(&self, device: &ParamPackage) -> bool {
+        if device.has("axis_x") && device.has("axis_y") {
+            // TODO: call engine.is_stick_inverted(device)
+            return false;
+        }
+        false
     }
 
     /// Reloads the input devices.
     /// Port of InputSubsystem::ReloadInputDevices
     pub fn reload_input_devices(&mut self) {
-        // impl->udp_client->ReloadSockets() in C++
-        todo!()
+        // TODO: udp_client->ReloadSockets() in C++
+        log::debug!("InputSubsystem::reload_input_devices called");
     }
 
     /// Start polling from all backends for a desired input type.

@@ -224,9 +224,85 @@ pub mod response {
         pub gyro: Gyroscope,
     }
 
+    /// Returns the expected size of the response data for a given message type.
+    fn get_size_of_response_type(t: super::MessageType) -> usize {
+        match t {
+            super::MessageType::Version => std::mem::size_of::<Version>(),
+            super::MessageType::PortInfo => std::mem::size_of::<PortInfo>(),
+            super::MessageType::PadData => std::mem::size_of::<PadData>(),
+        }
+    }
+
     /// Validates response data and returns the message type if valid.
     /// Port of Response::Validate from udp_protocol.cpp
-    pub fn validate(_data: &[u8]) -> Option<super::MessageType> {
-        todo!()
+    ///
+    /// Note: Modifies the buffer to zero out the crc (since that's the easiest way to check
+    /// without copying the buffer).
+    pub fn validate(data: &mut [u8]) -> Option<super::MessageType> {
+        let header_size = std::mem::size_of::<super::Header>();
+        if data.len() < header_size {
+            return None;
+        }
+
+        // Read header fields
+        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let protocol_version = u16::from_le_bytes([data[4], data[5]]);
+        let payload_length = u16::from_le_bytes([data[6], data[7]]);
+        let crc32 = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        // id at offset 12..16
+        let message_type_raw = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+
+        if magic != super::SERVER_MAGIC {
+            return None;
+        }
+        if protocol_version != super::PROTOCOL_VERSION {
+            return None;
+        }
+
+        let message_type = match message_type_raw {
+            0x00100000 => super::MessageType::Version,
+            0x00100001 => super::MessageType::PortInfo,
+            0x00100002 => super::MessageType::PadData,
+            _ => return None,
+        };
+
+        // Packet size must equal sizeof(Header) + sizeof(Data)
+        // payload_length == sizeof(T) + sizeof(Type)
+        let data_len = get_size_of_response_type(message_type);
+        let type_size = std::mem::size_of::<u32>(); // sizeof(Type) == 4
+        if payload_length as usize != data_len + type_size
+            || data.len() < data_len + header_size
+        {
+            return None;
+        }
+
+        // Zero out the CRC field in the buffer and compute CRC-32
+        data[8] = 0;
+        data[9] = 0;
+        data[10] = 0;
+        data[11] = 0;
+
+        let computed_crc = crc32_compute(&data[..data_len + header_size]);
+        if crc32 != computed_crc {
+            return None;
+        }
+
+        Some(message_type)
+    }
+
+    /// Simple CRC-32 implementation (ISO 3309 / ITU-T V.42, same as boost::crc_32_type).
+    fn crc32_compute(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFFFFFF;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0xEDB88320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        !crc
     }
 }

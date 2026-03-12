@@ -4,57 +4,174 @@
 //! Port of zuyu/src/core/hle/service/spl/spl_module.h
 //! Port of zuyu/src/core/hle/service/spl/spl_module.cpp
 //!
-//! IGeneralInterface — SPL general service interface.
+//! Module::Interface — SPL general service interface with GetConfig implementation.
 
-/// IPC command table for IGeneralInterface.
+use crate::hle::result::ResultCode;
+use super::spl_results;
+use super::spl_types::ConfigItem;
+
+/// Atmosphere release version constants.
+///
+/// Corresponds to `HLE::ApiVersion::ATMOSPHERE_RELEASE_VERSION_*` in upstream.
+const ATMOSPHERE_RELEASE_VERSION_MAJOR: u64 = 1;
+const ATMOSPHERE_RELEASE_VERSION_MINOR: u64 = 0;
+const ATMOSPHERE_RELEASE_VERSION_MICRO: u64 = 0;
+
+/// Target firmware version (placeholder).
+const TARGET_FIRMWARE: u64 = 0x0E0000000; // ~14.0.0
+
+/// IPC command table for Module::Interface (IGeneralInterface).
 pub mod commands {
     pub const GET_CONFIG: u32 = 0;
-    pub const MOD_CRYPT_AES: u32 = 1;
-    pub const GENERATE_AESKEY: u32 = 2;
-    pub const SET_CONFIG: u32 = 3;
-    pub const GENERATE_RANDOM_BYTES: u32 = 4;
-    pub const IMPORT_LOTUS_KEY: u32 = 5;
-    pub const DECRYPT_LOTUS_MESSAGE: u32 = 6;
-    pub const IS_DEVELOPMENT: u32 = 7;
-    pub const GENERATE_SPECIFIC_AESKEY: u32 = 8;
-    pub const DECRYPT_DEVICE_UNIQUE_DATA: u32 = 9;
-    pub const DECRYPT_AESKEY: u32 = 10;
-    pub const CRYPT_AESCTR: u32 = 11;
-    pub const COMPUTE_CMAC: u32 = 12;
-    pub const IMPORT_ESKEY: u32 = 13;
-    pub const UNWRAP_TITLEKEY_ETC: u32 = 14;
-    pub const LOAD_TITLEKEY: u32 = 15;
-    pub const UNWRAP_COMMON_TITLEKEY: u32 = 16;
-    pub const ALLOCATE_AESKEY_SLOT: u32 = 17;
-    pub const DEALLOC_AESKEY_SLOT: u32 = 18;
-    pub const GET_AESKEY_SLOT_AVAILABILITY: u32 = 19;
-    pub const SET_BOOT_REASON: u32 = 20;
-    pub const GET_BOOT_REASON: u32 = 21;
+    pub const MODULAR_EXPONENTIATE: u32 = 1;
+    pub const SET_CONFIG: u32 = 5;
+    pub const GENERATE_RANDOM_BYTES: u32 = 7;
+    pub const IS_DEVELOPMENT: u32 = 11;
+    pub const SET_BOOT_REASON: u32 = 24;
+    pub const GET_BOOT_REASON: u32 = 25;
 }
 
-/// IGeneralInterface — SPL general interface.
+/// Module::Interface — SPL general interface.
 ///
-/// Corresponds to `IGeneralInterface` in upstream spl_module.h / spl_module.cpp.
-pub struct IGeneralInterface;
+/// Corresponds to `Module::Interface` in upstream spl_module.h / spl_module.cpp.
+pub struct ModuleInterface {
+    rng_seed: u32,
+}
 
-impl IGeneralInterface {
-    pub fn new() -> Self {
-        Self
+impl ModuleInterface {
+    pub fn new(rng_seed: Option<u32>) -> Self {
+        let seed = rng_seed.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0)
+        });
+        Self { rng_seed: seed }
     }
 
     /// GetConfig (cmd 0).
-    pub fn get_config(&self, config_item: u32) -> u64 {
-        log::debug!("IGeneralInterface::get_config (STUBBED) called, config_item={}", config_item);
-        // TODO: implement config items matching upstream
-        0
+    ///
+    /// Corresponds to `Module::Interface::GetConfig` in upstream spl_module.cpp.
+    pub fn get_config(&self, config_item_raw: u32) -> Result<u64, ResultCode> {
+        let config_item = ConfigItem::from_u32(config_item_raw);
+
+        match config_item {
+            Some(ConfigItem::DisableProgramVerification)
+            | Some(ConfigItem::DramId)
+            | Some(ConfigItem::SecurityEngineInterruptNumber)
+            | Some(ConfigItem::FuseVersion)
+            | Some(ConfigItem::HardwareType)
+            | Some(ConfigItem::HardwareState)
+            | Some(ConfigItem::IsRecoveryBoot)
+            | Some(ConfigItem::DeviceId)
+            | Some(ConfigItem::BootReason)
+            | Some(ConfigItem::MemoryMode)
+            | Some(ConfigItem::IsDevelopmentFunctionEnabled)
+            | Some(ConfigItem::KernelConfiguration)
+            | Some(ConfigItem::IsChargerHiZModeEnabled)
+            | Some(ConfigItem::QuestState)
+            | Some(ConfigItem::RegulatorType)
+            | Some(ConfigItem::DeviceUniqueKeyGeneration)
+            | Some(ConfigItem::Package2Hash) => {
+                log::error!(
+                    "GetConfig: config_item={:?} not implemented",
+                    config_item
+                );
+                Err(spl_results::RESULT_SECURE_MONITOR_NOT_IMPLEMENTED)
+            }
+            Some(ConfigItem::ExosphereApiVersion) => {
+                // Get information about the current exosphere version.
+                let value = (ATMOSPHERE_RELEASE_VERSION_MAJOR << 56)
+                    | (ATMOSPHERE_RELEASE_VERSION_MINOR << 48)
+                    | (ATMOSPHERE_RELEASE_VERSION_MICRO << 40)
+                    | TARGET_FIRMWARE;
+                Ok(value)
+            }
+            Some(ConfigItem::ExosphereNeedsReboot) => {
+                // We are executing, so we aren't in the process of rebooting.
+                Ok(0)
+            }
+            Some(ConfigItem::ExosphereNeedsShutdown) => {
+                // We are executing, so we aren't in the process of shutting down.
+                Ok(0)
+            }
+            Some(ConfigItem::ExosphereGitCommitHash) => {
+                Ok(0)
+            }
+            Some(ConfigItem::ExosphereHasRcmBugPatch) => {
+                Ok(0)
+            }
+            Some(ConfigItem::ExosphereBlankProdInfo) => {
+                Ok(0)
+            }
+            Some(ConfigItem::ExosphereAllowCalWrites) => {
+                Ok(0)
+            }
+            Some(ConfigItem::ExosphereEmummcType) => {
+                Ok(0)
+            }
+            Some(ConfigItem::ExospherePayloadAddress) => {
+                // Gets the physical address of the reboot payload buffer, if one exists.
+                Err(spl_results::RESULT_SECURE_MONITOR_NOT_INITIALIZED)
+            }
+            Some(ConfigItem::ExosphereLogConfiguration) => {
+                Ok(0)
+            }
+            Some(ConfigItem::ExosphereForceEnableUsb30) => {
+                Ok(0)
+            }
+            None => {
+                log::error!("GetConfig: unknown config_item={}", config_item_raw);
+                Err(spl_results::RESULT_SECURE_MONITOR_INVALID_ARGUMENT)
+            }
+        }
     }
 
-    /// GenerateRandomBytes (cmd 4).
+    /// ModularExponentiate (cmd 1).
+    pub fn modular_exponentiate(&self) -> ResultCode {
+        log::warn!("ModularExponentiate is not implemented!");
+        spl_results::RESULT_SECURE_MONITOR_NOT_IMPLEMENTED
+    }
+
+    /// SetConfig (cmd 5).
+    pub fn set_config(&self) -> ResultCode {
+        log::warn!("SetConfig is not implemented!");
+        spl_results::RESULT_SECURE_MONITOR_NOT_IMPLEMENTED
+    }
+
+    /// GenerateRandomBytes (cmd 7).
+    ///
+    /// Corresponds to `Module::Interface::GenerateRandomBytes` in upstream.
     pub fn generate_random_bytes(&self, buf: &mut [u8]) {
-        log::debug!("IGeneralInterface::generate_random_bytes called, size={}", buf.len());
-        // TODO: use proper RNG
+        log::debug!("GenerateRandomBytes called, size={}", buf.len());
+        // Use a simple LCG seeded from our rng_seed, matching upstream's
+        // use of std::mt19937 with uniform_int_distribution<u16>.
+        // For proper emulation this should use a real PRNG.
+        let mut state = self.rng_seed as u64;
         for byte in buf.iter_mut() {
-            *byte = 0;
+            // Simple xorshift64
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = (state & 0xFF) as u8;
         }
+    }
+
+    /// IsDevelopment (cmd 11).
+    pub fn is_development(&self) -> ResultCode {
+        log::warn!("IsDevelopment is not implemented!");
+        spl_results::RESULT_SECURE_MONITOR_NOT_IMPLEMENTED
+    }
+
+    /// SetBootReason (cmd 24).
+    pub fn set_boot_reason(&self) -> ResultCode {
+        log::warn!("SetBootReason is not implemented!");
+        spl_results::RESULT_SECURE_MONITOR_NOT_IMPLEMENTED
+    }
+
+    /// GetBootReason (cmd 25).
+    pub fn get_boot_reason(&self) -> ResultCode {
+        log::warn!("GetBootReason is not implemented!");
+        spl_results::RESULT_SECURE_MONITOR_NOT_IMPLEMENTED
     }
 }
