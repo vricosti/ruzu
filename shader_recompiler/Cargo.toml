@@ -1,0 +1,12 @@
+[package]
+name = "shader_recompiler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common.workspace = true
+log.workspace = true
+thiserror.workspace = true
+bitflags.workspace = true
+rspirv.workspace = true
+spirv.workspace = true

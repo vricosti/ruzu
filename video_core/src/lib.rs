@@ -46,7 +46,7 @@ pub mod shader;
 pub mod shader_cache;
 pub mod shader_environment;
 pub mod shader_notify;
-pub mod shader_recompiler;
+// shader_recompiler is a separate crate (matches upstream top-level directory)
 pub mod smaa_area_tex;
 pub mod smaa_search_tex;
 pub mod surface;

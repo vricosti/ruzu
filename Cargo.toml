@@ -4,6 +4,7 @@ members = [
     "common",
     "core",
     "core/crypto",
+    "shader_recompiler",
     "video_core",
     "hid_core",
     "input_common",
@@ -24,6 +25,7 @@ license = "GPL-3.0-or-later"
 common = { path = "common" }
 core = { path = "core" }
 crypto = { path = "core/crypto" }
+shader_recompiler = { path = "shader_recompiler" }
 video_core = { path = "video_core" }
 hid_core = { path = "hid_core" }
 input_common = { path = "input_common" }

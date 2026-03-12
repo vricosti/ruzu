@@ -13,7 +13,7 @@ use log::{debug, warn};
 
 use crate::engines::maxwell_3d::{DrawCall, ShaderStageType};
 use crate::shader;
-use crate::shader_recompiler::{CompiledShader, PipelineCache, ShaderStage};
+use shader_recompiler::{CompiledShader, PipelineCache, ShaderStage};
 
 use super::fixed_pipeline_state::FixedPipelineState;
 
