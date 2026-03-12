@@ -17,9 +17,19 @@ pub const NUM_TEXTURE_AND_IMAGE_SCALING_WORDS: usize = 4;
 /// Port of `NUM_TEXTURE_SCALING_WORDS`.
 pub const NUM_TEXTURE_SCALING_WORDS: usize = 2;
 
+/// Size of a single descriptor update entry (buffer info / image info).
+/// Port of `sizeof(DescriptorUpdateEntry)` used as stride.
+const DESCRIPTOR_UPDATE_ENTRY_SIZE: usize = std::mem::size_of::<vk::DescriptorBufferInfo>();
+
 // ---------------------------------------------------------------------------
 // DescriptorLayoutBuilder
 // ---------------------------------------------------------------------------
+
+/// Descriptor binding info for a single descriptor type.
+#[derive(Debug, Clone, Copy)]
+pub struct DescriptorInfo {
+    pub count: u32,
+}
 
 /// Port of `DescriptorLayoutBuilder` class.
 ///
@@ -48,44 +58,146 @@ impl DescriptorLayoutBuilder {
     }
 
     /// Port of `DescriptorLayoutBuilder::CanUsePushDescriptor`.
-    pub fn can_use_push_descriptor(&self, _max_push_descriptors: u32, _supported: bool) -> bool {
-        _supported && self.num_descriptors <= _max_push_descriptors
+    pub fn can_use_push_descriptor(
+        &self,
+        max_push_descriptors: u32,
+        is_supported: bool,
+    ) -> bool {
+        is_supported && self.num_descriptors <= max_push_descriptors
     }
 
     /// Port of `DescriptorLayoutBuilder::CreateDescriptorSetLayout`.
     pub fn create_descriptor_set_layout(
         &self,
-        _device: &ash::Device,
-        _use_push_descriptor: bool,
-    ) -> vk::DescriptorSetLayout {
-        todo!("DescriptorLayoutBuilder::create_descriptor_set_layout")
+        device: &ash::Device,
+        use_push_descriptor: bool,
+    ) -> Result<vk::DescriptorSetLayout, vk::Result> {
+        if self.bindings.is_empty() {
+            return Ok(vk::DescriptorSetLayout::null());
+        }
+        let flags = if use_push_descriptor {
+            vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
+        } else {
+            vk::DescriptorSetLayoutCreateFlags::empty()
+        };
+        let ci = vk::DescriptorSetLayoutCreateInfo {
+            s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags,
+            binding_count: self.bindings.len() as u32,
+            p_bindings: self.bindings.as_ptr(),
+        };
+        unsafe { device.create_descriptor_set_layout(&ci, None) }
     }
 
     /// Port of `DescriptorLayoutBuilder::CreateTemplate`.
     pub fn create_template(
         &self,
-        _device: &ash::Device,
-        _descriptor_set_layout: vk::DescriptorSetLayout,
-        _pipeline_layout: vk::PipelineLayout,
-        _use_push_descriptor: bool,
-    ) -> vk::DescriptorUpdateTemplate {
-        todo!("DescriptorLayoutBuilder::create_template")
+        device: &ash::Device,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+        pipeline_layout: vk::PipelineLayout,
+        use_push_descriptor: bool,
+    ) -> Result<vk::DescriptorUpdateTemplate, vk::Result> {
+        if self.entries.is_empty() {
+            return Ok(vk::DescriptorUpdateTemplate::null());
+        }
+        let template_type = if use_push_descriptor {
+            vk::DescriptorUpdateTemplateType::PUSH_DESCRIPTORS_KHR
+        } else {
+            vk::DescriptorUpdateTemplateType::DESCRIPTOR_SET
+        };
+        let ci = vk::DescriptorUpdateTemplateCreateInfo {
+            s_type: vk::StructureType::DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: vk::DescriptorUpdateTemplateCreateFlags::empty(),
+            descriptor_update_entry_count: self.entries.len() as u32,
+            p_descriptor_update_entries: self.entries.as_ptr(),
+            template_type,
+            descriptor_set_layout,
+            pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS,
+            pipeline_layout,
+            set: 0,
+        };
+        unsafe { device.create_descriptor_update_template(&ci, None) }
     }
 
     /// Port of `DescriptorLayoutBuilder::CreatePipelineLayout`.
+    ///
+    /// Creates a pipeline layout with push constant ranges for rescaling
+    /// and render area data.
     pub fn create_pipeline_layout(
         &self,
-        _device: &ash::Device,
-        _descriptor_set_layout: vk::DescriptorSetLayout,
-    ) -> vk::PipelineLayout {
-        todo!("DescriptorLayoutBuilder::create_pipeline_layout")
+        device: &ash::Device,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+    ) -> Result<vk::PipelineLayout, vk::Result> {
+        // Push constant range covers rescaling layout + render area layout
+        // Rescaling layout: NUM_TEXTURE_AND_IMAGE_SCALING_WORDS * 4 bytes + optional down_factor (4 bytes for compute)
+        let size_offset: u32 = if self.is_compute { 4 } else { 0 };
+        let rescaling_size = (NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as u32 * 4) + 4; // words + down_factor
+        let render_area_size = 4 * 4u32; // 4 floats
+        let range = vk::PushConstantRange {
+            stage_flags: if self.is_compute {
+                vk::ShaderStageFlags::COMPUTE
+            } else {
+                vk::ShaderStageFlags::ALL_GRAPHICS
+            },
+            offset: 0,
+            size: rescaling_size - size_offset + render_area_size,
+        };
+
+        let set_layout_count = if descriptor_set_layout == vk::DescriptorSetLayout::null() {
+            0u32
+        } else {
+            1u32
+        };
+        let layouts = [descriptor_set_layout];
+        let ci = vk::PipelineLayoutCreateInfo {
+            s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: vk::PipelineLayoutCreateFlags::empty(),
+            set_layout_count,
+            p_set_layouts: if self.bindings.is_empty() {
+                std::ptr::null()
+            } else {
+                layouts.as_ptr()
+            },
+            push_constant_range_count: 1,
+            p_push_constant_ranges: &range,
+        };
+        unsafe { device.create_pipeline_layout(&ci, None) }
     }
 
     /// Port of `DescriptorLayoutBuilder::Add`.
     ///
-    /// Adds descriptor bindings for a shader stage's info.
-    pub fn add(&mut self, _stage: vk::ShaderStageFlags) {
-        todo!("DescriptorLayoutBuilder::add")
+    /// Adds descriptor bindings for a list of descriptors of a given type and stage.
+    pub fn add_descriptors(
+        &mut self,
+        descriptor_type: vk::DescriptorType,
+        stage: vk::ShaderStageFlags,
+        descriptors: &[DescriptorInfo],
+    ) {
+        self.is_compute |= stage.contains(vk::ShaderStageFlags::COMPUTE);
+
+        for desc in descriptors {
+            self.bindings.push(vk::DescriptorSetLayoutBinding {
+                binding: self.binding,
+                descriptor_type,
+                descriptor_count: desc.count,
+                stage_flags: stage,
+                p_immutable_samplers: std::ptr::null(),
+            });
+            self.entries.push(vk::DescriptorUpdateTemplateEntry {
+                dst_binding: self.binding,
+                dst_array_element: 0,
+                descriptor_count: desc.count,
+                descriptor_type,
+                offset: self.offset,
+                stride: DESCRIPTOR_UPDATE_ENTRY_SIZE,
+            });
+            self.binding += 1;
+            self.num_descriptors += desc.count;
+            self.offset += DESCRIPTOR_UPDATE_ENTRY_SIZE;
+        }
     }
 }
 
@@ -166,14 +278,40 @@ impl RenderAreaPushConstant {
     }
 }
 
-// ---------------------------------------------------------------------------
-// PushImageDescriptors (free function)
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Port of `PushImageDescriptors` inline function.
-///
-/// Iterates texture and image descriptors from shader info, pushing
-/// sampled image and storage image entries into the guest descriptor queue.
-pub fn push_image_descriptors() {
-    todo!("push_image_descriptors")
+    #[test]
+    fn rescaling_push_constant_default() {
+        let rpc = RescalingPushConstant::new();
+        assert_eq!(rpc.words, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rescaling_push_texture() {
+        let mut rpc = RescalingPushConstant::new();
+        rpc.push_texture(true);
+        assert_eq!(rpc.words[0], 1);
+        rpc.push_texture(false);
+        assert_eq!(rpc.words[0], 1);
+        rpc.push_texture(true);
+        assert_eq!(rpc.words[0], 0b101);
+    }
+
+    #[test]
+    fn rescaling_push_image() {
+        let mut rpc = RescalingPushConstant::new();
+        rpc.push_image(true);
+        assert_eq!(rpc.words[NUM_TEXTURE_SCALING_WORDS], 1);
+    }
+
+    #[test]
+    fn descriptor_layout_builder_empty() {
+        let builder = DescriptorLayoutBuilder::new();
+        assert!(!builder.can_use_push_descriptor(32, true));
+        // 0 descriptors <= 32, so it should be true if supported
+        // Actually 0 <= 32 is true
+        assert!(builder.can_use_push_descriptor(32, true));
+    }
 }

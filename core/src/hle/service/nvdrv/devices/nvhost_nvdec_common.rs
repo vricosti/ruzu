@@ -9,7 +9,6 @@ use std::sync::Mutex;
 
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::core::syncpoint_manager::ChannelType;
-use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
 use crate::hle::service::nvdrv::nvdata::*;
 

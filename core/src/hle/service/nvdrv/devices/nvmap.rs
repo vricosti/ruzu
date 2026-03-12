@@ -150,18 +150,20 @@ impl NvMapDevice {
         }
 
         let handle = handle.unwrap();
-        if handle.allocated {
-            log::error!("Object is already allocated, handle={:08X}", params.handle);
-            return NvResult::InsufficientMemory;
+        {
+            let inner = handle.lock_inner();
+            if inner.allocated {
+                log::error!("Object is already allocated, handle={:08X}", params.handle);
+                return NvResult::InsufficientMemory;
+            }
         }
 
         let sessions = self.sessions.lock().unwrap();
         let session_id = sessions.get(&fd).copied().unwrap_or_default();
         drop(sessions);
 
-        // Stubbed: In full implementation, would lock page table for device address space.
-        let _result = NvResult::Success;
-        NvResult::Success
+        let result = handle.alloc(params.flags, params.align, params.kind, params.address, session_id);
+        result
     }
 
     pub fn ioc_get_id(&self, params: &mut IocGetIdParams) -> NvResult {
@@ -197,7 +199,6 @@ impl NvMapDevice {
         }
 
         let handle = handle.unwrap();
-        // Would call handle.duplicate(false) but requires &mut access. Stubbed.
         self.file().duplicate_handle(params.id, false);
         params.handle = handle.id;
         NvResult::Success
@@ -218,6 +219,7 @@ impl NvMapDevice {
         }
 
         let handle = handle.unwrap();
+        let inner = handle.lock_inner();
         match params.param {
             1 => {
                 // Size
@@ -225,7 +227,7 @@ impl NvMapDevice {
             }
             2 => {
                 // Alignment
-                params.result = handle.align as u32;
+                params.result = inner.align as u32;
             }
             3 => {
                 // Base
@@ -233,7 +235,7 @@ impl NvMapDevice {
             }
             4 => {
                 // Heap
-                if handle.allocated {
+                if inner.allocated {
                     params.result = 0x40000000;
                 } else {
                     params.result = 0;
@@ -241,11 +243,11 @@ impl NvMapDevice {
             }
             5 => {
                 // Kind
-                params.result = handle.kind as u32;
+                params.result = inner.kind as u32;
             }
             6 => {
                 // IsSharedMemMapped
-                params.result = handle.is_shared_mem_mapped as u32;
+                params.result = inner.is_shared_mem_mapped as u32;
             }
             _ => {
                 return NvResult::BadValue;
@@ -264,7 +266,6 @@ impl NvMapDevice {
         }
 
         if let Some(free_info) = self.file().free_handle(params.handle, false) {
-            // Stubbed: In full implementation, would unlock page table for device address space.
             params.address = free_info.address;
             params.size = free_info.size as u32;
             params.flags.raw = 0;

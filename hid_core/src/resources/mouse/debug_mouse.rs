@@ -3,8 +3,14 @@
 
 //! Port of hid_core/resources/mouse/debug_mouse.h and debug_mouse.cpp
 
-use crate::hid_types::{AnalogStickState, MouseState};
+use crate::hid_types::{AnalogStickState, MouseAttribute, MouseButton, MouseState};
 use crate::resources::controller_base::ControllerActivation;
+use crate::resources::mouse::mouse::MousePosition;
+use crate::resources::shared_memory_format::MouseSharedMemoryFormat;
+
+/// Screen dimensions for mouse coordinate mapping (undocked mode).
+const SCREEN_WIDTH: f32 = 1280.0;
+const SCREEN_HEIGHT: f32 = 720.0;
 
 /// DebugMouse controller — identical to Mouse but writes to the debug_mouse
 /// field of shared memory. Upstream shares the exact same update logic.
@@ -28,9 +34,41 @@ impl DebugMouse {
 
     /// Port of DebugMouse::OnUpdate — same logic as Mouse::OnUpdate but
     /// targets `shared_memory_format->debug_mouse`.
-    pub fn on_update(&mut self) {
-        let _ = &self.next_state;
-        let _ = &self.last_mouse_wheel_state;
+    pub fn on_update(
+        &mut self,
+        shared_memory: &mut MouseSharedMemoryFormat,
+        mouse_enabled: bool,
+        mouse_button_state: &MouseButton,
+        mouse_position_state: &MousePosition,
+        mouse_wheel_state: &AnalogStickState,
+    ) {
+        if !self.activation.is_controller_activated() {
+            shared_memory.mouse_lifo.buffer_count = 0;
+            shared_memory.mouse_lifo.buffer_tail = 0;
+            return;
+        }
+
+        self.next_state = MouseState::default();
+
+        let last_entry = shared_memory.mouse_lifo.read_current_entry().state;
+        self.next_state.sampling_number = last_entry.sampling_number + 1;
+
+        if mouse_enabled {
+            self.next_state.attribute = MouseAttribute { raw: 1 }; // is_connected = 1
+            self.next_state.x = (mouse_position_state.x * SCREEN_WIDTH) as i32;
+            self.next_state.y = (mouse_position_state.y * SCREEN_HEIGHT) as i32;
+            self.next_state.delta_x = self.next_state.x - last_entry.x;
+            self.next_state.delta_y = self.next_state.y - last_entry.y;
+            self.next_state.delta_wheel_x =
+                mouse_wheel_state.x - self.last_mouse_wheel_state.x;
+            self.next_state.delta_wheel_y =
+                mouse_wheel_state.y - self.last_mouse_wheel_state.y;
+
+            self.last_mouse_wheel_state = *mouse_wheel_state;
+            self.next_state.button = *mouse_button_state;
+        }
+
+        shared_memory.mouse_lifo.write_next_entry(self.next_state);
     }
 }
 

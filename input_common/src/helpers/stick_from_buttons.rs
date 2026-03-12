@@ -6,7 +6,13 @@
 //! An analog device factory that takes direction button devices and combines
 //! them into an analog device.
 
-use common::input::InputDevice;
+use std::sync::Mutex;
+use std::time::Instant;
+
+use common::input::{
+    self, AnalogProperties, AnalogStatus, CallbackStatus, InputCallback, InputDevice, InputType,
+    StickStatus,
+};
 use common::param_package::ParamPackage;
 
 /// Some games such as EARTH DEFENSE FORCE: WORLD BROTHERS
@@ -18,27 +24,15 @@ pub const TAU: f32 = common::math_util::PI * 2.0;
 pub const APERTURE: f32 = TAU * 0.15;
 
 /// Default analog properties for stick from buttons.
-pub struct StickAnalogProperties {
-    pub deadzone: f32,
-    pub range: f32,
-    pub threshold: f32,
-    pub offset: f32,
-    pub inverted: bool,
-    pub toggle: bool,
-}
-
-impl Default for StickAnalogProperties {
-    fn default() -> Self {
-        Self {
-            deadzone: 0.0,
-            range: 1.0,
-            threshold: 0.5,
-            offset: 0.0,
-            inverted: false,
-            toggle: false,
-        }
-    }
-}
+const STICK_PROPERTIES: AnalogProperties = AnalogProperties {
+    deadzone: 0.0,
+    range: 1.0,
+    threshold: 0.5,
+    offset: 0.0,
+    inverted: false,
+    inverted_button: false,
+    toggle: false,
+};
 
 /// Returns whether old_angle is greater than new_angle within aperture.
 /// Port of Stick::IsAngleGreater
@@ -98,6 +92,194 @@ pub fn compute_goal_angle(r: bool, l: bool, u: bool, d: bool) -> f32 {
     0.0
 }
 
+/// Port of the inner `Stick` class from stick_from_buttons.cpp.
+///
+/// Handles angle interpolation for smooth diagonal transitions.
+struct Stick {
+    up: Box<dyn InputDevice>,
+    down: Box<dyn InputDevice>,
+    left: Box<dyn InputDevice>,
+    right: Box<dyn InputDevice>,
+    modifier: Box<dyn InputDevice>,
+    updater: Box<dyn InputDevice>,
+    modifier_scale: f32,
+    modifier_angle: f32,
+    angle: f32,
+    goal_angle: f32,
+    amplitude: f32,
+    up_status: bool,
+    down_status: bool,
+    left_status: bool,
+    right_status: bool,
+    last_x_axis_value: f32,
+    last_y_axis_value: f32,
+    modifier_value: bool,
+    modifier_toggle: bool,
+    modifier_locked: bool,
+    last_update: Instant,
+    callback: Mutex<InputCallback>,
+}
+
+impl Stick {
+    fn new(
+        up: Box<dyn InputDevice>,
+        down: Box<dyn InputDevice>,
+        left: Box<dyn InputDevice>,
+        right: Box<dyn InputDevice>,
+        modifier: Box<dyn InputDevice>,
+        updater: Box<dyn InputDevice>,
+        modifier_scale: f32,
+        modifier_angle: f32,
+    ) -> Self {
+        Self {
+            up,
+            down,
+            left,
+            right,
+            modifier,
+            updater,
+            modifier_scale,
+            modifier_angle,
+            angle: 0.0,
+            goal_angle: 0.0,
+            amplitude: 0.0,
+            up_status: false,
+            down_status: false,
+            left_status: false,
+            right_status: false,
+            last_x_axis_value: 0.0,
+            last_y_axis_value: 0.0,
+            modifier_value: false,
+            modifier_toggle: false,
+            modifier_locked: false,
+            last_update: Instant::now(),
+            callback: Mutex::new(InputCallback { on_change: None }),
+        }
+    }
+
+    fn get_angle(&self, now: Instant) -> f32 {
+        let mut new_angle = self.angle;
+
+        let mut time_difference = now
+            .duration_since(self.last_update)
+            .as_secs_f32();
+        if time_difference > 0.5 {
+            time_difference = 0.5;
+        }
+
+        if is_angle_greater(new_angle, self.goal_angle) {
+            new_angle -= self.modifier_angle * time_difference;
+            if new_angle < 0.0 {
+                new_angle += TAU;
+            }
+            if !is_angle_greater(new_angle, self.goal_angle) {
+                return self.goal_angle;
+            }
+        } else if is_angle_smaller(new_angle, self.goal_angle) {
+            new_angle += self.modifier_angle * time_difference;
+            if new_angle >= TAU {
+                new_angle -= TAU;
+            }
+            if !is_angle_smaller(new_angle, self.goal_angle) {
+                return self.goal_angle;
+            }
+        } else {
+            return self.goal_angle;
+        }
+        new_angle
+    }
+
+    fn set_goal_angle(&mut self, r: bool, l: bool, u: bool, d: bool) {
+        self.goal_angle = compute_goal_angle(r, l, u, d);
+    }
+
+    fn get_status(&self) -> StickStatus {
+        let mut status = StickStatus::default();
+        status.x.properties = STICK_PROPERTIES;
+        status.y.properties = STICK_PROPERTIES;
+
+        // TODO: Check Settings::values.emulate_analog_keyboard
+        // For now use goal_angle directly (non-analog-emulation path)
+        status.x.raw_value = self.goal_angle.cos() * self.amplitude;
+        status.y.raw_value = self.goal_angle.sin() * self.amplitude;
+        status
+    }
+
+    fn update_status(&mut self) {
+        let mut r = self.right_status;
+        let mut l = self.left_status;
+        let mut u = self.up_status;
+        let mut d = self.down_status;
+
+        // Eliminate contradictory movements
+        if r && l {
+            r = false;
+            l = false;
+        }
+        if u && d {
+            u = false;
+            d = false;
+        }
+
+        // Move if a key is pressed
+        if r || l || u || d {
+            self.amplitude = if self.modifier_value {
+                self.modifier_scale
+            } else {
+                MAX_RANGE
+            };
+        } else {
+            self.amplitude = 0.0;
+        }
+
+        let now = Instant::now();
+        let time_difference = now
+            .duration_since(self.last_update)
+            .as_millis() as u64;
+
+        if time_difference < 10 {
+            // Disable analog mode if inputs are too fast
+            self.set_goal_angle(r, l, u, d);
+            self.angle = self.goal_angle;
+        } else {
+            self.angle = self.get_angle(now);
+            self.set_goal_angle(r, l, u, d);
+        }
+
+        self.last_update = now;
+        let stick_status = self.get_status();
+        self.last_x_axis_value = stick_status.x.raw_value;
+        self.last_y_axis_value = stick_status.y.raw_value;
+        let status = CallbackStatus {
+            input_type: InputType::Stick,
+            stick_status,
+            ..Default::default()
+        };
+        self.trigger_on_change(&status);
+    }
+}
+
+impl InputDevice for Stick {
+    fn force_update(&mut self) {
+        self.up.force_update();
+        self.down.force_update();
+        self.left.force_update();
+        self.right.force_update();
+        self.modifier.force_update();
+    }
+
+    fn set_callback(&mut self, callback: InputCallback) {
+        *self.callback.lock().unwrap() = callback;
+    }
+
+    fn trigger_on_change(&self, status: &CallbackStatus) {
+        let cb = self.callback.lock().unwrap();
+        if let Some(ref on_change) = cb.on_change {
+            on_change(status);
+        }
+    }
+}
+
 /// Port of `StickFromButton` class from stick_from_buttons.h / stick_from_buttons.cpp
 ///
 /// Creates an analog device from direction button devices.
@@ -120,13 +302,32 @@ impl StickFromButton {
     /// Creates the inner Stick device with up/down/left/right/modifier buttons.
     /// The Stick device handles angle interpolation for smooth diagonal transitions,
     /// modifier for reduced-range movement, and callback-based input forwarding.
-    pub fn create(&self, _params: &ParamPackage) -> Box<dyn InputDevice> {
-        // Full implementation requires:
-        // 1. Common::Input::CreateInputDeviceFromString for each direction button
-        // 2. Setting up callbacks on each button device
-        // 3. Creating the inner Stick device with angle-interpolation state machine
-        // These depend on the input device factory registration system
-        todo!("Requires input device factory registration system")
+    pub fn create(&self, params: &ParamPackage) -> Box<dyn InputDevice> {
+        let null_engine = {
+            let mut p = ParamPackage::default();
+            p.set_str("engine", "null".to_string());
+            p.serialize()
+        };
+        let up = input::create_input_device_from_string(&params.get_str("up", &null_engine));
+        let down = input::create_input_device_from_string(&params.get_str("down", &null_engine));
+        let left = input::create_input_device_from_string(&params.get_str("left", &null_engine));
+        let right = input::create_input_device_from_string(&params.get_str("right", &null_engine));
+        let modifier =
+            input::create_input_device_from_string(&params.get_str("modifier", &null_engine));
+        let updater = input::create_input_device_from_string("engine:updater,button:0");
+        let modifier_scale = params.get_float("modifier_scale", 0.5);
+        let modifier_angle = params.get_float("modifier_angle", 5.5);
+
+        Box::new(Stick::new(
+            up,
+            down,
+            left,
+            right,
+            modifier,
+            updater,
+            modifier_scale,
+            modifier_angle,
+        ))
     }
 }
 

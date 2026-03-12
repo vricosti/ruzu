@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use crate::file_sys::errors;
 use crate::file_sys::vfs::vfs::VfsFile;
-use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use common::ResultCode;
 
 /// Compute floor(log2(value)), assuming value > 0 and is a power of two.
@@ -160,6 +160,49 @@ impl HierarchicalSha256Storage {
         } else {
             0
         }
+    }
+}
+
+/// Implement VfsFile so HierarchicalSha256Storage can be used as a VirtualFile.
+impl VfsFile for HierarchicalSha256Storage {
+    fn get_name(&self) -> String {
+        String::from("HierarchicalSha256Storage")
+    }
+
+    fn get_size(&self) -> usize {
+        self.get_size()
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        false
+    }
+
+    fn is_readable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let actual = length.min(data.len());
+        if actual == 0 {
+            return 0;
+        }
+        self.read(&mut data[..actual], actual, offset)
+    }
+
+    fn write(&self, _data: &[u8], _length: usize, _offset: usize) -> usize {
+        0
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
     }
 }
 

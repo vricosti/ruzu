@@ -4,7 +4,9 @@
 //! Port of hid_core/resources/keyboard/keyboard.h and keyboard.cpp
 
 use super::keyboard_types::KeyboardState;
+use crate::hid_types::{KeyboardAttribute, KeyboardKey, KeyboardModifier};
 use crate::resources::controller_base::ControllerActivation;
+use crate::resources::shared_memory_format::KeyboardSharedMemoryFormat;
 
 /// Keyboard controller — reads keyboard input from emulated devices and writes
 /// into shared memory.
@@ -38,8 +40,30 @@ impl Keyboard {
     ///       next_state.modifier = emulated_devices->GetKeyboardModifier()
     ///       next_state.attribute.is_connected = 1
     ///   keyboard_lifo.WriteNextEntry(next_state)
-    pub fn on_update(&mut self) {
-        let _ = &self.next_state;
+    pub fn on_update(
+        &mut self,
+        shared_memory: &mut KeyboardSharedMemoryFormat,
+        keyboard_enabled: bool,
+        keyboard_state: &KeyboardKey,
+        keyboard_modifier: &KeyboardModifier,
+    ) {
+        if !self.activation.is_controller_activated() {
+            shared_memory.keyboard_lifo.buffer_count = 0;
+            shared_memory.keyboard_lifo.buffer_tail = 0;
+            return;
+        }
+
+        let last_entry = shared_memory.keyboard_lifo.read_current_entry();
+        self.next_state.sampling_number = last_entry.state.sampling_number + 1;
+
+        if keyboard_enabled {
+            self.next_state.key = *keyboard_state;
+            self.next_state.modifier = *keyboard_modifier;
+            // attribute.is_connected.Assign(1)
+            self.next_state.attribute = KeyboardAttribute { raw: 1 };
+        }
+
+        shared_memory.keyboard_lifo.write_next_entry(self.next_state);
     }
 }
 

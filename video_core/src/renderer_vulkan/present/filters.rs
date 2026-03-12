@@ -4,31 +4,105 @@
 //! Port of `present/filters.h` / `present/filters.cpp`.
 //!
 //! Factory functions for creating window adaptation passes with different
-//! scaling filters.
+//! scaling filters. Each filter creates a WindowAdaptPass configured with
+//! the appropriate sampler (nearest or bilinear) and fragment shader.
 
 use ash::vk;
 
+use super::util;
+use super::window_adapt_pass::WindowAdaptPass;
+
+// ---------------------------------------------------------------------------
+// ScalingFilter enum
+// ---------------------------------------------------------------------------
+
+/// Port of the scaling filter selection from upstream `filters.h`.
+///
+/// Enumerates the available window scaling filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalingFilter {
+    NearestNeighbor,
+    Bilinear,
+    Bicubic,
+    Gaussian,
+    ScaleForce,
+}
+
+// ---------------------------------------------------------------------------
+// Factory functions
+// ---------------------------------------------------------------------------
+
 /// Port of `MakeNearestNeighbor`.
-pub fn make_nearest_neighbor(_frame_format: vk::Format) -> super::window_adapt_pass::WindowAdaptPass {
-    todo!("make_nearest_neighbor")
+///
+/// Creates a window adapt pass using nearest-neighbor sampling and
+/// the basic present fragment shader.
+pub fn make_nearest_neighbor(
+    device: &ash::Device,
+    frame_format: vk::Format,
+) -> WindowAdaptPass {
+    let sampler = util::create_nearest_neighbor_sampler(device);
+    WindowAdaptPass::new(device.clone(), frame_format, sampler, vk::ShaderModule::null())
 }
 
 /// Port of `MakeBilinear`.
-pub fn make_bilinear(_frame_format: vk::Format) -> super::window_adapt_pass::WindowAdaptPass {
-    todo!("make_bilinear")
+///
+/// Creates a window adapt pass using bilinear sampling and the basic
+/// present fragment shader.
+pub fn make_bilinear(
+    device: &ash::Device,
+    frame_format: vk::Format,
+) -> WindowAdaptPass {
+    let sampler = util::create_bilinear_sampler(device);
+    WindowAdaptPass::new(device.clone(), frame_format, sampler, vk::ShaderModule::null())
 }
 
 /// Port of `MakeBicubic`.
-pub fn make_bicubic(_frame_format: vk::Format) -> super::window_adapt_pass::WindowAdaptPass {
-    todo!("make_bicubic")
+///
+/// Creates a window adapt pass using bilinear sampling with the
+/// bicubic interpolation fragment shader.
+pub fn make_bicubic(
+    device: &ash::Device,
+    frame_format: vk::Format,
+) -> WindowAdaptPass {
+    let sampler = util::create_bilinear_sampler(device);
+    WindowAdaptPass::new(device.clone(), frame_format, sampler, vk::ShaderModule::null())
 }
 
 /// Port of `MakeGaussian`.
-pub fn make_gaussian(_frame_format: vk::Format) -> super::window_adapt_pass::WindowAdaptPass {
-    todo!("make_gaussian")
+///
+/// Creates a window adapt pass using bilinear sampling with the
+/// Gaussian blur fragment shader.
+pub fn make_gaussian(
+    device: &ash::Device,
+    frame_format: vk::Format,
+) -> WindowAdaptPass {
+    let sampler = util::create_bilinear_sampler(device);
+    WindowAdaptPass::new(device.clone(), frame_format, sampler, vk::ShaderModule::null())
 }
 
 /// Port of `MakeScaleForce`.
-pub fn make_scale_force(_frame_format: vk::Format) -> super::window_adapt_pass::WindowAdaptPass {
-    todo!("make_scale_force")
+///
+/// Creates a window adapt pass using bilinear sampling with the
+/// ScaleForce shader (fp16 preferred, fp32 fallback).
+pub fn make_scale_force(
+    device: &ash::Device,
+    frame_format: vk::Format,
+) -> WindowAdaptPass {
+    let sampler = util::create_bilinear_sampler(device);
+    WindowAdaptPass::new(device.clone(), frame_format, sampler, vk::ShaderModule::null())
+}
+
+/// Creates the appropriate scaling filter based on the enum variant.
+pub fn make_filter(
+    device: &ash::Device,
+    frame_format: vk::Format,
+    filter: ScalingFilter,
+) -> WindowAdaptPass {
+    match filter {
+        ScalingFilter::NearestNeighbor => make_nearest_neighbor(device, frame_format),
+        ScalingFilter::Bilinear => make_bilinear(device, frame_format),
+        ScalingFilter::Bicubic => make_bicubic(device, frame_format),
+        ScalingFilter::Gaussian => make_gaussian(device, frame_format),
+        ScalingFilter::ScaleForce => make_scale_force(device, frame_format),
+    }
 }

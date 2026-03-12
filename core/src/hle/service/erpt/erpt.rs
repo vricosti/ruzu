@@ -3,9 +3,11 @@
 
 //! Port of zuyu/src/core/hle/service/erpt/erpt.cpp
 //!
-//! ErrorReportContext ("erpt:c") and ErrorReportSession ("erpt:r") services.
+//! Error report services: ErrorReportContext ("erpt:c") and ErrorReportSession ("erpt:r").
 
-/// IPC command IDs for ErrorReportContext
+/// IPC command IDs for ErrorReportContext ("erpt:c").
+///
+/// Corresponds to the function table in upstream erpt.cpp `ErrorReportContext` constructor.
 pub mod context_commands {
     pub const SUBMIT_CONTEXT: u32 = 0;
     pub const CREATE_REPORT_V0: u32 = 1;
@@ -26,7 +28,9 @@ pub mod context_commands {
     pub const INVALIDATE_FORCED_SHUTDOWN_DETECTION: u32 = 30;
 }
 
-/// IPC command IDs for ErrorReportSession
+/// IPC command IDs for ErrorReportSession ("erpt:r").
+///
+/// Corresponds to the function table in upstream erpt.cpp `ErrorReportSession` constructor.
 pub mod session_commands {
     pub const OPEN_REPORT: u32 = 0;
     pub const OPEN_MANAGER: u32 = 1;
@@ -34,6 +38,8 @@ pub mod session_commands {
 }
 
 /// ErrorReportContext service ("erpt:c").
+///
+/// Corresponds to `ErrorReportContext` in upstream erpt.cpp.
 pub struct ErrorReportContext;
 
 impl ErrorReportContext {
@@ -41,21 +47,44 @@ impl ErrorReportContext {
         Self
     }
 
-    /// Stubbed: SubmitContext (cmd 0)
-    pub fn submit_context(&self, _context_entry: &[u8], _field_list: &[u8]) {
-        log::warn!("(STUBBED) ErrorReportContext::submit_context called");
+    /// SubmitContext (cmd 0).
+    ///
+    /// Corresponds to `ErrorReportContext::SubmitContext` in upstream erpt.cpp.
+    pub fn submit_context(&self, context_entry: &[u8], field_list: &[u8]) {
+        log::warn!(
+            "(STUBBED) ErrorReportContext::submit_context called, context_entry_size={}, field_list_size={}",
+            context_entry.len(),
+            field_list.len()
+        );
     }
 
-    /// Stubbed: CreateReportV0 (cmd 1)
-    pub fn create_report_v0(&self, report_type: u32) {
+    /// CreateReportV0 (cmd 1).
+    ///
+    /// Corresponds to `ErrorReportContext::CreateReportV0` in upstream erpt.cpp.
+    pub fn create_report_v0(
+        &self,
+        report_type: u32,
+        _context_entry: &[u8],
+        _report_list: &[u8],
+        _report_meta_data: &[u8],
+    ) {
         log::warn!(
             "(STUBBED) ErrorReportContext::create_report_v0 called, report_type={:#x}",
             report_type
         );
     }
 
-    /// Stubbed: CreateReportV1 (cmd 11)
-    pub fn create_report_v1(&self, report_type: u32, unknown: u32) {
+    /// CreateReportV1 (cmd 11).
+    ///
+    /// Corresponds to `ErrorReportContext::CreateReportV1` in upstream erpt.cpp.
+    pub fn create_report_v1(
+        &self,
+        report_type: u32,
+        unknown: u32,
+        _context_entry: &[u8],
+        _report_list: &[u8],
+        _report_meta_data: &[u8],
+    ) {
         log::warn!(
             "(STUBBED) ErrorReportContext::create_report_v1 called, report_type={:#x}, unknown={:#x}",
             report_type,
@@ -63,10 +92,20 @@ impl ErrorReportContext {
         );
     }
 
-    /// Stubbed: CreateReport (cmd 12)
-    pub fn create_report(&self, report_type: u32, unknown: u32, create_report_option_flag: u32) {
+    /// CreateReport (cmd 12).
+    ///
+    /// Corresponds to `ErrorReportContext::CreateReport` in upstream erpt.cpp.
+    pub fn create_report(
+        &self,
+        report_type: u32,
+        unknown: u32,
+        create_report_option_flag: u32,
+        _context_entry: &[u8],
+        _report_list: &[u8],
+        _report_meta_data: &[u8],
+    ) {
         log::warn!(
-            "(STUBBED) ErrorReportContext::create_report called, report_type={:#x}, unknown={:#x}, flag={:#x}",
+            "(STUBBED) ErrorReportContext::create_report called, report_type={:#x}, unknown={:#x}, create_report_option_flag={:#x}",
             report_type,
             unknown,
             create_report_option_flag
@@ -74,7 +113,10 @@ impl ErrorReportContext {
     }
 }
 
-/// ErrorReportSession service ("erpt:r"). All commands are unimplemented stubs.
+/// ErrorReportSession service ("erpt:r").
+///
+/// Corresponds to `ErrorReportSession` in upstream erpt.cpp.
+/// All commands are nullptr (unimplemented) in upstream.
 pub struct ErrorReportSession;
 
 impl ErrorReportSession {
@@ -85,7 +127,8 @@ impl ErrorReportSession {
 
 /// Registers "erpt:c" and "erpt:r" services.
 ///
-/// Corresponds to `LoopProcess` in upstream `erpt.cpp`.
+/// Corresponds to `LoopProcess` in upstream erpt.cpp.
 pub fn loop_process() {
+    log::debug!("ERPT::LoopProcess called");
     // TODO: register services with ServerManager
 }

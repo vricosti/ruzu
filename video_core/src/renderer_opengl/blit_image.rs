@@ -55,15 +55,58 @@ impl BlitImageHelper {
     /// Corresponds to `BlitImageHelper::BlitColor()`.
     pub fn blit_color(
         &self,
-        _program_manager: &mut ProgramManager,
-        _dst_framebuffer: u32,
-        _src_image_view: u32,
-        _src_sampler: u32,
-        _dst_region: &Region2D,
-        _src_region: &Region2D,
-        _src_size: &Extent3D,
+        program_manager: &mut ProgramManager,
+        dst_framebuffer: u32,
+        src_image_view: u32,
+        src_sampler: u32,
+        dst_region: &Region2D,
+        src_region: &Region2D,
+        src_size: &Extent3D,
     ) {
-        todo!("BlitImageHelper::BlitColor")
+        if self.full_screen_vert == 0 || self.blit_color_to_color_frag == 0 {
+            return;
+        }
+
+        unsafe {
+            gl::Disable(gl::CULL_FACE);
+            gl::Disable(gl::COLOR_LOGIC_OP);
+            gl::Disable(gl::DEPTH_TEST);
+            gl::Disable(gl::STENCIL_TEST);
+            gl::Disable(gl::POLYGON_OFFSET_FILL);
+            gl::Disable(gl::RASTERIZER_DISCARD);
+            gl::Disablei(gl::BLEND, 0);
+            gl::PolygonMode(gl::FRONT_AND_BACK, gl::FILL);
+            gl::FrontFace(gl::CW);
+            gl::ColorMaski(0, gl::TRUE, gl::TRUE, gl::TRUE, gl::TRUE);
+            gl::DepthRangeIndexed(0, 0.0, 0.0);
+
+            program_manager.bind_present_programs(
+                self.full_screen_vert,
+                self.blit_color_to_color_frag,
+            );
+
+            let scale_x = (src_region.end.x - src_region.start.x) as f32
+                / src_size.width as f32;
+            let scale_y = (src_region.end.y - src_region.start.y) as f32
+                / src_size.height as f32;
+            gl::ProgramUniform2f(self.full_screen_vert, 0, scale_x, scale_y);
+
+            let offset_x = src_region.start.x as f32 / src_size.width as f32;
+            let offset_y = src_region.start.y as f32 / src_size.height as f32;
+            gl::ProgramUniform2f(self.full_screen_vert, 1, offset_x, offset_y);
+
+            let vp_x = dst_region.start.x.min(dst_region.end.x);
+            let vp_y = dst_region.start.y.min(dst_region.end.y);
+            let vp_w = (dst_region.end.x - dst_region.start.x).unsigned_abs();
+            let vp_h = (dst_region.end.y - dst_region.start.y).unsigned_abs();
+            gl::Viewport(vp_x, vp_y, vp_w as i32, vp_h as i32);
+
+            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, dst_framebuffer);
+            gl::BindSampler(0, src_sampler);
+            gl::BindTextureUnit(0, src_image_view);
+            gl::Clear(gl::COLOR_BUFFER_BIT);
+            gl::DrawArrays(gl::TRIANGLES, 0, 3);
+        }
     }
 }
 

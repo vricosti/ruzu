@@ -10,7 +10,8 @@
 use std::sync::Mutex;
 
 use super::utility::add_counter;
-use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::vfs::vfs::VfsFile;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 
 /// AES block size in bytes.
 ///
@@ -110,7 +111,7 @@ impl AesXtsStorage {
     /// Currently reads without decryption.
     ///
     /// Corresponds to upstream `AesXtsStorage::Read`.
-    pub fn read(&self, buffer: &mut [u8], offset: usize) -> usize {
+    pub fn read_at(&self, buffer: &mut [u8], offset: usize) -> usize {
         let size = buffer.len();
 
         // Allow zero-size reads.
@@ -145,6 +146,49 @@ impl AesXtsStorage {
         let _ = ctr;
 
         size
+    }
+}
+
+/// Implement VfsFile so AesXtsStorage can be used as a VirtualFile.
+impl VfsFile for AesXtsStorage {
+    fn get_name(&self) -> String {
+        String::from("AesXtsStorage")
+    }
+
+    fn get_size(&self) -> usize {
+        self.base_storage.get_size()
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false // Read-only storage
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        false
+    }
+
+    fn is_readable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let actual_len = length.min(data.len());
+        if actual_len == 0 {
+            return 0;
+        }
+        self.read_at(&mut data[..actual_len], offset)
+    }
+
+    fn write(&self, _data: &[u8], _length: usize, _offset: usize) -> usize {
+        0 // Read-only
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
     }
 }
 

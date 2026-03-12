@@ -31,7 +31,7 @@ impl HeapMapper {
         start >= self.m_vaddress && end <= (self.m_vaddress + self.m_size as u64)
     }
 
-    pub fn map(&self, start: u64, size: usize) -> u64 {
+    pub fn map(&self, start: u64, _size: usize) -> u64 {
         let _lock = self.m_guard.lock().unwrap();
         // Stubbed: In the C++ code, this manages device memory mapping via range sets.
         self.m_daddress + (start - self.m_vaddress)

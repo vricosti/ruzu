@@ -74,29 +74,102 @@ impl<F: FenceBase + Send> FenceManager<F> {
 
     /// Signal a fence with an associated callback.
     ///
-    /// In the full port, this interacts with the rasterizer, texture cache,
-    /// buffer cache, and query cache.
-    pub fn signal_fence(&mut self, _func: Box<dyn FnOnce() + Send>) {
-        todo!("signal_fence requires rasterizer and cache integration");
+    /// Port of `FenceManager::SignalFence()`.
+    ///
+    /// In the full implementation, this:
+    /// 1. Tries to release pending fences
+    /// 2. Commits async flushes from texture/buffer/query caches
+    /// 3. Creates a new backend fence
+    /// 4. Moves uncommitted operations into the pending queue
+    /// 5. Queues the fence into the backend
+    /// 6. Optionally delays the callback for high GPU accuracy
+    pub fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
+        // Try to release any already-signaled fences first
+        self.try_release_pending_fences(false);
+
+        // Move uncommitted operations into a new pending batch
+        let mut batch: VecDeque<Box<dyn FnOnce() + Send>> =
+            std::mem::take(&mut self.uncommitted_operations);
+
+        // In the non-delayed path, execute the callback immediately
+        func();
+
+        self.pending_operations.push_back(batch);
+
+        // NOTE: In the full implementation, this would also:
+        // - Call CommitAsyncFlushes() on texture/buffer/query caches
+        // - Create a backend fence via CreateFence()
+        // - Queue the fence via QueueFence()
+        // - Optionally call rasterizer.FlushCommands()
+        // - Call rasterizer.InvalidateGPUCache()
     }
 
     /// Signal a syncpoint increment.
-    pub fn signal_sync_point(&mut self, _value: u32) {
-        todo!("signal_sync_point requires syncpoint manager integration");
+    ///
+    /// Port of `FenceManager::SignalSyncPoint()`.
+    ///
+    /// In the full implementation, this increments the guest syncpoint
+    /// and creates a fence whose callback increments the host syncpoint.
+    pub fn signal_sync_point(&mut self, value: u32) {
+        // In the full implementation:
+        // syncpoint_manager.IncrementGuest(value);
+        // Then call signal_fence with a callback that does IncrementHost(value).
+        log::debug!("SignalSyncPoint({})", value);
+        let func = Box::new(move || {
+            log::debug!("SyncPoint {} host increment", value);
+        });
+        self.signal_fence(func);
     }
 
     /// Wait for all pending fences to complete.
-    pub fn wait_pending_fences(&mut self, _force: bool) {
-        todo!("wait_pending_fences requires backend fence integration");
+    ///
+    /// Port of `FenceManager::WaitPendingFences()`.
+    pub fn wait_pending_fences(&mut self, force: bool) {
+        if !force {
+            return;
+        }
+        // Force-wait: drain all pending fences
+        self.try_release_pending_fences(true);
     }
 
     /// Signal ordering (accumulate flushes).
+    ///
+    /// Port of `FenceManager::SignalOrdering()`.
+    ///
+    /// In the full implementation, this tries to release pending fences and
+    /// calls buffer_cache.AccumulateFlushes().
     pub fn signal_ordering(&mut self) {
-        todo!("signal_ordering requires buffer cache integration");
+        self.try_release_pending_fences(false);
+        // In full implementation: buffer_cache.AccumulateFlushes()
     }
 
     /// Signal a reference (no-op fence).
+    ///
+    /// Port of `FenceManager::SignalReference()`.
     pub fn signal_reference(&mut self) {
-        todo!("signal_reference requires signal_fence");
+        let do_nothing: Box<dyn FnOnce() + Send> = Box::new(|| {});
+        self.signal_fence(do_nothing);
+    }
+
+    /// Try to release pending fences that have been signaled.
+    ///
+    /// Port of `FenceManager::TryReleasePendingFences()`.
+    fn try_release_pending_fences(&mut self, force_wait: bool) {
+        while !self.fences.is_empty() {
+            // In full implementation: check IsFenceSignaled / WaitFence
+            // For now, just drain all pending operations
+            if !force_wait {
+                // Without force, only process already-signaled fences
+                // Since we don't have real fence checking yet, just return
+                return;
+            }
+            self.fences.pop_front();
+
+            if let Some(operations) = self.pending_operations.pop_front() {
+                for op in operations {
+                    op();
+                }
+            }
+        }
     }
 }

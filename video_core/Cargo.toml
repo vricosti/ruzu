@@ -17,3 +17,4 @@ parking_lot.workspace = true
 rspirv.workspace = true
 spirv.workspace = true
 bitflags.workspace = true
+bytemuck.workspace = true

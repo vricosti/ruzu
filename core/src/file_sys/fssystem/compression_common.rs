@@ -7,9 +7,10 @@ use common::ResultCode;
 
 /// Compression type used in NCA compressed storage.
 /// Corresponds to upstream `CompressionType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum CompressionType {
+    #[default]
     None = 0,
     Zeros = 1,
     Two = 2,

@@ -511,3 +511,15 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 **Status:** In progress.
 
 **Exceptions:** *(to be filled as the port progresses)*
+
+## Directories Excluded From The Port
+
+The following upstream directories are **intentionally not ported** and should never be flagged as missing during parity audits.
+
+### `yuzu` — `/home/vricosti/shared/zuyu/src/yuzu`
+
+**Not ported.** This is the Qt-based GUI frontend application. The ruzu project will implement its own frontend using a different UI library (not Qt). This directory should not be ported.
+
+### `tests` — `/home/vricosti/shared/zuyu/src/tests`
+
+**Not ported.** Upstream C++ test suite. Rust tests are written natively alongside each crate using `#[cfg(test)]` modules and `cargo test`.

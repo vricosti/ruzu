@@ -9,6 +9,7 @@
 
 use super::compression_common::{CompressionType, DecompressorFunction, GetDecompressorFunction};
 use super::nca_file_system_driver::NcaCompressionConfiguration;
+use crate::file_sys::errors;
 use common::ResultCode;
 
 /// Decompress LZ4-compressed data.
@@ -22,7 +23,7 @@ fn decompress_lz4(dst: &mut [u8], src: &[u8]) -> Result<(), ResultCode> {
         let result = lz4_flex::decompress_into(src, dst);
         match result {
             Ok(size) if size == dst.len() => Ok(()),
-            _ => Err(ResultCode::new(0xD42A)), // ResultUnexpectedInCompressedStorageC
+            _ => Err(errors::RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_C), // ResultUnexpectedInCompressedStorageC
         }
     }
     #[cfg(not(feature = "lz4"))]
@@ -34,7 +35,7 @@ fn decompress_lz4(dst: &mut [u8], src: &[u8]) -> Result<(), ResultCode> {
             dst.len()
         );
         let _ = (dst, src);
-        Err(ResultCode(0xD42A)) // ResultUnexpectedInCompressedStorageC
+        Err(errors::RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_C) // ResultUnexpectedInCompressedStorageC
     }
 }
 

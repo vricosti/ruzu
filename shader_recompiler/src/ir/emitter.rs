@@ -841,12 +841,32 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::VoteAny, vec![pred]))
     }
 
+    pub fn vote_equal(&mut self, pred: Value) -> Value {
+        self.emit(Inst::new(Opcode::VoteEqual, vec![pred]))
+    }
+
     pub fn subgroup_ballot(&mut self, pred: Value) -> Value {
         self.emit(Inst::new(Opcode::SubgroupBallot, vec![pred]))
     }
 
     pub fn shuffle_index(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
         self.emit(Inst::new(Opcode::ShuffleIndex, vec![value, index, seg_mask]))
+    }
+
+    // ── Geometry ──────────────────────────────────────────────────────
+
+    pub fn emit_vertex(&mut self, stream: Value) -> Value {
+        self.emit(Inst::new(Opcode::EmitVertex, vec![stream]))
+    }
+
+    pub fn end_primitive(&mut self, stream: Value) -> Value {
+        self.emit(Inst::new(Opcode::EndPrimitive, vec![stream]))
+    }
+
+    // ── System values ────────────────────────────────────────────────
+
+    pub fn sample_id(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::SampleId, vec![]))
     }
 
     // ── Helper: apply abs/neg modifiers ───────────────────────────────

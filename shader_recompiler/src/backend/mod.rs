@@ -9,6 +9,7 @@
 pub mod bindings;
 pub mod glasm;
 pub mod glsl;
+pub mod spirv;
 pub mod spirv_context;
 pub mod emit_atomic;
 pub mod emit_barriers;
