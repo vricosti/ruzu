@@ -11,7 +11,7 @@ common = { path = "../common" }
 # ruzu-kernel = { path = "../ruzu-kernel" }
 # ruzu-service = { path = "../ruzu-service" }
 # ruzu-loader = { path = "../ruzu-loader" }
-# ruzu-gpu = { path = "../ruzu-gpu" }
+# video_core = { path = "../video_core" }
 aes.workspace = true
 bitflags.workspace = true
 cipher.workspace = true

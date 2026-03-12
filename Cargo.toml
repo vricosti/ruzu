@@ -9,7 +9,7 @@ members = [
     "ruzu-cpu",
     "ruzu-kernel",
     "ruzu-service",
-    "ruzu-gpu",
+    "video_core",
 ]
 resolver = "2"
 
@@ -28,7 +28,7 @@ ruzu-loader = { path = "ruzu-loader" }
 ruzu-cpu = { path = "ruzu-cpu" }
 ruzu-kernel = { path = "ruzu-kernel" }
 ruzu-service = { path = "ruzu-service" }
-ruzu-gpu = { path = "ruzu-gpu" }
+video_core = { path = "video_core" }
 
 # JIT recompiler
 rdynarmic = { path = "../rdynarmic" }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crypto::KeyManager;
-use ruzu_gpu::gpu_context::GpuContext;
+use video_core::gpu_context::GpuContext;
 use ruzu_kernel::kernel::{IpcHandler, IpcHandlerResult};
 use ruzu_kernel::objects::{KSharedMemory, KernelObject};
 use ruzu_kernel::KernelCore;
@@ -1232,7 +1232,7 @@ fn run_with_window(
             match vulkan_presenter::VulkanPresenter::new(&emu_window.window) {
                 Ok(vk) => {
                     // Try to create a RasterizerVulkan for GPU-accelerated shader rendering.
-                    match ruzu_gpu::renderer_vulkan::RasterizerVulkan::new(
+                    match video_core::renderer_vulkan::RasterizerVulkan::new(
                         vk.instance(),
                         vk.physical_device(),
                         vk.device(),
@@ -1796,7 +1796,7 @@ fn run_with_window(
 
                 let result = if offset != 0 && width > 0 && height > 0 {
                     // Calculate tiled buffer size (may be larger than linear due to GOB alignment).
-                    let block_height_log2 = ruzu_gpu::swizzle::guess_block_height_log2(height);
+                    let block_height_log2 = video_core::swizzle::guess_block_height_log2(height);
                     let block_height = 1usize << block_height_log2;
                     let gob_size_y = 8usize;
                     let gob_size_x = 64usize;
@@ -1816,7 +1816,7 @@ fn run_with_window(
                         // Check if data looks tiled (non-zero content).
                         let has_content = tiled.iter().any(|&b| b != 0);
                         if has_content {
-                            let linear = ruzu_gpu::swizzle::detile_block_linear(
+                            let linear = video_core::swizzle::detile_block_linear(
                                 &tiled,
                                 width,
                                 height,

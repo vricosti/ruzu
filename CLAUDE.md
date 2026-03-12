@@ -506,7 +506,7 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 
 ### `video_core` — `/home/vricosti/shared/zuyu/src/video_core`
 
-**Rust crate:** `ruzu-gpu` at `/home/vricosti/shared/ruzu/ruzu-gpu`
+**Rust crate:** `video_core` at `/home/vricosti/shared/ruzu/video_core`
 
 **Status:** In progress.
 

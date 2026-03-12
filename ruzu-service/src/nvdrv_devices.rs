@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ruzu_gpu::command_processor::GpEntry;
-use ruzu_gpu::gpu_context::GpuContext;
+use video_core::command_processor::GpEntry;
+use video_core::gpu_context::GpuContext;
 
 /// Trait for an NVIDIA device that handles ioctl commands.
 pub trait NvDevice: Send + Sync {
@@ -379,7 +379,7 @@ impl NvDevice for NvHostGpu {
                 self.gpu.submit_gpfifo(entries);
 
                 // Increment the fence syncpoint and return the new value.
-                let new_value = if (fence_id as usize) < ruzu_gpu::syncpoint::NUM_SYNCPOINTS {
+                let new_value = if (fence_id as usize) < video_core::syncpoint::NUM_SYNCPOINTS {
                     self.gpu.syncpoints.increment(fence_id)
                 } else {
                     0
