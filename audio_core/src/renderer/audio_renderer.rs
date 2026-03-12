@@ -4,7 +4,7 @@ use crate::renderer::{Manager, System};
 use crate::Result;
 use common::ResultCode;
 use parking_lot::Mutex;
-use ruzu_kernel::KProcess;
+use ruzu_core::hle::kernel::k_process::KProcess;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 

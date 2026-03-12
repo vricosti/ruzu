@@ -20,14 +20,25 @@
 
 pub mod arithmetic_fp;
 pub mod arithmetic_int;
+pub mod atomic;
+pub mod attribute;
+pub mod barrier;
+pub mod bitwise;
+pub mod common_encoding;
+pub mod common_funcs;
 pub mod comparison;
 pub mod conversion;
-pub mod bitwise;
-pub mod predicate;
-pub mod move_sel;
+pub mod double_arithmetic;
+pub mod flow_control;
+pub mod half_float;
 pub mod memory;
+pub mod misc;
+pub mod move_sel;
+pub mod predicate;
+pub mod surface;
 pub mod texture;
-pub mod attribute;
+pub mod video;
+pub mod warp;
 
 use crate::shader_recompiler::frontend::maxwell_opcodes::{MaxwellOpcode, SrcType};
 use crate::shader_recompiler::ir::emitter::Emitter;

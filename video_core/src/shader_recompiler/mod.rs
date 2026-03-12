@@ -35,7 +35,19 @@ pub mod backend;
 pub mod ir_opt;
 pub mod pipeline_cache;
 
+// Root-level modules matching upstream shader_recompiler/ files
+pub mod environment;
+pub mod exception;
+pub mod host_translate_info;
+pub mod object_pool;
+pub mod profile;
+pub mod program_header;
+pub mod runtime_info;
+pub mod shader_info;
+pub mod stage;
+pub mod varying_state;
+
 // Re-export public API
-pub use backend::Profile;
+pub use backend::Profile as BackendProfile;
 pub use pipeline_cache::{compile_shader, CompiledShader, PipelineCache, ShaderKey};
 pub use ir::types::ShaderStage;

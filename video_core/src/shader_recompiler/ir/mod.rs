@@ -18,19 +18,31 @@
 //! results). A structured control flow AST (`SyntaxNode`) describes nested
 //! if/loop/break regions for direct SPIR-V emission.
 
+pub mod abstract_syntax_list;
 pub mod basic_block;
+pub mod breadth_first_search;
+pub mod condition;
 pub mod emitter;
+pub mod flow_test;
 pub mod instruction;
+pub mod modifiers;
 pub mod opcodes;
+pub mod patch;
+pub mod post_order;
 pub mod program;
 pub mod types;
 pub mod value;
 
 // Re-export key types for convenience.
+pub use abstract_syntax_list::{AbstractSyntaxData, AbstractSyntaxList, AbstractSyntaxNode};
 pub use basic_block::Block;
+pub use condition::{Condition, IrPred};
 pub use emitter::Emitter;
+pub use flow_test::FlowTest;
 pub use instruction::Inst;
 pub use opcodes::Opcode;
+pub use patch::IrPatch;
+pub use post_order::post_order;
 pub use program::{Program, ShaderInfo, SyntaxNode};
 pub use types::{FmzMode, FpControl, FpRounding, ShaderStage, TextureInstInfo, Type};
 pub use value::{Attribute, InstRef, Patch, Pred, Reg, Value};

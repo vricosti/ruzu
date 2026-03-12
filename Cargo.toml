@@ -1,15 +1,15 @@
 [workspace]
 members = [
     "audio_core",
-    "ruzu-cmd",
     "common",
     "core",
     "core/crypto",
-    "ruzu-loader",
-    "ruzu-cpu",
-    "ruzu-kernel",
-    "ruzu-service",
     "video_core",
+    "hid_core",
+    "input_common",
+    "network",
+    "web_service",
+    "frontend_common",
 ]
 resolver = "2"
 
@@ -24,11 +24,12 @@ license = "GPL-3.0-or-later"
 common = { path = "common" }
 core = { path = "core" }
 crypto = { path = "core/crypto" }
-ruzu-loader = { path = "ruzu-loader" }
-ruzu-cpu = { path = "ruzu-cpu" }
-ruzu-kernel = { path = "ruzu-kernel" }
-ruzu-service = { path = "ruzu-service" }
 video_core = { path = "video_core" }
+hid_core = { path = "hid_core" }
+input_common = { path = "input_common" }
+network = { path = "network" }
+web_service = { path = "web_service" }
+frontend_common = { path = "frontend_common" }
 
 # JIT recompiler
 rdynarmic = { path = "../rdynarmic" }

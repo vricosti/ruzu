@@ -14,6 +14,19 @@ pub mod identity_removal;
 pub mod dead_code_elimination;
 pub mod constant_propagation;
 pub mod collect_info;
+pub mod conditional_barrier_pass;
+pub mod dual_vertex_pass;
+pub mod global_memory_to_storage_buffer_pass;
+pub mod layer_pass;
+pub mod lower_fp16_to_fp32;
+pub mod lower_fp64_to_fp32;
+pub mod lower_int64_to_int32;
+pub mod position_pass;
+pub mod rescaling_pass;
+pub mod ssa_rewrite_pass;
+pub mod texture_pass;
+pub mod vendor_workaround_pass;
+pub mod verification_pass;
 
 use crate::shader_recompiler::ir::program::Program;
 

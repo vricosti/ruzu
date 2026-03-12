@@ -1,0 +1,8 @@
+[package]
+name = "web_service"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common.workspace = true
+log.workspace = true

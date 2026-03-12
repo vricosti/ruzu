@@ -5,13 +5,6 @@ edition.workspace = true
 
 [dependencies]
 common = { path = "../common" }
-# Dependencies below are commented out until their compilation issues are resolved.
-# They will be needed when wiring up subsystems (kernel, GPU, services, etc.)
-# ruzu-cpu = { path = "../ruzu-cpu" }
-# ruzu-kernel = { path = "../ruzu-kernel" }
-# ruzu-service = { path = "../ruzu-service" }
-# ruzu-loader = { path = "../ruzu-loader" }
-# video_core = { path = "../video_core" }
 aes.workspace = true
 bitflags.workspace = true
 cipher.workspace = true
@@ -19,6 +12,8 @@ ctr.workspace = true
 hex.workspace = true
 libc = "0.2"
 log.workspace = true
+memmap2.workspace = true
 parking_lot.workspace = true
+thiserror.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

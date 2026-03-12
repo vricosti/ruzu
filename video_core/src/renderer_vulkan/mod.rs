@@ -64,7 +64,7 @@ use crate::engines::maxwell_3d::{
 };
 use crate::engines::Framebuffer;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
-use crate::shader_recompiler::{PipelineCache, Profile};
+use crate::shader_recompiler::{BackendProfile as Profile, PipelineCache};
 use crate::syncpoint::SyncpointManager;
 
 use buffer_cache::BufferCache;
