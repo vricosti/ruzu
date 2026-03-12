@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ruzu_gpu::gpu_context::GpuContext;
+use video_core::gpu_context::GpuContext;
 
 use crate::framework::ServiceHandler;
 use crate::ipc::{IpcCommand, IpcResponse};

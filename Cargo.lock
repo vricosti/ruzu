@@ -959,12 +959,12 @@ dependencies = [
  "parking_lot",
  "rust-ini",
  "ruzu-cpu",
- "ruzu-gpu",
  "ruzu-kernel",
  "ruzu-loader",
  "ruzu-service",
  "sdl2",
  "thiserror",
+ "video_core",
 ]
 
 [[package]]
@@ -974,23 +974,6 @@ dependencies = [
  "common",
  "log",
  "rdynarmic",
-]
-
-[[package]]
-name = "ruzu-gpu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ash",
- "common",
- "gl",
- "log",
- "parking_lot",
- "raw-window-handle 0.6.2",
- "rspirv",
- "spirv",
- "thiserror",
- "vulkano",
 ]
 
 [[package]]
@@ -1037,9 +1020,9 @@ dependencies = [
  "core",
  "log",
  "parking_lot",
- "ruzu-gpu",
  "ruzu-kernel",
  "thiserror",
+ "video_core",
 ]
 
 [[package]]
@@ -1288,6 +1271,24 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "video_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "bitflags 2.11.0",
+ "common",
+ "gl",
+ "log",
+ "parking_lot",
+ "raw-window-handle 0.6.2",
+ "rspirv",
+ "spirv",
+ "thiserror",
+ "vulkano",
+]
 
 [[package]]
 name = "vk-parse"

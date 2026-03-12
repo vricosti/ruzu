@@ -13,8 +13,8 @@ use log::info;
 use sdl2::video::{GLContext, Window};
 use thiserror::Error;
 
-use ruzu_gpu::renderer_opengl::RendererOpenGL;
-use ruzu_gpu::syncpoint::SyncpointManager;
+use video_core::renderer_opengl::RendererOpenGL;
+use video_core::syncpoint::SyncpointManager;
 
 #[derive(Debug, Error)]
 pub enum OpenGLPresenterError {

@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use ruzu_gpu::gpu_context::GpuContext;
+use video_core::gpu_context::GpuContext;
 
 use crate::buffer_queue::{BufferQueue, GraphicBuffer};
 use crate::framework::ServiceHandler;
