@@ -194,314 +194,6 @@ fn on_status_message_received(msg_type: u32, nickname: &str) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Minimal SVC handler for rtld bootstrap
-// ---------------------------------------------------------------------------
-
-/// Handle a supervisor call during early game startup.
-///
-/// This is a temporary shim that provides just enough SVC responses for
-/// the rtld dynamic linker to proceed. In the full implementation, SVCs
-/// are dispatched through the kernel's svc_dispatch module.
-///
-/// Return convention: R0 = result code (0 = success).
-fn handle_svc(
-    svc_num: u32,
-    args: &mut [u64; 8],
-    is_64bit: bool,
-    code_base: u64,
-    code_size: u64,
-    stack_base: u64,
-    stack_size: u64,
-    shared_memory: &ruzu_core::hle::kernel::k_process::SharedProcessMemory,
-) {
-    use ruzu_core::hle::kernel::svc_dispatch::SvcId;
-
-    match SvcId::from_u32(svc_num) {
-        Some(SvcId::SetHeapSize) => {
-            // SVC 0x01: SetHeapSize(size) -> (result, address)
-            // Upstream allocates heap via page table.
-            // For now, return a fixed heap address after the stack.
-            let heap_size = args[1];
-            let heap_base = stack_base + stack_size;
-            log::info!("  SetHeapSize({:#x}) -> heap at {:#x}", heap_size, heap_base);
-            args[0] = 0; // Success
-            args[1] = heap_base;
-        }
-
-        Some(SvcId::SetMemoryAttribute) => {
-            // SVC 0x03: SetMemoryAttribute(addr, size, mask, attr) -> result
-            // No-op for now, return success.
-            args[0] = 0;
-        }
-
-        Some(SvcId::SetMemoryPermission) => {
-            // SVC 0x02: SetMemoryPermission(addr, size, perm) -> result
-            args[0] = 0;
-        }
-
-        Some(SvcId::MapMemory) => {
-            // SVC 0x04: MapMemory(dst, src, size) -> result
-            args[0] = 0;
-        }
-
-        Some(SvcId::UnmapMemory) => {
-            // SVC 0x05: UnmapMemory(dst, src, size) -> result
-            args[0] = 0;
-        }
-
-        Some(SvcId::QueryMemory) => {
-            // SVC 0x06: QueryMemory(mem_info_ptr, page_info_ptr, addr) -> result
-            // For ARM32: R0=mem_info_ptr, R1=page_info_ptr, R2=addr
-            // Upstream writes a MemoryInfo struct (40 bytes) to mem_info_ptr.
-            // MemoryInfo layout: { base_addr: u64, size: u64, state: u32, attr: u32,
-            //                      perm: u32, ipc_count: u32, device_count: u32, padding: u32 }
-            let mem_info_ptr = args[0];
-            let query_addr = args[2];
-            log::info!("  QueryMemory(info_ptr={:#x}, addr={:#x})", mem_info_ptr, query_addr);
-
-            // Determine which region the query address falls in.
-            let heap_base = stack_base + stack_size;
-            let (base, size, state, perm) = if query_addr >= code_base && query_addr < code_base + code_size {
-                // Code region: RX
-                (code_base, code_size, 6u32 /* CodeStatic */, 5u32 /* RX */)
-            } else if query_addr >= stack_base && query_addr < stack_base + stack_size {
-                // Stack region: RW
-                (stack_base, stack_size, 5u32 /* Stack */, 3u32 /* RW */)
-            } else if query_addr >= heap_base {
-                // Heap region: RW
-                (heap_base, 0x1000_0000u64, 4u32 /* Normal */, 3u32 /* RW */)
-            } else {
-                // Unmapped
-                (0u64, query_addr, 0u32 /* Free */, 0u32 /* None */)
-            };
-
-            // Write MemoryInfo struct to guest memory.
-            {
-                let mut mem = shared_memory.write().unwrap();
-                if mem.is_valid_range(mem_info_ptr, 40) {
-                    mem.write_64(mem_info_ptr, base);           // base_address
-                    mem.write_64(mem_info_ptr + 8, size);       // size
-                    mem.write_32(mem_info_ptr + 16, state);     // state
-                    mem.write_32(mem_info_ptr + 20, 0);         // attribute
-                    mem.write_32(mem_info_ptr + 24, perm);      // permission
-                    mem.write_32(mem_info_ptr + 28, 0);         // ipc_count
-                    mem.write_32(mem_info_ptr + 32, 0);         // device_count
-                    mem.write_32(mem_info_ptr + 36, 0);         // padding
-                }
-            }
-
-            args[0] = 0; // Success
-            // page_info is returned in R1 for 32-bit
-            args[1] = 0;
-        }
-
-        Some(SvcId::ExitProcess) => {
-            // SVC 0x07: ExitProcess
-            log::info!("  ExitProcess called — stopping execution");
-            args[0] = 0;
-        }
-
-        Some(SvcId::CreateThread) => {
-            // SVC 0x08: CreateThread(entry, arg, stack_top, priority, core_id) -> (result, handle)
-            log::warn!("  CreateThread: not implemented");
-            args[0] = 0xF601; // ResultOutOfResource (stub)
-        }
-
-        Some(SvcId::SleepThread) => {
-            // SVC 0x0B: SleepThread(nanoseconds)
-            // No-op.
-            args[0] = 0;
-        }
-
-        Some(SvcId::GetCurrentProcessorNumber) => {
-            // SVC 0x10: -> core_id
-            args[0] = 0; // Always core 0
-        }
-
-        Some(SvcId::CloseHandle) => {
-            // SVC 0x16: CloseHandle(handle) -> result
-            args[0] = 0;
-        }
-
-        Some(SvcId::GetSystemTick) => {
-            // SVC 0x1E: -> tick
-            // Return a monotonically increasing tick.
-            static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let t = TICK.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
-            args[0] = t;
-            args[1] = t; // For 32-bit: R0=lo, R1=hi
-        }
-
-        Some(SvcId::ConnectToNamedPort) => {
-            // SVC 0x1F: ConnectToNamedPort(name_ptr) -> (result, handle)
-            log::warn!("  ConnectToNamedPort: returning dummy handle");
-            args[0] = 0;
-            args[1] = 0x1000; // Dummy handle
-        }
-
-        Some(SvcId::SendSyncRequest) => {
-            // SVC 0x21: SendSyncRequest(handle) -> result
-            log::warn!("  SendSyncRequest(handle={:#x}): stub", args[0]);
-            args[0] = 0;
-        }
-
-        Some(SvcId::GetProcessId) => {
-            // SVC 0x24: GetProcessId(handle) -> (result, pid)
-            args[0] = 0;
-            args[1] = 1; // PID = 1
-        }
-
-        Some(SvcId::GetThreadId) => {
-            // SVC 0x25: GetThreadId(handle) -> (result, tid)
-            args[0] = 0;
-            args[1] = 1; // TID = 1
-        }
-
-        Some(SvcId::Break) => {
-            // SVC 0x26: Break(reason, info1, info2)
-            log::error!("  Break(reason={:#x}, info1={:#x}, info2={:#x})",
-                args[0], args[1], args[2]);
-            args[0] = 0;
-        }
-
-        Some(SvcId::OutputDebugString) => {
-            // SVC 0x27: OutputDebugString(str_ptr, size) -> result
-            let str_ptr = args[0];
-            let str_size = args[1] as usize;
-            let msg = {
-                let mem = shared_memory.read().unwrap();
-                let bytes = if mem.is_valid_range(str_ptr, str_size) {
-                    mem.read_block(str_ptr, str_size).to_vec()
-                } else {
-                    vec![]
-                };
-                String::from_utf8_lossy(&bytes).to_string()
-            };
-            log::info!("  OutputDebugString: \"{}\"", msg);
-            args[0] = 0;
-        }
-
-        Some(SvcId::GetInfo) => {
-            // SVC 0x29: GetInfo(info_type, handle, sub_id) -> (result, value)
-            // This is the most critical SVC for rtld.
-            let info_type = args[1] as u32;
-            let handle = args[2] as u32;
-            let sub_id = args[3];
-
-            let (result, value) = handle_get_info(
-                info_type, handle, sub_id,
-                code_base, code_size, stack_base, stack_size,
-            );
-
-            args[0] = result;
-            args[1] = value;
-        }
-
-        Some(SvcId::MapPhysicalMemory) => {
-            // SVC 0x2C: MapPhysicalMemory(addr, size) -> result
-            args[0] = 0;
-        }
-
-        Some(SvcId::GetResourceLimitLimitValue) => {
-            // SVC 0x30: GetResourceLimitLimitValue(handle, which) -> (result, value)
-            args[0] = 0;
-            args[1] = 0x1_0000_0000; // 4 GiB
-        }
-
-        Some(SvcId::GetResourceLimitCurrentValue) => {
-            // SVC 0x31: GetResourceLimitCurrentValue(handle, which) -> (result, value)
-            args[0] = 0;
-            args[1] = 0;
-        }
-
-        Some(other) => {
-            log::warn!("  Unhandled SVC: {:?} (0x{:02X})", other, svc_num);
-            args[0] = 0; // Return success to keep going
-        }
-
-        None => {
-            log::error!("  Unknown SVC 0x{:02X}", svc_num);
-            args[0] = 0xF001; // Generic error
-        }
-    }
-}
-
-/// Handle SVC 0x29 (GetInfo).
-///
-/// Returns (result_code, value). This is the most important SVC for rtld
-/// as it queries memory layout information needed for relocation.
-fn handle_get_info(
-    info_type: u32,
-    _handle: u32,
-    sub_id: u64,
-    code_base: u64,
-    code_size: u64,
-    stack_base: u64,
-    stack_size: u64,
-) -> (u64, u64) {
-    // InfoType values from svc_types.rs
-    const ALIAS_REGION_ADDRESS: u32 = 2;
-    const ALIAS_REGION_SIZE: u32 = 3;
-    const HEAP_REGION_ADDRESS: u32 = 4;
-    const HEAP_REGION_SIZE: u32 = 5;
-    const TOTAL_MEMORY_SIZE: u32 = 6;
-    const USED_MEMORY_SIZE: u32 = 7;
-    const DEBUGGER_ATTACHED: u32 = 8;
-    const ASLR_REGION_ADDRESS: u32 = 12;
-    const ASLR_REGION_SIZE: u32 = 13;
-    const STACK_REGION_ADDRESS: u32 = 14;
-    const STACK_REGION_SIZE: u32 = 15;
-    const SYSTEM_RESOURCE_SIZE_TOTAL: u32 = 16;
-    const SYSTEM_RESOURCE_SIZE_USED: u32 = 17;
-    const PROGRAM_ID: u32 = 18;
-    const RANDOM_ENTROPY: u32 = 20;
-    const USER_EXCEPTION_CONTEXT_ADDR: u32 = 21;
-    const TOTAL_NON_SYSTEM_MEMORY_SIZE: u32 = 22;
-    const USED_NON_SYSTEM_MEMORY_SIZE: u32 = 23;
-    const IS_APPLICATION: u32 = 24;
-
-    let heap_base = stack_base + stack_size;
-
-    let value = match info_type {
-        ALIAS_REGION_ADDRESS => {
-            // For 32-bit: alias region at 1 GiB
-            0x4000_0000u64
-        }
-        ALIAS_REGION_SIZE => {
-            // 1 GiB
-            0x4000_0000u64
-        }
-        HEAP_REGION_ADDRESS => heap_base,
-        HEAP_REGION_SIZE => 0x1000_0000, // 256 MiB
-        TOTAL_MEMORY_SIZE => 0x1000_0000, // 256 MiB
-        USED_MEMORY_SIZE => code_size + stack_size,
-        DEBUGGER_ATTACHED => 0, // Not attached
-        ASLR_REGION_ADDRESS => code_base,
-        ASLR_REGION_SIZE => 0x8000_0000, // 2 GiB for 32-bit
-        STACK_REGION_ADDRESS => stack_base,
-        STACK_REGION_SIZE => stack_size,
-        SYSTEM_RESOURCE_SIZE_TOTAL => 0,
-        SYSTEM_RESOURCE_SIZE_USED => 0,
-        PROGRAM_ID => 0x0100152000022000, // MK8D title ID
-        RANDOM_ENTROPY => {
-            // Return random entropy for the given sub_id (0-3).
-            // Upstream uses KProcess::GetRandomEntropy(sub_id).
-            0xDEAD_BEEF_0000_0000u64 | sub_id
-        }
-        USER_EXCEPTION_CONTEXT_ADDR => 0, // Not yet set up
-        TOTAL_NON_SYSTEM_MEMORY_SIZE => 0x1000_0000,
-        USED_NON_SYSTEM_MEMORY_SIZE => code_size + stack_size,
-        IS_APPLICATION => 1, // Yes, this is an application
-        _ => {
-            log::warn!("  GetInfo: unknown info_type={}, sub_id={}", info_type, sub_id);
-            return (0, 0); // Return success with 0
-        }
-    };
-
-    log::debug!("  GetInfo(type={}, sub_id={}) -> {:#x}", info_type, sub_id, value);
-    (0, value) // Success
-}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -618,21 +310,177 @@ fn main() {
             if is_64bit { "AArch64" } else { "AArch32" }
         );
 
-        // Dump first 32 words of rtld for debugging.
+        // Pre-execution: verify module data by reading .dynstr for sdk module.
+        // sdk is the main symbol exporter — if its dynstr is valid, decompression worked.
         {
             let mem = shared_memory.read().unwrap();
-            log::info!("rtld header dump:");
-            for i in 0..16 {
-                let addr = code_base + i * 4;
-                let word = mem.read_32(addr);
-                log::info!("  [{:#010x}] = {:#010x}", addr, word);
+            // Helper to read module .dynamic and dump first symbols.
+            let dump_module = |name: &str, base: u64| {
+                let mod0_ptr = mem.read_32(base + 4) as u64;
+                let mod0_addr = base + mod0_ptr;
+                let magic = mem.read_32(mod0_addr);
+                if magic != 0x30444F4D {
+                    log::warn!("{} @ {:#x}: bad MOD0 magic {:#x}", name, base, magic);
+                    return;
+                }
+                let dyn_off = mem.read_32(mod0_addr + 4) as i32;
+                let dyn_addr = (mod0_addr as i64 + dyn_off as i64) as u64;
+                let mut strtab = 0u64;
+                let mut symtab = 0u64;
+                let mut strsz = 0u64;
+                let mut dt_hash = 0u64;
+                let mut dt_gnu_hash = 0u64;
+                for i in 0..80u64 {
+                    let tag = mem.read_32(dyn_addr + i * 8);
+                    let val = mem.read_32(dyn_addr + i * 8 + 4);
+                    match tag {
+                        4 => dt_hash = val as u64,
+                        5 => strtab = val as u64,
+                        6 => symtab = val as u64,
+                        10 => strsz = val as u64,
+                        _ => {
+                            // DT_GNU_HASH = 0x6ffffef5
+                            if tag == 0x6ffffef5u32 { dt_gnu_hash = val as u64; }
+                        }
+                    }
+                    if tag == 0 { break; }
+                }
+                // DT_STRTAB/DT_SYMTAB are un-relocated — add base to read correct addresses.
+                let strtab_addr = base + strtab;
+                let symtab_addr = base + symtab;
+                log::info!("{} @ {:#x}: DT_STRTAB={:#x}(abs={:#x}) DT_SYMTAB={:#x}(abs={:#x}) STRSZ={:#x} DT_HASH={:#x} DT_GNU_HASH={:#x}",
+                    name, base, strtab, strtab_addr, symtab, symtab_addr, strsz, dt_hash, dt_gnu_hash);
+                // Dump first 5 symbols.
+                for si in 0..5u64 {
+                    let sa = symtab_addr + si * 16;
+                    if !mem.is_valid_range(sa, 16) { break; }
+                    let st_name = mem.read_32(sa);
+                    let st_value = mem.read_32(sa + 4);
+                    let st_info = mem.read_8(sa + 12);
+                    let na = strtab_addr + st_name as u64;
+                    let mut sn = String::new();
+                    if mem.is_valid_range(na, 1) {
+                        for j in 0..80u64 {
+                            let c = mem.read_8(na + j);
+                            if c == 0 { break; }
+                            sn.push(c as char);
+                        }
+                    }
+                    log::info!("  sym[{}]: st_name={:#x} val={:#x} info={:#x} '{}'", si, st_name, st_value, st_info, sn);
+                }
+                // Search for __nnDetailInitLibc0 in this module's strtab.
+                let target = b"__nnDetailInitLibc0";
+                let target_len = target.len() as u64;
+                if strsz > target_len && mem.is_valid_range(strtab_addr, strsz as usize) {
+                    let mut sym_found = false;
+                    for offset in 0..(strsz - target_len) {
+                        let mut m = true;
+                        for (k, &b) in target.iter().enumerate() {
+                            if mem.read_8(strtab_addr + offset + k as u64) != b {
+                                m = false;
+                                break;
+                            }
+                        }
+                        if m {
+                            // Check it's a real string boundary (preceded by NUL or at offset 0)
+                            let preceded_by_nul = offset == 0 ||
+                                mem.read_8(strtab_addr + offset - 1) == 0;
+                            if preceded_by_nul {
+                                log::info!("  FOUND '__nnDetailInitLibc0' at strtab+{:#x} (abs={:#x})",
+                                    offset, strtab_addr + offset);
+                                // Now find which symbol entry references this strtab offset
+                                // by scanning the symtab for st_name == offset
+                                let sym_entry_size = 16u64; // ELF32 Sym size
+                                let n_syms = (strtab_addr - symtab_addr) / sym_entry_size;
+                                for si in 0..n_syms {
+                                    let sa = symtab_addr + si * sym_entry_size;
+                                    if !mem.is_valid_range(sa, sym_entry_size as usize) { break; }
+                                    let st_name_val = mem.read_32(sa);
+                                    if st_name_val as u64 == offset {
+                                        let st_value = mem.read_32(sa + 4);
+                                        let st_size = mem.read_32(sa + 8);
+                                        let st_info = mem.read_8(sa + 12);
+                                        let st_other = mem.read_8(sa + 13);
+                                        let st_shndx = mem.read_16(sa + 14);
+                                        let bind = st_info >> 4;
+                                        let stype = st_info & 0xf;
+                                        log::info!("    sym[{}]: val={:#x} sz={:#x} bind={} type={} other={} shndx={}",
+                                            si, st_value, st_size, bind, stype, st_other, st_shndx);
+                                    }
+                                }
+                                sym_found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !sym_found {
+                        log::info!("  '__nnDetailInitLibc0' NOT in strtab");
+                    }
+                }
+            };
+            dump_module("rtld", code_base);
+            dump_module("main", 0x206000);
+            dump_module("subsdk0", 0x1512000);
+            dump_module("subsdk1", 0x16AB000);
+            dump_module("subsdk2", 0x16D3000);
+            dump_module("subsdk3", 0x16E6000);
+            dump_module("subsdk4", 0x1723000);
+            dump_module("sdk", 0x1C9C000);
+
+            // Dump first 32 bytes of rtld's data segment (GOT is typically here).
+            // After self-relocation, GOT entries should contain base-adjusted addresses.
+            log::info!("rtld data segment (0x205000) PRE-execution:");
+            for i in 0..8u64 {
+                let addr = 0x205000 + i * 4;
+                let val = mem.read_32(addr);
+                log::info!("  [{:#010x}] = {:#010x}", addr, val);
             }
         }
 
-        // Allocate stack memory (1 MiB) after the code region.
+        // Allocate TLS (Thread Local Storage) region.
+        // Upstream: KThread::Initialize() calls owner->CreateThreadLocalRegion()
+        // which allocates a page and zeros it. The CP15 TPIDRURO register is set
+        // to this address before running the thread (physical_core.cpp:158).
+        // rtld reads TPIDRURO to find thread-local data for symbol resolution.
+        // ThreadLocalRegionSize = 0x200 upstream, but a full page is allocated.
+        let tls_page_size: u64 = 0x1000;
+        // Leave a small gap after modules (upstream shows FREE gap before TLS).
+        let tls_base = {
+            let modules_end = code_base + code_size as u64;
+            // Align to page boundary (should already be aligned).
+            let gap = 0x4000u64; // Upstream shows ~0x4000 gap before TLS
+            let base = modules_end + gap;
+            // Page-align
+            (base + 0xFFF) & !0xFFF
+        };
+        {
+            let mut mem = shared_memory.write().unwrap();
+            let tls_end = tls_base + tls_page_size;
+            let new_total = (tls_end - mem.base) as usize;
+            if new_total > mem.data.len() {
+                mem.data.resize(new_total, 0);
+            }
+            // Zero the TLS region (upstream: Memory::ZeroBlock(m_tls_address, ThreadLocalRegionSize))
+            let tls_offset = (tls_base - mem.base) as usize;
+            for b in &mut mem.data[tls_offset..tls_offset + tls_page_size as usize] {
+                *b = 0;
+            }
+            // Register TLS in the block manager for QueryMemory.
+            use ruzu_core::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
+            mem.update_region(
+                tls_base,
+                tls_page_size,
+                KMemoryState::THREAD_LOCAL,
+                KMemoryPermission::USER_READ_WRITE,
+            );
+        }
+        log::info!("TLS: base={:#x}, size={:#x}", tls_base, tls_page_size);
+
+        // Allocate stack memory (1 MiB) after the TLS region.
         // Upstream: KProcess::Run() allocates stack via page table.
         let stack_size: u64 = 1024 * 1024;
-        let stack_base = code_base + code_size as u64;
+        // Leave a gap after TLS (upstream shows FREE gap between TLS and stack).
+        let stack_base = tls_base + tls_page_size + 0x4000; // ~0x4000 gap like upstream
         let stack_top = stack_base + stack_size;
         {
             let mut mem = shared_memory.write().unwrap();
@@ -640,13 +488,41 @@ fn main() {
             if new_total > mem.data.len() {
                 mem.data.resize(new_total, 0);
             }
+            // Register stack in the block manager for QueryMemory.
+            use ruzu_core::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
+            mem.update_region(
+                stack_base,
+                stack_size,
+                KMemoryState::STACK,
+                KMemoryPermission::USER_READ_WRITE,
+            );
         }
         log::info!("Stack: base={:#x}, top={:#x} ({} KiB)", stack_base, stack_top, stack_size / 1024);
+
+        // Log tracked memory regions for debugging.
+        {
+            let mem = shared_memory.read().unwrap();
+            let mut count = 0;
+            for block in mem.block_manager.iter() {
+                use ruzu_core::hle::kernel::k_memory_block::KMemoryState;
+                if block.get_state() != KMemoryState::FREE {
+                    let perm = block.get_permission();
+                    log::info!("  [{:#010x}..{:#010x}) size={:#x} state={:?} perm={:?}",
+                        block.get_address(),
+                        block.get_end_address(),
+                        block.get_size(),
+                        block.get_state(),
+                        perm);
+                    count += 1;
+                }
+            }
+            log::info!("Memory regions: {} non-free blocks tracked", count);
+        }
 
         use ruzu_core::arm::arm_interface::{
             ArmInterface, HaltReason, KProcess as OpaqueKProcess, KThread as OpaqueKThread,
         };
-        use ruzu_core::hle::kernel::svc_dispatch;
+        use ruzu_core::hle::kernel::svc_dispatch::{self, SvcContext};
 
         let dummy_system: u32 = 0;
         let dummy_exclusive: u32 = 0;
@@ -674,6 +550,20 @@ fn main() {
             ))
         };
 
+        // Arc identity check: verify JIT and host share the same memory instance
+        log::info!("Arc identity: shared_memory ptr = {:?}", std::sync::Arc::as_ptr(&shared_memory));
+
+        // Create SVC context for the kernel dispatch module.
+        let svc_ctx = SvcContext {
+            shared_memory: shared_memory.clone(),
+            code_base,
+            code_size: code_size as u64,
+            stack_base,
+            stack_size,
+            program_id: 0x0100152000022000, // MK8D title ID
+            tls_base,
+        };
+
         // Set initial context.
         // Maps to upstream ResetThreadContext32/64 in k_thread.cpp.
         let mut ctx = ruzu_core::arm::arm_interface::ThreadContext::default();
@@ -690,6 +580,12 @@ fn main() {
         }
         jit.set_context(&ctx);
 
+        // Set TLS pointer register (CP15 TPIDRURO for AArch32, TPIDRRO_EL0 for AArch64).
+        // Upstream: physical_core.cpp:158 — SetTpidrroEl0(GetInteger(thread->GetTlsAddress()))
+        // rtld reads this register to find thread-local storage for symbol resolution.
+        jit.set_tpidrro_el0(tls_base);
+        log::info!("TLS: set TPIDRURO/TPIDRRO_EL0 = {:#x}", tls_base);
+
         log::info!(
             "CPU: starting {} JIT, PC={:#x}, SP={:#x}",
             if is_64bit { "AArch64" } else { "AArch32" },
@@ -697,56 +593,11 @@ fn main() {
         );
 
         // SVC dispatch loop.
+        // Maps to upstream KProcess::Run() → PhysicalCore event loop.
         let dummy_thread = unsafe {
             &mut *(&mut 0u32 as *mut u32 as *mut OpaqueKThread)
         };
 
-        // Step through the first N instructions to diagnose where the code goes.
-        let step_count = 200;
-        log::info!("Stepping through first {} instructions...", step_count);
-        for i in 0..step_count {
-            jit.get_context(&mut ctx);
-            let pc = ctx.pc;
-
-            // Read the instruction at PC
-            let insn = {
-                let mem = shared_memory.read().unwrap();
-                if mem.is_valid_range(pc, 4) { mem.read_32(pc) } else { 0xDEADDEAD }
-            };
-
-            if i < 50 || pc == 0 || i % 50 == 0 {
-                log::info!(
-                    "  step {}: PC={:#010x} insn={:#010x} SP={:#x} R0={:#x} R1={:#x} LR={:#x}",
-                    i, pc, insn, ctx.sp, ctx.r[0], ctx.r[1], ctx.lr
-                );
-            }
-
-            if pc == 0 {
-                log::error!("Reached PC=0 at step {}", i);
-                break;
-            }
-
-            let halt_reason = jit.step_thread(dummy_thread);
-
-            if halt_reason.contains(HaltReason::SUPERVISOR_CALL) {
-                let svc_num = jit.get_svc_number();
-                log::info!("  SVC at step {}: {:#x}", i, svc_num);
-                // Handle SVC and continue
-                let mut svc_args = [0u64; 8];
-                jit.get_svc_arguments(&mut svc_args);
-                handle_svc(svc_num, &mut svc_args, is_64bit, code_base, code_size as u64, stack_base, stack_size, &shared_memory);
-                jit.set_svc_arguments(&svc_args);
-            } else if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
-                jit.get_context(&mut ctx);
-                log::error!("PREFETCH_ABORT at step {} PC={:#x}", i, ctx.pc);
-                break;
-            }
-        }
-
-        jit.get_context(&mut ctx);
-        log::info!("After stepping: PC={:#x}, SP={:#x}, R0={:#x}", ctx.pc, ctx.sp, ctx.r[0]);
-
-        let max_iterations = 10000;
         let mut svc_count = 0u32;
         let mut iteration = 0u32;
 
@@ -758,7 +609,6 @@ fn main() {
                 let svc_num = jit.get_svc_number();
                 svc_count += 1;
 
-                // Get SVC arguments from registers.
                 let mut svc_args = [0u64; 8];
                 jit.get_svc_arguments(&mut svc_args);
 
@@ -766,41 +616,46 @@ fn main() {
                     .map(|id| format!("{:?}", id))
                     .unwrap_or_else(|| format!("Unknown(0x{:02X})", svc_num));
 
+                jit.get_context(&mut ctx);
                 log::info!(
-                    "SVC #{}: {} (0x{:02X}) args=[{:#x}, {:#x}, {:#x}, {:#x}]",
+                    "SVC #{}: {} (0x{:02X}) args=[{:#x}, {:#x}, {:#x}, {:#x}] PC={:#x} LR={:#x}",
                     svc_count, svc_name, svc_num,
-                    svc_args[0], svc_args[1], svc_args[2], svc_args[3]
+                    svc_args[0], svc_args[1], svc_args[2], svc_args[3],
+                    ctx.pc, ctx.lr
                 );
 
-                // Minimal SVC handling for rtld bootstrap.
-                // Return success (R0=0) for most SVCs so rtld can proceed.
-                handle_svc(svc_num, &mut svc_args, is_64bit, code_base, code_size as u64, stack_base, stack_size, &shared_memory);
+                if svc_num == 0x27 {
+                    // OutputDebugString — read the guest string
+                    let mem = shared_memory.read().unwrap();
+                    let str_addr = svc_args[0];
+                    let str_len = svc_args[1] as usize;
+                    if mem.is_valid_range(str_addr, str_len.max(1)) {
+                        let mut s = String::new();
+                        for j in 0..str_len {
+                            let c = mem.read_8(str_addr + j as u64);
+                            if c == 0 { break; }
+                            s.push(c as char);
+                        }
+                        log::info!("  [guest] {}", s);
+                    }
+                }
 
-                // Write back SVC results.
+                svc_dispatch::call(svc_num, is_64bit, &mut svc_args, &svc_ctx);
                 jit.set_svc_arguments(&svc_args);
 
-                if svc_count > 500 {
-                    log::warn!("SVC limit reached ({}), stopping", svc_count);
-                    break;
-                }
             } else if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
                 jit.get_context(&mut ctx);
-                log::error!("PREFETCH_ABORT at PC={:#x}", ctx.pc);
+                log::error!("PREFETCH_ABORT at PC={:#x}, SP={:#x}, LR={:#x}", ctx.pc, ctx.sp, ctx.lr);
                 break;
             } else if halt_reason.contains(HaltReason::BREAK_LOOP) {
                 log::info!("BREAK_LOOP after {} iterations, {} SVCs", iteration, svc_count);
                 break;
             } else {
                 jit.get_context(&mut ctx);
-                log::info!(
+                log::warn!(
                     "JIT halted: {:?} at PC={:#x}, SP={:#x} (iter={}, svcs={})",
                     halt_reason, ctx.pc, ctx.sp, iteration, svc_count
                 );
-                break;
-            }
-
-            if iteration >= max_iterations {
-                log::warn!("Max iterations ({}) reached, stopping", max_iterations);
                 break;
             }
         }

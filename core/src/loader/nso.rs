@@ -287,8 +287,11 @@ impl AppLoaderNso {
         let image_size = page_align_size(program_image.len() as u32 + bss_size);
         program_image.resize(image_size as usize, 0);
 
-        // Allocate argument data if requested
-        if should_pass_arguments {
+        // Allocate argument data if requested AND there are actual arguments.
+        // Upstream: only allocates when `!Settings::values.program_args.GetValue().empty()`.
+        // Since we don't pass program_args yet, skip this to match upstream module layout.
+        // TODO: Pass actual program_args through when Settings is ported.
+        if should_pass_arguments && false /* no program_args yet */ {
             let arg_start = program_image.len();
             program_image.resize(arg_start + NSO_ARGUMENT_DATA_ALLOCATION_SIZE as usize, 0);
             // Write NsoArgumentHeader at arg_start
@@ -313,6 +316,50 @@ impl AppLoaderNso {
         if load_into_process {
             process.write_memory(load_base, &program_image);
             log::info!("NSO: loaded {} bytes at {:#X}", program_image.len(), load_base);
+
+            // Register per-segment memory regions in the block manager for QueryMemory.
+            // Upstream does this via KProcess::LoadModule -> CodeSet -> PageTable.
+            // Segment 0 = text (RX), segment 1 = rodata (R), segment 2 = data+bss (RW).
+            use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
+            let mut mem = process.process_memory.write().unwrap();
+
+            // Text segment: Read+Execute, state=Code
+            let text_base = load_base + nso_header.segments[0].location as u64;
+            let text_size = page_align_size(nso_header.segments[0].size) as u64;
+            if text_size > 0 {
+                mem.update_region(
+                    text_base,
+                    text_size,
+                    KMemoryState::CODE,
+                    KMemoryPermission::USER_READ_EXECUTE,
+                );
+            }
+
+            // RoData segment: Read-only, state=Code
+            let rodata_base = load_base + nso_header.segments[1].location as u64;
+            let rodata_size = page_align_size(nso_header.segments[1].size) as u64;
+            if rodata_size > 0 {
+                mem.update_region(
+                    rodata_base,
+                    rodata_size,
+                    KMemoryState::CODE,
+                    KMemoryPermission::USER_READ,
+                );
+            }
+
+            // Data+BSS segment: Read+Write, state=CodeData
+            let data_base = load_base + nso_header.segments[2].location as u64;
+            let data_size = page_align_size(
+                nso_header.segments[2].size + nso_header.segments[2].alignment_or_bss_size,
+            ) as u64;
+            if data_size > 0 {
+                mem.update_region(
+                    data_base,
+                    data_size,
+                    KMemoryState::CODE_DATA,
+                    KMemoryPermission::USER_READ_WRITE,
+                );
+            }
         }
 
         Some(load_base + program_image.len() as u64)

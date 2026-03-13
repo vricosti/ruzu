@@ -11,6 +11,11 @@ use std::sync::{Arc, RwLock};
 
 use super::k_capabilities::KCapabilities;
 use super::k_handle_table::KHandleTable;
+use super::k_memory_block::{
+    KMemoryAttribute, KMemoryBlockDisableMergeAttribute, KMemoryPermission, KMemoryState,
+    PAGE_SIZE,
+};
+use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_process_page_table::KProcessPageTable;
 use super::k_typed_address::KProcessAddress;
 use crate::hardware_properties::NUM_CPU_CORES;
@@ -30,6 +35,9 @@ pub struct ProcessMemoryData {
     pub data: Vec<u8>,
     /// Base address of this memory in the guest address space.
     pub base: u64,
+    /// Memory block manager tracking per-segment state and permissions.
+    /// Used by QueryMemory SVC. Upstream: KProcess -> KProcessPageTable -> KMemoryBlockManager.
+    pub block_manager: KMemoryBlockManager,
 }
 
 impl ProcessMemoryData {
@@ -37,6 +45,7 @@ impl ProcessMemoryData {
         Self {
             data: Vec::new(),
             base: 0,
+            block_manager: KMemoryBlockManager::new(),
         }
     }
 
@@ -108,6 +117,8 @@ impl ProcessMemoryData {
         let offset = vaddr.wrapping_sub(self.base) as usize;
         if offset + 4 <= self.data.len() {
             self.data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        } else {
+            log::warn!("write_32 OOB: vaddr={:#x} base={:#x} offset={:#x} data_len={:#x}", vaddr, self.base, offset, self.data.len());
         }
     }
 
@@ -125,6 +136,26 @@ impl ProcessMemoryData {
     pub fn is_valid_range(&self, vaddr: u64, size: usize) -> bool {
         let offset = vaddr.wrapping_sub(self.base) as usize;
         offset + size <= self.data.len()
+    }
+
+    /// Check if a virtual address is in a writable memory region.
+    /// Returns true for writable regions, false for read-only/execute-only.
+    /// Also returns true for unmapped/FREE regions (to avoid blocking initial setup).
+    /// This enforces page table write protection that C++ upstream gets from hardware.
+    #[inline]
+    pub fn is_writable(&self, vaddr: u64) -> bool {
+        use super::k_memory_block::{KMemoryPermission, KMemoryState};
+        if let Some(block) = self.block_manager.find_block(vaddr as usize) {
+            let state = block.get_state();
+            if state == KMemoryState::FREE {
+                return true; // Unmapped — allow (setup writes)
+            }
+            let perm = block.get_permission();
+            // Check if USER_WRITE bit is set
+            perm.contains(KMemoryPermission::USER_WRITE)
+        } else {
+            true // No block info — allow
+        }
     }
 
     /// Write a block of data at guest address.
@@ -147,6 +178,39 @@ impl ProcessMemoryData {
     pub fn allocate(&mut self, base: u64, size: usize) {
         self.base = base;
         self.data = vec![0u8; size];
+        // Initialize the block manager covering the full 32-bit or 64-bit address space.
+        // The actual code region is [base, base+size), but QueryMemory needs to handle
+        // addresses outside this range too. Use a generous address space.
+        let addr_space_end = if base < 0x1_0000_0000 {
+            0x1_0000_0000usize // 4 GiB for 32-bit
+        } else {
+            0x80_0000_0000usize // 512 GiB for 64-bit
+        };
+        let _ = self.block_manager.initialize(0, addr_space_end);
+    }
+
+    /// Update a region in the block manager to track memory state.
+    /// Used during NSO loading to register text/rodata/data segments.
+    pub fn update_region(
+        &mut self,
+        base: u64,
+        size: u64,
+        state: KMemoryState,
+        perm: KMemoryPermission,
+    ) {
+        if size == 0 {
+            return;
+        }
+        let num_pages = (size as usize) / PAGE_SIZE;
+        self.block_manager.update(
+            base as usize,
+            num_pages,
+            state,
+            perm,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NORMAL,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
     }
 }
 
