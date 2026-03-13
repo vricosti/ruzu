@@ -108,8 +108,10 @@ impl ThreadManager {
 
     /// Creates and starts the GPU thread.
     pub fn start_thread(&mut self) {
-        // In the full port, this spawns a thread that processes commands from the queue.
-        todo!("start_thread requires renderer and scheduler integration");
+        // NOTE: Full implementation spawns a dedicated OS thread that calls
+        // RunThread(renderer, context, scheduler). Stubbed until renderer and
+        // scheduler integration is complete.
+        log::warn!("ThreadManager::start_thread: renderer/scheduler not integrated, GPU thread not started");
     }
 
     /// Push GPU command entries to be processed.
@@ -129,21 +131,25 @@ impl ThreadManager {
             );
             return;
         }
-        // In async mode with extreme GPU accuracy, use sync operation
-        todo!("flush_region async path requires GPU sync operations");
+        // NOTE: In async mode with extreme GPU accuracy, the upstream pushes a
+        // FlushRegion command with block=true and uses a GPU sync operation.
+        // Stubbed until GPU sync operations are integrated.
+        log::warn!("ThreadManager::flush_region: async GPU sync not integrated, dropping flush");
     }
 
     /// Notify rasterizer that a region should be invalidated.
     pub fn invalidate_region(&self, _addr: DAddr, _size: u64) {
-        // rasterizer.on_cache_invalidation(addr, size);
-        todo!("invalidate_region requires rasterizer");
+        // NOTE: Full implementation calls rasterizer->OnCacheInvalidation(addr, size).
+        // Stubbed until rasterizer integration is complete.
+        log::warn!("ThreadManager::invalidate_region: rasterizer not integrated, skipping");
     }
 
     /// Notify rasterizer that a region should be flushed and invalidated.
     pub fn flush_and_invalidate_region(&self, _addr: DAddr, _size: u64) {
-        // Skip flush on async mode
-        // rasterizer.on_cache_invalidation(addr, size);
-        todo!("flush_and_invalidate_region requires rasterizer");
+        // NOTE: Full implementation skips the flush in async mode and calls
+        // rasterizer->OnCacheInvalidation(addr, size).
+        // Stubbed until rasterizer integration is complete.
+        log::warn!("ThreadManager::flush_and_invalidate_region: rasterizer not integrated, skipping");
     }
 
     /// Tick the GPU to process pending requests.

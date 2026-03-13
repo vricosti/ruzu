@@ -54,7 +54,10 @@ impl KTimerTask {
     ///
     /// TODO: Implement via KThread::OnTimer() when KThread is ported.
     pub fn on_timer(&self) {
-        todo!("KTimerTask::OnTimer requires KThread implementation");
+        // In upstream (kernel 13.0.0+), OnTimer was devirtualized: the only concrete
+        // implementation is KThread::OnTimer, which wakes the thread from timed wait.
+        // TODO: Implement via KThread::OnTimer() when KThread is ported.
+        log::warn!("KTimerTask::on_timer: KThread not yet ported, no-op");
     }
 }
 

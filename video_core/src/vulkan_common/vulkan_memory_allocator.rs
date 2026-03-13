@@ -387,21 +387,31 @@ impl MemoryAllocator {
     /// Creates a VMA-allocated image.
     ///
     /// Port of `MemoryAllocator::CreateImage`.
-    /// TODO: Implement VMA image allocation via gpu-allocator or raw Vulkan.
+    ///
+    /// NOTE: The C++ implementation calls `vmaCreateImage` via the VMA library.
+    /// VMA is not yet integrated in the Rust port. Returns
+    /// `ERROR_FEATURE_NOT_PRESENT` until gpu-allocator or raw VkMemory
+    /// sub-allocation is wired up.
     pub fn create_image(&self, _ci: &vk::ImageCreateInfo) -> Result<vk::Image, VulkanError> {
-        todo!("MemoryAllocator::create_image — requires VMA or gpu-allocator integration")
+        log::warn!("MemoryAllocator::create_image: VMA not integrated, returning error");
+        Err(VulkanError::new(vk::Result::ERROR_FEATURE_NOT_PRESENT))
     }
 
     /// Creates a VMA-allocated buffer.
     ///
     /// Port of `MemoryAllocator::CreateBuffer`.
-    /// TODO: Implement VMA buffer allocation via gpu-allocator or raw Vulkan.
+    ///
+    /// NOTE: The C++ implementation calls `vmaCreateBuffer` via the VMA library.
+    /// VMA is not yet integrated in the Rust port. Returns
+    /// `ERROR_FEATURE_NOT_PRESENT` until gpu-allocator or raw VkMemory
+    /// sub-allocation is wired up.
     pub fn create_buffer(
         &self,
         _ci: &vk::BufferCreateInfo,
         _usage: MemoryUsage,
     ) -> Result<vk::Buffer, VulkanError> {
-        todo!("MemoryAllocator::create_buffer — requires VMA or gpu-allocator integration")
+        log::warn!("MemoryAllocator::create_buffer: VMA not integrated, returning error");
+        Err(VulkanError::new(vk::Result::ERROR_FEATURE_NOT_PRESENT))
     }
 
     /// Commits a memory region with the specified requirements.

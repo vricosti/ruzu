@@ -144,9 +144,9 @@ impl IUserManager {
     }
 
     /// CreateUserInterface (cmd 0).
-    pub fn create_user_interface(&self) -> super::nfp_interface::IUser {
+    pub fn create_user_interface(&self) -> super::nfp_interface::Interface {
         log::debug!("IUserManager::create_user_interface called");
-        super::nfp_interface::IUser::new()
+        super::nfp_interface::Interface::new("IUser")
     }
 }
 

@@ -28,7 +28,8 @@ pub fn verify_login(host: &str, username: &str, token: &str) -> bool {
     }
     // NOTE: Would parse JSON and check if "username" field matches.
     // Stubbed since HTTP client and JSON parsing are not implemented.
-    todo!("verify_login requires HTTP client and JSON parsing")
+    log::warn!("verify_login: JSON parsing not implemented; returning false");
+    false
 }
 
 #[cfg(test)]

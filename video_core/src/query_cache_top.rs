@@ -88,8 +88,13 @@ impl CounterStreamBase {
 
     /// Resets the stream to zero without disabling.
     pub fn reset(&mut self) {
-        // In the full port, this ends the current query and starts a new one.
-        todo!("reset requires host counter integration");
+        // NOTE: Full implementation ends the current HostCounter query and starts a new one
+        // at value 0. This requires HostCounter integration (GPU query objects).
+        // Stubbed: no-op until host counter integration is complete.
+        log::warn!(
+            "CounterStreamBase::reset: host counter not integrated, reset ignored for {:?}",
+            self.query_type
+        );
     }
 }
 
@@ -120,12 +125,16 @@ impl QueryCacheLegacy {
 
     /// Invalidate a memory region.
     pub fn invalidate_region(&self, _addr: u64, _size: usize) {
-        todo!("invalidate_region requires full query cache implementation");
+        // NOTE: Full implementation walks the cached_queries map and removes
+        // entries that overlap [addr, addr+size). Requires CachedQuery integration.
+        // Stubbed until query cache implementation is complete.
     }
 
     /// Flush a memory region.
     pub fn flush_region(&self, _addr: u64, _size: usize) {
-        todo!("flush_region requires full query cache implementation");
+        // NOTE: Full implementation flushes any cached queries overlapping
+        // [addr, addr+size) back to guest memory. Requires CachedQuery integration.
+        // Stubbed until query cache implementation is complete.
     }
 
     /// Enable all counter streams.
@@ -153,7 +162,8 @@ impl QueryCacheLegacy {
     }
 
     pub fn commit_async_flushes(&self) {
-        todo!("commit_async_flushes");
+        // NOTE: Full implementation moves uncommitted_flushes into committed_flushes queue.
+        // Stubbed until async flush queue is integrated.
     }
 
     pub fn has_uncommitted_flushes(&self) -> bool {
@@ -165,7 +175,8 @@ impl QueryCacheLegacy {
     }
 
     pub fn pop_async_flushes(&self) {
-        todo!("pop_async_flushes");
+        // NOTE: Full implementation pops the front of committed_flushes and flushes
+        // any associated CachedQuery objects. Stubbed until async flush queue is integrated.
     }
 }
 

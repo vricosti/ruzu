@@ -47,11 +47,14 @@ pub trait DeviceInterface {
 pub struct MemoryInterface;
 
 /// Internal allocator for device memory manager.
-/// Corresponds to DeviceMemoryManagerAllocator<DTraits> in C++.
+/// Corresponds to `DeviceMemoryManagerAllocator<DTraits>` in C++.
+///
+/// The C++ implementation uses `Common::FlatAllocator<DAddr, 0, device_virtual_bits>`
+/// as `main_allocator` plus a `MultiAddressContainer` for multi-mapped device pages.
+/// Here we wrap `common::address_space::FlatAllocator` (which operates on u32
+/// internally but is sufficient since device_virtual_bits <= 34).
 struct DeviceMemoryManagerAllocator {
-    // TODO: Implement buddy allocator or equivalent when the full allocation
-    // logic from the .cpp is available. The C++ implementation file was not
-    // found, so we provide the structural framework.
+    main_allocator: common::address_space::FlatAllocator,
 }
 
 /// Counter type for page cache tracking.
@@ -100,8 +103,7 @@ const _: () = assert!(
 /// In C++ this is `DeviceMemoryManager<Traits>`.
 pub struct DeviceMemoryManager<Traits: DeviceMemoryManagerTraits> {
     // Internal allocator (corresponds to `impl` unique_ptr in C++)
-    // TODO: Implement when the .cpp allocator logic is available
-    _allocator: Option<DeviceMemoryManagerAllocator>,
+    allocator: DeviceMemoryManagerAllocator,
 
     /// Base pointer for physical memory, matching `physical_base` in C++.
     physical_base: usize,
@@ -168,6 +170,15 @@ impl<Traits: DeviceMemoryManagerTraits> DeviceMemoryManager<Traits> {
     /// Matches C++ `static constexpr bool HAS_FLUSH_INVALIDATION = true`.
     pub const HAS_FLUSH_INVALIDATION: bool = true;
 
+    /// First valid device address (matches `first_address = 1 << YUZU_PAGEBITS` in C++).
+    const FIRST_ADDRESS: u32 = (1u32 << Self::PAGE_BITS) as u32;
+    /// Maximum device address space size, capped to u32::MAX for the FlatAllocator.
+    const MAX_DEVICE_AREA: u32 = {
+        // device_virtual_bits is at most 34; clamp to fit u32 for FlatAllocator.
+        let bits = Traits::DEVICE_VIRTUAL_BITS;
+        if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 }
+    };
+
     /// Create a new DeviceMemoryManager backed by the given DeviceMemory.
     pub fn new(device_memory: &DeviceMemory) -> Self {
         let physical_base = device_memory.buffer.backing_base_pointer() as usize;
@@ -179,8 +190,17 @@ impl<Traits: DeviceMemoryManagerTraits> DeviceMemoryManager<Traits> {
             cached_pages.push(CounterEntry::new());
         }
 
+        // Corresponds to `impl = std::make_unique<DeviceMemoryManagerAllocator<Traits>>()`
+        // which calls `main_allocator(first_address)` where first_address = 1 << page_bits.
+        let allocator = DeviceMemoryManagerAllocator {
+            main_allocator: common::address_space::FlatAllocator::new(
+                Self::FIRST_ADDRESS,
+                Self::MAX_DEVICE_AREA,
+            ),
+        };
+
         Self {
-            _allocator: None,
+            allocator,
             physical_base,
             device_inter: None,
             compressed_physical_ptr: VirtualBuffer::with_count(device_pages),
@@ -202,22 +222,35 @@ impl<Traits: DeviceMemoryManagerTraits> DeviceMemoryManager<Traits> {
 
     /// Allocate device virtual address space of the given size.
     /// Returns the start DAddr of the allocation.
-    pub fn allocate(&mut self, _size: usize) -> u64 {
-        // TODO: Implement using the buddy allocator from the .cpp
-        // The C++ implementation file was not available.
-        todo!("DeviceMemoryManager::allocate requires allocator implementation")
+    ///
+    /// Corresponds to `DeviceMemoryManager::Allocate` which calls `impl->Allocate(size)`.
+    pub fn allocate(&mut self, size: usize) -> u64 {
+        self.allocator
+            .main_allocator
+            .allocate(size as u32)
+            .map(|addr| addr as u64)
+            .unwrap_or_else(|| {
+                log::error!("DeviceMemoryManager::allocate: address space exhausted (size={})", size);
+                0
+            })
     }
 
     /// Allocate a fixed range of device virtual address space.
-    pub fn allocate_fixed(&mut self, _start: u64, _size: usize) {
-        // TODO: Implement using the buddy allocator from the .cpp
-        todo!("DeviceMemoryManager::allocate_fixed requires allocator implementation")
+    ///
+    /// Corresponds to `DeviceMemoryManager::AllocateFixed` which calls `impl->AllocateFixed(start, size)`.
+    pub fn allocate_fixed(&mut self, start: u64, size: usize) {
+        self.allocator
+            .main_allocator
+            .allocate_fixed(start as u32, size as u32);
     }
 
     /// Free a previously allocated device virtual address range.
-    pub fn free(&mut self, _start: u64, _size: usize) {
-        // TODO: Implement using the buddy allocator from the .cpp
-        todo!("DeviceMemoryManager::free requires allocator implementation")
+    ///
+    /// Corresponds to `DeviceMemoryManager::Free` which calls `impl->Free(start, size)`.
+    pub fn free(&mut self, start: u64, size: usize) {
+        self.allocator
+            .main_allocator
+            .free(start as u32, size as u32);
     }
 
     /// Map a range of device virtual addresses to a CPU virtual address range.

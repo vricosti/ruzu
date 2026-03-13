@@ -17,15 +17,21 @@ impl SaveDataController {
     }
 
     pub fn create_save_data(&self) {
-        todo!("SaveDataController::create_save_data");
+        // Upstream: factory->Create(attribute, creation_info)
+        // TODO: Requires SaveDataFactory (FileSys crate) to be ported.
+        log::warn!("SaveDataController::create_save_data: SaveDataFactory not yet ported");
     }
 
     pub fn open_save_data(&self) {
-        todo!("SaveDataController::open_save_data");
+        // Upstream: factory->Open(attribute)
+        // TODO: Requires SaveDataFactory (FileSys crate) to be ported.
+        log::warn!("SaveDataController::open_save_data: SaveDataFactory not yet ported");
     }
 
     pub fn open_save_data_space(&self) {
-        todo!("SaveDataController::open_save_data_space");
+        // Upstream: factory->OpenSaveDataSpace(space)
+        // TODO: Requires SaveDataFactory (FileSys crate) to be ported.
+        log::warn!("SaveDataController::open_save_data_space: SaveDataFactory not yet ported");
     }
 
     pub fn set_auto_create(&mut self, _state: bool) {

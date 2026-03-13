@@ -44,3 +44,14 @@ pub fn emit_emit_vertex(_ctx: &mut SpirvEmitContext, _stream: u32) {
 pub fn emit_end_primitive(_ctx: &mut SpirvEmitContext, _stream: u32) {
     log::trace!("SPIR-V: emit_end_primitive");
 }
+
+/// Emit `OpDemoteToHelperInvocation` (or `OpKill` as fallback).
+///
+/// Matches upstream `EmitDemoteToHelperInvocation(EmitContext&)`.
+pub fn emit_demote_to_helper_invocation(ctx: &mut SpirvEmitContext) {
+    if ctx.profile.support_demote_to_helper {
+        ctx.builder.demote_to_helper_invocation().unwrap();
+    } else {
+        ctx.builder.kill().unwrap();
+    }
+}

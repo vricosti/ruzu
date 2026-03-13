@@ -8,7 +8,7 @@
 //! checks.  In C++ this is a CRTP template class; in Rust it is a concrete
 //! struct parameterized by a `QueryCacheTraits` trait.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use super::query_base::{QueryBase, VAddr};
@@ -101,11 +101,23 @@ pub type ContentCache = HashMap<u64, HashMap<u32, QueryLocation>>;
 /// Core query cache state shared across all backend implementations.
 ///
 /// Maps to C++ `QueryCacheBase<Traits>` (non-template-dependent state).
+///
+/// Methods that require access to the runtime-specific `impl` struct
+/// (streamers, rasterizer, device memory) log a warning and return safe
+/// defaults until those types are ported.
 pub struct QueryCacheBase {
     /// Page-indexed cache of active query locations.
     pub cached_queries: ContentCache,
     /// Mutex protecting `cached_queries`.
     pub cache_mutex: Mutex<()>,
+    /// Pending flush-mask queue.
+    ///
+    /// Maps to C++ `QueryCacheBaseImpl::flushes_pending` (`std::deque<u64>`).
+    pub flushes_pending: VecDeque<u64>,
+    /// Mutex protecting `flushes_pending`.
+    ///
+    /// Maps to C++ `QueryCacheBaseImpl::flush_guard`.
+    pub flush_guard: Mutex<()>,
 }
 
 impl QueryCacheBase {
@@ -114,21 +126,61 @@ impl QueryCacheBase {
         Self {
             cached_queries: HashMap::new(),
             cache_mutex: Mutex::new(()),
+            flushes_pending: VecDeque::new(),
+            flush_guard: Mutex::new(()),
         }
     }
 
+    // ── Cache-only operations (fully implementable without backend) ────
+
     /// Invalidate all cached queries overlapping `[addr, addr+size)`.
     ///
-    /// Maps to C++ `QueryCacheBase::InvalidateRegion`.
-    pub fn invalidate_region(&mut self, _addr: VAddr, _size: usize) {
-        todo!("QueryCacheBase::invalidate_region")
+    /// Maps to C++ `QueryCacheBase::InvalidateRegion`:
+    /// ```cpp
+    /// IterateCache<true>(addr, size, [this](QueryLocation loc) {
+    ///     InvalidateQuery(loc);
+    /// });
+    /// ```
+    ///
+    /// `InvalidateQuery` sets the `IsInvalidated` flag on the query.  Since
+    /// the streamer objects required to mutate flag bits are not yet ported,
+    /// we remove the entries from `cached_queries` (which is what
+    /// `remove_from_cache=true` does in `IterateCache`) and log a note.
+    pub fn invalidate_region(&mut self, addr: VAddr, size: usize) {
+        // IterateCache<remove_from_cache=true> — each matched entry is removed.
+        // We also would call InvalidateQuery on each, but that requires
+        // access to the streamer slot vectors.  Log a warning for the missing
+        // flag-set step.
+        log::trace!(
+            "QueryCacheBase::invalidate_region: addr={:#x} size={} — \
+             removing cache entries; streamer flag mutation requires backend (not yet ported)",
+            addr, size
+        );
+        self.iterate_cache(addr, size, true, |_location| false);
     }
 
     /// Flush all cached queries overlapping `[addr, addr+size)`.
     ///
-    /// Maps to C++ `QueryCacheBase::FlushRegion`.
-    pub fn flush_region(&mut self, _addr: VAddr, _size: usize) {
-        todo!("QueryCacheBase::flush_region")
+    /// Maps to C++ `QueryCacheBase::FlushRegion`:
+    /// ```cpp
+    /// bool result = false;
+    /// IterateCache<false>(addr, size, [&](QueryLocation loc) {
+    ///     result |= SemiFlushQueryDirty(loc);
+    ///     return result; // early-exit on first dirty
+    /// });
+    /// if (result) RequestGuestHostSync();
+    /// ```
+    ///
+    /// `SemiFlushQueryDirty` and `RequestGuestHostSync` require the streamer
+    /// and rasterizer, which are not yet ported.  We iterate the range (no
+    /// removal) and log a warning.
+    pub fn flush_region(&mut self, addr: VAddr, size: usize) {
+        log::trace!(
+            "QueryCacheBase::flush_region: addr={:#x} size={} — \
+             streamer SemiFlushQueryDirty / rasterizer ReleaseFences not yet ported",
+            addr, size
+        );
+        self.iterate_cache(addr, size, false, |_location| false);
     }
 
     /// Build a bitmask from a slice of query types.
@@ -144,35 +196,91 @@ impl QueryCacheBase {
 
     /// Return true when a CPU region has been modified from the GPU.
     ///
-    /// Maps to C++ `QueryCacheBase::IsRegionGpuModified`.
-    pub fn is_region_gpu_modified(&self, _addr: VAddr, _size: usize) -> bool {
-        todo!("QueryCacheBase::is_region_gpu_modified")
+    /// Maps to C++ `QueryCacheBase::IsRegionGpuModified`:
+    /// ```cpp
+    /// bool result = false;
+    /// IterateCache<false>(addr, size, [&](QueryLocation loc) {
+    ///     result |= IsQueryDirty(loc);
+    ///     return result;
+    /// });
+    /// return result;
+    /// ```
+    ///
+    /// `IsQueryDirty` reads streamer slot data.  Without the streamer, we
+    /// conservatively return false (safe: may cause unnecessary CPU reads but
+    /// never incorrect writes).
+    pub fn is_region_gpu_modified(&self, addr: VAddr, size: usize) -> bool {
+        // Determine whether any cached query location falls in the range.
+        // We cannot evaluate IsQueryDirty without the streamer, so we return
+        // false conservatively.
+        let addr_begin = addr;
+        let addr_end = addr_begin + size as u64;
+        let page_end = addr_end >> DEVICE_PAGEBITS;
+        let mut page = addr_begin >> DEVICE_PAGEBITS;
+        while page <= page_end {
+            let page_start = page << DEVICE_PAGEBITS;
+            if let Some(contents) = self.cached_queries.get(&page) {
+                for (&offset, _) in contents.iter() {
+                    let cache_begin = page_start + offset as u64;
+                    let cache_end = cache_begin + std::mem::size_of::<u32>() as u64;
+                    if cache_begin < addr_end && addr_begin < cache_end {
+                        // There is a cached query in range, but we cannot check
+                        // IsQueryDirty without the streamer.
+                        log::trace!(
+                            "QueryCacheBase::is_region_gpu_modified: addr={:#x} size={} — \
+                             cached query present but IsQueryDirty requires backend",
+                            addr, size
+                        );
+                        return false;
+                    }
+                }
+            }
+            page += 1;
+        }
+        false
     }
+
+    // ── Streamer-dependent operations (stub with log::warn) ────────────
 
     /// Enable or disable a counter.
     ///
-    /// Maps to C++ `QueryCacheBase::CounterEnable`.
+    /// Maps to C++ `QueryCacheBase::CounterEnable`:
+    /// calls `StartCounter` or `PauseCounter` on the matching streamer.
+    /// Requires the streamer array from `QueryCacheBaseImpl`.
     pub fn counter_enable(&mut self, _counter_type: QueryType, _is_enabled: bool) {
-        todo!("QueryCacheBase::counter_enable")
+        log::warn!(
+            "QueryCacheBase::counter_enable: streamer array not yet available (backend not ported)"
+        );
     }
 
     /// Reset a counter.
     ///
-    /// Maps to C++ `QueryCacheBase::CounterReset`.
+    /// Maps to C++ `QueryCacheBase::CounterReset`:
+    /// calls `ResetCounter` on the matching streamer.
     pub fn counter_reset(&mut self, _counter_type: QueryType) {
-        todo!("QueryCacheBase::counter_reset")
+        log::warn!(
+            "QueryCacheBase::counter_reset: streamer array not yet available (backend not ported)"
+        );
     }
 
     /// Close a counter.
     ///
-    /// Maps to C++ `QueryCacheBase::CounterClose`.
+    /// Maps to C++ `QueryCacheBase::CounterClose`:
+    /// calls `CloseCounter` on the matching streamer.
     pub fn counter_close(&mut self, _counter_type: QueryType) {
-        todo!("QueryCacheBase::counter_close")
+        log::warn!(
+            "QueryCacheBase::counter_close: streamer array not yet available (backend not ported)"
+        );
     }
 
     /// Report a counter value to the given GPU virtual address.
     ///
     /// Maps to C++ `QueryCacheBase::CounterReport`.
+    ///
+    /// Requires GPU memory manager (GpuToCpuAddress), streamer
+    /// (WriteCounter / GetQuery / Free), rasterizer (SignalFence /
+    /// SyncOperation), and device memory (GetPointer).  None of these are
+    /// yet available.
     pub fn counter_report(
         &mut self,
         _addr: GPUVAddr,
@@ -181,63 +289,120 @@ impl QueryCacheBase {
         _payload: u32,
         _subreport: u32,
     ) {
-        todo!("QueryCacheBase::counter_report")
+        log::warn!(
+            "QueryCacheBase::counter_report: GPU memory manager / streamer / rasterizer \
+             not yet ported"
+        );
     }
 
     /// Notify that a Wait-For-Idle has been issued.
     ///
-    /// Maps to C++ `QueryCacheBase::NotifyWFI`.
+    /// Maps to C++ `QueryCacheBase::NotifyWFI`:
+    /// syncs all pending streamer writes via PresyncWrites / SyncWrites and
+    /// issues a runtime Barrier pair.
     pub fn notify_wfi(&mut self) {
-        todo!("QueryCacheBase::notify_wfi")
+        log::warn!(
+            "QueryCacheBase::notify_wfi: streamer / runtime Barriers not yet available"
+        );
     }
 
     /// Attempt to use host-side conditional rendering.
     ///
     /// Maps to C++ `QueryCacheBase::AccelerateHostConditionalRendering`.
+    ///
+    /// Reads Maxwell3D render-enable registers and performs GPU-side
+    /// conditional rendering acceleration.  Requires Maxwell3D engine and
+    /// runtime.  Returns false (fall back to CPU path).
     pub fn accelerate_host_conditional_rendering(&mut self) -> bool {
-        todo!("QueryCacheBase::accelerate_host_conditional_rendering")
+        log::warn!(
+            "QueryCacheBase::accelerate_host_conditional_rendering: Maxwell3D / runtime \
+             not yet ported — returning false"
+        );
+        false
     }
 
     /// Commit pending async flushes.
     ///
-    /// Maps to C++ `QueryCacheBase::CommitAsyncFlushes`.
+    /// Maps to C++ `QueryCacheBase::CommitAsyncFlushes`:
+    /// calls `NotifyWFI`, then for each streamer with unsynced queries pushes
+    /// them and appends a mask to `flushes_pending`.
+    ///
+    /// The full implementation requires the streamer array.  We push a zero
+    /// mask (no-op flush batch) to keep `flushes_pending` in sync with any
+    /// caller that checks `ShouldWaitAsyncFlushes`.
     pub fn commit_async_flushes(&mut self) {
-        todo!("QueryCacheBase::commit_async_flushes")
+        log::warn!(
+            "QueryCacheBase::commit_async_flushes: streamer / runtime not yet available — \
+             pushing zero mask"
+        );
+        let _guard = self.flush_guard.lock().unwrap();
+        self.flushes_pending.push_back(0u64);
     }
 
     /// Check if there are uncommitted flushes.
     ///
-    /// Maps to C++ `QueryCacheBase::HasUncommittedFlushes`.
+    /// Maps to C++ `QueryCacheBase::HasUncommittedFlushes`:
+    /// returns true if any streamer has unsynced queries.
+    /// Without the streamer array, conservatively returns false.
     pub fn has_uncommitted_flushes(&self) -> bool {
-        todo!("QueryCacheBase::has_uncommitted_flushes")
+        false
     }
 
     /// Check if we should wait for async flushes.
     ///
-    /// Maps to C++ `QueryCacheBase::ShouldWaitAsyncFlushes`.
+    /// Maps to C++ `QueryCacheBase::ShouldWaitAsyncFlushes`:
+    /// ```cpp
+    /// return !flushes_pending.empty() && flushes_pending.front() != 0;
+    /// ```
     pub fn should_wait_async_flushes(&self) -> bool {
-        todo!("QueryCacheBase::should_wait_async_flushes")
+        let _guard = self.flush_guard.lock().unwrap();
+        !self.flushes_pending.is_empty() && self.flushes_pending.front() != Some(&0u64)
     }
 
     /// Pop completed async flushes.
     ///
-    /// Maps to C++ `QueryCacheBase::PopAsyncFlushes`.
+    /// Maps to C++ `QueryCacheBase::PopAsyncFlushes`:
+    /// pops the front mask and calls `PopUnsyncedQueries` on each streamer
+    /// in the mask (in dependency order).  Without streamers, just pops the
+    /// front entry.
     pub fn pop_async_flushes(&mut self) {
-        todo!("QueryCacheBase::pop_async_flushes")
+        let mask = {
+            let _guard = self.flush_guard.lock().unwrap();
+            self.flushes_pending.pop_front()
+        };
+        if let Some(m) = mask {
+            if m != 0 {
+                log::warn!(
+                    "QueryCacheBase::pop_async_flushes: non-zero mask {:#x} — \
+                     streamer PopUnsyncedQueries not yet available",
+                    m
+                );
+            }
+        }
     }
 
     /// Notify a GPU segment transition (pause/resume).
     ///
-    /// Maps to C++ `QueryCacheBase::NotifySegment`.
+    /// Maps to C++ `QueryCacheBase::NotifySegment`:
+    /// on pause closes ZPassPixelCount64 and StreamingByteCount counters and
+    /// calls runtime PauseHostConditionalRendering; on resume calls
+    /// ResumeHostConditionalRendering.
     pub fn notify_segment(&mut self, _resume: bool) {
-        todo!("QueryCacheBase::notify_segment")
+        log::warn!(
+            "QueryCacheBase::notify_segment: runtime / streamer not yet available"
+        );
     }
 
     /// Iterate over cached queries in the given address range.
     ///
-    /// If `remove_from_cache` is true, matching entries are removed after iteration.
+    /// If `remove_from_cache` is true, matching entries are removed after
+    /// iteration.
     ///
-    /// Maps to C++ `QueryCacheBase::IterateCache`.
+    /// Maps to C++ `QueryCacheBase::IterateCache<remove_from_cache>`.
+    ///
+    /// The callback `func` receives each matching `QueryLocation` and should
+    /// return `true` to stop iteration early (matches the bool-returning
+    /// variant in upstream).
     pub fn iterate_cache<F>(
         &mut self,
         addr: VAddr,
@@ -287,39 +452,63 @@ impl QueryCacheBase {
         }
     }
 
+    // ── Per-query operations (require streamer — stub with log::warn) ──
+
     /// Invalidate a single query by location.
     ///
-    /// Maps to C++ `QueryCacheBase::InvalidateQuery`.
+    /// Maps to C++ `QueryCacheBase::InvalidateQuery`:
+    /// sets `IsInvalidated` flag via `ObtainQuery(location)`.
+    /// Requires the streamer array to look up the `QueryBase`.
     pub fn invalidate_query_at(_location: QueryLocation) {
-        todo!("QueryCacheBase::invalidate_query_at")
+        log::warn!(
+            "QueryCacheBase::invalidate_query_at: streamer array not yet available"
+        );
     }
 
     /// Check if a query is dirty (host-managed but not guest-synced).
     ///
-    /// Maps to C++ `QueryCacheBase::IsQueryDirty`.
+    /// Maps to C++ `QueryCacheBase::IsQueryDirty`:
+    /// ```cpp
+    /// return IsHostManaged && !IsGuestSynced;
+    /// ```
+    /// Requires streamer to obtain `QueryBase`.  Returns false conservatively.
     pub fn is_query_dirty(_location: QueryLocation) -> bool {
-        todo!("QueryCacheBase::is_query_dirty")
+        false
     }
 
     /// Semi-flush a dirty query (write final value to guest memory if available).
     ///
-    /// Maps to C++ `QueryCacheBase::SemiFlushQueryDirty`.
+    /// Maps to C++ `QueryCacheBase::SemiFlushQueryDirty`:
+    /// if `IsFinalValueSynced && !IsGuestSynced` writes the value to guest
+    /// memory via device_memory.GetPointer and returns false; otherwise
+    /// returns whether the query is still host-managed-dirty.
+    /// Requires streamer + device_memory.  Returns false conservatively.
     pub fn semi_flush_query_dirty(_location: QueryLocation) -> bool {
-        todo!("QueryCacheBase::semi_flush_query_dirty")
+        false
     }
 
     /// Request a guest-host synchronization.
     ///
-    /// Maps to C++ `QueryCacheBase::RequestGuestHostSync`.
+    /// Maps to C++ `QueryCacheBase::RequestGuestHostSync`:
+    /// calls `rasterizer.ReleaseFences()`.
+    /// Requires the rasterizer interface.
     pub fn request_guest_host_sync(&self) {
-        todo!("QueryCacheBase::request_guest_host_sync")
+        log::warn!(
+            "QueryCacheBase::request_guest_host_sync: rasterizer not yet available"
+        );
     }
 
     /// Unregister queries that have been processed.
     ///
-    /// Maps to C++ `QueryCacheBase::UnregisterPending`.
+    /// Maps to C++ `QueryCacheBase::UnregisterPending`:
+    /// iterates `pending_unregister`, removes entries from `cached_queries`,
+    /// and frees the corresponding query slots via the streamer.
+    /// Requires the streamer array and `pending_unregister` vec (both live in
+    /// `QueryCacheBaseImpl`).
     pub fn unregister_pending(&mut self) {
-        todo!("QueryCacheBase::unregister_pending")
+        log::warn!(
+            "QueryCacheBase::unregister_pending: streamer / impl state not yet available"
+        );
     }
 }
 

@@ -7,7 +7,7 @@
 //! Friend interface service ("friend:a", "friend:m", "friend:s", "friend:u", "friend:v").
 
 use std::sync::Arc;
-use super::friend_module::Module;
+use super::friend::Module;
 
 /// IPC command IDs for Friend interface
 pub mod commands {
@@ -33,22 +33,22 @@ impl Friend {
     }
 
     /// CreateFriendService (cmd 0)
-    pub fn create_friend_service(&self) -> super::friend_module::IFriendService {
+    pub fn create_friend_service(&self) -> super::friend::IFriendService {
         log::debug!("Friend({})::create_friend_service called", self.name);
-        super::friend_module::IFriendService::new()
+        super::friend::IFriendService::new()
     }
 
     /// CreateNotificationService (cmd 1)
     pub fn create_notification_service(
         &self,
         uuid: u128,
-    ) -> super::friend_module::INotificationService {
+    ) -> super::friend::INotificationService {
         log::debug!(
             "Friend({})::create_notification_service called, uuid={:#x}",
             self.name,
             uuid
         );
-        super::friend_module::INotificationService::new(uuid)
+        super::friend::INotificationService::new(uuid)
     }
 }
 

@@ -44,8 +44,9 @@ impl FileSystemController {
     }
 
     pub fn create_factories(&mut self) {
-        // TODO: Wire up VfsFilesystem factories
-        todo!("FileSystemController::create_factories");
+        // Upstream creates SDMCFactory and BISFactory using the VfsFilesystem.
+        // TODO: Wire up VfsFilesystem factories when FileSys crate is ported.
+        log::warn!("FileSystemController::create_factories: VfsFilesystem not yet ported, skipping");
     }
 
     pub fn reset(&mut self) {
@@ -71,9 +72,7 @@ impl VfsDirectoryServiceWrapper {
 /// - "fsp:pr"  -> FSP_PR
 /// - "fsp-srv" -> FSP_SRV
 pub fn loop_process() {
-    // TODO: Wire up to ServerManager
-    // server_manager->RegisterNamedService("fsp-ldr", FSP_LDR)
-    // server_manager->RegisterNamedService("fsp:pr", FSP_PR)
-    // server_manager->RegisterNamedService("fsp-srv", FSP_SRV)
-    todo!("FileSystem::LoopProcess");
+    // Upstream registers FSP_LDR, FSP_PR, FSP_SRV with the ServerManager.
+    // TODO: Wire up to ServerManager when service framework is ported.
+    log::warn!("FileSystem::loop_process: ServerManager not yet ported, services not registered");
 }

@@ -67,13 +67,14 @@ pub fn fill_block_both(
 /// depend on the Maxwell3D register layout which is defined in the engines module.
 /// This is a stub that will be filled in once the engine register definitions are ported.
 pub fn setup_dirty_flags(tables: &mut DirtyTables) {
-    // TODO: Implement once Maxwell3D register layout (Regs) is ported.
-    // Upstream calls:
-    //   SetupDirtyVertexBuffers(tables)
-    //   SetupIndexBuffer(tables)
-    //   SetupDirtyDescriptors(tables)
-    //   SetupDirtyRenderTargets(tables)
-    //   SetupDirtyShaders(tables)
+    // NOTE: Full implementation calls:
+    //   SetupDirtyVertexBuffers(tables)  — marks VERTEX_BUFFERS / VERTEX_BUFFER0..31
+    //   SetupIndexBuffer(tables)          — marks INDEX_BUFFER range
+    //   SetupDirtyDescriptors(tables)     — marks DESCRIPTORS range
+    //   SetupDirtyRenderTargets(tables)   — marks RENDER_TARGETS, COLOR_BUFFER0..7, ZETA_BUFFER
+    //   SetupDirtyShaders(tables)         — marks SHADERS range
+    // Each sub-function iterates over Maxwell3D::Regs offsets and calls fill_block_both.
+    // Stubbed until the Maxwell3D register layout (Regs struct offsets) is ported.
     let _ = tables;
-    todo!("setup_dirty_flags requires Maxwell3D register layout");
+    log::warn!("setup_dirty_flags: Maxwell3D register layout not ported, dirty table not configured");
 }

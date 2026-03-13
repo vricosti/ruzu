@@ -405,22 +405,30 @@ impl H264 {
 
 impl DecoderImpl for H264 {
     fn compose_frame(&mut self) -> Vec<u8> {
-        // TODO: Read H264DecoderContext from memory_manager at picture_info_offset.
-        // TODO: Compose SPS/PPS headers using H264BitWriter.
-        // TODO: Append raw bitstream from frame_bitstream_offset.
-        // Stubbed — requires memory manager integration.
-        todo!("H264::compose_frame — requires memory manager integration")
+        // Stubbed — requires memory manager integration to read H264DecoderContext from memory
+        // at picture_info_offset, compose SPS/PPS headers via H264BitWriter, and append
+        // the raw bitstream from frame_bitstream_offset.
+        // Upstream: H264::ComposeFrame() in video_core/host1x/codecs/h264.cpp
+        log::warn!("H264::compose_frame: not yet implemented (requires memory manager integration)");
+        Vec::new()
     }
 
     fn get_progressive_offsets(&self) -> (u64, u64) {
+        // Upstream: surface_luma_offsets[curr_pic_idx].Address() + luma_frame_offset.Address()
+        //           surface_chroma_offsets[curr_pic_idx].Address() + chroma_frame_offset.Address()
+        // Stubbed until NvdecRegisters are wired into the decoder.
         let pic_idx = self.current_context.h264_parameter_set.curr_pic_idx() as usize;
-        // TODO: Access regs.surface_luma_offsets[pic_idx] + luma_frame_offset, etc.
         let _ = pic_idx;
-        todo!("H264::get_progressive_offsets — requires NvdecRegisters access")
+        log::warn!("H264::get_progressive_offsets: not yet implemented (requires NvdecRegisters)");
+        (0, 0)
     }
 
     fn get_interlaced_offsets(&self) -> (u64, u64, u64, u64) {
-        todo!("H264::get_interlaced_offsets — requires NvdecRegisters access")
+        // Upstream: surface_luma_offsets[curr_pic_idx].Address() + luma_top/bot_offset.Address()
+        //           surface_chroma_offsets[curr_pic_idx].Address() + chroma_top/bot_offset.Address()
+        // Stubbed until NvdecRegisters are wired into the decoder.
+        log::warn!("H264::get_interlaced_offsets: not yet implemented (requires NvdecRegisters)");
+        (0, 0, 0, 0)
     }
 
     fn is_interlaced(&self) -> bool {

@@ -202,15 +202,17 @@ impl SoftwareBlitEngine {
     /// Perform a 2D surface blit.
     ///
     /// Corresponds to `SoftwareBlitEngine::Blit`.
-    /// TODO: full implementation requires memory manager access, surface format
-    /// definitions, and texture decoder integration.
+    /// Stubbed — full implementation requires memory manager access to read/write surface
+    /// pixels, surface format definitions, and texture decoder integration for format conversion.
+    /// Upstream: SoftwareBlitEngine::Blit() in video_core/engines/sw_blitter/blitter.cpp
     pub fn blit(
         &mut self,
         _src: &Surface,
         _dst: &Surface,
         _config: &BlitConfig,
     ) -> bool {
-        todo!("SoftwareBlitEngine::blit requires memory manager and format integration")
+        log::warn!("SoftwareBlitEngine::blit: not yet implemented (requires memory manager and format integration)");
+        false
     }
 }
 

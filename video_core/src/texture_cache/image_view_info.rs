@@ -66,8 +66,14 @@ impl ImageViewInfo {
     /// Construct from a TIC entry and base layer.
     ///
     /// Port of `ImageViewInfo::ImageViewInfo(const TICEntry&, s32 base_layer)`.
+    ///
+    /// Full implementation requires TICEntry from Tegra::Texture, which is not
+    /// yet ported.  Returns a default `ImageViewInfo` and logs a warning.
     pub fn from_tic_entry(_config: &(), _base_layer: i32) -> Self {
-        todo!("ImageViewInfo::from_tic_entry — needs TICEntry port")
+        log::warn!(
+            "ImageViewInfo::from_tic_entry: TICEntry not yet ported — returning default"
+        );
+        Self::default()
     }
 
     /// Construct for a render target (no real swizzle).

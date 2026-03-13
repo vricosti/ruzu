@@ -4,6 +4,7 @@
 // Ported from: core/file_sys/fssystem/fssystem_nca_file_system_driver.h / .cpp
 
 use super::aes_ctr_counter_extended_storage::AesCtrCounterExtendedStorage;
+use super::aes_ctr_storage::AesCtrStorage;
 use super::compressed_storage::CompressedStorage;
 use super::compression_common::GetDecompressorFunction;
 use super::indirect_storage::IndirectStorage;
@@ -379,12 +380,57 @@ impl NcaFileSystemDriver {
             return Ok(body_storage);
         }
 
-        // Store as the fs data storage.
-        ctx.fs_data_storage = Some(body_storage.clone());
+        // Apply decryption layer based on the encryption type.
+        // Corresponds to upstream OpenStorageImpl decryption logic.
+        let encryption_type = out_header_reader.get_encryption_type();
+        let decrypted_storage = if encryption_type == NcaFsEncryptionType::AesCtr as u8
+            || encryption_type == NcaFsEncryptionType::AesCtrEx as u8
+            || encryption_type == NcaFsEncryptionType::AesCtrSkipLayerHash as u8
+            || encryption_type == NcaFsEncryptionType::AesCtrExSkipLayerHash as u8
+        {
+            // Get the AES-CTR decryption key.
+            // Upstream checks HasExternalDecryptionKey() first (title key for rights-id NCAs).
+            let key = if self.reader.has_external_decryption_key() {
+                self.reader.get_external_decryption_key()
+            } else {
+                self.reader.get_decryption_key(DECRYPTION_KEY_AES_CTR)
+            };
 
-        // Return the body storage as the result.
-        // The full implementation would apply decryption/compression/integrity layers here.
-        Ok(body_storage)
+            // Build the base IV from the upper IV and the section offset.
+            let upper_iv = out_header_reader.get_aes_ctr_upper_iv();
+            let mut iv = [0u8; 16];
+            AesCtrStorage::make_iv(&mut iv, upper_iv.value, fs_offset);
+
+            log::trace!(
+                "AES-CTR decryption: fs_index={}, offset=0x{:X}, size=0x{:X}",
+                fs_index, fs_offset, fs_size
+            );
+
+            // Wrap the body storage in an AES-CTR decryption layer.
+            let ctr_storage: VirtualFile =
+                Arc::new(AesCtrStorage::new(body_storage, key, &iv));
+            ctr_storage
+        } else if encryption_type == NcaFsEncryptionType::None as u8 {
+            // No encryption; use body storage as-is.
+            body_storage
+        } else {
+            log::warn!(
+                "Unsupported NCA FS encryption type: {} for fs_index={}",
+                encryption_type,
+                fs_index
+            );
+            body_storage
+        };
+
+        // Store as the fs data storage.
+        ctx.fs_data_storage = Some(decrypted_storage.clone());
+
+        // Apply hash/integrity layer to extract the data region.
+        // Corresponds to upstream CreateStorageByRawStorage.
+        let final_storage =
+            self.create_storage_by_raw_storage(out_header_reader, decrypted_storage, ctx)?;
+
+        Ok(final_storage)
     }
 
     /// Create a body sub-storage for the given offset and size.
@@ -415,13 +461,92 @@ impl NcaFileSystemDriver {
     }
 
     /// Create a storage from raw storage and a header reader.
+    /// Applies hash/integrity verification layers to extract the data region.
+    ///
     /// Corresponds to upstream `NcaFileSystemDriver::CreateStorageByRawStorage`.
+    ///
+    /// NOTE: Currently implements data region extraction without integrity
+    /// verification. The full implementation would create
+    /// HierarchicalSha256Storage or HierarchicalIntegrityVerificationStorage.
     pub fn create_storage_by_raw_storage(
         &self,
-        _header_reader: &NcaFsHeaderReader,
+        header_reader: &NcaFsHeaderReader,
         raw_storage: VirtualFile,
         ctx: &mut StorageContext,
     ) -> Result<VirtualFile, ResultCode> {
+        let hash_type = header_reader.get_hash_type();
+
+        if hash_type == NcaFsHashType::HierarchicalSha256Hash as u8
+            || hash_type == NcaFsHashType::HierarchicalSha3256Hash as u8
+        {
+            // Extract data region from HierarchicalSha256 hash data.
+            // The hash data contains layer regions; the last layer is the data region.
+            let hash_data = header_reader.get_hash_data();
+            let sha256_data = unsafe { hash_data.as_hierarchical_sha256() };
+
+            let layer_count = sha256_data.hash_layer_count as usize;
+            log::debug!(
+                "HierarchicalSha256: hash_block_size=0x{:X}, layer_count={}",
+                sha256_data.hash_block_size, layer_count
+            );
+            for i in 0..layer_count.min(HierarchicalSha256Data::HASH_LAYER_COUNT_MAX) {
+                let r = &sha256_data.hash_layer_region[i];
+                log::trace!(
+                    "  region[{}]: offset=0x{:X}, size=0x{:X}",
+                    i, r.offset.get(), r.size.get()
+                );
+            }
+            if layer_count >= 2 && layer_count <= HierarchicalSha256Data::HASH_LAYER_COUNT_MAX {
+                let data_region = &sha256_data.hash_layer_region[layer_count - 1];
+                let data_offset = data_region.offset.get() as usize;
+                let data_size = data_region.size.get() as usize;
+
+                log::debug!(
+                    "HierarchicalSha256: extracting data region at offset=0x{:X}, size=0x{:X} (layer_count={})",
+                    data_offset, data_size, layer_count
+                );
+
+                let data_storage: VirtualFile = Arc::new(OffsetVfsFile::new(
+                    raw_storage,
+                    data_size,
+                    data_offset,
+                    String::new(),
+                ));
+                ctx.fs_data_storage = Some(data_storage.clone());
+                return Ok(data_storage);
+            }
+        } else if hash_type == NcaFsHashType::HierarchicalIntegrityHash as u8
+            || hash_type == NcaFsHashType::HierarchicalIntegritySha3Hash as u8
+        {
+            // Extract data region from IntegrityMetaInfo.
+            // The last level in the level hash info is the data region.
+            let hash_data = header_reader.get_hash_data();
+            let meta_info = unsafe { hash_data.as_integrity_meta_info() };
+
+            let max_layers = meta_info.level_hash_info.max_layers as usize;
+            if max_layers >= 2 {
+                let data_idx = max_layers - 2;
+                let data_level = &meta_info.level_hash_info.info[data_idx];
+                let data_offset = data_level.offset.get() as usize;
+                let data_size = data_level.size.get() as usize;
+
+                log::debug!(
+                    "HierarchicalIntegrity: extracting data region at offset=0x{:X}, size=0x{:X} (max_layers={})",
+                    data_offset, data_size, max_layers
+                );
+
+                let data_storage: VirtualFile = Arc::new(OffsetVfsFile::new(
+                    raw_storage,
+                    data_size,
+                    data_offset,
+                    String::new(),
+                ));
+                ctx.fs_data_storage = Some(data_storage.clone());
+                return Ok(data_storage);
+            }
+        }
+
+        // For None or unsupported hash types, return raw storage.
         ctx.fs_data_storage = Some(raw_storage.clone());
         Ok(raw_storage)
     }

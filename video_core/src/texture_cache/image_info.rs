@@ -113,38 +113,58 @@ impl ImageInfo {
     /// Construct from a TIC entry.
     ///
     /// Port of `ImageInfo::ImageInfo(const TICEntry& config)`.
-    /// TODO: Full implementation requires TICEntry, PixelFormatFromTextureInfo,
-    /// NumSamples*, CalculateLayerStride/Size helpers.
+    ///
+    /// Full implementation requires TICEntry, PixelFormatFromTextureInfo,
+    /// NumSamples*, CalculateLayerStride/Size helpers — these types are not yet
+    /// ported from Tegra::Texture.  Returns a default `ImageInfo` and logs a
+    /// warning until the upstream types are available.
     pub fn from_tic_entry(_config: &()) -> Self {
-        todo!("ImageInfo::from_tic_entry — needs TICEntry port")
+        log::warn!("ImageInfo::from_tic_entry: TICEntry not yet ported — returning default");
+        Self::default()
     }
 
     /// Construct from a render target config.
     ///
     /// Port of `ImageInfo::ImageInfo(const RenderTargetConfig& ct, MsaaMode)`.
+    ///
+    /// Requires Maxwell3D register types not yet ported.
     pub fn from_render_target_config(_ct: &(), _msaa_mode: u32) -> Self {
-        todo!("ImageInfo::from_render_target_config — needs Maxwell3D regs port")
+        log::warn!(
+            "ImageInfo::from_render_target_config: Maxwell3D regs not yet ported — returning default"
+        );
+        Self::default()
     }
 
     /// Construct from depth/stencil config.
     ///
     /// Port of `ImageInfo::ImageInfo(const Zeta&, const ZetaSize&, MsaaMode)`.
+    ///
+    /// Requires Maxwell3D register types not yet ported.
     pub fn from_zeta(_zt: &(), _zt_size: &(), _msaa_mode: u32) -> Self {
-        todo!("ImageInfo::from_zeta — needs Maxwell3D regs port")
+        log::warn!("ImageInfo::from_zeta: Maxwell3D regs not yet ported — returning default");
+        Self::default()
     }
 
     /// Construct from a Fermi2D surface.
     ///
     /// Port of `ImageInfo::ImageInfo(const Fermi2D::Surface& config)`.
+    ///
+    /// Requires Fermi2D engine types not yet ported.
     pub fn from_fermi2d_surface(_config: &()) -> Self {
-        todo!("ImageInfo::from_fermi2d_surface — needs Fermi2D port")
+        log::warn!(
+            "ImageInfo::from_fermi2d_surface: Fermi2D not yet ported — returning default"
+        );
+        Self::default()
     }
 
     /// Construct from a DMA image operand.
     ///
     /// Port of `ImageInfo::ImageInfo(const DMA::ImageOperand& config)`.
+    ///
+    /// Requires DMA engine types not yet ported.
     pub fn from_dma_operand(_config: &()) -> Self {
-        todo!("ImageInfo::from_dma_operand — needs DMA port")
+        log::warn!("ImageInfo::from_dma_operand: DMA engine not yet ported — returning default");
+        Self::default()
     }
 }
 

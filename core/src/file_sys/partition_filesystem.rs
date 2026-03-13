@@ -242,7 +242,13 @@ impl PartitionFilesystem {
                 String::new()
             };
 
-            let file_offset = pf.content_offset as u64 + entry.offset;
+            let entry_off = { entry.offset };
+            let entry_sz = { entry.size };
+            let file_offset = pf.content_offset as u64 + entry_off;
+            log::trace!(
+                "PFS entry[{}]: name='{}', offset=0x{:X} (content_off=0x{:X} + entry_off=0x{:X}), size=0x{:X}",
+                i, name, file_offset, pf.content_offset, entry_off, entry_sz
+            );
             pf.offsets.insert(name.clone(), file_offset);
             pf.sizes.insert(name.clone(), entry.size);
 

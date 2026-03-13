@@ -8,5 +8,5 @@
 //!
 //! Friend services: "friend:a", "friend:m", "friend:s", "friend:u", "friend:v".
 
-pub mod friend_module;
+pub mod friend;
 pub mod friend_interface;

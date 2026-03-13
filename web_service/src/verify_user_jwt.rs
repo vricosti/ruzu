@@ -83,7 +83,8 @@ impl VerifyUserJwt {
             log::info!("Verification failed: missing public key or token");
             return UserData::default();
         }
-        todo!("VerifyUserJwt::load_user_data requires JWT library")
+        log::warn!("VerifyUserJwt::load_user_data: JWT library not implemented; returning default UserData");
+        UserData::default()
     }
 }
 

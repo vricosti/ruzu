@@ -1,58 +1,107 @@
-// SPDX-FileCopyrightText: 2025 ruzu contributors
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
 
+//! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/
+//!
 //! Maxwell → IR translator.
 //!
 //! The `TranslatorVisitor` decodes each Maxwell instruction and emits
 //! corresponding IR instructions via the `Emitter`.
 //!
-//! Organized by instruction category, mirroring zuyu's impl/ directory:
-//! - arithmetic_fp.rs: FADD, FMUL, FFMA, FMNMX, MUFU, etc.
-//! - arithmetic_int.rs: IADD, IADD3, IMAD, IMUL, XMAD, ISCADD, LEA, etc.
-//! - comparison.rs: FSETP, ISETP, FSET, ISET, FCMP, ICMP, etc.
-//! - conversion.rs: F2I, I2F, F2F, I2I
-//! - bitwise.rs: LOP, LOP3, SHL, SHR, SHF, BFE, BFI, POPC, FLO, PRMT
-//! - predicate.rs: PSETP, PSET, CSETP, CSET, P2R, R2P
-//! - move_sel.rs: MOV, SEL, S2R, CS2R
-//! - memory.rs: LDG, STG, LDL, STL, LDS, STS, LD, ST, LDC
-//! - texture.rs: TEX, TEXS, TLD, TLDS, TLD4, TLD4S, TXQ, TMML, TXD, TXA
-//! - attribute.rs: ALD, AST, IPA, OUT
+//! Each submodule corresponds 1:1 to an upstream `impl/*.cpp` file.
 
-pub mod arithmetic_fp;
-pub mod arithmetic_int;
-pub mod atomic;
-pub mod attribute;
-pub mod barrier;
-pub mod bitwise;
+// Instruction translation modules (1:1 with upstream impl/*.cpp files)
+pub mod atomic_operations_global_memory;
+pub mod atomic_operations_shared_memory;
+pub mod attribute_memory_to_physical;
+pub mod barrier_operations;
+pub mod bitfield_extract;
+pub mod bitfield_insert;
+pub mod branch_indirect;
 pub mod common_encoding;
 pub mod common_funcs;
-pub mod comparison;
-pub mod conversion;
-pub mod double_arithmetic;
+pub mod condition_code_set;
+pub mod double_add;
+pub mod double_compare_and_set;
+pub mod double_fused_multiply_add;
+pub mod double_min_max;
+pub mod double_multiply;
+pub mod double_set_predicate;
 pub mod exit_program;
-pub mod flow_control;
-pub mod half_float;
-pub mod internal_stage;
+pub mod find_leading_one;
+pub mod floating_point_add;
+pub mod floating_point_compare;
+pub mod floating_point_compare_and_set;
+pub mod floating_point_conversion_floating_point;
+pub mod floating_point_conversion_integer;
+pub mod floating_point_fused_multiply_add;
+pub mod floating_point_min_max;
+pub mod floating_point_multi_function;
+pub mod floating_point_multiply;
+pub mod floating_point_range_reduction;
+pub mod floating_point_set_predicate;
+pub mod floating_point_swizzled_add;
+pub mod half_floating_point_add;
+pub mod half_floating_point_fused_multiply_add;
+pub mod half_floating_point_helper;
+pub mod half_floating_point_multiply;
+pub mod half_floating_point_set;
+pub mod half_floating_point_set_predicate;
+pub mod integer_add;
+pub mod integer_add_three_input;
+pub mod integer_compare;
+pub mod integer_compare_and_set;
+pub mod integer_floating_point_conversion;
+pub mod integer_funnel_shift;
+pub mod integer_minimum_maximum;
+pub mod integer_popcount;
+pub mod integer_scaled_add;
+pub mod integer_set_predicate;
+pub mod integer_shift_left;
+pub mod integer_shift_right;
+pub mod integer_short_multiply_add;
+pub mod integer_to_integer_conversion;
+pub mod internal_stage_buffer_entry_read;
 pub mod load_constant;
-pub mod memory;
-pub mod misc;
-pub mod move_sel;
+pub mod load_effective_address;
+pub mod load_store_attribute;
+pub mod load_store_local_shared;
+pub mod load_store_memory;
+pub mod logic_operation;
+pub mod logic_operation_three_input;
+pub mod move_predicate_to_register;
+pub mod move_register;
+pub mod move_register_to_predicate;
+pub mod move_special_register;
 pub mod not_implemented;
 pub mod output_geometry;
 pub mod pixel_load;
-pub mod predicate;
-pub mod surface;
-pub mod texture;
-pub mod video;
+pub mod predicate_set_predicate;
+pub mod predicate_set_register;
+pub mod select_source_with_predicate;
+pub mod surface_atomic_operations;
+pub mod surface_load_store;
+pub mod texture_fetch;
+pub mod texture_fetch_swizzled;
+pub mod texture_gather;
+pub mod texture_gather_swizzled;
+pub mod texture_gradient;
+pub mod texture_load;
+pub mod texture_load_swizzled;
+pub mod texture_mipmap_level;
+pub mod texture_query;
+pub mod video_helper;
+pub mod video_minimum_maximum;
+pub mod video_multiply_add;
+pub mod video_set_predicate;
 pub mod vote;
-pub mod warp;
+pub mod warp_shuffle;
 
-use crate::frontend::maxwell_opcodes::{MaxwellOpcode, SrcType};
+use crate::frontend::maxwell_opcodes::{self, MaxwellOpcode, SrcType};
 use crate::ir::emitter::Emitter;
 use crate::ir::program::{Program, ShaderInfo};
 use crate::ir::types::ShaderStage;
 use crate::ir::value::{Reg, Value};
-use crate::frontend::maxwell_opcodes;
 
 /// Maxwell instruction bit field extraction helpers.
 pub fn field(insn: u64, start: u32, len: u32) -> u32 {
@@ -74,6 +123,8 @@ pub fn sfield(insn: u64, start: u32, len: u32) -> i32 {
 }
 
 /// The translator visitor: holds state during translation of a single shader.
+///
+/// Corresponds to the `TranslatorVisitor` class in upstream `impl.h` / `impl.cpp`.
 pub struct TranslatorVisitor<'a> {
     pub ir: Emitter<'a>,
     pub stage: ShaderStage,
@@ -130,13 +181,11 @@ impl<'a> TranslatorVisitor<'a> {
                 let cb_offset = field(insn, 20, 14) << 2;
                 let binding = Value::ImmU32(cb_index);
                 let offset = Value::ImmU32(cb_offset);
-                // Register in shader info
                 self.ir.program.info.register_cbuf(cb_index);
                 self.ir.get_cbuf_u32(binding, offset)
             }
             SrcType::Immediate => {
                 let imm = field(insn, 20, 19);
-                // Sign-extend from 19 bits
                 let sign_ext = if imm & (1 << 18) != 0 {
                     imm | !((1u32 << 19) - 1)
                 } else {
@@ -163,7 +212,7 @@ impl<'a> TranslatorVisitor<'a> {
                 self.ir.get_cbuf_f32(binding, offset)
             }
             SrcType::Immediate => {
-                let imm_bits = field(insn, 20, 19) << 13; // FP immediate in upper bits
+                let imm_bits = field(insn, 20, 19) << 13;
                 let f = f32::from_bits(imm_bits);
                 Value::ImmF32(f)
             }
@@ -195,7 +244,123 @@ impl<'a> TranslatorVisitor<'a> {
         field(insn, 1, 3)
     }
 
+    /// Get a double-precision (F64) value from a register pair at reg_idx and reg_idx+1.
+    ///
+    /// Corresponds to `TranslatorVisitor::D(IR::Reg reg)` upstream.
+    pub fn d(&mut self, reg_idx: u32) -> Value {
+        let lo = self.x(reg_idx);
+        let hi = self.x(reg_idx + 1);
+        let vec = self.ir.composite_construct_u32x2(lo, hi);
+        self.ir.pack_double_2x32(vec)
+    }
+
+    /// Store a double-precision (F64) value into a register pair.
+    ///
+    /// Corresponds to `TranslatorVisitor::D(IR::Reg dest, const IR::F64& value)` upstream.
+    pub fn set_d(&mut self, reg_idx: u32, value: Value) {
+        let unpacked = self.ir.unpack_double_2x32(value);
+        let lo = self.ir.composite_extract_u32x2_idx(unpacked.clone(), 0);
+        let hi = self.ir.composite_extract_u32x2_idx(unpacked, 1);
+        self.set_x(reg_idx, lo);
+        self.set_x(reg_idx + 1, hi);
+    }
+
+    /// Get a reg from bits [20:27] as U32 (GetReg20 upstream).
+    pub fn get_reg20(&mut self, insn: u64) -> Value {
+        let idx = field(insn, 20, 8);
+        self.x(idx)
+    }
+
+    /// Get a reg from bits [39:46] as U32 (GetReg39 upstream).
+    pub fn get_reg39(&mut self, insn: u64) -> Value {
+        let idx = field(insn, 39, 8);
+        self.x(idx)
+    }
+
+    /// Get a double from register pair at bits [20:27].
+    pub fn get_double_reg20(&mut self, insn: u64) -> Value {
+        let idx = field(insn, 20, 8);
+        self.d(idx)
+    }
+
+    /// Get a double from register pair at bits [39:46].
+    pub fn get_double_reg39(&mut self, insn: u64) -> Value {
+        let idx = field(insn, 39, 8);
+        self.d(idx)
+    }
+
+    /// Get a U32 from a constant buffer (GetCbuf upstream).
+    pub fn get_cbuf(&mut self, insn: u64) -> Value {
+        let cb_index = field(insn, 34, 5);
+        let cb_offset = field(insn, 20, 14) << 2;
+        let binding = Value::ImmU32(cb_index);
+        let offset = Value::ImmU32(cb_offset);
+        self.ir.program.info.register_cbuf(cb_index);
+        self.ir.get_cbuf_u32(binding, offset)
+    }
+
+    /// Get an F32 from a constant buffer.
+    pub fn get_float_cbuf(&mut self, insn: u64) -> Value {
+        let cb_index = field(insn, 34, 5);
+        let cb_offset = field(insn, 20, 14) << 2;
+        let binding = Value::ImmU32(cb_index);
+        let offset = Value::ImmU32(cb_offset);
+        self.ir.program.info.register_cbuf(cb_index);
+        self.ir.get_cbuf_f32(binding, offset)
+    }
+
+    /// Get an F64 from a constant buffer (two 32-bit reads packed into F64).
+    pub fn get_double_cbuf(&mut self, insn: u64) -> Value {
+        let cb_index = field(insn, 34, 5);
+        let cb_offset = field(insn, 20, 14) << 2;
+        let binding = Value::ImmU32(cb_index);
+        self.ir.program.info.register_cbuf(cb_index);
+        let lo = self.ir.get_cbuf_u32(binding.clone(), Value::ImmU32(cb_offset));
+        let hi = self.ir.get_cbuf_u32(binding, Value::ImmU32(cb_offset + 4));
+        let vec = self.ir.composite_construct_u32x2(lo, hi);
+        self.ir.pack_double_2x32(vec)
+    }
+
+    /// Get a sign-extended 20-bit immediate as U32 (GetImm20 upstream).
+    pub fn get_imm20(&self, insn: u64) -> Value {
+        let imm = sfield(insn, 20, 20);
+        Value::ImmU32(imm as u32)
+    }
+
+    /// Get a 20-bit immediate as F32 (sign bit at bit 56, mantissa at [20:38]).
+    pub fn get_float_imm20(&self, insn: u64) -> Value {
+        let imm = field(insn, 20, 19) << 12;
+        let sign = if bit(insn, 56) { 1u32 << 31 } else { 0 };
+        Value::ImmF32(f32::from_bits(imm | sign))
+    }
+
+    /// Get a 20-bit double immediate packed into F64 (upper bits zero).
+    pub fn get_double_imm20(&self, insn: u64) -> Value {
+        let imm = sfield(insn, 20, 20) as i64;
+        Value::ImmF64(imm as f64)
+    }
+
+    /// Get a register value from bits [8:15] as F32 (GetFloatReg8 upstream).
+    pub fn get_float_reg8(&mut self, insn: u64) -> Value {
+        let idx = field(insn, 8, 8);
+        self.f(idx)
+    }
+
+    /// Get a register value from bits [20:27] as F32 (GetFloatReg20 upstream).
+    pub fn get_float_reg20(&mut self, insn: u64) -> Value {
+        let idx = field(insn, 20, 8);
+        self.f(idx)
+    }
+
+    /// Get a register value from bits [39:46] as F32 (GetFloatReg39 upstream).
+    pub fn get_float_reg39(&mut self, insn: u64) -> Value {
+        let idx = field(insn, 39, 8);
+        self.f(idx)
+    }
+
     /// Translate a single Maxwell instruction word.
+    ///
+    /// Corresponds to the dispatch table in upstream `impl.cpp`.
     pub fn translate_instruction(&mut self, insn: u64) {
         let opcode = match maxwell_opcodes::decode_opcode(insn) {
             Some(op) => op,
@@ -206,210 +371,262 @@ impl<'a> TranslatorVisitor<'a> {
         };
 
         match opcode {
-            // FP32 arithmetic
+            // FP32 arithmetic — floating_point_add.cpp
             MaxwellOpcode::FADD_reg | MaxwellOpcode::FADD_cbuf | MaxwellOpcode::FADD_imm => {
-                self::arithmetic_fp::fadd(self, insn, opcode);
+                self::floating_point_add::fadd(self, insn, opcode);
             }
             MaxwellOpcode::FADD32I => {
-                self::arithmetic_fp::fadd32i(self, insn);
+                self::floating_point_add::fadd32i(self, insn);
             }
+
+            // floating_point_multiply.cpp
             MaxwellOpcode::FMUL_reg | MaxwellOpcode::FMUL_cbuf | MaxwellOpcode::FMUL_imm => {
-                self::arithmetic_fp::fmul(self, insn, opcode);
+                self::floating_point_multiply::fmul(self, insn, opcode);
             }
             MaxwellOpcode::FMUL32I => {
-                self::arithmetic_fp::fmul32i(self, insn);
+                self::floating_point_multiply::fmul32i(self, insn);
             }
+
+            // floating_point_fused_multiply_add.cpp
             MaxwellOpcode::FFMA_reg
             | MaxwellOpcode::FFMA_rc
             | MaxwellOpcode::FFMA_cr
             | MaxwellOpcode::FFMA_imm => {
-                self::arithmetic_fp::ffma(self, insn, opcode);
+                self::floating_point_fused_multiply_add::ffma(self, insn, opcode);
             }
             MaxwellOpcode::FFMA32I => {
-                self::arithmetic_fp::ffma32i(self, insn);
-            }
-            MaxwellOpcode::FMNMX_reg | MaxwellOpcode::FMNMX_cbuf | MaxwellOpcode::FMNMX_imm => {
-                self::arithmetic_fp::fmnmx(self, insn, opcode);
-            }
-            MaxwellOpcode::MUFU => {
-                self::arithmetic_fp::mufu(self, insn);
+                self::floating_point_fused_multiply_add::ffma32i(self, insn);
             }
 
-            // Integer arithmetic
+            // floating_point_min_max.cpp
+            MaxwellOpcode::FMNMX_reg | MaxwellOpcode::FMNMX_cbuf | MaxwellOpcode::FMNMX_imm => {
+                self::floating_point_min_max::fmnmx(self, insn, opcode);
+            }
+
+            // floating_point_multi_function.cpp
+            MaxwellOpcode::MUFU => {
+                self::floating_point_multi_function::mufu(self, insn);
+            }
+
+            // integer_add.cpp
             MaxwellOpcode::IADD_reg | MaxwellOpcode::IADD_cbuf | MaxwellOpcode::IADD_imm => {
-                self::arithmetic_int::iadd(self, insn, opcode);
+                self::integer_add::iadd(self, insn, opcode);
             }
             MaxwellOpcode::IADD32I => {
-                self::arithmetic_int::iadd32i(self, insn);
+                self::integer_add::iadd32i(self, insn);
             }
+
+            // integer_add_three_input.cpp
             MaxwellOpcode::IADD3_reg | MaxwellOpcode::IADD3_cbuf | MaxwellOpcode::IADD3_imm => {
-                self::arithmetic_int::iadd3(self, insn, opcode);
+                self::integer_add_three_input::iadd3(self, insn, opcode);
             }
+
+            // integer_short_multiply_add.cpp
             MaxwellOpcode::IMAD_reg
             | MaxwellOpcode::IMAD_rc
             | MaxwellOpcode::IMAD_cr
             | MaxwellOpcode::IMAD_imm => {
-                self::arithmetic_int::imad(self, insn, opcode);
+                self::integer_short_multiply_add::imad(self, insn, opcode);
             }
             MaxwellOpcode::IMAD32I => {
-                self::arithmetic_int::imad32i(self, insn);
-            }
-            MaxwellOpcode::IMUL_reg | MaxwellOpcode::IMUL_cbuf | MaxwellOpcode::IMUL_imm => {
-                self::arithmetic_int::imul(self, insn, opcode);
-            }
-            MaxwellOpcode::ISCADD_reg
-            | MaxwellOpcode::ISCADD_cbuf
-            | MaxwellOpcode::ISCADD_imm => {
-                self::arithmetic_int::iscadd(self, insn, opcode);
+                self::integer_short_multiply_add::imad32i(self, insn);
             }
             MaxwellOpcode::XMAD_reg
             | MaxwellOpcode::XMAD_rc
             | MaxwellOpcode::XMAD_cr
             | MaxwellOpcode::XMAD_imm => {
-                self::arithmetic_int::xmad(self, insn, opcode);
+                self::integer_short_multiply_add::xmad(self, insn, opcode);
             }
+
+            // integer_scaled_add.cpp
+            MaxwellOpcode::ISCADD_reg
+            | MaxwellOpcode::ISCADD_cbuf
+            | MaxwellOpcode::ISCADD_imm => {
+                self::integer_scaled_add::iscadd(self, insn, opcode);
+            }
+
+            // integer_minimum_maximum.cpp
             MaxwellOpcode::IMNMX_reg | MaxwellOpcode::IMNMX_cbuf | MaxwellOpcode::IMNMX_imm => {
-                self::arithmetic_int::imnmx(self, insn, opcode);
+                self::integer_minimum_maximum::imnmx(self, insn, opcode);
             }
 
-            // Comparison
+            // floating_point_set_predicate.cpp
             MaxwellOpcode::FSETP_reg | MaxwellOpcode::FSETP_cbuf | MaxwellOpcode::FSETP_imm => {
-                self::comparison::fsetp(self, insn, opcode);
+                self::floating_point_set_predicate::fsetp(self, insn, opcode);
             }
+
+            // integer_set_predicate.cpp
             MaxwellOpcode::ISETP_reg | MaxwellOpcode::ISETP_cbuf | MaxwellOpcode::ISETP_imm => {
-                self::comparison::isetp(self, insn, opcode);
+                self::integer_set_predicate::isetp(self, insn, opcode);
             }
+
+            // floating_point_compare_and_set.cpp
             MaxwellOpcode::FSET_reg | MaxwellOpcode::FSET_cbuf | MaxwellOpcode::FSET_imm => {
-                self::comparison::fset(self, insn, opcode);
+                self::floating_point_compare_and_set::fset(self, insn, opcode);
             }
+
+            // integer_compare_and_set.cpp
             MaxwellOpcode::ISET_reg | MaxwellOpcode::ISET_cbuf | MaxwellOpcode::ISET_imm => {
-                self::comparison::iset(self, insn, opcode);
+                self::integer_compare_and_set::iset(self, insn, opcode);
             }
 
-            // Conversion
+            // floating_point_conversion_integer.cpp
             MaxwellOpcode::F2I_reg | MaxwellOpcode::F2I_cbuf | MaxwellOpcode::F2I_imm => {
-                self::conversion::f2i(self, insn, opcode);
-            }
-            MaxwellOpcode::I2F_reg | MaxwellOpcode::I2F_cbuf | MaxwellOpcode::I2F_imm => {
-                self::conversion::i2f(self, insn, opcode);
-            }
-            MaxwellOpcode::F2F_reg | MaxwellOpcode::F2F_cbuf | MaxwellOpcode::F2F_imm => {
-                self::conversion::f2f(self, insn, opcode);
-            }
-            MaxwellOpcode::I2I_reg | MaxwellOpcode::I2I_cbuf | MaxwellOpcode::I2I_imm => {
-                self::conversion::i2i(self, insn, opcode);
+                self::floating_point_conversion_integer::f2i(self, insn, opcode);
             }
 
-            // Bitwise
-            MaxwellOpcode::LOP_reg | MaxwellOpcode::LOP_cbuf | MaxwellOpcode::LOP_imm => {
-                self::bitwise::lop(self, insn, opcode);
+            // integer_floating_point_conversion.cpp
+            MaxwellOpcode::I2F_reg | MaxwellOpcode::I2F_cbuf | MaxwellOpcode::I2F_imm => {
+                self::integer_floating_point_conversion::i2f(self, insn, opcode);
             }
-            MaxwellOpcode::LOP3_reg | MaxwellOpcode::LOP3_cbuf | MaxwellOpcode::LOP3_imm => {
-                self::bitwise::lop3(self, insn, opcode);
+
+            // floating_point_conversion_floating_point.cpp
+            MaxwellOpcode::F2F_reg | MaxwellOpcode::F2F_cbuf | MaxwellOpcode::F2F_imm => {
+                self::floating_point_conversion_floating_point::f2f(self, insn, opcode);
+            }
+
+            // integer_to_integer_conversion.cpp
+            MaxwellOpcode::I2I_reg | MaxwellOpcode::I2I_cbuf | MaxwellOpcode::I2I_imm => {
+                self::integer_to_integer_conversion::i2i(self, insn, opcode);
+            }
+
+            // logic_operation.cpp
+            MaxwellOpcode::LOP_reg | MaxwellOpcode::LOP_cbuf | MaxwellOpcode::LOP_imm => {
+                self::logic_operation::lop(self, insn, opcode);
             }
             MaxwellOpcode::LOP32I => {
-                self::bitwise::lop32i(self, insn);
+                self::logic_operation::lop32i(self, insn);
             }
+
+            // logic_operation_three_input.cpp
+            MaxwellOpcode::LOP3_reg | MaxwellOpcode::LOP3_cbuf | MaxwellOpcode::LOP3_imm => {
+                self::logic_operation_three_input::lop3(self, insn, opcode);
+            }
+
+            // integer_shift_left.cpp
             MaxwellOpcode::SHL_reg | MaxwellOpcode::SHL_cbuf | MaxwellOpcode::SHL_imm => {
-                self::bitwise::shl(self, insn, opcode);
+                self::integer_shift_left::shl(self, insn, opcode);
             }
+
+            // integer_shift_right.cpp
             MaxwellOpcode::SHR_reg | MaxwellOpcode::SHR_cbuf | MaxwellOpcode::SHR_imm => {
-                self::bitwise::shr(self, insn, opcode);
+                self::integer_shift_right::shr(self, insn, opcode);
             }
+
+            // bitfield_extract.cpp
             MaxwellOpcode::BFE_reg | MaxwellOpcode::BFE_cbuf | MaxwellOpcode::BFE_imm => {
-                self::bitwise::bfe(self, insn, opcode);
+                self::bitfield_extract::bfe(self, insn, opcode);
             }
+
+            // bitfield_insert.cpp
             MaxwellOpcode::BFI_reg
             | MaxwellOpcode::BFI_rc
             | MaxwellOpcode::BFI_cr
             | MaxwellOpcode::BFI_imm => {
-                self::bitwise::bfi(self, insn, opcode);
-            }
-            MaxwellOpcode::POPC_reg | MaxwellOpcode::POPC_cbuf | MaxwellOpcode::POPC_imm => {
-                self::bitwise::popc(self, insn, opcode);
-            }
-            MaxwellOpcode::FLO_reg | MaxwellOpcode::FLO_cbuf | MaxwellOpcode::FLO_imm => {
-                self::bitwise::flo(self, insn, opcode);
-            }
-            MaxwellOpcode::PRMT_reg
-            | MaxwellOpcode::PRMT_rc
-            | MaxwellOpcode::PRMT_cr
-            | MaxwellOpcode::PRMT_imm => {
-                self::bitwise::prmt(self, insn, opcode);
+                self::bitfield_insert::bfi(self, insn, opcode);
             }
 
-            // Move / Select
+            // integer_popcount.cpp
+            MaxwellOpcode::POPC_reg | MaxwellOpcode::POPC_cbuf | MaxwellOpcode::POPC_imm => {
+                self::integer_popcount::popc(self, insn, opcode);
+            }
+
+            // find_leading_one.cpp
+            MaxwellOpcode::FLO_reg | MaxwellOpcode::FLO_cbuf | MaxwellOpcode::FLO_imm => {
+                self::find_leading_one::flo(self, insn, opcode);
+            }
+
+            // move_register.cpp
             MaxwellOpcode::MOV_reg | MaxwellOpcode::MOV_cbuf | MaxwellOpcode::MOV_imm => {
-                self::move_sel::mov(self, insn, opcode);
+                self::move_register::mov(self, insn, opcode);
             }
             MaxwellOpcode::MOV32I => {
-                self::move_sel::mov32i(self, insn);
+                self::move_register::mov32i(self, insn);
             }
+
+            // select_source_with_predicate.cpp
             MaxwellOpcode::SEL_reg | MaxwellOpcode::SEL_cbuf | MaxwellOpcode::SEL_imm => {
-                self::move_sel::sel(self, insn, opcode);
+                self::select_source_with_predicate::sel(self, insn, opcode);
             }
+
+            // move_special_register.cpp
             MaxwellOpcode::S2R => {
-                self::move_sel::s2r(self, insn);
+                self::move_special_register::s2r(self, insn);
             }
 
-            // Predicate
+            // predicate_set_predicate.cpp
             MaxwellOpcode::PSETP => {
-                self::predicate::psetp(self, insn);
-            }
-            MaxwellOpcode::PSET => {
-                self::predicate::pset(self, insn);
+                self::predicate_set_predicate::psetp(self, insn);
             }
 
-            // Memory
+            // predicate_set_register.cpp
+            MaxwellOpcode::PSET => {
+                self::predicate_set_register::pset(self, insn);
+            }
+
+            // load_store_memory.cpp
             MaxwellOpcode::LDG => {
-                self::memory::ldg(self, insn);
+                self::load_store_memory::ldg(self, insn);
             }
             MaxwellOpcode::STG => {
-                self::memory::stg(self, insn);
+                self::load_store_memory::stg(self, insn);
             }
+
+            // load_constant.cpp
             MaxwellOpcode::LDC => {
-                self::memory::ldc(self, insn);
+                self::load_constant::ldc(self, insn);
             }
+
+            // load_store_local_shared.cpp
             MaxwellOpcode::LDL => {
-                self::memory::ldl(self, insn);
+                self::load_store_local_shared::ldl(self, insn);
             }
             MaxwellOpcode::STL => {
-                self::memory::stl(self, insn);
+                self::load_store_local_shared::stl(self, insn);
             }
 
-            // Texture
+            // texture_fetch.cpp
             MaxwellOpcode::TEX | MaxwellOpcode::TEX_b => {
-                self::texture::tex(self, insn, opcode);
-            }
-            MaxwellOpcode::TEXS => {
-                self::texture::texs(self, insn);
-            }
-            MaxwellOpcode::TLD | MaxwellOpcode::TLD_b => {
-                self::texture::tld(self, insn, opcode);
-            }
-            MaxwellOpcode::TLDS => {
-                self::texture::tlds(self, insn);
-            }
-            MaxwellOpcode::TLD4 | MaxwellOpcode::TLD4_b => {
-                self::texture::tld4(self, insn, opcode);
-            }
-            MaxwellOpcode::TXQ | MaxwellOpcode::TXQ_b => {
-                self::texture::txq(self, insn, opcode);
+                self::texture_fetch::tex(self, insn, opcode);
             }
 
-            // Attribute
+            // texture_fetch_swizzled.cpp
+            MaxwellOpcode::TEXS => {
+                self::texture_fetch_swizzled::texs(self, insn);
+            }
+
+            // texture_load.cpp
+            MaxwellOpcode::TLD | MaxwellOpcode::TLD_b => {
+                self::texture_load::tld(self, insn, opcode);
+            }
+
+            // texture_load_swizzled.cpp
+            MaxwellOpcode::TLDS => {
+                self::texture_load_swizzled::tlds(self, insn);
+            }
+
+            // texture_gather.cpp
+            MaxwellOpcode::TLD4 | MaxwellOpcode::TLD4_b => {
+                self::texture_gather::tld4(self, insn, opcode);
+            }
+
+            // texture_query.cpp
+            MaxwellOpcode::TXQ | MaxwellOpcode::TXQ_b => {
+                self::texture_query::txq(self, insn, opcode);
+            }
+
+            // load_store_attribute.cpp
             MaxwellOpcode::ALD => {
-                self::attribute::ald(self, insn);
+                self::load_store_attribute::ald(self, insn);
             }
             MaxwellOpcode::AST => {
-                self::attribute::ast(self, insn);
+                self::load_store_attribute::ast(self, insn);
             }
             MaxwellOpcode::IPA => {
-                self::attribute::ipa(self, insn);
+                self::load_store_attribute::ipa(self, insn);
             }
 
-            // Control flow — handled by the CFG builder, but we need to
-            // translate the predicate conditions.
+            // Control flow — handled by the CFG builder
             MaxwellOpcode::BRA
             | MaxwellOpcode::BRK
             | MaxwellOpcode::SYNC
@@ -422,13 +639,10 @@ impl<'a> TranslatorVisitor<'a> {
             | MaxwellOpcode::CAL
             | MaxwellOpcode::RET => {
                 // Control flow is handled by the CFG/structured CF passes.
-                // The translator doesn't emit IR for these.
             }
 
             // NOP / dependency barrier
-            MaxwellOpcode::NOP | MaxwellOpcode::DEPBAR => {
-                // No-op in IR.
-            }
+            MaxwellOpcode::NOP | MaxwellOpcode::DEPBAR => {}
 
             // Kill
             MaxwellOpcode::KIL => {
@@ -441,7 +655,7 @@ impl<'a> TranslatorVisitor<'a> {
                 self.ir.device_memory_barrier();
             }
 
-            // Everything else — log and skip
+            // Everything else
             _ => {
                 log::trace!(
                     "Unimplemented Maxwell opcode in translator: {} (0x{:016X})",

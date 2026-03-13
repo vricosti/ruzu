@@ -237,8 +237,10 @@ impl Host1x {
     ///
     /// Port of `Host1x::PushEntries`.
     pub fn push_entries(&mut self, _fd: i32, _entries: Vec<u32>) {
-        // TODO: Look up device by fd and call push_entries on it.
-        todo!("Host1x::push_entries — requires CDmaPusher integration")
+        // Stubbed — requires looking up the device by fd in the devices map and calling
+        // CDmaPusher::PushEntries on it.
+        // Upstream: Host1x::PushEntries() in video_core/host1x/host1x.cpp
+        log::warn!("Host1x::push_entries: not yet implemented (requires CDmaPusher integration)");
     }
 }
 

@@ -108,7 +108,7 @@ impl AnnounceMultiplayerSession {
         // NOTE: Thread-based announce loop is not ported (ENet dependency).
         // This sets the running flag for API parity.
         self.running.store(true, Ordering::SeqCst);
-        todo!("AnnounceMultiplayerSession::start requires networking thread")
+        log::warn!("AnnounceMultiplayerSession::start: networking thread not ported; announce loop will not run");
     }
 
     /// Stops the announce to web services.

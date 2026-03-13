@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Ported from: core/file_sys/fssystem/fssystem_aes_ctr_storage.h / .cpp
-// Status: COMPLETE (structural parity; actual AES-CTR decryption deferred)
+// Status: COMPLETE (structural parity with AES-CTR decryption implemented)
 //
 // AES-CTR storage layer. Reads/writes data through an AES-CTR cipher,
 // operating on block-aligned accesses of BLOCK_SIZE bytes.
 
 use super::utility::add_counter;
+use crate::crypto::aes_util::{AesCipher, Mode, Op};
 use crate::file_sys::vfs::vfs::VfsFile;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
+use parking_lot::Mutex;
 
 /// AES block size in bytes.
 ///
@@ -33,6 +35,8 @@ pub struct AesCtrStorage {
     base_storage: VirtualFile,
     key: [u8; KEY_SIZE],
     iv: [u8; IV_SIZE],
+    /// AES cipher context; interior-mutable because cipher state changes during read.
+    cipher: Mutex<AesCipher>,
 }
 
 impl AesCtrStorage {
@@ -48,10 +52,13 @@ impl AesCtrStorage {
         k.copy_from_slice(key);
         i.copy_from_slice(iv);
 
+        let cipher = AesCipher::new_128(k, Mode::CTR);
+
         Self {
             base_storage: base,
             key: k,
             iv: i,
+            cipher: Mutex::new(cipher),
         }
     }
 
@@ -103,17 +110,18 @@ impl AesCtrStorage {
             "AesCtrStorage::read: size must be block-aligned"
         );
 
-        // Read the data.
-        self.base_storage.read(buffer, size, offset);
+        // Read the encrypted data.
+        let read_len = self.base_storage.read(buffer, size, offset);
 
         // Setup the counter.
         let mut ctr = self.iv;
         add_counter(&mut ctr, (offset / BLOCK_SIZE) as u64);
 
-        // TODO: Decrypt using AES-CTR.
-        // m_cipher.SetIV(ctr);
-        // m_cipher.Transcode(buffer, size, buffer, Decrypt);
-        let _ = ctr;
+        // Decrypt using AES-CTR.
+        let mut cipher = self.cipher.lock();
+        cipher.set_iv(&ctr);
+        let src = buffer[..read_len].to_vec();
+        cipher.transcode(&src, &mut buffer[..read_len], Op::Decrypt);
 
         size
     }
@@ -185,7 +193,25 @@ impl VfsFile for AesCtrStorage {
         if actual_len == 0 {
             return 0;
         }
-        self.read_at(&mut data[..actual_len], offset)
+
+        // If already block-aligned, use the direct path.
+        if offset % BLOCK_SIZE == 0 && actual_len % BLOCK_SIZE == 0 {
+            return self.read_at(&mut data[..actual_len], offset);
+        }
+
+        // Handle non-block-aligned reads by reading aligned blocks and copying
+        // the relevant portion.
+        let aligned_offset = offset / BLOCK_SIZE * BLOCK_SIZE;
+        let end = offset + actual_len;
+        let aligned_end = (end + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        let aligned_size = aligned_end - aligned_offset;
+
+        let mut aligned_buf = vec![0u8; aligned_size];
+        self.read_at(&mut aligned_buf, aligned_offset);
+
+        let start_in_buf = offset - aligned_offset;
+        data[..actual_len].copy_from_slice(&aligned_buf[start_in_buf..start_in_buf + actual_len]);
+        actual_len
     }
 
     fn write(&self, data: &[u8], length: usize, offset: usize) -> usize {

@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2025 ruzu contributors
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of `ir_opt/position_pass.cpp`
 //!
@@ -10,6 +10,9 @@
 use crate::ir::program::Program;
 
 /// Apply render area position transformation to position outputs.
+///
+/// Not yet implemented: requires identifying position attribute stores and
+/// inserting FMA with render area dimensions.
 pub fn position_pass(_program: &mut Program) {
-    todo!("PositionPass: apply render area scaling to position outputs")
+    log::warn!("PositionPass not yet implemented — position outputs left unscaled");
 }

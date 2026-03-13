@@ -133,22 +133,35 @@ impl Gpu {
 
     /// Flush all current written commands into the host GPU for execution.
     pub fn flush_commands(&self) {
-        todo!("flush_commands requires rasterizer");
+        // NOTE: Full implementation calls rasterizer->FlushCommands().
+        // Stubbed until rasterizer integration is complete.
+        log::warn!("Gpu::flush_commands: rasterizer not integrated, skipping flush");
     }
 
     /// Synchronizes CPU writes with Host GPU memory.
     pub fn invalidate_gpu_cache(&self) {
-        todo!("invalidate_gpu_cache requires system integration");
+        // NOTE: Full implementation calls system.GatherGPUDirtyMemory then
+        // rasterizer->OnCacheInvalidation for each dirty range.
+        // Stubbed until system/rasterizer integration is complete.
+        log::warn!("Gpu::invalidate_gpu_cache: system integration not available, skipping");
     }
 
     /// Signal the ending of command list.
     pub fn on_command_list_end(&self) {
-        todo!("on_command_list_end requires rasterizer");
+        // NOTE: Full implementation calls rasterizer->ReleaseFences(false) then
+        // Settings::UpdateGPUAccuracy().
+        // Stubbed until rasterizer integration is complete.
+        log::warn!("Gpu::on_command_list_end: rasterizer not integrated, skipping");
     }
 
     /// Request a host GPU memory flush from the CPU.
     pub fn request_flush(&self, _addr: DAddr, _size: usize) -> u64 {
-        todo!("request_flush requires rasterizer");
+        // NOTE: Full implementation calls RequestSyncOperation which enqueues a flush.
+        // Returns the next fence counter value.
+        // Stubbed until rasterizer integration is complete.
+        let fence = self.current_sync_fence.load(Ordering::Relaxed) + 1;
+        log::warn!("Gpu::request_flush: rasterizer not integrated, returning fence {}", fence);
+        fence
     }
 
     /// Obtains current flush request fence id.
@@ -178,7 +191,10 @@ impl Gpu {
 
     /// Returns the GPU ticks.
     pub fn get_ticks(&self) -> u64 {
-        todo!("get_ticks requires CoreTiming");
+        // NOTE: Full implementation calls system.CoreTiming().GetGPUTicks()
+        // and divides by 256 when use_fast_gpu_time is enabled.
+        // Stubbed until CoreTiming integration is complete.
+        0
     }
 
     /// Returns whether async GPU mode is enabled.
@@ -193,7 +209,9 @@ impl Gpu {
 
     /// Start the GPU thread.
     pub fn start(&self) {
-        todo!("start requires gpu_thread and renderer");
+        // NOTE: Full implementation calls gpu_thread.StartThread(*renderer, renderer->Context(), *scheduler).
+        // Stubbed until renderer/gpu_thread integration is complete.
+        log::warn!("Gpu::start: gpu_thread and renderer not integrated, skipping");
     }
 
     /// Notify shutdown.
@@ -203,46 +221,70 @@ impl Gpu {
 
     /// Push GPU command entries to be processed.
     pub fn push_gpu_entries(&self, _channel: i32, _entries: CommandList) {
-        todo!("push_gpu_entries requires gpu_thread");
+        // NOTE: Full implementation calls gpu_thread.SubmitList(channel, entries).
+        // Stubbed until gpu_thread integration is complete.
+        log::warn!("Gpu::push_gpu_entries: gpu_thread not integrated, dropping entries");
     }
 
     /// Notify rasterizer about a CPU read.
-    pub fn on_cpu_read(&self, _addr: DAddr, _size: u64) -> RasterizerDownloadArea {
-        todo!("on_cpu_read requires rasterizer");
+    pub fn on_cpu_read(&self, addr: DAddr, _size: u64) -> RasterizerDownloadArea {
+        // NOTE: Full implementation calls rasterizer->GetFlushArea, then
+        // RequestSyncOperation to flush the area, then WaitForSyncOperation.
+        // Return a preemptive area covering the address.
+        log::warn!("Gpu::on_cpu_read: rasterizer not integrated, returning empty area");
+        RasterizerDownloadArea {
+            start_address: addr,
+            end_address: addr,
+            preemtive: true,
+        }
     }
 
     /// Flush a region.
     pub fn flush_region(&self, _addr: DAddr, _size: u64) {
-        todo!("flush_region requires gpu_thread");
+        // NOTE: Full implementation calls gpu_thread.FlushRegion(addr, size).
+        // Stubbed until gpu_thread integration is complete.
+        log::warn!("Gpu::flush_region: gpu_thread not integrated, skipping flush");
     }
 
     /// Invalidate a region.
     pub fn invalidate_region(&self, _addr: DAddr, _size: u64) {
-        todo!("invalidate_region requires gpu_thread");
+        // NOTE: Full implementation calls gpu_thread.InvalidateRegion(addr, size).
+        // Stubbed until gpu_thread integration is complete.
+        log::warn!("Gpu::invalidate_region: gpu_thread not integrated, skipping invalidation");
     }
 
     /// Notify rasterizer of a CPU write.
     pub fn on_cpu_write(&self, _addr: DAddr, _size: u64) -> bool {
-        todo!("on_cpu_write requires rasterizer");
+        // NOTE: Full implementation calls rasterizer->OnCPUWrite(addr, size).
+        // Stubbed until rasterizer integration is complete; return false (no cache hit).
+        false
     }
 
     /// Flush and invalidate a region.
     pub fn flush_and_invalidate_region(&self, _addr: DAddr, _size: u64) {
-        todo!("flush_and_invalidate_region requires gpu_thread");
+        // NOTE: Full implementation calls gpu_thread.FlushAndInvalidateRegion(addr, size).
+        // Stubbed until gpu_thread integration is complete.
+        log::warn!("Gpu::flush_and_invalidate_region: gpu_thread not integrated, skipping");
     }
 
     /// Request framebuffer compositing.
     pub fn request_composite(&self, _layers: Vec<FramebufferConfig>) {
-        todo!("request_composite requires renderer and syncpoint integration");
+        // NOTE: Full implementation enqueues a sync operation that calls
+        // renderer->Composite(layers) after all pending fences are signaled.
+        // Stubbed until renderer and syncpoint integration is complete.
+        log::warn!("Gpu::request_composite: renderer not integrated, skipping composite");
     }
 
     /// Get the applet capture buffer.
     pub fn get_applet_capture_buffer(&self) -> Vec<u8> {
-        todo!("get_applet_capture_buffer requires renderer");
+        // NOTE: Full implementation calls renderer->GetAppletCaptureBuffer() via sync operation.
+        // Stubbed until renderer integration is complete.
+        Vec::new()
     }
 
     /// Renderer frame end notification.
     pub fn renderer_frame_end_notify(&self) {
-        todo!("renderer_frame_end_notify requires perf stats");
+        // NOTE: Full implementation calls system.GetPerfStats().EndGameFrame().
+        // Stubbed until perf stats integration is complete.
     }
 }

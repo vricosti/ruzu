@@ -8,13 +8,184 @@ use crate::arm::arm_interface::{
     ArmInterface, ArmInterfaceBase, Architecture, DebugWatchpoint, HaltReason, KProcess,
     KThread, ThreadContext,
 };
+use crate::hle::kernel::k_process::SharedProcessMemory;
+
+use rdynarmic::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
+
+/// Translate rdynarmic's HaltReason to core's HaltReason.
+///
+/// Same mapping as in arm_dynarmic_64.rs.
+fn translate_halt_reason(hr: rdynarmic::halt_reason::HaltReason) -> HaltReason {
+    let mut result = HaltReason::empty();
+
+    if hr.contains(rdynarmic::halt_reason::HaltReason::STEP) {
+        result |= HaltReason::STEP_THREAD;
+    }
+    if hr.contains(rdynarmic::halt_reason::HaltReason::SVC) {
+        result |= HaltReason::SUPERVISOR_CALL;
+    }
+    if hr.contains(rdynarmic::halt_reason::HaltReason::BREAKPOINT) {
+        result |= HaltReason::INSTRUCTION_BREAKPOINT;
+    }
+    if hr.contains(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED) {
+        result |= HaltReason::PREFETCH_ABORT;
+    }
+    if hr.contains(rdynarmic::halt_reason::HaltReason::EXTERNAL_HALT) {
+        result |= HaltReason::BREAK_LOOP;
+    }
+
+    result
+}
+
+/// JIT callbacks for ARM32.
+///
+/// Corresponds to upstream `DynarmicCallbacks32`.
+///
+/// Holds a shared reference to guest process memory, matching upstream's
+/// `Core::Memory::Memory& m_memory` obtained from `process->GetMemory()`.
+struct DynarmicCallbacks32 {
+    /// Shared guest memory reference.
+    memory: SharedProcessMemory,
+    /// SVC/SWI number from last supervisor call
+    svc_swi: u32,
+}
+
+impl DynarmicCallbacks32 {
+    fn new(memory: SharedProcessMemory) -> Self {
+        Self { memory, svc_swi: 0 }
+    }
+}
+
+impl JitCallbacks for DynarmicCallbacks32 {
+    fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+        let mem = self.memory.read().unwrap();
+        if mem.is_valid_range(vaddr, 4) {
+            Some(mem.read_32(vaddr))
+        } else {
+            log::warn!("DynarmicCallbacks32::memory_read_code({:#x}): out of range", vaddr);
+            None
+        }
+    }
+
+    fn memory_read_8(&self, vaddr: u64) -> u8 {
+        self.memory.read().unwrap().read_8(vaddr)
+    }
+
+    fn memory_read_16(&self, vaddr: u64) -> u16 {
+        self.memory.read().unwrap().read_16(vaddr)
+    }
+
+    fn memory_read_32(&self, vaddr: u64) -> u32 {
+        self.memory.read().unwrap().read_32(vaddr)
+    }
+
+    fn memory_read_64(&self, vaddr: u64) -> u64 {
+        self.memory.read().unwrap().read_64(vaddr)
+    }
+
+    fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
+        let mem = self.memory.read().unwrap();
+        (mem.read_64(vaddr), mem.read_64(vaddr + 8))
+    }
+
+    fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+        self.memory.write().unwrap().write_8(vaddr, value);
+    }
+
+    fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+        self.memory.write().unwrap().write_16(vaddr, value);
+    }
+
+    fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+        self.memory.write().unwrap().write_32(vaddr, value);
+    }
+
+    fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+        self.memory.write().unwrap().write_64(vaddr, value);
+    }
+
+    fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
+        let mut mem = self.memory.write().unwrap();
+        mem.write_64(vaddr, value_lo);
+        mem.write_64(vaddr + 8, value_hi);
+    }
+
+    fn exclusive_read_8(&self, vaddr: u64) -> u8 {
+        self.memory.read().unwrap().read_8(vaddr)
+    }
+
+    fn exclusive_read_16(&self, vaddr: u64) -> u16 {
+        self.memory.read().unwrap().read_16(vaddr)
+    }
+
+    fn exclusive_read_32(&self, vaddr: u64) -> u32 {
+        self.memory.read().unwrap().read_32(vaddr)
+    }
+
+    fn exclusive_read_64(&self, vaddr: u64) -> u64 {
+        self.memory.read().unwrap().read_64(vaddr)
+    }
+
+    fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
+        let mem = self.memory.read().unwrap();
+        (mem.read_64(vaddr), mem.read_64(vaddr + 8))
+    }
+
+    fn exclusive_write_8(&mut self, vaddr: u64, value: u8) -> bool {
+        self.memory.write().unwrap().write_8(vaddr, value);
+        true
+    }
+
+    fn exclusive_write_16(&mut self, vaddr: u64, value: u16) -> bool {
+        self.memory.write().unwrap().write_16(vaddr, value);
+        true
+    }
+
+    fn exclusive_write_32(&mut self, vaddr: u64, value: u32) -> bool {
+        self.memory.write().unwrap().write_32(vaddr, value);
+        true
+    }
+
+    fn exclusive_write_64(&mut self, vaddr: u64, value: u64) -> bool {
+        self.memory.write().unwrap().write_64(vaddr, value);
+        true
+    }
+
+    fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) -> bool {
+        let mut mem = self.memory.write().unwrap();
+        mem.write_64(vaddr, value_lo);
+        mem.write_64(vaddr + 8, value_hi);
+        true
+    }
+
+    fn exclusive_clear(&mut self) {
+        // No-op until exclusive monitor is wired
+    }
+
+    fn call_supervisor(&mut self, svc_num: u32) {
+        self.svc_swi = svc_num;
+    }
+
+    fn exception_raised(&mut self, pc: u64, exception: u64) {
+        log::error!(
+            "DynarmicCallbacks32::exception_raised(pc={:#x}, exception={:#x})",
+            pc, exception
+        );
+    }
+
+    fn add_ticks(&mut self, _ticks: u64) {
+        // TODO: Wire to CoreTiming
+    }
+
+    fn get_ticks_remaining(&self) -> u64 {
+        // TODO: Wire to CoreTiming
+        1000
+    }
+}
 
 /// ARM32 Dynarmic JIT backend.
 ///
 /// Corresponds to upstream `Core::ArmDynarmic32`.
-///
-/// This is a structural port. The actual JIT (Dynarmic::A32::Jit) is represented
-/// as an opaque type until rdynarmic is integrated.
 pub struct ArmDynarmic32 {
     pub base: ArmInterfaceBase,
 
@@ -36,10 +207,11 @@ pub struct ArmDynarmic32 {
     /// Context saved at breakpoint
     breakpoint_context: ThreadContext,
 
-    // TODO: Opaque JIT handle
-    // m_jit: Dynarmic::A32::Jit,
-    // m_cb: DynarmicCallbacks32,
-    // m_cp15: DynarmicCP15,
+    /// The rdynarmic A32 JIT instance
+    jit: Option<rdynarmic::A32Jit>,
+
+    /// CP15 user-read-only register (TPIDRURO), upstream: m_cp15->uro
+    cp15_uro: u32,
 }
 
 impl ArmDynarmic32 {
@@ -52,11 +224,28 @@ impl ArmDynarmic32 {
         _process: &KProcess,
         _exclusive_monitor: &dyn std::any::Any,
         core_index: usize,
+        shared_memory: SharedProcessMemory,
     ) -> Self {
-        // TODO: Create JIT, callbacks, and CP15 coprocessor
-        // auto& page_table_impl = process->GetPageTable().GetBasePageTable().GetImpl();
-        // m_jit = MakeJit(&page_table_impl);
-        // ScopedJitExecution::RegisterHandler();
+        let callbacks = DynarmicCallbacks32::new(shared_memory);
+
+        let config = JitConfig {
+            callbacks: Box::new(callbacks),
+            enable_cycle_counting: !uses_wall_clock,
+            code_cache_size: 512 * 1024 * 1024,
+            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+            unsafe_optimizations: false,
+        };
+
+        let jit = match rdynarmic::A32Jit::new(config) {
+            Ok(jit) => {
+                log::info!("ArmDynarmic32: JIT created successfully for core {}", core_index);
+                Some(jit)
+            }
+            Err(e) => {
+                log::error!("ArmDynarmic32: Failed to create JIT for core {}: {}", core_index, e);
+                None
+            }
+        };
 
         Self {
             base: ArmInterfaceBase::new(uses_wall_clock),
@@ -64,6 +253,8 @@ impl ArmDynarmic32 {
             svc_swi: 0,
             halted_watchpoint: None,
             breakpoint_context: ThreadContext::default(),
+            jit,
+            cp15_uro: 0,
         }
     }
 
@@ -71,8 +262,13 @@ impl ArmDynarmic32 {
     ///
     /// Corresponds to upstream `ArmDynarmic32::IsInThumbMode`.
     pub fn is_in_thumb_mode(&self) -> bool {
-        // return (m_jit->Cpsr() & 0x20) != 0;
-        todo!("Requires JIT integration")
+        if let Some(jit) = self.jit.as_ref() {
+            // Thumb bit is bit 5 of CPSR
+            (jit.get_cpsr() & 0x20) != 0
+        } else {
+            log::warn!("ArmDynarmic32::is_in_thumb_mode: JIT not available");
+            false
+        }
     }
 
     /// Convert FPSCR to separate FPSR and FPCR values.
@@ -108,57 +304,157 @@ impl ArmDynarmic32 {
 
 impl ArmInterface for ArmDynarmic32 {
     fn run_thread(&mut self, _thread: &mut KThread) -> HaltReason {
-        // ScopedJitExecution sj(thread->GetOwnerProcess());
-        // m_jit->ClearExclusiveState();
-        // return TranslateHaltReason(m_jit->Run());
-        todo!("Requires JIT integration")
+        let jit = match self.jit.as_mut() {
+            Some(jit) => jit,
+            None => {
+                log::error!("ArmDynarmic32::run_thread: JIT not available");
+                return HaltReason::BREAK_LOOP;
+            }
+        };
+
+        jit.clear_exclusive_state();
+        let rdynarmic_hr = jit.run();
+        translate_halt_reason(rdynarmic_hr)
     }
 
     fn step_thread(&mut self, _thread: &mut KThread) -> HaltReason {
-        // ScopedJitExecution sj(thread->GetOwnerProcess());
-        // m_jit->ClearExclusiveState();
-        // return TranslateHaltReason(m_jit->Step());
-        todo!("Requires JIT integration")
+        let jit = match self.jit.as_mut() {
+            Some(jit) => jit,
+            None => {
+                log::error!("ArmDynarmic32::step_thread: JIT not available");
+                return HaltReason::BREAK_LOOP;
+            }
+        };
+
+        jit.clear_exclusive_state();
+        let rdynarmic_hr = jit.step();
+        translate_halt_reason(rdynarmic_hr)
     }
 
     fn clear_instruction_cache(&mut self) {
-        // m_jit->ClearCache();
-        todo!("Requires JIT integration")
+        if let Some(jit) = self.jit.as_mut() {
+            jit.clear_cache();
+        }
     }
 
-    fn invalidate_cache_range(&mut self, _addr: u64, _size: usize) {
-        // m_jit->InvalidateCacheRange(static_cast<u32>(addr), size);
-        todo!("Requires JIT integration")
+    fn invalidate_cache_range(&mut self, addr: u64, size: usize) {
+        if let Some(jit) = self.jit.as_mut() {
+            // Upstream casts addr to u32 for A32
+            jit.invalidate_cache_range(addr, size as u64);
+        }
     }
 
     fn get_architecture(&self) -> Architecture {
         Architecture::AArch32
     }
 
-    fn get_context(&self, _ctx: &mut ThreadContext) {
-        // Upstream reads from JIT GPRs, ExtRegs, Cpsr, Fpscr
-        // and maps them into ThreadContext fields.
-        todo!("Requires JIT integration")
+    fn get_context(&self, ctx: &mut ThreadContext) {
+        let jit = match self.jit.as_ref() {
+            Some(jit) => jit,
+            None => {
+                log::warn!("ArmDynarmic32::get_context: JIT not available");
+                return;
+            }
+        };
+
+        // Upstream maps A32 GPRs to ThreadContext:
+        // GPR[0..15] -> ctx.r[0..15], rest zeroed
+        for i in 0..15 {
+            ctx.r[i] = jit.get_register(i) as u64;
+        }
+        // r[15] is PC in A32
+        ctx.pc = jit.get_register(15) as u64;
+        ctx.sp = jit.get_register(13) as u64;
+        ctx.lr = jit.get_register(14) as u64;
+
+        ctx.pstate = jit.get_cpsr();
+
+        // ExtRegs -> Vectors (A32 uses VFP/NEON extension registers)
+        // Upstream reads 64 ExtRegs (u32 each) and maps groups of 4 to u128 vectors.
+        // ext_reg layout: 64 x u32, where ext_reg[i*4..i*4+4] maps to ctx.v[i].
+        for i in 0..16 {
+            let e0 = jit.get_ext_reg(i * 4) as u128;
+            let e1 = jit.get_ext_reg(i * 4 + 1) as u128;
+            let e2 = jit.get_ext_reg(i * 4 + 2) as u128;
+            let e3 = jit.get_ext_reg(i * 4 + 3) as u128;
+            ctx.v[i] = e0 | (e1 << 32) | (e2 << 64) | (e3 << 96);
+        }
+        // A32 only has 16 Q-registers (D0-D31 / S0-S63)
+        for i in 16..32 {
+            ctx.v[i] = 0;
+        }
+
+        let (fpsr, fpcr) = Self::fpscr_to_fpsr_fpcr(jit.get_fpscr());
+        ctx.fpcr = fpcr;
+        ctx.fpsr = fpsr;
+        ctx.tpidr = 0; // A32 uses CP15 for thread pointer
     }
 
-    fn set_context(&mut self, _ctx: &ThreadContext) {
-        // Upstream writes JIT GPRs, ExtRegs, Cpsr, Fpscr from ThreadContext.
-        todo!("Requires JIT integration")
+    fn set_context(&mut self, ctx: &ThreadContext) {
+        let jit = match self.jit.as_mut() {
+            Some(jit) => jit,
+            None => {
+                log::warn!("ArmDynarmic32::set_context: JIT not available");
+                return;
+            }
+        };
+
+        // Upstream maps ThreadContext back to A32 GPRs
+        for i in 0..15 {
+            jit.set_register(i, ctx.r[i] as u32);
+        }
+        jit.set_register(15, ctx.pc as u32);
+
+        jit.set_cpsr(ctx.pstate);
+
+        // Vectors -> ExtRegs
+        for i in 0..16 {
+            jit.set_ext_reg(i * 4, ctx.v[i] as u32);
+            jit.set_ext_reg(i * 4 + 1, (ctx.v[i] >> 32) as u32);
+            jit.set_ext_reg(i * 4 + 2, (ctx.v[i] >> 64) as u32);
+            jit.set_ext_reg(i * 4 + 3, (ctx.v[i] >> 96) as u32);
+        }
+
+        let fpscr = Self::fpsr_fpcr_to_fpscr(ctx.fpsr as u64, ctx.fpcr as u64);
+        jit.set_fpscr(fpscr);
     }
 
-    fn set_tpidrro_el0(&mut self, _value: u64) {
-        // m_cp15->uro = static_cast<u32>(value);
-        todo!("Requires JIT integration")
+    fn set_tpidrro_el0(&mut self, value: u64) {
+        // Upstream: m_cp15->uro = static_cast<u32>(value)
+        self.cp15_uro = value as u32;
+        if let Some(jit) = self.jit.as_mut() {
+            jit.set_cp15_uro(value as u32);
+        }
     }
 
-    fn get_svc_arguments(&self, _args: &mut [u64; 8]) {
-        // Reads GPR[0..8] from JIT
-        todo!("Requires JIT integration")
+    fn get_svc_arguments(&self, args: &mut [u64; 8]) {
+        let jit = match self.jit.as_ref() {
+            Some(jit) => jit,
+            None => {
+                log::warn!("ArmDynarmic32::get_svc_arguments: JIT not available");
+                return;
+            }
+        };
+
+        // Upstream reads GPR[0..8] from JIT
+        for i in 0..8 {
+            args[i] = jit.get_register(i) as u64;
+        }
     }
 
-    fn set_svc_arguments(&mut self, _args: &[u64; 8]) {
-        // Writes GPR[0..8] to JIT as u32
-        todo!("Requires JIT integration")
+    fn set_svc_arguments(&mut self, args: &[u64; 8]) {
+        let jit = match self.jit.as_mut() {
+            Some(jit) => jit,
+            None => {
+                log::warn!("ArmDynarmic32::set_svc_arguments: JIT not available");
+                return;
+            }
+        };
+
+        // Upstream writes GPR[0..8] to JIT as u32
+        for i in 0..8 {
+            jit.set_register(i, args[i] as u32);
+        }
     }
 
     fn get_svc_number(&self) -> u32 {
@@ -166,8 +462,9 @@ impl ArmInterface for ArmDynarmic32 {
     }
 
     fn signal_interrupt(&mut self, _thread: &mut KThread) {
-        // m_jit->HaltExecution(BreakLoop);
-        todo!("Requires JIT integration")
+        if let Some(jit) = self.jit.as_ref() {
+            jit.halt_execution(rdynarmic::halt_reason::HaltReason::EXTERNAL_HALT);
+        }
     }
 
     fn halted_watchpoint(&self) -> Option<&DebugWatchpoint> {
@@ -175,7 +472,7 @@ impl ArmInterface for ArmDynarmic32 {
     }
 
     fn rewind_breakpoint_instruction(&mut self) {
-        // this->SetContext(m_breakpoint_context);
-        todo!("Requires JIT integration")
+        let ctx = self.breakpoint_context.clone();
+        self.set_context(&ctx);
     }
 }

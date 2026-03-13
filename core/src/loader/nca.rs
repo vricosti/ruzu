@@ -5,14 +5,14 @@
 //!
 //! NCA (Nintendo Content Archive) loader.
 
-use crate::file_sys::vfs::vfs::VfsFile;
+use crate::file_sys::content_archive::{NCAContentType, NCA};
+use crate::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 
+use super::deconstructed_rom_directory::AppLoaderDeconstructedRomDirectory;
 use super::loader::{
     AppLoader, FileType, FileTypeIdentifier, KProcess, LoadResult, Modules, ResultStatus, System,
-    NACP,
 };
-use super::nso::read_object;
 
 // ============================================================================
 // Constants for VerifyIntegrity
@@ -30,6 +30,24 @@ const NCA_SHA256_HASH_LENGTH: usize = 32;
 /// Maps to upstream `NcaSha256HalfHashLength` in nca.cpp.
 const NCA_SHA256_HALF_HASH_LENGTH: usize = NCA_SHA256_HASH_LENGTH / 2;
 
+/// Map file_sys ResultStatus to loader ResultStatus.
+///
+/// Both enums share many variant names; this function converts the file_sys
+/// version used by NCA/NSP parsing into the loader version returned by Load().
+fn map_fs_status(fs: FsResultStatus) -> ResultStatus {
+    match fs {
+        FsResultStatus::Success => ResultStatus::Success,
+        FsResultStatus::ErrorBadNCAHeader => ResultStatus::ErrorBadNCAHeader,
+        FsResultStatus::ErrorMissingKeyAreaKey => ResultStatus::ErrorMissingKeyAreaKey,
+        FsResultStatus::ErrorMissingTitlekey => ResultStatus::ErrorMissingTitlekey,
+        FsResultStatus::ErrorMissingTitlekek => ResultStatus::ErrorMissingTitlekek,
+        FsResultStatus::ErrorMissingBKTRBaseRomFS => ResultStatus::ErrorNotImplemented,
+        FsResultStatus::ErrorNullFile => ResultStatus::ErrorNullFile,
+        FsResultStatus::ErrorNSPMissingProgramNCA => ResultStatus::ErrorNSPMissingProgramNCA,
+        _ => ResultStatus::ErrorNotImplemented,
+    }
+}
+
 // ============================================================================
 // AppLoaderNca
 // ============================================================================
@@ -40,9 +58,8 @@ const NCA_SHA256_HALF_HASH_LENGTH: usize = NCA_SHA256_HASH_LENGTH / 2;
 pub struct AppLoaderNca {
     file: VirtualFile,
     is_loaded: bool,
-    // TODO: Replace with actual FileSys::NCA when ported.
-    // nca: Option<FileSys::NCA>,
-    // directory_loader: Option<AppLoaderDeconstructedRomDirectory>,
+    nca: NCA,
+    directory_loader: Option<AppLoaderDeconstructedRomDirectory>,
 }
 
 impl FileTypeIdentifier for AppLoaderNca {
@@ -79,10 +96,12 @@ impl AppLoaderNca {
     ///
     /// Maps to upstream `AppLoader_NCA::AppLoader_NCA`.
     pub fn new(file: VirtualFile) -> Self {
-        // TODO: Create FileSys::NCA from file when that type is ported.
+        let nca = NCA::new(file.clone(), None);
         Self {
             file,
             is_loaded: false,
+            nca,
+            directory_loader: None,
         }
     }
 }
@@ -93,22 +112,52 @@ impl AppLoader for AppLoaderNca {
     }
 
     /// Maps to upstream `AppLoader_NCA::Load`.
-    fn load(&mut self, _process: &mut KProcess, _system: &mut System) -> LoadResult {
+    fn load(&mut self, process: &mut KProcess, system: &mut System) -> LoadResult {
         if self.is_loaded {
             return (ResultStatus::ErrorAlreadyLoaded, None);
         }
 
-        // TODO: Full implementation requires:
-        // - FileSys::NCA to parse NCA content
-        // - Check NCA status and type
-        // - Extract ExeFS
-        // - Fall back to update NCA if base has no ExeFS
-        // - Create AppLoader_DeconstructedRomDirectory from ExeFS
-        // - Load via directory_loader
-        // - Register with FileSystemController
+        let nca_status = self.nca.get_status();
+        if nca_status != FsResultStatus::Success {
+            return (map_fs_status(nca_status), None);
+        }
 
-        log::warn!("NCA loader: Load not fully implemented (requires FileSys::NCA)");
-        (ResultStatus::ErrorNotImplemented, None)
+        if self.nca.get_type() != NCAContentType::Program {
+            return (ResultStatus::ErrorNCANotProgram, None);
+        }
+
+        let exefs = self.nca.get_exefs();
+        if exefs.is_none() {
+            log::info!("No ExeFS found in NCA, looking for ExeFS from update");
+
+            // TODO: This NCA may be a sparse base of an installed title.
+            // Try to fetch the ExeFS from the installed update via
+            // system.get_content_provider().get_entry(get_update_title_id(...), Program).
+            // For now, return ErrorNoExeFS since content provider integration
+            // is not yet wired up.
+            return (ResultStatus::ErrorNoExeFS, None);
+        }
+
+        let exefs = exefs.unwrap();
+
+        // Upstream: directory_loader = make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true);
+        // The second arg `true` means override_update=true, is_hbl=false.
+        let mut dir_loader =
+            AppLoaderDeconstructedRomDirectory::new_from_directory(exefs, true, false);
+
+        let load_result = dir_loader.load(process, system);
+        if load_result.0 != ResultStatus::Success {
+            self.directory_loader = Some(dir_loader);
+            return load_result;
+        }
+
+        // TODO: Register with FileSystemController:
+        // system.get_filesystem_controller().register_process(
+        //     process.get_process_id(), nca.get_title_id(), ...);
+
+        self.directory_loader = Some(dir_loader);
+        self.is_loaded = true;
+        load_result
     }
 
     /// Maps to upstream `AppLoader_NCA::VerifyIntegrity`.
@@ -174,32 +223,80 @@ impl AppLoader for AppLoaderNca {
         ResultStatus::Success
     }
 
+    /// Maps to upstream `AppLoader_NCA::ReadRomFS`.
     fn read_rom_fs(
         &self,
-        _out_file: &mut Option<VirtualFile>,
+        out_file: &mut Option<VirtualFile>,
     ) -> ResultStatus {
-        // TODO: Requires FileSys::NCA to be ported.
-        ResultStatus::ErrorNotInitialized
+        if self.nca.get_status() != FsResultStatus::Success {
+            return ResultStatus::ErrorNotInitialized;
+        }
+
+        match self.nca.get_romfs() {
+            Some(romfs) if romfs.get_size() > 0 => {
+                *out_file = Some(romfs);
+                ResultStatus::Success
+            }
+            _ => ResultStatus::ErrorNoRomFS,
+        }
     }
 
-    fn read_program_id(&self, _out_program_id: &mut u64) -> ResultStatus {
-        // TODO: Requires FileSys::NCA to be ported.
-        ResultStatus::ErrorNotInitialized
+    /// Maps to upstream `AppLoader_NCA::ReadProgramId`.
+    fn read_program_id(&self, out_program_id: &mut u64) -> ResultStatus {
+        if self.nca.get_status() != FsResultStatus::Success {
+            return ResultStatus::ErrorNotInitialized;
+        }
+
+        *out_program_id = self.nca.get_title_id();
+        ResultStatus::Success
     }
 
-    fn read_banner(&self, _buffer: &mut Vec<u8>) -> ResultStatus {
-        // TODO: Requires FileSys::NCA to be ported.
-        ResultStatus::ErrorNotInitialized
+    /// Maps to upstream `AppLoader_NCA::ReadBanner`.
+    fn read_banner(&self, buffer: &mut Vec<u8>) -> ResultStatus {
+        if self.nca.get_status() != FsResultStatus::Success {
+            return ResultStatus::ErrorNotInitialized;
+        }
+
+        let logo = match self.nca.get_logo_partition() {
+            Some(l) => l,
+            None => return ResultStatus::ErrorNoIcon,
+        };
+
+        match logo.get_file("StartupMovie.gif") {
+            Some(f) => {
+                *buffer = f.read_all_bytes();
+                ResultStatus::Success
+            }
+            None => ResultStatus::ErrorNoIcon,
+        }
     }
 
-    fn read_logo(&self, _buffer: &mut Vec<u8>) -> ResultStatus {
-        // TODO: Requires FileSys::NCA to be ported.
-        ResultStatus::ErrorNotInitialized
+    /// Maps to upstream `AppLoader_NCA::ReadLogo`.
+    fn read_logo(&self, buffer: &mut Vec<u8>) -> ResultStatus {
+        if self.nca.get_status() != FsResultStatus::Success {
+            return ResultStatus::ErrorNotInitialized;
+        }
+
+        let logo = match self.nca.get_logo_partition() {
+            Some(l) => l,
+            None => return ResultStatus::ErrorNoIcon,
+        };
+
+        match logo.get_file("NintendoLogo.png") {
+            Some(f) => {
+                *buffer = f.read_all_bytes();
+                ResultStatus::Success
+            }
+            None => ResultStatus::ErrorNoIcon,
+        }
     }
 
-    fn read_nso_modules(&self, _modules: &mut Modules) -> ResultStatus {
-        // TODO: Requires directory_loader to be initialized.
-        ResultStatus::ErrorNotInitialized
+    /// Maps to upstream `AppLoader_NCA::ReadNSOModules`.
+    fn read_nso_modules(&self, modules: &mut Modules) -> ResultStatus {
+        match &self.directory_loader {
+            Some(loader) => loader.read_nso_modules(modules),
+            None => ResultStatus::ErrorNotInitialized,
+        }
     }
 }
 

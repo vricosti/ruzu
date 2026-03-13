@@ -1,7 +1,7 @@
-// SPDX-FileCopyrightText: 2025 ruzu contributors
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of `frontend/maxwell/translate_program.h` and `translate_program.cpp`
+//! Port of `frontend/maxwell/translate_program.cpp`
 //!
 //! Top-level shader translation: takes a CFG and environment, translates
 //! each block using the TranslatorVisitor, builds the structured control
@@ -11,37 +11,44 @@ use crate::ir::program::Program;
 
 /// Translate a Maxwell shader program from CFG to IR.
 ///
-/// This is the main entry point for shader translation. It:
-/// 1. Creates basic blocks from the CFG
-/// 2. Translates each Maxwell instruction to IR via TranslatorVisitor
-/// 3. Builds the structured control flow AST
-/// 4. Returns the complete IR::Program
+/// Not yet implemented: requires full CFG construction, block translation loop,
+/// and structured control-flow AST building.
 pub fn translate_program(
     _instructions: &[u64],
-    _stage: crate::ir::types::ShaderStage,
+    stage: crate::ir::types::ShaderStage,
 ) -> Program {
-    todo!("TranslateProgram: full CFG-based shader translation")
+    log::warn!("TranslateProgram not yet implemented — returning empty program");
+    Program::new(stage)
 }
 
 /// Merge dual vertex programs (VertexA + VertexB) into a single program.
+///
+/// Not yet implemented: requires dual-vertex-specific CFG merging and
+/// `JoinTextureInfo`/`JoinStorageInfo` pass invocation.
 pub fn merge_dual_vertex_programs(
     _vertex_a: &mut Program,
     _vertex_b: &mut Program,
 ) -> Program {
-    todo!("MergeDualVertexPrograms: combine VertexA and VertexB")
+    log::warn!("MergeDualVertexPrograms not yet implemented — returning empty program");
+    Program::new(crate::ir::types::ShaderStage::Vertex)
 }
 
 /// Convert legacy (fixed-function) varyings to generic attributes.
+///
+/// Not yet implemented: requires attribute mapping tables and instruction mutation.
 pub fn convert_legacy_to_generic(
     _program: &mut Program,
     _runtime_info: &crate::runtime_info::RuntimeInfo,
 ) {
-    todo!("ConvertLegacyToGeneric: remap fixed-function attributes to generics")
+    log::warn!("ConvertLegacyToGeneric not yet implemented — attributes left unmapped");
 }
 
 /// Generate a passthrough geometry shader for layer emulation.
+///
+/// Not yet implemented: requires generating a full passthrough GS IR program.
 pub fn generate_geometry_passthrough(
     _source_program: &mut Program,
 ) -> Program {
-    todo!("GenerateGeometryPassthrough: create passthrough GS for layer emulation")
+    log::warn!("GenerateGeometryPassthrough not yet implemented — returning empty program");
+    Program::new(crate::ir::types::ShaderStage::Vertex)
 }

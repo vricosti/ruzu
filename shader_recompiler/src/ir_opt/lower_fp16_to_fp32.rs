@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2025 ruzu contributors
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of `ir_opt/lower_fp16_to_fp32.cpp`
 //!
@@ -9,6 +9,9 @@
 use crate::ir::program::Program;
 
 /// Lower all FP16 operations to FP32 equivalents.
+///
+/// Not yet implemented: requires walking all IR instructions and replacing
+/// FP16 opcodes with FP32 equivalents plus convert instructions.
 pub fn lower_fp16_to_fp32(_program: &mut Program) {
-    todo!("LowerFp16ToFp32: replace FP16 opcodes with FP32 equivalents")
+    log::warn!("LowerFp16ToFp32 pass not yet implemented — FP16 ops left as-is");
 }

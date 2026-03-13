@@ -40,30 +40,40 @@ pub fn decompress_bcn(
     _copy: &mut BufferImageCopy,
     pixel_format: PixelFormat,
 ) {
+    // NOTE: upstream calls into bc_decoder.h (bcn::DecodeBc1..7).
+    // A Rust BCn decoder crate is not yet integrated.  Log and zero-fill the
+    // output so callers do not receive uninitialised data.
     match pixel_format {
         PixelFormat::Bc1RgbaUnorm | PixelFormat::Bc1RgbaSrgb => {
-            todo!("DecompressBCn: BC1")
+            log::warn!("DecompressBCn: BC1 not yet implemented (no BCn decoder crate)");
+            _output.fill(0);
         }
         PixelFormat::Bc2Unorm | PixelFormat::Bc2Srgb => {
-            todo!("DecompressBCn: BC2")
+            log::warn!("DecompressBCn: BC2 not yet implemented (no BCn decoder crate)");
+            _output.fill(0);
         }
         PixelFormat::Bc3Unorm | PixelFormat::Bc3Srgb => {
-            todo!("DecompressBCn: BC3")
+            log::warn!("DecompressBCn: BC3 not yet implemented (no BCn decoder crate)");
+            _output.fill(0);
         }
         PixelFormat::Bc4Snorm | PixelFormat::Bc4Unorm => {
-            todo!("DecompressBCn: BC4")
+            log::warn!("DecompressBCn: BC4 not yet implemented (no BCn decoder crate)");
+            _output.fill(0);
         }
         PixelFormat::Bc5Snorm | PixelFormat::Bc5Unorm => {
-            todo!("DecompressBCn: BC5")
+            log::warn!("DecompressBCn: BC5 not yet implemented (no BCn decoder crate)");
+            _output.fill(0);
         }
         PixelFormat::Bc6hSfloat | PixelFormat::Bc6hUfloat => {
-            todo!("DecompressBCn: BC6")
+            log::warn!("DecompressBCn: BC6 not yet implemented (no BCn decoder crate)");
+            _output.fill(0);
         }
         PixelFormat::Bc7Srgb | PixelFormat::Bc7Unorm => {
-            todo!("DecompressBCn: BC7")
+            log::warn!("DecompressBCn: BC7 not yet implemented (no BCn decoder crate)");
+            _output.fill(0);
         }
         _ => {
-            log::warn!("Unimplemented BCn decompression {:?}", pixel_format);
+            log::warn!("DecompressBCn: unimplemented format {:?}", pixel_format);
         }
     }
 }

@@ -20,5 +20,6 @@ pub fn loop_process() {
     //   server_manager->RegisterNamedService("audrec:u", IFinalOutputRecorderManager)
     //   server_manager->RegisterNamedService("audren:u", IAudioRendererManager)
     //   server_manager->RegisterNamedService("hwopus", IHardwareOpusDecoderManager)
-    todo!("Audio::LoopProcess");
+    // TODO: Wire up to ServerManager when service framework is ported.
+    log::warn!("Audio::loop_process: ServerManager not yet ported, services not registered");
 }

@@ -164,17 +164,22 @@ const fn page_align_size(size: u32) -> u32 {
 ///
 /// Maps to upstream `DecompressSegment`.
 fn decompress_segment(compressed_data: &[u8], expected_size: u32) -> Vec<u8> {
-    // TODO: Use lz4 crate for actual decompression.
-    // For now, log a warning and return empty data.
-    log::warn!(
-        "NSO LZ4 decompression not yet implemented (compressed={}, expected={})",
-        compressed_data.len(),
-        expected_size
-    );
-    // Placeholder: in production this must use Common::Compression::DecompressDataLZ4
     let mut result = vec![0u8; expected_size as usize];
-    let copy_len = std::cmp::min(compressed_data.len(), result.len());
-    result[..copy_len].copy_from_slice(&compressed_data[..copy_len]);
+    match lz4_flex::block::decompress_into(compressed_data, &mut result) {
+        Ok(written) => {
+            if written != expected_size as usize {
+                log::warn!(
+                    "NSO LZ4 decompression: expected {} bytes, got {}",
+                    expected_size, written
+                );
+            }
+        }
+        Err(e) => {
+            log::error!("NSO LZ4 decompression failed: {}", e);
+            // Return zeroed buffer on failure
+            result.fill(0);
+        }
+    }
     result
 }
 
@@ -240,12 +245,12 @@ impl AppLoaderNso {
     /// - Cheat system integration
     /// - Process memory mapping
     pub fn load_module(
-        _process: &mut KProcess,
+        process: &mut KProcess,
         _system: &mut System,
         nso_file: &dyn VfsFile,
         load_base: u64,
-        _should_pass_arguments: bool,
-        _load_into_process: bool,
+        should_pass_arguments: bool,
+        load_into_process: bool,
     ) -> Option<u64> {
         if nso_file.get_size() < std::mem::size_of::<NsoHeader>() {
             return None;
@@ -282,10 +287,35 @@ impl AppLoaderNso {
         let image_size = page_align_size(program_image.len() as u32 + bss_size);
         program_image.resize(image_size as usize, 0);
 
+        // Allocate argument data if requested
+        if should_pass_arguments {
+            let arg_start = program_image.len();
+            program_image.resize(arg_start + NSO_ARGUMENT_DATA_ALLOCATION_SIZE as usize, 0);
+            // Write NsoArgumentHeader at arg_start
+            let arg_header = NsoArgumentHeader {
+                allocated_size: NSO_ARGUMENT_DATA_ALLOCATION_SIZE,
+                actual_size: 0, // no arguments
+                _padding: [0u8; 0x18],
+            };
+            let header_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &arg_header as *const NsoArgumentHeader as *const u8,
+                    std::mem::size_of::<NsoArgumentHeader>(),
+                )
+            };
+            program_image[arg_start..arg_start + header_bytes.len()]
+                .copy_from_slice(header_bytes);
+        }
+
         // TODO: Apply patches (PatchManager), NCE patching, cheats, and
         // actually load into process memory via codeset.
 
-        Some(load_base + image_size as u64)
+        if load_into_process {
+            process.write_memory(load_base, &program_image);
+            log::info!("NSO: loaded {} bytes at {:#X}", program_image.len(), load_base);
+        }
+
+        Some(load_base + program_image.len() as u64)
     }
 }
 

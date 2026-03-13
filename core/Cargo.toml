@@ -12,6 +12,8 @@ ctr.workspace = true
 hex.workspace = true
 libc = "0.2"
 log.workspace = true
+lz4_flex.workspace = true
+rdynarmic = { workspace = true }
 memmap2.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true

@@ -8,6 +8,11 @@
 //! system and the full key derivation pipeline, matching the C++ file structure.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use common::fs::path_util::{get_ruzu_path, RuzuPath};
+use common::hex_util::hex_string_to_array;
 
 use super::sha_util::Sha256Hash;
 
@@ -322,6 +327,137 @@ pub struct KeyIndex<T: Ord> {
     pub field2: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Static key name → KeyIndex mappings (port of s128_file_id / s256_file_id / KEYS_VARIABLE_LENGTH)
+// ---------------------------------------------------------------------------
+
+/// Fixed 128-bit key names that map to a single KeyIndex (no trailing hex index).
+/// Port of upstream `s128_file_id`.
+const S128_FILE_ID: &[(&str, S128KeyType, u64, u64)] = &[
+    ("eticket_rsa_kek", S128KeyType::ETicketRSAKek, 0, 0),
+    ("eticket_rsa_kek_source", S128KeyType::Source, SourceKeyType::ETicketKek as u64, 0),
+    ("eticket_rsa_kekek_source", S128KeyType::Source, SourceKeyType::ETicketKekek as u64, 0),
+    ("rsa_kek_mask_0", S128KeyType::RSAKek, RSAKekType::Mask0 as u64, 0),
+    ("rsa_kek_seed_3", S128KeyType::RSAKek, RSAKekType::Seed3 as u64, 0),
+    ("rsa_oaep_kek_generation_source", S128KeyType::Source, SourceKeyType::RSAOaepKekGeneration as u64, 0),
+    ("sd_card_kek_source", S128KeyType::Source, SourceKeyType::SDKek as u64, 0),
+    ("aes_kek_generation_source", S128KeyType::Source, SourceKeyType::AESKekGeneration as u64, 0),
+    ("aes_key_generation_source", S128KeyType::Source, SourceKeyType::AESKeyGeneration as u64, 0),
+    ("package2_key_source", S128KeyType::Source, SourceKeyType::Package2 as u64, 0),
+    ("master_key_source", S128KeyType::Source, SourceKeyType::Master as u64, 0),
+    ("header_kek_source", S128KeyType::Source, SourceKeyType::HeaderKek as u64, 0),
+    ("key_area_key_application_source", S128KeyType::Source, SourceKeyType::KeyAreaKey as u64, KeyAreaKeyType::Application as u64),
+    ("key_area_key_ocean_source", S128KeyType::Source, SourceKeyType::KeyAreaKey as u64, KeyAreaKeyType::Ocean as u64),
+    ("key_area_key_system_source", S128KeyType::Source, SourceKeyType::KeyAreaKey as u64, KeyAreaKeyType::System as u64),
+    ("titlekek_source", S128KeyType::Source, SourceKeyType::Titlekek as u64, 0),
+    ("keyblob_mac_key_source", S128KeyType::Source, SourceKeyType::KeyblobMAC as u64, 0),
+    ("tsec_key", S128KeyType::TSEC, 0, 0),
+    ("secure_boot_key", S128KeyType::SecureBoot, 0, 0),
+    ("sd_seed", S128KeyType::SDSeed, 0, 0),
+    ("bis_key_0_crypt", S128KeyType::BIS, 0, BISKeyType::Crypto as u64),
+    ("bis_key_0_tweak", S128KeyType::BIS, 0, BISKeyType::Tweak as u64),
+    ("bis_key_1_crypt", S128KeyType::BIS, 1, BISKeyType::Crypto as u64),
+    ("bis_key_1_tweak", S128KeyType::BIS, 1, BISKeyType::Tweak as u64),
+    ("bis_key_2_crypt", S128KeyType::BIS, 2, BISKeyType::Crypto as u64),
+    ("bis_key_2_tweak", S128KeyType::BIS, 2, BISKeyType::Tweak as u64),
+    ("bis_key_3_crypt", S128KeyType::BIS, 3, BISKeyType::Crypto as u64),
+    ("bis_key_3_tweak", S128KeyType::BIS, 3, BISKeyType::Tweak as u64),
+    ("header_kek", S128KeyType::HeaderKek, 0, 0),
+    ("sd_card_kek", S128KeyType::SDKek, 0, 0),
+];
+
+/// Fixed 256-bit key names that map to a single KeyIndex.
+/// Port of upstream `s256_file_id`.
+const S256_FILE_ID: &[(&str, S256KeyType, u64, u64)] = &[
+    ("header_key", S256KeyType::Header, 0, 0),
+    ("sd_card_save_key_source", S256KeyType::SDKeySource, SDKeyType::Save as u64, 0),
+    ("sd_card_nca_key_source", S256KeyType::SDKeySource, SDKeyType::NCA as u64, 0),
+    ("header_key_source", S256KeyType::HeaderSource, 0, 0),
+    ("sd_card_save_key", S256KeyType::SDKey, SDKeyType::Save as u64, 0),
+    ("sd_card_nca_key", S256KeyType::SDKey, SDKeyType::NCA as u64, 0),
+];
+
+/// Variable-length 128-bit key names with a trailing hex revision index.
+/// Port of upstream `KEYS_VARIABLE_LENGTH`.
+/// Each entry is (key_type, sub_id, prefix_string).
+/// If sub_id == 0, the parsed hex index goes into field1; otherwise it goes into field2.
+const KEYS_VARIABLE_LENGTH: &[(S128KeyType, u64, &str)] = &[
+    (S128KeyType::Master, 0, "master_key_"),
+    (S128KeyType::Package1, 0, "package1_key_"),
+    (S128KeyType::Package2, 0, "package2_key_"),
+    (S128KeyType::Titlekek, 0, "titlekek_"),
+    (S128KeyType::Source, SourceKeyType::Keyblob as u64, "keyblob_key_source_"),
+    (S128KeyType::Keyblob, 0, "keyblob_key_"),
+    (S128KeyType::KeyblobMAC, 0, "keyblob_mac_key_"),
+];
+
+/// Key area key prefixes with their KeyAreaKeyType index.
+/// Port of upstream `kak_names` array.
+const KAK_NAMES: &[(&str, u64)] = &[
+    ("key_area_key_application_", KeyAreaKeyType::Application as u64),
+    ("key_area_key_ocean_", KeyAreaKeyType::Ocean as u64),
+    ("key_area_key_system_", KeyAreaKeyType::System as u64),
+];
+
+/// Check that a substring of `base` starting at `begin` with `length` chars consists entirely
+/// of hex digits. Port of upstream `ValidCryptoRevisionString`.
+fn valid_crypto_revision_string(base: &str, begin: usize, length: usize) -> bool {
+    if base.len() < begin + length {
+        return false;
+    }
+    base[begin..begin + length]
+        .bytes()
+        .all(|c| c.is_ascii_hexdigit())
+}
+
+/// Find a 128-bit key name in the static table.
+fn find_128_by_name(name: &str) -> Option<(S128KeyType, u64, u64)> {
+    for &(n, kt, f1, f2) in S128_FILE_ID {
+        if n == name {
+            return Some((kt, f1, f2));
+        }
+    }
+    None
+}
+
+/// Find a 256-bit key name in the static table.
+fn find_256_by_name(name: &str) -> Option<(S256KeyType, u64, u64)> {
+    for &(n, kt, f1, f2) in S256_FILE_ID {
+        if n == name {
+            return Some((kt, f1, f2));
+        }
+    }
+    None
+}
+
+/// Resolve the keys directory. Uses the common path manager (RuzuPath::KeysDir).
+/// Also searches fallback locations used by yuzu/suyu for user convenience.
+fn resolve_keys_dir() -> PathBuf {
+    // Primary: use the common path manager
+    let primary = get_ruzu_path(RuzuPath::KeysDir);
+    if primary.exists() {
+        return primary;
+    }
+
+    // Fallback locations (matching yuzu/suyu key file paths)
+    let home = std::env::var("HOME").unwrap_or_default();
+    let fallbacks = [
+        format!("{}/.local/share/yuzu/keys", home),
+        format!("{}/.config/yuzu/keys", home),
+        format!("{}/.local/share/suyu/keys", home),
+    ];
+
+    for fb in &fallbacks {
+        let p = PathBuf::from(fb);
+        if p.exists() {
+            return p;
+        }
+    }
+
+    // Return primary even if it does not exist; caller will handle missing files.
+    primary
+}
+
 /// Key manager singleton. Manages all cryptographic keys.
 /// Port of Core::Crypto::KeyManager.
 pub struct KeyManager {
@@ -338,6 +474,17 @@ pub struct KeyManager {
 }
 
 impl KeyManager {
+    /// Returns the singleton KeyManager instance.
+    ///
+    /// Corresponds to upstream `KeyManager::Instance()`.
+    /// Keys are loaded from disk once on first access.
+    pub fn instance() -> Arc<Mutex<KeyManager>> {
+        static INSTANCE: OnceLock<Arc<Mutex<KeyManager>>> = OnceLock::new();
+        INSTANCE
+            .get_or_init(|| Arc::new(Mutex::new(KeyManager::new())))
+            .clone()
+    }
+
     pub fn new() -> Self {
         let mut mgr = Self {
             s128_keys: BTreeMap::new(),
@@ -351,7 +498,7 @@ impl KeyManager {
             eticket_rsa_keypair: RsaKeyPair::default(),
             dev_mode: false,
         };
-        // TODO: mgr.reload_keys();
+        mgr.reload_keys();
         mgr
     }
 
@@ -441,9 +588,18 @@ impl KeyManager {
         self.s256_keys.insert(idx, key);
     }
 
-    pub fn key_file_exists(_title: bool) -> bool {
-        // TODO: Check for prod.keys / title.keys / dev.keys existence
-        false
+    /// Check if the key file exists on disk.
+    /// Port of upstream `KeyManager::KeyFileExists`.
+    pub fn key_file_exists(title: bool) -> bool {
+        let keys_dir = resolve_keys_dir();
+
+        if title {
+            return keys_dir.join("title.keys").exists();
+        }
+
+        // TODO: Check Settings::values.use_dev_keys when global settings are wired up
+        // For now, only check prod.keys (dev_mode = false default).
+        keys_dir.join("prod.keys").exists()
     }
 
     pub fn derive_sd_seed_lazy(&mut self) {
@@ -520,8 +676,262 @@ impl KeyManager {
         true
     }
 
+    /// Reload all keys from disk.
+    /// Port of upstream `KeyManager::ReloadKeys`.
+    ///
+    /// Loads keys from the keys directory in this order (matching upstream):
+    /// 1. prod.keys_autogenerated / dev.keys_autogenerated
+    /// 2. prod.keys / dev.keys
+    /// 3. title.keys_autogenerated
+    /// 4. title.keys
+    /// 5. console.keys_autogenerated
+    /// 6. console.keys
     pub fn reload_keys(&mut self) {
-        // TODO: Load keys from files matching upstream ReloadKeys
+        let keys_dir = resolve_keys_dir();
+
+        if !keys_dir.exists() {
+            // Attempt to create the directory, matching upstream behavior.
+            if let Err(e) = std::fs::create_dir_all(&keys_dir) {
+                log::error!("Failed to create the keys directory: {}", e);
+            }
+        }
+
+        // TODO: Read Settings::values.use_dev_keys when global settings are wired up.
+        // For now, always use prod mode (dev_mode = false).
+        self.dev_mode = false;
+
+        if self.dev_mode {
+            self.load_from_file(&keys_dir.join("dev.keys_autogenerated"), false);
+            self.load_from_file(&keys_dir.join("dev.keys"), false);
+        } else {
+            self.load_from_file(&keys_dir.join("prod.keys_autogenerated"), false);
+            self.load_from_file(&keys_dir.join("prod.keys"), false);
+        }
+
+        self.load_from_file(&keys_dir.join("title.keys_autogenerated"), true);
+        self.load_from_file(&keys_dir.join("title.keys"), true);
+        self.load_from_file(&keys_dir.join("console.keys_autogenerated"), false);
+        self.load_from_file(&keys_dir.join("console.keys"), false);
+    }
+
+    /// Load keys from a single key file.
+    /// Port of upstream `KeyManager::LoadFromFile`.
+    ///
+    /// If `is_title_keys` is true, each line is treated as `rights_id_hex = title_key_hex`,
+    /// stored as S128KeyType::Titlekey. Otherwise, the key name is matched against the
+    /// static tables (s128_file_id, s256_file_id, KEYS_VARIABLE_LENGTH, kak_names, etc.).
+    fn load_from_file(&mut self, file_path: &Path, is_title_keys: bool) {
+        if !file_path.exists() {
+            return;
+        }
+
+        let content = match std::fs::read_to_string(file_path) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("Failed to read key file {}: {}", file_path.display(), e);
+                return;
+            }
+        };
+
+        log::info!("Loading keys from {}", file_path.display());
+
+        for line in content.lines() {
+            // Split on '=' into exactly two parts
+            let mut parts = line.splitn(2, '=');
+            let name_part = match parts.next() {
+                Some(s) => s,
+                None => continue,
+            };
+            let value_part = match parts.next() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Strip all spaces (upstream does erase+remove of ' ')
+            let name: String = name_part.chars().filter(|c| *c != ' ').collect();
+            let value: String = value_part.chars().filter(|c| *c != ' ').collect();
+
+            if name.is_empty() || value.is_empty() {
+                continue;
+            }
+
+            // Skip comments
+            if name.starts_with('#') {
+                continue;
+            }
+
+            if is_title_keys {
+                // Parse rights_id (32 hex chars = 16 bytes) and title key (32 hex chars = 16 bytes)
+                if name.len() < 32 || value.len() < 32 {
+                    continue;
+                }
+                let rights_id_raw: [u8; 16] = hex_string_to_array(&name);
+                // Interpret as u128 (two u64s in little-endian byte order, matching upstream memcpy)
+                let rights_id_lo = u64::from_le_bytes([
+                    rights_id_raw[0], rights_id_raw[1], rights_id_raw[2], rights_id_raw[3],
+                    rights_id_raw[4], rights_id_raw[5], rights_id_raw[6], rights_id_raw[7],
+                ]);
+                let rights_id_hi = u64::from_le_bytes([
+                    rights_id_raw[8], rights_id_raw[9], rights_id_raw[10], rights_id_raw[11],
+                    rights_id_raw[12], rights_id_raw[13], rights_id_raw[14], rights_id_raw[15],
+                ]);
+                let key: Key128 = hex_string_to_array(&value);
+                // Upstream stores: s128_keys[{Titlekey, rights_id[1], rights_id[0]}] = key
+                // rights_id[0] is the first u64 (lo), rights_id[1] is the second u64 (hi)
+                self.s128_keys.insert(
+                    KeyIndex {
+                        key_type: S128KeyType::Titlekey,
+                        field1: rights_id_hi,
+                        field2: rights_id_lo,
+                    },
+                    key,
+                );
+            } else {
+                let lower_name = name.to_lowercase();
+
+                // Try fixed 128-bit key names
+                if let Some((kt, f1, f2)) = find_128_by_name(&lower_name) {
+                    if value.len() >= 32 {
+                        let key: Key128 = hex_string_to_array(&value);
+                        self.s128_keys.insert(
+                            KeyIndex { key_type: kt, field1: f1, field2: f2 },
+                            key,
+                        );
+                    }
+                    continue;
+                }
+
+                // Try fixed 256-bit key names
+                if let Some((kt, f1, f2)) = find_256_by_name(&lower_name) {
+                    if value.len() >= 64 {
+                        let key: Key256 = hex_string_to_array(&value);
+                        self.s256_keys.insert(
+                            KeyIndex { key_type: kt, field1: f1, field2: f2 },
+                            key,
+                        );
+                    }
+                    continue;
+                }
+
+                // Try keyblob_XX (not keyblob_key_* or keyblob_mac_key_*)
+                if lower_name.starts_with("keyblob_") && !lower_name.starts_with("keyblob_k") {
+                    if valid_crypto_revision_string(&lower_name, 8, 2) && value.len() >= 0x90 * 2
+                    {
+                        let index =
+                            u64::from_str_radix(&lower_name[8..10], 16).unwrap_or(0) as usize;
+                        if index < 0x20 {
+                            self.keyblobs[index] = hex_string_to_array(&value);
+                        }
+                    }
+                    continue;
+                }
+
+                // Try encrypted_keyblob_XX
+                if lower_name.starts_with("encrypted_keyblob_") {
+                    if valid_crypto_revision_string(&lower_name, 18, 2)
+                        && value.len() >= 0xB0 * 2
+                    {
+                        let index =
+                            u64::from_str_radix(&lower_name[18..20], 16).unwrap_or(0) as usize;
+                        if index < 0x20 {
+                            self.encrypted_keyblobs[index] = hex_string_to_array(&value);
+                        }
+                    }
+                    continue;
+                }
+
+                // Try eticket_extended_kek
+                if lower_name.starts_with("eticket_extended_kek") {
+                    if value.len() >= 576 * 2 {
+                        self.eticket_extended_kek = hex_string_to_array(&value);
+                    }
+                    continue;
+                }
+
+                // Try eticket_rsa_keypair
+                if lower_name.starts_with("eticket_rsa_keypair") {
+                    if value.len() >= 528 * 2 {
+                        let key_data: [u8; 528] = hex_string_to_array(&value);
+                        let decryption_key = &key_data[..0x100];
+                        let modulus = &key_data[0x100..0x200];
+                        let exponent = &key_data[0x200..0x204];
+                        self.eticket_rsa_keypair.decryption_key[..0x100]
+                            .copy_from_slice(decryption_key);
+                        self.eticket_rsa_keypair.modulus[..0x100].copy_from_slice(modulus);
+                        self.eticket_rsa_keypair.exponent.copy_from_slice(exponent);
+                    }
+                    continue;
+                }
+
+                // Try variable-length key names (master_key_XX, titlekek_XX, etc.)
+                let mut matched_variable = false;
+                for &(key_type, sub_id, prefix) in KEYS_VARIABLE_LENGTH {
+                    if !valid_crypto_revision_string(&lower_name, prefix.len(), 2) {
+                        continue;
+                    }
+                    if lower_name.starts_with(prefix) {
+                        let index = u64::from_str_radix(
+                            &lower_name[prefix.len()..prefix.len() + 2],
+                            16,
+                        )
+                        .unwrap_or(0);
+                        if value.len() >= 32 {
+                            let key: Key128 = hex_string_to_array(&value);
+                            if sub_id == 0 {
+                                self.s128_keys.insert(
+                                    KeyIndex { key_type, field1: index, field2: 0 },
+                                    key,
+                                );
+                            } else {
+                                self.s128_keys.insert(
+                                    KeyIndex { key_type, field1: sub_id, field2: index },
+                                    key,
+                                );
+                            }
+                        }
+                        matched_variable = true;
+                        break;
+                    }
+                }
+                if matched_variable {
+                    // Upstream does NOT continue here; it falls through to kak_names.
+                    // But note: upstream puts kak_names in an else-branch of the
+                    // KEYS_VARIABLE_LENGTH loop, so it always runs for non-variable keys.
+                    // Actually re-reading upstream: the kak_names loop is OUTSIDE the else-if
+                    // chain, in the final else block, so it only runs when no other match
+                    // was found. But it is NOT inside the for-loop break. Let me re-read...
+                    // Actually in upstream, both the KEYS_VARIABLE_LENGTH loop and the
+                    // kak_names loop are in the final `else` block sequentially.
+                    // After the KEYS_VARIABLE_LENGTH loop breaks, execution continues to
+                    // the kak_names loop. So we should NOT skip the kak_names check.
+                }
+
+                // Try key_area_key_application_XX, key_area_key_ocean_XX, key_area_key_system_XX
+                for &(prefix, kak_type) in KAK_NAMES {
+                    if lower_name.starts_with(prefix) {
+                        let suffix_start = prefix.len();
+                        if valid_crypto_revision_string(&lower_name, suffix_start, 2)
+                            && value.len() >= 32
+                        {
+                            let index = u64::from_str_radix(
+                                &lower_name[suffix_start..suffix_start + 2],
+                                16,
+                            )
+                            .unwrap_or(0);
+                            let key: Key128 = hex_string_to_array(&value);
+                            self.s128_keys.insert(
+                                KeyIndex {
+                                    key_type: S128KeyType::KeyArea,
+                                    field1: index,
+                                    field2: kak_type,
+                                },
+                                key,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn are_keys_loaded(&self) -> bool {
