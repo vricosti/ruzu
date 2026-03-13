@@ -4,6 +4,9 @@
 //! Port of zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h and arm_dynarmic_64.cpp
 //! ARM64 dynarmic backend.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
 use crate::arm::arm_interface::{
     ArmInterface, ArmInterfaceBase, Architecture, DebugWatchpoint, HaltReason, KProcess,
     KThread, ThreadContext,
@@ -56,8 +59,9 @@ struct DynarmicCallbacks64 {
     /// Shared guest memory reference.
     /// Corresponds to upstream `m_memory` (Core::Memory::Memory&).
     memory: SharedProcessMemory,
-    /// SVC number from last supervisor call
-    svc: u32,
+    /// SVC number from last supervisor call, shared with parent ArmDynarmic64.
+    /// Upstream: callback writes to m_parent.m_svc via back-reference.
+    svc: Arc<AtomicU32>,
     /// TPIDRRO_EL0 system register (read-only thread ID)
     tpidrro_el0: u64,
     /// TPIDR_EL0 system register (read-write thread ID)
@@ -65,10 +69,10 @@ struct DynarmicCallbacks64 {
 }
 
 impl DynarmicCallbacks64 {
-    fn new(memory: SharedProcessMemory) -> Self {
+    fn new(memory: SharedProcessMemory, svc: Arc<AtomicU32>) -> Self {
         Self {
             memory,
-            svc: 0,
+            svc,
             tpidrro_el0: 0,
             tpidr_el0: 0,
         }
@@ -83,8 +87,10 @@ impl JitCallbacks for DynarmicCallbacks64 {
         if mem.is_valid_range(vaddr, 4) {
             Some(mem.read_32(vaddr))
         } else {
-            log::warn!("memory_read_code({:#x}): out of range", vaddr);
-            None
+            // Return UDF (permanently undefined) instruction to trigger a clean
+            // exception rather than hanging when code branches to unmapped memory.
+            log::warn!("memory_read_code({:#x}): unmapped, returning UDF", vaddr);
+            Some(0x00000000) // A64: UDF #0
         }
     }
 
@@ -207,7 +213,7 @@ impl JitCallbacks for DynarmicCallbacks64 {
     }
 
     fn call_supervisor(&mut self, svc_num: u32) {
-        self.svc = svc_num;
+        self.svc.store(svc_num, Ordering::Relaxed);
         // The JIT will halt with SVC halt reason after this callback returns
     }
 
@@ -246,8 +252,9 @@ pub struct ArmDynarmic64 {
     /// Core index for this CPU
     core_index: usize,
 
-    /// SVC callback number (read from callbacks after halt)
-    svc: u32,
+    /// SVC callback number, shared with DynarmicCallbacks64.
+    /// Upstream: m_svc written by callback via m_parent reference.
+    svc: Arc<AtomicU32>,
 
     /// Watchpoint that caused a halt
     halted_watchpoint: Option<DebugWatchpoint>,
@@ -282,7 +289,8 @@ impl ArmDynarmic64 {
         shared_memory: SharedProcessMemory,
     ) -> Self {
         // Create JIT callbacks with shared memory reference
-        let callbacks = DynarmicCallbacks64::new(shared_memory);
+        let svc = Arc::new(AtomicU32::new(0));
+        let callbacks = DynarmicCallbacks64::new(shared_memory, svc.clone());
 
         // Configure JIT
         // Upstream: enable_cycle_counting = !uses_wall_clock
@@ -309,7 +317,7 @@ impl ArmDynarmic64 {
         Self {
             base: ArmInterfaceBase::new(uses_wall_clock),
             core_index,
-            svc: 0,
+            svc,
             halted_watchpoint: None,
             breakpoint_context: ThreadContext::default(),
             jit,
@@ -468,7 +476,7 @@ impl ArmInterface for ArmDynarmic64 {
     }
 
     fn get_svc_number(&self) -> u32 {
-        self.svc
+        self.svc.load(Ordering::Relaxed)
     }
 
     fn signal_interrupt(&mut self, _thread: &mut KThread) {
