@@ -523,3 +523,21 @@ The following upstream directories are **intentionally not ported** and should n
 ### `tests` — `/home/vricosti/shared/zuyu/src/tests`
 
 **Not ported.** Upstream C++ test suite. Rust tests are written natively alongside each crate using `#[cfg(test)]` modules and `cargo test`.
+
+---
+
+## Testing yuzu-cmd
+
+### Manual test with Mario Kart 8 Deluxe (AArch32)
+
+```bash
+cargo run --bin yuzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+```
+
+With debug logging:
+
+```bash
+RUST_LOG=info cargo run --bin yuzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+```
+
+**Note:** MK8D is an ARM32 (AArch32) game — title ID `0100152000022000`.

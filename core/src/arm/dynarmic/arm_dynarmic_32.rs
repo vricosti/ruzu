@@ -4,6 +4,9 @@
 //! Port of zuyu/src/core/arm/dynarmic/arm_dynarmic_32.h and arm_dynarmic_32.cpp
 //! ARM32 dynarmic backend.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
 use crate::arm::arm_interface::{
     ArmInterface, ArmInterfaceBase, Architecture, DebugWatchpoint, HaltReason, KProcess,
     KThread, ThreadContext,
@@ -46,13 +49,14 @@ fn translate_halt_reason(hr: rdynarmic::halt_reason::HaltReason) -> HaltReason {
 struct DynarmicCallbacks32 {
     /// Shared guest memory reference.
     memory: SharedProcessMemory,
-    /// SVC/SWI number from last supervisor call
-    svc_swi: u32,
+    /// SVC/SWI number from last supervisor call, shared with parent ArmDynarmic32.
+    /// Upstream: callback writes to m_parent.m_svc_swi via back-reference.
+    svc_swi: Arc<AtomicU32>,
 }
 
 impl DynarmicCallbacks32 {
-    fn new(memory: SharedProcessMemory) -> Self {
-        Self { memory, svc_swi: 0 }
+    fn new(memory: SharedProcessMemory, svc_swi: Arc<AtomicU32>) -> Self {
+        Self { memory, svc_swi }
     }
 }
 
@@ -62,8 +66,11 @@ impl JitCallbacks for DynarmicCallbacks32 {
         if mem.is_valid_range(vaddr, 4) {
             Some(mem.read_32(vaddr))
         } else {
-            log::warn!("DynarmicCallbacks32::memory_read_code({:#x}): out of range", vaddr);
-            None
+            // Return UDF (permanently undefined) instruction to trigger a clean
+            // exception rather than hanging when code branches to unmapped memory.
+            // ARM encoding: 0xE7F000F0 = UDF #0
+            log::warn!("DynarmicCallbacks32::memory_read_code({:#x}): unmapped, returning UDF", vaddr);
+            Some(0xE7F000F0)
         }
     }
 
@@ -163,7 +170,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn call_supervisor(&mut self, svc_num: u32) {
-        self.svc_swi = svc_num;
+        self.svc_swi.store(svc_num, Ordering::Relaxed);
     }
 
     fn exception_raised(&mut self, pc: u64, exception: u64) {
@@ -198,8 +205,9 @@ pub struct ArmDynarmic32 {
     /// Core index for this CPU
     core_index: usize,
 
-    /// SVC callback number
-    svc_swi: u32,
+    /// SVC callback number, shared with DynarmicCallbacks32.
+    /// Upstream: m_svc_swi written by callback via m_parent reference.
+    svc_swi: Arc<AtomicU32>,
 
     /// Watchpoint that caused a halt
     halted_watchpoint: Option<DebugWatchpoint>,
@@ -226,7 +234,8 @@ impl ArmDynarmic32 {
         core_index: usize,
         shared_memory: SharedProcessMemory,
     ) -> Self {
-        let callbacks = DynarmicCallbacks32::new(shared_memory);
+        let svc_swi = Arc::new(AtomicU32::new(0));
+        let callbacks = DynarmicCallbacks32::new(shared_memory, svc_swi.clone());
 
         let config = JitConfig {
             callbacks: Box::new(callbacks),
@@ -250,7 +259,7 @@ impl ArmDynarmic32 {
         Self {
             base: ArmInterfaceBase::new(uses_wall_clock),
             core_index,
-            svc_swi: 0,
+            svc_swi,
             halted_watchpoint: None,
             breakpoint_context: ThreadContext::default(),
             jit,
@@ -399,11 +408,11 @@ impl ArmInterface for ArmDynarmic32 {
             }
         };
 
-        // Upstream maps ThreadContext back to A32 GPRs
-        for i in 0..15 {
+        // Upstream maps ThreadContext back to A32 GPRs.
+        // Upstream loops 0..16, reading all 16 GPRs (including R15/PC) from ctx.r[i].
+        for i in 0..16 {
             jit.set_register(i, ctx.r[i] as u32);
         }
-        jit.set_register(15, ctx.pc as u32);
 
         jit.set_cpsr(ctx.pstate);
 
@@ -458,7 +467,7 @@ impl ArmInterface for ArmDynarmic32 {
     }
 
     fn get_svc_number(&self) -> u32 {
-        self.svc_swi
+        self.svc_swi.load(Ordering::Relaxed)
     }
 
     fn signal_interrupt(&mut self, _thread: &mut KThread) {
