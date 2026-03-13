@@ -689,6 +689,41 @@ pub struct MifareReadData {
     pub data: [u8; 16],
 }
 
+/// Port of `InputReportPassive` struct from joycon_types.h
+///
+/// #pragma pack(push, 1) in upstream — repr(C, packed) here.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C, packed)]
+pub struct InputReportPassive {
+    pub report_mode: u8,
+    pub button_input: u16,
+    pub stick_state: u8,
+    pub unknown_data: [u8; 10],
+}
+const _: () = assert!(std::mem::size_of::<InputReportPassive>() == 0xE);
+
+/// Port of `InputReportActive` struct from joycon_types.h
+///
+/// #pragma pack(push, 1) in upstream — repr(C, packed) here.
+/// motion_input is 6*2 = 12 i16 values (3 samples of accel+gyro).
+/// Upstream uses `std::array<s16, 6 * 2>` which is 6 sensors × 2 samples but
+/// the code only uses indices 0..5 (first sample). The struct is 0x29 bytes.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C, packed)]
+pub struct InputReportActive {
+    pub report_mode: u8,
+    pub packet_id: u8,
+    pub battery_status: u8,
+    pub button_input: [u8; 3],
+    pub left_stick_state: [u8; 3],
+    pub right_stick_state: [u8; 3],
+    pub vibration_code: u8,
+    pub motion_input: [i16; 12],
+    pub _pad: [u8; 2],
+    pub ring_input: i16,
+}
+const _: () = assert!(std::mem::size_of::<InputReportActive>() == 0x29);
+
 /// Port of `JoyconCallbacks` struct from joycon_types.h
 pub struct JoyconCallbacks {
     pub on_battery_data: Option<Box<dyn Fn(Battery) + Send + Sync>>,

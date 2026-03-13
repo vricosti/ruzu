@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2025 ruzu contributors
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of `ir_opt/lower_int64_to_int32.cpp`
 //!
@@ -8,7 +8,10 @@
 
 use crate::ir::program::Program;
 
-/// Lower all 64-bit integer operations to 32-bit pairs.
+/// Lower all 64-bit integer operations to 32-bit hi/lo pairs.
+///
+/// Not yet implemented: requires walking all IR instructions and splitting
+/// 64-bit integer opcodes into 32-bit pairs.
 pub fn lower_int64_to_int32(_program: &mut Program) {
-    todo!("LowerInt64ToInt32: split 64-bit integer ops into 32-bit hi/lo pairs")
+    log::warn!("LowerInt64ToInt32 pass not yet implemented — 64-bit integer ops left as-is");
 }

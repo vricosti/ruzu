@@ -49,8 +49,13 @@ struct HleDrawArraysIndirect {
 
 impl CachedMacro for HleDrawArraysIndirect {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // TODO: Wire to Maxwell3D draw_manager when engines are integrated
-        todo!("HLE_DrawArraysIndirect::Execute")
+        // Stubbed — requires Maxwell3D reference to call draw_manager->DrawArrayIndirect()
+        // and set indirect draw parameters.
+        // Upstream: HLE_DrawArraysIndirect<extended>::Execute() in video_core/macro/macro_hle.cpp
+        log::warn!(
+            "HLE_DrawArraysIndirect(extended={}): not yet implemented (requires Maxwell3D integration)",
+            self.extended
+        );
     }
 }
 
@@ -63,7 +68,13 @@ struct HleDrawIndexedIndirect {
 
 impl CachedMacro for HleDrawIndexedIndirect {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_DrawIndexedIndirect::Execute")
+        // Stubbed — requires Maxwell3D reference to call draw_manager->DrawIndexedIndirect()
+        // and set element_base/base_instance registers.
+        // Upstream: HLE_DrawIndexedIndirect<extended>::Execute() in video_core/macro/macro_hle.cpp
+        log::warn!(
+            "HLE_DrawIndexedIndirect(extended={}): not yet implemented (requires Maxwell3D integration)",
+            self.extended
+        );
     }
 }
 
@@ -74,7 +85,10 @@ struct HleMultiLayerClear;
 
 impl CachedMacro for HleMultiLayerClear {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_MultiLayerClear::Execute")
+        // Stubbed — requires Maxwell3D reference to decode ClearSurface params and
+        // call draw_manager->Clear(num_layers).
+        // Upstream: HLE_MultiLayerClear::Execute() in video_core/macro/macro_hle.cpp
+        log::warn!("HLE_MultiLayerClear: not yet implemented (requires Maxwell3D integration)");
     }
 }
 
@@ -85,7 +99,10 @@ struct HleMultiDrawIndexedIndirectCount;
 
 impl CachedMacro for HleMultiDrawIndexedIndirectCount {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_MultiDrawIndexedIndirectCount::Execute")
+        // Stubbed — requires Maxwell3D reference to set indirect draw parameters and call
+        // draw_manager->DrawIndexedIndirect() with count/stride from parameters.
+        // Upstream: HLE_MultiDrawIndexedIndirectCount::Execute() in video_core/macro/macro_hle.cpp
+        log::warn!("HLE_MultiDrawIndexedIndirectCount: not yet implemented (requires Maxwell3D integration)");
     }
 }
 
@@ -96,7 +113,10 @@ struct HleDrawIndirectByteCount;
 
 impl CachedMacro for HleDrawIndirectByteCount {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_DrawIndirectByteCount::Execute")
+        // Stubbed — requires Maxwell3D reference to set draw_auto_stride/byte_count registers
+        // and call draw_manager->DrawArrayIndirect(topology) with is_byte_count=true.
+        // Upstream: HLE_DrawIndirectByteCount::Execute() in video_core/macro/macro_hle.cpp
+        log::warn!("HLE_DrawIndirectByteCount: not yet implemented (requires Maxwell3D integration)");
     }
 }
 
@@ -107,7 +127,16 @@ struct HleC713C83d8f63Ccf3;
 
 impl CachedMacro for HleC713C83d8f63Ccf3 {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_C713C83D8F63CCF3::Execute")
+        // Stubbed — requires Maxwell3D register access to read shadow_scratch[24] and
+        // write const_buffer.{size, address_high, address_low, offset}.
+        // Upstream: HLE_C713C83D8F63CCF3::Execute() in video_core/macro/macro_hle.cpp:
+        //   offset = (params[0] & 0x3FFFFFFF) << 2
+        //   address = regs.shadow_scratch[24]
+        //   const_buffer.size = 0x7000
+        //   const_buffer.address_high = (address >> 24) & 0xFF
+        //   const_buffer.address_low = address << 8
+        //   const_buffer.offset = offset
+        log::warn!("HLE_C713C83D8F63CCF3: not yet implemented (requires Maxwell3D integration)");
     }
 }
 
@@ -118,7 +147,16 @@ struct HleD7333d26e0a93Ede;
 
 impl CachedMacro for HleD7333d26e0a93Ede {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_D7333D26E0A93EDE::Execute")
+        // Stubbed — requires Maxwell3D register access to read shadow_scratch[42+index] and
+        // shadow_scratch[47+index] and write const_buffer.{size, address_high, address_low}.
+        // Upstream: HLE_D7333D26E0A93EDE::Execute() in video_core/macro/macro_hle.cpp:
+        //   index = params[0]
+        //   address = regs.shadow_scratch[42 + index]
+        //   size = regs.shadow_scratch[47 + index]
+        //   const_buffer.size = size
+        //   const_buffer.address_high = (address >> 24) & 0xFF
+        //   const_buffer.address_low = address << 8
+        log::warn!("HLE_D7333D26E0A93EDE: not yet implemented (requires Maxwell3D integration)");
     }
 }
 
@@ -129,7 +167,17 @@ struct HleBindShader;
 
 impl CachedMacro for HleBindShader {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_BindShader::Execute")
+        // Stubbed — requires Maxwell3D register access to update pipelines[index].offset,
+        // shadow_scratch entries, const_buffer address fields, and call ProcessCBBind.
+        // Upstream: HLE_BindShader::Execute() in video_core/macro/macro_hle.cpp:
+        //   index = params[0]; if params[1] == shadow_scratch[28+index] => early return
+        //   regs.pipelines[index & 0xF].offset = params[2]
+        //   dirty.flags[Shaders] = true
+        //   shadow_scratch[28+index] = params[1]; shadow_scratch[34+index] = params[2]
+        //   address = params[4]
+        //   const_buffer.{size=0x10000, address_high, address_low, offset=0}
+        //   bind_group[params[3] & 0x7F].raw_config = 0x11; ProcessCBBind(bind_group_id)
+        log::warn!("HLE_BindShader: not yet implemented (requires Maxwell3D integration)");
     }
 }
 
@@ -140,7 +188,15 @@ struct HleSetRasterBoundingBox;
 
 impl CachedMacro for HleSetRasterBoundingBox {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_SetRasterBoundingBox::Execute")
+        // Stubbed — requires Maxwell3D register access to read conservative_raster_enable
+        // and shadow_scratch[52], then write raster_bounding_box.
+        // Upstream: HLE_SetRasterBoundingBox::Execute() in video_core/macro/macro_hle.cpp:
+        //   raster_mode = params[0]
+        //   raster_enabled = regs.conservative_raster_enable
+        //   scratch_data = regs.shadow_scratch[52]
+        //   regs.raster_bounding_box.raw = raster_mode & 0xFFFFF00F
+        //   regs.raster_bounding_box.pad = scratch_data & raster_enabled
+        log::warn!("HLE_SetRasterBoundingBox: not yet implemented (requires Maxwell3D integration)");
     }
 }
 
@@ -153,7 +209,18 @@ struct HleClearConstBuffer {
 
 impl CachedMacro for HleClearConstBuffer {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_ClearConstBuffer::Execute")
+        // Stubbed — requires Maxwell3D register access to set const_buffer registers
+        // and call ProcessCBMultiData with a zero buffer of base_size entries.
+        // Upstream: HLE_ClearConstBuffer<base_size>::Execute() in video_core/macro/macro_hle.cpp:
+        //   regs.const_buffer.size = base_size
+        //   regs.const_buffer.address_high = params[0]
+        //   regs.const_buffer.address_low  = params[1]
+        //   regs.const_buffer.offset = 0
+        //   ProcessCBMultiData(zeroes.data(), params[2] * 4)
+        log::warn!(
+            "HLE_ClearConstBuffer(base_size=0x{:X}): not yet implemented (requires Maxwell3D integration)",
+            self.base_size
+        );
     }
 }
 
@@ -167,7 +234,14 @@ struct HleClearMemory {
 
 impl CachedMacro for HleClearMemory {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_ClearMemory::Execute")
+        // Stubbed — requires Maxwell3D register access to set upload registers and call
+        // CallMethod(launch_dma) + CallMultiMethod(inline_data) with zeroed memory.
+        // Upstream: HLE_ClearMemory::Execute() in video_core/macro/macro_hle.cpp:
+        //   needed_memory = params[2] / sizeof(u32)
+        //   regs.upload.{line_length_in=params[2], line_count=1, dest.address_{high,low}}
+        //   CallMethod(MAXWELL3D_REG_INDEX(launch_dma), 0x1011, true)
+        //   CallMultiMethod(MAXWELL3D_REG_INDEX(inline_data), zero_memory, needed_memory, ...)
+        log::warn!("HLE_ClearMemory: not yet implemented (requires Maxwell3D integration)");
     }
 }
 
@@ -178,7 +252,17 @@ struct HleTransformFeedbackSetup;
 
 impl CachedMacro for HleTransformFeedbackSetup {
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("HLE_TransformFeedbackSetup::Execute")
+        // Stubbed — requires Maxwell3D register access to set transform_feedback_enabled,
+        // clear buffer start_offsets, set upload dest address, call CallMethod(launch_dma)
+        // and CallMethod(inline_data) with the TF stride, then RegisterTransformFeedback.
+        // Upstream: HLE_TransformFeedbackSetup::Execute() in video_core/macro/macro_hle.cpp:
+        //   regs.transform_feedback_enabled = 1
+        //   regs.transform_feedback.buffers[0..3].start_offset = 0
+        //   regs.upload.{line_length_in=4, line_count=1, dest.{address_high=params[0], address_low=params[1]}}
+        //   CallMethod(launch_dma, 0x1011, true)
+        //   CallMethod(inline_data, tf.controls[0].stride, true)
+        //   Rasterizer().RegisterTransformFeedback(upload.dest.Address())
+        log::warn!("HLE_TransformFeedbackSetup: not yet implemented (requires Maxwell3D integration)");
     }
 }
 

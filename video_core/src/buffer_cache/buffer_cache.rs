@@ -49,6 +49,17 @@ const DISABLE_DOWNLOADS: bool = true;
 /// Number of page-table entries: covers 2^34 bytes / CACHING_PAGESIZE.
 const PAGE_TABLE_SIZE: usize = (1u64 << 34) as usize >> CACHING_PAGEBITS;
 
+/// Stream score threshold above which a buffer region is treated as a stream buffer.
+const STREAM_LEAP_THRESHOLD: i32 = 16;
+
+/// Device page size (4 KiB). Matches `Core::DEVICE_PAGESIZE` upstream.
+const DEVICE_PAGESIZE: u64 = 4096;
+
+/// Address space bits used by the Maxwell device memory manager.
+///
+/// Upstream: `Tegra::MaxwellDeviceMemoryManager::AS_BITS = 34`.
+const AS_BITS: u32 = 34;
+
 // ---------------------------------------------------------------------------
 // BufferCache<P>
 // ---------------------------------------------------------------------------
@@ -141,8 +152,55 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // -----------------------------------------------------------------------
 
     /// Advance one frame: run GC, update cache statistics, tick delayed destruction.
+    ///
+    /// Upstream: `BufferCache<P>::TickFrame`
+    ///
+    /// NOTE: Parts of this method that require `runtime` (TickFrame, CanReportMemoryUsage,
+    /// GetDeviceMemoryUsage) and `delayed_destruction_ring` are stubbed out — those types
+    /// are not yet available in this port.
     pub fn tick_frame(&mut self) {
-        todo!()
+        // Homebrew console apps don't create or bind any channels, so this will be None.
+        if self.channel_state.is_none() {
+            return;
+        }
+
+        // Calculate hits and shots and move hit bits to the right (shift history window).
+        // Upstream: std::reduce + std::copy_n to shift history arrays left by one.
+        if let Some(ref mut cs) = self.channel_state {
+            let hits: u32 = cs.uniform_cache_hits.iter().copied().sum();
+            let shots: u32 = cs.uniform_cache_shots.iter().copied().sum();
+
+            // Shift history: copy [0..N-1] into [1..N], then zero slot 0.
+            for i in (1..cs.uniform_cache_hits.len()).rev() {
+                cs.uniform_cache_hits[i] = cs.uniform_cache_hits[i - 1];
+            }
+            for i in (1..cs.uniform_cache_shots.len()).rev() {
+                cs.uniform_cache_shots[i] = cs.uniform_cache_shots[i - 1];
+            }
+            cs.uniform_cache_hits[0] = 0;
+            cs.uniform_cache_shots[0] = 0;
+
+            // Determine whether to skip the cache for small uniform buffers.
+            // Upstream: skip_preferred = hits * 256 < shots * 251
+            let skip_preferred = hits.saturating_mul(256) < shots.saturating_mul(251);
+            cs.uniform_buffer_skip_cache_size = if skip_preferred {
+                DEFAULT_SKIP_CACHE_SIZE
+            } else {
+                0
+            };
+        }
+
+        // TODO: runtime.TickFrame(slot_buffers) — runtime not yet available.
+        // TODO: total_used_memory = runtime.GetDeviceMemoryUsage() if CanReportMemoryUsage.
+
+        if self.total_used_memory >= self.minimum_memory {
+            self.run_garbage_collector();
+        }
+
+        self.frame_tick += 1;
+
+        // TODO: delayed_destruction_ring.Tick() — not yet ported.
+        // TODO: async_buffers_death_ring cleanup — requires runtime staging buffer free.
     }
 
     // -----------------------------------------------------------------------
@@ -150,43 +208,145 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // -----------------------------------------------------------------------
 
     /// Notify the cache that a CPU write happened at `[device_addr, device_addr+size)`.
+    ///
+    /// Upstream: `BufferCache<P>::WriteMemory`
     pub fn write_memory(&mut self, device_addr: VAddr, size: u64) {
-        todo!()
+        if self.memory_tracker.is_region_gpu_modified(device_addr, size) {
+            self.clear_download(device_addr, size);
+            Self::range_subtract(&mut self.gpu_modified_ranges, device_addr, size);
+        }
+        self.memory_tracker.mark_region_as_cpu_modified(device_addr, size);
     }
 
     /// Notify the cache about a cached (deferred) CPU write.
+    ///
+    /// Upstream: `BufferCache<P>::CachedWriteMemory`
+    ///
+    /// NOTE: `device_memory.ReadBlockUnsafe` is not available; the inline path falls back to
+    /// `write_memory` for non-GPU-modified regions and logs a warning for the inline path.
     pub fn cached_write_memory(&mut self, device_addr: VAddr, size: u64) {
-        todo!()
+        let is_dirty = self.is_region_registered(device_addr, size as usize);
+        if !is_dirty {
+            return;
+        }
+        let aligned_start = device_addr & !(DEVICE_PAGESIZE - 1);
+        let aligned_end = (device_addr + size + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1);
+        if !self.is_region_gpu_modified(aligned_start, (aligned_end - aligned_start) as usize) {
+            self.write_memory(device_addr, size);
+            return;
+        }
+        // TODO: device_memory.ReadBlockUnsafe — not yet available in this port.
+        // Upstream reads back current memory content and calls InlineMemoryImplementation.
+        // We fall through to write_memory as a safe approximation.
+        log::warn!(
+            "cached_write_memory: GPU-modified region at {:#x}+{} — inline path requires \
+             device_memory which is not yet ported; falling back to write_memory",
+            device_addr,
+            size
+        );
+        self.write_memory(device_addr, size);
     }
 
     /// Called when a CPU write is detected. Returns true if the caller must
     /// flush GPU-modified data first.
+    ///
+    /// Upstream: `BufferCache<P>::OnCPUWrite`
     pub fn on_cpu_write(&mut self, device_addr: VAddr, size: u64) -> bool {
-        todo!()
+        let is_dirty = self.is_region_registered(device_addr, size as usize);
+        if !is_dirty {
+            return false;
+        }
+        if self.memory_tracker.is_region_gpu_modified(device_addr, size) {
+            return true;
+        }
+        self.write_memory(device_addr, size);
+        false
     }
 
     /// Download GPU-modified memory back to the CPU for the given range.
+    ///
+    /// Upstream: `BufferCache<P>::DownloadMemory`
     pub fn download_memory(&mut self, device_addr: VAddr, size: u64) {
-        todo!()
+        // Collect overlapping buffer IDs first to avoid borrow issues.
+        let mut buffer_ids = Vec::new();
+        {
+            let page_end = div_ceil(device_addr + size, CACHING_PAGESIZE);
+            let mut page = device_addr >> CACHING_PAGEBITS;
+            while page < page_end {
+                let buffer_id = self.page_table[page as usize];
+                if !buffer_id.is_valid() {
+                    page += 1;
+                    continue;
+                }
+                if !buffer_ids.contains(&buffer_id) {
+                    buffer_ids.push(buffer_id);
+                }
+                let buffer = &self.slot_buffers[buffer_id];
+                let end_addr = buffer.cpu_addr() + buffer.size_bytes() as u64;
+                page = div_ceil(end_addr, CACHING_PAGESIZE);
+            }
+        }
+        for buffer_id in buffer_ids {
+            self.download_buffer_memory_range(buffer_id, device_addr, size);
+        }
     }
 
     /// Get the flush area for a device address range.
+    ///
+    /// Upstream: `BufferCache<P>::GetFlushArea`
     pub fn get_flush_area(
         &mut self,
-        _device_addr: VAddr,
-        _size: u64,
+        device_addr: VAddr,
+        size: u64,
     ) -> Option<RasterizerDownloadArea> {
-        todo!()
+        let device_addr_start_aligned = device_addr & !(DEVICE_PAGESIZE - 1);
+        let device_addr_end_aligned =
+            (device_addr + size + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1);
+
+        if self.memory_tracker.is_region_preflushable(device_addr, size) {
+            return Some(RasterizerDownloadArea {
+                start_address: device_addr_start_aligned,
+                end_address: device_addr_end_aligned,
+                preemtive: true,
+            });
+        }
+
+        let preemtive = !self.is_region_gpu_modified(
+            device_addr_start_aligned,
+            (device_addr_end_aligned - device_addr_start_aligned) as usize,
+        );
+        self.memory_tracker.mark_region_as_preflushable(
+            device_addr_start_aligned,
+            device_addr_end_aligned - device_addr_start_aligned,
+        );
+
+        Some(RasterizerDownloadArea {
+            start_address: device_addr_start_aligned,
+            end_address: device_addr_end_aligned,
+            preemtive,
+        })
     }
 
     /// Inline a small memory write directly into the buffer.
+    ///
+    /// Upstream: `BufferCache<P>::InlineMemory`
     pub fn inline_memory(
         &mut self,
-        _dest_address: VAddr,
-        _copy_size: usize,
-        _inlined_buffer: &[u8],
+        dest_address: VAddr,
+        copy_size: usize,
+        inlined_buffer: &[u8],
     ) -> bool {
-        todo!()
+        let is_dirty = self.is_region_registered(dest_address, copy_size);
+        if !is_dirty {
+            return false;
+        }
+        let aligned_start = dest_address & !(DEVICE_PAGESIZE - 1);
+        let aligned_end = (dest_address + copy_size as u64 + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1);
+        if !self.is_region_gpu_modified(aligned_start, (aligned_end - aligned_start) as usize) {
+            return false;
+        }
+        self.inline_memory_implementation(dest_address, copy_size, inlined_buffer);
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -194,62 +354,157 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // -----------------------------------------------------------------------
 
     /// Bind a graphics uniform buffer.
+    ///
+    /// Upstream: `BufferCache<P>::BindGraphicsUniformBuffer`
+    ///
+    /// NOTE: `gpu_memory->GpuToCpuAddress` is not yet available. We store `gpu_addr`
+    /// directly in the `device_addr` field as a placeholder.
     pub fn bind_graphics_uniform_buffer(
         &mut self,
-        _stage: usize,
-        _index: u32,
-        _gpu_addr: u64,
-        _size: u32,
+        stage: usize,
+        index: u32,
+        gpu_addr: u64,
+        size: u32,
     ) {
-        todo!()
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        // TODO: translate gpu_addr via gpu_memory->GpuToCpuAddress once available.
+        let binding = Binding {
+            device_addr: gpu_addr,
+            size,
+            buffer_id: NULL_BUFFER_ID,
+        };
+        if stage < NUM_STAGES as usize && (index as usize) < NUM_GRAPHICS_UNIFORM_BUFFERS as usize {
+            cs.uniform_buffers[stage][index as usize] = binding;
+        }
     }
 
     /// Disable a graphics uniform buffer.
-    pub fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {
-        todo!()
+    ///
+    /// Upstream: `BufferCache<P>::DisableGraphicsUniformBuffer`
+    pub fn disable_graphics_uniform_buffer(&mut self, stage: usize, index: u32) {
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        if stage < NUM_STAGES as usize && (index as usize) < NUM_GRAPHICS_UNIFORM_BUFFERS as usize {
+            cs.uniform_buffers[stage][index as usize] = NULL_BINDING;
+        }
     }
 
     /// Update all graphics buffer bindings.
-    pub fn update_graphics_buffers(&mut self, _is_indexed: bool) {
-        todo!()
+    ///
+    /// Upstream: `BufferCache<P>::UpdateGraphicsBuffers`
+    pub fn update_graphics_buffers(&mut self, is_indexed: bool) {
+        if self.channel_state.is_none() {
+            return;
+        }
+        loop {
+            if let Some(ref mut cs) = self.channel_state {
+                cs.has_deleted_buffers = false;
+            }
+            self.do_update_graphics_buffers(is_indexed);
+            if let Some(ref cs) = self.channel_state {
+                if !cs.has_deleted_buffers {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
     }
 
     /// Update all compute buffer bindings.
+    ///
+    /// Upstream: `BufferCache<P>::UpdateComputeBuffers`
     pub fn update_compute_buffers(&mut self) {
-        todo!()
+        if self.channel_state.is_none() {
+            return;
+        }
+        loop {
+            if let Some(ref mut cs) = self.channel_state {
+                cs.has_deleted_buffers = false;
+            }
+            self.do_update_compute_buffers();
+            if let Some(ref cs) = self.channel_state {
+                if !cs.has_deleted_buffers {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
     }
 
     /// Bind host geometry buffers (index + vertex).
-    pub fn bind_host_geometry_buffers(&mut self, _is_indexed: bool) {
-        todo!()
+    ///
+    /// Upstream: `BufferCache<P>::BindHostGeometryBuffers`
+    ///
+    /// NOTE: draw state (maxwell3d, current_draw_indirect) not yet available.
+    pub fn bind_host_geometry_buffers(&mut self, is_indexed: bool) {
+        if is_indexed {
+            self.bind_host_index_buffer();
+        }
+        // Non-indexed quad topology path requires maxwell3d draw state — stubbed.
+        self.bind_host_vertex_buffers();
+        self.bind_host_transform_feedback_buffers();
+        // TODO: if current_draw_indirect — requires engine state not yet ported.
     }
 
     /// Bind host stage buffers.
-    pub fn bind_host_stage_buffers(&mut self, _stage: usize) {
-        todo!()
+    ///
+    /// Upstream: `BufferCache<P>::BindHostStageBuffers`
+    pub fn bind_host_stage_buffers(&mut self, stage: usize) {
+        self.bind_host_graphics_uniform_buffers(stage);
+        self.bind_host_graphics_storage_buffers(stage);
+        self.bind_host_graphics_texture_buffers(stage);
     }
 
     /// Bind host compute buffers.
+    ///
+    /// Upstream: `BufferCache<P>::BindHostComputeBuffers`
     pub fn bind_host_compute_buffers(&mut self) {
-        todo!()
+        self.bind_host_compute_uniform_buffers();
+        self.bind_host_compute_storage_buffers();
+        self.bind_host_compute_texture_buffers();
     }
 
     /// Set the uniform buffer state for graphics stages.
+    ///
+    /// Upstream: `BufferCache<P>::SetUniformBuffersState`
     pub fn set_uniform_buffers_state(
         &mut self,
-        _mask: &[u32; NUM_STAGES as usize],
-        _sizes: &UniformBufferSizes,
+        mask: &[u32; NUM_STAGES as usize],
+        sizes: &UniformBufferSizes,
     ) {
-        todo!()
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS && cs.enabled_uniform_buffer_masks != *mask {
+            if P::IS_OPENGL {
+                cs.fast_bound_uniform_buffers.fill(0);
+            }
+            cs.dirty_uniform_buffers.fill(!0u32);
+            cs.uniform_buffer_binding_sizes = [[0u32; NUM_GRAPHICS_UNIFORM_BUFFERS as usize];
+                NUM_STAGES as usize];
+        }
+        cs.enabled_uniform_buffer_masks = *mask;
+        cs.uniform_buffer_sizes = Some(Box::new(*sizes));
     }
 
     /// Set the uniform buffer state for compute.
+    ///
+    /// Upstream: `BufferCache<P>::SetComputeUniformBufferState`
     pub fn set_compute_uniform_buffer_state(
         &mut self,
-        _mask: u32,
-        _sizes: &ComputeUniformBufferSizes,
+        mask: u32,
+        sizes: &ComputeUniformBufferSizes,
     ) {
-        todo!()
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        cs.enabled_compute_uniform_buffer_mask = mask;
+        cs.compute_uniform_buffer_sizes = Some(Box::new(*sizes));
     }
 
     // -----------------------------------------------------------------------
@@ -257,36 +512,90 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // -----------------------------------------------------------------------
 
     /// Unbind all graphics storage buffers for a stage.
-    pub fn unbind_graphics_storage_buffers(&mut self, _stage: usize) {
-        todo!()
+    ///
+    /// Upstream: `BufferCache<P>::UnbindGraphicsStorageBuffers`
+    pub fn unbind_graphics_storage_buffers(&mut self, stage: usize) {
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        if stage < NUM_STAGES as usize {
+            cs.enabled_storage_buffers[stage] = 0;
+            cs.written_storage_buffers[stage] = 0;
+        }
     }
 
     /// Bind a graphics storage buffer.
+    ///
+    /// Upstream: `BufferCache<P>::BindGraphicsStorageBuffer`
+    ///
+    /// NOTE: Resolving the storage buffer address requires maxwell3d shader stage state
+    /// (`cbufs.const_buffers[cbuf_index].address + cbuf_offset`) which is not yet available.
+    /// We store the placeholder NULL_BINDING and set the enabled/written masks correctly.
     pub fn bind_graphics_storage_buffer(
         &mut self,
-        _stage: usize,
-        _ssbo_index: usize,
-        _cbuf_index: u32,
-        _cbuf_offset: u32,
-        _is_written: bool,
+        stage: usize,
+        ssbo_index: usize,
+        cbuf_index: u32,
+        cbuf_offset: u32,
+        is_written: bool,
     ) {
-        todo!()
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        if stage >= NUM_STAGES as usize || ssbo_index >= NUM_STORAGE_BUFFERS as usize {
+            return;
+        }
+        cs.enabled_storage_buffers[stage] |= 1u32 << ssbo_index;
+        cs.written_storage_buffers[stage] |= if is_written { 1u32 } else { 0u32 } << ssbo_index;
+
+        // TODO: resolve ssbo_addr = cbufs[cbuf_index].address + cbuf_offset via maxwell3d state.
+        // Upstream calls StorageBufferBinding(ssbo_addr, cbuf_index, is_written).
+        // For now store NULL_BINDING — the buffer_id will be resolved in UpdateStorageBuffers.
+        let _ = (cbuf_index, cbuf_offset);
+        cs.storage_buffers[stage][ssbo_index] = NULL_BINDING;
     }
 
     /// Unbind all compute storage buffers.
+    ///
+    /// Upstream: `BufferCache<P>::UnbindComputeStorageBuffers`
     pub fn unbind_compute_storage_buffers(&mut self) {
-        todo!()
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        cs.enabled_compute_storage_buffers = 0;
+        cs.written_compute_storage_buffers = 0;
+        cs.image_compute_texture_buffers = 0;
     }
 
     /// Bind a compute storage buffer.
+    ///
+    /// Upstream: `BufferCache<P>::BindComputeStorageBuffer`
+    ///
+    /// NOTE: Resolving the SSBO address requires kepler_compute launch description which is
+    /// not yet available. We set masks and store NULL_BINDING.
     pub fn bind_compute_storage_buffer(
         &mut self,
-        _ssbo_index: usize,
-        _cbuf_index: u32,
-        _cbuf_offset: u32,
-        _is_written: bool,
+        ssbo_index: usize,
+        cbuf_index: u32,
+        cbuf_offset: u32,
+        is_written: bool,
     ) {
-        todo!()
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        if ssbo_index >= cs.compute_storage_buffers.len() {
+            log::error!(
+                "bind_compute_storage_buffer: index {} exceeds maximum storage buffer count",
+                ssbo_index
+            );
+            return;
+        }
+        cs.enabled_compute_storage_buffers |= 1u32 << ssbo_index;
+        cs.written_compute_storage_buffers |= if is_written { 1u32 } else { 0u32 } << ssbo_index;
+
+        // TODO: resolve ssbo_addr via kepler_compute->launch_description.const_buffer_config.
+        let _ = (cbuf_index, cbuf_offset);
+        cs.compute_storage_buffers[ssbo_index] = NULL_BINDING;
     }
 
     // -----------------------------------------------------------------------
@@ -294,40 +603,100 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // -----------------------------------------------------------------------
 
     /// Unbind all graphics texture buffers for a stage.
-    pub fn unbind_graphics_texture_buffers(&mut self, _stage: usize) {
-        todo!()
+    ///
+    /// Upstream: `BufferCache<P>::UnbindGraphicsTextureBuffers`
+    pub fn unbind_graphics_texture_buffers(&mut self, stage: usize) {
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        if stage < NUM_STAGES as usize {
+            cs.enabled_texture_buffers[stage] = 0;
+            cs.written_texture_buffers[stage] = 0;
+            cs.image_texture_buffers[stage] = 0;
+        }
     }
 
     /// Bind a graphics texture buffer.
+    ///
+    /// Upstream: `BufferCache<P>::BindGraphicsTextureBuffer`
     pub fn bind_graphics_texture_buffer(
         &mut self,
-        _stage: usize,
-        _tbo_index: usize,
-        _gpu_addr: u64,
-        _size: u32,
-        _format: u32,
-        _is_written: bool,
-        _is_image: bool,
+        stage: usize,
+        tbo_index: usize,
+        gpu_addr: u64,
+        size: u32,
+        format: u32,
+        is_written: bool,
+        is_image: bool,
     ) {
-        todo!()
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        if stage >= NUM_STAGES as usize || tbo_index >= NUM_TEXTURE_BUFFERS as usize {
+            return;
+        }
+        cs.enabled_texture_buffers[stage] |= 1u32 << tbo_index;
+        cs.written_texture_buffers[stage] |= if is_written { 1u32 } else { 0u32 } << tbo_index;
+        if P::SEPARATE_IMAGE_BUFFER_BINDINGS {
+            cs.image_texture_buffers[stage] |= if is_image { 1u32 } else { 0u32 } << tbo_index;
+        }
+        // TODO: translate gpu_addr via gpu_memory->GpuToCpuAddress.
+        // Call GetTextureBufferBinding(gpu_addr, size, format) once GPU memory is available.
+        cs.texture_buffers[stage][tbo_index] = TextureBufferBinding {
+            device_addr: gpu_addr,
+            size,
+            buffer_id: NULL_BUFFER_ID,
+            format,
+        };
     }
 
     /// Unbind all compute texture buffers.
+    ///
+    /// Upstream: `BufferCache<P>::UnbindComputeTextureBuffers`
     pub fn unbind_compute_texture_buffers(&mut self) {
-        todo!()
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        cs.enabled_compute_texture_buffers = 0;
+        cs.written_compute_texture_buffers = 0;
+        cs.image_compute_texture_buffers = 0;
     }
 
     /// Bind a compute texture buffer.
+    ///
+    /// Upstream: `BufferCache<P>::BindComputeTextureBuffer`
     pub fn bind_compute_texture_buffer(
         &mut self,
-        _tbo_index: usize,
-        _gpu_addr: u64,
-        _size: u32,
-        _format: u32,
-        _is_written: bool,
-        _is_image: bool,
+        tbo_index: usize,
+        gpu_addr: u64,
+        size: u32,
+        format: u32,
+        is_written: bool,
+        is_image: bool,
     ) {
-        todo!()
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        if tbo_index >= cs.compute_texture_buffers.len() {
+            log::error!(
+                "bind_compute_texture_buffer: index {} exceeds maximum texture buffer count",
+                tbo_index
+            );
+            return;
+        }
+        cs.enabled_compute_texture_buffers |= 1u32 << tbo_index;
+        cs.written_compute_texture_buffers |=
+            if is_written { 1u32 } else { 0u32 } << tbo_index;
+        if P::SEPARATE_IMAGE_BUFFER_BINDINGS {
+            cs.image_compute_texture_buffers |= if is_image { 1u32 } else { 0u32 } << tbo_index;
+        }
+        // TODO: translate gpu_addr via gpu_memory->GpuToCpuAddress.
+        cs.compute_texture_buffers[tbo_index] = TextureBufferBinding {
+            device_addr: gpu_addr,
+            size,
+            buffer_id: NULL_BUFFER_ID,
+            format,
+        };
     }
 
     // -----------------------------------------------------------------------
@@ -337,6 +706,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Obtain a buffer by GPU virtual address.
     ///
     /// Returns `(buffer_id, offset)` within the buffer.
+    ///
+    /// Upstream: `BufferCache<P>::ObtainBuffer`
+    ///
+    /// NOTE: gpu_memory->GpuToCpuAddress translation is not yet available.
+    /// Returns the null buffer; callers should use obtain_cpu_buffer when device_addr is known.
     pub fn obtain_buffer(
         &mut self,
         _gpu_addr: u64,
@@ -344,18 +718,48 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         _sync_info: ObtainBufferSynchronize,
         _post_op: ObtainBufferOperation,
     ) -> (BufferId, u32) {
-        todo!()
+        // TODO: translate gpu_addr via gpu_memory->GpuToCpuAddress, then call obtain_cpu_buffer.
+        log::warn!(
+            "obtain_buffer: GPU->CPU address translation not yet available; returning null buffer"
+        );
+        (NULL_BUFFER_ID, 0)
     }
 
     /// Obtain a buffer by CPU/device address.
+    ///
+    /// Upstream: `BufferCache<P>::ObtainCPUBuffer`
     pub fn obtain_cpu_buffer(
         &mut self,
-        _device_addr: VAddr,
-        _size: u32,
-        _sync_info: ObtainBufferSynchronize,
-        _post_op: ObtainBufferOperation,
+        device_addr: VAddr,
+        size: u32,
+        sync_info: ObtainBufferSynchronize,
+        post_op: ObtainBufferOperation,
     ) -> (BufferId, u32) {
-        todo!()
+        let buffer_id = self.find_buffer(device_addr, size);
+
+        match sync_info {
+            ObtainBufferSynchronize::FullSynchronize => {
+                self.synchronize_buffer(buffer_id, device_addr, size);
+            }
+            _ => {}
+        }
+
+        match post_op {
+            ObtainBufferOperation::MarkAsWritten => {
+                self.mark_written_buffer(buffer_id, device_addr, size);
+            }
+            ObtainBufferOperation::DiscardWrite => {
+                let device_addr_start = device_addr & !63u64; // AlignDown(device_addr, 64)
+                let device_addr_end = (device_addr + size as u64 + 63) & !63u64;
+                let new_size = device_addr_end - device_addr_start;
+                self.clear_download(device_addr_start, new_size);
+                Self::range_subtract(&mut self.gpu_modified_ranges, device_addr_start, new_size);
+            }
+            _ => {}
+        }
+
+        let offset = self.slot_buffers[buffer_id].offset(device_addr);
+        (buffer_id, offset)
     }
 
     // -----------------------------------------------------------------------
@@ -363,8 +767,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // -----------------------------------------------------------------------
 
     /// Flush all cached CPU writes.
+    ///
+    /// Upstream: `BufferCache<P>::FlushCachedWrites`
     pub fn flush_cached_writes(&mut self) {
-        todo!()
+        self.memory_tracker.flush_cached_writes();
     }
 
     /// Return true when there are uncommitted buffers to be downloaded.
@@ -373,8 +779,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     }
 
     /// Accumulate current uncommitted ranges into committed.
+    ///
+    /// Upstream: `BufferCache<P>::AccumulateFlushes`
     pub fn accumulate_flushes(&mut self) {
-        todo!()
+        if self.uncommitted_gpu_modified_ranges.is_empty() {
+            return;
+        }
+        // Move uncommitted ranges into a new committed slot.
+        let ranges = std::mem::take(&mut self.uncommitted_gpu_modified_ranges);
+        self.committed_gpu_modified_ranges.push_back(ranges);
     }
 
     /// Return true when the caller should wait for async flushes.
@@ -383,23 +796,61 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     }
 
     /// Commit asynchronous downloads.
+    ///
+    /// Upstream: `BufferCache<P>::CommitAsyncFlushes` delegates to CommitAsyncFlushesHigh.
     pub fn commit_async_flushes(&mut self) {
-        todo!()
+        self.commit_async_flushes_high();
     }
 
     /// Commit asynchronous downloads (high priority).
+    ///
+    /// Upstream: `BufferCache<P>::CommitAsyncFlushesHigh`
+    ///
+    /// NOTE: This method depends on runtime staging buffer allocation and GPU copy operations
+    /// which are not yet available in this port. We accumulate flushes and log the intent.
     pub fn commit_async_flushes_high(&mut self) {
-        todo!()
+        self.accumulate_flushes();
+
+        if self.committed_gpu_modified_ranges.is_empty() {
+            // Upstream pushes empty optional async buffer.
+            return;
+        }
+
+        // TODO: full implementation requires:
+        //   - runtime.DownloadStagingBuffer
+        //   - runtime.PreCopyBarrier / PostCopyBarrier
+        //   - runtime.CopyBuffer (GPU→staging)
+        //   - memory_tracker.ForEachDownloadRange (already available but needs range_set walk)
+        //   - gpu_modified_ranges.ForEachInRange (range_set not yet ported)
+        // For now, clear committed ranges so the cache does not stall indefinitely.
+        log::warn!(
+            "commit_async_flushes_high: GPU download staging not yet implemented; \
+             clearing {} committed range sets",
+            self.committed_gpu_modified_ranges.len()
+        );
+        self.committed_gpu_modified_ranges.clear();
     }
 
     /// Pop completed asynchronous downloads.
+    ///
+    /// Upstream: `BufferCache<P>::PopAsyncFlushes` delegates to PopAsyncBuffers.
     pub fn pop_async_flushes(&mut self) {
-        todo!()
+        self.pop_async_buffers();
     }
 
     /// Pop completed asynchronous buffers.
+    ///
+    /// Upstream: `BufferCache<P>::PopAsyncBuffers`
+    ///
+    /// NOTE: Requires async_buffers (staging buffer queue) and device_memory.WriteBlockUnsafe
+    /// which are not yet ported.
     pub fn pop_async_buffers(&mut self) {
-        todo!()
+        if self.pending_downloads.is_empty() {
+            return;
+        }
+        // TODO: full implementation reads back from staging memory and writes to device_memory.
+        // For now simply drain pending downloads to avoid stale state.
+        self.pending_downloads.pop_front();
     }
 
     // -----------------------------------------------------------------------
@@ -407,13 +858,25 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // -----------------------------------------------------------------------
 
     /// Perform a DMA copy between two GPU virtual addresses.
+    ///
+    /// Upstream: `BufferCache<P>::DMACopy`
+    ///
+    /// NOTE: GPU->CPU address translation and runtime.CopyBuffer are not yet available.
     pub fn dma_copy(&mut self, _src_address: u64, _dest_address: u64, _amount: u64) -> bool {
-        todo!()
+        // TODO: requires gpu_memory->GpuToCpuAddress, runtime.CopyBuffer, and range_set ops.
+        log::warn!("dma_copy: not yet implemented (requires GPU memory + runtime)");
+        false
     }
 
     /// Perform a DMA clear.
+    ///
+    /// Upstream: `BufferCache<P>::DMAClear`
+    ///
+    /// NOTE: GPU->CPU address translation and runtime.ClearBuffer are not yet available.
     pub fn dma_clear(&mut self, _src_address: u64, _amount: u64, _value: u32) -> bool {
-        todo!()
+        // TODO: requires gpu_memory->GpuToCpuAddress and runtime.ClearBuffer.
+        log::warn!("dma_clear: not yet implemented (requires GPU memory + runtime)");
+        false
     }
 
     // -----------------------------------------------------------------------
@@ -421,18 +884,50 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // -----------------------------------------------------------------------
 
     /// Return true when a device region is GPU-modified.
-    pub fn is_region_gpu_modified(&self, _addr: VAddr, _size: usize) -> bool {
-        todo!()
+    ///
+    /// Upstream: `BufferCache<P>::IsRegionGpuModified`
+    ///
+    /// NOTE: Upstream iterates `gpu_modified_ranges` (a RangeSet) via ForEachInRange.
+    /// We approximate with a linear scan over our Vec-based range list.
+    pub fn is_region_gpu_modified(&self, addr: VAddr, size: usize) -> bool {
+        let end = addr + size as u64;
+        for &(start, range_end) in &self.gpu_modified_ranges {
+            if start < end && addr < range_end {
+                return true;
+            }
+        }
+        false
     }
 
     /// Return true when a region is registered in the cache.
-    pub fn is_region_registered(&self, _addr: VAddr, _size: usize) -> bool {
-        todo!()
+    ///
+    /// Upstream: `BufferCache<P>::IsRegionRegistered`
+    pub fn is_region_registered(&self, addr: VAddr, size: usize) -> bool {
+        let end_addr = addr + size as u64;
+        let page_end = div_ceil(end_addr, CACHING_PAGESIZE);
+        let mut page = addr >> CACHING_PAGEBITS;
+        while page < page_end {
+            let buffer_id = self.page_table[page as usize];
+            if !buffer_id.is_valid() {
+                page += 1;
+                continue;
+            }
+            let buffer = &self.slot_buffers[buffer_id];
+            let buf_start = buffer.cpu_addr();
+            let buf_end = buf_start + buffer.size_bytes() as u64;
+            if buf_start < end_addr && addr < buf_end {
+                return true;
+            }
+            page = div_ceil(end_addr, CACHING_PAGESIZE);
+        }
+        false
     }
 
     /// Return true when a device region is CPU-modified.
-    pub fn is_region_cpu_modified(&self, _addr: VAddr, _size: usize) -> bool {
-        todo!()
+    ///
+    /// Upstream: `BufferCache<P>::IsRegionCpuModified`
+    pub fn is_region_cpu_modified(&mut self, addr: VAddr, size: usize) -> bool {
+        self.memory_tracker.is_region_cpu_modified(addr, size as u64)
     }
 
     // -----------------------------------------------------------------------
@@ -440,13 +935,27 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // -----------------------------------------------------------------------
 
     /// Get the draw indirect count buffer.
+    ///
+    /// Upstream: `BufferCache<P>::GetDrawIndirectCount`
     pub fn get_draw_indirect_count(&mut self) -> (BufferId, u32) {
-        todo!()
+        let Some(ref cs) = self.channel_state else {
+            return (NULL_BUFFER_ID, 0);
+        };
+        let binding = cs.count_buffer_binding;
+        let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+        (binding.buffer_id, offset)
     }
 
     /// Get the draw indirect buffer.
+    ///
+    /// Upstream: `BufferCache<P>::GetDrawIndirectBuffer`
     pub fn get_draw_indirect_buffer(&mut self) -> (BufferId, u32) {
-        todo!()
+        let Some(ref cs) = self.channel_state else {
+            return (NULL_BUFFER_ID, 0);
+        };
+        let binding = cs.indirect_buffer_binding;
+        let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+        (binding.buffer_id, offset)
     }
 
     // -----------------------------------------------------------------------
@@ -521,257 +1030,1350 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     }
 
     // -----------------------------------------------------------------------
-    // Private helpers — operations (all todo!() for structural port)
+    // Range-set helpers (Vec-based approximation of Common::RangeSet)
     // -----------------------------------------------------------------------
 
+    /// Add a range `[addr, addr+size)` to a range list.
+    ///
+    /// This is a simplified approximation of `RangeSet::Add`. Ranges are
+    /// stored unsorted and may overlap; `is_region_gpu_modified` handles
+    /// overlap detection via linear scan.
+    fn range_add(ranges: &mut Vec<(VAddr, VAddr)>, addr: VAddr, size: u64) {
+        ranges.push((addr, addr + size));
+    }
+
+    /// Remove all parts of `[addr, addr+size)` from a range list.
+    ///
+    /// This is a simplified approximation of `RangeSet::Subtract`.
+    fn range_subtract(ranges: &mut Vec<(VAddr, VAddr)>, addr: VAddr, size: u64) {
+        let end = addr + size;
+        let mut new_ranges = Vec::with_capacity(ranges.len());
+        for &(s, e) in ranges.iter() {
+            if e <= addr || s >= end {
+                // No overlap — keep as is.
+                new_ranges.push((s, e));
+            } else {
+                // Partial overlap — keep the parts outside [addr, end).
+                if s < addr {
+                    new_ranges.push((s, addr));
+                }
+                if e > end {
+                    new_ranges.push((end, e));
+                }
+            }
+        }
+        *ranges = new_ranges;
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers — operations
+    // -----------------------------------------------------------------------
+
+    /// Run the garbage collector: destroy LRU buffers until memory pressure is reduced.
+    ///
+    /// Upstream: `BufferCache<P>::RunGarbageCollector`
+    ///
+    /// NOTE: Upstream uses `lru_cache.ForEachItemBelow` which is not yet ported.
+    /// We perform a simplified pass that destroys the oldest buffers heuristically.
     fn run_garbage_collector(&mut self) {
-        todo!()
+        let aggressive_gc = self.total_used_memory >= self.critical_memory;
+        let ticks_to_destroy: u64 = if aggressive_gc { 60 } else { 120 };
+        let num_iterations: usize = if aggressive_gc { 64 } else { 32 };
+
+        // Collect buffer IDs whose LRU age exceeds the threshold.
+        // TODO: replace with lru_cache.ForEachItemBelow once LRU cache is ported.
+        // For now we do nothing — we cannot iterate by age without the LRU cache.
+        let _ = (ticks_to_destroy, num_iterations);
     }
 
     fn bind_host_index_buffer(&mut self) {
-        todo!()
+        // Upstream: synchronizes + binds the index buffer to the GPU.
+        // Requires runtime.BindIndexBuffer and draw_state — not yet available.
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let binding = cs.index_buffer;
+        let buffer_id = binding.buffer_id;
+        let device_addr = binding.device_addr;
+        let size = binding.size;
+        drop(cs); // release borrow
+
+        // Touch and synchronize.
+        self.touch_buffer(buffer_id);
+        self.synchronize_buffer(buffer_id, device_addr, size);
+        // TODO: runtime.BindIndexBuffer — not yet available.
     }
 
     fn bind_host_vertex_buffers(&mut self) {
-        todo!()
+        // Upstream: iterates vertex buffers, synchronizes, collects host bindings, then
+        // calls runtime.BindVertexBuffers. Runtime not yet available.
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let bindings: Vec<Binding> = cs.vertex_buffers.to_vec();
+        drop(cs);
+
+        for binding in bindings {
+            self.touch_buffer(binding.buffer_id);
+            self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
+        }
+        // TODO: runtime.BindVertexBuffers — not yet available.
     }
 
     fn bind_host_draw_indirect_buffers(&mut self) {
-        todo!()
+        // Upstream: synchronize count + indirect buffers.
+        // current_draw_indirect is engine state not yet ported.
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let count_binding = cs.count_buffer_binding;
+        let indirect_binding = cs.indirect_buffer_binding;
+        drop(cs);
+
+        self.touch_buffer(count_binding.buffer_id);
+        self.synchronize_buffer(
+            count_binding.buffer_id,
+            count_binding.device_addr,
+            count_binding.size,
+        );
+        self.touch_buffer(indirect_binding.buffer_id);
+        self.synchronize_buffer(
+            indirect_binding.buffer_id,
+            indirect_binding.device_addr,
+            indirect_binding.size,
+        );
     }
 
-    fn bind_host_graphics_uniform_buffers(&mut self, _stage: usize) {
-        todo!()
+    /// Upstream: `BufferCache<P>::BindHostGraphicsUniformBuffers`
+    fn bind_host_graphics_uniform_buffers(&mut self, stage: usize) {
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let dirty = if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
+            let d = cs.dirty_uniform_buffers[stage];
+            d
+        } else {
+            !0u32
+        };
+        let mask = cs.enabled_uniform_buffer_masks[stage];
+        drop(cs);
+
+        if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
+            if let Some(ref mut cs) = self.channel_state {
+                cs.dirty_uniform_buffers[stage] = 0;
+            }
+        }
+
+        let mut binding_index = 0u32;
+        let mask_copy = mask;
+        let dirty_copy = dirty;
+        Self::for_each_enabled_bit(mask_copy, |index| {
+            let needs_bind = ((dirty_copy >> index) & 1) != 0;
+            // NOTE: We capture binding_index by value here because we can't borrow self
+            // inside the closure. The method is called after the closure completes.
+            let _ = (needs_bind, binding_index);
+            if P::NEEDS_BIND_UNIFORM_INDEX {
+                binding_index += 1;
+            }
+        });
+
+        // Do the actual binding outside the for_each_enabled_bit call to avoid closure borrow issues.
+        let mut binding_index = 0u32;
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_uniform_buffer_masks[stage];
+        let dirty = if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
+            cs.dirty_uniform_buffers[stage]
+        } else {
+            !0u32
+        };
+        drop(cs);
+
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+            let needs_bind = ((dirty >> idx) & 1) != 0;
+            self.bind_host_graphics_uniform_buffer(stage, idx, binding_index, needs_bind);
+            if P::NEEDS_BIND_UNIFORM_INDEX {
+                binding_index += 1;
+            }
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
+    /// Upstream: `BufferCache<P>::BindHostGraphicsUniformBuffer`
+    ///
+    /// NOTE: The fast-buffer path (runtime.BindMappedUniformBuffer,
+    /// runtime.PushFastUniformBuffer) requires device_memory and runtime which are
+    /// not yet available. We fall through to the synchronize path only.
     fn bind_host_graphics_uniform_buffer(
         &mut self,
-        _stage: usize,
-        _index: u32,
-        _binding_index: u32,
-        _needs_bind: bool,
+        stage: usize,
+        index: u32,
+        binding_index: u32,
+        needs_bind: bool,
     ) {
-        todo!()
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let binding = cs.uniform_buffers[stage][index as usize];
+        let skip_cache_size = cs.uniform_buffer_skip_cache_size;
+        let ub_sizes = cs.uniform_buffer_sizes.clone();
+        drop(cs);
+
+        let device_addr = binding.device_addr;
+        let size = if let Some(ref sizes) = ub_sizes {
+            binding.size.min(sizes[stage][index as usize])
+        } else {
+            binding.size
+        };
+
+        // Touch the buffer.
+        self.touch_buffer(binding.buffer_id);
+
+        let use_fast_buffer = binding.buffer_id != NULL_BUFFER_ID
+            && size <= skip_cache_size
+            && !self.memory_tracker.is_region_gpu_modified(device_addr, size as u64);
+
+        if use_fast_buffer {
+            // TODO: fast buffer path (BindMappedUniformBuffer / PushFastUniformBuffer)
+            // requires device_memory and runtime — log and skip for now.
+            if P::IS_OPENGL {
+                if let Some(ref mut cs) = self.channel_state {
+                    cs.fast_bound_uniform_buffers[stage] |= 1u32 << binding_index;
+                    cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
+                }
+            }
+            return;
+        }
+
+        // Classic cached path.
+        let sync_cached = self.synchronize_buffer(binding.buffer_id, device_addr, size);
+        if let Some(ref mut cs) = self.channel_state {
+            if sync_cached {
+                cs.uniform_cache_hits[0] = cs.uniform_cache_hits[0].wrapping_add(1);
+            }
+            cs.uniform_cache_shots[0] = cs.uniform_cache_shots[0].wrapping_add(1);
+        }
+
+        let has_fast_bound = self.has_fast_uniform_buffer_bound(stage, binding_index);
+        let binding_size_differs = if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
+            self.channel_state.as_ref().map_or(false, |cs| {
+                cs.uniform_buffer_binding_sizes[stage][binding_index as usize] != size
+            })
+        } else {
+            false
+        };
+        let needs_bind = needs_bind | has_fast_bound | binding_size_differs;
+        if !needs_bind {
+            return;
+        }
+
+        let offset = self.slot_buffers[binding.buffer_id].offset(device_addr);
+        if P::IS_OPENGL {
+            if let Some(ref mut cs) = self.channel_state {
+                cs.fast_bound_uniform_buffers[stage] &= !(1u32 << binding_index);
+            }
+        }
+        if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
+            if let Some(ref mut cs) = self.channel_state {
+                cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
+            }
+        }
+        // TODO: runtime.BindUniformBuffer — not yet available.
+        let _ = (offset, size, binding_index);
     }
 
-    fn bind_host_graphics_storage_buffers(&mut self, _stage: usize) {
-        todo!()
+    fn bind_host_graphics_storage_buffers(&mut self, stage: usize) {
+        // Upstream: iterates enabled storage buffers, synchronizes, then calls
+        // runtime.BindStorageBuffer. Runtime not yet available.
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_storage_buffers[stage];
+        let written_mask = cs.written_storage_buffers[stage];
+        let bindings: Vec<Binding> = cs.storage_buffers[stage].to_vec();
+        drop(cs);
+
+        let mut binding_index = 0u32;
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            let binding = bindings[idx as usize];
+            self.touch_buffer(binding.buffer_id);
+            self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
+
+            let is_written = ((written_mask >> idx) & 1) != 0;
+            if is_written {
+                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
+            }
+            // TODO: runtime.BindStorageBuffer — not yet available.
+            let _ = binding_index;
+            if P::NEEDS_BIND_STORAGE_INDEX {
+                binding_index += 1;
+            }
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
-    fn bind_host_graphics_texture_buffers(&mut self, _stage: usize) {
-        todo!()
+    fn bind_host_graphics_texture_buffers(&mut self, stage: usize) {
+        // Upstream: iterates enabled texture buffers, synchronizes, calls
+        // runtime.BindTextureBuffer / BindImageBuffer. Runtime not yet available.
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_texture_buffers[stage];
+        let written_mask = cs.written_texture_buffers[stage];
+        let image_mask = cs.image_texture_buffers[stage];
+        let bindings: Vec<TextureBufferBinding> = cs.texture_buffers[stage].to_vec();
+        drop(cs);
+
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            let binding = bindings[idx as usize];
+            self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
+
+            let is_written = ((written_mask >> idx) & 1) != 0;
+            if is_written {
+                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
+            }
+            let _is_image = P::SEPARATE_IMAGE_BUFFER_BINDINGS && ((image_mask >> idx) & 1) != 0;
+            // TODO: runtime.BindTextureBuffer / BindImageBuffer — not yet available.
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
     fn bind_host_transform_feedback_buffers(&mut self) {
-        todo!()
+        // Upstream: iterates transform feedback buffers if tfb is enabled.
+        // Requires maxwell3d->regs.transform_feedback_enabled — not yet available.
+        // We synchronize unconditionally for all non-null bindings.
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let bindings: Vec<Binding> = cs.transform_feedback_buffers.to_vec();
+        drop(cs);
+
+        for binding in bindings {
+            if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
+                continue;
+            }
+            self.touch_buffer(binding.buffer_id);
+            self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
+            self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
+            // TODO: runtime.BindTransformFeedbackBuffers — not yet available.
+        }
     }
 
     fn bind_host_compute_uniform_buffers(&mut self) {
-        todo!()
+        // Upstream: marks all uniform buffers dirty (persistent bindings), then
+        // iterates and calls runtime.BindComputeUniformBuffer.
+        if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
+            if let Some(ref mut cs) = self.channel_state {
+                cs.dirty_uniform_buffers.fill(!0u32);
+                cs.fast_bound_uniform_buffers.fill(0);
+            }
+        }
+
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_compute_uniform_buffer_mask;
+        let ub_sizes = cs.compute_uniform_buffer_sizes.clone();
+        let bindings: Vec<Binding> = cs.compute_uniform_buffers.to_vec();
+        drop(cs);
+
+        let mut binding_index = 0u32;
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            let binding = bindings[idx as usize];
+            self.touch_buffer(binding.buffer_id);
+            let size = if let Some(ref sizes) = ub_sizes {
+                binding.size.min(sizes[idx as usize])
+            } else {
+                binding.size
+            };
+            self.synchronize_buffer(binding.buffer_id, binding.device_addr, size);
+            // TODO: runtime.BindComputeUniformBuffer — not yet available.
+            if P::NEEDS_BIND_UNIFORM_INDEX {
+                binding_index += 1;
+            }
+            let _ = binding_index;
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
     fn bind_host_compute_storage_buffers(&mut self) {
-        todo!()
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_compute_storage_buffers;
+        let written_mask = cs.written_compute_storage_buffers;
+        let bindings: Vec<Binding> = cs.compute_storage_buffers.to_vec();
+        drop(cs);
+
+        let mut binding_index = 0u32;
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            let binding = bindings[idx as usize];
+            self.touch_buffer(binding.buffer_id);
+            self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
+
+            let is_written = ((written_mask >> idx) & 1) != 0;
+            if is_written {
+                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
+            }
+            // TODO: runtime.BindComputeStorageBuffer — not yet available.
+            if P::NEEDS_BIND_STORAGE_INDEX {
+                binding_index += 1;
+            }
+            let _ = binding_index;
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
     fn bind_host_compute_texture_buffers(&mut self) {
-        todo!()
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_compute_texture_buffers;
+        let written_mask = cs.written_compute_texture_buffers;
+        let image_mask = cs.image_compute_texture_buffers;
+        let bindings: Vec<TextureBufferBinding> = cs.compute_texture_buffers.to_vec();
+        drop(cs);
+
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            let binding = bindings[idx as usize];
+            self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
+
+            let is_written = ((written_mask >> idx) & 1) != 0;
+            if is_written {
+                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
+            }
+            let _is_image = P::SEPARATE_IMAGE_BUFFER_BINDINGS && ((image_mask >> idx) & 1) != 0;
+            // TODO: runtime.BindTextureBuffer / BindImageBuffer — not yet available.
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
-    fn do_update_graphics_buffers(&mut self, _is_indexed: bool) {
-        todo!()
+    /// Upstream: `BufferCache<P>::DoUpdateGraphicsBuffers`
+    ///
+    /// NOTE: UpdateIndexBuffer, UpdateVertexBuffer, UpdateDrawIndirect, and
+    /// UpdateTransformFeedbackBuffer all depend on maxwell3d engine state which
+    /// is not yet available. Those sub-methods are stubbed below.
+    fn do_update_graphics_buffers(&mut self, is_indexed: bool) {
+        self.buffer_operations(|cache| {
+            if is_indexed {
+                cache.update_index_buffer();
+            }
+            cache.update_vertex_buffers();
+            cache.update_transform_feedback_buffers();
+            for stage in 0..NUM_STAGES as usize {
+                cache.update_uniform_buffers(stage);
+                cache.update_storage_buffers(stage);
+                cache.update_texture_buffers(stage);
+            }
+            // TODO: if current_draw_indirect → update_draw_indirect()
+        });
     }
 
+    /// Upstream: `BufferCache<P>::DoUpdateComputeBuffers`
     fn do_update_compute_buffers(&mut self) {
-        todo!()
+        self.buffer_operations(|cache| {
+            cache.update_compute_uniform_buffers();
+            cache.update_compute_storage_buffers();
+            cache.update_compute_texture_buffers();
+        });
     }
 
+    /// Upstream: `BufferCache<P>::UpdateIndexBuffer`
+    ///
+    /// NOTE: Depends on maxwell3d draw_state and gpu_memory — not yet available.
     fn update_index_buffer(&mut self) {
-        todo!()
+        // TODO: full implementation reads maxwell3d draw state and resolves GPU address.
+        // Stub: no-op until engine state is available.
     }
 
+    /// Upstream: `BufferCache<P>::UpdateVertexBuffers`
+    ///
+    /// NOTE: Depends on maxwell3d dirty flags — not yet available.
     fn update_vertex_buffers(&mut self) {
-        todo!()
+        // TODO: check maxwell3d->dirty.flags[Dirty::VertexBuffers].
     }
 
+    /// Upstream: `BufferCache<P>::UpdateVertexBuffer`
     fn update_vertex_buffer(&mut self, _index: u32) {
-        todo!()
+        // TODO: depends on maxwell3d vertex stream registers and gpu_memory.
     }
 
+    /// Upstream: `BufferCache<P>::UpdateDrawIndirect`
     fn update_draw_indirect(&mut self) {
-        todo!()
+        // TODO: depends on current_draw_indirect engine state.
     }
 
-    fn update_uniform_buffers(&mut self, _stage: usize) {
-        todo!()
+    /// Upstream: `BufferCache<P>::UpdateUniformBuffers`
+    fn update_uniform_buffers(&mut self, stage: usize) {
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_uniform_buffer_masks[stage];
+        drop(cs);
+
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            if let Some(ref cs) = self.channel_state {
+                let binding = cs.uniform_buffers[stage][idx as usize];
+                // If already resolved, skip.
+                if binding.buffer_id.is_valid() && binding.buffer_id != NULL_BUFFER_ID {
+                    idx += 1;
+                    bits >>= 1;
+                    continue;
+                }
+            }
+
+            // Mark as dirty and resolve buffer_id.
+            if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
+                if let Some(ref mut cs) = self.channel_state {
+                    cs.dirty_uniform_buffers[stage] |= 1u32 << idx;
+                }
+            }
+
+            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+                let b = cs.uniform_buffers[stage][idx as usize];
+                (b.device_addr, b.size)
+            } else {
+                break;
+            };
+            let buffer_id = self.find_buffer(device_addr, size);
+            if let Some(ref mut cs) = self.channel_state {
+                cs.uniform_buffers[stage][idx as usize].buffer_id = buffer_id;
+            }
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
-    fn update_storage_buffers(&mut self, _stage: usize) {
-        todo!()
+    /// Upstream: `BufferCache<P>::UpdateStorageBuffers`
+    fn update_storage_buffers(&mut self, stage: usize) {
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_storage_buffers[stage];
+        drop(cs);
+
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+                let b = cs.storage_buffers[stage][idx as usize];
+                (b.device_addr, b.size)
+            } else {
+                break;
+            };
+            let buffer_id = self.find_buffer(device_addr, size);
+            if let Some(ref mut cs) = self.channel_state {
+                cs.storage_buffers[stage][idx as usize].buffer_id = buffer_id;
+            }
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
-    fn update_texture_buffers(&mut self, _stage: usize) {
-        todo!()
+    /// Upstream: `BufferCache<P>::UpdateTextureBuffers`
+    fn update_texture_buffers(&mut self, stage: usize) {
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_texture_buffers[stage];
+        drop(cs);
+
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+                let b = cs.texture_buffers[stage][idx as usize];
+                (b.device_addr, b.size)
+            } else {
+                break;
+            };
+            let buffer_id = self.find_buffer(device_addr, size);
+            if let Some(ref mut cs) = self.channel_state {
+                cs.texture_buffers[stage][idx as usize].buffer_id = buffer_id;
+            }
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
+    /// Upstream: `BufferCache<P>::UpdateTransformFeedbackBuffers`
     fn update_transform_feedback_buffers(&mut self) {
-        todo!()
+        // TODO: check maxwell3d->regs.transform_feedback_enabled.
+        for index in 0..NUM_TRANSFORM_FEEDBACK_BUFFERS {
+            self.update_transform_feedback_buffer(index);
+        }
     }
 
+    /// Upstream: `BufferCache<P>::UpdateTransformFeedbackBuffer`
     fn update_transform_feedback_buffer(&mut self, _index: u32) {
-        todo!()
+        // TODO: depends on maxwell3d transform_feedback.buffers[index] registers and gpu_memory.
     }
 
+    /// Upstream: `BufferCache<P>::UpdateComputeUniformBuffers`
     fn update_compute_uniform_buffers(&mut self) {
-        todo!()
+        // TODO: depends on kepler_compute->launch_description for GPU address resolution.
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_compute_uniform_buffer_mask;
+        drop(cs);
+
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            // Reset to NULL_BINDING first (upstream always resets).
+            if let Some(ref mut cs) = self.channel_state {
+                cs.compute_uniform_buffers[idx as usize] = NULL_BINDING;
+            }
+            // TODO: resolve GPU address from kepler_compute launch description.
+            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+                let b = cs.compute_uniform_buffers[idx as usize];
+                (b.device_addr, b.size)
+            } else {
+                break;
+            };
+            let buffer_id = self.find_buffer(device_addr, size);
+            if let Some(ref mut cs) = self.channel_state {
+                cs.compute_uniform_buffers[idx as usize].buffer_id = buffer_id;
+            }
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
+    /// Upstream: `BufferCache<P>::UpdateComputeStorageBuffers`
     fn update_compute_storage_buffers(&mut self) {
-        todo!()
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_compute_storage_buffers;
+        drop(cs);
+
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+                let b = cs.compute_storage_buffers[idx as usize];
+                (b.device_addr, b.size)
+            } else {
+                break;
+            };
+            let buffer_id = self.find_buffer(device_addr, size);
+            if let Some(ref mut cs) = self.channel_state {
+                cs.compute_storage_buffers[idx as usize].buffer_id = buffer_id;
+            }
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
+    /// Upstream: `BufferCache<P>::UpdateComputeTextureBuffers`
     fn update_compute_texture_buffers(&mut self) {
-        todo!()
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mask = cs.enabled_compute_texture_buffers;
+        drop(cs);
+
+        let mut bits = mask;
+        let mut idx: u32 = 0;
+        while bits != 0 {
+            let skip = bits.trailing_zeros();
+            idx += skip;
+            bits >>= skip;
+
+            let (device_addr, size) = if let Some(ref cs) = self.channel_state {
+                let b = cs.compute_texture_buffers[idx as usize];
+                (b.device_addr, b.size)
+            } else {
+                break;
+            };
+            let buffer_id = self.find_buffer(device_addr, size);
+            if let Some(ref mut cs) = self.channel_state {
+                cs.compute_texture_buffers[idx as usize].buffer_id = buffer_id;
+            }
+
+            idx += 1;
+            bits >>= 1;
+        }
     }
 
-    fn mark_written_buffer(&mut self, _buffer_id: BufferId, _device_addr: VAddr, _size: u32) {
-        todo!()
+    /// Mark a buffer region as GPU-written.
+    ///
+    /// Upstream: `BufferCache<P>::MarkWrittenBuffer`
+    fn mark_written_buffer(&mut self, _buffer_id: BufferId, device_addr: VAddr, size: u32) {
+        self.memory_tracker
+            .mark_region_as_gpu_modified(device_addr, size as u64);
+        Self::range_add(&mut self.gpu_modified_ranges, device_addr, size as u64);
+        Self::range_add(
+            &mut self.uncommitted_gpu_modified_ranges,
+            device_addr,
+            size as u64,
+        );
     }
 
-    fn find_buffer(&mut self, _device_addr: VAddr, _size: u32) -> BufferId {
-        todo!()
+    /// Find or create a buffer covering `[device_addr, device_addr+size)`.
+    ///
+    /// Upstream: `BufferCache<P>::FindBuffer`
+    fn find_buffer(&mut self, device_addr: VAddr, size: u32) -> BufferId {
+        if device_addr == 0 {
+            return NULL_BUFFER_ID;
+        }
+        let page = device_addr >> CACHING_PAGEBITS;
+        let buffer_id = self.page_table[page as usize];
+        if !buffer_id.is_valid() {
+            return self.create_buffer(device_addr, size);
+        }
+        if self.slot_buffers[buffer_id].is_in_bounds(device_addr, size as u64) {
+            return buffer_id;
+        }
+        self.create_buffer(device_addr, size)
     }
 
-    fn resolve_overlaps(&mut self, _device_addr: VAddr, _wanted_size: u32) -> OverlapResult {
-        todo!()
+    /// Collect all buffers that overlap `[device_addr, device_addr+wanted_size)`.
+    ///
+    /// Upstream: `BufferCache<P>::ResolveOverlaps`
+    fn resolve_overlaps(&mut self, device_addr: VAddr, wanted_size: u32) -> OverlapResult {
+        let mut overlap_ids: Vec<BufferId> = Vec::new();
+        let mut begin = device_addr;
+        let mut end = device_addr + wanted_size as u64;
+
+        let max_page: u64 = 1u64 << AS_BITS;
+
+        let expand_begin = |begin: &mut u64, addr: &mut u64, add_value: u64| {
+            let min_page = CACHING_PAGESIZE + DEVICE_PAGESIZE;
+            if add_value > *begin - min_page {
+                *begin = min_page;
+                *addr = DEVICE_PAGESIZE;
+            } else {
+                *begin -= add_value;
+                *addr = *begin - CACHING_PAGESIZE;
+            }
+        };
+
+        let expand_end = |end: &mut u64, add_value: u64| {
+            if add_value > max_page - *end {
+                *end = max_page;
+            } else {
+                *end += add_value;
+            }
+        };
+
+        if begin == 0 {
+            return OverlapResult {
+                ids: overlap_ids,
+                begin,
+                end,
+                has_stream_leap: false,
+            };
+        }
+
+        let mut stream_score: i32 = 0;
+        let mut has_stream_leap = false;
+        let mut scan_addr = device_addr;
+
+        loop {
+            if scan_addr >> CACHING_PAGEBITS >= div_ceil(end, CACHING_PAGESIZE) {
+                break;
+            }
+
+            let overlap_id = self.page_table[(scan_addr >> CACHING_PAGEBITS) as usize];
+            if overlap_id.is_valid() && !self.slot_buffers[overlap_id].is_picked() {
+                overlap_ids.push(overlap_id);
+                self.slot_buffers[overlap_id].pick();
+
+                let overlap_device_addr = self.slot_buffers[overlap_id].cpu_addr();
+                let expands_left = overlap_device_addr < begin;
+                if expands_left {
+                    begin = overlap_device_addr;
+                }
+                let overlap_end =
+                    overlap_device_addr + self.slot_buffers[overlap_id].size_bytes() as u64;
+                let expands_right = overlap_end > end;
+                if expands_right {
+                    end = overlap_end;
+                }
+
+                stream_score += self.slot_buffers[overlap_id].stream_score();
+                if stream_score > STREAM_LEAP_THRESHOLD && !has_stream_leap {
+                    has_stream_leap = true;
+                    let mut addr_copy = scan_addr;
+                    if expands_right {
+                        expand_begin(&mut begin, &mut addr_copy, CACHING_PAGESIZE * 128);
+                    }
+                    if expands_left {
+                        expand_end(&mut end, CACHING_PAGESIZE * 128);
+                    }
+                }
+            }
+
+            let next = scan_addr.checked_add(CACHING_PAGESIZE).unwrap_or(u64::MAX);
+            if next == u64::MAX {
+                break;
+            }
+            scan_addr = next;
+        }
+
+        // Unmark picked buffers.
+        for &id in &overlap_ids {
+            self.slot_buffers[id].unpick();
+        }
+
+        OverlapResult {
+            ids: overlap_ids,
+            begin,
+            end,
+            has_stream_leap,
+        }
     }
 
+    /// Copy an overlapping buffer into `new_buffer_id` and delete the overlap.
+    ///
+    /// Upstream: `BufferCache<P>::JoinOverlap`
+    ///
+    /// NOTE: runtime.CopyBuffer is not yet available; we accumulate stream score only.
     fn join_overlap(
         &mut self,
-        _new_buffer_id: BufferId,
-        _overlap_id: BufferId,
-        _accumulate_stream_score: bool,
+        new_buffer_id: BufferId,
+        overlap_id: BufferId,
+        accumulate_stream_score: bool,
     ) {
-        todo!()
+        if accumulate_stream_score {
+            let score = self.slot_buffers[overlap_id].stream_score() + 1;
+            self.slot_buffers[new_buffer_id].increase_stream_score(score);
+        }
+        // TODO: runtime.CopyBuffer(new_buffer, overlap, copies, true) — not yet available.
+        // Data transfer from overlap to new_buffer is skipped for now.
+        self.delete_buffer(overlap_id, true);
     }
 
-    fn create_buffer(&mut self, _device_addr: VAddr, _wanted_size: u32) -> BufferId {
-        todo!()
+    /// Allocate a new buffer that covers `[device_addr, device_addr+wanted_size)`,
+    /// merging any overlapping buffers.
+    ///
+    /// Upstream: `BufferCache<P>::CreateBuffer`
+    ///
+    /// NOTE: runtime.ClearBuffer is not yet available — the GPU-side clear is skipped.
+    fn create_buffer(&mut self, device_addr: VAddr, wanted_size: u32) -> BufferId {
+        // Align start and end to caching page boundaries.
+        let device_addr_end =
+            (device_addr + wanted_size as u64 + CACHING_PAGESIZE - 1) & !(CACHING_PAGESIZE - 1);
+        let device_addr = device_addr & !(CACHING_PAGESIZE - 1);
+        let wanted_size = (device_addr_end - device_addr) as u32;
+
+        let overlap = self.resolve_overlaps(device_addr, wanted_size);
+        let size = (overlap.end - overlap.begin) as u32;
+
+        let new_buffer_id = self.slot_buffers.insert(BufferBase::new(overlap.begin, size as u64));
+        // TODO: runtime.ClearBuffer(new_buffer, 0, size_bytes, 0) — not yet available.
+
+        let overlap_ids: Vec<BufferId> = overlap.ids.clone();
+        let has_stream_leap = overlap.has_stream_leap;
+        for overlap_id in overlap_ids {
+            self.join_overlap(new_buffer_id, overlap_id, !has_stream_leap);
+        }
+
+        self.register(new_buffer_id);
+        self.touch_buffer(new_buffer_id);
+        new_buffer_id
     }
 
-    fn register(&mut self, _buffer_id: BufferId) {
-        todo!()
+    /// Register a buffer in the page table and update memory accounting.
+    ///
+    /// Upstream: `BufferCache<P>::Register`
+    fn register(&mut self, buffer_id: BufferId) {
+        self.change_register(buffer_id, true);
     }
 
-    fn unregister(&mut self, _buffer_id: BufferId) {
-        todo!()
+    /// Unregister a buffer from the page table and update memory accounting.
+    ///
+    /// Upstream: `BufferCache<P>::Unregister`
+    fn unregister(&mut self, buffer_id: BufferId) {
+        self.change_register(buffer_id, false);
     }
 
-    fn change_register(&mut self, _buffer_id: BufferId, _insert: bool) {
-        todo!()
+    /// Insert or remove a buffer from the page table.
+    ///
+    /// Upstream: `BufferCache<P>::ChangeRegister<insert>`
+    fn change_register(&mut self, buffer_id: BufferId, insert: bool) {
+        let (device_addr_begin, size) = {
+            let buffer = &self.slot_buffers[buffer_id];
+            (buffer.cpu_addr(), buffer.size_bytes())
+        };
+
+        if insert {
+            self.total_used_memory += (size + 1023) as u64 & !1023u64; // AlignUp(size, 1024)
+            // TODO: lru_cache.Insert — not yet ported; set_lru_id to a placeholder.
+            // We use frame_tick as a monotonic stand-in for now.
+            self.slot_buffers[buffer_id].set_lru_id(self.frame_tick as usize);
+        } else {
+            let aligned = (size + 1023) as u64 & !1023u64;
+            self.total_used_memory = self.total_used_memory.saturating_sub(aligned);
+            // TODO: lru_cache.Free — not yet ported.
+        }
+
+        let device_addr_end = device_addr_begin + size as u64;
+        let page_begin = device_addr_begin / CACHING_PAGESIZE;
+        let page_end = div_ceil(device_addr_end, CACHING_PAGESIZE);
+
+        for page in page_begin..page_end {
+            if insert {
+                self.page_table[page as usize] = buffer_id;
+            } else {
+                self.page_table[page as usize] = SlotId::invalid();
+            }
+        }
     }
 
-    fn touch_buffer(&mut self, _buffer_id: BufferId) {
-        // Touches the buffer in the LRU cache
-        todo!()
+    /// Update the LRU position of a buffer.
+    ///
+    /// Upstream: `BufferCache<P>::TouchBuffer`
+    fn touch_buffer(&mut self, buffer_id: BufferId) {
+        if buffer_id != NULL_BUFFER_ID && buffer_id.is_valid() {
+            // TODO: lru_cache.Touch(buffer.getLRUID(), frame_tick) — not yet ported.
+        }
     }
 
-    fn synchronize_buffer(
-        &mut self,
-        _buffer_id: BufferId,
-        _device_addr: VAddr,
-        _size: u32,
-    ) -> bool {
-        todo!()
+    /// Synchronize CPU-modified data to the GPU buffer.
+    ///
+    /// Upstream: `BufferCache<P>::SynchronizeBuffer`
+    ///
+    /// Returns `true` if no upload was needed (region was already clean).
+    fn synchronize_buffer(&mut self, buffer_id: BufferId, device_addr: VAddr, size: u32) -> bool {
+        let mut copies: Vec<BufferCopy> = Vec::new();
+        let mut total_size_bytes: u64 = 0;
+        let mut largest_copy: u64 = 0;
+
+        let buffer_start = self.slot_buffers[buffer_id].cpu_addr();
+
+        self.memory_tracker.for_each_upload_range(
+            device_addr,
+            size as u64,
+            &mut |device_addr_out, range_size| {
+                copies.push(BufferCopy {
+                    src_offset: total_size_bytes,
+                    dst_offset: device_addr_out - buffer_start,
+                    size: range_size,
+                });
+                total_size_bytes += range_size;
+                largest_copy = largest_copy.max(range_size);
+            },
+        );
+
+        if total_size_bytes == 0 {
+            return true;
+        }
+
+        self.upload_memory(buffer_id, total_size_bytes, largest_copy, &mut copies);
+        false
     }
 
+    /// Upload CPU data to a GPU buffer.
+    ///
+    /// Upstream: `BufferCache<P>::UploadMemory`
     fn upload_memory(
         &mut self,
-        _buffer_id: BufferId,
-        _total_size_bytes: u64,
-        _largest_copy: u64,
-        _copies: &mut [BufferCopy],
+        buffer_id: BufferId,
+        total_size_bytes: u64,
+        largest_copy: u64,
+        copies: &mut [BufferCopy],
     ) {
-        todo!()
+        if P::USE_MEMORY_MAPS_FOR_UPLOADS {
+            self.mapped_upload_memory(buffer_id, total_size_bytes, copies);
+        } else {
+            self.immediate_upload_memory(buffer_id, largest_copy, copies);
+        }
     }
 
+    /// Upload memory via direct buffer writes.
+    ///
+    /// Upstream: `BufferCache<P>::ImmediateUploadMemory`
+    ///
+    /// NOTE: `device_memory.GetPointer` and `buffer.ImmediateUpload` are not yet available.
     fn immediate_upload_memory(
         &mut self,
         _buffer_id: BufferId,
         _largest_copy: u64,
         _copies: &[BufferCopy],
     ) {
-        todo!()
+        if P::USE_MEMORY_MAPS_FOR_UPLOADS {
+            return; // This path is only for the non-memory-map case.
+        }
+        // TODO: device_memory.GetPointer / ReadBlockUnsafe — not yet available.
+        // Upstream reads CPU memory and calls buffer.ImmediateUpload(copy.dst_offset, span).
     }
 
+    /// Upload memory via staging buffer.
+    ///
+    /// Upstream: `BufferCache<P>::MappedUploadMemory`
+    ///
+    /// NOTE: runtime.UploadStagingBuffer and runtime.CopyBuffer are not yet available.
     fn mapped_upload_memory(
         &mut self,
         _buffer_id: BufferId,
         _total_size_bytes: u64,
         _copies: &mut [BufferCopy],
     ) {
-        todo!()
+        if !P::USE_MEMORY_MAPS {
+            return;
+        }
+        // TODO: runtime.UploadStagingBuffer, device_memory.ReadBlockUnsafe, runtime.CopyBuffer.
     }
 
-    fn download_buffer_memory(&mut self, _buffer_id: BufferId) {
-        todo!()
+    /// Download buffer memory back to the CPU (full buffer).
+    ///
+    /// Upstream: `BufferCache<P>::DownloadBufferMemory(Buffer&)`
+    fn download_buffer_memory(&mut self, buffer_id: BufferId) {
+        let (cpu_addr, size_bytes) = {
+            let b = &self.slot_buffers[buffer_id];
+            (b.cpu_addr(), b.size_bytes() as u64)
+        };
+        self.download_buffer_memory_range(buffer_id, cpu_addr, size_bytes);
     }
 
+    /// Download a sub-range of buffer memory back to the CPU.
+    ///
+    /// Upstream: `BufferCache<P>::DownloadBufferMemory(Buffer&, DAddr, u64)`
+    ///
+    /// NOTE: runtime memory maps, staging buffer, and device_memory.WriteBlockUnsafe
+    /// are not yet available.
     fn download_buffer_memory_range(
         &mut self,
-        _buffer_id: BufferId,
-        _device_addr: VAddr,
-        _size: u64,
+        buffer_id: BufferId,
+        device_addr: VAddr,
+        size: u64,
     ) {
-        todo!()
+        // Collect the ranges that need to be downloaded via memory_tracker.
+        // We split the logic into two phases to avoid the borrow conflict:
+        // Phase 1: collect download ranges from memory_tracker (borrows memory_tracker).
+        // Phase 2: apply range subtractions and build copy list (borrows gpu_modified_ranges).
+        let buffer_addr = self.slot_buffers[buffer_id].cpu_addr();
+
+        let mut download_ranges: Vec<(VAddr, u64)> = Vec::new();
+        self.memory_tracker.for_each_download_range_and_clear(
+            device_addr,
+            size,
+            &mut |device_addr_out: VAddr, range_size: u64| {
+                download_ranges.push((device_addr_out, range_size));
+            },
+        );
+
+        let mut copies: Vec<BufferCopy> = Vec::new();
+        let mut total_size_bytes: u64 = 0;
+        let mut largest_copy: u64 = 0;
+
+        for (device_addr_out, range_size) in download_ranges {
+            // Iterate GPU-modified sub-ranges (approximation without RangeSet).
+            let range_end = device_addr_out + range_size;
+            // Collect matching gpu_modified_ranges sub-intervals.
+            let sub_intervals: Vec<(VAddr, VAddr)> = self
+                .gpu_modified_ranges
+                .iter()
+                .filter_map(|&(s, e)| {
+                    let new_start = s.max(device_addr_out);
+                    let new_end = e.min(range_end);
+                    if new_start < new_end {
+                        Some((new_start, new_end))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for (new_start, new_end) in sub_intervals {
+                let new_offset = new_start - buffer_addr;
+                let new_size = new_end - new_start;
+                copies.push(BufferCopy {
+                    src_offset: new_offset,
+                    dst_offset: total_size_bytes,
+                    size: new_size,
+                });
+                constexpr_align_up(&mut total_size_bytes, new_size, 64);
+                largest_copy = largest_copy.max(new_size);
+            }
+
+            self.clear_download(device_addr_out, range_size);
+            Self::range_subtract(&mut self.gpu_modified_ranges, device_addr_out, range_size);
+        }
+
+        if total_size_bytes == 0 {
+            return;
+        }
+
+        if DISABLE_DOWNLOADS {
+            return;
+        }
+
+        // TODO: USE_MEMORY_MAPS path and non-mapped path both require runtime/device_memory.
+        let _ = largest_copy;
     }
 
-    fn delete_buffer(&mut self, _buffer_id: BufferId, _do_not_mark: bool) {
-        todo!()
+    /// Delete a buffer, cleaning up all state that references it.
+    ///
+    /// Upstream: `BufferCache<P>::DeleteBuffer`
+    fn delete_buffer(&mut self, buffer_id: BufferId, do_not_mark: bool) {
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+
+        // Clear any bindings that reference this buffer.
+        if cs.index_buffer.buffer_id == buffer_id {
+            cs.index_buffer.buffer_id = SlotId::invalid();
+        }
+        for binding in cs.vertex_buffers.iter_mut() {
+            if binding.buffer_id == buffer_id {
+                binding.buffer_id = SlotId::invalid();
+            }
+        }
+        for stage_buffers in cs.uniform_buffers.iter_mut() {
+            for binding in stage_buffers.iter_mut() {
+                if binding.buffer_id == buffer_id {
+                    binding.buffer_id = SlotId::invalid();
+                }
+            }
+        }
+        for stage_buffers in cs.storage_buffers.iter_mut() {
+            for binding in stage_buffers.iter_mut() {
+                if binding.buffer_id == buffer_id {
+                    binding.buffer_id = SlotId::invalid();
+                }
+            }
+        }
+        for binding in cs.transform_feedback_buffers.iter_mut() {
+            if binding.buffer_id == buffer_id {
+                binding.buffer_id = SlotId::invalid();
+            }
+        }
+        for binding in cs.compute_uniform_buffers.iter_mut() {
+            if binding.buffer_id == buffer_id {
+                binding.buffer_id = SlotId::invalid();
+            }
+        }
+        for binding in cs.compute_storage_buffers.iter_mut() {
+            if binding.buffer_id == buffer_id {
+                binding.buffer_id = SlotId::invalid();
+            }
+        }
+
+        if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
+            cs.dirty_uniform_buffers.fill(!0u32);
+            cs.uniform_buffer_binding_sizes = [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize];
+                NUM_STAGES as usize];
+        }
+
+        cs.has_deleted_buffers = true;
+        drop(cs); // release borrow before calling methods that need &mut self
+
+        // Mark the whole buffer as CPU-modified to stop tracking.
+        if !do_not_mark {
+            let (cpu_addr, size_bytes) = {
+                let b = &self.slot_buffers[buffer_id];
+                (b.cpu_addr(), b.size_bytes() as u64)
+            };
+            self.memory_tracker.mark_region_as_cpu_modified(cpu_addr, size_bytes);
+        }
+
+        self.unregister(buffer_id);
+        // TODO: delayed_destruction_ring.Push — not yet ported; just erase immediately.
+        self.slot_buffers.erase(buffer_id);
     }
 
+    /// Build a storage buffer binding from a GPU virtual SSBO address.
+    ///
+    /// Upstream: `BufferCache<P>::StorageBufferBinding`
+    ///
+    /// NOTE: gpu_memory read operations are not yet available. Returns NULL_BINDING.
     fn storage_buffer_binding(
         &self,
         _ssbo_addr: u64,
-        _cbuf_index: u32,
+        cbuf_index: u32,
         _is_written: bool,
     ) -> Binding {
-        todo!()
+        // TODO: gpu_memory->Read<u64>(ssbo_addr) and gpu_memory->GpuToCpuAddress — not yet ported.
+        log::warn!(
+            "storage_buffer_binding: GPU memory read not available for cbuf_index {}",
+            cbuf_index
+        );
+        NULL_BINDING
     }
 
+    /// Build a texture buffer binding from a GPU virtual address.
+    ///
+    /// Upstream: `BufferCache<P>::GetTextureBufferBinding`
+    ///
+    /// NOTE: gpu_memory->GpuToCpuAddress is not yet available. Stores gpu_addr directly.
     fn get_texture_buffer_binding(
         &mut self,
-        _gpu_addr: u64,
-        _size: u32,
-        _format: u32,
+        gpu_addr: u64,
+        size: u32,
+        format: u32,
     ) -> TextureBufferBinding {
-        todo!()
+        // TODO: translate gpu_addr via gpu_memory->GpuToCpuAddress.
+        if gpu_addr == 0 || size == 0 {
+            TextureBufferBinding {
+                device_addr: 0,
+                size: 0,
+                buffer_id: NULL_BUFFER_ID,
+                format: 0,
+            }
+        } else {
+            TextureBufferBinding {
+                device_addr: gpu_addr, // placeholder until GPU memory is available
+                size,
+                buffer_id: NULL_BUFFER_ID,
+                format,
+            }
+        }
     }
 
+    /// Get an immediate buffer slice backed by device memory at `device_addr`.
+    ///
+    /// Upstream: `BufferCache<P>::ImmediateBufferWithData`
+    ///
+    /// NOTE: device_memory.GetPointer is not yet available. Returns empty slice.
     fn immediate_buffer_with_data(&mut self, _device_addr: VAddr, _size: usize) -> &[u8] {
-        todo!()
+        // TODO: device_memory.GetPointer — not yet available.
+        &[]
     }
 
-    fn immediate_buffer(&mut self, _wanted_capacity: usize) -> &mut [u8] {
-        todo!()
+    /// Ensure `immediate_buffer_alloc` has at least `wanted_capacity` bytes and return a slice.
+    ///
+    /// Upstream: `BufferCache<P>::ImmediateBuffer`
+    fn immediate_buffer(&mut self, wanted_capacity: usize) -> &mut [u8] {
+        if self.immediate_buffer_alloc.len() < wanted_capacity {
+            self.immediate_buffer_alloc.resize(wanted_capacity, 0u8);
+        }
+        &mut self.immediate_buffer_alloc[..wanted_capacity]
     }
 
-    fn has_fast_uniform_buffer_bound(&self, _stage: usize, _binding_index: u32) -> bool {
-        todo!()
+    /// Return true if a fast uniform buffer is currently bound at `(stage, binding_index)`.
+    ///
+    /// Upstream: `BufferCache<P>::HasFastUniformBufferBound`
+    fn has_fast_uniform_buffer_bound(&self, stage: usize, binding_index: u32) -> bool {
+        if P::IS_OPENGL {
+            self.channel_state.as_ref().map_or(false, |cs| {
+                ((cs.fast_bound_uniform_buffers[stage] >> binding_index) & 1) != 0
+            })
+        } else {
+            // Only OpenGL has fast uniform buffers.
+            false
+        }
     }
 
-    fn clear_download(&mut self, _base_addr: VAddr, _size: u64) {
-        todo!()
+    /// Remove `[base_addr, base_addr+size)` from all download tracking structures.
+    ///
+    /// Upstream: `BufferCache<P>::ClearDownload`
+    fn clear_download(&mut self, base_addr: VAddr, size: u64) {
+        // async_downloads.DeleteAll — not yet ported (no RangeSet).
+        Self::range_subtract(&mut self.uncommitted_gpu_modified_ranges, base_addr, size);
+        for range_set in self.committed_gpu_modified_ranges.iter_mut() {
+            Self::range_subtract(range_set, base_addr, size);
+        }
     }
 
+    /// Perform the inline memory write into the buffer cache.
+    ///
+    /// Upstream: `BufferCache<P>::InlineMemoryImplementation`
+    ///
+    /// NOTE: runtime.UploadStagingBuffer and buffer.ImmediateUpload are not yet available.
     fn inline_memory_implementation(
         &mut self,
-        _dest_address: VAddr,
-        _copy_size: usize,
+        dest_address: VAddr,
+        copy_size: usize,
         _inlined_buffer: &[u8],
     ) {
-        todo!()
+        self.clear_download(dest_address, copy_size as u64);
+        Self::range_subtract(&mut self.gpu_modified_ranges, dest_address, copy_size as u64);
+
+        let buffer_id = self.find_buffer(dest_address, copy_size as u32);
+        self.synchronize_buffer(buffer_id, dest_address, copy_size as u32);
+
+        // TODO: USE_MEMORY_MAPS_FOR_UPLOADS path: runtime.UploadStagingBuffer + CopyBuffer.
+        // TODO: non-mapped path: buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer).
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Align `total` up by `new_size` rounded to `align`.
+#[inline]
+fn constexpr_align_up(total: &mut u64, new_size: u64, align: u64) {
+    *total += (new_size + align - 1) & !(align - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -835,5 +2437,150 @@ mod tests {
         assert!(!BufferCache::<TestParams, DummyTracker>::is_range_granular(
             0x1F00, 0x200
         ));
+    }
+
+    #[test]
+    fn test_tick_frame_no_channel() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        // Should return early without panicking when channel_state is None.
+        cache.tick_frame();
+        assert_eq!(cache.frame_tick, 0);
+    }
+
+    #[test]
+    fn test_write_memory_marks_cpu_modified() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        // write_memory should not panic.
+        cache.write_memory(0x10000, 0x1000);
+    }
+
+    #[test]
+    fn test_on_cpu_write_unregistered() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        // An unregistered region should return false (no GPU data to flush).
+        let result = cache.on_cpu_write(0x20000, 0x100);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_get_flush_area() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        let area = cache.get_flush_area(0x1234, 0x100);
+        assert!(area.is_some());
+        let a = area.unwrap();
+        // Should be aligned to DEVICE_PAGESIZE (4096).
+        assert_eq!(a.start_address % DEVICE_PAGESIZE, 0);
+        assert_eq!(a.end_address % DEVICE_PAGESIZE, 0);
+        assert!(a.start_address <= 0x1234);
+        assert!(a.end_address >= 0x1234 + 0x100);
+    }
+
+    #[test]
+    fn test_accumulate_flushes() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        // Add something to uncommitted ranges.
+        cache.uncommitted_gpu_modified_ranges.push((0x1000, 0x2000));
+        assert!(cache.has_uncommitted_flushes());
+        cache.accumulate_flushes();
+        assert!(!cache.has_uncommitted_flushes());
+        assert!(cache.should_wait_async_flushes());
+    }
+
+    #[test]
+    fn test_disable_graphics_uniform_buffer() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
+        cache.disable_graphics_uniform_buffer(0, 0);
+        let cs = cache.channel_state.as_ref().unwrap();
+        assert_eq!(cs.uniform_buffers[0][0].device_addr, 0);
+        assert_eq!(cs.uniform_buffers[0][0].buffer_id, NULL_BUFFER_ID);
+    }
+
+    #[test]
+    fn test_unbind_graphics_storage_buffers() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
+        if let Some(ref mut cs) = cache.channel_state {
+            cs.enabled_storage_buffers[0] = 0xFF;
+            cs.written_storage_buffers[0] = 0x0F;
+        }
+        cache.unbind_graphics_storage_buffers(0);
+        let cs = cache.channel_state.as_ref().unwrap();
+        assert_eq!(cs.enabled_storage_buffers[0], 0);
+        assert_eq!(cs.written_storage_buffers[0], 0);
+    }
+
+    #[test]
+    fn test_unbind_compute_storage_buffers() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        cache.channel_state = Some(Box::new(BufferCacheChannelInfo::default()));
+        if let Some(ref mut cs) = cache.channel_state {
+            cs.enabled_compute_storage_buffers = 0xFF;
+            cs.written_compute_storage_buffers = 0x0F;
+        }
+        cache.unbind_compute_storage_buffers();
+        let cs = cache.channel_state.as_ref().unwrap();
+        assert_eq!(cs.enabled_compute_storage_buffers, 0);
+        assert_eq!(cs.written_compute_storage_buffers, 0);
+    }
+
+    #[test]
+    fn test_range_subtract() {
+        let mut ranges = vec![(0u64, 100u64)];
+        BufferCache::<TestParams, DummyTracker>::range_subtract(&mut ranges, 20, 30);
+        // Should split into (0, 20) and (50, 100).
+        assert_eq!(ranges, vec![(0, 20), (50, 100)]);
+    }
+
+    #[test]
+    fn test_range_subtract_full_removal() {
+        let mut ranges = vec![(10u64, 50u64)];
+        BufferCache::<TestParams, DummyTracker>::range_subtract(&mut ranges, 0, 100);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_is_region_registered_empty() {
+        let tracker = DummyTracker;
+        let cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        assert!(!cache.is_region_registered(0x1000, 0x100));
+    }
+
+    #[test]
+    fn test_find_buffer_null_addr() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        let id = cache.find_buffer(0, 0x100);
+        assert_eq!(id, NULL_BUFFER_ID);
+    }
+
+    #[test]
+    fn test_create_and_find_buffer() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        let addr = 0x0001_0000u64;
+        let size = 0x1000u32;
+        let id1 = cache.find_buffer(addr, size);
+        // Finding again should return the same buffer.
+        let id2 = cache.find_buffer(addr, size);
+        assert_eq!(id1, id2);
+        assert_ne!(id1, NULL_BUFFER_ID);
+    }
+
+    #[test]
+    fn test_inline_memory_unregistered() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        // Unregistered region should return false.
+        let result = cache.inline_memory(0x5000, 0x10, &[0u8; 16]);
+        assert!(!result);
     }
 }

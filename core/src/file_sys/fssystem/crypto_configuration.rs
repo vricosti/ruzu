@@ -9,6 +9,7 @@
 //! function that maps key types to actual decryption keys.
 
 use super::nca_file_system_driver::{KeyType, NcaCryptoConfiguration};
+use crate::crypto::key_manager::{KeyManager, S128KeyType, S256KeyType};
 
 /// Generate a decryption key from a source key and key type.
 ///
@@ -19,7 +20,7 @@ use super::nca_file_system_driver::{KeyType, NcaCryptoConfiguration};
 /// - ZeroKey: output is all zeros
 /// - InvalidKey or out of range: output is all 0xFF
 /// - NcaHeaderKey1/2: reads from KeyManager header key
-/// - Others: derives from key area encryption keys
+/// - Others: derives from key area encryption keys via AES-ECB
 fn generate_key(dst_key: &mut [u8], src_key: &[u8], key_type: i32) {
     let zero_key = KeyType::ZeroKey as i32;
     let invalid_key = KeyType::InvalidKey as i32;
@@ -37,25 +38,38 @@ fn generate_key(dst_key: &mut [u8], src_key: &[u8], key_type: i32) {
         return;
     }
 
+    let keys_arc = KeyManager::instance();
+    let keys = keys_arc.lock().unwrap();
+
     if key_type == nca_header_key1 || key_type == nca_header_key2 {
-        // TODO: Read from KeyManager when integrated.
-        // For now, fill with zeros.
-        let _key_index = if key_type == nca_header_key2 { 1 } else { 0 };
-        dst_key.fill(0);
+        // Read the 256-bit header key and split into two 128-bit halves.
+        let key_index = if key_type == nca_header_key2 { 1 } else { 0 };
+        let header_key = keys.get_key_256(S256KeyType::Header, 0, 0);
+        let half_start = key_index * 0x10;
+        let copy_len = dst_key.len().min(0x10);
+        dst_key[..copy_len].copy_from_slice(&header_key[half_start..half_start + copy_len]);
         return;
     }
 
-    // Derive from key area encryption keys.
-    let _key_generation =
+    // Derive from key area encryption keys via AES-ECB decrypt.
+    let key_generation =
         std::cmp::max(key_type / NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT, 1)
             - 1;
-    let _key_index =
+    let key_index =
         key_type % NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT;
 
-    // TODO: Perform AES-ECB decrypt using KeyManager keys.
-    // For now, copy source key as placeholder.
-    let copy_len = dst_key.len().min(src_key.len());
-    dst_key[..copy_len].copy_from_slice(&src_key[..copy_len]);
+    let kak = keys.get_key_128(S128KeyType::KeyArea, key_generation as u64, key_index as u64);
+    if kak == [0u8; 16] {
+        // Key not available; copy source as-is (will likely fail downstream).
+        let copy_len = dst_key.len().min(src_key.len());
+        dst_key[..copy_len].copy_from_slice(&src_key[..copy_len]);
+        return;
+    }
+
+    // Decrypt the source key using AES-ECB with the key area key.
+    use crate::crypto::aes_util::{AesCipher, Mode, Op};
+    let mut cipher = AesCipher::new_128(kak, Mode::ECB);
+    cipher.transcode(src_key, dst_key, Op::Decrypt);
 }
 
 /// Get the global NCA crypto configuration.

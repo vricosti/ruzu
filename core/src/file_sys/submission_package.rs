@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::content_archive::{is_directory_exefs, NCA, NCAContentType};
-use super::nca_metadata::{CNMTHeader, ContentRecordType, TitleType, CNMT};
+use super::nca_metadata::{ContentRecordType, TitleType, CNMT};
 use super::partition_filesystem::{PartitionFilesystem, ResultStatus};
 use super::vfs::vfs::{VfsDirectory, VfsFile};
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
@@ -142,13 +142,17 @@ impl NSP {
     }
 
     /// Get all NCAs collapsed into a flat vector.
-    pub fn get_ncas_collapsed(&self) -> Vec<NCA> {
+    pub fn get_ncas_collapsed(&self) -> Vec<Arc<NCA>> {
         if self.extracted {
             log::warn!("get_ncas_collapsed called on an NSP that is of type extracted.");
         }
-        // NOTE: This returns empty because NCA construction requires crypto.
-        // The full implementation would iterate self.ncas and collect.
-        Vec::new()
+        let mut out = Vec::new();
+        for inner_map in self.ncas.values() {
+            for nca in inner_map.values() {
+                out.push(nca.clone());
+            }
+        }
+        out
     }
 
     pub fn get_ncas(
@@ -206,19 +210,111 @@ impl NSP {
     }
 
     fn read_ncas(&mut self, files: &[VirtualFile]) {
-        // TODO: Full NCA reading requires crypto subsystem.
-        // This is a structural stub that matches the upstream API.
         for outer_file in files {
             let name = outer_file.get_name();
             if name.len() < 9 || !name.ends_with(".cnmt.nca") {
                 continue;
             }
 
-            // NCA parsing requires crypto; skip for now
-            // In full implementation:
-            // 1. Parse the .cnmt.nca as NCA
-            // 2. Read CNMT from section0
-            // 3. Resolve content records to NCAs in PFS
+            let nca = Arc::new(NCA::new(outer_file.clone(), None));
+            if nca.get_status() != ResultStatus::Success
+                || nca.get_subdirectories().is_empty()
+            {
+                log::warn!(
+                    "read_ncas: failed to parse cnmt NCA '{}': status={:?}",
+                    name,
+                    nca.get_status()
+                );
+                self.program_status
+                    .insert(nca.get_title_id(), nca.get_status());
+                continue;
+            }
+
+            let section0 = &nca.get_subdirectories()[0];
+
+            for inner_file in section0.get_files() {
+                if inner_file.get_extension() != "cnmt" {
+                    continue;
+                }
+
+                let cnmt = CNMT::from_file(&inner_file);
+                let cnmt_title_id = cnmt.get_title_id();
+                let cnmt_type = cnmt.get_type() as u8;
+
+                // Store the .cnmt.nca itself as the Meta record.
+                self.ncas
+                    .entry(cnmt_title_id)
+                    .or_insert_with(BTreeMap::new)
+                    .insert((cnmt_type, ContentRecordType::Meta as u8), nca.clone());
+
+                for rec in cnmt.get_content_records() {
+                    // Convert NCA ID (16 bytes) to lowercase hex string.
+                    let id_string: String = rec
+                        .nca_id
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect();
+                    let nca_filename = format!("{}.nca", id_string);
+
+                    let next_file = self.pfs.get_file(&nca_filename);
+                    if next_file.is_none() {
+                        if rec.record_type != ContentRecordType::DeltaFragment {
+                            log::warn!(
+                                "NCA with ID {}.nca is listed in content metadata, but cannot \
+                                 be found in PFS. NSP appears to be corrupted.",
+                                id_string
+                            );
+                        }
+                        continue;
+                    }
+
+                    let next_nca = Arc::new(NCA::new(next_file.unwrap(), None));
+
+                    if next_nca.get_type() == NCAContentType::Program {
+                        self.program_status
+                            .insert(next_nca.get_title_id(), next_nca.get_status());
+                        self.program_ids
+                            .insert(next_nca.get_title_id() & 0xFFFFFFFFFFFFF000);
+                    }
+
+                    if next_nca.get_status() != ResultStatus::Success
+                        && next_nca.get_status() != ResultStatus::ErrorMissingBKTRBaseRomFS
+                    {
+                        continue;
+                    }
+
+                    let rec_type = rec.record_type as u8;
+
+                    // If the last 3 hexadecimal digits of the CNMT TitleID is 0x800 or is
+                    // missing the BKTRBaseRomFS, this is an update NCA.
+                    if (cnmt_title_id & 0x800) != 0
+                        || next_nca.get_status() == ResultStatus::ErrorMissingBKTRBaseRomFS
+                    {
+                        // If the last 3 hexadecimal digits of the NCA's TitleID is between
+                        // 0x1 and 0x7FF, this is a multi-program update NCA.
+                        if (next_nca.get_title_id() & 0x7FF) != 0
+                            && (next_nca.get_title_id() & 0x800) == 0
+                        {
+                            self.ncas
+                                .entry(next_nca.get_title_id())
+                                .or_insert_with(BTreeMap::new)
+                                .insert((cnmt_type, rec_type), next_nca);
+                        } else {
+                            self.ncas
+                                .entry(cnmt_title_id)
+                                .or_insert_with(BTreeMap::new)
+                                .insert((cnmt_type, rec_type), next_nca);
+                        }
+                    } else {
+                        self.ncas
+                            .entry(next_nca.get_title_id())
+                            .or_insert_with(BTreeMap::new)
+                            .insert((cnmt_type, rec_type), next_nca);
+                    }
+                }
+
+                break;
+            }
         }
     }
 }

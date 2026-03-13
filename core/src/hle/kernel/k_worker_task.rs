@@ -41,7 +41,9 @@ impl KWorkerTask {
     ///
     /// TODO: Implement once KThread and KProcess are ported.
     pub fn do_worker_task(&self) {
-        todo!("KWorkerTask::DoWorkerTask requires KThread and KProcess");
+        // In C++: DynamicCast to KThread or KProcess and call DoWorkerTaskImpl().
+        // TODO: Implement once KThread and KProcess are ported.
+        log::warn!("KWorkerTask::do_worker_task: KThread/KProcess not yet ported, no-op");
     }
 }
 

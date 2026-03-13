@@ -853,6 +853,30 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::ShuffleIndex, vec![value, index, seg_mask]))
     }
 
+    pub fn subgroup_eq_mask(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::SubgroupEqMask, vec![]))
+    }
+
+    pub fn subgroup_lt_mask(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::SubgroupLtMask, vec![]))
+    }
+
+    pub fn subgroup_le_mask(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::SubgroupLeMask, vec![]))
+    }
+
+    pub fn subgroup_gt_mask(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::SubgroupGtMask, vec![]))
+    }
+
+    pub fn subgroup_ge_mask(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::SubgroupGeMask, vec![]))
+    }
+
+    pub fn y_direction(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::YDirection, vec![]))
+    }
+
     // ── Geometry ──────────────────────────────────────────────────────
 
     pub fn emit_vertex(&mut self, stream: Value) -> Value {
@@ -881,5 +905,235 @@ impl<'a> Emitter<'a> {
             result = self.fp_neg_32(result);
         }
         result
+    }
+
+    // ── FP64 comparison ───────────────────────────────────────────────
+
+    pub fn fp_ord_equal_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdEqual64, vec![a, b]))
+    }
+
+    pub fn fp_ord_not_equal_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdNotEqual64, vec![a, b]))
+    }
+
+    pub fn fp_ord_less_than_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdLessThan64, vec![a, b]))
+    }
+
+    pub fn fp_ord_greater_than_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdGreaterThan64, vec![a, b]))
+    }
+
+    pub fn fp_ord_less_than_equal_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdLessThanEqual64, vec![a, b]))
+    }
+
+    pub fn fp_ord_greater_than_equal_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdGreaterThanEqual64, vec![a, b]))
+    }
+
+    pub fn fp_unord_equal_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordEqual64, vec![a, b]))
+    }
+
+    pub fn fp_unord_not_equal_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordNotEqual64, vec![a, b]))
+    }
+
+    pub fn fp_unord_less_than_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordLessThan64, vec![a, b]))
+    }
+
+    pub fn fp_unord_greater_than_64(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordGreaterThan64, vec![a, b]))
+    }
+
+    pub fn fp_is_nan_64(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPIsNan64, vec![a]))
+    }
+
+    pub fn fp_abs_neg_64(&mut self, value: Value, abs: bool, neg: bool) -> Value {
+        let mut result = value;
+        if abs {
+            result = self.fp_abs_64(result);
+        }
+        if neg {
+            result = self.fp_neg_64(result);
+        }
+        result
+    }
+
+    // ── FP32 swizzled add ─────────────────────────────────────────────
+
+    pub fn fp_swizzle_add(&mut self, a: Value, b: Value, swizzle: Value) -> Value {
+        self.emit(Inst::new(Opcode::FSwizzleAdd, vec![a, b, swizzle]))
+    }
+
+    // ── FP16 arithmetic ───────────────────────────────────────────────
+
+    pub fn fp_abs_16(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPAbs16, vec![a]))
+    }
+
+    pub fn fp_neg_16(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPNeg16, vec![a]))
+    }
+
+    pub fn fp_add_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPAdd16, vec![a, b]))
+    }
+
+    pub fn fp_mul_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPMul16, vec![a, b]))
+    }
+
+    pub fn fp_fma_16(&mut self, a: Value, b: Value, c: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPFma16, vec![a, b, c]))
+    }
+
+    pub fn fp_min_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPMin16, vec![a, b]))
+    }
+
+    pub fn fp_max_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPMax16, vec![a, b]))
+    }
+
+    pub fn fp_saturate_16(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPSaturate16, vec![a]))
+    }
+
+    pub fn fp_abs_neg_16(&mut self, value: Value, abs: bool, neg: bool) -> Value {
+        let mut result = value;
+        if abs {
+            result = self.fp_abs_16(result);
+        }
+        if neg {
+            result = self.fp_neg_16(result);
+        }
+        result
+    }
+
+    // ── FP16 comparison ───────────────────────────────────────────────
+
+    pub fn fp_ord_equal_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdEqual16, vec![a, b]))
+    }
+
+    pub fn fp_ord_not_equal_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdNotEqual16, vec![a, b]))
+    }
+
+    pub fn fp_ord_less_than_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdLessThan16, vec![a, b]))
+    }
+
+    pub fn fp_ord_greater_than_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdGreaterThan16, vec![a, b]))
+    }
+
+    pub fn fp_ord_less_than_equal_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdLessThanEqual16, vec![a, b]))
+    }
+
+    pub fn fp_ord_greater_than_equal_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPOrdGreaterThanEqual16, vec![a, b]))
+    }
+
+    pub fn fp_unord_equal_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordEqual16, vec![a, b]))
+    }
+
+    pub fn fp_unord_not_equal_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordNotEqual16, vec![a, b]))
+    }
+
+    pub fn fp_unord_less_than_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordLessThan16, vec![a, b]))
+    }
+
+    pub fn fp_unord_greater_than_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordGreaterThan16, vec![a, b]))
+    }
+
+    pub fn fp_unord_less_than_equal_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordLessThanEqual16, vec![a, b]))
+    }
+
+    pub fn fp_unord_greater_than_equal_16(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPUnordGreaterThanEqual16, vec![a, b]))
+    }
+
+    pub fn fp_is_nan_16(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPIsNan16, vec![a]))
+    }
+
+    // ── F16x2 composite operations ────────────────────────────────────
+
+    pub fn unpack_float_2x16(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::UnpackFloat2x16, vec![a]))
+    }
+
+    pub fn pack_float_2x16(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::PackFloat2x16, vec![a]))
+    }
+
+    pub fn composite_construct_f16x2(&mut self, a: Value, b: Value) -> Value {
+        self.emit(Inst::new(Opcode::CompositeConstructF16x2, vec![a, b]))
+    }
+
+    pub fn composite_extract_f16x2(&mut self, vec: Value, index: u32) -> Value {
+        self.emit(Inst::new(Opcode::CompositeExtractF16x2, vec![vec, Value::ImmU32(index)]))
+    }
+
+    pub fn composite_insert_f16x2(&mut self, vec: Value, val: Value, index: u32) -> Value {
+        self.emit(Inst::new(Opcode::CompositeInsertF16x2, vec![vec, val, Value::ImmU32(index)]))
+    }
+
+    // ── 64-bit integer packing ────────────────────────────────────────
+
+    pub fn pack_uint_2x32(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::PackUint2x32, vec![a]))
+    }
+
+    pub fn unpack_uint_2x32(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::UnpackUint2x32, vec![a]))
+    }
+
+    pub fn composite_extract_u32x2_idx(&mut self, vec: Value, index: u32) -> Value {
+        self.emit(Inst::new(Opcode::CompositeExtractU32x2, vec![vec, Value::ImmU32(index)]))
+    }
+
+    // ── 64-bit shift ──────────────────────────────────────────────────
+
+    pub fn shift_left_logical_64(&mut self, base: Value, shift: Value) -> Value {
+        self.emit(Inst::new(Opcode::ShiftLeftLogical64, vec![base, shift]))
+    }
+
+    // ── Integer negate 64 ────────────────────────────────────────────
+
+    pub fn ineg_64(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::INeg64, vec![a]))
+    }
+
+    // ── Shared memory ────────────────────────────────────────────────
+
+    pub fn load_shared_u32(&mut self, offset: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadSharedU32, vec![offset]))
+    }
+
+    pub fn write_shared_u32(&mut self, offset: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteSharedU32, vec![offset, value]));
+    }
+
+    // ── Double (F64) packing from register pair ────────────────────────
+
+    pub fn pack_double_2x32(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::PackDouble2x32, vec![a]))
+    }
+
+    pub fn unpack_double_2x32(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::UnpackDouble2x32, vec![a]))
     }
 }

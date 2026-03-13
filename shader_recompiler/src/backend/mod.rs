@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! SPIR-V backend: emit SPIR-V binary from IR using rspirv.
+//! Shader backend: emits target-specific binary from IR.
+//!
+//! The primary backend is SPIR-V via the `spirv/` subdirectory, which contains
+//! one Rust file per upstream `backend/spirv/emit_spirv_*.cpp` source file.
 //!
 //! The entry point is `emit_spirv()`, which takes an `IR::Program` and a
 //! `Profile` and returns a `Vec<u32>` of SPIR-V words.
@@ -10,27 +13,6 @@ pub mod bindings;
 pub mod glasm;
 pub mod glsl;
 pub mod spirv;
-pub mod spirv_context;
-pub mod emit_atomic;
-pub mod emit_barriers;
-pub mod emit_bitwise_conversion;
-pub mod emit_composite;
-pub mod emit_context;
-pub mod emit_context_get_set;
-pub mod emit_control;
-pub mod emit_convert;
-pub mod emit_float;
-pub mod emit_image;
-pub mod emit_image_atomic;
-pub mod emit_integer;
-pub mod emit_logical;
-pub mod emit_memory;
-pub mod emit_select;
-pub mod emit_shared_memory;
-pub mod emit_special;
-pub mod emit_texture;
-pub mod emit_undefined;
-pub mod emit_warp;
 
 use crate::ir;
 
@@ -67,12 +49,9 @@ impl Default for Profile {
 /// Emit SPIR-V binary from an IR program.
 ///
 /// Returns the SPIR-V words ready to be loaded into a VkShaderModule.
+/// Delegates to `spirv::emit_spirv::emit_spirv`.
 pub fn emit_spirv(program: &ir::Program, profile: &Profile) -> Vec<u32> {
-    let mut ctx = spirv_context::EmitContext::new(program, profile);
-    ctx.define_types_and_constants();
-    ctx.define_global_variables(program);
-    ctx.define_main_function(program);
-    ctx.finalize()
+    spirv::emit_spirv::emit_spirv(program, profile)
 }
 
 #[cfg(test)]
@@ -81,7 +60,7 @@ mod tests {
     use crate::ir::basic_block::Block;
     use crate::ir::emitter::Emitter;
     use crate::ir::types::ShaderStage;
-    use crate::ir::value::{Attribute, Value};
+    use crate::ir::value::Value;
 
     #[test]
     fn test_emit_empty_vertex_shader() {

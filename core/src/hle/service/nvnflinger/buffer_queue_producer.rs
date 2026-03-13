@@ -87,9 +87,11 @@ impl BufferQueueProducer {
         _format: PixelFormat,
         _usage: u32,
     ) -> (Status, i32, Fence) {
-        // Full implementation requires WaitForFreeSlotThenRelock and complex
-        // slot management. This is a structural port of the method signature.
-        todo!("BufferQueueProducer::dequeue_buffer requires full slot management infrastructure")
+        // Full implementation requires WaitForFreeSlotThenRelock, NvMap, and kernel
+        // event infrastructure. This is a structural port of the method signature.
+        // TODO: Implement when NvMap and kernel events are ported.
+        log::warn!("BufferQueueProducer::dequeue_buffer: slot management infrastructure not yet ported");
+        (Status::WouldBlock, -1, Fence::default())
     }
 
     pub fn queue_buffer(
@@ -97,8 +99,11 @@ impl BufferQueueProducer {
         _slot: i32,
         _input: &QueueBufferInput,
     ) -> (Status, QueueBufferOutput) {
-        // Full implementation requires complete buffer queue management.
-        todo!("BufferQueueProducer::queue_buffer requires full buffer queue infrastructure")
+        // Full implementation requires complete buffer queue management including
+        // consumer listener, frame counting, and fence handling.
+        // TODO: Implement when buffer queue infrastructure is ported.
+        log::warn!("BufferQueueProducer::queue_buffer: buffer queue infrastructure not yet ported");
+        (Status::WouldBlock, QueueBufferOutput::new())
     }
 
     pub fn cancel_buffer(&self, slot: i32, fence: &Fence) {

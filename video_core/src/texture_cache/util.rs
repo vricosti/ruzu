@@ -545,8 +545,12 @@ pub fn calculate_level_stride_alignment(info: &ImageInfo, level: u32) -> u32 {
 // ── Format helpers ─────────────────────────────────────────────────────
 
 /// Port of `PixelFormatFromTIC`.
+///
+/// Full implementation requires `Tegra::Texture::TICEntry`, which is not yet
+/// ported.  Returns `PixelFormat::Invalid` and logs a warning.
 pub fn pixel_format_from_tic(_config: &()) -> PixelFormat {
-    todo!("pixel_format_from_tic — needs TICEntry port")
+    log::warn!("pixel_format_from_tic: TICEntry not yet ported — returning Invalid");
+    PixelFormat::Invalid
 }
 
 /// Port of `RenderTargetImageViewType`.
@@ -659,13 +663,22 @@ pub fn make_reinterpret_image_copies(
 // ── Validation ─────────────────────────────────────────────────────────
 
 /// Port of `IsValidEntry`.
+///
+/// Upstream reads the GPU virtual address from a `TICEntry` and checks whether
+/// it maps to a valid physical address via `Tegra::MemoryManager`.  Both types
+/// are not yet ported; returns `false` and logs a warning.
 pub fn is_valid_entry(_gpu_memory: &(), _config: &()) -> bool {
-    todo!("is_valid_entry — needs MemoryManager & TICEntry")
+    log::warn!("is_valid_entry: MemoryManager / TICEntry not yet ported — returning false");
+    false
 }
 
 // ── Swizzle / unswizzle ────────────────────────────────────────────────
 
 /// Port of `UnswizzleImage`.
+///
+/// Upstream reads swizzled texture data from GPU memory via `Tegra::MemoryManager`
+/// and writes the unswizzled result.  The memory manager is not yet ported;
+/// returns an empty copy list and logs a warning.
 pub fn unswizzle_image(
     _gpu_memory: &(),
     _gpu_addr: GPUVAddr,
@@ -673,7 +686,8 @@ pub fn unswizzle_image(
     _input: &[u8],
     _output: &mut [u8],
 ) -> Vec<BufferImageCopy> {
-    todo!("unswizzle_image")
+    log::warn!("unswizzle_image: MemoryManager not yet ported — returning empty copy list");
+    Vec::new()
 }
 
 /// Port of `ConvertImage`.
@@ -841,6 +855,10 @@ pub fn full_upload_swizzles(info: &ImageInfo) -> Vec<SwizzleParameters> {
 }
 
 /// Port of `SwizzleImage`.
+///
+/// Upstream writes swizzled texture data back to GPU memory via
+/// `Tegra::MemoryManager`.  The memory manager is not yet ported; logs a
+/// warning and returns without writing.
 pub fn swizzle_image(
     _gpu_memory: &(),
     _gpu_addr: GPUVAddr,
@@ -849,7 +867,7 @@ pub fn swizzle_image(
     _memory: &[u8],
     _tmp_buffer: &mut Vec<u8>,
 ) {
-    todo!("swizzle_image")
+    log::warn!("swizzle_image: MemoryManager not yet ported — no data written");
 }
 
 // ── Mip helpers ────────────────────────────────────────────────────────

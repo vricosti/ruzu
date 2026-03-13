@@ -1,0 +1,21 @@
+[package]
+name = "dedicated_room"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dedicated-room"
+path = "src/main.rs"
+
+[dependencies]
+common = { workspace = true }
+network = { workspace = true }
+web_service = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

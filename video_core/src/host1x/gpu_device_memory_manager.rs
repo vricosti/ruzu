@@ -27,47 +27,61 @@ pub struct MaxwellDeviceMemoryManager {
 
 impl MaxwellDeviceMemoryManager {
     /// Read a value of type T from a device address.
+    ///
+    /// Stubbed — requires the full `Core::DeviceMemoryManager<MaxwellDeviceTraits>` port.
     pub fn read_u8(&self, _addr: DAddr) -> u8 {
-        todo!("MaxwellDeviceMemoryManager::read_u8")
+        log::warn!("MaxwellDeviceMemoryManager::read_u8: not yet implemented");
+        0
     }
 
     pub fn read_u16(&self, _addr: DAddr) -> u16 {
-        todo!("MaxwellDeviceMemoryManager::read_u16")
+        log::warn!("MaxwellDeviceMemoryManager::read_u16: not yet implemented");
+        0
     }
 
     pub fn read_u32(&self, _addr: DAddr) -> u32 {
-        todo!("MaxwellDeviceMemoryManager::read_u32")
+        log::warn!("MaxwellDeviceMemoryManager::read_u32: not yet implemented");
+        0
     }
 
     pub fn read_u64(&self, _addr: DAddr) -> u64 {
-        todo!("MaxwellDeviceMemoryManager::read_u64")
+        log::warn!("MaxwellDeviceMemoryManager::read_u64: not yet implemented");
+        0
     }
 
     /// Write a value of type T to a device address.
+    ///
+    /// Stubbed — requires the full `Core::DeviceMemoryManager<MaxwellDeviceTraits>` port.
     pub fn write_u8(&self, _addr: DAddr, _data: u8) {
-        todo!("MaxwellDeviceMemoryManager::write_u8")
+        log::warn!("MaxwellDeviceMemoryManager::write_u8: not yet implemented");
     }
 
     pub fn write_u16(&self, _addr: DAddr, _data: u16) {
-        todo!("MaxwellDeviceMemoryManager::write_u16")
+        log::warn!("MaxwellDeviceMemoryManager::write_u16: not yet implemented");
     }
 
     pub fn write_u32(&self, _addr: DAddr, _data: u32) {
-        todo!("MaxwellDeviceMemoryManager::write_u32")
+        log::warn!("MaxwellDeviceMemoryManager::write_u32: not yet implemented");
     }
 
     pub fn write_u64(&self, _addr: DAddr, _data: u64) {
-        todo!("MaxwellDeviceMemoryManager::write_u64")
+        log::warn!("MaxwellDeviceMemoryManager::write_u64: not yet implemented");
     }
 
     /// Get a pointer to the given device address.
+    ///
+    /// Stubbed — requires the full `Core::DeviceMemoryManager<MaxwellDeviceTraits>` port.
     pub fn get_pointer(&self, _addr: DAddr) -> *const u8 {
-        todo!("MaxwellDeviceMemoryManager::get_pointer")
+        log::warn!("MaxwellDeviceMemoryManager::get_pointer: not yet implemented");
+        std::ptr::null()
     }
 
     /// Get a mutable pointer to the given device address.
+    ///
+    /// Stubbed — requires the full `Core::DeviceMemoryManager<MaxwellDeviceTraits>` port.
     pub fn get_pointer_mut(&self, _addr: DAddr) -> *mut u8 {
-        todo!("MaxwellDeviceMemoryManager::get_pointer_mut")
+        log::warn!("MaxwellDeviceMemoryManager::get_pointer_mut: not yet implemented");
+        std::ptr::null_mut()
     }
 }
 
@@ -77,7 +91,11 @@ impl MaxwellDeviceMemoryManager {
 pub struct MaxwellDeviceMethods;
 
 impl MaxwellDeviceMethods {
+    /// Mark a region of device memory as cacheable or non-cacheable.
+    ///
+    /// Stubbed — requires platform-specific cache invalidation (e.g., CacheInvalidate on
+    /// Tegra). Upstream: Tegra::MaxwellDeviceMethods::MarkRegionCaching().
     pub fn mark_region_caching(_address: u64, _size: usize, _caching: bool) {
-        todo!("MaxwellDeviceMethods::mark_region_caching")
+        log::warn!("MaxwellDeviceMethods::mark_region_caching: not yet implemented");
     }
 }

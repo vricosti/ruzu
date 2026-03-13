@@ -234,9 +234,9 @@ impl DmaPusher {
         // In the full port, this loops while system.is_powered_on()
         while self.step() {}
 
-        // gpu.flush_commands();
-        // gpu.on_command_list_end();
-        todo!("dispatch_calls requires GPU and System integration");
+        // NOTE: Full implementation calls gpu.flush_commands() and gpu.on_command_list_end().
+        // Stubbed until GPU and System integration is complete.
+        log::warn!("DmaPusher::dispatch_calls: GPU/System not integrated, skipping flush");
     }
 
     /// Process the next step of command submission.
@@ -244,8 +244,12 @@ impl DmaPusher {
         if !self.ib_enable || self.dma_pushbuffer.is_empty() {
             return false;
         }
-        // Full implementation requires memory manager for reading command buffers
-        todo!("step requires MemoryManager integration");
+        // NOTE: Full implementation reads command buffer entries from GPU memory via
+        // the memory manager. Without memory manager integration, we cannot process
+        // the pushbuffer entries.
+        log::warn!("DmaPusher::step: MemoryManager not integrated, dropping pushbuffer");
+        self.dma_pushbuffer.clear();
+        false
     }
 
     /// Process a span of command headers.
@@ -323,12 +327,22 @@ impl DmaPusher {
     }
 
     fn call_method(&self, _argument: u32) {
-        // In the full port, dispatches to puller or subchannel engine
-        todo!("call_method requires engine integration");
+        // NOTE: Full implementation dispatches to the puller or the subchannel engine
+        // based on dma_state.subchannel and dma_state.method.
+        // Stubbed until engine integration is complete.
+        log::warn!(
+            "DmaPusher::call_method: engine not integrated, ignoring method 0x{:X}",
+            self.dma_state.method
+        );
     }
 
     fn call_multi_method(&self, _commands: &[CommandHeader]) {
-        // In the full port, dispatches to puller or subchannel engine
-        todo!("call_multi_method requires engine integration");
+        // NOTE: Full implementation dispatches to the puller or subchannel engine for
+        // non-incrementing multi-method writes.
+        // Stubbed until engine integration is complete.
+        log::warn!(
+            "DmaPusher::call_multi_method: engine not integrated, ignoring method 0x{:X}",
+            self.dma_state.method
+        );
     }
 }

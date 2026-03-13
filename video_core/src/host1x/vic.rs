@@ -546,11 +546,14 @@ impl Vic {
     ///
     /// Port of `Vic::Execute`.
     fn execute(&mut self) {
-        // TODO: Read ConfigStruct from memory at config_struct_offset.
-        // TODO: For each enabled slot, read the decoded frame from frame_queue,
-        //       perform color conversion and blending, write output surface.
-        // Stubbed — requires memory manager and FFmpeg frame integration.
-        todo!("Vic::execute — requires memory manager and frame integration")
+        // Stubbed — requires memory manager to read ConfigStruct from config_struct_offset,
+        // frame_queue access to dequeue decoded FFmpeg frames, and a color-conversion/
+        // blending pipeline to write the output surface.
+        // Upstream: Vic::Execute() in video_core/host1x/vic.cpp
+        log::warn!(
+            "Vic::execute (id={}): not yet implemented (requires memory manager and frame integration)",
+            self.id
+        );
     }
 }
 

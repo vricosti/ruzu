@@ -1,0 +1,24 @@
+[package]
+name = "yuzu_cmd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yuzu-cmd"
+path = "src/main.rs"
+
+[dependencies]
+common = { workspace = true }
+ruzu_core = { package = "core", path = "../core" }
+video_core = { workspace = true }
+input_common = { workspace = true }
+frontend_common = { workspace = true }
+sdl2 = { workspace = true }
+gl = { workspace = true }
+ash = { workspace = true }
+raw-window-handle = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

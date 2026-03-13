@@ -106,9 +106,8 @@ impl AesXtsStorage {
 
     /// Read and decrypt data from the storage.
     ///
-    /// In upstream, this reads data and decrypts each block using AES-XTS,
-    /// handling unaligned head/tail blocks with a temporary buffer.
-    /// Currently reads without decryption.
+    /// Reads data from the base storage and decrypts each XTS sector using
+    /// AES-XTS with Nintendo's big-endian tweak convention.
     ///
     /// Corresponds to upstream `AesXtsStorage::Read`.
     pub fn read_at(&self, buffer: &mut [u8], offset: usize) -> usize {
@@ -129,23 +128,30 @@ impl AesXtsStorage {
             "AesXtsStorage::read: size must be AES-block-aligned"
         );
 
-        // Read the data.
-        self.base_storage.read(buffer, size, offset);
+        let _lock = self.mutex.lock().unwrap();
 
-        // Setup the counter.
-        let mut ctr = self.iv;
-        add_counter(&mut ctr, (offset / self.block_size) as u64);
+        // Read the encrypted data from the base storage.
+        let read = self.base_storage.read(buffer, size, offset);
+        if read == 0 {
+            return 0;
+        }
 
-        // TODO: Decrypt using AES-XTS.
-        // Handle unaligned head (offset % block_size != 0):
-        //   1. Read full block into temp buffer
-        //   2. Decrypt
-        //   3. Copy relevant portion
-        // Then decrypt aligned chunks:
-        //   Loop with block_size chunks, decrypting each
-        let _ = ctr;
+        // Decrypt using AES-XTS with the crypto module.
+        use crate::crypto::aes_util::{AesCipher, Mode, Op};
+        let mut cipher = AesCipher::new_256(self.key, Mode::XTS);
 
-        size
+        // Starting sector number.
+        let start_sector = offset / self.block_size;
+
+        cipher.xts_transcode(
+            &buffer[..read].to_vec(),
+            &mut buffer[..read],
+            start_sector,
+            self.block_size,
+            Op::Decrypt,
+        );
+
+        read
     }
 }
 

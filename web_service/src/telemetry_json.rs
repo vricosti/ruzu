@@ -180,7 +180,7 @@ impl TelemetryJson {
 
         // NOTE: Would POST to /telemetry via a detached task. Stubbed.
         let _content = format!("{:?}", self.inner.top_section());
-        todo!("TelemetryJson::complete requires HTTP client")
+        log::warn!("TelemetryJson::complete: HTTP client not implemented; telemetry data not submitted");
     }
 
     /// Submits a testcase.
@@ -195,7 +195,8 @@ impl TelemetryJson {
             .serialize_section(FieldType::UserConfig, "UserConfig");
 
         // NOTE: Would POST to /gamedb/testcase. Stubbed.
-        todo!("TelemetryJson::submit_testcase requires HTTP client")
+        log::warn!("TelemetryJson::submit_testcase: HTTP client not implemented; testcase not submitted");
+        false
     }
 }
 

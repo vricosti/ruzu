@@ -128,7 +128,11 @@ impl CachedMacro for MacroJitX64Impl {
     ///
     /// Port of `MacroJITx64Impl::Execute`.
     fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        todo!("MacroJITx64 execution requires actual x64 code generation")
+        // Stubbed — actual execution requires a generated native code buffer and a
+        // function pointer to the compiled program (Xbyak in upstream;
+        // dynasm-rs or cranelift in a full Rust port).
+        // Upstream: MacroJITx64Impl::Execute() in video_core/macro/macro_jit_x64.cpp
+        log::warn!("MacroJITx64::execute: JIT execution not yet implemented (requires x64 code generation)");
     }
 }
 

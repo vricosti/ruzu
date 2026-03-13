@@ -188,7 +188,7 @@ impl XCI {
         // Parse secure partition as NSP
         if let Some(secure_raw) = &xci.partitions_raw[XCIPartition::Secure as usize] {
             let nsp = Arc::new(NSP::new(secure_raw.clone(), program_id, program_index));
-            xci.ncas = nsp.get_ncas_collapsed().into_iter().map(Arc::new).collect();
+            xci.ncas = nsp.get_ncas_collapsed();
 
             let prog_tid = nsp.get_program_title_id();
             // TODO: xci.program = nsp.get_nca(prog_tid, ContentRecordType::Program)

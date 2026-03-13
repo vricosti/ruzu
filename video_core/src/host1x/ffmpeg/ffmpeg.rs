@@ -4,8 +4,8 @@
 //! Port of `video_core/host1x/ffmpeg/ffmpeg.h` and `ffmpeg.cpp`.
 //!
 //! Wraps FFmpeg types (AVPacket, AVFrame, AVCodec, AVCodecContext) for video
-//! decoding. All bodies are stubbed with `todo!()` since actual FFmpeg
-//! integration requires external C bindings.
+//! decoding. All bodies that depend on FFmpeg are stubbed with `log::warn!` and
+//! safe default returns since actual FFmpeg integration requires external C bindings.
 
 use std::sync::Arc;
 
@@ -92,7 +92,10 @@ impl Decoder {
     }
 
     pub fn supports_decoding_on_device(&self) -> bool {
-        todo!("FFmpeg::Decoder::supports_decoding_on_device — requires FFmpeg bindings")
+        // Stubbed — requires FFmpeg C bindings to query AVCodec hardware device support.
+        // Upstream: FFmpeg::Decoder::SupportDecodingOnDevice() in ffmpeg.cpp
+        log::warn!("FFmpeg::Decoder::supports_decoding_on_device: FFmpeg bindings not available");
+        false
     }
 }
 
@@ -107,7 +110,10 @@ impl HardwareContext {
     }
 
     pub fn get_supported_device_types() -> Vec<u32> {
-        todo!("FFmpeg::HardwareContext::get_supported_device_types — requires FFmpeg bindings")
+        // Stubbed — requires FFmpeg C bindings to enumerate AV_HWDEVICE_TYPE_* values.
+        // Upstream: FFmpeg::HardwareContext::GetSupportedDeviceTypes() in ffmpeg.cpp
+        log::warn!("FFmpeg::HardwareContext::get_supported_device_types: FFmpeg bindings not available");
+        Vec::new()
     }
 
     pub fn initialize_for_decoder(
@@ -115,7 +121,11 @@ impl HardwareContext {
         _decoder_context: &mut DecoderContext,
         _decoder: &Decoder,
     ) -> bool {
-        todo!("FFmpeg::HardwareContext::initialize_for_decoder — requires FFmpeg bindings")
+        // Stubbed — requires FFmpeg C bindings to create and attach an AVBufferRef
+        // hardware device context to the AVCodecContext.
+        // Upstream: FFmpeg::HardwareContext::InitializeForDecoder() in ffmpeg.cpp
+        log::warn!("FFmpeg::HardwareContext::initialize_for_decoder: FFmpeg bindings not available");
+        false
     }
 }
 
@@ -140,19 +150,31 @@ impl DecoderContext {
     }
 
     pub fn initialize_hardware_decoder(&mut self, _context: &HardwareContext, _hw_pix_fmt: i32) {
-        todo!("FFmpeg::DecoderContext::initialize_hardware_decoder — requires FFmpeg bindings")
+        // Stubbed — requires FFmpeg C bindings to set AVCodecContext hw_device_ctx
+        // and get_format callback.
+        // Upstream: FFmpeg::DecoderContext::InitializeHardwareDecoder() in ffmpeg.cpp
+        log::warn!("FFmpeg::DecoderContext::initialize_hardware_decoder: FFmpeg bindings not available");
     }
 
     pub fn open_context(&mut self, _decoder: &Decoder) -> bool {
-        todo!("FFmpeg::DecoderContext::open_context — requires FFmpeg bindings")
+        // Stubbed — requires FFmpeg C bindings to call avcodec_open2().
+        // Upstream: FFmpeg::DecoderContext::OpenContext() in ffmpeg.cpp
+        log::warn!("FFmpeg::DecoderContext::open_context: FFmpeg bindings not available");
+        false
     }
 
     pub fn send_packet(&mut self, _packet: &Packet) -> bool {
-        todo!("FFmpeg::DecoderContext::send_packet — requires FFmpeg bindings")
+        // Stubbed — requires FFmpeg C bindings to call avcodec_send_packet().
+        // Upstream: FFmpeg::DecoderContext::SendPacket() in ffmpeg.cpp
+        log::warn!("FFmpeg::DecoderContext::send_packet: FFmpeg bindings not available");
+        false
     }
 
     pub fn receive_frame(&mut self) -> Option<Arc<Frame>> {
-        todo!("FFmpeg::DecoderContext::receive_frame — requires FFmpeg bindings")
+        // Stubbed — requires FFmpeg C bindings to call avcodec_receive_frame().
+        // Upstream: FFmpeg::DecoderContext::ReceiveFrame() in ffmpeg.cpp
+        log::warn!("FFmpeg::DecoderContext::receive_frame: FFmpeg bindings not available");
+        None
     }
 
     pub fn using_decode_order(&self) -> bool {
@@ -203,11 +225,18 @@ impl DecodeApi {
     }
 
     pub fn send_packet(&mut self, _packet_data: &[u8]) -> bool {
-        todo!("DecodeApi::send_packet — requires FFmpeg bindings")
+        // Stubbed — requires FFmpeg C bindings to wrap data in AVPacket and call
+        // DecoderContext::send_packet().
+        // Upstream: FFmpeg::DecodeApi::SendPacket() in ffmpeg.cpp
+        log::warn!("FFmpeg::DecodeApi::send_packet: FFmpeg bindings not available");
+        false
     }
 
     pub fn receive_frame(&mut self) -> Option<Arc<Frame>> {
-        todo!("DecodeApi::receive_frame — requires FFmpeg bindings")
+        // Stubbed — requires FFmpeg C bindings to call DecoderContext::receive_frame().
+        // Upstream: FFmpeg::DecodeApi::ReceiveFrame() in ffmpeg.cpp
+        log::warn!("FFmpeg::DecodeApi::receive_frame: FFmpeg bindings not available");
+        None
     }
 }
 

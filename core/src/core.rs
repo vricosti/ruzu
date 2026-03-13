@@ -10,12 +10,15 @@
 use crate::core_timing::CoreTiming;
 use crate::cpu_manager::CpuManager;
 use crate::device_memory::DeviceMemory;
+use crate::file_sys::fs_filesystem::OpenMode;
+use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use crate::hardware_properties;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Enumeration representing the return values of the System Initialize and Load process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +115,19 @@ pub struct System {
     /// Callback to exit the application.
     exit_callback: Option<ExitCallback>,
 
+    // ── Loader / VFS ──
+    /// The application loader used to load the game.
+    app_loader: Option<Box<dyn crate::loader::loader::AppLoader>>,
+    /// The virtual filesystem backed by the real filesystem.
+    virtual_filesystem: Option<Arc<RealVfsFilesystem>>,
+
+    // ── Process ──
+    /// The current application process.
+    /// Stored here after loading so CPU execution can access the process memory.
+    current_process: Option<crate::hle::kernel::k_process::KProcess>,
+    /// Load parameters from the loader (thread priority, stack size).
+    load_parameters: Option<crate::loader::loader::LoadParameters>,
+
     // ── Per-core profiling data ──
     /// Dynarmic tick counters per CPU core (for profiling).
     _dynarmic_ticks: [u64; hardware_properties::NUM_CPU_CORES as usize],
@@ -142,6 +158,10 @@ impl System {
             user_channel: VecDeque::new(),
             execute_program_callback: None,
             exit_callback: None,
+            app_loader: None,
+            virtual_filesystem: None,
+            current_process: None,
+            load_parameters: None,
             _dynarmic_ticks: [0u64; hardware_properties::NUM_CPU_CORES as usize],
         }
     }
@@ -171,6 +191,65 @@ impl System {
         self.cpu_manager.set_async_gpu(self.is_async_gpu);
 
         log::info!("System: initialized (multicore={}, async_gpu={})", self.is_multicore, self.is_async_gpu);
+    }
+
+    /// Load the game at the given filepath.
+    ///
+    /// Corresponds to C++ System::Load().
+    /// Creates a RealVfsFilesystem, opens the game file, identifies the loader,
+    /// and calls AppLoader::load().
+    pub fn load(&mut self, filepath: &str) -> SystemResultStatus {
+        // Create a RealVfsFilesystem if not already set.
+        if self.virtual_filesystem.is_none() {
+            self.virtual_filesystem = Some(RealVfsFilesystem::new());
+        }
+
+        let vfs = self.virtual_filesystem.as_ref().unwrap();
+
+        // Open the game file.
+        let file = match vfs.arc_open_file(filepath, OpenMode::READ) {
+            Some(f) => f,
+            None => {
+                log::error!("Failed to open ROM file: {}", filepath);
+                return SystemResultStatus::ErrorGetLoader;
+            }
+        };
+
+        // Get the appropriate loader for this file type.
+        let mut loader_system = crate::loader::loader::System;
+        let loader = crate::loader::loader::get_loader(&mut loader_system, file, 0, 0);
+
+        let mut loader = match loader {
+            Some(l) => l,
+            None => {
+                log::error!("Failed to obtain loader for ROM file: {}", filepath);
+                return SystemResultStatus::ErrorGetLoader;
+            }
+        };
+
+        // Create a KProcess and call the loader.
+        let mut process = crate::loader::loader::KProcess::new();
+        let (result_status, load_parameters) = loader.load(&mut process, &mut loader_system);
+
+        if result_status != crate::loader::loader::ResultStatus::Success {
+            log::error!(
+                "Failed to load ROM: {} ({})",
+                crate::loader::loader::get_result_status_string(result_status),
+                filepath,
+            );
+            self.status = SystemResultStatus::ErrorLoader;
+            return SystemResultStatus::ErrorLoader;
+        }
+
+        // Store the loader and process.
+        self.app_loader = Some(loader);
+        self.load_parameters = load_parameters;
+        self.current_process = Some(process);
+        self.is_powered_on.store(true, Ordering::Relaxed);
+        self.status = SystemResultStatus::Success;
+
+        log::info!("Successfully loaded ROM: {}", filepath);
+        SystemResultStatus::Success
     }
 
     /// Run the OS and Application.
@@ -463,6 +542,21 @@ impl System {
     /// Placeholder - full implementation requires the kernel module.
     pub fn register_host_thread(&mut self) {
         // In C++: impl->kernel.RegisterHostThread();
+    }
+
+    /// Get a reference to the current application process.
+    pub fn current_process(&self) -> Option<&crate::hle::kernel::k_process::KProcess> {
+        self.current_process.as_ref()
+    }
+
+    /// Get a mutable reference to the current application process.
+    pub fn current_process_mut(&mut self) -> Option<&mut crate::hle::kernel::k_process::KProcess> {
+        self.current_process.as_mut()
+    }
+
+    /// Get the load parameters from the last successful load.
+    pub fn load_parameters(&self) -> Option<&crate::loader::loader::LoadParameters> {
+        self.load_parameters.as_ref()
     }
 
     /// Initialize performance stats for a specific title.

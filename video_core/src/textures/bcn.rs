@@ -107,18 +107,24 @@ fn compress_bcn<const BYTES_PER_BLOCK: u32, const THRESHOLD_ALPHA: bool>(
 /// Compress RGBA8 data into BC1 format.
 ///
 /// Port of `Tegra::Texture::BCN::CompressBC1`.
+///
+/// NOTE: Full implementation uses stb_compress_bc1_block from the stb_dxt library.
+/// Without that library, each output block is zeroed (invalid BC1 block).
 pub fn compress_bc1(data: &[u8], width: u32, height: u32, depth: u32, output: &mut [u8]) {
+    log::warn!("compress_bc1: stb_dxt not available, outputting zeroed BC1 blocks");
     compress_bcn::<8, true>(
         data,
         width,
         height,
         depth,
         output,
-        |block_output, block_input, any_alpha| {
-            // TODO: Replace with actual stb_dxt BC1 compression
-            // stb_compress_bc1_block(block_output, block_input, any_alpha, STB_DXT_NORMAL)
-            let _ = (block_output, block_input, any_alpha);
-            todo!("BC1 block compression requires stb_dxt or equivalent")
+        |block_output, _block_input, _any_alpha| {
+            // Zero-fill the 8-byte BC1 block. This produces a valid-but-wrong block
+            // (both endpoints = 0, all texels map to endpoint 0 = black).
+            // Full implementation: stb_compress_bc1_block(block_output, block_input, any_alpha, STB_DXT_NORMAL)
+            for b in block_output.iter_mut() {
+                *b = 0;
+            }
         },
     );
 }
@@ -126,18 +132,23 @@ pub fn compress_bc1(data: &[u8], width: u32, height: u32, depth: u32, output: &m
 /// Compress RGBA8 data into BC3 format.
 ///
 /// Port of `Tegra::Texture::BCN::CompressBC3`.
+///
+/// NOTE: Full implementation uses stb_compress_bc3_block from the stb_dxt library.
+/// Without that library, each output block is zeroed (invalid BC3 block).
 pub fn compress_bc3(data: &[u8], width: u32, height: u32, depth: u32, output: &mut [u8]) {
+    log::warn!("compress_bc3: stb_dxt not available, outputting zeroed BC3 blocks");
     compress_bcn::<16, false>(
         data,
         width,
         height,
         depth,
         output,
-        |block_output, block_input, _any_alpha| {
-            // TODO: Replace with actual stb_dxt BC3 compression
-            // stb_compress_bc3_block(block_output, block_input, STB_DXT_NORMAL)
-            let _ = (block_output, block_input);
-            todo!("BC3 block compression requires stb_dxt or equivalent")
+        |block_output, _block_input, _any_alpha| {
+            // Zero-fill the 16-byte BC3 block.
+            // Full implementation: stb_compress_bc3_block(block_output, block_input, STB_DXT_NORMAL)
+            for b in block_output.iter_mut() {
+                *b = 0;
+            }
         },
     );
 }

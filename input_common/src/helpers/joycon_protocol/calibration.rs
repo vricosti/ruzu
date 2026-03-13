@@ -11,7 +11,7 @@
 use common::input::DriverResult;
 
 use super::common_protocol::{JoyconCommonProtocol, ScopedSetBlocking};
-use super::joycon_types::*;
+use super::joycon_types::{CalibrationMagic, JoyStickCalibration, MotionCalibration, RingCalibration, SpiAddress};
 
 /// Default stick center value.
 const DEFAULT_STICK_CENTER: u16 = 0x800;
@@ -93,36 +93,167 @@ impl CalibrationProtocol {
     /// Port of CalibrationProtocol::GetLeftJoyStickCalibration
     pub fn get_left_joy_stick_calibration(
         &mut self,
-        _calibration: &mut JoyStickCalibration,
+        calibration: &mut JoyStickCalibration,
     ) -> DriverResult {
-        // Requires ReadSPI which depends on hidapi handle wiring.
-        // The full flow is:
-        // 1. ScopedSetBlocking
-        // 2. HasUserCalibration(USER_LEFT_MAGIC)
-        // 3. ReadSPI(USER_LEFT_DATA or FACT_LEFT_DATA, spi_calibration)
-        // 4. Extract x/y axis from 3-byte blocks using GetXAxisCalibrationValue/GetYAxisCalibrationValue
-        // 5. ValidateCalibration
-        todo!("Requires ReadSPI via hidapi handle")
+        let _sb = ScopedSetBlocking::new(&mut self.protocol);
+        let mut result = DriverResult::Success;
+        let mut spi_calibration = JoystickLeftSpiCalibration::default();
+        let mut has_user_cal = false;
+        *calibration = JoyStickCalibration::default();
+
+        if result == DriverResult::Success {
+            result = self.has_user_calibration(SpiAddress::UserLeftMagic, &mut has_user_cal);
+        }
+
+        // Read user defined calibration
+        if result == DriverResult::Success && has_user_cal {
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut spi_calibration as *mut _ as *mut u8,
+                    std::mem::size_of::<JoystickLeftSpiCalibration>(),
+                )
+            };
+            result = self.protocol.read_raw_spi(SpiAddress::UserLeftData, buf);
+        }
+
+        // Read factory calibration
+        if result == DriverResult::Success && !has_user_cal {
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut spi_calibration as *mut _ as *mut u8,
+                    std::mem::size_of::<JoystickLeftSpiCalibration>(),
+                )
+            };
+            result = self.protocol.read_raw_spi(SpiAddress::FactLeftData, buf);
+        }
+
+        if result == DriverResult::Success {
+            calibration.x.center = self.get_x_axis_calibration_value(&spi_calibration.center);
+            calibration.y.center = self.get_y_axis_calibration_value(&spi_calibration.center);
+            calibration.x.min = self.get_x_axis_calibration_value(&spi_calibration.min);
+            calibration.y.min = self.get_y_axis_calibration_value(&spi_calibration.min);
+            calibration.x.max = self.get_x_axis_calibration_value(&spi_calibration.max);
+            calibration.y.max = self.get_y_axis_calibration_value(&spi_calibration.max);
+        }
+
+        // Set a valid default calibration if data is missing
+        self.validate_stick_calibration(calibration);
+
+        result
     }
 
     /// Sends a request to obtain the right stick calibration from memory.
     /// Port of CalibrationProtocol::GetRightJoyStickCalibration
     pub fn get_right_joy_stick_calibration(
         &mut self,
-        _calibration: &mut JoyStickCalibration,
+        calibration: &mut JoyStickCalibration,
     ) -> DriverResult {
-        // Same flow as left, but with USER_RIGHT_MAGIC/USER_RIGHT_DATA/FACT_RIGHT_DATA
-        todo!("Requires ReadSPI via hidapi handle")
+        let _sb = ScopedSetBlocking::new(&mut self.protocol);
+        let mut result = DriverResult::Success;
+        let mut spi_calibration = JoystickRightSpiCalibration::default();
+        let mut has_user_cal = false;
+        *calibration = JoyStickCalibration::default();
+
+        if result == DriverResult::Success {
+            result = self.has_user_calibration(SpiAddress::UserRightMagic, &mut has_user_cal);
+        }
+
+        // Read user defined calibration
+        if result == DriverResult::Success && has_user_cal {
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut spi_calibration as *mut _ as *mut u8,
+                    std::mem::size_of::<JoystickRightSpiCalibration>(),
+                )
+            };
+            result = self.protocol.read_raw_spi(SpiAddress::UserRightData, buf);
+        }
+
+        // Read factory calibration
+        if result == DriverResult::Success && !has_user_cal {
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut spi_calibration as *mut _ as *mut u8,
+                    std::mem::size_of::<JoystickRightSpiCalibration>(),
+                )
+            };
+            result = self.protocol.read_raw_spi(SpiAddress::FactRightData, buf);
+        }
+
+        if result == DriverResult::Success {
+            calibration.x.center = self.get_x_axis_calibration_value(&spi_calibration.center);
+            calibration.y.center = self.get_y_axis_calibration_value(&spi_calibration.center);
+            calibration.x.min = self.get_x_axis_calibration_value(&spi_calibration.min);
+            calibration.y.min = self.get_y_axis_calibration_value(&spi_calibration.min);
+            calibration.x.max = self.get_x_axis_calibration_value(&spi_calibration.max);
+            calibration.y.max = self.get_y_axis_calibration_value(&spi_calibration.max);
+        }
+
+        // Set a valid default calibration if data is missing
+        self.validate_stick_calibration(calibration);
+
+        result
     }
 
     /// Sends a request to obtain the motion calibration from memory.
     /// Port of CalibrationProtocol::GetImuCalibration
     pub fn get_imu_calibration(
         &mut self,
-        _calibration: &mut MotionCalibration,
+        calibration: &mut MotionCalibration,
     ) -> DriverResult {
-        // Reads SPI for USER_IMU_MAGIC, then USER_IMU_DATA or FACT_IMU_DATA
-        todo!("Requires ReadSPI via hidapi handle")
+        let _sb = ScopedSetBlocking::new(&mut self.protocol);
+        let mut result = DriverResult::Success;
+        let mut spi_calibration = ImuSpiCalibration::default();
+        let mut has_user_cal = false;
+        *calibration = MotionCalibration::default();
+
+        if result == DriverResult::Success {
+            result = self.has_user_calibration(SpiAddress::UserImuMagic, &mut has_user_cal);
+        }
+
+        // Read user defined calibration
+        if result == DriverResult::Success && has_user_cal {
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut spi_calibration as *mut _ as *mut u8,
+                    std::mem::size_of::<ImuSpiCalibration>(),
+                )
+            };
+            result = self.protocol.read_raw_spi(SpiAddress::UserImuData, buf);
+        }
+
+        // Read factory calibration
+        if result == DriverResult::Success && !has_user_cal {
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut spi_calibration as *mut _ as *mut u8,
+                    std::mem::size_of::<ImuSpiCalibration>(),
+                )
+            };
+            result = self.protocol.read_raw_spi(SpiAddress::FactImuData, buf);
+        }
+
+        if result == DriverResult::Success {
+            calibration.accelerometer[0].offset = spi_calibration.accelerometer_offset[0];
+            calibration.accelerometer[1].offset = spi_calibration.accelerometer_offset[1];
+            calibration.accelerometer[2].offset = spi_calibration.accelerometer_offset[2];
+
+            calibration.accelerometer[0].scale = spi_calibration.accelerometer_scale[0];
+            calibration.accelerometer[1].scale = spi_calibration.accelerometer_scale[1];
+            calibration.accelerometer[2].scale = spi_calibration.accelerometer_scale[2];
+
+            calibration.gyro[0].offset = spi_calibration.gyroscope_offset[0];
+            calibration.gyro[1].offset = spi_calibration.gyroscope_offset[1];
+            calibration.gyro[2].offset = spi_calibration.gyroscope_offset[2];
+
+            calibration.gyro[0].scale = spi_calibration.gyroscope_scale[0];
+            calibration.gyro[1].scale = spi_calibration.gyroscope_scale[1];
+            calibration.gyro[2].scale = spi_calibration.gyroscope_scale[2];
+        }
+
+        self.validate_motion_calibration(calibration);
+
+        result
     }
 
     /// Calculates on run time the proper calibration of the ring controller.
@@ -154,11 +285,23 @@ impl CalibrationProtocol {
     /// Port of CalibrationProtocol::HasUserCalibration
     fn has_user_calibration(
         &mut self,
-        _address: SpiAddress,
-        _has_user_calibration: &mut bool,
+        address: SpiAddress,
+        has_user_calibration: &mut bool,
     ) -> DriverResult {
-        // Requires ReadSPI to read MagicSpiCalibration and check against USR_MAGIC_0/USR_MAGIC_1
-        todo!("Requires ReadSPI via hidapi handle")
+        let mut spi_magic = MagicSpiCalibration::default();
+        let buf = unsafe {
+            std::slice::from_raw_parts_mut(
+                &mut spi_magic as *mut _ as *mut u8,
+                std::mem::size_of::<MagicSpiCalibration>(),
+            )
+        };
+        let result = self.protocol.read_raw_spi(address, buf);
+        *has_user_calibration = false;
+        if result == DriverResult::Success {
+            *has_user_calibration = spi_magic.first == CalibrationMagic::UsrMagic0 as u8
+                && spi_magic.second == CalibrationMagic::UsrMagic1 as u8;
+        }
+        result
     }
 
     /// Converts a raw calibration block to an u16 value containing the x axis value.

@@ -288,7 +288,7 @@ impl JoyconDriver {
 
     /// Port of JoyconDriver::SetIrMode
     pub fn set_ir_mode(&mut self) -> DriverResult {
-        let _lock = self.mutex.lock();
+        // Rust &mut self already guarantees exclusive access; no mutex needed.
 
         if !self.supported_features.irs {
             return DriverResult::NotSupported;
@@ -308,7 +308,7 @@ impl JoyconDriver {
 
     /// Port of JoyconDriver::SetNfcMode
     pub fn set_nfc_mode(&mut self) -> DriverResult {
-        let _lock = self.mutex.lock();
+        // Rust &mut self already guarantees exclusive access; no mutex needed.
 
         if !self.supported_features.nfc {
             return DriverResult::NotSupported;
@@ -324,7 +324,7 @@ impl JoyconDriver {
 
     /// Port of JoyconDriver::SetRingConMode
     pub fn set_ring_con_mode(&mut self) -> DriverResult {
-        let _lock = self.mutex.lock();
+        // Rust &mut self already guarantees exclusive access; no mutex needed.
 
         if !self.supported_features.hidbus {
             return DriverResult::NotSupported;

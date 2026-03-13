@@ -11,6 +11,8 @@ members = [
     "network",
     "web_service",
     "frontend_common",
+    "dedicated_room",
+    "yuzu_cmd",
 ]
 resolver = "2"
 

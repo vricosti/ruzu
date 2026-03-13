@@ -285,19 +285,27 @@ impl Vp9 {
 
 impl DecoderImpl for Vp9 {
     fn compose_frame(&mut self) -> Vec<u8> {
-        // TODO: Read PictureInfo/EntropyProbs from memory, compose compressed
-        // and uncompressed headers, append bitstream.
-        // Stubbed — requires memory manager integration.
-        todo!("VP9::compose_frame — requires memory manager integration")
+        // Stubbed — requires memory manager integration to read PictureInfo/EntropyProbs
+        // from memory, compose compressed and uncompressed headers, and append the bitstream.
+        // Upstream: VP9::ComposeFrame() in video_core/host1x/codecs/vp9.cpp
+        log::warn!("VP9::compose_frame: not yet implemented (requires memory manager integration)");
+        Vec::new()
     }
 
     fn get_progressive_offsets(&self) -> (u64, u64) {
-        // Upstream uses surface_luma_offsets[Current] and surface_chroma_offsets[Current].
-        todo!("VP9::get_progressive_offsets — requires NvdecRegisters access")
+        // Upstream reads surface_luma_offsets[Current].Address() and
+        // surface_chroma_offsets[Current].Address() from NvdecRegisters.
+        // Stubbed until NvdecRegisters are wired into the decoder.
+        log::warn!("VP9::get_progressive_offsets: not yet implemented (requires NvdecRegisters)");
+        (0, 0)
     }
 
     fn get_interlaced_offsets(&self) -> (u64, u64, u64, u64) {
-        todo!("VP9::get_interlaced_offsets — requires NvdecRegisters access")
+        // Upstream returns (luma_top, luma_bottom, chroma_top, chroma_bottom) all from
+        // surface_luma_offsets[Current] / surface_chroma_offsets[Current].
+        // Stubbed until NvdecRegisters are wired into the decoder.
+        log::warn!("VP9::get_interlaced_offsets: not yet implemented (requires NvdecRegisters)");
+        (0, 0, 0, 0)
     }
 
     fn is_interlaced(&self) -> bool {

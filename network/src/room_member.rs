@@ -383,22 +383,23 @@ impl RoomMember {
         _password: &str,
         _token: &str,
     ) {
-        todo!("RoomMember::join requires ENet networking layer")
+        log::warn!("RoomMember::join: ENet networking layer not ported; setting state to Error");
+        self.room_member_impl.set_error(RoomMemberError::CouldNotConnect);
     }
 
     /// Sends a proxy packet to the room.
     pub fn send_proxy_packet(&self, _packet: &ProxyPacket) {
-        todo!("RoomMember::send_proxy_packet requires ENet networking layer")
+        log::warn!("RoomMember::send_proxy_packet: ENet networking layer not ported; packet dropped");
     }
 
     /// Sends an LDN packet to the room.
     pub fn send_ldn_packet(&self, _packet: &LdnPacket) {
-        todo!("RoomMember::send_ldn_packet requires ENet networking layer")
+        log::warn!("RoomMember::send_ldn_packet: ENet networking layer not ported; packet dropped");
     }
 
     /// Sends a chat message to the room.
     pub fn send_chat_message(&self, _message: &str) {
-        todo!("RoomMember::send_chat_message requires ENet networking layer")
+        log::warn!("RoomMember::send_chat_message: ENet networking layer not ported; message dropped");
     }
 
     /// Sends the current game info to the room.
@@ -407,7 +408,7 @@ impl RoomMember {
         if !self.is_connected() {
             return;
         }
-        todo!("RoomMember::send_game_info requires ENet networking layer")
+        log::warn!("RoomMember::send_game_info: ENet networking layer not ported; game info not sent");
     }
 
     /// Sends a moderation request to the room.
@@ -421,7 +422,7 @@ impl RoomMember {
         if !self.is_connected() {
             return;
         }
-        todo!("RoomMember::send_moderation_request requires ENet networking layer")
+        log::warn!("RoomMember::send_moderation_request: ENet networking layer not ported; request dropped");
     }
 
     /// Attempts to retrieve ban list from the room.
@@ -429,7 +430,7 @@ impl RoomMember {
         if !self.is_connected() {
             return;
         }
-        todo!("RoomMember::request_ban_list requires ENet networking layer")
+        log::warn!("RoomMember::request_ban_list: ENet networking layer not ported; request dropped");
     }
 
     // -----------------------------------------------------------------------

@@ -62,11 +62,21 @@ impl GenericProtocol {
 
     /// Sends a request to obtain the joycon firmware and mac from handle.
     /// Port of GenericProtocol::GetDeviceInfo
-    pub fn get_device_info(&mut self, _device_info: &mut DeviceInfo) -> DriverResult {
+    ///
+    /// NOTE: Upstream calls SendSubCommand(REQ_DEV_INFO, {}, output) and extracts
+    /// output.device_info from the SubCommandResponse union. The SubCommandResponse struct
+    /// requires hidapi handle wiring for the read loop; that infrastructure is not yet
+    /// available in this port.
+    pub fn get_device_info(&mut self, device_info: &mut DeviceInfo) -> DriverResult {
         let _sb = ScopedSetBlocking::new(&mut self.protocol);
-        // Requires SendSubCommand with output response parsing (SubCommandResponse)
-        // which depends on the hidapi handle wiring
-        todo!("Requires hidapi handle wiring for SubCommandResponse parsing")
+        *device_info = DeviceInfo {
+            firmware: FirmwareVersion::default(),
+            unknown_1: [0; 2],
+            mac_address: [0; 6],
+            unknown_2: [0; 2],
+        };
+        log::warn!("get_device_info: SubCommandResponse not yet wired; no hidapi handle available");
+        DriverResult::ErrorReadingData
     }
 
     /// Sends a request to obtain the joycon type from handle.

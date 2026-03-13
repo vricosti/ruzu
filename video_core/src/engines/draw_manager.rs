@@ -202,16 +202,20 @@ impl DrawManager {
     /// Process a method call that may trigger draw operations.
     ///
     /// Corresponds to `DrawManager::ProcessMethodCall`.
-    /// TODO: full implementation requires access to Maxwell3D registers.
+    /// Stubbed — full implementation requires access to Maxwell3D registers to decode
+    /// MAXWELL3D_REG_INDEX values (clear_surface, draw.begin/end, index_buffer32_*, etc.)
+    /// Upstream: DrawManager::ProcessMethodCall() in video_core/engines/draw_manager.cpp
     pub fn process_method_call(&mut self, _method: u32, _argument: u32) {
-        todo!("DrawManager::process_method_call requires Maxwell3D register access")
+        log::warn!("DrawManager::process_method_call: not yet implemented (requires Maxwell3D register access)");
     }
 
     /// Execute a clear operation.
     ///
     /// Corresponds to `DrawManager::Clear`.
+    /// Stubbed — requires rasterizer access to call rasterizer->Clear(layer_count).
+    /// Upstream: DrawManager::Clear() in video_core/engines/draw_manager.cpp
     pub fn clear(&mut self, _layer_count: u32) {
-        todo!("DrawManager::clear requires rasterizer access")
+        log::warn!("DrawManager::clear: not yet implemented (requires rasterizer access)");
     }
 
     /// Flush any deferred instanced draw calls.
@@ -395,9 +399,11 @@ impl DrawManager {
     /// Handle draw-texture trigger.
     ///
     /// Corresponds to `DrawManager::DrawTexture`.
-    /// TODO: requires access to Maxwell3D draw_texture and surface_clip registers.
+    /// Stubbed — requires access to Maxwell3D draw_texture and surface_clip registers to
+    /// compute dst/src coordinates, then calls rasterizer->DrawTexture().
+    /// Upstream: DrawManager::DrawTexture() in video_core/engines/draw_manager.cpp
     pub fn draw_texture(&mut self) {
-        todo!("DrawManager::draw_texture requires Maxwell3D register access")
+        log::warn!("DrawManager::draw_texture: not yet implemented (requires Maxwell3D register access)");
     }
 
     /// Update topology based on topology control mode and override.

@@ -169,8 +169,11 @@ impl KSynchronizationObject {
         _objects: &mut [&mut KSynchronizationObject],
         _timeout: i64,
     ) -> ResultCode {
+        // Upstream: acquires KScopedSchedulerLockAndSleep, iterates objects,
+        // checks IsSignaled(), enqueues thread onto waiting list, then blocks.
         // TODO: Implement once KThread and KScheduler are ported.
-        todo!("KSynchronizationObject::Wait requires KThread and KScheduler")
+        log::warn!("KSynchronizationObject::wait: KThread/KScheduler not yet ported, returning error");
+        crate::hle::result::RESULT_UNKNOWN
     }
 }
 

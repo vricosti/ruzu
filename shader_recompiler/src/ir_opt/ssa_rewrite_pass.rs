@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2025 ruzu contributors
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of `ir_opt/ssa_rewrite_pass.cpp`
 //!
@@ -13,6 +13,9 @@
 use crate::ir::program::Program;
 
 /// Rewrite the program into SSA form.
+///
+/// Not yet implemented: requires full phi-node insertion and register renaming
+/// infrastructure.
 pub fn ssa_rewrite_pass(_program: &mut Program) {
-    todo!("SsaRewritePass: convert register-based IR to SSA with phi nodes")
+    log::warn!("SsaRewritePass not yet implemented — IR left in register form");
 }

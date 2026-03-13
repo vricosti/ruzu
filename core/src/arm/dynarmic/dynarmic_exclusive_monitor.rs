@@ -38,22 +38,30 @@ impl DynarmicExclusiveMonitor {
 impl ExclusiveMonitor for DynarmicExclusiveMonitor {
     fn exclusive_read8(&mut self, _core_index: usize, _addr: VAddr) -> u8 {
         // monitor.ReadAndMark<u8>(core_index, addr, || memory.Read8(addr))
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::exclusive_read8: not integrated, returning 0");
+        0
     }
 
     fn exclusive_read16(&mut self, _core_index: usize, _addr: VAddr) -> u16 {
         // monitor.ReadAndMark<u16>(core_index, addr, || memory.Read16(addr))
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::exclusive_read16: not integrated, returning 0");
+        0
     }
 
     fn exclusive_read32(&mut self, _core_index: usize, _addr: VAddr) -> u32 {
         // monitor.ReadAndMark<u32>(core_index, addr, || memory.Read32(addr))
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::exclusive_read32: not integrated, returning 0");
+        0
     }
 
     fn exclusive_read64(&mut self, _core_index: usize, _addr: VAddr) -> u64 {
         // monitor.ReadAndMark<u64>(core_index, addr, || memory.Read64(addr))
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::exclusive_read64: not integrated, returning 0");
+        0
     }
 
     fn exclusive_read128(&mut self, _core_index: usize, _addr: VAddr) -> u128 {
@@ -62,34 +70,47 @@ impl ExclusiveMonitor for DynarmicExclusiveMonitor {
         //     let hi = memory.Read64(addr + 8);
         //     (hi as u128) << 64 | lo as u128
         // })
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::exclusive_read128: not integrated, returning 0");
+        0
     }
 
     fn clear_exclusive(&mut self, _core_index: usize) {
         // monitor.ClearProcessor(core_index)
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::clear_exclusive: not integrated, no-op");
     }
 
     fn exclusive_write8(&mut self, _core_index: usize, _vaddr: VAddr, _value: u8) -> bool {
         // monitor.DoExclusiveOperation<u8>(core_index, vaddr, |expected| {
         //     memory.WriteExclusive8(vaddr, value, expected)
         // })
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::exclusive_write8: not integrated, returning false");
+        false
     }
 
     fn exclusive_write16(&mut self, _core_index: usize, _vaddr: VAddr, _value: u16) -> bool {
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::exclusive_write16: not integrated, returning false");
+        false
     }
 
     fn exclusive_write32(&mut self, _core_index: usize, _vaddr: VAddr, _value: u32) -> bool {
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::exclusive_write32: not integrated, returning false");
+        false
     }
 
     fn exclusive_write64(&mut self, _core_index: usize, _vaddr: VAddr, _value: u64) -> bool {
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::exclusive_write64: not integrated, returning false");
+        false
     }
 
     fn exclusive_write128(&mut self, _core_index: usize, _vaddr: VAddr, _value: u128) -> bool {
-        todo!("Requires rdynarmic integration")
+        // TODO: Requires rdynarmic integration
+        log::warn!("DynarmicExclusiveMonitor::exclusive_write128: not integrated, returning false");
+        false
     }
 }

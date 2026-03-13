@@ -12,14 +12,14 @@ use std::sync::Arc;
 
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 
-// TODO: These types are not yet ported. Use opaque placeholder types.
-// Upstream: Core::System, Kernel::KProcess, FileSys::NACP
+// TODO: System and NACP are not yet ported. Use opaque placeholder types.
+// Upstream: Core::System, FileSys::NACP
+// KProcess is re-exported from the kernel module below.
 
 /// Opaque placeholder for Core::System (not yet fully ported).
 pub struct System;
 
-/// Opaque placeholder for Kernel::KProcess (not yet fully ported).
-pub struct KProcess;
+pub use crate::hle::kernel::k_process::KProcess;
 
 /// Opaque placeholder for FileSys::NACP (not yet fully ported).
 pub struct NACP;

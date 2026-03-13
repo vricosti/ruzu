@@ -159,6 +159,7 @@ impl NcaReader {
             check_nca_magic(self.header.magic).map_err(|_| magic_result)?;
 
             // Configure to use the plaintext header.
+            log::debug!("NcaReader::initialize: using plaintext header (XTS decryption failed)");
             let base_storage_size = base_storage.get_size();
             final_header_storage = Arc::new(OffsetVfsFile::new(
                 base_storage.clone(),
@@ -258,6 +259,14 @@ impl NcaReader {
             self.decryption_keys[DECRYPTION_KEY_AES_CTR_HW]
                 .copy_from_slice(&self.header.encrypted_key_area[hw_offset..hw_offset + AES_128_KEY_SIZE]);
         }
+
+        // Log key derivation results.
+        log::trace!(
+            "NcaReader::initialize: rights_id={:02X?}, key_index={}, key_gen={}",
+            &self.header.rights_id,
+            self.header.key_index,
+            self.header.get_proper_key_generation(),
+        );
 
         // Clear the external decryption key.
         self.external_decryption_key = [0u8; AES_128_KEY_SIZE];

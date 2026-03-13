@@ -7,12 +7,154 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU16};
+use std::sync::{Arc, RwLock};
 
 use super::k_capabilities::KCapabilities;
 use super::k_handle_table::KHandleTable;
 use super::k_process_page_table::KProcessPageTable;
 use super::k_typed_address::KProcessAddress;
 use crate::hardware_properties::NUM_CPU_CORES;
+
+// ---------------------------------------------------------------------------
+// SharedProcessMemory — shared guest memory backing
+// ---------------------------------------------------------------------------
+
+/// The inner state of shared process memory.
+///
+/// This is separated from KProcess so that JIT callbacks can hold a reference
+/// to the memory without needing a reference to the entire process.
+/// Upstream achieves this via `Core::Memory::Memory&` obtained from
+/// `process->GetMemory()`.
+pub struct ProcessMemoryData {
+    /// Flat guest memory backing.
+    pub data: Vec<u8>,
+    /// Base address of this memory in the guest address space.
+    pub base: u64,
+}
+
+impl ProcessMemoryData {
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            base: 0,
+        }
+    }
+
+    /// Read a single byte at guest virtual address.
+    #[inline]
+    pub fn read_8(&self, vaddr: u64) -> u8 {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        if offset < self.data.len() {
+            self.data[offset]
+        } else {
+            0
+        }
+    }
+
+    /// Read a u16 (little-endian) at guest virtual address.
+    #[inline]
+    pub fn read_16(&self, vaddr: u64) -> u16 {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        if offset + 2 <= self.data.len() {
+            u16::from_le_bytes([self.data[offset], self.data[offset + 1]])
+        } else {
+            0
+        }
+    }
+
+    /// Read a u32 (little-endian) at guest virtual address.
+    #[inline]
+    pub fn read_32(&self, vaddr: u64) -> u32 {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        if offset + 4 <= self.data.len() {
+            u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    /// Read a u64 (little-endian) at guest virtual address.
+    #[inline]
+    pub fn read_64(&self, vaddr: u64) -> u64 {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        if offset + 8 <= self.data.len() {
+            u64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    /// Write a single byte at guest virtual address.
+    #[inline]
+    pub fn write_8(&mut self, vaddr: u64, value: u8) {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        if offset < self.data.len() {
+            self.data[offset] = value;
+        }
+    }
+
+    /// Write a u16 (little-endian) at guest virtual address.
+    #[inline]
+    pub fn write_16(&mut self, vaddr: u64, value: u16) {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        if offset + 2 <= self.data.len() {
+            self.data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// Write a u32 (little-endian) at guest virtual address.
+    #[inline]
+    pub fn write_32(&mut self, vaddr: u64, value: u32) {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        if offset + 4 <= self.data.len() {
+            self.data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// Write a u64 (little-endian) at guest virtual address.
+    #[inline]
+    pub fn write_64(&mut self, vaddr: u64, value: u64) {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        if offset + 8 <= self.data.len() {
+            self.data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// Check if a virtual address range is valid.
+    #[inline]
+    pub fn is_valid_range(&self, vaddr: u64, size: usize) -> bool {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        offset + size <= self.data.len()
+    }
+
+    /// Write a block of data at guest address.
+    pub fn write_block(&mut self, vaddr: u64, data: &[u8]) {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        let end = offset + data.len();
+        if end > self.data.len() {
+            self.data.resize(end, 0);
+        }
+        self.data[offset..end].copy_from_slice(data);
+    }
+
+    /// Read a block of data from guest address.
+    pub fn read_block(&self, vaddr: u64, size: usize) -> &[u8] {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        &self.data[offset..offset + size]
+    }
+
+    /// Allocate memory at the given base address.
+    pub fn allocate(&mut self, base: u64, size: usize) {
+        self.base = base;
+        self.data = vec![0u8; size];
+    }
+}
+
+/// Shared handle to process memory, clonable for JIT callbacks.
+///
+/// Corresponds to upstream `Core::Memory::Memory&` — the shared memory
+/// reference that both the process and JIT callbacks hold.
+pub type SharedProcessMemory = Arc<RwLock<ProcessMemoryData>>;
 
 /// Number of watchpoints (cast from hardware_properties::NUM_WATCHPOINTS).
 const NUM_WATCHPOINTS: usize = crate::hardware_properties::NUM_WATCHPOINTS as usize;
@@ -128,6 +270,12 @@ pub struct KProcess {
     pub running_thread_switch_counts: [u64; NUM_CPU_CORES as usize],
     pub pinned_threads: [Option<u64>; NUM_CPU_CORES as usize],
     pub watchpoints: [DebugWatchpoint; NUM_WATCHPOINTS],
+    /// Guest process memory — shared with JIT callbacks.
+    ///
+    /// In upstream, `KProcess` owns `Core::Memory::Memory` and the JIT
+    /// callbacks hold a reference to it via `process->GetMemory()`.
+    /// Here we use `Arc<RwLock<ProcessMemoryData>>` for shared access.
+    pub process_memory: SharedProcessMemory,
     pub debug_page_refcounts: BTreeMap<u64, u64>,
     pub cpu_time: AtomicI64,
     pub num_process_switches: AtomicI64,
@@ -187,6 +335,7 @@ impl KProcess {
             running_thread_switch_counts: [0u64; NUM_CPU_CORES as usize],
             pinned_threads: [None; NUM_CPU_CORES as usize],
             watchpoints: [DebugWatchpoint::default(); NUM_WATCHPOINTS],
+            process_memory: Arc::new(RwLock::new(ProcessMemoryData::new())),
             debug_page_refcounts: BTreeMap::new(),
             cpu_time: AtomicI64::new(0),
             num_process_switches: AtomicI64::new(0),
@@ -435,6 +584,33 @@ impl KProcess {
             }
         }
         false
+    }
+
+    /// Write data to process memory at the given guest address.
+    pub fn write_memory(&mut self, guest_addr: u64, data: &[u8]) {
+        let mut mem = self.process_memory.write().unwrap();
+        mem.write_block(guest_addr, data);
+    }
+
+    /// Read data from process memory at the given guest address (copies into a Vec).
+    pub fn read_memory_vec(&self, guest_addr: u64, size: usize) -> Vec<u8> {
+        let mem = self.process_memory.read().unwrap();
+        mem.read_block(guest_addr, size).to_vec()
+    }
+
+    /// Allocate process memory for code loading.
+    /// Sets the memory base and pre-allocates the given size.
+    pub fn allocate_code_memory(&mut self, base: u64, size: usize) {
+        let mut mem = self.process_memory.write().unwrap();
+        mem.allocate(base, size);
+    }
+
+    /// Get a shared handle to the process memory for JIT callbacks.
+    ///
+    /// Corresponds to upstream `KProcess::GetMemory()` — returns a reference
+    /// that the JIT callbacks can hold independently.
+    pub fn get_shared_memory(&self) -> SharedProcessMemory {
+        self.process_memory.clone()
     }
 
     /// Change the process state and signal.

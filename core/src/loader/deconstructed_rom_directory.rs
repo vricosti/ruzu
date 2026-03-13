@@ -8,10 +8,12 @@
 //! Switch game dumps. The path should be a "main" NSO in a directory that
 //! contains the other standard ExeFS NSOs (rtld, sdk, etc.).
 
+use crate::file_sys::program_metadata::ProgramMetadata;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 
 use super::loader::{
-    AppLoader, FileType, FileTypeIdentifier, KProcess, LoadResult, Modules, ResultStatus, System,
+    AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult, Modules,
+    ResultStatus, System,
 };
 
 // ============================================================================
@@ -187,7 +189,9 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
     }
 
     /// Maps to upstream `AppLoader_DeconstructedRomDirectory::Load`.
-    fn load(&mut self, _process: &mut KProcess, _system: &mut System) -> LoadResult {
+    fn load(&mut self, process: &mut KProcess, system: &mut System) -> LoadResult {
+        use crate::file_sys::partition_filesystem::ResultStatus as PfsResultStatus;
+
         if self.is_loaded {
             return (ResultStatus::ErrorAlreadyLoaded, None);
         }
@@ -208,26 +212,125 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
         };
 
         // Read meta to determine title ID
-        let npdm = dir.get_file("main.npdm");
-        if npdm.is_none() {
-            return (ResultStatus::ErrorMissingNPDM, None);
+        let npdm_file = match dir.get_file("main.npdm") {
+            Some(f) => f,
+            None => return (ResultStatus::ErrorMissingNPDM, None),
+        };
+
+        let mut metadata = ProgramMetadata::new();
+        let result = metadata.load(npdm_file);
+        if result != PfsResultStatus::Success {
+            // Map PFS result status to loader result status for NPDM errors
+            let loader_status = match result {
+                PfsResultStatus::ErrorBadNCAHeader => ResultStatus::ErrorBadNPDMHeader,
+                _ => ResultStatus::ErrorBadNPDMHeader,
+            };
+            return (loader_status, None);
         }
 
-        // TODO: Full implementation requires:
-        // - ProgramMetadata::Load from npdm
-        // - PatchManager::PatchExeFS if override_update
-        // - Reload metadata after patching
-        // - NCE setup based on address space type
-        // - Two-pass NSO loading (layout computation then actual load)
-        //   using AppLoaderNso::load_module for each static module
-        // - Process setup via LoadFromMetadata
-        // - Cheat/patch application
+        // TODO: PatchManager::PatchExeFS when override_update is set
+        // TODO: Reload metadata after patching
 
-        log::warn!(
-            "DeconstructedRomDirectory loader: Load not fully implemented \
-             (requires ProgramMetadata, PatchManager, NSO loading pipeline)"
-        );
-        (ResultStatus::ErrorNotImplemented, None)
+        metadata.print();
+        self.title_id = metadata.get_title_id();
+
+        // Upstream does not block on 32-bit ISA here; it passes metadata
+        // to KProcess::LoadFromMetadata which handles address space setup.
+        let is_64bit = metadata.is_64_bit_program();
+        if !is_64bit {
+            log::info!("Loading a 32-bit (AArch32) program");
+        }
+
+        // ====================================================================
+        // Pass 1: Layout computation (load_into_process = false)
+        // ====================================================================
+        // Use the NSO module loader to figure out the code layout.
+        // Maps to upstream first loop with `LoadModule(..., false, ...)`.
+        let mut code_size: u64 = 0;
+
+        for &module_name in STATIC_MODULES {
+            let module_file = match dir.get_file(module_name) {
+                Some(f) => f,
+                None => continue,
+            };
+
+            let should_pass_args = module_name == "rtld";
+            match super::nso::AppLoaderNso::load_module(
+                process,
+                system,
+                module_file.as_ref(),
+                code_size,
+                should_pass_args,
+                false, // load_into_process = false
+            ) {
+                Some(tentative_next_load_addr) => {
+                    code_size = tentative_next_load_addr;
+                }
+                None => {
+                    return (ResultStatus::ErrorLoadingNSO, None);
+                }
+            }
+        }
+
+        // ====================================================================
+        // Process setup
+        // ====================================================================
+        // Upstream calls: process.LoadFromMetadata(metadata, code_size, fastmem_base, is_hbl)
+        // which sets up the process code region, page table, capabilities, etc.
+        // TODO: Call process.load_from_metadata() when KProcess is fully wired.
+
+        // Base address depends on address space width.
+        // 32-bit: MapSmall starts at 0x200000 (2 MiB)
+        // 39-bit: code region at 0x7100000000 (used by upstream for ASLR-disabled loads)
+        let code_base: u64 = if is_64bit { 0x7100000000 } else { 0x200000 };
+
+        // Pre-allocate code memory so write_memory doesn't try to grow from base 0.
+        // Upstream does this inside process.LoadFromMetadata().
+        process.allocate_code_memory(code_base, code_size as usize);
+
+        // ====================================================================
+        // Pass 2: Actual loading (load_into_process = true)
+        // ====================================================================
+        // Maps to upstream second loop with `LoadModule(..., true, ...)`.
+        self.modules.clear();
+        let mut next_load_addr: u64 = code_base;
+
+        for &module_name in STATIC_MODULES {
+            let module_file = match dir.get_file(module_name) {
+                Some(f) => f,
+                None => continue,
+            };
+
+            let load_addr = next_load_addr;
+            let should_pass_args = module_name == "rtld";
+            match super::nso::AppLoaderNso::load_module(
+                process,
+                system,
+                module_file.as_ref(),
+                load_addr,
+                should_pass_args,
+                true, // load_into_process = true
+            ) {
+                Some(tentative_next_load_addr) => {
+                    next_load_addr = tentative_next_load_addr;
+                    self.modules.insert(load_addr, module_name.to_string());
+                    log::debug!("loaded module {} @ {:#X}", module_name, load_addr);
+                }
+                None => {
+                    return (ResultStatus::ErrorLoadingNSO, None);
+                }
+            }
+        }
+
+        self.is_loaded = true;
+
+        (
+            ResultStatus::Success,
+            Some(LoadParameters {
+                main_thread_priority: metadata.get_main_thread_priority() as i32,
+                main_thread_stack_size: metadata.get_main_thread_stack_size() as u64,
+            }),
+        )
     }
 
     fn read_rom_fs(&self, out_file: &mut Option<VirtualFile>) -> ResultStatus {

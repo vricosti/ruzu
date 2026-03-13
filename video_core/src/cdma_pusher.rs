@@ -181,15 +181,22 @@ impl CDmaPusher {
     ///
     /// In the full port, this runs in a dedicated thread with stop token support.
     pub fn process_entries(&mut self) {
-        todo!("process_entries requires Host1x integration and threading");
+        // NOTE: Full implementation spawns a dedicated thread that drains the command_lists
+        // queue and calls execute_command for each entry. Requires Host1x integration.
+        // Stubbed until Host1x and threading integration is complete.
+        log::warn!("CdmaPusher::process_entries: Host1x integration not available, skipping");
     }
 
     /// Execute a single command based on current class state.
     fn execute_command(&mut self, method: u32, arg: u32) {
         match self.current_class {
             ChClassId::Control => {
-                // host_processor.process_method(method, arg);
-                todo!("Control class processing");
+                // NOTE: Full implementation calls host_processor.process_method(method, arg).
+                // Stubbed until host_processor (Host1x HostProcessor) is integrated.
+                log::warn!(
+                    "CdmaPusher::execute_command: Control class not integrated, ignoring method 0x{:X} arg 0x{:X}",
+                    method, arg
+                );
             }
             _ => {
                 self.thi_regs.reg_array[method as usize] = arg;
@@ -204,9 +211,14 @@ impl CDmaPusher {
                             syncpoint_id,
                             _cond
                         );
-                        // syncpoint_manager.increment_guest(syncpoint_id);
-                        // syncpoint_manager.increment_host(syncpoint_id);
-                        todo!("syncpoint increment requires Host1x");
+                        // NOTE: Full implementation calls
+                        //   syncpoint_manager.increment_guest(syncpoint_id)
+                        //   syncpoint_manager.increment_host(syncpoint_id)
+                        // Stubbed until Host1x syncpoint_manager is integrated.
+                        log::warn!(
+                            "CdmaPusher: IncSyncpt syncpt {} not forwarded — Host1x not integrated",
+                            syncpoint_id
+                        );
                     }
                     17 => {
                         // ThiMethod::SetMethod1
@@ -227,6 +239,12 @@ impl CDmaPusher {
 
     /// Device-specific method processing. Override in subclasses.
     fn process_method(&mut self, _method: u32, _arg: u32) {
-        todo!("process_method is virtual, implement in device-specific subtype");
+        // NOTE: This is a virtual dispatch point in C++ (pure virtual in the base class).
+        // Device-specific implementations (VIC, NVDEC, etc.) override this.
+        // The base implementation is unreachable in the full port.
+        log::warn!(
+            "CdmaPusher::process_method: no device-specific handler for method 0x{:X}, ignoring",
+            _method
+        );
     }
 }

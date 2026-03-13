@@ -402,15 +402,19 @@ impl Puller {
     /// Dispatch a method call to the bound engine.
     ///
     /// Corresponds to `Puller::CallEngineMethod`.
-    /// TODO: requires access to channel_state engines.
+    /// Stubbed — requires access to channel_state engines to look up the bound engine for
+    /// the subchannel and call engine->CallMethod(method_call).
+    /// Upstream: Puller::CallEngineMethod() in video_core/engines/puller.cpp
     pub fn call_engine_method(&mut self, _method_call: &MethodCall) {
-        todo!("Puller::call_engine_method requires channel_state engine access")
+        log::warn!("Puller::call_engine_method: not yet implemented (requires channel_state engine access)");
     }
 
     /// Dispatch a multi-method call to the bound engine.
     ///
     /// Corresponds to `Puller::CallEngineMultiMethod`.
-    /// TODO: requires access to channel_state engines.
+    /// Stubbed — requires access to channel_state engines to look up the bound engine for
+    /// the subchannel and call engine->CallMultiMethod(method, base_start, amount, methods_pending).
+    /// Upstream: Puller::CallEngineMultiMethod() in video_core/engines/puller.cpp
     pub fn call_engine_multi_method(
         &mut self,
         _method: u32,
@@ -419,7 +423,7 @@ impl Puller {
         _amount: u32,
         _methods_pending: u32,
     ) {
-        todo!("Puller::call_engine_multi_method requires channel_state engine access")
+        log::warn!("Puller::call_engine_multi_method: not yet implemented (requires channel_state engine access)");
     }
 
     // ── Private helpers ─────────────────────────────────────────────────
