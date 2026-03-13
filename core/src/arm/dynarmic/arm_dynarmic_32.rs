@@ -56,6 +56,9 @@ struct DynarmicCallbacks32 {
 
 impl DynarmicCallbacks32 {
     fn new(memory: SharedProcessMemory, svc_swi: Arc<AtomicU32>) -> Self {
+        log::info!("DynarmicCallbacks32: Arc memory ptr = {:?}, base = {:#x}",
+            std::sync::Arc::as_ptr(&memory),
+            memory.read().unwrap().base);
         Self { memory, svc_swi }
     }
 }
@@ -96,23 +99,47 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
-        self.memory.write().unwrap().write_8(vaddr, value);
+        let mut mem = self.memory.write().unwrap();
+        if !mem.is_writable(vaddr) {
+            log::trace!("JIT write8 blocked (read-only): [{:#010x}]", vaddr);
+            return;
+        }
+        mem.write_8(vaddr, value);
     }
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
-        self.memory.write().unwrap().write_16(vaddr, value);
+        let mut mem = self.memory.write().unwrap();
+        if !mem.is_writable(vaddr) {
+            log::trace!("JIT write16 blocked (read-only): [{:#010x}]", vaddr);
+            return;
+        }
+        mem.write_16(vaddr, value);
     }
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
-        self.memory.write().unwrap().write_32(vaddr, value);
+        let mut mem = self.memory.write().unwrap();
+        if !mem.is_writable(vaddr) {
+            log::trace!("JIT write32 blocked (read-only): [{:#010x}]", vaddr);
+            return;
+        }
+        mem.write_32(vaddr, value);
     }
 
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
-        self.memory.write().unwrap().write_64(vaddr, value);
+        let mut mem = self.memory.write().unwrap();
+        if !mem.is_writable(vaddr) {
+            log::trace!("JIT write64 blocked (read-only): [{:#010x}]", vaddr);
+            return;
+        }
+        mem.write_64(vaddr, value);
     }
 
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
         let mut mem = self.memory.write().unwrap();
+        if !mem.is_writable(vaddr) {
+            log::trace!("JIT write128 blocked (read-only): [{:#010x}]", vaddr);
+            return;
+        }
         mem.write_64(vaddr, value_lo);
         mem.write_64(vaddr + 8, value_hi);
     }
@@ -139,27 +166,51 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8) -> bool {
-        self.memory.write().unwrap().write_8(vaddr, value);
+        let mut mem = self.memory.write().unwrap();
+        if !mem.is_writable(vaddr) {
+            log::warn!("JIT excl_write8 BLOCKED (read-only): [{:#010x}]", vaddr);
+            return false;
+        }
+        mem.write_8(vaddr, value);
         true
     }
 
     fn exclusive_write_16(&mut self, vaddr: u64, value: u16) -> bool {
-        self.memory.write().unwrap().write_16(vaddr, value);
+        let mut mem = self.memory.write().unwrap();
+        if !mem.is_writable(vaddr) {
+            log::warn!("JIT excl_write16 BLOCKED (read-only): [{:#010x}]", vaddr);
+            return false;
+        }
+        mem.write_16(vaddr, value);
         true
     }
 
     fn exclusive_write_32(&mut self, vaddr: u64, value: u32) -> bool {
-        self.memory.write().unwrap().write_32(vaddr, value);
+        let mut mem = self.memory.write().unwrap();
+        if !mem.is_writable(vaddr) {
+            log::warn!("JIT excl_write32 BLOCKED (read-only): [{:#010x}]", vaddr);
+            return false;
+        }
+        mem.write_32(vaddr, value);
         true
     }
 
     fn exclusive_write_64(&mut self, vaddr: u64, value: u64) -> bool {
-        self.memory.write().unwrap().write_64(vaddr, value);
+        let mut mem = self.memory.write().unwrap();
+        if !mem.is_writable(vaddr) {
+            log::warn!("JIT excl_write64 BLOCKED (read-only): [{:#010x}]", vaddr);
+            return false;
+        }
+        mem.write_64(vaddr, value);
         true
     }
 
     fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) -> bool {
         let mut mem = self.memory.write().unwrap();
+        if !mem.is_writable(vaddr) {
+            log::warn!("JIT excl_write128 BLOCKED (read-only): [{:#010x}]", vaddr);
+            return false;
+        }
         mem.write_64(vaddr, value_lo);
         mem.write_64(vaddr + 8, value_hi);
         true
