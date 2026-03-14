@@ -61,12 +61,29 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
 
     let mut context = HLERequestContext::new();
     context.set_session_request_manager(request_manager.clone());
+    context.set_service_manager(ctx.service_manager.clone());
     let incoming = read_tls_command_buffer(ctx, tls_address);
     context.populate_from_incoming_command_buffer(&incoming);
 
+    log::info!(
+        "  SendSyncRequest: handle={:#x} tls={:#x} cmd_type={} cmd_id={}",
+        session_handle, tls_address,
+        incoming[0] & 0xFFFF, // command type from header
+        incoming[8],          // command ID (after SFCI magic at word[4])
+    );
+
     let result = complete_sync_request(&request_manager, &mut context);
 
-    write_tls_command_buffer(ctx, tls_address, context.command_buffer());
+    let outgoing = context.command_buffer();
+    log::info!(
+        "  SendSyncRequest result: {:#x} words[0..12]=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+        result.get_inner_value(),
+        outgoing[0], outgoing[1], outgoing[2], outgoing[3],
+        outgoing[4], outgoing[5], outgoing[6], outgoing[7],
+        outgoing[8], outgoing[9], outgoing[10], outgoing[11],
+    );
+
+    write_tls_command_buffer(ctx, tls_address, outgoing);
     result
 }
 
