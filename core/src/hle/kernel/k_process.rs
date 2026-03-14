@@ -7,10 +7,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU16};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use super::code_set::CodeSet;
 use super::k_capabilities::KCapabilities;
+use super::k_event::KEvent;
+use super::k_handle_table::MAX_TABLE_SIZE;
 use super::k_handle_table::KHandleTable;
 use super::k_memory_block::{
     KMemoryAttribute, KMemoryBlockDisableMergeAttribute, KMemoryPermission, KMemoryState,
@@ -18,8 +20,16 @@ use super::k_memory_block::{
 };
 use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_process_page_table::KProcessPageTable;
+use super::k_readable_event::KReadableEvent;
+use super::k_scheduler::KScheduler;
+use super::k_synchronization_object;
+use super::k_synchronization_object::SynchronizationObjectState;
+use super::k_thread::KThread;
+use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAGE_SIZE};
 use super::k_typed_address::KProcessAddress;
 use crate::hardware_properties::NUM_CPU_CORES;
+use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
+use crate::hle::result::RESULT_SUCCESS;
 
 // ---------------------------------------------------------------------------
 // SharedProcessMemory — shared guest memory backing
@@ -289,7 +299,9 @@ pub struct KProcess {
 
     // -- Thread-local page trees (stubbed as Vecs) --
     // In upstream these are intrusive red-black trees of KThreadLocalPage.
-    // Stubbed here; full implementation depends on KThreadLocalPage integration.
+    // Use a Vec for now while keeping ownership in KProcess.
+    pub thread_local_pages: Vec<KThreadLocalPage>,
+    pub next_thread_local_page_address: u64,
 
     pub ideal_core_id: i32,
     // m_resource_limit — stubbed (raw pointer in upstream)
@@ -325,6 +337,11 @@ pub struct KProcess {
     pub exception_thread_id: Option<u64>,
     // Thread list — stubbed as Vec of thread ids
     pub thread_list: Vec<u64>,
+    pub thread_objects: BTreeMap<u64, Arc<Mutex<KThread>>>,
+    pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
+    pub readable_event_objects: BTreeMap<u64, Arc<Mutex<KReadableEvent>>>,
+    pub sync_object: SynchronizationObjectState,
+    pub scheduler: Option<Weak<Mutex<KScheduler>>>,
     // Shared memory list — stubbed
     pub is_suspended: bool,
     pub is_immortal: bool,
@@ -367,6 +384,8 @@ impl KProcess {
         Self {
             page_table: KProcessPageTable::new(),
             used_kernel_memory_size: std::sync::atomic::AtomicUsize::new(0),
+            thread_local_pages: Vec::new(),
+            next_thread_local_page_address: 0,
             ideal_core_id: 0,
             memory_release_hint: 0,
             state: ProcessState::default(),
@@ -392,6 +411,11 @@ impl KProcess {
             plr_address: KProcessAddress::default(),
             exception_thread_id: None,
             thread_list: Vec::new(),
+            thread_objects: BTreeMap::new(),
+            event_objects: BTreeMap::new(),
+            readable_event_objects: BTreeMap::new(),
+            sync_object: SynchronizationObjectState::new(),
+            scheduler: None,
             is_suspended: false,
             is_immortal: false,
             is_handle_table_initialized: false,
@@ -525,6 +549,24 @@ impl KProcess {
         self.is_signaled
     }
 
+    pub fn link_waiter(&mut self, thread_id: u64) {
+        let mut waiters = std::mem::take(&mut self.sync_object.waiters);
+        waiters.link(
+            self,
+            super::k_synchronization_object::SynchronizationWaitNodeHandle {
+                thread_id,
+                wait_index: 0,
+            },
+        );
+        self.sync_object.waiters = waiters;
+    }
+
+    pub fn unlink_waiter(&mut self, thread_id: u64) {
+        let mut waiters = std::mem::take(&mut self.sync_object.waiters);
+        waiters.unlink(self, thread_id, 0);
+        self.sync_object.waiters = waiters;
+    }
+
     pub fn get_process_local_region_address(&self) -> KProcessAddress {
         self.plr_address
     }
@@ -543,6 +585,85 @@ impl KProcess {
 
     pub fn increment_scheduled_count(&mut self) {
         self.schedule_count += 1;
+    }
+
+    pub fn attach_scheduler(&mut self, scheduler: &Arc<Mutex<KScheduler>>) {
+        self.scheduler = Some(Arc::downgrade(scheduler));
+    }
+
+    pub fn initialize_handle_table(&mut self) -> u32 {
+        let size = match self.capabilities.get_handle_table_size() {
+            0 => MAX_TABLE_SIZE as i32,
+            value => value,
+        };
+        let result = self.handle_table.initialize(size);
+        if result == RESULT_SUCCESS.get_inner_value() {
+            self.is_handle_table_initialized = true;
+        }
+        result
+    }
+
+    pub fn ensure_handle_table_initialized(&mut self) -> u32 {
+        if self.is_handle_table_initialized {
+            RESULT_SUCCESS.get_inner_value()
+        } else {
+            self.initialize_handle_table()
+        }
+    }
+
+    pub fn initialize_thread_local_region_base(&mut self, next_page_address: u64) {
+        self.next_thread_local_page_address = next_page_address;
+    }
+
+    pub fn create_thread_local_region(&mut self) -> Option<KProcessAddress> {
+        for page in &mut self.thread_local_pages {
+            if let Some(region) = page.reserve() {
+                return Some(region);
+            }
+        }
+
+        if self.next_thread_local_page_address == 0 {
+            return None;
+        }
+
+        let page_address = self.next_thread_local_page_address;
+        self.next_thread_local_page_address += THREAD_LOCAL_PAGE_SIZE as u64;
+
+        {
+            let mut mem = self.process_memory.write().unwrap();
+            let page_end = page_address + THREAD_LOCAL_PAGE_SIZE as u64;
+            let new_total = (page_end - mem.base) as usize;
+            if new_total > mem.data.len() {
+                mem.data.resize(new_total, 0);
+            }
+            let page_offset = (page_address - mem.base) as usize;
+            for byte in &mut mem.data[page_offset..page_offset + THREAD_LOCAL_PAGE_SIZE] {
+                *byte = 0;
+            }
+            mem.update_region(
+                page_address,
+                THREAD_LOCAL_PAGE_SIZE as u64,
+                KMemoryState::THREAD_LOCAL,
+                KMemoryPermission::USER_READ_WRITE,
+            );
+        }
+
+        let mut page = KThreadLocalPage::new(KProcessAddress::new(page_address));
+        let region = page.reserve();
+        self.thread_local_pages.push(page);
+        region
+    }
+
+    pub fn delete_thread_local_region(&mut self, address: KProcessAddress) -> u32 {
+        for page in &mut self.thread_local_pages {
+            let start = page.get_address().get();
+            let end = start + THREAD_LOCAL_PAGE_SIZE as u64;
+            if (start..end).contains(&address.get()) {
+                page.release(address);
+                return RESULT_SUCCESS.get_inner_value();
+            }
+        }
+        1
     }
 
     pub fn set_running_thread(&mut self, core: i32, thread_id: u64, idle_count: u64, switch_count: u64) {
@@ -594,10 +715,13 @@ impl KProcess {
     }
 
     /// Reset the process.
-    /// TODO: Port from k_process.cpp.
     pub fn reset(&mut self) -> u32 {
-        // TODO: Full implementation
-        0
+        if self.state != ProcessState::Terminated || !self.is_signaled {
+            return RESULT_INVALID_STATE.get_inner_value();
+        }
+
+        self.is_signaled = false;
+        RESULT_SUCCESS.get_inner_value()
     }
 
     /// Finalize the process.
@@ -609,6 +733,64 @@ impl KProcess {
     /// Register a thread with this process.
     pub fn register_thread(&mut self, thread_id: u64) {
         self.thread_list.push(thread_id);
+    }
+
+    pub fn register_thread_object(&mut self, thread: Arc<Mutex<KThread>>) {
+        let (thread_id, object_id) = {
+            let thread = thread.lock().unwrap();
+            (thread.thread_id, thread.object_id)
+        };
+        self.register_thread(thread_id);
+        self.thread_objects.insert(object_id, thread);
+    }
+
+    pub fn unregister_thread_object_by_object_id(&mut self, object_id: u64) {
+        if let Some(thread) = self.thread_objects.remove(&object_id) {
+            let thread_id = thread.lock().unwrap().thread_id;
+            self.unregister_thread(thread_id);
+        }
+    }
+
+    pub fn get_thread_by_object_id(&self, object_id: u64) -> Option<Arc<Mutex<KThread>>> {
+        self.thread_objects.get(&object_id).cloned()
+    }
+
+    pub fn get_thread_by_thread_id(&self, thread_id: u64) -> Option<Arc<Mutex<KThread>>> {
+        self.thread_objects
+            .values()
+            .find(|thread| thread.lock().unwrap().thread_id == thread_id)
+            .cloned()
+    }
+
+    pub fn register_event_object(&mut self, object_id: u64, event: Arc<Mutex<KEvent>>) {
+        self.event_objects.insert(object_id, event);
+    }
+
+    pub fn unregister_event_object_by_object_id(&mut self, object_id: u64) {
+        self.event_objects.remove(&object_id);
+    }
+
+    pub fn get_event_by_object_id(&self, object_id: u64) -> Option<Arc<Mutex<KEvent>>> {
+        self.event_objects.get(&object_id).cloned()
+    }
+
+    pub fn register_readable_event_object(
+        &mut self,
+        object_id: u64,
+        readable_event: Arc<Mutex<KReadableEvent>>,
+    ) {
+        self.readable_event_objects.insert(object_id, readable_event);
+    }
+
+    pub fn unregister_readable_event_object_by_object_id(&mut self, object_id: u64) {
+        self.readable_event_objects.remove(&object_id);
+    }
+
+    pub fn get_readable_event_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<KReadableEvent>>> {
+        self.readable_event_objects.get(&object_id).cloned()
     }
 
     /// Unregister a thread from this process.
@@ -723,7 +905,11 @@ impl KProcess {
         if self.state != new_state {
             self.state = new_state;
             self.is_signaled = true;
-            // TODO: NotifyAvailable()
+            k_synchronization_object::notify_available(
+                self,
+                self.process_id,
+                crate::hle::result::RESULT_SUCCESS.get_inner_value(),
+            );
         }
     }
 

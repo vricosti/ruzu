@@ -13,11 +13,19 @@
 //! - The main `call` entry point
 
 use crate::hle::kernel::k_process::SharedProcessMemory;
+use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::kernel::k_thread::KThread;
+use crate::hle::kernel::svc::svc_activity;
 use crate::hle::kernel::svc::svc_debug_string;
+use crate::hle::kernel::svc::svc_event;
 use crate::hle::kernel::svc::svc_exception;
 use crate::hle::kernel::svc::svc_processor;
+use crate::hle::kernel::svc::svc_synchronization;
 use crate::hle::kernel::svc::svc_thread;
 use crate::hle::result::RESULT_SUCCESS;
+use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::{Arc, Mutex};
 
 /// Kernel state context passed to SVC handlers.
 ///
@@ -34,6 +42,12 @@ pub struct SvcContext {
     /// Base address of the TLS (Thread Local Storage) region for the main thread.
     /// Upstream: KThread::m_tls_address, set by CreateThreadLocalRegion().
     pub tls_base: u64,
+    pub current_process: Arc<Mutex<KProcess>>,
+    pub current_thread_id: Arc<Mutex<u64>>,
+    pub scheduler: Arc<Mutex<KScheduler>>,
+    pub next_thread_id: Arc<AtomicU64>,
+    pub next_object_id: Arc<AtomicU32>,
+    pub is_64bit: bool,
 }
 
 /// SVC identifier — maps to the immediate value in the SVC instruction.
@@ -532,39 +546,75 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
         Some(SvcId::CreateThread) => {
             // IN: func=arg32[1], arg=arg32[2], stack_bottom=arg32[3], priority=arg32[0], core_id=arg32[4]
             // OUT: ret=arg32[0], out_handle=arg32[1]
-            log::warn!("  CreateThread: stub");
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            let priority = get_arg32(args, 0) as i32;
+            let entry_point = get_arg32(args, 1) as u64;
+            let arg = get_arg32(args, 2) as u64;
+            let stack_bottom = get_arg32(args, 3) as u64;
+            let core_id = get_arg32(args, 4) as i32;
+            let mut out_handle = 0;
+            let result = svc_thread::create_thread(
+                ctx,
+                &mut out_handle,
+                entry_point,
+                arg,
+                stack_bottom,
+                priority,
+                core_id,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out_handle);
         }
         Some(SvcId::StartThread) => {
             // IN: handle=arg32[0]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let handle = get_arg32(args, 0);
+            let result = svc_thread::start_thread(ctx, handle);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::ExitThread) => {
-            svc_thread::exit_thread();
+            svc_thread::exit_thread(ctx);
         }
         Some(SvcId::SleepThread) => {
             // IN: ns=gather64[0,1]; OUT: (none)
             let ns = gather64(args, 0, 1) as i64;
-            svc_thread::sleep_thread(ns);
+            svc_thread::sleep_thread(ctx, ns);
         }
         Some(SvcId::GetThreadPriority) => {
             // IN: handle=arg32[1]; OUT: ret=arg32[0], priority=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, 0x2C); // default priority
+            let handle = get_arg32(args, 1);
+            let mut out_priority = 0;
+            let result = svc_thread::get_thread_priority(ctx, &mut out_priority, handle);
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out_priority as u32);
         }
         Some(SvcId::SetThreadPriority) => {
             // IN: handle=arg32[0], priority=arg32[1]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let handle = get_arg32(args, 0);
+            let priority = get_arg32(args, 1) as i32;
+            let result = svc_thread::set_thread_priority(ctx, handle, priority);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::GetThreadCoreMask) => {
             // IN: handle=arg32[2]; OUT: ret=arg32[0], core_id=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, 0); // core 0
+            let handle = get_arg32(args, 2);
+            let mut out_core_id = 0;
+            let mut out_affinity_mask = 0;
+            let result = svc_thread::get_thread_core_mask(
+                ctx,
+                &mut out_core_id,
+                &mut out_affinity_mask,
+                handle,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out_core_id as u32);
+            scatter64(args, 2, 3, out_affinity_mask);
         }
         Some(SvcId::SetThreadCoreMask) => {
             // IN: handle=arg32[0], core_id=arg32[1], affinity=gather64[2,3]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let handle = get_arg32(args, 0);
+            let core_id = get_arg32(args, 1) as i32;
+            let affinity_mask = gather64(args, 2, 3);
+            let result = svc_thread::set_thread_core_mask(ctx, handle, core_id, affinity_mask);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::GetCurrentProcessorNumber) => {
             // IN: (none); OUT: ret=arg32[0]
@@ -572,11 +622,28 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
         }
         Some(SvcId::GetThreadId) => {
             // IN: handle=arg32[1]; OUT: ret=arg32[0], tid=scatter64[1,2]
-            set_arg32(args, 0, STUB_SUCCESS);
-            scatter64(args, 1, 2, 1); // tid = 1
+            let handle = get_arg32(args, 1);
+            let mut out_thread_id = 0;
+            let result = svc_thread::get_thread_id(ctx, &mut out_thread_id, handle);
+            set_arg32(args, 0, result.get_inner_value());
+            scatter64(args, 1, 2, out_thread_id);
         }
         Some(SvcId::SetThreadActivity) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let handle = get_arg32(args, 0);
+            let result = match get_arg32(args, 1) {
+                0 => svc_activity::set_thread_activity(
+                    ctx,
+                    handle,
+                    crate::hle::kernel::svc::svc_types::ThreadActivity::Runnable,
+                ),
+                1 => svc_activity::set_thread_activity(
+                    ctx,
+                    handle,
+                    crate::hle::kernel::svc::svc_types::ThreadActivity::Paused,
+                ),
+                _ => crate::hle::kernel::svc::svc_results::RESULT_INVALID_ENUM_VALUE,
+            };
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::GetThreadContext3) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -591,25 +658,38 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
         // Synchronization
         // =====================================================================
         Some(SvcId::SignalEvent) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_event::signal_event(ctx, get_arg32(args, 0));
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::ClearEvent) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_event::clear_event(ctx, get_arg32(args, 0));
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::CloseHandle) => {
             // IN: handle=arg32[0]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_synchronization::close_handle(ctx, get_arg32(args, 0));
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::ResetSignal) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_synchronization::reset_signal(ctx, get_arg32(args, 0));
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::WaitSynchronization) => {
             // IN: handles=arg32[1], num=arg32[2], timeout=gather64[0,3]; OUT: ret=arg32[0], index=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, 0); // index 0
+            let mut out_index = -1;
+            let result = svc_synchronization::wait_synchronization(
+                ctx,
+                &mut out_index,
+                get_arg32(args, 1) as u64,
+                get_arg32(args, 2) as i32,
+                gather64(args, 0, 3) as i64,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out_index as u32);
         }
         Some(SvcId::CancelSynchronization) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_synchronization::cancel_synchronization(ctx, get_arg32(args, 0));
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::ArbitrateLock) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -634,9 +714,12 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
         }
         Some(SvcId::CreateEvent) => {
             // OUT: ret=arg32[0], write_handle=arg32[1], read_handle=arg32[2]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
-            set_arg32(args, 2, alloc_stub_handle());
+            let mut write_handle = 0;
+            let mut read_handle = 0;
+            let result = svc_event::create_event(ctx, &mut write_handle, &mut read_handle);
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, write_handle);
+            set_arg32(args, 2, read_handle);
         }
 
         // =====================================================================
@@ -1081,39 +1164,73 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             log::info!("  ExitProcess called");
         }
         Some(SvcId::CreateThread) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
-            set_arg64(args, 1, alloc_stub_handle() as u64);
+            let mut out_handle = 0;
+            let result = svc_thread::create_thread(
+                ctx,
+                &mut out_handle,
+                get_arg64(args, 1),
+                get_arg64(args, 2),
+                get_arg64(args, 3),
+                get_arg64(args, 4) as i32,
+                get_arg64(args, 5) as i32,
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, out_handle as u64);
         }
         Some(SvcId::StartThread) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let result = svc_thread::start_thread(ctx, get_arg64(args, 0) as u32);
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::ExitThread) => {
-            svc_thread::exit_thread();
+            svc_thread::exit_thread(ctx);
         }
         Some(SvcId::SleepThread) => {
             let ns = get_arg64(args, 0) as i64;
-            svc_thread::sleep_thread(ns);
+            svc_thread::sleep_thread(ctx, ns);
         }
         Some(SvcId::GetThreadPriority) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
-            set_arg64(args, 1, 0x2C);
+            let mut out_priority = 0;
+            let result =
+                svc_thread::get_thread_priority(ctx, &mut out_priority, get_arg64(args, 1) as u32);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, out_priority as u64);
         }
         Some(SvcId::SetThreadPriority) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let result = svc_thread::set_thread_priority(
+                ctx,
+                get_arg64(args, 0) as u32,
+                get_arg64(args, 1) as i32,
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetThreadCoreMask) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
-            set_arg64(args, 1, 0);
-            set_arg64(args, 2, 0xF); // all 4 cores
+            let mut out_core_id = 0;
+            let mut out_affinity_mask = 0;
+            let result = svc_thread::get_thread_core_mask(
+                ctx,
+                &mut out_core_id,
+                &mut out_affinity_mask,
+                get_arg64(args, 2) as u32,
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, out_core_id as u64);
+            set_arg64(args, 2, out_affinity_mask);
         }
         Some(SvcId::SetThreadCoreMask) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let result = svc_thread::set_thread_core_mask(
+                ctx,
+                get_arg64(args, 0) as u32,
+                get_arg64(args, 1) as i32,
+                get_arg64(args, 2),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetCurrentProcessorNumber) => {
             set_arg64(args, 0, svc_processor::get_current_processor_number() as u64);
         }
         Some(SvcId::CloseHandle) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let result = svc_synchronization::close_handle(ctx, get_arg64(args, 0) as u32);
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetSystemTick) => {
             set_arg64(args, 0, get_tick() as u64);
@@ -1130,8 +1247,10 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             set_arg64(args, 1, 1); // pid=1
         }
         Some(SvcId::GetThreadId) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
-            set_arg64(args, 1, 1); // tid=1
+            let mut out_thread_id = 0;
+            let result = svc_thread::get_thread_id(ctx, &mut out_thread_id, get_arg64(args, 1) as u32);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, out_thread_id);
         }
         Some(SvcId::Break) => {
             let reason = get_arg64(args, 0) as u32;

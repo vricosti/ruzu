@@ -1,15 +1,21 @@
 //! Port of zuyu/src/core/hle/kernel/k_event.h / k_event.cpp
-//! Status: Partial (structural port)
-//! Derniere synchro: 2026-03-11
+//! Status: Partial (owner/process wiring ported)
+//! Derniere synchro: 2026-03-14
 //!
 //! KEvent: a kernel event object containing a readable event.
+
+use std::sync::{Arc, Mutex};
+
+use super::k_process::KProcess;
+use super::k_scheduler::KScheduler;
+use crate::hle::result::RESULT_SUCCESS;
 
 /// The kernel event object.
 /// Matches upstream `KEvent` class (k_event.h).
 pub struct KEvent {
-    /// Embedded readable event ID.
+    /// Embedded readable event object id registered in the owner process.
     pub readable_event_id: u64,
-    /// Owner process ID.
+    /// Owner process id.
     pub owner_process_id: Option<u64>,
     pub initialized: bool,
     pub readable_event_destroyed: bool,
@@ -26,8 +32,9 @@ impl KEvent {
     }
 
     /// Initialize the event with an owner process.
-    pub fn initialize(&mut self, owner_process_id: u64) {
+    pub fn initialize(&mut self, owner_process_id: u64, readable_event_id: u64) {
         self.owner_process_id = Some(owner_process_id);
+        self.readable_event_id = readable_event_id;
         self.initialized = true;
     }
 
@@ -40,17 +47,31 @@ impl KEvent {
     }
 
     /// Signal the event.
-    /// TODO: Port from k_event.cpp.
-    pub fn signal(&mut self) -> u32 {
-        // TODO: Full implementation — delegate to readable event
-        0
+    /// Matches upstream `KEvent::Signal`.
+    pub fn signal(&mut self, process: &mut KProcess, scheduler: &Arc<Mutex<KScheduler>>) -> u32 {
+        if self.readable_event_destroyed {
+            return RESULT_SUCCESS.get_inner_value();
+        }
+
+        let Some(readable_event) = process.get_readable_event_by_object_id(self.readable_event_id) else {
+            return RESULT_SUCCESS.get_inner_value();
+        };
+        let result = readable_event.lock().unwrap().signal(process, scheduler);
+        result
     }
 
     /// Clear the event.
-    /// TODO: Port from k_event.cpp.
-    pub fn clear(&mut self) -> u32 {
-        // TODO: Full implementation
-        0
+    /// Matches upstream `KEvent::Clear`.
+    pub fn clear(&mut self, process: &KProcess) -> u32 {
+        if self.readable_event_destroyed {
+            return RESULT_SUCCESS.get_inner_value();
+        }
+
+        let Some(readable_event) = process.get_readable_event_by_object_id(self.readable_event_id) else {
+            return RESULT_SUCCESS.get_inner_value();
+        };
+        let result = readable_event.lock().unwrap().clear();
+        result
     }
 
     /// Called when the readable event is destroyed.
@@ -59,9 +80,8 @@ impl KEvent {
     }
 
     /// Finalize the event.
-    /// TODO: Port from k_event.cpp.
     pub fn finalize(&mut self) {
-        // TODO: Full implementation
+        self.initialized = false;
     }
 }
 

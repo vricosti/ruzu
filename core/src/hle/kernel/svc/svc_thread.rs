@@ -1,20 +1,48 @@
 //! Port of zuyu/src/core/hle/kernel/svc/svc_thread.cpp
-//! Status: COMPLET (stubs for kernel calls)
-//! Derniere synchro: 2026-03-11
+//! Status: Partial (kernel object-backed thread create/start/query path)
+//! Derniere synchro: 2026-03-14
 //!
 //! SVC handlers for thread operations.
 
+use std::sync::{Arc, Mutex};
+
+use crate::hle::kernel::k_thread::KThread;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
-use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
+use crate::hle::kernel::svc_common::{Handle, PseudoHandle, INVALID_HANDLE};
+use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 fn is_valid_virtual_core_id(core_id: i32) -> bool {
-    (0..4).contains(&core_id) // Core::Hardware::NUM_CPU_CORES = 4
+    (0..4).contains(&core_id)
+}
+
+fn resolve_thread_handle(ctx: &SvcContext, handle: Handle) -> Option<Arc<Mutex<KThread>>> {
+    if handle == PseudoHandle::CurrentThread as Handle {
+        let current_thread_id = *ctx.current_thread_id.lock().unwrap();
+        return ctx
+            .current_process
+            .lock()
+            .unwrap()
+            .get_thread_by_thread_id(current_thread_id);
+    }
+
+    let process = ctx.current_process.lock().unwrap();
+    let object_id = process.handle_table.get_object(handle)?;
+    process.get_thread_by_object_id(object_id)
+}
+
+fn resolve_current_thread(ctx: &SvcContext) -> Option<Arc<Mutex<KThread>>> {
+    let current_thread_id = *ctx.current_thread_id.lock().unwrap();
+    ctx.current_process
+        .lock()
+        .unwrap()
+        .get_thread_by_thread_id(current_thread_id)
 }
 
 /// Creates a new thread.
 pub fn create_thread(
+    ctx: &SvcContext,
     out_handle: &mut Handle,
     entry_point: u64,
     arg: u64,
@@ -27,171 +55,237 @@ pub fn create_thread(
         entry_point, arg, stack_bottom, priority, core_id
     );
 
-    // Adjust core id, if it's the default magic.
-    if core_id == IDEAL_CORE_USE_PROCESS_VALUE {
-        // TODO: core_id = process.GetIdealCoreId()
-        core_id = 0; // placeholder
+    {
+        let process = ctx.current_process.lock().unwrap();
+        if core_id == IDEAL_CORE_USE_PROCESS_VALUE {
+            core_id = process.get_ideal_core_id();
+        }
+
+        if !is_valid_virtual_core_id(core_id) {
+            return RESULT_INVALID_CORE_ID;
+        }
+        if ((1u64 << core_id) & process.get_core_mask()) == 0 {
+            return RESULT_INVALID_CORE_ID;
+        }
+        if !(HIGHEST_THREAD_PRIORITY..=LOWEST_THREAD_PRIORITY).contains(&priority) {
+            return RESULT_INVALID_PRIORITY;
+        }
+        if !process.check_thread_priority(priority) {
+            return RESULT_INVALID_PRIORITY;
+        }
     }
 
-    // Validate arguments.
-    if !is_valid_virtual_core_id(core_id) {
-        return RESULT_INVALID_CORE_ID;
+    let object_id = ctx.next_object_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
+    let thread_id = ctx
+        .next_thread_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let thread = Arc::new(Mutex::new(KThread::new()));
+    {
+        let mut new_thread = thread.lock().unwrap();
+        let result = new_thread.initialize_user_thread(
+            entry_point,
+            arg,
+            stack_bottom,
+            priority,
+            core_id,
+            &ctx.current_process,
+            thread_id,
+            object_id,
+            ctx.is_64bit,
+        );
+        if result != RESULT_SUCCESS.get_inner_value() {
+            return ResultCode::new(result);
+        }
+
+        let current_thread_id = *ctx.current_thread_id.lock().unwrap();
+        let current_thread = ctx
+            .current_process
+            .lock()
+            .unwrap()
+            .get_thread_by_thread_id(current_thread_id)
+            .expect("current thread must exist");
+        let current_thread = current_thread.lock().unwrap();
+        new_thread.clone_fpu_status_from(&current_thread);
     }
-    // TODO: R_UNLESS(((1 << core_id) & process.GetCoreMask()) != 0, ResultInvalidCoreId)
 
-    if !(HIGHEST_THREAD_PRIORITY..=LOWEST_THREAD_PRIORITY).contains(&priority) {
-        return RESULT_INVALID_PRIORITY;
+    let thread_tls_address = {
+        let thread = thread.lock().unwrap();
+        thread.get_tls_address()
+    };
+
+    let mut process = ctx.current_process.lock().unwrap();
+    let handle_table_result = process.ensure_handle_table_initialized();
+    if handle_table_result != RESULT_SUCCESS.get_inner_value() {
+        let _ = process.delete_thread_local_region(thread_tls_address);
+        return ResultCode::new(handle_table_result);
     }
-    // TODO: R_UNLESS(process.CheckThreadPriority(priority), ResultInvalidPriority)
 
-    // TODO: Reserve thread from resource limit.
-    // TODO: KThread::Create, InitializeUserThread, Commit, CloneFpuStatus, Register, AddToHandleTable
-    *out_handle = 0;
-    log::warn!("svc::CreateThread: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
-}
-
-/// Starts the thread for the provided handle.
-pub fn start_thread(thread_handle: Handle) -> ResultCode {
-    log::debug!("svc::StartThread called thread=0x{:08X}", thread_handle);
-
-    // TODO: Get thread from handle, call thread->Run()
-    log::warn!("svc::StartThread: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
-}
-
-/// Called when a thread exits.
-pub fn exit_thread() {
-    // TODO: Get current thread, remove from global scheduler, call Exit()
-    log::warn!("svc::ExitThread: kernel object access not yet implemented");
-}
-
-/// Sleeps the current thread.
-pub fn sleep_thread(ns: i64) {
-    log::trace!("svc::SleepThread called nanoseconds={}", ns);
-
-    if ns > 0 {
-        // Convert timeout to ticks and sleep.
-        // TODO: kernel.HardwareTimer().GetTick() + offset + 2
-        // TODO: GetCurrentThread(kernel).Sleep(timeout)
-        log::warn!("svc::SleepThread(sleep): kernel object access not yet implemented");
-    } else {
-        let yield_type = ns;
-        match yield_type {
-            0 => {
-                // YieldType::WithoutCoreMigration
-                // TODO: KScheduler::YieldWithoutCoreMigration(kernel)
-            }
-            -1 => {
-                // YieldType::WithCoreMigration
-                // TODO: KScheduler::YieldWithCoreMigration(kernel)
-            }
-            -2 => {
-                // YieldType::ToAnyThread
-                // TODO: KScheduler::YieldToAnyThread(kernel)
-            }
-            _ => {
-                // Nintendo does nothing for invalid values.
-            }
+    process.register_thread_object(thread);
+    match process.handle_table.add(object_id) {
+        Ok(handle) => {
+            *out_handle = handle;
+            ctx.scheduler.lock().unwrap().request_schedule();
+            RESULT_SUCCESS
+        }
+        Err(_) => {
+            process.unregister_thread_object_by_object_id(object_id);
+            let _ = process.delete_thread_local_region(thread_tls_address);
+            RESULT_OUT_OF_HANDLES
         }
     }
 }
 
+/// Starts the thread for the provided handle.
+pub fn start_thread(ctx: &SvcContext, thread_handle: Handle) -> ResultCode {
+    log::debug!("svc::StartThread called thread=0x{:08X}", thread_handle);
+
+    let Some(thread) = resolve_thread_handle(ctx, thread_handle) else {
+        return RESULT_INVALID_HANDLE;
+    };
+
+    let result = thread.lock().unwrap().run();
+    if result == RESULT_SUCCESS.get_inner_value() {
+        ctx.scheduler.lock().unwrap().request_schedule();
+    }
+    ResultCode::new(result)
+}
+
+/// Called when a thread exits.
+pub fn exit_thread(ctx: &SvcContext) {
+    let Some(thread) = resolve_current_thread(ctx) else {
+        log::warn!("svc::ExitThread: current thread missing");
+        return;
+    };
+
+    thread.lock().unwrap().exit();
+    ctx.scheduler.lock().unwrap().request_schedule();
+}
+
+/// Sleeps the current thread.
+pub fn sleep_thread(ctx: &SvcContext, ns: i64) {
+    log::trace!("svc::SleepThread called nanoseconds={}", ns);
+
+    if ns > 0 {
+        let Some(thread) = resolve_current_thread(ctx) else {
+            log::warn!("svc::SleepThread(sleep): current thread missing");
+            return;
+        };
+
+        let result = thread.lock().unwrap().sleep(ns);
+        if result != RESULT_SUCCESS.get_inner_value() {
+            log::warn!("svc::SleepThread(sleep) failed: {:#x}", result);
+            return;
+        }
+
+        ctx.scheduler.lock().unwrap().request_schedule();
+        return;
+    }
+
+    let current_thread_id = *ctx.current_thread_id.lock().unwrap();
+    let mut scheduler = ctx.scheduler.lock().unwrap();
+    if ns == YieldType::WithoutCoreMigration as i64 {
+        scheduler.yield_without_core_migration(&ctx.current_process, current_thread_id);
+    } else if ns == YieldType::WithCoreMigration as i64 {
+        scheduler.yield_with_core_migration(&ctx.current_process, current_thread_id);
+    } else if ns == YieldType::ToAnyThread as i64 {
+        scheduler.yield_to_any_thread(&ctx.current_process, current_thread_id);
+    }
+}
+
 /// Gets the thread context.
-pub fn get_thread_context3(out_context: u64, thread_handle: Handle) -> ResultCode {
+pub fn get_thread_context3(_ctx: &SvcContext, out_context: u64, thread_handle: Handle) -> ResultCode {
     log::debug!(
         "svc::GetThreadContext3 called, out_context=0x{:08X}, thread_handle=0x{:X}",
         out_context, thread_handle
     );
-
-    // TODO: Get thread from handle.
-    // TODO: Require thread is in current process, not current thread.
-    // TODO: thread->GetThreadContext3(&context)
-    // TODO: Write context to user memory.
-    log::warn!("svc::GetThreadContext3: kernel object access not yet implemented");
     RESULT_NOT_IMPLEMENTED
 }
 
 /// Gets the priority for the specified thread.
-pub fn get_thread_priority(out_priority: &mut i32, handle: Handle) -> ResultCode {
-    log::trace!("svc::GetThreadPriority called");
+pub fn get_thread_priority(
+    ctx: &SvcContext,
+    out_priority: &mut i32,
+    handle: Handle,
+) -> ResultCode {
+    let Some(thread) = resolve_thread_handle(ctx, handle) else {
+        return RESULT_INVALID_HANDLE;
+    };
 
-    // TODO: Get thread from handle, get priority.
-    *out_priority = 0;
-    log::warn!("svc::GetThreadPriority: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+    *out_priority = thread.lock().unwrap().get_priority();
+    RESULT_SUCCESS
 }
 
 /// Sets the priority for the specified thread.
-pub fn set_thread_priority(thread_handle: Handle, priority: i32) -> ResultCode {
+pub fn set_thread_priority(ctx: &SvcContext, thread_handle: Handle, priority: i32) -> ResultCode {
     if !(HIGHEST_THREAD_PRIORITY..=LOWEST_THREAD_PRIORITY).contains(&priority) {
         return RESULT_INVALID_PRIORITY;
     }
-    // TODO: process.CheckThreadPriority(priority)
-    // TODO: Get thread from handle, thread->SetBasePriority(priority)
-    log::warn!("svc::SetThreadPriority: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+
+    {
+        let process = ctx.current_process.lock().unwrap();
+        if !process.check_thread_priority(priority) {
+            return RESULT_INVALID_PRIORITY;
+        }
+    }
+
+    let Some(thread) = resolve_thread_handle(ctx, thread_handle) else {
+        return RESULT_INVALID_HANDLE;
+    };
+    thread.lock().unwrap().set_base_priority(priority);
+    RESULT_SUCCESS
 }
 
 /// Gets the thread list.
 pub fn get_thread_list(
+    ctx: &SvcContext,
     out_num_threads: &mut i32,
     _out_thread_ids: u64,
     out_thread_ids_size: i32,
     debug_handle: Handle,
 ) -> ResultCode {
-    // TODO: Handle debug_handle case when debug events are supported.
     if debug_handle != INVALID_HANDLE {
         log::warn!("svc::GetThreadList: debug handle not yet supported");
     }
-
-    log::debug!(
-        "svc::GetThreadList called. out_thread_ids_size={}",
-        out_thread_ids_size
-    );
-
     if (out_thread_ids_size as u32 & 0xF000_0000) != 0 {
-        log::error!("Supplied size outside [0, 0x0FFFFFFF] range. size={}", out_thread_ids_size);
         return RESULT_OUT_OF_RANGE;
     }
 
-    // TODO: Get thread list from current process, copy to user memory.
-    *out_num_threads = 0;
-    log::warn!("svc::GetThreadList: kernel object access not yet implemented");
+    *out_num_threads = ctx.current_process.lock().unwrap().thread_list.len() as i32;
     RESULT_NOT_IMPLEMENTED
 }
 
 /// Gets the thread core mask.
 pub fn get_thread_core_mask(
+    ctx: &SvcContext,
     out_core_id: &mut i32,
     out_affinity_mask: &mut u64,
     thread_handle: Handle,
 ) -> ResultCode {
-    log::trace!("svc::GetThreadCoreMask called, handle=0x{:08X}", thread_handle);
-
-    // TODO: Get thread from handle, thread->GetCoreMask(out_core_id, out_affinity_mask)
-    *out_core_id = 0;
-    *out_affinity_mask = 0;
-    log::warn!("svc::GetThreadCoreMask: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+    let Some(thread) = resolve_thread_handle(ctx, thread_handle) else {
+        return RESULT_INVALID_HANDLE;
+    };
+    let (core_id, affinity_mask) = thread.lock().unwrap().get_core_mask();
+    *out_core_id = core_id;
+    *out_affinity_mask = affinity_mask;
+    RESULT_SUCCESS
 }
 
 /// Sets the thread core mask.
 pub fn set_thread_core_mask(
+    ctx: &SvcContext,
     thread_handle: Handle,
     mut core_id: i32,
     mut affinity_mask: u64,
 ) -> ResultCode {
+    let process = ctx.current_process.lock().unwrap();
     if core_id == IDEAL_CORE_USE_PROCESS_VALUE {
-        // TODO: core_id = GetCurrentProcess(kernel).GetIdealCoreId()
-        core_id = 0; // placeholder
+        core_id = process.get_ideal_core_id();
         affinity_mask = 1u64 << core_id;
     } else {
-        // TODO: Validate affinity_mask against process core mask.
         if affinity_mask == 0 {
             return RESULT_INVALID_COMBINATION;
         }
-
         if is_valid_virtual_core_id(core_id) {
             if ((1u64 << core_id) & affinity_mask) == 0 {
                 return RESULT_INVALID_COMBINATION;
@@ -200,16 +294,117 @@ pub fn set_thread_core_mask(
             return RESULT_INVALID_CORE_ID;
         }
     }
+    drop(process);
 
-    // TODO: Get thread from handle, thread->SetCoreMask(core_id, affinity_mask)
-    log::warn!("svc::SetThreadCoreMask: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+    let Some(thread) = resolve_thread_handle(ctx, thread_handle) else {
+        return RESULT_INVALID_HANDLE;
+    };
+    let result = ResultCode::new(thread.lock().unwrap().set_core_mask(core_id, affinity_mask));
+    result
 }
 
 /// Gets the ID for the specified thread.
-pub fn get_thread_id(out_thread_id: &mut u64, thread_handle: Handle) -> ResultCode {
-    // TODO: Get thread from handle, *out_thread_id = thread->GetId()
-    *out_thread_id = 0;
-    log::warn!("svc::GetThreadId: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+pub fn get_thread_id(ctx: &SvcContext, out_thread_id: &mut u64, thread_handle: Handle) -> ResultCode {
+    let Some(thread) = resolve_thread_handle(ctx, thread_handle) else {
+        return RESULT_INVALID_HANDLE;
+    };
+    *out_thread_id = thread.lock().unwrap().get_thread_id();
+    RESULT_SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+
+    use super::*;
+    use crate::hle::kernel::k_process::KProcess;
+
+    fn test_context() -> SvcContext {
+        let mut process = KProcess::new();
+        process.capabilities.core_mask = 0xF;
+        process.capabilities.priority_mask = u64::MAX;
+        process.flags = 0;
+        process.allocate_code_memory(0x200000, 0x20000);
+        process.initialize_handle_table();
+        process.initialize_thread_local_region_base(0x240000);
+
+        let process = Arc::new(Mutex::new(process));
+        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let scheduler = Arc::new(Mutex::new(crate::hle::kernel::k_scheduler::KScheduler::new(0)));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.initialize_main_thread(0x200000, 0x250000, 0, 0x23f000, &process, 1, 1, false);
+            thread.set_priority(44);
+            thread.set_base_priority(44);
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(current_thread.clone());
+        scheduler.lock().unwrap().initialize(1, 0, 0);
+
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+
+        SvcContext {
+            shared_memory,
+            code_base: 0x200000,
+            code_size: 0x20000,
+            stack_base: 0x240000,
+            stack_size: 0x10000,
+            program_id: 1,
+            tls_base: 0x23f000,
+            current_process: process,
+            current_thread_id: Arc::new(Mutex::new(1)),
+            scheduler,
+            next_thread_id: Arc::new(AtomicU64::new(2)),
+            next_object_id: Arc::new(AtomicU32::new(2)),
+            is_64bit: false,
+        }
+    }
+
+    #[test]
+    fn create_and_start_thread_registers_kernel_objects() {
+        let ctx = test_context();
+        let mut handle = 0;
+        let result = create_thread(&ctx, &mut handle, 0x201000, 0x1234, 0x260000, 44, 0);
+        assert_eq!(result, RESULT_SUCCESS);
+        assert_ne!(handle, INVALID_HANDLE);
+
+        let process = ctx.current_process.lock().unwrap();
+        let object_id = process.handle_table.get_object(handle).unwrap();
+        let thread = process.get_thread_by_object_id(object_id).unwrap();
+        drop(process);
+
+        assert_eq!(thread.lock().unwrap().get_state(), crate::hle::kernel::k_thread::ThreadState::INITIALIZED);
+
+        let result = start_thread(&ctx, handle);
+        assert_eq!(result, RESULT_SUCCESS);
+        assert_eq!(thread.lock().unwrap().get_state(), crate::hle::kernel::k_thread::ThreadState::RUNNABLE);
+    }
+
+    #[test]
+    fn yield_switches_to_other_equal_priority_thread() {
+        let ctx = test_context();
+        let mut handle = 0;
+        let result = create_thread(&ctx, &mut handle, 0x201000, 0x1234, 0x260000, 44, 0);
+        assert_eq!(result, RESULT_SUCCESS);
+        assert_eq!(start_thread(&ctx, handle), RESULT_SUCCESS);
+
+        let current_thread_id = *ctx.current_thread_id.lock().unwrap();
+        let next_before_yield = ctx
+            .scheduler
+            .lock()
+            .unwrap()
+            .select_next_thread_id(&ctx.current_process, current_thread_id);
+        assert_eq!(next_before_yield, Some(current_thread_id));
+
+        sleep_thread(&ctx, YieldType::WithoutCoreMigration as i64);
+
+        let next_after_yield = ctx
+            .scheduler
+            .lock()
+            .unwrap()
+            .select_next_thread_id(&ctx.current_process, current_thread_id);
+        assert_eq!(next_after_yield, Some(2));
+    }
 }
