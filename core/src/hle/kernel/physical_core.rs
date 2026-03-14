@@ -149,7 +149,9 @@ impl PhysicalCore {
     ) {
         svc_dispatch::call(svc_num, is_64bit, svc_args, svc_context);
         jit.set_svc_arguments(svc_args);
+        log::trace!("dispatch_supervisor_call: before handoff (svc=0x{:x})", svc_num);
         self.handoff_after_svc(jit, thread_context, scheduler, process);
+        log::trace!("dispatch_supervisor_call: after handoff (svc=0x{:x})", svc_num);
     }
 
     pub fn run_loop<FSvc, FHalt>(
@@ -174,13 +176,32 @@ impl PhysicalCore {
             .ok()
             .and_then(|value| value.parse::<u32>().ok());
 
+        let mut post_svc_trace_count = 0u32;
         loop {
-            let event = if step_after_svc.is_some_and(|threshold| svc_count >= threshold) {
+            let use_step = step_after_svc.is_some_and(|threshold| svc_count >= threshold);
+            let event = if use_step {
                 self.step_thread(jit, thread)
             } else {
                 self.run_thread(jit, thread)
             };
             iteration += 1;
+
+            // Log PC for the first 20 iterations after stepping starts
+            if use_step && post_svc_trace_count < 20 {
+                post_svc_trace_count += 1;
+                jit.get_context(thread_context);
+                log::info!(
+                    "[STEP TRACE #{}/iter={}] PC={:#x} LR={:#x} halt={:?}",
+                    post_svc_trace_count, iteration,
+                    thread_context.pc, thread_context.lr,
+                    match &event {
+                        PhysicalCoreExecutionEvent::SupervisorCall { svc_num, .. } =>
+                            format!("SVC(0x{:x})", svc_num),
+                        PhysicalCoreExecutionEvent::Halted(hr) =>
+                            format!("Halt({:#x})", hr.bits()),
+                    }
+                );
+            }
 
             match event {
                 PhysicalCoreExecutionEvent::SupervisorCall { svc_num, mut svc_args } => {

@@ -628,11 +628,12 @@ impl KProcess {
     }
 
     pub fn signal_condition_variable(&mut self, cv_key: u64, count: i32) {
-        let Some(process) = self.self_reference.as_ref().and_then(Weak::upgrade) else {
-            return;
-        };
-
-        let _ = self.cond_var.signal(&process, cv_key, count);
+        // Take cond_var out temporarily to avoid borrowing self while passing
+        // &mut self to signal(). This is safe because no other code accesses
+        // cond_var while we hold &mut self.
+        let mut cond_var = std::mem::take(&mut self.cond_var);
+        let _ = cond_var.signal(self, cv_key, count);
+        self.cond_var = cond_var;
     }
 
     pub fn initialize_handle_table(&mut self) -> u32 {
