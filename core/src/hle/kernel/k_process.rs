@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU16};
 use std::sync::{Arc, RwLock};
 
+use super::code_set::CodeSet;
 use super::k_capabilities::KCapabilities;
 use super::k_handle_table::KHandleTable;
 use super::k_memory_block::{
@@ -654,6 +655,46 @@ impl KProcess {
     pub fn write_memory(&mut self, guest_addr: u64, data: &[u8]) {
         let mut mem = self.process_memory.write().unwrap();
         mem.write_block(guest_addr, data);
+    }
+
+    /// Load a module into process memory and apply per-segment permissions.
+    ///
+    /// Matches upstream `KProcess::LoadModule(CodeSet, KProcessAddress)`.
+    pub fn load_module(&mut self, code_set: CodeSet, base_addr: u64) {
+        {
+            let mut mem = self.process_memory.write().unwrap();
+            mem.write_block(base_addr, &code_set.memory);
+
+            let reprotect_segment = |mem: &mut ProcessMemoryData,
+                                     segment: &super::code_set::Segment,
+                                     permission: KMemoryPermission| {
+                if segment.size == 0 {
+                    return;
+                }
+
+                let state = if permission == KMemoryPermission::USER_READ_EXECUTE
+                    || permission == KMemoryPermission::USER_READ
+                {
+                    KMemoryState::CODE
+                } else {
+                    KMemoryState::CODE_DATA
+                };
+
+                mem.update_region(base_addr + segment.addr, segment.size as u64, state, permission);
+            };
+
+            reprotect_segment(
+                &mut mem,
+                code_set.code_segment(),
+                KMemoryPermission::USER_READ_EXECUTE,
+            );
+            reprotect_segment(&mut mem, code_set.rodata_segment(), KMemoryPermission::USER_READ);
+            reprotect_segment(
+                &mut mem,
+                code_set.data_segment(),
+                KMemoryPermission::USER_READ_WRITE,
+            );
+        }
     }
 
     /// Read data from process memory at the given guest address (copies into a Vec).

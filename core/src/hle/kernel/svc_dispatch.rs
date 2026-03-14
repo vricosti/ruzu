@@ -807,11 +807,15 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
                 16 => 0,                 // SystemResourceSizeTotal
                 17 => 0,                 // SystemResourceSizeUsed
                 18 => ctx.program_id,    // ProgramId
-                20 => 0xDEAD_BEEF_0000_0000u64 | info_subtype, // RandomEntropy
-                21 => 0,                 // UserExceptionContextAddress
-                22 => 0x1000_0000,       // TotalNonSystemMemorySize
-                23 => ctx.code_size + ctx.stack_size, // UsedNonSystemMemorySize
-                24 => 1,                 // IsApplication
+                10 => 0,                 // IdleTickCount
+                11 => 0xDEAD_BEEF_0000_0000u64 | info_subtype, // RandomEntropy
+                19 => 0,                 // InitialProcessIdRange
+                20 => 0,                 // UserExceptionContextAddress
+                21 => 0x1000_0000,       // TotalNonSystemMemorySize
+                22 => ctx.code_size + ctx.stack_size, // UsedNonSystemMemorySize
+                23 => 1,                 // IsApplication
+                24 => 64,                // FreeThreadCount
+                25 => 0,                 // ThreadTickCount
                 _ => {
                     log::warn!("  GetInfo: unknown type={}, sub_id={}", info_type, info_subtype);
                     0
@@ -1169,11 +1173,15 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
                 16 => 0,
                 17 => 0,
                 18 => ctx.program_id,
-                20 => 0xDEAD_BEEF_0000_0000u64 | info_subtype,
-                21 => 0,
-                22 => 0x1000_0000,
-                23 => ctx.code_size + ctx.stack_size,
-                24 => 1,
+                10 => 0,
+                11 => 0xDEAD_BEEF_0000_0000u64 | info_subtype,
+                19 => 0,
+                20 => 0,
+                21 => 0x1000_0000,
+                22 => ctx.code_size + ctx.stack_size,
+                23 => 1,
+                24 => 64,
+                25 => 0,
                 _ => {
                     log::warn!("  GetInfo: unknown type={}, sub_id={}", info_type, info_subtype);
                     0

@@ -23,6 +23,7 @@
 //! | `-v` / `--version`   | handled by clap          |
 
 use clap::Parser;
+use rdynarmic::frontend::a32::decoder::decode_arm;
 
 pub mod emu_window;
 pub mod sdl_config;
@@ -435,6 +436,10 @@ fn main() {
                 let val = mem.read_32(addr);
                 log::info!("  [{:#010x}] = {:#010x}", addr, val);
             }
+
+            if mem.is_valid_range(code_base, 0x6000) {
+                let _ = std::fs::write("/tmp/rtld.bin", mem.read_block(code_base, 0x6000));
+            }
         }
 
         // Allocate TLS (Thread Local Storage) region.
@@ -600,7 +605,8 @@ fn main() {
 
         let mut svc_count = 0u32;
         let mut iteration = 0u32;
-
+        let mut query_memory_count = 0u32;
+        let mut dumped_module_objects = false;
         loop {
             let halt_reason = jit.run_thread(dummy_thread);
             iteration += 1;
@@ -624,6 +630,83 @@ fn main() {
                     ctx.pc, ctx.lr
                 );
 
+                if svc_num == 0x06 {
+                    query_memory_count += 1;
+                } else if query_memory_count >= 25 && !dumped_module_objects {
+                    dumped_module_objects = true;
+                    let mem = shared_memory.read().unwrap();
+                    let dump_module_object = |name: &str, base: u64| {
+                        if !mem.is_valid_range(base + 4, 4) {
+                            log::info!("{} @ {:#x}: module header unavailable", name, base);
+                            return;
+                        }
+
+                        let mod_offset = mem.read_32(base + 4) as u64;
+                        let mod_addr = base + mod_offset;
+                        if !mem.is_valid_range(mod_addr, 0x1c) {
+                            log::info!(
+                                "{} @ {:#x}: MOD0 out of range (offset={:#x})",
+                                name,
+                                base,
+                                mod_offset
+                            );
+                            return;
+                        }
+
+                        let magic = mem.read_32(mod_addr);
+                        let dynamic_offset = mem.read_32(mod_addr + 4) as u64;
+                        let bss_start_offset = mem.read_32(mod_addr + 8) as u64;
+                        let bss_end_offset = mem.read_32(mod_addr + 12) as u64;
+                        let module_offset = mem.read_32(mod_addr + 24) as u64;
+                        let module_object = base + module_offset;
+
+                        log::info!(
+                            "{} @ {:#x}: MOD0={:#x} mod={:#x} dyn={:#x} bss=[{:#x}..{:#x}) module_obj={:#x}",
+                            name,
+                            base,
+                            magic,
+                            mod_addr,
+                            mod_addr + dynamic_offset,
+                            base + bss_start_offset,
+                            base + bss_end_offset,
+                            module_object
+                        );
+
+                        if !mem.is_valid_range(module_object, 0x40) {
+                            log::info!(
+                                "  {} module object @ {:#x} is out of range",
+                                name,
+                                module_object
+                            );
+                            return;
+                        }
+
+                        for i in 0..16u64 {
+                            let addr = module_object + i * 4;
+                            let val = mem.read_32(addr);
+                            log::info!("  [{} + {:#04x}] = {:#010x}", name, i * 4, val);
+                        }
+                    };
+
+                    log::info!(
+                        "=== RTLD MODULE OBJECT DUMP after {} QueryMemory calls, first non-QM SVC=0x{:02X} ===",
+                        query_memory_count,
+                        svc_num
+                    );
+                    dump_module_object("rtld", 0x200000);
+                    dump_module_object("main", 0x206000);
+                    dump_module_object("subsdk0", 0x1512000);
+                    dump_module_object("subsdk1", 0x16AB000);
+                    dump_module_object("subsdk2", 0x16D3000);
+                    dump_module_object("subsdk3", 0x16E6000);
+                    dump_module_object("subsdk4", 0x1723000);
+                    dump_module_object("sdk", 0x1C9C000);
+                    log::info!("=== RTLD LIST REGION DUMP 0x2051d0..0x205240 ===");
+                    for addr in (0x2051d0u64..0x205240u64).step_by(4) {
+                        log::info!("  [{:#010x}] = {:#010x}", addr, mem.read_32(addr));
+                    }
+                }
+
                 if svc_num == 0x27 {
                     // OutputDebugString — read the guest string
                     let mem = shared_memory.read().unwrap();
@@ -646,6 +729,24 @@ fn main() {
             } else if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
                 jit.get_context(&mut ctx);
                 log::error!("PREFETCH_ABORT at PC={:#x}, SP={:#x}, LR={:#x}", ctx.pc, ctx.sp, ctx.lr);
+                let mem = shared_memory.read().unwrap();
+                let crash_start = ctx.pc.saturating_sub(0x10);
+                for addr in (crash_start..=ctx.pc.saturating_add(0x10)).step_by(4) {
+                    if !mem.is_valid_range(addr, 4) {
+                        log::error!("  [{:#010x}] <unmapped>", addr);
+                        continue;
+                    }
+                    let insn = mem.read_32(addr);
+                    let decoded = decode_arm(insn);
+                    let marker = if addr == ctx.pc { " <PC>" } else { "" };
+                    log::error!(
+                        "  [{:#010x}] {:#010x} {:?}{}",
+                        addr,
+                        insn,
+                        decoded.id,
+                        marker
+                    );
+                }
                 break;
             } else if halt_reason.contains(HaltReason::BREAK_LOOP) {
                 log::info!("BREAK_LOOP after {} iterations, {} SVCs", iteration, svc_count);
