@@ -166,13 +166,15 @@ impl KConditionVariable {
     // -- Condition variable --
 
     /// Signal up to `count` threads waiting on the given condition variable key.
+    ///
+    /// Note: the caller must already hold the process lock. This method takes
+    /// `&mut KProcess` directly to avoid re-locking.
     pub fn signal(
         &mut self,
-        process: &Arc<Mutex<KProcess>>,
+        mut process_guard: &mut KProcess,
         cv_key: u64,
         count: i32,
     ) -> ResultCode {
-        let mut process_guard = process.lock().unwrap();
         let mut index = 0usize;
         let mut num_waiters = 0i32;
 
@@ -292,7 +294,7 @@ impl KConditionVariable {
 
     fn signal_impl(
         &mut self,
-        process_guard: &mut KProcess,
+        mut process_guard: &mut KProcess,
         waiting_thread: &Arc<Mutex<KThread>>,
     ) -> ResultCode {
         let (address, own_tag, previous_tag) = {
