@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::file_sys::vfs::vfs::VfsFile;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::hle::kernel::code_set::CodeSet;
 
 use super::loader::{
     make_magic, AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult,
@@ -262,7 +263,8 @@ impl AppLoaderNso {
             return None;
         }
 
-        // Build program image
+        // Build program image and codeset metadata.
+        let mut code_set = CodeSet::new();
         let mut program_image = Vec::new();
 
         for i in 0..3 {
@@ -280,12 +282,21 @@ impl AppLoaderNso {
             }
             let loc = nso_header.segments[i].location as usize;
             program_image[loc..loc + data.len()].copy_from_slice(&data);
+
+            code_set.segments[i].addr = nso_header.segments[i].location as u64;
+            code_set.segments[i].offset = loc;
+            code_set.segments[i].size = nso_header.segments[i].size;
         }
 
         // Add BSS
         let bss_size = nso_header.segments[2].alignment_or_bss_size;
         let image_size = page_align_size(program_image.len() as u32 + bss_size);
         program_image.resize(image_size as usize, 0);
+        code_set.data_segment_mut().size += bss_size;
+
+        for segment in &mut code_set.segments {
+            segment.size = page_align_size(segment.size);
+        }
 
         // Allocate argument data if requested AND there are actual arguments.
         // Upstream: only allocates when `!Settings::values.program_args.GetValue().empty()`.
@@ -314,55 +325,16 @@ impl AppLoaderNso {
         // actually load into process memory via codeset.
 
         if load_into_process {
-            process.write_memory(load_base, &program_image);
-            log::info!("NSO: loaded {} bytes at {:#X}", program_image.len(), load_base);
-
-            // Register per-segment memory regions in the block manager for QueryMemory.
-            // Upstream does this via KProcess::LoadModule -> CodeSet -> PageTable.
-            // Segment 0 = text (RX), segment 1 = rodata (R), segment 2 = data+bss (RW).
-            use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
-            let mut mem = process.process_memory.write().unwrap();
-
-            // Text segment: Read+Execute, state=Code
-            let text_base = load_base + nso_header.segments[0].location as u64;
-            let text_size = page_align_size(nso_header.segments[0].size) as u64;
-            if text_size > 0 {
-                mem.update_region(
-                    text_base,
-                    text_size,
-                    KMemoryState::CODE,
-                    KMemoryPermission::USER_READ_EXECUTE,
-                );
-            }
-
-            // RoData segment: Read-only, state=Code
-            let rodata_base = load_base + nso_header.segments[1].location as u64;
-            let rodata_size = page_align_size(nso_header.segments[1].size) as u64;
-            if rodata_size > 0 {
-                mem.update_region(
-                    rodata_base,
-                    rodata_size,
-                    KMemoryState::CODE,
-                    KMemoryPermission::USER_READ,
-                );
-            }
-
-            // Data+BSS segment: Read+Write, state=CodeData
-            let data_base = load_base + nso_header.segments[2].location as u64;
-            let data_size = page_align_size(
-                nso_header.segments[2].size + nso_header.segments[2].alignment_or_bss_size,
-            ) as u64;
-            if data_size > 0 {
-                mem.update_region(
-                    data_base,
-                    data_size,
-                    KMemoryState::CODE_DATA,
-                    KMemoryPermission::USER_READ_WRITE,
-                );
-            }
+            code_set.memory = program_image;
+            process.load_module(code_set, load_base);
+            log::info!(
+                "NSO: loaded {} bytes at {:#X}",
+                image_size,
+                load_base
+            );
         }
 
-        Some(load_base + program_image.len() as u64)
+        Some(load_base + image_size as u64)
     }
 }
 

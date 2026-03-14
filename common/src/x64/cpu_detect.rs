@@ -146,7 +146,7 @@ fn bit(value: i32, n: u32) -> bool {
 #[inline]
 fn cpuid_ex(function_id: u32, subfunction_id: u32) -> [i32; 4] {
     // __cpuid_count is safe on x86_64 (always supported).
-    let result = std::arch::x86_64::__cpuid_count(function_id, subfunction_id);
+    let result = unsafe { std::arch::x86_64::__cpuid_count(function_id, subfunction_id) };
     [
         result.eax as i32,
         result.ebx as i32,
