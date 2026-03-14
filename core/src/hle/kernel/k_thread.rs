@@ -17,6 +17,7 @@ use super::k_synchronization_object;
 use super::k_synchronization_object::SynchronizationWaitSet;
 use super::k_synchronization_object::SynchronizationObjectState;
 use super::k_typed_address::{KProcessAddress, KVirtualAddress};
+use crate::arm::arm_interface::ThreadContext as ArmThreadContext;
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results::{
     RESULT_CANCELLED, RESULT_INVALID_STATE, RESULT_NO_SYNCHRONIZATION_OBJECT,
@@ -367,6 +368,32 @@ pub struct KThread {
 }
 
 impl KThread {
+    pub fn restore_guest_context(&self, ctx: &mut ArmThreadContext) {
+        ctx.r = self.thread_context.r;
+        ctx.fp = self.thread_context.fp;
+        ctx.lr = self.thread_context.lr;
+        ctx.sp = self.thread_context.sp;
+        ctx.pc = self.thread_context.pc;
+        ctx.pstate = self.thread_context.pstate;
+        ctx.v = self.thread_context.v;
+        ctx.fpcr = self.thread_context.fpcr;
+        ctx.fpsr = self.thread_context.fpsr;
+        ctx.tpidr = self.thread_context.tpidr;
+    }
+
+    pub fn capture_guest_context(&mut self, ctx: &ArmThreadContext) {
+        self.thread_context.r = ctx.r;
+        self.thread_context.fp = ctx.fp;
+        self.thread_context.lr = ctx.lr;
+        self.thread_context.sp = ctx.sp;
+        self.thread_context.pc = ctx.pc;
+        self.thread_context.pstate = ctx.pstate;
+        self.thread_context.v = ctx.v;
+        self.thread_context.fpcr = ctx.fpcr;
+        self.thread_context.fpsr = ctx.fpsr;
+        self.thread_context.tpidr = ctx.tpidr;
+    }
+
     /// Create a new KThread with default/zero-initialized state.
     pub fn new() -> Self {
         Self {

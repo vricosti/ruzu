@@ -195,6 +195,68 @@ fn on_status_message_received(msg_type: u32, nickname: &str) {
     }
 }
 
+fn restore_thread_to_jit(
+    jit: &mut dyn ruzu_core::arm::arm_interface::ArmInterface,
+    ctx: &mut ruzu_core::arm::arm_interface::ThreadContext,
+    thread: &std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_thread::KThread>>,
+) {
+    let thread = thread.lock().unwrap();
+    thread.restore_guest_context(ctx);
+    jit.set_context(ctx);
+    jit.set_tpidrro_el0(thread.get_tls_address().get());
+}
+
+struct GuestRuntimeBridge {
+    active_thread: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_thread::KThread>>,
+}
+
+impl GuestRuntimeBridge {
+    fn new(
+        main_thread: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_thread::KThread>>,
+    ) -> Self {
+        Self {
+            active_thread: main_thread,
+        }
+    }
+
+    fn initialize_jit(
+        &self,
+        jit: &mut dyn ruzu_core::arm::arm_interface::ArmInterface,
+        ctx: &mut ruzu_core::arm::arm_interface::ThreadContext,
+    ) {
+        restore_thread_to_jit(jit, ctx, &self.active_thread);
+    }
+
+    fn handoff_after_svc(
+        &mut self,
+        jit: &mut dyn ruzu_core::arm::arm_interface::ArmInterface,
+        ctx: &mut ruzu_core::arm::arm_interface::ThreadContext,
+        scheduler: &std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_scheduler::KScheduler>>,
+        process: &std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_process::KProcess>>,
+    ) {
+        jit.get_context(ctx);
+        self.active_thread.lock().unwrap().capture_guest_context(ctx);
+
+        let current_thread_id = self.active_thread.lock().unwrap().get_thread_id();
+        let next_thread = scheduler
+            .lock()
+            .unwrap()
+            .wait_for_next_thread(process, current_thread_id);
+        let Some(next_thread) = next_thread else {
+            return;
+        };
+
+        let switch_needed =
+            next_thread.lock().unwrap().get_thread_id() != self.active_thread.lock().unwrap().get_thread_id();
+        if !switch_needed {
+            return;
+        }
+
+        restore_thread_to_jit(jit, ctx, &next_thread);
+        self.active_thread = next_thread;
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -534,7 +596,6 @@ fn main() {
         let process = std::sync::Arc::new(std::sync::Mutex::new(process));
         let next_thread_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
         let next_object_id = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2));
-        let current_thread_id = std::sync::Arc::new(std::sync::Mutex::new(1u64));
         let scheduler = std::sync::Arc::new(std::sync::Mutex::new(
             ruzu_core::hle::kernel::k_scheduler::KScheduler::new(0),
         ));
@@ -606,7 +667,6 @@ fn main() {
             program_id: 0x0100152000022000, // MK8D title ID
             tls_base,
             current_process: process.clone(),
-            current_thread_id: current_thread_id.clone(),
             scheduler: scheduler.clone(),
             next_thread_id: next_thread_id.clone(),
             next_object_id: next_object_id.clone(),
@@ -615,27 +675,11 @@ fn main() {
 
         // Set initial context.
         // Maps to upstream ResetThreadContext32/64 in k_thread.cpp via KThread::Initialize.
-        let kernel_ctx = {
-            let thread = main_thread.lock().unwrap();
-            thread.thread_context.clone()
-        };
         let mut ctx = ruzu_core::arm::arm_interface::ThreadContext::default();
-        ctx.r = kernel_ctx.r;
-        ctx.fp = kernel_ctx.fp;
-        ctx.lr = kernel_ctx.lr;
-        ctx.sp = kernel_ctx.sp;
-        ctx.pc = kernel_ctx.pc;
-        ctx.pstate = kernel_ctx.pstate;
-        ctx.v = kernel_ctx.v;
-        ctx.fpcr = kernel_ctx.fpcr;
-        ctx.fpsr = kernel_ctx.fpsr;
-        ctx.tpidr = kernel_ctx.tpidr;
-        jit.set_context(&ctx);
+        let mut guest_runtime = GuestRuntimeBridge::new(main_thread.clone());
+        guest_runtime.initialize_jit(&mut *jit, &mut ctx);
 
-        // Set TLS pointer register (CP15 TPIDRURO for AArch32, TPIDRRO_EL0 for AArch64).
         // Upstream: physical_core.cpp:158 — SetTpidrroEl0(GetInteger(thread->GetTlsAddress()))
-        // rtld reads this register to find thread-local storage for symbol resolution.
-        jit.set_tpidrro_el0(tls_base);
         log::info!("TLS: set TPIDRURO/TPIDRRO_EL0 = {:#x}", tls_base);
 
         log::info!(
@@ -643,8 +687,6 @@ fn main() {
             if is_64bit { "AArch64" } else { "AArch32" },
             code_base, stack_top
         );
-
-        let mut active_thread = main_thread.clone();
 
         // SVC dispatch loop.
         // Maps to upstream KProcess::Run() → PhysicalCore event loop.
@@ -773,88 +815,12 @@ fn main() {
                 svc_dispatch::call(svc_num, is_64bit, &mut svc_args, &svc_ctx);
                 jit.set_svc_arguments(&svc_args);
 
-                // Save the current CPU context back into the active kernel thread and let the
-                // scheduler choose the next runnable guest thread.
-                jit.get_context(&mut ctx);
-                {
-                    let mut thread = active_thread.lock().unwrap();
-                    thread.thread_context.r = ctx.r;
-                    thread.thread_context.fp = ctx.fp;
-                    thread.thread_context.lr = ctx.lr;
-                    thread.thread_context.sp = ctx.sp;
-                    thread.thread_context.pc = ctx.pc;
-                    thread.thread_context.pstate = ctx.pstate;
-                    thread.thread_context.v = ctx.v;
-                    thread.thread_context.fpcr = ctx.fpcr;
-                    thread.thread_context.fpsr = ctx.fpsr;
-                    thread.thread_context.tpidr = ctx.tpidr;
-                }
-
-                let next_thread_id = {
-                    loop {
-                        let current_thread_id_value = *current_thread_id.lock().unwrap();
-                        let mut scheduler_guard = scheduler.lock().unwrap();
-                        scheduler_guard.wake_expired_sleeping_threads(&process);
-                        scheduler_guard.wake_signaled_synchronization_threads(&process);
-
-                        if let Some(next_thread_id) =
-                            scheduler_guard.select_next_thread_id(&process, current_thread_id_value)
-                        {
-                            break Some(next_thread_id);
-                        }
-
-                        let next_deadline = scheduler_guard.next_sleep_deadline(&process);
-                        drop(scheduler_guard);
-
-                        if let Some(deadline) = next_deadline {
-                            let now = std::time::Instant::now();
-                            if deadline > now {
-                                std::thread::sleep(deadline.duration_since(now));
-                            }
-                            continue;
-                        }
-
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                };
-
-                if let Some(next_thread_id) = next_thread_id {
-                    let next_thread = process
-                        .lock()
-                        .unwrap()
-                        .get_thread_by_thread_id(next_thread_id);
-                    if let Some(next_thread) = next_thread {
-                        let switch_needed =
-                            next_thread.lock().unwrap().get_thread_id()
-                                != active_thread.lock().unwrap().get_thread_id();
-                        if switch_needed {
-                            let next_ctx = next_thread.lock().unwrap().thread_context.clone();
-                            ctx.r = next_ctx.r;
-                            ctx.fp = next_ctx.fp;
-                            ctx.lr = next_ctx.lr;
-                            ctx.sp = next_ctx.sp;
-                            ctx.pc = next_ctx.pc;
-                            ctx.pstate = next_ctx.pstate;
-                            ctx.v = next_ctx.v;
-                            ctx.fpcr = next_ctx.fpcr;
-                            ctx.fpsr = next_ctx.fpsr;
-                            ctx.tpidr = next_ctx.tpidr;
-                            jit.set_context(&ctx);
-                            jit.set_tpidrro_el0(next_thread.lock().unwrap().get_tls_address().get());
-                            *current_thread_id.lock().unwrap() = next_thread_id;
-                            scheduler
-                                .lock()
-                                .unwrap()
-                                .set_scheduler_current_thread_id(next_thread_id);
-                            active_thread = next_thread;
-                        } else {
-                            scheduler
-                                .lock()
-                                .unwrap()
-                                .set_scheduler_current_thread_id(next_thread_id);
-                        }
-                    }
-                }
+                guest_runtime.handoff_after_svc(
+                    &mut *jit,
+                    &mut ctx,
+                    &scheduler,
+                    &process,
+                );
 
             } else if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
                 jit.get_context(&mut ctx);

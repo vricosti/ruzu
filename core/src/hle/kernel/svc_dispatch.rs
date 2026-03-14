@@ -43,11 +43,27 @@ pub struct SvcContext {
     /// Upstream: KThread::m_tls_address, set by CreateThreadLocalRegion().
     pub tls_base: u64,
     pub current_process: Arc<Mutex<KProcess>>,
-    pub current_thread_id: Arc<Mutex<u64>>,
     pub scheduler: Arc<Mutex<KScheduler>>,
     pub next_thread_id: Arc<AtomicU64>,
     pub next_object_id: Arc<AtomicU32>,
     pub is_64bit: bool,
+}
+
+impl SvcContext {
+    pub fn current_thread_id(&self) -> Option<u64> {
+        self.scheduler
+            .lock()
+            .unwrap()
+            .get_scheduler_current_thread_id()
+    }
+
+    pub fn current_thread(&self) -> Option<Arc<Mutex<KThread>>> {
+        let current_thread_id = self.current_thread_id()?;
+        self.current_process
+            .lock()
+            .unwrap()
+            .get_thread_by_thread_id(current_thread_id)
+    }
 }
 
 /// SVC identifier — maps to the immediate value in the SVC instruction.

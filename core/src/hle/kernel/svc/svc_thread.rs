@@ -19,12 +19,7 @@ fn is_valid_virtual_core_id(core_id: i32) -> bool {
 
 fn resolve_thread_handle(ctx: &SvcContext, handle: Handle) -> Option<Arc<Mutex<KThread>>> {
     if handle == PseudoHandle::CurrentThread as Handle {
-        let current_thread_id = *ctx.current_thread_id.lock().unwrap();
-        return ctx
-            .current_process
-            .lock()
-            .unwrap()
-            .get_thread_by_thread_id(current_thread_id);
+        return ctx.current_thread();
     }
 
     let process = ctx.current_process.lock().unwrap();
@@ -33,11 +28,7 @@ fn resolve_thread_handle(ctx: &SvcContext, handle: Handle) -> Option<Arc<Mutex<K
 }
 
 fn resolve_current_thread(ctx: &SvcContext) -> Option<Arc<Mutex<KThread>>> {
-    let current_thread_id = *ctx.current_thread_id.lock().unwrap();
-    ctx.current_process
-        .lock()
-        .unwrap()
-        .get_thread_by_thread_id(current_thread_id)
+    ctx.current_thread()
 }
 
 /// Creates a new thread.
@@ -98,13 +89,7 @@ pub fn create_thread(
             return ResultCode::new(result);
         }
 
-        let current_thread_id = *ctx.current_thread_id.lock().unwrap();
-        let current_thread = ctx
-            .current_process
-            .lock()
-            .unwrap()
-            .get_thread_by_thread_id(current_thread_id)
-            .expect("current thread must exist");
+        let current_thread = ctx.current_thread().expect("current thread must exist");
         let current_thread = current_thread.lock().unwrap();
         new_thread.clone_fpu_status_from(&current_thread);
     }
@@ -182,7 +167,10 @@ pub fn sleep_thread(ctx: &SvcContext, ns: i64) {
         return;
     }
 
-    let current_thread_id = *ctx.current_thread_id.lock().unwrap();
+    let Some(current_thread_id) = ctx.current_thread_id() else {
+        log::warn!("svc::SleepThread(yield): current thread missing");
+        return;
+    };
     let mut scheduler = ctx.scheduler.lock().unwrap();
     if ns == YieldType::WithoutCoreMigration as i64 {
         scheduler.yield_without_core_migration(&ctx.current_process, current_thread_id);
@@ -354,7 +342,6 @@ mod tests {
             program_id: 1,
             tls_base: 0x23f000,
             current_process: process,
-            current_thread_id: Arc::new(Mutex::new(1)),
             scheduler,
             next_thread_id: Arc::new(AtomicU64::new(2)),
             next_object_id: Arc::new(AtomicU32::new(2)),
@@ -390,7 +377,7 @@ mod tests {
         assert_eq!(result, RESULT_SUCCESS);
         assert_eq!(start_thread(&ctx, handle), RESULT_SUCCESS);
 
-        let current_thread_id = *ctx.current_thread_id.lock().unwrap();
+        let current_thread_id = ctx.current_thread_id().unwrap();
         let next_before_yield = ctx
             .scheduler
             .lock()

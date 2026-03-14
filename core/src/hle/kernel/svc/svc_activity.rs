@@ -35,7 +35,9 @@ pub fn set_thread_activity(
         return RESULT_INVALID_ENUM_VALUE;
     }
 
-    let current_thread_id = *ctx.current_thread_id.lock().unwrap();
+    let Some(current_thread_id) = ctx.current_thread_id() else {
+        return RESULT_INVALID_HANDLE;
+    };
     let process = ctx.current_process.lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(thread_handle) else {
         return RESULT_INVALID_HANDLE;
@@ -111,7 +113,6 @@ mod tests {
             program_id: 1,
             tls_base: 0x23f000,
             current_process: process,
-            current_thread_id: Arc::new(Mutex::new(1)),
             scheduler,
             next_thread_id: Arc::new(AtomicU64::new(2)),
             next_object_id: Arc::new(AtomicU32::new(2)),
