@@ -108,15 +108,13 @@ impl KConditionVariable {
 
     /// Wait for the lock at the given address.
     ///
-    /// Upstream behavior: if the tag at `addr` equals `(handle | HANDLE_WAIT_MASK)`,
-    /// the calling thread blocks until the lock owner calls ArbitrateUnlock.
+    /// Matches upstream `KConditionVariable::WaitForAddress()`:
+    /// if the tag at `addr` equals `(handle | HANDLE_WAIT_MASK)`, the calling
+    /// thread is added as a waiter on the owner thread and enters WAITING state.
+    /// In upstream, the thread truly blocks until ArbitrateUnlock signals it.
     ///
-    /// In our cooperative single-thread model, true blocking is not possible.
-    /// Instead we use UpdateLockAtomic semantics: atomically try to take the lock.
-    /// If the tag is 0 (free), we write our own tag. If the tag indicates another
-    /// owner, we set the wait mask and add ourselves as a waiter so the next
-    /// ArbitrateUnlock will transfer ownership to us. We then return the wait
-    /// result directly rather than truly suspending.
+    /// In our cooperative model, `begin_wait()` sets the state but doesn't
+    /// truly suspend — the scheduler handoff after the SVC must handle this.
     pub fn wait_for_address(
         process: &Arc<Mutex<KProcess>>,
         current_thread: &Arc<Mutex<KThread>>,
@@ -131,7 +129,7 @@ impl KConditionVariable {
             return RESULT_TERMINATION_REQUESTED;
         }
 
-        // Read the current tag from guest memory.
+        // Read the tag from userspace.
         let test_tag = {
             let mem = process_guard.process_memory.read().unwrap();
             if !mem.is_valid_range(addr, 4) {
@@ -140,27 +138,27 @@ impl KConditionVariable {
             mem.read_32(addr)
         };
 
-        // If the tag isn't (handle | HANDLE_WAIT_MASK), the lock is available
-        // or not in the expected contended state — return SUCCESS immediately.
+        // If the tag isn't (handle | HANDLE_WAIT_MASK), we're done.
         if test_tag != (handle | HANDLE_WAIT_MASK) {
             return RESULT_SUCCESS;
         }
 
-        // The lock is contended (tag == handle | HANDLE_WAIT_MASK).
-        //
-        // INTENTIONAL DIVERGENCE: upstream would block the thread here and wait
-        // for ArbitrateUnlock from the owner. In single-thread cooperative mode,
-        // we can't truly block — there's no other thread to release the lock.
-        //
-        // Instead, we clear the mutex word to 0 so the guest's userspace
-        // LDREX/STREX retry loop will succeed on the next attempt. This
-        // effectively forces the lock to be released, which is correct for
-        // single-thread execution where no real contention exists.
-        process_guard
-            .process_memory
-            .write()
-            .unwrap()
-            .write_32(addr, 0);
+        // Get the lock owner thread.
+        let Some(owner_object_id) = process_guard.handle_table.get_object(handle) else {
+            return RESULT_INVALID_HANDLE;
+        };
+        let Some(owner_thread) = process_guard.get_thread_by_object_id(owner_object_id) else {
+            return RESULT_INVALID_HANDLE;
+        };
+
+        // Update the lock: set address key on current thread and add as waiter.
+        {
+            let mut current_thread = current_thread.lock().unwrap();
+            current_thread.set_user_address_key(KProcessAddress::new(addr), value);
+            current_thread.begin_wait();
+            current_thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
+        }
+        owner_thread.lock().unwrap().add_waiter(current_thread_id);
 
         RESULT_SUCCESS
     }
@@ -416,8 +414,8 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_address_takes_lock_in_single_thread_mode() {
-        let (process, _owner, waiter, owner_handle, address) = setup_threads();
+    fn wait_for_address_enqueues_waiter_on_owner_thread() {
+        let (process, owner, waiter, owner_handle, address) = setup_threads();
         process
             .lock()
             .unwrap()
@@ -435,12 +433,12 @@ mod tests {
         );
 
         assert_eq!(result, RESULT_SUCCESS);
-        // In single-thread cooperative mode, the lock is released (cleared to 0)
-        // so the guest's LDREX/STREX retry loop will succeed.
-        let tag = process.lock().unwrap().process_memory.read().unwrap().read_32(address);
-        assert_eq!(tag, 0);
-        // Waiter should remain RUNNABLE (not WAITING) since we can't block.
-        assert_eq!(waiter.lock().unwrap().get_state(), ThreadState::RUNNABLE);
+        assert_eq!(waiter.lock().unwrap().get_state(), ThreadState::WAITING);
+        assert_eq!(
+            waiter.lock().unwrap().get_wait_reason_for_debugging(),
+            ThreadWaitReasonForDebugging::ConditionVar
+        );
+        assert_eq!(owner.lock().unwrap().waiter_thread_ids(), &[2]);
     }
 
     #[test]
