@@ -13,6 +13,7 @@ use crate::device_memory::DeviceMemory;
 use crate::file_sys::fs_filesystem::OpenMode;
 use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use crate::hardware_properties;
+use crate::hle::kernel::kernel::KernelCore;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 
 use parking_lot::Mutex;
@@ -59,6 +60,9 @@ pub struct System {
 
     /// The CPU manager (thread dispatch).
     pub cpu_manager: CpuManager,
+
+    /// The kernel core (schedulers, physical cores, kernel objects).
+    kernel: Option<KernelCore>,
 
     /// Device memory (emulated Switch DRAM).
     device_memory: Option<Box<DeviceMemory>>,
@@ -139,6 +143,7 @@ impl System {
         Self {
             core_timing: CoreTiming::new(),
             cpu_manager: CpuManager::new(),
+            kernel: None,
             device_memory: None,
             suspend_guard: Mutex::new(()),
             is_paused: AtomicBool::new(false),
@@ -189,6 +194,11 @@ impl System {
 
         self.cpu_manager.set_multicore(self.is_multicore);
         self.cpu_manager.set_async_gpu(self.is_async_gpu);
+
+        let mut kernel = KernelCore::new();
+        kernel.set_multicore(self.is_multicore);
+        kernel.initialize();
+        self.kernel = Some(kernel);
 
         log::info!("System: initialized (multicore={}, async_gpu={})", self.is_multicore, self.is_async_gpu);
     }
@@ -542,6 +552,16 @@ impl System {
     /// Placeholder - full implementation requires the kernel module.
     pub fn register_host_thread(&mut self) {
         // In C++: impl->kernel.RegisterHostThread();
+    }
+
+    /// Get a reference to the kernel core.
+    pub fn kernel(&self) -> Option<&KernelCore> {
+        self.kernel.as_ref()
+    }
+
+    /// Get a mutable reference to the kernel core.
+    pub fn kernel_mut(&mut self) -> Option<&mut KernelCore> {
+        self.kernel.as_mut()
     }
 
     /// Get a reference to the current application process.

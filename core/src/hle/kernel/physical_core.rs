@@ -1,18 +1,29 @@
 //! Port of zuyu/src/core/hle/kernel/physical_core.h/.cpp
-//! Status: COMPLET (stub — runtime dependencies not yet available)
+//! Status: EN COURS
 //! Derniere synchro: 2026-03-11
 //!
 //! PhysicalCore: represents a single emulated CPU core, responsible for
 //! running guest threads and handling interrupts. Full implementation
 //! requires KernelCore, KThread, KProcess, ArmInterface, Debugger.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+
+use crate::arm::arm_interface::{ArmInterface, HaltReason, KThread as OpaqueKThread, ThreadContext};
+use crate::hle::kernel::svc_dispatch::{self, SvcArgs, SvcContext};
+
+use super::{k_process::KProcess, k_scheduler::KScheduler, k_thread::KThread};
+
+pub enum PhysicalCoreExecutionControl {
+    Continue,
+    Break,
+}
 
 /// Represents a single emulated physical CPU core.
 pub struct PhysicalCore {
     m_core_index: usize,
     m_guard: Mutex<PhysicalCoreState>,
     m_on_interrupt: Condvar,
+    m_runtime: Mutex<Option<PhysicalCoreRuntime>>,
 }
 
 struct PhysicalCoreState {
@@ -20,6 +31,15 @@ struct PhysicalCoreState {
     m_is_single_core: bool,
     // m_arm_interface: Option<&mut ArmInterface>,
     // m_current_thread: Option<&mut KThread>,
+}
+
+struct PhysicalCoreRuntime {
+    m_current_thread: Arc<Mutex<KThread>>,
+}
+
+pub enum PhysicalCoreExecutionEvent {
+    SupervisorCall { svc_num: u32, svc_args: SvcArgs },
+    Halted(HaltReason),
 }
 
 impl PhysicalCore {
@@ -31,12 +51,157 @@ impl PhysicalCore {
                 m_is_single_core: !is_multicore,
             }),
             m_on_interrupt: Condvar::new(),
+            m_runtime: Mutex::new(None),
         }
     }
 
-    /// Execute guest code on the given thread.
-    pub fn run_thread(&self) {
-        // TODO: Implement once KThread, ArmInterface, Debugger are available.
+    /// Execute guest code until the next runtime event.
+    pub fn run_thread(
+        &self,
+        jit: &mut dyn ArmInterface,
+        thread: &mut OpaqueKThread,
+    ) -> PhysicalCoreExecutionEvent {
+        let halt_reason = jit.run_thread(thread);
+        if halt_reason.contains(HaltReason::SUPERVISOR_CALL) {
+            let svc_num = jit.get_svc_number();
+            let mut svc_args = [0u64; 8];
+            jit.get_svc_arguments(&mut svc_args);
+            PhysicalCoreExecutionEvent::SupervisorCall { svc_num, svc_args }
+        } else {
+            PhysicalCoreExecutionEvent::Halted(halt_reason)
+        }
+    }
+
+    pub fn initialize_guest_runtime(
+        &self,
+        main_thread: Arc<Mutex<KThread>>,
+        jit: &mut dyn ArmInterface,
+        thread_context: &mut ThreadContext,
+    ) {
+        self.restore_thread_to_jit(jit, thread_context, &main_thread);
+        *self.m_runtime.lock().unwrap() = Some(PhysicalCoreRuntime {
+            m_current_thread: main_thread,
+        });
+    }
+
+    pub fn handoff_after_svc(
+        &self,
+        jit: &mut dyn ArmInterface,
+        thread_context: &mut ThreadContext,
+        scheduler: &Arc<Mutex<KScheduler>>,
+        process: &Arc<Mutex<KProcess>>,
+    ) {
+        let mut runtime_guard = self.m_runtime.lock().unwrap();
+        let Some(runtime) = runtime_guard.as_mut() else {
+            return;
+        };
+
+        jit.get_context(thread_context);
+        runtime
+            .m_current_thread
+            .lock()
+            .unwrap()
+            .capture_guest_context(thread_context);
+
+        let current_thread_id = runtime.m_current_thread.lock().unwrap().get_thread_id();
+        let next_thread = scheduler
+            .lock()
+            .unwrap()
+            .wait_for_next_thread(process, current_thread_id);
+        let Some(next_thread) = next_thread else {
+            return;
+        };
+
+        let next_thread_id = next_thread.lock().unwrap().get_thread_id();
+        if next_thread_id == current_thread_id {
+            return;
+        }
+
+        self.restore_thread_to_jit(jit, thread_context, &next_thread);
+        runtime.m_current_thread = next_thread;
+    }
+
+    pub fn dispatch_supervisor_call(
+        &self,
+        jit: &mut dyn ArmInterface,
+        thread_context: &mut ThreadContext,
+        scheduler: &Arc<Mutex<KScheduler>>,
+        process: &Arc<Mutex<KProcess>>,
+        svc_num: u32,
+        is_64bit: bool,
+        svc_args: &mut SvcArgs,
+        svc_context: &SvcContext,
+    ) {
+        svc_dispatch::call(svc_num, is_64bit, svc_args, svc_context);
+        jit.set_svc_arguments(svc_args);
+        self.handoff_after_svc(jit, thread_context, scheduler, process);
+    }
+
+    pub fn run_loop<FSvc, FHalt>(
+        &self,
+        jit: &mut dyn ArmInterface,
+        thread: &mut OpaqueKThread,
+        thread_context: &mut ThreadContext,
+        scheduler: &Arc<Mutex<KScheduler>>,
+        process: &Arc<Mutex<KProcess>>,
+        is_64bit: bool,
+        svc_context: &SvcContext,
+        mut on_supervisor_call: FSvc,
+        mut on_halted: FHalt,
+    ) -> (u32, u32)
+    where
+        FSvc: FnMut(u32, &mut SvcArgs, &ThreadContext, u32, u32) -> PhysicalCoreExecutionControl,
+        FHalt: FnMut(HaltReason, &ThreadContext, u32, u32) -> PhysicalCoreExecutionControl,
+    {
+        let mut svc_count = 0u32;
+        let mut iteration = 0u32;
+
+        loop {
+            let event = self.run_thread(jit, thread);
+            iteration += 1;
+
+            match event {
+                PhysicalCoreExecutionEvent::SupervisorCall { svc_num, mut svc_args } => {
+                    svc_count += 1;
+                    jit.get_context(thread_context);
+
+                    if matches!(
+                        on_supervisor_call(
+                            svc_num,
+                            &mut svc_args,
+                            thread_context,
+                            svc_count,
+                            iteration,
+                        ),
+                        PhysicalCoreExecutionControl::Break
+                    ) {
+                        break;
+                    }
+
+                    self.dispatch_supervisor_call(
+                        jit,
+                        thread_context,
+                        scheduler,
+                        process,
+                        svc_num,
+                        is_64bit,
+                        &mut svc_args,
+                        svc_context,
+                    );
+                }
+                PhysicalCoreExecutionEvent::Halted(halt_reason) => {
+                    jit.get_context(thread_context);
+                    if matches!(
+                        on_halted(halt_reason, thread_context, svc_count, iteration),
+                        PhysicalCoreExecutionControl::Break
+                    ) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        (iteration, svc_count)
     }
 
     /// Load context from thread to current core.
@@ -85,5 +250,17 @@ impl PhysicalCore {
     /// Get the core index.
     pub fn core_index(&self) -> usize {
         self.m_core_index
+    }
+
+    fn restore_thread_to_jit(
+        &self,
+        jit: &mut dyn ArmInterface,
+        thread_context: &mut ThreadContext,
+        thread: &Arc<Mutex<KThread>>,
+    ) {
+        let thread = thread.lock().unwrap();
+        thread.restore_guest_context(thread_context);
+        jit.set_context(thread_context);
+        jit.set_tpidrro_el0(thread.get_tls_address().get());
     }
 }
