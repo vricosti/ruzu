@@ -147,8 +147,14 @@ pub trait ServiceFramework: SessionRequestHandler {
                 result = ipc_helpers::RESULT_SESSION_CLOSED;
             }
             ipc::CommandType::ControlWithContext | ipc::CommandType::Control => {
-                // TODO: system.ServiceManager().InvokeControlRequest(ctx);
-                log::warn!("Control request not yet wired up");
+                // Dispatch Control requests to SmController via ServiceManager.
+                // Matches upstream: system.ServiceManager().InvokeControlRequest(ctx)
+                let sm = ctx.get_service_manager().cloned();
+                if let Some(sm) = sm {
+                    sm.lock().unwrap().invoke_control_request(ctx);
+                } else {
+                    log::warn!("Control request but no ServiceManager available");
+                }
             }
             ipc::CommandType::RequestWithContext | ipc::CommandType::Request => {
                 self.invoke_request(ctx);
