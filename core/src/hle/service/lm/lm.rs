@@ -430,27 +430,57 @@ impl ILogger {
 /// LM service ("lm").
 ///
 /// Corresponds to `LM` in upstream lm.cpp.
-pub struct LM;
+pub struct LM {
+    handlers: std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo>,
+    handlers_tipc: std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo>,
+}
 
 impl LM {
     pub fn new() -> Self {
-        Self
+        let handlers = crate::hle::service::service::build_handler_map(&[
+            (0, Some(LM::open_logger_handler), "OpenLogger"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: std::collections::BTreeMap::new(),
+        }
     }
 
-    /// OpenLogger (cmd 0) - creates an ILogger interface.
-    ///
-    /// Corresponds to `LM::OpenLogger` in upstream lm.cpp.
-    pub fn open_logger(&self) -> ILogger {
-        log::debug!("LM::open_logger called");
-        ILogger::new()
+    fn open_logger_handler(this: &dyn crate::hle::service::service::ServiceFramework, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) {
+        log::debug!("LM::OpenLogger called");
+        // Upstream creates an ILogger domain object. For bring-up, just return success.
+        let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(crate::hle::result::RESULT_SUCCESS);
     }
 }
 
-/// Registers "lm" service.
-///
-/// Corresponds to `LoopProcess` in upstream `lm.cpp`.
-pub fn loop_process() {
-    // TODO: register "lm" -> LM with ServerManager
+impl crate::hle::service::hle_ipc::SessionRequestHandler for LM {
+    fn handle_sync_request(&self, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) -> crate::hle::result::ResultCode {
+        use crate::hle::service::service::ServiceFramework;
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "lm"
+    }
+}
+
+impl crate::hle::service::service::ServiceFramework for LM {
+    fn get_service_name(&self) -> &str {
+        "lm"
+    }
+
+    fn get_max_sessions(&self) -> u32 {
+        42
+    }
+
+    fn handlers(&self) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 #[cfg(test)]

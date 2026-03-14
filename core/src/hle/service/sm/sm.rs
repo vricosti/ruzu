@@ -435,6 +435,8 @@ pub fn loop_process() {
 /// manager as more HLE service processes are wired up.
 pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
     let service_manager = Arc::new(Mutex::new(ServiceManager::new()));
+
+    // Register sm: service.
     let sm_service = Arc::new(Sm::new(service_manager.clone()));
     let sm_clone = sm_service.clone();
     let factory: SessionRequestHandlerFactory = Box::new(move || sm_clone.clone());
@@ -443,7 +445,28 @@ pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
         .unwrap()
         .register_service("sm:".to_string(), 64, factory);
     assert!(result.is_success(), "failed to register sm: service bootstrap");
+
+    // Register core HLE services that games expect.
+    // Matches upstream Services::InstallInterfaces() service registration.
+    register_stub_service(&service_manager, "lm", || {
+        Arc::new(crate::hle::service::lm::lm::LM::new())
+    });
+
     service_manager
+}
+
+/// Helper to register a service with a factory closure.
+fn register_stub_service<F>(sm: &Arc<Mutex<ServiceManager>>, name: &str, factory: F)
+where
+    F: Fn() -> SessionRequestHandlerPtr + Send + Sync + 'static,
+{
+    let result = sm
+        .lock()
+        .unwrap()
+        .register_service(name.to_string(), 64, Box::new(factory));
+    if result.is_error() {
+        log::warn!("Failed to register service '{}': {:#x}", name, result.get_inner_value());
+    }
 }
 
 #[cfg(test)]
