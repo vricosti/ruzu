@@ -6,9 +6,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::k_process::KProcess;
+use super::k_thread::KThread;
 use super::k_thread::ThreadState;
 
 /// Scheduling state held per-core.
@@ -327,6 +329,47 @@ impl KScheduler {
         }
 
         next_deadline
+    }
+
+    pub fn wait_for_next_runnable_thread(
+        &mut self,
+        process: &Arc<Mutex<KProcess>>,
+        current_thread_id: u64,
+    ) -> u64 {
+        loop {
+            self.wake_expired_sleeping_threads(process);
+            self.wake_signaled_synchronization_threads(process);
+
+            if let Some(next_thread_id) = self.select_next_thread_id(process, current_thread_id) {
+                return next_thread_id;
+            }
+
+            if let Some(deadline) = self.next_sleep_deadline(process) {
+                let now = Instant::now();
+                if deadline > now {
+                    thread::sleep(deadline.duration_since(now));
+                }
+                continue;
+            }
+
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub fn wait_for_next_thread(
+        &mut self,
+        process: &Arc<Mutex<KProcess>>,
+        current_thread_id: u64,
+    ) -> Option<Arc<Mutex<KThread>>> {
+        let next_thread_id = self.wait_for_next_runnable_thread(process, current_thread_id);
+        let next_thread = process
+            .lock()
+            .unwrap()
+            .get_thread_by_thread_id(next_thread_id);
+        if next_thread.is_some() {
+            self.set_scheduler_current_thread_id(next_thread_id);
+        }
+        next_thread
     }
 
     pub fn select_next_thread_id(

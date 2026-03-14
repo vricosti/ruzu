@@ -136,7 +136,6 @@ mod tests {
             program_id: 1,
             tls_base: 0,
             current_process: process,
-            current_thread_id: Arc::new(Mutex::new(1)),
             scheduler,
             next_thread_id: Arc::new(AtomicU64::new(2)),
             next_object_id: Arc::new(AtomicU32::new(2)),
