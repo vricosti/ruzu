@@ -38,6 +38,10 @@ pub struct FunctionInfo {
 ///
 /// Services implement this trait to register CMIF/TIPC handlers and dispatch IPC requests.
 /// The upstream C++ CRTP (Curiously Recurring Template Pattern) is replaced by a trait.
+///
+/// Upstream stores `Core::System& system` in `ServiceFrameworkBase`, giving every service
+/// access to `system.ServiceManager()`. Here, services store an `Arc<Mutex<ServiceManager>>`
+/// and expose it via `service_manager()`.
 pub trait ServiceFramework: SessionRequestHandler {
     /// Returns the service name.
     fn get_service_name(&self) -> &str;
@@ -52,6 +56,12 @@ pub trait ServiceFramework: SessionRequestHandler {
 
     /// Returns a reference to the TIPC handler map.
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo>;
+
+    /// Returns the ServiceManager, matching upstream `system.ServiceManager()`.
+    /// Services store this reference at construction time.
+    fn service_manager(&self) -> Option<std::sync::Arc<std::sync::Mutex<crate::hle::service::sm::sm::ServiceManager>>> {
+        None
+    }
 
     /// Invokes a service request routine using the HIPC protocol.
     fn invoke_request(&self, ctx: &mut HLERequestContext)
@@ -149,11 +159,10 @@ pub trait ServiceFramework: SessionRequestHandler {
             ipc::CommandType::ControlWithContext | ipc::CommandType::Control => {
                 // Dispatch Control requests to SmController via ServiceManager.
                 // Matches upstream: system.ServiceManager().InvokeControlRequest(ctx)
-                let sm = ctx.get_service_manager().cloned();
-                if let Some(sm) = sm {
+                if let Some(sm) = self.service_manager() {
                     sm.lock().unwrap().invoke_control_request(ctx);
                 } else {
-                    log::warn!("Control request but no ServiceManager available");
+                    log::warn!("Control request but no ServiceManager available on service '{}'", self.get_service_name());
                 }
             }
             ipc::CommandType::RequestWithContext | ipc::CommandType::Request => {

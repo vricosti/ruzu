@@ -403,6 +403,10 @@ impl ServiceFramework for Sm {
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
     }
+
+    fn service_manager(&self) -> Option<Arc<Mutex<ServiceManager>>> {
+        Some(self.service_manager.clone())
+    }
 }
 
 /// Runs SM services.
