@@ -259,7 +259,6 @@ pub struct HLERequestContext {
     pub domain_offset: u32,
 
     manager: Option<Arc<Mutex<SessionRequestManager>>>,
-    service_manager: Option<Arc<Mutex<crate::hle::service::sm::sm::ServiceManager>>>,
     is_deferred: bool,
 }
 
@@ -288,7 +287,6 @@ impl HLERequestContext {
             handles_offset: 0,
             domain_offset: 0,
             manager: None,
-            service_manager: None,
             is_deferred: false,
         };
         ctx.cmd_buf[0] = 0;
@@ -396,14 +394,6 @@ impl HLERequestContext {
 
     pub fn set_session_request_manager(&mut self, manager: Arc<Mutex<SessionRequestManager>>) {
         self.manager = Some(manager);
-    }
-
-    pub fn set_service_manager(&mut self, sm: Arc<Mutex<crate::hle::service::sm::sm::ServiceManager>>) {
-        self.service_manager = Some(sm);
-    }
-
-    pub fn get_service_manager(&self) -> Option<&Arc<Mutex<crate::hle::service::sm::sm::ServiceManager>>> {
-        self.service_manager.as_ref()
     }
 
     pub fn get_manager(&self) -> Option<&Arc<Mutex<SessionRequestManager>>> {

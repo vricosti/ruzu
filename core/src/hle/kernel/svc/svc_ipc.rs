@@ -61,7 +61,6 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
 
     let mut context = HLERequestContext::new();
     context.set_session_request_manager(request_manager.clone());
-    context.set_service_manager(ctx.service_manager.clone());
     let incoming = read_tls_command_buffer(ctx, tls_address);
     context.populate_from_incoming_command_buffer(&incoming);
 
