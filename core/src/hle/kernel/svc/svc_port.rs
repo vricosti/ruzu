@@ -4,16 +4,73 @@
 //!
 //! SVC handlers for port operations (ConnectToNamedPort, CreatePort, ConnectToPort, ManageNamedPort).
 
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+
+use crate::hle::kernel::k_client_session::KClientSession;
+use crate::hle::kernel::k_session::KSession;
+use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::SessionRequestManager;
+
+const PORT_NAME_MAX_LENGTH: usize = 12;
+
+fn read_port_name(ctx: &SvcContext, user_name: u64) -> String {
+    let mem = ctx.shared_memory.read().unwrap();
+    let mut bytes = Vec::new();
+    for i in 0..PORT_NAME_MAX_LENGTH as u64 {
+        if !mem.is_valid_range(user_name + i, 1) {
+            break;
+        }
+        let byte = mem.read_8(user_name + i);
+        if byte == 0 {
+            break;
+        }
+        bytes.push(byte);
+    }
+    String::from_utf8_lossy(&bytes).to_string()
+}
 
 /// Connects to a named port.
-pub fn connect_to_named_port(_out: &mut Handle, _user_name: u64) -> ResultCode {
-    // TODO: Read port name from user memory
-    // TODO: KObjectName::Find<KClientPort>, reserve handle, create session
-    log::warn!("svc::ConnectToNamedPort: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+pub fn connect_to_named_port(ctx: &SvcContext, out: &mut Handle, user_name: u64) -> ResultCode {
+    let name = read_port_name(ctx, user_name);
+    log::info!("  ConnectToNamedPort(\"{}\")", name);
+
+    let Some(session_handler) = ctx.service_manager.lock().unwrap().get_service(&name) else {
+        return RESULT_NOT_FOUND;
+    };
+
+    let session_object_id = ctx.next_object_id.fetch_add(1, Ordering::Relaxed) as u64;
+    let client_session_object_id = ctx.next_object_id.fetch_add(1, Ordering::Relaxed) as u64;
+
+    let request_manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+    request_manager
+        .lock()
+        .unwrap()
+        .set_session_handler(session_handler);
+
+    let session = Arc::new(Mutex::new(KSession::new()));
+    session.lock().unwrap().initialize(None, 0);
+
+    let client_session = Arc::new(Mutex::new(KClientSession::new()));
+    client_session
+        .lock()
+        .unwrap()
+        .initialize_with_manager(session_object_id, request_manager);
+
+    let mut process = ctx.current_process.lock().unwrap();
+    process.register_session_object(session_object_id, session);
+    process.register_client_session_object(client_session_object_id, client_session);
+
+    match process.handle_table.add(client_session_object_id) {
+        Ok(handle) => {
+            *out = handle;
+            RESULT_SUCCESS
+        }
+        Err(_) => RESULT_OUT_OF_HANDLES,
+    }
 }
 
 /// Creates a port.

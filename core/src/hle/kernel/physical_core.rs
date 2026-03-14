@@ -43,6 +43,21 @@ pub enum PhysicalCoreExecutionEvent {
 }
 
 impl PhysicalCore {
+    fn event_from_halt(
+        &self,
+        jit: &mut dyn ArmInterface,
+        halt_reason: HaltReason,
+    ) -> PhysicalCoreExecutionEvent {
+        if halt_reason.contains(HaltReason::SUPERVISOR_CALL) {
+            let svc_num = jit.get_svc_number();
+            let mut svc_args = [0u64; 8];
+            jit.get_svc_arguments(&mut svc_args);
+            PhysicalCoreExecutionEvent::SupervisorCall { svc_num, svc_args }
+        } else {
+            PhysicalCoreExecutionEvent::Halted(halt_reason)
+        }
+    }
+
     pub fn new(core_index: usize, is_multicore: bool) -> Self {
         Self {
             m_core_index: core_index,
@@ -62,14 +77,16 @@ impl PhysicalCore {
         thread: &mut OpaqueKThread,
     ) -> PhysicalCoreExecutionEvent {
         let halt_reason = jit.run_thread(thread);
-        if halt_reason.contains(HaltReason::SUPERVISOR_CALL) {
-            let svc_num = jit.get_svc_number();
-            let mut svc_args = [0u64; 8];
-            jit.get_svc_arguments(&mut svc_args);
-            PhysicalCoreExecutionEvent::SupervisorCall { svc_num, svc_args }
-        } else {
-            PhysicalCoreExecutionEvent::Halted(halt_reason)
-        }
+        self.event_from_halt(jit, halt_reason)
+    }
+
+    pub fn step_thread(
+        &self,
+        jit: &mut dyn ArmInterface,
+        thread: &mut OpaqueKThread,
+    ) -> PhysicalCoreExecutionEvent {
+        let halt_reason = jit.step_thread(thread);
+        self.event_from_halt(jit, halt_reason)
     }
 
     pub fn initialize_guest_runtime(
@@ -97,13 +114,11 @@ impl PhysicalCore {
         };
 
         jit.get_context(thread_context);
-        runtime
-            .m_current_thread
-            .lock()
-            .unwrap()
-            .capture_guest_context(thread_context);
-
-        let current_thread_id = runtime.m_current_thread.lock().unwrap().get_thread_id();
+        let current_thread_id = {
+            let mut current_thread = runtime.m_current_thread.lock().unwrap();
+            current_thread.capture_guest_context(thread_context);
+            current_thread.get_thread_id()
+        };
         let next_thread = scheduler
             .lock()
             .unwrap()
@@ -155,9 +170,16 @@ impl PhysicalCore {
     {
         let mut svc_count = 0u32;
         let mut iteration = 0u32;
+        let step_after_svc = std::env::var("RUZU_STEP_AFTER_SVC")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok());
 
         loop {
-            let event = self.run_thread(jit, thread);
+            let event = if step_after_svc.is_some_and(|threshold| svc_count >= threshold) {
+                self.step_thread(jit, thread)
+            } else {
+                self.run_thread(jit, thread)
+            };
             iteration += 1;
 
             match event {

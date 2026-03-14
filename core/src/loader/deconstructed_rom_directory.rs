@@ -10,6 +10,7 @@
 
 use crate::file_sys::program_metadata::ProgramMetadata;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
+use crate::hle::result::RESULT_SUCCESS;
 
 use super::loader::{
     AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult, Modules,
@@ -275,17 +276,19 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
         // ====================================================================
         // Process setup
         // ====================================================================
-        // Upstream calls: process.LoadFromMetadata(metadata, code_size, fastmem_base, is_hbl)
-        // which sets up the process code region, page table, capabilities, etc.
-        // TODO: Call process.load_from_metadata() when KProcess is fully wired.
+        // Upstream calls `process.LoadFromMetadata(...)` here. The Rust port
+        // still has a reduced implementation, but process-owned metadata now
+        // lives in KProcess instead of being reconstructed by the frontend.
+        let process_setup_result = process.load_from_metadata(&metadata, code_size);
+        if process_setup_result != RESULT_SUCCESS.get_inner_value() {
+            return (ResultStatus::ErrorBadNPDMHeader, None);
+        }
 
-        // Base address depends on address space width.
-        // 32-bit: MapSmall starts at 0x200000 (2 MiB)
-        // 39-bit: code region at 0x7100000000 (used by upstream for ASLR-disabled loads)
-        let code_base: u64 = if is_64bit { 0x7100000000 } else { 0x200000 };
+        let code_base: u64 = process.get_entry_point().get();
 
         // Pre-allocate code memory so write_memory doesn't try to grow from base 0.
-        // Upstream does this inside process.LoadFromMetadata().
+        // Full page-table ownership is still pending, so keep the temporary
+        // pre-allocation in the loader for now.
         process.allocate_code_memory(code_base, code_size as usize);
 
         // ====================================================================

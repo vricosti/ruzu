@@ -14,6 +14,7 @@ use crate::file_sys::fs_filesystem::OpenMode;
 use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use crate::hardware_properties;
 use crate::hle::kernel::kernel::KernelCore;
+use crate::hle::service::sm::sm::ServiceManager;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 
 use parking_lot::Mutex;
@@ -63,6 +64,9 @@ pub struct System {
 
     /// The kernel core (schedulers, physical cores, kernel objects).
     kernel: Option<KernelCore>,
+
+    /// Shared HLE service registry.
+    service_manager: Option<Arc<std::sync::Mutex<ServiceManager>>>,
 
     /// Device memory (emulated Switch DRAM).
     device_memory: Option<Box<DeviceMemory>>,
@@ -144,6 +148,7 @@ impl System {
             core_timing: CoreTiming::new(),
             cpu_manager: CpuManager::new(),
             kernel: None,
+            service_manager: None,
             device_memory: None,
             suspend_guard: Mutex::new(()),
             is_paused: AtomicBool::new(false),
@@ -199,6 +204,7 @@ impl System {
         kernel.set_multicore(self.is_multicore);
         kernel.initialize();
         self.kernel = Some(kernel);
+        self.service_manager = Some(crate::hle::service::sm::sm::create_service_manager());
 
         log::info!("System: initialized (multicore={}, async_gpu={})", self.is_multicore, self.is_async_gpu);
     }
@@ -562,6 +568,11 @@ impl System {
     /// Get a mutable reference to the kernel core.
     pub fn kernel_mut(&mut self) -> Option<&mut KernelCore> {
         self.kernel.as_mut()
+    }
+
+    /// Get the shared HLE service registry.
+    pub fn service_manager(&self) -> Option<Arc<std::sync::Mutex<ServiceManager>>> {
+        self.service_manager.clone()
     }
 
     /// Get a reference to the current application process.

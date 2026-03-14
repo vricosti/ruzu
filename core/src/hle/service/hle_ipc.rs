@@ -49,6 +49,14 @@ pub struct SessionRequestManager {
     domain_handlers: Vec<Option<SessionRequestHandlerPtr>>,
 }
 
+#[derive(Clone)]
+enum PreparedSyncRequest {
+    Session(SessionRequestHandlerPtr),
+    Domain(SessionRequestHandlerPtr),
+    CloseVirtualHandle(usize),
+    StubSuccess,
+}
+
 impl SessionRequestManager {
     pub fn new() -> Self {
         Self {
@@ -127,23 +135,47 @@ impl SessionRequestManager {
         }
     }
 
-    pub fn complete_sync_request(&mut self, context: &mut HLERequestContext) -> ResultCode {
-        let mut result = RESULT_SUCCESS;
-
-        if self.has_session_request_handler(context) {
-            if self.is_domain() && context.has_domain_message_header() {
-                result = self.handle_domain_sync_request(context);
-            } else if self.has_session_handler() {
-                if let Some(handler) = &self.session_handler {
-                    result = handler.handle_sync_request(context);
-                }
-            }
-        } else {
+    fn prepare_sync_request(&self, context: &HLERequestContext) -> PreparedSyncRequest {
+        if !self.has_session_request_handler(context) {
             log::error!("Session handler is invalid, stubbing response!");
-            let mut rb = super::ipc_helpers::ResponseBuilder::new(context, 2, 0, 0);
-            rb.push_result(RESULT_SUCCESS);
+            return PreparedSyncRequest::StubSuccess;
         }
 
+        if self.is_domain() && context.has_domain_message_header() {
+            let domain_message_header = context.get_domain_message_header().unwrap();
+            let object_id = domain_message_header.object_id() as usize;
+            let command = domain_message_header.command();
+
+            match command {
+                ipc::DomainCommandType::SendMessage => {
+                    if object_id > self.domain_handler_count() {
+                        log::error!(
+                            "object_id {} is too big! This probably means a recent service call \
+                             needed to return a new interface!",
+                            object_id
+                        );
+                        return PreparedSyncRequest::StubSuccess;
+                    }
+                    if let Some(Some(handler)) = self.domain_handlers.get(object_id - 1) {
+                        return PreparedSyncRequest::Domain(handler.clone());
+                    }
+                    log::error!("Domain handler at index {} is null", object_id - 1);
+                    return PreparedSyncRequest::StubSuccess;
+                }
+                ipc::DomainCommandType::CloseVirtualHandle => {
+                    log::debug!("CloseVirtualHandle, object_id=0x{:08X}", object_id);
+                    return PreparedSyncRequest::CloseVirtualHandle(object_id - 1);
+                }
+            }
+        }
+
+        match &self.session_handler {
+            Some(handler) => PreparedSyncRequest::Session(handler.clone()),
+            None => PreparedSyncRequest::StubSuccess,
+        }
+    }
+
+    fn finish_sync_request(&mut self) {
         if self.convert_to_domain {
             assert!(
                 !self.is_domain(),
@@ -151,45 +183,6 @@ impl SessionRequestManager {
             );
             self.convert_to_domain();
             self.convert_to_domain = false;
-        }
-
-        result
-    }
-
-    pub fn handle_domain_sync_request(&mut self, context: &mut HLERequestContext) -> ResultCode {
-        if !context.has_domain_message_header() {
-            return RESULT_SUCCESS;
-        }
-
-        let domain_message_header = context.get_domain_message_header().unwrap();
-        let object_id = domain_message_header.object_id() as usize;
-        let command = domain_message_header.command();
-
-        match command {
-            ipc::DomainCommandType::SendMessage => {
-                if object_id > self.domain_handler_count() {
-                    log::error!(
-                        "object_id {} is too big! This probably means a recent service call \
-                         needed to return a new interface!",
-                        object_id
-                    );
-                    return RESULT_SUCCESS;
-                }
-                if let Some(Some(handler)) = self.domain_handlers.get(object_id - 1) {
-                    handler.handle_sync_request(context)
-                } else {
-                    log::error!("Domain handler at index {} is null", object_id - 1);
-                    RESULT_SUCCESS
-                }
-            }
-            ipc::DomainCommandType::CloseVirtualHandle => {
-                log::debug!("CloseVirtualHandle, object_id=0x{:08X}", object_id);
-                self.close_domain_handler(object_id - 1);
-
-                let mut rb = super::ipc_helpers::ResponseBuilder::new(context, 2, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
-                RESULT_SUCCESS
-            }
         }
     }
 
@@ -200,6 +193,36 @@ impl SessionRequestManager {
     pub fn set_is_initialized_for_sm(&mut self) {
         self.is_initialized_for_sm = true;
     }
+}
+
+pub fn complete_sync_request(
+    manager: &Arc<Mutex<SessionRequestManager>>,
+    context: &mut HLERequestContext,
+) -> ResultCode {
+    let dispatch = {
+        let guard = manager.lock().unwrap();
+        guard.prepare_sync_request(context)
+    };
+
+    let result = match dispatch {
+        PreparedSyncRequest::Session(handler) | PreparedSyncRequest::Domain(handler) => {
+            handler.handle_sync_request(context)
+        }
+        PreparedSyncRequest::CloseVirtualHandle(index) => {
+            manager.lock().unwrap().close_domain_handler(index);
+            let mut rb = super::ipc_helpers::ResponseBuilder::new(context, 2, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+            RESULT_SUCCESS
+        }
+        PreparedSyncRequest::StubSuccess => {
+            let mut rb = super::ipc_helpers::ResponseBuilder::new(context, 2, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+            RESULT_SUCCESS
+        }
+    };
+
+    manager.lock().unwrap().finish_sync_request();
+    result
 }
 
 /// Class containing information about an in-flight IPC request being handled by an HLE service

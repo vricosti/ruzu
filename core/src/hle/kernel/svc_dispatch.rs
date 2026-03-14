@@ -16,10 +16,16 @@ use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_thread::KThread;
+use crate::hle::service::sm::sm::ServiceManager;
 use crate::hle::kernel::svc::svc_activity;
+use crate::hle::kernel::svc::svc_address_arbiter;
+use crate::hle::kernel::svc::svc_condition_variable;
 use crate::hle::kernel::svc::svc_debug_string;
 use crate::hle::kernel::svc::svc_event;
 use crate::hle::kernel::svc::svc_exception;
+use crate::hle::kernel::svc::svc_ipc;
+use crate::hle::kernel::svc::svc_lock;
+use crate::hle::kernel::svc::svc_port;
 use crate::hle::kernel::svc::svc_processor;
 use crate::hle::kernel::svc::svc_synchronization;
 use crate::hle::kernel::svc::svc_thread;
@@ -43,6 +49,7 @@ pub struct SvcContext {
     /// Upstream: KThread::m_tls_address, set by CreateThreadLocalRegion().
     pub tls_base: u64,
     pub current_process: Arc<Mutex<KProcess>>,
+    pub service_manager: Arc<Mutex<ServiceManager>>,
     pub scheduler: Arc<Mutex<KScheduler>>,
     pub next_thread_id: Arc<AtomicU64>,
     pub next_object_id: Arc<AtomicU32>,
@@ -708,22 +715,52 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::ArbitrateLock) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_lock::arbitrate_lock(
+                ctx,
+                get_arg32(args, 0),
+                get_arg32(args, 1) as u64,
+                get_arg32(args, 2),
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::ArbitrateUnlock) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_lock::arbitrate_unlock(ctx, get_arg32(args, 0) as u64);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::WaitProcessWideKeyAtomic) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_condition_variable::wait_process_wide_key_atomic(
+                ctx,
+                get_arg32(args, 0) as u64,
+                get_arg32(args, 1) as u64,
+                get_arg32(args, 2),
+                gather64(args, 3, 4) as i64,
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SignalProcessWideKey) => {
-            // No return value
+            svc_condition_variable::signal_process_wide_key(
+                ctx,
+                get_arg32(args, 0) as u64,
+                get_arg32(args, 1) as i32,
+            );
         }
         Some(SvcId::WaitForAddress) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_address_arbiter::wait_for_address(
+                get_arg32(args, 0) as u64,
+                unsafe { std::mem::transmute(get_arg32(args, 1)) },
+                get_arg32(args, 2) as i32,
+                gather64(args, 3, 4) as i64,
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SignalToAddress) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_address_arbiter::signal_to_address(
+                get_arg32(args, 0) as u64,
+                unsafe { std::mem::transmute(get_arg32(args, 1)) },
+                get_arg32(args, 2) as i32,
+                get_arg32(args, 3) as i32,
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SynchronizePreemptionState) => {
             // No return value
@@ -751,32 +788,17 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
         // IPC
         // =====================================================================
         Some(SvcId::ConnectToNamedPort) => {
-            // IN: name=arg32[1]; OUT: ret=arg32[0], handle=arg32[1]
-            let name_ptr = get_arg32(args, 1) as u64;
-            let name = {
-                let mem = ctx.shared_memory.read().unwrap();
-                let mut buf = Vec::new();
-                for i in 0..12u64 {
-                    if mem.is_valid_range(name_ptr + i, 1) {
-                        let b = mem.read_8(name_ptr + i);
-                        if b == 0 { break; }
-                        buf.push(b);
-                    } else {
-                        break;
-                    }
-                }
-                String::from_utf8_lossy(&buf).to_string()
-            };
-            log::info!("  ConnectToNamedPort(\"{}\")", name);
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            let mut out = 0;
+            let result = svc_port::connect_to_named_port(ctx, &mut out, get_arg32(args, 1) as u64);
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out);
         }
         Some(SvcId::SendSyncRequestLight) => {
             set_arg32(args, 0, STUB_SUCCESS);
         }
         Some(SvcId::SendSyncRequest) => {
-            // IN: session_handle=arg32[0]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_ipc::send_sync_request(ctx, get_arg32(args, 0));
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SendSyncRequestWithUserBuffer) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -1244,11 +1266,14 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             set_arg64(args, 0, get_tick() as u64);
         }
         Some(SvcId::ConnectToNamedPort) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
-            set_arg64(args, 1, alloc_stub_handle() as u64);
+            let mut out = 0;
+            let result = svc_port::connect_to_named_port(ctx, &mut out, get_arg64(args, 1));
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, out as u64);
         }
         Some(SvcId::SendSyncRequest) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let result = svc_ipc::send_sync_request(ctx, get_arg64(args, 0) as u32);
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetProcessId) => {
             set_arg64(args, 0, STUB_SUCCESS as u64);
