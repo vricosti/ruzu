@@ -677,11 +677,65 @@ impl HLERequestContext {
         }
     }
 
-    /// Writes data from this context back to the requesting process/thread.
-    /// In the full implementation this would write back to guest memory.
-    /// For now, this is a stub.
-    pub fn write_to_outgoing_command_buffer(&self) -> ResultCode {
-        // TODO: implement full write-back when kernel integration is ready
+    /// Writes data from this context back into the command buffer.
+    ///
+    /// Matches upstream `HLERequestContext::WriteToOutgoingCommandBuffer()`:
+    /// 1. Translate outgoing copy objects → handles (TODO: needs handle table)
+    /// 2. Translate outgoing move objects → handles (TODO: needs handle table)
+    /// 3. Write domain objects IDs into the buffer
+    ///
+    /// Note: upstream also writes the buffer back to guest TLS memory via
+    /// `memory.WriteBlock(thread->GetTlsAddress(), ...)`. In our architecture,
+    /// the caller (`send_sync_request`) handles the TLS write-back separately.
+    pub fn write_to_outgoing_command_buffer(&mut self) -> ResultCode {
+        let mut current_offset = self.handles_offset as usize;
+
+        // Translate outgoing copy objects to handles.
+        // TODO: needs handle_table.Add() — for now write 0 placeholders.
+        for _ in &self.outgoing_copy_objects {
+            if current_offset < ipc::COMMAND_BUFFER_LENGTH {
+                // TODO: handle_table.Add(&handle, object); cmd_buf[offset] = handle;
+                self.cmd_buf[current_offset] = 0;
+                current_offset += 1;
+            }
+        }
+
+        // Translate outgoing move objects to handles.
+        // TODO: needs handle_table.Add() — for now write 0 placeholders.
+        for _ in &self.outgoing_move_objects {
+            if current_offset < ipc::COMMAND_BUFFER_LENGTH {
+                // TODO: handle_table.Add(&handle, object); object.Close(); cmd_buf[offset] = handle;
+                self.cmd_buf[current_offset] = 0;
+                current_offset += 1;
+            }
+        }
+
+        // Write domain objects to the command buffer (after raw untranslated data).
+        // Matches upstream: domain objects go at domain_offset - count.
+        let is_domain = self
+            .manager
+            .as_ref()
+            .map_or(false, |m| m.lock().unwrap().is_domain());
+
+        if is_domain {
+            let num_domain_objects = self.outgoing_domain_objects.len();
+            current_offset = self.domain_offset as usize - num_domain_objects;
+
+            let domain_objects = std::mem::take(&mut self.outgoing_domain_objects);
+            for object in domain_objects {
+                if current_offset < ipc::COMMAND_BUFFER_LENGTH {
+                    if let Some(manager) = &self.manager {
+                        manager.lock().unwrap().append_domain_handler(object);
+                        let count = manager.lock().unwrap().domain_handler_count();
+                        self.cmd_buf[current_offset] = count as u32;
+                    } else {
+                        self.cmd_buf[current_offset] = 0;
+                    }
+                    current_offset += 1;
+                }
+            }
+        }
+
         RESULT_SUCCESS
     }
 

@@ -64,11 +64,20 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
     let incoming = read_tls_command_buffer(ctx, tls_address);
     context.populate_from_incoming_command_buffer(&incoming);
 
+    let is_domain = request_manager.lock().unwrap().is_domain();
     log::info!(
-        "  SendSyncRequest: handle={:#x} tls={:#x} cmd_type={} cmd_id={}",
+        "  SendSyncRequest: handle={:#x} tls={:#x} cmd_type={} is_domain={} parsed_cmd={} dp_offset={}",
         session_handle, tls_address,
-        incoming[0] & 0xFFFF, // command type from header
-        incoming[8],          // command ID (after SFCI magic at word[4])
+        incoming[0] & 0xFFFF, is_domain,
+        context.get_command(),
+        context.data_payload_offset,
+    );
+    log::info!(
+        "  TLS raw: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+        incoming[0], incoming[1], incoming[2], incoming[3],
+        incoming[4], incoming[5], incoming[6], incoming[7],
+        incoming[8], incoming[9], incoming[10], incoming[11],
+        incoming[12], incoming[13], incoming[14], incoming[15],
     );
 
     let result = complete_sync_request(&request_manager, &mut context);
