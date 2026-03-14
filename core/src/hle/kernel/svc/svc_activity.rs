@@ -7,6 +7,7 @@
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
+use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Sets the thread activity.
@@ -14,7 +15,11 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 /// Validates the activity, gets the thread from its handle,
 /// checks that it belongs to the current process and is not the current thread,
 /// then sets the activity.
-pub fn set_thread_activity(thread_handle: Handle, thread_activity: ThreadActivity) -> ResultCode {
+pub fn set_thread_activity(
+    ctx: &SvcContext,
+    thread_handle: Handle,
+    thread_activity: ThreadActivity,
+) -> ResultCode {
     log::debug!(
         "svc::SetThreadActivity called, handle=0x{:08X}, activity={:?}",
         thread_handle,
@@ -30,12 +35,26 @@ pub fn set_thread_activity(thread_handle: Handle, thread_activity: ThreadActivit
         return RESULT_INVALID_ENUM_VALUE;
     }
 
-    // TODO: Get the thread from its handle via GetCurrentProcess().GetHandleTable().GetObject<KThread>()
-    // TODO: Check that the activity is being set on a non-current thread for the current process.
-    // TODO: thread->SetActivity(thread_activity)
+    let current_thread_id = *ctx.current_thread_id.lock().unwrap();
+    let process = ctx.current_process.lock().unwrap();
+    let Some(object_id) = process.handle_table.get_object(thread_handle) else {
+        return RESULT_INVALID_HANDLE;
+    };
+    let Some(thread) = process.get_thread_by_object_id(object_id) else {
+        return RESULT_INVALID_HANDLE;
+    };
+    drop(process);
 
-    log::warn!("svc::SetThreadActivity: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+    if thread.lock().unwrap().get_thread_id() == current_thread_id {
+        return RESULT_BUSY;
+    }
+
+    let activity = match thread_activity {
+        ThreadActivity::Runnable => 0,
+        ThreadActivity::Paused => 1,
+    };
+    let result = ResultCode::new(thread.lock().unwrap().set_activity(activity));
+    result
 }
 
 /// Sets the process activity. (Unimplemented upstream.)
@@ -45,4 +64,87 @@ pub fn set_process_activity(
 ) -> ResultCode {
     log::warn!("svc::SetProcessActivity: UNIMPLEMENTED");
     RESULT_NOT_IMPLEMENTED
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_thread::{KThread, SuspendType};
+    use crate::hle::kernel::svc::svc_thread;
+
+    fn test_context() -> SvcContext {
+        let mut process = KProcess::new();
+        process.capabilities.core_mask = 0xF;
+        process.capabilities.priority_mask = u64::MAX;
+        process.flags = 0;
+        process.allocate_code_memory(0x200000, 0x20000);
+        process.initialize_handle_table();
+        process.initialize_thread_local_region_base(0x240000);
+
+        let process = Arc::new(Mutex::new(process));
+        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let scheduler = Arc::new(Mutex::new(crate::hle::kernel::k_scheduler::KScheduler::new(0)));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.initialize_main_thread(0x200000, 0x250000, 0, 0x23f000, &process, 1, 1, false);
+            thread.set_priority(44);
+            thread.set_base_priority(44);
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(current_thread.clone());
+        scheduler.lock().unwrap().initialize(1, 0, 0);
+
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+
+        SvcContext {
+            shared_memory,
+            code_base: 0x200000,
+            code_size: 0x20000,
+            stack_base: 0x240000,
+            stack_size: 0x10000,
+            program_id: 1,
+            tls_base: 0x23f000,
+            current_process: process,
+            current_thread_id: Arc::new(Mutex::new(1)),
+            scheduler,
+            next_thread_id: Arc::new(AtomicU64::new(2)),
+            next_object_id: Arc::new(AtomicU32::new(2)),
+            is_64bit: false,
+        }
+    }
+
+    #[test]
+    fn set_thread_activity_pauses_and_resumes_non_current_thread() {
+        let ctx = test_context();
+        let mut handle = 0;
+        assert_eq!(
+            svc_thread::create_thread(&ctx, &mut handle, 0x201000, 0x1234, 0x260000, 44, 0),
+            RESULT_SUCCESS
+        );
+        assert_eq!(svc_thread::start_thread(&ctx, handle), RESULT_SUCCESS);
+
+        assert_eq!(
+            set_thread_activity(&ctx, handle, ThreadActivity::Paused),
+            RESULT_SUCCESS
+        );
+
+        let process = ctx.current_process.lock().unwrap();
+        let object_id = process.handle_table.get_object(handle).unwrap();
+        let thread = process.get_thread_by_object_id(object_id).unwrap();
+        drop(process);
+
+        assert!(thread.lock().unwrap().is_suspend_requested_type(SuspendType::Thread));
+
+        assert_eq!(
+            set_thread_activity(&ctx, handle, ThreadActivity::Runnable),
+            RESULT_SUCCESS
+        );
+        assert!(!thread.lock().unwrap().is_suspend_requested_type(SuspendType::Thread));
+    }
 }
