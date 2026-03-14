@@ -166,6 +166,9 @@ mod tests {
             program_id: 1,
             tls_base: 0,
             current_process: process,
+            service_manager: Arc::new(Mutex::new(
+                crate::hle::service::sm::sm::ServiceManager::new(),
+            )),
             scheduler,
             next_thread_id: Arc::new(AtomicU64::new(2)),
             next_object_id: Arc::new(AtomicU32::new(2)),

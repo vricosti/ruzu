@@ -474,6 +474,11 @@ fn main() {
             log::info!("Memory regions: {} non-free blocks tracked", count);
         }
 
+        let load_parameters = system
+            .load_parameters()
+            .cloned()
+            .expect("loader must provide process launch parameters");
+
         let process = std::sync::Arc::new(std::sync::Mutex::new(process));
         process.lock().unwrap().bind_self_reference(&process);
         let next_thread_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
@@ -482,13 +487,19 @@ fn main() {
             ruzu_core::hle::kernel::k_scheduler::KScheduler::new(0),
         ));
         process.lock().unwrap().attach_scheduler(&scheduler);
-        let stack_size: usize = 1024 * 1024;
         let (main_thread, _main_thread_handle, stack_base, stack_top) =
             process
                 .lock()
                 .unwrap()
-                .run(0, stack_size, 1, 1, is_64bit)
+                .run(
+                    load_parameters.main_thread_priority,
+                    load_parameters.main_thread_stack_size as usize,
+                    1,
+                    1,
+                    is_64bit,
+                )
                 .expect("process runtime bootstrap must succeed");
+        let stack_size = load_parameters.main_thread_stack_size as usize;
         let tls_base = main_thread.lock().unwrap().get_tls_address().get();
         log::info!("TLS: base={:#x}, size={:#x}", tls_base, tls_page_size);
         log::info!(
@@ -543,6 +554,9 @@ fn main() {
             program_id: 0x0100152000022000, // MK8D title ID
             tls_base,
             current_process: process.clone(),
+            service_manager: system
+                .service_manager()
+                .expect("System service manager must exist after initialize"),
             scheduler: scheduler.clone(),
             next_thread_id: next_thread_id.clone(),
             next_object_id: next_object_id.clone(),
@@ -573,6 +587,14 @@ fn main() {
 
         let mut query_memory_count = 0u32;
         let mut dumped_module_objects = false;
+        let mut step_halt_count = 0u64;
+        let mut last_step_pc = 0u64;
+        let mut repeated_step_pc_count = 0u64;
+        let mut dumped_repeated_step_window = false;
+        let repeated_step_window_threshold = std::env::var("RUZU_REPEAT_STEP_WINDOW")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10_000);
         let (iteration, svc_count) = physical_core.run_loop(
             &mut *jit,
             dummy_thread,
@@ -672,7 +694,77 @@ fn main() {
                 PhysicalCoreExecutionControl::Continue
             },
             |halt_reason, ctx, svc_count, iteration| {
-                if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
+                if halt_reason.contains(HaltReason::STEP_THREAD) {
+                    step_halt_count += 1;
+                    if ctx.pc == last_step_pc {
+                        repeated_step_pc_count += 1;
+                    } else {
+                        last_step_pc = ctx.pc;
+                        repeated_step_pc_count = 1;
+                        dumped_repeated_step_window = false;
+                    }
+                    if step_halt_count == 1 {
+                        let mem = shared_memory.read().unwrap();
+                        let start = ctx.pc.saturating_sub(0x10);
+                        log::info!("First STEP halt instruction window around PC={:#x}", ctx.pc);
+                        for addr in (start..=ctx.pc.saturating_add(0x10)).step_by(4) {
+                            if !mem.is_valid_range(addr, 4) {
+                                log::info!("  [{:#010x}] <unmapped>", addr);
+                                continue;
+                            }
+                            let insn = mem.read_32(addr);
+                            let decoded = decode_arm(insn);
+                            let marker = if addr == ctx.pc { " <PC>" } else { "" };
+                            log::info!(
+                                "  [{:#010x}] {:#010x} {:?}{}",
+                                addr,
+                                insn,
+                                decoded.id,
+                                marker
+                            );
+                        }
+                    }
+                    if repeated_step_pc_count >= repeated_step_window_threshold
+                        && !dumped_repeated_step_window
+                    {
+                        dumped_repeated_step_window = true;
+                        let mem = shared_memory.read().unwrap();
+                        let start = ctx.pc.saturating_sub(0x10);
+                        log::info!(
+                            "Repeated STEP PC window after {} repeats at PC={:#x}",
+                            repeated_step_pc_count,
+                            ctx.pc
+                        );
+                        for addr in (start..=ctx.pc.saturating_add(0x10)).step_by(4) {
+                            if !mem.is_valid_range(addr, 4) {
+                                log::info!("  [{:#010x}] <unmapped>", addr);
+                                continue;
+                            }
+                            let insn = mem.read_32(addr);
+                            let decoded = decode_arm(insn);
+                            let marker = if addr == ctx.pc { " <PC>" } else { "" };
+                            log::info!(
+                                "  [{:#010x}] {:#010x} {:?}{}",
+                                addr,
+                                insn,
+                                decoded.id,
+                                marker
+                            );
+                        }
+                    }
+                    if step_halt_count == 1 || step_halt_count % 10_000 == 0 {
+                        log::info!(
+                            "STEP halt #{} at PC={:#x}, SP={:#x}, LR={:#x} (iter={}, svcs={})",
+                            step_halt_count,
+                            ctx.pc,
+                            ctx.sp,
+                            ctx.lr,
+                            iteration,
+                            svc_count
+                        );
+                    }
+                    return PhysicalCoreExecutionControl::Continue;
+                } else if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
                     log::error!("PREFETCH_ABORT at PC={:#x}, SP={:#x}, LR={:#x}", ctx.pc, ctx.sp, ctx.lr);
                     let mem = shared_memory.read().unwrap();
                     let crash_start = ctx.pc.saturating_sub(0x10);

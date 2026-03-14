@@ -324,6 +324,7 @@ pub struct KThread {
     // m_waiting_lock_info — stubbed
 
     pub address_key_value: u32,
+    pub user_waiter_thread_ids: Vec<u64>,
     pub suspend_request_flags: u32,
     pub suspend_allowed_flags: u32,
     pub synced_index: i32,
@@ -416,6 +417,7 @@ impl KThread {
             per_core_priority_queue_entry: Default::default(),
             wait_queue_active: false,
             address_key_value: 0,
+            user_waiter_thread_ids: Vec::new(),
             suspend_request_flags: 0,
             suspend_allowed_flags: ThreadState::SUSPEND_FLAG_MASK.bits() as u32,
             synced_index: 0,
@@ -710,6 +712,57 @@ impl KThread {
         self.address_key_value
     }
 
+    pub fn add_waiter(&mut self, thread_id: u64) {
+        if self.user_waiter_thread_ids.contains(&thread_id) {
+            return;
+        }
+        self.user_waiter_thread_ids.push(thread_id);
+        self.num_kernel_waiters += 1;
+    }
+
+    pub fn remove_waiter(&mut self, thread_id: u64) {
+        if let Some(index) = self
+            .user_waiter_thread_ids
+            .iter()
+            .position(|candidate| *candidate == thread_id)
+        {
+            self.user_waiter_thread_ids.remove(index);
+            self.num_kernel_waiters = self.num_kernel_waiters.saturating_sub(1);
+        }
+    }
+
+    pub fn remove_user_waiter_by_key(
+        &mut self,
+        process: &KProcess,
+        address: KProcessAddress,
+        has_waiters: &mut bool,
+    ) -> Option<u64> {
+        let mut index = 0usize;
+        while index < self.user_waiter_thread_ids.len() {
+            let waiter_thread_id = self.user_waiter_thread_ids[index];
+            let Some(waiter_thread) = process.get_thread_by_thread_id(waiter_thread_id) else {
+                self.user_waiter_thread_ids.remove(index);
+                self.num_kernel_waiters = self.num_kernel_waiters.saturating_sub(1);
+                continue;
+            };
+
+            if waiter_thread.lock().unwrap().get_address_key() != address {
+                index += 1;
+                continue;
+            }
+
+            self.user_waiter_thread_ids.remove(index);
+            self.num_kernel_waiters = self.num_kernel_waiters.saturating_sub(1);
+            *has_waiters = self.user_waiter_thread_ids.iter().filter_map(|candidate_id| {
+                process.get_thread_by_thread_id(*candidate_id)
+            }).any(|thread| thread.lock().unwrap().get_address_key() == address);
+            return Some(waiter_thread_id);
+        }
+
+        *has_waiters = false;
+        None
+    }
+
     pub fn get_is_kernel_address_key(&self) -> bool {
         self.is_kernel_address_key
     }
@@ -810,6 +863,11 @@ impl KThread {
     }
 
     fn clear_wait_synchronization(&mut self) {
+        if !self.synchronization_wait.is_active() {
+            self.clear_cancellable();
+            return;
+        }
+
         if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
             let mut process_guard = parent.lock().unwrap();
             k_synchronization_object::clear_wait_set(
@@ -1367,7 +1425,7 @@ impl KThread {
 
     /// Clear condition variable state.
     pub fn clear_condition_variable(&mut self) {
-        // condvar_tree pointer cleared in upstream
+        self.condvar_key = 0;
     }
 
     /// Set address arbiter state.
@@ -1378,6 +1436,10 @@ impl KThread {
     /// Clear address arbiter state.
     pub fn clear_address_arbiter(&mut self) {
         // condvar_tree pointer cleared in upstream
+    }
+
+    pub fn waiter_thread_ids(&self) -> &[u64] {
+        &self.user_waiter_thread_ids
     }
 
     /// Continue if has kernel waiters.

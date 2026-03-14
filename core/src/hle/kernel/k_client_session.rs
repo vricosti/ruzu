@@ -4,25 +4,48 @@
 //!
 //! KClientSession: the client endpoint of a session, used to send IPC requests.
 
+use std::sync::{Arc, Mutex};
+
+use crate::hle::service::hle_ipc::SessionRequestManager;
+
 /// The client session object.
 /// Matches upstream `KClientSession` class (k_client_session.h).
 pub struct KClientSession {
     /// Parent KSession ID.
     pub parent_id: Option<u64>,
+    pub request_manager: Option<Arc<Mutex<SessionRequestManager>>>,
 }
 
 impl KClientSession {
     pub fn new() -> Self {
-        Self { parent_id: None }
+        Self {
+            parent_id: None,
+            request_manager: None,
+        }
     }
 
     /// Initialize with a parent session.
     pub fn initialize(&mut self, parent_id: u64) {
         self.parent_id = Some(parent_id);
+        self.request_manager = None;
+    }
+
+    /// Initialize with a parent session and its request manager.
+    pub fn initialize_with_manager(
+        &mut self,
+        parent_id: u64,
+        request_manager: Arc<Mutex<SessionRequestManager>>,
+    ) {
+        self.parent_id = Some(parent_id);
+        self.request_manager = Some(request_manager);
     }
 
     pub fn get_parent_id(&self) -> Option<u64> {
         self.parent_id
+    }
+
+    pub fn request_manager(&self) -> Option<Arc<Mutex<SessionRequestManager>>> {
+        self.request_manager.clone()
     }
 
     /// Send a synchronous IPC request.

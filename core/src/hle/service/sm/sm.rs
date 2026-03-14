@@ -409,7 +409,7 @@ impl ServiceFramework for Sm {
 ///
 /// Corresponds to upstream `Service::SM::LoopProcess`.
 pub fn loop_process() {
-    let service_manager = Arc::new(Mutex::new(ServiceManager::new()));
+    let service_manager = create_service_manager();
     let mut server_manager = ServerManager::new();
 
     // TODO: manage deferral event
@@ -422,6 +422,24 @@ pub fn loop_process() {
     server_manager.manage_named_port("sm:", factory, 64);
 
     // TODO: ServerManager::RunServer(server_manager);
+}
+
+/// Creates the process-external SM service registry and registers the "sm:" named port.
+///
+/// This is the current Rust-side owner for the subset of upstream system service bootstrap
+/// needed by kernel IPC bring-up. Additional named services can be registered on the returned
+/// manager as more HLE service processes are wired up.
+pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
+    let service_manager = Arc::new(Mutex::new(ServiceManager::new()));
+    let sm_service = Arc::new(Sm::new(service_manager.clone()));
+    let sm_clone = sm_service.clone();
+    let factory: SessionRequestHandlerFactory = Box::new(move || sm_clone.clone());
+    let result = service_manager
+        .lock()
+        .unwrap()
+        .register_service("sm:".to_string(), 64, factory);
+    assert!(result.is_success(), "failed to register sm: service bootstrap");
+    service_manager
 }
 
 #[cfg(test)]

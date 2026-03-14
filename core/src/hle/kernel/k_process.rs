@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use super::code_set::CodeSet;
 use super::k_capabilities::KCapabilities;
+use super::k_client_session::KClientSession;
+use super::k_condition_variable::KConditionVariable;
 use super::k_event::KEvent;
 use super::k_handle_table::MAX_TABLE_SIZE;
 use super::k_handle_table::KHandleTable;
@@ -22,13 +24,16 @@ use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_process_page_table::KProcessPageTable;
 use super::k_readable_event::KReadableEvent;
 use super::k_scheduler::KScheduler;
+use super::k_session::KSession;
 use super::k_synchronization_object;
 use super::k_synchronization_object::SynchronizationObjectState;
 use super::k_thread::KThread;
 use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAGE_SIZE};
 use super::k_typed_address::KProcessAddress;
 use super::svc_common::Handle;
+use super::svc_types::CreateProcessFlag;
 use crate::hardware_properties::NUM_CPU_CORES;
+use crate::file_sys::program_metadata::{PoolPartition, ProgramAddressSpaceType, ProgramMetadata};
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::RESULT_SUCCESS;
 
@@ -147,7 +152,9 @@ impl ProcessMemoryData {
     #[inline]
     pub fn is_valid_range(&self, vaddr: u64, size: usize) -> bool {
         let offset = vaddr.wrapping_sub(self.base) as usize;
-        offset + size <= self.data.len()
+        offset
+            .checked_add(size)
+            .is_some_and(|end| end <= self.data.len())
     }
 
     /// Check if a virtual address is in a writable memory region.
@@ -311,7 +318,7 @@ pub struct KProcess {
     pub state: ProcessState,
     // m_state_lock — KLightLock
     // m_list_lock — KLightLock
-    // m_cond_var — KConditionVariable
+    pub cond_var: KConditionVariable,
     // m_address_arbiter — KAddressArbiter
     pub entropy: [u64; 4],
     pub is_signaled: bool,
@@ -339,6 +346,8 @@ pub struct KProcess {
     // Thread list — stubbed as Vec of thread ids
     pub thread_list: Vec<u64>,
     pub thread_objects: BTreeMap<u64, Arc<Mutex<KThread>>>,
+    pub session_objects: BTreeMap<u64, Arc<Mutex<KSession>>>,
+    pub client_session_objects: BTreeMap<u64, Arc<Mutex<KClientSession>>>,
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
     pub readable_event_objects: BTreeMap<u64, Arc<Mutex<KReadableEvent>>>,
     pub sync_object: SynchronizationObjectState,
@@ -391,6 +400,7 @@ impl KProcess {
             ideal_core_id: 0,
             memory_release_hint: 0,
             state: ProcessState::default(),
+            cond_var: KConditionVariable::new(),
             entropy: [0u64; 4],
             is_signaled: false,
             is_initialized: false,
@@ -414,6 +424,8 @@ impl KProcess {
             exception_thread_id: None,
             thread_list: Vec::new(),
             thread_objects: BTreeMap::new(),
+            session_objects: BTreeMap::new(),
+            client_session_objects: BTreeMap::new(),
             event_objects: BTreeMap::new(),
             readable_event_objects: BTreeMap::new(),
             sync_object: SynchronizationObjectState::new(),
@@ -598,6 +610,31 @@ impl KProcess {
         self.self_reference = Some(Arc::downgrade(process));
     }
 
+    pub fn wait_condition_variable(
+        &mut self,
+        current_thread: &Arc<Mutex<KThread>>,
+        address: u64,
+        cv_key: u64,
+        tag: u32,
+        timeout: i64,
+    ) -> u32 {
+        let Some(process) = self.self_reference.as_ref().and_then(Weak::upgrade) else {
+            return RESULT_INVALID_STATE.get_inner_value();
+        };
+
+        self.cond_var
+            .wait(&process, current_thread, address, cv_key, tag, timeout)
+            .get_inner_value()
+    }
+
+    pub fn signal_condition_variable(&mut self, cv_key: u64, count: i32) {
+        let Some(process) = self.self_reference.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+
+        let _ = self.cond_var.signal(&process, cv_key, count);
+    }
+
     pub fn initialize_handle_table(&mut self) -> u32 {
         let size = match self.capabilities.get_handle_table_size() {
             0 => MAX_TABLE_SIZE as i32,
@@ -753,6 +790,86 @@ impl KProcess {
     pub fn initialize(&mut self) -> u32 {
         // TODO: Full implementation
         0
+    }
+
+    /// Port of the metadata-owned subset of upstream `KProcess::LoadFromMetadata`.
+    ///
+    /// This Rust port currently wires the process fields needed by the runtime
+    /// bootstrap path: process flags, code address, code size, title id, main
+    /// thread properties, and process name/affinity ownership. Full address
+    /// space and resource-limit setup is still pending with page table parity.
+    pub fn load_from_metadata(
+        &mut self,
+        metadata: &ProgramMetadata,
+        code_size: u64,
+    ) -> u32 {
+        let mut flags = CreateProcessFlag::empty();
+        let mut code_address = 0u64;
+
+        if matches!(metadata.get_pool_partition(), PoolPartition::Application) {
+            flags |= CreateProcessFlag::IS_APPLICATION;
+            self.is_application = true;
+        } else {
+            self.is_application = false;
+        }
+
+        if metadata.is_64_bit_program() {
+            flags |= CreateProcessFlag::IS_64_BIT;
+        }
+
+        match metadata.get_address_space_type() {
+            ProgramAddressSpaceType::Is39Bit => {
+                flags |= CreateProcessFlag::ADDRESS_SPACE_64_BIT;
+                code_address = 0x8000_0000;
+            }
+            ProgramAddressSpaceType::Is36Bit => {
+                flags |= CreateProcessFlag::ADDRESS_SPACE_64_BIT_DEPRECATED;
+                code_address = 0x0800_0000;
+            }
+            ProgramAddressSpaceType::Is32Bit => {
+                flags |= CreateProcessFlag::ADDRESS_SPACE_32_BIT;
+                code_address = 0x0020_0000;
+            }
+            ProgramAddressSpaceType::Is32BitNoMap => {
+                flags |= CreateProcessFlag::ADDRESS_SPACE_32_BIT_WITHOUT_ALIAS;
+                code_address = 0x0020_0000;
+            }
+        }
+
+        flags |= match metadata.get_pool_partition() {
+            PoolPartition::Application => CreateProcessFlag::POOL_PARTITION_APPLICATION,
+            PoolPartition::Applet => CreateProcessFlag::POOL_PARTITION_APPLET,
+            PoolPartition::System => CreateProcessFlag::POOL_PARTITION_SYSTEM,
+            PoolPartition::SystemNonSecure => {
+                CreateProcessFlag::POOL_PARTITION_SYSTEM_NON_SECURE
+            }
+        };
+
+        self.flags = flags.bits();
+        self.program_id = metadata.get_title_id();
+        self.code_address = KProcessAddress::new(code_address);
+        self.code_size = code_size as usize;
+        self.main_thread_stack_size = metadata.get_main_thread_stack_size() as usize;
+        self.ideal_core_id = metadata.get_main_thread_core() as i32;
+        self.is_hbl = false;
+
+        self.name = [0; 13];
+        let name = metadata.get_name();
+        let name_len = name
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(name.len())
+            .min(self.name.len() - 1);
+        self.name[..name_len].copy_from_slice(&name[..name_len]);
+
+        let caps_result = self
+            .capabilities
+            .initialize_for_user(metadata.get_kernel_capabilities());
+        if caps_result != RESULT_SUCCESS.get_inner_value() {
+            return caps_result;
+        }
+
+        RESULT_SUCCESS.get_inner_value()
     }
 
     /// Exit the process.
@@ -921,6 +1038,37 @@ impl KProcess {
 
     pub fn register_event_object(&mut self, object_id: u64, event: Arc<Mutex<KEvent>>) {
         self.event_objects.insert(object_id, event);
+    }
+
+    pub fn register_session_object(&mut self, object_id: u64, session: Arc<Mutex<KSession>>) {
+        self.session_objects.insert(object_id, session);
+    }
+
+    pub fn unregister_session_object_by_object_id(&mut self, object_id: u64) {
+        self.session_objects.remove(&object_id);
+    }
+
+    pub fn get_session_by_object_id(&self, object_id: u64) -> Option<Arc<Mutex<KSession>>> {
+        self.session_objects.get(&object_id).cloned()
+    }
+
+    pub fn register_client_session_object(
+        &mut self,
+        object_id: u64,
+        client_session: Arc<Mutex<KClientSession>>,
+    ) {
+        self.client_session_objects.insert(object_id, client_session);
+    }
+
+    pub fn unregister_client_session_object_by_object_id(&mut self, object_id: u64) {
+        self.client_session_objects.remove(&object_id);
+    }
+
+    pub fn get_client_session_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<KClientSession>>> {
+        self.client_session_objects.get(&object_id).cloned()
     }
 
     pub fn unregister_event_object_by_object_id(&mut self, object_id: u64) {
@@ -1092,6 +1240,7 @@ impl Default for KProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_sys::program_metadata::{ProgramAddressSpaceType, ProgramMetadata};
     use crate::hle::kernel::k_scheduler::KScheduler;
 
     #[test]
@@ -1192,5 +1341,32 @@ mod tests {
             .expect("tls page must be tracked");
         assert_eq!(block.get_state(), KMemoryState::THREAD_LOCAL);
         assert_eq!(block.get_permission(), KMemoryPermission::USER_READ_WRITE);
+    }
+
+    #[test]
+    fn load_from_metadata_sets_process_owned_entrypoint_and_launch_properties() {
+        let mut metadata = ProgramMetadata::new();
+        metadata.load_manual(
+            false,
+            ProgramAddressSpaceType::Is32Bit,
+            0x2c,
+            1,
+            0x40000,
+            0x0100_1520_0002_2000,
+            0,
+            0,
+            vec![],
+        );
+
+        let mut process = KProcess::new();
+        let result = process.load_from_metadata(&metadata, 0x120000);
+
+        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+        assert_eq!(process.get_entry_point().get(), 0x0020_0000);
+        assert_eq!(process.get_program_id(), 0x0100_1520_0002_2000);
+        assert_eq!(process.get_ideal_core_id(), 1);
+        assert_eq!(process.get_main_stack_size(), 0x40000);
+        assert!(!process.is_64bit());
+        assert!(process.is_application());
     }
 }

@@ -4,11 +4,13 @@
 //!
 //! SVC handlers for condition variable operations.
 
+use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::kernel::svc::svc_results::*;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::ResultCode;
 
 /// Wait process wide key atomic.
 pub fn wait_process_wide_key_atomic(
+    ctx: &SvcContext,
     address: u64,
     cv_key: u64,
     tag: u32,
@@ -39,24 +41,30 @@ pub fn wait_process_wide_key_atomic(
         timeout_ns
     };
 
-    // Align cv_key down to sizeof(u32).
-    let _aligned_cv_key = cv_key & !3u64;
+    let Some(current_thread) = ctx.current_thread() else {
+        return RESULT_INVALID_HANDLE;
+    };
 
-    // TODO: GetCurrentProcess(kernel).WaitConditionVariable(address, aligned_cv_key, tag, timeout)
-    log::warn!("svc::WaitProcessWideKeyAtomic: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+    let aligned_cv_key = cv_key & !3u64;
+    let result = ctx
+        .current_process
+        .lock()
+        .unwrap()
+        .wait_condition_variable(&current_thread, address, aligned_cv_key, tag, _timeout);
+
+    ResultCode::new(result)
 }
 
 /// Signal process wide key.
-pub fn signal_process_wide_key(cv_key: u64, count: i32) {
+pub fn signal_process_wide_key(ctx: &SvcContext, cv_key: u64, count: i32) {
     log::trace!(
         "svc::SignalProcessWideKey called, cv_key=0x{:X}, count=0x{:08X}",
         cv_key, count
     );
 
-    // Align cv_key down to sizeof(u32).
-    let _aligned_cv_key = cv_key & !3u64;
-
-    // TODO: GetCurrentProcess(kernel).SignalConditionVariable(aligned_cv_key, count)
-    log::warn!("svc::SignalProcessWideKey: kernel object access not yet implemented");
+    let aligned_cv_key = cv_key & !3u64;
+    ctx.current_process
+        .lock()
+        .unwrap()
+        .signal_condition_variable(aligned_cv_key, count);
 }
