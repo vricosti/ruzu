@@ -27,6 +27,7 @@ use super::k_synchronization_object::SynchronizationObjectState;
 use super::k_thread::KThread;
 use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAGE_SIZE};
 use super::k_typed_address::KProcessAddress;
+use super::svc_common::Handle;
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::RESULT_SUCCESS;
@@ -341,6 +342,7 @@ pub struct KProcess {
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
     pub readable_event_objects: BTreeMap<u64, Arc<Mutex<KReadableEvent>>>,
     pub sync_object: SynchronizationObjectState,
+    pub self_reference: Option<Weak<Mutex<KProcess>>>,
     pub scheduler: Option<Weak<Mutex<KScheduler>>>,
     // Shared memory list — stubbed
     pub is_suspended: bool,
@@ -415,6 +417,7 @@ impl KProcess {
             event_objects: BTreeMap::new(),
             readable_event_objects: BTreeMap::new(),
             sync_object: SynchronizationObjectState::new(),
+            self_reference: None,
             scheduler: None,
             is_suspended: false,
             is_immortal: false,
@@ -591,6 +594,10 @@ impl KProcess {
         self.scheduler = Some(Arc::downgrade(scheduler));
     }
 
+    pub fn bind_self_reference(&mut self, process: &Arc<Mutex<KProcess>>) {
+        self.self_reference = Some(Arc::downgrade(process));
+    }
+
     pub fn initialize_handle_table(&mut self) -> u32 {
         let size = match self.capabilities.get_handle_table_size() {
             0 => MAX_TABLE_SIZE as i32,
@@ -613,6 +620,60 @@ impl KProcess {
 
     pub fn initialize_thread_local_region_base(&mut self, next_page_address: u64) {
         self.next_thread_local_page_address = next_page_address;
+    }
+
+    /// Configure where process-owned thread-local pages will begin.
+    ///
+    /// The first main thread created after this call will allocate its TLR from
+    /// the returned page base via `create_thread_local_region()`, matching the
+    /// upstream ownership where `KThread::InitializeUserThread()` asks the
+    /// process to create the thread-local region.
+    pub fn initialize_thread_local_region_allocation(&mut self, modules_end: u64) -> u64 {
+        let gap = 0x4000u64;
+        let base = modules_end + gap;
+        let tls_page_base = (base + 0xFFF) & !0xFFF;
+        self.initialize_thread_local_region_base(tls_page_base);
+        tls_page_base
+    }
+
+    /// Bootstrap the main-thread stack region in process-owned guest memory.
+    ///
+    /// This is the current Rust-side owner for the stack portion of upstream
+    /// `KProcess::Run()`. Once `KProcessPageTable::MapPages()` is ported, this
+    /// helper should delegate there instead of updating the shared memory
+    /// backing directly.
+    pub fn initialize_main_thread_stack_region(
+        &mut self,
+        tls_region_end: u64,
+        stack_size: usize,
+    ) -> (u64, u64) {
+        let aligned_stack_size = ((stack_size as u64) + (PAGE_SIZE as u64 - 1)) & !(PAGE_SIZE as u64 - 1);
+        let stack_base = tls_region_end + 0x4000;
+        let stack_top = stack_base + aligned_stack_size;
+
+        {
+            let mut mem = self.process_memory.write().unwrap();
+            let new_total = (stack_top - mem.base) as usize;
+            if new_total > mem.data.len() {
+                mem.data.resize(new_total, 0);
+            }
+
+            let stack_offset = (stack_base - mem.base) as usize;
+            let stack_len = aligned_stack_size as usize;
+            for byte in &mut mem.data[stack_offset..stack_offset + stack_len] {
+                *byte = 0;
+            }
+
+            mem.update_region(
+                stack_base,
+                aligned_stack_size,
+                KMemoryState::STACK,
+                KMemoryPermission::USER_READ_WRITE,
+            );
+        }
+
+        self.main_thread_stack_size = aligned_stack_size as usize;
+        (stack_base, stack_top)
     }
 
     pub fn create_thread_local_region(&mut self) -> Option<KProcessAddress> {
@@ -707,11 +768,107 @@ impl KProcess {
         0
     }
 
-    /// Run the process.
-    /// TODO: Port from k_process.cpp.
-    pub fn run(&mut self, _priority: i32, _stack_size: usize) -> u32 {
-        // TODO: Full implementation
-        0
+    /// Bootstrap and run the process main thread for the guest runtime path.
+    ///
+    /// This is the current Rust-side owner for the subset of upstream
+    /// `KProcess::Run()` that is already implemented here: initialize the
+    /// handle table, allocate the main-thread stack, create and register the
+    /// main thread, publish its handle, update process state, and mark the
+    /// thread runnable.
+    pub fn run(
+        &mut self,
+        priority: i32,
+        stack_size: usize,
+        main_thread_id: u64,
+        main_object_id: u64,
+        is_64bit: bool,
+    ) -> Result<(Arc<Mutex<KThread>>, Handle, u64, u64), u32> {
+        let state = self.state;
+        if state != ProcessState::Created && state != ProcessState::CreatedAttached {
+            return Err(RESULT_INVALID_STATE.get_inner_value());
+        }
+
+        let handle_result = self.ensure_handle_table_initialized();
+        if handle_result != RESULT_SUCCESS.get_inner_value() {
+            return Err(handle_result);
+        }
+
+        let tls_page_base = self.next_thread_local_page_address;
+        if tls_page_base == 0 {
+            return Err(RESULT_INVALID_STATE.get_inner_value());
+        }
+
+        let self_weak = self
+            .self_reference
+            .clone()
+            .ok_or_else(|| RESULT_INVALID_STATE.get_inner_value())?;
+        let scheduler_weak = self.scheduler.clone();
+        let entry_point = self.get_entry_point().get();
+        let ideal_core_id = self.get_ideal_core_id();
+        let tls_address = self
+            .create_thread_local_region()
+            .ok_or_else(|| RESULT_INVALID_STATE.get_inner_value())?;
+        let (stack_base, stack_top) =
+            self.initialize_main_thread_stack_region(tls_page_base + THREAD_LOCAL_PAGE_SIZE as u64, stack_size);
+
+        let main_thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut thread = main_thread.lock().unwrap();
+            let result = thread.initialize_user_thread_with_tls(
+                entry_point,
+                0,
+                stack_top,
+                priority,
+                ideal_core_id,
+                self_weak,
+                scheduler_weak,
+                tls_address,
+                main_thread_id,
+                main_object_id,
+                is_64bit,
+            );
+            if result != RESULT_SUCCESS.get_inner_value() {
+                return Err(result);
+            }
+            thread.thread_type = super::k_thread::ThreadType::Main;
+        }
+
+        let thread_handle = {
+            self.register_thread_object(main_thread.clone());
+
+            let thread_handle = self.handle_table.add(main_object_id)?;
+            {
+                let mut thread = main_thread.lock().unwrap();
+                thread.thread_context.r[0] = 0;
+                thread.thread_context.r[1] = thread_handle as u64;
+            }
+
+            self.change_state(match state {
+                ProcessState::Created => ProcessState::Running,
+                ProcessState::CreatedAttached => ProcessState::RunningAttached,
+                _ => unreachable!("validated process state above"),
+            });
+
+            if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
+                let core_id = self.get_ideal_core_id();
+                scheduler
+                    .lock()
+                    .unwrap()
+                    .initialize(main_thread_id, 0, core_id);
+            }
+
+            thread_handle
+        };
+
+        {
+            let mut thread = main_thread.lock().unwrap();
+            let run_result = thread.run();
+            if run_result != RESULT_SUCCESS.get_inner_value() {
+                return Err(run_result);
+            }
+        }
+
+        Ok((main_thread, thread_handle, stack_base, stack_top))
     }
 
     /// Reset the process.
@@ -935,6 +1092,7 @@ impl Default for KProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_scheduler::KScheduler;
 
     #[test]
     fn test_process_state_values() {
@@ -948,5 +1106,91 @@ mod tests {
         assert_eq!(KProcess::INITIAL_PROCESS_ID_MIN, 1);
         assert_eq!(KProcess::INITIAL_PROCESS_ID_MAX, 0x50);
         assert_eq!(KProcess::PROCESS_ID_MIN, 0x51);
+    }
+
+    #[test]
+    fn run_bootstraps_process_owned_main_thread() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.code_address = KProcessAddress::new(0x100000);
+            process_guard.allocate_code_memory(0x100000, 0x300000);
+            process_guard.bind_self_reference(&process);
+            process_guard.attach_scheduler(&scheduler);
+            process_guard.initialize_thread_local_region_allocation(0x1c0000);
+        }
+
+        let (main_thread, main_thread_handle, stack_base, stack_top) =
+            process
+                .lock()
+                .unwrap()
+                .run(0, 0x100000, 1, 1, false)
+                .expect("process runtime bootstrap should succeed");
+
+        assert_ne!(main_thread_handle, 0);
+        assert_eq!(process.lock().unwrap().state, ProcessState::Running);
+        assert_eq!(
+            scheduler.lock().unwrap().get_scheduler_current_thread_id(),
+            Some(1)
+        );
+
+        let thread = main_thread.lock().unwrap();
+        assert_eq!(thread.thread_context.pc, 0x100000);
+        assert_eq!(thread.thread_context.sp, stack_top);
+        assert_eq!(thread.thread_context.r[0], 0);
+        assert_eq!(thread.thread_context.r[1], main_thread_handle as u64);
+        assert_eq!(thread.get_tls_address().get(), 0x1c4000);
+        assert_eq!(stack_base, 0x1c9000);
+        assert_eq!(stack_top, 0x2c9000);
+        assert_eq!(thread.get_state(), super::super::k_thread::ThreadState::RUNNABLE);
+    }
+
+    #[test]
+    fn initialize_main_thread_stack_region_updates_process_owned_memory() {
+        let mut process = KProcess::new();
+        process.allocate_code_memory(0x100000, 0x400000);
+
+        let (stack_base, stack_top) =
+            process.initialize_main_thread_stack_region(0x201000, 0x100000);
+
+        assert_eq!(stack_base, 0x205000);
+        assert_eq!(stack_top, 0x305000);
+        assert_eq!(process.main_thread_stack_size, 0x100000);
+
+        let mem = process.process_memory.read().unwrap();
+        let block = mem
+            .block_manager
+            .iter()
+            .find(|block| block.get_address() == stack_base as usize)
+            .expect("stack region must be tracked");
+        assert_eq!(block.get_end_address(), stack_top as usize);
+        assert_eq!(block.get_state(), KMemoryState::STACK);
+        assert_eq!(block.get_permission(), KMemoryPermission::USER_READ_WRITE);
+    }
+
+    #[test]
+    fn initialize_thread_local_region_allocation_feeds_first_main_thread_tlr() {
+        let mut process = KProcess::new();
+        process.allocate_code_memory(0x100000, 0x400000);
+
+        let tls_page_base = process.initialize_thread_local_region_allocation(0x180000);
+        let tls_region = process
+            .create_thread_local_region()
+            .expect("first thread local region should allocate");
+
+        assert_eq!(tls_page_base, 0x184000);
+        assert_eq!(tls_region.get(), tls_page_base);
+        assert_eq!(process.next_thread_local_page_address, 0x185000);
+
+        let mem = process.process_memory.read().unwrap();
+        let block = mem
+            .block_manager
+            .iter()
+            .find(|block| block.get_address() == tls_page_base as usize)
+            .expect("tls page must be tracked");
+        assert_eq!(block.get_state(), KMemoryState::THREAD_LOCAL);
+        assert_eq!(block.get_permission(), KMemoryPermission::USER_READ_WRITE);
     }
 }

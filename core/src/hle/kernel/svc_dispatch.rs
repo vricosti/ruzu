@@ -865,17 +865,9 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
         Some(SvcId::OutputDebugString) => {
             // IN: str=arg32[0], len=arg32[1]; OUT: ret=arg32[0]
             let str_ptr = get_arg32(args, 0) as u64;
-            let str_len = get_arg32(args, 1) as usize;
-            let msg = {
-                let mem = ctx.shared_memory.read().unwrap();
-                if str_len > 0 && mem.is_valid_range(str_ptr, str_len) {
-                    String::from_utf8_lossy(mem.read_block(str_ptr, str_len)).to_string()
-                } else {
-                    String::new()
-                }
-            };
-            log::info!("  OutputDebugString: \"{}\"", msg);
-            set_arg32(args, 0, STUB_SUCCESS);
+            let str_len = get_arg32(args, 1) as u64;
+            let result = svc_debug_string::output_debug_string(ctx, str_ptr, str_len);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::ReturnFromException) => {
             // IN: result=arg32[0]; OUT: (none)
@@ -1276,17 +1268,9 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
         }
         Some(SvcId::OutputDebugString) => {
             let str_ptr = get_arg64(args, 0);
-            let str_len = get_arg64(args, 1) as usize;
-            let msg = {
-                let mem = ctx.shared_memory.read().unwrap();
-                if str_len > 0 && mem.is_valid_range(str_ptr, str_len) {
-                    String::from_utf8_lossy(mem.read_block(str_ptr, str_len)).to_string()
-                } else {
-                    String::new()
-                }
-            };
-            log::info!("  OutputDebugString: \"{}\"", msg);
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let str_len = get_arg64(args, 1);
+            let result = svc_debug_string::output_debug_string(ctx, str_ptr, str_len);
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetInfo) => {
             let info_type = get_arg64(args, 1) as u32;

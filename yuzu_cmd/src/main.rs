@@ -195,69 +195,6 @@ fn on_status_message_received(msg_type: u32, nickname: &str) {
     }
 }
 
-fn restore_thread_to_jit(
-    jit: &mut dyn ruzu_core::arm::arm_interface::ArmInterface,
-    ctx: &mut ruzu_core::arm::arm_interface::ThreadContext,
-    thread: &std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_thread::KThread>>,
-) {
-    let thread = thread.lock().unwrap();
-    thread.restore_guest_context(ctx);
-    jit.set_context(ctx);
-    jit.set_tpidrro_el0(thread.get_tls_address().get());
-}
-
-struct GuestRuntimeBridge {
-    active_thread: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_thread::KThread>>,
-}
-
-impl GuestRuntimeBridge {
-    fn new(
-        main_thread: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_thread::KThread>>,
-    ) -> Self {
-        Self {
-            active_thread: main_thread,
-        }
-    }
-
-    fn initialize_jit(
-        &self,
-        jit: &mut dyn ruzu_core::arm::arm_interface::ArmInterface,
-        ctx: &mut ruzu_core::arm::arm_interface::ThreadContext,
-    ) {
-        restore_thread_to_jit(jit, ctx, &self.active_thread);
-    }
-
-    fn handoff_after_svc(
-        &mut self,
-        jit: &mut dyn ruzu_core::arm::arm_interface::ArmInterface,
-        ctx: &mut ruzu_core::arm::arm_interface::ThreadContext,
-        scheduler: &std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_scheduler::KScheduler>>,
-        process: &std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_process::KProcess>>,
-    ) {
-        jit.get_context(ctx);
-        self.active_thread.lock().unwrap().capture_guest_context(ctx);
-
-        let current_thread_id = self.active_thread.lock().unwrap().get_thread_id();
-        let next_thread = scheduler
-            .lock()
-            .unwrap()
-            .wait_for_next_thread(process, current_thread_id);
-        let Some(next_thread) = next_thread else {
-            return;
-        };
-
-        let switch_needed =
-            next_thread.lock().unwrap().get_thread_id() != self.active_thread.lock().unwrap().get_thread_id();
-        if !switch_needed {
-            return;
-        }
-
-        restore_thread_to_jit(jit, ctx, &next_thread);
-        self.active_thread = next_thread;
-    }
-}
-
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -506,67 +443,16 @@ fn main() {
             }
         }
 
-        // Allocate TLS (Thread Local Storage) region.
-        // Upstream: KThread::Initialize() calls owner->CreateThreadLocalRegion()
-        // which allocates a page and zeros it. The CP15 TPIDRURO register is set
-        // to this address before running the thread (physical_core.cpp:158).
-        // rtld reads TPIDRURO to find thread-local data for symbol resolution.
-        // ThreadLocalRegionSize = 0x200 upstream, but a full page is allocated.
+        // Configure process-owned TLS page allocation. The actual main-thread
+        // TLR is allocated during `KProcess::run()`.
         let tls_page_size: u64 = 0x1000;
-        // Leave a small gap after modules (upstream shows FREE gap before TLS).
-        let tls_base = {
-            let modules_end = code_base + code_size as u64;
-            // Align to page boundary (should already be aligned).
-            let gap = 0x4000u64; // Upstream shows ~0x4000 gap before TLS
-            let base = modules_end + gap;
-            // Page-align
-            (base + 0xFFF) & !0xFFF
-        };
-        {
-            let mut mem = shared_memory.write().unwrap();
-            let tls_end = tls_base + tls_page_size;
-            let new_total = (tls_end - mem.base) as usize;
-            if new_total > mem.data.len() {
-                mem.data.resize(new_total, 0);
-            }
-            // Zero the TLS region (upstream: Memory::ZeroBlock(m_tls_address, ThreadLocalRegionSize))
-            let tls_offset = (tls_base - mem.base) as usize;
-            for b in &mut mem.data[tls_offset..tls_offset + tls_page_size as usize] {
-                *b = 0;
-            }
-            // Register TLS in the block manager for QueryMemory.
-            use ruzu_core::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
-            mem.update_region(
-                tls_base,
-                tls_page_size,
-                KMemoryState::THREAD_LOCAL,
-                KMemoryPermission::USER_READ_WRITE,
-            );
-        }
-        log::info!("TLS: base={:#x}, size={:#x}", tls_base, tls_page_size);
-
-        // Allocate stack memory (1 MiB) after the TLS region.
-        // Upstream: KProcess::Run() allocates stack via page table.
-        let stack_size: u64 = 1024 * 1024;
-        // Leave a gap after TLS (upstream shows FREE gap between TLS and stack).
-        let stack_base = tls_base + tls_page_size + 0x4000; // ~0x4000 gap like upstream
-        let stack_top = stack_base + stack_size;
-        {
-            let mut mem = shared_memory.write().unwrap();
-            let new_total = (stack_top - mem.base) as usize;
-            if new_total > mem.data.len() {
-                mem.data.resize(new_total, 0);
-            }
-            // Register stack in the block manager for QueryMemory.
-            use ruzu_core::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
-            mem.update_region(
-                stack_base,
-                stack_size,
-                KMemoryState::STACK,
-                KMemoryPermission::USER_READ_WRITE,
-            );
-        }
-        log::info!("Stack: base={:#x}, top={:#x} ({} KiB)", stack_base, stack_top, stack_size / 1024);
+        let tls_page_base =
+            process.initialize_thread_local_region_allocation(code_base + code_size as u64);
+        log::info!(
+            "TLS page allocation base={:#x}, size={:#x}",
+            tls_page_base,
+            tls_page_size
+        );
 
         // Log tracked memory regions for debugging.
         {
@@ -588,44 +474,34 @@ fn main() {
             log::info!("Memory regions: {} non-free blocks tracked", count);
         }
 
-        // The loader path does not yet call KProcess::LoadFromMetadata(), so bootstrap the
-        // process-owned runtime pieces that upstream would normally initialize there.
-        process.initialize_handle_table();
-        process.initialize_thread_local_region_base(tls_base + tls_page_size);
-
         let process = std::sync::Arc::new(std::sync::Mutex::new(process));
+        process.lock().unwrap().bind_self_reference(&process);
         let next_thread_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
         let next_object_id = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2));
         let scheduler = std::sync::Arc::new(std::sync::Mutex::new(
             ruzu_core::hle::kernel::k_scheduler::KScheduler::new(0),
         ));
         process.lock().unwrap().attach_scheduler(&scheduler);
-        let main_thread = std::sync::Arc::new(std::sync::Mutex::new(
-            ruzu_core::hle::kernel::k_thread::KThread::new(),
-        ));
-        {
-            let mut thread = main_thread.lock().unwrap();
-            thread.initialize_main_thread(
-                code_base,
-                stack_top,
-                0,
-                tls_base,
-                &process,
-                1,
-                1,
-                is_64bit,
-            );
-        }
-        {
-            let mut process_guard = process.lock().unwrap();
-            process_guard.register_thread_object(main_thread.clone());
-            let _ = process_guard.handle_table.add(1);
-        }
-        scheduler.lock().unwrap().initialize(1, 0, 0);
+        let stack_size: usize = 1024 * 1024;
+        let (main_thread, _main_thread_handle, stack_base, stack_top) =
+            process
+                .lock()
+                .unwrap()
+                .run(0, stack_size, 1, 1, is_64bit)
+                .expect("process runtime bootstrap must succeed");
+        let tls_base = main_thread.lock().unwrap().get_tls_address().get();
+        log::info!("TLS: base={:#x}, size={:#x}", tls_base, tls_page_size);
+        log::info!(
+            "Stack: base={:#x}, top={:#x} ({} KiB)",
+            stack_base,
+            stack_top,
+            stack_size / 1024
+        );
 
         use ruzu_core::arm::arm_interface::{
             ArmInterface, HaltReason, KProcess as OpaqueKProcess, KThread as OpaqueKThread,
         };
+        use ruzu_core::hle::kernel::physical_core::PhysicalCoreExecutionControl;
         use ruzu_core::hle::kernel::svc_dispatch::{self, SvcContext};
 
         let dummy_system: u32 = 0;
@@ -663,7 +539,7 @@ fn main() {
             code_base,
             code_size: code_size as u64,
             stack_base,
-            stack_size,
+            stack_size: stack_size as u64,
             program_id: 0x0100152000022000, // MK8D title ID
             tls_base,
             current_process: process.clone(),
@@ -676,8 +552,11 @@ fn main() {
         // Set initial context.
         // Maps to upstream ResetThreadContext32/64 in k_thread.cpp via KThread::Initialize.
         let mut ctx = ruzu_core::arm::arm_interface::ThreadContext::default();
-        let mut guest_runtime = GuestRuntimeBridge::new(main_thread.clone());
-        guest_runtime.initialize_jit(&mut *jit, &mut ctx);
+        let physical_core = system
+            .kernel()
+            .and_then(|kernel| kernel.physical_core(0))
+            .expect("kernel physical core 0 must exist after System::initialize");
+        physical_core.initialize_guest_runtime(main_thread.clone(), &mut *jit, &mut ctx);
 
         // Upstream: physical_core.cpp:158 — SetTpidrroEl0(GetInteger(thread->GetTlsAddress()))
         log::info!("TLS: set TPIDRURO/TPIDRRO_EL0 = {:#x}", tls_base);
@@ -692,26 +571,20 @@ fn main() {
         // Maps to upstream KProcess::Run() → PhysicalCore event loop.
         let dummy_thread = unsafe { &mut *(&mut 0u32 as *mut u32 as *mut OpaqueKThread) };
 
-        let mut svc_count = 0u32;
-        let mut iteration = 0u32;
         let mut query_memory_count = 0u32;
         let mut dumped_module_objects = false;
-        loop {
-            let halt_reason = jit.run_thread(dummy_thread);
-            iteration += 1;
-
-            if halt_reason.contains(HaltReason::SUPERVISOR_CALL) {
-                let svc_num = jit.get_svc_number();
-                svc_count += 1;
-
-                let mut svc_args = [0u64; 8];
-                jit.get_svc_arguments(&mut svc_args);
-
+        let (iteration, svc_count) = physical_core.run_loop(
+            &mut *jit,
+            dummy_thread,
+            &mut ctx,
+            &scheduler,
+            &process,
+            is_64bit,
+            &svc_ctx,
+            |svc_num, svc_args, ctx, svc_count, _iteration| {
                 let svc_name = svc_dispatch::SvcId::from_u32(svc_num)
                     .map(|id| format!("{:?}", id))
                     .unwrap_or_else(|| format!("Unknown(0x{:02X})", svc_num));
-
-                jit.get_context(&mut ctx);
                 log::info!(
                     "SVC #{}: {} (0x{:02X}) args=[{:#x}, {:#x}, {:#x}, {:#x}] PC={:#x} LR={:#x}",
                     svc_count, svc_name, svc_num,
@@ -796,66 +669,42 @@ fn main() {
                     }
                 }
 
-                if svc_num == 0x27 {
-                    // OutputDebugString — read the guest string
+                PhysicalCoreExecutionControl::Continue
+            },
+            |halt_reason, ctx, svc_count, iteration| {
+                if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
+                    log::error!("PREFETCH_ABORT at PC={:#x}, SP={:#x}, LR={:#x}", ctx.pc, ctx.sp, ctx.lr);
                     let mem = shared_memory.read().unwrap();
-                    let str_addr = svc_args[0];
-                    let str_len = svc_args[1] as usize;
-                    if mem.is_valid_range(str_addr, str_len.max(1)) {
-                        let mut s = String::new();
-                        for j in 0..str_len {
-                            let c = mem.read_8(str_addr + j as u64);
-                            if c == 0 { break; }
-                            s.push(c as char);
+                    let crash_start = ctx.pc.saturating_sub(0x10);
+                    for addr in (crash_start..=ctx.pc.saturating_add(0x10)).step_by(4) {
+                        if !mem.is_valid_range(addr, 4) {
+                            log::error!("  [{:#010x}] <unmapped>", addr);
+                            continue;
                         }
-                        log::info!("  [guest] {}", s);
+                        let insn = mem.read_32(addr);
+                        let decoded = decode_arm(insn);
+                        let marker = if addr == ctx.pc { " <PC>" } else { "" };
+                        log::error!(
+                            "  [{:#010x}] {:#010x} {:?}{}",
+                            addr,
+                            insn,
+                            decoded.id,
+                            marker
+                        );
                     }
-                }
-
-                svc_dispatch::call(svc_num, is_64bit, &mut svc_args, &svc_ctx);
-                jit.set_svc_arguments(&svc_args);
-
-                guest_runtime.handoff_after_svc(
-                    &mut *jit,
-                    &mut ctx,
-                    &scheduler,
-                    &process,
-                );
-
-            } else if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
-                jit.get_context(&mut ctx);
-                log::error!("PREFETCH_ABORT at PC={:#x}, SP={:#x}, LR={:#x}", ctx.pc, ctx.sp, ctx.lr);
-                let mem = shared_memory.read().unwrap();
-                let crash_start = ctx.pc.saturating_sub(0x10);
-                for addr in (crash_start..=ctx.pc.saturating_add(0x10)).step_by(4) {
-                    if !mem.is_valid_range(addr, 4) {
-                        log::error!("  [{:#010x}] <unmapped>", addr);
-                        continue;
-                    }
-                    let insn = mem.read_32(addr);
-                    let decoded = decode_arm(insn);
-                    let marker = if addr == ctx.pc { " <PC>" } else { "" };
-                    log::error!(
-                        "  [{:#010x}] {:#010x} {:?}{}",
-                        addr,
-                        insn,
-                        decoded.id,
-                        marker
+                    PhysicalCoreExecutionControl::Break
+                } else if halt_reason.contains(HaltReason::BREAK_LOOP) {
+                    log::info!("BREAK_LOOP after {} iterations, {} SVCs", iteration, svc_count);
+                    PhysicalCoreExecutionControl::Break
+                } else {
+                    log::warn!(
+                        "JIT halted: {:?} at PC={:#x}, SP={:#x} (iter={}, svcs={})",
+                        halt_reason, ctx.pc, ctx.sp, iteration, svc_count
                     );
+                    PhysicalCoreExecutionControl::Break
                 }
-                break;
-            } else if halt_reason.contains(HaltReason::BREAK_LOOP) {
-                log::info!("BREAK_LOOP after {} iterations, {} SVCs", iteration, svc_count);
-                break;
-            } else {
-                jit.get_context(&mut ctx);
-                log::warn!(
-                    "JIT halted: {:?} at PC={:#x}, SP={:#x} (iter={}, svcs={})",
-                    halt_reason, ctx.pc, ctx.sp, iteration, svc_count
-                );
-                break;
-            }
-        }
+            },
+        );
 
         // Final context dump.
         jit.get_context(&mut ctx);

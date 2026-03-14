@@ -923,7 +923,39 @@ impl KThread {
                 None => return RESULT_OUT_OF_RESOURCE.get_inner_value(),
             }
         };
+        let owner_weak = Arc::downgrade(owner);
+        let scheduler = owner.lock().unwrap().scheduler.clone();
 
+        self.initialize_user_thread_with_tls(
+            entry_point,
+            arg,
+            stack_top,
+            prio,
+            virt_core,
+            owner_weak,
+            scheduler,
+            tls_address,
+            thread_id,
+            object_id,
+            is_64bit,
+        )
+    }
+
+    pub fn initialize_user_thread_with_tls(
+        &mut self,
+        entry_point: u64,
+        arg: u64,
+        stack_top: u64,
+        prio: i32,
+        virt_core: i32,
+        owner: Weak<Mutex<KProcess>>,
+        scheduler: Option<Weak<Mutex<KScheduler>>>,
+        tls_address: KProcessAddress,
+        thread_id: u64,
+        object_id: u64,
+        is_64bit: bool,
+    ) -> u32 {
+        
         let phys_core = virt_core;
         self.object_id = object_id;
         self.thread_type = ThreadType::User;
@@ -940,8 +972,8 @@ impl KThread {
         self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
         self.suspend_request_flags = 0;
         self.tls_address = tls_address;
-        self.parent = Some(Arc::downgrade(owner));
-        self.scheduler = owner.lock().unwrap().scheduler.clone();
+        self.parent = Some(owner);
+        self.scheduler = scheduler;
         self.signaled = false;
         self.termination_requested.store(false, Ordering::Relaxed);
         self.wait_cancelled = false;
