@@ -56,14 +56,27 @@ impl IParentalControlServiceFactory {
         let factory = unsafe {
             &*(this as *const dyn ServiceFramework as *const IParentalControlServiceFactory)
         };
-        let service = Arc::new(super::parental_control_service::IParentalControlService::new(
-            factory.capability,
-        ));
-        let handle = ctx.create_session_for_service(service).unwrap_or(0);
+        let service: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
+            Arc::new(super::parental_control_service::IParentalControlService::new(
+                factory.capability,
+            ));
 
+        // Use the same domain/non-domain dispatch pattern as IApplicationProxy.
+        let is_domain = ctx
+            .get_manager()
+            .map_or(false, |manager| manager.lock().unwrap().is_domain());
+        let move_handle = if is_domain {
+            0
+        } else {
+            ctx.create_session_for_service(service.clone()).unwrap_or(0)
+        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_move_objects(handle);
+        if is_domain {
+            ctx.add_domain_object(service);
+        } else {
+            rb.push_move_objects(move_handle);
+        }
     }
 
     fn create_service_without_initialize_handler(
