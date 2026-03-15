@@ -84,7 +84,13 @@ impl IApplicationProxy {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        Self::push_interface_response(ctx, Arc::new(super::common_state_getter::ICommonStateGetter::new()));
+        // Create a signaled event for the lifecycle message system.
+        // Matches upstream: LifecycleManager creates a KEvent and
+        // SetFocusState(InFocus) signals it at applet launch.
+        let event_handle = ctx.create_readable_event_handle(true).unwrap_or(0);
+        Self::push_interface_response(ctx, Arc::new(
+            super::common_state_getter::ICommonStateGetter::new_with_event_handle(event_handle)
+        ));
     }
 
     fn get_self_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

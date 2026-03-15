@@ -6,6 +6,7 @@
 
 use crate::hle::service::am::am_types::{AppletId, FocusState, OperationMode, SystemButtonType};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -69,18 +70,19 @@ pub struct ICommonStateGetter {
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     /// Event handle for GetEventHandle (cmd 0).
     /// In upstream, this comes from the LifecycleManager's system event.
-    /// For bring-up, we create a dummy event that's always signaled.
     message_event_handle: u32,
+    /// Whether the initial FocusStateChanged message has been consumed.
+    /// Upstream manages this through LifecycleManager::PopMessageInOrderOfPriority.
+    focus_message_delivered: AtomicBool,
 }
 
 impl ICommonStateGetter {
-    pub fn new() -> Self {
-        // Create a dummy event handle. In upstream this would be a real
-        // KReadableEvent from the LifecycleManager.
-        static NEXT_EVENT_HANDLE: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(0xBEEF_0000);
-        let message_event_handle =
-            NEXT_EVENT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    /// Create with a pre-allocated event handle registered in the process handle table.
+    ///
+    /// Matches upstream: LifecycleManager creates a KEvent via ServiceContext,
+    /// and SetFocusState(InFocus) is called when the applet starts.
+    pub fn new_with_event_handle(event_handle: u32) -> Self {
+        let message_event_handle = event_handle;
 
         let handlers = build_handler_map(&[
             (0, Some(Self::get_event_handle_handler), "GetEventHandle"),
@@ -121,6 +123,7 @@ impl ICommonStateGetter {
             handlers,
             handlers_tipc: BTreeMap::new(),
             message_event_handle,
+            focus_message_delivered: AtomicBool::new(false),
         }
     }
 
@@ -196,16 +199,29 @@ impl ICommonStateGetter {
     }
 
     /// ReceiveMessage (cmd 1): receives an applet message.
-    /// For bring-up, returns NoMessages to indicate no pending messages.
-    fn receive_message_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("ICommonStateGetter::ReceiveMessage called");
-        // Return ResultNoMessages (AM module, error 3)
-        // This is the normal "no message available" response.
-        let result_no_messages = ResultCode::from_module_description(
-            crate::hle::result::ErrorModule::AM, 3
-        );
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(result_no_messages);
+    ///
+    /// Matches upstream LifecycleManager::PopMessage which returns messages
+    /// in priority order. On first call, returns FocusStateChanged (15) to
+    /// simulate the application receiving focus at launch. Subsequent calls
+    /// return ResultNoMessages.
+    fn receive_message_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+
+        if !service.focus_message_delivered.swap(true, Ordering::Relaxed) {
+            // First call: deliver FocusStateChanged message.
+            // Matches upstream: SetFocusState(InFocus) → PopMessage returns FocusStateChanged.
+            log::info!("ICommonStateGetter::ReceiveMessage -> FocusStateChanged");
+            let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_u32(15); // AppletMessage::FocusStateChanged = 15
+        } else {
+            log::debug!("ICommonStateGetter::ReceiveMessage -> NoMessages");
+            let result_no_messages = ResultCode::from_module_description(
+                crate::hle::result::ErrorModule::AM, 3
+            );
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(result_no_messages);
+        }
     }
 
     fn get_operation_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

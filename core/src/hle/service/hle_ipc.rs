@@ -500,6 +500,37 @@ impl HLERequestContext {
         Some(handle)
     }
 
+    /// Creates a signaled KReadableEvent and registers it in the process
+    /// handle table. Returns the handle for use in copy handle responses.
+    ///
+    /// Matches upstream `ServiceContext::CreateEvent` + signal pattern.
+    pub fn create_readable_event_handle(&self, signaled: bool) -> Option<Handle> {
+        let thread = self.thread.as_ref()?;
+        let thread_guard = thread.lock().unwrap();
+        let parent = thread_guard.parent.as_ref()?.upgrade()?;
+        let mut process = parent.lock().unwrap();
+
+        static NEXT_EVENT_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0x2000_0000);
+        let object_id = NEXT_EVENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Create and register a KReadableEvent.
+        let readable = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::hle::kernel::k_readable_event::KReadableEvent::new(),
+        ));
+        {
+            let mut re = readable.lock().unwrap();
+            re.initialize(0, object_id);
+            if signaled {
+                re.is_signaled = true;
+            }
+        }
+        process.register_readable_event_object(object_id, readable);
+
+        let handle = process.handle_table.add(object_id).ok()?;
+        Some(handle)
+    }
+
     pub fn get_is_deferred(&self) -> bool {
         self.is_deferred
     }
