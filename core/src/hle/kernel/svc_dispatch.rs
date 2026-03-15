@@ -25,6 +25,7 @@ use crate::hle::kernel::svc::svc_event;
 use crate::hle::kernel::svc::svc_exception;
 use crate::hle::kernel::svc::svc_ipc;
 use crate::hle::kernel::svc::svc_lock;
+use crate::hle::kernel::svc::svc_physical_memory;
 use crate::hle::kernel::svc::svc_port;
 use crate::hle::kernel::svc::svc_processor;
 use crate::hle::kernel::svc::svc_synchronization;
@@ -455,10 +456,10 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
         Some(SvcId::SetHeapSize) => {
             // IN: size=arg32[1]; OUT: ret=arg32[0], out_address=arg32[1]
             let size = get_arg32(args, 1) as u64;
-            let heap_base = ctx.stack_base + ctx.stack_size;
+            let mut heap_base = 0;
+            let result = svc_physical_memory::set_heap_size_current_process(ctx, &mut heap_base, size);
             log::info!("  SetHeapSize({:#x}) -> heap at {:#x}", size, heap_base);
-            // TODO: Actually allocate heap memory
-            set_arg32(args, 0, STUB_SUCCESS);
+            set_arg32(args, 0, result.get_inner_value());
             set_arg32(args, 1, heap_base as u32);
         }
         Some(SvcId::SetMemoryPermission) => {
@@ -904,12 +905,14 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             let info_type = get_arg32(args, 1);
             let _handle = get_arg32(args, 2);
             let info_subtype = gather64(args, 0, 3);
-            let heap_base = ctx.stack_base + ctx.stack_size;
+            let process = ctx.current_process.lock().unwrap();
+            let heap_base = process.page_table.get_heap_region_start().get();
+            let heap_size = process.page_table.get_heap_region_size() as u64;
             let value: u64 = match info_type {
                 2 => 0x4000_0000,       // AliasRegionAddress
                 3 => 0x4000_0000,       // AliasRegionSize
                 4 => heap_base,          // HeapRegionAddress
-                5 => 0x1000_0000,        // HeapRegionSize (256 MiB)
+                5 => heap_size,          // HeapRegionSize
                 6 => 0x1000_0000,        // TotalMemorySize
                 7 => ctx.code_size + ctx.stack_size, // UsedMemorySize
                 8 => 0,                  // DebuggerAttached
@@ -1151,10 +1154,10 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
     match SvcId::from_u32(imm) {
         Some(SvcId::SetHeapSize) => {
             let size = get_arg64(args, 1);
-            let heap_base = ctx.stack_base + ctx.stack_size;
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let mut heap_base = 0;
+            let result = svc_physical_memory::set_heap_size_current_process(ctx, &mut heap_base, size);
+            set_arg64(args, 0, result.get_inner_value() as u64);
             set_arg64(args, 1, heap_base);
-            let _ = size;
         }
         Some(SvcId::SetMemoryPermission) => {
             set_arg64(args, 0, STUB_SUCCESS as u64);
@@ -1301,12 +1304,14 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             let info_type = get_arg64(args, 1) as u32;
             let _handle = get_arg64(args, 2) as u32;
             let info_subtype = get_arg64(args, 3);
-            let heap_base = ctx.stack_base + ctx.stack_size;
+            let process = ctx.current_process.lock().unwrap();
+            let heap_base = process.page_table.get_heap_region_start().get();
+            let heap_size = process.page_table.get_heap_region_size() as u64;
             let value: u64 = match info_type {
                 2 => 0x4000_0000,
                 3 => 0x4000_0000,
                 4 => heap_base,
-                5 => 0x1000_0000,
+                5 => heap_size,
                 6 => 0x1000_0000,
                 7 => ctx.code_size + ctx.stack_size,
                 8 => 0,

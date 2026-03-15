@@ -40,8 +40,8 @@ pub struct FunctionInfo {
 /// The upstream C++ CRTP (Curiously Recurring Template Pattern) is replaced by a trait.
 ///
 /// Upstream stores `Core::System& system` in `ServiceFrameworkBase`, giving every service
-/// access to `system.ServiceManager()`. Here, services store an `Arc<Mutex<ServiceManager>>`
-/// and expose it via `service_manager()`.
+/// access to `system.ServiceManager()`. The Rust port routes that global owner through
+/// `HLERequestContext`, so control requests remain system-owned instead of service-owned.
 pub trait ServiceFramework: SessionRequestHandler {
     /// Returns the service name.
     fn get_service_name(&self) -> &str;
@@ -57,8 +57,7 @@ pub trait ServiceFramework: SessionRequestHandler {
     /// Returns a reference to the TIPC handler map.
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo>;
 
-    /// Returns the ServiceManager, matching upstream `system.ServiceManager()`.
-    /// Services store this reference at construction time.
+    /// Deprecated compatibility hook kept for older services.
     fn service_manager(&self) -> Option<std::sync::Arc<std::sync::Mutex<crate::hle::service::sm::sm::ServiceManager>>> {
         None
     }
@@ -157,12 +156,14 @@ pub trait ServiceFramework: SessionRequestHandler {
                 result = ipc_helpers::RESULT_SESSION_CLOSED;
             }
             ipc::CommandType::ControlWithContext | ipc::CommandType::Control => {
-                // Dispatch Control requests to SmController via ServiceManager.
                 // Matches upstream: system.ServiceManager().InvokeControlRequest(ctx)
-                if let Some(sm) = self.service_manager() {
+                if let Some(sm) = ctx.get_service_manager().cloned().or_else(|| self.service_manager()) {
                     sm.lock().unwrap().invoke_control_request(ctx);
                 } else {
-                    log::warn!("Control request but no ServiceManager available on service '{}'", self.get_service_name());
+                    log::warn!(
+                        "Control request but no ServiceManager available for service '{}'",
+                        self.get_service_name()
+                    );
                 }
             }
             ipc::CommandType::RequestWithContext | ipc::CommandType::Request => {

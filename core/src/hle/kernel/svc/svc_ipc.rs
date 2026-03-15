@@ -51,6 +51,7 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
         tls_address,
     );
     context.set_session_request_manager(request_manager.clone());
+    context.set_service_manager(ctx.service_manager.clone());
 
     // Read command buffer from TLS and parse (done inside populate).
     context.populate_from_incoming_command_buffer(&[]);
@@ -107,6 +108,7 @@ mod tests {
     use crate::hle::kernel::svc::svc_port;
     use crate::hle::kernel::svc_dispatch::SvcContext;
     use crate::hle::result::RESULT_SUCCESS;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::sm::sm::create_service_manager;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -126,6 +128,7 @@ mod tests {
             let mut thread = current_thread.lock().unwrap();
             thread.thread_id = 1;
             thread.object_id = 1;
+            thread.parent = Some(Arc::downgrade(&process));
             thread.tls_address = KProcessAddress::new(0x2395000);
             thread
                 .thread_state
@@ -180,6 +183,35 @@ mod tests {
         mem.write_32(ctx.tls_base + 0x1C, 0);
     }
 
+    fn write_sm_get_service_request(ctx: &SvcContext, name: &str) {
+        let request_type = ipc::CommandType::Request as u32;
+        let sfci_magic = u32::from_le_bytes([b'S', b'F', b'C', b'I']);
+        let mut name_buf = [0u8; 8];
+        let copy_len = name.len().min(name_buf.len());
+        name_buf[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
+
+        let mut mem = ctx.shared_memory.write().unwrap();
+        mem.write_32(ctx.tls_base, request_type);
+        mem.write_32(ctx.tls_base + 4, 0);
+        mem.write_32(ctx.tls_base + 0x10, sfci_magic);
+        mem.write_32(ctx.tls_base + 0x14, 0);
+        mem.write_32(ctx.tls_base + 0x18, 1);
+        mem.write_32(ctx.tls_base + 0x1C, 0);
+        mem.write_64(ctx.tls_base + 0x20, u64::from_le_bytes(name_buf));
+    }
+
+    fn write_control_query_pointer_buffer_size_request(ctx: &SvcContext) {
+        let control_type = ipc::CommandType::Control as u32;
+        let sfci_magic = u32::from_le_bytes([b'S', b'F', b'C', b'I']);
+        let mut mem = ctx.shared_memory.write().unwrap();
+        mem.write_32(ctx.tls_base, control_type);
+        mem.write_32(ctx.tls_base + 4, 0);
+        mem.write_32(ctx.tls_base + 0x10, sfci_magic);
+        mem.write_32(ctx.tls_base + 0x14, 0);
+        mem.write_32(ctx.tls_base + 0x18, 3);
+        mem.write_32(ctx.tls_base + 0x1C, 0);
+    }
+
     #[test]
     fn send_sync_request_dispatches_sm_initialize_over_tls() {
         let ctx = test_context();
@@ -198,6 +230,34 @@ mod tests {
         let mem = ctx.shared_memory.read().unwrap();
         assert_eq!(mem.read_32(ctx.tls_base + 0x18), RESULT_SUCCESS.get_inner_value());
         assert_eq!(mem.read_32(ctx.tls_base + 0x1C), 0);
+    }
+
+    #[test]
+    fn send_sync_request_dispatches_control_query_pointer_buffer_size_for_service_session() {
+        let ctx = test_context();
+        let current_thread = ctx
+            .current_process
+            .lock()
+            .unwrap()
+            .get_thread_by_thread_id(1)
+            .unwrap();
+        let mut request_context = HLERequestContext::new_with_thread(
+            current_thread,
+            ctx.shared_memory.clone(),
+            ctx.tls_base,
+        );
+        request_context.set_service_manager(ctx.service_manager.clone());
+        let lm_handler: SessionRequestHandlerPtr =
+            Arc::new(crate::hle::service::lm::lm::LM::new());
+        let lm_handle = request_context.create_session_for_service(lm_handler).unwrap();
+
+        write_control_query_pointer_buffer_size_request(&ctx);
+        assert_eq!(send_sync_request(&ctx, lm_handle), RESULT_SUCCESS);
+
+        let mem = ctx.shared_memory.read().unwrap();
+        assert_eq!(mem.read_32(ctx.tls_base + 0x18), RESULT_SUCCESS.get_inner_value());
+        assert_eq!(mem.read_32(ctx.tls_base + 0x1C), 0);
+        assert_eq!(mem.read_32(ctx.tls_base + 0x20), 0x8000);
     }
 }
 

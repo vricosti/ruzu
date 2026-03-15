@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::ipc;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::sm::sm::ServiceManager;
 
 /// Handle type alias matching upstream `Kernel::Handle`.
 pub type Handle = u32;
@@ -271,6 +272,7 @@ pub struct HLERequestContext {
     pub domain_offset: u32,
 
     manager: Option<Arc<Mutex<SessionRequestManager>>>,
+    service_manager: Option<Arc<Mutex<ServiceManager>>>,
     is_deferred: bool,
 }
 
@@ -309,6 +311,7 @@ impl HLERequestContext {
             handles_offset: 0,
             domain_offset: 0,
             manager: None,
+            service_manager: None,
             is_deferred: false,
         };
         ctx.cmd_buf[0] = 0;
@@ -344,6 +347,7 @@ impl HLERequestContext {
             handles_offset: 0,
             domain_offset: 0,
             manager: None,
+            service_manager: None,
             is_deferred: false,
         }
     }
@@ -453,6 +457,14 @@ impl HLERequestContext {
 
     pub fn get_manager(&self) -> Option<&Arc<Mutex<SessionRequestManager>>> {
         self.manager.as_ref()
+    }
+
+    pub fn set_service_manager(&mut self, service_manager: Arc<Mutex<ServiceManager>>) {
+        self.service_manager = Some(service_manager);
+    }
+
+    pub fn get_service_manager(&self) -> Option<&Arc<Mutex<ServiceManager>>> {
+        self.service_manager.as_ref()
     }
 
     /// Creates a client session for a service handler and registers it in the

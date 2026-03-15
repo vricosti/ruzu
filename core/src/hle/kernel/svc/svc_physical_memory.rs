@@ -7,6 +7,7 @@
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::HEAP_SIZE_ALIGNMENT;
+use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 fn is_4kb_aligned(val: u64) -> bool {
@@ -17,6 +18,17 @@ fn is_4kb_aligned(val: u64) -> bool {
 pub fn set_heap_size(out_address: &mut u64, size: u64) -> ResultCode {
     log::trace!("svc::SetHeapSize called, heap_size=0x{:X}", size);
 
+    let validation = validate_heap_size(size);
+    if validation != RESULT_SUCCESS {
+        return validation;
+    }
+
+    // TODO: GetCurrentProcess(kernel).GetPageTable().SetHeapSize(&address, size)
+    *out_address = 0;
+    RESULT_NOT_IMPLEMENTED
+}
+
+fn validate_heap_size(size: u64) -> ResultCode {
     // Validate size.
     if size % (HEAP_SIZE_ALIGNMENT as u64) != 0 {
         return RESULT_INVALID_SIZE;
@@ -24,11 +36,26 @@ pub fn set_heap_size(out_address: &mut u64, size: u64) -> ResultCode {
     if size >= MAIN_MEMORY_SIZE_MAX {
         return RESULT_INVALID_SIZE;
     }
+    RESULT_SUCCESS
+}
 
-    // TODO: GetCurrentProcess(kernel).GetPageTable().SetHeapSize(&address, size)
-    *out_address = 0;
-    log::warn!("svc::SetHeapSize: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+/// Set the process heap to a given size using the current process page table.
+///
+/// Matches upstream ownership: current process -> page table -> SetHeapSize.
+pub fn set_heap_size_current_process(
+    ctx: &SvcContext,
+    out_address: &mut u64,
+    size: u64,
+) -> ResultCode {
+    let validation = validate_heap_size(size);
+    if validation != RESULT_SUCCESS {
+        *out_address = 0;
+        return validation;
+    }
+
+    let (result, address) = ctx.current_process.lock().unwrap().set_heap_size(size as usize);
+    *out_address = address.get();
+    ResultCode::new(result)
 }
 
 /// Maps memory at a desired address.
