@@ -186,16 +186,25 @@ impl PhysicalCore {
             };
             iteration += 1;
 
-            // Log PC for the first 200 iterations after stepping starts
-            if use_step && post_svc_trace_count < 200 {
+            // Log first 50 steps with all registers + TLS[3] check + disasm
+            if use_step && post_svc_trace_count < 50 {
                 post_svc_trace_count += 1;
                 jit.get_context(thread_context);
+                // Check TLS word 3 (handle offset)
+                let tls_word3 = if let Some(ref runtime) = *self.m_runtime.lock().unwrap() {
+                    let tls = runtime.m_current_thread.lock().unwrap().get_tls_address().get();
+                    process.lock().unwrap().process_memory.read().unwrap().read_32(tls + 12)
+                } else { 0 };
+                let insn = process.lock().unwrap().process_memory.read().unwrap().read_32(thread_context.pc);
                 log::info!(
-                    "[STEP #{}/i={}] PC={:#x} R0={:#x} R1={:#x} R4={:#x} R5={:#x}",
+                    "[S#{}/i={}] PC={:#x} [{:#010x}] R0-7=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] TLS[3]={:#x}",
                     post_svc_trace_count, iteration,
-                    thread_context.pc,
+                    thread_context.pc, insn,
                     thread_context.r[0], thread_context.r[1],
+                    thread_context.r[2], thread_context.r[3],
                     thread_context.r[4], thread_context.r[5],
+                    thread_context.r[6], thread_context.r[7],
+                    tls_word3,
                 );
             }
 
