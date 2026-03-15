@@ -614,6 +614,83 @@ fn main() {
                     ctx.pc, ctx.lr
                 );
 
+                // Debug: dump TLS when SendSyncRequest is called with handle=0
+                if svc_num == 0x21 && svc_args[0] == 0 {
+                    let mem = shared_memory.read().unwrap();
+                    log::error!(
+                        "  SendSyncRequest(0x0): TLS at {:#x} = [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                        tls_base,
+                        mem.read_32(tls_base), mem.read_32(tls_base + 4),
+                        mem.read_32(tls_base + 8), mem.read_32(tls_base + 12),
+                        mem.read_32(tls_base + 16), mem.read_32(tls_base + 20),
+                        mem.read_32(tls_base + 24), mem.read_32(tls_base + 28),
+                    );
+                    // Also dump registers
+                    log::error!(
+                        "  Registers: R0={:#x} R1={:#x} R2={:#x} R3={:#x} R4={:#x} R5={:#x} R6={:#x} R7={:#x}",
+                        ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3],
+                        ctx.r[4], ctx.r[5], ctx.r[6], ctx.r[7],
+                    );
+                }
+
+                // One-time dump when first ArbitrateLock is hit
+                static DUMPED_ARBITRATE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if svc_num == 0x1A
+                    && !DUMPED_ARBITRATE.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    let mem = shared_memory.read().unwrap();
+                    let addr = svc_args[1] as u64;
+                    let handle = svc_args[0] as u32;
+                    let tag = svc_args[2] as u32;
+
+                    log::info!("=== FIRST ArbitrateLock DUMP ===");
+                    log::info!(
+                        "  handle={:#x}, addr={:#x}, tag={:#x}, addr%4={}",
+                        handle, addr, tag, addr % 4
+                    );
+                    if mem.is_valid_range(addr, 4) {
+                        let mutex_val = mem.read_32(addr);
+                        log::info!(
+                            "  mutex word @ {:#x} = {:#010x} (owner_handle={:#x}, has_waiters={})",
+                            addr,
+                            mutex_val,
+                            mutex_val & !0x40000000u32,
+                            mutex_val & 0x40000000 != 0
+                        );
+                    } else {
+                        log::info!("  mutex word @ {:#x} = <unmapped>", addr);
+                    }
+
+                    // Dump guest code around the SVC call site (PC) and the caller (LR)
+                    for (label, base) in [("SVC site (PC)", ctx.pc), ("Caller (LR)", ctx.lr)] {
+                        log::info!("  {} = {:#x}:", label, base);
+                        let start = base.saturating_sub(0x20);
+                        for a in (start..=base.saturating_add(0x20)).step_by(4) {
+                            if !mem.is_valid_range(a, 4) {
+                                continue;
+                            }
+                            let insn = mem.read_32(a);
+                            let decoded = decode_arm(insn);
+                            let marker = if a == base { " <--" } else { "" };
+                            log::info!(
+                                "    [{:#010x}] {:#010x} {:?}{}",
+                                a, insn, decoded.id, marker
+                            );
+                        }
+                    }
+
+                    // Also dump a wider area around the mutex address
+                    log::info!("  Memory around mutex addr {:#x}:", addr);
+                    let mstart = addr.saturating_sub(0x10);
+                    for a in (mstart..addr.saturating_add(0x20)).step_by(4) {
+                        if mem.is_valid_range(a, 4) {
+                            log::info!("    [{:#010x}] = {:#010x}", a, mem.read_32(a));
+                        }
+                    }
+                    log::info!("=== END ArbitrateLock DUMP ===");
+                }
+
                 if svc_num == 0x06 {
                     query_memory_count += 1;
                 } else if query_memory_count >= 25 && !dumped_module_objects {
