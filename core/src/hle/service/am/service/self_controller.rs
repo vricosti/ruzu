@@ -58,6 +58,8 @@ impl ISelfController {
             (0, Some(Self::exit_handler), "Exit"),
             (1, Some(Self::lock_exit_handler), "LockExit"),
             (2, Some(Self::unlock_exit_handler), "UnlockExit"),
+            (9, Some(Self::get_library_applet_launchable_event_handler), "GetLibraryAppletLaunchableEvent"),
+            (10, Some(Self::set_screen_shot_permission_handler), "SetScreenShotPermission"),
             (
                 11,
                 Some(Self::set_operation_mode_changed_notification_handler),
@@ -69,6 +71,13 @@ impl ISelfController {
                 "SetPerformanceModeChangedNotification",
             ),
             (13, Some(Self::set_focus_handling_mode_handler), "SetFocusHandlingMode"),
+            (14, Some(Self::set_restart_message_enabled_handler), "SetRestartMessageEnabled"),
+            (16, Some(Self::set_out_of_focus_suspending_enabled_handler), "SetOutOfFocusSuspendingEnabled"),
+            (40, Some(Self::create_managed_display_layer_handler), "CreateManagedDisplayLayer"),
+            (62, Some(Self::set_idle_time_detection_extension_handler), "SetIdleTimeDetectionExtension"),
+            (63, Some(Self::get_idle_time_detection_extension_handler), "GetIdleTimeDetectionExtension"),
+            (68, Some(Self::set_auto_sleep_disabled_handler), "SetAutoSleepDisabled"),
+            (91, Some(Self::get_accumulated_suspended_tick_changed_event_handler), "GetAccumulatedSuspendedTickChangedEvent"),
         ]);
         Self {
             handlers,
@@ -192,6 +201,97 @@ impl ISelfController {
         service.set_focus_handling_mode(rp.pop_bool(), rp.pop_bool(), rp.pop_bool());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_library_applet_launchable_event_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) GetLibraryAppletLaunchableEvent called");
+        let handle = ctx.create_readable_event_handle(true).unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
+    }
+
+    fn set_screen_shot_permission_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) SetScreenShotPermission called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_restart_message_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) SetRestartMessageEnabled called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_out_of_focus_suspending_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) SetOutOfFocusSuspendingEnabled called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// CreateManagedDisplayLayer (cmd 40): returns a layer ID.
+    /// Matches upstream: display_layer_manager.CreateManagedDisplayLayer(out_layer_id)
+    fn create_managed_display_layer_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::info!("ISelfController::CreateManagedDisplayLayer called");
+        // Return a dummy layer ID. Upstream creates a real display layer
+        // via DisplayLayerManager.
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(1); // layer_id = 1
+    }
+
+    fn set_idle_time_detection_extension_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) SetIdleTimeDetectionExtension called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_idle_time_detection_extension_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) GetIdleTimeDetectionExtension called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(0); // IdleTimeDetectionExtension::Disabled = 0
+    }
+
+    fn set_auto_sleep_disabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) SetAutoSleepDisabled called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_accumulated_suspended_tick_changed_event_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) GetAccumulatedSuspendedTickChangedEvent called");
+        let handle = ctx.create_readable_event_handle(false).unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
     }
 }
 
