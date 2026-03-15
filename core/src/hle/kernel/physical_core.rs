@@ -186,20 +186,16 @@ impl PhysicalCore {
             };
             iteration += 1;
 
-            // Log PC for the first 20 iterations after stepping starts
-            if use_step && post_svc_trace_count < 20 {
+            // Log PC for the first 200 iterations after stepping starts
+            if use_step && post_svc_trace_count < 200 {
                 post_svc_trace_count += 1;
                 jit.get_context(thread_context);
                 log::info!(
-                    "[STEP TRACE #{}/iter={}] PC={:#x} LR={:#x} halt={:?}",
+                    "[STEP #{}/i={}] PC={:#x} R0={:#x} R1={:#x} R4={:#x} R5={:#x}",
                     post_svc_trace_count, iteration,
-                    thread_context.pc, thread_context.lr,
-                    match &event {
-                        PhysicalCoreExecutionEvent::SupervisorCall { svc_num, .. } =>
-                            format!("SVC(0x{:x})", svc_num),
-                        PhysicalCoreExecutionEvent::Halted(hr) =>
-                            format!("Halt({:#x})", hr.bits()),
-                    }
+                    thread_context.pc,
+                    thread_context.r[0], thread_context.r[1],
+                    thread_context.r[4], thread_context.r[5],
                 );
             }
 
