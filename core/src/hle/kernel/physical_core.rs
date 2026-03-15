@@ -195,16 +195,29 @@ impl PhysicalCore {
                     let tls = runtime.m_current_thread.lock().unwrap().get_tls_address().get();
                     process.lock().unwrap().process_memory.read().unwrap().read_32(tls + 12)
                 } else { 0 };
-                let insn = process.lock().unwrap().process_memory.read().unwrap().read_32(thread_context.pc);
+                let (insn, obj_bytes) = {
+                    let p = process.lock().unwrap();
+                    let m = p.process_memory.read().unwrap();
+                    let insn = m.read_32(thread_context.pc);
+                    let obj_addr = 0x22c8564u64;
+                    let obj_bytes = if m.is_valid_range(obj_addr, 16) {
+                        format!("[{:#x},{:#x},{:#x},{:#x}]",
+                            m.read_32(obj_addr), m.read_32(obj_addr + 4),
+                            m.read_32(obj_addr + 8), m.read_32(obj_addr + 12))
+                    } else {
+                        "<unmapped>".to_string()
+                    };
+                    (insn, obj_bytes)
+                };
                 log::info!(
-                    "[S#{}/i={}] PC={:#x} [{:#010x}] R0-7=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] TLS[3]={:#x}",
+                    "[S#{}/i={}] PC={:#x} [{:#010x}] R0-7=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] obj@22c8564={}",
                     post_svc_trace_count, iteration,
                     thread_context.pc, insn,
                     thread_context.r[0], thread_context.r[1],
                     thread_context.r[2], thread_context.r[3],
                     thread_context.r[4], thread_context.r[5],
                     thread_context.r[6], thread_context.r[7],
-                    tls_word3,
+                    obj_bytes,
                 );
             }
 
