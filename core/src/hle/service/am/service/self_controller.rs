@@ -205,10 +205,13 @@ impl ISelfController {
     ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         let mut rp = RequestParser::new(ctx);
-        let notify = rp.pop_bool();
-        let _background = rp.pop_bool();
-        let suspend = rp.pop_bool();
-        log::info!("SetFocusHandlingMode: notify={} suspend={}", notify, suspend);
+        // CMIF packs consecutive bools as bytes in one u32 word.
+        // Upstream D<> macro reads them byte-level via CmifReplyWrap.
+        let packed = rp.pop_u32();
+        let notify = (packed & 0xFF) != 0;
+        let _background = ((packed >> 8) & 0xFF) != 0;
+        let suspend = ((packed >> 16) & 0xFF) != 0;
+        log::info!("SetFocusHandlingMode: notify={} background={} suspend={}", notify, _background, suspend);
 
         let mut applet = service.applet.lock().unwrap();
         applet.lifecycle_manager.set_focus_state_changed_notification_enabled(notify);
