@@ -6,7 +6,12 @@
 //!
 //! IParentalControlService — actual parental control operations.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::pctl_results::*;
 use super::pctl_types::{
     ApplicationInfo, Capability, PlayTimerSettings, RestrictionSettings,
@@ -128,16 +133,53 @@ pub struct IParentalControlService {
     restriction_settings: RestrictionSettings,
     pin_code: [u8; 8],
     capability: Capability,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IParentalControlService {
     pub fn new(capability: Capability) -> Self {
+        let handlers = build_handler_map(&[
+            (commands::INITIALIZE, Some(Self::initialize_handler), "Initialize"),
+            (
+                commands::CHECK_FREE_COMMUNICATION_PERMISSION,
+                Some(Self::check_free_communication_permission_handler),
+                "CheckFreeCommunicationPermission",
+            ),
+            (
+                commands::CONFIRM_STEREO_VISION_PERMISSION,
+                Some(Self::confirm_stereo_vision_permission_handler),
+                "ConfirmStereoVisionPermission",
+            ),
+            (
+                commands::IS_RESTRICTION_ENABLED,
+                Some(Self::is_restriction_enabled_handler),
+                "IsRestrictionEnabled",
+            ),
+            (
+                commands::IS_RESTRICTION_TEMPORARY_UNLOCKED,
+                Some(Self::is_restriction_temporary_unlocked_handler),
+                "IsRestrictionTemporaryUnlocked",
+            ),
+            (
+                commands::IS_RESTRICTED_SYSTEM_SETTINGS_ENTERED,
+                Some(Self::is_restricted_system_settings_entered_handler),
+                "IsRestrictedSystemSettingsEntered",
+            ),
+            (
+                commands::IS_FREE_COMMUNICATION_AVAILABLE,
+                Some(Self::is_free_communication_available_handler),
+                "IsFreeCommunicationAvailable",
+            ),
+        ]);
         Self {
             states: States::default(),
             settings: ParentalControlSettings::default(),
             restriction_settings: RestrictionSettings::default(),
             pin_code: [0u8; 8],
             capability,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -488,5 +530,129 @@ impl IParentalControlService {
     pub fn is_play_timer_alarm_disabled(&self) -> Result<bool, ResultCode> {
         log::info!("IsPlayTimerAlarmDisabled called");
         Ok(false)
+    }
+
+    fn initialize_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        let result = if service
+            .capability
+            .intersects(Capability::APPLICATION | Capability::SYSTEM)
+        {
+            crate::hle::result::RESULT_SUCCESS
+        } else {
+            RESULT_NO_CAPABILITY
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+
+    fn check_free_communication_permission_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        let result = if service.check_free_communication_permission_impl() {
+            crate::hle::result::RESULT_SUCCESS
+        } else {
+            RESULT_NO_FREE_COMMUNICATION
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+
+    fn confirm_stereo_vision_permission_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        let result = if service.confirm_stereo_vision_permission_impl() {
+            crate::hle::result::RESULT_SUCCESS
+        } else {
+            RESULT_STEREO_VISION_RESTRICTED
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+
+    fn is_restriction_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        let (result, value) = match service.is_restriction_enabled() {
+            Ok(value) => (crate::hle::result::RESULT_SUCCESS, value),
+            Err(err) => (err, false),
+        };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(result);
+        rb.push_bool(value);
+    }
+
+    fn is_restriction_temporary_unlocked_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        let (result, value) = match service.is_restriction_temporary_unlocked() {
+            Ok(value) => (crate::hle::result::RESULT_SUCCESS, value),
+            Err(err) => (err, false),
+        };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(result);
+        rb.push_bool(value);
+    }
+
+    fn is_restricted_system_settings_entered_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        let (result, value) = match service.is_restricted_system_settings_entered() {
+            Ok(value) => (crate::hle::result::RESULT_SUCCESS, value),
+            Err(err) => (err, false),
+        };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(result);
+        rb.push_bool(value);
+    }
+
+    fn is_free_communication_available_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        let result = service
+            .is_free_communication_available()
+            .err()
+            .unwrap_or(crate::hle::result::RESULT_SUCCESS);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+}
+
+impl SessionRequestHandler for IParentalControlService {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+}
+
+impl ServiceFramework for IParentalControlService {
+    fn get_service_name(&self) -> &str {
+        "IParentalControlService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

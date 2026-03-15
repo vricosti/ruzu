@@ -479,6 +479,10 @@ pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
     register_stub_service(&service_manager, "lm", || {
         Arc::new(crate::hle::service::lm::lm::LM::new())
     });
+    crate::hle::service::apm::apm::register_services(&service_manager);
+    crate::hle::service::pctl::pctl::register_services(&service_manager);
+    crate::hle::service::aoc::addon_content_manager::loop_process(&service_manager);
+    crate::hle::service::am::am::register_services(&service_manager);
 
     service_manager
 }

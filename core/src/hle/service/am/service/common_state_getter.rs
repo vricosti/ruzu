@@ -5,6 +5,12 @@
 //! Port of zuyu/src/core/hle/service/am/service/common_state_getter.cpp
 
 use crate::hle::service::am::am_types::{AppletId, FocusState, OperationMode, SystemButtonType};
+use std::collections::BTreeMap;
+
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for ICommonStateGetter:
 /// - 0: GetEventHandle
@@ -60,11 +66,49 @@ use crate::hle::service::am::am_types::{AppletId, FocusState, OperationMode, Sys
 /// - 900: SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled
 pub struct ICommonStateGetter {
     // TODO: Applet reference
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ICommonStateGetter {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (5, Some(Self::get_operation_mode_handler), "GetOperationMode"),
+            (8, Some(Self::get_boot_mode_handler), "GetBootMode"),
+            (9, Some(Self::get_current_focus_state_handler), "GetCurrentFocusState"),
+            (50, Some(Self::is_vr_mode_enabled_handler), "IsVrModeEnabled"),
+            (51, Some(Self::set_vr_mode_enabled_handler), "SetVrModeEnabled"),
+            (
+                55,
+                Some(Self::is_in_controller_firmware_update_section_handler),
+                "IsInControllerFirmwareUpdateSection",
+            ),
+            (
+                60,
+                Some(Self::get_default_display_resolution_handler),
+                "GetDefaultDisplayResolution",
+            ),
+            (68, Some(Self::get_built_in_display_type_handler), "GetBuiltInDisplayType"),
+            (
+                80,
+                Some(Self::perform_system_button_pressing_if_in_focus_handler),
+                "PerformSystemButtonPressingIfInFocus",
+            ),
+            (
+                200,
+                Some(Self::get_operation_mode_system_info_handler),
+                "GetOperationModeSystemInfo",
+            ),
+            (
+                900,
+                Some(Self::set_request_exit_to_library_applet_at_execute_next_program_enabled_handler),
+                "SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled",
+            ),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// Port of ICommonStateGetter::GetCurrentFocusState
@@ -126,5 +170,130 @@ impl ICommonStateGetter {
     /// Port of ICommonStateGetter::SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled
     pub fn set_request_exit_to_library_applet_at_execute_next_program_enabled(&self) {
         log::warn!("(STUBBED) SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled called");
+    }
+
+    fn get_operation_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u8(service.get_operation_mode() as u8);
+    }
+
+    fn get_boot_mode_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u8(0);
+    }
+
+    fn get_current_focus_state_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u8(service.get_current_focus_state() as u8);
+    }
+
+    fn is_vr_mode_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(service.is_vr_mode_enabled());
+    }
+
+    fn set_vr_mode_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rp = RequestParser::new(ctx);
+        service.set_vr_mode_enabled(rp.pop_bool());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn is_in_controller_firmware_update_section_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(service.is_in_controller_firmware_update_section());
+    }
+
+    fn get_default_display_resolution_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let (w, h) = service.get_default_display_resolution();
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(w);
+        rb.push_i32(h);
+    }
+
+    fn get_built_in_display_type_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(service.get_built_in_display_type());
+    }
+
+    fn perform_system_button_pressing_if_in_focus_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rp = RequestParser::new(ctx);
+        let button = match rp.pop_i32() {
+            1 => SystemButtonType::HomeButtonShortPressing,
+            2 => SystemButtonType::HomeButtonLongPressing,
+            6 => SystemButtonType::CaptureButtonShortPressing,
+            7 => SystemButtonType::CaptureButtonLongPressing,
+            _ => SystemButtonType::None,
+        };
+        service.perform_system_button_pressing_if_in_focus(button);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_operation_mode_system_info_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(service.get_operation_mode_system_info());
+    }
+
+    fn set_request_exit_to_library_applet_at_execute_next_program_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        service.set_request_exit_to_library_applet_at_execute_next_program_enabled();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for ICommonStateGetter {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+}
+
+impl ServiceFramework for ICommonStateGetter {
+    fn get_service_name(&self) -> &str {
+        "am::ICommonStateGetter"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

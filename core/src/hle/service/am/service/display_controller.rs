@@ -4,6 +4,13 @@
 //! Port of zuyu/src/core/hle/service/am/service/display_controller.h
 //! Port of zuyu/src/core/hle/service/am/service/display_controller.cpp
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// IPC command table for IDisplayController:
 /// - 0: GetLastForegroundCaptureImage (unimplemented)
 /// - 1: UpdateLastForegroundCaptureImage (unimplemented)
@@ -35,11 +42,24 @@
 /// - 28: TakeScreenShotOfOwnLayerEx (unimplemented)
 pub struct IDisplayController {
     // TODO: Applet reference
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IDisplayController {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (7, Some(Self::get_caller_applet_capture_image_ex_handler), "GetCallerAppletCaptureImageEx"),
+            (8, Some(Self::take_screen_shot_of_own_layer_handler), "TakeScreenShotOfOwnLayer"),
+            (20, Some(Self::clear_capture_buffer_handler), "ClearCaptureBuffer"),
+            (25, Some(Self::release_last_foreground_capture_shared_buffer_handler), "ReleaseLastForegroundCaptureSharedBuffer"),
+            (27, Some(Self::release_caller_applet_capture_shared_buffer_handler), "ReleaseCallerAppletCaptureSharedBuffer"),
+            (23, Some(Self::release_last_application_capture_shared_buffer_handler), "ReleaseLastApplicationCaptureSharedBuffer"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// Port of IDisplayController::GetCallerAppletCaptureImageEx
@@ -71,5 +91,84 @@ impl IDisplayController {
     /// Port of IDisplayController::ReleaseLastApplicationCaptureSharedBuffer
     pub fn release_last_application_capture_shared_buffer(&self) {
         log::warn!("(STUBBED) ReleaseLastApplicationCaptureSharedBuffer called");
+    }
+
+    fn get_caller_applet_capture_image_ex_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(service.get_caller_applet_capture_image_ex());
+    }
+
+    fn take_screen_shot_of_own_layer_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        let mut rp = RequestParser::new(ctx);
+        service.take_screen_shot_of_own_layer(rp.pop_bool(), rp.pop_i32());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn clear_capture_buffer_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        let mut rp = RequestParser::new(ctx);
+        service.clear_capture_buffer(rp.pop_bool(), rp.pop_i32(), rp.pop_u32());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn release_last_foreground_capture_shared_buffer_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        service.release_last_foreground_capture_shared_buffer();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn release_caller_applet_capture_shared_buffer_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        service.release_caller_applet_capture_shared_buffer();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn release_last_application_capture_shared_buffer_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        service.release_last_application_capture_shared_buffer();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for IDisplayController {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+}
+
+impl ServiceFramework for IDisplayController {
+    fn get_service_name(&self) -> &str {
+        "am::IDisplayController"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
