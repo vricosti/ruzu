@@ -55,6 +55,9 @@ pub struct ProcessMemoryData {
     /// Memory block manager tracking per-segment state and permissions.
     /// Used by QueryMemory SVC. Upstream: KProcess -> KProcessPageTable -> KMemoryBlockManager.
     pub block_manager: KMemoryBlockManager,
+    /// Sparse guest pages outside the contiguous image/TLS/stack bootstrap area.
+    /// This keeps large heap regions from forcing a single huge host allocation.
+    pub sparse_pages: BTreeMap<u64, Vec<u8>>,
 }
 
 impl ProcessMemoryData {
@@ -63,6 +66,7 @@ impl ProcessMemoryData {
             data: Vec::new(),
             base: 0,
             block_manager: KMemoryBlockManager::new(),
+            sparse_pages: BTreeMap::new(),
         }
     }
 
@@ -73,41 +77,40 @@ impl ProcessMemoryData {
         if offset < self.data.len() {
             self.data[offset]
         } else {
-            0
+            self.read_sparse_8(vaddr)
         }
     }
 
     /// Read a u16 (little-endian) at guest virtual address.
     #[inline]
     pub fn read_16(&self, vaddr: u64) -> u16 {
-        let offset = vaddr.wrapping_sub(self.base) as usize;
-        if offset + 2 <= self.data.len() {
-            u16::from_le_bytes([self.data[offset], self.data[offset + 1]])
-        } else {
-            0
-        }
+        u16::from_le_bytes([self.read_8(vaddr), self.read_8(vaddr + 1)])
     }
 
     /// Read a u32 (little-endian) at guest virtual address.
     #[inline]
     pub fn read_32(&self, vaddr: u64) -> u32 {
-        let offset = vaddr.wrapping_sub(self.base) as usize;
-        if offset + 4 <= self.data.len() {
-            u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap())
-        } else {
-            0
-        }
+        u32::from_le_bytes([
+            self.read_8(vaddr),
+            self.read_8(vaddr + 1),
+            self.read_8(vaddr + 2),
+            self.read_8(vaddr + 3),
+        ])
     }
 
     /// Read a u64 (little-endian) at guest virtual address.
     #[inline]
     pub fn read_64(&self, vaddr: u64) -> u64 {
-        let offset = vaddr.wrapping_sub(self.base) as usize;
-        if offset + 8 <= self.data.len() {
-            u64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap())
-        } else {
-            0
-        }
+        u64::from_le_bytes([
+            self.read_8(vaddr),
+            self.read_8(vaddr + 1),
+            self.read_8(vaddr + 2),
+            self.read_8(vaddr + 3),
+            self.read_8(vaddr + 4),
+            self.read_8(vaddr + 5),
+            self.read_8(vaddr + 6),
+            self.read_8(vaddr + 7),
+        ])
     }
 
     /// Write a single byte at guest virtual address.
@@ -116,16 +119,17 @@ impl ProcessMemoryData {
         let offset = vaddr.wrapping_sub(self.base) as usize;
         if offset < self.data.len() {
             self.data[offset] = value;
+        } else {
+            self.write_sparse_8(vaddr, value);
         }
     }
 
     /// Write a u16 (little-endian) at guest virtual address.
     #[inline]
     pub fn write_16(&mut self, vaddr: u64, value: u16) {
-        let offset = vaddr.wrapping_sub(self.base) as usize;
-        if offset + 2 <= self.data.len() {
-            self.data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-        }
+        let bytes = value.to_le_bytes();
+        self.write_8(vaddr, bytes[0]);
+        self.write_8(vaddr + 1, bytes[1]);
     }
 
     /// Write a u32 (little-endian) at guest virtual address.
@@ -135,16 +139,19 @@ impl ProcessMemoryData {
         if offset + 4 <= self.data.len() {
             self.data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         } else {
-            log::warn!("write_32 OOB: vaddr={:#x} base={:#x} offset={:#x} data_len={:#x}", vaddr, self.base, offset, self.data.len());
+            let bytes = value.to_le_bytes();
+            for (index, byte) in bytes.into_iter().enumerate() {
+                self.write_8(vaddr + index as u64, byte);
+            }
         }
     }
 
     /// Write a u64 (little-endian) at guest virtual address.
     #[inline]
     pub fn write_64(&mut self, vaddr: u64, value: u64) {
-        let offset = vaddr.wrapping_sub(self.base) as usize;
-        if offset + 8 <= self.data.len() {
-            self.data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        let bytes = value.to_le_bytes();
+        for (index, byte) in bytes.into_iter().enumerate() {
+            self.write_8(vaddr + index as u64, byte);
         }
     }
 
@@ -152,9 +159,34 @@ impl ProcessMemoryData {
     #[inline]
     pub fn is_valid_range(&self, vaddr: u64, size: usize) -> bool {
         let offset = vaddr.wrapping_sub(self.base) as usize;
-        offset
+        if offset
             .checked_add(size)
             .is_some_and(|end| end <= self.data.len())
+        {
+            return true;
+        }
+
+        if size == 0 {
+            return false;
+        }
+
+        let start = vaddr as usize;
+        let end = match start.checked_add(size) {
+            Some(end) => end,
+            None => return false,
+        };
+
+        let mut page = start & !(PAGE_SIZE - 1);
+        while page < end {
+            let Some(block) = self.block_manager.find_block(page) else {
+                return false;
+            };
+            if block.get_state() == KMemoryState::FREE {
+                return false;
+            }
+            page = page.saturating_add(PAGE_SIZE);
+        }
+        true
     }
 
     /// Check if a virtual address is in a writable memory region.
@@ -181,10 +213,16 @@ impl ProcessMemoryData {
     pub fn write_block(&mut self, vaddr: u64, data: &[u8]) {
         let offset = vaddr.wrapping_sub(self.base) as usize;
         let end = offset + data.len();
-        if end > self.data.len() {
+        if offset <= self.data.len() && end > self.data.len() {
             self.data.resize(end, 0);
         }
-        self.data[offset..end].copy_from_slice(data);
+        if end <= self.data.len() {
+            self.data[offset..end].copy_from_slice(data);
+        } else {
+            for (index, byte) in data.iter().copied().enumerate() {
+                self.write_8(vaddr + index as u64, byte);
+            }
+        }
     }
 
     /// Read a block of data from guest address.
@@ -193,10 +231,27 @@ impl ProcessMemoryData {
         &self.data[offset..offset + size]
     }
 
+    pub fn read_bytes(&self, vaddr: u64, size: usize) -> Vec<u8> {
+        let offset = vaddr.wrapping_sub(self.base) as usize;
+        if offset
+            .checked_add(size)
+            .is_some_and(|end| end <= self.data.len())
+        {
+            return self.data[offset..offset + size].to_vec();
+        }
+
+        let mut out = vec![0u8; size];
+        for (index, byte) in out.iter_mut().enumerate() {
+            *byte = self.read_8(vaddr + index as u64);
+        }
+        out
+    }
+
     /// Allocate memory at the given base address.
     pub fn allocate(&mut self, base: u64, size: usize) {
         self.base = base;
         self.data = vec![0u8; size];
+        self.sparse_pages.clear();
         // Initialize the block manager covering the full 32-bit or 64-bit address space.
         // The actual code region is [base, base+size), but QueryMemory needs to handle
         // addresses outside this range too. Use a generous address space.
@@ -206,6 +261,21 @@ impl ProcessMemoryData {
             0x80_0000_0000usize // 512 GiB for 64-bit
         };
         let _ = self.block_manager.initialize(0, addr_space_end);
+    }
+
+    pub fn clear_sparse_range(&mut self, vaddr: u64, size: usize) {
+        if size == 0 {
+            return;
+        }
+
+        let start_page = vaddr & !((PAGE_SIZE as u64) - 1);
+        let end_addr = vaddr.saturating_add(size as u64);
+        let end_page = (end_addr.saturating_add(PAGE_SIZE as u64 - 1)) & !((PAGE_SIZE as u64) - 1);
+        let mut page = start_page;
+        while page < end_page {
+            self.sparse_pages.remove(&page);
+            page = page.saturating_add(PAGE_SIZE as u64);
+        }
     }
 
     /// Update a region in the block manager to track memory state.
@@ -230,6 +300,25 @@ impl ProcessMemoryData {
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
+    }
+
+    fn read_sparse_8(&self, vaddr: u64) -> u8 {
+        let page_base = vaddr & !((PAGE_SIZE as u64) - 1);
+        let page_offset = (vaddr - page_base) as usize;
+        self.sparse_pages
+            .get(&page_base)
+            .and_then(|page| page.get(page_offset).copied())
+            .unwrap_or(0)
+    }
+
+    fn write_sparse_8(&mut self, vaddr: u64, value: u8) {
+        let page_base = vaddr & !((PAGE_SIZE as u64) - 1);
+        let page_offset = (vaddr - page_base) as usize;
+        let page = self
+            .sparse_pages
+            .entry(page_base)
+            .or_insert_with(|| vec![0u8; PAGE_SIZE]);
+        page[page_offset] = value;
     }
 }
 
@@ -711,6 +800,20 @@ impl KProcess {
         }
 
         self.main_thread_stack_size = aligned_stack_size as usize;
+        self.page_table
+            .set_stack_region(KProcessAddress::new(stack_base), aligned_stack_size as usize);
+        let address_space_end = self
+            .page_table
+            .get_address_space_start()
+            .get()
+            .saturating_add(self.page_table.get_address_space_size() as u64);
+        if address_space_end > stack_top {
+            self.page_table.set_heap_region(
+                KProcessAddress::new(stack_top),
+                (address_space_end - stack_top) as usize,
+            );
+            self.max_process_memory = self.page_table.get_heap_region_size();
+        }
         (stack_base, stack_top)
     }
 
@@ -1196,6 +1299,45 @@ impl KProcess {
     pub fn allocate_code_memory(&mut self, base: u64, size: usize) {
         let mut mem = self.process_memory.write().unwrap();
         mem.allocate(base, size);
+        let address_space_size = if base < 0x1_0000_0000 {
+            0x1_0000_0000usize
+        } else {
+            0x80_0000_0000usize
+        };
+        let width = if base < 0x1_0000_0000 { 32 } else { 39 };
+        self.page_table.configure_address_space(KProcessAddress::new(0), address_space_size, width);
+        self.page_table
+            .set_code_region(KProcessAddress::new(base), size);
+    }
+
+    pub fn set_heap_size(&mut self, size: usize) -> (u32, KProcessAddress) {
+        let old_size = self.page_table.get_current_heap_size();
+        let (result, heap_base) = self.page_table.set_heap_size(size);
+        if result != RESULT_SUCCESS.get_inner_value() {
+            return (result, heap_base);
+        }
+
+        let heap_base_u64 = heap_base.get();
+        let mut mem = self.process_memory.write().unwrap();
+
+        if size > old_size {
+            mem.update_region(
+                heap_base_u64 + old_size as u64,
+                (size - old_size) as u64,
+                KMemoryState::NORMAL,
+                KMemoryPermission::USER_READ_WRITE,
+            );
+        } else if old_size > size {
+            mem.update_region(
+                heap_base_u64 + size as u64,
+                (old_size - size) as u64,
+                KMemoryState::FREE,
+                KMemoryPermission::NONE,
+            );
+            mem.clear_sparse_range(heap_base_u64 + size as u64, old_size - size);
+        }
+
+        (RESULT_SUCCESS.get_inner_value(), heap_base)
     }
 
     /// Get a shared handle to the process memory for JIT callbacks.
@@ -1342,6 +1484,27 @@ mod tests {
             .expect("tls page must be tracked");
         assert_eq!(block.get_state(), KMemoryState::THREAD_LOCAL);
         assert_eq!(block.get_permission(), KMemoryPermission::USER_READ_WRITE);
+    }
+
+    #[test]
+    fn set_heap_size_maps_sparse_heap_region_without_resizing_contiguous_image() {
+        let mut process = KProcess::new();
+        process.allocate_code_memory(0x200000, 0x229a000);
+        process.initialize_main_thread_stack_region(0x2396000, 0x100000);
+
+        let contiguous_len_before = process.process_memory.read().unwrap().data.len();
+        let (result, heap_base) = process.set_heap_size(0x78000000);
+        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+        assert_eq!(heap_base.get(), 0x249a000);
+        assert_eq!(process.page_table.get_current_heap_size(), 0x78000000);
+        assert!(process.process_memory.read().unwrap().is_valid_range(heap_base.get(), 4));
+
+        {
+            let mut mem = process.process_memory.write().unwrap();
+            mem.write_32(heap_base.get(), 0x1234_5678);
+            assert_eq!(mem.read_32(heap_base.get()), 0x1234_5678);
+            assert_eq!(mem.data.len(), contiguous_len_before);
+        }
     }
 
     #[test]

@@ -14,13 +14,40 @@ use super::k_typed_address::{KPhysicalAddress, KProcessAddress};
 /// In upstream this is a thin wrapper around KPageTable. We stub the inner
 /// page table and expose the same public API surface.
 pub struct KProcessPageTable {
-    // m_page_table: KPageTable — stubbed
-    _placeholder: (),
+    address_space_start: KProcessAddress,
+    address_space_size: usize,
+    heap_region_start: KProcessAddress,
+    heap_region_size: usize,
+    current_heap_size: usize,
+    alias_region_start: KProcessAddress,
+    alias_region_size: usize,
+    stack_region_start: KProcessAddress,
+    stack_region_size: usize,
+    kernel_map_region_start: KProcessAddress,
+    kernel_map_region_size: usize,
+    code_region_start: KProcessAddress,
+    code_region_size: usize,
+    address_space_width: u32,
 }
 
 impl KProcessPageTable {
     pub fn new() -> Self {
-        Self { _placeholder: () }
+        Self {
+            address_space_start: KProcessAddress::default(),
+            address_space_size: 0,
+            heap_region_start: KProcessAddress::default(),
+            heap_region_size: 0,
+            current_heap_size: 0,
+            alias_region_start: KProcessAddress::default(),
+            alias_region_size: 0,
+            stack_region_start: KProcessAddress::default(),
+            stack_region_size: 0,
+            kernel_map_region_start: KProcessAddress::default(),
+            kernel_map_region_size: 0,
+            code_region_start: KProcessAddress::default(),
+            code_region_size: 0,
+            address_space_width: 0,
+        }
     }
 
     /// Initialize the page table for a process.
@@ -45,68 +72,68 @@ impl KProcessPageTable {
     /// Get the address space start.
     /// TODO: Port from k_process_page_table.h.
     pub fn get_address_space_start(&self) -> KProcessAddress {
-        KProcessAddress::default()
+        self.address_space_start
     }
 
     /// Get the address space size.
     /// TODO: Port from k_process_page_table.h.
     pub fn get_address_space_size(&self) -> usize {
-        0
+        self.address_space_size
     }
 
     /// Get the heap region start.
     pub fn get_heap_region_start(&self) -> KProcessAddress {
-        KProcessAddress::default()
+        self.heap_region_start
     }
 
     /// Get the heap region size.
     pub fn get_heap_region_size(&self) -> usize {
-        0
+        self.heap_region_size
     }
 
     /// Get the alias region start.
     pub fn get_alias_region_start(&self) -> KProcessAddress {
-        KProcessAddress::default()
+        self.alias_region_start
     }
 
     /// Get the alias region size.
     pub fn get_alias_region_size(&self) -> usize {
-        0
+        self.alias_region_size
     }
 
     /// Get the stack region start.
     pub fn get_stack_region_start(&self) -> KProcessAddress {
-        KProcessAddress::default()
+        self.stack_region_start
     }
 
     /// Get the stack region size.
     pub fn get_stack_region_size(&self) -> usize {
-        0
+        self.stack_region_size
     }
 
     /// Get the kernel map region start.
     pub fn get_kernel_map_region_start(&self) -> KProcessAddress {
-        KProcessAddress::default()
+        self.kernel_map_region_start
     }
 
     /// Get the kernel map region size.
     pub fn get_kernel_map_region_size(&self) -> usize {
-        0
+        self.kernel_map_region_size
     }
 
     /// Get the code region start.
     pub fn get_code_region_start(&self) -> KProcessAddress {
-        KProcessAddress::default()
+        self.code_region_start
     }
 
     /// Get the code region size.
     pub fn get_code_region_size(&self) -> usize {
-        0
+        self.code_region_size
     }
 
     /// Get the address space width.
     pub fn get_address_space_width(&self) -> u32 {
-        0
+        self.address_space_width
     }
 
     /// Set memory permission.
@@ -122,8 +149,12 @@ impl KProcessPageTable {
 
     /// Set heap size.
     /// TODO: Port from k_process_page_table.h.
-    pub fn set_heap_size(&mut self, _size: usize) -> (u32, KProcessAddress) {
-        (0, KProcessAddress::default())
+    pub fn set_heap_size(&mut self, size: usize) -> (u32, KProcessAddress) {
+        if size > self.heap_region_size {
+            return (1, KProcessAddress::default());
+        }
+        self.current_heap_size = size;
+        (0, self.heap_region_start)
     }
 
     /// Map memory.
@@ -150,7 +181,10 @@ impl KProcessPageTable {
 
     /// Check if address range is contained.
     pub fn contains(&self, _addr: KProcessAddress, _size: usize) -> bool {
-        false // TODO
+        let start = self.address_space_start.get();
+        let end = start.saturating_add(self.address_space_size as u64);
+        let addr = _addr.get();
+        addr >= start && addr.checked_add(_size as u64).is_some_and(|range_end| range_end <= end)
     }
 
     /// Get physical address for a virtual address.
@@ -159,6 +193,37 @@ impl KProcessPageTable {
         _address: KProcessAddress,
     ) -> Option<KPhysicalAddress> {
         None // TODO
+    }
+
+    pub fn configure_address_space(
+        &mut self,
+        start: KProcessAddress,
+        size: usize,
+        width: u32,
+    ) {
+        self.address_space_start = start;
+        self.address_space_size = size;
+        self.address_space_width = width;
+    }
+
+    pub fn set_code_region(&mut self, start: KProcessAddress, size: usize) {
+        self.code_region_start = start;
+        self.code_region_size = size;
+    }
+
+    pub fn set_stack_region(&mut self, start: KProcessAddress, size: usize) {
+        self.stack_region_start = start;
+        self.stack_region_size = size;
+    }
+
+    pub fn set_heap_region(&mut self, start: KProcessAddress, size: usize) {
+        self.heap_region_start = start;
+        self.heap_region_size = size;
+        self.current_heap_size = self.current_heap_size.min(size);
+    }
+
+    pub fn get_current_heap_size(&self) -> usize {
+        self.current_heap_size
     }
 }
 
