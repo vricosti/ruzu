@@ -150,7 +150,7 @@ impl CoreTiming {
             is_multicore: false,
             pause_end_time: 0,
             cpu_ticks: 0,
-            downcount: 0,
+            downcount: MAX_SLICE_LENGTH,
         }
     }
 

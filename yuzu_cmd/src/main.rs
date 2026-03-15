@@ -535,7 +535,7 @@ fn main() {
             use ruzu_core::arm::dynarmic::arm_dynarmic_32::ArmDynarmic32;
             Box::new(ArmDynarmic32::new(
                 &dummy_system as &dyn std::any::Any,
-                true, dummy_process,
+                true, dummy_process, // TODO: use false for single-core scheduling once rdynarmic cycle counting perf is fixed
                 &dummy_exclusive as &dyn std::any::Any,
                 0, shared_memory.clone(),
             ))
@@ -863,8 +863,9 @@ fn main() {
                     }
                     PhysicalCoreExecutionControl::Break
                 } else if halt_reason.contains(HaltReason::BREAK_LOOP) {
-                    log::info!("BREAK_LOOP after {} iterations, {} SVCs", iteration, svc_count);
-                    PhysicalCoreExecutionControl::Break
+                    // Cycle budget expired — this is normal with cycle counting.
+                    // Continue execution (matching upstream scheduler yield behavior).
+                    PhysicalCoreExecutionControl::Continue
                 } else {
                     log::warn!(
                         "JIT halted: {:?} at PC={:#x}, SP={:#x} (iter={}, svcs={})",

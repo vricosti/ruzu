@@ -46,20 +46,33 @@ fn translate_halt_reason(hr: rdynarmic::halt_reason::HaltReason) -> HaltReason {
 ///
 /// Holds a shared reference to guest process memory, matching upstream's
 /// `Core::Memory::Memory& m_memory` obtained from `process->GetMemory()`.
+///
+/// Also holds a reference to CoreTiming for tick management, matching upstream's
+/// `m_parent.m_system.CoreTiming()` access pattern.
 struct DynarmicCallbacks32 {
     /// Shared guest memory reference.
     memory: SharedProcessMemory,
     /// SVC/SWI number from last supervisor call, shared with parent ArmDynarmic32.
-    /// Upstream: callback writes to m_parent.m_svc_swi via back-reference.
     svc_swi: Arc<AtomicU32>,
+    /// Whether wall clock is used (if true, ticking is disabled).
+    /// Matches upstream `m_parent.m_uses_wall_clock`.
+    uses_wall_clock: bool,
+    /// Core timing reference for tick management.
+    /// Matches upstream `m_parent.m_system.CoreTiming()`.
+    core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
 }
 
 impl DynarmicCallbacks32 {
-    fn new(memory: SharedProcessMemory, svc_swi: Arc<AtomicU32>) -> Self {
+    fn new(
+        memory: SharedProcessMemory,
+        svc_swi: Arc<AtomicU32>,
+        uses_wall_clock: bool,
+        core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+    ) -> Self {
         log::info!("DynarmicCallbacks32: Arc memory ptr = {:?}, base = {:#x}",
             std::sync::Arc::as_ptr(&memory),
             memory.read().unwrap().base);
-        Self { memory, svc_swi }
+        Self { memory, svc_swi, uses_wall_clock, core_timing }
     }
 }
 
@@ -231,13 +244,34 @@ impl JitCallbacks for DynarmicCallbacks32 {
         );
     }
 
-    fn add_ticks(&mut self, _ticks: u64) {
-        // TODO: Wire to CoreTiming
+    /// Matches upstream `DynarmicCallbacks32::AddTicks`:
+    /// Divides ticks by NUM_CPU_CORES (4), passes to CoreTiming::AddTicks.
+    fn add_ticks(&mut self, ticks: u64) {
+        if self.uses_wall_clock {
+            return;
+        }
+        // Divide by number of CPU cores, minimum 1 tick.
+        // Matches upstream: amortized_ticks = max(ticks / NUM_CPU_CORES, 1)
+        let amortized_ticks = std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
+        self.core_timing.lock().unwrap().add_ticks(amortized_ticks);
     }
 
+    /// Matches upstream `DynarmicCallbacks32::GetTicksRemaining`:
+    /// Returns max(CoreTiming::GetDowncount(), 0).
+    ///
+    /// Also calls ResetTicks when downcount is depleted, matching the
+    /// upstream scheduler loop that calls ResetTicks() after each yield.
     fn get_ticks_remaining(&self) -> u64 {
-        // TODO: Wire to CoreTiming
-        1000
+        if self.uses_wall_clock {
+            return u64::MAX;
+        }
+        let mut ct = self.core_timing.lock().unwrap();
+        let downcount = ct.get_downcount();
+        if downcount <= 0 {
+            ct.reset_ticks();
+            return std::cmp::max(ct.get_downcount(), 0) as u64;
+        }
+        downcount as u64
     }
 }
 
@@ -285,8 +319,15 @@ impl ArmDynarmic32 {
         core_index: usize,
         shared_memory: SharedProcessMemory,
     ) -> Self {
+        // Create a CoreTiming instance for tick management.
+        // In upstream, this would come from System::CoreTiming().
+        // For now, each JIT instance has its own (single-core mode).
+        let core_timing = Arc::new(std::sync::Mutex::new(crate::core_timing::CoreTiming::new()));
+
         let svc_swi = Arc::new(AtomicU32::new(0));
-        let callbacks = DynarmicCallbacks32::new(shared_memory, svc_swi.clone());
+        let callbacks = DynarmicCallbacks32::new(
+            shared_memory, svc_swi.clone(), uses_wall_clock, core_timing,
+        );
 
         let config = JitConfig {
             callbacks: Box::new(callbacks),
