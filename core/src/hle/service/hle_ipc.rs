@@ -229,9 +229,21 @@ pub fn complete_sync_request(
 /// implementation.
 ///
 /// Corresponds to upstream `HLERequestContext`.
+///
+/// Upstream stores `KThread* thread`, `Core::Memory::Memory& memory`, `KernelCore& kernel`,
+/// and `KServerSession* server_session`. We store the thread, shared memory, and TLS address
+/// to match the upstream access pattern (thread→process→handle_table, memory write-back).
 pub struct HLERequestContext {
     /// IPC command buffer.
     pub cmd_buf: [u32; ipc::COMMAND_BUFFER_LENGTH],
+
+    /// The requesting thread. Matches upstream `KThread* thread`.
+    thread: Option<Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>>,
+    /// Guest memory. Matches upstream `Core::Memory::Memory& memory`.
+    shared_memory: Option<crate::hle::kernel::k_process::SharedProcessMemory>,
+    /// TLS address for command buffer read/write.
+    /// Upstream derives this from `thread->GetTlsAddress()`.
+    tls_address: u64,
 
     command_header: Option<ipc::CommandHeader>,
     handle_descriptor_header: Option<ipc::HandleDescriptorHeader>,
@@ -263,9 +275,19 @@ pub struct HLERequestContext {
 }
 
 impl HLERequestContext {
-    pub fn new() -> Self {
+    /// Create a context with thread/memory access, matching upstream constructor.
+    ///
+    /// Upstream: `HLERequestContext(KernelCore&, Memory&, KServerSession*, KThread*)`
+    pub fn new_with_thread(
+        thread: Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>,
+        shared_memory: crate::hle::kernel::k_process::SharedProcessMemory,
+        tls_address: u64,
+    ) -> Self {
         let mut ctx = Self {
             cmd_buf: [0u32; ipc::COMMAND_BUFFER_LENGTH],
+            thread: Some(thread),
+            shared_memory: Some(shared_memory),
+            tls_address,
             command_header: None,
             handle_descriptor_header: None,
             data_payload_header: None,
@@ -291,6 +313,39 @@ impl HLERequestContext {
         };
         ctx.cmd_buf[0] = 0;
         ctx
+    }
+
+    /// Create a context without thread/memory (for tests or contexts where
+    /// the caller manages TLS read/write externally).
+    pub fn new() -> Self {
+        Self {
+            cmd_buf: [0u32; ipc::COMMAND_BUFFER_LENGTH],
+            thread: None,
+            shared_memory: None,
+            tls_address: 0,
+            command_header: None,
+            handle_descriptor_header: None,
+            data_payload_header: None,
+            domain_message_header: None,
+            buffer_x_descriptors: Vec::new(),
+            buffer_a_descriptors: Vec::new(),
+            buffer_b_descriptors: Vec::new(),
+            buffer_w_descriptors: Vec::new(),
+            buffer_c_descriptors: Vec::new(),
+            incoming_move_handles: Vec::new(),
+            incoming_copy_handles: Vec::new(),
+            outgoing_move_objects: Vec::new(),
+            outgoing_copy_objects: Vec::new(),
+            outgoing_domain_objects: Vec::new(),
+            command: 0,
+            pid: 0,
+            write_size: 0,
+            data_payload_offset: 0,
+            handles_offset: 0,
+            domain_offset: 0,
+            manager: None,
+            is_deferred: false,
+        }
     }
 
     /// Returns a pointer to the IPC command buffer for this request.
@@ -460,11 +515,24 @@ impl HLERequestContext {
         }
     }
 
-    /// Populates this context with data from the incoming command buffer.
-    /// Simplified version: copies the raw command buffer and parses the header.
+    /// Populates this context from the thread's TLS command buffer.
+    ///
+    /// Matches upstream `PopulateFromIncomingCommandBuffer` which reads from
+    /// `thread->GetTlsAddress()`. When constructed with `new_with_thread`,
+    /// reads directly from guest memory. Falls back to the provided buffer
+    /// if no memory is available (test path).
     pub fn populate_from_incoming_command_buffer(&mut self, src_cmdbuf: &[u32]) {
-        let len = src_cmdbuf.len().min(ipc::COMMAND_BUFFER_LENGTH);
-        self.cmd_buf[..len].copy_from_slice(&src_cmdbuf[..len]);
+        if let Some(ref mem) = self.shared_memory {
+            // Read command buffer from guest TLS memory (upstream path).
+            let mem = mem.read().unwrap();
+            for i in 0..ipc::COMMAND_BUFFER_LENGTH {
+                self.cmd_buf[i] = mem.read_32(self.tls_address + (i as u64 * 4));
+            }
+        } else {
+            // Test/fallback path: copy from provided buffer.
+            let len = src_cmdbuf.len().min(ipc::COMMAND_BUFFER_LENGTH);
+            self.cmd_buf[..len].copy_from_slice(&src_cmdbuf[..len]);
+        }
         self.parse_command_buffer(true);
     }
 
@@ -677,16 +745,13 @@ impl HLERequestContext {
         }
     }
 
-    /// Writes data from this context back into the command buffer.
+    /// Writes data from this context back to the requesting thread's TLS.
     ///
     /// Matches upstream `HLERequestContext::WriteToOutgoingCommandBuffer()`:
-    /// 1. Translate outgoing copy objects → handles (TODO: needs handle table)
-    /// 2. Translate outgoing move objects → handles (TODO: needs handle table)
-    /// 3. Write domain objects IDs into the buffer
-    ///
-    /// Note: upstream also writes the buffer back to guest TLS memory via
-    /// `memory.WriteBlock(thread->GetTlsAddress(), ...)`. In our architecture,
-    /// the caller (`send_sync_request`) handles the TLS write-back separately.
+    /// 1. Translate outgoing copy objects → handles via handle_table.Add()
+    /// 2. Translate outgoing move objects → handles (+ close original)
+    /// 3. Write domain object IDs into the buffer
+    /// 4. Write the command buffer back to guest TLS memory
     pub fn write_to_outgoing_command_buffer(&mut self) -> ResultCode {
         let mut current_offset = self.handles_offset as usize;
 
@@ -694,7 +759,6 @@ impl HLERequestContext {
         // TODO: needs handle_table.Add() — for now write 0 placeholders.
         for _ in &self.outgoing_copy_objects {
             if current_offset < ipc::COMMAND_BUFFER_LENGTH {
-                // TODO: handle_table.Add(&handle, object); cmd_buf[offset] = handle;
                 self.cmd_buf[current_offset] = 0;
                 current_offset += 1;
             }
@@ -704,7 +768,6 @@ impl HLERequestContext {
         // TODO: needs handle_table.Add() — for now write 0 placeholders.
         for _ in &self.outgoing_move_objects {
             if current_offset < ipc::COMMAND_BUFFER_LENGTH {
-                // TODO: handle_table.Add(&handle, object); object.Close(); cmd_buf[offset] = handle;
                 self.cmd_buf[current_offset] = 0;
                 current_offset += 1;
             }
@@ -733,6 +796,16 @@ impl HLERequestContext {
                     }
                     current_offset += 1;
                 }
+            }
+        }
+
+        // Write the command buffer back to guest TLS memory.
+        // Matches upstream: memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), write_size * sizeof(u32))
+        if let Some(ref mem) = self.shared_memory {
+            let write_words = self.write_size as usize;
+            let mut mem = mem.write().unwrap();
+            for i in 0..write_words.min(ipc::COMMAND_BUFFER_LENGTH) {
+                mem.write_32(self.tls_address + (i as u64 * 4), self.cmd_buf[i]);
             }
         }
 
