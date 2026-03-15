@@ -4,7 +4,6 @@
 //!
 //! SVC handlers for IPC (Inter-Process Communication) operations.
 
-use crate::hle::ipc;
 use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
@@ -12,27 +11,14 @@ use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{complete_sync_request, HLERequestContext};
 
-fn read_tls_command_buffer(ctx: &SvcContext, tls_address: u64) -> [u32; ipc::COMMAND_BUFFER_LENGTH] {
-    let mem = ctx.shared_memory.read().unwrap();
-    let mut cmd_buf = [0u32; ipc::COMMAND_BUFFER_LENGTH];
-    for (index, word) in cmd_buf.iter_mut().enumerate() {
-        *word = mem.read_32(tls_address + (index as u64 * core::mem::size_of::<u32>() as u64));
-    }
-    cmd_buf
-}
-
-fn write_tls_command_buffer(
-    ctx: &SvcContext,
-    tls_address: u64,
-    cmd_buf: &[u32; ipc::COMMAND_BUFFER_LENGTH],
-) {
-    let mut mem = ctx.shared_memory.write().unwrap();
-    for (index, word) in cmd_buf.iter().copied().enumerate() {
-        mem.write_32(tls_address + (index as u64 * core::mem::size_of::<u32>() as u64), word);
-    }
-}
-
 /// Makes a blocking IPC call to a service.
+///
+/// Matches upstream `SendSyncRequest` → `SendSyncRequestImpl`:
+/// 1. Get current thread and TLS address
+/// 2. Resolve client session from handle
+/// 3. Create HLERequestContext with thread/memory references
+/// 4. Read command buffer from TLS, dispatch to handler
+/// 5. Write response back to TLS (inside write_to_outgoing_command_buffer)
 pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode {
     let current_thread = match ctx.current_thread() {
         Some(thread) => thread,
@@ -40,7 +26,7 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
     };
     let tls_address = current_thread.lock().unwrap().get_tls_address().get();
 
-    let (client_session, process) = {
+    let (client_session, shared_memory) = {
         let process = ctx.current_process.lock().unwrap();
         let Some(object_id) = process.handle_table.get_object(session_handle) else {
             return RESULT_INVALID_HANDLE;
@@ -48,56 +34,47 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
         let Some(client_session) = process.get_client_session_by_object_id(object_id) else {
             return RESULT_INVALID_HANDLE;
         };
-        (client_session, process)
+        process.num_ipc_messages.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (client_session, process.get_shared_memory())
     };
-
-    process.num_ipc_messages.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    drop(process);
 
     let request_manager = match client_session.lock().unwrap().request_manager() {
         Some(manager) => manager,
         None => return RESULT_INVALID_HANDLE,
     };
 
-    let mut context = HLERequestContext::new();
+    // Create context with thread/memory references (matches upstream constructor).
+    let mut context = HLERequestContext::new_with_thread(
+        current_thread,
+        shared_memory,
+        tls_address,
+    );
     context.set_session_request_manager(request_manager.clone());
-    let incoming = read_tls_command_buffer(ctx, tls_address);
-    context.populate_from_incoming_command_buffer(&incoming);
 
-    let is_domain = request_manager.lock().unwrap().is_domain();
+    // Read command buffer from TLS and parse (done inside populate).
+    context.populate_from_incoming_command_buffer(&[]);
+
     log::info!(
-        "  SendSyncRequest: handle={:#x} tls={:#x} cmd_type={} is_domain={} parsed_cmd={} dp_offset={}",
+        "  SendSyncRequest: handle={:#x} tls={:#x} cmd_type={:?} is_domain={} parsed_cmd={}",
         session_handle, tls_address,
-        incoming[0] & 0xFFFF, is_domain,
+        context.get_command_type(),
+        request_manager.lock().unwrap().is_domain(),
         context.get_command(),
-        context.data_payload_offset,
-    );
-    log::info!(
-        "  TLS raw: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-        incoming[0], incoming[1], incoming[2], incoming[3],
-        incoming[4], incoming[5], incoming[6], incoming[7],
-        incoming[8], incoming[9], incoming[10], incoming[11],
-        incoming[12], incoming[13], incoming[14], incoming[15],
     );
 
+    // Dispatch to service handler.
     let result = complete_sync_request(&request_manager, &mut context);
 
-    let outgoing = context.command_buffer();
-    log::info!(
-        "  SendSyncRequest result: {:#x} words[0..12]=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-        result.get_inner_value(),
-        outgoing[0], outgoing[1], outgoing[2], outgoing[3],
-        outgoing[4], outgoing[5], outgoing[6], outgoing[7],
-        outgoing[8], outgoing[9], outgoing[10], outgoing[11],
-    );
+    // write_to_outgoing_command_buffer writes back to TLS (upstream path).
+    // It's already called inside handle_sync_request_impl via ServiceFramework.
 
-    write_tls_command_buffer(ctx, tls_address, outgoing);
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::ipc;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::{KThread, ThreadState};
     use crate::hle::kernel::k_typed_address::KProcessAddress;
