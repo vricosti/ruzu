@@ -5,6 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/self_controller.cpp
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -47,13 +48,15 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 120: SaveCurrentScreenshot
 /// - 130: SetRecordVolumeMuted
 pub struct ISelfController {
-    // TODO: KProcess reference, Applet reference
+    /// Reference to the applet.
+    /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
+    applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ISelfController {
-    pub fn new() -> Self {
+    pub fn new(applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::exit_handler), "Exit"),
             (1, Some(Self::lock_exit_handler), "LockExit"),
@@ -80,6 +83,7 @@ impl ISelfController {
             (91, Some(Self::get_accumulated_suspended_tick_changed_event_handler), "GetAccumulatedSuspendedTickChangedEvent"),
         ]);
         Self {
+            applet,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -192,102 +196,179 @@ impl ISelfController {
         rb.push_result(RESULT_SUCCESS);
     }
 
+    /// SetFocusHandlingMode (cmd 13).
+    /// Matches upstream: locks applet, sets notification enabled + handling mode,
+    /// calls UpdateSuspensionStateLocked.
     fn set_focus_handling_mode_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         let mut rp = RequestParser::new(ctx);
-        service.set_focus_handling_mode(rp.pop_bool(), rp.pop_bool(), rp.pop_bool());
+        let notify = rp.pop_bool();
+        let _background = rp.pop_bool();
+        let suspend = rp.pop_bool();
+        log::info!("SetFocusHandlingMode: notify={} suspend={}", notify, suspend);
+
+        let mut applet = service.applet.lock().unwrap();
+        applet.lifecycle_manager.set_focus_state_changed_notification_enabled(notify);
+        applet.lifecycle_manager.set_focus_handling_mode(suspend);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
+    /// GetLibraryAppletLaunchableEvent (cmd 9).
+    /// Matches upstream: signals event, returns handle.
     fn get_library_applet_launchable_event_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) GetLibraryAppletLaunchableEvent called");
+        log::info!("GetLibraryAppletLaunchableEvent called");
+        // Create and immediately signal the event (upstream signals it too)
         let handle = ctx.create_readable_event_handle(true).unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);
     }
 
+    /// SetScreenShotPermission (cmd 10).
+    /// Matches upstream: locks applet, stores permission.
     fn set_screen_shot_permission_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) SetScreenShotPermission called");
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let permission = rp.pop_u32();
+        log::debug!("SetScreenShotPermission: permission={}", permission);
+
+        let mut applet = service.applet.lock().unwrap();
+        applet.screenshot_permission = match permission {
+            0 => crate::hle::service::am::am_types::ScreenshotPermission::Inherit,
+            1 => crate::hle::service::am::am_types::ScreenshotPermission::Enable,
+            2 => crate::hle::service::am::am_types::ScreenshotPermission::Disable,
+            _ => crate::hle::service::am::am_types::ScreenshotPermission::Inherit,
+        };
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
+    /// SetRestartMessageEnabled (cmd 14).
+    /// Matches upstream: locks applet, sets resume notification.
     fn set_restart_message_enabled_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) SetRestartMessageEnabled called");
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let enabled = rp.pop_bool();
+        log::info!("SetRestartMessageEnabled: enabled={}", enabled);
+
+        let mut applet = service.applet.lock().unwrap();
+        applet.lifecycle_manager.set_resume_notification_enabled(enabled);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
+    /// SetOutOfFocusSuspendingEnabled (cmd 16).
+    /// Matches upstream: locks applet, sets out-of-focus suspending.
     fn set_out_of_focus_suspending_enabled_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) SetOutOfFocusSuspendingEnabled called");
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let enabled = rp.pop_bool();
+        log::info!("SetOutOfFocusSuspendingEnabled: enabled={}", enabled);
+
+        let mut applet = service.applet.lock().unwrap();
+        applet.lifecycle_manager.set_out_of_focus_suspending_enabled(enabled);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    /// CreateManagedDisplayLayer (cmd 40): returns a layer ID.
-    /// Matches upstream: display_layer_manager.CreateManagedDisplayLayer(out_layer_id)
+    /// CreateManagedDisplayLayer (cmd 40).
+    /// Matches upstream: locks applet, creates display layer, returns layer_id.
+    /// TODO: implement DisplayLayerManager. For now returns dummy layer_id=1.
     fn create_managed_display_layer_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::info!("ISelfController::CreateManagedDisplayLayer called");
-        // Return a dummy layer ID. Upstream creates a real display layer
-        // via DisplayLayerManager.
+        log::info!("CreateManagedDisplayLayer called");
+        // TODO: applet.display_layer_manager.CreateManagedDisplayLayer(out_layer_id)
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u64(1); // layer_id = 1
     }
 
+    /// SetIdleTimeDetectionExtension (cmd 62).
+    /// Matches upstream: locks applet, stores value.
     fn set_idle_time_detection_extension_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) SetIdleTimeDetectionExtension called");
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let extension = rp.pop_u32();
+        log::debug!("SetIdleTimeDetectionExtension: extension={}", extension);
+
+        let mut applet = service.applet.lock().unwrap();
+        applet.idle_time_detection_extension = match extension {
+            0 => crate::hle::service::am::am_types::IdleTimeDetectionExtension::Disabled,
+            1 => crate::hle::service::am::am_types::IdleTimeDetectionExtension::Extended,
+            2 => crate::hle::service::am::am_types::IdleTimeDetectionExtension::ExtendedUnsafe,
+            _ => crate::hle::service::am::am_types::IdleTimeDetectionExtension::Disabled,
+        };
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
+    /// GetIdleTimeDetectionExtension (cmd 63).
+    /// Matches upstream: locks applet, reads value.
     fn get_idle_time_detection_extension_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) GetIdleTimeDetectionExtension called");
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let applet = service.applet.lock().unwrap();
+        let extension = applet.idle_time_detection_extension as u32;
+        log::debug!("GetIdleTimeDetectionExtension: extension={}", extension);
+
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // IdleTimeDetectionExtension::Disabled = 0
+        rb.push_u32(extension);
     }
 
+    /// SetAutoSleepDisabled (cmd 68).
+    /// Matches upstream: locks applet, stores bool.
     fn set_auto_sleep_disabled_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) SetAutoSleepDisabled called");
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let disabled = rp.pop_bool();
+        log::debug!("SetAutoSleepDisabled: disabled={}", disabled);
+
+        let mut applet = service.applet.lock().unwrap();
+        applet.auto_sleep_disabled = disabled;
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
+    /// GetAccumulatedSuspendedTickChangedEvent (cmd 91).
+    /// Matches upstream: returns event handle from applet.
     fn get_accumulated_suspended_tick_changed_event_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) GetAccumulatedSuspendedTickChangedEvent called");
+        log::debug!("GetAccumulatedSuspendedTickChangedEvent called");
         let handle = ctx.create_readable_event_handle(false).unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);

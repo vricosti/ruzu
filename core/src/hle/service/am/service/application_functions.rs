@@ -78,13 +78,15 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 1000: CreateMovieMaker (unimplemented)
 /// - 1001: PrepareForJit
 pub struct IApplicationFunctions {
-    // TODO: Applet reference
+    /// Reference to the applet.
+    /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
+    applet: std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IApplicationFunctions {
-    pub fn new() -> Self {
+    pub fn new(applet: std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
         let handlers = build_handler_map(&[
             (1, Some(Self::pop_launch_parameter_handler), "PopLaunchParameter"),
             (20, Some(Self::ensure_save_data_handler), "EnsureSaveData"),
@@ -105,6 +107,7 @@ impl IApplicationFunctions {
             (1001, Some(Self::prepare_for_jit_handler), "PrepareForJit"),
         ]);
         Self {
+            applet,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -253,9 +256,17 @@ impl IApplicationFunctions {
         rb.push_u64(language_code);
     }
 
-    /// SetTerminateResult (cmd 22)
-    fn set_terminate_result_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::warn!("(STUBBED) SetTerminateResult called");
+    /// SetTerminateResult (cmd 22).
+    /// Matches upstream: locks applet, stores result.
+    fn set_terminate_result_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let mut rp = RequestParser::new(ctx);
+        let result = rp.pop_u32();
+        log::info!("SetTerminateResult: result={:#x}", result);
+
+        let mut applet = service.applet.lock().unwrap();
+        applet.terminate_result = result;
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -277,9 +288,21 @@ impl IApplicationFunctions {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    /// SetGamePlayRecordingState (cmd 67)
-    fn set_game_play_recording_state_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::warn!("(STUBBED) SetGamePlayRecordingState called");
+    /// SetGamePlayRecordingState (cmd 67).
+    /// Matches upstream: locks applet, stores state.
+    fn set_game_play_recording_state_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let mut rp = RequestParser::new(ctx);
+        let state = rp.pop_u32();
+        log::warn!("(STUBBED) SetGamePlayRecordingState: state={}", state);
+
+        let mut applet = service.applet.lock().unwrap();
+        applet.game_play_recording_state = match state {
+            0 => crate::hle::service::am::am_types::GamePlayRecordingState::Disabled,
+            1 => crate::hle::service::am::am_types::GamePlayRecordingState::Enabled,
+            _ => crate::hle::service::am::am_types::GamePlayRecordingState::Disabled,
+        };
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
