@@ -498,6 +498,7 @@ impl HLERequestContext {
         &self,
         manager: Arc<std::sync::Mutex<SessionRequestManager>>,
     ) -> Option<Handle> {
+        log::info!("HLERequestContext::create_session_with_manager: begin");
         let thread = self.thread.as_ref()?;
         let thread_guard = thread.lock().unwrap();
         let parent = thread_guard.parent.as_ref()?.upgrade()?;
@@ -509,23 +510,57 @@ impl HLERequestContext {
 
         // Create the full KSession (owns both server and client endpoints).
         // Matches upstream: KSession::Create(kernel) + Initialize(nullptr, 0).
-        let mut ksession = crate::hle::kernel::k_session::KSession::new();
-        ksession.initialize(None, 0);
+        let session = Arc::new(std::sync::Mutex::new(
+            crate::hle::kernel::k_session::KSession::new(),
+        ));
+        {
+            let mut ksession = session.lock().unwrap();
+            ksession.initialize(None, 0);
+            ksession.server.lock().unwrap().initialize(object_id);
+            ksession
+                .client
+                .lock()
+                .unwrap()
+                .initialize_with_manager(object_id, manager.clone());
+        }
+        log::info!(
+            "HLERequestContext::create_session_with_manager: endpoints initialized object_id={:#x}",
+            object_id
+        );
 
-        // Link the server session to the manager.
-        // Matches upstream: ServerManager::RegisterSession(server_session, manager).
-        ksession.server.lock().unwrap().set_manager(manager.clone());
+        let server_session = session.lock().unwrap().get_server_session().clone();
+        let client_session = session.lock().unwrap().get_client_session().clone();
 
-        // Set up the client session with the manager for IPC dispatch.
-        ksession.client.lock().unwrap().initialize_with_manager(object_id, manager);
+        // Register the server session with the service-side server manager when available.
+        // This matches upstream ownership better than setting the manager only on the client.
+        if let Some(service_manager) = self.get_service_manager() {
+            log::info!("HLERequestContext::create_session_with_manager: registering with ServiceManager");
+            service_manager
+                .lock()
+                .unwrap()
+                .server_manager()
+                .lock()
+                .unwrap()
+                .register_session(server_session, manager.clone());
+        } else {
+            // Fallback for older paths that still don't carry ServiceManager through the context.
+            log::info!("HLERequestContext::create_session_with_manager: fallback registration path");
+            server_session.lock().unwrap().set_manager(manager.clone());
+            client_session
+                .lock()
+                .unwrap()
+                .initialize_with_manager(object_id, manager.clone());
+        }
 
-        // Extract the client session Arc for registration.
-        let client_session = ksession.get_client_session().clone();
-
-        // Register in process and add to handle table.
-        // TODO: also register the KSession and KServerSession for lifecycle management.
+        // Register the owning session and the client endpoint in the process object tables.
+        log::info!("HLERequestContext::create_session_with_manager: registering process objects");
+        process.register_session_object(object_id, session);
         process.register_client_session_object(object_id, client_session);
         let handle = process.handle_table.add(object_id).ok()?;
+        log::info!(
+            "HLERequestContext::create_session_with_manager: done handle={:#x}",
+            handle
+        );
 
         Some(handle)
     }

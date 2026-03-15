@@ -124,7 +124,7 @@ impl Controller {
     /// Matches upstream: creates a new KSession, copies the session handler
     /// from the current manager, and pushes the client session as a move handle.
     fn clone_current_object(&self, ctx: &mut HLERequestContext) {
-        log::debug!("Controller::CloneCurrentObject called");
+        log::info!("Controller::CloneCurrentObject called");
 
         // Upstream registers the clone with the SAME session_manager as the parent.
         // This means the clone shares the same domain state, handlers, etc.
@@ -133,11 +133,17 @@ impl Controller {
         let parent_manager = ctx.get_manager().cloned();
 
         let session_handle = if let Some(manager) = parent_manager {
+            log::info!("Controller::CloneCurrentObject: creating clone session");
             ctx.create_session_with_manager(manager).unwrap_or(0)
         } else {
             log::warn!("CloneCurrentObject: no manager to clone");
             0
         };
+
+        log::info!(
+            "Controller::CloneCurrentObject: clone session handle={:#x}",
+            session_handle
+        );
 
         let mut rb = ResponseBuilder::new_with_flags(
             ctx, 2, 0, 1,
