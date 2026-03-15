@@ -37,7 +37,12 @@ pub enum SuspendMode {
 }
 
 pub struct LifecycleManager {
-    // Events - stubbed as booleans until kernel event types are wired
+    // Events — kernel handles registered in the process handle table.
+    // Matches upstream: Event m_system_event, Event m_operation_mode_changed_system_event
+    pub system_event_handle: u32,
+    pub operation_mode_changed_system_event_handle: u32,
+
+    // Cached signal state for SignalSystemEventIfNeeded
     system_event_signaled: bool,
     operation_mode_changed_system_event_signaled: bool,
 
@@ -78,6 +83,8 @@ pub struct LifecycleManager {
 impl LifecycleManager {
     pub fn new(is_application: bool) -> Self {
         Self {
+            system_event_handle: 0,
+            operation_mode_changed_system_event_handle: 0,
             system_event_signaled: false,
             operation_mode_changed_system_event_signaled: false,
             unordered_messages: VecDeque::new(),
@@ -110,6 +117,18 @@ impl LifecycleManager {
             requested_focus_state: FocusState::default(),
             acknowledged_focus_state: FocusState::default(),
         }
+    }
+
+    /// Returns the system event handle for GetEventHandle.
+    /// Matches upstream `Event& GetSystemEvent()`.
+    pub fn get_system_event_handle(&self) -> u32 {
+        self.system_event_handle
+    }
+
+    /// Returns the operation mode changed event handle.
+    /// Matches upstream `Event& GetOperationModeChangedSystemEvent()`.
+    pub fn get_operation_mode_changed_system_event_handle(&self) -> u32 {
+        self.operation_mode_changed_system_event_handle
     }
 
     pub fn is_application(&self) -> bool {

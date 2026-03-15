@@ -4,9 +4,10 @@
 //! Port of zuyu/src/core/hle/service/am/service/common_state_getter.h
 //! Port of zuyu/src/core/hle/service/am/service/common_state_getter.cpp
 
-use crate::hle::service::am::am_types::{AppletId, FocusState, OperationMode, SystemButtonType};
+use crate::hle::service::am::am_types::{AppletId, AppletMessage, FocusState, OperationMode, SystemButtonType};
+use crate::hle::service::am::applet::Applet;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -68,21 +69,15 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 pub struct ICommonStateGetter {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    /// Event handle for GetEventHandle (cmd 0).
-    /// In upstream, this comes from the LifecycleManager's system event.
-    message_event_handle: u32,
-    /// Whether the initial FocusStateChanged message has been consumed.
-    /// Upstream manages this through LifecycleManager::PopMessageInOrderOfPriority.
-    focus_message_delivered: AtomicBool,
+    /// Reference to the applet.
+    /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
+    applet: Arc<Mutex<Applet>>,
 }
 
 impl ICommonStateGetter {
-    /// Create with a pre-allocated event handle registered in the process handle table.
-    ///
-    /// Matches upstream: LifecycleManager creates a KEvent via ServiceContext,
-    /// and SetFocusState(InFocus) is called when the applet starts.
-    pub fn new_with_event_handle(event_handle: u32) -> Self {
-        let message_event_handle = event_handle;
+    /// Create with an applet reference, matching upstream constructor:
+    /// `ICommonStateGetter(Core::System&, std::shared_ptr<Applet>)`
+    pub fn new(applet: Arc<Mutex<Applet>>) -> Self {
 
         let handlers = build_handler_map(&[
             (0, Some(Self::get_event_handle_handler), "GetEventHandle"),
@@ -122,16 +117,16 @@ impl ICommonStateGetter {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
-            message_event_handle,
-            focus_message_delivered: AtomicBool::new(false),
+            applet,
         }
     }
 
     /// Port of ICommonStateGetter::GetCurrentFocusState
+    /// Matches upstream: locks applet, returns lifecycle_manager.GetAndClearFocusState()
     pub fn get_current_focus_state(&self) -> FocusState {
         log::debug!("GetCurrentFocusState called");
-        // TODO: lock applet, return lifecycle_manager.GetAndClearFocusState()
-        FocusState::InFocus
+        let mut applet = self.applet.lock().unwrap();
+        applet.lifecycle_manager.get_and_clear_focus_state()
     }
 
     /// Port of ICommonStateGetter::GetOperationMode
@@ -189,31 +184,29 @@ impl ICommonStateGetter {
     }
 
     /// GetEventHandle (cmd 0): returns a copy handle to the message event.
-    /// Matches upstream: OutCopyHandle<KReadableEvent> from LifecycleManager.
+    /// Matches upstream: `*out_event = m_applet->lifecycle_manager.GetSystemEvent().GetHandle()`
     fn get_event_handle_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
-        log::debug!("ICommonStateGetter::GetEventHandle called -> handle={:#x}", service.message_event_handle);
+        let applet = service.applet.lock().unwrap();
+        let handle = applet.lifecycle_manager.get_system_event_handle();
+        log::debug!("ICommonStateGetter::GetEventHandle called -> handle={:#x}", handle);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0); // 1 copy handle
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(service.message_event_handle);
+        rb.push_copy_objects(handle);
     }
 
     /// ReceiveMessage (cmd 1): receives an applet message.
-    ///
-    /// Matches upstream LifecycleManager::PopMessage which returns messages
-    /// in priority order. On first call, returns FocusStateChanged (15) to
-    /// simulate the application receiving focus at launch. Subsequent calls
-    /// return ResultNoMessages.
+    /// Matches upstream: `m_applet->lifecycle_manager.PopMessage(out_applet_message)`
     fn receive_message_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut applet = service.applet.lock().unwrap();
+        let mut message = AppletMessage::None;
 
-        if !service.focus_message_delivered.swap(true, Ordering::Relaxed) {
-            // First call: deliver FocusStateChanged message.
-            // Matches upstream: SetFocusState(InFocus) → PopMessage returns FocusStateChanged.
-            log::info!("ICommonStateGetter::ReceiveMessage -> FocusStateChanged");
+        if applet.lifecycle_manager.pop_message(&mut message) {
+            log::info!("ICommonStateGetter::ReceiveMessage -> {:?}", message);
             let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
             rb.push_result(RESULT_SUCCESS);
-            rb.push_u32(15); // AppletMessage::FocusStateChanged = 15
+            rb.push_u32(message as u32);
         } else {
             log::debug!("ICommonStateGetter::ReceiveMessage -> NoMessages");
             let result_no_messages = ResultCode::from_module_description(

@@ -5,9 +5,10 @@
 //! Port of zuyu/src/core/hle/service/am/service/application_proxy.cpp
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::am::applet::Applet;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -23,13 +24,17 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 20: GetApplicationFunctions
 /// - 1000: GetDebugFunctions
 pub struct IApplicationProxy {
-    // TODO: WindowSystem reference, KProcess reference, Applet reference
+    /// Reference to the applet.
+    /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
+    applet: Arc<Mutex<Applet>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IApplicationProxy {
-    pub fn new() -> Self {
+    /// Create with an applet reference.
+    /// Matches upstream: `IApplicationProxy(Core::System&, std::shared_ptr<Applet>)`
+    pub fn new(applet: Arc<Mutex<Applet>>) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::get_common_state_getter_handler), "GetCommonStateGetter"),
             (1, Some(Self::get_self_controller_handler), "GetSelfController"),
@@ -54,6 +59,7 @@ impl IApplicationProxy {
             (1000, Some(Self::get_debug_functions_handler), "GetDebugFunctions"),
         ]);
         Self {
+            applet,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -81,15 +87,22 @@ impl IApplicationProxy {
     }
 
     fn get_common_state_getter_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        // Create a signaled event for the lifecycle message system.
-        // Matches upstream: LifecycleManager creates a KEvent and
-        // SetFocusState(InFocus) signals it at applet launch.
-        let event_handle = ctx.create_readable_event_handle(true).unwrap_or(0);
+        let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
+        // Create the system event handle and store in the LifecycleManager.
+        // Matches upstream: LifecycleManager creates a KEvent via ServiceContext.
+        {
+            let mut applet = proxy.applet.lock().unwrap();
+            if applet.lifecycle_manager.get_system_event_handle() == 0 {
+                if let Some(handle) = ctx.create_readable_event_handle(true) {
+                    applet.lifecycle_manager.system_event_handle = handle;
+                }
+            }
+        }
         Self::push_interface_response(ctx, Arc::new(
-            super::common_state_getter::ICommonStateGetter::new_with_event_handle(event_handle)
+            super::common_state_getter::ICommonStateGetter::new(proxy.applet.clone())
         ));
     }
 
