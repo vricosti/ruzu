@@ -500,6 +500,33 @@ impl HLERequestContext {
         Some(handle)
     }
 
+    /// Creates a client session that shares an existing SessionRequestManager.
+    /// Used by CloneCurrentObject to replicate upstream behavior where the clone
+    /// shares the same manager (and thus the same domain state) as the parent.
+    pub fn create_session_with_manager(
+        &self,
+        manager: Arc<std::sync::Mutex<SessionRequestManager>>,
+    ) -> Option<Handle> {
+        let thread = self.thread.as_ref()?;
+        let thread_guard = thread.lock().unwrap();
+        let parent = thread_guard.parent.as_ref()?.upgrade()?;
+        let mut process = parent.lock().unwrap();
+
+        static NEXT_SESSION_OBJECT_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0x1000_0000);
+        let object_id = NEXT_SESSION_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let session = Arc::new(std::sync::Mutex::new(
+            crate::hle::kernel::k_client_session::KClientSession::new(),
+        ));
+        session.lock().unwrap().initialize_with_manager(object_id, manager);
+
+        process.register_client_session_object(object_id, session);
+        let handle = process.handle_table.add(object_id).ok()?;
+
+        Some(handle)
+    }
+
     /// Creates a signaled KReadableEvent and registers it in the process
     /// handle table. Returns the handle for use in copy handle responses.
     ///

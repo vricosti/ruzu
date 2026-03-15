@@ -126,14 +126,16 @@ impl Controller {
     fn clone_current_object(&self, ctx: &mut HLERequestContext) {
         log::debug!("Controller::CloneCurrentObject called");
 
-        // Clone the current session's handler into a new client session.
-        let handler = ctx.get_manager()
-            .and_then(|m| m.lock().unwrap().session_handler().cloned());
+        // Upstream registers the clone with the SAME session_manager as the parent.
+        // This means the clone shares the same domain state, handlers, etc.
+        // We replicate this by creating a new KClientSession that references
+        // the parent's SessionRequestManager directly (not a new one).
+        let parent_manager = ctx.get_manager().cloned();
 
-        let session_handle = if let Some(handler) = handler {
-            ctx.create_session_for_service(handler).unwrap_or(0)
+        let session_handle = if let Some(manager) = parent_manager {
+            ctx.create_session_with_manager(manager).unwrap_or(0)
         } else {
-            log::warn!("CloneCurrentObject: no session handler to clone");
+            log::warn!("CloneCurrentObject: no manager to clone");
             0
         };
 
