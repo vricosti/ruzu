@@ -7,6 +7,12 @@
 use crate::hle::service::am::am_types::{
     GamePlayRecordingState, ProgramSpecifyKind, WindowOriginMode,
 };
+use std::collections::BTreeMap;
+
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IApplicationFunctions:
 /// - 1: PopLaunchParameter
@@ -73,11 +79,23 @@ use crate::hle::service::am::am_types::{
 /// - 1001: PrepareForJit
 pub struct IApplicationFunctions {
     // TODO: Applet reference
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IApplicationFunctions {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (40, Some(Self::notify_running_handler), "NotifyRunning"),
+            (65, Some(Self::is_game_play_recording_supported_handler), "IsGamePlayRecordingSupported"),
+            (90, Some(Self::enable_application_crash_report_handler), "EnableApplicationCrashReport"),
+            (123, Some(Self::get_previous_program_index_handler), "GetPreviousProgramIndex"),
+            (1001, Some(Self::prepare_for_jit_handler), "PrepareForJit"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// Port of IApplicationFunctions::NotifyRunning
@@ -147,5 +165,70 @@ impl IApplicationFunctions {
     pub fn prepare_for_jit(&self) {
         log::warn!("(STUBBED) PrepareForJit called");
         // TODO: lock applet, set jit_service_launched = true
+    }
+
+    fn notify_running_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(service.notify_running());
+    }
+
+    fn is_game_play_recording_supported_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(service.is_game_play_recording_supported());
+    }
+
+    fn enable_application_crash_report_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let mut rp = RequestParser::new(ctx);
+        service.enable_application_crash_report(rp.pop_bool());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_previous_program_index_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(service.get_previous_program_index());
+    }
+
+    fn prepare_for_jit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        service.prepare_for_jit();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for IApplicationFunctions {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+}
+
+impl ServiceFramework for IApplicationFunctions {
+    fn get_service_name(&self) -> &str {
+        "am::IApplicationFunctions"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

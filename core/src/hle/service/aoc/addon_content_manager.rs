@@ -6,7 +6,17 @@
 //!
 //! IAddOnContentManager service ("aoc:u").
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{
+    HLERequestContext, SessionRequestHandler, SessionRequestHandlerFactory,
+    SessionRequestHandlerPtr,
+};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::service::sm::sm::ServiceManager;
 
 /// IPC command IDs for IAddOnContentManager
 pub mod commands {
@@ -40,12 +50,43 @@ pub mod commands {
 pub struct IAddOnContentManager {
     add_on_content: Vec<u64>,
     // TODO: service_context, aoc_change_event
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IAddOnContentManager {
     pub fn new() -> Self {
+        let handlers = build_handler_map(&[
+            (
+                commands::COUNT_ADD_ON_CONTENT,
+                Some(Self::count_add_on_content_handler),
+                "CountAddOnContent",
+            ),
+            (
+                commands::GET_ADD_ON_CONTENT_BASE_ID,
+                Some(Self::get_add_on_content_base_id_handler),
+                "GetAddOnContentBaseId",
+            ),
+            (
+                commands::PREPARE_ADD_ON_CONTENT,
+                Some(Self::prepare_add_on_content_handler),
+                "PrepareAddOnContent",
+            ),
+            (
+                commands::CREATE_EC_PURCHASED_EVENT_MANAGER,
+                Some(Self::create_ec_purchased_event_manager_handler),
+                "CreateEcPurchasedEventManager",
+            ),
+            (
+                commands::CREATE_PERMANENT_EC_PURCHASED_EVENT_MANAGER,
+                Some(Self::create_permanent_ec_purchased_event_manager_handler),
+                "CreatePermanentEcPurchasedEventManager",
+            ),
+        ]);
         Self {
             add_on_content: Vec::new(),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -122,11 +163,107 @@ impl IAddOnContentManager {
         log::warn!("(STUBBED) IAddOnContentManager::create_permanent_ec_purchased_event_manager called");
         Arc::new(super::purchase_event_manager::IPurchaseEventManager::new())
     }
+
+    fn count_add_on_content_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        let count = service.count_add_on_content(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn get_add_on_content_base_id_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        let base_id = service.get_add_on_content_base_id(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(base_id);
+    }
+
+    fn prepare_add_on_content_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        let mut rp = RequestParser::new(ctx);
+        let addon_index = rp.pop_i32();
+        service.prepare_add_on_content(addon_index, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn create_ec_purchased_event_manager_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        let manager = service.create_ec_purchased_event_manager();
+        let handle = ctx.create_session_for_service(manager).unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_move_objects(handle);
+    }
+
+    fn create_permanent_ec_purchased_event_manager_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        let manager = service.create_permanent_ec_purchased_event_manager();
+        let handle = ctx.create_session_for_service(manager).unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_move_objects(handle);
+    }
 }
 
 /// Registers "aoc:u" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `addon_content_manager.cpp`.
-pub fn loop_process() {
-    // TODO: register "aoc:u" -> IAddOnContentManager with ServerManager
+pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
+    let factory: SessionRequestHandlerFactory =
+        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IAddOnContentManager::new()) });
+    let result = service_manager
+        .lock()
+        .unwrap()
+        .register_service("aoc:u".to_string(), 64, factory);
+    if result.is_error() {
+        log::warn!(
+            "Failed to register service 'aoc:u': {:#x}",
+            result.get_inner_value()
+        );
+    }
+}
+
+impl SessionRequestHandler for IAddOnContentManager {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+}
+
+impl ServiceFramework for IAddOnContentManager {
+    fn get_service_name(&self) -> &str {
+        "aoc:u"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }

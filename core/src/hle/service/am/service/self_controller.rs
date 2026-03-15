@@ -4,6 +4,13 @@
 //! Port of zuyu/src/core/hle/service/am/service/self_controller.h
 //! Port of zuyu/src/core/hle/service/am/service/self_controller.cpp
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// IPC command table for ISelfController:
 /// - 0: Exit
 /// - 1: LockExit
@@ -41,11 +48,32 @@
 /// - 130: SetRecordVolumeMuted
 pub struct ISelfController {
     // TODO: KProcess reference, Applet reference
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ISelfController {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (0, Some(Self::exit_handler), "Exit"),
+            (1, Some(Self::lock_exit_handler), "LockExit"),
+            (2, Some(Self::unlock_exit_handler), "UnlockExit"),
+            (
+                11,
+                Some(Self::set_operation_mode_changed_notification_handler),
+                "SetOperationModeChangedNotification",
+            ),
+            (
+                12,
+                Some(Self::set_performance_mode_changed_notification_handler),
+                "SetPerformanceModeChangedNotification",
+            ),
+            (13, Some(Self::set_focus_handling_mode_handler), "SetFocusHandlingMode"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// Port of ISelfController::Exit
@@ -110,5 +138,79 @@ impl ISelfController {
     /// Port of ISelfController::ReportUserIsActive
     pub fn report_user_is_active(&self) {
         log::warn!("(STUBBED) ReportUserIsActive called");
+    }
+
+    fn exit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        service.exit();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn lock_exit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        service.lock_exit();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn unlock_exit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        service.unlock_exit();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_operation_mode_changed_notification_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        service.set_operation_mode_changed_notification(rp.pop_bool());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_performance_mode_changed_notification_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        service.set_performance_mode_changed_notification(rp.pop_bool());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_focus_handling_mode_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        service.set_focus_handling_mode(rp.pop_bool(), rp.pop_bool(), rp.pop_bool());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for ISelfController {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+}
+
+impl ServiceFramework for ISelfController {
+    fn get_service_name(&self) -> &str {
+        "am::ISelfController"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

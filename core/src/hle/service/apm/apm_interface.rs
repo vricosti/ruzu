@@ -6,7 +6,13 @@
 //!
 //! APM and APM_Sys service interfaces, and ISession.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::apm::Module;
 use super::apm_controller::{Controller, CpuBoostMode, PerformanceConfiguration, PerformanceMode};
 
@@ -41,11 +47,35 @@ pub mod session_commands {
 /// Corresponds to `ISession` in upstream `apm_interface.cpp`.
 pub struct ISession {
     controller: Arc<Mutex<Controller>>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ISession {
     pub fn new(controller: Arc<Mutex<Controller>>) -> Self {
-        Self { controller }
+        let handlers = build_handler_map(&[
+            (
+                session_commands::SET_PERFORMANCE_CONFIGURATION,
+                Some(ISession::set_performance_configuration_handler),
+                "SetPerformanceConfiguration",
+            ),
+            (
+                session_commands::GET_PERFORMANCE_CONFIGURATION,
+                Some(ISession::get_performance_configuration_handler),
+                "GetPerformanceConfiguration",
+            ),
+            (
+                session_commands::SET_CPU_OVERCLOCK_ENABLED,
+                Some(ISession::set_cpu_overclock_enabled_handler),
+                "SetCpuOverclockEnabled",
+            ),
+        ]);
+
+        Self {
+            controller,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     pub fn set_performance_configuration(
@@ -84,6 +114,84 @@ impl ISession {
             enabled
         );
     }
+
+    fn set_performance_configuration_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let session = unsafe { &*(this as *const dyn ServiceFramework as *const ISession) };
+        let mut rp = RequestParser::new(ctx);
+        let mode = match rp.pop_u32() {
+            0 => PerformanceMode::Normal,
+            1 => PerformanceMode::Boost,
+            _ => PerformanceMode::Normal,
+        };
+        let config = match rp.pop_u32() {
+            0 => PerformanceConfiguration::Config1,
+            1 => PerformanceConfiguration::Config2,
+            2 => PerformanceConfiguration::Config3,
+            3 => PerformanceConfiguration::Config4,
+            _ => PerformanceConfiguration::Config1,
+        };
+        session.set_performance_configuration(mode, config);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_performance_configuration_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let session = unsafe { &*(this as *const dyn ServiceFramework as *const ISession) };
+        let mut rp = RequestParser::new(ctx);
+        let mode = match rp.pop_u32() {
+            0 => PerformanceMode::Normal,
+            1 => PerformanceMode::Boost,
+            _ => PerformanceMode::Normal,
+        };
+        let config = session.get_performance_configuration(mode);
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(config as u32);
+    }
+
+    fn set_cpu_overclock_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let session = unsafe { &*(this as *const dyn ServiceFramework as *const ISession) };
+        let mut rp = RequestParser::new(ctx);
+        session.set_cpu_overclock_enabled(rp.pop_bool());
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for ISession {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "apm::ISession"
+    }
+}
+
+impl ServiceFramework for ISession {
+    fn get_service_name(&self) -> &str {
+        "apm::ISession"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// APM service ("apm", "apm:am").
@@ -93,14 +201,35 @@ pub struct APM {
     module: Arc<Module>,
     controller: Arc<Mutex<Controller>>,
     name: String,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl APM {
     pub fn new(module: Arc<Module>, controller: Arc<Mutex<Controller>>, name: &str) -> Self {
+        let handlers = build_handler_map(&[
+            (
+                apm_commands::OPEN_SESSION,
+                Some(APM::open_session_handler),
+                "OpenSession",
+            ),
+            (
+                apm_commands::GET_PERFORMANCE_MODE,
+                Some(APM::get_performance_mode_handler),
+                "GetPerformanceMode",
+            ),
+            (
+                apm_commands::IS_CPU_OVERCLOCK_ENABLED,
+                Some(APM::is_cpu_overclock_enabled_handler),
+                "IsCpuOverclockEnabled",
+            ),
+        ]);
         Self {
             module,
             controller,
             name: name.to_string(),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -118,6 +247,61 @@ impl APM {
         log::warn!("(STUBBED) APM({})::is_cpu_overclock_enabled called", self.name);
         false
     }
+
+    fn open_session_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let apm = unsafe { &*(this as *const dyn ServiceFramework as *const APM) };
+        let session = Arc::new(apm.open_session());
+        let handle = ctx.create_session_for_service(session).unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_move_objects(handle);
+    }
+
+    fn get_performance_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let apm = unsafe { &*(this as *const dyn ServiceFramework as *const APM) };
+        let mode = apm.get_performance_mode();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(mode as u32);
+    }
+
+    fn is_cpu_overclock_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let apm = unsafe { &*(this as *const dyn ServiceFramework as *const APM) };
+        let enabled = apm.is_cpu_overclock_enabled();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(enabled);
+    }
+}
+
+impl SessionRequestHandler for APM {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl ServiceFramework for APM {
+    fn get_service_name(&self) -> &str {
+        &self.name
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// APM_Sys service ("apm:sys").
@@ -125,11 +309,40 @@ impl APM {
 /// Corresponds to `APM_Sys` class in upstream `apm_interface.h`.
 pub struct ApmSys {
     controller: Arc<Mutex<Controller>>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ApmSys {
     pub fn new(controller: Arc<Mutex<Controller>>) -> Self {
-        Self { controller }
+        let handlers = build_handler_map(&[
+            (0, None, "RequestPerformanceMode"),
+            (
+                apm_sys_commands::GET_PERFORMANCE_EVENT,
+                Some(ApmSys::get_performance_event_handler),
+                "GetPerformanceEvent",
+            ),
+            (2, None, "GetThrottlingState"),
+            (3, None, "GetLastThrottlingState"),
+            (4, None, "ClearLastThrottlingState"),
+            (5, None, "LoadAndApplySettings"),
+            (
+                apm_sys_commands::SET_CPU_BOOST_MODE,
+                Some(ApmSys::set_cpu_boost_mode_handler),
+                "SetCpuBoostMode",
+            ),
+            (
+                apm_sys_commands::GET_CURRENT_PERFORMANCE_CONFIGURATION,
+                Some(ApmSys::get_current_performance_configuration_handler),
+                "GetCurrentPerformanceConfiguration",
+            ),
+        ]);
+
+        Self {
+            controller,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     pub fn get_performance_event(&self) -> ISession {
@@ -147,5 +360,66 @@ impl ApmSys {
         let mut ctrl = self.controller.lock().unwrap();
         let mode = ctrl.get_current_performance_mode();
         ctrl.get_current_performance_configuration(mode)
+    }
+
+    fn get_performance_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ApmSys) };
+        let session = Arc::new(service.get_performance_event());
+        let handle = ctx.create_session_for_service(session).unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_move_objects(handle);
+    }
+
+    fn set_cpu_boost_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ApmSys) };
+        let mut rp = RequestParser::new(ctx);
+        let mode = match rp.pop_u32() {
+            0 => CpuBoostMode::Normal,
+            1 => CpuBoostMode::FastLoad,
+            2 => CpuBoostMode::Partial,
+            _ => CpuBoostMode::Normal,
+        };
+        service.set_cpu_boost_mode(mode);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_current_performance_configuration_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ApmSys) };
+        let config = service.get_current_performance_configuration();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(config as u32);
+    }
+}
+
+impl SessionRequestHandler for ApmSys {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "apm:sys"
+    }
+}
+
+impl ServiceFramework for ApmSys {
+    fn get_service_name(&self) -> &str {
+        "apm:sys"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

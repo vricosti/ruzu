@@ -6,7 +6,12 @@
 //!
 //! IPurchaseEventManager service.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ErrorModule, ResultCode};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Error: no purchased product info available.
 /// Upstream: `ResultNoPurchasedProductInfoAvailable{ErrorModule::NIMShop, 400}`
@@ -27,11 +32,28 @@ pub mod commands {
 /// Corresponds to `IPurchaseEventManager` in upstream `purchase_event_manager.h`.
 pub struct IPurchaseEventManager {
     // TODO: service_context, purchased_event
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IPurchaseEventManager {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (
+                commands::POP_PURCHASED_PRODUCT_INFO,
+                Some(Self::pop_purchased_product_info_handler),
+                "PopPurchasedProductInfo",
+            ),
+            (
+                commands::POP_PURCHASED_PRODUCT_INFO_WITH_UID,
+                Some(Self::pop_purchased_product_info_with_uid_handler),
+                "PopPurchasedProductInfoWithUid",
+            ),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// Stubbed: SetDefaultDeliveryTarget (cmd 0)
@@ -66,5 +88,53 @@ impl IPurchaseEventManager {
     pub fn pop_purchased_product_info_with_uid(&self) -> Result<(), ResultCode> {
         log::debug!("(STUBBED) IPurchaseEventManager::pop_purchased_product_info_with_uid called");
         Err(RESULT_NO_PURCHASED_PRODUCT_INFO_AVAILABLE)
+    }
+
+    fn pop_purchased_product_info_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IPurchaseEventManager) };
+        let result = service
+            .pop_purchased_product_info()
+            .err()
+            .unwrap_or(crate::hle::result::RESULT_SUCCESS);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+
+    fn pop_purchased_product_info_with_uid_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IPurchaseEventManager) };
+        let result = service
+            .pop_purchased_product_info_with_uid()
+            .err()
+            .unwrap_or(crate::hle::result::RESULT_SUCCESS);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+}
+
+impl SessionRequestHandler for IPurchaseEventManager {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+}
+
+impl ServiceFramework for IPurchaseEventManager {
+    fn get_service_name(&self) -> &str {
+        "aoc::IPurchaseEventManager"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
