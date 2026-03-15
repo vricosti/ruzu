@@ -537,7 +537,7 @@ fn main() {
                 &dummy_system as &dyn std::any::Any,
                 true, dummy_process, // TODO: use false for single-core scheduling once rdynarmic cycle counting perf is fixed
                 &dummy_exclusive as &dyn std::any::Any,
-                0, shared_memory.clone(),
+                0, shared_memory.clone(), system.core_timing_shared(),
             ))
         };
 
@@ -566,11 +566,12 @@ fn main() {
         // Set initial context.
         // Maps to upstream ResetThreadContext32/64 in k_thread.cpp via KThread::Initialize.
         let mut ctx = ruzu_core::arm::arm_interface::ThreadContext::default();
-        let physical_core = system
+        let physical_core: *const ruzu_core::hle::kernel::physical_core::PhysicalCore = system
             .kernel()
             .and_then(|kernel| kernel.physical_core(0))
+            .map(|core| core as *const _)
             .expect("kernel physical core 0 must exist after System::initialize");
-        physical_core.initialize_guest_runtime(main_thread.clone(), &mut *jit, &mut ctx);
+        unsafe { &*physical_core }.initialize_guest_runtime(main_thread.clone(), &mut *jit, &mut ctx);
 
         // Upstream: physical_core.cpp:158 — SetTpidrroEl0(GetInteger(thread->GetTlsAddress()))
         log::info!("TLS: set TPIDRURO/TPIDRRO_EL0 = {:#x}", tls_base);
@@ -595,15 +596,19 @@ fn main() {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(10_000);
-        let (iteration, svc_count) = physical_core.run_loop(
-            &mut *jit,
-            dummy_thread,
-            &mut ctx,
-            &scheduler,
-            &process,
-            is_64bit,
-            &svc_ctx,
-            |svc_num, svc_args, ctx, svc_count, _iteration| {
+        let mut total_iteration = 0u32;
+        let mut total_svc_count = 0u32;
+        loop {
+            let physical_core_ref = unsafe { &*physical_core };
+            let (iteration, svc_count, exec_control) = physical_core_ref.run_loop(
+                &mut *jit,
+                dummy_thread,
+                &mut ctx,
+                &scheduler,
+                &process,
+                is_64bit,
+                &svc_ctx,
+                |svc_num, svc_args, ctx, svc_count, _iteration| {
                 let svc_name = svc_dispatch::SvcId::from_u32(svc_num)
                     .map(|id| format!("{:?}", id))
                     .unwrap_or_else(|| format!("Unknown(0x{:02X})", svc_num));
@@ -663,7 +668,7 @@ fn main() {
                     }
 
                     // Dump guest code around the SVC call site (PC) and the caller (LR)
-                    for (label, base) in [("SVC site (PC)", ctx.pc), ("Caller (LR)", ctx.lr)] {
+                    for (label, base) in [("SVC site (PC)", ctx.pc as u64), ("Caller (LR)", ctx.lr as u64)] {
                         log::info!("  {} = {:#x}:", label, base);
                         let start = base.saturating_sub(0x20);
                         for a in (start..=base.saturating_add(0x20)).step_by(4) {
@@ -768,9 +773,36 @@ fn main() {
                     }
                 }
 
-                PhysicalCoreExecutionControl::Continue
-            },
-            |halt_reason, ctx, svc_count, iteration| {
+                    PhysicalCoreExecutionControl::Continue
+                },
+                |halt_reason: HaltReason, exception_address, ctx, svc_count, iteration| {
+                let dump_instruction_window = |label: &str, center: u64, mark_pc: Option<u64>| {
+                    let mem = shared_memory.read().unwrap();
+                    let start = center.saturating_sub(0x10);
+                    log::error!("{} around {:#x}", label, center);
+                    for addr in (start..=center.saturating_add(0x10)).step_by(4) {
+                        if !mem.is_valid_range(addr, 4) {
+                            log::error!("  [{:#010x}] <unmapped>", addr);
+                            continue;
+                        }
+                        let insn = mem.read_32(addr);
+                        let decoded = decode_arm(insn);
+                        let marker = if Some(addr) == mark_pc {
+                            " <PC>"
+                        } else if addr == center {
+                            " <EXC>"
+                        } else {
+                            ""
+                        };
+                        log::error!(
+                            "  [{:#010x}] {:#010x} {:?}{}",
+                            addr,
+                            insn,
+                            decoded.id,
+                            marker
+                        );
+                    }
+                };
                 if halt_reason.contains(HaltReason::STEP_THREAD) {
                     step_halt_count += 1;
                     if ctx.pc == last_step_pc {
@@ -843,43 +875,43 @@ fn main() {
                     return PhysicalCoreExecutionControl::Continue;
                 } else if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
                     log::error!("PREFETCH_ABORT at PC={:#x}, SP={:#x}, LR={:#x}", ctx.pc, ctx.sp, ctx.lr);
-                    let mem = shared_memory.read().unwrap();
-                    let crash_start = ctx.pc.saturating_sub(0x10);
-                    for addr in (crash_start..=ctx.pc.saturating_add(0x10)).step_by(4) {
-                        if !mem.is_valid_range(addr, 4) {
-                            log::error!("  [{:#010x}] <unmapped>", addr);
-                            continue;
-                        }
-                        let insn = mem.read_32(addr);
-                        let decoded = decode_arm(insn);
-                        let marker = if addr == ctx.pc { " <PC>" } else { "" };
-                        log::error!(
-                            "  [{:#010x}] {:#010x} {:?}{}",
-                            addr,
-                            insn,
-                            decoded.id,
-                            marker
-                        );
+                    log::error!("Reported exception address: {:?}", exception_address);
+                    dump_instruction_window("Crash window", ctx.pc, Some(ctx.pc));
+                    if let Some(exception_address) = exception_address {
+                        dump_instruction_window("Exception window", exception_address, Some(exception_address));
                     }
                     PhysicalCoreExecutionControl::Break
                 } else if halt_reason.contains(HaltReason::BREAK_LOOP) {
-                    // Cycle budget expired — this is normal with cycle counting.
-                    // Continue execution (matching upstream scheduler yield behavior).
-                    PhysicalCoreExecutionControl::Continue
+                    PhysicalCoreExecutionControl::Yield
                 } else {
                     log::warn!(
                         "JIT halted: {:?} at PC={:#x}, SP={:#x} (iter={}, svcs={})",
                         halt_reason, ctx.pc, ctx.sp, iteration, svc_count
                     );
                     PhysicalCoreExecutionControl::Break
+                    }
+                },
+            );
+            total_iteration += iteration;
+            total_svc_count += svc_count;
+
+            match exec_control {
+                PhysicalCoreExecutionControl::Continue => continue,
+                PhysicalCoreExecutionControl::Yield => {
+                    let core_timing = system.core_timing_shared();
+                    system
+                        .get_cpu_manager_mut()
+                        .preempt_single_core(&core_timing, true);
+                    continue;
                 }
-            },
-        );
+                PhysicalCoreExecutionControl::Break => break,
+            }
+        }
 
         // Final context dump.
         jit.get_context(&mut ctx);
         log::info!("Final: PC={:#x}, SP={:#x}, R0={:#x}, iterations={}, SVCs={}",
-            ctx.pc, ctx.sp, ctx.r[0], iteration, svc_count);
+            ctx.pc, ctx.sp, ctx.r[0], total_iteration, total_svc_count);
     } else {
         log::warn!("No process loaded, skipping CPU execution");
     }

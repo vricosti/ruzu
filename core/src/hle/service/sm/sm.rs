@@ -48,7 +48,7 @@ pub const RESULT_NOT_REGISTERED: ResultCode =
 ///
 /// Corresponds to upstream `Service::SM::ServiceManager`.
 pub struct ServiceManager {
-    controller_interface: Controller,
+    controller_interface: Arc<Controller>,
 
     /// Map of registered services.
     registered_services: HashMap<String, SessionRequestHandlerFactory>,
@@ -56,21 +56,36 @@ pub struct ServiceManager {
     /// Map of service ports (handles). In the full implementation these are KClientPort*.
     service_ports: HashMap<String, u32>,
 
+    /// HLE server manager backing session registration.
+    /// Matches upstream ownership where session clones are registered through
+    /// ServerManager::RegisterSession.
+    server_manager: Arc<Mutex<ServerManager>>,
+
     // TODO: deferral_event when kernel integration is ready
 }
 
 impl ServiceManager {
     pub fn new() -> Self {
         Self {
-            controller_interface: Controller::new(),
+            controller_interface: Arc::new(Controller::new()),
             registered_services: HashMap::new(),
             service_ports: HashMap::new(),
+            server_manager: Arc::new(Mutex::new(ServerManager::new())),
         }
     }
 
     /// Invokes a control request on the controller interface.
     pub fn invoke_control_request(&self, ctx: &mut HLERequestContext) {
         self.controller_interface.invoke_request(ctx);
+    }
+
+    /// Returns the shared IPC controller.
+    pub fn controller_interface(&self) -> Arc<Controller> {
+        self.controller_interface.clone()
+    }
+
+    pub fn server_manager(&self) -> Arc<Mutex<ServerManager>> {
+        self.server_manager.clone()
     }
 
     /// Validates a service name.

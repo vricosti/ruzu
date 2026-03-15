@@ -55,18 +55,18 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 100: InitializeApplicationCopyrightFrameBuffer
 /// - 101: SetApplicationCopyrightImage
 /// - 102: SetApplicationCopyrightVisibility
-/// - 110: QueryApplicationPlayStatistics
-/// - 111: QueryApplicationPlayStatisticsByUid
-/// - 120: ExecuteProgram
-/// - 121: ClearUserChannel
-/// - 122: UnpopToUserChannel
+/// - 110: QueryApplicationPlayStatistics (unimplemented)
+/// - 111: QueryApplicationPlayStatisticsByUid (unimplemented)
+/// - 120: ExecuteProgram (unimplemented)
+/// - 121: ClearUserChannel (unimplemented)
+/// - 122: UnpopToUserChannel (unimplemented)
 /// - 123: GetPreviousProgramIndex
 /// - 124: EnableApplicationAllThreadDumpOnCrash (unimplemented)
 /// - 130: GetGpuErrorDetectedSystemEvent
 /// - 131: SetDelayTimeToAbortOnGpuError (unimplemented)
 /// - 140: GetFriendInvitationStorageChannelEvent
-/// - 141: TryPopFromFriendInvitationStorageChannel
-/// - 150: GetNotificationStorageChannelEvent
+/// - 141: TryPopFromFriendInvitationStorageChannel (unimplemented)
+/// - 150: GetNotificationStorageChannelEvent (unimplemented)
 /// - 151: TryPopFromNotificationStorageChannel (unimplemented)
 /// - 160: GetHealthWarningDisappearedSystemEvent
 /// - 170: SetHdcpAuthenticationActivated (unimplemented)
@@ -99,11 +99,10 @@ impl IApplicationFunctions {
             (67, Some(Self::set_game_play_recording_state_handler), "SetGamePlayRecordingState"),
             (90, Some(Self::enable_application_crash_report_handler), "EnableApplicationCrashReport"),
             (100, Some(Self::initialize_application_copyright_frame_buffer_handler), "InitializeApplicationCopyrightFrameBuffer"),
-            (110, Some(Self::get_gpu_error_detected_system_event_handler), "GetGpuErrorDetectedSystemEvent"),
-            (120, Some(Self::get_friend_invitation_storage_channel_event_handler), "GetFriendInvitationStorageChannelEvent"),
             (123, Some(Self::get_previous_program_index_handler), "GetPreviousProgramIndex"),
-            (124, Some(Self::get_launch_reason_handler), "GetLaunchReason"),
-            (130, Some(Self::get_health_warning_disappeared_system_event_handler), "GetHealthWarningDisappearedSystemEvent"),
+            (130, Some(Self::get_gpu_error_detected_system_event_handler), "GetGpuErrorDetectedSystemEvent"),
+            (140, Some(Self::get_friend_invitation_storage_channel_event_handler), "GetFriendInvitationStorageChannelEvent"),
+            (160, Some(Self::get_health_warning_disappeared_system_event_handler), "GetHealthWarningDisappearedSystemEvent"),
             (1001, Some(Self::prepare_for_jit_handler), "PrepareForJit"),
         ]);
         Self {
@@ -332,15 +331,7 @@ impl IApplicationFunctions {
         rb.push_copy_objects(handle);
     }
 
-    /// GetLaunchReason (cmd 124)
-    fn get_launch_reason_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::warn!("(STUBBED) GetLaunchReason called");
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // AppletProcessLaunchReason::Normal = 0
-    }
-
-    /// GetHealthWarningDisappearedSystemEvent (cmd 130): returns an event handle
+    /// GetHealthWarningDisappearedSystemEvent (cmd 160): returns an event handle
     fn get_health_warning_disappeared_system_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("(STUBBED) GetHealthWarningDisappearedSystemEvent called");
         let handle = ctx.create_readable_event_handle(false).unwrap_or(0);

@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/arm/dynarmic/arm_dynarmic_32.h and arm_dynarmic_32.cpp
 //! ARM32 dynarmic backend.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::arm::arm_interface::{
@@ -60,6 +60,8 @@ struct DynarmicCallbacks32 {
     /// Core timing reference for tick management.
     /// Matches upstream `m_parent.m_system.CoreTiming()`.
     core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+    /// Last exception address reported by dynarmic.
+    last_exception_address: Arc<AtomicU64>,
 }
 
 impl DynarmicCallbacks32 {
@@ -68,11 +70,12 @@ impl DynarmicCallbacks32 {
         svc_swi: Arc<AtomicU32>,
         uses_wall_clock: bool,
         core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+        last_exception_address: Arc<AtomicU64>,
     ) -> Self {
         log::info!("DynarmicCallbacks32: Arc memory ptr = {:?}, base = {:#x}",
             std::sync::Arc::as_ptr(&memory),
             memory.read().unwrap().base);
-        Self { memory, svc_swi, uses_wall_clock, core_timing }
+        Self { memory, svc_swi, uses_wall_clock, core_timing, last_exception_address }
     }
 }
 
@@ -238,10 +241,24 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn exception_raised(&mut self, pc: u64, exception: u64) {
+        self.last_exception_address
+            .store(pc, Ordering::Relaxed);
         log::error!(
             "DynarmicCallbacks32::exception_raised(pc={:#x}, exception={:#x})",
             pc, exception
         );
+        let mem = self.memory.read().unwrap();
+        let start = pc.saturating_sub(0x10);
+        log::error!("DynarmicCallbacks32 exception window around pc={:#x}", pc);
+        for addr in (start..=pc.saturating_add(0x10)).step_by(4) {
+            if !mem.is_valid_range(addr, 4) {
+                log::error!("  [{:#010x}] <unmapped>", addr);
+                continue;
+            }
+            let insn = mem.read_32(addr);
+            let marker = if addr == pc { " <EXC>" } else { "" };
+            log::error!("  [{:#010x}] {:#010x}{}", addr, insn, marker);
+        }
     }
 
     /// Matches upstream `DynarmicCallbacks32::AddTicks`:
@@ -258,20 +275,12 @@ impl JitCallbacks for DynarmicCallbacks32 {
 
     /// Matches upstream `DynarmicCallbacks32::GetTicksRemaining`:
     /// Returns max(CoreTiming::GetDowncount(), 0).
-    ///
-    /// Also calls ResetTicks when downcount is depleted, matching the
-    /// upstream scheduler loop that calls ResetTicks() after each yield.
     fn get_ticks_remaining(&self) -> u64 {
         if self.uses_wall_clock {
             return u64::MAX;
         }
-        let mut ct = self.core_timing.lock().unwrap();
-        let downcount = ct.get_downcount();
-        if downcount <= 0 {
-            ct.reset_ticks();
-            return std::cmp::max(ct.get_downcount(), 0) as u64;
-        }
-        downcount as u64
+        let ct = self.core_timing.lock().unwrap();
+        std::cmp::max(ct.get_downcount(), 0) as u64
     }
 }
 
@@ -305,6 +314,9 @@ pub struct ArmDynarmic32 {
 
     /// CP15 user-read-only register (TPIDRURO), upstream: m_cp15->uro
     cp15_uro: u32,
+
+    /// Last exception address reported by dynarmic for the current halt.
+    last_exception_address: Arc<AtomicU64>,
 }
 
 impl ArmDynarmic32 {
@@ -318,15 +330,16 @@ impl ArmDynarmic32 {
         _exclusive_monitor: &dyn std::any::Any,
         core_index: usize,
         shared_memory: SharedProcessMemory,
+        core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
     ) -> Self {
-        // Create a CoreTiming instance for tick management.
-        // In upstream, this would come from System::CoreTiming().
-        // For now, each JIT instance has its own (single-core mode).
-        let core_timing = Arc::new(std::sync::Mutex::new(crate::core_timing::CoreTiming::new()));
-
         let svc_swi = Arc::new(AtomicU32::new(0));
+        let last_exception_address = Arc::new(AtomicU64::new(0));
         let callbacks = DynarmicCallbacks32::new(
-            shared_memory, svc_swi.clone(), uses_wall_clock, core_timing,
+            shared_memory,
+            svc_swi.clone(),
+            uses_wall_clock,
+            core_timing,
+            last_exception_address.clone(),
         );
 
         let config = JitConfig {
@@ -356,6 +369,7 @@ impl ArmDynarmic32 {
             breakpoint_context: ThreadContext::default(),
             jit,
             cp15_uro: 0,
+            last_exception_address,
         }
     }
 
@@ -405,6 +419,7 @@ impl ArmDynarmic32 {
 
 impl ArmInterface for ArmDynarmic32 {
     fn run_thread(&mut self, _thread: &mut KThread) -> HaltReason {
+        self.last_exception_address.store(0, Ordering::Relaxed);
         let jit = match self.jit.as_mut() {
             Some(jit) => jit,
             None => {
@@ -419,6 +434,7 @@ impl ArmInterface for ArmDynarmic32 {
     }
 
     fn step_thread(&mut self, _thread: &mut KThread) -> HaltReason {
+        self.last_exception_address.store(0, Ordering::Relaxed);
         let jit = match self.jit.as_mut() {
             Some(jit) => jit,
             None => {
@@ -560,6 +576,15 @@ impl ArmInterface for ArmDynarmic32 {
 
     fn get_svc_number(&self) -> u32 {
         self.svc_swi.load(Ordering::Relaxed)
+    }
+
+    fn get_last_exception_address(&self) -> Option<u64> {
+        let address = self.last_exception_address.load(Ordering::Relaxed);
+        if address == 0 {
+            None
+        } else {
+            Some(address)
+        }
     }
 
     fn signal_interrupt(&mut self, _thread: &mut KThread) {

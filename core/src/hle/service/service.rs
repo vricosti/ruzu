@@ -158,7 +158,8 @@ pub trait ServiceFramework: SessionRequestHandler {
             ipc::CommandType::ControlWithContext | ipc::CommandType::Control => {
                 // Matches upstream: system.ServiceManager().InvokeControlRequest(ctx)
                 if let Some(sm) = ctx.get_service_manager().cloned().or_else(|| self.service_manager()) {
-                    sm.lock().unwrap().invoke_control_request(ctx);
+                    let controller = sm.lock().unwrap().controller_interface();
+                    controller.invoke_request(ctx);
                 } else {
                     log::warn!(
                         "Control request but no ServiceManager available for service '{}'",

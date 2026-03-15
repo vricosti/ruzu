@@ -15,6 +15,7 @@ use super::{k_process::KProcess, k_scheduler::KScheduler, k_thread::KThread};
 
 pub enum PhysicalCoreExecutionControl {
     Continue,
+    Yield,
     Break,
 }
 
@@ -165,10 +166,10 @@ impl PhysicalCore {
         svc_context: &SvcContext,
         mut on_supervisor_call: FSvc,
         mut on_halted: FHalt,
-    ) -> (u32, u32)
+    ) -> (u32, u32, PhysicalCoreExecutionControl)
     where
         FSvc: FnMut(u32, &mut SvcArgs, &ThreadContext, u32, u32) -> PhysicalCoreExecutionControl,
-        FHalt: FnMut(HaltReason, &ThreadContext, u32, u32) -> PhysicalCoreExecutionControl,
+        FHalt: FnMut(HaltReason, Option<u64>, &ThreadContext, u32, u32) -> PhysicalCoreExecutionControl,
     {
         let mut svc_count = 0u32;
         let mut iteration = 0u32;
@@ -212,17 +213,20 @@ impl PhysicalCore {
                     svc_count += 1;
                     jit.get_context(thread_context);
 
-                    if matches!(
-                        on_supervisor_call(
-                            svc_num,
-                            &mut svc_args,
-                            thread_context,
-                            svc_count,
-                            iteration,
-                        ),
-                        PhysicalCoreExecutionControl::Break
+                    match on_supervisor_call(
+                        svc_num,
+                        &mut svc_args,
+                        thread_context,
+                        svc_count,
+                        iteration,
                     ) {
-                        break;
+                        PhysicalCoreExecutionControl::Break => {
+                            return (iteration, svc_count, PhysicalCoreExecutionControl::Break);
+                        }
+                        PhysicalCoreExecutionControl::Yield => {
+                            return (iteration, svc_count, PhysicalCoreExecutionControl::Yield);
+                        }
+                        PhysicalCoreExecutionControl::Continue => {}
                     }
 
                     self.dispatch_supervisor_call(
@@ -238,17 +242,27 @@ impl PhysicalCore {
                 }
                 PhysicalCoreExecutionEvent::Halted(halt_reason) => {
                     jit.get_context(thread_context);
-                    if matches!(
-                        on_halted(halt_reason, thread_context, svc_count, iteration),
-                        PhysicalCoreExecutionControl::Break
+                    let exception_address = jit.get_last_exception_address();
+                    match on_halted(
+                        halt_reason,
+                        exception_address,
+                        thread_context,
+                        svc_count,
+                        iteration,
                     ) {
-                        break;
+                        PhysicalCoreExecutionControl::Break => {
+                            return (iteration, svc_count, PhysicalCoreExecutionControl::Break);
+                        }
+                        PhysicalCoreExecutionControl::Yield => {
+                            return (iteration, svc_count, PhysicalCoreExecutionControl::Yield);
+                        }
+                        PhysicalCoreExecutionControl::Continue => {}
                     }
                 }
             }
         }
 
-        (iteration, svc_count)
+        (iteration, svc_count, PhysicalCoreExecutionControl::Break)
     }
 
     /// Load context from thread to current core.

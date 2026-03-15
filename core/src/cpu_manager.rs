@@ -7,9 +7,10 @@
 //! added once the kernel scheduler and physical core abstractions are in place.
 
 use crate::hardware_properties;
+use crate::core_timing::CoreTiming;
 use common::thread::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Per-core data held by the CPU manager.
 struct CoreData {
@@ -141,21 +142,27 @@ impl CpuManager {
     ///
     /// In the C++ code, this advances the core timing, rotates to the next core,
     /// and triggers the kernel scheduler preemption.
-    pub fn preempt_single_core(&mut self, from_running_environment: bool) {
+    pub fn preempt_single_core(
+        &mut self,
+        core_timing: &Arc<Mutex<CoreTiming>>,
+        from_running_environment: bool,
+    ) {
         if self.idle_count >= 4 || from_running_environment {
             if !from_running_environment {
+                core_timing.lock().unwrap().idle();
                 self.idle_count = 0;
             }
-            // In C++: kernel.SetIsPhantomModeForSingleCore(true);
-            // system.CoreTiming().Advance();
-            // kernel.SetIsPhantomModeForSingleCore(false);
+            // Upstream toggles phantom mode around Advance(); the Rust kernel
+            // scheduler path is not there yet, but the timing slice advance
+            // still belongs to single-core preemption rather than the JIT callback.
+            let _ = core_timing.lock().unwrap().advance();
         }
 
         let next_core =
             (self.current_core.load(Ordering::Relaxed) + 1) % hardware_properties::NUM_CPU_CORES as usize;
         self.current_core.store(next_core, Ordering::Relaxed);
 
-        // In C++: system.CoreTiming().ResetTicks();
+        core_timing.lock().unwrap().reset_ticks();
         // kernel.Scheduler(current_core).PreemptSingleCore();
     }
 }

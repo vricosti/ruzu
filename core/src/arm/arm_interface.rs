@@ -125,6 +125,9 @@ pub trait ArmInterface {
     fn get_svc_arguments(&self, args: &mut [u64; 8]);
     fn set_svc_arguments(&mut self, args: &[u64; 8]);
     fn get_svc_number(&self) -> u32;
+    fn get_last_exception_address(&self) -> Option<u64> {
+        None
+    }
 
     /// Signal an interrupt for execution to halt as soon as possible.
     /// It is safe to call this if the CPU is not running.

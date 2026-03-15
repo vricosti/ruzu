@@ -20,7 +20,7 @@ use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 /// Enumeration representing the return values of the System Initialize and Load process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +57,7 @@ pub type ExitCallback = Box<dyn Fn() + Send>;
 pub struct System {
     // ── Core subsystems ──
     /// The core timing system (event scheduling).
-    pub core_timing: CoreTiming,
+    pub core_timing: Arc<StdMutex<CoreTiming>>,
 
     /// The CPU manager (thread dispatch).
     pub cpu_manager: CpuManager,
@@ -145,7 +145,7 @@ impl System {
     /// Creates a new System instance.
     pub fn new() -> Self {
         Self {
-            core_timing: CoreTiming::new(),
+            core_timing: Arc::new(StdMutex::new(CoreTiming::new())),
             cpu_manager: CpuManager::new(),
             kernel: None,
             service_manager: None,
@@ -190,9 +190,9 @@ impl System {
         // self.is_multicore = Settings::values.use_multi_core...;
         // self.extended_memory_layout = ...;
 
-        self.core_timing.set_multicore(self.is_multicore);
+        self.core_timing.lock().unwrap().set_multicore(self.is_multicore);
         // In C++: core_timing.Initialize([&system]() { system.RegisterHostThread(); });
-        self.core_timing.initialize(|| {
+        self.core_timing.lock().unwrap().initialize(|| {
             // Host thread registration placeholder.
             // In full implementation, this registers the timer thread with the kernel.
         });
@@ -274,7 +274,7 @@ impl System {
         let _lk = self.suspend_guard.lock();
 
         // In C++: kernel.SuspendEmulation(false);
-        self.core_timing.sync_pause(false);
+        self.core_timing.lock().unwrap().sync_pause(false);
         self.is_paused.store(false, Ordering::Relaxed);
 
         log::info!("System: running");
@@ -285,7 +285,7 @@ impl System {
     pub fn pause(&mut self) {
         let _lk = self.suspend_guard.lock();
 
-        self.core_timing.sync_pause(true);
+        self.core_timing.lock().unwrap().sync_pause(true);
         // In C++: kernel.SuspendEmulation(true);
         self.is_paused.store(true, Ordering::Relaxed);
 
@@ -303,7 +303,9 @@ impl System {
 
         // Log last frame performance stats if game was loaded
         if let Some(ref perf_stats) = self.perf_stats {
-            let perf_results = perf_stats.get_and_reset_stats(self.core_timing.get_global_time_us());
+            let perf_results = perf_stats.get_and_reset_stats(
+                self.core_timing.lock().unwrap().get_global_time_us()
+            );
             log::info!(
                 "Shutdown stats: speed={:.1}%, fps={:.1}, frametime={:.3}ms",
                 perf_results.emulation_speed * 100.0,
@@ -319,7 +321,7 @@ impl System {
         // In C++: gpu_core->NotifyShutdown();
         // stop_event.request_stop();
 
-        self.core_timing.sync_pause(false);
+        self.core_timing.lock().unwrap().sync_pause(false);
 
         // In C++:
         // Network::CancelPendingSocketOperations();
@@ -332,7 +334,7 @@ impl System {
         // cheat_engine.reset();
         // telemetry_session.reset();
 
-        self.core_timing.clear_pending_events();
+        self.core_timing.lock().unwrap().clear_pending_events();
 
         // In C++:
         // app_loader.reset();
@@ -367,14 +369,14 @@ impl System {
     pub fn stall_application(&mut self) -> parking_lot::MutexGuard<'_, ()> {
         let lk = self.suspend_guard.lock();
         // In C++: kernel.SuspendEmulation(true);
-        self.core_timing.sync_pause(true);
+        self.core_timing.lock().unwrap().sync_pause(true);
         lk
     }
 
     /// Unstall the application (resume if not paused).
     pub fn unstall_application(&mut self) {
         if !self.is_paused() {
-            self.core_timing.sync_pause(false);
+            self.core_timing.lock().unwrap().sync_pause(false);
             // In C++: kernel.SuspendEmulation(false);
         }
     }
@@ -395,13 +397,13 @@ impl System {
     }
 
     /// Gets a reference to the core timing instance.
-    pub fn core_timing(&self) -> &CoreTiming {
-        &self.core_timing
+    pub fn core_timing(&self) -> Arc<StdMutex<CoreTiming>> {
+        self.core_timing.clone()
     }
 
-    /// Gets a mutable reference to the core timing instance.
-    pub fn core_timing_mut(&mut self) -> &mut CoreTiming {
-        &mut self.core_timing
+    /// Gets a shared reference to the core timing instance.
+    pub fn core_timing_shared(&self) -> Arc<StdMutex<CoreTiming>> {
+        self.core_timing.clone()
     }
 
     /// Gets a reference to the CPU manager.
@@ -446,7 +448,9 @@ impl System {
     /// Gets and resets performance statistics.
     pub fn get_and_reset_perf_stats(&self) -> PerfStatsResults {
         match &self.perf_stats {
-            Some(stats) => stats.get_and_reset_stats(self.core_timing.get_global_time_us()),
+            Some(stats) => stats.get_and_reset_stats(
+                self.core_timing.lock().unwrap().get_global_time_us()
+            ),
             None => PerfStatsResults::default(),
         }
     }
