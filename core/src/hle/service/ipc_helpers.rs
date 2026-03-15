@@ -201,6 +201,20 @@ impl<'a> ResponseBuilder<'a> {
         self.push_u32(0);
     }
 
+    /// Push a copy handle into the handle descriptor area.
+    ///
+    /// Matches upstream `ResponseBuilder::PushCopyObjects`.
+    /// Copy handles are written at handles_offset + copy_index.
+    pub fn push_copy_objects(&mut self, handle: u32) {
+        let offset = self.context.handles_offset as usize;
+        let copy_index = self.context.outgoing_copy_objects.len();
+        let target = offset + copy_index;
+        if target < ipc::COMMAND_BUFFER_LENGTH {
+            self.context.cmd_buf[target] = handle;
+        }
+        self.context.outgoing_copy_objects.push(handle);
+    }
+
     /// Push a move handle into the handle descriptor area.
     ///
     /// Matches upstream `ResponseBuilder::PushMoveObjects`.
