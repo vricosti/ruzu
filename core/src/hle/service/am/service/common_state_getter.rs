@@ -65,14 +65,26 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 503: IsDisablingSleepSuppressed (unimplemented)
 /// - 900: SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled
 pub struct ICommonStateGetter {
-    // TODO: Applet reference
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
+    /// Event handle for GetEventHandle (cmd 0).
+    /// In upstream, this comes from the LifecycleManager's system event.
+    /// For bring-up, we create a dummy event that's always signaled.
+    message_event_handle: u32,
 }
 
 impl ICommonStateGetter {
     pub fn new() -> Self {
+        // Create a dummy event handle. In upstream this would be a real
+        // KReadableEvent from the LifecycleManager.
+        static NEXT_EVENT_HANDLE: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0xBEEF_0000);
+        let message_event_handle =
+            NEXT_EVENT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let handlers = build_handler_map(&[
+            (0, Some(Self::get_event_handle_handler), "GetEventHandle"),
+            (1, Some(Self::receive_message_handler), "ReceiveMessage"),
             (5, Some(Self::get_operation_mode_handler), "GetOperationMode"),
             (8, Some(Self::get_boot_mode_handler), "GetBootMode"),
             (9, Some(Self::get_current_focus_state_handler), "GetCurrentFocusState"),
@@ -108,6 +120,7 @@ impl ICommonStateGetter {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            message_event_handle,
         }
     }
 
@@ -170,6 +183,29 @@ impl ICommonStateGetter {
     /// Port of ICommonStateGetter::SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled
     pub fn set_request_exit_to_library_applet_at_execute_next_program_enabled(&self) {
         log::warn!("(STUBBED) SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled called");
+    }
+
+    /// GetEventHandle (cmd 0): returns a copy handle to the message event.
+    /// Matches upstream: OutCopyHandle<KReadableEvent> from LifecycleManager.
+    fn get_event_handle_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        log::debug!("ICommonStateGetter::GetEventHandle called -> handle={:#x}", service.message_event_handle);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0); // 1 copy handle
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(service.message_event_handle);
+    }
+
+    /// ReceiveMessage (cmd 1): receives an applet message.
+    /// For bring-up, returns NoMessages to indicate no pending messages.
+    fn receive_message_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ICommonStateGetter::ReceiveMessage called");
+        // Return ResultNoMessages (AM module, error 3)
+        // This is the normal "no message available" response.
+        let result_no_messages = ResultCode::from_module_description(
+            crate::hle::result::ErrorModule::AM, 3
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result_no_messages);
     }
 
     fn get_operation_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
