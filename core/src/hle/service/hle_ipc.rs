@@ -259,8 +259,8 @@ pub struct HLERequestContext {
     incoming_move_handles: Vec<Handle>,
     incoming_copy_handles: Vec<Handle>,
 
-    outgoing_move_objects: Vec<Handle>,
-    outgoing_copy_objects: Vec<Handle>,
+    pub(crate) outgoing_move_objects: Vec<Handle>,
+    pub(crate) outgoing_copy_objects: Vec<Handle>,
     outgoing_domain_objects: Vec<SessionRequestHandlerPtr>,
 
     command: u32,
@@ -453,6 +453,39 @@ impl HLERequestContext {
 
     pub fn get_manager(&self) -> Option<&Arc<Mutex<SessionRequestManager>>> {
         self.manager.as_ref()
+    }
+
+    /// Creates a client session for a service handler and registers it in the
+    /// process handle table. Returns the handle that can be pushed as a move object.
+    ///
+    /// Matches upstream flow: KClientPort::CreateSession → handle_table.Add().
+    pub fn create_session_for_service(
+        &self,
+        handler: SessionRequestHandlerPtr,
+    ) -> Option<Handle> {
+        let thread = self.thread.as_ref()?;
+        let thread_guard = thread.lock().unwrap();
+        let parent = thread_guard.parent.as_ref()?.upgrade()?;
+        let mut process = parent.lock().unwrap();
+
+        // Create a new KClientSession with a SessionRequestManager for this handler.
+        static NEXT_SESSION_OBJECT_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0x1000_0000);
+        let object_id = NEXT_SESSION_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let manager = Arc::new(std::sync::Mutex::new(SessionRequestManager::new()));
+        manager.lock().unwrap().set_session_handler(handler);
+
+        let session = Arc::new(std::sync::Mutex::new(
+            crate::hle::kernel::k_client_session::KClientSession::new(),
+        ));
+        session.lock().unwrap().initialize_with_manager(object_id, manager);
+
+        // Register in process and add to handle table.
+        process.register_client_session_object(object_id, session);
+        let handle = process.handle_table.add(object_id).ok()?;
+
+        Some(handle)
     }
 
     pub fn get_is_deferred(&self) -> bool {
@@ -756,19 +789,22 @@ impl HLERequestContext {
         let mut current_offset = self.handles_offset as usize;
 
         // Translate outgoing copy objects to handles.
-        // TODO: needs handle_table.Add() — for now write 0 placeholders.
+        // TODO: needs handle_table.Add() for proper KAutoObject translation.
+        // For now, skip past — handles were written by push_move_objects/push_copy_objects.
         for _ in &self.outgoing_copy_objects {
             if current_offset < ipc::COMMAND_BUFFER_LENGTH {
-                self.cmd_buf[current_offset] = 0;
+                // Handle already written at this offset by ResponseBuilder
                 current_offset += 1;
             }
         }
 
         // Translate outgoing move objects to handles.
-        // TODO: needs handle_table.Add() — for now write 0 placeholders.
+        // Handles were already written by ResponseBuilder::push_move_objects.
+        // In upstream, this would call handle_table.Add() to translate KAutoObject*
+        // to handles. Our handles are already direct handle values.
         for _ in &self.outgoing_move_objects {
             if current_offset < ipc::COMMAND_BUFFER_LENGTH {
-                self.cmd_buf[current_offset] = 0;
+                // Handle already written at this offset by ResponseBuilder
                 current_offset += 1;
             }
         }
@@ -802,7 +838,11 @@ impl HLERequestContext {
         // Write the command buffer back to guest TLS memory.
         // Matches upstream: memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), write_size * sizeof(u32))
         if let Some(ref mem) = self.shared_memory {
-            let write_words = self.write_size as usize;
+            // write_size may not cover the full header+handles area if it was
+            // calculated from data_size only. Use the full COMMAND_BUFFER_LENGTH
+            // to ensure handles in the header area are written back.
+            // TODO: compute exact write size matching upstream.
+            let write_words = ipc::COMMAND_BUFFER_LENGTH;
             let mut mem = mem.write().unwrap();
             for i in 0..write_words.min(ipc::COMMAND_BUFFER_LENGTH) {
                 mem.write_32(self.tls_address + (i as u64 * 4), self.cmd_buf[i]);
