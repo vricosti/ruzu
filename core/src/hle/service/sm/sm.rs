@@ -294,12 +294,14 @@ impl Sm {
     fn get_service_impl(&self, ctx: &mut HLERequestContext) -> (ResultCode, Option<u32>) {
         if let Some(manager) = ctx.get_manager() {
             if !manager.lock().unwrap().get_is_initialized_for_sm() {
+                log::warn!("  GetService: client not initialized for SM");
                 return (RESULT_INVALID_CLIENT, None);
             }
         }
 
         let mut rp = RequestParser::new(ctx);
         let name = Self::pop_service_name(&mut rp);
+        log::info!("  GetService: looking up \"{}\"", name);
 
         let sm = self.service_manager.lock().unwrap();
         match sm.get_service_port(&name) {
@@ -308,7 +310,7 @@ impl Sm {
                 (RESULT_INVALID_SERVICE_NAME, None)
             }
             Err(_) => {
-                log::info!("Waiting for service {} to become available", name);
+                log::error!("GetService: service '{}' not registered!", name);
                 ctx.set_is_deferred();
                 (RESULT_NOT_REGISTERED, None)
             }

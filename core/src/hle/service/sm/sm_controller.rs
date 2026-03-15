@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::ipc_helpers::{ResponseBuilder, ResponseBuilderFlags};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC Controller service.
@@ -120,14 +120,29 @@ impl Controller {
     }
 
     /// Clones the current session object.
+    ///
+    /// Matches upstream: creates a new KSession, copies the session handler
+    /// from the current manager, and pushes the client session as a move handle.
     fn clone_current_object(&self, ctx: &mut HLERequestContext) {
         log::debug!("Controller::CloneCurrentObject called");
 
-        // TODO: Full implementation requires creating a new KSession, registering with the
-        // server manager, and pushing the client session as a move handle.
-        // For now, just push success.
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        // Clone the current session's handler into a new client session.
+        let handler = ctx.get_manager()
+            .and_then(|m| m.lock().unwrap().session_handler().cloned());
+
+        let session_handle = if let Some(handler) = handler {
+            ctx.create_session_for_service(handler).unwrap_or(0)
+        } else {
+            log::warn!("CloneCurrentObject: no session handler to clone");
+            0
+        };
+
+        let mut rb = ResponseBuilder::new_with_flags(
+            ctx, 2, 0, 1,
+            ResponseBuilderFlags::AlwaysMoveHandles,
+        );
         rb.push_result(RESULT_SUCCESS);
+        rb.push_move_objects(session_handle);
     }
 
     /// Clones the current session object (extended variant).
