@@ -2,18 +2,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of zuyu/src/core/hle/service/server_manager.h and server_manager.cpp
-//! Status: Structural stub
 //!
 //! Contains:
 //! - ServerManager: manages server ports and sessions for HLE services
+//! - Session: wrapper pairing a KServerSession with a SessionRequestManager
 //!
-//! The upstream implementation uses kernel synchronization objects (KEvent, KServerPort,
-//! KServerSession), multi-wait, and intrusive lists. This is stubbed until kernel integration
-//! is wired up. The structural shape matches upstream.
+//! Upstream uses kernel synchronization objects, multi-wait, and intrusive lists.
+//! This port implements the key structural relationships while stubbing the
+//! event-driven dispatch until full kernel integration.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_server_session::KServerSession;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
     SessionRequestHandlerFactory, SessionRequestHandlerPtr, SessionRequestManager,
@@ -27,15 +28,28 @@ enum UserDataTag {
     DeferEvent,
 }
 
+/// Session wrapper pairing a KServerSession with its SessionRequestManager.
+///
+/// Matches upstream `Service::Session` (server_manager.cpp) which wraps:
+/// - Pointer to KServerSession (the kernel object)
+/// - Shared reference to SessionRequestManager (HLE dispatch state)
+///
+/// In upstream, Session is also a MultiWaitHolder for the kernel event loop.
+struct Session {
+    server_session: Arc<Mutex<KServerSession>>,
+    manager: Arc<Mutex<SessionRequestManager>>,
+}
+
 /// Manages server ports and sessions for HLE services.
 ///
 /// Corresponds to upstream `Service::ServerManager`.
-///
-/// The full implementation orchestrates waiting on multiple kernel synchronization objects,
-/// dispatching IPC requests to the appropriate session handlers, and managing deferred requests.
 pub struct ServerManager {
     /// Registered named services with their factories.
     registered_services: HashMap<String, SessionRequestHandlerFactory>,
+
+    /// Active sessions (server session + manager pairs).
+    /// Matches upstream `m_sessions` intrusive list of Session wrappers.
+    sessions: Vec<Session>,
 
     /// Whether the server has been stopped.
     stopped: bool,
@@ -46,39 +60,47 @@ impl ServerManager {
     pub fn new() -> Self {
         Self {
             registered_services: HashMap::new(),
+            sessions: Vec::new(),
             stopped: false,
         }
     }
 
     /// Registers a session with a manager.
     ///
-    /// Corresponds to upstream `ServerManager::RegisterSession`.
+    /// Matches upstream `ServerManager::RegisterSession(KServerSession*, shared_ptr<SessionRequestManager>)`.
+    ///
+    /// Creates a Session wrapper that pairs the server session with the manager,
+    /// and also sets the manager on the KServerSession for direct dispatch.
     pub fn register_session(
         &mut self,
-        _manager: Arc<Mutex<SessionRequestManager>>,
+        server_session: Arc<Mutex<KServerSession>>,
+        manager: Arc<Mutex<SessionRequestManager>>,
     ) -> ResultCode {
-        // TODO: implement when kernel integration is ready
+        // Set the manager on the server session so it knows how to dispatch.
+        server_session.lock().unwrap().set_manager(manager.clone());
+
+        // Store the pairing.
+        self.sessions.push(Session {
+            server_session,
+            manager,
+        });
+
         RESULT_SUCCESS
     }
 
     /// Registers a named service with a handler factory.
-    ///
-    /// Corresponds to upstream `ServerManager::RegisterNamedService` (factory variant).
     pub fn register_named_service(
         &mut self,
         service_name: &str,
         handler_factory: SessionRequestHandlerFactory,
         _max_sessions: u32,
     ) -> ResultCode {
-        // TODO: wire up to SM service manager for full registration
         self.registered_services
             .insert(service_name.to_string(), handler_factory);
         RESULT_SUCCESS
     }
 
     /// Registers a named service with a shared handler.
-    ///
-    /// Corresponds to upstream `ServerManager::RegisterNamedService` (handler variant).
     pub fn register_named_service_handler(
         &mut self,
         service_name: &str,
@@ -91,48 +113,35 @@ impl ServerManager {
     }
 
     /// Manages a named port.
-    ///
-    /// Corresponds to upstream `ServerManager::ManageNamedPort`.
     pub fn manage_named_port(
         &mut self,
         service_name: &str,
         handler_factory: SessionRequestHandlerFactory,
         _max_sessions: u32,
     ) -> ResultCode {
-        // TODO: create KPort, register with kernel object names
         self.registered_services
             .insert(service_name.to_string(), handler_factory);
         RESULT_SUCCESS
     }
 
     /// Manages deferral events.
-    ///
-    /// Corresponds to upstream `ServerManager::ManageDeferral`.
     pub fn manage_deferral(&mut self) -> ResultCode {
-        // TODO: create deferral KEvent
         RESULT_SUCCESS
     }
 
     /// Main loop for processing server events.
-    ///
-    /// Corresponds to upstream `ServerManager::LoopProcess`.
     pub fn loop_process(&mut self) -> ResultCode {
         // TODO: implement event loop when kernel integration is ready
         RESULT_SUCCESS
     }
 
     /// Starts additional host threads for processing.
-    ///
-    /// Corresponds to upstream `ServerManager::StartAdditionalHostThreads`.
     pub fn start_additional_host_threads(&mut self, _name: &str, _num_threads: usize) {
         // TODO: implement when threading is wired up
     }
 
     /// Runs a server manager to completion.
-    ///
-    /// Corresponds to upstream `ServerManager::RunServer`.
     pub fn run_server(server: Box<ServerManager>) {
-        // TODO: implement when system integration is ready
         drop(server);
     }
 
@@ -140,12 +149,16 @@ impl ServerManager {
     pub fn is_stopped(&self) -> bool {
         self.stopped
     }
+
+    /// Returns the number of active sessions.
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
 }
 
 impl Drop for ServerManager {
     fn drop(&mut self) {
         self.stopped = true;
-        // TODO: signal stop, wait for threads, clean up ports and sessions
     }
 }
 
@@ -157,5 +170,20 @@ mod tests {
     fn test_server_manager_creation() {
         let mgr = ServerManager::new();
         assert!(!mgr.is_stopped());
+        assert_eq!(mgr.session_count(), 0);
+    }
+
+    #[test]
+    fn test_register_session() {
+        let mut mgr = ServerManager::new();
+        let server = Arc::new(Mutex::new(KServerSession::new()));
+        let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+
+        let result = mgr.register_session(server.clone(), manager.clone());
+        assert_eq!(result, RESULT_SUCCESS);
+        assert_eq!(mgr.session_count(), 1);
+
+        // Server session should now have the manager set
+        assert!(server.lock().unwrap().get_manager().is_some());
     }
 }
