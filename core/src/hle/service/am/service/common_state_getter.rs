@@ -83,8 +83,11 @@ impl ICommonStateGetter {
             (0, Some(Self::get_event_handle_handler), "GetEventHandle"),
             (1, Some(Self::receive_message_handler), "ReceiveMessage"),
             (5, Some(Self::get_operation_mode_handler), "GetOperationMode"),
+            (6, Some(Self::get_performance_mode_handler), "GetPerformanceMode"),
             (8, Some(Self::get_boot_mode_handler), "GetBootMode"),
             (9, Some(Self::get_current_focus_state_handler), "GetCurrentFocusState"),
+            (10, Some(Self::request_to_acquire_sleep_lock_handler), "RequestToAcquireSleepLock"),
+            (13, Some(Self::get_acquired_sleep_lock_event_handler), "GetAcquiredSleepLockEvent"),
             (50, Some(Self::is_vr_mode_enabled_handler), "IsVrModeEnabled"),
             (51, Some(Self::set_vr_mode_enabled_handler), "SetVrModeEnabled"),
             (
@@ -215,6 +218,33 @@ impl ICommonStateGetter {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(result_no_messages);
         }
+    }
+
+    /// GetPerformanceMode (cmd 6): returns current performance mode.
+    /// Matches upstream: `*out = system.GetAPMController().GetCurrentPerformanceMode()`
+    fn get_performance_mode_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ICommonStateGetter::GetPerformanceMode called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(0); // PerformanceMode::Normal = 0
+    }
+
+    /// RequestToAcquireSleepLock (cmd 10): acquires sleep lock immediately.
+    /// Matches upstream: signals sleep_lock_event.
+    fn request_to_acquire_sleep_lock_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) RequestToAcquireSleepLock called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// GetAcquiredSleepLockEvent (cmd 13): returns event handle for sleep lock.
+    /// Matches upstream: returns OutCopyHandle<KReadableEvent> from sleep_lock_event.
+    fn get_acquired_sleep_lock_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) GetAcquiredSleepLockEvent called");
+        let handle = ctx.create_readable_event_handle(true).unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
     }
 
     fn get_operation_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

@@ -86,10 +86,22 @@ pub struct IApplicationFunctions {
 impl IApplicationFunctions {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
+            (1, Some(Self::pop_launch_parameter_handler), "PopLaunchParameter"),
+            (20, Some(Self::ensure_save_data_handler), "EnsureSaveData"),
+            (21, Some(Self::get_desired_language_handler), "GetDesiredLanguage"),
+            (22, Some(Self::set_terminate_result_handler), "SetTerminateResult"),
             (40, Some(Self::notify_running_handler), "NotifyRunning"),
+            (50, Some(Self::get_pseudo_device_id_handler), "GetPseudoDeviceId"),
             (65, Some(Self::is_game_play_recording_supported_handler), "IsGamePlayRecordingSupported"),
+            (66, Some(Self::initialize_game_play_recording_handler), "InitializeGamePlayRecording"),
+            (67, Some(Self::set_game_play_recording_state_handler), "SetGamePlayRecordingState"),
             (90, Some(Self::enable_application_crash_report_handler), "EnableApplicationCrashReport"),
+            (100, Some(Self::initialize_application_copyright_frame_buffer_handler), "InitializeApplicationCopyrightFrameBuffer"),
+            (110, Some(Self::get_gpu_error_detected_system_event_handler), "GetGpuErrorDetectedSystemEvent"),
+            (120, Some(Self::get_friend_invitation_storage_channel_event_handler), "GetFriendInvitationStorageChannelEvent"),
             (123, Some(Self::get_previous_program_index_handler), "GetPreviousProgramIndex"),
+            (124, Some(Self::get_launch_reason_handler), "GetLaunchReason"),
+            (130, Some(Self::get_health_warning_disappeared_system_event_handler), "GetHealthWarningDisappearedSystemEvent"),
             (1001, Some(Self::prepare_for_jit_handler), "PrepareForJit"),
         ]);
         Self {
@@ -210,6 +222,108 @@ impl IApplicationFunctions {
         service.prepare_for_jit();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// PopLaunchParameter (cmd 1): returns empty launch parameter
+    fn pop_launch_parameter_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) PopLaunchParameter called");
+        // Upstream returns LaunchParameterData via IStorage.
+        // For bring-up, return ResultNoDataInChannel.
+        let result = ResultCode::from_module_description(crate::hle::result::ErrorModule::AM, 2);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+
+    /// EnsureSaveData (cmd 20): ensures save data exists for the given user.
+    /// Upstream creates save data via filesystem controller, returns Out<u64> = 0.
+    fn ensure_save_data_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) EnsureSaveData called");
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(0); // size = 0
+    }
+
+    /// GetDesiredLanguage (cmd 21): returns the desired language code.
+    fn get_desired_language_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) GetDesiredLanguage called");
+        // "en" language code
+        let language_code: u64 = u64::from_le_bytes([b'e', b'n', 0, 0, 0, 0, 0, 0]);
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(language_code);
+    }
+
+    /// SetTerminateResult (cmd 22)
+    fn set_terminate_result_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) SetTerminateResult called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// GetPseudoDeviceId (cmd 50): returns a pseudo device ID (UUID).
+    fn get_pseudo_device_id_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) GetPseudoDeviceId called");
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        // Push 128-bit UUID (all zeros for stub)
+        rb.push_u64(0);
+        rb.push_u64(0);
+    }
+
+    /// InitializeGamePlayRecording (cmd 66)
+    fn initialize_game_play_recording_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) InitializeGamePlayRecording called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// SetGamePlayRecordingState (cmd 67)
+    fn set_game_play_recording_state_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) SetGamePlayRecordingState called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// InitializeApplicationCopyrightFrameBuffer (cmd 100)
+    fn initialize_application_copyright_frame_buffer_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) InitializeApplicationCopyrightFrameBuffer called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// GetGpuErrorDetectedSystemEvent (cmd 110): returns an event handle
+    fn get_gpu_error_detected_system_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) GetGpuErrorDetectedSystemEvent called");
+        let handle = ctx.create_readable_event_handle(false).unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
+    }
+
+    /// GetFriendInvitationStorageChannelEvent (cmd 120): returns an event handle
+    fn get_friend_invitation_storage_channel_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) GetFriendInvitationStorageChannelEvent called");
+        let handle = ctx.create_readable_event_handle(false).unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
+    }
+
+    /// GetLaunchReason (cmd 124)
+    fn get_launch_reason_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) GetLaunchReason called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(0); // AppletProcessLaunchReason::Normal = 0
+    }
+
+    /// GetHealthWarningDisappearedSystemEvent (cmd 130): returns an event handle
+    fn get_health_warning_disappeared_system_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) GetHealthWarningDisappearedSystemEvent called");
+        let handle = ctx.create_readable_event_handle(false).unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
     }
 }
 
