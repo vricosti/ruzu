@@ -88,12 +88,15 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
     {
         let mem = debug_memory.read().unwrap();
         log::info!(
-            "  TLS after response: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            "  TLS[0..15]: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
             mem.read_32(tls_address), mem.read_32(tls_address + 4),
             mem.read_32(tls_address + 8), mem.read_32(tls_address + 12),
             mem.read_32(tls_address + 16), mem.read_32(tls_address + 20),
             mem.read_32(tls_address + 24), mem.read_32(tls_address + 28),
             mem.read_32(tls_address + 32), mem.read_32(tls_address + 36),
+            mem.read_32(tls_address + 40), mem.read_32(tls_address + 44),
+            mem.read_32(tls_address + 48), mem.read_32(tls_address + 52),
+            mem.read_32(tls_address + 56), mem.read_32(tls_address + 60),
         );
     }
 
