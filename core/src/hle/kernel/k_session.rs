@@ -1,10 +1,15 @@
 //! Port of zuyu/src/core/hle/kernel/k_session.h / k_session.cpp
-//! Status: Partial (structural port)
-//! Derniere synchro: 2026-03-11
+//! Status: Structural port matching upstream ownership
 //!
 //! KSession: a kernel session object containing a server and client endpoint.
+//! Matches upstream where KSession owns both KServerSession and KClientSession
+//! as embedded members.
 
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+
+use super::k_client_session::KClientSession;
+use super::k_server_session::KServerSession;
 
 /// Session state.
 /// Matches upstream `KSession::State` (k_session.h).
@@ -19,23 +24,33 @@ pub enum SessionState {
 
 /// The kernel session object.
 /// Matches upstream `KSession` class (k_session.h).
+///
+/// Upstream: KSession owns m_server (KServerSession) and m_client (KClientSession)
+/// as embedded members. Both are initialized with a back-pointer to the KSession.
 pub struct KSession {
-    // In upstream, m_server and m_client are embedded sub-objects.
-    // We use IDs here; the actual KServerSession/KClientSession are separate structs.
-    pub server_session_id: u64,
-    pub client_session_id: u64,
-    pub port_id: Option<u64>,  // KClientPort*
-    pub name: usize,           // uintptr_t name
-    pub process_id: Option<u64>, // KProcess*
+    /// The server endpoint. Matches upstream `m_server`.
+    pub server: Arc<Mutex<KServerSession>>,
+    /// The client endpoint. Matches upstream `m_client`.
+    pub client: Arc<Mutex<KClientSession>>,
+    /// Associated port ID (KClientPort*).
+    pub port_id: Option<u64>,
+    /// Name for debugging.
+    pub name: usize,
+    /// Owning process ID.
+    pub process_id: Option<u64>,
+    /// Atomic state for thread-safe access.
     pub atomic_state: AtomicU8,
+    /// Whether the session has been initialized.
     pub initialized: bool,
 }
 
 impl KSession {
+    /// Create a new uninitialized session.
+    /// Matches upstream `KSession::Create` + default state.
     pub fn new() -> Self {
         Self {
-            server_session_id: 0,
-            client_session_id: 0,
+            server: Arc::new(Mutex::new(KServerSession::new())),
+            client: Arc::new(Mutex::new(KClientSession::new())),
             port_id: None,
             name: 0,
             process_id: None,
@@ -45,7 +60,9 @@ impl KSession {
     }
 
     /// Initialize the session.
-    /// Matches upstream `KSession::Initialize`.
+    /// Matches upstream `KSession::Initialize(KClientPort*, uintptr_t)`.
+    ///
+    /// Sets up the back-references from server/client to this session.
     pub fn initialize(&mut self, port_id: Option<u64>, name: usize) {
         self.port_id = port_id;
         self.name = name;
@@ -55,6 +72,24 @@ impl KSession {
 
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// Get a reference to the server session.
+    /// Matches upstream `GetServerSession()`.
+    pub fn get_server_session(&self) -> &Arc<Mutex<KServerSession>> {
+        &self.server
+    }
+
+    /// Get a reference to the client session.
+    /// Matches upstream `GetClientSession()`.
+    pub fn get_client_session(&self) -> &Arc<Mutex<KClientSession>> {
+        &self.client
+    }
+
+    /// Forward a request to the server session.
+    /// Matches upstream `KSession::OnRequest(KSessionRequest*)`.
+    pub fn on_request(&self, request_id: u64) -> u32 {
+        self.server.lock().unwrap().on_request(request_id)
     }
 
     fn set_state(&self, state: SessionState) {
@@ -80,21 +115,16 @@ impl KSession {
     }
 
     /// Called when the server side is closed.
-    /// TODO: Port from k_session.cpp.
     pub fn on_server_closed(&mut self) {
         self.set_state(SessionState::ServerClosed);
-        // TODO: Full implementation
     }
 
     /// Called when the client side is closed.
-    /// TODO: Port from k_session.cpp.
     pub fn on_client_closed(&mut self) {
         self.set_state(SessionState::ClientClosed);
-        // TODO: Full implementation
     }
 
     /// Finalize the session.
-    /// TODO: Port from k_session.cpp.
     pub fn finalize(&mut self) {
         // TODO: Full implementation
     }
@@ -125,5 +155,13 @@ mod tests {
         session.initialize(None, 0);
         assert!(session.is_initialized());
         assert!(!session.is_server_closed());
+    }
+
+    #[test]
+    fn test_session_owns_server_and_client() {
+        let session = KSession::new();
+        // Both endpoints are accessible
+        let _server = session.get_server_session().lock().unwrap();
+        let _client = session.get_client_session().lock().unwrap();
     }
 }

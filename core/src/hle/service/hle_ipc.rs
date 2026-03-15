@@ -467,42 +467,33 @@ impl HLERequestContext {
         self.service_manager.as_ref()
     }
 
-    /// Creates a client session for a service handler and registers it in the
-    /// process handle table. Returns the handle that can be pushed as a move object.
+    /// Creates a full KSession (server + client) for a service handler.
+    /// Registers the client session in the process handle table and links
+    /// the server session to the manager.
     ///
-    /// Matches upstream flow: KClientPort::CreateSession → handle_table.Add().
+    /// Matches upstream flow:
+    /// 1. KSession::Create(kernel) → creates session with server + client
+    /// 2. session->Initialize(nullptr, 0)
+    /// 3. ServerManager::RegisterSession(server_session, manager)
+    /// 4. handle_table.Add(client_session)
     pub fn create_session_for_service(
         &self,
         handler: SessionRequestHandlerPtr,
     ) -> Option<Handle> {
-        let thread = self.thread.as_ref()?;
-        let thread_guard = thread.lock().unwrap();
-        let parent = thread_guard.parent.as_ref()?.upgrade()?;
-        let mut process = parent.lock().unwrap();
-
-        // Create a new KClientSession with a SessionRequestManager for this handler.
-        static NEXT_SESSION_OBJECT_ID: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0x1000_0000);
-        let object_id = NEXT_SESSION_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         let manager = Arc::new(std::sync::Mutex::new(SessionRequestManager::new()));
         manager.lock().unwrap().set_session_handler(handler);
-
-        let session = Arc::new(std::sync::Mutex::new(
-            crate::hle::kernel::k_client_session::KClientSession::new(),
-        ));
-        session.lock().unwrap().initialize_with_manager(object_id, manager);
-
-        // Register in process and add to handle table.
-        process.register_client_session_object(object_id, session);
-        let handle = process.handle_table.add(object_id).ok()?;
-
-        Some(handle)
+        self.create_session_with_manager(manager)
     }
 
-    /// Creates a client session that shares an existing SessionRequestManager.
+    /// Creates a full KSession that shares an existing SessionRequestManager.
     /// Used by CloneCurrentObject to replicate upstream behavior where the clone
-    /// shares the same manager (and thus the same domain state) as the parent.
+    /// is registered with the SAME manager as the parent session.
+    ///
+    /// Matches upstream `Controller::CloneCurrentObject`:
+    /// ```cpp
+    /// session_manager->GetServerManager().RegisterSession(
+    ///     &session->GetServerSession(), session_manager);
+    /// ```
     pub fn create_session_with_manager(
         &self,
         manager: Arc<std::sync::Mutex<SessionRequestManager>>,
@@ -516,12 +507,24 @@ impl HLERequestContext {
             std::sync::atomic::AtomicU64::new(0x1000_0000);
         let object_id = NEXT_SESSION_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let session = Arc::new(std::sync::Mutex::new(
-            crate::hle::kernel::k_client_session::KClientSession::new(),
-        ));
-        session.lock().unwrap().initialize_with_manager(object_id, manager);
+        // Create the full KSession (owns both server and client endpoints).
+        // Matches upstream: KSession::Create(kernel) + Initialize(nullptr, 0).
+        let mut ksession = crate::hle::kernel::k_session::KSession::new();
+        ksession.initialize(None, 0);
 
-        process.register_client_session_object(object_id, session);
+        // Link the server session to the manager.
+        // Matches upstream: ServerManager::RegisterSession(server_session, manager).
+        ksession.server.lock().unwrap().set_manager(manager.clone());
+
+        // Set up the client session with the manager for IPC dispatch.
+        ksession.client.lock().unwrap().initialize_with_manager(object_id, manager);
+
+        // Extract the client session Arc for registration.
+        let client_session = ksession.get_client_session().clone();
+
+        // Register in process and add to handle table.
+        // TODO: also register the KSession and KServerSession for lifecycle management.
+        process.register_client_session_object(object_id, client_session);
         let handle = process.handle_table.add(object_id).ok()?;
 
         Some(handle)
