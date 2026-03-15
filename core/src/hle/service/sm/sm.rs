@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
     HLERequestContext, SessionRequestHandler, SessionRequestHandlerFactory,
@@ -239,15 +240,20 @@ impl Sm {
 
     /// SM::GetService (CMIF variant).
     fn get_service_cmif(&self, ctx: &mut HLERequestContext) {
-        let result = self.get_service_impl(ctx);
+        let (result, session_handle) = self.get_service_impl(ctx);
         if ctx.get_is_deferred() {
             return;
         }
 
         if result.is_success() {
-            // In the full implementation, push the client session as a move handle.
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            // Push the client session as a move handle.
+            // Matches upstream: rb{ctx, 2, 0, 1, AlwaysMoveHandles}; rb.PushMoveObjects(session)
+            let mut rb = ResponseBuilder::new_with_flags(
+                ctx, 2, 0, 1,
+                crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
+            );
             rb.push_result(result);
+            rb.push_move_objects(session_handle.unwrap_or(0));
         } else {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(result);
@@ -256,13 +262,17 @@ impl Sm {
 
     /// SM::GetService (TIPC variant).
     fn get_service_tipc(&self, ctx: &mut HLERequestContext) {
-        let result = self.get_service_impl(ctx);
+        let (result, session_handle) = self.get_service_impl(ctx);
         if ctx.get_is_deferred() {
             return;
         }
 
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        let mut rb = ResponseBuilder::new_with_flags(
+            ctx, 2, 0, 1,
+            crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
+        );
         rb.push_result(result);
+        rb.push_move_objects(if result.is_success() { session_handle.unwrap_or(0) } else { 0 });
     }
 
     /// Pop service name from request: 8 bytes of ASCII, printable characters only.
@@ -278,10 +288,13 @@ impl Sm {
     }
 
     /// Internal implementation for GetService.
-    fn get_service_impl(&self, ctx: &mut HLERequestContext) -> ResultCode {
+    /// Returns (result_code, optional session handle).
+    ///
+    /// Matches upstream `SM::GetServiceImpl(KClientSession**, HLERequestContext&)`.
+    fn get_service_impl(&self, ctx: &mut HLERequestContext) -> (ResultCode, Option<u32>) {
         if let Some(manager) = ctx.get_manager() {
             if !manager.lock().unwrap().get_is_initialized_for_sm() {
-                return RESULT_INVALID_CLIENT;
+                return (RESULT_INVALID_CLIENT, None);
             }
         }
 
@@ -292,16 +305,31 @@ impl Sm {
         match sm.get_service_port(&name) {
             Err(e) if e == RESULT_INVALID_SERVICE_NAME => {
                 log::error!("Invalid service name '{}'", name);
-                RESULT_INVALID_SERVICE_NAME
+                (RESULT_INVALID_SERVICE_NAME, None)
             }
             Err(_) => {
                 log::info!("Waiting for service {} to become available", name);
                 ctx.set_is_deferred();
-                RESULT_NOT_REGISTERED
+                (RESULT_NOT_REGISTERED, None)
             }
             Ok(_port) => {
-                // TODO: create a session via the client port
-                RESULT_SUCCESS
+                // Create a session for the service handler.
+                // Matches upstream: client_port->CreateSession(&session)
+                let handler = sm.get_service(&name);
+                drop(sm); // Release ServiceManager lock before accessing process
+
+                if let Some(handler) = handler {
+                    if let Some(handle) = ctx.create_session_for_service(handler) {
+                        log::info!("  GetService(\"{}\") -> handle={:#x}", name, handle);
+                        (RESULT_SUCCESS, Some(handle))
+                    } else {
+                        log::error!("  GetService(\"{}\"): failed to create session", name);
+                        (RESULT_INVALID_STATE, None)
+                    }
+                } else {
+                    log::error!("  GetService(\"{}\"): service handler not found", name);
+                    (RESULT_INVALID_STATE, None)
+                }
             }
         }
     }

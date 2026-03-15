@@ -44,6 +44,7 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
     };
 
     // Create context with thread/memory references (matches upstream constructor).
+    let debug_memory = shared_memory.clone();
     let mut context = HLERequestContext::new_with_thread(
         current_thread,
         shared_memory,
@@ -67,6 +68,19 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
 
     // write_to_outgoing_command_buffer writes back to TLS (upstream path).
     // It's already called inside handle_sync_request_impl via ServiceFramework.
+
+    // Debug: dump TLS after response
+    {
+        let mem = debug_memory.read().unwrap();
+        log::info!(
+            "  TLS after response: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            mem.read_32(tls_address), mem.read_32(tls_address + 4),
+            mem.read_32(tls_address + 8), mem.read_32(tls_address + 12),
+            mem.read_32(tls_address + 16), mem.read_32(tls_address + 20),
+            mem.read_32(tls_address + 24), mem.read_32(tls_address + 28),
+            mem.read_32(tls_address + 32), mem.read_32(tls_address + 36),
+        );
+    }
 
     result
 }

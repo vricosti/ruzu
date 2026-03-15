@@ -201,6 +201,22 @@ impl<'a> ResponseBuilder<'a> {
         self.push_u32(0);
     }
 
+    /// Push a move handle into the handle descriptor area.
+    ///
+    /// Matches upstream `ResponseBuilder::PushMoveObjects`.
+    /// The handle is written at handles_offset + num_copy + move_index.
+    pub fn push_move_objects(&mut self, handle: u32) {
+        let offset = self.context.handles_offset as usize + self.num_handles_to_copy as usize;
+        // Find the next free move handle slot
+        // For simplicity, use outgoing_move_objects count as the index
+        let move_index = self.context.outgoing_move_objects.len();
+        let target = offset + move_index;
+        if target < ipc::COMMAND_BUFFER_LENGTH {
+            self.context.cmd_buf[target] = handle;
+        }
+        self.context.outgoing_move_objects.push(handle);
+    }
+
     /// Push a u32 value.
     pub fn push_u32(&mut self, value: u32) {
         if self.index < ipc::COMMAND_BUFFER_LENGTH {
