@@ -63,6 +63,18 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
         context.get_command(),
     );
 
+    // Debug: if handle is 0, the game didn't receive the previous response correctly
+    if session_handle == 0 {
+        let mem = debug_memory.read().unwrap();
+        log::error!(
+            "  SendSyncRequest with handle=0! TLS at send time: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            mem.read_32(tls_address), mem.read_32(tls_address + 4),
+            mem.read_32(tls_address + 8), mem.read_32(tls_address + 12),
+            mem.read_32(tls_address + 16), mem.read_32(tls_address + 20),
+            mem.read_32(tls_address + 24), mem.read_32(tls_address + 28),
+        );
+    }
+
     // Dispatch to service handler.
     let result = complete_sync_request(&request_manager, &mut context);
 
