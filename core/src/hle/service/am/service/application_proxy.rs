@@ -106,8 +106,11 @@ impl IApplicationProxy {
         ));
     }
 
-    fn get_self_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        Self::push_interface_response(ctx, Arc::new(super::self_controller::ISelfController::new()));
+    fn get_self_controller_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
+        Self::push_interface_response(ctx, Arc::new(
+            super::self_controller::ISelfController::new(proxy.applet.clone())
+        ));
     }
 
     fn get_window_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -143,12 +146,13 @@ impl IApplicationProxy {
     }
 
     fn get_application_functions_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::application_functions::IApplicationFunctions::new()),
+            Arc::new(super::application_functions::IApplicationFunctions::new(proxy.applet.clone())),
         );
     }
 
