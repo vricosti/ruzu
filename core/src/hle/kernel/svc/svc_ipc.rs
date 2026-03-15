@@ -29,9 +29,11 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
     let (client_session, shared_memory) = {
         let process = ctx.current_process.lock().unwrap();
         let Some(object_id) = process.handle_table.get_object(session_handle) else {
+            log::error!("  SendSyncRequest: handle {:#x} not in handle table", session_handle);
             return RESULT_INVALID_HANDLE;
         };
         let Some(client_session) = process.get_client_session_by_object_id(object_id) else {
+            log::error!("  SendSyncRequest: object_id {} not a client session", object_id);
             return RESULT_INVALID_HANDLE;
         };
         process.num_ipc_messages.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
