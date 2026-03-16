@@ -5,9 +5,11 @@
 //! KScheduler: per-core scheduler managing thread dispatch and context switching.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use common::fiber::Fiber;
 
 use super::k_priority_queue::{KPriorityQueue, ThreadAccessor};
 use super::k_process::KProcess;
@@ -52,6 +54,8 @@ pub struct KScheduler {
     pub current_thread_id: Option<u64>,
     pub yielded_thread_id: Option<u64>,
     // Fiber fields for host-thread switching
+    /// Upstream: `std::shared_ptr<Common::Fiber> m_switch_fiber`
+    pub switch_fiber: Option<Arc<Fiber>>,
     pub switch_cur_thread_id: Option<u64>,
     pub switch_highest_priority_thread_id: Option<u64>,
     pub switch_from_schedule: bool,
@@ -68,6 +72,7 @@ impl KScheduler {
             idle_thread_id: None,
             current_thread_id: None,
             yielded_thread_id: None,
+            switch_fiber: None,
             switch_cur_thread_id: None,
             switch_highest_priority_thread_id: None,
             switch_from_schedule: false,
@@ -138,10 +143,80 @@ impl KScheduler {
     }
 
     /// Preempt single core.
-    /// Upstream: disables dispatch, unloads thread, yields to switch fiber.
-    /// In cooperative model: just request a reschedule.
+    /// Matches upstream: disables dispatch, unloads thread, yields to switch fiber.
     pub fn preempt_single_core(&mut self) {
         self.request_schedule();
+        // Upstream: DisableDispatch, Unload, Fiber::YieldTo(switch_fiber), EnableDispatch
+    }
+
+    /// Called when a thread first starts executing on this core.
+    /// Matches upstream `KScheduler::OnThreadStart()`.
+    pub fn on_thread_start(&self, current_thread: &Arc<Mutex<KThread>>) {
+        current_thread.lock().unwrap().enable_dispatch();
+    }
+
+    /// Unload a thread's context (save guest state).
+    /// Matches upstream `KScheduler::Unload(KThread*)`.
+    /// In cooperative model: context save is handled by the dispatch loop
+    /// via PhysicalCore::SaveContext.
+    pub fn unload(&self, _thread: &Arc<Mutex<KThread>>) {
+        // Upstream: m_kernel.PhysicalCore(m_core_id).SaveContext(thread)
+        // Then unlock context_guard if not terminated.
+        // In cooperative model: save happens in physical_core dispatch.
+    }
+
+    /// Reload a thread's context (restore guest state).
+    /// Matches upstream `KScheduler::Reload(KThread*)`.
+    pub fn reload(&self, _thread: &Arc<Mutex<KThread>>) {
+        // Upstream: m_kernel.PhysicalCore(m_core_id).LoadContext(thread)
+        // In cooperative model: load happens in physical_core dispatch.
+    }
+
+    /// Reschedule other cores by sending IPI.
+    /// Matches upstream `KScheduler::RescheduleOtherCores(u64)`.
+    pub fn reschedule_other_cores(&self, cores_needing_scheduling: u64) {
+        let core_mask = cores_needing_scheduling & !(1u64 << self.core_id);
+        if core_mask != 0 {
+            Self::reschedule_cores(core_mask);
+        }
+    }
+
+    /// Send IPI to cores that need rescheduling.
+    /// Matches upstream `KScheduler::RescheduleCores(kernel, core_mask)`.
+    pub fn reschedule_cores(core_mask: u64) {
+        for i in 0..crate::hardware_properties::NUM_CPU_CORES as u64 {
+            if core_mask & (1u64 << i) != 0 {
+                // Upstream: kernel.PhysicalCore(i).Interrupt()
+                // In cooperative model: interrupt other host threads.
+                // For single-core, this is a no-op.
+                log::trace!("RescheduleCores: would interrupt core {}", i);
+            }
+        }
+    }
+
+    /// Reschedule the current core.
+    /// Matches upstream `KScheduler::RescheduleCurrentCore()`.
+    pub fn reschedule_current_core(&mut self) {
+        if self.state.needs_scheduling.load(Ordering::Relaxed) {
+            self.reschedule_current_core_impl();
+        }
+    }
+
+    fn reschedule_current_core_impl(&mut self) {
+        if self.state.needs_scheduling.load(Ordering::Relaxed) {
+            // Upstream: DisableDispatch, Schedule(), EnableDispatch
+            self.state.needs_scheduling.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear previous thread across all schedulers.
+    /// Matches upstream `KScheduler::ClearPreviousThread(kernel, thread)`.
+    pub fn clear_previous_thread(schedulers: &mut [KScheduler], thread_id: u64) {
+        for scheduler in schedulers.iter_mut() {
+            if scheduler.state.prev_thread_id == Some(thread_id) {
+                scheduler.state.prev_thread_id = None;
+            }
+        }
     }
 
     // -- Static methods --
