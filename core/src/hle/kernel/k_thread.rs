@@ -358,7 +358,12 @@ pub struct KThread {
     pub stack_parameters: StackParameters,
 
     // Emulation fields
-    // m_host_context — fiber; stubbed
+    /// Host fiber context for this thread.
+    /// Upstream: `std::shared_ptr<Common::Fiber> m_host_context`
+    pub host_context: Option<Arc<common::fiber::Fiber>>,
+    /// Context guard for fiber switching.
+    /// Upstream: `KSpinLock m_context_guard`
+    pub context_guard: parking_lot::Mutex<()>,
     pub thread_type: ThreadType,
     pub step_state: StepState,
     pub dummy_thread_runnable: bool,
@@ -456,6 +461,8 @@ impl KThread {
             resource_limit_release_hint: false,
             is_kernel_address_key: false,
             stack_parameters: StackParameters::default(),
+            host_context: None,
+            context_guard: parking_lot::Mutex::new(()),
             thread_type: ThreadType::User,
             step_state: StepState::default(),
             dummy_thread_runnable: true,
