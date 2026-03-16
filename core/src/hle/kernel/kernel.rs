@@ -49,7 +49,7 @@ pub struct KernelCore {
     // -- Subsystems --
     hardware_timer: Option<Arc<Mutex<KHardwareTimer>>>,
     global_object_list_container: Option<KAutoObjectWithListContainer>,
-    global_scheduler_context: Option<GlobalSchedulerContext>,
+    global_scheduler_context: Option<Arc<Mutex<GlobalSchedulerContext>>>,
     object_name_global_data: Option<KObjectNameGlobalData>,
 
     // -- Physical cores and schedulers --
@@ -123,7 +123,7 @@ impl KernelCore {
         self.hardware_timer = Some(Arc::new(Mutex::new(KHardwareTimer::new())));
 
         self.global_object_list_container = Some(KAutoObjectWithListContainer::new());
-        self.global_scheduler_context = Some(GlobalSchedulerContext::new());
+        self.global_scheduler_context = Some(Arc::new(Mutex::new(GlobalSchedulerContext::new())));
 
         self.is_phantom_mode_for_singlecore.store(false, Ordering::Relaxed);
 
@@ -196,14 +196,9 @@ impl KernelCore {
         // TODO: Clear server managers.
     }
 
-    /// Get the global scheduler context.
-    pub fn global_scheduler_context(&self) -> Option<&GlobalSchedulerContext> {
+    /// Get the global scheduler context (Arc reference).
+    pub fn global_scheduler_context(&self) -> Option<&Arc<Mutex<GlobalSchedulerContext>>> {
         self.global_scheduler_context.as_ref()
-    }
-
-    /// Get the global scheduler context (mutable).
-    pub fn global_scheduler_context_mut(&mut self) -> Option<&mut GlobalSchedulerContext> {
-        self.global_scheduler_context.as_mut()
     }
 
     /// Get a physical core by index.
