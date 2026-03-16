@@ -216,6 +216,7 @@ impl KScheduler {
     }
 
     /// Yield without core migration.
+    /// Matches upstream `KScheduler::YieldWithoutCoreMigration(kernel)`.
     pub fn yield_without_core_migration(
         &mut self,
         process: &Arc<Mutex<KProcess>>,
@@ -226,19 +227,43 @@ impl KScheduler {
             return;
         };
 
-        let mut current_thread = current_thread.lock().unwrap();
-        if current_thread.get_state() != ThreadState::RUNNABLE {
-            return;
+        {
+            let current_thread = current_thread.lock().unwrap();
+            if current_thread.get_state() != ThreadState::RUNNABLE {
+                return;
+            }
+            if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
+                return;
+            }
         }
 
-        if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
-            return;
-        }
-
+        // Move current thread to the back of its priority level in the PQ.
+        // Upstream: next_thread = priority_queue.MoveToScheduledBack(cur_thread)
+        let next_thread_id = {
+            let mut pq = std::mem::take(&mut process.priority_queue);
+            let next = pq.move_to_scheduled_back(current_thread_id, &*process);
+            process.priority_queue = pq;
+            next
+        };
         process.increment_scheduled_count();
-        self.yielded_thread_id = Some(current_thread_id);
-        self.state.prev_thread_id = Some(current_thread_id);
-        self.request_schedule();
+
+        if let Some(next_id) = next_thread_id {
+            if next_id != current_thread_id {
+                // A different thread is now at the front — schedule update needed.
+                self.yielded_thread_id = Some(current_thread_id);
+                self.request_schedule();
+            } else {
+                // No other thread at this priority — set yield count.
+                current_thread
+                    .lock()
+                    .unwrap()
+                    .set_yield_schedule_count(process.get_scheduled_count());
+            }
+        } else {
+            // PQ was empty (thread not in PQ) — fall back to old behavior.
+            self.yielded_thread_id = Some(current_thread_id);
+            self.request_schedule();
+        }
     }
 
     /// Yield with core migration.
