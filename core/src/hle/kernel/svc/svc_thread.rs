@@ -334,6 +334,8 @@ mod tests {
             .lock()
             .unwrap()
             .register_thread_object(current_thread.clone());
+        // Push main thread into priority queue (it's already RUNNABLE).
+        process.lock().unwrap().push_back_to_priority_queue(1);
         scheduler.lock().unwrap().initialize(1, 0, 0);
 
         let shared_memory = process.lock().unwrap().get_shared_memory();

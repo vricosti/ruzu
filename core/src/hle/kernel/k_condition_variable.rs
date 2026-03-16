@@ -159,11 +159,14 @@ impl KConditionVariable {
             (next_owner_thread, result)
         };
 
-        if let Some(next_owner_thread) = next_owner_thread {
+        if let Some(ref next_owner_thread) = next_owner_thread {
+            let thread_id = next_owner_thread.lock().unwrap().get_thread_id();
             next_owner_thread
                 .lock()
                 .unwrap()
                 .end_wait(result.get_inner_value());
+            // Thread became RUNNABLE — add to PQ.
+            process.lock().unwrap().push_back_to_priority_queue(thread_id);
         }
 
         result
@@ -220,6 +223,8 @@ impl KConditionVariable {
         };
 
         // Update the lock: set address key on current thread and add as waiter.
+        // Thread leaves RUNNABLE → remove from PQ.
+        process_guard.remove_from_priority_queue(current_thread_id);
         let owner_thread_id = owner_thread.lock().unwrap().get_thread_id();
         Self::begin_wait_for_address(current_thread, owner_thread_id, addr, value);
         owner_thread.lock().unwrap().add_waiter(current_thread_id);
@@ -373,6 +378,9 @@ impl KConditionVariable {
             }
         }
 
+        // Thread leaves RUNNABLE → remove from PQ.
+        process_guard.remove_from_priority_queue(current_thread_id);
+
         Self::begin_wait_condition_variable(current_thread, addr, key, value, timeout);
         let thread_key = current_thread.lock().unwrap().condition_variable_tree_key();
         self.waiting_threads.insert(thread_key);
@@ -414,11 +422,15 @@ impl KConditionVariable {
             .unwrap()
             .write_32(address.get(), updated_value);
 
+        let waiting_thread_id = waiting_thread.lock().unwrap().get_thread_id();
+
         if previous_tag == INVALID_HANDLE {
             waiting_thread
                 .lock()
                 .unwrap()
                 .end_wait(RESULT_SUCCESS.get_inner_value());
+            // Thread became RUNNABLE — add to PQ.
+            process_guard.push_back_to_priority_queue(waiting_thread_id);
             return RESULT_SUCCESS;
         }
 
@@ -428,6 +440,7 @@ impl KConditionVariable {
                 .lock()
                 .unwrap()
                 .end_wait(RESULT_INVALID_STATE.get_inner_value());
+            process_guard.push_back_to_priority_queue(waiting_thread_id);
             return RESULT_INVALID_STATE;
         };
         let Some(owner_thread) = process_guard.get_thread_by_object_id(owner_object_id) else {
@@ -435,6 +448,7 @@ impl KConditionVariable {
                 .lock()
                 .unwrap()
                 .end_wait(RESULT_INVALID_STATE.get_inner_value());
+            process_guard.push_back_to_priority_queue(waiting_thread_id);
             return RESULT_INVALID_STATE;
         };
 
