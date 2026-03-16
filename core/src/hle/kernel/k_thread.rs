@@ -1139,6 +1139,8 @@ impl KThread {
 
         if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
             let mut process = parent.lock().unwrap();
+            // Thread leaving RUNNABLE (or any state) → remove from PQ.
+            process.remove_from_priority_queue(self.thread_id);
             process.clear_running_thread(self.thread_id);
             let waiter_snapshot = self.sync_object.waiter_snapshot(&process);
             let outcome = k_synchronization_object::process_waiter_snapshot(

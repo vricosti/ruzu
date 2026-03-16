@@ -777,6 +777,9 @@ impl ThreadQueueImplForKSynchronizationObjectWait {
     ) -> bool {
         if notify_waiter_available(thread, process, signaled_object_id, result) {
             wait_queue.base_end_wait(thread, result);
+            // Note: PQ push for the woken thread must happen AFTER the thread
+            // lock is released (to avoid deadlock in ThreadAccessor). The caller
+            // (process_waiter_snapshot) handles this.
             true
         } else {
             false
@@ -852,6 +855,8 @@ pub fn process_waiter_snapshot(
     let mut woke_any = false;
     let mut unlink_thread_ids = Vec::new();
 
+    let mut woke_thread_ids = Vec::new();
+
     for waiter_thread_id in waiter_thread_ids.iter().copied() {
         let Some(waiter_thread) = process.get_thread_by_thread_id(waiter_thread_id) else {
             unlink_thread_ids.push(waiter_thread_id);
@@ -861,10 +866,16 @@ pub fn process_waiter_snapshot(
         let mut waiter_thread = waiter_thread.lock().unwrap();
         if waiter_thread.notify_available(process, signaled_object_id, result) {
             unlink_thread_ids.push(waiter_thread_id);
+            woke_thread_ids.push(waiter_thread_id);
             woke_any = true;
         } else if waiter_thread.get_state() != super::k_thread::ThreadState::WAITING {
             unlink_thread_ids.push(waiter_thread_id);
         }
+    }
+
+    // Push woken threads to PQ after thread locks are released.
+    for thread_id in woke_thread_ids {
+        process.push_back_to_priority_queue(thread_id);
     }
 
     NotifyWaitersOutcome {
@@ -913,6 +924,9 @@ pub fn wait(
     let current_thread_id = current_thread.lock().unwrap().thread_id;
     wait_set.bind_thread(current_thread_id);
     link_wait_set(process, &wait_set);
+
+    // Thread leaving RUNNABLE → remove from PQ.
+    process.remove_from_priority_queue(current_thread_id);
 
     current_thread
         .lock()
