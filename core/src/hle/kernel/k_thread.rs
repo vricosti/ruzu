@@ -1239,24 +1239,41 @@ impl KThread {
         if old_state == new_state {
             return;
         }
-        let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) else {
-            return;
-        };
-        scheduler.lock().unwrap().on_thread_state_changed(
-            self.thread_id,
-            old_state & ThreadState::MASK,
-            new_state & ThreadState::MASK,
-        );
+
+        let old_base = old_state & ThreadState::MASK;
+        let new_base = new_state & ThreadState::MASK;
+
+        // NOTE: PQ updates happen here in upstream (via KScheduler::OnThreadStateChanged
+        // which calls PQ.Remove/PushBack). We cannot do it here because this is called
+        // while the thread's own mutex is held, and locking the parent process would
+        // create a lock-ordering deadlock (thread→process vs process→thread).
+        //
+        // Instead, callers that transition thread state while holding the process lock
+        // should call process.push_back_to_priority_queue / remove_from_priority_queue
+        // directly. The cooperative dispatch fallback (select_next_thread_id) handles
+        // the case where the PQ is not up to date.
+
+        // Notify the scheduler for dispatch.
+        if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
+            scheduler.lock().unwrap().on_thread_state_changed(
+                self.thread_id,
+                old_base,
+                new_base,
+            );
+        }
     }
 
     fn notify_priority_change(&self, old_priority: i32) {
-        let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) else {
-            return;
-        };
-        scheduler
-            .lock()
-            .unwrap()
-            .on_thread_priority_changed(self.thread_id, old_priority);
+        // Same note as notify_state_transition: PQ updates cannot happen here
+        // due to lock ordering. Callers holding the process lock should call
+        // process.change_priority_in_queue directly.
+
+        if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
+            scheduler
+                .lock()
+                .unwrap()
+                .on_thread_priority_changed(self.thread_id, old_priority);
+        }
     }
 
     fn request_schedule(&self) {

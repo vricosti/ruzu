@@ -372,6 +372,13 @@ impl KScheduler {
             self.wake_expired_sleeping_threads(process);
             self.wake_signaled_synchronization_threads(process);
 
+            // Try PQ-based selection first (O(1) for highest priority thread).
+            if let Some(next) = self.select_next_thread_from_pq(process) {
+                return next;
+            }
+
+            // Fallback to linear scan (handles edge cases where PQ might
+            // not be populated yet, e.g. during early initialization).
             if let Some(next_thread_id) = self.select_next_thread_id(process, current_thread_id) {
                 return next_thread_id;
             }
@@ -386,6 +393,48 @@ impl KScheduler {
 
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Select the next thread using the priority queue.
+    /// This is the upstream-matching dispatch path: O(1) lookup of the
+    /// highest priority RUNNABLE thread for our core.
+    fn select_next_thread_from_pq(
+        &mut self,
+        process: &Arc<Mutex<KProcess>>,
+    ) -> Option<u64> {
+        let process_guard = process.lock().unwrap();
+        let next_thread_id = process_guard.get_scheduled_front(self.core_id)?;
+
+        // Handle yield: if the current thread yielded, try the next one.
+        if let Some(yielded) = self.yielded_thread_id {
+            if next_thread_id == yielded {
+                // The yielded thread is still highest priority.
+                // Get the next thread at the same or lower priority.
+                let next = process_guard.priority_queue.get_scheduled_next(
+                    self.core_id,
+                    next_thread_id,
+                    process_guard
+                        .get_thread_by_thread_id(next_thread_id)
+                        .map(|t| t.lock().unwrap().get_priority())
+                        .unwrap_or(63),
+                    &*process_guard,
+                );
+                if let Some(alternative) = next {
+                    self.yielded_thread_id = None;
+                    return Some(alternative);
+                }
+                // No alternative — yield had no effect, mark it done.
+                if let Some(thread) = process_guard.get_thread_by_thread_id(yielded) {
+                    thread
+                        .lock()
+                        .unwrap()
+                        .set_yield_schedule_count(process_guard.get_scheduled_count());
+                }
+                self.yielded_thread_id = None;
+            }
+        }
+
+        Some(next_thread_id)
     }
 
     pub fn wait_for_next_thread(
