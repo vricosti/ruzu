@@ -145,20 +145,56 @@ impl KScheduler {
     }
 
     // -- Static methods --
-    // In upstream these take `KernelCore&` and access global state.
-    // In our cooperative model they are no-ops or simplified.
+    // In upstream these take `KernelCore&` and access global state via
+    // GetCurrentThread(kernel). Here they take the current thread directly.
 
-    /// Upstream: increments current thread's disable_dispatch_count.
-    /// In cooperative model: no-op (process lock provides exclusion).
-    pub fn disable_scheduling() {}
+    /// Matches upstream `KScheduler::DisableScheduling(kernel)`.
+    /// Increments the current thread's disable_dispatch_count.
+    pub fn disable_scheduling(current_thread: &Arc<Mutex<KThread>>) {
+        current_thread.lock().unwrap().disable_dispatch();
+    }
 
-    /// Upstream: decrements dispatch count, reschedules cores via IPI.
-    /// In cooperative model: no-op (scheduling at SVC boundaries).
-    pub fn enable_scheduling(_cores_needing_scheduling: u64) {}
+    /// Matches upstream `KScheduler::EnableScheduling(kernel, cores_needing_scheduling)`.
+    /// Decrements dispatch count. If it reaches 0, reschedules.
+    /// In cooperative model: scheduling happens at SVC boundaries via the
+    /// dispatch loop, so we just decrement. Upstream would call
+    /// RescheduleOtherCores + RescheduleCurrentCore here.
+    pub fn enable_scheduling(current_thread: &Arc<Mutex<KThread>>, _cores_needing_scheduling: u64) {
+        current_thread.lock().unwrap().enable_dispatch();
+    }
 
-    /// Upstream: checks IsSchedulerUpdateNeeded, calls UpdateHighestPriorityThreadsImpl.
-    /// In cooperative model: returns 0 (no IPI-based rescheduling needed).
-    pub fn update_highest_priority_threads() -> u64 { 0 }
+    /// Matches upstream `KScheduler::UpdateHighestPriorityThreads(kernel)`.
+    /// Called by KAbstractSchedulerLock::Unlock.
+    pub fn update_highest_priority_threads() -> u64 {
+        // In cooperative model, the dispatch loop's select_next_thread_from_pq
+        // handles thread selection at SVC boundaries. This static method
+        // would need GlobalSchedulerContext access (not available here).
+        // Returns 0 = no cores need IPI-based rescheduling.
+        0
+    }
+
+    /// Matches upstream `KScheduler::UpdateHighestPriorityThreadsImpl(kernel)`.
+    /// Selects the highest-priority thread per core from the PQ.
+    /// Returns bitmask of cores needing rescheduling.
+    ///
+    /// This is the simplified single-core version. The full upstream version
+    /// handles pinned threads, idle core migration, and multi-core balancing.
+    pub fn update_highest_priority_threads_impl(
+        schedulers: &mut [KScheduler],
+        process: &KProcess,
+    ) -> u64 {
+        let mut cores_needing_scheduling = 0u64;
+
+        for (core_id, scheduler) in schedulers.iter_mut().enumerate() {
+            let top_thread_id = process.priority_queue.get_scheduled_front(core_id as i32);
+            cores_needing_scheduling |= scheduler.update_highest_priority_thread(top_thread_id);
+        }
+
+        // Upstream also handles idle core migration (moving suggested threads
+        // to idle cores). For single-core this is not applicable.
+
+        cores_needing_scheduling
+    }
 
     /// Update the highest priority thread for this core.
     /// Matches upstream `KScheduler::UpdateHighestPriorityThread(KThread*)`.
@@ -522,6 +558,69 @@ impl KScheduler {
         }
 
         Some(next_thread_id)
+    }
+
+    /// Matches upstream `KScheduler::ScheduleImpl()`.
+    /// Clears needs_scheduling, selects the highest priority thread.
+    ///
+    /// In upstream, this yields to a fiber for context switching.
+    /// In our cooperative model, it updates current_thread_id and returns
+    /// the next thread for the dispatch loop to switch to.
+    pub fn schedule_impl(&mut self, process: &Arc<Mutex<KProcess>>) -> Option<u64> {
+        self.state.needs_scheduling.store(false, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::SeqCst);
+
+        let highest_priority_thread_id = self.state.highest_priority_thread_id;
+
+        // If the interrupt task is runnable, switch to idle.
+        let target = if self.state.interrupt_task_runnable {
+            self.idle_thread_id
+        } else {
+            highest_priority_thread_id
+        };
+
+        // If same as current, nothing to do.
+        if target == self.current_thread_id {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            return None;
+        }
+
+        // Switch thread.
+        if let Some(next_id) = target {
+            self.switch_thread(process, next_id);
+            Some(next_id)
+        } else {
+            // No thread — switch to idle.
+            if let Some(idle_id) = self.idle_thread_id {
+                self.switch_thread(process, idle_id);
+                Some(idle_id)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Matches upstream `KScheduler::SwitchThread(KThread* next_thread)`.
+    /// Updates CPU time tracking, previous thread, current thread.
+    ///
+    /// Upstream also handles process switching and TLS region switching.
+    /// In cooperative model: just update tracking state.
+    pub fn switch_thread(&mut self, process: &Arc<Mutex<KProcess>>, next_thread_id: u64) {
+        let cur_thread_id = self.current_thread_id;
+
+        // Update CPU time tracking.
+        // Upstream: gets clock ticks from CoreTiming, adds delta to thread and process.
+        // Simplified: just update last_context_switch_time.
+        let prev_tick = self.last_context_switch_time;
+        // TODO: get actual tick from CoreTiming
+        let cur_tick = prev_tick + 1;
+        self.last_context_switch_time = cur_tick;
+
+        // Update previous thread.
+        self.state.prev_thread_id = cur_thread_id;
+
+        // Set the new thread.
+        self.current_thread_id = Some(next_thread_id);
     }
 
     pub fn wait_for_next_thread(

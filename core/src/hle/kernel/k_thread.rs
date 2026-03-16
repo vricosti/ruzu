@@ -1620,6 +1620,43 @@ impl super::k_priority_queue::KPriorityQueueMember for KThread {
 // red-black tree through this node. The impl can be restored if/when we
 // switch to an intrusive tree.
 
+/// RAII guard that disables dispatch on construction and enables on destruction.
+/// Matches upstream `KScopedDisableDispatch` (k_thread.h).
+///
+/// On construction: increments current thread's disable_dispatch_count.
+/// On destruction: if count would reach 0, triggers RescheduleCurrentCore
+/// (or RescheduleCurrentHLEThread for phantom/single-core mode).
+/// Otherwise just decrements.
+pub struct KScopedDisableDispatch {
+    thread: Arc<Mutex<KThread>>,
+}
+
+impl KScopedDisableDispatch {
+    /// Create a new scoped disable dispatch guard.
+    /// Upstream takes `KernelCore&` and uses `GetCurrentThread(kernel)`.
+    /// We take the thread directly.
+    pub fn new(thread: &Arc<Mutex<KThread>>) -> Self {
+        thread.lock().unwrap().disable_dispatch();
+        Self {
+            thread: thread.clone(),
+        }
+    }
+}
+
+impl Drop for KScopedDisableDispatch {
+    fn drop(&mut self) {
+        let mut thread = self.thread.lock().unwrap();
+        if thread.get_disable_dispatch_count() <= 1 {
+            // Upstream: would call RescheduleCurrentCore() or
+            // RescheduleCurrentHLEThread(). In cooperative model,
+            // scheduling happens at SVC boundaries. Just enable dispatch.
+            thread.enable_dispatch();
+        } else {
+            thread.enable_dispatch();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
