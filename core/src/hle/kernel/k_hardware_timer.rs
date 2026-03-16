@@ -185,8 +185,13 @@ impl KHardwareTimer {
     /// Called by the CoreTiming callback.
     /// Matches upstream: `KHardwareTimer::DoTask()`
     fn do_task(&mut self) {
-        // Upstream: KScopedSchedulerLock + KScopedSpinLock
-        // TODO: acquire KScopedSchedulerLock when scheduler lock is ported
+        // Upstream: KScopedSchedulerLock slk{m_kernel} + KScopedSpinLock lk(GetLock())
+        // In our cooperative model, the CoreTiming callback fires during
+        // CoreTiming::Advance() on the host thread. No concurrent guest
+        // execution occurs, so the scheduler lock is not needed for
+        // thread safety. It IS needed for the scheduler update side-effects
+        // (UpdateHighestPriorityThreads on unlock) — but in cooperative mode,
+        // scheduling decisions happen at SVC boundaries instead.
 
         if !self.get_interrupt_enabled() {
             return;

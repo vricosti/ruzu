@@ -22,15 +22,38 @@ pub struct SchedulerCallbacks {
     pub update_highest_priority_threads: fn() -> u64,
 }
 
-/// Default (stub) callbacks before KScheduler is fully wired.
-fn stub_disable_scheduling() {}
-fn stub_enable_scheduling(_cores: u64) {}
-fn stub_update_highest_priority_threads() -> u64 { 0 }
+/// Single-core cooperative model callbacks.
+///
+/// In the cooperative model, only one guest thread runs at a time.
+/// The process lock provides the scheduling exclusion that upstream gets
+/// from DisableScheduling/EnableScheduling + the scheduler lock.
+///
+/// DisableScheduling: upstream increments thread dispatch_count to prevent
+/// rescheduling during critical sections. In our cooperative model, the
+/// Rust mutex on KScheduler/KProcess serves this purpose.
+///
+/// EnableScheduling: upstream decrements dispatch_count and triggers
+/// RescheduleCurrentCore if needed. In our model, scheduling decisions
+/// happen at SVC return boundaries in the cpu_manager dispatch loop.
+///
+/// UpdateHighestPriorityThreads: upstream selects the highest priority
+/// thread per core. In our model, select_next_thread_from_pq handles this
+/// at dispatch time. Returns 0 (no cores need IPI-based rescheduling).
+fn cooperative_disable_scheduling() {
+    // No-op: process lock provides exclusion in cooperative model.
+}
+fn cooperative_enable_scheduling(_cores_needing_scheduling: u64) {
+    // No-op: scheduling happens at SVC boundaries in cooperative model.
+}
+fn cooperative_update_highest_priority_threads() -> u64 {
+    // No cores need rescheduling via IPI in cooperative model.
+    0
+}
 
-static DEFAULT_CALLBACKS: SchedulerCallbacks = SchedulerCallbacks {
-    disable_scheduling: stub_disable_scheduling,
-    enable_scheduling: stub_enable_scheduling,
-    update_highest_priority_threads: stub_update_highest_priority_threads,
+static COOPERATIVE_CALLBACKS: SchedulerCallbacks = SchedulerCallbacks {
+    disable_scheduling: cooperative_disable_scheduling,
+    enable_scheduling: cooperative_enable_scheduling,
+    update_highest_priority_threads: cooperative_update_highest_priority_threads,
 };
 
 /// KAbstractSchedulerLock — recursive scheduler lock.
@@ -63,7 +86,7 @@ impl KAbstractSchedulerLock {
             m_spin_lock: KAlignedSpinLock::new(),
             m_lock_count: std::cell::Cell::new(0),
             m_owner_thread: AtomicU64::new(0),
-            callbacks: &DEFAULT_CALLBACKS,
+            callbacks: &COOPERATIVE_CALLBACKS,
         }
     }
 
