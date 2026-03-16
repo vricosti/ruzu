@@ -96,8 +96,10 @@ impl KConditionVariable {
 
     /// Signal to the given address, releasing the lock to the next waiter.
     ///
-    /// TODO: upstream wraps this in KScopedSchedulerLock. Add once
-    /// KScheduler is fully ported.
+    /// Upstream wraps in KScopedSchedulerLock. In our single-core cooperative
+    /// model, only one guest thread runs at a time (protected by process lock),
+    /// so the scheduler lock is not strictly needed yet. Wire it when
+    /// KConditionVariable gains a KernelCore reference.
     pub fn signal_to_address(
         process: &Arc<Mutex<KProcess>>,
         current_thread: &Arc<Mutex<KThread>>,
@@ -177,8 +179,10 @@ impl KConditionVariable {
     /// In our cooperative model, `begin_wait()` sets the state but doesn't
     /// truly suspend — the scheduler handoff after the SVC must handle this.
     ///
-    /// TODO: upstream wraps this in KScopedSchedulerLock. Add once
-    /// KScheduler is fully ported.
+    /// Upstream wraps in KScopedSchedulerLock. In our single-core cooperative
+    /// model, only one guest thread runs at a time (protected by process lock),
+    /// so the scheduler lock is not strictly needed yet. Wire it when
+    /// KConditionVariable gains a KernelCore reference.
     pub fn wait_for_address(
         process: &Arc<Mutex<KProcess>>,
         current_thread: &Arc<Mutex<KThread>>,
@@ -220,9 +224,9 @@ impl KConditionVariable {
         Self::begin_wait_for_address(current_thread, owner_thread_id, addr, value);
         owner_thread.lock().unwrap().add_waiter(current_thread_id);
 
-        // TODO: upstream calls owner_thread->Close() here to release the
-        // handle reference obtained from the handle table. Once we implement
-        // reference counting on kernel objects, add the Close() call.
+        // Upstream calls owner_thread->Close() here to release the handle
+        // reference. In Rust, Arc reference counting handles this automatically
+        // when owner_thread goes out of scope.
 
         RESULT_SUCCESS
     }
@@ -234,8 +238,7 @@ impl KConditionVariable {
     /// Note: the caller must already hold the process lock. This method takes
     /// `&mut KProcess` directly to avoid re-locking.
     ///
-    /// TODO: upstream wraps this in KScopedSchedulerLock for thread-safe access.
-    /// Once KScheduler is fully ported, add scheduler lock acquisition here.
+    /// Upstream wraps in KScopedSchedulerLock. See signal_to_address comment.
     pub fn signal(
         &mut self,
         mut process_guard: &mut KProcess,
@@ -304,9 +307,10 @@ impl KConditionVariable {
         self.wait_locked(&mut process_guard, current_thread, addr, key, value, timeout)
     }
 
-    /// TODO: upstream wraps this in KScopedSchedulerLockAndSleep for
-    /// atomic scheduler lock + sleep setup. Once KScheduler is fully ported,
-    /// add the RAII guard here.
+    /// Upstream wraps in KScopedSchedulerLockAndSleep for atomic lock + sleep.
+    /// In our single-core cooperative model, the process lock provides
+    /// equivalent protection. Wire KScopedSchedulerLockAndSleep when
+    /// KConditionVariable gains a KernelCore reference.
     pub fn wait_locked(
         &mut self,
         process_guard: &mut KProcess,
@@ -377,9 +381,9 @@ impl KConditionVariable {
 
     /// Upstream: SignalImpl uses UpdateLockAtomic with exclusive monitor
     /// (ExclusiveRead32/ExclusiveWrite32) for CAS-like atomic address tag
-    /// updates. In our single-core cooperative model we use plain read/write.
-    /// TODO: implement exclusive monitor retry loop once multi-core guest
-    /// execution is supported.
+    /// updates. In our single-core cooperative model, only one guest thread
+    /// runs at a time, so plain read/write is sufficient. Implement the
+    /// exclusive monitor retry loop if multi-core guest execution is added.
     fn signal_impl(
         &mut self,
         mut process_guard: &mut KProcess,
