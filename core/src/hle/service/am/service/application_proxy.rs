@@ -114,7 +114,11 @@ impl IApplicationProxy {
     }
 
     fn get_window_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        Self::push_interface_response(ctx, Arc::new(super::window_controller::IWindowController::new()));
+        let proxy = unsafe { &*(_this as *const dyn ServiceFramework as *const IApplicationProxy) };
+        Self::push_interface_response(
+            ctx,
+            Arc::new(super::window_controller::IWindowController::new(proxy.applet.clone())),
+        );
     }
 
     fn get_audio_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

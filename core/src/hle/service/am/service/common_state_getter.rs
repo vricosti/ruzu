@@ -142,12 +142,14 @@ impl ICommonStateGetter {
     /// Port of ICommonStateGetter::IsVrModeEnabled
     pub fn is_vr_mode_enabled(&self) -> bool {
         log::debug!("IsVrModeEnabled called");
-        false
+        self.applet.lock().unwrap().vr_mode_enabled
     }
 
     /// Port of ICommonStateGetter::SetVrModeEnabled
-    pub fn set_vr_mode_enabled(&self, _enabled: bool) {
-        log::warn!("(STUBBED) SetVrModeEnabled called");
+    pub fn set_vr_mode_enabled(&self, enabled: bool) {
+        let mut applet = self.applet.lock().unwrap();
+        applet.vr_mode_enabled = enabled;
+        log::warn!("VR Mode is {}", if applet.vr_mode_enabled { "on" } else { "off" });
     }
 
     /// Port of ICommonStateGetter::IsInControllerFirmwareUpdateSection
@@ -182,8 +184,14 @@ impl ICommonStateGetter {
     }
 
     /// Port of ICommonStateGetter::SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled
+    ///
+    /// Upstream takes no parameter — it unconditionally sets the flag to true.
     pub fn set_request_exit_to_library_applet_at_execute_next_program_enabled(&self) {
-        log::warn!("(STUBBED) SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled called");
+        log::info!("SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled called");
+        self.applet
+            .lock()
+            .unwrap()
+            .request_exit_to_library_applet_at_execute_next_program_enabled = true;
     }
 
     /// GetEventHandle (cmd 0): returns a copy handle to the message event.
@@ -231,17 +239,44 @@ impl ICommonStateGetter {
 
     /// RequestToAcquireSleepLock (cmd 10): acquires sleep lock immediately.
     /// Matches upstream: signals sleep_lock_event.
-    fn request_to_acquire_sleep_lock_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn request_to_acquire_sleep_lock_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         log::warn!("(STUBBED) RequestToAcquireSleepLock called");
+        let _ = {
+            let mut applet = service.applet.lock().unwrap();
+            applet.ensure_sleep_lock_event(ctx)
+        };
+        if let Some(thread) = ctx.get_thread() {
+            if let Some(process) = thread
+                .lock()
+                .unwrap()
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
+            {
+                let mut process = process.lock().unwrap();
+                service
+                    .applet
+                    .lock()
+                    .unwrap()
+                    .signal_sleep_lock_event(&mut process);
+            }
+        }
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// GetAcquiredSleepLockEvent (cmd 13): returns event handle for sleep lock.
     /// Matches upstream: returns OutCopyHandle<KReadableEvent> from sleep_lock_event.
-    fn get_acquired_sleep_lock_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_acquired_sleep_lock_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         log::warn!("(STUBBED) GetAcquiredSleepLockEvent called");
-        let handle = ctx.create_readable_event_handle(true).unwrap_or(0);
+        let handle = service
+            .applet
+            .lock()
+            .unwrap()
+            .ensure_sleep_lock_event(ctx)
+            .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);

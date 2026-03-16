@@ -5,8 +5,10 @@
 //! Port of zuyu/src/core/hle/service/am/service/window_controller.cpp
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::am::applet::Applet;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -21,13 +23,14 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 20: SetAppletWindowVisibility
 /// - 21: SetAppletGpuTimeSlice
 pub struct IWindowController {
-    // TODO: WindowSystem reference, Applet reference
+    /// Matches upstream `std::shared_ptr<Applet> m_applet`.
+    applet: Arc<Mutex<Applet>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IWindowController {
-    pub fn new() -> Self {
+    pub fn new(applet: Arc<Mutex<Applet>>) -> Self {
         let handlers = build_handler_map(&[
             (1, Some(Self::get_applet_resource_user_id_handler), "GetAppletResourceUserId"),
             (
@@ -50,6 +53,7 @@ impl IWindowController {
             (21, Some(Self::set_applet_gpu_time_slice_handler), "SetAppletGpuTimeSlice"),
         ]);
         Self {
+            applet,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -58,12 +62,13 @@ impl IWindowController {
     /// Port of IWindowController::GetAppletResourceUserId
     pub fn get_applet_resource_user_id(&self) -> u64 {
         log::info!("GetAppletResourceUserId called");
-        0
+        self.applet.lock().unwrap().aruid.pid
     }
 
     /// Port of IWindowController::GetAppletResourceUserIdOfCallerApplet
     pub fn get_applet_resource_user_id_of_caller_applet(&self) -> u64 {
         log::info!("GetAppletResourceUserIdOfCallerApplet called");
+        // Caller applet ownership is still missing in the Rust port.
         0
     }
 

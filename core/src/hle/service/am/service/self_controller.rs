@@ -107,11 +107,19 @@ impl ISelfController {
     /// Port of ISelfController::SetOperationModeChangedNotification
     pub fn set_operation_mode_changed_notification(&self, enabled: bool) {
         log::info!("SetOperationModeChangedNotification called, enabled={}", enabled);
+        let mut applet = self.applet.lock().unwrap();
+        applet
+            .lifecycle_manager
+            .set_operation_mode_changed_notification_enabled(enabled);
     }
 
     /// Port of ISelfController::SetPerformanceModeChangedNotification
     pub fn set_performance_mode_changed_notification(&self, enabled: bool) {
         log::info!("SetPerformanceModeChangedNotification called, enabled={}", enabled);
+        let mut applet = self.applet.lock().unwrap();
+        applet
+            .lifecycle_manager
+            .set_performance_mode_changed_notification_enabled(enabled);
     }
 
     /// Port of ISelfController::SetFocusHandlingMode
@@ -120,11 +128,22 @@ impl ISelfController {
             "SetFocusHandlingMode called, notify={} background={} suspend={}",
             notify, background, suspend
         );
+        let mut applet = self.applet.lock().unwrap();
+        applet
+            .lifecycle_manager
+            .set_focus_state_changed_notification_enabled(notify);
+        applet.lifecycle_manager.set_focus_handling_mode(suspend);
+        applet.update_suspension_state_locked(true);
     }
 
     /// Port of ISelfController::SetOutOfFocusSuspendingEnabled
     pub fn set_out_of_focus_suspending_enabled(&self, enabled: bool) {
         log::info!("SetOutOfFocusSuspendingEnabled called, enabled={}", enabled);
+        let mut applet = self.applet.lock().unwrap();
+        applet
+            .lifecycle_manager
+            .set_out_of_focus_suspending_enabled(enabled);
+        applet.update_suspension_state_locked(false);
     }
 
     /// Port of ISelfController::SetHandlesRequestToDisplay
@@ -180,7 +199,8 @@ impl ISelfController {
     ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         let mut rp = RequestParser::new(ctx);
-        service.set_operation_mode_changed_notification(rp.pop_bool());
+        let enabled = rp.pop_bool();
+        service.set_operation_mode_changed_notification(enabled);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -191,7 +211,8 @@ impl ISelfController {
     ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         let mut rp = RequestParser::new(ctx);
-        service.set_performance_mode_changed_notification(rp.pop_bool());
+        let enabled = rp.pop_bool();
+        service.set_performance_mode_changed_notification(enabled);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -213,9 +234,7 @@ impl ISelfController {
         let suspend = ((packed >> 16) & 0xFF) != 0;
         log::info!("SetFocusHandlingMode: notify={} background={} suspend={}", notify, _background, suspend);
 
-        let mut applet = service.applet.lock().unwrap();
-        applet.lifecycle_manager.set_focus_state_changed_notification_enabled(notify);
-        applet.lifecycle_manager.set_focus_handling_mode(suspend);
+        service.set_focus_handling_mode(notify, _background, suspend);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -224,12 +243,33 @@ impl ISelfController {
     /// GetLibraryAppletLaunchableEvent (cmd 9).
     /// Matches upstream: signals event, returns handle.
     fn get_library_applet_launchable_event_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         log::info!("GetLibraryAppletLaunchableEvent called");
-        // Create and immediately signal the event (upstream signals it too)
-        let handle = ctx.create_readable_event_handle(true).unwrap_or(0);
+        let handle = {
+            let mut applet = service.applet.lock().unwrap();
+            applet
+                .ensure_library_applet_launchable_event(ctx)
+                .unwrap_or(0)
+        };
+        if let Some(thread) = ctx.get_thread() {
+            if let Some(process) = thread
+                .lock()
+                .unwrap()
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
+            {
+                let mut process = process.lock().unwrap();
+                service
+                    .applet
+                    .lock()
+                    .unwrap()
+                    .signal_library_applet_launchable_event(&mut process);
+            }
+        }
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);
@@ -287,8 +327,7 @@ impl ISelfController {
         let enabled = rp.pop_bool();
         log::info!("SetOutOfFocusSuspendingEnabled: enabled={}", enabled);
 
-        let mut applet = service.applet.lock().unwrap();
-        applet.lifecycle_manager.set_out_of_focus_suspending_enabled(enabled);
+        service.set_out_of_focus_suspending_enabled(enabled);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);

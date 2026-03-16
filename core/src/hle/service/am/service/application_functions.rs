@@ -314,27 +314,45 @@ impl IApplicationFunctions {
     }
 
     /// GetGpuErrorDetectedSystemEvent (cmd 110): returns an event handle
-    fn get_gpu_error_detected_system_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_gpu_error_detected_system_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("(STUBBED) GetGpuErrorDetectedSystemEvent called");
-        let handle = ctx.create_readable_event_handle(false).unwrap_or(0);
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let handle = service
+            .applet
+            .lock()
+            .unwrap()
+            .ensure_gpu_error_detected_system_event(ctx)
+            .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);
     }
 
     /// GetFriendInvitationStorageChannelEvent (cmd 120): returns an event handle
-    fn get_friend_invitation_storage_channel_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_friend_invitation_storage_channel_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("(STUBBED) GetFriendInvitationStorageChannelEvent called");
-        let handle = ctx.create_readable_event_handle(false).unwrap_or(0);
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let handle = service
+            .applet
+            .lock()
+            .unwrap()
+            .ensure_friend_invitation_storage_channel_event(ctx)
+            .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);
     }
 
     /// GetHealthWarningDisappearedSystemEvent (cmd 160): returns an event handle
-    fn get_health_warning_disappeared_system_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_health_warning_disappeared_system_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("(STUBBED) GetHealthWarningDisappearedSystemEvent called");
-        let handle = ctx.create_readable_event_handle(false).unwrap_or(0);
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let handle = service
+            .applet
+            .lock()
+            .unwrap()
+            .ensure_health_warning_disappeared_system_event(ctx)
+            .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);

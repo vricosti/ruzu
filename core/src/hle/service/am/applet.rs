@@ -4,6 +4,12 @@
 //! Port of zuyu/src/core/hle/service/am/applet.h
 //! Port of zuyu/src/core/hle/service/am/applet.cpp
 
+use std::sync::{Arc, Mutex};
+
+use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
+
 use super::am_types::*;
 use super::lifecycle_manager::LifecycleManager;
 
@@ -76,6 +82,18 @@ pub struct Applet {
     pub is_activity_runnable: bool,
     pub is_interactible: bool,
     pub window_visible: bool,
+
+    // Events
+    pub gpu_error_detected_event: Option<Arc<Mutex<KReadableEvent>>>,
+    pub gpu_error_detected_event_handle: Option<Handle>,
+    pub friend_invitation_storage_channel_event: Option<Arc<Mutex<KReadableEvent>>>,
+    pub friend_invitation_storage_channel_event_handle: Option<Handle>,
+    pub health_warning_disappeared_system_event: Option<Arc<Mutex<KReadableEvent>>>,
+    pub health_warning_disappeared_system_event_handle: Option<Handle>,
+    pub library_applet_launchable_event: Option<Arc<Mutex<KReadableEvent>>>,
+    pub library_applet_launchable_event_handle: Option<Handle>,
+    pub sleep_lock_event: Option<Arc<Mutex<KReadableEvent>>>,
+    pub sleep_lock_event_handle: Option<Handle>,
 }
 
 impl Applet {
@@ -128,7 +146,112 @@ impl Applet {
             is_activity_runnable: false,
             is_interactible: true,
             window_visible: true,
+            gpu_error_detected_event: None,
+            gpu_error_detected_event_handle: None,
+            friend_invitation_storage_channel_event: None,
+            friend_invitation_storage_channel_event_handle: None,
+            health_warning_disappeared_system_event: None,
+            health_warning_disappeared_system_event_handle: None,
+            library_applet_launchable_event: None,
+            library_applet_launchable_event_handle: None,
+            sleep_lock_event: None,
+            sleep_lock_event_handle: None,
         }
+    }
+
+    fn ensure_persistent_readable_event(
+        ctx: &HLERequestContext,
+        readable_event: &mut Option<Arc<Mutex<KReadableEvent>>>,
+        handle: &mut Option<Handle>,
+        signaled: bool,
+    ) -> Option<Handle> {
+        if let Some(existing) = *handle {
+            return Some(existing);
+        }
+
+        let (new_handle, new_event) = ctx.create_readable_event(signaled)?;
+        *readable_event = Some(new_event);
+        *handle = Some(new_handle);
+        Some(new_handle)
+    }
+
+    fn signal_persistent_readable_event(
+        process: &mut KProcess,
+        readable_event: &Arc<Mutex<KReadableEvent>>,
+    ) {
+        let Some(scheduler) = process.scheduler.as_ref().and_then(|scheduler| scheduler.upgrade()) else {
+            return;
+        };
+        readable_event.lock().unwrap().signal(process, &scheduler);
+    }
+
+    pub fn ensure_sleep_lock_event(&mut self, ctx: &HLERequestContext) -> Option<Handle> {
+        Self::ensure_persistent_readable_event(
+            ctx,
+            &mut self.sleep_lock_event,
+            &mut self.sleep_lock_event_handle,
+            false,
+        )
+    }
+
+    pub fn signal_sleep_lock_event(&mut self, process: &mut KProcess) {
+        if let Some(event) = self.sleep_lock_event.as_ref() {
+            Self::signal_persistent_readable_event(process, event);
+        }
+    }
+
+    pub fn ensure_library_applet_launchable_event(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<Handle> {
+        Self::ensure_persistent_readable_event(
+            ctx,
+            &mut self.library_applet_launchable_event,
+            &mut self.library_applet_launchable_event_handle,
+            false,
+        )
+    }
+
+    pub fn signal_library_applet_launchable_event(&mut self, process: &mut KProcess) {
+        if let Some(event) = self.library_applet_launchable_event.as_ref() {
+            Self::signal_persistent_readable_event(process, event);
+        }
+    }
+
+    pub fn ensure_gpu_error_detected_system_event(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<Handle> {
+        Self::ensure_persistent_readable_event(
+            ctx,
+            &mut self.gpu_error_detected_event,
+            &mut self.gpu_error_detected_event_handle,
+            false,
+        )
+    }
+
+    pub fn ensure_friend_invitation_storage_channel_event(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<Handle> {
+        Self::ensure_persistent_readable_event(
+            ctx,
+            &mut self.friend_invitation_storage_channel_event,
+            &mut self.friend_invitation_storage_channel_event_handle,
+            false,
+        )
+    }
+
+    pub fn ensure_health_warning_disappeared_system_event(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<Handle> {
+        Self::ensure_persistent_readable_event(
+            ctx,
+            &mut self.health_warning_disappeared_system_event,
+            &mut self.health_warning_disappeared_system_event_handle,
+            false,
+        )
     }
 
     /// Port of Applet::UpdateSuspensionStateLocked
