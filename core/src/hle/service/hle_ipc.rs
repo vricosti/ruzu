@@ -12,6 +12,7 @@
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::ipc;
+use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::sm::sm::ServiceManager;
 
@@ -29,7 +30,7 @@ pub trait SessionRequestHandler: Send + Sync {
 
     /// Returns the service name, for logging.
     fn service_name(&self) -> &str {
-        ""
+        std::any::type_name::<Self>()
     }
 }
 
@@ -112,6 +113,11 @@ impl SessionRequestManager {
     }
 
     pub fn append_domain_handler(&mut self, handler: SessionRequestHandlerPtr) {
+        log::debug!(
+            "AppendDomainHandler: index={} handler={}",
+            self.domain_handlers.len() + 1,
+            handler.service_name()
+        );
         self.domain_handlers.push(Some(handler));
     }
 
@@ -158,6 +164,12 @@ impl SessionRequestManager {
                         return PreparedSyncRequest::StubSuccess;
                     }
                     if let Some(Some(handler)) = self.domain_handlers.get(object_id - 1) {
+                        log::debug!(
+                            "HandleDomainSyncRequest: object_id={} cmd={} handler={}",
+                            object_id,
+                            context.get_command(),
+                            handler.service_name()
+                        );
                         return PreparedSyncRequest::Domain(handler.clone());
                     }
                     log::error!("Domain handler at index {} is null", object_id - 1);
@@ -355,6 +367,15 @@ impl HLERequestContext {
     /// Returns a pointer to the IPC command buffer for this request.
     pub fn command_buffer(&self) -> &[u32; ipc::COMMAND_BUFFER_LENGTH] {
         &self.cmd_buf
+    }
+
+    /// Returns the requesting thread.
+    ///
+    /// Matches upstream ownership where `HLERequestContext` carries `KThread* thread`.
+    pub fn get_thread(
+        &self,
+    ) -> Option<Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>> {
+        self.thread.clone()
     }
 
     /// Returns a mutable pointer to the IPC command buffer.
@@ -565,11 +586,15 @@ impl HLERequestContext {
         Some(handle)
     }
 
-    /// Creates a signaled KReadableEvent and registers it in the process
-    /// handle table. Returns the handle for use in copy handle responses.
+    /// Creates a KReadableEvent and registers it in the current process handle table.
     ///
-    /// Matches upstream `ServiceContext::CreateEvent` + signal pattern.
-    pub fn create_readable_event_handle(&self, signaled: bool) -> Option<Handle> {
+    /// Matches the ownership of upstream `ServiceContext::CreateEvent`, while returning both the
+    /// readable-end object and the process handle so service owners can keep persistent event
+    /// objects instead of manufacturing one-off handles per request.
+    pub fn create_readable_event(
+        &self,
+        signaled: bool,
+    ) -> Option<(Handle, Arc<Mutex<KReadableEvent>>)> {
         let thread = self.thread.as_ref()?;
         let thread_guard = thread.lock().unwrap();
         let parent = thread_guard.parent.as_ref()?.upgrade()?;
@@ -580,9 +605,7 @@ impl HLERequestContext {
         let object_id = NEXT_EVENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Create and register a KReadableEvent.
-        let readable = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::hle::kernel::k_readable_event::KReadableEvent::new(),
-        ));
+        let readable = Arc::new(Mutex::new(KReadableEvent::new()));
         {
             let mut re = readable.lock().unwrap();
             re.initialize(0, object_id);
@@ -590,10 +613,18 @@ impl HLERequestContext {
                 re.is_signaled = true;
             }
         }
-        process.register_readable_event_object(object_id, readable);
+        process.register_readable_event_object(object_id, readable.clone());
 
         let handle = process.handle_table.add(object_id).ok()?;
-        Some(handle)
+        Some((handle, readable))
+    }
+
+    /// Creates a signaled KReadableEvent and registers it in the process
+    /// handle table. Returns the handle for use in copy handle responses.
+    ///
+    /// Matches upstream `ServiceContext::CreateEvent` + signal pattern.
+    pub fn create_readable_event_handle(&self, signaled: bool) -> Option<Handle> {
+        self.create_readable_event(signaled).map(|(handle, _)| handle)
     }
 
     pub fn get_is_deferred(&self) -> bool {
@@ -708,7 +739,22 @@ impl HLERequestContext {
             self.handle_descriptor_header = Some(hdh);
 
             if hdh.send_current_pid() {
-                // Skip 2 words for PID
+                // Upstream sets the client PID from the requesting thread's owner process
+                // when the handle descriptor requests SendCurrentPid, then skips the
+                // placeholder words in the incoming command buffer.
+                self.pid = self
+                    .thread
+                    .as_ref()
+                    .and_then(|thread| {
+                        thread
+                            .lock()
+                            .unwrap()
+                            .parent
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                    })
+                    .map(|process| process.lock().unwrap().get_process_id())
+                    .unwrap_or(0);
                 index += 2;
             }
 
@@ -988,6 +1034,8 @@ fn bit_field_extract(value: u32, position: usize, bits: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_thread::KThread;
 
     #[test]
     fn test_session_request_manager_default() {
@@ -1005,5 +1053,31 @@ mod tests {
         assert!(!ctx.is_tipc());
         assert!(!ctx.has_domain_message_header());
         assert!(!ctx.get_is_deferred());
+    }
+
+    #[test]
+    fn test_send_current_pid_uses_requesting_thread_process_id() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        process.lock().unwrap().process_id = 0x51;
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+        let tls_address = 0x2000;
+        {
+            let mut mem = shared_memory.write().unwrap();
+            mem.allocate(0x2000, 0x1000);
+            mem.write_32(tls_address, ipc::CommandType::Request as u32);
+            mem.write_32(tls_address + 4, 1u32 << 31);
+            mem.write_32(tls_address + 8, 1);
+            mem.write_32(tls_address + 12, 0);
+            mem.write_32(tls_address + 16, 0);
+        }
+
+        let mut ctx = HLERequestContext::new_with_thread(thread, shared_memory, tls_address);
+        ctx.populate_from_incoming_command_buffer(&[]);
+
+        assert_eq!(ctx.get_pid(), 0x51);
     }
 }

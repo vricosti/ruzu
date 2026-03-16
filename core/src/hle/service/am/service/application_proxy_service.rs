@@ -46,13 +46,29 @@ impl IApplicationProxyService {
             &*(this as *const dyn ServiceFramework as *const IApplicationProxyService)
         };
         service.open_application_proxy();
-        // Create an Applet for this application.
-        // Matches upstream: AppletManager creates the Applet and calls
-        // SetFocusState(InFocus) when the application starts.
         let applet = Arc::new(Mutex::new(Applet::new(true)));
         {
             let mut applet_guard = applet.lock().unwrap();
+            if ctx.get_pid() != 0 {
+                applet_guard.aruid.pid = ctx.get_pid();
+            }
+            if let Some(thread) = ctx.get_thread() {
+                if let Some(process) = thread.lock().unwrap().parent.as_ref().and_then(|p| p.upgrade()) {
+                    let process = process.lock().unwrap();
+                    if applet_guard.aruid.pid == 0 {
+                        applet_guard.aruid.pid = process.get_process_id();
+                    }
+                    applet_guard.program_id = process.get_program_id();
+                }
+            }
+            applet_guard.is_process_running = true;
             applet_guard.lifecycle_manager.set_focus_state(FocusState::InFocus);
+            applet_guard.update_suspension_state_locked(true);
+            log::info!(
+                "OpenApplicationProxy: seeded applet aruid={:#x} program_id={:#x}",
+                applet_guard.aruid.pid,
+                applet_guard.program_id
+            );
         }
         let proxy = Arc::new(super::application_proxy::IApplicationProxy::new(applet));
         let is_domain = ctx

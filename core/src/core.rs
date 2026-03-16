@@ -257,6 +257,10 @@ impl System {
             return SystemResultStatus::ErrorLoader;
         }
 
+        if let Some(kernel) = self.kernel_mut() {
+            process.process_id = kernel.create_new_user_process_id();
+        }
+
         // Store the loader and process.
         self.app_loader = Some(loader);
         self.load_parameters = load_parameters;
