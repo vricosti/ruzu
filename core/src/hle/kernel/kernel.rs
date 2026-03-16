@@ -11,7 +11,7 @@
 //! KResourceLimit, KWorkerTaskManager, and many other subsystems.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::global_scheduler_context::GlobalSchedulerContext;
 use super::init::init_slab_setup::KSlabResourceCounts;
@@ -19,6 +19,7 @@ use super::k_auto_object_container::KAutoObjectWithListContainer;
 use super::k_hardware_timer::KHardwareTimer;
 use super::k_object_name::KObjectNameGlobalData;
 use super::physical_core::PhysicalCore;
+use crate::core_timing::CoreTiming;
 use crate::hardware_properties;
 
 /// Constants from the upstream KernelCore::Impl.
@@ -44,7 +45,7 @@ pub struct KernelCore {
     next_thread_id: AtomicU64,
 
     // -- Subsystems --
-    hardware_timer: Option<KHardwareTimer>,
+    hardware_timer: Option<Arc<Mutex<KHardwareTimer>>>,
     global_object_list_container: Option<KAutoObjectWithListContainer>,
     global_scheduler_context: Option<GlobalSchedulerContext>,
     object_name_global_data: Option<KObjectNameGlobalData>,
@@ -111,10 +112,7 @@ impl KernelCore {
 
     /// Initialize the kernel.
     pub fn initialize(&mut self) {
-        self.hardware_timer = Some(KHardwareTimer::new());
-        if let Some(ref mut timer) = self.hardware_timer {
-            timer.initialize();
-        }
+        self.hardware_timer = Some(Arc::new(Mutex::new(KHardwareTimer::new())));
 
         self.global_object_list_container = Some(KAutoObjectWithListContainer::new());
         self.global_scheduler_context = Some(GlobalSchedulerContext::new());
@@ -131,6 +129,14 @@ impl KernelCore {
 
         // Initialize global data.
         self.object_name_global_data = Some(KObjectNameGlobalData::new());
+    }
+
+    /// Wire the hardware timer to CoreTiming.
+    /// Must be called after initialize() when System has CoreTiming available.
+    pub fn wire_hardware_timer(&self, core_timing: Arc<std::sync::Mutex<CoreTiming>>) {
+        if let Some(ref timer) = self.hardware_timer {
+            KHardwareTimer::wire_callback(timer, core_timing);
+        }
     }
 
     /// Shutdown the kernel.
@@ -169,8 +175,8 @@ impl KernelCore {
         }
         self.global_object_list_container = None;
 
-        if let Some(ref mut timer) = self.hardware_timer {
-            timer.finalize();
+        if let Some(ref timer) = self.hardware_timer {
+            timer.lock().unwrap().finalize();
         }
         self.hardware_timer = None;
 
@@ -197,14 +203,9 @@ impl KernelCore {
         self.cores.get(id)
     }
 
-    /// Get the hardware timer.
-    pub fn hardware_timer(&self) -> Option<&KHardwareTimer> {
+    /// Get the hardware timer (Arc reference).
+    pub fn hardware_timer(&self) -> Option<&Arc<Mutex<KHardwareTimer>>> {
         self.hardware_timer.as_ref()
-    }
-
-    /// Get the hardware timer (mutable).
-    pub fn hardware_timer_mut(&mut self) -> Option<&mut KHardwareTimer> {
-        self.hardware_timer.as_mut()
     }
 
     /// Get the object list container.

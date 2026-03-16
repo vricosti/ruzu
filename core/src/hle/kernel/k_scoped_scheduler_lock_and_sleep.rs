@@ -1,65 +1,67 @@
 //! Port of zuyu/src/core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h
 //! Status: EN COURS
-//! Derniere synchro: 2026-03-11
+//! Derniere synchro: 2026-03-16
 //!
 //! KScopedSchedulerLockAndSleep — RAII guard that locks the scheduler and
 //! optionally registers a timer task on drop.
-//!
-//! Stubbed until KHardwareTimer, GlobalSchedulerContext, and KThread are ported.
+
+use std::sync::{Arc, Mutex};
+
+use super::k_hardware_timer::KHardwareTimer;
+use super::k_scheduler_lock::KAbstractSchedulerLock;
+use super::k_thread::KThread;
 
 /// KScopedSchedulerLockAndSleep — acquires the scheduler lock on construction,
 /// and on drop registers an absolute timer task if the timeout is positive,
 /// then releases the scheduler lock.
 ///
-/// Mirrors upstream `Kernel::KScopedSchedulerLockAndSleep`.
-pub struct KScopedSchedulerLockAndSleep {
-    m_kernel: usize,
+/// Matches upstream `Kernel::KScopedSchedulerLockAndSleep`.
+pub struct KScopedSchedulerLockAndSleep<'a> {
+    m_scheduler_lock: &'a KAbstractSchedulerLock,
     m_timeout_tick: i64,
-    /// Opaque thread handle until KThread is ported.
-    // TODO: Replace with *mut KThread.
-    m_thread: usize,
-    /// Whether we have a timer registered.
-    // TODO: Replace with Option<&KHardwareTimer> when ported.
-    m_has_timer: bool,
+    m_thread: Arc<Mutex<KThread>>,
+    m_timer: Option<Arc<Mutex<KHardwareTimer>>>,
 }
 
-impl KScopedSchedulerLockAndSleep {
+impl<'a> KScopedSchedulerLockAndSleep<'a> {
     /// Create a new scoped scheduler lock and sleep.
     ///
-    /// Mirrors the C++ constructor:
-    /// ```cpp
-    /// KScopedSchedulerLockAndSleep(KernelCore& kernel, KHardwareTimer** out_timer,
-    ///                               KThread* thread, s64 timeout_tick)
-    /// ```
-    ///
-    /// TODO: Acquire the actual scheduler lock from GlobalSchedulerContext.
-    /// TODO: Set out_timer to &kernel.HardwareTimer() if timeout_tick > 0.
+    /// Matches upstream constructor:
+    /// - Locks the scheduler lock
+    /// - Sets the hardware timer reference if timeout > 0
+    /// - Returns the timer reference via `out_timer` for caller use
     pub fn new(
-        kernel: usize,
+        scheduler_lock: &'a KAbstractSchedulerLock,
+        hardware_timer: Option<&Arc<Mutex<KHardwareTimer>>>,
+        thread: Arc<Mutex<KThread>>,
         timeout_tick: i64,
-        thread: usize,
-    ) -> Self {
-        // TODO: kernel.GlobalSchedulerContext().m_scheduler_lock.Lock();
-        let has_timer = timeout_tick > 0;
-        // TODO: *out_timer = if has_timer { &kernel.HardwareTimer() } else { null };
+    ) -> (Self, Option<Arc<Mutex<KHardwareTimer>>>) {
+        // Lock the scheduler.
+        scheduler_lock.lock();
 
-        Self {
-            m_kernel: kernel,
-            m_timeout_tick: timeout_tick,
-            m_thread: thread,
-            m_has_timer: has_timer,
-        }
+        // Set our timer only if the time is positive.
+        let timer = if timeout_tick > 0 {
+            hardware_timer.cloned()
+        } else {
+            None
+        };
+
+        let out_timer = timer.clone();
+        (
+            Self {
+                m_scheduler_lock: scheduler_lock,
+                m_timeout_tick: timeout_tick,
+                m_thread: thread,
+                m_timer: timer,
+            },
+            out_timer,
+        )
     }
 
     /// Cancel the sleep — prevents the timer registration on drop.
-    /// Mirrors upstream `CancelSleep()`.
+    /// Matches upstream `CancelSleep()`.
     pub fn cancel_sleep(&mut self) {
         self.m_timeout_tick = 0;
-    }
-
-    /// Get the kernel handle.
-    pub fn kernel(&self) -> usize {
-        self.m_kernel
     }
 
     /// Check if a timer will be registered on drop.
@@ -68,15 +70,20 @@ impl KScopedSchedulerLockAndSleep {
     }
 }
 
-impl Drop for KScopedSchedulerLockAndSleep {
+impl Drop for KScopedSchedulerLockAndSleep<'_> {
     fn drop(&mut self) {
         // Register the sleep timer if the timeout is still positive.
         if self.m_timeout_tick > 0 {
-            // TODO: m_timer.RegisterAbsoluteTask(m_thread, m_timeout_tick);
+            if let Some(ref timer) = self.m_timer {
+                timer
+                    .lock()
+                    .unwrap()
+                    .register_absolute_task(&self.m_thread, self.m_timeout_tick);
+            }
         }
 
         // Unlock the scheduler.
-        // TODO: m_kernel.GlobalSchedulerContext().m_scheduler_lock.Unlock();
+        self.m_scheduler_lock.unlock();
     }
 }
 
@@ -86,7 +93,10 @@ mod tests {
 
     #[test]
     fn test_cancel_sleep() {
-        let mut slp = KScopedSchedulerLockAndSleep::new(0, 100, 0);
+        let lock = KAbstractSchedulerLock::new();
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        let (mut slp, _timer) =
+            KScopedSchedulerLockAndSleep::new(&lock, None, thread, 100);
         assert!(slp.has_timer());
         slp.cancel_sleep();
         assert!(!slp.has_timer());
