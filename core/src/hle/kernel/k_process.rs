@@ -23,6 +23,7 @@ use super::k_memory_block::{
 use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_process_page_table::KProcessPageTable;
 use super::k_readable_event::KReadableEvent;
+use super::k_priority_queue::{KPriorityQueueMember, ThreadAccessor};
 use super::k_scheduler::KScheduler;
 use super::k_session::KSession;
 use super::k_synchronization_object;
@@ -1400,6 +1401,32 @@ impl KProcess {
 impl Default for KProcess {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// ThreadAccessor impl for KProcess — allows the KPriorityQueue to
+/// read/write thread queue entries through the process's thread table.
+///
+/// Upstream doesn't need this because KPriorityQueue uses raw Member*
+/// pointers (which ARE the KThread objects). We need indirection because
+/// our threads are behind Arc<Mutex<>>.
+impl ThreadAccessor for KProcess {
+    fn with_thread<F, R>(&self, thread_id: u64, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn KPriorityQueueMember) -> R,
+    {
+        let thread = self.get_thread_by_thread_id(thread_id)?;
+        let guard = thread.lock().unwrap();
+        Some(f(&*guard))
+    }
+
+    fn with_thread_mut<F, R>(&self, thread_id: u64, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut dyn KPriorityQueueMember) -> R,
+    {
+        let thread = self.get_thread_by_thread_id(thread_id)?;
+        let mut guard = thread.lock().unwrap();
+        Some(f(&mut *guard))
     }
 }
 
