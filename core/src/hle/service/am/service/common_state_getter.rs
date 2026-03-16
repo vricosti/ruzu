@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/common_state_getter.h
 //! Port of zuyu/src/core/hle/service/am/service/common_state_getter.cpp
 
-use crate::hle::service::am::am_types::{AppletId, AppletMessage, FocusState, OperationMode, SystemButtonType};
+use crate::hle::service::am::am_types::{AppletMessage, FocusState, OperationMode, SystemButtonType};
 use crate::hle::service::am::applet::Applet;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -99,6 +99,11 @@ impl ICommonStateGetter {
                 60,
                 Some(Self::get_default_display_resolution_handler),
                 "GetDefaultDisplayResolution",
+            ),
+            (
+                61,
+                Some(Self::get_default_display_resolution_change_event_handler),
+                "GetDefaultDisplayResolutionChangeEvent",
             ),
             (68, Some(Self::get_built_in_display_type_handler), "GetBuiltInDisplayType"),
             (
@@ -198,8 +203,13 @@ impl ICommonStateGetter {
     /// Matches upstream: `*out_event = m_applet->lifecycle_manager.GetSystemEvent().GetHandle()`
     fn get_event_handle_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
-        let applet = service.applet.lock().unwrap();
-        let handle = applet.lifecycle_manager.get_system_event_handle();
+        let handle = service
+            .applet
+            .lock()
+            .unwrap()
+            .lifecycle_manager
+            .ensure_system_event(ctx)
+            .unwrap_or(0);
         log::debug!("ICommonStateGetter::GetEventHandle called -> handle={:#x}", handle);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0); // 1 copy handle
         rb.push_result(RESULT_SUCCESS);
@@ -337,6 +347,23 @@ impl ICommonStateGetter {
         rb.push_result(RESULT_SUCCESS);
         rb.push_i32(w);
         rb.push_i32(h);
+    }
+
+    fn get_default_display_resolution_change_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let handle = service
+            .applet
+            .lock()
+            .unwrap()
+            .lifecycle_manager
+            .ensure_operation_mode_changed_system_event(ctx)
+            .unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
     }
 
     fn get_built_in_display_type_handler(

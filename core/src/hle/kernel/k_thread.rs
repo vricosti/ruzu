@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
 use super::k_synchronization_object;
+use super::k_thread_queue::KThreadQueue;
 use super::k_synchronization_object::SynchronizationWaitSet;
 use super::k_synchronization_object::SynchronizationObjectState;
 use super::k_typed_address::{KProcessAddress, KVirtualAddress};
@@ -24,6 +25,9 @@ use crate::hle::kernel::svc::svc_results::{
     RESULT_OUT_OF_RESOURCE, RESULT_TERMINATION_REQUESTED, RESULT_TIMED_OUT,
 };
 use crate::hle::result::RESULT_SUCCESS;
+// RBEntry kept for structural parity with upstream m_condvar_arbiter_tree_node.
+// Currently unused: we use BTreeSet externally instead of an intrusive tree.
+use common::tree::RBEntry;
 
 // ---------------------------------------------------------------------------
 // Enums matching upstream k_thread.h
@@ -40,6 +44,21 @@ pub enum ThreadType {
     User = 3,
     /// Special thread type for emulation purposes only.
     Dummy = 100,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConditionVariableTreeState {
+    #[default]
+    None,
+    ConditionVariable,
+    AddressArbiter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ConditionVariableThreadKey {
+    pub cv_key: u64,
+    pub priority: i32,
+    pub thread_id: u64,
 }
 
 /// Suspend type.
@@ -295,9 +314,11 @@ pub struct KThread {
     // -- Core KThread fields --
     pub object_id: u64,
     pub thread_context: ThreadContext,
+    pub condvar_arbiter_tree_node: RBEntry,
     pub priority: i32,
 
     // Condition variable / arbiter tree membership
+    pub condvar_tree_state: ConditionVariableTreeState,
     pub condvar_key: u64,
     pub virtual_affinity_mask: u64,
     pub physical_affinity_mask: KAffinityMask,
@@ -315,15 +336,15 @@ pub struct KThread {
     pub last_scheduled_tick: i64,
     pub per_core_priority_queue_entry: [QueueEntry; NUM_CPU_CORES as usize],
 
-    // Wait queue — opaque reference
-    // m_wait_queue: Option<*const KThreadQueue> — we use an index/id
-    pub wait_queue_active: bool,
+    // Wait queue — upstream `m_wait_queue`
+    pub wait_queue: Option<KThreadQueue>,
 
     // Lock with priority inheritance
     // m_held_lock_info_list — stubbed
     // m_waiting_lock_info — stubbed
 
     pub address_key_value: u32,
+    pub waiting_lock_owner_thread_id: Option<u64>,
     pub user_waiter_thread_ids: Vec<u64>,
     pub suspend_request_flags: u32,
     pub suspend_allowed_flags: u32,
@@ -400,7 +421,9 @@ impl KThread {
         Self {
             object_id: 0,
             thread_context: ThreadContext::default(),
+            condvar_arbiter_tree_node: RBEntry::default(),
             priority: 0,
+            condvar_tree_state: ConditionVariableTreeState::None,
             condvar_key: 0,
             virtual_affinity_mask: 0,
             physical_affinity_mask: KAffinityMask::default(),
@@ -415,8 +438,9 @@ impl KThread {
             schedule_count: 0,
             last_scheduled_tick: 0,
             per_core_priority_queue_entry: Default::default(),
-            wait_queue_active: false,
+            wait_queue: None,
             address_key_value: 0,
+            waiting_lock_owner_thread_id: None,
             user_waiter_thread_ids: Vec::new(),
             suspend_request_flags: 0,
             suspend_allowed_flags: ThreadState::SUSPEND_FLAG_MASK.bits() as u32,
@@ -700,6 +724,13 @@ impl KThread {
         self.condvar_key
     }
 
+    pub fn get_condition_variable_tree(&self) -> Option<ConditionVariableTreeState> {
+        match self.condvar_tree_state {
+            ConditionVariableTreeState::None => None,
+            state => Some(state),
+        }
+    }
+
     pub fn get_address_arbiter_key(&self) -> u64 {
         self.condvar_key
     }
@@ -820,25 +851,13 @@ impl KThread {
             self.sleep_deadline = None;
         }
 
-        self.begin_wait();
+        self.begin_wait_with_queue(
+            k_synchronization_object::ThreadQueueImplForKSynchronizationObjectWait::queue(),
+        );
     }
 
     pub fn check_synchronization_ready(&self, process: &KProcess) -> Option<i32> {
         k_synchronization_object::check_wait_ready(process, self)
-    }
-
-    pub fn notify_available_synchronization(
-        &mut self,
-        signaled_object_id: u64,
-        process: &mut KProcess,
-        result: u32,
-    ) -> bool {
-        k_synchronization_object::notify_waiter_available(
-            self,
-            process,
-            signaled_object_id,
-            result,
-        )
     }
 
     pub fn complete_synchronization_wait(&mut self, synced_index: i32, result: u32) {
@@ -862,7 +881,7 @@ impl KThread {
             .unlink_waiter(process, thread_id, self.object_id, 0);
     }
 
-    fn clear_wait_synchronization(&mut self) {
+    pub(crate) fn clear_wait_synchronization(&mut self) {
         if !self.synchronization_wait.is_active() {
             self.clear_cancellable();
             return;
@@ -885,7 +904,7 @@ impl KThread {
         self.clear_cancellable();
     }
 
-    fn apply_wait_result_to_context(&mut self) {
+    pub(crate) fn apply_wait_result_to_context(&mut self) {
         self.thread_context.r[0] = self.wait_result as u64;
         self.thread_context.r[1] = (self.synced_index as u32) as u64;
     }
@@ -1071,9 +1090,35 @@ impl KThread {
     /// TODO: Port full implementation from k_thread.cpp.
     pub fn set_base_priority(&mut self, value: i32) {
         let old_priority = self.priority;
+        let waiting_on_condition_variable = matches!(
+            self.get_condition_variable_tree(),
+            Some(ConditionVariableTreeState::ConditionVariable)
+        );
+        let parent = if waiting_on_condition_variable {
+            self.parent.as_ref().and_then(Weak::upgrade)
+        } else {
+            None
+        };
+
+        if old_priority != value {
+            if let Some(parent) = parent.as_ref() {
+                parent
+                    .lock()
+                    .unwrap()
+                    .before_update_condition_variable_priority(self.thread_id);
+            }
+        }
+
         self.base_priority = value;
         self.priority = value;
         if old_priority != value {
+            let updated_thread_key = self.condition_variable_tree_key();
+            if let Some(parent) = parent.as_ref() {
+                parent
+                    .lock()
+                    .unwrap()
+                    .after_update_condition_variable_priority(updated_thread_key);
+            }
             self.notify_priority_change(old_priority);
         }
     }
@@ -1099,7 +1144,7 @@ impl KThread {
         self.clear_wait_synchronization();
         self.set_state(ThreadState::TERMINATED);
         self.signaled = true;
-        self.wait_queue_active = false;
+        self.wait_queue = None;
 
         if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
             let mut process = parent.lock().unwrap();
@@ -1167,7 +1212,6 @@ impl KThread {
         let suspend_bits = ThreadState::from_bits_truncate(self.get_suspend_flags() as u16);
         let new_state = suspend_bits | base_state;
         self.thread_state.store(new_state.bits(), Ordering::Relaxed);
-        self.wait_queue_active = base_state == ThreadState::WAITING;
         if new_state != old_state && self.is_suspended() && base_state == ThreadState::WAITING {
             self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Suspended);
         }
@@ -1181,7 +1225,6 @@ impl KThread {
         let continued_state = old_state & ThreadState::MASK;
         self.thread_state
             .store(continued_state.bits(), Ordering::Relaxed);
-        self.wait_queue_active = continued_state == ThreadState::WAITING;
         if continued_state != ThreadState::WAITING {
             self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::None);
         }
@@ -1195,11 +1238,6 @@ impl KThread {
         self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::None);
         let new_state = (old_state & !ThreadState::MASK) | (state & ThreadState::MASK);
         self.thread_state.store(new_state.bits(), Ordering::Relaxed);
-        if state == ThreadState::WAITING || state == ThreadState::TERMINATED {
-            self.wait_queue_active = state == ThreadState::WAITING;
-        } else {
-            self.wait_queue_active = false;
-        }
         if new_state != old_state {
             self.schedule_count = -1;
         }
@@ -1262,32 +1300,67 @@ impl KThread {
     }
 
     /// Begin wait on a thread queue.
-    /// TODO: Port from k_thread.cpp.
-    pub fn begin_wait(&mut self) {
-        self.wait_queue_active = true;
+    ///
+    /// Matches upstream `KThread::BeginWait(KThreadQueue* queue)`:
+    /// sets state to Waiting, then assigns the wait queue.
+    pub fn begin_wait_with_queue(&mut self, wait_queue: KThreadQueue) {
         self.set_state(ThreadState::WAITING);
+        self.wait_queue = Some(wait_queue);
+    }
+
+    /// Begin wait without a specialized queue implementation.
+    pub fn begin_wait(&mut self) {
+        self.begin_wait_with_queue(KThreadQueue::default());
+    }
+
+    /// Clear the thread's active wait queue.
+    ///
+    /// Matches upstream `KThread::ClearWaitQueue()` ownership.
+    pub fn clear_wait_queue(&mut self) {
+        self.wait_queue = None;
+    }
+
+    pub fn notify_available(
+        &mut self,
+        process: &mut KProcess,
+        signaled_object_id: u64,
+        result: u32,
+    ) -> bool {
+        let Some(wait_queue) = self.wait_queue else {
+            return false;
+        };
+
+        wait_queue.notify_available(self, process, signaled_object_id, result)
     }
 
     /// End wait with a result.
     /// TODO: Port from k_thread.cpp.
     pub fn end_wait(&mut self, _wait_result: u32) {
-        self.wait_queue_active = false;
         self.sleep_deadline = None;
-        self.wait_result = _wait_result;
+        self.waiting_lock_owner_thread_id = None;
         self.clear_wait_synchronization();
+        self.wait_result = _wait_result;
         self.apply_wait_result_to_context();
-        self.set_state(ThreadState::RUNNABLE);
+
+        let wait_queue = self
+            .wait_queue
+            .expect("KThread::end_wait requires wait_queue while waiting");
+        wait_queue.end_wait(self, _wait_result);
     }
 
     /// Cancel wait.
     /// TODO: Port from k_thread.cpp.
     pub fn cancel_wait(&mut self, _wait_result: u32, _cancel_timer_task: bool) {
-        self.wait_queue_active = false;
         self.sleep_deadline = None;
-        self.wait_result = _wait_result;
+        self.waiting_lock_owner_thread_id = None;
         self.clear_wait_synchronization();
+        self.wait_result = _wait_result;
         self.apply_wait_result_to_context();
-        self.set_state(ThreadState::RUNNABLE);
+
+        let wait_queue = self
+            .wait_queue
+            .expect("KThread::cancel_wait requires wait_queue while waiting");
+        wait_queue.cancel_wait(self, _wait_result, _cancel_timer_task);
     }
 
     /// Set the thread's activity (pause/resume).
@@ -1411,12 +1484,16 @@ impl KThread {
     }
 
     /// Set condition variable state.
+    /// Upstream: ASSERT(m_waiting_lock_info == nullptr) — checks
+    /// LockWithPriorityInheritanceInfo, not waiting_lock_owner_thread_id.
+    /// TODO: add assertion once LockWithPriorityInheritanceInfo is ported.
     pub fn set_condition_variable(
         &mut self,
         address: KProcessAddress,
         cv_key: u64,
         value: u32,
     ) {
+        self.condvar_tree_state = ConditionVariableTreeState::ConditionVariable;
         self.condvar_key = cv_key;
         self.address_key = address;
         self.address_key_value = value;
@@ -1425,17 +1502,52 @@ impl KThread {
 
     /// Clear condition variable state.
     pub fn clear_condition_variable(&mut self) {
-        self.condvar_key = 0;
+        self.condvar_tree_state = ConditionVariableTreeState::None;
+    }
+
+    pub fn is_waiting_for_condition_variable(&self) -> bool {
+        self.condvar_tree_state == ConditionVariableTreeState::ConditionVariable
+    }
+
+    pub fn is_waiting_for_address_arbiter(&self) -> bool {
+        self.condvar_tree_state == ConditionVariableTreeState::AddressArbiter
     }
 
     /// Set address arbiter state.
+    /// Upstream: ASSERT(m_waiting_lock_info == nullptr) — checks
+    /// LockWithPriorityInheritanceInfo, not waiting_lock_owner_thread_id.
+    /// TODO: add assertion once LockWithPriorityInheritanceInfo is ported.
     pub fn set_address_arbiter(&mut self, address: u64) {
+        self.condvar_tree_state = ConditionVariableTreeState::AddressArbiter;
         self.condvar_key = address;
     }
 
     /// Clear address arbiter state.
     pub fn clear_address_arbiter(&mut self) {
-        // condvar_tree pointer cleared in upstream
+        self.condvar_tree_state = ConditionVariableTreeState::None;
+    }
+
+    pub fn condition_variable_tree_key(&self) -> ConditionVariableThreadKey {
+        ConditionVariableThreadKey {
+            cv_key: self.condvar_key,
+            priority: self.priority,
+            thread_id: self.thread_id,
+        }
+    }
+
+    pub fn set_waiting_lock_owner_thread_id(&mut self, owner_thread_id: Option<u64>) {
+        self.waiting_lock_owner_thread_id = owner_thread_id;
+    }
+
+    pub fn get_lock_owner(&self) -> Option<Arc<Mutex<KThread>>> {
+        let owner_thread_id = self.waiting_lock_owner_thread_id?;
+        let parent = self.parent.as_ref()?.upgrade()?;
+        let process = parent.lock().unwrap();
+        process.get_thread_by_thread_id(owner_thread_id)
+    }
+
+    pub fn has_wait_queue(&self) -> bool {
+        self.wait_queue.is_some()
     }
 
     pub fn waiter_thread_ids(&self) -> &[u64] {
@@ -1455,6 +1567,12 @@ impl Default for KThread {
         Self::new()
     }
 }
+
+// HasRBEntry impl removed: condvar_arbiter_tree_node field is kept for
+// structural parity with upstream m_condvar_arbiter_tree_node, but we use
+// BTreeSet<ConditionVariableThreadKey> externally rather than an intrusive
+// red-black tree through this node. The impl can be restored if/when we
+// switch to an intrusive tree.
 
 #[cfg(test)]
 mod tests {

@@ -707,13 +707,15 @@ impl KProcess {
         tag: u32,
         timeout: i64,
     ) -> u32 {
-        let Some(process) = self.self_reference.as_ref().and_then(Weak::upgrade) else {
-            return RESULT_INVALID_STATE.get_inner_value();
-        };
-
-        self.cond_var
-            .wait(&process, current_thread, address, cv_key, tag, timeout)
-            .get_inner_value()
+        // Mirror the signal/reprioritize ownership pattern: take the condition
+        // variable owner out temporarily so it can operate on the process state
+        // without a second mutable borrow of `self`.
+        let mut cond_var = std::mem::take(&mut self.cond_var);
+        let result = cond_var
+            .wait_locked(self, current_thread, address, cv_key, tag, timeout)
+            .get_inner_value();
+        self.cond_var = cond_var;
+        result
     }
 
     pub fn signal_condition_variable(&mut self, cv_key: u64, count: i32) {
@@ -722,6 +724,27 @@ impl KProcess {
         // cond_var while we hold &mut self.
         let mut cond_var = std::mem::take(&mut self.cond_var);
         let _ = cond_var.signal(self, cv_key, count);
+        self.cond_var = cond_var;
+    }
+
+    pub fn before_update_condition_variable_priority(&mut self, thread_id: u64) {
+        let mut cond_var = std::mem::take(&mut self.cond_var);
+        cond_var.before_update_priority(thread_id);
+        self.cond_var = cond_var;
+    }
+
+    pub fn after_update_condition_variable_priority(
+        &mut self,
+        thread_key: super::k_thread::ConditionVariableThreadKey,
+    ) {
+        let mut cond_var = std::mem::take(&mut self.cond_var);
+        cond_var.after_update_priority(thread_key);
+        self.cond_var = cond_var;
+    }
+
+    pub fn remove_condition_variable_waiter(&mut self, thread_id: u64) {
+        let mut cond_var = std::mem::take(&mut self.cond_var);
+        cond_var.remove_waiter(thread_id);
         self.cond_var = cond_var;
     }
 
