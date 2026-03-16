@@ -24,6 +24,13 @@ pub const PREEMPTION_PRIORITIES: [u32; hardware_properties::NUM_CPU_CORES as usi
 ///
 /// Upstream holds a KSchedulerPriorityQueue, a LockType (KAbstractSchedulerLock),
 /// a set of dummy threads pending wakeup, and a thread list.
+///
+/// Upstream stores `KernelCore& m_kernel` for accessing schedulers in
+/// PreemptThreads/UpdateHighestPriorityThreadsImpl. In our cooperative model,
+/// the KernelCore ref is not yet needed because:
+/// - PreemptThreads is called every 10ms by the cpu_manager and is stubbed
+/// - The PQ lives in KProcess temporarily (single-process model)
+/// When multi-process or multi-core support is needed, add the kernel ref.
 pub struct GlobalSchedulerContext {
     pub m_scheduler_update_needed: std::sync::atomic::AtomicBool,
     pub m_priority_queue: KPriorityQueue,
