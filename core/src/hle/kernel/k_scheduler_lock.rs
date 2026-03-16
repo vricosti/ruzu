@@ -96,14 +96,12 @@ impl KAbstractSchedulerLock {
     }
 
     /// Check if the lock is held by the current thread.
-    /// Upstream: `IsLockedByCurrentThread()` compares m_owner_thread with
-    /// GetCurrentThreadPointer(m_kernel).
+    /// Upstream: compares m_owner_thread with GetCurrentThreadPointer(m_kernel).
     ///
-    /// TODO: compare with actual current thread once thread-local current
-    /// thread tracking is implemented.
+    /// In single-core cooperative model, if lock_count > 0 we are the owner
+    /// (only one host thread runs guest code at a time). For multi-core,
+    /// this needs actual thread-local current thread tracking.
     pub fn is_locked_by_current_thread(&self) -> bool {
-        // For single-core cooperative model, if lock_count > 0 we are the owner.
-        // This is correct because only one thread runs at a time.
         self.m_lock_count.get() > 0
     }
 
@@ -119,8 +117,10 @@ impl KAbstractSchedulerLock {
             debug_assert!(self.m_lock_count.get() == 0);
             debug_assert!(self.m_owner_thread.load(Ordering::Relaxed) == 0);
 
-            // TODO: m_owner_thread = GetCurrentThreadPointer(m_kernel)
-            self.m_owner_thread.store(1, Ordering::Relaxed); // placeholder
+            // Upstream: m_owner_thread = GetCurrentThreadPointer(m_kernel)
+            // In cooperative model, store a sentinel (1) as owner marker.
+            // For multi-core, store actual thread ID from thread-local.
+            self.m_owner_thread.store(1, Ordering::Relaxed);
         }
 
         self.m_lock_count.set(self.m_lock_count.get() + 1);

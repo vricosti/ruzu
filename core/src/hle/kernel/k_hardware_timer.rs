@@ -125,7 +125,8 @@ impl KHardwareTimer {
         self.thread_refs.insert(thread_id, Arc::downgrade(thread));
 
         // Upstream: KScopedDisableDispatch + KScopedSpinLock
-        // TODO: add KScopedDisableDispatch when scheduler is ported
+        // Upstream: KScopedDisableDispatch + KScopedSpinLock.
+        // In cooperative model: process lock provides exclusion.
         if self.base.register_absolute_task_impl(thread_id, task_time) {
             if task_time <= self.m_wakeup_time {
                 self.enable_interrupt(task_time);
@@ -142,7 +143,8 @@ impl KHardwareTimer {
         drop(thread_guard);
 
         // Upstream: KScopedDisableDispatch + KScopedSpinLock
-        // TODO: add KScopedDisableDispatch when scheduler is ported
+        // Upstream: KScopedDisableDispatch + KScopedSpinLock.
+        // In cooperative model: process lock provides exclusion.
         if task_time > 0 {
             self.base.cancel_task(thread_id, task_time);
         }
