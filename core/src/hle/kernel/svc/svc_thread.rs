@@ -129,8 +129,13 @@ pub fn start_thread(ctx: &SvcContext, thread_handle: Handle) -> ResultCode {
         return RESULT_INVALID_HANDLE;
     };
 
+    let thread_id = thread.lock().unwrap().get_thread_id();
     let result = thread.lock().unwrap().run();
     if result == RESULT_SUCCESS.get_inner_value() {
+        ctx.current_process
+            .lock()
+            .unwrap()
+            .push_back_to_priority_queue(thread_id);
         ctx.scheduler.lock().unwrap().request_schedule();
     }
     ResultCode::new(result)
