@@ -11,7 +11,9 @@
 //! KResourceLimit, KWorkerTaskManager, and many other subsystems.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+
+use super::k_thread::KThread;
 
 use super::global_scheduler_context::GlobalSchedulerContext;
 use super::init::init_slab_setup::KSlabResourceCounts;
@@ -67,6 +69,11 @@ pub struct KernelCore {
 
     // -- Host thread management --
     next_host_thread_id: AtomicU32,
+
+    // -- Current thread tracking --
+    // Upstream: thread_local KThread* current_thread in Impl.
+    // In cooperative model, only one guest thread runs at a time.
+    current_emu_thread: Option<Weak<Mutex<KThread>>>,
 }
 
 // KProcess initial ID constants (matching upstream).
@@ -101,6 +108,7 @@ impl KernelCore {
             registered_in_use_objects: Mutex::new(Vec::new()),
 
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
+            current_emu_thread: None,
         }
     }
 
@@ -216,6 +224,18 @@ impl KernelCore {
     /// Get the object name global data.
     pub fn object_name_global_data(&self) -> Option<&KObjectNameGlobalData> {
         self.object_name_global_data.as_ref()
+    }
+
+    /// Get the current emulation thread.
+    /// Matches upstream `KernelCore::GetCurrentEmuThread()`.
+    pub fn get_current_emu_thread(&self) -> Option<Arc<Mutex<KThread>>> {
+        self.current_emu_thread.as_ref()?.upgrade()
+    }
+
+    /// Set the current emulation thread.
+    /// Matches upstream `KernelCore::SetCurrentEmuThread(KThread*)`.
+    pub fn set_current_emu_thread(&mut self, thread: Option<&Arc<Mutex<KThread>>>) {
+        self.current_emu_thread = thread.map(Arc::downgrade);
     }
 
     /// Register a kernel object for leak tracking.
