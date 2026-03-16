@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::hardware_properties;
 
-use super::k_priority_queue::KPriorityQueue;
+use super::k_priority_queue::{KPriorityQueue, KPriorityQueueMember, ThreadAccessor};
 use super::k_scheduler_lock::KAbstractSchedulerLock;
 use super::k_thread::KThread;
 
@@ -20,27 +20,53 @@ pub const HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY: i32 = 2;
 /// Preemption priorities for each core (indices 0-3).
 pub const PREEMPTION_PRIORITIES: [u32; hardware_properties::NUM_CPU_CORES as usize] = [59, 59, 59, 63];
 
+/// ThreadAccessor backed by a snapshot of Arc<Mutex<KThread>> references.
+/// Used for PQ operations that need to resolve thread IDs to thread data.
+pub struct ThreadListAccessor {
+    threads: Vec<Arc<Mutex<KThread>>>,
+}
+
+impl ThreadListAccessor {
+    fn find_thread(&self, thread_id: u64) -> Option<&Arc<Mutex<KThread>>> {
+        self.threads.iter().find(|t| {
+            t.lock().unwrap().get_thread_id() == thread_id
+        })
+    }
+}
+
+impl ThreadAccessor for ThreadListAccessor {
+    fn with_thread<F, R>(&self, thread_id: u64, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn KPriorityQueueMember) -> R,
+    {
+        let thread = self.find_thread(thread_id)?;
+        let guard = thread.lock().unwrap();
+        Some(f(&*guard))
+    }
+
+    fn with_thread_mut<F, R>(&self, thread_id: u64, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut dyn KPriorityQueueMember) -> R,
+    {
+        let thread = self.find_thread(thread_id)?;
+        let mut guard = thread.lock().unwrap();
+        Some(f(&mut *guard))
+    }
+}
+
 /// The global scheduler context.
 ///
-/// Upstream holds a KSchedulerPriorityQueue, a LockType (KAbstractSchedulerLock),
-/// a set of dummy threads pending wakeup, and a thread list.
-///
-/// Upstream stores `KernelCore& m_kernel` for accessing schedulers in
-/// PreemptThreads/UpdateHighestPriorityThreadsImpl. In our cooperative model,
-/// the KernelCore ref is not yet needed because:
-/// - PreemptThreads is called every 10ms by the cpu_manager and is stubbed
-/// - The PQ lives in KProcess temporarily (single-process model)
-/// When multi-process or multi-core support is needed, add the kernel ref.
+/// Matches upstream `GlobalSchedulerContext` (global_scheduler_context.h).
+/// Owns the KSchedulerPriorityQueue, the scheduler lock, the thread list,
+/// and dummy thread wakeup tracking.
 pub struct GlobalSchedulerContext {
     pub m_scheduler_update_needed: std::sync::atomic::AtomicBool,
     pub m_priority_queue: KPriorityQueue,
     pub m_scheduler_lock: KAbstractSchedulerLock,
 
     /// Dummy threads pending wakeup on lock release.
-    /// Upstream: std::set<KThread*>
     m_woken_dummy_threads: Mutex<HashSet<u64>>,
     /// All thread pointers that are alive.
-    /// Upstream: std::vector<KThread*> with std::mutex m_global_list_guard
     m_thread_list: Mutex<Vec<Arc<Mutex<KThread>>>>,
 }
 
@@ -55,14 +81,12 @@ impl GlobalSchedulerContext {
         }
     }
 
-    /// Add a thread to the global thread list.
-    /// Matches upstream: `std::scoped_lock lock{m_global_list_guard}; m_thread_list.push_back(thread);`
+    // -- Thread list management --
+
     pub fn add_thread(&self, thread: Arc<Mutex<KThread>>) {
         self.m_thread_list.lock().unwrap().push(thread);
     }
 
-    /// Remove a thread from the global thread list.
-    /// Matches upstream: `std::scoped_lock lock{m_global_list_guard}; std::erase(m_thread_list, thread);`
     pub fn remove_thread(&self, thread_id: u64) {
         self.m_thread_list
             .lock()
@@ -70,60 +94,102 @@ impl GlobalSchedulerContext {
             .retain(|t| t.lock().unwrap().get_thread_id() != thread_id);
     }
 
-    /// Returns a snapshot of the thread list.
     pub fn get_thread_list(&self) -> Vec<Arc<Mutex<KThread>>> {
         self.m_thread_list.lock().unwrap().clone()
     }
 
-    /// Returns thread IDs for compatibility with existing code.
-    pub fn get_thread_id_list(&self) -> Vec<u64> {
+    pub fn get_thread_by_thread_id(&self, thread_id: u64) -> Option<Arc<Mutex<KThread>>> {
         self.m_thread_list
             .lock()
             .unwrap()
             .iter()
-            .map(|t| t.lock().unwrap().get_thread_id())
-            .collect()
+            .find(|t| t.lock().unwrap().get_thread_id() == thread_id)
+            .cloned()
     }
 
-    /// Preempt threads at the preemption priorities for each core.
-    /// Matches upstream: calls KScheduler::RotateScheduledQueue per core.
-    ///
-    /// Note: requires a &mut KProcess to access the PQ. This is called
-    /// externally (e.g., by cpu_manager every 10ms) with the process lock held.
-    pub fn preempt_threads_with_process(&self, process: &mut super::k_process::KProcess) {
-        for core_id in 0..hardware_properties::NUM_CPU_CORES {
-            let priority = PREEMPTION_PRIORITIES[core_id as usize] as i32;
-            super::k_scheduler::KScheduler::rotate_scheduled_queue(process, core_id as i32, priority);
+    // -- Priority queue operations --
+    // These snapshot the thread list, then operate on the PQ with that snapshot
+    // as the ThreadAccessor. The PQ is extracted via std::mem::take to avoid
+    // double-borrow issues (same pattern as KProcess::push_back_to_priority_queue).
+
+    pub fn make_accessor(&self) -> ThreadListAccessor {
+        ThreadListAccessor {
+            threads: self.m_thread_list.lock().unwrap().clone(),
         }
     }
 
-    /// Returns true if the global scheduler lock is held by the current thread.
+    pub fn push_back_to_priority_queue(&mut self, thread_id: u64) {
+        let accessor = self.make_accessor();
+        let mut pq = std::mem::take(&mut self.m_priority_queue);
+        pq.push_back(thread_id, &accessor);
+        self.m_priority_queue = pq;
+    }
+
+    pub fn remove_from_priority_queue(&mut self, thread_id: u64) {
+        let accessor = self.make_accessor();
+        let mut pq = std::mem::take(&mut self.m_priority_queue);
+        pq.remove(thread_id, &accessor);
+        self.m_priority_queue = pq;
+    }
+
+    pub fn change_priority_in_queue(&mut self, thread_id: u64, old_priority: i32, is_running: bool) {
+        let accessor = self.make_accessor();
+        let mut pq = std::mem::take(&mut self.m_priority_queue);
+        pq.change_priority(old_priority, is_running, thread_id, &accessor);
+        self.m_priority_queue = pq;
+    }
+
+    pub fn get_scheduled_front(&self, core: i32) -> Option<u64> {
+        self.m_priority_queue.get_scheduled_front(core)
+    }
+
+    pub fn move_to_scheduled_back(&mut self, thread_id: u64) -> Option<u64> {
+        let accessor = self.make_accessor();
+        let mut pq = std::mem::take(&mut self.m_priority_queue);
+        let result = pq.move_to_scheduled_back(thread_id, &accessor);
+        self.m_priority_queue = pq;
+        result
+    }
+
+    pub fn get_scheduled_next(&self, core: i32, thread_id: u64, priority: i32) -> Option<u64> {
+        let accessor = self.make_accessor();
+        self.m_priority_queue.get_scheduled_next(core, thread_id, priority, &accessor)
+    }
+
+    // -- PreemptThreads --
+
+    pub fn preempt_threads(&mut self) {
+        let accessor = self.make_accessor();
+        for core_id in 0..hardware_properties::NUM_CPU_CORES {
+            let priority = PREEMPTION_PRIORITIES[core_id as usize] as i32;
+            let mut pq = std::mem::take(&mut self.m_priority_queue);
+            let top_thread_id = pq.get_scheduled_front_at_priority(core_id as i32, priority);
+            if let Some(top_id) = top_thread_id {
+                let _ = pq.move_to_scheduled_back(top_id, &accessor);
+            }
+            self.m_priority_queue = pq;
+        }
+    }
+
+    // -- Scheduler lock and state --
+
     pub fn is_locked(&self) -> bool {
         self.m_scheduler_lock.is_locked_by_current_thread()
     }
 
-    /// Register a dummy thread for wakeup on scheduler lock release.
+    pub fn scheduler_lock(&self) -> &KAbstractSchedulerLock {
+        &self.m_scheduler_lock
+    }
+
     pub fn register_dummy_thread_for_wakeup(&self, thread_id: u64) {
-        debug_assert!(self.is_locked());
-        self.m_woken_dummy_threads
-            .lock()
-            .unwrap()
-            .insert(thread_id);
+        self.m_woken_dummy_threads.lock().unwrap().insert(thread_id);
     }
 
-    /// Unregister a dummy thread from wakeup.
     pub fn unregister_dummy_thread_for_wakeup(&self, thread_id: u64) {
-        debug_assert!(self.is_locked());
-        self.m_woken_dummy_threads
-            .lock()
-            .unwrap()
-            .remove(&thread_id);
+        self.m_woken_dummy_threads.lock().unwrap().remove(&thread_id);
     }
 
-    /// Wake up all waiting dummy threads.
-    /// Matches upstream: for each thread, calls thread.DummyThreadEndWait()
     pub fn wakeup_waiting_dummy_threads(&self) {
-        debug_assert!(self.is_locked());
         let thread_ids: Vec<u64> = {
             let set = self.m_woken_dummy_threads.lock().unwrap();
             set.iter().copied().collect()
@@ -139,11 +205,6 @@ impl GlobalSchedulerContext {
         }
 
         self.m_woken_dummy_threads.lock().unwrap().clear();
-    }
-
-    /// Get a reference to the scheduler lock.
-    pub fn scheduler_lock(&self) -> &KAbstractSchedulerLock {
-        &self.m_scheduler_lock
     }
 }
 

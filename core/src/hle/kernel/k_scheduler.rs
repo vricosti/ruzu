@@ -177,21 +177,36 @@ impl KScheduler {
     /// Selects the highest-priority thread per core from the PQ.
     /// Returns bitmask of cores needing rescheduling.
     ///
-    /// This is the simplified single-core version. The full upstream version
-    /// handles pinned threads, idle core migration, and multi-core balancing.
+    /// Full upstream version handles pinned threads and idle core migration.
     pub fn update_highest_priority_threads_impl(
         schedulers: &mut [KScheduler],
-        process: &KProcess,
+        gsc: &super::global_scheduler_context::GlobalSchedulerContext,
     ) -> u64 {
-        let mut cores_needing_scheduling = 0u64;
+        use crate::hardware_properties::NUM_CPU_CORES;
 
-        for (core_id, scheduler) in schedulers.iter_mut().enumerate() {
-            let top_thread_id = process.priority_queue.get_scheduled_front(core_id as i32);
-            cores_needing_scheduling |= scheduler.update_highest_priority_thread(top_thread_id);
+        let mut cores_needing_scheduling = 0u64;
+        let mut idle_cores = 0u64;
+        let mut top_threads: [Option<u64>; NUM_CPU_CORES as usize] = [None; NUM_CPU_CORES as usize];
+
+        // Select top thread per core from PQ.
+        for core_id in 0..NUM_CPU_CORES as usize {
+            let top_thread_id = gsc.m_priority_queue.get_scheduled_front(core_id as i32);
+
+            // Upstream: check pinned threads here. Simplified for now.
+            if top_thread_id.is_none() {
+                idle_cores |= 1u64 << core_id;
+            }
+
+            top_threads[core_id] = top_thread_id;
+            if core_id < schedulers.len() {
+                cores_needing_scheduling |=
+                    schedulers[core_id].update_highest_priority_thread(top_threads[core_id]);
+            }
         }
 
-        // Upstream also handles idle core migration (moving suggested threads
-        // to idle cores). For single-core this is not applicable.
+        // Upstream: migrate suggested threads to idle cores.
+        // For single-core with one active core, this is rarely needed.
+        // TODO: implement full idle core migration for multi-core.
 
         cores_needing_scheduling
     }
@@ -270,11 +285,10 @@ impl KScheduler {
 
         // Move current thread to the back of its priority level in the PQ.
         // Upstream: next_thread = priority_queue.MoveToScheduledBack(cur_thread)
-        let next_thread_id = {
-            let mut pq = std::mem::take(&mut process.priority_queue);
-            let next = pq.move_to_scheduled_back(current_thread_id, &*process);
-            process.priority_queue = pq;
-            next
+        let next_thread_id = if let Some(ref gsc) = process.global_scheduler_context {
+            gsc.lock().unwrap().move_to_scheduled_back(current_thread_id)
+        } else {
+            None
         };
         process.increment_scheduled_count();
 
@@ -336,19 +350,20 @@ impl KScheduler {
     ///
     /// Moves the front thread at `priority` to the back, then tries to
     /// migrate a suggested thread to fill the gap.
-    pub fn rotate_scheduled_queue(process: &mut KProcess, core_id: i32, priority: i32) {
-        let mut pq = std::mem::take(&mut process.priority_queue);
-
-        // Rotate the front of the queue to the end.
+    /// Rotate the scheduled queue at a given priority for a core.
+    /// Operates on the GlobalSchedulerContext's PQ.
+    pub fn rotate_scheduled_queue(
+        gsc: &mut super::global_scheduler_context::GlobalSchedulerContext,
+        core_id: i32,
+        priority: i32,
+    ) {
+        let accessor = gsc.make_accessor();
+        let mut pq = std::mem::take(&mut gsc.m_priority_queue);
         let top_thread_id = pq.get_scheduled_front_at_priority(core_id, priority);
         if let Some(top_id) = top_thread_id {
-            let _next_id = pq.move_to_scheduled_back(top_id, process);
+            let _ = pq.move_to_scheduled_back(top_id, &accessor);
         }
-
-        // Upstream also tries to migrate suggested threads here.
-        // For single-core, core migration is not applicable — skip.
-
-        process.priority_queue = pq;
+        gsc.m_priority_queue = pq;
     }
 
     pub fn needs_scheduling(&self) -> bool {
@@ -493,7 +508,7 @@ impl KScheduler {
     /// Used when PQ is empty (threads woken via timer/cancel_wait that
     /// bypass PQ). Returns the thread_id and pushes it to PQ for future use.
     fn scan_runnable_threads(&self, process: &Arc<Mutex<KProcess>>) -> Option<u64> {
-        let mut process = process.lock().unwrap();
+        let process = process.lock().unwrap();
         let mut best_id = None;
         let mut best_priority = i32::MAX;
 
@@ -526,27 +541,26 @@ impl KScheduler {
         process: &Arc<Mutex<KProcess>>,
     ) -> Option<u64> {
         let process_guard = process.lock().unwrap();
-        let next_thread_id = process_guard.get_scheduled_front(self.core_id)?;
+        let gsc = process_guard.global_scheduler_context.as_ref()?;
+        let gsc_guard = gsc.lock().unwrap();
+        let next_thread_id = gsc_guard.get_scheduled_front(self.core_id)?;
 
         // Handle yield: if the current thread yielded, try the next one.
         if let Some(yielded) = self.yielded_thread_id {
             if next_thread_id == yielded {
-                // The yielded thread is still highest priority.
-                // Get the next thread at the same or lower priority.
-                let next = process_guard.priority_queue.get_scheduled_next(
+                let priority = process_guard
+                    .get_thread_by_thread_id(next_thread_id)
+                    .map(|t| t.lock().unwrap().get_priority())
+                    .unwrap_or(63);
+                let next = gsc_guard.get_scheduled_next(
                     self.core_id,
                     next_thread_id,
-                    process_guard
-                        .get_thread_by_thread_id(next_thread_id)
-                        .map(|t| t.lock().unwrap().get_priority())
-                        .unwrap_or(63),
-                    &*process_guard,
+                    priority,
                 );
                 if let Some(alternative) = next {
                     self.yielded_thread_id = None;
                     return Some(alternative);
                 }
-                // No alternative — yield had no effect, mark it done.
                 if let Some(thread) = process_guard.get_thread_by_thread_id(yielded) {
                     thread
                         .lock()

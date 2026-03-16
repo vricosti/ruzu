@@ -23,7 +23,7 @@ use super::k_memory_block::{
 use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_process_page_table::KProcessPageTable;
 use super::k_readable_event::KReadableEvent;
-use super::k_priority_queue::{KPriorityQueue, KPriorityQueueMember, ThreadAccessor};
+use super::k_priority_queue::{KPriorityQueueMember, ThreadAccessor};
 use super::k_scheduler::KScheduler;
 use super::k_session::KSession;
 use super::k_synchronization_object;
@@ -409,11 +409,9 @@ pub struct KProcess {
     // m_state_lock — KLightLock
     // m_list_lock — KLightLock
     pub cond_var: KConditionVariable,
-    /// Priority queue for thread scheduling.
-    /// Upstream: this lives in GlobalSchedulerContext. Placed here temporarily
-    /// for single-process bring-up; will move to GlobalSchedulerContext when
-    /// multi-process scheduling is needed.
-    pub priority_queue: KPriorityQueue,
+    /// Reference to the global scheduler context that owns the priority queue.
+    /// Upstream: accessed via kernel.GlobalSchedulerContext().
+    pub global_scheduler_context: Option<Arc<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>>,
     // m_address_arbiter — KAddressArbiter
     pub entropy: [u64; 4],
     pub is_signaled: bool,
@@ -496,7 +494,7 @@ impl KProcess {
             memory_release_hint: 0,
             state: ProcessState::default(),
             cond_var: KConditionVariable::new(),
-            priority_queue: KPriorityQueue::new(),
+            global_scheduler_context: None,
             entropy: [0u64; 4],
             is_signaled: false,
             is_initialized: false,
@@ -756,34 +754,33 @@ impl KProcess {
     }
 
     // -- Priority queue operations --
+    // Delegate to GlobalSchedulerContext which owns the PQ.
+    // Matches upstream: GetPriorityQueue(kernel).PushBack/Remove/etc.
 
-    /// Add a thread to the priority queue (called when thread becomes RUNNABLE).
-    /// Matches upstream: GetPriorityQueue(kernel).PushBack(thread)
-    pub fn push_back_to_priority_queue(&mut self, thread_id: u64) {
-        let mut pq = std::mem::take(&mut self.priority_queue);
-        pq.push_back(thread_id, self);
-        self.priority_queue = pq;
+    pub fn push_back_to_priority_queue(&self, thread_id: u64) {
+        if let Some(ref gsc) = self.global_scheduler_context {
+            gsc.lock().unwrap().push_back_to_priority_queue(thread_id);
+        }
     }
 
-    /// Remove a thread from the priority queue (called when thread leaves RUNNABLE).
-    /// Matches upstream: GetPriorityQueue(kernel).Remove(thread)
-    pub fn remove_from_priority_queue(&mut self, thread_id: u64) {
-        let mut pq = std::mem::take(&mut self.priority_queue);
-        pq.remove(thread_id, self);
-        self.priority_queue = pq;
+    pub fn remove_from_priority_queue(&self, thread_id: u64) {
+        if let Some(ref gsc) = self.global_scheduler_context {
+            gsc.lock().unwrap().remove_from_priority_queue(thread_id);
+        }
     }
 
-    /// Change a thread's priority in the priority queue.
-    /// Matches upstream: GetPriorityQueue(kernel).ChangePriority(old_priority, is_running, thread)
-    pub fn change_priority_in_queue(&mut self, thread_id: u64, old_priority: i32, is_running: bool) {
-        let mut pq = std::mem::take(&mut self.priority_queue);
-        pq.change_priority(old_priority, is_running, thread_id, self);
-        self.priority_queue = pq;
+    pub fn change_priority_in_queue(&self, thread_id: u64, old_priority: i32, is_running: bool) {
+        if let Some(ref gsc) = self.global_scheduler_context {
+            gsc.lock().unwrap().change_priority_in_queue(thread_id, old_priority, is_running);
+        }
     }
 
-    /// Get the highest priority runnable thread for a core from the PQ.
     pub fn get_scheduled_front(&self, core: i32) -> Option<u64> {
-        self.priority_queue.get_scheduled_front(core)
+        self.global_scheduler_context
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .get_scheduled_front(core)
     }
 
     pub fn initialize_handle_table(&mut self) -> u32 {
