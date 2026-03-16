@@ -206,23 +206,9 @@ impl Default for StackParameters {
 }
 
 // ---------------------------------------------------------------------------
-// QueueEntry — matches upstream KThread::QueueEntry
-// ---------------------------------------------------------------------------
-
-/// Per-core priority queue entry.
-/// Matches upstream `KThread::QueueEntry` (k_thread.h).
-#[derive(Default)]
-pub struct QueueEntry {
-    pub prev: Option<usize>, // index into a thread table
-    pub next: Option<usize>,
-}
-
-impl QueueEntry {
-    pub fn initialize(&mut self) {
-        self.prev = None;
-        self.next = None;
-    }
-}
+// QueueEntry — re-exported from k_priority_queue for KThread field.
+// Matches upstream `KThread::QueueEntry` (k_thread.h).
+pub use super::k_priority_queue::QueueEntry;
 
 // ---------------------------------------------------------------------------
 // NativeExecutionParameters
@@ -385,6 +371,10 @@ pub struct KThread {
     pub stack_top: KProcessAddress,
     pub native_execution_parameters: NativeExecutionParameters,
     pub sleep_deadline: Option<Instant>,
+    /// Upstream: KTimerTask::m_time — absolute time in nanoseconds for
+    /// the hardware timer. Set by KHardwareTimer::RegisterAbsoluteTask,
+    /// cleared to 0 when the task fires or is cancelled.
+    pub timer_task_time: i64,
     pub synchronization_wait: SynchronizationWaitSet,
     pub sync_object: SynchronizationObjectState,
 }
@@ -476,6 +466,7 @@ impl KThread {
             stack_top: KProcessAddress::default(),
             native_execution_parameters: NativeExecutionParameters::default(),
             sleep_deadline: None,
+            timer_task_time: 0,
             synchronization_wait: SynchronizationWaitSet::new(),
             sync_object: SynchronizationObjectState::new(),
         }
@@ -1550,6 +1541,16 @@ impl KThread {
         self.wait_queue.is_some()
     }
 
+    /// Get the timer task time (upstream KTimerTask::GetTime()).
+    pub fn get_timer_task_time(&self) -> i64 {
+        self.timer_task_time
+    }
+
+    /// Set the timer task time (upstream KTimerTask::SetTime()).
+    pub fn set_timer_task_time(&mut self, time: i64) {
+        self.timer_task_time = time;
+    }
+
     pub fn waiter_thread_ids(&self) -> &[u64] {
         &self.user_waiter_thread_ids
     }
@@ -1565,6 +1566,32 @@ impl KThread {
 impl Default for KThread {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl super::k_priority_queue::KPriorityQueueMember for KThread {
+    fn get_priority_queue_entry(&self, core: i32) -> &QueueEntry {
+        &self.per_core_priority_queue_entry[core as usize]
+    }
+
+    fn get_priority_queue_entry_mut(&mut self, core: i32) -> &mut QueueEntry {
+        &mut self.per_core_priority_queue_entry[core as usize]
+    }
+
+    fn get_affinity_mask_value(&self) -> u64 {
+        self.physical_affinity_mask.get_affinity_mask()
+    }
+
+    fn get_active_core(&self) -> i32 {
+        self.core_id
+    }
+
+    fn get_priority(&self) -> i32 {
+        self.priority
+    }
+
+    fn is_dummy_thread(&self) -> bool {
+        self.thread_type == ThreadType::Dummy
     }
 }
 

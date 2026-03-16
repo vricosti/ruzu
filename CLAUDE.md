@@ -30,7 +30,7 @@ This document exists because earlier progress proved that a crate can be "substa
 
 The C++ source of truth is:
 
-- `/home/vricosti/shared/zuyu/src/`
+- `/home/vricosti/Dev/emulators/zuyu/src/`
 
 That tree is read-only.
 
@@ -51,7 +51,7 @@ Always treat it as authoritative for:
 
 The Rust destination is:
 
-- `/home/vricosti/shared/ruzu/`
+- `/home/vricosti/Dev/emulators/ruzu/`
 
 The Rust port should be judged against the C++ tree, not against whether the Rust design looks idiomatic in isolation.
 
