@@ -8,7 +8,7 @@
 //! The Wait() static method and thread queue integration are stubbed until
 //! KThread, KScheduler, and KThreadQueue are ported.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use super::k_auto_object::{KAutoObjectBase, KAutoObjectWithList, TypeObj};
 use super::k_class_token;
@@ -16,6 +16,7 @@ use super::k_process::KProcess;
 use super::k_readable_event::KReadableEvent;
 use super::k_scheduler::KScheduler;
 use super::k_thread::KThread;
+use super::k_thread_queue::{KThreadQueue, KThreadQueueWithoutEndWait};
 use crate::hle::kernel::svc::svc_results::{
     RESULT_CANCELLED, RESULT_INVALID_HANDLE, RESULT_TERMINATION_REQUESTED, RESULT_TIMED_OUT,
 };
@@ -158,6 +159,8 @@ impl SynchronizationWaiters {
         set_wait_object_links(process, handle, None, None, false);
     }
 }
+
+pub(crate) struct ThreadQueueImplForKSynchronizationObjectWait;
 
 impl SynchronizationObjectState {
     pub fn new() -> Self {
@@ -731,7 +734,7 @@ pub fn notify_waiter_available(
     thread: &mut KThread,
     process: &mut KProcess,
     signaled_object_id: u64,
-    result: u32,
+    _result: u32,
 ) -> bool {
     if !thread.synchronization_wait.is_active()
         || thread.get_state() != super::k_thread::ThreadState::WAITING
@@ -749,11 +752,55 @@ pub fn notify_waiter_available(
     };
 
     // The process lock is already held by the caller in the object-notify path,
-    // so consume the active wait registration before end_wait() runs and tries
-    // to clear it again through the parent process.
+    // so consume the active wait registration before the base wait queue cleanup runs.
     thread.synchronization_wait.clear();
-    thread.complete_synchronization_wait(synced_index as i32, result);
+    thread.synced_index = synced_index as i32;
+    thread.clear_cancellable();
     true
+}
+
+impl ThreadQueueImplForKSynchronizationObjectWait {
+    pub(crate) fn queue() -> KThreadQueue {
+        KThreadQueueWithoutEndWait::with_callbacks(
+            Some(Self::notify_available),
+            Some(Self::cancel_wait),
+        )
+        .base
+    }
+
+    fn notify_available(
+        wait_queue: &KThreadQueue,
+        thread: &mut KThread,
+        process: &mut KProcess,
+        signaled_object_id: u64,
+        result: u32,
+    ) -> bool {
+        if notify_waiter_available(thread, process, signaled_object_id, result) {
+            wait_queue.base_end_wait(thread, result);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cancel_wait(thread: &mut KThread) {
+        if !thread.synchronization_wait.is_active() {
+            thread.clear_cancellable();
+            return;
+        }
+
+        if let Some(parent) = thread.parent.as_ref().and_then(Weak::upgrade) {
+            let mut process_guard = parent.lock().unwrap();
+            clear_wait_set(
+                Some(&mut process_guard),
+                thread.thread_id,
+                &mut thread.synchronization_wait,
+            );
+        } else {
+            clear_wait_set(None, thread.thread_id, &mut thread.synchronization_wait);
+        }
+        thread.clear_cancellable();
+    }
 }
 
 pub fn first_signaled_index(process: &KProcess, wait_set: &SynchronizationWaitSet) -> Option<usize> {
@@ -812,7 +859,7 @@ pub fn process_waiter_snapshot(
         };
 
         let mut waiter_thread = waiter_thread.lock().unwrap();
-        if waiter_thread.notify_available_synchronization(signaled_object_id, process, result) {
+        if waiter_thread.notify_available(process, signaled_object_id, result) {
             unlink_thread_ids.push(waiter_thread_id);
             woke_any = true;
         } else if waiter_thread.get_state() != super::k_thread::ThreadState::WAITING {
@@ -1280,6 +1327,16 @@ mod tests {
         );
         assert_eq!(result, RESULT_SUCCESS);
         assert_eq!(out_index, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "KThreadQueueWithoutEndWait::end_wait should never be called")]
+    fn synchronization_wait_queue_disallows_direct_end_wait() {
+        let queue = ThreadQueueImplForKSynchronizationObjectWait::queue();
+        assert!(!queue.end_wait_allowed);
+
+        let mut thread = KThread::new();
+        queue.end_wait(&mut thread, RESULT_SUCCESS.get_inner_value());
     }
 
     #[test]

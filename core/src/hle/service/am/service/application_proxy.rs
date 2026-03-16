@@ -91,15 +91,12 @@ impl IApplicationProxy {
         ctx: &mut HLERequestContext,
     ) {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
-        // Create the system event handle and store in the LifecycleManager.
-        // Matches upstream: LifecycleManager creates a KEvent via ServiceContext.
         {
             let mut applet = proxy.applet.lock().unwrap();
-            if applet.lifecycle_manager.get_system_event_handle() == 0 {
-                if let Some(handle) = ctx.create_readable_event_handle(true) {
-                    applet.lifecycle_manager.system_event_handle = handle;
-                }
-            }
+            let _ = applet.lifecycle_manager.ensure_system_event(ctx);
+            let _ = applet
+                .lifecycle_manager
+                .ensure_operation_mode_changed_system_event(ctx);
         }
         Self::push_interface_response(ctx, Arc::new(
             super::common_state_getter::ICommonStateGetter::new(proxy.applet.clone())

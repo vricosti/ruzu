@@ -1,5 +1,7 @@
 # CLAUDE.md — Porting Philosophy And Execution Contract
 
+STRICT MODE ON
+
 ## Purpose
 
 This document defines how a ChatGPT/Codex-style agent must port C++ code from `/home/vricosti/shared/zuyu/src/` into `/home/vricosti/shared/ruzu/`.
@@ -538,6 +540,15 @@ With debug logging:
 
 ```bash
 RUST_LOG=info cargo run --bin yuzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+```
+
+With isolated data directories (avoids polluting `~/.local/share/ruzu`, `~/.cache/ruzu`, `~/.config/ruzu`):
+
+```bash
+env XDG_DATA_HOME=/tmp/ruzu-data \
+    XDG_CACHE_HOME=/tmp/ruzu-cache \
+    XDG_CONFIG_HOME=/tmp/ruzu-config \
+    RUST_LOG=info cargo run --bin yuzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
 ```
 
 **Note:** MK8D is an ARM32 (AArch32) game — title ID `0100152000022000`.

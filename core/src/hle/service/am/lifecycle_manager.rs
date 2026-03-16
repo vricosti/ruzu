@@ -5,6 +5,10 @@
 //! Port of zuyu/src/core/hle/service/am/lifecycle_manager.cpp
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 
 use super::am_types::{AppletMessage, FocusState};
 
@@ -37,9 +41,10 @@ pub enum SuspendMode {
 }
 
 pub struct LifecycleManager {
-    // Events — kernel handles registered in the process handle table.
     // Matches upstream: Event m_system_event, Event m_operation_mode_changed_system_event
+    system_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub system_event_handle: u32,
+    operation_mode_changed_system_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub operation_mode_changed_system_event_handle: u32,
 
     // Cached signal state for SignalSystemEventIfNeeded
@@ -83,7 +88,9 @@ pub struct LifecycleManager {
 impl LifecycleManager {
     pub fn new(is_application: bool) -> Self {
         Self {
+            system_event: None,
             system_event_handle: 0,
+            operation_mode_changed_system_event: None,
             operation_mode_changed_system_event_handle: 0,
             system_event_signaled: false,
             operation_mode_changed_system_event_signaled: false,
@@ -129,6 +136,29 @@ impl LifecycleManager {
     /// Matches upstream `Event& GetOperationModeChangedSystemEvent()`.
     pub fn get_operation_mode_changed_system_event_handle(&self) -> u32 {
         self.operation_mode_changed_system_event_handle
+    }
+
+    pub fn ensure_system_event(&mut self, ctx: &HLERequestContext) -> Option<Handle> {
+        let signaled = self.should_signal_system_event();
+        Self::ensure_event(
+            ctx,
+            &mut self.system_event,
+            &mut self.system_event_handle,
+            signaled,
+        )
+    }
+
+    pub fn ensure_operation_mode_changed_system_event(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<Handle> {
+        let signaled = self.operation_mode_changed_system_event_signaled;
+        Self::ensure_event(
+            ctx,
+            &mut self.operation_mode_changed_system_event,
+            &mut self.operation_mode_changed_system_event_handle,
+            signaled,
+        )
     }
 
     pub fn is_application(&self) -> bool {
@@ -491,4 +521,21 @@ impl LifecycleManager {
             || self.has_album_screen_shot_taken
             || self.has_album_recording_saved
     }
+
+    fn ensure_event(
+        ctx: &HLERequestContext,
+        readable_event: &mut Option<Arc<Mutex<KReadableEvent>>>,
+        handle: &mut Handle,
+        signaled: bool,
+    ) -> Option<Handle> {
+        if *handle != 0 {
+            return Some(*handle);
+        }
+
+        let (new_handle, new_event) = ctx.create_readable_event(signaled)?;
+        *readable_event = Some(new_event);
+        *handle = new_handle;
+        Some(new_handle)
+    }
+
 }
