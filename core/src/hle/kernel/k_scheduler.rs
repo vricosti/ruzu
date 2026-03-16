@@ -75,22 +75,27 @@ impl KScheduler {
     }
 
     /// Initialize the scheduler with main and idle threads.
-    /// TODO: Port from k_scheduler.cpp.
+    /// Matches upstream `KScheduler::Initialize(main_thread, idle_thread, core_id)`.
     pub fn initialize(
         &mut self,
         main_thread_id: u64,
         idle_thread_id: u64,
         core_id: i32,
     ) {
+        self.core_id = core_id;
         self.idle_thread_id = Some(idle_thread_id);
         self.current_thread_id = Some(main_thread_id);
-        self.core_id = core_id;
+        // Upstream also: sets idle_thread_stack, interrupt_task_manager,
+        // inserts main_thread into PQ, sets scheduler update needed.
+        // PQ insertion is done by the caller (KProcess::create_main_thread).
     }
 
     /// Activate the scheduler.
-    /// TODO: Port from k_scheduler.cpp.
+    /// Matches upstream `KScheduler::Activate()`.
     pub fn activate(&mut self) {
         self.is_active = true;
+        // Upstream: calls RescheduleCurrentCore().
+        // In cooperative model, scheduling happens at SVC boundaries.
     }
 
     /// Get the idle thread count.
@@ -119,47 +124,41 @@ impl KScheduler {
     }
 
     /// Set the interrupt task as runnable.
-    /// TODO: Port from k_scheduler.cpp.
+    /// Matches upstream: sets flag and needs_scheduling.
     pub fn set_interrupt_task_runnable(&mut self) {
         self.state.interrupt_task_runnable = true;
+        self.state.needs_scheduling.store(true, Ordering::Relaxed);
     }
 
     /// Request schedule on interrupt.
-    /// TODO: Port from k_scheduler.cpp.
+    /// Matches upstream: sets needs_scheduling, calls ScheduleOnInterrupt
+    /// if dispatch is allowed. In cooperative model, just set the flag.
     pub fn request_schedule_on_interrupt(&mut self) {
         self.state.needs_scheduling.store(true, Ordering::Relaxed);
     }
 
     /// Preempt single core.
-    /// TODO: Port from k_scheduler.cpp.
+    /// Upstream: disables dispatch, unloads thread, yields to switch fiber.
+    /// In cooperative model: just request a reschedule.
     pub fn preempt_single_core(&mut self) {
-        // TODO: Full implementation
+        self.request_schedule();
     }
 
-    // -- Static methods (take kernel state references) --
+    // -- Static methods --
+    // In upstream these take `KernelCore&` and access global state.
+    // In our cooperative model they are no-ops or simplified.
 
-    /// Disable scheduling for the current thread.
-    /// TODO: Port from k_scheduler.cpp.
-    pub fn disable_scheduling() {
-        // TODO: Full implementation
-    }
+    /// Upstream: increments current thread's disable_dispatch_count.
+    /// In cooperative model: no-op (process lock provides exclusion).
+    pub fn disable_scheduling() {}
 
-    /// Enable scheduling, rescheduling cores as needed.
-    /// TODO: Port from k_scheduler.cpp.
-    pub fn enable_scheduling(_cores_needing_scheduling: u64) {
-        // TODO: Full implementation
-    }
+    /// Upstream: decrements dispatch count, reschedules cores via IPI.
+    /// In cooperative model: no-op (scheduling at SVC boundaries).
+    pub fn enable_scheduling(_cores_needing_scheduling: u64) {}
 
-    /// Update highest priority threads across all cores.
-    /// Matches upstream `KScheduler::UpdateHighestPriorityThreads(kernel)`.
-    /// Called by KAbstractSchedulerLock::Unlock.
-    pub fn update_highest_priority_threads() -> u64 {
-        // Upstream checks IsSchedulerUpdateNeeded, then calls
-        // UpdateHighestPriorityThreadsImpl. Since we don't have the global
-        // scheduler context accessible from a static method, return 0.
-        // The cooperative dispatch handles thread selection differently.
-        0
-    }
+    /// Upstream: checks IsSchedulerUpdateNeeded, calls UpdateHighestPriorityThreadsImpl.
+    /// In cooperative model: returns 0 (no IPI-based rescheduling needed).
+    pub fn update_highest_priority_threads() -> u64 { 0 }
 
     /// Update the highest priority thread for this core.
     /// Matches upstream `KScheduler::UpdateHighestPriorityThread(KThread*)`.

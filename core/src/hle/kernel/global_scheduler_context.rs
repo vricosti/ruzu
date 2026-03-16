@@ -87,11 +87,13 @@ impl GlobalSchedulerContext {
 
     /// Preempt threads at the preemption priorities for each core.
     /// Matches upstream: calls KScheduler::RotateScheduledQueue per core.
-    pub fn preempt_threads(&self) {
-        debug_assert!(self.is_locked());
+    ///
+    /// Note: requires a &mut KProcess to access the PQ. This is called
+    /// externally (e.g., by cpu_manager every 10ms) with the process lock held.
+    pub fn preempt_threads_with_process(&self, process: &mut super::k_process::KProcess) {
         for core_id in 0..hardware_properties::NUM_CPU_CORES {
-            let _priority = PREEMPTION_PRIORITIES[core_id as usize];
-            // TODO: KScheduler::RotateScheduledQueue(kernel, core_id, priority);
+            let priority = PREEMPTION_PRIORITIES[core_id as usize] as i32;
+            super::k_scheduler::KScheduler::rotate_scheduled_queue(process, core_id as i32, priority);
         }
     }
 
