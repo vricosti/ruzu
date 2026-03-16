@@ -1252,7 +1252,7 @@ impl KThread {
         //
         // Instead, callers that transition thread state while holding the process lock
         // should call process.push_back_to_priority_queue / remove_from_priority_queue
-        // directly. The cooperative dispatch fallback (select_next_thread_id) handles
+        // directly. The dispatch loop's scan_runnable_threads fallback handles
         // the case where the PQ is not up to date.
 
         // Notify the scheduler for dispatch.

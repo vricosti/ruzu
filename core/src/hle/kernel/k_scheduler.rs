@@ -194,14 +194,10 @@ impl KScheduler {
         self.state.prev_thread_id = Some(thread_id);
         self.request_schedule();
 
-        // Update the priority queue if we have one.
-        // Upstream: if old_state == Runnable, Remove from PQ.
-        //           if new_state == Runnable, PushBack to PQ.
-        // The PQ operations require a ThreadAccessor, which we don't have
-        // here (we'd need KProcess). For now, the cooperative dispatch
-        // in select_next_thread_id scans all threads, so PQ updates are
-        // not strictly needed. They will be wired when the dispatch loop
-        // migrates to PQ-based scheduling.
+        // PQ updates happen at the call sites that transition thread state
+        // while holding the process lock (condvar wait/signal, sync wait,
+        // thread exit, etc.). The dispatch loop's scan_runnable_threads
+        // fallback catches any threads that bypass PQ updates.
     }
 
     /// On thread priority changed.
@@ -300,6 +296,26 @@ impl KScheduler {
         self.state.needs_scheduling.store(true, Ordering::Relaxed);
     }
 
+    /// Rotate the scheduled queue at a given priority for a core.
+    /// Matches upstream `KScheduler::RotateScheduledQueue(kernel, core_id, priority)`.
+    ///
+    /// Moves the front thread at `priority` to the back, then tries to
+    /// migrate a suggested thread to fill the gap.
+    pub fn rotate_scheduled_queue(process: &mut KProcess, core_id: i32, priority: i32) {
+        let mut pq = std::mem::take(&mut process.priority_queue);
+
+        // Rotate the front of the queue to the end.
+        let top_thread_id = pq.get_scheduled_front_at_priority(core_id, priority);
+        if let Some(top_id) = top_thread_id {
+            let _next_id = pq.move_to_scheduled_back(top_id, process);
+        }
+
+        // Upstream also tries to migrate suggested threads here.
+        // For single-core, core migration is not applicable — skip.
+
+        process.priority_queue = pq;
+    }
+
     pub fn needs_scheduling(&self) -> bool {
         self.state.needs_scheduling.load(Ordering::Relaxed)
     }
@@ -308,6 +324,7 @@ impl KScheduler {
         let now = Instant::now();
         let mut process = process.lock().unwrap();
         let mut woke_any = false;
+        let mut woke_ids = Vec::new();
 
         for thread_id in &process.thread_list {
             let Some(thread) = process.get_thread_by_thread_id(*thread_id) else {
@@ -322,8 +339,15 @@ impl KScheduler {
                 continue;
             }
 
+            let tid = thread.get_thread_id();
             thread.on_timer();
+            woke_ids.push(tid);
             woke_any = true;
+        }
+
+        // Push woken threads to PQ (they're now RUNNABLE).
+        for tid in woke_ids {
+            process.push_back_to_priority_queue(tid);
         }
 
         if woke_any {
@@ -337,8 +361,9 @@ impl KScheduler {
         &mut self,
         process: &Arc<Mutex<KProcess>>,
     ) -> bool {
-        let process = process.lock().unwrap();
+        let mut process = process.lock().unwrap();
         let mut woke_any = false;
+        let mut woke_ids = Vec::new();
 
         for thread_id in &process.thread_list {
             let Some(thread) = process.get_thread_by_thread_id(*thread_id) else {
@@ -354,8 +379,15 @@ impl KScheduler {
                 continue;
             };
 
+            let tid = thread.get_thread_id();
             thread.complete_synchronization_wait(synced_index, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+            woke_ids.push(tid);
             woke_any = true;
+        }
+
+        // Push woken threads to PQ (they're now RUNNABLE).
+        for tid in woke_ids {
+            process.push_back_to_priority_queue(tid);
         }
 
         if woke_any {
@@ -365,7 +397,7 @@ impl KScheduler {
         woke_any
     }
 
-    pub fn next_sleep_deadline(&self, process: &Arc<Mutex<KProcess>>) -> Option<Instant> {
+    fn next_sleep_deadline(&self, process: &Arc<Mutex<KProcess>>) -> Option<Instant> {
         let process = process.lock().unwrap();
         let mut next_deadline = None;
 
@@ -397,15 +429,17 @@ impl KScheduler {
             self.wake_expired_sleeping_threads(process);
             self.wake_signaled_synchronization_threads(process);
 
-            // Try PQ-based selection first (O(1) for highest priority thread).
+            // PQ-based selection (O(1) for highest priority thread).
             if let Some(next) = self.select_next_thread_from_pq(process) {
                 return next;
             }
 
-            // Fallback to linear scan (handles edge cases where PQ might
-            // not be populated yet, e.g. during early initialization).
-            if let Some(next_thread_id) = self.select_next_thread_id(process, current_thread_id) {
-                return next_thread_id;
+            // PQ empty — fallback to linear scan for RUNNABLE threads that
+            // aren't in the PQ (timer/cancel_wait wakeups, early init).
+            // This is a safety net; once all wakeup paths push to PQ, this
+            // becomes unreachable.
+            if let Some(next) = self.scan_runnable_threads(process) {
+                return next;
             }
 
             if let Some(deadline) = self.next_sleep_deadline(process) {
@@ -418,6 +452,35 @@ impl KScheduler {
 
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Fallback: scan for the highest-priority RUNNABLE thread.
+    /// Used when PQ is empty (threads woken via timer/cancel_wait that
+    /// bypass PQ). Returns the thread_id and pushes it to PQ for future use.
+    fn scan_runnable_threads(&self, process: &Arc<Mutex<KProcess>>) -> Option<u64> {
+        let mut process = process.lock().unwrap();
+        let mut best_id = None;
+        let mut best_priority = i32::MAX;
+
+        for thread_id in &process.thread_list {
+            let Some(thread) = process.get_thread_by_thread_id(*thread_id) else {
+                continue;
+            };
+            let thread = thread.lock().unwrap();
+            if thread.get_state() != ThreadState::RUNNABLE {
+                continue;
+            }
+            if thread.get_priority() < best_priority {
+                best_priority = thread.get_priority();
+                best_id = Some(thread.get_thread_id());
+            }
+        }
+
+        // Push the found thread to PQ so future lookups are O(1).
+        if let Some(tid) = best_id {
+            process.push_back_to_priority_queue(tid);
+        }
+        best_id
     }
 
     /// Select the next thread using the priority queue.
@@ -478,6 +541,9 @@ impl KScheduler {
         next_thread
     }
 
+    /// Deprecated: linear scan for next thread. Replaced by PQ-based dispatch.
+    /// Kept only for test compatibility (svc_thread tests use it directly).
+    #[cfg(test)]
     pub fn select_next_thread_id(
         &mut self,
         process: &Arc<Mutex<KProcess>>,
