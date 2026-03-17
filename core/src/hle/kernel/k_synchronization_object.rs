@@ -1021,6 +1021,16 @@ mod tests {
         }
         process.register_thread_object(Arc::clone(&thread));
 
+        let waiter = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut waiter_guard = waiter.lock().unwrap();
+            waiter_guard.thread_id = 99;
+            waiter_guard.object_id = 88;
+            waiter_guard.synchronization_wait.begin(vec![2]);
+            waiter_guard.synchronization_wait.bind_thread(99);
+        }
+        process.register_thread_object(Arc::clone(&waiter));
+
         assert!(!is_object_signaled(&process, 2));
         readable.lock().unwrap().is_signaled = true;
         assert!(is_object_signaled(&process, 2));
@@ -1049,23 +1059,34 @@ mod tests {
         );
         assert!(readable.lock().unwrap().sync_object.waiters_are_empty());
 
+        waiter
+            .lock()
+            .unwrap()
+            .synchronization_wait
+            .begin(vec![55]);
+        waiter
+            .lock()
+            .unwrap()
+            .synchronization_wait
+            .bind_thread(99);
+
         link_waiter(
             &mut process,
             SynchronizationWaitNode {
                 object_id: 55,
                 handle: SynchronizationWaitNodeHandle {
-                    thread_id: 77,
+                    thread_id: 99,
                     wait_index: 0,
                 },
             },
         );
-        assert_eq!(process.sync_object.waiter_snapshot(&process), vec![77]);
+        assert_eq!(process.sync_object.waiter_snapshot(&process), vec![99]);
         unlink_waiter(
             &mut process,
             &SynchronizationWaitNode {
                 object_id: 55,
                 handle: SynchronizationWaitNodeHandle {
-                    thread_id: 77,
+                    thread_id: 99,
                     wait_index: 0,
                 },
             },

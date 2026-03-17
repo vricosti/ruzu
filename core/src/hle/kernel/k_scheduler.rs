@@ -70,6 +70,30 @@ pub struct KScheduler {
 }
 
 impl KScheduler {
+    fn exit_thread_if_termination_requested(
+        &self,
+        process: &Arc<Mutex<KProcess>>,
+        thread_id: u64,
+    ) -> bool {
+        let thread = {
+            let process = process.lock().unwrap();
+            process.get_thread_by_thread_id(thread_id)
+        };
+        let Some(thread) = thread else {
+            return false;
+        };
+
+        if {
+            let thread = thread.lock().unwrap();
+            thread.is_termination_requested() && !thread.is_signaled()
+        } {
+            thread.lock().unwrap().exit();
+            return true;
+        }
+
+        false
+    }
+
     /// Create a new scheduler for the given core.
     pub fn new(core_id: i32) -> Self {
         Self {
@@ -495,11 +519,22 @@ impl KScheduler {
         process: &Arc<Mutex<KProcess>>,
         current_thread_id: u64,
     ) {
-        let mut process = process.lock().unwrap();
-        let Some(current_thread) = process.get_thread_by_thread_id(current_thread_id) else {
+        // Cooperative runtime approximation of a thread observing its pending
+        // termination and exiting at the next yield boundary.
+        if self.exit_thread_if_termination_requested(process, current_thread_id) {
+            self.request_schedule();
+            return;
+        }
+
+        let current_thread = {
+            let process = process.lock().unwrap();
+            process.get_thread_by_thread_id(current_thread_id)
+        };
+        let Some(current_thread) = current_thread else {
             return;
         };
 
+        let mut process = process.lock().unwrap();
         {
             let current_thread = current_thread.lock().unwrap();
             if current_thread.get_state() != ThreadState::RUNNABLE {
@@ -959,6 +994,9 @@ impl KScheduler {
         process: &Arc<Mutex<KProcess>>,
         current_thread_id: u64,
     ) -> Option<Arc<Mutex<KThread>>> {
+        if self.exit_thread_if_termination_requested(process, current_thread_id) {
+            self.request_schedule();
+        }
         let next_thread_id = self.wait_for_next_runnable_thread(process, current_thread_id);
         let next_thread = process
             .lock()
@@ -978,6 +1016,9 @@ impl KScheduler {
         process: &Arc<Mutex<KProcess>>,
         current_thread_id: u64,
     ) -> Option<u64> {
+        if self.exit_thread_if_termination_requested(process, current_thread_id) {
+            self.request_schedule();
+        }
         let mut process = process.lock().unwrap();
 
         let mut best_thread_id = None;

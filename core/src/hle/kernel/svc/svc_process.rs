@@ -4,16 +4,20 @@
 //!
 //! SVC handlers for process operations (ExitProcess, GetProcessId, GetProcessList, etc.).
 
+use crate::hle::kernel::svc_dispatch::SvcContext;
+use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::ResultCode;
 
 /// Exits the current process.
-pub fn exit_process() {
-    // TODO: Get current process, verify state == Running, call system.Exit()
-    log::info!("svc::ExitProcess called");
-    log::warn!("svc::ExitProcess: kernel object access not yet implemented");
+pub fn exit_process(ctx: &SvcContext) {
+    let process_id = ctx.current_process.lock().unwrap().get_process_id();
+    log::info!("svc::ExitProcess called for process {}", process_id);
+
+    KProcess::exit_with_current_thread(&ctx.current_process);
+    ctx.scheduler.lock().unwrap().request_schedule();
 }
 
 /// Gets the ID of the specified process or a specified thread's owning process.
@@ -103,4 +107,76 @@ pub fn start_process(
 pub fn terminate_process(_process_handle: Handle) -> ResultCode {
     log::warn!("svc::TerminateProcess: UNIMPLEMENTED");
     RESULT_NOT_IMPLEMENTED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_process::{KProcess, ProcessState};
+    use crate::hle::kernel::k_scheduler::KScheduler;
+    use crate::hle::kernel::k_thread::{KThread, ThreadState};
+    use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use std::sync::{Arc, Mutex};
+
+    fn test_context() -> SvcContext {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
+
+        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.thread_id = 1;
+            thread.object_id = 1;
+            thread.parent = Some(Arc::downgrade(&process));
+            thread.scheduler = Some(Arc::downgrade(&scheduler));
+            thread.set_state(ThreadState::RUNNABLE);
+        }
+
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.bind_self_reference(&process);
+            process_guard.attach_scheduler(&scheduler);
+            process_guard.state = ProcessState::Running;
+            process_guard.increment_running_thread_count();
+            process_guard.register_thread_object(current_thread);
+        }
+
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+        SvcContext {
+            shared_memory,
+            code_base: 0,
+            code_size: 0,
+            stack_base: 0,
+            stack_size: 0,
+            program_id: 1,
+            tls_base: 0,
+            current_process: process,
+            service_manager: Arc::new(Mutex::new(
+                crate::hle::service::sm::sm::ServiceManager::new(),
+            )),
+            scheduler,
+            next_thread_id: Arc::new(AtomicU64::new(2)),
+            next_object_id: Arc::new(AtomicU32::new(2)),
+            is_64bit: false,
+        }
+    }
+
+    #[test]
+    fn exit_process_exits_current_process_and_thread() {
+        let ctx = test_context();
+
+        exit_process(&ctx);
+        KWorkerTaskManager::wait_for_global_idle();
+
+        let process = ctx.current_process.lock().unwrap();
+        let current_thread = process.get_thread_by_thread_id(1).unwrap();
+        assert_ne!(process.state, ProcessState::Running);
+        drop(process);
+
+        let thread = current_thread.lock().unwrap();
+        assert!(thread.is_termination_requested());
+        assert!(thread.is_signaled());
+    }
 }

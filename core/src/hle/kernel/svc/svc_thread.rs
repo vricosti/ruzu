@@ -311,6 +311,8 @@ mod tests {
 
     use super::*;
     use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_thread::ThreadState;
+    use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
 
     fn test_context() -> SvcContext {
         let mut process = KProcess::new();
@@ -403,5 +405,24 @@ mod tests {
             .unwrap()
             .select_next_thread_id(&ctx.current_process, current_thread_id);
         assert_eq!(next_after_yield, Some(2));
+    }
+
+    #[test]
+    fn yield_exits_current_thread_when_termination_was_requested() {
+        let ctx = test_context();
+        let mut handle = 0;
+        let result = create_thread(&ctx, &mut handle, 0x201000, 0x1234, 0x260000, 44, 0);
+        assert_eq!(result, RESULT_SUCCESS);
+        assert_eq!(start_thread(&ctx, handle), RESULT_SUCCESS);
+
+        let current_thread = ctx.current_thread().unwrap();
+        current_thread.lock().unwrap().request_terminate();
+
+        sleep_thread(&ctx, YieldType::WithoutCoreMigration as i64);
+        KWorkerTaskManager::wait_for_global_idle();
+
+        let thread = current_thread.lock().unwrap();
+        assert_eq!(thread.get_state(), ThreadState::TERMINATED);
+        assert!(thread.is_signaled());
     }
 }

@@ -213,6 +213,9 @@ impl KPageTableBase {
     pub fn get_heap_region_size(&self) -> usize {
         self.m_heap_region_end - self.m_heap_region_start
     }
+    pub fn get_current_heap_size(&self) -> usize {
+        self.m_current_heap_end.saturating_sub(self.m_heap_region_start)
+    }
     pub fn get_alias_region_start(&self) -> usize {
         self.m_alias_region_start
     }

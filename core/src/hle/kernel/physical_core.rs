@@ -44,6 +44,24 @@ pub enum PhysicalCoreExecutionEvent {
 }
 
 impl PhysicalCore {
+    fn drain_current_thread_termination(&self, scheduler: &Arc<Mutex<KScheduler>>) -> bool {
+        let runtime_guard = self.m_runtime.lock().unwrap();
+        let Some(runtime) = runtime_guard.as_ref() else {
+            return false;
+        };
+
+        if {
+            let thread = runtime.m_current_thread.lock().unwrap();
+            thread.is_termination_requested() && !thread.is_signaled()
+        } {
+            runtime.m_current_thread.lock().unwrap().exit();
+            scheduler.lock().unwrap().request_schedule();
+            return true;
+        }
+
+        false
+    }
+
     fn event_from_halt(
         &self,
         jit: &mut dyn ArmInterface,
@@ -258,6 +276,14 @@ impl PhysicalCore {
                         }
                         PhysicalCoreExecutionControl::Continue => {}
                     }
+
+                    // Upstream observes the same condition when returning from an
+                    // interrupt/timer tick and re-entering scheduling. In this
+                    // cooperative port, the dispatch quantum boundary is the
+                    // equivalent place to drain a pending termination request.
+                    if self.drain_current_thread_termination(scheduler) {
+                        self.handoff_after_svc(jit, thread_context, scheduler, process);
+                    }
                 }
             }
         }
@@ -323,5 +349,197 @@ impl PhysicalCore {
         thread.restore_guest_context(thread_context);
         jit.set_context(thread_context);
         jit.set_tpidrro_el0(thread.get_tls_address().get());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+
+    use crate::arm::arm_interface::{Architecture, DebugWatchpoint, KThread as OpaqueKThread};
+    use crate::hle::kernel::k_thread::ThreadState;
+    use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
+    use crate::hle::service::sm::sm::ServiceManager;
+
+    use super::*;
+
+    struct TestArmInterface {
+        halt_reasons: VecDeque<HaltReason>,
+        context: ThreadContext,
+        tpidrro_el0: u64,
+    }
+
+    impl TestArmInterface {
+        fn new(halt_reasons: impl Into<VecDeque<HaltReason>>) -> Self {
+            Self {
+                halt_reasons: halt_reasons.into(),
+                context: ThreadContext::default(),
+                tpidrro_el0: 0,
+            }
+        }
+    }
+
+    impl ArmInterface for TestArmInterface {
+        fn run_thread(&mut self, _thread: &mut OpaqueKThread) -> HaltReason {
+            self.halt_reasons
+                .pop_front()
+                .unwrap_or(HaltReason::BREAK_LOOP)
+        }
+
+        fn step_thread(&mut self, thread: &mut OpaqueKThread) -> HaltReason {
+            self.run_thread(thread)
+        }
+
+        fn clear_instruction_cache(&mut self) {}
+
+        fn invalidate_cache_range(&mut self, _addr: u64, _size: usize) {}
+
+        fn get_architecture(&self) -> Architecture {
+            Architecture::AArch64
+        }
+
+        fn get_context(&self, ctx: &mut ThreadContext) {
+            *ctx = self.context.clone();
+        }
+
+        fn set_context(&mut self, ctx: &ThreadContext) {
+            self.context = ctx.clone();
+        }
+
+        fn set_tpidrro_el0(&mut self, value: u64) {
+            self.tpidrro_el0 = value;
+        }
+
+        fn get_svc_arguments(&self, args: &mut [u64; 8]) {
+            *args = [0; 8];
+        }
+
+        fn set_svc_arguments(&mut self, _args: &[u64; 8]) {}
+
+        fn get_svc_number(&self) -> u32 {
+            0
+        }
+
+        fn signal_interrupt(&mut self, _thread: &mut OpaqueKThread) {}
+
+        fn halted_watchpoint(&self) -> Option<&DebugWatchpoint> {
+            None
+        }
+
+        fn rewind_breakpoint_instruction(&mut self) {}
+    }
+
+    fn test_context() -> (
+        PhysicalCore,
+        Arc<Mutex<KProcess>>,
+        Arc<Mutex<KScheduler>>,
+        Arc<Mutex<KThread>>,
+        SvcContext,
+    ) {
+        let mut process = KProcess::new();
+        process.capabilities.core_mask = 0xF;
+        process.capabilities.priority_mask = u64::MAX;
+        process.flags = 0;
+        process.allocate_code_memory(0x200000, 0x20000);
+        process.initialize_handle_table();
+        process.initialize_thread_local_region_base(0x240000);
+
+        let process = Arc::new(Mutex::new(process));
+        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let other_thread = Arc::new(Mutex::new(KThread::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.initialize_main_thread(0x200000, 0x250000, 0, 0x23f000, &process, 1, 1, false);
+            thread.set_priority(44);
+            thread.set_base_priority(44);
+        }
+        {
+            let mut thread = other_thread.lock().unwrap();
+            thread.initialize_main_thread(0x201000, 0x260000, 0, 0x24f000, &process, 2, 2, false);
+            thread.set_priority(44);
+            thread.set_base_priority(44);
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(current_thread.clone());
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(other_thread.clone());
+        process.lock().unwrap().push_back_to_priority_queue(1);
+        process.lock().unwrap().push_back_to_priority_queue(2);
+        scheduler.lock().unwrap().initialize(1, 0, 0);
+
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+        let svc_context = SvcContext {
+            shared_memory,
+            code_base: 0x200000,
+            code_size: 0x20000,
+            stack_base: 0x240000,
+            stack_size: 0x10000,
+            program_id: 1,
+            tls_base: 0x23f000,
+            current_process: process.clone(),
+            service_manager: Arc::new(Mutex::new(ServiceManager::new())),
+            scheduler: scheduler.clone(),
+            next_thread_id: Arc::new(AtomicU64::new(3)),
+            next_object_id: Arc::new(AtomicU32::new(3)),
+            is_64bit: false,
+        };
+
+        (
+            PhysicalCore::new(0, false),
+            process,
+            scheduler,
+            current_thread,
+            svc_context,
+        )
+    }
+
+    #[test]
+    fn run_loop_drains_current_thread_termination_on_halt_boundary() {
+        let (physical_core, process, scheduler, current_thread, svc_context) = test_context();
+        let mut thread_context = ThreadContext::default();
+        let mut jit = TestArmInterface::new(VecDeque::from([
+            HaltReason::BREAK_LOOP,
+            HaltReason::BREAK_LOOP,
+        ]));
+        physical_core.initialize_guest_runtime(current_thread.clone(), &mut jit, &mut thread_context);
+
+        current_thread.lock().unwrap().request_terminate();
+
+        let mut opaque_thread = unsafe { std::mem::zeroed::<OpaqueKThread>() };
+        let (_iterations, _svc_count, control) = physical_core.run_loop(
+            &mut jit,
+            &mut opaque_thread,
+            &mut thread_context,
+            &scheduler,
+            &process,
+            false,
+            &svc_context,
+            |_svc_num, _svc_args, _thread_context, _svc_count, _iteration| {
+                PhysicalCoreExecutionControl::Continue
+            },
+            |_halt_reason, _exception_address, _thread_context, _svc_count, iteration| {
+                if iteration >= 2 {
+                    PhysicalCoreExecutionControl::Break
+                } else {
+                    PhysicalCoreExecutionControl::Continue
+                }
+            },
+        );
+        KWorkerTaskManager::wait_for_global_idle();
+
+        assert!(matches!(control, PhysicalCoreExecutionControl::Break));
+        let thread = current_thread.lock().unwrap();
+        assert_eq!(thread.get_state(), ThreadState::TERMINATED);
+        assert!(thread.is_signaled());
+        assert_eq!(
+            scheduler.lock().unwrap().get_scheduler_current_thread_id(),
+            Some(2)
+        );
     }
 }

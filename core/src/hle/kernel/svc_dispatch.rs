@@ -27,10 +27,10 @@ use crate::hle::kernel::svc::svc_ipc;
 use crate::hle::kernel::svc::svc_lock;
 use crate::hle::kernel::svc::svc_physical_memory;
 use crate::hle::kernel::svc::svc_port;
+use crate::hle::kernel::svc::svc_process;
 use crate::hle::kernel::svc::svc_processor;
 use crate::hle::kernel::svc::svc_synchronization;
 use crate::hle::kernel::svc::svc_thread;
-use crate::hle::result::RESULT_SUCCESS;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 
@@ -71,6 +71,21 @@ impl SvcContext {
             .lock()
             .unwrap()
             .get_thread_by_thread_id(current_thread_id)
+    }
+}
+
+fn drain_current_thread_termination(ctx: &SvcContext) {
+    let current_thread = ctx.current_thread();
+    let Some(current_thread) = current_thread else {
+        return;
+    };
+
+    if {
+        let thread = current_thread.lock().unwrap();
+        thread.is_termination_requested() && !thread.is_signaled()
+    } {
+        current_thread.lock().unwrap().exit();
+        ctx.scheduler.lock().unwrap().request_schedule();
     }
 }
 
@@ -911,7 +926,7 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
 
             // Dump guest registers for diagnosis.
             log::error!("=== GUEST REGISTER DUMP AT BREAK ===");
-            for i in 0..16 {
+            for i in 0..args.len() {
                 log::error!("  r{:2} = {:#010x}", i, args[i]);
             }
             // Read abort message from guest memory if info1 points to a string.
@@ -1243,7 +1258,7 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             set_arg64(args, 1, 0); // page_info
         }
         Some(SvcId::ExitProcess) => {
-            log::info!("  ExitProcess called");
+            svc_process::exit_process(ctx);
         }
         Some(SvcId::CreateThread) => {
             let mut out_handle = 0;
@@ -1435,11 +1450,62 @@ pub fn call(imm: u32, is_64bit: bool, args: &mut SvcArgs, ctx: &SvcContext) {
     } else {
         call32(imm, args, ctx);
     }
+
+    // Upstream reaches the equivalent behavior when the scheduler lock is
+    // released after the SVC handler. In this cooperative port, drain a
+    // pending current-thread termination once per SVC return path.
+    drain_current_thread_termination(ctx);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_thread::ThreadState;
+    use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
+
+    fn test_context() -> SvcContext {
+        let mut process = KProcess::new();
+        process.capabilities.core_mask = 0xF;
+        process.capabilities.priority_mask = u64::MAX;
+        process.flags = 0;
+        process.allocate_code_memory(0x200000, 0x20000);
+        process.initialize_handle_table();
+        process.initialize_thread_local_region_base(0x240000);
+
+        let process = Arc::new(Mutex::new(process));
+        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.initialize_main_thread(0x200000, 0x250000, 0, 0x23f000, &process, 1, 1, false);
+            thread.set_priority(44);
+            thread.set_base_priority(44);
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(current_thread.clone());
+        process.lock().unwrap().push_back_to_priority_queue(1);
+        scheduler.lock().unwrap().initialize(1, 0, 0);
+
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+
+        SvcContext {
+            shared_memory,
+            code_base: 0x200000,
+            code_size: 0x20000,
+            stack_base: 0x240000,
+            stack_size: 0x10000,
+            program_id: 1,
+            tls_base: 0x23f000,
+            current_process: process,
+            service_manager: Arc::new(Mutex::new(ServiceManager::new())),
+            scheduler,
+            next_thread_id: Arc::new(AtomicU64::new(2)),
+            next_object_id: Arc::new(AtomicU32::new(2)),
+            is_64bit: false,
+        }
+    }
 
     #[test]
     fn test_svc_id_roundtrip() {
@@ -1480,5 +1546,20 @@ mod tests {
         scatter64(&mut args, 1, 2, 0xAAAABBBB_CCCCDDDD);
         assert_eq!(args[1], 0xCCCCDDDD);
         assert_eq!(args[2], 0xAAAABBBB);
+    }
+
+    #[test]
+    fn call_drains_current_thread_termination_on_svc_return() {
+        let ctx = test_context();
+        let current_thread = ctx.current_thread().expect("main thread must exist");
+        current_thread.lock().unwrap().request_terminate();
+
+        let mut args: SvcArgs = [0; 8];
+        call(SvcId::GetSystemTick as u32, true, &mut args, &ctx);
+        KWorkerTaskManager::wait_for_global_idle();
+
+        let thread = current_thread.lock().unwrap();
+        assert_eq!(thread.get_state(), ThreadState::TERMINATED);
+        assert!(thread.is_signaled());
     }
 }

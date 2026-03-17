@@ -31,6 +31,7 @@ use super::k_synchronization_object;
 use super::k_synchronization_object::SynchronizationObjectState;
 use super::k_thread::KThread;
 use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAGE_SIZE};
+use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
 use super::k_typed_address::KProcessAddress;
 use super::svc_common::Handle;
 use super::svc_types::{CreateProcessFlag, ADDRESS_SPACE_MASK};
@@ -485,6 +486,30 @@ impl KProcess {
 
     /// ASLR alignment (2 MiB).
     pub const ASLR_ALIGNMENT: usize = 2 * 1024 * 1024;
+
+    /// Rust-side orchestration helper for the upstream `KProcess::Exit()`
+    /// sequence when the process is owned behind `Arc<Mutex<_>>`.
+    ///
+    /// This preserves lifecycle ownership in `k_process.rs` while allowing
+    /// callers to perform the final current-thread exit after dropping the
+    /// process mutex.
+    pub fn exit_with_current_thread(process: &Arc<Mutex<KProcess>>) {
+        let current_thread = {
+            let process_guard = process.lock().unwrap();
+            let current_thread_id = process_guard
+                .scheduler
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .and_then(|scheduler| scheduler.lock().unwrap().get_scheduler_current_thread_id());
+            current_thread_id.and_then(|thread_id| process_guard.get_thread_by_thread_id(thread_id))
+        };
+
+        process.lock().unwrap().exit();
+
+        if let Some(thread) = current_thread {
+            thread.lock().unwrap().exit();
+        }
+    }
 
     /// Create a new process with default state.
     pub fn new() -> Self {
@@ -1195,27 +1220,8 @@ impl KProcess {
     ///
     /// Terminates child threads (other than the caller) and finalizes the
     /// handle table if the process isn't immortal.
-    ///
-    /// NOTE: Upstream calls `TerminateChildren(kernel, this, GetCurrentThreadPointer(kernel))`
-    /// which iterates the intrusive thread list and calls RequestTerminate/Terminate on
-    /// each child. Our port iterates the thread_objects map and requests termination.
-    /// The scheduler lock scoping is simplified since we don't yet have KScopedSchedulerLock.
     fn start_termination(&mut self, current_thread_id: Option<u64>) -> u32 {
-        // Terminate child threads other than the current one.
-        // Matches upstream TerminateChildren(kernel, process, thread_to_not_terminate).
-        let thread_ids: Vec<u64> = self.thread_objects.keys().copied().collect();
-        for &obj_id in &thread_ids {
-            if let Some(thread) = self.thread_objects.get(&obj_id) {
-                let thread = thread.clone();
-                let mut guard = thread.lock().unwrap();
-                let tid = guard.thread_id;
-                if Some(tid) != current_thread_id {
-                    if guard.get_state() != super::k_thread::ThreadState::TERMINATED {
-                        guard.request_terminate();
-                    }
-                }
-            }
-        }
+        let terminate_result = self.terminate_children(current_thread_id);
 
         // Finalize the handle table when done, if the process isn't immortal.
         if !self.is_immortal && self.is_handle_table_initialized {
@@ -1223,7 +1229,7 @@ impl KProcess {
             self.is_handle_table_initialized = false;
         }
 
-        RESULT_SUCCESS.get_inner_value()
+        terminate_result
     }
 
     /// Finish process termination.
@@ -1256,8 +1262,10 @@ impl KProcess {
     /// Matches upstream `KProcess::Exit()`.
     ///
     /// Determines whether termination is needed, starts it if so, and
-    /// registers the process for worker task completion. In upstream, the
-    /// current thread then calls Exit() on itself.
+    /// registers the process for worker task completion. The final
+    /// `GetCurrentThread(m_kernel).Exit()` step from upstream is still
+    /// delegated to the caller because this port currently invokes
+    /// `KProcess::exit()` while holding the process mutex.
     pub fn exit(&mut self) {
         // Determine whether we need to start terminating.
         let mut needs_terminate = false;
@@ -1279,20 +1287,29 @@ impl KProcess {
 
         // If we need to start termination, do so.
         if needs_terminate {
-            // NOTE: Upstream passes GetCurrentThreadPointer(kernel) to exclude
-            // the calling thread from termination. We pass None here because
-            // the calling thread ID isn't available in this context.
-            // TODO: Accept current_thread_id parameter when the scheduler is wired.
-            self.start_termination(None);
+            let current_thread_id = self
+                .scheduler
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .and_then(|scheduler| scheduler.lock().unwrap().get_scheduler_current_thread_id());
+            self.start_termination(current_thread_id);
 
-            // Upstream registers with WorkerTaskManager for async FinishTermination.
-            // We call FinishTermination directly since no worker task manager exists yet.
-            // TODO: Register with KWorkerTaskManager::WorkerType::Exit.
-            self.finish_termination();
+            if let Some(process) = self.self_reference.as_ref().and_then(Weak::upgrade) {
+                KWorkerTaskManager::add_task_static(
+                    0,
+                    WorkerType::Exit,
+                    Box::new(move || {
+                        process.lock().unwrap().do_worker_task_impl();
+                    }),
+                );
+            } else {
+                self.finish_termination();
+            }
         }
 
-        // Upstream: GetCurrentThread(m_kernel).Exit();
-        // The caller is responsible for exiting the current thread.
+        // Upstream: GetCurrentThread(m_kernel).Exit().
+        // The caller still owns that step in this port to avoid re-entering
+        // thread exit while `self` is borrowed under the process mutex.
     }
 
     /// Terminate the process (called externally).
@@ -1332,10 +1349,17 @@ impl KProcess {
                 // Finish termination.
                 self.finish_termination();
             } else {
-                // Upstream: Register with WorkerTaskManager for async completion.
-                // TODO: Register with KWorkerTaskManager::WorkerType::Exit.
-                // For now, finish directly.
-                self.finish_termination();
+                if let Some(process) = self.self_reference.as_ref().and_then(Weak::upgrade) {
+                    KWorkerTaskManager::add_task_static(
+                        0,
+                        WorkerType::Exit,
+                        Box::new(move || {
+                            process.lock().unwrap().do_worker_task_impl();
+                        }),
+                    );
+                } else {
+                    self.finish_termination();
+                }
             }
         }
 
@@ -1346,18 +1370,7 @@ impl KProcess {
     /// Matches upstream `KProcess::DoWorkerTaskImpl()` (k_process.cpp:456-467).
     /// Called by KWorkerTaskManager after Exit() registers the process as a task.
     pub fn do_worker_task_impl(&mut self) {
-        // Terminate child threads.
-        // Upstream: TerminateChildren(m_kernel, this, nullptr)
-        let thread_ids: Vec<u64> = self.thread_objects.keys().copied().collect();
-        for &obj_id in &thread_ids {
-            if let Some(thread) = self.thread_objects.get(&obj_id) {
-                let thread = thread.clone();
-                let mut guard = thread.lock().unwrap();
-                if guard.get_state() != super::k_thread::ThreadState::TERMINATED {
-                    guard.request_terminate();
-                }
-            }
-        }
+        self.terminate_children(None);
 
         // Finalize the handle table, if we're not immortal.
         if !self.is_immortal && self.is_handle_table_initialized {
@@ -1367,6 +1380,55 @@ impl KProcess {
 
         // Finish termination.
         self.finish_termination();
+    }
+
+    /// Terminate child threads, preserving upstream ownership in `k_process.cpp`.
+    ///
+    /// Upstream's `TerminateChildren(...)` does two passes:
+    /// 1. request termination on every child other than the exempt thread
+    /// 2. iterate again and synchronously `Terminate()` remaining children
+    ///
+    /// This port keeps the same ownership boundary and first-pass ordering.
+    /// The second pass is still constrained by the cooperative runtime: we only
+    /// use blocking `KThread::terminate_thread()` when the target is already in
+    /// a state that can complete immediately without needing guest execution.
+    fn terminate_children(&mut self, thread_to_not_terminate_id: Option<u64>) -> u32 {
+        let children: Vec<Arc<Mutex<KThread>>> = self
+            .thread_objects
+            .values()
+            .cloned()
+            .collect();
+
+        for child in &children {
+            let mut guard = child.lock().unwrap();
+            if Some(guard.thread_id) == thread_to_not_terminate_id {
+                continue;
+            }
+            if guard.get_state() != super::k_thread::ThreadState::TERMINATED {
+                guard.request_terminate();
+            }
+        }
+
+        for child in children {
+            let should_terminate = {
+                let guard = child.lock().unwrap();
+                if Some(guard.thread_id) == thread_to_not_terminate_id {
+                    false
+                } else {
+                    let state = guard.get_state();
+                    state == super::k_thread::ThreadState::INITIALIZED || guard.is_signaled()
+                }
+            };
+
+            if should_terminate {
+                let terminate_result = KThread::terminate_thread(&child);
+                if terminate_result != RESULT_SUCCESS.get_inner_value() {
+                    return terminate_result;
+                }
+            }
+        }
+
+        RESULT_SUCCESS.get_inner_value()
     }
 
     /// Bootstrap and run the process main thread for the guest runtime path.
@@ -1563,8 +1625,11 @@ impl KProcess {
 
     pub fn register_thread_object(&mut self, thread: Arc<Mutex<KThread>>) {
         let (thread_id, object_id) = {
-            let thread = thread.lock().unwrap();
-            (thread.thread_id, thread.object_id)
+            let mut thread_guard = thread.lock().unwrap();
+            // Preserve upstream-style self ownership so KThread::Exit can queue
+            // itself directly as a worker task.
+            thread_guard.bind_self_reference(&thread);
+            (thread_guard.thread_id, thread_guard.object_id)
         };
         self.register_thread(thread_id);
         self.thread_objects.insert(object_id, thread);
@@ -2006,5 +2071,145 @@ mod tests {
         assert_eq!(process.get_main_stack_size(), 0x40000);
         assert!(!process.is_64bit());
         assert!(process.is_application());
+    }
+
+    #[test]
+    fn exit_excludes_scheduler_current_thread_from_start_termination() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
+
+        let current = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = current.lock().unwrap();
+            guard.thread_id = 1;
+            guard.object_id = 10;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
+        }
+
+        let other = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = other.lock().unwrap();
+            guard.thread_id = 2;
+            guard.object_id = 11;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
+        }
+
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.attach_scheduler(&scheduler);
+            process_guard.state = ProcessState::Running;
+            process_guard.register_thread_object(current.clone());
+            process_guard.register_thread_object(other.clone());
+            process_guard.exit();
+        }
+
+        assert!(!current.lock().unwrap().is_termination_requested());
+        assert!(other.lock().unwrap().is_termination_requested());
+    }
+
+    #[test]
+    fn register_thread_object_binds_thread_self_reference() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = 3;
+            guard.object_id = 33;
+        }
+
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(thread.clone());
+
+        let rebound = thread
+            .lock()
+            .unwrap()
+            .self_reference
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .expect("thread self reference must be bound during process registration");
+        assert!(Arc::ptr_eq(&rebound, &thread));
+    }
+
+    #[test]
+    fn exit_with_current_thread_also_exits_scheduler_current_thread() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
+
+        let current = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = current.lock().unwrap();
+            guard.thread_id = 1;
+            guard.object_id = 10;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
+        }
+
+        let other = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = other.lock().unwrap();
+            guard.thread_id = 2;
+            guard.object_id = 11;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
+        }
+
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.attach_scheduler(&scheduler);
+            process_guard.state = ProcessState::Running;
+            process_guard.increment_running_thread_count();
+            process_guard.increment_running_thread_count();
+            process_guard.register_thread_object(current.clone());
+            process_guard.register_thread_object(other.clone());
+        }
+
+        KProcess::exit_with_current_thread(&process);
+        KWorkerTaskManager::wait_for_global_idle();
+
+        assert!(current.lock().unwrap().is_termination_requested());
+        assert!(other.lock().unwrap().is_termination_requested());
+    }
+
+    #[test]
+    fn start_termination_synchronously_finishes_initialized_children() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let current = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = current.lock().unwrap();
+            guard.thread_id = 1;
+            guard.object_id = 10;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
+        }
+
+        let initialized_child = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = initialized_child.lock().unwrap();
+            guard.thread_id = 2;
+            guard.object_id = 11;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(super::super::k_thread::ThreadState::INITIALIZED);
+        }
+
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.state = ProcessState::Running;
+            process_guard.register_thread_object(current.clone());
+            process_guard.register_thread_object(initialized_child.clone());
+            let result = process_guard.start_termination(Some(1));
+            assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+        }
+
+        assert_eq!(
+            initialized_child.lock().unwrap().get_state(),
+            super::super::k_thread::ThreadState::TERMINATED
+        );
+        assert!(!current.lock().unwrap().is_termination_requested());
     }
 }
