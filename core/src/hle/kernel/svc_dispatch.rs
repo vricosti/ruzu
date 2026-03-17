@@ -615,6 +615,31 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             let handle = get_arg32(args, 0);
             let priority = get_arg32(args, 1) as i32;
             let result = svc_thread::set_thread_priority(ctx, handle, priority);
+            log::info!("  SetThreadPriority(handle={:#x}, priority={}) -> result={:#x}",
+                handle, priority, result.get_inner_value());
+            if result.is_error() {
+                let process = ctx.current_process.lock().unwrap();
+                let prio_mask = process.get_priority_mask();
+                let prio_check = process.check_thread_priority(priority);
+                log::error!("  priority_mask={:#018x}, check_thread_priority({})={}",
+                    prio_mask, priority, prio_check);
+                log::error!("  Handle table dump: count={}, table_size={}",
+                    process.handle_table.count, process.handle_table.table_size);
+                for i in 0..std::cmp::min(process.handle_table.count as usize + 2, 10) {
+                    let obj = process.handle_table.objects[i];
+                    let li = unsafe { process.handle_table.entry_infos[i].linear_id };
+                    if obj != 0 {
+                        let h = crate::hle::kernel::k_handle_table::encode_handle(i as u16, li);
+                        log::error!("    [{}] object_id={} handle={:#x}", i, obj, h);
+                    }
+                }
+                // Check the specific index
+                let (idx, lid, _) = crate::hle::kernel::k_handle_table::decode_handle(handle);
+                log::error!("  Decoded handle: index={}, linear_id={}", idx, lid);
+                log::error!("  At index {}: object_id={}, entry linear_id={}",
+                    idx, process.handle_table.objects[idx as usize],
+                    unsafe { process.handle_table.entry_infos[idx as usize].linear_id });
+            }
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::GetThreadCoreMask) => {
