@@ -65,7 +65,7 @@ impl IApplicationProxy {
         }
     }
 
-    fn push_interface_response(
+    pub fn push_interface_response(
         ctx: &mut HLERequestContext,
         object: Arc<dyn SessionRequestHandler>,
     ) {
