@@ -500,6 +500,8 @@ pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
     crate::hle::service::pctl::pctl::register_services(&service_manager);
     crate::hle::service::aoc::addon_content_manager::loop_process(&service_manager);
     crate::hle::service::am::am::register_services(&service_manager);
+    crate::hle::service::vi::vi::register_services(&service_manager);
+    crate::hle::service::nvdrv::register_services(&service_manager);
 
     service_manager
 }
