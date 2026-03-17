@@ -1,6 +1,6 @@
 //! Port of zuyu/src/core/hle/kernel/k_process.h / k_process.cpp
-//! Status: Partial (structural port, complex methods stubbed)
-//! Derniere synchro: 2026-03-11
+//! Status: Partial (lifecycle methods ported, resource limits / system resource not yet wired)
+//! Derniere synchro: 2026-03-17
 //!
 //! KProcess: the kernel process object. Preserves all state fields, enums,
 //! and method signatures from upstream.
@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use super::code_set::CodeSet;
 use super::k_capabilities::KCapabilities;
 use super::k_client_session::KClientSession;
+use super::k_resource_limit::{KResourceLimit, LimitableResource};
 use super::k_condition_variable::KConditionVariable;
 use super::k_event::KEvent;
 use super::k_handle_table::MAX_TABLE_SIZE;
@@ -32,7 +33,7 @@ use super::k_thread::KThread;
 use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAGE_SIZE};
 use super::k_typed_address::KProcessAddress;
 use super::svc_common::Handle;
-use super::svc_types::CreateProcessFlag;
+use super::svc_types::{CreateProcessFlag, ADDRESS_SPACE_MASK};
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::file_sys::program_metadata::{PoolPartition, ProgramAddressSpaceType, ProgramMetadata};
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
@@ -402,7 +403,9 @@ pub struct KProcess {
     pub next_thread_local_page_address: u64,
 
     pub ideal_core_id: i32,
-    // m_resource_limit — stubbed (raw pointer in upstream)
+    /// Resource limit for this process.
+    /// Matches upstream `KResourceLimit* m_resource_limit`.
+    pub resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
     // m_system_resource — stubbed
     pub memory_release_hint: usize,
     pub state: ProcessState,
@@ -491,6 +494,7 @@ impl KProcess {
             thread_local_pages: Vec::new(),
             next_thread_local_page_address: 0,
             ideal_core_id: 0,
+            resource_limit: None,
             memory_release_hint: 0,
             state: ProcessState::default(),
             cond_var: KConditionVariable::new(),
@@ -950,6 +954,25 @@ impl KProcess {
         self.running_thread_switch_counts[c] = switch_count;
     }
 
+    /// Increment running thread count.
+    /// Matches upstream `KProcess::IncrementRunningThreadCount()`.
+    pub fn increment_running_thread_count(&self) {
+        self.num_running_threads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Decrement running thread count.
+    /// Matches upstream `KProcess::DecrementRunningThreadCount()` (k_process.cpp:756-762).
+    ///
+    /// Returns true if the count reached zero and the caller should terminate
+    /// the process. Upstream calls `this->Terminate()` inline, but we cannot
+    /// do that here because the caller typically holds thread locks that would
+    /// deadlock with terminate()'s thread iteration. The caller must drop its
+    /// locks and then call `process.terminate()`.
+    pub fn decrement_running_thread_count(&mut self) -> bool {
+        let prev = self.num_running_threads.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        prev == 1
+    }
+
     pub fn clear_running_thread(&mut self, thread_id: u64) {
         for slot in self.running_threads.iter_mut() {
             if *slot == Some(thread_id) {
@@ -962,13 +985,125 @@ impl KProcess {
         self.pinned_threads[core_id as usize]
     }
 
-    // -- Complex methods stubbed --
+    // -- Lifecycle methods --
 
-    /// Initialize the process.
-    /// TODO: Port from k_process.cpp.
-    pub fn initialize(&mut self) -> u32 {
-        // TODO: Full implementation
-        0
+    /// Pin a thread on a given core.
+    /// Matches upstream private `KProcess::PinThread(s32, KThread*)`.
+    fn pin_thread(&mut self, core_id: i32, thread_id: u64) {
+        assert!((0..NUM_CPU_CORES as i32).contains(&core_id));
+        assert!(self.pinned_threads[core_id as usize].is_none());
+        self.pinned_threads[core_id as usize] = Some(thread_id);
+    }
+
+    /// Unpin a thread on a given core.
+    /// Matches upstream private `KProcess::UnpinThread(s32, KThread*)`.
+    fn unpin_thread_on_core(&mut self, core_id: i32, thread_id: u64) {
+        assert!((0..NUM_CPU_CORES as i32).contains(&core_id));
+        assert_eq!(self.pinned_threads[core_id as usize], Some(thread_id));
+        self.pinned_threads[core_id as usize] = None;
+    }
+
+    /// Initialize the process base fields.
+    /// Matches upstream `KProcess::Initialize(params, res_limit, is_real)`.
+    ///
+    /// This is the "base" initializer called by the two heavier overloads
+    /// (for KIP and for user processes). It sets misc fields, computes
+    /// max_process_memory, generates entropy, and marks the process as
+    /// initialized.
+    ///
+    /// NOTE: `is_real` controls whether a PLR (process local region) is created.
+    pub fn initialize(&mut self, name: &[u8], flags: u32, program_id: u64,
+                      code_address: u64, code_num_pages: u64, version: u32,
+                      resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+                      is_real: bool) -> u32 {
+        // Create and clear PLR if real.
+        if is_real {
+            if let Some(plr) = self.create_thread_local_region() {
+                self.plr_address = plr;
+                // Zero the PLR in guest memory (Svc::ThreadLocalRegionSize = 0x200).
+                let mut mem = self.process_memory.write().unwrap();
+                for i in 0..0x200usize {
+                    mem.write_8(plr.get() + i as u64, 0);
+                }
+            }
+        }
+
+        // Copy in the name from parameters.
+        self.name = [0u8; 13];
+        let copy_len = name.len().min(12);
+        self.name[..copy_len].copy_from_slice(&name[..copy_len]);
+        // Null terminate
+        self.name[copy_len] = 0;
+
+        // Set misc fields.
+        self.state = ProcessState::Created;
+        self.main_thread_stack_size = 0;
+        self.used_kernel_memory_size.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.ideal_core_id = 0;
+        self.flags = flags;
+        self.version = version;
+        self.program_id = program_id;
+        self.code_address = KProcessAddress::new(code_address);
+        self.code_size = (code_num_pages as usize) * PAGE_SIZE;
+        self.is_application = (flags & CreateProcessFlag::IS_APPLICATION.bits()) != 0;
+
+        // Set thread fields.
+        for i in 0..NUM_CPU_CORES as usize {
+            self.running_threads[i] = None;
+            self.pinned_threads[i] = None;
+            self.running_thread_idle_counts[i] = 0;
+            self.running_thread_switch_counts[i] = 0;
+        }
+
+        // Set max memory based on address space type.
+        // Upstream reads from page_table.GetHeapRegionSize()/GetAliasRegionSize().
+        let as_mask = flags & ADDRESS_SPACE_MASK;
+        if as_mask == CreateProcessFlag::ADDRESS_SPACE_32_BIT_WITHOUT_ALIAS.bits() {
+            self.max_process_memory = self.page_table.get_heap_region_size()
+                + self.page_table.get_alias_region_size();
+        } else {
+            self.max_process_memory = self.page_table.get_heap_region_size();
+        }
+
+        // Generate random entropy.
+        {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            for (i, val) in self.entropy.iter_mut().enumerate() {
+                let mut hasher = DefaultHasher::new();
+                (i as u64).hash(&mut hasher);
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+                    .hash(&mut hasher);
+                *val = hasher.finish();
+            }
+        }
+
+        // Clear remaining fields.
+        self.num_running_threads.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_process_switches.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_thread_switches.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_fpu_switches.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_supervisor_calls.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_ipc_messages.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        self.is_signaled = false;
+        self.exception_thread_id = None;
+        self.is_suspended = false;
+        self.memory_release_hint = 0;
+        self.schedule_count = 0;
+        self.is_handle_table_initialized = false;
+
+        // Open a reference to our resource limit.
+        // Upstream: m_resource_limit = res_limit; m_resource_limit->Open();
+        self.resource_limit = resource_limit;
+
+        // We're initialized!
+        self.is_initialized = true;
+
+        RESULT_SUCCESS.get_inner_value()
     }
 
     /// Port of the metadata-owned subset of upstream `KProcess::LoadFromMetadata`.
@@ -1055,17 +1190,183 @@ impl KProcess {
         RESULT_SUCCESS.get_inner_value()
     }
 
-    /// Exit the process.
-    /// TODO: Port from k_process.cpp.
-    pub fn exit(&mut self) {
-        // TODO: Full implementation
+    /// Start process termination.
+    /// Matches upstream private `KProcess::StartTermination()`.
+    ///
+    /// Terminates child threads (other than the caller) and finalizes the
+    /// handle table if the process isn't immortal.
+    ///
+    /// NOTE: Upstream calls `TerminateChildren(kernel, this, GetCurrentThreadPointer(kernel))`
+    /// which iterates the intrusive thread list and calls RequestTerminate/Terminate on
+    /// each child. Our port iterates the thread_objects map and requests termination.
+    /// The scheduler lock scoping is simplified since we don't yet have KScopedSchedulerLock.
+    fn start_termination(&mut self, current_thread_id: Option<u64>) -> u32 {
+        // Terminate child threads other than the current one.
+        // Matches upstream TerminateChildren(kernel, process, thread_to_not_terminate).
+        let thread_ids: Vec<u64> = self.thread_objects.keys().copied().collect();
+        for &obj_id in &thread_ids {
+            if let Some(thread) = self.thread_objects.get(&obj_id) {
+                let thread = thread.clone();
+                let mut guard = thread.lock().unwrap();
+                let tid = guard.thread_id;
+                if Some(tid) != current_thread_id {
+                    if guard.get_state() != super::k_thread::ThreadState::TERMINATED {
+                        guard.request_terminate();
+                    }
+                }
+            }
+        }
+
+        // Finalize the handle table when done, if the process isn't immortal.
+        if !self.is_immortal && self.is_handle_table_initialized {
+            self.handle_table.finalize();
+            self.is_handle_table_initialized = false;
+        }
+
+        RESULT_SUCCESS.get_inner_value()
     }
 
-    /// Terminate the process.
-    /// TODO: Port from k_process.cpp.
+    /// Finish process termination.
+    /// Matches upstream `KProcess::FinishTermination()`.
+    ///
+    /// Only terminates if the process isn't immortal: releases resource limit
+    /// hint, changes state to Terminated, and closes a reference.
+    fn finish_termination(&mut self) {
+        if !self.is_immortal {
+            // Release resource limit hint.
+            // Upstream: m_memory_release_hint = GetUsedNonSystemUserPhysicalMemorySize();
+            //           m_resource_limit->Release(PhysicalMemoryMax, 0, m_memory_release_hint);
+            self.memory_release_hint = self.code_size + self.main_thread_stack_size;
+            if let Some(ref rl) = self.resource_limit {
+                rl.lock().unwrap().release_with_hint(
+                    LimitableResource::PhysicalMemoryMax,
+                    0,
+                    self.memory_release_hint as i64,
+                );
+            }
+
+            // Change state.
+            self.change_state(ProcessState::Terminated);
+
+            // TODO: self.close() — reference counting not yet implemented.
+        }
+    }
+
+    /// Exit the process (called by the current thread).
+    /// Matches upstream `KProcess::Exit()`.
+    ///
+    /// Determines whether termination is needed, starts it if so, and
+    /// registers the process for worker task completion. In upstream, the
+    /// current thread then calls Exit() on itself.
+    pub fn exit(&mut self) {
+        // Determine whether we need to start terminating.
+        let mut needs_terminate = false;
+        {
+            // Upstream: KScopedLightLock lk(m_state_lock);
+            //           KScopedSchedulerLock sl(m_kernel);
+            assert!(self.state != ProcessState::Created);
+            assert!(self.state != ProcessState::CreatedAttached);
+            assert!(self.state != ProcessState::Crashed);
+            assert!(self.state != ProcessState::Terminated);
+            if self.state == ProcessState::Running
+                || self.state == ProcessState::RunningAttached
+                || self.state == ProcessState::DebugBreak
+            {
+                self.change_state(ProcessState::Terminating);
+                needs_terminate = true;
+            }
+        }
+
+        // If we need to start termination, do so.
+        if needs_terminate {
+            // NOTE: Upstream passes GetCurrentThreadPointer(kernel) to exclude
+            // the calling thread from termination. We pass None here because
+            // the calling thread ID isn't available in this context.
+            // TODO: Accept current_thread_id parameter when the scheduler is wired.
+            self.start_termination(None);
+
+            // Upstream registers with WorkerTaskManager for async FinishTermination.
+            // We call FinishTermination directly since no worker task manager exists yet.
+            // TODO: Register with KWorkerTaskManager::WorkerType::Exit.
+            self.finish_termination();
+        }
+
+        // Upstream: GetCurrentThread(m_kernel).Exit();
+        // The caller is responsible for exiting the current thread.
+    }
+
+    /// Terminate the process (called externally).
+    /// Matches upstream `KProcess::Terminate()`.
     pub fn terminate(&mut self) -> u32 {
-        // TODO: Full implementation
-        0
+        // Determine whether we need to start terminating.
+        let mut needs_terminate = false;
+        {
+            // Upstream: KScopedLightLock lk(m_state_lock);
+
+            // Check whether we're allowed to terminate.
+            // R_UNLESS(m_state != State::Created, ResultInvalidState);
+            if self.state == ProcessState::Created {
+                return RESULT_INVALID_STATE.get_inner_value();
+            }
+            // R_UNLESS(m_state != State::CreatedAttached, ResultInvalidState);
+            if self.state == ProcessState::CreatedAttached {
+                return RESULT_INVALID_STATE.get_inner_value();
+            }
+
+            // Upstream: KScopedSchedulerLock sl(m_kernel);
+            if self.state == ProcessState::Running
+                || self.state == ProcessState::RunningAttached
+                || self.state == ProcessState::Crashed
+                || self.state == ProcessState::DebugBreak
+            {
+                self.change_state(ProcessState::Terminating);
+                needs_terminate = true;
+            }
+        }
+
+        // If we need to terminate, do so.
+        if needs_terminate {
+            // Start termination.
+            let start_result = self.start_termination(None);
+            if start_result == RESULT_SUCCESS.get_inner_value() {
+                // Finish termination.
+                self.finish_termination();
+            } else {
+                // Upstream: Register with WorkerTaskManager for async completion.
+                // TODO: Register with KWorkerTaskManager::WorkerType::Exit.
+                // For now, finish directly.
+                self.finish_termination();
+            }
+        }
+
+        RESULT_SUCCESS.get_inner_value()
+    }
+
+    /// Worker task implementation.
+    /// Matches upstream `KProcess::DoWorkerTaskImpl()` (k_process.cpp:456-467).
+    /// Called by KWorkerTaskManager after Exit() registers the process as a task.
+    pub fn do_worker_task_impl(&mut self) {
+        // Terminate child threads.
+        // Upstream: TerminateChildren(m_kernel, this, nullptr)
+        let thread_ids: Vec<u64> = self.thread_objects.keys().copied().collect();
+        for &obj_id in &thread_ids {
+            if let Some(thread) = self.thread_objects.get(&obj_id) {
+                let thread = thread.clone();
+                let mut guard = thread.lock().unwrap();
+                if guard.get_state() != super::k_thread::ThreadState::TERMINATED {
+                    guard.request_terminate();
+                }
+            }
+        }
+
+        // Finalize the handle table, if we're not immortal.
+        if !self.is_immortal && self.is_handle_table_initialized {
+            self.handle_table.finalize();
+            self.is_handle_table_initialized = false;
+        }
+
+        // Finish termination.
+        self.finish_termination();
     }
 
     /// Bootstrap and run the process main thread for the guest runtime path.
@@ -1168,26 +1469,91 @@ impl KProcess {
             }
             let thread_id = thread.get_thread_id();
             drop(thread);
+
+            // Increment running thread count (thread.run() no longer does this
+            // to avoid deadlock when called with process lock held).
+            self.increment_running_thread_count();
             self.push_back_to_priority_queue(thread_id);
         }
 
         Ok((main_thread, thread_handle, stack_base, stack_top))
     }
 
-    /// Reset the process.
+    /// Reset the process signal.
+    /// Matches upstream `KProcess::Reset()`.
+    ///
+    /// Upstream condition: fail if state == Terminated, fail if !signaled.
+    /// Valid when process is NOT terminated but IS signaled.
     pub fn reset(&mut self) -> u32 {
-        if self.state != ProcessState::Terminated || !self.is_signaled {
+        // R_UNLESS(m_state != State::Terminated, ResultInvalidState);
+        if self.state == ProcessState::Terminated {
+            return RESULT_INVALID_STATE.get_inner_value();
+        }
+        // R_UNLESS(m_is_signaled, ResultInvalidState);
+        if !self.is_signaled {
             return RESULT_INVALID_STATE.get_inner_value();
         }
 
+        // Clear signaled.
         self.is_signaled = false;
         RESULT_SUCCESS.get_inner_value()
     }
 
     /// Finalize the process.
-    /// TODO: Port from k_process.cpp.
+    /// Matches upstream `KProcess::Finalize()`.
+    ///
+    /// Cleans up the process local region, page table, shared memory,
+    /// thread local pages, resource limits, and ARM interfaces.
     pub fn finalize(&mut self) {
-        // TODO: Full implementation
+        // Delete the process local region.
+        if self.plr_address.get() != 0 {
+            self.delete_thread_local_region(self.plr_address);
+        }
+
+        // Get the used memory size (for resource limit release).
+        let used_memory_size = self.code_size + self.main_thread_stack_size;
+        // TODO: When page table is fully wired:
+        //   used_memory_size = self.get_used_non_system_user_physical_memory_size();
+
+        // Finalize the page table.
+        self.page_table.finalize();
+
+        // TODO: Finish using our system resource (m_system_resource->Close()).
+        // System resource is not yet wired in this port.
+
+        // Free all shared memory infos.
+        // TODO: When shared memory list is implemented, iterate and close.
+
+        // Our thread local page list must be empty at this point.
+        // (In practice, all TLRs should have been deleted during termination.)
+        self.thread_local_pages.clear();
+
+        // Release memory to the resource limit.
+        // Upstream: m_resource_limit->Release(PhysicalMemoryMax, used_memory_size,
+        //                                    used_memory_size - m_memory_release_hint);
+        //           m_resource_limit->Close();
+        if let Some(ref rl) = self.resource_limit {
+            debug_assert!(used_memory_size >= self.memory_release_hint);
+            let hint = (used_memory_size - self.memory_release_hint) as i64;
+            rl.lock().unwrap().release_with_hint(
+                LimitableResource::PhysicalMemoryMax,
+                used_memory_size as i64,
+                hint,
+            );
+        }
+        // Drop our reference to the resource limit.
+        self.resource_limit = None;
+
+        // Clear thread and session objects.
+        self.thread_objects.clear();
+        self.session_objects.clear();
+        self.client_session_objects.clear();
+        self.event_objects.clear();
+        self.readable_event_objects.clear();
+
+        // Perform inherited finalization.
+        // Upstream: KSynchronizationObject::Finalize();
+        self.sync_object = SynchronizationObjectState::new();
     }
 
     /// Register a thread with this process.
