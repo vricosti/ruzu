@@ -157,10 +157,135 @@ impl KCapabilities {
     }
 
     /// Initialize capabilities for a user process.
-    /// TODO: Port from k_capabilities.cpp.
-    pub fn initialize_for_user(&mut self, _user_caps: &[u32]) -> u32 {
-        // TODO: Full implementation
-        0
+    /// Matches upstream `KCapabilities::InitializeForUser`.
+    pub fn initialize_for_user(&mut self, user_caps: &[u32]) -> u32 {
+        self.core_mask = 0;
+        self.phys_core_mask = 0;
+        self.priority_mask = 0;
+        self.intended_kernel_version = 0;
+        self.program_type = 0;
+
+        self.set_capabilities(user_caps)
+    }
+
+    /// Parse a capabilities array.
+    /// Matches upstream `KCapabilities::SetCapabilities`.
+    fn set_capabilities(&mut self, caps: &[u32]) -> u32 {
+        let mut set_flags = 0u32;
+        let mut set_svc = 0u32;
+        let mut i = 0;
+
+        while i < caps.len() {
+            let cap = caps[i];
+            let cap_type = get_capability_type(cap);
+
+            if cap_type == CapabilityType::MapRange {
+                // MapRange is a pair — skip both entries.
+                i += 2;
+                continue;
+            }
+
+            if cap_type == CapabilityType::Padding {
+                i += 1;
+                continue;
+            }
+
+            if cap_type == CapabilityType::Invalid {
+                log::warn!("KCapabilities: invalid capability {:#x} at index {}", cap, i);
+                i += 1;
+                continue;
+            }
+
+            // Process the capability.
+            match cap_type {
+                CapabilityType::CorePriority => {
+                    self.set_core_priority_capability(cap);
+                }
+                CapabilityType::SyscallMask => {
+                    self.set_syscall_mask_capability(cap, &mut set_svc);
+                }
+                CapabilityType::HandleTable => {
+                    // HandleTable: bits [26..16] = size
+                    let size = ((cap >> 16) & 0x3FF) as i32;
+                    self.handle_table_size = size;
+                }
+                CapabilityType::ProgramType => {
+                    // ProgramType: bits [17..14] = type
+                    let ptype = (cap >> 14) & 0x7;
+                    self.program_type = ptype;
+                }
+                CapabilityType::KernelVersion => {
+                    self.intended_kernel_version = cap;
+                }
+                CapabilityType::DebugFlags => {
+                    self.debug_capabilities = cap;
+                }
+                _ => {
+                    // MapIoPage, MapRegion, InterruptPair — skip for now
+                }
+            }
+
+            i += 1;
+        }
+
+        0 // success
+    }
+
+    /// Parse CorePriority capability.
+    /// Matches upstream `KCapabilities::SetCorePriorityCapability`.
+    fn set_core_priority_capability(&mut self, cap: u32) {
+        // CorePriority pack layout (upstream BitField in k_capabilities.h):
+        // bits [3..0]   = type id (CorePriority = 0x7)
+        // bits [9..4]   = lowest_thread_priority (6 bits, max numerical value)
+        // bits [15..10] = highest_thread_priority (6 bits, min numerical value)
+        // bits [23..16] = minimum_core_id (8 bits)
+        // bits [31..24] = maximum_core_id (8 bits)
+        let max_prio = ((cap >> 4) & 0x3F) as u32;  // lowest_thread_priority
+        let min_prio = ((cap >> 10) & 0x3F) as u32; // highest_thread_priority
+        let min_core = ((cap >> 16) & 0xFF) as u32;
+        let max_core = ((cap >> 24) & 0xFF) as u32;
+
+        log::debug!(
+            "KCapabilities::SetCorePriorityCapability: cores=[{}..{}], priority=[{}..{}]",
+            min_core, max_core, min_prio, max_prio
+        );
+
+        if min_core > max_core || min_prio > max_prio {
+            log::warn!("KCapabilities: invalid CorePriority cap {:#x}", cap);
+            return;
+        }
+
+        // Set core mask.
+        for core_id in min_core..=max_core {
+            self.core_mask |= 1u64 << core_id;
+        }
+        // Physical core mask = same as virtual for now.
+        self.phys_core_mask = self.core_mask;
+
+        // Set priority mask.
+        for prio in min_prio..=max_prio {
+            if prio < 64 {
+                self.priority_mask |= 1u64 << prio;
+            }
+        }
+    }
+
+    /// Parse SyscallMask capability.
+    /// Matches upstream `KCapabilities::SetSyscallMaskCapability`.
+    fn set_syscall_mask_capability(&mut self, cap: u32, set_svc: &mut u32) {
+        // SyscallMask layout:
+        // bits [4..0]   = type (0xF -> SyscallMask after decode)
+        // bits [28..5]  = mask (24 bits)
+        // bits [31..29] = index (which group of 24 SVCs)
+        let mask = (cap >> 5) & 0x00FF_FFFF;
+        let index = (cap >> 29) & 0x7;
+
+        for bit in 0..24u32 {
+            if mask & (1 << bit) != 0 {
+                let svc_id = index * 24 + bit;
+                self.set_svc_allowed(svc_id);
+            }
+        }
     }
 
     /// Set an SVC as allowed.
