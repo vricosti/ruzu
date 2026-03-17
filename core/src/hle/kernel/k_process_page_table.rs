@@ -119,7 +119,7 @@ impl KProcessPageTable {
     }
 
     pub fn get_current_heap_size(&self) -> usize {
-        self.base.get_heap_region_size() // TODO: track current heap vs region
+        self.base.get_current_heap_size()
     }
 
     // -- Mapping operations delegating to base --

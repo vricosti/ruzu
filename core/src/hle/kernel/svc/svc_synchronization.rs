@@ -125,6 +125,7 @@ mod tests {
     use super::*;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::{KThread, ThreadState};
+    use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
     use crate::hle::kernel::svc::svc_event;
     use crate::hle::kernel::svc::svc_thread;
     use std::sync::atomic::Ordering;
@@ -368,6 +369,7 @@ mod tests {
         );
 
         target_thread.lock().unwrap().exit();
+        KWorkerTaskManager::wait_for_global_idle();
 
         let thread = current_thread.lock().unwrap();
         assert_eq!(

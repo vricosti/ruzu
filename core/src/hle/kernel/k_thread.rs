@@ -15,6 +15,7 @@ use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
 use super::k_synchronization_object;
 use super::k_thread_queue::KThreadQueue;
+use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
 use super::k_synchronization_object::SynchronizationWaitSet;
 use super::k_synchronization_object::SynchronizationObjectState;
 use super::k_typed_address::{KProcessAddress, KVirtualAddress};
@@ -288,6 +289,116 @@ impl KAffinityMask {
 }
 
 // ---------------------------------------------------------------------------
+// LockWithPriorityInheritanceInfo
+// Matches upstream KThread::LockWithPriorityInheritanceInfo (k_thread.h:771-845).
+// ---------------------------------------------------------------------------
+
+/// Key for ordering waiters in the lock's thread tree.
+/// Upstream uses LockWithPriorityInheritanceComparator which orders by
+/// (condvar_key, priority, thread_id) — same as ConditionVariableComparator.
+/// For lock waiters, condvar_key is effectively the address key, so we
+/// order by (priority, thread_id) which is the meaningful ordering for
+/// selecting the highest-priority waiter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct LockWaiterKey {
+    pub priority: i32,
+    pub thread_id: u64,
+}
+
+/// Per-address lock tracking structure.
+/// Upstream: nested class inside KThread, slab-allocated, intrusive-list node.
+/// In Rust: owned in a Vec on the holding thread.
+///
+/// Each instance tracks one address key (mutex/lock address) and the set
+/// of threads waiting to acquire that lock.
+pub struct LockWithPriorityInheritanceInfo {
+    /// Waiters ordered by (priority, thread_id) — matches upstream red-black tree.
+    tree: std::collections::BTreeSet<LockWaiterKey>,
+    /// The address being locked.
+    address_key: KProcessAddress,
+    /// Owner thread ID (upstream: raw pointer to KThread).
+    owner_thread_id: u64,
+    /// Number of waiters.
+    waiter_count: u32,
+    /// Whether this is a kernel address key.
+    is_kernel_address_key: bool,
+}
+
+impl LockWithPriorityInheritanceInfo {
+    /// Create a new lock info for the given address key.
+    /// Matches upstream `LockWithPriorityInheritanceInfo::Create()`.
+    pub fn new(address_key: KProcessAddress, is_kernel_address_key: bool) -> Self {
+        Self {
+            tree: std::collections::BTreeSet::new(),
+            address_key,
+            owner_thread_id: 0,
+            waiter_count: 0,
+            is_kernel_address_key,
+        }
+    }
+
+    pub fn set_owner(&mut self, owner_thread_id: u64) {
+        self.owner_thread_id = owner_thread_id;
+    }
+
+    /// Add a waiter thread. The caller must provide the waiter's priority and thread_id.
+    /// Matches upstream `AddWaiter(KThread*)`.
+    pub fn add_waiter(&mut self, priority: i32, thread_id: u64) {
+        self.tree.insert(LockWaiterKey {
+            priority,
+            thread_id,
+        });
+        self.waiter_count += 1;
+    }
+
+    /// Remove a waiter thread. Returns true if the lock has no more waiters.
+    /// Matches upstream `RemoveWaiter(KThread*)`.
+    pub fn remove_waiter(&mut self, priority: i32, thread_id: u64) -> bool {
+        self.tree.remove(&LockWaiterKey {
+            priority,
+            thread_id,
+        });
+        self.waiter_count -= 1;
+        self.waiter_count == 0
+    }
+
+    /// Get the highest priority waiter's key.
+    /// Matches upstream `GetHighestPriorityWaiter()` — front of tree = lowest
+    /// (priority, thread_id) = highest priority.
+    pub fn get_highest_priority_waiter(&self) -> Option<LockWaiterKey> {
+        self.tree.iter().next().copied()
+    }
+
+    pub fn get_address_key(&self) -> KProcessAddress {
+        self.address_key
+    }
+
+    pub fn get_is_kernel_address_key(&self) -> bool {
+        self.is_kernel_address_key
+    }
+
+    pub fn get_owner_thread_id(&self) -> u64 {
+        self.owner_thread_id
+    }
+
+    pub fn get_waiter_count(&self) -> u32 {
+        self.waiter_count
+    }
+}
+
+/// Reference to a LockWithPriorityInheritanceInfo on another thread.
+/// Upstream uses a raw pointer; we store enough info to find it.
+#[derive(Clone, Debug)]
+pub struct WaitingLockRef {
+    /// The thread that owns the lock info.
+    pub owner_thread_id: u64,
+    /// The address key identifying the lock.
+    pub address_key: KProcessAddress,
+    /// Whether it's a kernel address key.
+    pub is_kernel_address_key: bool,
+}
+
+// ---------------------------------------------------------------------------
 // KThread — the main thread structure
 // ---------------------------------------------------------------------------
 
@@ -299,6 +410,7 @@ impl KAffinityMask {
 pub struct KThread {
     // -- Core KThread fields --
     pub object_id: u64,
+    pub self_reference: Option<Weak<Mutex<KThread>>>,
     pub thread_context: ThreadContext,
     pub condvar_arbiter_tree_node: RBEntry,
     pub priority: i32,
@@ -325,13 +437,18 @@ pub struct KThread {
     // Wait queue — upstream `m_wait_queue`
     pub wait_queue: Option<KThreadQueue>,
 
-    // Lock with priority inheritance
-    // m_held_lock_info_list — stubbed
-    // m_waiting_lock_info — stubbed
+    // Lock with priority inheritance — matches upstream fields:
+    // LockWithPriorityInheritanceInfoList m_held_lock_info_list{};
+    // LockWithPriorityInheritanceInfo* m_waiting_lock_info{};
+    pub held_lock_info_list: Vec<LockWithPriorityInheritanceInfo>,
+    /// Index into the *owner* thread's held_lock_info_list that this thread
+    /// is waiting on. None if not waiting on any lock.
+    /// Upstream: raw pointer `m_waiting_lock_info`.
+    /// We store (owner_thread_id, address_key, is_kernel_address_key) so we
+    /// can find the lock info on the owner thread.
+    pub waiting_lock_info: Option<WaitingLockRef>,
 
     pub address_key_value: u32,
-    pub waiting_lock_owner_thread_id: Option<u64>,
-    pub user_waiter_thread_ids: Vec<u64>,
     pub suspend_request_flags: u32,
     pub suspend_allowed_flags: u32,
     pub synced_index: i32,
@@ -350,6 +467,7 @@ pub struct KThread {
     pub wait_cancelled: bool,
     pub cancellable: bool,
     pub signaled: bool,
+    pub termination_wait_pair: Arc<(Mutex<bool>, Condvar)>,
     pub initialized: bool,
     pub debug_attached: bool,
     pub priority_inheritance_count: i8,
@@ -415,6 +533,7 @@ impl KThread {
     pub fn new() -> Self {
         Self {
             object_id: 0,
+            self_reference: None,
             thread_context: ThreadContext::default(),
             condvar_arbiter_tree_node: RBEntry::default(),
             priority: 0,
@@ -434,9 +553,9 @@ impl KThread {
             last_scheduled_tick: 0,
             per_core_priority_queue_entry: Default::default(),
             wait_queue: None,
+            held_lock_info_list: Vec::new(),
+            waiting_lock_info: None,
             address_key_value: 0,
-            waiting_lock_owner_thread_id: None,
-            user_waiter_thread_ids: Vec::new(),
             suspend_request_flags: 0,
             suspend_allowed_flags: ThreadState::SUSPEND_FLAG_MASK.bits() as u32,
             synced_index: 0,
@@ -455,6 +574,7 @@ impl KThread {
             wait_cancelled: false,
             cancellable: false,
             signaled: false,
+            termination_wait_pair: Arc::new((Mutex::new(false), Condvar::new())),
             initialized: false,
             debug_attached: false,
             priority_inheritance_count: 0,
@@ -487,6 +607,10 @@ impl KThread {
 
     pub fn get_object_id(&self) -> u64 {
         self.object_id
+    }
+
+    pub fn bind_self_reference(&mut self, thread: &Arc<Mutex<KThread>>) {
+        self.self_reference = Some(Arc::downgrade(thread));
     }
 
     pub fn set_priority(&mut self, value: i32) {
@@ -741,55 +865,298 @@ impl KThread {
         self.address_key_value
     }
 
-    pub fn add_waiter(&mut self, thread_id: u64) {
-        if self.user_waiter_thread_ids.contains(&thread_id) {
-            return;
-        }
-        self.user_waiter_thread_ids.push(thread_id);
-        self.num_kernel_waiters += 1;
+    // -- LockWithPriorityInheritanceInfo methods --
+
+    /// Find a held lock info by address key.
+    /// Matches upstream `KThread::FindHeldLock()`.
+    pub fn find_held_lock_index(
+        &self,
+        address_key: KProcessAddress,
+        is_kernel_address_key: bool,
+    ) -> Option<usize> {
+        self.held_lock_info_list.iter().position(|info| {
+            info.get_address_key() == address_key
+                && info.get_is_kernel_address_key() == is_kernel_address_key
+        })
     }
 
-    pub fn remove_waiter(&mut self, thread_id: u64) {
-        if let Some(index) = self
-            .user_waiter_thread_ids
-            .iter()
-            .position(|candidate| *candidate == thread_id)
-        {
-            self.user_waiter_thread_ids.remove(index);
-            self.num_kernel_waiters = self.num_kernel_waiters.saturating_sub(1);
+    /// Add a lock info to our held list and set ourselves as owner.
+    /// Matches upstream `KThread::AddHeldLock()`.
+    pub fn add_held_lock(&mut self, mut lock_info: LockWithPriorityInheritanceInfo) {
+        if lock_info.get_is_kernel_address_key() {
+            self.num_kernel_waiters += lock_info.get_waiter_count() as i32;
         }
+        lock_info.set_owner(self.thread_id);
+        self.held_lock_info_list.push(lock_info);
     }
 
-    pub fn remove_user_waiter_by_key(
+    /// Set the waiting lock info reference.
+    /// Matches upstream `KThread::SetWaitingLockInfo()`.
+    pub fn set_waiting_lock_info(&mut self, lock_ref: Option<WaitingLockRef>) {
+        self.waiting_lock_info = lock_ref;
+    }
+
+    /// Get the waiting lock info reference.
+    /// Matches upstream `KThread::GetWaitingLockInfo()`.
+    pub fn get_waiting_lock_info(&self) -> Option<&WaitingLockRef> {
+        self.waiting_lock_info.as_ref()
+    }
+
+    /// Add a waiter thread to the appropriate lock info.
+    /// Matches upstream `KThread::AddWaiterImpl()` (k_thread.cpp:962-989).
+    ///
+    /// The waiter's address_key and is_kernel_address_key must already be set.
+    pub fn add_waiter_impl(
         &mut self,
-        process: &KProcess,
-        address: KProcessAddress,
-        has_waiters: &mut bool,
-    ) -> Option<u64> {
-        let mut index = 0usize;
-        while index < self.user_waiter_thread_ids.len() {
-            let waiter_thread_id = self.user_waiter_thread_ids[index];
-            let Some(waiter_thread) = process.get_thread_by_thread_id(waiter_thread_id) else {
-                self.user_waiter_thread_ids.remove(index);
-                self.num_kernel_waiters = self.num_kernel_waiters.saturating_sub(1);
-                continue;
-            };
-
-            if waiter_thread.lock().unwrap().get_address_key() != address {
-                index += 1;
-                continue;
-            }
-
-            self.user_waiter_thread_ids.remove(index);
-            self.num_kernel_waiters = self.num_kernel_waiters.saturating_sub(1);
-            *has_waiters = self.user_waiter_thread_ids.iter().filter_map(|candidate_id| {
-                process.get_thread_by_thread_id(*candidate_id)
-            }).any(|thread| thread.lock().unwrap().get_address_key() == address);
-            return Some(waiter_thread_id);
+        waiter_thread_id: u64,
+        waiter_priority: i32,
+        waiter_address_key: KProcessAddress,
+        waiter_is_kernel_address_key: bool,
+    ) {
+        // Keep track of kernel waiters.
+        if waiter_is_kernel_address_key {
+            self.num_kernel_waiters += 1;
         }
 
-        *has_waiters = false;
-        None
+        // Find or create the lock info for this address.
+        let lock_idx = self.find_held_lock_index(waiter_address_key, waiter_is_kernel_address_key);
+        let lock_idx = match lock_idx {
+            Some(idx) => idx,
+            None => {
+                let lock_info =
+                    LockWithPriorityInheritanceInfo::new(waiter_address_key, waiter_is_kernel_address_key);
+                self.add_held_lock(lock_info);
+                self.held_lock_info_list.len() - 1
+            }
+        };
+
+        // Add the waiter.
+        self.held_lock_info_list[lock_idx].add_waiter(waiter_priority, waiter_thread_id);
+    }
+
+    /// Remove a waiter thread from its lock info.
+    /// Matches upstream `KThread::RemoveWaiterImpl()` (k_thread.cpp:991-1009).
+    ///
+    /// `waiter_lock_ref` identifies which lock the waiter is on.
+    pub fn remove_waiter_impl(
+        &mut self,
+        waiter_thread_id: u64,
+        waiter_priority: i32,
+        waiter_is_kernel_address_key: bool,
+        waiter_address_key: KProcessAddress,
+    ) {
+        // Keep track of kernel waiters.
+        if waiter_is_kernel_address_key {
+            self.num_kernel_waiters -= 1;
+        }
+
+        // Find the lock info.
+        let lock_idx = self
+            .find_held_lock_index(waiter_address_key, waiter_is_kernel_address_key)
+            .expect("RemoveWaiterImpl: lock info not found");
+
+        // Remove the waiter; if the lock is now empty, remove it.
+        let is_empty = self.held_lock_info_list[lock_idx].remove_waiter(waiter_priority, waiter_thread_id);
+        if is_empty {
+            self.held_lock_info_list.remove(lock_idx);
+        }
+    }
+
+    /// Public AddWaiter: adds waiter then triggers priority inheritance.
+    /// Matches upstream `KThread::AddWaiter()` (k_thread.cpp:1063-1070).
+    ///
+    /// NOTE: Priority inheritance (RestorePriority) is simplified here —
+    /// full chain-walking requires access to other threads' mutexes.
+    /// Callers that need full priority inheritance should call
+    /// `restore_priority_simplified()` after this.
+    pub fn add_waiter(
+        &mut self,
+        waiter_thread_id: u64,
+        waiter_priority: i32,
+        waiter_address_key: KProcessAddress,
+        waiter_is_kernel_address_key: bool,
+    ) {
+        self.add_waiter_impl(
+            waiter_thread_id,
+            waiter_priority,
+            waiter_address_key,
+            waiter_is_kernel_address_key,
+        );
+
+        // If the waiter has higher priority than us, inherit it.
+        if waiter_priority < self.priority {
+            self.restore_priority_simplified();
+        }
+    }
+
+    /// Public RemoveWaiter: removes waiter then may restore priority.
+    /// Matches upstream `KThread::RemoveWaiter()` (k_thread.cpp:1072-1081).
+    pub fn remove_waiter(
+        &mut self,
+        waiter_thread_id: u64,
+        waiter_priority: i32,
+        waiter_is_kernel_address_key: bool,
+        waiter_address_key: KProcessAddress,
+    ) {
+        self.remove_waiter_impl(
+            waiter_thread_id,
+            waiter_priority,
+            waiter_is_kernel_address_key,
+            waiter_address_key,
+        );
+
+        // If our priority equals the removed waiter's and we've inherited,
+        // we may need to drop back.
+        if self.priority == waiter_priority && self.priority < self.base_priority {
+            self.restore_priority_simplified();
+        }
+    }
+
+    /// Remove the highest priority waiter for a given address key and transfer
+    /// lock ownership to it.
+    /// Matches upstream `KThread::RemoveWaiterByKey()` (k_thread.cpp:1083-1142).
+    pub fn remove_waiter_by_key(
+        &mut self,
+        address_key: KProcessAddress,
+        is_kernel_address_key: bool,
+        has_waiters: &mut bool,
+    ) -> Option<(u64, i32)> {
+        // Find the lock info for this address.
+        let lock_idx = self.find_held_lock_index(address_key, is_kernel_address_key)?;
+
+        // Remove the lock info from our held list.
+        let mut lock_info = self.held_lock_info_list.remove(lock_idx);
+
+        // Adjust kernel waiter count.
+        if lock_info.get_is_kernel_address_key() {
+            self.num_kernel_waiters -= lock_info.get_waiter_count() as i32;
+            assert!(self.num_kernel_waiters >= 0);
+        }
+
+        assert!(lock_info.get_waiter_count() > 0);
+
+        // Remove the highest priority waiter to become the next owner.
+        let next_owner_key = lock_info.get_highest_priority_waiter()
+            .expect("RemoveWaiterByKey: lock has waiters but tree is empty");
+
+        let next_owner_thread_id = next_owner_key.thread_id;
+        let next_owner_priority = next_owner_key.priority;
+
+        if lock_info.remove_waiter(next_owner_key.priority, next_owner_key.thread_id) {
+            // The new owner was the only waiter — lock info is freed (dropped).
+            *has_waiters = false;
+        } else {
+            // There are additional waiters — transfer to new owner.
+            *has_waiters = true;
+
+            // Track kernel waiters for the new owner.
+            // NOTE: The caller must call `next_owner.add_held_lock(lock_info)`
+            // after locking the next owner thread. We return the lock_info
+            // via a separate method to avoid borrow issues.
+            // For now, we store it temporarily — the caller retrieves it.
+            self.held_lock_info_list.push(lock_info);
+            // Mark the last element as the "transfer" slot.
+            // The caller must pop it and give it to the new owner.
+        }
+
+        // If our priority matched the next owner's and we've inherited, restore.
+        if self.priority == next_owner_priority && self.priority < self.base_priority {
+            self.restore_priority_simplified();
+        }
+
+        Some((next_owner_thread_id, next_owner_priority))
+    }
+
+    /// Take the last lock info from the held list (used for lock transfer
+    /// after `remove_waiter_by_key` when has_waiters is true).
+    pub fn take_transfer_lock_info(&mut self) -> Option<LockWithPriorityInheritanceInfo> {
+        self.held_lock_info_list.pop()
+    }
+
+    /// Simplified RestorePriority — computes new priority from base priority
+    /// and all held locks' highest-priority waiters.
+    /// Matches upstream `KThread::RestorePriority()` (k_thread.cpp:1011-1061)
+    /// but without the chain-walking (which requires locking other threads).
+    pub fn restore_priority_simplified(&mut self) {
+        let mut new_priority = self.base_priority;
+        for lock_info in &self.held_lock_info_list {
+            if let Some(highest) = lock_info.get_highest_priority_waiter() {
+                new_priority = new_priority.min(highest.priority);
+            }
+        }
+
+        if new_priority != self.priority {
+            let old_priority = self.priority;
+            self.priority = new_priority;
+            self.notify_priority_change(old_priority);
+        }
+    }
+
+    /// Collect all waiter thread IDs across all held locks.
+    /// Replaces the old `waiter_thread_ids()` that returned the flat Vec.
+    pub fn waiter_thread_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for lock_info in &self.held_lock_info_list {
+            for key in lock_info.tree.iter() {
+                ids.push(key.thread_id);
+            }
+        }
+        ids
+    }
+
+    /// Get waiter thread IDs for a specific address key.
+    pub fn waiter_thread_ids_for_address(&self, address_key: KProcessAddress) -> Vec<u64> {
+        for lock_info in &self.held_lock_info_list {
+            if lock_info.get_address_key() == address_key {
+                return lock_info.tree.iter().map(|k| k.thread_id).collect();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Legacy compatibility: add_waiter with just a thread_id.
+    /// Used by callers that set the waiter's address key separately.
+    /// The waiter_priority must be provided. For callers that don't have it,
+    /// use a default of 0 (highest) — they should be updated to pass the real priority.
+    pub fn add_waiter_by_id(
+        &mut self,
+        waiter_thread_id: u64,
+        waiter_priority: i32,
+        waiter_address_key: KProcessAddress,
+        waiter_is_kernel_address_key: bool,
+    ) {
+        self.add_waiter(
+            waiter_thread_id,
+            waiter_priority,
+            waiter_address_key,
+            waiter_is_kernel_address_key,
+        );
+    }
+
+    /// Legacy compatibility: remove_waiter with a thread_id.
+    /// Searches all held locks for the given thread_id.
+    pub fn remove_waiter_by_thread_id(&mut self, waiter_thread_id: u64) {
+        for i in 0..self.held_lock_info_list.len() {
+            let found = self.held_lock_info_list[i]
+                .tree
+                .iter()
+                .find(|k| k.thread_id == waiter_thread_id)
+                .copied();
+            if let Some(key) = found {
+                let is_kernel = self.held_lock_info_list[i].get_is_kernel_address_key();
+                let is_empty = self.held_lock_info_list[i].remove_waiter(key.priority, key.thread_id);
+                if is_kernel {
+                    self.num_kernel_waiters -= 1;
+                }
+                if is_empty {
+                    self.held_lock_info_list.remove(i);
+                }
+                if self.priority == key.priority && self.priority < self.base_priority {
+                    self.restore_priority_simplified();
+                }
+                return;
+            }
+        }
     }
 
     pub fn get_is_kernel_address_key(&self) -> bool {
@@ -1050,6 +1417,8 @@ impl KThread {
         self.parent = Some(owner);
         self.scheduler = scheduler;
         self.signaled = false;
+        let (termination_lock, _) = &*self.termination_wait_pair;
+        *termination_lock.lock().unwrap() = false;
         self.termination_requested.store(false, Ordering::Relaxed);
         self.wait_cancelled = false;
         self.cancellable = false;
@@ -1230,6 +1599,12 @@ impl KThread {
         // Signal.
         // Upstream: m_signaled = true; KSynchronizationObject::NotifyAvailable();
         self.signaled = true;
+        {
+            let (lock, cv) = &*self.termination_wait_pair;
+            let mut termination_completed = lock.lock().unwrap();
+            *termination_completed = true;
+            cv.notify_all();
+        }
 
         // Notify any waiters (matches KSynchronizationObject::NotifyAvailable).
         if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
@@ -1261,9 +1636,8 @@ impl KThread {
     /// 4. Register with KWorkerTaskManager::WorkerType::Exit
     /// 5. UNREACHABLE — the thread never returns from Exit()
     ///
-    /// Our port inlines FinishTermination() instead of deferring to worker task,
-    /// because KWorkerTaskManager is not yet wired. The caller returns normally
-    /// (no UNREACHABLE) since we use cooperative scheduling.
+    /// Our port queues `DoWorkerTaskImpl()` on KWorkerTaskManager like upstream,
+    /// but still returns normally because guest thread exit is cooperative here.
     pub fn exit(&mut self) {
         // Release resource hint and decrement running count from parent.
         if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
@@ -1301,10 +1675,30 @@ impl KThread {
             // Start termination.
             self.start_termination();
 
-            // Upstream: KWorkerTaskManager::AddTask(kernel, WorkerType::Exit, this)
-            // Worker task would later call DoWorkerTaskImpl() -> FinishTermination().
-            // We call FinishTermination() inline since no worker task manager exists.
-            self.finish_termination();
+            let worker_thread = self
+                .self_reference
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .or_else(|| {
+                    self.parent.as_ref().and_then(Weak::upgrade).and_then(|parent| {
+                        parent
+                            .lock()
+                            .unwrap()
+                            .get_thread_by_object_id(self.object_id)
+                    })
+                });
+
+            if let Some(worker_thread) = worker_thread {
+                KWorkerTaskManager::add_task_static(
+                    0,
+                    WorkerType::Exit,
+                    Box::new(move || {
+                        worker_thread.lock().unwrap().do_worker_task_impl();
+                    }),
+                );
+            } else {
+                self.finish_termination();
+            }
         }
 
         // Upstream: UNREACHABLE_MSG("KThread::Exit() would return")
@@ -1320,9 +1714,9 @@ impl KThread {
     /// 3. If not yet terminated: KSynchronizationObject::Wait(kernel, &index,
     ///    &[this], 1, WaitInfinite) — blocks until the thread signals
     ///
-    /// Our port cannot block (cooperative scheduling), so after requesting
-    /// termination we return immediately. The thread will terminate at the
-    /// next SVC boundary or when its execution slice ends.
+    /// Our `&mut self` variant cannot block safely because callers commonly
+    /// hold the thread mutex while invoking it. Use `terminate_thread()` when
+    /// a caller owns `Arc<Mutex<KThread>>` and needs upstream-style waiting.
     pub fn terminate(&mut self) -> u32 {
         // Request termination.
         let new_state = self.request_terminate();
@@ -1344,6 +1738,29 @@ impl KThread {
         //
         // TODO: Implement KSynchronizationObject::Wait() for true blocking
         // once multi-threaded scheduling is wired.
+
+        RESULT_SUCCESS.get_inner_value()
+    }
+
+    /// Rust-side helper for upstream-style `KThread::Terminate()` semantics.
+    ///
+    /// This variant can safely wait for `FinishTermination()` because it drops
+    /// the thread mutex before blocking on the termination condition variable.
+    pub fn terminate_thread(thread: &Arc<Mutex<KThread>>) -> u32 {
+        let wait_pair = {
+            let mut guard = thread.lock().unwrap();
+            let new_state = guard.request_terminate();
+            if new_state == ThreadState::TERMINATED || guard.is_signaled() {
+                return RESULT_SUCCESS.get_inner_value();
+            }
+            guard.termination_wait_pair.clone()
+        };
+
+        let (lock, cv) = &*wait_pair;
+        let mut termination_completed = lock.lock().unwrap();
+        while !*termination_completed {
+            termination_completed = cv.wait(termination_completed).unwrap();
+        }
 
         RESULT_SUCCESS.get_inner_value()
     }
@@ -1383,6 +1800,16 @@ impl KThread {
             const TERMINATING_THREAD_PRIORITY: i32 = -1; // SystemThreadPriorityHighest - 1
             self.increase_base_priority(TERMINATING_THREAD_PRIORITY);
 
+            // If RUNNABLE, request an interrupt-driven reschedule like upstream
+            // sending a termination IPI to the candidate cores.
+            if self.get_state() == ThreadState::RUNNABLE {
+                if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
+                    scheduler.lock().unwrap().request_schedule_on_interrupt();
+                } else {
+                    self.request_schedule();
+                }
+            }
+
             // If WAITING, cancel the wait.
             if self.get_state() == ThreadState::WAITING {
                 if let Some(wq) = self.wait_queue {
@@ -1400,12 +1827,7 @@ impl KThread {
         if self.base_priority > priority {
             self.base_priority = priority;
             // Upstream: RestorePriority(kernel, this)
-            // Without LockWithPriorityInheritanceInfo, we do a simplified version.
-            let old_priority = self.priority;
-            self.priority = self.base_priority;
-            if old_priority != self.priority {
-                self.notify_priority_change(old_priority);
-            }
+            self.restore_priority_simplified();
         }
     }
 
@@ -1645,7 +2067,7 @@ impl KThread {
     /// Matches upstream `KThread::EndWait()`.
     pub fn end_wait(&mut self, _wait_result: u32) {
         self.sleep_deadline = None;
-        self.waiting_lock_owner_thread_id = None;
+        self.waiting_lock_info = None;
         self.clear_wait_synchronization();
         self.wait_result = _wait_result;
         self.apply_wait_result_to_context();
@@ -1660,7 +2082,7 @@ impl KThread {
     /// Matches upstream `KThread::CancelWait()`.
     pub fn cancel_wait(&mut self, _wait_result: u32, _cancel_timer_task: bool) {
         self.sleep_deadline = None;
-        self.waiting_lock_owner_thread_id = None;
+        self.waiting_lock_info = None;
         self.clear_wait_synchronization();
         self.wait_result = _wait_result;
         self.apply_wait_result_to_context();
@@ -1761,6 +2183,7 @@ impl KThread {
         // If the thread has an owner process, unregister it.
         if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
             let mut process = parent.lock().unwrap();
+            process.thread_objects.remove(&self.object_id);
             process.unregister_thread(self.thread_id);
 
             // If the thread has a local region, delete it.
@@ -1770,25 +2193,46 @@ impl KThread {
         }
 
         // Release any waiters.
-        // Upstream: asserts m_waiting_lock_info == nullptr, m_num_kernel_waiters == 0,
-        // then walks m_held_lock_info_list removing all waiters, cancelling their
-        // waits, erasing from the list, and freeing the LockWithPriorityInheritanceInfo.
-        //
-        // Without LockWithPriorityInheritanceInfo, we cancel waiters directly.
+        // Matches upstream KThread::Finalize() (k_thread.cpp:344-380).
         {
-            assert_eq!(self.num_kernel_waiters, 0,
-                "thread {} has kernel waiters at finalize", self.thread_id);
+            debug_assert!(
+                self.waiting_lock_info.is_none(),
+                "thread {} has waiting_lock_info at finalize",
+                self.thread_id
+            );
+            assert_eq!(
+                self.num_kernel_waiters, 0,
+                "thread {} has kernel waiters at finalize",
+                self.thread_id
+            );
 
-            for waiter_id in self.user_waiter_thread_ids.drain(..) {
-                if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-                    let process = parent.lock().unwrap();
-                    if let Some(waiter) = process.get_thread_by_thread_id(waiter_id) {
-                        let mut waiter_guard = waiter.lock().unwrap();
-                        if waiter_guard.get_state() == ThreadState::WAITING {
-                            waiter_guard.cancel_wait(RESULT_INVALID_STATE.get_inner_value(), true);
+            // Walk held_lock_info_list, cancel all waiters, free lock infos.
+            while let Some(mut lock_info) = self.held_lock_info_list.pop() {
+                debug_assert!(
+                    !lock_info.get_is_kernel_address_key(),
+                    "finalize: lock info should not have kernel address key"
+                );
+
+                // Remove all waiters from this lock.
+                while lock_info.get_waiter_count() != 0 {
+                    let Some(waiter_key) = lock_info.get_highest_priority_waiter() else {
+                        break;
+                    };
+                    lock_info.remove_waiter(waiter_key.priority, waiter_key.thread_id);
+
+                    // Cancel the waiter's wait.
+                    if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
+                        let process = parent.lock().unwrap();
+                        if let Some(waiter) = process.get_thread_by_thread_id(waiter_key.thread_id)
+                        {
+                            let mut waiter_guard = waiter.lock().unwrap();
+                            waiter_guard.set_waiting_lock_info(None);
+                            waiter_guard
+                                .cancel_wait(RESULT_INVALID_STATE.get_inner_value(), true);
                         }
                     }
                 }
+                // lock_info is dropped here (equivalent to upstream Free).
             }
         }
 
@@ -1844,15 +2288,17 @@ impl KThread {
     }
 
     /// Set condition variable state.
-    /// Upstream: ASSERT(m_waiting_lock_info == nullptr) — checks
-    /// LockWithPriorityInheritanceInfo, not waiting_lock_owner_thread_id.
-    /// TODO: add assertion once LockWithPriorityInheritanceInfo is ported.
+    /// Upstream: ASSERT(m_waiting_lock_info == nullptr).
     pub fn set_condition_variable(
         &mut self,
         address: KProcessAddress,
         cv_key: u64,
         value: u32,
     ) {
+        debug_assert!(
+            self.waiting_lock_info.is_none(),
+            "set_condition_variable: m_waiting_lock_info must be null"
+        );
         self.condvar_tree_state = ConditionVariableTreeState::ConditionVariable;
         self.condvar_key = cv_key;
         self.address_key = address;
@@ -1874,10 +2320,12 @@ impl KThread {
     }
 
     /// Set address arbiter state.
-    /// Upstream: ASSERT(m_waiting_lock_info == nullptr) — checks
-    /// LockWithPriorityInheritanceInfo, not waiting_lock_owner_thread_id.
-    /// TODO: add assertion once LockWithPriorityInheritanceInfo is ported.
+    /// Upstream: ASSERT(m_waiting_lock_info == nullptr).
     pub fn set_address_arbiter(&mut self, address: u64) {
+        debug_assert!(
+            self.waiting_lock_info.is_none(),
+            "set_address_arbiter: m_waiting_lock_info must be null"
+        );
         self.condvar_tree_state = ConditionVariableTreeState::AddressArbiter;
         self.condvar_key = address;
     }
@@ -1895,15 +2343,36 @@ impl KThread {
         }
     }
 
+    /// Set the waiting lock info (which lock this thread is blocked on).
+    /// Replaces the old `set_waiting_lock_owner_thread_id`.
+    /// Pass `None` to clear (thread is no longer waiting on a lock).
     pub fn set_waiting_lock_owner_thread_id(&mut self, owner_thread_id: Option<u64>) {
-        self.waiting_lock_owner_thread_id = owner_thread_id;
+        match owner_thread_id {
+            Some(id) => {
+                self.waiting_lock_info = Some(WaitingLockRef {
+                    owner_thread_id: id,
+                    address_key: self.address_key,
+                    is_kernel_address_key: self.is_kernel_address_key,
+                });
+            }
+            None => {
+                self.waiting_lock_info = None;
+            }
+        }
     }
 
+    /// Get the lock owner thread.
+    /// Matches upstream `KThread::GetLockOwner()` (k_thread.cpp:732-734).
     pub fn get_lock_owner(&self) -> Option<Arc<Mutex<KThread>>> {
-        let owner_thread_id = self.waiting_lock_owner_thread_id?;
+        let lock_ref = self.waiting_lock_info.as_ref()?;
         let parent = self.parent.as_ref()?.upgrade()?;
         let process = parent.lock().unwrap();
-        process.get_thread_by_thread_id(owner_thread_id)
+        process.get_thread_by_thread_id(lock_ref.owner_thread_id)
+    }
+
+    /// Get the lock owner thread ID (without looking up the thread).
+    pub fn get_lock_owner_thread_id(&self) -> Option<u64> {
+        self.waiting_lock_info.as_ref().map(|r| r.owner_thread_id)
     }
 
     pub fn has_wait_queue(&self) -> bool {
@@ -1918,10 +2387,6 @@ impl KThread {
     /// Set the timer task time (upstream KTimerTask::SetTime()).
     pub fn set_timer_task_time(&mut self, time: i64) {
         self.timer_task_time = time;
-    }
-
-    pub fn waiter_thread_ids(&self) -> &[u64] {
-        &self.user_waiter_thread_ids
     }
 
     /// Continue if has kernel waiters.
@@ -2157,6 +2622,114 @@ mod tests {
             .store(false, Ordering::Relaxed);
 
         thread.set_base_priority(30);
+
+        assert!(scheduler.lock().unwrap().needs_scheduling());
+    }
+
+    #[test]
+    fn test_add_held_lock_transfers_kernel_waiter_count() {
+        let mut thread = KThread::new();
+        thread.thread_id = 7;
+
+        let mut lock_info = LockWithPriorityInheritanceInfo::new(KProcessAddress::new(0x4000), true);
+        lock_info.add_waiter(3, 10);
+        lock_info.add_waiter(5, 11);
+
+        thread.add_held_lock(lock_info);
+
+        assert_eq!(thread.get_num_kernel_waiters(), 2);
+        assert_eq!(thread.held_lock_info_list.len(), 1);
+        assert_eq!(thread.held_lock_info_list[0].get_owner_thread_id(), 7);
+    }
+
+    #[test]
+    fn test_remove_waiter_by_thread_id_restores_priority() {
+        let mut thread = KThread::new();
+        thread.thread_id = 1;
+        thread.base_priority = 10;
+        thread.priority = 3;
+
+        let mut lock_info =
+            LockWithPriorityInheritanceInfo::new(KProcessAddress::new(0x5000), false);
+        lock_info.add_waiter(3, 2);
+        thread.add_held_lock(lock_info);
+
+        thread.remove_waiter_by_thread_id(2);
+
+        assert_eq!(thread.priority, 10);
+        assert!(thread.held_lock_info_list.is_empty());
+    }
+
+    #[test]
+    fn test_finalize_unregisters_thread_object_from_owner_process() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let thread = Arc::new(Mutex::new(KThread::new()));
+
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = 11;
+            guard.object_id = 22;
+            guard.parent = Some(Arc::downgrade(&process));
+        }
+        process.lock().unwrap().register_thread_object(thread.clone());
+
+        thread.lock().unwrap().finalize();
+
+        let process_guard = process.lock().unwrap();
+        assert!(process_guard.get_thread_by_object_id(22).is_none());
+        assert!(!process_guard.thread_list.contains(&11));
+    }
+
+    #[test]
+    fn terminate_thread_waits_for_finish_termination_signal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        use std::time::Duration;
+
+        let target = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = target.lock().unwrap();
+            guard.object_id = 44;
+            guard.thread_id = 7;
+            guard.bind_self_reference(&target);
+            guard.set_state(ThreadState::RUNNABLE);
+        }
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = completed.clone();
+        let target_clone = target.clone();
+        let waiter = thread::spawn(move || {
+            let result = KThread::terminate_thread(&target_clone);
+            assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+            completed_clone.store(true, Ordering::SeqCst);
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        assert!(!completed.load(Ordering::SeqCst));
+
+        target.lock().unwrap().exit();
+
+        waiter.join().unwrap();
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(target.lock().unwrap().is_signaled());
+    }
+
+    #[test]
+    fn request_terminate_runnable_thread_requests_interrupt_reschedule() {
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let mut thread = KThread::new();
+        thread.thread_id = 9;
+        thread.scheduler = Some(Arc::downgrade(&scheduler));
+        thread.set_state(ThreadState::RUNNABLE);
+
+        scheduler
+            .lock()
+            .unwrap()
+            .state
+            .needs_scheduling
+            .store(false, Ordering::Relaxed);
+
+        thread.request_terminate();
 
         assert!(scheduler.lock().unwrap().needs_scheduling());
     }

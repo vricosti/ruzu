@@ -1,6 +1,6 @@
 //! Port of zuyu/src/core/hle/kernel/k_condition_variable.h/.cpp
-//! Status: COMPLET (stub — runtime dependencies not yet available)
-//! Derniere synchro: 2026-03-11
+//! Status: Partial (core wait/signal logic ported, scheduler/runtime wiring simplified)
+//! Derniere synchro: 2026-03-17
 //!
 //! KConditionVariable: implements condition-variable-style synchronization
 //! for userspace mutexes and condition variables.
@@ -51,7 +51,10 @@ impl ThreadQueueImplForKConditionVariableWaitForAddress {
     /// is cleared by the base queue's state transition.
     fn cancel_wait(waiting_thread: &mut KThread) {
         if let Some(owner_thread) = waiting_thread.get_lock_owner() {
-            owner_thread.lock().unwrap().remove_waiter(waiting_thread.thread_id);
+            owner_thread
+                .lock()
+                .unwrap()
+                .remove_waiter_by_thread_id(waiting_thread.thread_id);
         }
         // Note: upstream does not clear address arbiter here; the base
         // KThreadQueue::CancelWait handles the state transition.
@@ -67,7 +70,10 @@ impl ThreadQueueImplForKConditionVariableWaitConditionVariable {
 
     fn cancel_wait(waiting_thread: &mut KThread) {
         if let Some(owner_thread) = waiting_thread.get_lock_owner() {
-            owner_thread.lock().unwrap().remove_waiter(waiting_thread.thread_id);
+            owner_thread
+                .lock()
+                .unwrap()
+                .remove_waiter_by_thread_id(waiting_thread.thread_id);
         }
 
         if matches!(
@@ -113,31 +119,40 @@ impl KConditionVariable {
                 return RESULT_INVALID_HANDLE;
             };
 
-            let waiter_ids = owner_thread.lock().unwrap().waiter_thread_ids().to_vec();
-            let mut next_owner_thread: Option<Arc<Mutex<KThread>>> = None;
             let mut has_waiters = false;
+            let next_owner_result = owner_thread.lock().unwrap().remove_waiter_by_key(
+                KProcessAddress::new(addr),
+                false, // user address key
+                &mut has_waiters,
+            );
 
-            for waiter_thread_id in waiter_ids {
-                let Some(waiter_thread) = process_guard.get_thread_by_thread_id(waiter_thread_id) else {
-                    owner_thread.lock().unwrap().remove_waiter(waiter_thread_id);
-                    continue;
+            // If there are remaining waiters, transfer the lock info to the next owner.
+            let next_owner_thread: Option<Arc<Mutex<KThread>>> =
+                if let Some((next_owner_id, _priority)) = next_owner_result {
+                    if has_waiters {
+                        // Take the transfer lock info and give it to the new owner.
+                        if let Some(lock_info) =
+                            owner_thread.lock().unwrap().take_transfer_lock_info()
+                        {
+                            if let Some(next_thread) =
+                                process_guard.get_thread_by_thread_id(next_owner_id)
+                            {
+                                next_thread.lock().unwrap().add_held_lock(lock_info);
+                            }
+                        }
+                    }
+                    // Clear the next owner's waiting_lock_info.
+                    if let Some(next_thread) =
+                        process_guard.get_thread_by_thread_id(next_owner_id)
+                    {
+                        next_thread.lock().unwrap().set_waiting_lock_info(None);
+                        Some(next_thread)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 };
-
-                if waiter_thread.lock().unwrap().get_address_key().get() != addr {
-                    continue;
-                }
-
-                owner_thread.lock().unwrap().remove_waiter(waiter_thread_id);
-                has_waiters = owner_thread
-                    .lock()
-                    .unwrap()
-                    .waiter_thread_ids()
-                    .iter()
-                    .filter_map(|candidate_id| process_guard.get_thread_by_thread_id(*candidate_id))
-                    .any(|thread| thread.lock().unwrap().get_address_key().get() == addr);
-                next_owner_thread = Some(waiter_thread);
-                break;
-            }
 
             let next_value = if let Some(thread) = next_owner_thread.as_ref() {
                 let mut next_value = thread.lock().unwrap().get_address_key_value();
@@ -227,7 +242,17 @@ impl KConditionVariable {
         process_guard.remove_from_priority_queue(current_thread_id);
         let owner_thread_id = owner_thread.lock().unwrap().get_thread_id();
         Self::begin_wait_for_address(current_thread, owner_thread_id, addr, value);
-        owner_thread.lock().unwrap().add_waiter(current_thread_id);
+        {
+            let ct = current_thread.lock().unwrap();
+            let priority = ct.get_priority();
+            let address_key = ct.get_address_key();
+            let is_kernel = ct.get_is_kernel_address_key();
+            drop(ct);
+            owner_thread
+                .lock()
+                .unwrap()
+                .add_waiter(current_thread_id, priority, address_key, is_kernel);
+        }
 
         // Upstream calls owner_thread->Close() here to release the handle
         // reference. In Rust, Arc reference counting handles this automatically
@@ -333,17 +358,31 @@ impl KConditionVariable {
 
         {
             let mut has_waiters = false;
-            let next_owner_thread_id = current_thread.lock().unwrap().remove_user_waiter_by_key(
-                &process_guard,
+            let next_owner_result = current_thread.lock().unwrap().remove_waiter_by_key(
                 KProcessAddress::new(addr),
+                false, // user address key
                 &mut has_waiters,
             );
 
+            // If there are remaining waiters, transfer the lock info to the next owner.
+            if has_waiters {
+                if let Some(lock_info) = current_thread.lock().unwrap().take_transfer_lock_info() {
+                    if let Some((next_id, _)) = next_owner_result {
+                        if let Some(next_thread) = process_guard.get_thread_by_thread_id(next_id) {
+                            next_thread.lock().unwrap().add_held_lock(lock_info);
+                        }
+                    }
+                }
+            }
+
             let mut next_value = 0u32;
-            if let Some(next_owner_thread_id) = next_owner_thread_id {
+            if let Some((next_owner_thread_id, _priority)) = next_owner_result {
                 let Some(next_owner_thread) = process_guard.get_thread_by_thread_id(next_owner_thread_id) else {
                     return RESULT_INVALID_STATE;
                 };
+
+                // Clear waiting lock info on the next owner.
+                next_owner_thread.lock().unwrap().set_waiting_lock_info(None);
 
                 next_value = next_owner_thread.lock().unwrap().get_address_key_value();
                 if has_waiters {
@@ -452,15 +491,26 @@ impl KConditionVariable {
             return RESULT_INVALID_STATE;
         };
 
-        owner_thread
-            .lock()
-            .unwrap()
-            .add_waiter(waiting_thread.lock().unwrap().get_thread_id());
-
         {
-            let mut waiting_thread_guard = waiting_thread.lock().unwrap();
-            waiting_thread_guard
-                .set_waiting_lock_owner_thread_id(Some(owner_thread.lock().unwrap().get_thread_id()));
+            let wt = waiting_thread.lock().unwrap();
+            let wt_id = wt.get_thread_id();
+            let wt_priority = wt.get_priority();
+            let wt_address_key = wt.get_address_key();
+            let wt_is_kernel = wt.get_is_kernel_address_key();
+            drop(wt);
+
+            owner_thread.lock().unwrap().add_waiter(
+                wt_id,
+                wt_priority,
+                wt_address_key,
+                wt_is_kernel,
+            );
+
+            let owner_id = owner_thread.lock().unwrap().get_thread_id();
+            waiting_thread
+                .lock()
+                .unwrap()
+                .set_waiting_lock_owner_thread_id(Some(owner_id));
         }
 
         RESULT_SUCCESS
@@ -496,8 +546,8 @@ impl KConditionVariable {
     ) {
         let mut current_thread = current_thread.lock().unwrap();
         current_thread.set_user_address_key(KProcessAddress::new(addr), value);
-        current_thread.set_waiting_lock_owner_thread_id(Some(owner_thread_id));
         current_thread.set_address_arbiter(addr);
+        current_thread.set_waiting_lock_owner_thread_id(Some(owner_thread_id));
         current_thread.begin_wait_with_queue(
             ThreadQueueImplForKConditionVariableWaitForAddress::queue(),
         );
@@ -640,7 +690,7 @@ mod tests {
             waiter.lock().unwrap().get_wait_reason_for_debugging(),
             ThreadWaitReasonForDebugging::ConditionVar
         );
-        assert_eq!(owner.lock().unwrap().waiter_thread_ids(), &[2]);
+        assert_eq!(owner.lock().unwrap().waiter_thread_ids(), vec![2]);
     }
 
     #[test]
@@ -652,7 +702,15 @@ mod tests {
             waiter_guard.begin_wait();
             waiter_guard.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
         }
-        owner.lock().unwrap().add_waiter(2);
+        {
+            let wt = waiter.lock().unwrap();
+            let addr_key = wt.get_address_key();
+            let is_kernel = wt.get_is_kernel_address_key();
+            let priority = wt.get_priority();
+            drop(wt);
+            owner.lock().unwrap().add_waiter(2, priority, addr_key, is_kernel);
+            waiter.lock().unwrap().set_waiting_lock_owner_thread_id(Some(1));
+        }
 
         let result = KConditionVariable::signal_to_address(&process, &owner, address);
 
@@ -669,7 +727,7 @@ mod tests {
                 .read_32(address),
             0xCAFE
         );
-        assert!(owner.lock().unwrap().waiter_thread_ids().is_empty());
+        assert!(owner.lock().unwrap().waiter_thread_ids().is_empty(), "owner should have no waiters after signal");
         assert_ne!(owner_handle, 0);
     }
 
