@@ -207,6 +207,62 @@ impl KProcessPageTable {
         None // TODO
     }
 
+    // -- Page mapping --
+
+    pub fn map_pages_find_free(
+        &mut self,
+        num_pages: usize,
+        alignment: usize,
+        phys_addr: u64,
+        is_pa_valid: bool,
+        region_start: KProcessAddress,
+        region_num_pages: usize,
+        state: super::k_memory_block::KMemoryState,
+        perm: KMemoryPermission,
+    ) -> (u32, KProcessAddress) {
+        let (result, addr) = self.base.map_pages_find_free(
+            num_pages, alignment, phys_addr, is_pa_valid,
+            region_start.get() as usize, region_num_pages, state, perm,
+        );
+        (result, KProcessAddress::new(addr as u64))
+    }
+
+    pub fn map_pages_at_address(
+        &mut self,
+        addr: KProcessAddress,
+        num_pages: usize,
+        state: super::k_memory_block::KMemoryState,
+        perm: KMemoryPermission,
+    ) -> u32 {
+        self.base.map_pages_at_address(addr.get() as usize, num_pages, state, perm)
+    }
+
+    pub fn unmap_pages(
+        &mut self,
+        addr: KProcessAddress,
+        num_pages: usize,
+        state: super::k_memory_block::KMemoryState,
+    ) -> u32 {
+        self.base.unmap_pages(addr.get() as usize, num_pages, state)
+    }
+
+    pub fn lock_for_transfer_memory(
+        &mut self,
+        addr: KProcessAddress,
+        size: usize,
+        perm: KMemoryPermission,
+    ) -> u32 {
+        self.base.lock_for_transfer_memory(addr.get() as usize, size, perm)
+    }
+
+    pub fn unlock_for_transfer_memory(
+        &mut self,
+        addr: KProcessAddress,
+        size: usize,
+    ) -> u32 {
+        self.base.unlock_for_transfer_memory(addr.get() as usize, size)
+    }
+
     // -- IPC memory locking --
 
     pub fn lock_for_ipc_user_buffer(
