@@ -1289,6 +1289,187 @@ impl KPageTableBase {
         0
     }
 
+    // -- LockMemoryAndOpen / UnlockMemory --
+
+    /// Lock a memory region, optionally changing permissions and setting lock attribute.
+    /// Matches upstream `KPageTableBase::LockMemoryAndOpen`.
+    pub fn lock_memory_and_open(
+        &mut self,
+        out_paddr: &mut u64,
+        addr: usize,
+        size: usize,
+        state_mask: KMemoryState,
+        state: KMemoryState,
+        perm_mask: KMemoryPermission,
+        perm: KMemoryPermission,
+        attr_mask: KMemoryAttribute,
+        attr: KMemoryAttribute,
+        new_perm: KMemoryPermission,
+        lock_attr: KMemoryAttribute,
+    ) -> u32 {
+        let num_pages = size / PAGE_SIZE;
+        if !self.contains_range(addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        // Check memory state with FlagReferenceCounted.
+        let check_state_mask = KMemoryState::from_bits_truncate(
+            state_mask.bits() | KMemoryState::FLAG_REFERENCE_COUNTED.bits(),
+        );
+        let check_state = KMemoryState::from_bits_truncate(
+            state.bits() | KMemoryState::FLAG_REFERENCE_COUNTED.bits(),
+        );
+        let (result, out_state, out_old_perm, out_old_attr, _) = self.check_memory_state_range(
+            addr, size, check_state_mask, check_state, perm_mask, perm, attr_mask, attr,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let old_state = out_state.unwrap_or(KMemoryState::FREE);
+        let old_perm = out_old_perm.unwrap_or(KMemoryPermission::NONE);
+        let old_attr = out_old_attr.unwrap_or(KMemoryAttribute::NONE);
+
+        // Get physical address.
+        // In our emulator: phys_addr = DramMemoryMap::Base + virtual address.
+        *out_paddr = crate::device_memory::dram_memory_map::BASE + addr as u64;
+
+        // Determine new perm and attr.
+        let effective_new_perm = if new_perm != KMemoryPermission::NONE { new_perm } else { old_perm };
+        let new_attr = KMemoryAttribute::from_bits_truncate(old_attr.bits() | lock_attr.bits());
+
+        // Change permissions if needed.
+        if effective_new_perm != old_perm {
+            let uncached = old_attr.contains(KMemoryAttribute::UNCACHED);
+            let properties = KPageProperties {
+                perm: effective_new_perm,
+                io: false,
+                uncached,
+                disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD_BODY_TAIL,
+            };
+            let op_result = self.operate(
+                addr, num_pages, 0, false, properties, OperationType::ChangePermissions,
+            );
+            if op_result != 0 {
+                return op_result;
+            }
+        }
+
+        // Update block manager.
+        self.m_memory_block_manager.update(
+            addr, num_pages, old_state, effective_new_perm, new_attr,
+            KMemoryBlockDisableMergeAttribute::LOCKED,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        0
+    }
+
+    /// Unlock a previously locked memory region.
+    /// Matches upstream `KPageTableBase::UnlockMemory`.
+    pub fn unlock_memory(
+        &mut self,
+        addr: usize,
+        size: usize,
+        state_mask: KMemoryState,
+        state: KMemoryState,
+        perm_mask: KMemoryPermission,
+        perm: KMemoryPermission,
+        attr_mask: KMemoryAttribute,
+        attr: KMemoryAttribute,
+        new_perm: KMemoryPermission,
+        lock_attr: KMemoryAttribute,
+    ) -> u32 {
+        let num_pages = size / PAGE_SIZE;
+        if !self.contains_range(addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        // Check memory state with FlagReferenceCounted.
+        let check_state_mask = KMemoryState::from_bits_truncate(
+            state_mask.bits() | KMemoryState::FLAG_REFERENCE_COUNTED.bits(),
+        );
+        let check_state = KMemoryState::from_bits_truncate(
+            state.bits() | KMemoryState::FLAG_REFERENCE_COUNTED.bits(),
+        );
+        let (result, out_state, out_old_perm, out_old_attr, _) = self.check_memory_state_range(
+            addr, size, check_state_mask, check_state, perm_mask, perm, attr_mask, attr,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let old_state = out_state.unwrap_or(KMemoryState::FREE);
+        let old_perm = out_old_perm.unwrap_or(KMemoryPermission::NONE);
+        let old_attr = out_old_attr.unwrap_or(KMemoryAttribute::NONE);
+
+        let effective_new_perm = if new_perm != KMemoryPermission::NONE { new_perm } else { old_perm };
+        let new_attr = KMemoryAttribute::from_bits_truncate(old_attr.bits() & !lock_attr.bits());
+
+        // Change permissions if needed.
+        if effective_new_perm != old_perm {
+            let uncached = old_attr.contains(KMemoryAttribute::UNCACHED);
+            let properties = KPageProperties {
+                perm: effective_new_perm,
+                io: false,
+                uncached,
+                disable_merge_attributes: DisableMergeAttribute::ENABLE_AND_MERGE_HEAD_BODY_TAIL,
+            };
+            let op_result = self.operate(
+                addr, num_pages, 0, false, properties, OperationType::ChangePermissions,
+            );
+            if op_result != 0 {
+                return op_result;
+            }
+        }
+
+        // Update block manager.
+        self.m_memory_block_manager.update(
+            addr, num_pages, old_state, effective_new_perm, new_attr,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::LOCKED,
+        );
+
+        0
+    }
+
+    /// Lock memory for IPC user buffer.
+    /// Matches upstream `KPageTableBase::LockForIpcUserBuffer`.
+    pub fn lock_for_ipc_user_buffer(&mut self, out_paddr: &mut u64, addr: usize, size: usize) -> u32 {
+        self.lock_memory_and_open(
+            out_paddr, addr, size,
+            KMemoryState::FLAG_CAN_IPC_USER_BUFFER,
+            KMemoryState::FLAG_CAN_IPC_USER_BUFFER,
+            KMemoryPermission::from_bits_truncate(0xFF), // All
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::from_bits_truncate(0xFF), // All
+            KMemoryAttribute::NONE,
+            // new_perm: NotMapped | KernelReadWrite
+            KMemoryPermission::from_bits_truncate(
+                KMemoryPermission::NOT_MAPPED.bits() | KMemoryPermission::KERNEL_READ_WRITE.bits(),
+            ),
+            KMemoryAttribute::LOCKED,
+        )
+    }
+
+    /// Unlock memory for IPC user buffer.
+    /// Matches upstream `KPageTableBase::UnlockForIpcUserBuffer`.
+    pub fn unlock_for_ipc_user_buffer(&mut self, addr: usize, size: usize) -> u32 {
+        self.unlock_memory(
+            addr, size,
+            KMemoryState::FLAG_CAN_IPC_USER_BUFFER,
+            KMemoryState::FLAG_CAN_IPC_USER_BUFFER,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF), // All
+            KMemoryAttribute::LOCKED,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::LOCKED,
+        )
+    }
+
     // -- MapStatic / MapIo / MapRegion (for capabilities) --
 
     pub fn map_static(&mut self, phys_addr: u64, size: usize, _perm: KMemoryPermission) -> u32 {

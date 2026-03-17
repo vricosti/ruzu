@@ -207,6 +207,21 @@ impl KProcessPageTable {
         None // TODO
     }
 
+    // -- IPC memory locking --
+
+    pub fn lock_for_ipc_user_buffer(
+        &mut self,
+        out_paddr: &mut u64,
+        addr: KProcessAddress,
+        size: usize,
+    ) -> u32 {
+        self.base.lock_for_ipc_user_buffer(out_paddr, addr.get() as usize, size)
+    }
+
+    pub fn unlock_for_ipc_user_buffer(&mut self, addr: KProcessAddress, size: usize) -> u32 {
+        self.base.unlock_for_ipc_user_buffer(addr.get() as usize, size)
+    }
+
     // -- Direct base access --
 
     pub fn get_base(&self) -> &KPageTableBase {
