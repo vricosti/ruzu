@@ -1041,43 +1041,147 @@ impl KPageTableBase {
     }
 
     /// Matches upstream `KPageTableBase::SetHeapSize`.
-    /// Grows or shrinks the heap region.
+    /// Faithfully implements heap grow/shrink with Operate calls.
     pub fn set_heap_size(&mut self, size: usize) -> (u32, usize) {
-        // Validate size.
-        if size > self.get_heap_region_size() {
+        // Validate preconditions.
+        if self.m_is_kernel {
+            return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
+        }
+        if size > (self.m_heap_region_end - self.m_heap_region_start) {
             return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
         }
         if size > self.m_max_heap_size {
             return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
         }
 
-        let target_end = self.m_heap_region_start + size;
+        let current_heap_size = self.m_current_heap_end - self.m_heap_region_start;
 
-        if target_end > self.m_current_heap_end {
-            // Growing heap — upstream allocates physical pages and maps them.
-            // For now, just advance the pointer. The memory backing is in
-            // the shared GuestMemory which already covers the full address space.
-            // TODO: call m_memory->MapMemoryRegion when Memory is ported.
-            self.m_current_heap_end = target_end;
-        } else if target_end < self.m_current_heap_end {
-            // Shrinking heap — upstream unmaps and frees pages.
-            // TODO: call m_memory->UnmapRegion when Memory is ported.
-            self.m_current_heap_end = target_end;
-        }
-
-        // Update memory block manager.
-        if size > 0 {
-            self.m_memory_block_manager.update(
-                self.m_heap_region_start,
-                size / PAGE_SIZE,
+        if size < current_heap_size {
+            // === Shrink heap ===
+            // Validate the memory being freed is Normal/UserReadWrite.
+            let free_start = self.m_heap_region_start + size;
+            let free_size = current_heap_size - size;
+            let result = self.check_memory_state(
+                free_start,
+                free_size,
+                KMemoryState::MASK,
                 KMemoryState::NORMAL,
+                KMemoryPermission::from_bits_truncate(0xFF),
                 KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::from_bits_truncate(0xFF),
+                KMemoryAttribute::NONE,
+            );
+            if result != 0 {
+                return (result, 0);
+            }
+
+            // Unmap the end of the heap.
+            let num_pages = free_size / PAGE_SIZE;
+            let unmap_properties = KPageProperties {
+                perm: KMemoryPermission::NONE,
+                io: false,
+                uncached: false,
+                disable_merge_attributes: DisableMergeAttribute::NONE,
+            };
+            let op_result = self.operate(
+                free_start,
+                num_pages,
+                0,
+                false,
+                unmap_properties,
+                OperationType::Unmap,
+            );
+            if op_result != 0 {
+                return (op_result, 0);
+            }
+
+            // Update block manager: freed region becomes Free.
+            self.m_memory_block_manager.update(
+                free_start,
+                num_pages,
+                KMemoryState::FREE,
+                KMemoryPermission::NONE,
                 KMemoryAttribute::NONE,
                 KMemoryBlockDisableMergeAttribute::NONE,
-                KMemoryBlockDisableMergeAttribute::NONE,
+                if size == 0 {
+                    KMemoryBlockDisableMergeAttribute::NORMAL
+                } else {
+                    KMemoryBlockDisableMergeAttribute::NONE
+                },
             );
+
+            self.m_current_heap_end = self.m_heap_region_start + size;
+            return (0, self.m_heap_region_start);
+        } else if size == current_heap_size {
+            // === Same size ===
+            return (0, self.m_heap_region_start);
         }
 
+        // === Grow heap ===
+        let cur_address = self.m_current_heap_end;
+        let allocation_size = size - current_heap_size;
+
+        // Upstream: reserve resource limit, allocate physical pages.
+        // In our emulator, physical memory is pre-allocated in DeviceMemory.
+        // We compute the physical address from the virtual address.
+        // Physical address = DramMemoryMap::Base + virtual address offset.
+        let phys_addr = crate::device_memory::dram_memory_map::BASE + cur_address as u64;
+
+        // Check that the region to grow is Free.
+        let result = self.check_memory_state(
+            cur_address,
+            allocation_size,
+            KMemoryState::MASK,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return (result, 0);
+        }
+
+        // Map the new heap pages.
+        let num_pages = allocation_size / PAGE_SIZE;
+        let map_properties = KPageProperties {
+            perm: KMemoryPermission::USER_READ_WRITE,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: if self.m_current_heap_end == self.m_heap_region_start {
+                DisableMergeAttribute::DISABLE_HEAD
+            } else {
+                DisableMergeAttribute::NONE
+            },
+        };
+        let op_result = self.operate(
+            cur_address,
+            num_pages,
+            phys_addr,
+            true,
+            map_properties,
+            OperationType::Map,
+        );
+        if op_result != 0 {
+            return (op_result, 0);
+        }
+
+        // Update block manager: new region is Normal/UserReadWrite.
+        self.m_memory_block_manager.update(
+            cur_address,
+            num_pages,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            if self.m_heap_region_start == self.m_current_heap_end {
+                KMemoryBlockDisableMergeAttribute::NORMAL
+            } else {
+                KMemoryBlockDisableMergeAttribute::NONE
+            },
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        self.m_current_heap_end = self.m_heap_region_start + size;
         (0, self.m_heap_region_start)
     }
 
@@ -1118,14 +1222,38 @@ impl KPageTableBase {
             return result;
         }
 
-        let state = out_state.unwrap_or(KMemoryState::NORMAL);
+        let old_state = out_state.unwrap_or(KMemoryState::NORMAL);
+        let old_perm = _out_perm.unwrap_or(KMemoryPermission::NONE);
 
-        // TODO: call Operate to change protection in Core::Memory::Memory
+        // If perm is already the same, nothing to do.
+        if old_perm == perm {
+            return 0;
+        }
+
+        // Change permissions via Operate.
+        let properties = KPageProperties {
+            perm,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: DisableMergeAttribute::NONE,
+        };
+        let op_result = self.operate(
+            addr,
+            num_pages,
+            0,
+            false,
+            properties,
+            OperationType::ChangePermissions,
+        );
+        if op_result != 0 {
+            return op_result;
+        }
+
         // Update block manager.
         self.m_memory_block_manager.update(
             addr,
             num_pages,
-            state,
+            old_state,
             perm,
             KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
@@ -1192,19 +1320,63 @@ impl KPageTableBase {
         perm: KMemoryPermission,
     ) -> u32 {
         let num_pages = size / PAGE_SIZE;
-        if !self.contains_range(addr, size) {
-            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+
+        // Check current state — must be Code-flagged.
+        let (result, out_state, out_perm, _out_attr, _) = self.check_memory_state_range(
+            addr, size,
+            KMemoryState::FLAG_CODE, KMemoryState::FLAG_CODE,
+            KMemoryPermission::NONE, KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
+        );
+        if result != 0 {
+            return result;
         }
 
-        // Upstream: determines new state based on current state + permission.
-        // Code + Write -> CodeData, Code + Execute -> Code, etc.
-        let new_state = if perm.contains(KMemoryPermission::USER_EXECUTE) {
-            KMemoryState::CODE
+        let old_state = out_state.unwrap_or(KMemoryState::CODE);
+        let old_perm = out_perm.unwrap_or(KMemoryPermission::NONE);
+
+        // Determine new state based on permission being set.
+        let is_w = perm.contains(KMemoryPermission::USER_WRITE);
+        let is_x = perm.contains(KMemoryPermission::USER_EXECUTE);
+        let was_x = old_perm.contains(KMemoryPermission::USER_EXECUTE);
+        debug_assert!(!(is_w && is_x));
+
+        let new_state = if is_w {
+            if old_state == KMemoryState::CODE {
+                KMemoryState::CODE_DATA
+            } else if old_state == KMemoryState::ALIAS_CODE {
+                KMemoryState::ALIAS_CODE_DATA
+            } else {
+                old_state
+            }
         } else {
-            KMemoryState::CODE_DATA
+            old_state
         };
 
-        // TODO: full CheckMemoryState, Operate (change protection), MakePageGroup
+        // Nothing to do if perm and state are unchanged.
+        if old_perm == perm && old_state == new_state {
+            return 0;
+        }
+
+        // Change permissions via Operate.
+        let operation = if was_x {
+            OperationType::ChangePermissionsAndRefreshAndFlush
+        } else {
+            OperationType::ChangePermissions
+        };
+        let properties = KPageProperties {
+            perm,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: DisableMergeAttribute::NONE,
+        };
+        let op_result = self.operate(addr, num_pages, 0, false, properties, operation);
+        if op_result != 0 {
+            return op_result;
+        }
+
+        // Update block manager.
         self.m_memory_block_manager.update(
             addr,
             num_pages,
@@ -1214,6 +1386,8 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
+
+        // TODO: if is_x, invalidate instruction cache
         0
     }
 
