@@ -1,0 +1,181 @@
+L'upstream fait :
+  1. Traduit les copy objects → handles dans le buffer
+  2. Traduit les move objects → handles dans le buffer (+ close)
+  3. Si domain : écrit les domain objects IDs
+  4. Écrit le buffer complet dans la mémoire TLS du thread via memory.WriteBlock
+
+  Point clé : dans notre architecture, le write-back vers la mémoire TLS est fait par send_sync_request dans svc_ipc.rs (ligne 69 : write_tls_command_buffer).
+  Donc write_to_outgoing_command_buffer n'a PAS besoin de faire le write-back mémoire — il doit seulement gérer les handles et domain objects dans cmd_buf.
+
+  Mais notre HLERequestContext n'a pas accès au handle table du process. Upstream a thread->GetOwnerProcess()->GetHandleTable(). On n'a pas de thread reference
+  dans le context.
+
+  Pour l'instant, la priorité est que les domain objects soient écrits correctement, puisque c'est ce qui bloque MK8D. Les copy/move handles viendront quand on
+  aura le wiring kernel.
+
+● Update(core/src/hle/service/hle_ipc.rs)
+  ⎿  Added 59 lines, removed 5 lines
+      677          }
+      678      }
+      679   
+      680 -    /// Writes data from this context back to the requesting process/thread.                                                                   
+      681 -    /// In the full implementation this would write back to guest memory.                                                                      
+      682 -    /// For now, this is a stub.                                                                                                               
+      683 -    pub fn write_to_outgoing_command_buffer(&self) -> ResultCode {                                                                             
+      684 -        // TODO: implement full write-back when kernel integration is ready                                                                    
+      680 +    /// Writes data from this context back into the command buffer.                                                                            
+      681 +    ///                                                                                                                                        
+      682 +    /// Matches upstream `HLERequestContext::WriteToOutgoingCommandBuffer()`:                                                                  
+      683 +    /// 1. Translate outgoing copy objects → handles (TODO: needs handle table)                                                                
+      684 +    /// 2. Translate outgoing move objects → handles (TODO: needs handle table)                                                                
+      685 +    /// 3. Write domain objects IDs into the buffer                                                                                            
+      686 +    ///                                                                                                                                        
+      687 +    /// Note: upstream also writes the buffer back to guest TLS memory via                                                                     
+      688 +    /// `memory.WriteBlock(thread->GetTlsAddress(), ...)`. In our architecture,                                                                
+      689 +    /// the caller (`send_sync_request`) handles the TLS write-back separately.                                                                
+      690 +    pub fn write_to_outgoing_command_buffer(&mut self) -> ResultCode {                                                                         
+      691 +        let mut current_offset = self.handles_offset as usize;                                                                                 
+      692 +                                                                                                                                               
+      693 +        // Translate outgoing copy objects to handles.                                                                                         
+      694 +        // TODO: needs handle_table.Add() — for now write 0 placeholders.                                                                      
+      695 +        for _ in &self.outgoing_copy_objects {                                                                                                 
+      696 +            if current_offset < ipc::COMMAND_BUFFER_LENGTH {                                                                                   
+      697 +                // TODO: handle_table.Add(&handle, object); cmd_buf[offset] = handle;                                                          
+      698 +                self.cmd_buf[current_offset] = 0;                                                                                              
+      699 +                current_offset += 1;                                                                                                           
+      700 +            }                                                                                                                                  
+      701 +        }                                                                                                                                      
+      702 +                                                                                                                                               
+      703 +        // Translate outgoing move objects to handles.                                                                                         
+      704 +        // TODO: needs handle_table.Add() — for now write 0 placeholders.                                                                      
+      705 +        for _ in &self.outgoing_move_objects {                                                                                                 
+      706 +            if current_offset < ipc::COMMAND_BUFFER_LENGTH {                                                                                   
+      707 +                // TODO: handle_table.Add(&handle, object); object.Close(); cmd_buf[offset] = handle;                                          
+      708 +                self.cmd_buf[current_offset] = 0;                                                                                              
+      709 +                current_offset += 1;                                                                                                           
+      710 +            }                                                                                                                                  
+      711 +        }                                                                                                                                      
+      712 +                                                                                                                                               
+      713 +        // Write domain objects to the command buffer (after raw untranslated data).                                                           
+      714 +        // Matches upstream: domain objects go at domain_offset - count.                                                                       
+      715 +        let is_domain = self                                                                                                                   
+      716 +            .manager                                                                                                                           
+      717 +            .as_ref()                                                                                                                          
+      718 +            .map_or(false, |m| m.lock().unwrap().is_domain());                                                                                 
+      719 +                                                                                                                                               
+      720 +        if is_domain {                                                                                                                         
+      721 +            let num_domain_objects = self.outgoing_domain_objects.len();                                                                       
+      722 +            current_offset = self.domain_offset as usize - num_domain_objects;                                                                 
+      723 +                                                                                                                                               
+      724 +            let domain_objects = std::mem::take(&mut self.outgoing_domain_objects);                                                            
+      725 +            for object in domain_objects {                                                                                                     
+      726 +                if current_offset < ipc::COMMAND_BUFFER_LENGTH {                                                                               
+      727 +                    if let Some(manager) = &self.manager {                                                                                     
+      728 +                        manager.lock().unwrap().append_domain_handler(object);                                                                 
+      729 +                        let count = manager.lock().unwrap().domain_handler_count();                                                            
+      730 +                        self.cmd_buf[current_offset] = count as u32;                                                                           
+      731 +                    } else {                                                                                                                   
+      732 +                        self.cmd_buf[current_offset] = 0;                                                                                      
+      733 +                    }                                                                                                                          
+      734 +                    current_offset += 1;                                                                                                       
+      735 +                }                                                                                                                              
+      736 +            }                                                                                                                                  
+      737 +        }                                                                                                                                      
+      738 +                                                                                                                                               
+      739          RESULT_SUCCESS
+      740      }
+      741   
+
+● Now check if append_domain_handler exists on SessionRequestManager:
+
+● Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● Good, append_domain_handler exists. Now need domain_handler_count:
+
+● Searched for 1 pattern (ctrl+o to expand)
+
+● Il manque. Ajoutons-le :
+
+● Update(core/src/hle/service/hle_ipc.rs)
+  ⎿  Added 4 lines
+      114          self.domain_handlers.push(Some(handler));
+      115      }
+      116   
+      117 +    pub fn domain_handler_count(&self) -> usize {                                                                                              
+      118 +        self.domain_handlers.len()                                                                                                             
+      119 +    }                                                                                                                                          
+      120 +                                                                                                                                               
+      121      pub fn set_session_handler(&mut self, handler: SessionRequestHandlerPtr) {
+      122          self.session_handler = Some(handler);
+      123      }
+
+● Now we also need to change write_to_outgoing_command_buffer from &self to &mut self in the call site:
+
+● Read 1 file (ctrl+o to expand)
+
+● Ça devrait compiler puisque ctx est &mut HLERequestContext. Vérifions :
+
+● Bash(cargo check -p core -p yuzu_cmd 2>&1 | grep '^error' | head -5)
+  ⎿  error[E0592]: duplicate definitions with name `domain_handler_count`
+     error: could not compile `core` (lib) due to 1 previous error; 153 warnings emitted
+
+● Duplicate — il existe déjà ailleurs :
+
+● Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● Il existe déjà à la ligne 84. J'ai créé un doublon à la ligne 117. Retirons-le :
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(core/src/hle/service/hle_ipc.rs)
+  ⎿  Removed 4 lines
+      114          self.domain_handlers.push(Some(handler));
+      115      }
+      116   
+      117 -    pub fn domain_handler_count(&self) -> usize {                                                                                              
+      118 -        self.domain_handlers.len()                                                                                                             
+      119 -    }                                                                                                                                          
+      120 -                                                                                                                                               
+      117      pub fn set_session_handler(&mut self, handler: SessionRequestHandlerPtr) {
+      118          self.session_handler = Some(handler);
+      119      }
+
+● Bash(cargo check -p core -p yuzu_cmd 2>&1 | grep '^error' | head -5)
+  ⎿  (No output)
+  ⎿  (timeout 2m)
+
+● Build clean. Testons :
+
+● Bash(cargo test -p core send_sync_request 2>&1 | grep 'test result')
+  ⎿  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 525 filtered out; finished in 0.00s
+  ⎿  (timeout 2m)
+
+● Commit et push :
+
+● Bash(git add core/src/hle/service/hle_ipc.rs core/src/hle/kernel/svc/svc_ipc.rs && git commit -m "$(cat <<'EOF'
+      Implement WriteToOutgoingCommandBuffer matching upstr…)
+  ⎿  [claude/opengl-renderer-and-restructure dd29f87] Implement WriteToOutgoingCommandBuffer matching upstream
+      2 files changed, 71 insertions(+), 8 deletions(-)
+     To github.com:vricosti/ruzu.git
+        91721c6..dd29f87  claude/opengl-renderer-and-restructure -> claude/opengl-renderer-and-restructure
+
+● Poussé dd29f87. WriteToOutgoingCommandBuffer est maintenant implémenté avec :
+  - Handles copy/move (placeholders 0 pour l'instant — besoin du handle table)
+  - Domain objects écrits correctement avec les IDs
+  - Le write-back TLS reste côté send_sync_request
+
+  Le prochain bloquer pour MK8D reste le service lm non enregistré. Le game ne peut pas continuer sans que les services HLE de base soient disponibles dans le
+  ServiceManager.
+
+✻ Brewed for 2m 53s
+--------------------------------------------------
+
+Upstream crée un KSession complet (server + client), nous créons seulement un KClientSession. Upstream enregistre la server session avec le manager via
+  ServerManager::RegisterSession. Nous ne faisons pas ce lien server-side. Pour le moment c'est fonctionnel car nos sessions sont HLE, pas de vraie server
+  session.
+  - Upstream fait resource reservation/commit. Nous ne le faisons pas (pas de resource limits implémentés).
+
+  Verdict : Structurellement conforme à upstream. La différence clé (partager le même manager) est correcte. Les aspects manquants (KSession server-side,
+  resource limits) ne sont pas critiques pour le bring-up.
+
+

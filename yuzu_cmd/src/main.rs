@@ -619,6 +619,45 @@ fn main() {
                     ctx.pc, ctx.lr
                 );
 
+                // Dump full register state for SVCs near the crash point.
+                if svc_count >= 134 {
+                    log::warn!("  [SVC #{}] r0-r15: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                        svc_count,
+                        ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3],
+                        ctx.r[4], ctx.r[5], ctx.r[6], ctx.r[7],
+                        ctx.r[8], ctx.r[9], ctx.r[10], ctx.r[11],
+                        ctx.r[12], ctx.sp, ctx.lr, ctx.pc);
+                }
+
+                // At SVC #136 (first abort SVC), dump stack backtrace.
+                if svc_count == 136 {
+                    let mem = shared_memory.read().unwrap();
+                    let sp = ctx.sp;
+                    log::error!("=== STACK BACKTRACE at SVC #136 (abort entry) ===");
+                    log::error!("  SP={:#x} LR={:#x}", sp, ctx.lr);
+                    for i in 0..16u64 {
+                        let addr = sp + i * 4;
+                        if mem.is_valid_range(addr, 4) {
+                            let val = mem.read_32(addr);
+                            // Check if it looks like a code address
+                            if val >= 0x200000 && val < 0x2400000 {
+                                log::error!("  [SP+{:#x}] = {:#010x} <- possible return address", i*4, val);
+                            } else {
+                                log::error!("  [SP+{:#x}] = {:#010x}", i*4, val);
+                            }
+                        }
+                    }
+
+                    // Also read the abort info struct at r4
+                    let abort_info = ctx.r[4];
+                    if abort_info > 0x200000 && mem.is_valid_range(abort_info, 32) {
+                        log::error!("=== ABORT INFO at r4={:#x} ===", abort_info);
+                        for j in 0..8u64 {
+                            log::error!("  [+{:#x}] = {:#010x}", j*4, mem.read_32(abort_info + j * 4));
+                        }
+                    }
+                }
+
                 // Debug: dump TLS when SendSyncRequest is called with handle=0
                 if svc_num == 0x21 && svc_args[0] == 0 {
                     let mem = shared_memory.read().unwrap();

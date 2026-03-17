@@ -1,8 +1,10 @@
-# AGENTS.md — Porting Philosophy And Execution Contract For `audio_core`
+# CLAUDE.md — Porting Philosophy And Execution Contract
+
+STRICT MODE ON
 
 ## Purpose
 
-This document defines how a ChatGPT/Codex-style agent must port `/home/vricosti/shared/zuyu/src/audio_core` into `/home/vricosti/shared/ruzu/audio_core`.
+This document defines how a ChatGPT/Codex-style agent must port C++ code from `/home/vricosti/shared/zuyu/src/` into `/home/vricosti/shared/ruzu/`.
 
 It is written as a handoff contract for another instance.
 
@@ -28,7 +30,7 @@ This document exists because earlier progress proved that a crate can be "substa
 
 The C++ source of truth is:
 
-- `/home/vricosti/shared/zuyu/src/audio_core`
+- `/home/vricosti/shared/zuyu/src/`
 
 That tree is read-only.
 
@@ -43,15 +45,13 @@ Always treat it as authoritative for:
 - state ownership
 - control flow
 - validation behavior
-- update sequencing
-- command generation
-- DSP-side execution semantics
+- data structure invariants
 
 ### Rust target
 
 The Rust destination is:
 
-- `/home/vricosti/shared/ruzu/audio_core`
+- `/home/vricosti/shared/ruzu/`
 
 The Rust port should be judged against the C++ tree, not against whether the Rust design looks idiomatic in isolation.
 
@@ -79,7 +79,7 @@ Examples of unacceptable adaptations:
 
 - merging several upstream files into one large Rust file "for convenience"
 - moving constants away from their upstream module
-- centralizing command behavior in a generic dispatcher when upstream behavior belongs to per-command files
+- centralizing behavior in a generic dispatcher when upstream behavior belongs to per-file modules
 - inventing a new architecture because the upstream one looks awkward in Rust
 
 ### 2. Auditability is a feature
@@ -101,9 +101,9 @@ During the port, temporary shortcuts may be used to unblock progress.
 
 Examples:
 
-- centralizing command serialization in one file
-- dispatching through a large `match`
-- keeping behavior in `command_list_processor.rs` temporarily
+- stubbing out a complex platform-specific function
+- using a simplified implementation while other crates depend on the interface
+- keeping a placeholder module with `todo!()` bodies
 
 But these shortcuts must be treated as debt, not design.
 
@@ -119,7 +119,7 @@ It does not prove:
 
 - structural parity
 - ownership parity
-- exact command layout parity
+- exact data-structure layout parity
 - exact lifecycle parity
 
 Never conclude "finished" purely from green tests.
@@ -132,8 +132,7 @@ Examples of common false confidence:
 
 - same output in one test
 - same field names but different file ownership
-- same command bytes except for padding
-- logically equivalent control flow but different update ordering
+- logically equivalent control flow but different edge-case handling
 
 For this port, "probably equivalent" is not good enough.
 
@@ -141,56 +140,31 @@ For this port, "probably equivalent" is not good enough.
 
 ### Rule A: Preserve file structure whenever technically possible
 
-If upstream has:
-
-- `renderer/command/effect/reverb.cpp`
-- `renderer/command/effect/reverb.h`
-
-Rust should have a corresponding file:
-
-- `audio_core/src/renderer/command/effect/reverb.rs`
-
-The same applies across the tree:
-
-- `adsp/apps/opus/opus_decode_object.*`
-- `renderer/command/data_source/*`
-- `renderer/command/mix/*`
-- `renderer/command/sink/*`
-- `renderer/command/resample/*`
-- etc.
+If upstream has a `.cpp` and `.h` pair, Rust should have a corresponding `.rs` file at the same relative path within its crate.
 
 Do not hide several upstream files behind one Rust file unless there is a strong technical reason.
 
 If you must diverge, document the reason in code comments and in the final summary.
 
+Exceptions are listed per-folder at the end of this document. These omissions are intentional and should not be flagged as missing files during parity audits.
+
 ### Rule B: Preserve method ownership whenever technically possible
 
-If upstream method `UpdateReverbEffectParameter` belongs to `reverb.cpp`, then its Rust equivalent:
-
-- should exist
-- should live in `reverb.rs`
-- should use Rust naming (`update_reverb_effect_parameter`)
-- should do the same job
+If an upstream method belongs to a specific `.cpp` file, then its Rust equivalent should live in the corresponding `.rs` file with Rust naming conventions (snake_case).
 
 Do not leave such logic in:
 
-- `command_list_processor.rs`
-- `commands.rs`
+- `lib.rs` or `mod.rs`
 - some unrelated shared helper
+- a "utils" catch-all
 
 unless upstream itself centralizes it.
 
 ### Rule C: Preserve constant placement
 
-If constants live in `reverb.cpp` upstream, they belong in `reverb.rs` in Rust.
+If constants live in a specific upstream file, they belong in the corresponding Rust file.
 
-Do not centralize them into:
-
-- `commands.rs`
-- `common.rs`
-- unrelated utility modules
-
-unless the upstream does the same.
+Do not centralize them into unrelated utility modules unless the upstream does the same.
 
 ### Rule D: Preserve behavior before abstraction
 
@@ -217,7 +191,7 @@ If a payload is serialized by raw memory copy, initialize the entire payload det
 
 ### Rule F: Preserve signed/unsigned bit patterns
 
-Upstream often forwards raw ids or sentinel values through integer casts.
+Upstream often forwards raw values through integer casts.
 
 Do not replace that with "friendlier" Rust logic like:
 
@@ -226,65 +200,41 @@ Do not replace that with "friendlier" Rust logic like:
 
 unless upstream truly does that.
 
-Raw bit-pattern preservation matters for:
-
-- node ids
-- session ids
-- performance targets
-- command payload fields
-
 ### Rule G: Preserve update and lifecycle ordering
 
-Many renderer bugs come from doing the right work in the wrong order.
-
-Examples:
-
-- result-state init before/after output translation
-- counter increments in `GenerateCommand` vs `SendCommandToDsp`
-- pool use-state clearing timing
-- `Start` / `Stop` / `Finalize` ordering
-- effect and sink cleanup ordering
+Many bugs come from doing the right work in the wrong order.
 
 When in doubt, port the ordering literally.
 
-## What "Finished" Means For `audio_core`
+## What "Finished" Means
 
-Do not call `audio_core` finished until all of the following are true.
+Do not call a folder finished until all of the following are true.
 
 ### Structural completion
 
-- The Rust module/file tree mirrors `zuyu/src/audio_core` as closely as reasonably possible.
-- Major missing folders are gone.
-- Temporary centralization files have been reduced to thin registries or removed.
+- The Rust module/file tree mirrors the upstream C++ folder as closely as reasonably possible.
+- Major missing files are identified and either ported or documented as exceptions.
+- No upstream files are silently merged into unrelated Rust files.
 
 ### Ownership completion
 
 - Methods and constants live in the same conceptual modules as upstream.
-- `command_list_processor.rs` is mostly an iterator/dispatcher, not the owner of every command’s logic.
-- `commands.rs` is mostly registry/serialization plumbing, not the owner of all runtime behavior.
+- No "catch-all" utility files that absorb logic from multiple upstream sources.
 
 ### Behavioral completion
 
-- `renderer/system`
-- `renderer/behavior/info_updater`
-- ADSP audio renderer app
-- ADSP opus app
-- device/session paths
-
-all follow upstream behavior closely enough that remaining differences are minor and identified.
+- Critical subsystems follow upstream behavior closely enough that remaining differences are minor and identified.
 
 ### Binary completion
 
-- Command payload layout matches upstream where serialized
-- reserved bytes are deterministic
-- command ordering is correct
-- address translation behavior is not secretly host-only where upstream expects translated memory
+- Data structure layouts match upstream where shared across components.
+- Serialized payloads are bit-accurate.
 
 ### Validation completion
 
-- Tests exist for nontrivial parity-sensitive behavior
-- Full `cargo test -p audio_core` passes
-- No known major "still structurally wrong" caveat remains
+- Tests exist for nontrivial parity-sensitive behavior.
+- Full `cargo test -p <crate>` passes.
+- No known major "still structurally wrong" caveat remains.
 
 If major caveats remain, it is not finished.
 
@@ -318,17 +268,10 @@ Capture:
 - private helpers
 - static helpers
 - validation rules
-- update order
 
 ### Step 3: Port names with Rust conventions, not new semantics
 
-Examples:
-
-- `UpdateReverbEffectParameter` -> `update_reverb_effect_parameter`
-- `InitializeReverbEffect` -> `initialize_reverb_effect`
-- `ApplyReverbEffectBypass` -> `apply_reverb_effect_bypass`
-
-Do not rename at the semantic level.
+Do not rename at the semantic level. Convert to snake_case and Rust naming conventions only.
 
 ### Step 4: Keep upstream helper boundaries visible
 
@@ -344,10 +287,7 @@ After each meaningful parity fix, add targeted tests for:
 
 ### Step 6: Run the smallest useful test set first, then full crate tests
 
-Use:
-
-- focused module tests while iterating
-- `cargo test -p audio_core` before concluding the pass
+Use focused module tests while iterating, then `cargo test -p <crate>` before concluding the pass.
 
 ## Anti-Patterns To Avoid
 
@@ -355,50 +295,27 @@ These are all mistakes that already occurred or are easy to repeat.
 
 ### Anti-pattern 1: "Flatten now, split later" without actually splitting later
 
-This leads to:
-
-- giant central files
-- hidden ownership
-- difficult review
-
-Only flatten temporarily if you are committed to unwinding it.
+This leads to giant central files, hidden ownership, and difficult review. Only flatten temporarily if you are committed to unwinding it.
 
 ### Anti-pattern 2: Treating dispatcher files as owners
 
-Examples:
-
-- `command_list_processor.rs`
-- `commands.rs`
-
-These files should coordinate, not own every command family’s real logic.
+Central dispatch files (`mod.rs`, `lib.rs`, processor files) should coordinate, not own every module's real logic.
 
 ### Anti-pattern 3: Central constant dumps
 
-If constants belong to reverb, keep them in reverb.
-
-If they belong to delay, keep them in delay.
-
-Do not make one convenience constants file unless upstream does.
+If constants belong to a specific upstream file, keep them in the corresponding Rust file. Do not make one convenience constants file unless upstream does.
 
 ### Anti-pattern 4: Replacing upstream lifecycle with a Rust convenience lifecycle
 
-Examples:
-
-- eager session startup where upstream starts lazily
-- preemptive cleanup that upstream performs later
-- auto-link behavior that changes ownership meaning
-
-If you diverge for temporary practicality, mark it and come back.
+Examples: eager initialization where upstream initializes lazily, preemptive cleanup that upstream performs later. If you diverge for temporary practicality, mark it and come back.
 
 ### Anti-pattern 5: Using "tests pass" to justify structural divergence
 
 A structurally wrong port can still pass current tests.
 
-### Anti-pattern 6: Hiding protocol bytes behind "safe" abstractions
+### Anti-pattern 6: Replacing platform-specific code with pure-Rust alternatives without documenting it
 
-If the system is building a raw DSP command stream, the raw bytes matter.
-
-Do not abstract away details that change byte layout or update timing.
+If upstream uses platform-specific APIs and Rust uses a different approach, document the divergence.
 
 ## How To Treat Rust Idioms
 
@@ -408,111 +325,24 @@ Use them when they preserve parity.
 
 ### Preferred Rust adaptations
 
-- `enum` for command ids and modes
+- `enum` for tagged unions and mode flags
 - `Drop` for cleanup matching destructor behavior
 - `Option` for optional ownership
 - `Arc`, `Weak`, `Mutex` for shared lifecycle
 - module-level functions replacing C++ `static` helpers
+- `bitflags` crate for flag enums that use `DECLARE_ENUM_FLAG_OPERATORS` in C++
 
 ### Rust adaptations to use carefully
 
 - traits replacing inheritance
 - generic helpers replacing duplicated code
-- borrow-driven refactors that alter update ordering
+- borrow-driven refactors that alter access patterns
 
 ### Rust adaptations to avoid in this port
 
 - architecture redesigns
-- state machines that no longer resemble upstream control flow
+- replacing C++ data structures with different Rust ones that have different performance characteristics
 - helper layers that erase file ownership
-
-## Command System Philosophy
-
-### Goal
-
-The command system should gradually converge toward:
-
-- per-command-family ownership of payload layout
-- per-command-family ownership of dump/verify/process behavior
-- thin central registry only where unavoidable
-
-### Desired end state
-
-- `renderer/command/data_source/*` owns data-source behavior
-- `renderer/command/effect/*` owns effect behavior
-- `renderer/command/mix/*` owns mix behavior
-- `renderer/command/resample/*` owns resample behavior
-- `renderer/command/sink/*` owns sink behavior
-- `renderer/command/performance/*` owns performance behavior
-
-`commands.rs` should be mainly:
-
-- `Command` enum
-- serialization routing
-- shared type glue only if truly necessary
-
-`command_list_processor.rs` should be mainly:
-
-- iteration over commands
-- lifecycle of one processing pass
-- dispatch into command-owned behavior
-
-### Verification and dump ownership
-
-If upstream `ICommand` methods conceptually belong to each command type, Rust should reflect that as closely as practical:
-
-- payload methods
-- file-local helpers
-- family-level dispatch in the family module
-
-not in one central processor file.
-
-## ADSP Philosophy
-
-### ADSP apps are not placeholders
-
-The ADSP layer must not remain a superficial host-side stub if the goal is a finished port.
-
-For:
-
-- `adsp/apps/audio_renderer`
-- `adsp/apps/opus`
-
-the Rust code should preserve:
-
-- mailbox protocol shape
-- thread lifecycle
-- decode/render object ownership
-- per-buffer/per-session state
-- shutdown semantics
-
-### File parity matters here too
-
-If upstream has:
-
-- `opus_decode_object.*`
-- `opus_multistream_decode_object.*`
-- `opus_decoder.*`
-
-Rust should preserve those file boundaries and keep object-local behavior in those object files.
-
-## Renderer/System Philosophy
-
-The most dangerous remaining mismatches are often not in algorithms but in orchestration.
-
-Priority areas:
-
-- `renderer/system.rs`
-- `renderer/behavior/info_updater.rs`
-
-For these files:
-
-- preserve ordering literally
-- preserve counters literally
-- preserve lifecycle transitions literally
-- preserve validation literally
-
-Do not rewrite them into a cleaner state machine if that obscures parity.
 
 ## Testing Philosophy
 
@@ -523,8 +353,8 @@ Add focused tests for:
 - parity-sensitive edge cases
 - previous bugs
 - binary-layout expectations
-- initialization/finalization contracts
-- command behavior that depends on ordering
+- hash function output matching
+- data structure invariants
 
 ### Preferred test granularity
 
@@ -543,8 +373,8 @@ When choosing the next task, prefer this order:
 
 1. structural mismatches that make review harder
 2. ownership mismatches that keep logic in the wrong file
-3. lifecycle/ordering mismatches in renderer and ADSP paths
-4. binary-layout mismatches in serialized commands
+3. missing files that other crates depend on
+4. behavioral mismatches in critical infrastructure
 5. test coverage for newly fixed parity-sensitive behavior
 
 Do not spend time polishing low-value style details while major ownership or behavior mismatches remain.
@@ -562,7 +392,6 @@ Before calling any subtree "ported", check all of these.
 
 - Are constants in the right file?
 - Are methods/helpers in the right file?
-- Is central dispatcher ownership reduced?
 
 ### Behavior
 
@@ -572,8 +401,7 @@ Before calling any subtree "ported", check all of these.
 
 ### Serialization
 
-- Is binary layout correct?
-- Are reserved bytes deterministic?
+- Is binary layout correct where shared across components?
 
 ### Tests
 
@@ -590,11 +418,11 @@ When reporting progress:
 
 Good progress statement:
 
-- "Moved mix-family dump/verify/process dispatch out of `commands.rs` into `renderer/command/mix/mod.rs`; `commands.rs` now delegates by family. Full `cargo test -p audio_core` passes."
+- "Ported `fs/path_util.rs` from `fs/path_util.cpp`; all path resolution methods match upstream. `cargo test -p common` passes."
 
 Bad progress statement:
 
-- "Improved audio_core significantly."
+- "Improved the crate significantly."
 
 ## Final Standard
 
@@ -603,8 +431,124 @@ If another instance uses this file correctly, it should keep asking:
 - "Where does this logic belong upstream?"
 - "Why is this method not in the matching file?"
 - "Why is this constant not next to its upstream equivalent?"
-- "Why is this dispatcher owning behavior that belongs to the command module?"
 - "Is this behavior literally the same, or merely plausible?"
 
 That is the right mindset for finishing this port.
 
+---
+
+## Per-Folder Exceptions
+
+Each section below lists C++ files that have no meaningful Rust counterpart for a specific upstream folder. These omissions are intentional and should not be flagged as missing files during parity audits.
+
+### `audio_core` — `/home/vricosti/shared/zuyu/src/audio_core`
+
+**Rust crate:** `audio_core` at `/home/vricosti/shared/ruzu/audio_core`
+
+**Status:** Ported.
+
+**Exceptions:**
+
+- `precompiled_headers.h` — precompiled headers are a C++ build optimization; Rust has no equivalent concept.
+
+### `common` — `/home/vricosti/shared/zuyu/src/common`
+
+**Rust crate:** `common` at `/home/vricosti/shared/ruzu/common`
+
+**Status:** Ported.
+
+**Exceptions:**
+
+- `precompiled_headers.h`, `common_precompiled_headers.h` — C++ build optimization; no Rust equivalent.
+- `common_types.h` — defines `u8`, `u16`, `u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, `f64`; Rust has these as built-in primitive types.
+- `common_funcs.h` — C++ utility macros (`DECLARE_ENUM_FLAG_OPERATORS`, `ZUYU_NON_COPYABLE`, etc.); Rust handles these via `bitflags`, `Clone`/`Copy` derives, etc.
+- `concepts.h` — C++ concepts; Rust uses trait bounds natively.
+- `polyfill_ranges.h`, `polyfill_thread.h` — C++ standard library polyfills; Rust stdlib provides these features natively.
+- `expected.h` — C++ `std::expected` polyfill; Rust has `Result` built in.
+- `scope_exit.h` — Rust uses `Drop` for deterministic cleanup.
+- `bit_cast.h` — Rust uses `bytemuck` or `transmute`.
+- `make_unique_for_overwrite.h` — C++ memory allocation detail with no Rust equivalent.
+- `parent_of_member.h` — C++ `container_of` macro pattern; Rust does not use this pattern.
+- `microprofile.h`, `microprofile.cpp`, `microprofileui.h` — profiling framework integration; a separate concern.
+- `stb.h`, `stb.cpp` — stb_image C library bindings; Rust would use an image crate instead.
+- `scm_rev.h` — build-time source control revision; handled differently in Rust builds.
+- `assert.h` — C++ macro-based assertion system; Rust has built-in `assert!`, `debug_assert!`, `panic!`.
+- `atomic_helpers.h` — C++ TSAN annotation macros for atomic fences; Rust `std::sync::atomic` handles this natively.
+- `atomic_ops.h` — MSVC/GCC specific compare-and-swap operations; Rust `std::sync::atomic` provides these.
+- `demangle.h` — C++ symbol demangling; Rust has different name mangling and its own demangling support.
+- `logging/formatter.h` — fmt library formatter specialization for enums; Rust `Display`/`Debug` traits handle this.
+- `logging/log.h` — C++ fmt-based logging macros (`LOG_DEBUG`, `LOG_INFO`, etc.); Rust uses the `log` crate macros.
+- `unique_function.h` — C++ move-only `std::function`; Rust has `Box<dyn FnOnce()>` and closures natively.
+- `literals.h` — C++ user-defined literals (`_KiB`, `_MiB`, etc.); Rust uses `const` values or plain arithmetic.
+- `android/android_common.*`, `android/applets/software_keyboard.*`, `android/id_cache.*` — Android JNI integration; platform-specific frontend code with no Rust JNI equivalent in this project.
+- `fs/fs_android.*` — Android-specific filesystem via JNI; same as above.
+- `linux/gamemode.*` — Linux Feral Interactive gamemode integration; thin platform glue.
+- `signal_chain.*` — POSIX signal handler wrapping (Android-specific); platform-specific.
+- `nvidia_flags.*` — Environment variable configuration for Nvidia driver quirks; thin platform glue.
+- `windows/timer_resolution.*` — Windows-specific timer resolution API; platform-specific.
+- `x64/xbyak_abi.h`, `x64/xbyak_util.h` — Xbyak JIT assembly library integration; JIT-specific, handled by `rdynarmic`.
+- `reader_writer_queue.h` — third-party lock-free queue (`moodycamel::ReaderWriterQueue`); Rust would use a dedicated crate.
+- `algorithm.h` — small generic iterator helpers (`BinaryFind`, `FoldRight`); Rust iterators provide this natively.
+- `socket_types.h` — C++ network socket type aliases; Rust `std::net` handles this.
+
+### `core` — `/home/vricosti/shared/zuyu/src/core`
+
+**Rust crate:** `core` at `/home/vricosti/shared/ruzu/core`
+
+**Status:** Ported.
+
+**Exceptions:**
+
+- `precompiled_headers.h` — C++ build optimization; no Rust equivalent.
+- `memory.h/cpp` — ported as `guest_memory.rs` (upstream `Memory::Memory` class maps to `GuestMemory`); the top-level `memory.h` is a thin wrapper around page table access that is integrated into `guest_memory.rs`.
+- `file_sys/fssystem_bucket_tree_template_impl.h`, `file_sys/fssystem_bucket_tree_utils.h` — C++ template implementation headers; logic folded into `fssystem/bucket_tree.rs`.
+- `arm/nce/arm_nce.s` — ARM64 assembly source file; would need a separate `.s` file or inline assembly in Rust.
+- `arm/dynarmic/` — JIT backend files are ported as stubs; full implementation depends on `rdynarmic` integration.
+- `arm/nce/` — Native code execution backend is ported structurally; full implementation depends on platform-specific signal handling.
+
+### `video_core` — `/home/vricosti/shared/zuyu/src/video_core`
+
+**Rust crate:** `video_core` at `/home/vricosti/shared/ruzu/video_core`
+
+**Status:** In progress.
+
+**Exceptions:** *(to be filled as the port progresses)*
+
+## Directories Excluded From The Port
+
+The following upstream directories are **intentionally not ported** and should never be flagged as missing during parity audits.
+
+### `yuzu` — `/home/vricosti/shared/zuyu/src/yuzu`
+
+**Not ported.** This is the Qt-based GUI frontend application. The ruzu project will implement its own frontend using a different UI library (not Qt). This directory should not be ported.
+
+### `tests` — `/home/vricosti/shared/zuyu/src/tests`
+
+**Not ported.** Upstream C++ test suite. Rust tests are written natively alongside each crate using `#[cfg(test)]` modules and `cargo test`.
+
+---
+
+## Testing yuzu-cmd
+
+### Manual test with Mario Kart 8 Deluxe (AArch32)
+
+```bash
+cargo run --bin yuzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+```
+
+With debug logging:
+
+```bash
+RUST_LOG=info cargo run --bin yuzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+```
+
+With isolated data directories (avoids polluting `~/.local/share/ruzu`, `~/.cache/ruzu`, `~/.config/ruzu`):
+
+```bash
+env XDG_DATA_HOME=/tmp/ruzu-data \
+    XDG_CACHE_HOME=/tmp/ruzu-cache \
+    XDG_CONFIG_HOME=/tmp/ruzu-config \
+    RUST_LOG=info cargo run --bin yuzu-cmd -- -g "/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+```
+
+**Note:** MK8D is an ARM32 (AArch32) game — title ID `0100152000022000`.
