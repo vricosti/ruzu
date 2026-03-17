@@ -883,6 +883,27 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             let reason = get_arg32(args, 0);
             let info1 = get_arg32(args, 1) as u64;
             let info2 = get_arg32(args, 2) as u64;
+
+            // Dump guest registers for diagnosis.
+            log::error!("=== GUEST REGISTER DUMP AT BREAK ===");
+            for i in 0..16 {
+                log::error!("  r{:2} = {:#010x}", i, args[i]);
+            }
+            // Read abort message from guest memory if info1 points to a string.
+            if info1 != 0 && info2 > 0 && info2 < 0x200 {
+                let process = ctx.current_process.lock().unwrap();
+                let mem = process.process_memory.read().unwrap();
+                if mem.is_valid_range(info1, info2 as usize) {
+                    let mut buf = vec![0u8; info2 as usize];
+                    for (i, byte) in buf.iter_mut().enumerate() {
+                        *byte = (mem.read_32(info1 + i as u64) & 0xFF) as u8;
+                    }
+                    if let Ok(msg) = String::from_utf8(buf) {
+                        log::error!("  Break message: {}", msg.trim_end_matches('\0'));
+                    }
+                }
+            }
+
             svc_exception::break_execution(reason, info1, info2);
         }
         Some(SvcId::OutputDebugString) => {
@@ -924,7 +945,7 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
                 17 => 0,                 // SystemResourceSizeUsed
                 18 => ctx.program_id,    // ProgramId
                 10 => 0,                 // IdleTickCount
-                11 => 0xDEAD_BEEF_0000_0000u64 | info_subtype, // RandomEntropy
+                11 => process.get_random_entropy(info_subtype as usize), // RandomEntropy
                 19 => 0,                 // InitialProcessIdRange
                 20 => 0,                 // UserExceptionContextAddress
                 21 => 0x1000_0000,       // TotalNonSystemMemorySize
@@ -1323,7 +1344,7 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
                 17 => 0,
                 18 => ctx.program_id,
                 10 => 0,
-                11 => 0xDEAD_BEEF_0000_0000u64 | info_subtype,
+                11 => process.get_random_entropy(info_subtype as usize),
                 19 => 0,
                 20 => 0,
                 21 => 0x1000_0000,

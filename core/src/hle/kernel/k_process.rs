@@ -495,7 +495,24 @@ impl KProcess {
             state: ProcessState::default(),
             cond_var: KConditionVariable::new(),
             global_scheduler_context: None,
-            entropy: [0u64; 4],
+            entropy: {
+                // Upstream: KProcess initializes entropy with random values
+                // from KSystemControl::GenerateRandomRange. We use std random.
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut e = [0u64; 4];
+                for (i, val) in e.iter_mut().enumerate() {
+                    let mut hasher = DefaultHasher::new();
+                    (i as u64).hash(&mut hasher);
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .hash(&mut hasher);
+                    *val = hasher.finish();
+                }
+                e
+            },
             is_signaled: false,
             is_initialized: false,
             is_application: false,
