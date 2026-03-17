@@ -1,10 +1,14 @@
-//! Port of zuyu/src/core/hle/kernel/k_page_table_base.h
-//! Status: Stubbed (structure and enums only — this is the large VM management file)
-//! Derniere synchro: 2026-03-11
+//! Port of zuyu/src/core/hle/kernel/k_page_table_base.h / k_page_table_base.cpp
+//! Status: Partial (~65 methods implemented, 13 stubs returning 0, ~29 upstream methods missing)
+//! Derniere synchro: 2026-03-17
 //!
 //! The base class for virtual memory page tables.
 //! Contains all address space regions, memory block manager, and virtual memory operations.
-//! Most methods are stubbed as todo!() since they depend on many other kernel subsystems.
+//!
+//! Missing upstream methods include: MapPageGroup, UnmapPageGroup, UnmapProcessMemory,
+//! QueryInfoImpl, QueryMappingImpl, IO memory ops, InitializeForKernel, and others.
+//! Stub methods (return 0 without real logic): IPC setup/cleanup, cache invalidation,
+//! debug memory read/write, linear copy operations.
 
 use bitflags::bitflags;
 
