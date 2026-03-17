@@ -362,6 +362,182 @@ impl KPageTableBase {
         self.m_heap_region_start <= addr && addr + size <= self.m_heap_region_end
     }
 
+    // -- CheckMemoryState --
+
+    /// Default ignore attribute for CheckMemoryState.
+    /// Matches upstream `DefaultMemoryIgnoreAttr`.
+    pub const DEFAULT_MEMORY_IGNORE_ATTR: KMemoryAttribute =
+        KMemoryAttribute::from_bits_truncate(
+            KMemoryAttribute::IPC_LOCKED.bits() | KMemoryAttribute::DEVICE_SHARED.bits(),
+        );
+
+    /// Check that a single block's state/perm/attr match expectations.
+    /// Matches upstream `CheckMemoryState(const KMemoryInfo&, ...)`.
+    pub fn check_memory_state_info(
+        info: &KMemoryInfo,
+        state_mask: KMemoryState,
+        state: KMemoryState,
+        perm_mask: KMemoryPermission,
+        perm: KMemoryPermission,
+        attr_mask: KMemoryAttribute,
+        attr: KMemoryAttribute,
+    ) -> u32 {
+        if (info.m_state & state_mask) != state {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+        if (info.m_permission & perm_mask) != perm {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+        if (info.m_attribute & attr_mask) != attr {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+        0
+    }
+
+    /// Check memory state over a contiguous range (all blocks must match independently).
+    /// Matches upstream `CheckMemoryStateContiguous`.
+    pub fn check_memory_state_contiguous(
+        &self,
+        addr: usize,
+        size: usize,
+        state_mask: KMemoryState,
+        state: KMemoryState,
+        perm_mask: KMemoryPermission,
+        perm: KMemoryPermission,
+        attr_mask: KMemoryAttribute,
+        attr: KMemoryAttribute,
+    ) -> (u32, usize) {
+        let last_addr = addr + size - 1;
+        let mut blocks_needed: usize = 0;
+
+        let mut iter = self.m_memory_block_manager.find_iterator(addr);
+        let Some(first_block) = iter.next() else {
+            return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), 0);
+        };
+        let mut info = first_block.get_memory_info();
+
+        // If start address isn't aligned to block start, need a split.
+        if (addr & !(PAGE_SIZE - 1)) != info.get_address() {
+            blocks_needed += 1;
+        }
+
+        loop {
+            let result = Self::check_memory_state_info(
+                &info, state_mask, state, perm_mask, perm, attr_mask, attr,
+            );
+            if result != 0 {
+                return (result, 0);
+            }
+
+            if last_addr <= info.get_last_address() {
+                break;
+            }
+
+            let Some(next_block) = iter.next() else {
+                return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), 0);
+            };
+            info = next_block.get_memory_info();
+        }
+
+        // If end address isn't aligned to block end, need a split.
+        if ((addr + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)) != info.get_end_address() {
+            blocks_needed += 1;
+        }
+
+        (0, blocks_needed)
+    }
+
+    /// Check memory state over a range (all blocks must have the SAME state/perm/attr).
+    /// Matches upstream `CheckMemoryState(out_state, out_perm, out_attr, ..., iterator, last_addr, ...)`.
+    pub fn check_memory_state_range(
+        &self,
+        addr: usize,
+        size: usize,
+        state_mask: KMemoryState,
+        state: KMemoryState,
+        perm_mask: KMemoryPermission,
+        perm: KMemoryPermission,
+        attr_mask: KMemoryAttribute,
+        attr: KMemoryAttribute,
+        ignore_attr: KMemoryAttribute,
+    ) -> (u32, Option<KMemoryState>, Option<KMemoryPermission>, Option<KMemoryAttribute>, usize) {
+        let last_addr = addr + size - 1;
+        let mut blocks_needed: usize = 0;
+
+        let mut iter = self.m_memory_block_manager.find_iterator(addr);
+        let Some(first_block) = iter.next() else {
+            return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), None, None, None, 0);
+        };
+
+        // If start address isn't aligned to block start, need a split.
+        if (addr & !(PAGE_SIZE - 1)) != first_block.get_address() {
+            blocks_needed += 1;
+        }
+
+        let mut info = first_block.get_memory_info();
+        let first_state = info.m_state;
+        let first_perm = info.m_permission;
+        let first_attr = info.m_attribute;
+
+        loop {
+            // All blocks must have the same state/perm/attr (ignoring ignore_attr).
+            if info.m_state != first_state {
+                return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), None, None, None, 0);
+            }
+            if info.m_permission != first_perm {
+                return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), None, None, None, 0);
+            }
+            if (info.m_attribute | ignore_attr) != (first_attr | ignore_attr) {
+                return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), None, None, None, 0);
+            }
+
+            // Check against the provided masks.
+            let result = Self::check_memory_state_info(
+                &info, state_mask, state, perm_mask, perm, attr_mask, attr,
+            );
+            if result != 0 {
+                return (result, None, None, None, 0);
+            }
+
+            if last_addr <= info.get_last_address() {
+                break;
+            }
+
+            let Some(next_block) = iter.next() else {
+                return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), None, None, None, 0);
+            };
+            info = next_block.get_memory_info();
+        }
+
+        // If end address isn't aligned to block end, need a split.
+        if ((last_addr & !(PAGE_SIZE - 1)) + PAGE_SIZE) != info.get_end_address() {
+            blocks_needed += 1;
+        }
+
+        let out_attr = first_attr & !ignore_attr;
+        (0, Some(first_state), Some(first_perm), Some(out_attr), blocks_needed)
+    }
+
+    /// Convenience: check memory state, discarding output.
+    /// Matches upstream `CheckMemoryState(addr, size, ...)`.
+    pub fn check_memory_state(
+        &self,
+        addr: usize,
+        size: usize,
+        state_mask: KMemoryState,
+        state: KMemoryState,
+        perm_mask: KMemoryPermission,
+        perm: KMemoryPermission,
+        attr_mask: KMemoryAttribute,
+        attr: KMemoryAttribute,
+    ) -> u32 {
+        let (result, _, _, _, _) = self.check_memory_state_range(
+            addr, size, state_mask, state, perm_mask, perm, attr_mask, attr,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
+        );
+        result
+    }
+
     // -- InitializeForProcess --
 
     /// Initialize the page table for a user process.
@@ -689,13 +865,28 @@ impl KPageTableBase {
         if !self.contains_range(addr, size) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
-        // TODO: full CheckMemoryState validation
-        // TODO: call Operate to change protection in m_memory
+
+        // Check current memory state — verify the region can be reprotected.
+        // Upstream: state_mask = FlagCanReprotect, state = FlagCanReprotect
+        let (result, out_state, _out_perm, _out_attr, _) = self.check_memory_state_range(
+            addr, size,
+            KMemoryState::FLAG_CAN_REPROTECT, KMemoryState::FLAG_CAN_REPROTECT,
+            KMemoryPermission::NONE, KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let state = out_state.unwrap_or(KMemoryState::NORMAL);
+
+        // TODO: call Operate to change protection in Core::Memory::Memory
         // Update block manager.
         self.m_memory_block_manager.update(
             addr,
             num_pages,
-            KMemoryState::FREE, // preserve existing state
+            state,
             perm,
             KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,

@@ -334,6 +334,22 @@ impl KMemoryBlockManager {
         self.memory_block_tree.values()
     }
 
+    /// Find an iterator starting at the block containing `address`.
+    /// Matches upstream `KMemoryBlockManager::FindIterator(address)`.
+    /// Returns an iterator over blocks from the one containing `address` to the end.
+    pub fn find_iterator(&self, address: usize) -> impl Iterator<Item = &KMemoryBlock> {
+        // Find the key of the block containing address.
+        let start_key = self
+            .memory_block_tree
+            .range(..=address)
+            .rev()
+            .find(|(_, block)| block.get_address() <= address && address < block.get_end_address())
+            .map(|(&k, _)| k)
+            .unwrap_or(address);
+
+        self.memory_block_tree.range(start_key..).map(|(_, b)| b)
+    }
+
     pub fn block_count(&self) -> usize {
         self.memory_block_tree.len()
     }
