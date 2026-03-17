@@ -8,6 +8,8 @@
 
 use bitflags::bitflags;
 
+use std::sync::{Arc, Mutex};
+
 use super::k_address_space_info::{AddressSpaceInfoType, KAddressSpaceInfo};
 use super::k_memory_block::*;
 use super::k_memory_block_manager::KMemoryBlockManager;
@@ -15,6 +17,7 @@ use super::k_memory_layout::KERNEL_ASLR_ALIGNMENT;
 use super::k_memory_manager;
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::result::ResultCode;
+use crate::memory::memory::Memory;
 
 // ---------------------------------------------------------------------------
 // DisableMergeAttribute
@@ -88,6 +91,7 @@ pub enum OperationType {
 // Constants
 // ---------------------------------------------------------------------------
 
+pub const PAGE_BITS: usize = 12;
 pub const MAX_PHYSICAL_MAP_ALIGNMENT: usize = 1 << 30; // 1 GiB
 pub const REGION_ALIGNMENT: usize = 2 << 20; // 2 MiB
 const _: () = assert!(REGION_ALIGNMENT == KERNEL_ASLR_ALIGNMENT);
@@ -100,6 +104,12 @@ const _: () = assert!(REGION_ALIGNMENT == KERNEL_ASLR_ALIGNMENT);
 ///
 /// Most methods are stubbed. This struct preserves all upstream fields.
 pub struct KPageTableBase {
+    /// The page table implementation used by dynarmic.
+    /// Upstream: `std::unique_ptr<Common::PageTable> m_impl`
+    pub(crate) m_impl: Option<Box<common::page_table::PageTable>>,
+    /// Reference to the Memory bridge (MapMemoryRegion/UnmapRegion/ProtectRegion).
+    /// Upstream: `Core::Memory::Memory* m_memory`
+    pub(crate) m_memory: Option<Arc<Mutex<Memory>>>,
     pub(crate) m_address_space_start: usize,
     pub(crate) m_address_space_end: usize,
     pub(crate) m_heap_region_start: usize,
@@ -134,6 +144,8 @@ pub struct KPageTableBase {
 impl KPageTableBase {
     pub fn new() -> Self {
         Self {
+            m_impl: None,
+            m_memory: None,
             m_address_space_start: 0,
             m_address_space_end: 0,
             m_heap_region_start: 0,
@@ -791,6 +803,233 @@ impl KPageTableBase {
         );
 
         0 // success
+    }
+
+    // -- Memory / PageTable wiring --
+
+    /// Set the Memory bridge and initialize the page table implementation.
+    /// Must be called after InitializeForProcess.
+    pub fn set_memory(&mut self, memory: Arc<Mutex<Memory>>) {
+        self.m_memory = Some(memory);
+    }
+
+    /// Initialize the Common::PageTable impl.
+    /// Matches upstream: `m_impl = make_unique<PageTable>(); m_impl->Resize(width, PageBits)`
+    pub fn initialize_impl(&mut self) {
+        let mut pt = Box::new(common::page_table::PageTable::new());
+        pt.resize(self.m_address_space_width as usize, PAGE_BITS);
+        self.m_impl = Some(pt);
+    }
+
+    /// Get the inner page table (for dynarmic).
+    pub fn get_impl(&self) -> Option<&common::page_table::PageTable> {
+        self.m_impl.as_deref()
+    }
+
+    pub fn get_impl_mut(&mut self) -> Option<&mut common::page_table::PageTable> {
+        self.m_impl.as_deref_mut()
+    }
+
+    // -- Operate --
+
+    /// Convert KMemoryPermission to Common::MemoryPermission.
+    /// Matches upstream `ConvertToMemoryPermission`.
+    fn convert_to_memory_permission(perm: KMemoryPermission) -> crate::memory::memory::MemoryPermission {
+        use crate::memory::memory::MemoryPermission;
+        let mut perms = MemoryPermission::empty();
+        if perm.contains(KMemoryPermission::USER_READ) {
+            perms |= MemoryPermission::READ;
+        }
+        if perm.contains(KMemoryPermission::USER_WRITE) {
+            perms |= MemoryPermission::WRITE;
+        }
+        perms
+    }
+
+    /// Core page table operation — maps, unmaps, or changes permissions.
+    /// Matches upstream `KPageTableBase::Operate(PageLinkedList*, virt_addr, num_pages,
+    /// phys_addr, is_pa_valid, properties, operation, reuse_ll)`.
+    ///
+    /// In the emulator, we don't use PageLinkedList (no guest page table entries).
+    /// The operation modifies Core::Memory::Memory which updates the dynarmic PageTable.
+    pub fn operate(
+        &mut self,
+        virt_addr: usize,
+        num_pages: usize,
+        phys_addr: u64,
+        _is_pa_valid: bool,
+        properties: KPageProperties,
+        operation: OperationType,
+    ) -> u32 {
+        debug_assert!(num_pages > 0);
+        debug_assert!(virt_addr % PAGE_SIZE == 0);
+
+        let size = num_pages * PAGE_SIZE;
+
+        match operation {
+            OperationType::Unmap | OperationType::UnmapPhysical => {
+                let separate_heap = matches!(operation, OperationType::UnmapPhysical);
+
+                if let (Some(memory), Some(impl_pt)) = (&self.m_memory, &mut self.m_impl) {
+                    memory.lock().unwrap().unmap_region(
+                        impl_pt,
+                        virt_addr as u64,
+                        size as u64,
+                        separate_heap,
+                    );
+                }
+
+                0 // success
+            }
+            OperationType::Map => {
+                debug_assert!(virt_addr != 0);
+
+                if let (Some(memory), Some(impl_pt)) = (&self.m_memory, &mut self.m_impl) {
+                    memory.lock().unwrap().map_memory_region(
+                        impl_pt,
+                        virt_addr as u64,
+                        size as u64,
+                        phys_addr,
+                        Self::convert_to_memory_permission(properties.perm),
+                        false,
+                    );
+                }
+
+                // TODO: if phys_addr is heap, call MemoryManager.Open(phys_addr, num_pages)
+
+                0
+            }
+            OperationType::Separate => {
+                // No-op in emulator.
+                0
+            }
+            OperationType::ChangePermissions
+            | OperationType::ChangePermissionsAndRefresh
+            | OperationType::ChangePermissionsAndRefreshAndFlush => {
+                if let (Some(memory), Some(impl_pt)) = (&self.m_memory, &mut self.m_impl) {
+                    memory.lock().unwrap().protect_region(
+                        impl_pt,
+                        virt_addr as u64,
+                        size as u64,
+                        Self::convert_to_memory_permission(properties.perm),
+                    );
+                }
+
+                0
+            }
+            _ => {
+                log::error!("KPageTableBase::Operate: unhandled operation {:?}", operation);
+                svc_results::RESULT_INVALID_STATE.get_inner_value()
+            }
+        }
+    }
+
+    // -- FindFreeArea --
+
+    /// Find a free area in the given region.
+    /// Matches upstream `KPageTableBase::FindFreeArea`.
+    ///
+    /// If ASLR is enabled, tries up to 8 random placements first,
+    /// then falls back to a random-offset linear scan, then a plain linear scan.
+    pub fn find_free_area(
+        &self,
+        region_start: usize,
+        region_num_pages: usize,
+        num_pages: usize,
+        alignment: usize,
+        offset: usize,
+        guard_pages: usize,
+    ) -> usize {
+        let mut address: usize = 0;
+
+        if num_pages <= region_num_pages {
+            if self.m_enable_aslr {
+                // Try to directly find a free area up to 8 times.
+                let max_offset_pages = region_num_pages
+                    .saturating_sub(num_pages)
+                    .saturating_sub(guard_pages);
+
+                for _ in 0..8 {
+                    if max_offset_pages == 0 || alignment == 0 {
+                        break;
+                    }
+                    let random_offset = {
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut h = DefaultHasher::new();
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos()
+                            .hash(&mut h);
+                        (h.finish() as usize % ((max_offset_pages * PAGE_SIZE / alignment) + 1))
+                            * alignment
+                    };
+                    let candidate =
+                        ((region_start + random_offset) & !(alignment - 1)) + offset;
+
+                    if let Some(info) = self.m_memory_block_manager.query_info(candidate) {
+                        if info.m_state != KMemoryState::FREE {
+                            continue;
+                        }
+                        if region_start > candidate {
+                            continue;
+                        }
+                        if info.get_address() + guard_pages * PAGE_SIZE > candidate {
+                            continue;
+                        }
+                        if candidate + (num_pages + guard_pages) * PAGE_SIZE - 1
+                            > info.get_last_address()
+                        {
+                            continue;
+                        }
+                        if candidate + (num_pages + guard_pages) * PAGE_SIZE - 1
+                            > region_start + region_num_pages * PAGE_SIZE - 1
+                        {
+                            continue;
+                        }
+                        address = candidate;
+                        break;
+                    }
+                }
+
+                // Fall back to finding free area with random offset.
+                if address == 0 {
+                    let offset_pages = {
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut h = DefaultHasher::new();
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos()
+                            .hash(&mut h);
+                        h.finish() as usize % (max_offset_pages + 1)
+                    };
+                    address = self.m_memory_block_manager.find_free_area(
+                        region_start + offset_pages * PAGE_SIZE,
+                        region_num_pages.saturating_sub(offset_pages),
+                        num_pages,
+                        alignment,
+                        offset,
+                        guard_pages,
+                    ).unwrap_or(0);
+                }
+            }
+            // Find the first free area (no ASLR or fallback).
+            if address == 0 {
+                address = self.m_memory_block_manager.find_free_area(
+                    region_start,
+                    region_num_pages,
+                    num_pages,
+                    alignment,
+                    offset,
+                    guard_pages,
+                ).unwrap_or(0);
+            }
+        }
+
+        address
     }
 
     // -- SetMaxHeapSize / SetHeapSize --
