@@ -503,7 +503,122 @@ pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
     crate::hle::service::vi::vi::register_services(&service_manager);
     crate::hle::service::nvdrv::register_services(&service_manager);
 
+    // Register all system services that games expect during SDK init.
+    // Matches upstream Services::InstallInterfaces() order.
+    // These are stub services that accept any IPC command and return success.
+    // Games may access them during nn::* initialization.
+    let system_services = &[
+        // Settings (set:*)
+        "set", "set:cal", "set:fd", "set:sys",
+        // Filesystem (fsp-srv, fsp-ldr, fsp:pr)
+        "fsp-srv", "fsp-ldr", "fsp:pr",
+        // HID (hid, hid:dbg, hid:sys, hidbus, irs, irs:sys, xcd:sys)
+        "hid", "hid:dbg", "hid:sys", "hidbus", "irs", "irs:sys", "xcd:sys",
+        // Account
+        "acc:u0", "acc:u1",
+        // Audio (audout:u, audin:u, audren:u, audctl, hwopus)
+        "audout:u", "audin:u", "audren:u", "audctl", "hwopus",
+        // NS
+        "ns:su", "ns:am2", "ns:ec", "ns:rid", "ns:rt", "ns:web", "ns:ro",
+        // PSC / Time
+        "psc:c", "psc:m", "time:u", "time:a", "time:s",
+        // Glue (arp, bgtc, ectx, notif)
+        "arp:r", "arp:w", "bgtc:t", "bgtc:sc", "ectx:aw",
+        "notif:a", "notif:s",
+        // Friends
+        "friend:u", "friend:v", "friend:m", "friend:s", "friend:a",
+        // NIFM (network)
+        "nifm:u", "nifm:a", "nifm:s",
+        // Mii
+        "mii:u", "mii:e",
+        // NVNflinger
+        "dispdrv",
+        // Others commonly needed
+        "fatal:u", "lbl", "mm:u",
+        "nfc:user", "nfc:sys", "nfp:user", "nfp:sys",
+        "spl:", "spl:mig", "spl:fs", "spl:ssl", "spl:es", "spl:manu",
+        "ssl", "nim:shp", "erpt:c", "erpt:r",
+        "bsd:u", "bsd:s", "bsdcfg", "nsd:u", "nsd:a", "sfdnsres",
+        "csrng", "btdrv", "btm",
+        "pcv", "caps:a", "caps:c", "caps:u", "caps:ss", "caps:sc",
+        "pl:u", "prepo:u", "prepo:s", "prepo:m", "prepo:a",
+        "eupld:c", "eupld:r",
+        "ovln:rcv", "ovln:snd",
+        "pm:shell", "pm:dmnt", "pm:info",
+        "lr", "ncm",
+        "ldr:pm", "ldr:shel", "ldr:dmnt",
+        "ro:1",
+        "usb:ds", "usb:hs", "usb:pm",
+        "grc:c", "grc:d",
+        "olsc:u",
+        "ngc:u",
+    ];
+
+    for name in system_services {
+        let svc_name = name.to_string();
+        register_stub_service(&service_manager, name, move || {
+            Arc::new(GenericStubService::new(&svc_name))
+        });
+    }
+
     service_manager
+}
+
+/// Generic stub service that accepts any IPC command and returns success.
+/// Used for services that aren't fully implemented yet but need to exist
+/// so that the game's SDK init doesn't abort.
+pub struct GenericStubService {
+    name: String,
+    handlers: std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo>,
+    handlers_tipc: std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo>,
+}
+
+impl GenericStubService {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            handlers: std::collections::BTreeMap::new(),
+            handlers_tipc: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl crate::hle::service::hle_ipc::SessionRequestHandler for GenericStubService {
+    fn handle_sync_request(
+        &self,
+        ctx: &mut crate::hle::service::hle_ipc::HLERequestContext,
+    ) -> crate::hle::result::ResultCode {
+        // Log the unhandled command and return success.
+        log::warn!(
+            "GenericStubService({}): unhandled command, returning success",
+            self.name
+        );
+        let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(crate::hle::result::RESULT_SUCCESS);
+        crate::hle::result::RESULT_SUCCESS
+    }
+
+    fn service_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl crate::hle::service::service::ServiceFramework for GenericStubService {
+    fn get_service_name(&self) -> &str {
+        &self.name
+    }
+
+    fn handlers(
+        &self,
+    ) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(
+        &self,
+    ) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// Helper to register a service with a factory closure.
