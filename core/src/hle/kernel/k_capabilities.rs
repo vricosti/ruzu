@@ -6,6 +6,8 @@
 //! (core mask, priority mask, SVC permissions, interrupts, etc.)
 
 use crate::hardware_properties;
+use crate::hle::kernel::k_memory_block::KMemoryPermission;
+use crate::hle::kernel::k_process_page_table::KProcessPageTable;
 use crate::hle::kernel::svc::svc_results;
 
 /// Number of possible interrupt IDs.
@@ -149,7 +151,7 @@ impl KCapabilities {
 
     /// Initialize capabilities for a KIP (kernel initial process).
     /// Matches upstream `KCapabilities::InitializeForKip`.
-    pub fn initialize_for_kip(&mut self, kern_caps: &[u32]) -> u32 {
+    pub fn initialize_for_kip(&mut self, kern_caps: &[u32], page_table: Option<&mut KProcessPageTable>) -> u32 {
         self.svc_access_flags = [false; SVC_ACCESS_FLAG_COUNT];
         self.irq_access_flags = [false; INTERRUPT_ID_COUNT];
         self.debug_capabilities = 0;
@@ -170,12 +172,12 @@ impl KCapabilities {
         let minor: u32 = 0;
         self.intended_kernel_version = (major << 19) | (minor << 15);
 
-        self.set_capabilities(kern_caps)
+        self.set_capabilities(kern_caps, page_table)
     }
 
     /// Initialize capabilities for a user process.
     /// Matches upstream `KCapabilities::InitializeForUser`.
-    pub fn initialize_for_user(&mut self, user_caps: &[u32]) -> u32 {
+    pub fn initialize_for_user(&mut self, user_caps: &[u32], page_table: Option<&mut KProcessPageTable>) -> u32 {
         // Reset all fields.
         self.svc_access_flags = [false; SVC_ACCESS_FLAG_COUNT];
         self.irq_access_flags = [false; INTERRUPT_ID_COUNT];
@@ -189,14 +191,14 @@ impl KCapabilities {
         self.phys_core_mask = 0;
         self.priority_mask = 0;
 
-        self.set_capabilities(user_caps)
+        self.set_capabilities(user_caps, page_table)
     }
 
     // -- Capability parsing --
 
     /// Parse a capabilities array.
     /// Matches upstream `KCapabilities::SetCapabilities`.
-    fn set_capabilities(&mut self, caps: &[u32]) -> u32 {
+    fn set_capabilities(&mut self, caps: &[u32], mut page_table: Option<&mut KProcessPageTable>) -> u32 {
         let mut set_flags = 0u32;
         let mut set_svc = 0u32;
         let mut i = 0;
@@ -214,13 +216,17 @@ impl KCapabilities {
                 if get_capability_type(size_cap) != CapabilityType::MapRange {
                     return svc_results::RESULT_INVALID_COMBINATION.get_inner_value();
                 }
-                // MapRange: would map into page table. Skip for now
-                // (requires KProcessPageTable integration).
+                if let Some(ref mut pt) = page_table {
+                    let result = Self::map_range(cap, size_cap, pt);
+                    if result != 0 {
+                        return result;
+                    }
+                }
                 i += 1;
                 continue;
             }
 
-            let result = self.set_capability(cap, &mut set_flags, &mut set_svc);
+            let result = self.set_capability(cap, &mut set_flags, &mut set_svc, &mut page_table);
             if result != 0 {
                 return result;
             }
@@ -232,7 +238,7 @@ impl KCapabilities {
 
     /// Process a single capability.
     /// Matches upstream `KCapabilities::SetCapability`.
-    fn set_capability(&mut self, cap: u32, set_flags: &mut u32, set_svc: &mut u32) -> u32 {
+    fn set_capability(&mut self, cap: u32, set_flags: &mut u32, set_svc: &mut u32, page_table: &mut Option<&mut KProcessPageTable>) -> u32 {
         let cap_type = get_capability_type(cap);
 
         // Invalid type.
@@ -256,12 +262,18 @@ impl KCapabilities {
             CapabilityType::CorePriority => self.set_core_priority_capability(cap),
             CapabilityType::SyscallMask => self.set_syscall_mask_capability(cap, set_svc),
             CapabilityType::MapIoPage => {
-                // Would map IO page into page table. Skip.
-                0
+                if let Some(ref mut pt) = page_table {
+                    Self::map_io_page(cap, pt)
+                } else {
+                    0
+                }
             }
             CapabilityType::MapRegion => {
-                // Would map region into page table. Skip.
-                0
+                if let Some(ref mut pt) = page_table {
+                    Self::map_region(cap, pt)
+                } else {
+                    0
+                }
             }
             CapabilityType::InterruptPair => self.set_interrupt_pair_capability(cap),
             CapabilityType::ProgramType => self.set_program_type_capability(cap),
@@ -458,6 +470,99 @@ impl KCapabilities {
         0
     }
 
+    // -- Mapping methods --
+
+    /// Matches upstream `KCapabilities::MapRange_`.
+    fn map_range(cap: u32, size_cap: u32, page_table: &mut KProcessPageTable) -> u32 {
+        const PAGE_SIZE: u64 = 0x1000;
+
+        // MapRange bitfield: bits [7..31] = address (24 bits), bit 31 = read_only
+        let phys_addr = (((cap >> 7) & 0x00FF_FFFF) as u64) * PAGE_SIZE;
+        let read_only = (cap >> 31) & 1;
+
+        // MapRangeSize bitfield: bits [7..27] = pages (20 bits), bits [27..31] = reserved, bit 31 = normal
+        let num_pages = ((size_cap >> 7) & 0x000F_FFFF) as usize;
+        let reserved = (size_cap >> 27) & 0xF;
+        let normal = (size_cap >> 31) & 1;
+
+        if reserved != 0 {
+            return svc_results::RESULT_OUT_OF_RANGE.get_inner_value();
+        }
+        let size = num_pages * PAGE_SIZE as usize;
+        if num_pages == 0 {
+            return svc_results::RESULT_INVALID_SIZE.get_inner_value();
+        }
+        if phys_addr >= phys_addr + size as u64 {
+            return svc_results::RESULT_INVALID_ADDRESS.get_inner_value();
+        }
+        if ((phys_addr + size as u64 - 1) & !PHYSICAL_MAP_ALLOWED_MASK) != 0 {
+            return svc_results::RESULT_INVALID_ADDRESS.get_inner_value();
+        }
+
+        let perm = if read_only != 0 {
+            KMemoryPermission::USER_READ
+        } else {
+            KMemoryPermission::USER_READ_WRITE
+        };
+
+        if normal != 0 {
+            page_table.map_static(phys_addr, size, perm)
+        } else {
+            page_table.map_io(phys_addr, size, perm)
+        }
+    }
+
+    /// Matches upstream `KCapabilities::MapIoPage_`.
+    fn map_io_page(cap: u32, page_table: &mut KProcessPageTable) -> u32 {
+        const PAGE_SIZE: u64 = 0x1000;
+
+        // MapIoPage bitfield: bits [8..32] = address (24 bits)
+        let phys_addr = (((cap >> 8) & 0x00FF_FFFF) as u64) * PAGE_SIZE;
+        let size = PAGE_SIZE as usize;
+
+        if phys_addr >= phys_addr + size as u64 {
+            return svc_results::RESULT_INVALID_ADDRESS.get_inner_value();
+        }
+        if ((phys_addr + size as u64 - 1) & !PHYSICAL_MAP_ALLOWED_MASK) != 0 {
+            return svc_results::RESULT_INVALID_ADDRESS.get_inner_value();
+        }
+
+        page_table.map_io(phys_addr, size, KMemoryPermission::USER_READ_WRITE)
+    }
+
+    /// Matches upstream `KCapabilities::MapRegion_`.
+    fn map_region(cap: u32, page_table: &mut KProcessPageTable) -> u32 {
+        // MapRegion bitfield:
+        //   bits [16..11] = region0 (6 bits, RegionType)
+        //   bit  17       = read_only0
+        //   bits [23..18] = region1
+        //   bit  24       = read_only1
+        //   bits [30..25] = region2
+        //   bit  31       = read_only2
+        let types = [
+            ((cap >> 11) & 0x3F, (cap >> 17) & 1),
+            ((cap >> 18) & 0x3F, (cap >> 24) & 1),
+            ((cap >> 25) & 0x3F, (cap >> 31) & 1),
+        ];
+
+        for &(region_type, read_only) in &types {
+            if region_type == RegionType::NoMapping as u32 {
+                continue;
+            }
+            let perm = if read_only != 0 {
+                KMemoryPermission::USER_READ
+            } else {
+                KMemoryPermission::USER_READ_WRITE
+            };
+            let result = page_table.map_region(region_type, perm);
+            if result != 0 {
+                return result;
+            }
+        }
+
+        0
+    }
+
     // -- Private helpers --
 
     fn set_svc_allowed(&mut self, id: u32) -> bool {
@@ -550,7 +655,7 @@ mod tests {
         let core_prio: u32 = 0x07 | (59 << 4) | (28 << 10) | (0 << 16) | (2 << 24);
         let handle_tbl: u32 = 0x7FFF | (512 << 16); // size=512
         let user_caps = [core_prio, handle_tbl];
-        let result = caps.initialize_for_user(&user_caps);
+        let result = caps.initialize_for_user(&user_caps, None);
         assert_eq!(result, 0);
         assert_eq!(caps.core_mask, 0b111);
         assert_ne!(caps.priority_mask, 0);
@@ -560,7 +665,7 @@ mod tests {
     #[test]
     fn test_initialize_for_kip() {
         let mut caps = KCapabilities::new();
-        let result = caps.initialize_for_kip(&[]);
+        let result = caps.initialize_for_kip(&[], None);
         assert_eq!(result, 0);
         // KIP: all cores, all user priorities
         assert_ne!(caps.core_mask, 0);

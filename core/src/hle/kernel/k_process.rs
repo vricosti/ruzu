@@ -1041,9 +1041,13 @@ impl KProcess {
             .min(self.name.len() - 1);
         self.name[..name_len].copy_from_slice(&name[..name_len]);
 
-        let caps_result = self
-            .capabilities
-            .initialize_for_user(metadata.get_kernel_capabilities());
+        // Extract capabilities to avoid double borrow (capabilities needs &mut page_table).
+        let mut caps = std::mem::take(&mut self.capabilities);
+        let caps_result = caps.initialize_for_user(
+            metadata.get_kernel_capabilities(),
+            Some(&mut self.page_table),
+        );
+        self.capabilities = caps;
         if caps_result != RESULT_SUCCESS.get_inner_value() {
             return caps_result;
         }
