@@ -1,217 +1,225 @@
-//! Port of zuyu/src/core/hle/kernel/k_process_page_table.h / k_process_page_table.cpp
-//! Status: Partial (structural port, all methods stubbed)
-//! Derniere synchro: 2026-03-11
+//! Port of zuyu/src/core/hle/kernel/k_process_page_table.h
+//! Status: EN COURS
+//! Derniere synchro: 2026-03-17
 //!
-//! KProcessPageTable: wrapper around KPageTable that provides the process's
-//! virtual memory management interface. All methods delegate to the inner
-//! page table.
+//! KProcessPageTable: thin wrapper around KPageTableBase matching upstream.
+//! All methods delegate to the inner KPageTableBase.
 
-use super::k_memory_block::KMemoryPermission;
+use super::k_memory_block::{KMemoryInfo, KMemoryPermission, PAGE_SIZE};
+use super::k_page_table_base::KPageTableBase;
 use super::k_typed_address::{KPhysicalAddress, KProcessAddress};
 
 /// The process page table.
-/// Matches upstream `KProcessPageTable` class (k_process_page_table.h).
-///
-/// In upstream this is a thin wrapper around KPageTable/KPageTableBase.
+/// Matches upstream `KProcessPageTable` (k_process_page_table.h).
+/// Thin wrapper around KPageTableBase.
 pub struct KProcessPageTable {
-    address_space_start: KProcessAddress,
-    address_space_size: usize,
-    heap_region_start: KProcessAddress,
-    heap_region_size: usize,
-    current_heap_size: usize,
-    alias_region_start: KProcessAddress,
-    alias_region_size: usize,
-    stack_region_start: KProcessAddress,
-    stack_region_size: usize,
-    kernel_map_region_start: KProcessAddress,
-    kernel_map_region_size: usize,
-    code_region_start: KProcessAddress,
-    code_region_size: usize,
-    /// ASLR region (alias code region).
-    /// Upstream: m_alias_code_region_start / m_alias_code_region_end
-    alias_code_region_start: KProcessAddress,
-    alias_code_region_size: usize,
-    address_space_width: u32,
+    base: KPageTableBase,
 }
 
 impl KProcessPageTable {
     pub fn new() -> Self {
         Self {
-            address_space_start: KProcessAddress::default(),
-            address_space_size: 0,
-            heap_region_start: KProcessAddress::default(),
-            heap_region_size: 0,
-            current_heap_size: 0,
-            alias_region_start: KProcessAddress::default(),
-            alias_region_size: 0,
-            stack_region_start: KProcessAddress::default(),
-            stack_region_size: 0,
-            kernel_map_region_start: KProcessAddress::default(),
-            kernel_map_region_size: 0,
-            code_region_start: KProcessAddress::default(),
-            code_region_size: 0,
-            alias_code_region_start: KProcessAddress::default(),
-            alias_code_region_size: 0,
-            address_space_width: 0,
+            base: KPageTableBase::new(),
         }
     }
 
-    /// Initialize the page table for a process.
-    /// TODO: Port from k_process_page_table.h (delegates to KPageTable::InitializeForProcess).
-    pub fn initialize(&mut self) -> u32 {
-        // TODO: Full implementation
-        0
+    /// Initialize for a user process.
+    /// Matches upstream delegation to m_page_table.InitializeForProcess.
+    pub fn initialize_for_process(
+        &mut self,
+        as_flags: u32,
+        enable_aslr: bool,
+        enable_das_merge: bool,
+        from_back: bool,
+        pool: u32,
+        code_address: usize,
+        code_size: usize,
+        aslr_space_start: usize,
+    ) -> u32 {
+        self.base.initialize_for_process(
+            as_flags,
+            enable_aslr,
+            enable_das_merge,
+            from_back,
+            pool,
+            code_address,
+            code_size,
+            aslr_space_start,
+        )
     }
 
-    /// Finalize the page table.
-    /// TODO: Port from k_process_page_table.h.
     pub fn finalize(&mut self) {
-        // TODO: Full implementation
+        // TODO: delegate to base.finalize()
     }
 
-    /// Get the allocate option.
-    /// TODO: Port from k_process_page_table.h.
-    pub fn get_allocate_option(&self) -> u32 {
-        0 // TODO
-    }
+    // -- Region getters delegating to base --
 
-    /// Get the address space start.
-    /// TODO: Port from k_process_page_table.h.
     pub fn get_address_space_start(&self) -> KProcessAddress {
-        self.address_space_start
+        KProcessAddress::new(self.base.get_address_space_start() as u64)
     }
 
-    /// Get the address space size.
-    /// TODO: Port from k_process_page_table.h.
     pub fn get_address_space_size(&self) -> usize {
-        self.address_space_size
+        self.base.get_address_space_size()
     }
 
-    /// Get the heap region start.
     pub fn get_heap_region_start(&self) -> KProcessAddress {
-        self.heap_region_start
+        KProcessAddress::new(self.base.get_heap_region_start() as u64)
     }
 
-    /// Get the heap region size.
     pub fn get_heap_region_size(&self) -> usize {
-        self.heap_region_size
+        self.base.get_heap_region_size()
     }
 
-    /// Get the alias region start.
     pub fn get_alias_region_start(&self) -> KProcessAddress {
-        self.alias_region_start
+        KProcessAddress::new(self.base.get_alias_region_start() as u64)
     }
 
-    /// Get the alias region size.
     pub fn get_alias_region_size(&self) -> usize {
-        self.alias_region_size
+        self.base.get_alias_region_size()
     }
 
-    /// Get the stack region start.
     pub fn get_stack_region_start(&self) -> KProcessAddress {
-        self.stack_region_start
+        KProcessAddress::new(self.base.get_stack_region_start() as u64)
     }
 
-    /// Get the stack region size.
     pub fn get_stack_region_size(&self) -> usize {
-        self.stack_region_size
+        self.base.get_stack_region_size()
     }
 
-    /// Get the kernel map region start.
     pub fn get_kernel_map_region_start(&self) -> KProcessAddress {
-        self.kernel_map_region_start
+        KProcessAddress::new(self.base.get_kernel_map_region_start() as u64)
     }
 
-    /// Get the kernel map region size.
     pub fn get_kernel_map_region_size(&self) -> usize {
-        self.kernel_map_region_size
+        self.base.get_kernel_map_region_size()
     }
 
-    /// Get the code region start.
     pub fn get_code_region_start(&self) -> KProcessAddress {
-        self.code_region_start
+        KProcessAddress::new(self.base.get_code_region_start() as u64)
     }
 
-    /// Get the code region size.
     pub fn get_code_region_size(&self) -> usize {
-        self.code_region_size
+        self.base.get_code_region_size()
     }
 
-    /// Get the alias code region (ASLR region) start.
-    /// Upstream: GetAliasCodeRegionStart()
     pub fn get_alias_code_region_start(&self) -> KProcessAddress {
-        self.alias_code_region_start
+        KProcessAddress::new(self.base.get_alias_code_region_start() as u64)
     }
 
-    /// Get the alias code region (ASLR region) size.
-    /// Upstream: GetAliasCodeRegionSize()
     pub fn get_alias_code_region_size(&self) -> usize {
-        self.alias_code_region_size
+        self.base.get_alias_code_region_size()
     }
 
-    /// Get the address space width.
     pub fn get_address_space_width(&self) -> u32 {
-        self.address_space_width
+        self.base.get_address_space_width()
     }
 
-    /// Set memory permission.
-    /// TODO: Port from k_process_page_table.h.
+    pub fn get_allocate_option(&self) -> u32 {
+        self.base.get_allocate_option()
+    }
+
+    pub fn get_current_heap_size(&self) -> usize {
+        self.base.get_heap_region_size() // TODO: track current heap vs region
+    }
+
+    // -- Mapping operations delegating to base --
+
+    pub fn set_heap_size(&mut self, size: usize) -> (u32, KProcessAddress) {
+        let (result, addr) = self.base.set_heap_size(size);
+        (result, KProcessAddress::new(addr as u64))
+    }
+
+    pub fn set_max_heap_size(&mut self, size: usize) -> u32 {
+        self.base.set_max_heap_size(size)
+    }
+
     pub fn set_memory_permission(
         &mut self,
-        _addr: KProcessAddress,
-        _size: usize,
-        _perm: u32,
+        addr: KProcessAddress,
+        size: usize,
+        perm: u32,
     ) -> u32 {
-        0
+        self.base.set_memory_permission(
+            addr.get() as usize,
+            size,
+            KMemoryPermission::from_bits_truncate(perm as u8),
+        )
     }
 
-    /// Set heap size.
-    /// TODO: Port from k_process_page_table.h.
-    pub fn set_heap_size(&mut self, size: usize) -> (u32, KProcessAddress) {
-        if size > self.heap_region_size {
-            return (1, KProcessAddress::default());
-        }
-        self.current_heap_size = size;
-        (0, self.heap_region_start)
-    }
-
-    /// Map memory.
-    /// TODO: Port from k_process_page_table.h.
-    pub fn map_memory(
+    pub fn set_memory_attribute(
         &mut self,
-        _dst: KProcessAddress,
-        _src: KProcessAddress,
-        _size: usize,
+        addr: KProcessAddress,
+        size: usize,
+        mask: u32,
+        attr: u32,
     ) -> u32 {
-        0
+        self.base.set_memory_attribute(addr.get() as usize, size, mask, attr)
     }
 
-    /// Unmap memory.
-    /// TODO: Port from k_process_page_table.h.
-    pub fn unmap_memory(
+    pub fn map_memory(&mut self, dst: KProcessAddress, src: KProcessAddress, size: usize) -> u32 {
+        self.base.map_memory(dst.get() as usize, src.get() as usize, size)
+    }
+
+    pub fn unmap_memory(&mut self, dst: KProcessAddress, src: KProcessAddress, size: usize) -> u32 {
+        self.base.unmap_memory(dst.get() as usize, src.get() as usize, size)
+    }
+
+    pub fn map_physical_memory(&mut self, addr: KProcessAddress, size: usize) -> u32 {
+        self.base.map_physical_memory(addr.get() as usize, size)
+    }
+
+    pub fn unmap_physical_memory(&mut self, addr: KProcessAddress, size: usize) -> u32 {
+        self.base.unmap_physical_memory(addr.get() as usize, size)
+    }
+
+    pub fn map_static(&mut self, phys_addr: u64, size: usize, perm: KMemoryPermission) -> u32 {
+        self.base.map_static(phys_addr, size, perm)
+    }
+
+    pub fn map_io(&mut self, phys_addr: u64, size: usize, perm: KMemoryPermission) -> u32 {
+        self.base.map_io(phys_addr, size, perm)
+    }
+
+    pub fn map_region(&mut self, region_type: u32, perm: KMemoryPermission) -> u32 {
+        self.base.map_region(region_type, perm)
+    }
+
+    pub fn set_process_memory_permission(
         &mut self,
-        _dst: KProcessAddress,
-        _src: KProcessAddress,
-        _size: usize,
+        addr: KProcessAddress,
+        size: usize,
+        perm: KMemoryPermission,
     ) -> u32 {
-        0
+        self.base.set_process_memory_permission(addr.get() as usize, size, perm)
     }
 
-    /// Check if address range is contained.
-    pub fn contains(&self, _addr: KProcessAddress, _size: usize) -> bool {
-        let start = self.address_space_start.get();
-        let end = start.saturating_add(self.address_space_size as u64);
-        let addr = _addr.get();
-        addr >= start && addr.checked_add(_size as u64).is_some_and(|range_end| range_end <= end)
+    // -- Query --
+
+    pub fn query_info(&self, addr: usize) -> Option<KMemoryInfo> {
+        self.base.query_info(addr)
     }
 
-    /// Get physical address for a virtual address.
-    pub fn get_physical_address(
-        &self,
-        _address: KProcessAddress,
-    ) -> Option<KPhysicalAddress> {
+    pub fn contains(&self, addr: KProcessAddress, size: usize) -> bool {
+        self.base.contains_range(addr.get() as usize, size)
+    }
+
+    pub fn get_physical_address(&self, _address: KProcessAddress) -> Option<KPhysicalAddress> {
         None // TODO
     }
+
+    // -- Direct base access --
+
+    pub fn get_base(&self) -> &KPageTableBase {
+        &self.base
+    }
+
+    pub fn get_base_mut(&mut self) -> &mut KPageTableBase {
+        &mut self.base
+    }
+
+    // -- Compatibility setters (used during process load before InitializeForProcess) --
+    // These directly modify the base fields. Will be removed once
+    // KProcess::load_from_metadata calls initialize_for_process instead.
 
     pub fn configure_address_space(
         &mut self,
@@ -219,106 +227,50 @@ impl KProcessPageTable {
         size: usize,
         width: u32,
     ) {
-        self.address_space_start = start;
-        self.address_space_size = size;
-        self.address_space_width = width;
+        let base = self.get_base_mut();
+        base.m_address_space_start = start.get() as usize;
+        base.m_address_space_end = start.get() as usize + size;
+        base.m_address_space_width = width;
+        // Initialize the block manager for this address space.
+        let _ = base.m_memory_block_manager.initialize(
+            base.m_address_space_start,
+            base.m_address_space_end,
+        );
     }
 
     pub fn set_code_region(&mut self, start: KProcessAddress, size: usize) {
-        self.code_region_start = start;
-        self.code_region_size = size;
+        let base = self.get_base_mut();
+        base.m_code_region_start = start.get() as usize;
+        base.m_code_region_end = start.get() as usize + size;
+        // For 32-bit, alias_code_region covers the full address space.
+        if base.m_address_space_width <= 32 {
+            base.m_alias_code_region_start = base.m_code_region_start;
+            base.m_alias_code_region_end = base.m_address_space_end;
+            base.m_stack_region_start = base.m_code_region_start;
+            base.m_stack_region_end = base.m_code_region_end;
+            base.m_kernel_map_region_start = base.m_code_region_start;
+            base.m_kernel_map_region_end = base.m_code_region_end;
+        }
     }
 
     pub fn set_stack_region(&mut self, start: KProcessAddress, size: usize) {
-        self.stack_region_start = start;
-        self.stack_region_size = size;
+        // Direct set for legacy compatibility.
+        let base = self.get_base_mut();
+        base.m_stack_region_start = start.get() as usize;
+        base.m_stack_region_end = start.get() as usize + size;
     }
 
     pub fn set_heap_region(&mut self, start: KProcessAddress, size: usize) {
-        self.heap_region_start = start;
-        self.heap_region_size = size;
-        self.current_heap_size = self.current_heap_size.min(size);
-    }
-
-    pub fn get_current_heap_size(&self) -> usize {
-        self.current_heap_size
-    }
-
-    pub fn set_alias_code_region(&mut self, start: KProcessAddress, size: usize) {
-        self.alias_code_region_start = start;
-        self.alias_code_region_size = size;
-    }
-
-    pub fn set_alias_region(&mut self, start: KProcessAddress, size: usize) {
-        self.alias_region_start = start;
-        self.alias_region_size = size;
-    }
-
-    pub fn set_kernel_map_region(&mut self, start: KProcessAddress, size: usize) {
-        self.kernel_map_region_start = start;
-        self.kernel_map_region_size = size;
-    }
-
-    // -- Mapping methods matching upstream --
-
-    /// Map a static physical memory region into the process address space.
-    /// Upstream: KPageTableBase::MapStatic -> finds region in KMemoryLayout,
-    /// maps with MapPages into the Static region.
-    ///
-    /// In our emulator, physical memory mapping is handled by the shared
-    /// process memory (GuestMemory). This method records the mapping request
-    /// for correctness tracking but the actual memory backing is in GuestMemory.
-    pub fn map_static(
-        &mut self,
-        phys_addr: u64,
-        size: usize,
-        _perm: KMemoryPermission,
-    ) -> u32 {
-        log::debug!(
-            "KProcessPageTable::map_static(phys={:#x}, size={:#x}, perm={:?})",
-            phys_addr, size, _perm
-        );
-        // Upstream validates alignment, region existence in KMemoryLayout,
-        // then calls MapPages to find a free VA range in the Static region
-        // and maps the physical pages there.
-        // In our emulator model, guest memory is flat — no real page table.
-        // We just record the request succeeded.
-        0
-    }
-
-    /// Map an IO memory region into the process address space.
-    /// Upstream: KPageTableBase::MapIo -> maps with MapIoImpl into IoRegister region.
-    pub fn map_io(
-        &mut self,
-        phys_addr: u64,
-        size: usize,
-        _perm: KMemoryPermission,
-    ) -> u32 {
-        log::debug!(
-            "KProcessPageTable::map_io(phys={:#x}, size={:#x}, perm={:?})",
-            phys_addr, size, _perm
-        );
-        // Same as map_static — in our flat memory model, IO mapping is a no-op
-        // but we validate the request.
-        0
-    }
-
-    /// Map a kernel memory region by type.
-    /// Upstream: KPageTableBase::MapRegion -> finds region in KMemoryLayout,
-    /// delegates to MapStatic.
-    pub fn map_region(
-        &mut self,
-        _region_type: u32,
-        _perm: KMemoryPermission,
-    ) -> u32 {
-        log::debug!(
-            "KProcessPageTable::map_region(type={}, perm={:?})",
-            _region_type, _perm
-        );
-        // KMemoryLayout region lookup not yet implemented.
-        // Return success — these regions are for kernel trace buffers, DTB, etc.
-        // that aren't needed for game execution.
-        0
+        let base = self.get_base_mut();
+        base.m_heap_region_start = start.get() as usize;
+        base.m_heap_region_end = start.get() as usize + size;
+        base.m_max_heap_size = size;
+        if base.m_current_heap_end < base.m_heap_region_start {
+            base.m_current_heap_end = base.m_heap_region_start;
+        }
+        if base.m_current_heap_end > base.m_heap_region_end {
+            base.m_current_heap_end = base.m_heap_region_end;
+        }
     }
 }
 
