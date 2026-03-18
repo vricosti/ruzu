@@ -498,6 +498,7 @@ pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
     });
     crate::hle::service::apm::apm::register_services(&service_manager);
     crate::hle::service::pctl::pctl::register_services(&service_manager);
+    crate::hle::service::filesystem::filesystem::register_services(&service_manager);
     crate::hle::service::aoc::addon_content_manager::loop_process(&service_manager);
     crate::hle::service::am::am::register_services(&service_manager);
     crate::hle::service::vi::vi::register_services(&service_manager);
@@ -510,8 +511,6 @@ pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
     let system_services = &[
         // Settings (set:*)
         "set", "set:cal", "set:fd", "set:sys",
-        // Filesystem (fsp-srv, fsp-ldr, fsp:pr)
-        "fsp-srv", "fsp-ldr", "fsp:pr",
         // HID (hid, hid:dbg, hid:sys, hidbus, irs, irs:sys, xcd:sys)
         "hid", "hid:dbg", "hid:sys", "hidbus", "irs", "irs:sys", "xcd:sys",
         // Account

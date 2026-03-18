@@ -2,6 +2,14 @@
 //!
 //! IStorage service.
 
+use std::collections::BTreeMap;
+
+use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// IPC command table for IStorage:
 ///
 /// | Cmd | Name         |
@@ -13,11 +21,122 @@
 /// | 4   | GetSize      |
 /// | 5   | OperateRange |
 pub struct IStorage {
-    // backend: VirtualFile,
+    backend: VirtualFile,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IStorage {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(backend: VirtualFile) -> Self {
+        Self {
+            backend,
+            handlers: build_handler_map(&[
+                (0, Some(Self::read_handler), "Read"),
+                (1, Some(Self::stub_success_handler), "Write"),
+                (2, Some(Self::stub_success_handler), "Flush"),
+                (3, Some(Self::stub_success_handler), "SetSize"),
+                (4, Some(Self::get_size_handler), "GetSize"),
+                (5, Some(Self::stub_success_handler), "OperateRange"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn read_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let storage = unsafe { &*(this as *const dyn ServiceFramework as *const IStorage) };
+        let mut rp = RequestParser::new(ctx);
+        let offset = rp.pop_i64();
+        let length = rp.pop_i64();
+
+        log::debug!("IStorage::Read called, offset=0x{:X}, length={}", offset, length);
+
+        if offset < 0 || length < 0 {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+            return;
+        }
+
+        let output_size = ctx.get_write_buffer_size(0);
+        let read_len = usize::min(length as usize, output_size);
+        let data = storage.backend.read_bytes(read_len, offset as usize);
+
+        if let Some(shared_memory) = ctx.get_shared_memory() {
+            let address = if !ctx.buffer_descriptor_b().is_empty() {
+                ctx.buffer_descriptor_b()[0].address()
+            } else if !ctx.buffer_descriptor_c().is_empty() {
+                ctx.buffer_descriptor_c()[0].address()
+            } else {
+                0
+            };
+
+            if address != 0 {
+                let mut mem = shared_memory.write().unwrap();
+                mem.write_block(address, &data);
+                if read_len > data.len() {
+                    mem.write_block(address + data.len() as u64, &vec![0; read_len - data.len()]);
+                }
+            }
+        }
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let storage = unsafe { &*(this as *const dyn ServiceFramework as *const IStorage) };
+        let size = storage.backend.get_size() as u64;
+
+        log::debug!("IStorage::GetSize called, size={}", size);
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(size);
+    }
+
+    fn stub_success_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for IStorage {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+
+    fn service_name(&self) -> &str {
+        "IStorage"
+    }
+}
+
+impl ServiceFramework for IStorage {
+    fn get_service_name(&self) -> &str {
+        "IStorage"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+
+    fn invoke_request(&self, ctx: &mut HLERequestContext)
+    where
+        Self: Sized,
+    {
+        let cmd = ctx.get_command();
+        if let Some(fi) = self.handlers().get(&cmd) {
+            if let Some(callback) = fi.handler_callback {
+                log::trace!("Service::{}: {}", self.get_service_name(), fi.name);
+                callback(self, ctx);
+                return;
+            }
+        }
+
+        log::warn!("IStorage: unimplemented command '{}' returned stub success", cmd);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 }

@@ -2,6 +2,11 @@
 //!
 //! FileSystemController and VfsDirectoryServiceWrapper.
 
+use std::sync::{Arc, Mutex};
+
+use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
+use crate::hle::service::sm::sm::ServiceManager;
+
 /// Port of Service::FileSystem::ContentStorageId
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -71,8 +76,36 @@ impl VfsDirectoryServiceWrapper {
 /// - "fsp-ldr" -> FSP_LDR
 /// - "fsp:pr"  -> FSP_PR
 /// - "fsp-srv" -> FSP_SRV
-pub fn loop_process() {
-    // Upstream registers FSP_LDR, FSP_PR, FSP_SRV with the ServerManager.
-    // TODO: Wire up to ServerManager when service framework is ported.
-    log::warn!("FileSystem::loop_process: ServerManager not yet ported, services not registered");
+pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
+    register_services(service_manager);
+}
+
+pub fn register_services(service_manager: &Arc<Mutex<ServiceManager>>) {
+    register_named_service(service_manager, "fsp-ldr", || -> SessionRequestHandlerPtr {
+        Arc::new(super::fsp::fsp_ldr::FspLdr::new())
+    });
+    register_named_service(service_manager, "fsp:pr", || -> SessionRequestHandlerPtr {
+        Arc::new(super::fsp::fsp_pr::FspPr::new())
+    });
+    register_named_service(service_manager, "fsp-srv", || -> SessionRequestHandlerPtr {
+        Arc::new(super::fsp::fsp_srv::FspSrv::new())
+    });
+}
+
+fn register_named_service<F>(service_manager: &Arc<Mutex<ServiceManager>>, name: &str, factory: F)
+where
+    F: Fn() -> SessionRequestHandlerPtr + Send + Sync + 'static,
+{
+    let boxed: SessionRequestHandlerFactory = Box::new(factory);
+    let result = service_manager
+        .lock()
+        .unwrap()
+        .register_service(name.to_string(), 64, boxed);
+    if result.is_error() {
+        log::warn!(
+            "Failed to register service '{}': {:#x}",
+            name,
+            result.get_inner_value()
+        );
+    }
 }
