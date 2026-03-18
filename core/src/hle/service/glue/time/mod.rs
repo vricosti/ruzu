@@ -14,7 +14,7 @@
 //!   - worker.h / worker.cpp
 
 pub mod manager;
-pub mod static_service;
+pub mod r#static;
 pub mod alarm_worker;
 pub mod file_timestamp_worker;
 pub mod pm_state_change_handler;

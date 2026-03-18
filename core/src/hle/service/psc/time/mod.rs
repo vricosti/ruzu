@@ -15,7 +15,7 @@ pub mod power_state_request_manager;
 pub mod power_state_service;
 pub mod service_manager;
 pub mod shared_memory;
-pub mod static_service;
+pub mod r#static;
 pub mod steady_clock;
 pub mod system_clock;
 pub mod time_zone;

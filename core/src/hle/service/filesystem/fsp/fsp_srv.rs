@@ -2,6 +2,20 @@
 //!
 //! FSP_SRV service ("fsp-srv").
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::file_sys::errors::RESULT_TARGET_NOT_FOUND;
+use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+use super::fs_i_filesystem::IFileSystem;
+use super::fs_i_storage::IStorage;
+
 /// Port of Service::FileSystem::AccessLogVersion
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -116,19 +130,186 @@ pub enum AccessLogMode {
 /// | 1200 | OpenMultiCommitManager                                                 |
 /// | 1300 | OpenBisWiper                                                           |
 pub struct FspSrv {
-    _current_process_id: u64,
-    _access_log_program_index: u32,
-    _access_log_mode: AccessLogMode,
-    _program_id: u64,
+    current_process_id: std::sync::Mutex<u64>,
+    access_log_program_index: std::sync::Mutex<u32>,
+    access_log_mode: std::sync::Mutex<AccessLogMode>,
+    program_id: std::sync::Mutex<u64>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl FspSrv {
     pub fn new() -> Self {
         Self {
-            _current_process_id: 0,
-            _access_log_program_index: 0,
-            _access_log_mode: AccessLogMode::None,
-            _program_id: 0,
+            current_process_id: std::sync::Mutex::new(0),
+            access_log_program_index: std::sync::Mutex::new(0),
+            access_log_mode: std::sync::Mutex::new(AccessLogMode::None),
+            program_id: std::sync::Mutex::new(0),
+            handlers: build_handler_map(&[
+                (1, Some(Self::set_current_process_handler), "SetCurrentProcess"),
+                (18, Some(Self::open_sd_card_file_system_handler), "OpenSdCardFileSystem"),
+                (200, Some(Self::open_data_storage_by_current_process_handler), "OpenDataStorageByCurrentProcess"),
+                (203, Some(Self::open_patch_data_storage_by_current_process_handler), "OpenPatchDataStorageByCurrentProcess"),
+                (1004, Some(Self::set_global_access_log_mode_handler), "SetGlobalAccessLogMode"),
+                (1005, Some(Self::get_global_access_log_mode_handler), "GetGlobalAccessLogMode"),
+                (1011, Some(Self::get_program_index_for_access_log_handler), "GetProgramIndexForAccessLog"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn push_interface_response(ctx: &mut HLERequestContext, object: Arc<dyn SessionRequestHandler>) {
+        let is_domain = ctx
+            .get_manager()
+            .map_or(false, |manager| manager.lock().unwrap().is_domain());
+        let move_handle = if is_domain {
+            0
+        } else {
+            ctx.create_session_for_service(object.clone()).unwrap_or(0)
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        if is_domain {
+            ctx.add_domain_object(object);
+        } else {
+            rb.push_move_objects(move_handle);
+        }
+    }
+
+    fn set_current_process_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        let pid = ctx.get_pid();
+        *service.current_process_id.lock().unwrap() = pid;
+        *service.program_id.lock().unwrap() = pid;
+        log::info!("FspSrv::SetCurrentProcess called, pid={:#x}", pid);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn open_sd_card_file_system_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let _service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        log::info!("FspSrv::OpenSdCardFileSystem called");
+        Self::push_interface_response(ctx, Arc::new(IFileSystem::new()));
+    }
+
+    fn open_data_storage_by_current_process_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        let program_id = *service.program_id.lock().unwrap();
+        let pid = *service.current_process_id.lock().unwrap();
+
+        log::info!(
+            "FspSrv::OpenDataStorageByCurrentProcess called, current_process_id={:#x}, program_id={:#x}",
+            pid,
+            program_id
+        );
+
+        // Rust-side temporary adaptation: the upstream owner is RomFsController::OpenRomFSCurrentProcess,
+        // but the service bootstrap here still lacks a System-backed RomFsController path.
+        // Return a real IStorage session with an empty readable backend instead of a bare success.
+        let backend: VirtualFile = Arc::new(VectorVfsFile::new(
+            Vec::new(),
+            format!("{program_id:016X}.romfs"),
+            None,
+        ));
+        Self::push_interface_response(ctx, Arc::new(IStorage::new(backend)));
+    }
+
+    fn open_patch_data_storage_by_current_process_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        let program_id = *service.program_id.lock().unwrap();
+
+        log::warn!(
+            "FspSrv::OpenPatchDataStorageByCurrentProcess called, program_id={:#x}; returning ResultTargetNotFound like upstream",
+            program_id
+        );
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(ResultCode::new(RESULT_TARGET_NOT_FOUND.raw()));
+    }
+
+    fn set_global_access_log_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        let mode_raw = ctx.command_buffer()[ctx.get_data_payload_offset() as usize + 2];
+        let mode = match mode_raw {
+            1 => AccessLogMode::Log,
+            2 => AccessLogMode::SdCard,
+            _ => AccessLogMode::None,
+        };
+        *service.access_log_mode.lock().unwrap() = mode;
+        log::info!("FspSrv::SetGlobalAccessLogMode called, mode={:?}", mode);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_global_access_log_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        let mode = *service.access_log_mode.lock().unwrap() as u32;
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(mode);
+    }
+
+    fn get_program_index_for_access_log_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        let version = AccessLogVersion::LATEST as u32;
+        let program_index = *service.access_log_program_index.lock().unwrap();
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(version);
+        rb.push_u32(program_index);
+    }
+}
+
+impl SessionRequestHandler for FspSrv {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+
+    fn service_name(&self) -> &str {
+        "fsp-srv"
+    }
+}
+
+impl ServiceFramework for FspSrv {
+    fn get_service_name(&self) -> &str {
+        "fsp-srv"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+
+    fn invoke_request(&self, ctx: &mut HLERequestContext)
+    where
+        Self: Sized,
+    {
+        let cmd = ctx.get_command();
+        if let Some(fi) = self.handlers().get(&cmd) {
+            if let Some(callback) = fi.handler_callback {
+                log::trace!("Service::{}: {}", self.get_service_name(), fi.name);
+                callback(self, ctx);
+                return;
+            }
+        }
+
+        log::warn!(
+            "FspSrv: unimplemented command '{}' returned stub success",
+            cmd
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 }

@@ -378,6 +378,13 @@ impl HLERequestContext {
         self.thread.clone()
     }
 
+    /// Returns the requesting process shared memory backing.
+    pub fn get_shared_memory(
+        &self,
+    ) -> Option<crate::hle::kernel::k_process::SharedProcessMemory> {
+        self.shared_memory.clone()
+    }
+
     /// Returns a mutable pointer to the IPC command buffer.
     pub fn command_buffer_mut(&mut self) -> &mut [u32; ipc::COMMAND_BUFFER_LENGTH] {
         &mut self.cmd_buf

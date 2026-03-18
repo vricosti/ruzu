@@ -5,11 +5,16 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/nvdrv_interface.h
 //! Port of zuyu/src/core/hle/service/nvdrv/nvdrv_interface.cpp
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use super::core::container::SessionId;
 use super::nvdata::*;
 use super::nvdrv::Module;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for NVDRV:
 /// - 0: Open
@@ -186,5 +191,276 @@ impl Drop for NvdrvInterface {
             let container = self.nvdrv.get_container();
             container.close_session(self.session_id);
         }
+    }
+}
+
+pub struct NvdrvService {
+    name: String,
+    interface: Mutex<NvdrvInterface>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NvdrvService {
+    pub fn new(nvdrv: Arc<Module>, name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            interface: Mutex::new(NvdrvInterface::new(nvdrv)),
+            handlers: build_handler_map(&[
+                (0, Some(Self::open_handler), "Open"),
+                (1, Some(Self::ioctl1_handler), "Ioctl"),
+                (2, Some(Self::close_handler), "Close"),
+                (3, Some(Self::initialize_handler), "Initialize"),
+                (4, Some(Self::query_event_handler), "QueryEvent"),
+                (6, Some(Self::get_status_handler), "GetStatus"),
+                (8, Some(Self::set_aruid_handler), "SetAruid"),
+                (9, Some(Self::dump_graphics_memory_info_handler), "DumpGraphicsMemoryInfo"),
+                (11, Some(Self::ioctl2_handler), "Ioctl2"),
+                (12, Some(Self::ioctl3_handler), "Ioctl3"),
+                (
+                    13,
+                    Some(Self::set_graphics_firmware_memory_margin_enabled_handler),
+                    "SetGraphicsFirmwareMemoryMarginEnabled",
+                ),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn read_buffer(ctx: &HLERequestContext, buffer_index: usize) -> Vec<u8> {
+        let Some(shared_memory) = ctx.get_shared_memory() else {
+            return Vec::new();
+        };
+
+        let size = ctx.get_read_buffer_size(buffer_index);
+        if size == 0 {
+            return Vec::new();
+        }
+
+        let address = if ctx.buffer_descriptor_a().len() > buffer_index
+            && ctx.buffer_descriptor_a()[buffer_index].size() > 0
+        {
+            ctx.buffer_descriptor_a()[buffer_index].address()
+        } else if ctx.buffer_descriptor_x().len() > buffer_index {
+            ctx.buffer_descriptor_x()[buffer_index].address()
+        } else {
+            0
+        };
+
+        if address == 0 {
+            return Vec::new();
+        }
+
+        let mem = shared_memory.read().unwrap();
+        mem.read_block(address, size).to_vec()
+    }
+
+    fn write_buffer(ctx: &HLERequestContext, buffer_index: usize, data: &[u8]) {
+        let Some(shared_memory) = ctx.get_shared_memory() else {
+            return;
+        };
+
+        let size = ctx.get_write_buffer_size(buffer_index);
+        if size == 0 {
+            return;
+        }
+
+        let address = if ctx.buffer_descriptor_b().len() > buffer_index
+            && ctx.buffer_descriptor_b()[buffer_index].size() > 0
+        {
+            ctx.buffer_descriptor_b()[buffer_index].address()
+        } else if ctx.buffer_descriptor_c().len() > buffer_index {
+            ctx.buffer_descriptor_c()[buffer_index].address()
+        } else {
+            0
+        };
+
+        if address == 0 {
+            return;
+        }
+
+        let mut mem = shared_memory.write().unwrap();
+        let write_len = data.len().min(size);
+        mem.write_block(address, &data[..write_len]);
+        if size > write_len {
+            mem.write_block(address + write_len as u64, &vec![0; size - write_len]);
+        }
+    }
+
+    fn push_nv_result(ctx: &mut HLERequestContext, nv_result: NvResult) {
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(nv_result as u32);
+    }
+
+    fn open_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        let device_name_bytes = Self::read_buffer(ctx, 0);
+        let end = device_name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(device_name_bytes.len());
+        let device_name = String::from_utf8_lossy(&device_name_bytes[..end]).to_string();
+
+        let (fd, nv_result) = service.interface.lock().unwrap().open(&device_name);
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(fd);
+        rb.push_u32(nv_result as u32);
+    }
+
+    fn ioctl1_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let command = rp.pop_raw::<Ioctl>();
+        let input = Self::read_buffer(ctx, 0);
+        let mut output = vec![0; ctx.get_write_buffer_size(0)];
+        let nv_result = service
+            .interface
+            .lock()
+            .unwrap()
+            .ioctl1(fd, command, &input, &mut output);
+        if command.is_out() {
+            Self::write_buffer(ctx, 0, &output);
+        }
+        Self::push_nv_result(ctx, nv_result);
+    }
+
+    fn ioctl2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let command = rp.pop_raw::<Ioctl>();
+        let input = Self::read_buffer(ctx, 0);
+        let inline_input = Self::read_buffer(ctx, 1);
+        let mut output = vec![0; ctx.get_write_buffer_size(0)];
+        let nv_result = service
+            .interface
+            .lock()
+            .unwrap()
+            .ioctl2(fd, command, &input, &inline_input, &mut output);
+        if command.is_out() {
+            Self::write_buffer(ctx, 0, &output);
+        }
+        Self::push_nv_result(ctx, nv_result);
+    }
+
+    fn ioctl3_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let command = rp.pop_raw::<Ioctl>();
+        let input = Self::read_buffer(ctx, 0);
+        let mut output = vec![0; ctx.get_write_buffer_size(0)];
+        let mut inline_output = vec![0; ctx.get_write_buffer_size(1)];
+        let nv_result = service
+            .interface
+            .lock()
+            .unwrap()
+            .ioctl3(fd, command, &input, &mut output, &mut inline_output);
+        if command.is_out() {
+            Self::write_buffer(ctx, 0, &output);
+            Self::write_buffer(ctx, 1, &inline_output);
+        }
+        Self::push_nv_result(ctx, nv_result);
+    }
+
+    fn close_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let nv_result = service.interface.lock().unwrap().close(fd);
+        Self::push_nv_result(ctx, nv_result);
+    }
+
+    fn initialize_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        let mut rp = RequestParser::new(ctx);
+        let _transfer_memory_size = rp.pop_u32();
+        let nv_result = service.interface.lock().unwrap().initialize();
+        Self::push_nv_result(ctx, nv_result);
+    }
+
+    fn query_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let event_id = rp.pop_u32();
+        let (nv_result, maybe_event) = service.interface.lock().unwrap().query_event(fd, event_id);
+        let copy_handle = if nv_result == NvResult::Success && maybe_event.is_some() {
+            ctx.create_readable_event_handle(false)
+        } else {
+            None
+        };
+
+        if let Some(handle) = copy_handle {
+            let mut rb = ResponseBuilder::new(ctx, 3, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+            rb.push_u32(nv_result as u32);
+        } else {
+            Self::push_nv_result(ctx, nv_result);
+        }
+    }
+
+    fn set_aruid_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        let mut rp = RequestParser::new(ctx);
+        let pid = rp.pop_u64();
+        service.interface.lock().unwrap().set_aruid(pid);
+        Self::push_nv_result(ctx, NvResult::Success);
+    }
+
+    fn get_status_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        let result = service.interface.lock().unwrap().get_status();
+        Self::push_nv_result(ctx, result);
+    }
+
+    fn dump_graphics_memory_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        service.interface.lock().unwrap().dump_graphics_memory_info();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_graphics_firmware_memory_margin_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        service
+            .interface
+            .lock()
+            .unwrap()
+            .set_graphics_firmware_memory_margin_enabled();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for NvdrvService {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+
+    fn service_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl ServiceFramework for NvdrvService {
+    fn get_service_name(&self) -> &str {
+        &self.name
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
