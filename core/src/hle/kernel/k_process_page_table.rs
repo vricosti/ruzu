@@ -5,9 +5,13 @@
 //! KProcessPageTable: thin wrapper around KPageTableBase matching upstream.
 //! All methods delegate to the inner KPageTableBase.
 
+use std::sync::{Arc, Mutex};
+
 use super::k_memory_block::{KMemoryInfo, KMemoryPermission, PAGE_SIZE};
 use super::k_page_table_base::KPageTableBase;
+use super::k_resource_limit::KResourceLimit;
 use super::k_typed_address::{KPhysicalAddress, KProcessAddress};
+use crate::memory::memory::Memory;
 
 /// The process page table.
 /// Matches upstream `KProcessPageTable` (k_process_page_table.h).
@@ -24,7 +28,9 @@ impl KProcessPageTable {
     }
 
     /// Initialize for a user process.
-    /// Matches upstream delegation to m_page_table.InitializeForProcess.
+    /// Upstream: `m_page_table.InitializeForProcess(as_type, enable_aslr, enable_das_merge,
+    ///     from_back, pool, code_address, code_size, system_resource, resource_limit,
+    ///     memory, aslr_space_start)`
     pub fn initialize_for_process(
         &mut self,
         as_flags: u32,
@@ -34,6 +40,8 @@ impl KProcessPageTable {
         pool: u32,
         code_address: usize,
         code_size: usize,
+        resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+        memory: Option<Arc<Mutex<Memory>>>,
         aslr_space_start: usize,
     ) -> u32 {
         self.base.initialize_for_process(
@@ -44,6 +52,8 @@ impl KProcessPageTable {
             pool,
             code_address,
             code_size,
+            resource_limit,
+            memory,
             aslr_space_start,
         )
     }
@@ -205,6 +215,16 @@ impl KProcessPageTable {
 
     pub fn get_physical_address(&self, _address: KProcessAddress) -> Option<KPhysicalAddress> {
         None // TODO
+    }
+
+    /// Upstream: `bool CanContain(KProcessAddress addr, size_t size, KMemoryState state) const`.
+    pub fn can_contain(
+        &self,
+        addr: KProcessAddress,
+        size: usize,
+        state: super::k_memory_block::KMemoryState,
+    ) -> bool {
+        self.base.can_contain(addr.get() as usize, size, state)
     }
 
     // -- Page mapping --

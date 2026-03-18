@@ -276,20 +276,36 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
         // ====================================================================
         // Process setup
         // ====================================================================
-        // Upstream calls `process.LoadFromMetadata(...)` here. The Rust port
-        // still has a reduced implementation, but process-owned metadata now
-        // lives in KProcess instead of being reconstructed by the frontend.
-        let process_setup_result = process.load_from_metadata(&metadata, code_size);
+        // Determine the code base address from address space type, matching upstream
+        // LoadFromMetadata's address space switch.
+        let code_base: u64 = match metadata.get_address_space_type() {
+            crate::file_sys::program_metadata::ProgramAddressSpaceType::Is32Bit |
+            crate::file_sys::program_metadata::ProgramAddressSpaceType::Is32BitNoMap => 0x0020_0000,
+            crate::file_sys::program_metadata::ProgramAddressSpaceType::Is36Bit => 0x0800_0000,
+            crate::file_sys::program_metadata::ProgramAddressSpaceType::Is39Bit => 0x8000_0000,
+        };
+
+        // Pre-allocate code memory BEFORE LoadFromMetadata, because
+        // LoadFromMetadata -> initialize_for_user -> initialize -> create_thread_local_region
+        // needs ProcessMemoryData::block_manager to be initialized.
+        // In upstream, the page table handles this; here we initialize ProcessMemoryData
+        // to cover the full code + TLS region.
+        process.allocate_code_memory(code_base, code_size as usize);
+
+        // Configure TLS page allocation base before LoadFromMetadata, which calls
+        // Initialize -> create_thread_local_region for the PLR.
+        process.initialize_thread_local_region_allocation(code_base + code_size);
+
+        // Upstream: process.LoadFromMetadata(metadata, code_size, aslr_space_start, is_hbl)
+        let process_setup_result = process.load_from_metadata(
+            &metadata,
+            code_size,
+            0, // aslr_space_start — upstream passes this from KProcess::Create
+            false, // is_hbl
+        );
         if process_setup_result != RESULT_SUCCESS.get_inner_value() {
             return (ResultStatus::ErrorBadNPDMHeader, None);
         }
-
-        let code_base: u64 = process.get_entry_point().get();
-
-        // Pre-allocate code memory so write_memory doesn't try to grow from base 0.
-        // Full page-table ownership is still pending, so keep the temporary
-        // pre-allocation in the loader for now.
-        process.allocate_code_memory(code_base, code_size as usize);
 
         // ====================================================================
         // Pass 2: Actual loading (load_into_process = true)

@@ -85,9 +85,6 @@ impl JitCallbacks for DynarmicCallbacks32 {
         if mem.is_valid_range(vaddr, 4) {
             Some(mem.read_32(vaddr))
         } else {
-            // Return UDF (permanently undefined) instruction to trigger a clean
-            // exception rather than hanging when code branches to unmapped memory.
-            // ARM encoding: 0xE7F000F0 = UDF #0
             log::warn!("DynarmicCallbacks32::memory_read_code({:#x}): unmapped, returning UDF", vaddr);
             Some(0xE7F000F0)
         }
@@ -504,7 +501,7 @@ impl ArmInterface for ArmDynarmic32 {
         let (fpsr, fpcr) = Self::fpscr_to_fpsr_fpcr(jit.get_fpscr());
         ctx.fpcr = fpcr;
         ctx.fpsr = fpsr;
-        ctx.tpidr = 0; // A32 uses CP15 for thread pointer
+        ctx.tpidr = jit.get_cp15_uprw() as u64; // Upstream: ctx.tpidr = m_cp15->uprw
     }
 
     fn set_context(&mut self, ctx: &ThreadContext) {
@@ -534,6 +531,8 @@ impl ArmInterface for ArmDynarmic32 {
 
         let fpscr = Self::fpsr_fpcr_to_fpscr(ctx.fpsr as u64, ctx.fpcr as u64);
         jit.set_fpscr(fpscr);
+        // Upstream: m_cp15->uprw = static_cast<u32>(ctx.tpidr)
+        jit.set_cp15_uprw(ctx.tpidr as u32);
     }
 
     fn set_tpidrro_el0(&mut self, value: u64) {

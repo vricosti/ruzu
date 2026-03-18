@@ -1277,12 +1277,11 @@ impl KThread {
     // -- Complex methods stubbed --
 
     fn reset_thread_context32(&mut self, stack_top: u64, entry_point: u64, arg: u64) {
+        // Upstream: ctx = {}; ctx.r[0]=arg; ctx.r[15]=entry; ctx.r[13]=sp; ctx.fpcr=0; ctx.fpsr=0;
         self.thread_context = ThreadContext::default();
         self.thread_context.r[0] = arg;
-        self.thread_context.r[13] = stack_top;
         self.thread_context.r[15] = entry_point;
-        self.thread_context.sp = stack_top;
-        self.thread_context.pc = entry_point;
+        self.thread_context.r[13] = stack_top;
         self.thread_context.fpcr = 0;
         self.thread_context.fpsr = 0;
     }
@@ -1343,7 +1342,9 @@ impl KThread {
         } else {
             self.reset_thread_context32(stack_top, entry_point, 0);
         }
-        self.thread_context.tpidr = tls_address;
+        // Upstream does NOT set thread_context.tpidr here.
+        // The TLS address is stored in m_tls_address and passed to the JIT
+        // via SetTpidrroEl0 (CP15 URO) during LoadContext, not via ctx.tpidr (UPRW).
     }
 
     pub fn initialize_user_thread(
@@ -1443,7 +1444,8 @@ impl KThread {
         } else {
             self.reset_thread_context32(stack_top, entry_point, arg);
         }
-        self.thread_context.tpidr = tls_address.get();
+        // Upstream does NOT set thread_context.tpidr here.
+        // The TLS address is passed via SetTpidrroEl0 (CP15 URO) during LoadContext.
 
         RESULT_SUCCESS.get_inner_value()
     }

@@ -27,8 +27,10 @@ use super::k_readable_event::KReadableEvent;
 use super::k_priority_queue::{KPriorityQueueMember, ThreadAccessor};
 use super::k_scheduler::KScheduler;
 use super::k_session::KSession;
+use super::k_memory_manager;
 use super::k_synchronization_object;
 use super::k_synchronization_object::SynchronizationObjectState;
+use super::k_system_resource::KSecureSystemResource;
 use super::k_thread::KThread;
 use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAGE_SIZE};
 use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
@@ -37,6 +39,7 @@ use super::svc_common::Handle;
 use super::svc_types::{CreateProcessFlag, ADDRESS_SPACE_MASK};
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::file_sys::program_metadata::{PoolPartition, ProgramAddressSpaceType, ProgramMetadata};
+use crate::hle::kernel::svc::svc_results;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::RESULT_SUCCESS;
 
@@ -407,7 +410,9 @@ pub struct KProcess {
     /// Resource limit for this process.
     /// Matches upstream `KResourceLimit* m_resource_limit`.
     pub resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
-    // m_system_resource — stubbed
+    /// System resource (slab managers for page table/memory blocks).
+    /// Upstream: `KSystemResource* m_system_resource`.
+    pub system_resource: Option<Arc<Mutex<KSecureSystemResource>>>,
     pub memory_release_hint: usize,
     pub state: ProcessState,
     // m_state_lock — KLightLock
@@ -426,7 +431,9 @@ pub struct KProcess {
     pub name: [u8; 13],
     pub num_running_threads: AtomicU16,
     pub flags: u32, // Svc::CreateProcessFlag
-    // m_memory_pool — KMemoryManager::Pool
+    /// Memory pool for this process.
+    /// Upstream: `KMemoryManager::Pool m_memory_pool`.
+    pub memory_pool: k_memory_manager::Pool,
     pub schedule_count: i64,
     pub capabilities: KCapabilities,
     pub program_id: u64,
@@ -520,6 +527,7 @@ impl KProcess {
             next_thread_local_page_address: 0,
             ideal_core_id: 0,
             resource_limit: None,
+            system_resource: None,
             memory_release_hint: 0,
             state: ProcessState::default(),
             cond_var: KConditionVariable::new(),
@@ -550,6 +558,7 @@ impl KProcess {
             name: [0u8; 13],
             num_running_threads: AtomicU16::new(0),
             flags: 0,
+            memory_pool: k_memory_manager::Pool::Application,
             schedule_count: 0,
             capabilities: KCapabilities::new(),
             program_id: 0,
@@ -724,6 +733,11 @@ impl KProcess {
 
     pub fn get_process_local_region_address(&self) -> KProcessAddress {
         self.plr_address
+    }
+
+    /// Upstream: `KMemoryManager::Pool GetMemoryPool() const`.
+    pub fn get_memory_pool(&self) -> k_memory_manager::Pool {
+        self.memory_pool
     }
 
     pub fn add_cpu_time(&self, diff: i64) {
@@ -1028,6 +1042,152 @@ impl KProcess {
         self.pinned_threads[core_id as usize] = None;
     }
 
+    /// Initialize for a user process.
+    /// Port of upstream `KProcess::Initialize(params, user_caps, res_limit, pool, aslr_space_start)`
+    /// (the 5-arg overload at k_process.cpp:353-454).
+    ///
+    /// Sets up the page table, maps the code region, initializes capabilities,
+    /// assigns a process ID, and calls the 3-arg `initialize()` for PLR/state setup.
+    pub fn initialize_for_user(
+        &mut self,
+        name: &[u8],
+        flags: u32,
+        program_id: u64,
+        code_address: u64,
+        code_num_pages: u64,
+        version: u32,
+        system_resource_num_pages: u64,
+        user_caps: &[u32],
+        resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+        pool: k_memory_manager::Pool,
+        aslr_space_start: u64,
+    ) -> u32 {
+        use super::k_scoped_resource_reservation::KScopedResourceReservation;
+
+        // Set members (upstream lines 358-361).
+        self.memory_pool = pool;
+        self.is_default_application_system_resource = false;
+        self.is_immortal = false;
+
+        // Get the memory sizes (upstream lines 363-367).
+        let code_size = (code_num_pages as usize) * PAGE_SIZE;
+        let _system_resource_size = (system_resource_num_pages as usize) * PAGE_SIZE;
+
+        // Reserve memory for our code resource (upstream lines 369-372).
+        let mut memory_reservation = KScopedResourceReservation::new(
+            resource_limit.clone(),
+            LimitableResource::PhysicalMemoryMax,
+            code_size as i64,
+        );
+        if !memory_reservation.succeeded() {
+            return svc_results::RESULT_LIMIT_REACHED.get_inner_value();
+        }
+
+        // System resource setup (upstream lines 374-400).
+        // Upstream creates a KSecureSystemResource for system_resource_num_pages != 0,
+        // or uses the kernel's global system resource. We store None for now —
+        // secure system resource initialization depends on KSystemControl and physical
+        // memory allocation that is not yet ported. The slab managers it provides are
+        // needed for advanced page table operations (MapPageGroup, etc.), not for the
+        // basic MapPages/SetHeapSize path.
+        if system_resource_num_pages != 0 {
+            log::warn!(
+                "initialize_for_user: system_resource_num_pages={} — \
+                 KSecureSystemResource::Initialize not yet ported, skipping",
+                system_resource_num_pages
+            );
+            // TODO: Create and initialize KSecureSystemResource
+        } else {
+            let is_app = (flags & CreateProcessFlag::IS_APPLICATION.bits()) != 0;
+            self.is_default_application_system_resource = is_app;
+            // TODO: reference kernel's global system resource
+        }
+
+        // Setup page table (upstream lines 408-417).
+        {
+            let as_type = flags & ADDRESS_SPACE_MASK;
+            let enable_aslr = (flags & CreateProcessFlag::ENABLE_ASLR.bits()) != 0;
+            let enable_das_merge =
+                (flags & CreateProcessFlag::DISABLE_DEVICE_ADDRESS_SPACE_MERGE.bits()) == 0;
+            let result = self.page_table.initialize_for_process(
+                as_type,
+                enable_aslr,
+                enable_das_merge,
+                !enable_aslr, // from_back
+                pool as u32,
+                code_address as usize,
+                code_size,
+                resource_limit.clone(),
+                None, // memory — TODO: wire Core::Memory::Memory
+                aslr_space_start as usize,
+            );
+            if result != RESULT_SUCCESS.get_inner_value() {
+                return result;
+            }
+        }
+
+        // Ensure we can insert the code region (upstream lines 426-428).
+        if !self.page_table.can_contain(
+            KProcessAddress::new(code_address),
+            code_size,
+            KMemoryState::CODE,
+        ) {
+            self.page_table.finalize();
+            return svc_results::RESULT_INVALID_MEMORY_REGION.get_inner_value();
+        }
+
+        // Map the code region (upstream lines 430-432).
+        let map_result = self.page_table.map_pages_at_address(
+            KProcessAddress::new(code_address),
+            code_num_pages as usize,
+            KMemoryState::CODE,
+            KMemoryPermission::KERNEL_READ | KMemoryPermission::NOT_MAPPED,
+        );
+        if map_result != RESULT_SUCCESS.get_inner_value() {
+            self.page_table.finalize();
+            return map_result;
+        }
+
+        // Initialize capabilities (upstream line 434-435).
+        let mut caps = std::mem::take(&mut self.capabilities);
+        let caps_result = caps.initialize_for_user(
+            user_caps,
+            Some(&mut self.page_table),
+        );
+        self.capabilities = caps;
+        if caps_result != RESULT_SUCCESS.get_inner_value() {
+            self.page_table.finalize();
+            return caps_result;
+        }
+
+        // Initialize the process ID (upstream lines 437-440).
+        // Upstream: m_process_id = m_kernel.CreateNewUserProcessID();
+        // We don't have a kernel reference here, so process_id must be set by the caller
+        // or passed in. For now, use the already-assigned process_id (set by System::load).
+        // TODO: wire kernel reference for proper ID generation.
+
+        // Call the 3-arg Initialize for PLR and state setup (upstream line 449).
+        let init_result = self.initialize(
+            name,
+            flags,
+            program_id,
+            code_address,
+            code_num_pages,
+            version,
+            resource_limit,
+            true, // is_real
+        );
+        if init_result != RESULT_SUCCESS.get_inner_value() {
+            self.page_table.finalize();
+            return init_result;
+        }
+
+        // Commit the code memory reservation (upstream line 452).
+        memory_reservation.commit();
+
+        RESULT_SUCCESS.get_inner_value()
+    }
+
     /// Initialize the process base fields.
     /// Matches upstream `KProcess::Initialize(params, res_limit, is_real)`.
     ///
@@ -1131,31 +1291,54 @@ impl KProcess {
         RESULT_SUCCESS.get_inner_value()
     }
 
-    /// Port of the metadata-owned subset of upstream `KProcess::LoadFromMetadata`.
+    /// Port of upstream `KProcess::LoadFromMetadata` (k_process.cpp:1153-1235).
     ///
-    /// This Rust port currently wires the process fields needed by the runtime
-    /// bootstrap path: process flags, code address, code size, title id, main
-    /// thread properties, and process name/affinity ownership. Full address
-    /// space and resource-limit setup is still pending with page table parity.
+    /// Creates a resource limit, builds process flags from metadata,
+    /// calls the 5-arg `initialize_for_user()`, and sets remaining properties.
     pub fn load_from_metadata(
         &mut self,
         metadata: &ProgramMetadata,
         code_size: u64,
+        aslr_space_start: u64,
+        is_hbl: bool,
     ) -> u32 {
-        let mut flags = CreateProcessFlag::empty();
-        let mut code_address = 0u64;
+        // Create a resource limit for the process (upstream lines 1156-1159).
+        let pool = match metadata.get_pool_partition() {
+            PoolPartition::Application => k_memory_manager::Pool::Application,
+            PoolPartition::Applet => k_memory_manager::Pool::Applet,
+            PoolPartition::System => k_memory_manager::Pool::System,
+            PoolPartition::SystemNonSecure => k_memory_manager::Pool::SystemNonSecure,
+        };
 
-        if matches!(metadata.get_pool_partition(), PoolPartition::Application) {
+        // Upstream: const auto physical_memory_size = m_kernel.MemoryManager().GetSize(pool);
+        // We don't have a kernel reference yet, so use a default physical memory size
+        // (4 GiB for Application pool, matching typical Switch memory layout).
+        // TODO: wire kernel.MemoryManager().GetSize(pool) when kernel reference is available.
+        let physical_memory_size: i64 = match pool {
+            k_memory_manager::Pool::Application => 0xCD500000, // ~3.2 GiB (Switch Application pool)
+            k_memory_manager::Pool::Applet => 0x1FB00000,       // ~507 MiB
+            _ => 0x2C600000,                                     // ~710 MiB (System)
+        };
+
+        let res_limit = Arc::new(Mutex::new(
+            super::k_resource_limit::create_resource_limit_for_process(physical_memory_size),
+        ));
+
+        // Declare flags and code address (upstream lines 1167-1168).
+        let mut flags = CreateProcessFlag::empty();
+        let mut code_address: u64 = 0;
+
+        // Determine if we are an application (upstream lines 1170-1174).
+        if pool == k_memory_manager::Pool::Application {
             flags |= CreateProcessFlag::IS_APPLICATION;
-            self.is_application = true;
-        } else {
-            self.is_application = false;
         }
 
+        // If we are 64-bit, create as such (upstream lines 1177-1179).
         if metadata.is_64_bit_program() {
             flags |= CreateProcessFlag::IS_64_BIT;
         }
 
+        // Set the address space type and code address (upstream lines 1182-1204).
         match metadata.get_address_space_type() {
             ProgramAddressSpaceType::Is39Bit => {
                 flags |= CreateProcessFlag::ADDRESS_SPACE_64_BIT;
@@ -1175,42 +1358,37 @@ impl KProcess {
             }
         }
 
-        flags |= match metadata.get_pool_partition() {
-            PoolPartition::Application => CreateProcessFlag::POOL_PARTITION_APPLICATION,
-            PoolPartition::Applet => CreateProcessFlag::POOL_PARTITION_APPLET,
-            PoolPartition::System => CreateProcessFlag::POOL_PARTITION_SYSTEM,
-            PoolPartition::SystemNonSecure => {
-                CreateProcessFlag::POOL_PARTITION_SYSTEM_NON_SECURE
-            }
-        };
+        // Build parameters (upstream lines 1206-1215).
+        let code_num_pages = code_size / PAGE_SIZE as u64;
+        let system_resource_num_pages = metadata.get_system_resource_size() as u64 / PAGE_SIZE as u64;
 
-        self.flags = flags.bits();
-        self.program_id = metadata.get_title_id();
-        self.code_address = KProcessAddress::new(code_address);
-        self.code_size = code_size as usize;
-        self.main_thread_stack_size = metadata.get_main_thread_stack_size() as usize;
-        self.ideal_core_id = metadata.get_main_thread_core() as i32;
-        self.is_hbl = false;
-
-        self.name = [0; 13];
-        let name = metadata.get_name();
-        let name_len = name
-            .iter()
-            .position(|&byte| byte == 0)
-            .unwrap_or(name.len())
-            .min(self.name.len() - 1);
-        self.name[..name_len].copy_from_slice(&name[..name_len]);
-
-        // Extract capabilities to avoid double borrow (capabilities needs &mut page_table).
-        let mut caps = std::mem::take(&mut self.capabilities);
-        let caps_result = caps.initialize_for_user(
+        // Initialize for application process (upstream line 1222-1224).
+        // Calls the 5-arg Initialize which sets up page table, maps code,
+        // initializes capabilities, assigns process ID, and calls the 3-arg
+        // Initialize for PLR/state.
+        let result = self.initialize_for_user(
+            metadata.get_name(),
+            flags.bits(),
+            metadata.get_title_id(),
+            code_address + aslr_space_start,
+            code_num_pages,
+            0, // version
+            system_resource_num_pages,
             metadata.get_kernel_capabilities(),
-            Some(&mut self.page_table),
+            Some(res_limit),
+            pool,
+            aslr_space_start,
         );
-        self.capabilities = caps;
-        if caps_result != RESULT_SUCCESS.get_inner_value() {
-            return caps_result;
+        if result != RESULT_SUCCESS.get_inner_value() {
+            return result;
         }
+
+        // Assign remaining properties (upstream lines 1227-1228).
+        self.is_hbl = is_hbl;
+        self.ideal_core_id = metadata.get_main_thread_core() as i32;
+
+        // TODO: Upstream calls this->InitializeInterfaces() here (line 1231)
+        // which creates ArmDynarmic32/64 per core. Currently done in main.rs.
 
         RESULT_SUCCESS.get_inner_value()
     }
@@ -1456,11 +1634,6 @@ impl KProcess {
             return Err(handle_result);
         }
 
-        let tls_page_base = self.next_thread_local_page_address;
-        if tls_page_base == 0 {
-            return Err(RESULT_INVALID_STATE.get_inner_value());
-        }
-
         let self_weak = self
             .self_reference
             .clone()
@@ -1471,8 +1644,50 @@ impl KProcess {
         let tls_address = self
             .create_thread_local_region()
             .ok_or_else(|| RESULT_INVALID_STATE.get_inner_value())?;
-        let (stack_base, stack_top) =
-            self.initialize_main_thread_stack_region(tls_page_base + THREAD_LOCAL_PAGE_SIZE as u64, stack_size);
+
+        // Allocate stack.
+        // Upstream: m_page_table.MapPages(&stack_bottom, stack_size/PageSize,
+        //                                 KMemoryState::Stack, KMemoryPermission::UserReadWrite)
+        // stack_top = stack_bottom + stack_size
+        //
+        // Upstream uses the page table's find-free MapPages which searches the
+        // stack region for a free range. The stack region in a 32-bit address
+        // space overlaps with the code region, and the page table tracks which
+        // pages are free vs mapped.
+        //
+        // For now, place the stack after the TLS page that contains the thread's
+        // TLR, matching the layout produced by the previous ad-hoc allocation.
+        // This is safe because the TLS page is the last page before the heap.
+        let tls_page = tls_address.get() & !(PAGE_SIZE as u64 - 1);
+        let stack_base = tls_page + THREAD_LOCAL_PAGE_SIZE as u64;
+        let stack_top = stack_base + stack_size as u64;
+        self.main_thread_stack_size = stack_size;
+
+        // Track the stack in the page table's memory block manager.
+        let stack_num_pages = stack_size / PAGE_SIZE;
+        let map_result = self.page_table.map_pages_at_address(
+            KProcessAddress::new(stack_base),
+            stack_num_pages,
+            KMemoryState::STACK,
+            KMemoryPermission::USER_READ_WRITE,
+        );
+        if map_result != RESULT_SUCCESS.get_inner_value() {
+            log::warn!("run: stack MapPages failed ({:#x}), continuing with ad-hoc allocation", map_result);
+        }
+
+        // Ensure the stack memory is backed in ProcessMemoryData.
+        {
+            let mut mem = self.process_memory.write().unwrap();
+            let needed = (stack_top - mem.base) as usize;
+            if needed > mem.data.len() {
+                mem.data.resize(needed, 0);
+            }
+        }
+
+        // Upstream: m_page_table.SetMaxHeapSize(m_max_process_memory -
+        //           (m_main_thread_stack_size + m_code_size))
+        let max_heap = self.max_process_memory.saturating_sub(self.main_thread_stack_size + self.code_size);
+        self.page_table.set_max_heap_size(max_heap);
 
         let main_thread = Arc::new(Mutex::new(KThread::new()));
         {

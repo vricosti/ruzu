@@ -3,6 +3,9 @@ name = "core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+debug-logs = []
+
 [dependencies]
 common = { path = "../common" }
 aes.workspace = true

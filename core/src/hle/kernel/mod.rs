@@ -125,3 +125,5 @@ pub mod k_transfer_memory;
 pub mod kernel;
 pub mod message_buffer;
 pub mod physical_core;
+#[cfg(feature = "debug-logs")]
+pub mod physical_core_log;
