@@ -123,6 +123,47 @@ pub struct StaticServiceSetupInfo {
 }
 const _: () = assert!(core::mem::size_of::<StaticServiceSetupInfo>() == 0x6);
 
+/// OperationEvent wraps a kernel event for context change notifications.
+///
+/// Corresponds to `OperationEvent` in upstream common.h.
+/// In upstream, this is an intrusive list node (IntrusiveListBaseNode<OperationEvent>)
+/// that holds a KEvent. ContextWriters maintain a list of these and signal all
+/// of them when a context changes.
+///
+/// Here we use an ID-based approach: each OperationEvent gets a unique ID so it
+/// can be tracked in the ContextWriter's list and removed if needed.
+pub struct OperationEvent {
+    id: u64,
+    // TODO: Kernel::KEvent* m_event — will be wired once kernel event
+    // infrastructure is available.
+}
+
+static NEXT_OPERATION_EVENT_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+impl OperationEvent {
+    /// Create a new OperationEvent.
+    ///
+    /// Corresponds to `OperationEvent::OperationEvent(Core::System&)` in upstream.
+    pub fn new() -> Self {
+        let id = NEXT_OPERATION_EVENT_ID
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { id }
+    }
+
+    /// Get this event's unique ID (for list tracking).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Signal this event's underlying kernel event.
+    ///
+    /// Corresponds to `m_event->Signal()` in upstream.
+    pub fn signal(&self) {
+        // TODO: m_event->Signal() once KEvent is wired
+    }
+}
+
 /// Get the span between two time points in seconds.
 pub fn get_span_between_time_points(
     a: &SteadyClockTimePoint,
