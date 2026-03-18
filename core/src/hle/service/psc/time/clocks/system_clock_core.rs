@@ -5,24 +5,31 @@
 //!
 //! SystemClockCore: base system clock that combines a steady clock with a context.
 
+use std::sync::{Arc, Mutex};
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::psc::time::common::{SteadyClockTimePoint, SystemClockContext};
+use crate::hle::service::psc::time::common::{
+    OperationEvent, SteadyClockTimePoint, SystemClockContext,
+};
 use crate::hle::service::psc::time::errors::RESULT_CLOCK_MISMATCH;
+
+use super::context_writers::ContextWriter;
 
 /// SystemClockCore holds a SystemClockContext and references a SteadyClockCore.
 ///
-/// In upstream C++, this holds a reference to SteadyClockCore and a pointer to
-/// ContextWriter. Here we store the context directly and use callbacks for the
-/// steady clock and context writer operations.
+/// In upstream C++, this holds a reference to SteadyClockCore and a raw pointer
+/// to ContextWriter. Here we use a callback for the steady clock time point and
+/// an `Arc<Mutex<dyn ContextWriter>>` for the writer — matching the upstream
+/// shared-reference pattern where both SystemClockCore and TimeManager can
+/// access the same writer.
 pub struct SystemClockCore {
     initialized: bool,
     context: SystemClockContext,
     /// Callback to get current time point from the steady clock.
     get_time_point: Box<dyn Fn() -> Result<SteadyClockTimePoint, ResultCode> + Send + Sync>,
-    /// Optional callback to write context (replaces ContextWriter pointer).
-    context_writer: Option<Box<dyn Fn(&SystemClockContext) -> ResultCode + Send + Sync>>,
-    /// Optional callback to signal operation events through context writer.
-    signal_fn: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Shared reference to the context writer.
+    /// Corresponds to `ContextWriter* m_context_writer` in upstream.
+    context_writer: Option<Arc<Mutex<dyn ContextWriter>>>,
 }
 
 impl SystemClockCore {
@@ -34,7 +41,6 @@ impl SystemClockCore {
             context: SystemClockContext::default(),
             get_time_point,
             context_writer: None,
-            signal_fn: None,
         }
     }
 
@@ -46,13 +52,12 @@ impl SystemClockCore {
         self.initialized = true;
     }
 
-    pub fn set_context_writer(
-        &mut self,
-        writer: Box<dyn Fn(&SystemClockContext) -> ResultCode + Send + Sync>,
-        signal: Box<dyn Fn() + Send + Sync>,
-    ) {
+    /// Set the context writer for this clock.
+    ///
+    /// Corresponds to upstream `m_context_writer = writer;` in the
+    /// ServiceManager setup code.
+    pub fn set_context_writer(&mut self, writer: Arc<Mutex<dyn ContextWriter>>) {
         self.context_writer = Some(writer);
-        self.signal_fn = Some(signal);
     }
 
     /// Check if the current steady clock source matches the context's steady time point.
@@ -70,7 +75,7 @@ impl SystemClockCore {
 
     /// Get the current time in seconds.
     pub fn get_current_time(&self) -> Result<i64, ResultCode> {
-        let time_point = (self.get_time_point)().map_err(|e| e)?;
+        let time_point = (self.get_time_point)()?;
         let context = self.get_context()?;
 
         if !context.steady_time_point.id_matches(&time_point) {
@@ -107,6 +112,9 @@ impl SystemClockCore {
         RESULT_SUCCESS
     }
 
+    /// Set the context and write through the context writer.
+    ///
+    /// Corresponds to `SystemClockCore::SetContextAndWrite` in upstream.
     pub fn set_context_and_write(&mut self, context: &SystemClockContext) -> ResultCode {
         let rc = self.set_context(context);
         if rc != RESULT_SUCCESS {
@@ -114,12 +122,22 @@ impl SystemClockCore {
         }
 
         if let Some(ref writer) = self.context_writer {
-            let rc = writer(context);
+            let rc = writer.lock().unwrap().write(context);
             if rc != RESULT_SUCCESS {
                 return rc;
             }
         }
 
         RESULT_SUCCESS
+    }
+
+    /// Link an operation event to this clock's context writer.
+    ///
+    /// Corresponds to `SystemClockCore::LinkOperationEvent` in upstream.
+    /// The operation event will be signaled whenever the context changes.
+    pub fn link_operation_event(&mut self, operation_event: OperationEvent) {
+        if let Some(ref writer) = self.context_writer {
+            writer.lock().unwrap().link(operation_event);
+        }
     }
 }

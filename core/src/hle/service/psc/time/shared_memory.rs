@@ -2,8 +2,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of zuyu/src/core/hle/service/psc/time/shared_memory.h/.cpp
+//!
+//! SharedMemory: manages lock-free atomic access to time-related data
+//! in a shared memory region accessible by both the kernel and userspace.
 
-use super::common::{ContinuousAdjustmentTimePoint, SteadyClockTimePoint, SystemClockContext};
+use std::sync::atomic::{fence, Ordering};
+
+use super::common::{
+    ClockSourceId, ContinuousAdjustmentTimePoint, SteadyClockTimePoint, SystemClockContext,
+};
+
+// =========================================================================
+// Lock-free atomic types (matching upstream LockFreeAtomicType<T>)
+// =========================================================================
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -21,19 +32,282 @@ pub struct LockFreeAtomicSystemClockContext {
     pub value: [SystemClockContext; 2],
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct LockFreeAtomicBool {
+    pub counter: u32,
+    pub value: [bool; 2],
+    pub _pad: [u8; 2],
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct LockFreeAtomicContinuousAdjustment {
+    pub counter: u32,
+    pub _padding: u32,
+    pub value: [ContinuousAdjustmentTimePoint; 2],
+}
+
+/// SharedMemoryStruct layout matching upstream.
+///
+/// This is the raw struct mapped into the kernel shared memory region.
+/// Guest code reads from this via lock-free atomic reads.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct SharedMemoryStruct {
-    pub steady_time_points: LockFreeAtomicSteadyClockTimePoint,
-    pub local_system_clock_contexts: LockFreeAtomicSystemClockContext,
-    pub network_system_clock_contexts: LockFreeAtomicSystemClockContext,
-    pub automatic_corrections_counter: u32,
-    pub _pad_ac: u32,
-    pub automatic_corrections: [bool; 2],
-    pub _pad_ac2: [u8; 6],
-    pub continuous_adjustment_counter: u32,
-    pub _pad_ca: u32,
-    pub continuous_adjustment_time_points: [ContinuousAdjustmentTimePoint; 2],
-    pub _pad0150: [u8; 0xEB0],
+    pub steady_time_points: LockFreeAtomicSteadyClockTimePoint,         // 0x000
+    pub local_system_clock_contexts: LockFreeAtomicSystemClockContext,   // 0x038
+    pub network_system_clock_contexts: LockFreeAtomicSystemClockContext, // 0x080
+    pub automatic_corrections: LockFreeAtomicBool,                      // 0x0C8
+    pub continuous_adjustment_time_points: LockFreeAtomicContinuousAdjustment, // 0x0D0
+    pub _pad0148: [u8; 0xEB8],                                         // 0x148 (pad to 0x1000)
 }
+
+// Upstream offset assertions
+const _: () = assert!(core::mem::offset_of!(SharedMemoryStruct, steady_time_points) == 0x0);
+const _: () =
+    assert!(core::mem::offset_of!(SharedMemoryStruct, local_system_clock_contexts) == 0x38);
+const _: () =
+    assert!(core::mem::offset_of!(SharedMemoryStruct, network_system_clock_contexts) == 0x80);
+const _: () = assert!(core::mem::offset_of!(SharedMemoryStruct, automatic_corrections) == 0xC8);
+const _: () =
+    assert!(core::mem::offset_of!(SharedMemoryStruct, continuous_adjustment_time_points) == 0xD0);
 const _: () = assert!(core::mem::size_of::<SharedMemoryStruct>() == 0x1000);
+
+// =========================================================================
+// Lock-free read/write helpers
+// =========================================================================
+
+/// Read a value from a lock-free atomic double-buffered slot.
+///
+/// Corresponds to `ReadFromLockFreeAtomicType` in upstream shared_memory.cpp.
+fn read_lock_free<T: Copy>(counter: &u32, values: &[T; 2]) -> T {
+    loop {
+        let c = *counter;
+        let value = values[(c % 2) as usize];
+        fence(Ordering::Acquire);
+        if c == *counter {
+            return value;
+        }
+    }
+}
+
+/// Write a value to a lock-free atomic double-buffered slot.
+///
+/// Corresponds to `WriteToLockFreeAtomicType` in upstream shared_memory.cpp.
+fn write_lock_free<T: Copy>(counter: &mut u32, values: &mut [T; 2], value: T) {
+    let c = counter.wrapping_add(1);
+    values[(c % 2) as usize] = value;
+    fence(Ordering::Release);
+    *counter = c;
+}
+
+// =========================================================================
+// SharedMemory service class
+// =========================================================================
+
+/// SharedMemory manages a SharedMemoryStruct region and provides setter
+/// methods matching the upstream `SharedMemory` class.
+///
+/// In upstream, this wraps a kernel `KSharedMemory` and writes directly to
+/// the mapped pointer. Here we own a boxed `SharedMemoryStruct` and will
+/// wire it to the kernel shared memory once KSharedMemory is available.
+pub struct SharedMemory {
+    shared_memory: Box<SharedMemoryStruct>,
+    // TODO: Kernel::KSharedMemory reference once kernel is wired
+}
+
+impl SharedMemory {
+    /// Create a new SharedMemory with zeroed data.
+    ///
+    /// Corresponds to `SharedMemory::SharedMemory(Core::System&)` in upstream.
+    pub fn new() -> Self {
+        // Upstream: std::memset(m_shared_memory_ptr, 0, sizeof(*m_shared_memory_ptr))
+        Self {
+            shared_memory: Box::new(unsafe { core::mem::zeroed() }),
+        }
+    }
+
+    /// Get a pointer to the raw shared memory struct for external mapping.
+    pub fn get_shared_memory_ptr(&self) -> *const SharedMemoryStruct {
+        &*self.shared_memory as *const SharedMemoryStruct
+    }
+
+    /// Get a mutable pointer to the raw shared memory struct.
+    pub fn get_shared_memory_ptr_mut(&mut self) -> *mut SharedMemoryStruct {
+        &mut *self.shared_memory as *mut SharedMemoryStruct
+    }
+
+    /// SetLocalSystemContext.
+    ///
+    /// Corresponds to `SharedMemory::SetLocalSystemContext` in upstream.
+    pub fn set_local_system_context(&mut self, context: &SystemClockContext) {
+        write_lock_free(
+            &mut self.shared_memory.local_system_clock_contexts.counter,
+            &mut self.shared_memory.local_system_clock_contexts.value,
+            *context,
+        );
+    }
+
+    /// SetNetworkSystemContext.
+    ///
+    /// Corresponds to `SharedMemory::SetNetworkSystemContext` in upstream.
+    pub fn set_network_system_context(&mut self, context: &SystemClockContext) {
+        write_lock_free(
+            &mut self.shared_memory.network_system_clock_contexts.counter,
+            &mut self.shared_memory.network_system_clock_contexts.value,
+            *context,
+        );
+    }
+
+    /// SetSteadyClockTimePoint.
+    ///
+    /// Corresponds to `SharedMemory::SetSteadyClockTimePoint` in upstream.
+    pub fn set_steady_clock_time_point(
+        &mut self,
+        clock_source_id: ClockSourceId,
+        time_point: i64,
+    ) {
+        write_lock_free(
+            &mut self.shared_memory.steady_time_points.counter,
+            &mut self.shared_memory.steady_time_points.value,
+            SteadyClockTimePoint {
+                time_point,
+                clock_source_id,
+            },
+        );
+    }
+
+    /// SetContinuousAdjustment.
+    ///
+    /// Corresponds to `SharedMemory::SetContinuousAdjustment` in upstream.
+    pub fn set_continuous_adjustment(&mut self, time_point: &ContinuousAdjustmentTimePoint) {
+        write_lock_free(
+            &mut self.shared_memory.continuous_adjustment_time_points.counter,
+            &mut self.shared_memory.continuous_adjustment_time_points.value,
+            *time_point,
+        );
+    }
+
+    /// SetAutomaticCorrection.
+    ///
+    /// Corresponds to `SharedMemory::SetAutomaticCorrection` in upstream.
+    pub fn set_automatic_correction(&mut self, automatic_correction: bool) {
+        write_lock_free(
+            &mut self.shared_memory.automatic_corrections.counter,
+            &mut self.shared_memory.automatic_corrections.value,
+            automatic_correction,
+        );
+    }
+
+    /// UpdateBaseTime.
+    ///
+    /// Corresponds to `SharedMemory::UpdateBaseTime` in upstream.
+    /// Reads the current steady clock time point, updates its time_point field,
+    /// and writes it back.
+    pub fn update_base_time(&mut self, time: i64) {
+        let mut time_point = read_lock_free(
+            &self.shared_memory.steady_time_points.counter,
+            &self.shared_memory.steady_time_points.value,
+        );
+        time_point.time_point = time;
+        write_lock_free(
+            &mut self.shared_memory.steady_time_points.counter,
+            &mut self.shared_memory.steady_time_points.value,
+            time_point,
+        );
+    }
+
+    // =====================================================================
+    // Read helpers (for testing / internal use)
+    // =====================================================================
+
+    /// Read the current local system clock context from shared memory.
+    pub fn get_local_system_context(&self) -> SystemClockContext {
+        read_lock_free(
+            &self.shared_memory.local_system_clock_contexts.counter,
+            &self.shared_memory.local_system_clock_contexts.value,
+        )
+    }
+
+    /// Read the current network system clock context from shared memory.
+    pub fn get_network_system_context(&self) -> SystemClockContext {
+        read_lock_free(
+            &self.shared_memory.network_system_clock_contexts.counter,
+            &self.shared_memory.network_system_clock_contexts.value,
+        )
+    }
+
+    /// Read the current steady clock time point from shared memory.
+    pub fn get_steady_clock_time_point(&self) -> SteadyClockTimePoint {
+        read_lock_free(
+            &self.shared_memory.steady_time_points.counter,
+            &self.shared_memory.steady_time_points.value,
+        )
+    }
+
+    /// Read the current automatic correction setting from shared memory.
+    pub fn get_automatic_correction(&self) -> bool {
+        read_lock_free(
+            &self.shared_memory.automatic_corrections.counter,
+            &self.shared_memory.automatic_corrections.value,
+        )
+    }
+
+    /// Read the current continuous adjustment time point from shared memory.
+    pub fn get_continuous_adjustment(&self) -> ContinuousAdjustmentTimePoint {
+        read_lock_free(
+            &self.shared_memory.continuous_adjustment_time_points.counter,
+            &self.shared_memory.continuous_adjustment_time_points.value,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_memory_struct_size() {
+        assert_eq!(core::mem::size_of::<SharedMemoryStruct>(), 0x1000);
+    }
+
+    #[test]
+    fn write_and_read_local_system_context() {
+        let mut sm = SharedMemory::new();
+        let ctx = SystemClockContext {
+            offset: 12345,
+            steady_time_point: SteadyClockTimePoint {
+                time_point: 67890,
+                clock_source_id: [1u8; 16],
+            },
+        };
+        sm.set_local_system_context(&ctx);
+        let read_ctx = sm.get_local_system_context();
+        assert_eq!(read_ctx.offset, 12345);
+        assert_eq!(read_ctx.steady_time_point.time_point, 67890);
+    }
+
+    #[test]
+    fn write_and_read_automatic_correction() {
+        let mut sm = SharedMemory::new();
+        assert!(!sm.get_automatic_correction());
+        sm.set_automatic_correction(true);
+        assert!(sm.get_automatic_correction());
+        sm.set_automatic_correction(false);
+        assert!(!sm.get_automatic_correction());
+    }
+
+    #[test]
+    fn update_base_time_preserves_clock_source_id() {
+        let mut sm = SharedMemory::new();
+        let source_id = [42u8; 16];
+        sm.set_steady_clock_time_point(source_id, 100);
+
+        sm.update_base_time(200);
+
+        let tp = sm.get_steady_clock_time_point();
+        assert_eq!(tp.time_point, 200);
+        assert_eq!(tp.clock_source_id, source_id);
+    }
+}
