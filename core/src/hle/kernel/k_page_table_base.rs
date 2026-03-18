@@ -19,6 +19,8 @@ use super::k_memory_block::*;
 use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_memory_layout::KERNEL_ASLR_ALIGNMENT;
 use super::k_memory_manager;
+use super::k_resource_limit::KResourceLimit;
+use super::svc_types::{ADDRESS_SPACE_MASK, CreateProcessFlag};
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::result::ResultCode;
 use crate::memory::memory::Memory;
@@ -143,6 +145,8 @@ pub struct KPageTableBase {
     pub(crate) m_heap_fill_value: MemoryFillValue,
     pub(crate) m_ipc_fill_value: MemoryFillValue,
     pub(crate) m_stack_fill_value: MemoryFillValue,
+    /// Upstream: `KResourceLimit* m_resource_limit`.
+    pub(crate) m_resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
 }
 
 impl KPageTableBase {
@@ -179,6 +183,7 @@ impl KPageTableBase {
             m_heap_fill_value: MemoryFillValue::Zero,
             m_ipc_fill_value: MemoryFillValue::Zero,
             m_stack_fill_value: MemoryFillValue::Zero,
+            m_resource_limit: None,
         }
     }
 
@@ -259,16 +264,19 @@ impl KPageTableBase {
     }
 
     /// Port of GetAddressSpaceWidth(Svc::CreateProcessFlag).
+    /// Upstream matches on the masked enum values directly:
+    ///   AddressSpace32Bit = 0<<1 = 0
+    ///   AddressSpace64BitDeprecated = 1<<1 = 2
+    ///   AddressSpace32BitWithoutAlias = 2<<1 = 4
+    ///   AddressSpace64Bit = 3<<1 = 6
     pub fn get_address_space_width_from_flags(flags: u32) -> usize {
-        // Mask bits [0:3] for address space type.
-        match flags & 0xF {
-            // AddressSpace64Bit
-            1 => 39,
-            // AddressSpace64BitDeprecated
-            2 => 36,
-            // AddressSpace32Bit, AddressSpace32BitWithoutAlias
-            0 | 3 => 32,
-            _ => panic!("Invalid address space flag"),
+        use super::svc_types::{ADDRESS_SPACE_MASK, CreateProcessFlag};
+        match flags & ADDRESS_SPACE_MASK {
+            x if x == CreateProcessFlag::ADDRESS_SPACE_64_BIT.bits() => 39,
+            x if x == CreateProcessFlag::ADDRESS_SPACE_64_BIT_DEPRECATED.bits() => 36,
+            x if x == CreateProcessFlag::ADDRESS_SPACE_32_BIT.bits() => 32,
+            x if x == CreateProcessFlag::ADDRESS_SPACE_32_BIT_WITHOUT_ALIAS.bits() => 32,
+            other => panic!("Invalid address space flag: flags={:#x}, masked={:#x}", flags, other),
         }
     }
 
@@ -564,6 +572,12 @@ impl KPageTableBase {
     ///
     /// Computes all memory region layouts based on address space width,
     /// code address/size, and ASLR randomization.
+    /// Upstream: `Result KPageTableBase::InitializeForProcess(
+    ///     Svc::CreateProcessFlag as_type, bool enable_aslr, bool enable_das_merge,
+    ///     bool from_back, KMemoryManager::Pool pool, KProcessAddress code_address,
+    ///     size_t code_size, KSystemResource* system_resource,
+    ///     KResourceLimit* resource_limit, Core::Memory::Memory& memory,
+    ///     KProcessAddress aslr_space_start)`
     pub fn initialize_for_process(
         &mut self,
         as_flags: u32,
@@ -573,8 +587,14 @@ impl KPageTableBase {
         pool: u32,
         code_address: usize,
         code_size: usize,
+        resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+        memory: Option<Arc<Mutex<Memory>>>,
         aslr_space_start: usize,
     ) -> u32 {
+        // Store resource limit and memory references.
+        // Upstream stores these for use in heap operations, mapping, etc.
+        self.m_resource_limit = resource_limit;
+        self.m_memory = memory;
         let as_width = Self::get_address_space_width_from_flags(as_flags) as u32;
         let start: usize = 0;
         let end: usize = 1usize << as_width;
@@ -597,9 +617,8 @@ impl KPageTableBase {
         let mut heap_region_size = get_space_size(AddressSpaceInfoType::Heap);
 
         // Adjust for 32-bit without alias.
-        let as_type = as_flags & 0xF;
-        if as_type == 3 {
-            // AddressSpace32BitWithoutAlias
+        // Upstream: AddressSpace32BitWithoutAlias = 2 << 1 = 4
+        if (as_flags & ADDRESS_SPACE_MASK) == CreateProcessFlag::ADDRESS_SPACE_32_BIT_WITHOUT_ALIAS.bits() {
             heap_region_size += alias_region_size;
             alias_region_size = 0;
         }

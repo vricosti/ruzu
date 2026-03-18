@@ -12,6 +12,8 @@ use crate::arm::arm_interface::{ArmInterface, HaltReason, KThread as OpaqueKThre
 use crate::hle::kernel::svc_dispatch::{self, SvcArgs, SvcContext};
 
 use super::{k_process::KProcess, k_scheduler::KScheduler, k_thread::KThread};
+#[cfg(feature = "debug-logs")]
+use super::physical_core_log;
 
 pub enum PhysicalCoreExecutionControl {
     Continue,
@@ -191,11 +193,12 @@ impl PhysicalCore {
     {
         let mut svc_count = 0u32;
         let mut iteration = 0u32;
-        let step_after_svc = std::env::var("RUZU_STEP_AFTER_SVC")
+        let mut step_after_svc = std::env::var("RUZU_STEP_AFTER_SVC")
             .ok()
             .and_then(|value| value.parse::<u32>().ok());
 
-        let mut post_svc_trace_count = 0u32;
+        #[cfg(feature = "debug-logs")]
+        let mut ring_buf = physical_core_log::InstructionRingBuffer::new();
         loop {
             let use_step = step_after_svc.is_some_and(|threshold| svc_count >= threshold);
             let event = if use_step {
@@ -205,31 +208,30 @@ impl PhysicalCore {
             };
             iteration += 1;
 
-            // Log first 200 steps with registers and instruction
-            if use_step && post_svc_trace_count < 200 {
-                post_svc_trace_count += 1;
+            if use_step {
                 jit.get_context(thread_context);
-                // Check TLS word 3 (handle offset)
-                let tls_word3 = if let Some(ref runtime) = *self.m_runtime.lock().unwrap() {
-                    let tls = runtime.m_current_thread.lock().unwrap().get_tls_address().get();
-                    process.lock().unwrap().process_memory.read().unwrap().read_32(tls + 12)
-                } else { 0 };
-                let insn = process.lock().unwrap().process_memory.read().unwrap().read_32(thread_context.pc);
-                log::info!(
-                    "[S#{}/i={}] PC={:#x} [{:#010x}] R0={:#x} R1={:#x} R2={:#x} R3={:#x} R4={:#x} R5={:#x} R6={:#x} R7={:#x}",
-                    post_svc_trace_count, iteration,
-                    thread_context.pc, insn,
-                    thread_context.r[0], thread_context.r[1],
-                    thread_context.r[2], thread_context.r[3],
-                    thread_context.r[4], thread_context.r[5],
-                    thread_context.r[6], thread_context.r[7],
-                );
+                #[cfg(feature = "debug-logs")]
+                {
+                    let insn = process.lock().unwrap().process_memory.read().unwrap().read_32(thread_context.pc);
+                    ring_buf.record(thread_context, insn);
+                    ring_buf.check_initlibc0_entry(thread_context);
+                    ring_buf.check_rtld_init_return(thread_context);
+                    if ring_buf.check_and_dump_abort(thread_context) {
+                        step_after_svc = None;
+                    }
+                }
             }
 
             match event {
                 PhysicalCoreExecutionEvent::SupervisorCall { svc_num, mut svc_args } => {
                     svc_count += 1;
                     jit.get_context(thread_context);
+
+                    // After SetHeapSize (SVC ~#89), dump module memory for comparison with zuyu
+                    #[cfg(feature = "debug-logs")]
+                    if svc_count == 90 {
+                        physical_core_log::dump_module_memory(process);
+                    }
 
                     match on_supervisor_call(
                         svc_num,

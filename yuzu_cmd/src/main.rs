@@ -23,9 +23,11 @@
 //! | `-v` / `--version`   | handled by clap          |
 
 use clap::Parser;
-use rdynarmic::frontend::a32::decoder::decode_arm;
+
 
 pub mod emu_window;
+#[cfg(feature = "debug-logs")]
+pub mod main_log;
 pub mod sdl_config;
 
 use emu_window::{
@@ -313,146 +315,13 @@ fn main() {
         );
 
         // Pre-execution: verify module data by reading .dynstr for sdk module.
-        // sdk is the main symbol exporter — if its dynstr is valid, decompression worked.
-        {
-            let mem = shared_memory.read().unwrap();
-            // Helper to read module .dynamic and dump first symbols.
-            let dump_module = |name: &str, base: u64| {
-                let mod0_ptr = mem.read_32(base + 4) as u64;
-                let mod0_addr = base + mod0_ptr;
-                let magic = mem.read_32(mod0_addr);
-                if magic != 0x30444F4D {
-                    log::warn!("{} @ {:#x}: bad MOD0 magic {:#x}", name, base, magic);
-                    return;
-                }
-                let dyn_off = mem.read_32(mod0_addr + 4) as i32;
-                let dyn_addr = (mod0_addr as i64 + dyn_off as i64) as u64;
-                let mut strtab = 0u64;
-                let mut symtab = 0u64;
-                let mut strsz = 0u64;
-                let mut dt_hash = 0u64;
-                let mut dt_gnu_hash = 0u64;
-                for i in 0..80u64 {
-                    let tag = mem.read_32(dyn_addr + i * 8);
-                    let val = mem.read_32(dyn_addr + i * 8 + 4);
-                    match tag {
-                        4 => dt_hash = val as u64,
-                        5 => strtab = val as u64,
-                        6 => symtab = val as u64,
-                        10 => strsz = val as u64,
-                        _ => {
-                            // DT_GNU_HASH = 0x6ffffef5
-                            if tag == 0x6ffffef5u32 { dt_gnu_hash = val as u64; }
-                        }
-                    }
-                    if tag == 0 { break; }
-                }
-                // DT_STRTAB/DT_SYMTAB are un-relocated — add base to read correct addresses.
-                let strtab_addr = base + strtab;
-                let symtab_addr = base + symtab;
-                log::info!("{} @ {:#x}: DT_STRTAB={:#x}(abs={:#x}) DT_SYMTAB={:#x}(abs={:#x}) STRSZ={:#x} DT_HASH={:#x} DT_GNU_HASH={:#x}",
-                    name, base, strtab, strtab_addr, symtab, symtab_addr, strsz, dt_hash, dt_gnu_hash);
-                // Dump first 5 symbols.
-                for si in 0..5u64 {
-                    let sa = symtab_addr + si * 16;
-                    if !mem.is_valid_range(sa, 16) { break; }
-                    let st_name = mem.read_32(sa);
-                    let st_value = mem.read_32(sa + 4);
-                    let st_info = mem.read_8(sa + 12);
-                    let na = strtab_addr + st_name as u64;
-                    let mut sn = String::new();
-                    if mem.is_valid_range(na, 1) {
-                        for j in 0..80u64 {
-                            let c = mem.read_8(na + j);
-                            if c == 0 { break; }
-                            sn.push(c as char);
-                        }
-                    }
-                    log::info!("  sym[{}]: st_name={:#x} val={:#x} info={:#x} '{}'", si, st_name, st_value, st_info, sn);
-                }
-                // Search for __nnDetailInitLibc0 in this module's strtab.
-                let target = b"__nnDetailInitLibc0";
-                let target_len = target.len() as u64;
-                if strsz > target_len && mem.is_valid_range(strtab_addr, strsz as usize) {
-                    let mut sym_found = false;
-                    for offset in 0..(strsz - target_len) {
-                        let mut m = true;
-                        for (k, &b) in target.iter().enumerate() {
-                            if mem.read_8(strtab_addr + offset + k as u64) != b {
-                                m = false;
-                                break;
-                            }
-                        }
-                        if m {
-                            // Check it's a real string boundary (preceded by NUL or at offset 0)
-                            let preceded_by_nul = offset == 0 ||
-                                mem.read_8(strtab_addr + offset - 1) == 0;
-                            if preceded_by_nul {
-                                log::info!("  FOUND '__nnDetailInitLibc0' at strtab+{:#x} (abs={:#x})",
-                                    offset, strtab_addr + offset);
-                                // Now find which symbol entry references this strtab offset
-                                // by scanning the symtab for st_name == offset
-                                let sym_entry_size = 16u64; // ELF32 Sym size
-                                let n_syms = (strtab_addr - symtab_addr) / sym_entry_size;
-                                for si in 0..n_syms {
-                                    let sa = symtab_addr + si * sym_entry_size;
-                                    if !mem.is_valid_range(sa, sym_entry_size as usize) { break; }
-                                    let st_name_val = mem.read_32(sa);
-                                    if st_name_val as u64 == offset {
-                                        let st_value = mem.read_32(sa + 4);
-                                        let st_size = mem.read_32(sa + 8);
-                                        let st_info = mem.read_8(sa + 12);
-                                        let st_other = mem.read_8(sa + 13);
-                                        let st_shndx = mem.read_16(sa + 14);
-                                        let bind = st_info >> 4;
-                                        let stype = st_info & 0xf;
-                                        log::info!("    sym[{}]: val={:#x} sz={:#x} bind={} type={} other={} shndx={}",
-                                            si, st_value, st_size, bind, stype, st_other, st_shndx);
-                                    }
-                                }
-                                sym_found = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !sym_found {
-                        log::info!("  '__nnDetailInitLibc0' NOT in strtab");
-                    }
-                }
-            };
-            dump_module("rtld", code_base);
-            dump_module("main", 0x206000);
-            dump_module("subsdk0", 0x1512000);
-            dump_module("subsdk1", 0x16AB000);
-            dump_module("subsdk2", 0x16D3000);
-            dump_module("subsdk3", 0x16E6000);
-            dump_module("subsdk4", 0x1723000);
-            dump_module("sdk", 0x1C9C000);
+        #[cfg(feature = "debug-logs")]
+        main_log::dump_all_modules(&shared_memory, code_base);
 
-            // Dump first 32 bytes of rtld's data segment (GOT is typically here).
-            // After self-relocation, GOT entries should contain base-adjusted addresses.
-            log::info!("rtld data segment (0x205000) PRE-execution:");
-            for i in 0..8u64 {
-                let addr = 0x205000 + i * 4;
-                let val = mem.read_32(addr);
-                log::info!("  [{:#010x}] = {:#010x}", addr, val);
-            }
-
-            if mem.is_valid_range(code_base, 0x6000) {
-                let _ = std::fs::write("/tmp/rtld.bin", mem.read_block(code_base, 0x6000));
-            }
-        }
-
-        // Configure process-owned TLS page allocation. The actual main-thread
-        // TLR is allocated during `KProcess::run()`.
+        // TLS page allocation and PLR are now set up by the loader
+        // (deconstructed_rom_directory.rs) calling load_from_metadata() ->
+        // initialize_for_user() -> initialize(), matching upstream flow.
         let tls_page_size: u64 = 0x1000;
-        let tls_page_base =
-            process.initialize_thread_local_region_allocation(code_base + code_size as u64);
-        log::info!(
-            "TLS page allocation base={:#x}, size={:#x}",
-            tls_page_base,
-            tls_page_size
-        );
 
         // Log tracked memory regions for debugging.
         {
@@ -575,12 +444,17 @@ fn main() {
 
         // Upstream: physical_core.cpp:158 — SetTpidrroEl0(GetInteger(thread->GetTlsAddress()))
         log::info!("TLS: set TPIDRURO/TPIDRRO_EL0 = {:#x}", tls_base);
+        jit.set_tpidrro_el0(tls_base);
 
         log::info!(
             "CPU: starting {} JIT, PC={:#x}, SP={:#x}",
             if is_64bit { "AArch64" } else { "AArch32" },
             code_base, stack_top
         );
+
+        // Dump __nnDetailInitLibc0 function code and TLS area.
+        #[cfg(feature = "debug-logs")]
+        main_log::dump_initlibc0_and_tls(&shared_memory, tls_base);
 
         // SVC dispatch loop.
         // Maps to upstream KProcess::Run() → PhysicalCore event loop.
@@ -619,8 +493,9 @@ fn main() {
                     ctx.pc, ctx.lr
                 );
 
-                // Dump full register state for SVCs near the crash point.
-                if svc_count >= 134 {
+                // Dump full register state for all SVCs to trace init sequence.
+                // Show args + LR for every SVC to trace the call chain.
+                if svc_count >= 85 {
                     log::warn!("  [SVC #{}] r0-r15: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
                         svc_count,
                         ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3],
@@ -629,219 +504,46 @@ fn main() {
                         ctx.r[12], ctx.sp, ctx.lr, ctx.pc);
                 }
 
-                // At SVC #136 (first abort SVC), dump stack backtrace.
-                if svc_count == 136 {
-                    let mem = shared_memory.read().unwrap();
-                    let sp = ctx.sp;
-                    log::error!("=== STACK BACKTRACE at SVC #136 (abort entry) ===");
-                    log::error!("  SP={:#x} LR={:#x}", sp, ctx.lr);
-                    for i in 0..16u64 {
-                        let addr = sp + i * 4;
-                        if mem.is_valid_range(addr, 4) {
-                            let val = mem.read_32(addr);
-                            // Check if it looks like a code address
-                            if val >= 0x200000 && val < 0x2400000 {
-                                log::error!("  [SP+{:#x}] = {:#010x} <- possible return address", i*4, val);
-                            } else {
-                                log::error!("  [SP+{:#x}] = {:#010x}", i*4, val);
-                            }
-                        }
-                    }
-
-                    // Also read the abort info struct at r4
-                    let abort_info = ctx.r[4];
-                    if abort_info > 0x200000 && mem.is_valid_range(abort_info, 32) {
-                        log::error!("=== ABORT INFO at r4={:#x} ===", abort_info);
-                        for j in 0..8u64 {
-                            log::error!("  [+{:#x}] = {:#010x}", j*4, mem.read_32(abort_info + j * 4));
-                        }
-                    }
-                }
-
-                // Debug: dump TLS when SendSyncRequest is called with handle=0
-                if svc_num == 0x21 && svc_args[0] == 0 {
-                    let mem = shared_memory.read().unwrap();
-                    log::error!(
-                        "  SendSyncRequest(0x0): TLS at {:#x} = [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                        tls_base,
-                        mem.read_32(tls_base), mem.read_32(tls_base + 4),
-                        mem.read_32(tls_base + 8), mem.read_32(tls_base + 12),
-                        mem.read_32(tls_base + 16), mem.read_32(tls_base + 20),
-                        mem.read_32(tls_base + 24), mem.read_32(tls_base + 28),
-                    );
-                    // Also dump registers
-                    log::error!(
-                        "  Registers: R0={:#x} R1={:#x} R2={:#x} R3={:#x} R4={:#x} R5={:#x} R6={:#x} R7={:#x}",
-                        ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3],
-                        ctx.r[4], ctx.r[5], ctx.r[6], ctx.r[7],
-                    );
-                }
-
-                // One-time dump when first ArbitrateLock is hit
-                static DUMPED_ARBITRATE: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if svc_num == 0x1A
-                    && !DUMPED_ARBITRATE.swap(true, std::sync::atomic::Ordering::Relaxed)
+                // Abort context dumps
+                #[cfg(feature = "debug-logs")]
                 {
-                    let mem = shared_memory.read().unwrap();
-                    let addr = svc_args[1] as u64;
-                    let handle = svc_args[0] as u32;
-                    let tag = svc_args[2] as u32;
-
-                    log::info!("=== FIRST ArbitrateLock DUMP ===");
-                    log::info!(
-                        "  handle={:#x}, addr={:#x}, tag={:#x}, addr%4={}",
-                        handle, addr, tag, addr % 4
-                    );
-                    if mem.is_valid_range(addr, 4) {
-                        let mutex_val = mem.read_32(addr);
-                        log::info!(
-                            "  mutex word @ {:#x} = {:#010x} (owner_handle={:#x}, has_waiters={})",
-                            addr,
-                            mutex_val,
-                            mutex_val & !0x40000000u32,
-                            mutex_val & 0x40000000 != 0
-                        );
-                    } else {
-                        log::info!("  mutex word @ {:#x} = <unmapped>", addr);
+                    // Detect abort handler entry: SetThreadPriority(0x0D) with
+                    // priority=44 (0x2c) is the abort handler thread setup.
+                    if svc_num == 0x0D && svc_args[1] == 0x2c {
+                        main_log::dump_abort_context(&shared_memory, ctx);
                     }
-
-                    // Dump guest code around the SVC call site (PC) and the caller (LR)
-                    for (label, base) in [("SVC site (PC)", ctx.pc as u64), ("Caller (LR)", ctx.lr as u64)] {
-                        log::info!("  {} = {:#x}:", label, base);
-                        let start = base.saturating_sub(0x20);
-                        for a in (start..=base.saturating_add(0x20)).step_by(4) {
-                            if !mem.is_valid_range(a, 4) {
-                                continue;
-                            }
-                            let insn = mem.read_32(a);
-                            let decoded = decode_arm(insn);
-                            let marker = if a == base { " <--" } else { "" };
-                            log::info!(
-                                "    [{:#010x}] {:#010x} {:?}{}",
-                                a, insn, decoded.id, marker
-                            );
-                        }
+                    // GetThreadId(0x25) right after SetThreadPriority is the
+                    // abort handler continuing.
+                    if svc_num == 0x25 && ctx.r[4] > 0x200000 {
+                        main_log::dump_abort_backtrace(&shared_memory, ctx);
                     }
-
-                    // Also dump a wider area around the mutex address
-                    log::info!("  Memory around mutex addr {:#x}:", addr);
-                    let mstart = addr.saturating_sub(0x10);
-                    for a in (mstart..addr.saturating_add(0x20)).step_by(4) {
-                        if mem.is_valid_range(a, 4) {
-                            log::info!("    [{:#010x}] = {:#010x}", a, mem.read_32(a));
-                        }
-                    }
-                    log::info!("=== END ArbitrateLock DUMP ===");
                 }
 
+                // ArbitrateLock debug
+                #[cfg(feature = "debug-logs")]
+                {
+                    static DUMPED_ARBITRATE: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if svc_num == 0x1A
+                        && !DUMPED_ARBITRATE.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        main_log::dump_arbitrate_lock(&shared_memory, ctx, svc_args);
+                    }
+                }
+
+                // Module object dump after rtld relocation
                 if svc_num == 0x06 {
                     query_memory_count += 1;
-                } else if query_memory_count >= 25 && !dumped_module_objects {
+                }
+                #[cfg(feature = "debug-logs")]
+                if query_memory_count >= 25 && !dumped_module_objects && svc_num != 0x06 {
                     dumped_module_objects = true;
-                    let mem = shared_memory.read().unwrap();
-                    let dump_module_object = |name: &str, base: u64| {
-                        if !mem.is_valid_range(base + 4, 4) {
-                            log::info!("{} @ {:#x}: module header unavailable", name, base);
-                            return;
-                        }
-
-                        let mod_offset = mem.read_32(base + 4) as u64;
-                        let mod_addr = base + mod_offset;
-                        if !mem.is_valid_range(mod_addr, 0x1c) {
-                            log::info!(
-                                "{} @ {:#x}: MOD0 out of range (offset={:#x})",
-                                name,
-                                base,
-                                mod_offset
-                            );
-                            return;
-                        }
-
-                        let magic = mem.read_32(mod_addr);
-                        let dynamic_offset = mem.read_32(mod_addr + 4) as u64;
-                        let bss_start_offset = mem.read_32(mod_addr + 8) as u64;
-                        let bss_end_offset = mem.read_32(mod_addr + 12) as u64;
-                        let module_offset = mem.read_32(mod_addr + 24) as u64;
-                        let module_object = base + module_offset;
-
-                        log::info!(
-                            "{} @ {:#x}: MOD0={:#x} mod={:#x} dyn={:#x} bss=[{:#x}..{:#x}) module_obj={:#x}",
-                            name,
-                            base,
-                            magic,
-                            mod_addr,
-                            mod_addr + dynamic_offset,
-                            base + bss_start_offset,
-                            base + bss_end_offset,
-                            module_object
-                        );
-
-                        if !mem.is_valid_range(module_object, 0x40) {
-                            log::info!(
-                                "  {} module object @ {:#x} is out of range",
-                                name,
-                                module_object
-                            );
-                            return;
-                        }
-
-                        for i in 0..16u64 {
-                            let addr = module_object + i * 4;
-                            let val = mem.read_32(addr);
-                            log::info!("  [{} + {:#04x}] = {:#010x}", name, i * 4, val);
-                        }
-                    };
-
-                    log::info!(
-                        "=== RTLD MODULE OBJECT DUMP after {} QueryMemory calls, first non-QM SVC=0x{:02X} ===",
-                        query_memory_count,
-                        svc_num
-                    );
-                    dump_module_object("rtld", 0x200000);
-                    dump_module_object("main", 0x206000);
-                    dump_module_object("subsdk0", 0x1512000);
-                    dump_module_object("subsdk1", 0x16AB000);
-                    dump_module_object("subsdk2", 0x16D3000);
-                    dump_module_object("subsdk3", 0x16E6000);
-                    dump_module_object("subsdk4", 0x1723000);
-                    dump_module_object("sdk", 0x1C9C000);
-                    log::info!("=== RTLD LIST REGION DUMP 0x2051d0..0x205240 ===");
-                    for addr in (0x2051d0u64..0x205240u64).step_by(4) {
-                        log::info!("  [{:#010x}] = {:#010x}", addr, mem.read_32(addr));
-                    }
+                    main_log::dump_module_objects(&shared_memory, query_memory_count, svc_num);
                 }
 
                     PhysicalCoreExecutionControl::Continue
                 },
                 |halt_reason: HaltReason, exception_address, ctx, svc_count, iteration| {
-                let dump_instruction_window = |label: &str, center: u64, mark_pc: Option<u64>| {
-                    let mem = shared_memory.read().unwrap();
-                    let start = center.saturating_sub(0x10);
-                    log::error!("{} around {:#x}", label, center);
-                    for addr in (start..=center.saturating_add(0x10)).step_by(4) {
-                        if !mem.is_valid_range(addr, 4) {
-                            log::error!("  [{:#010x}] <unmapped>", addr);
-                            continue;
-                        }
-                        let insn = mem.read_32(addr);
-                        let decoded = decode_arm(insn);
-                        let marker = if Some(addr) == mark_pc {
-                            " <PC>"
-                        } else if addr == center {
-                            " <EXC>"
-                        } else {
-                            ""
-                        };
-                        log::error!(
-                            "  [{:#010x}] {:#010x} {:?}{}",
-                            addr,
-                            insn,
-                            decoded.id,
-                            marker
-                        );
-                    }
-                };
                 if halt_reason.contains(HaltReason::STEP_THREAD) {
                     step_halt_count += 1;
                     if ctx.pc == last_step_pc {
@@ -851,73 +553,39 @@ fn main() {
                         repeated_step_pc_count = 1;
                         dumped_repeated_step_window = false;
                     }
-                    if step_halt_count == 1 {
-                        let mem = shared_memory.read().unwrap();
-                        let start = ctx.pc.saturating_sub(0x10);
-                        log::info!("First STEP halt instruction window around PC={:#x}", ctx.pc);
-                        for addr in (start..=ctx.pc.saturating_add(0x10)).step_by(4) {
-                            if !mem.is_valid_range(addr, 4) {
-                                log::info!("  [{:#010x}] <unmapped>", addr);
-                                continue;
-                            }
-                            let insn = mem.read_32(addr);
-                            let decoded = decode_arm(insn);
-                            let marker = if addr == ctx.pc { " <PC>" } else { "" };
-                            log::info!(
-                                "  [{:#010x}] {:#010x} {:?}{}",
-                                addr,
-                                insn,
-                                decoded.id,
-                                marker
-                            );
-                        }
-                    }
-                    if repeated_step_pc_count >= repeated_step_window_threshold
-                        && !dumped_repeated_step_window
+                    #[cfg(feature = "debug-logs")]
                     {
-                        dumped_repeated_step_window = true;
-                        let mem = shared_memory.read().unwrap();
-                        let start = ctx.pc.saturating_sub(0x10);
-                        log::info!(
-                            "Repeated STEP PC window after {} repeats at PC={:#x}",
-                            repeated_step_pc_count,
-                            ctx.pc
-                        );
-                        for addr in (start..=ctx.pc.saturating_add(0x10)).step_by(4) {
-                            if !mem.is_valid_range(addr, 4) {
-                                log::info!("  [{:#010x}] <unmapped>", addr);
-                                continue;
-                            }
-                            let insn = mem.read_32(addr);
-                            let decoded = decode_arm(insn);
-                            let marker = if addr == ctx.pc { " <PC>" } else { "" };
-                            log::info!(
-                                "  [{:#010x}] {:#010x} {:?}{}",
-                                addr,
-                                insn,
-                                decoded.id,
-                                marker
+                        if step_halt_count == 1 {
+                            main_log::dump_instruction_window(&shared_memory, "First STEP halt", ctx.pc, Some(ctx.pc));
+                        }
+                        if repeated_step_pc_count >= repeated_step_window_threshold
+                            && !dumped_repeated_step_window
+                        {
+                            dumped_repeated_step_window = true;
+                            main_log::dump_instruction_window(
+                                &shared_memory,
+                                &format!("Repeated STEP PC after {} repeats", repeated_step_pc_count),
+                                ctx.pc,
+                                Some(ctx.pc),
                             );
                         }
                     }
                     if step_halt_count == 1 || step_halt_count % 10_000 == 0 {
                         log::info!(
                             "STEP halt #{} at PC={:#x}, SP={:#x}, LR={:#x} (iter={}, svcs={})",
-                            step_halt_count,
-                            ctx.pc,
-                            ctx.sp,
-                            ctx.lr,
-                            iteration,
-                            svc_count
+                            step_halt_count, ctx.pc, ctx.sp, ctx.lr, iteration, svc_count
                         );
                     }
                     return PhysicalCoreExecutionControl::Continue;
                 } else if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
                     log::error!("PREFETCH_ABORT at PC={:#x}, SP={:#x}, LR={:#x}", ctx.pc, ctx.sp, ctx.lr);
                     log::error!("Reported exception address: {:?}", exception_address);
-                    dump_instruction_window("Crash window", ctx.pc, Some(ctx.pc));
-                    if let Some(exception_address) = exception_address {
-                        dump_instruction_window("Exception window", exception_address, Some(exception_address));
+                    #[cfg(feature = "debug-logs")]
+                    {
+                        main_log::dump_instruction_window(&shared_memory, "Crash window", ctx.pc, Some(ctx.pc));
+                        if let Some(exception_address) = exception_address {
+                            main_log::dump_instruction_window(&shared_memory, "Exception window", exception_address, Some(exception_address));
+                        }
                     }
                     PhysicalCoreExecutionControl::Break
                 } else if halt_reason.contains(HaltReason::BREAK_LOOP) {

@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+debug-logs = ["ruzu_core/debug-logs"]
+
 [[bin]]
 name = "yuzu-cmd"
 path = "src/main.rs"
