@@ -85,6 +85,20 @@ impl DynarmicCallbacks32 {
             if core_memory.is_some() { "wired" } else { "fallback" });
         Self { memory, core_memory, svc_swi, uses_wall_clock, core_timing, last_exception_address }
     }
+
+    /// Matches upstream `DynarmicCallbacks32::CheckMemoryAccess`.
+    fn check_memory_access(&self, addr: u64, size: u64) -> bool {
+        if let Some(ref cm) = self.core_memory {
+            if !cm.lock().unwrap().is_valid_virtual_address_range(addr, size) {
+                log::error!(
+                    "DynarmicCallbacks32::CheckMemoryAccess: unmapped access at {:#x} size={}",
+                    addr, size
+                );
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl JitCallbacks for DynarmicCallbacks32 {
@@ -108,6 +122,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_read_8(&self, vaddr: u64) -> u8 {
+        self.check_memory_access(vaddr, 1);
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().read_8(vaddr)
         } else {
@@ -116,6 +131,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
+        self.check_memory_access(vaddr, 2);
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().read_16(vaddr)
         } else {
@@ -124,6 +140,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_read_32(&self, vaddr: u64) -> u32 {
+        self.check_memory_access(vaddr, 4);
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().read_32(vaddr)
         } else {
@@ -132,6 +149,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
+        self.check_memory_access(vaddr, 8);
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().read_64(vaddr)
         } else {
@@ -140,6 +158,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
+        self.check_memory_access(vaddr, 16);
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
             (m.read_64(vaddr), m.read_64(vaddr + 8))
@@ -150,6 +169,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+        if !self.check_memory_access(vaddr, 1) { return; }
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().write_8(vaddr, value);
         } else {
@@ -158,6 +178,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+        if !self.check_memory_access(vaddr, 2) { return; }
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().write_16(vaddr, value);
         } else {
@@ -166,6 +187,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+        if !self.check_memory_access(vaddr, 4) { return; }
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().write_32(vaddr, value);
         } else {
@@ -174,6 +196,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+        if !self.check_memory_access(vaddr, 8) { return; }
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().write_64(vaddr, value);
         } else {
@@ -182,6 +205,7 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
+        if !self.check_memory_access(vaddr, 16) { return; }
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
             m.write_64(vaddr, value_lo);
@@ -213,29 +237,54 @@ impl JitCallbacks for DynarmicCallbacks32 {
         self.memory_read_128(vaddr)
     }
 
-    fn exclusive_write_8(&mut self, vaddr: u64, value: u8) -> bool {
-        self.memory_write_8(vaddr, value);
-        true
+    fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+        self.check_memory_access(vaddr, 1)
+            && if let Some(ref cm) = self.core_memory {
+                cm.lock().unwrap().write_exclusive_8(vaddr, value, expected)
+            } else {
+                self.memory_write_8(vaddr, value);
+                true
+            }
     }
 
-    fn exclusive_write_16(&mut self, vaddr: u64, value: u16) -> bool {
-        self.memory_write_16(vaddr, value);
-        true
+    fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+        self.check_memory_access(vaddr, 2)
+            && if let Some(ref cm) = self.core_memory {
+                cm.lock().unwrap().write_exclusive_16(vaddr, value, expected)
+            } else {
+                self.memory_write_16(vaddr, value);
+                true
+            }
     }
 
-    fn exclusive_write_32(&mut self, vaddr: u64, value: u32) -> bool {
-        self.memory_write_32(vaddr, value);
-        true
+    fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+        self.check_memory_access(vaddr, 4)
+            && if let Some(ref cm) = self.core_memory {
+                cm.lock().unwrap().write_exclusive_32(vaddr, value, expected)
+            } else {
+                self.memory_write_32(vaddr, value);
+                true
+            }
     }
 
-    fn exclusive_write_64(&mut self, vaddr: u64, value: u64) -> bool {
-        self.memory_write_64(vaddr, value);
-        true
+    fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+        self.check_memory_access(vaddr, 8)
+            && if let Some(ref cm) = self.core_memory {
+                cm.lock().unwrap().write_exclusive_64(vaddr, value, expected)
+            } else {
+                self.memory_write_64(vaddr, value);
+                true
+            }
     }
 
-    fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) -> bool {
-        self.memory_write_128(vaddr, value_lo, value_hi);
-        true
+    fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64, expected_lo: u64, expected_hi: u64) -> bool {
+        self.check_memory_access(vaddr, 16)
+            && if let Some(ref cm) = self.core_memory {
+                cm.lock().unwrap().write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
+            } else {
+                self.memory_write_128(vaddr, value_lo, value_hi);
+                true
+            }
     }
 
     fn exclusive_clear(&mut self) {
@@ -247,6 +296,8 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn exception_raised(&mut self, pc: u64, exception: u64) {
+        // ARM32 exception type 3 = NoExecuteFault (from upstream dynarmic Exception enum).
+        // Other values are unexpected for A32.
         self.last_exception_address
             .store(pc, Ordering::Relaxed);
         log::error!(
