@@ -224,7 +224,7 @@ impl KProcessPageTable {
         size: usize,
         state: super::k_memory_block::KMemoryState,
     ) -> bool {
-        self.base.can_contain(addr.get() as usize, size, state)
+        self.base.can_contain_k(addr.get() as usize, size, state)
     }
 
     // -- Page mapping --
