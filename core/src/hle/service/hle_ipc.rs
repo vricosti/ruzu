@@ -697,6 +697,181 @@ impl HLERequestContext {
         }
     }
 
+    // -- ReadBuffer / WriteBuffer --
+    //
+    // Matches upstream methods on HLERequestContext (hle_ipc.h lines 261-328,
+    // hle_ipc.cpp lines 317-506).
+    //
+    // Upstream uses `Core::Memory::Memory& memory` (page-table-aware) to
+    // read/write guest buffers. Ruzu uses the same `Memory` bridge when
+    // available, falling back to `shared_memory` (ProcessMemoryData) for
+    // test paths.
+    //
+    // Upstream `ReadBuffer` returns `std::span<const u8>` (zero-copy).
+    // We return `Vec<u8>` (copy) because the Memory bridge is behind a Mutex.
+    // See DIFF_WITH_YUZU.md for rationale.
+
+    /// Returns a reference to the Memory bridge.
+    ///
+    /// Matches upstream `Core::Memory::Memory& GetMemory() const`.
+    pub fn get_memory(&self) -> Option<&Arc<std::sync::Mutex<crate::memory::memory::Memory>>> {
+        self.memory.as_ref()
+    }
+
+    /// Read from buffer descriptor A at the given index.
+    ///
+    /// Matches upstream `HLERequestContext::ReadBufferA(size_t buffer_index)`.
+    pub fn read_buffer_a(&self, buffer_index: usize) -> Vec<u8> {
+        if buffer_index >= self.buffer_a_descriptors.len() {
+            log::error!("BufferDescriptorA invalid buffer_index {}", buffer_index);
+            return Vec::new();
+        }
+        let size = self.buffer_a_descriptors[buffer_index].size() as usize;
+        let address = self.buffer_a_descriptors[buffer_index].address();
+        self.read_guest_memory(address, size)
+    }
+
+    /// Read from buffer descriptor X at the given index.
+    ///
+    /// Matches upstream `HLERequestContext::ReadBufferX(size_t buffer_index)`.
+    pub fn read_buffer_x(&self, buffer_index: usize) -> Vec<u8> {
+        if buffer_index >= self.buffer_x_descriptors.len() {
+            log::error!("BufferDescriptorX invalid buffer_index {}", buffer_index);
+            return Vec::new();
+        }
+        let size = self.buffer_x_descriptors[buffer_index].size() as usize;
+        let address = self.buffer_x_descriptors[buffer_index].address();
+        self.read_guest_memory(address, size)
+    }
+
+    /// Read from the appropriate buffer descriptor (A if available, else X).
+    ///
+    /// Matches upstream `HLERequestContext::ReadBuffer(size_t buffer_index)`.
+    /// Returns a copy (see `ReadBufferCopy` in upstream for equivalent semantics).
+    pub fn read_buffer(&self, buffer_index: usize) -> Vec<u8> {
+        let is_buffer_a = self.buffer_a_descriptors.len() > buffer_index
+            && self.buffer_a_descriptors[buffer_index].size() > 0;
+        let is_buffer_x = self.buffer_x_descriptors.len() > buffer_index
+            && self.buffer_x_descriptors[buffer_index].size() > 0;
+
+        if is_buffer_a && is_buffer_x {
+            log::warn!(
+                "ReadBuffer: both A and X descriptors available, a.size={}, x.size={}",
+                self.buffer_a_descriptors[buffer_index].size(),
+                self.buffer_x_descriptors[buffer_index].size()
+            );
+        }
+
+        if is_buffer_a {
+            self.read_buffer_a(buffer_index)
+        } else {
+            self.read_buffer_x(buffer_index)
+        }
+    }
+
+    /// Write to the appropriate buffer descriptor (B if available, else C).
+    ///
+    /// Matches upstream `HLERequestContext::WriteBuffer(const void*, size_t, size_t)`.
+    /// Returns the number of bytes written.
+    pub fn write_buffer(&self, data: &[u8], buffer_index: usize) -> usize {
+        if data.is_empty() {
+            log::warn!("WriteBuffer: skip empty buffer write");
+            return 0;
+        }
+
+        let is_buffer_b = self.buffer_b_descriptors.len() > buffer_index
+            && self.buffer_b_descriptors[buffer_index].size() > 0;
+        let buffer_size = self.get_write_buffer_size(buffer_index);
+        let mut size = data.len();
+        if size > buffer_size {
+            log::error!(
+                "WriteBuffer: size ({:#x}) > buffer_size ({:#x})",
+                size,
+                buffer_size
+            );
+            size = buffer_size;
+        }
+
+        if is_buffer_b {
+            self.write_buffer_b(&data[..size], buffer_index)
+        } else {
+            self.write_buffer_c(&data[..size], buffer_index)
+        }
+    }
+
+    /// Write to buffer descriptor B at the given index.
+    ///
+    /// Matches upstream `HLERequestContext::WriteBufferB(const void*, size_t, size_t)`.
+    pub fn write_buffer_b(&self, data: &[u8], buffer_index: usize) -> usize {
+        if buffer_index >= self.buffer_b_descriptors.len() || data.is_empty() {
+            return 0;
+        }
+        let buffer_size = self.buffer_b_descriptors[buffer_index].size() as usize;
+        let size = data.len().min(buffer_size);
+        let address = self.buffer_b_descriptors[buffer_index].address();
+        self.write_guest_memory(address, &data[..size]);
+        size
+    }
+
+    /// Write to buffer descriptor C at the given index.
+    ///
+    /// Matches upstream `HLERequestContext::WriteBufferC(const void*, size_t, size_t)`.
+    pub fn write_buffer_c(&self, data: &[u8], buffer_index: usize) -> usize {
+        if buffer_index >= self.buffer_c_descriptors.len() || data.is_empty() {
+            return 0;
+        }
+        let buffer_size = self.buffer_c_descriptors[buffer_index].size() as usize;
+        let size = data.len().min(buffer_size);
+        let address = self.buffer_c_descriptors[buffer_index].address();
+        self.write_guest_memory(address, &data[..size]);
+        size
+    }
+
+    /// Read `size` bytes from guest virtual address using the Memory bridge.
+    ///
+    /// Uses `Memory::read_block` (page-table-aware) when available, falls back
+    /// to `ProcessMemoryData` for test paths.
+    fn read_guest_memory(&self, address: u64, size: usize) -> Vec<u8> {
+        if size == 0 || address == 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; size];
+        if let Some(ref memory) = self.memory {
+            memory.lock().unwrap().read_block(address, &mut buf);
+        } else if let Some(ref shared_memory) = self.shared_memory {
+            let mem = shared_memory.read().unwrap();
+            let block = mem.read_block(address, size);
+            let copy_len = block.len().min(size);
+            buf[..copy_len].copy_from_slice(&block[..copy_len]);
+        } else {
+            log::error!(
+                "read_guest_memory: no memory accessor available for addr={:#x} size={:#x}",
+                address,
+                size
+            );
+        }
+        buf
+    }
+
+    /// Write bytes to guest virtual address using the Memory bridge.
+    fn write_guest_memory(&self, address: u64, data: &[u8]) {
+        if data.is_empty() || address == 0 {
+            return;
+        }
+        if let Some(ref memory) = self.memory {
+            memory.lock().unwrap().write_block(address, data);
+        } else if let Some(ref shared_memory) = self.shared_memory {
+            let mut mem = shared_memory.write().unwrap();
+            mem.write_block(address, data);
+        } else {
+            log::error!(
+                "write_guest_memory: no memory accessor available for addr={:#x} size={:#x}",
+                address,
+                data.len()
+            );
+        }
+    }
+
     /// Populates this context from the thread's TLS command buffer.
     ///
     /// Matches upstream `PopulateFromIncomingCommandBuffer` which reads from
