@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h and arm_dynarmic_64.cpp
 //! ARM64 dynarmic backend.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::arm::arm_interface::{
@@ -69,6 +69,14 @@ struct DynarmicCallbacks64 {
     tpidrro_el0: u64,
     /// TPIDR_EL0 system register (read-write thread ID)
     tpidr_el0: u64,
+    /// Whether wall clock is used (if true, ticking is disabled).
+    /// Matches upstream `m_parent.m_uses_wall_clock`.
+    uses_wall_clock: bool,
+    /// Core timing reference for tick management.
+    /// Matches upstream `m_parent.m_system.CoreTiming()`.
+    core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+    /// Last exception address reported by dynarmic.
+    last_exception_address: Arc<AtomicU64>,
 }
 
 impl DynarmicCallbacks64 {
@@ -76,6 +84,9 @@ impl DynarmicCallbacks64 {
         memory: SharedProcessMemory,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
         svc: Arc<AtomicU32>,
+        uses_wall_clock: bool,
+        core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+        last_exception_address: Arc<AtomicU64>,
     ) -> Self {
         Self {
             memory,
@@ -83,7 +94,29 @@ impl DynarmicCallbacks64 {
             svc,
             tpidrro_el0: 0,
             tpidr_el0: 0,
+            uses_wall_clock,
+            core_timing,
+            last_exception_address,
         }
+    }
+
+    /// Matches upstream `DynarmicCallbacks64::CheckMemoryAccess`.
+    ///
+    /// Returns true if the access is valid. When core_memory is wired,
+    /// checks `IsValidVirtualAddressRange`; logs and returns false if unmapped.
+    /// Debug watchpoint support is not yet implemented (upstream checks
+    /// `MatchingWatchpoint` here, but we don't have debugger wired).
+    fn check_memory_access(&self, addr: u64, size: u64) -> bool {
+        if let Some(ref cm) = self.core_memory {
+            if !cm.lock().unwrap().is_valid_virtual_address_range(addr, size) {
+                log::error!(
+                    "DynarmicCallbacks64::CheckMemoryAccess: unmapped access at {:#x} size={}",
+                    addr, size
+                );
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -108,26 +141,31 @@ impl JitCallbacks for DynarmicCallbacks64 {
     }
 
     fn memory_read_8(&self, vaddr: u64) -> u8 {
+        self.check_memory_access(vaddr, 1);
         if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_8(vaddr) }
         else { self.memory.read().unwrap().read_8(vaddr) }
     }
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
+        self.check_memory_access(vaddr, 2);
         if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_16(vaddr) }
         else { self.memory.read().unwrap().read_16(vaddr) }
     }
 
     fn memory_read_32(&self, vaddr: u64) -> u32 {
+        self.check_memory_access(vaddr, 4);
         if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_32(vaddr) }
         else { self.memory.read().unwrap().read_32(vaddr) }
     }
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
+        self.check_memory_access(vaddr, 8);
         if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_64(vaddr) }
         else { self.memory.read().unwrap().read_64(vaddr) }
     }
 
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
+        self.check_memory_access(vaddr, 16);
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
             (m.read_64(vaddr), m.read_64(vaddr + 8))
@@ -138,26 +176,31 @@ impl JitCallbacks for DynarmicCallbacks64 {
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+        if !self.check_memory_access(vaddr, 1) { return; }
         if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_8(vaddr, value); }
         else { self.memory.write().unwrap().write_8(vaddr, value); }
     }
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+        if !self.check_memory_access(vaddr, 2) { return; }
         if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_16(vaddr, value); }
         else { self.memory.write().unwrap().write_16(vaddr, value); }
     }
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+        if !self.check_memory_access(vaddr, 4) { return; }
         if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_32(vaddr, value); }
         else { self.memory.write().unwrap().write_32(vaddr, value); }
     }
 
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+        if !self.check_memory_access(vaddr, 8) { return; }
         if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_64(vaddr, value); }
         else { self.memory.write().unwrap().write_64(vaddr, value); }
     }
 
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
+        if !self.check_memory_access(vaddr, 16) { return; }
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
             m.write_64(vaddr, value_lo);
@@ -189,33 +232,75 @@ impl JitCallbacks for DynarmicCallbacks64 {
         self.memory_read_128(vaddr)
     }
 
-    fn exclusive_write_8(&mut self, vaddr: u64, value: u8) -> bool {
-        self.memory_write_8(vaddr, value);
-        true
+    fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+        self.check_memory_access(vaddr, 1)
+            && if let Some(ref cm) = self.core_memory {
+                cm.lock().unwrap().write_exclusive_8(vaddr, value, expected)
+            } else {
+                self.memory_write_8(vaddr, value);
+                true
+            }
     }
 
-    fn exclusive_write_16(&mut self, vaddr: u64, value: u16) -> bool {
-        self.memory_write_16(vaddr, value);
-        true
+    fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+        self.check_memory_access(vaddr, 2)
+            && if let Some(ref cm) = self.core_memory {
+                cm.lock().unwrap().write_exclusive_16(vaddr, value, expected)
+            } else {
+                self.memory_write_16(vaddr, value);
+                true
+            }
     }
 
-    fn exclusive_write_32(&mut self, vaddr: u64, value: u32) -> bool {
-        self.memory_write_32(vaddr, value);
-        true
+    fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+        self.check_memory_access(vaddr, 4)
+            && if let Some(ref cm) = self.core_memory {
+                cm.lock().unwrap().write_exclusive_32(vaddr, value, expected)
+            } else {
+                self.memory_write_32(vaddr, value);
+                true
+            }
     }
 
-    fn exclusive_write_64(&mut self, vaddr: u64, value: u64) -> bool {
-        self.memory_write_64(vaddr, value);
-        true
+    fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+        self.check_memory_access(vaddr, 8)
+            && if let Some(ref cm) = self.core_memory {
+                cm.lock().unwrap().write_exclusive_64(vaddr, value, expected)
+            } else {
+                self.memory_write_64(vaddr, value);
+                true
+            }
     }
 
-    fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) -> bool {
-        self.memory_write_128(vaddr, value_lo, value_hi);
-        true
+    fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64, expected_lo: u64, expected_hi: u64) -> bool {
+        self.check_memory_access(vaddr, 16)
+            && if let Some(ref cm) = self.core_memory {
+                cm.lock().unwrap().write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
+            } else {
+                self.memory_write_128(vaddr, value_lo, value_hi);
+                true
+            }
     }
 
     fn exclusive_clear(&mut self) {
         // No-op until exclusive monitor is wired
+    }
+
+    fn instruction_cache_operation(&mut self, op: u64, vaddr: u64) {
+        // Upstream IC operations:
+        // 0 = InvalidateByVAToPoU (IC IVAU) — invalidate cache line at vaddr
+        // 1 = InvalidateAllToPoU (IC IALLU) — invalidate entire icache
+        match op {
+            0 => {
+                log::trace!("IC IVAU @ {:#x} (no-op, cache invalidation handled at JIT level)", vaddr);
+            }
+            1 => {
+                log::trace!("IC IALLU (no-op, cache invalidation handled at JIT level)");
+            }
+            _ => {
+                log::warn!("Unknown instruction_cache_operation op={} vaddr={:#x}", op, vaddr);
+            }
+        }
     }
 
     fn call_supervisor(&mut self, svc_num: u32) {
@@ -224,22 +309,60 @@ impl JitCallbacks for DynarmicCallbacks64 {
     }
 
     fn exception_raised(&mut self, pc: u64, exception: u64) {
+        // ARM64 exception types from upstream dynarmic Exception enum:
+        // 0=Yield, 1=WFI, 2=WFE, 3=SendEvent, 4=SendEventLocal, 8=NoExecuteFault
+        match exception {
+            0 | 1 | 2 | 3 | 4 => {
+                // Hint instructions (Yield, WFI, WFE, SEV, SEVL) — benign, return early.
+                return;
+            }
+            _ => {}
+        }
+
+        self.last_exception_address.store(pc, Ordering::Relaxed);
         log::error!(
             "DynarmicCallbacks64::exception_raised(pc={:#x}, exception={:#x})",
             pc, exception
         );
+        // Dump instruction window around exception PC
+        if let Some(ref cm) = self.core_memory {
+            let m = cm.lock().unwrap();
+            let start = pc.saturating_sub(0x10);
+            for addr in (start..=pc.saturating_add(0x10)).step_by(4) {
+                if !m.is_valid_virtual_address(addr) {
+                    log::error!("  [{:#018x}] <unmapped>", addr);
+                    continue;
+                }
+                let insn = m.read_32(addr);
+                let marker = if addr == pc { " <EXC>" } else { "" };
+                log::error!("  [{:#018x}] {:#010x}{}", addr, insn, marker);
+            }
+        }
     }
 
-    fn add_ticks(&mut self, _ticks: u64) {
-        // TODO: Wire to CoreTiming when available.
-        // Upstream divides by NUM_CPU_CORES and passes to CoreTiming::AddTicks.
+    /// Matches upstream `DynarmicCallbacks64::GetCNTPCT`.
+    fn get_cntpct(&self) -> u64 {
+        self.core_timing.lock().unwrap().get_clock_ticks()
     }
 
+    /// Matches upstream `DynarmicCallbacks64::AddTicks`:
+    /// Divides ticks by NUM_CPU_CORES (4), passes to CoreTiming::AddTicks.
+    fn add_ticks(&mut self, ticks: u64) {
+        if self.uses_wall_clock {
+            return;
+        }
+        let amortized_ticks = std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
+        self.core_timing.lock().unwrap().add_ticks(amortized_ticks);
+    }
+
+    /// Matches upstream `DynarmicCallbacks64::GetTicksRemaining`:
+    /// Returns max(CoreTiming::GetDowncount(), 0).
     fn get_ticks_remaining(&self) -> u64 {
-        // TODO: Wire to CoreTiming when available.
-        // Upstream returns max(CoreTiming::GetDowncount(), 0).
-        // Return a reasonable default tick budget.
-        1000
+        if self.uses_wall_clock {
+            return u64::MAX;
+        }
+        let ct = self.core_timing.lock().unwrap();
+        std::cmp::max(ct.get_downcount(), 0) as u64
     }
 }
 
@@ -277,6 +400,9 @@ pub struct ArmDynarmic64 {
 
     /// TPIDR_EL0 system register value
     tpidr_el0: u64,
+
+    /// Last exception address reported by dynarmic for the current halt.
+    last_exception_address: Arc<AtomicU64>,
 }
 
 impl ArmDynarmic64 {
@@ -293,11 +419,16 @@ impl ArmDynarmic64 {
         _exclusive_monitor: &dyn std::any::Any,
         core_index: usize,
         shared_memory: SharedProcessMemory,
+        core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
     ) -> Self {
         // Create JIT callbacks with shared memory reference
         let svc = Arc::new(AtomicU32::new(0));
-        let callbacks = DynarmicCallbacks64::new(shared_memory, core_memory, svc.clone());
+        let last_exception_address = Arc::new(AtomicU64::new(0));
+        let callbacks = DynarmicCallbacks64::new(
+            shared_memory, core_memory, svc.clone(),
+            uses_wall_clock, core_timing, last_exception_address.clone(),
+        );
 
         // Configure JIT
         // Upstream: enable_cycle_counting = !uses_wall_clock
@@ -330,13 +461,14 @@ impl ArmDynarmic64 {
             jit,
             tpidrro_el0: 0,
             tpidr_el0: 0,
+            last_exception_address,
         }
     }
 }
 
 impl ArmInterface for ArmDynarmic64 {
     fn run_thread(&mut self, _thread: &mut KThread) -> HaltReason {
-        // ScopedJitExecution sj(thread->GetOwnerProcess());
+        self.last_exception_address.store(0, Ordering::Relaxed);
         let jit = match self.jit.as_mut() {
             Some(jit) => jit,
             None => {
@@ -351,7 +483,7 @@ impl ArmInterface for ArmDynarmic64 {
     }
 
     fn step_thread(&mut self, _thread: &mut KThread) -> HaltReason {
-        // ScopedJitExecution sj(thread->GetOwnerProcess());
+        self.last_exception_address.store(0, Ordering::Relaxed);
         let jit = match self.jit.as_mut() {
             Some(jit) => jit,
             None => {
@@ -484,6 +616,15 @@ impl ArmInterface for ArmDynarmic64 {
 
     fn get_svc_number(&self) -> u32 {
         self.svc.load(Ordering::Relaxed)
+    }
+
+    fn get_last_exception_address(&self) -> Option<u64> {
+        let address = self.last_exception_address.load(Ordering::Relaxed);
+        if address == 0 {
+            None
+        } else {
+            Some(address)
+        }
     }
 
     fn signal_interrupt(&mut self, _thread: &mut KThread) {

@@ -565,6 +565,92 @@ impl Memory {
         true
     }
 
+    // =========================================================================
+    // Exclusive Write (atomic CAS) via PageTable pointers
+    // Matches upstream Core::Memory::Memory::WriteExclusive* methods.
+    // =========================================================================
+
+    /// Exclusive write u8 with atomic CAS.
+    /// Matches upstream `Memory::WriteExclusive8`.
+    pub fn write_exclusive_8(&self, vaddr: u64, value: u8, expected: u8) -> bool {
+        let ptr = self.get_pointer_impl(vaddr);
+        if ptr.is_null() {
+            log::error!("Unmapped WriteExclusive8 @ {:#018x}", vaddr);
+            return true;
+        }
+        unsafe {
+            let atomic = &*(ptr as *const std::sync::atomic::AtomicU8);
+            atomic
+                .compare_exchange(expected, value, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .is_ok()
+        }
+    }
+
+    /// Exclusive write u16 with atomic CAS.
+    /// Matches upstream `Memory::WriteExclusive16`.
+    pub fn write_exclusive_16(&self, vaddr: u64, value: u16, expected: u16) -> bool {
+        let ptr = self.get_pointer_impl(vaddr);
+        if ptr.is_null() {
+            log::error!("Unmapped WriteExclusive16 @ {:#018x}", vaddr);
+            return true;
+        }
+        unsafe {
+            let atomic = &*(ptr as *const std::sync::atomic::AtomicU16);
+            atomic
+                .compare_exchange(expected, value, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .is_ok()
+        }
+    }
+
+    /// Exclusive write u32 with atomic CAS.
+    /// Matches upstream `Memory::WriteExclusive32`.
+    pub fn write_exclusive_32(&self, vaddr: u64, value: u32, expected: u32) -> bool {
+        let ptr = self.get_pointer_impl(vaddr);
+        if ptr.is_null() {
+            log::error!("Unmapped WriteExclusive32 @ {:#018x}", vaddr);
+            return true;
+        }
+        unsafe {
+            let atomic = &*(ptr as *const std::sync::atomic::AtomicU32);
+            atomic
+                .compare_exchange(expected, value, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .is_ok()
+        }
+    }
+
+    /// Exclusive write u64 with atomic CAS.
+    /// Matches upstream `Memory::WriteExclusive64`.
+    pub fn write_exclusive_64(&self, vaddr: u64, value: u64, expected: u64) -> bool {
+        let ptr = self.get_pointer_impl(vaddr);
+        if ptr.is_null() {
+            log::error!("Unmapped WriteExclusive64 @ {:#018x}", vaddr);
+            return true;
+        }
+        unsafe {
+            let atomic = &*(ptr as *const std::sync::atomic::AtomicU64);
+            atomic
+                .compare_exchange(expected, value, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .is_ok()
+        }
+    }
+
+    /// Exclusive write 128-bit with two 64-bit atomic CAS operations.
+    /// Matches upstream `Memory::WriteExclusive128`.
+    pub fn write_exclusive_128(
+        &self, vaddr: u64,
+        value_lo: u64, value_hi: u64,
+        expected_lo: u64, expected_hi: u64,
+    ) -> bool {
+        // Upstream uses AtomicCompareAndSwap for 128-bit. On x86-64 without
+        // native 128-bit CAS, fall back to two 64-bit CAS operations.
+        // The low half must succeed before attempting the high half.
+        let lo_ok = self.write_exclusive_64(vaddr, value_lo, expected_lo);
+        if !lo_ok {
+            return false;
+        }
+        self.write_exclusive_64(vaddr + 8, value_hi, expected_hi)
+    }
+
     /// Internal: update page table entries for a range of pages.
     ///
     /// Matches upstream `Memory::Impl::MapPages`.

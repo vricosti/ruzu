@@ -402,6 +402,7 @@ fn main() {
                 true, dummy_process,
                 &dummy_exclusive as &dyn std::any::Any,
                 0, shared_memory.clone(),
+                system.core_timing_shared(),
                 core_memory.clone(),
             ))
         } else {
