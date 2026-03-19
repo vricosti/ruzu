@@ -156,7 +156,7 @@ mod tests {
     use crate::hle::kernel::svc::svc_port;
     use crate::hle::result::RESULT_SUCCESS;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
-    use crate::hle::service::sm::sm::create_service_manager;
+    use crate::hle::service::sm::sm::ServiceManager;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 

@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of zuyu/src/core/hle/service/apm/apm.h
-//! Port of zuyu/src/core/hle/service/apm/apm.cpp
+//! Port of zuzu/src/core/hle/service/apm/apm.cpp
 //!
 //! APM Module and LoopProcess.
 
 use std::sync::{Arc, Mutex};
 
 use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
+use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 
 /// APM Module.
@@ -22,62 +23,53 @@ impl Module {
     }
 }
 
-/// Registers "apm", "apm:am", "apm:sys" services.
+/// Launches APM services.
 ///
-/// Corresponds to `LoopProcess` in upstream `apm.cpp`.
+/// Matches upstream `void APM::LoopProcess(Core::System& system)`:
+/// ```cpp
+/// void LoopProcess(Core::System& system) {
+///     auto module = std::make_shared<Module>();
+///     auto server_manager = std::make_unique<ServerManager>(system);
+///     server_manager->RegisterNamedService("apm", ...);
+///     server_manager->RegisterNamedService("apm:am", ...);
+///     server_manager->RegisterNamedService("apm:sys", ...);
+///     ServerManager::RunServer(std::move(server_manager));
+/// }
+/// ```
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
-    register_services(service_manager);
-}
-
-pub fn register_services(service_manager: &Arc<Mutex<ServiceManager>>) {
     let module = Arc::new(Module::new());
     let controller = Arc::new(Mutex::new(super::apm_controller::Controller::new()));
+    let mut server_manager = ServerManager::new(service_manager.clone());
 
-    register_named_service(service_manager, "apm", {
+    let factory: SessionRequestHandlerFactory = {
         let module = module.clone();
         let controller = controller.clone();
-        move || -> SessionRequestHandlerPtr {
+        Box::new(move || -> SessionRequestHandlerPtr {
             Arc::new(super::apm_interface::APM::new(module.clone(), controller.clone(), "apm"))
-        }
-    });
+        })
+    };
+    server_manager.register_named_service("apm", factory, 64);
 
-    register_named_service(service_manager, "apm:am", {
+    let factory: SessionRequestHandlerFactory = {
         let module = module.clone();
         let controller = controller.clone();
-        move || -> SessionRequestHandlerPtr {
+        Box::new(move || -> SessionRequestHandlerPtr {
             Arc::new(super::apm_interface::APM::new(
                 module.clone(),
                 controller.clone(),
                 "apm:am",
             ))
-        }
-    });
+        })
+    };
+    server_manager.register_named_service("apm:am", factory, 64);
 
-    register_named_service(service_manager, "apm:sys", {
+    let factory: SessionRequestHandlerFactory = {
         let controller = controller.clone();
-        move || -> SessionRequestHandlerPtr {
+        Box::new(move || -> SessionRequestHandlerPtr {
             Arc::new(super::apm_interface::ApmSys::new(controller.clone()))
-        }
-    });
-}
+        })
+    };
+    server_manager.register_named_service("apm:sys", factory, 64);
 
-fn register_named_service<F>(
-    service_manager: &Arc<Mutex<ServiceManager>>,
-    name: &str,
-    factory: F,
-) where
-    F: Fn() -> SessionRequestHandlerPtr + Send + Sync + 'static,
-{
-    let boxed: SessionRequestHandlerFactory = Box::new(factory);
-    let result = service_manager
-        .lock()
-        .unwrap()
-        .register_service(name.to_string(), 64, boxed);
-    if result.is_error() {
-        log::warn!(
-            "Failed to register service '{}': {:#x}",
-            name,
-            result.get_inner_value()
-        );
-    }
+    ServerManager::run_server(server_manager);
 }
