@@ -302,6 +302,14 @@ impl KProcessPageTable {
         self.base.unlock_for_ipc_user_buffer(addr.get() as usize, size)
     }
 
+    // -- Memory bridge --
+
+    /// Set the Memory bridge on the underlying KPageTableBase.
+    /// Must be called after the address space is configured.
+    pub fn set_memory(&mut self, memory: Arc<Mutex<Memory>>) {
+        self.base.set_memory(memory);
+    }
+
     // -- Direct base access --
 
     pub fn get_base(&self) -> &KPageTableBase {
@@ -331,6 +339,10 @@ impl KProcessPageTable {
             base.m_address_space_start,
             base.m_address_space_end,
         );
+        // Initialize the page table implementation (Common::PageTable).
+        // Upstream does this in InitializeForProcess; here we do it in the
+        // legacy path as well so that Operate() can write page table entries.
+        base.initialize_impl();
     }
 
     pub fn set_code_region(&mut self, start: KProcessAddress, size: usize) {

@@ -287,9 +287,9 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
 
         // Pre-allocate code memory BEFORE LoadFromMetadata, because
         // LoadFromMetadata -> initialize_for_user -> initialize -> create_thread_local_region
-        // needs ProcessMemoryData::block_manager to be initialized.
-        // In upstream, the page table handles this; here we initialize ProcessMemoryData
-        // to cover the full code + TLS region.
+        // needs the page table's block manager to be initialized.
+        // allocate_code_memory configures the address space and initializes
+        // ProcessMemoryData to cover the full code + TLS region.
         process.allocate_code_memory(code_base, code_size as usize);
 
         // Configure TLS page allocation base before LoadFromMetadata, which calls

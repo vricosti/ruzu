@@ -150,14 +150,16 @@ impl ArmNce {
             self.stack = Some(stack_mem);
         }
 
-        // TODO: Signal handler installation (std::call_once equivalent).
+        // Install signal handlers.
         // Upstream installs handlers for:
         //   - ReturnToRunCodeByExceptionLevelChangeSignal (SIGUSR2)
         //   - BreakFromRunCodeSignal (SIGURG)
         //   - GuestAlignmentFaultSignal (SIGBUS)
         //   - GuestAccessFaultSignal (SIGSEGV)
-        // These handlers call assembly trampolines that save/restore guest context.
-        // This requires unsafe + platform-specific signal handling code.
+        // Full handlers require assembly trampolines for context save/restore.
+        // For now, install a minimal SIGSEGV handler for diagnostics.
+        #[cfg(target_os = "linux")]
+        install_guest_access_fault_handler();
     }
 
     /// Run a guest thread until a halt condition occurs.
@@ -262,5 +264,84 @@ impl ArmNce {
 impl Drop for ArmNce {
     fn drop(&mut self) {
         // Corresponds to upstream `ArmNce::~ArmNce() = default`.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIGSEGV signal handler for guest memory access faults
+// ---------------------------------------------------------------------------
+//
+// Matches upstream `HandleGuestAccessFault` (arm_nce.cpp).
+// When the JIT accesses memory through the fastmem arena (mmap'd virtual
+// space), an unmapped or mprotect'd page triggers SIGSEGV. This handler
+// logs the fault address and aborts with diagnostic context.
+//
+// A more advanced handler (lazy mapping, separate heap, etc.) can be added
+// later by extending this handler.
+
+#[cfg(target_os = "linux")]
+static HANDLER_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Install a minimal SIGSEGV handler for guest access fault diagnostics.
+///
+/// Matches upstream signal handler installation in `ArmNce::Initialize()`.
+/// Only installs once (uses atomic flag like upstream's `std::call_once`).
+#[cfg(target_os = "linux")]
+fn install_guest_access_fault_handler() {
+    if HANDLER_INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return; // Already installed.
+    }
+
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = guest_access_fault_handler as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sa.sa_mask);
+        let result = libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        if result != 0 {
+            log::error!(
+                "Failed to install SIGSEGV handler: {}",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            log::info!("Installed SIGSEGV handler for guest access fault diagnostics");
+        }
+    }
+}
+
+/// SIGSEGV handler — logs the faulting address and aborts.
+///
+/// Matches upstream `HandleGuestAccessFault` which checks if the faulting
+/// address is in the guest address space (fastmem arena) and either:
+/// - Handles the fault (lazy mapping / permission change)
+/// - Converts to a guest data abort
+/// - Re-raises for host crashes
+///
+/// For now: log and abort with context for debugging.
+#[cfg(target_os = "linux")]
+extern "C" fn guest_access_fault_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ucontext: *mut libc::c_void,
+) {
+    let fault_addr = unsafe { (*info).si_addr() as u64 };
+
+    // Log the fault — use write() directly since log macros may not be
+    // signal-safe, but eprintln uses write() under the hood.
+    eprintln!(
+        "\n=== SIGSEGV (signal {}) at address {:#018x} ===",
+        sig, fault_addr
+    );
+    eprintln!("This may be a guest memory access fault (unmapped or protected page).");
+    eprintln!("If this address is within the fastmem arena, it's likely a guest fault.");
+    eprintln!("Otherwise, it's a host crash.\n");
+
+    // Re-raise the signal with default handler to get a core dump.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::raise(libc::SIGSEGV);
     }
 }

@@ -422,17 +422,17 @@ fn get_tick() -> i64 {
 // QueryMemory helper
 // =============================================================================
 
-/// Resolve memory info for a given address using the KMemoryBlockManager.
+/// Resolve memory info for a given address using the page table's KMemoryBlockManager.
 /// Returns (base, size, svc_state, svc_permission).
 ///
-/// Queries the block manager populated during NSO loading.
-/// This mirrors upstream's KPageTableBase::QueryInfoImpl() behavior.
+/// Queries the block manager in KPageTableBase, matching upstream's
+/// KPageTableBase::QueryInfoImpl() behavior.
 fn query_memory_info(ctx: &SvcContext, query_addr: u64) -> (u64, u64, u32, u32) {
     use crate::hle::kernel::k_memory_block::KMemoryPermission;
 
-    let mem = ctx.shared_memory.read().unwrap();
+    let process = ctx.current_process.lock().unwrap();
 
-    if let Some(info) = mem.block_manager.query_info(query_addr as usize) {
+    if let Some(info) = process.page_table.query_info(query_addr as usize) {
         let svc_state = info.get_svc_state();
         // Convert KMemoryPermission to SVC permission (lower 3 bits = user R/W/X).
         let svc_perm = (info.get_permission() & KMemoryPermission::USER_MASK).bits() as u32;
@@ -445,7 +445,8 @@ fn query_memory_info(ctx: &SvcContext, query_addr: u64) -> (u64, u64, u32, u32) 
     } else {
         // Address outside managed range — return Inaccessible.
         // Upstream: creates fake block from address_space_end to max.
-        let addr_space_end = mem.block_manager.get_end_address() as u64;
+        let addr_space_end = process.page_table.get_address_space_start().get()
+            + process.page_table.get_address_space_size() as u64;
         (
             addr_space_end,
             u64::MAX - addr_space_end + 1,
@@ -500,17 +501,32 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             let (base, size, state, perm) = query_memory_info(ctx, query_addr);
             log::info!("  QueryMemory(info_ptr={:#x}, addr={:#x}) -> base={:#x} size={:#x} state={} perm={}",
                 mem_info_ptr, query_addr, base, size, state, perm);
+            // Write MemoryInfo structure to guest memory.
+            // Upstream: current_memory.WriteBlock(out_memory_info, &svc_mem_info, sizeof(...))
             {
-                let mut mem = ctx.shared_memory.write().unwrap();
-                if mem.is_valid_range(mem_info_ptr, 40) {
-                    mem.write_64(mem_info_ptr, base);
-                    mem.write_64(mem_info_ptr + 8, size);
-                    mem.write_32(mem_info_ptr + 16, state);
-                    mem.write_32(mem_info_ptr + 20, 0); // attribute
-                    mem.write_32(mem_info_ptr + 24, perm);
-                    mem.write_32(mem_info_ptr + 28, 0); // ipc_count
-                    mem.write_32(mem_info_ptr + 32, 0); // device_count
-                    mem.write_32(mem_info_ptr + 36, 0); // padding
+                let process = ctx.current_process.lock().unwrap();
+                if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+                    let m = memory.lock().unwrap();
+                    m.write_64(mem_info_ptr, base);
+                    m.write_64(mem_info_ptr + 8, size);
+                    m.write_32(mem_info_ptr + 16, state);
+                    m.write_32(mem_info_ptr + 20, 0); // attribute
+                    m.write_32(mem_info_ptr + 24, perm);
+                    m.write_32(mem_info_ptr + 28, 0); // ipc_count
+                    m.write_32(mem_info_ptr + 32, 0); // device_count
+                    m.write_32(mem_info_ptr + 36, 0); // padding
+                } else {
+                    let mut mem = ctx.shared_memory.write().unwrap();
+                    if mem.is_valid_range(mem_info_ptr, 40) {
+                        mem.write_64(mem_info_ptr, base);
+                        mem.write_64(mem_info_ptr + 8, size);
+                        mem.write_32(mem_info_ptr + 16, state);
+                        mem.write_32(mem_info_ptr + 20, 0);
+                        mem.write_32(mem_info_ptr + 24, perm);
+                        mem.write_32(mem_info_ptr + 28, 0);
+                        mem.write_32(mem_info_ptr + 32, 0);
+                        mem.write_32(mem_info_ptr + 36, 0);
+                    }
                 }
             }
             set_arg32(args, 0, STUB_SUCCESS);
@@ -1242,16 +1258,29 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             log::info!("  QueryMemory(info_ptr={:#x}, addr={:#x}) -> base={:#x} size={:#x} state={} perm={}",
                 mem_info_ptr, query_addr, base, size, state, perm);
             {
-                let mut mem = ctx.shared_memory.write().unwrap();
-                if mem.is_valid_range(mem_info_ptr, 40) {
-                    mem.write_64(mem_info_ptr, base);
-                    mem.write_64(mem_info_ptr + 8, size);
-                    mem.write_32(mem_info_ptr + 16, state);
-                    mem.write_32(mem_info_ptr + 20, 0);
-                    mem.write_32(mem_info_ptr + 24, perm);
-                    mem.write_32(mem_info_ptr + 28, 0);
-                    mem.write_32(mem_info_ptr + 32, 0);
-                    mem.write_32(mem_info_ptr + 36, 0);
+                let process = ctx.current_process.lock().unwrap();
+                if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+                    let m = memory.lock().unwrap();
+                    m.write_64(mem_info_ptr, base);
+                    m.write_64(mem_info_ptr + 8, size);
+                    m.write_32(mem_info_ptr + 16, state);
+                    m.write_32(mem_info_ptr + 20, 0);
+                    m.write_32(mem_info_ptr + 24, perm);
+                    m.write_32(mem_info_ptr + 28, 0);
+                    m.write_32(mem_info_ptr + 32, 0);
+                    m.write_32(mem_info_ptr + 36, 0);
+                } else {
+                    let mut mem = ctx.shared_memory.write().unwrap();
+                    if mem.is_valid_range(mem_info_ptr, 40) {
+                        mem.write_64(mem_info_ptr, base);
+                        mem.write_64(mem_info_ptr + 8, size);
+                        mem.write_32(mem_info_ptr + 16, state);
+                        mem.write_32(mem_info_ptr + 20, 0);
+                        mem.write_32(mem_info_ptr + 24, perm);
+                        mem.write_32(mem_info_ptr + 28, 0);
+                        mem.write_32(mem_info_ptr + 32, 0);
+                        mem.write_32(mem_info_ptr + 36, 0);
+                    }
                 }
             }
             set_arg64(args, 0, STUB_SUCCESS as u64);

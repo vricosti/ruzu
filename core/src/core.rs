@@ -15,6 +15,7 @@ use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use crate::hardware_properties;
 use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::service::sm::sm::ServiceManager;
+use crate::memory::memory::Memory;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 
 use parking_lot::Mutex;
@@ -70,6 +71,9 @@ pub struct System {
 
     /// Device memory (emulated Switch DRAM).
     device_memory: Option<Box<DeviceMemory>>,
+    /// Core::Memory::Memory bridge (maps virtual→physical→host).
+    /// Upstream: `std::unique_ptr<Core::Memory::Memory> m_memory`.
+    memory: Option<Arc<StdMutex<Memory>>>,
 
     // ── State flags ──
     /// Guard for suspend/resume operations.
@@ -150,6 +154,7 @@ impl System {
             kernel: None,
             service_manager: None,
             device_memory: None,
+            memory: None,
             suspend_guard: Mutex::new(()),
             is_paused: AtomicBool::new(false),
             is_shutting_down: AtomicBool::new(false),
@@ -183,6 +188,13 @@ impl System {
     pub fn initialize(&mut self) {
         // Allocate device memory
         self.device_memory = Some(Box::new(DeviceMemory::new()));
+
+        // Create the Memory bridge (maps virtual→physical→host via PageTable).
+        // Upstream: m_memory = make_unique<Core::Memory::Memory>(system)
+        let dm_ptr = self.device_memory.as_ref().unwrap().as_ref() as *const DeviceMemory;
+        let buffer_ptr = unsafe { &(*dm_ptr).buffer as *const common::host_memory::HostMemory };
+        let memory = unsafe { Memory::new(dm_ptr, buffer_ptr) };
+        self.memory = Some(Arc::new(StdMutex::new(memory)));
 
         // Read configuration from settings
         // In C++: is_multicore = Settings::values.use_multi_core.GetValue()
@@ -245,7 +257,27 @@ impl System {
 
         // Create a KProcess and call the loader.
         let mut process = crate::loader::loader::KProcess::new();
+
+        // Wire the Memory bridge to the process page table BEFORE loading.
+        // Upstream: Memory is passed to KPageTableBase::InitializeForProcess
+        // which is called during KProcess::Initialize, before LoadModule.
+        // We must set it here so that operate() can populate page table
+        // entries during allocate_code_memory/load_module.
+        if let Some(ref memory) = self.memory {
+            process.page_table.set_memory(memory.clone());
+        }
+
         let (result_status, load_parameters) = loader.load(&mut process, &mut loader_system);
+
+        // Set the current page table on Memory so reads/writes resolve
+        // through the process's PageTable → DeviceMemory.
+        // Upstream: KProcess::Initialize calls m_memory.SetCurrentPageTable(*this).
+        if let Some(ref memory) = self.memory {
+            if let Some(impl_pt) = process.page_table.get_base_mut().get_impl_mut() {
+                let pt_ptr = impl_pt as *mut common::page_table::PageTable;
+                memory.lock().unwrap().set_current_page_table(pt_ptr);
+            }
+        }
 
         if result_status != crate::loader::loader::ResultStatus::Success {
             log::error!(
@@ -408,6 +440,12 @@ impl System {
     /// Gets a shared reference to the core timing instance.
     pub fn core_timing_shared(&self) -> Arc<StdMutex<CoreTiming>> {
         self.core_timing.clone()
+    }
+
+    /// Gets a shared reference to the Memory bridge, if initialized.
+    /// Upstream: `System::Memory()`.
+    pub fn memory_shared(&self) -> Option<Arc<StdMutex<Memory>>> {
+        self.memory.clone()
     }
 
     /// Gets a reference to the CPU manager.
