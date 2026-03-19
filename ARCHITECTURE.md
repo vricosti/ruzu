@@ -213,6 +213,17 @@ m_alias_code_region_start / m_alias_code_region_end  // Alias code region
 
 `GetRegionAddress` and `GetRegionSize` map `Svc::MemoryState` values to these regions, matching upstream's switch statement exactly. Convenience overloads (`get_region_address_k`, etc.) convert from internal `KMemoryState` via `static_cast<Svc::MemoryState>(state & Mask)`, matching the inline overloads in upstream's `k_page_table_base.h`.
 
+**Kernel vs user processes (`m_is_kernel`):**
+
+`KPageTableBase` tracks whether the page table belongs to a kernel or user process via the `m_is_kernel` field (set during `initialize_for_process`). This affects memory layout behavior:
+
+| | Kernel process | User process |
+|---|---|---|
+| `GetNumGuardPages()` | 1 (4 KiB) | 4 (16 KiB) |
+| Guard pages purpose | Smaller guard between mappings | Larger guard for stack overflow detection |
+
+Guard pages are FREE regions inserted by `MapPages` (find-free variant) before each mapping. They are not backed by physical memory — any access would fault. In the current port, `KProcess::run()` uses `get_num_guard_pages()` to place the stack with the correct gap after TLS, matching upstream's `MapPages` find-free behavior.
+
 ---
 
 ## 4. JIT Execution (rdynarmic)
