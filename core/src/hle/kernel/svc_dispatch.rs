@@ -359,11 +359,29 @@ fn scatter64(args: &mut SvcArgs, lo: usize, hi: usize, val: u64) {
 /// handler would succeed but we haven't implemented the kernel object access.
 const STUB_SUCCESS: u32 = 0;
 
-/// Monotonic handle counter for stub handles.
-static NEXT_HANDLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x1000);
-
-fn alloc_stub_handle() -> u32 {
-    NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+/// Allocate a stub handle registered in the process handle table.
+///
+/// Upstream SVCs like CreateTransferMemory create a real kernel object
+/// (e.g. KTransferMemory) and add it to the handle table via
+/// `handle_table.Add(out, trmem)`. When the game later calls CloseHandle,
+/// it must find the handle in the table or it gets ResultInvalidHandle.
+///
+/// For stubbed SVCs where we don't create the real kernel object yet,
+/// we still must register a handle in the process table so that
+/// CloseHandle succeeds. We use the kernel's object ID allocator to
+/// get a unique ID as the opaque "object".
+fn alloc_stub_handle(system: &System) -> u32 {
+    let object_id = system
+        .kernel()
+        .map(|k| k.create_new_object_id())
+        .unwrap_or(1) as u64;
+    system
+        .current_process_arc()
+        .lock()
+        .unwrap()
+        .handle_table
+        .add(object_id)
+        .unwrap_or(0)
 }
 
 /// Monotonic tick counter.
@@ -537,7 +555,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             // IN: params=arg32[1], caps=arg32[2], num_caps=arg32[3]; OUT: ret=arg32[0], handle=arg32[1]
             log::warn!("  CreateProcess: stub");
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::StartProcess) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -817,7 +835,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         Some(SvcId::SendAsyncRequestWithUserBuffer) => {
             // OUT: ret=arg32[0], event_handle=arg32[1]
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::ReplyAndReceiveLight) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -834,29 +852,29 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         Some(SvcId::CreateSession) => {
             // OUT: ret=arg32[0], server=arg32[1], client=arg32[2]
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
-            set_arg32(args, 2, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
+            set_arg32(args, 2, alloc_stub_handle(system));
         }
         Some(SvcId::AcceptSession) => {
             // OUT: ret=arg32[0], handle=arg32[1]
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::CreatePort) => {
             // OUT: ret=arg32[0], server=arg32[1], client=arg32[2]
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
-            set_arg32(args, 2, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
+            set_arg32(args, 2, alloc_stub_handle(system));
         }
         Some(SvcId::ManageNamedPort) => {
             // OUT: ret=arg32[0], server=arg32[1]
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::ConnectToPort) => {
             // OUT: ret=arg32[0], handle=arg32[1]
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
 
         // =====================================================================
@@ -883,12 +901,12 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         Some(SvcId::CreateTransferMemory) => {
             // OUT: ret=arg32[0], handle=arg32[1]
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::CreateSharedMemory) => {
             // OUT: ret=arg32[0], handle=arg32[1]
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::MapTransferMemory) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -1022,7 +1040,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         Some(SvcId::CreateResourceLimit) => {
             // OUT: ret=arg32[0], handle=arg32[1]
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::SetResourceLimitLimitValue) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -1051,7 +1069,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         Some(SvcId::CreateCodeMemory) => {
             // OUT: ret=arg32[0], handle=arg32[1]
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::ControlCodeMemory) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -1062,7 +1080,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         // =====================================================================
         Some(SvcId::DebugActiveProcess) => {
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::BreakDebugProcess) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -1110,11 +1128,11 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         // =====================================================================
         Some(SvcId::CreateIoPool) => {
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::CreateIoRegion) => {
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::MapIoRegion) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -1124,7 +1142,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::CreateInterruptEvent) => {
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::QueryPhysicalAddress) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -1136,7 +1154,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::CreateDeviceAddressSpace) => {
             set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle());
+            set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::AttachDeviceAddressSpace) => {
             set_arg32(args, 0, STUB_SUCCESS);
