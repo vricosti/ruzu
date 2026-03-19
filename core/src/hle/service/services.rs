@@ -109,6 +109,7 @@ impl Services {
         service_manager: &Arc<Mutex<ServiceManager>>,
         device_memory: *const crate::device_memory::DeviceMemory,
         memory_manager: *mut crate::hle::kernel::k_memory_manager::KMemoryManager,
+        filesystem_controller: Arc<Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
     ) -> Self {
         let dm_addr = device_memory as usize;
         let mm_addr = memory_manager as usize;
@@ -127,7 +128,7 @@ impl Services {
         // kernel.RunOnHostCoreProcess("vi",         [&, token] { VI::LoopProcess(system, token); }).detach();
 
         Self::loop_process_audio(service_manager);
-        Self::loop_process_filesystem(service_manager);
+        Self::loop_process_filesystem(service_manager, filesystem_controller);
         Self::loop_process_jit(service_manager);
         Self::loop_process_ldn(service_manager);
         Self::loop_process_loader(service_manager);
@@ -254,8 +255,11 @@ impl Services {
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_filesystem(sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::filesystem::filesystem::loop_process(sm);
+    fn loop_process_filesystem(
+        sm: &Arc<Mutex<ServiceManager>>,
+        fsc: Arc<Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
+    ) {
+        crate::hle::service::filesystem::filesystem::loop_process(sm, fsc);
     }
 
     fn loop_process_jit(sm: &Arc<Mutex<ServiceManager>>) {
@@ -591,7 +595,10 @@ mod tests {
         // Verify Services can be constructed with a minimal ServiceManager.
         // We don't pass real device_memory/memory_manager in tests.
         let sm = Arc::new(Mutex::new(ServiceManager::new()));
-        let _services = Services::new(&sm, std::ptr::null(), std::ptr::null_mut());
+        let fsc = Arc::new(Mutex::new(
+            crate::hle::service::filesystem::filesystem::FileSystemController::new(),
+        ));
+        let _services = Services::new(&sm, std::ptr::null(), std::ptr::null_mut(), fsc);
 
         // Verify some services are registered.
         let sm_lock = sm.lock().unwrap();

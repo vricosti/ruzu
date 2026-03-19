@@ -130,6 +130,8 @@ pub enum AccessLogMode {
 /// | 1200 | OpenMultiCommitManager                                                 |
 /// | 1300 | OpenBisWiper                                                           |
 pub struct FspSrv {
+    /// Upstream: `FileSystemController& fsc`.
+    fsc: Option<Arc<std::sync::Mutex<super::super::filesystem::FileSystemController>>>,
     current_process_id: std::sync::Mutex<u64>,
     access_log_program_index: std::sync::Mutex<u32>,
     access_log_mode: std::sync::Mutex<AccessLogMode>,
@@ -141,6 +143,7 @@ pub struct FspSrv {
 impl FspSrv {
     pub fn new() -> Self {
         Self {
+            fsc: None,
             current_process_id: std::sync::Mutex::new(0),
             access_log_program_index: std::sync::Mutex::new(0),
             access_log_mode: std::sync::Mutex::new(AccessLogMode::None),
@@ -156,6 +159,16 @@ impl FspSrv {
             ]),
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    /// Create an FspSrv with a reference to the FileSystemController.
+    /// Matches upstream `FSP_SRV(Core::System& system_)` constructor.
+    pub fn new_with_fsc(
+        fsc: Arc<std::sync::Mutex<super::super::filesystem::FileSystemController>>,
+    ) -> Self {
+        let mut srv = Self::new();
+        srv.fsc = Some(fsc);
+        srv
     }
 
     fn push_interface_response(ctx: &mut HLERequestContext, object: Arc<dyn SessionRequestHandler>) {
@@ -176,15 +189,42 @@ impl FspSrv {
         }
     }
 
+    /// Port of upstream `FSP_SRV::SetCurrentProcess` (fsp_srv.cpp:186-193).
+    ///
+    /// Upstream calls `fsc.OpenProcess(&program_id, ..., current_process_id)`
+    /// which looks up the process_id → program_id mapping registered by the
+    /// NCA loader via `FileSystemController::RegisterProcess`.
     fn set_current_process_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
         let pid = ctx.get_pid();
         *service.current_process_id.lock().unwrap() = pid;
-        *service.program_id.lock().unwrap() = pid;
-        log::info!("FspSrv::SetCurrentProcess called, pid={:#x}", pid);
 
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        // Upstream: fsc.OpenProcess(&program_id, &save_data_controller, &romfs_controller, pid)
+        let program_id = service
+            .fsc
+            .as_ref()
+            .and_then(|fsc| fsc.lock().unwrap().open_process(pid));
+
+        match program_id {
+            Some(program_id) => {
+                *service.program_id.lock().unwrap() = program_id;
+                log::info!(
+                    "FspSrv::SetCurrentProcess: pid={:#x}, program_id={:#018x}",
+                    pid, program_id,
+                );
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+            }
+            None => {
+                // No registration found — matches upstream returning ResultTargetNotFound.
+                log::warn!(
+                    "FspSrv::SetCurrentProcess: pid={:#x} not registered with FileSystemController",
+                    pid,
+                );
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(ResultCode::new(RESULT_TARGET_NOT_FOUND.raw()));
+            }
+        }
     }
 
     fn open_sd_card_file_system_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
