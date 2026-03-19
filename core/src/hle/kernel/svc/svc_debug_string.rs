@@ -15,7 +15,12 @@ pub fn output_debug_string(ctx: &SvcContext, address: u64, len: u64) -> ResultCo
     }
 
     let len = len as usize;
-    let msg = {
+    let msg = if let Some(memory) = ctx.get_memory() {
+        let m = memory.lock().unwrap();
+        let mut buf = vec![0u8; len];
+        m.read_block(address, &mut buf);
+        String::from_utf8_lossy(&buf).to_string()
+    } else {
         let mem = ctx.shared_memory.read().unwrap();
         if mem.is_valid_range(address, len) {
             String::from_utf8_lossy(mem.read_block(address, len)).to_string()

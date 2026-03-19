@@ -18,17 +18,28 @@ use crate::hle::service::hle_ipc::SessionRequestManager;
 const PORT_NAME_MAX_LENGTH: usize = 12;
 
 fn read_port_name(ctx: &SvcContext, user_name: u64) -> String {
-    let mem = ctx.shared_memory.read().unwrap();
     let mut bytes = Vec::new();
-    for i in 0..PORT_NAME_MAX_LENGTH as u64 {
-        if !mem.is_valid_range(user_name + i, 1) {
-            break;
+    if let Some(memory) = ctx.get_memory() {
+        let m = memory.lock().unwrap();
+        for i in 0..PORT_NAME_MAX_LENGTH as u64 {
+            let byte = m.read_8(user_name + i);
+            if byte == 0 {
+                break;
+            }
+            bytes.push(byte);
         }
-        let byte = mem.read_8(user_name + i);
-        if byte == 0 {
-            break;
+    } else {
+        let mem = ctx.shared_memory.read().unwrap();
+        for i in 0..PORT_NAME_MAX_LENGTH as u64 {
+            if !mem.is_valid_range(user_name + i, 1) {
+                break;
+            }
+            let byte = mem.read_8(user_name + i);
+            if byte == 0 {
+                break;
+            }
+            bytes.push(byte);
         }
-        bytes.push(byte);
     }
     String::from_utf8_lossy(&bytes).to_string()
 }

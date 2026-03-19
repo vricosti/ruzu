@@ -72,6 +72,20 @@ impl SvcContext {
             .unwrap()
             .get_thread_by_thread_id(current_thread_id)
     }
+
+    /// Get the Memory bridge for guest memory access.
+    /// Matches upstream `GetCurrentMemory(kernel)` which returns
+    /// `GetCurrentProcess(kernel).GetMemory()`.
+    /// Returns None when Memory is not wired (tests).
+    pub fn get_memory(&self) -> Option<Arc<std::sync::Mutex<crate::memory::memory::Memory>>> {
+        self.current_process
+            .lock()
+            .unwrap()
+            .page_table
+            .get_base()
+            .m_memory
+            .clone()
+    }
 }
 
 fn drain_current_thread_termination(ctx: &SvcContext) {
@@ -504,8 +518,7 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             // Write MemoryInfo structure to guest memory.
             // Upstream: current_memory.WriteBlock(out_memory_info, &svc_mem_info, sizeof(...))
             {
-                let process = ctx.current_process.lock().unwrap();
-                if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+                if let Some(memory) = ctx.get_memory() {
                     let m = memory.lock().unwrap();
                     m.write_64(mem_info_ptr, base);
                     m.write_64(mem_info_ptr + 8, size);
@@ -947,16 +960,22 @@ fn call32(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             }
             // Read abort message from guest memory if info1 points to a string.
             if info1 != 0 && info2 > 0 && info2 < 0x200 {
-                let process = ctx.current_process.lock().unwrap();
-                let mem = process.process_memory.read().unwrap();
-                if mem.is_valid_range(info1, info2 as usize) {
-                    let mut buf = vec![0u8; info2 as usize];
-                    for (i, byte) in buf.iter_mut().enumerate() {
-                        *byte = (mem.read_32(info1 + i as u64) & 0xFF) as u8;
+                let len = info2 as usize;
+                let mut buf = vec![0u8; len];
+                if let Some(memory) = ctx.get_memory() {
+                    let m = memory.lock().unwrap();
+                    m.read_block(info1, &mut buf);
+                } else {
+                    let process = ctx.current_process.lock().unwrap();
+                    let mem = process.process_memory.read().unwrap();
+                    if mem.is_valid_range(info1, len) {
+                        for (i, byte) in buf.iter_mut().enumerate() {
+                            *byte = mem.read_8(info1 + i as u64);
+                        }
                     }
-                    if let Ok(msg) = String::from_utf8(buf) {
-                        log::error!("  Break message: {}", msg.trim_end_matches('\0'));
-                    }
+                }
+                if let Ok(msg) = String::from_utf8(buf) {
+                    log::error!("  Break message: {}", msg.trim_end_matches('\0'));
                 }
             }
 
@@ -1258,8 +1277,7 @@ fn call64(imm: u32, args: &mut SvcArgs, ctx: &SvcContext) {
             log::info!("  QueryMemory(info_ptr={:#x}, addr={:#x}) -> base={:#x} size={:#x} state={} perm={}",
                 mem_info_ptr, query_addr, base, size, state, perm);
             {
-                let process = ctx.current_process.lock().unwrap();
-                if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+                if let Some(memory) = ctx.get_memory() {
                     let m = memory.lock().unwrap();
                     m.write_64(mem_info_ptr, base);
                     m.write_64(mem_info_ptr + 8, size);

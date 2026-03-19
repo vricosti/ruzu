@@ -93,17 +93,23 @@ impl InstructionRingBuffer {
 /// Called after SetHeapSize (SVC ~#89).
 pub fn dump_module_memory(process: &Arc<Mutex<KProcess>>) {
     let proc = process.lock().unwrap();
-    let mem = proc.process_memory.read().unwrap();
     for (label, addr) in [
         ("sdk_module_desc(0x22c8000)", 0x22c8000u64),
         ("abort_desc(0x207c850)", 0x207c850u64),
         ("sdk_base(0x1c9c000)", 0x1c9c000u64),
     ] {
-        if mem.is_valid_range(addr, 64) {
-            let bytes = mem.read_block(addr, 64);
+        if let Some(memory) = proc.page_table.get_base().m_memory.as_ref() {
+            let mut bytes = [0u8; 64];
+            memory.lock().unwrap().read_block(addr, &mut bytes);
             log::error!("MEMDUMP {} @ {:#x}: {:02x?}", label, addr, &bytes[..64]);
         } else {
-            log::error!("MEMDUMP {} @ {:#x}: NOT MAPPED", label, addr);
+            let mem = proc.process_memory.read().unwrap();
+            if mem.is_valid_range(addr, 64) {
+                let bytes = mem.read_block(addr, 64);
+                log::error!("MEMDUMP {} @ {:#x}: {:02x?}", label, addr, &bytes[..64]);
+            } else {
+                log::error!("MEMDUMP {} @ {:#x}: NOT MAPPED", label, addr);
+            }
         }
     }
 }

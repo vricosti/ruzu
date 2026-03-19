@@ -60,17 +60,26 @@ pub fn wait_synchronization(
     }
 
     let mut process = ctx.current_process.lock().unwrap();
-    let mem = process.process_memory.read().unwrap();
-    let handle_bytes = num_handles as usize * std::mem::size_of::<Handle>();
-    if num_handles > 0 && !mem.is_valid_range(user_handles, handle_bytes) {
-        return RESULT_INVALID_POINTER;
-    }
 
     let mut handles = Vec::with_capacity(num_handles as usize);
-    for i in 0..num_handles as usize {
-        handles.push(mem.read_32(user_handles + (i * 4) as u64));
+    if num_handles > 0 {
+        if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+            let m = memory.lock().unwrap();
+            for i in 0..num_handles as usize {
+                handles.push(m.read_32(user_handles + (i * 4) as u64));
+            }
+        } else {
+            let mem = process.process_memory.read().unwrap();
+            let handle_bytes = num_handles as usize * std::mem::size_of::<Handle>();
+            if !mem.is_valid_range(user_handles, handle_bytes) {
+                return RESULT_INVALID_POINTER;
+            }
+            for i in 0..num_handles as usize {
+                handles.push(mem.read_32(user_handles + (i * 4) as u64));
+            }
+            drop(mem);
+        }
     }
-    drop(mem);
 
     let Some(current_thread_id) = ctx.current_thread_id() else {
         return RESULT_INVALID_HANDLE;

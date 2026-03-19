@@ -68,14 +68,25 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
 
     // Debug: if handle is 0, the game didn't receive the previous response correctly
     if session_handle == 0 {
-        let mem = debug_memory.read().unwrap();
-        log::error!(
-            "  SendSyncRequest with handle=0! TLS at send time: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-            mem.read_32(tls_address), mem.read_32(tls_address + 4),
-            mem.read_32(tls_address + 8), mem.read_32(tls_address + 12),
-            mem.read_32(tls_address + 16), mem.read_32(tls_address + 20),
-            mem.read_32(tls_address + 24), mem.read_32(tls_address + 28),
-        );
+        if let Some(memory) = ctx.get_memory() {
+            let m = memory.lock().unwrap();
+            log::error!(
+                "  SendSyncRequest with handle=0! TLS at send time: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                m.read_32(tls_address), m.read_32(tls_address + 4),
+                m.read_32(tls_address + 8), m.read_32(tls_address + 12),
+                m.read_32(tls_address + 16), m.read_32(tls_address + 20),
+                m.read_32(tls_address + 24), m.read_32(tls_address + 28),
+            );
+        } else {
+            let mem = debug_memory.read().unwrap();
+            log::error!(
+                "  SendSyncRequest with handle=0! TLS at send time: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                mem.read_32(tls_address), mem.read_32(tls_address + 4),
+                mem.read_32(tls_address + 8), mem.read_32(tls_address + 12),
+                mem.read_32(tls_address + 16), mem.read_32(tls_address + 20),
+                mem.read_32(tls_address + 24), mem.read_32(tls_address + 28),
+            );
+        }
     }
 
     // Dispatch to service handler.
@@ -86,18 +97,33 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
 
     // Debug: dump TLS after response
     {
-        let mem = debug_memory.read().unwrap();
-        log::info!(
-            "  TLS[0..15]: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-            mem.read_32(tls_address), mem.read_32(tls_address + 4),
-            mem.read_32(tls_address + 8), mem.read_32(tls_address + 12),
-            mem.read_32(tls_address + 16), mem.read_32(tls_address + 20),
-            mem.read_32(tls_address + 24), mem.read_32(tls_address + 28),
-            mem.read_32(tls_address + 32), mem.read_32(tls_address + 36),
-            mem.read_32(tls_address + 40), mem.read_32(tls_address + 44),
-            mem.read_32(tls_address + 48), mem.read_32(tls_address + 52),
-            mem.read_32(tls_address + 56), mem.read_32(tls_address + 60),
-        );
+        if let Some(memory) = ctx.get_memory() {
+            let m = memory.lock().unwrap();
+            log::info!(
+                "  TLS[0..15]: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                m.read_32(tls_address), m.read_32(tls_address + 4),
+                m.read_32(tls_address + 8), m.read_32(tls_address + 12),
+                m.read_32(tls_address + 16), m.read_32(tls_address + 20),
+                m.read_32(tls_address + 24), m.read_32(tls_address + 28),
+                m.read_32(tls_address + 32), m.read_32(tls_address + 36),
+                m.read_32(tls_address + 40), m.read_32(tls_address + 44),
+                m.read_32(tls_address + 48), m.read_32(tls_address + 52),
+                m.read_32(tls_address + 56), m.read_32(tls_address + 60),
+            );
+        } else {
+            let mem = debug_memory.read().unwrap();
+            log::info!(
+                "  TLS[0..15]: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                mem.read_32(tls_address), mem.read_32(tls_address + 4),
+                mem.read_32(tls_address + 8), mem.read_32(tls_address + 12),
+                mem.read_32(tls_address + 16), mem.read_32(tls_address + 20),
+                mem.read_32(tls_address + 24), mem.read_32(tls_address + 28),
+                mem.read_32(tls_address + 32), mem.read_32(tls_address + 36),
+                mem.read_32(tls_address + 40), mem.read_32(tls_address + 44),
+                mem.read_32(tls_address + 48), mem.read_32(tls_address + 52),
+                mem.read_32(tls_address + 56), mem.read_32(tls_address + 60),
+            );
+        }
     }
 
     // Upstream: SendSyncRequest always returns ResultSuccess to the guest.

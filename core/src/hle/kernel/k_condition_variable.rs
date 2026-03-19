@@ -164,7 +164,10 @@ impl KConditionVariable {
                 INVALID_HANDLE
             };
 
-            let result = if process_guard.process_memory.read().unwrap().is_valid_range(addr, 4) {
+            let result = if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+                memory.lock().unwrap().write_32(addr, next_value);
+                RESULT_SUCCESS
+            } else if process_guard.process_memory.read().unwrap().is_valid_range(addr, 4) {
                 process_guard.process_memory.write().unwrap().write_32(addr, next_value);
                 RESULT_SUCCESS
             } else {
@@ -216,7 +219,9 @@ impl KConditionVariable {
         }
 
         // Read the tag from userspace.
-        let test_tag = {
+        let test_tag = if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+            memory.lock().unwrap().read_32(addr)
+        } else {
             let mem = process_guard.process_memory.read().unwrap();
             if !mem.is_valid_range(addr, 4) {
                 return RESULT_INVALID_CURRENT_MEMORY;
@@ -311,7 +316,9 @@ impl KConditionVariable {
             self.waiting_threads.nfind_key(cv_key),
             Some(waiting_thread_key) if waiting_thread_key.cv_key == cv_key
         ) {
-            if process_guard.process_memory.read().unwrap().is_valid_range(cv_key, 4) {
+            if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+                memory.lock().unwrap().write_32(cv_key, 0);
+            } else if process_guard.process_memory.read().unwrap().is_valid_range(cv_key, 4) {
                 process_guard
                     .process_memory
                     .write()
@@ -395,19 +402,22 @@ impl KConditionVariable {
                     .end_wait(RESULT_SUCCESS.get_inner_value());
             }
 
-            if !process_guard.process_memory.read().unwrap().is_valid_range(key, 4)
-                || !process_guard.process_memory.read().unwrap().is_valid_range(addr, 4)
-            {
-                return RESULT_INVALID_CURRENT_MEMORY;
-            }
-
-            {
-                let mut mem = process_guard.process_memory.write().unwrap();
-                mem.write_32(key, 1);
+            if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+                let m = memory.lock().unwrap();
+                m.write_32(key, 1);
                 // Upstream: std::atomic_thread_fence(std::memory_order_seq_cst)
                 // ensures the cv_key write is visible before the address write.
-                // In our single-threaded guest model this is a no-op, but we
-                // preserve the ordering by writing key before addr.
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                m.write_32(addr, next_value);
+            } else {
+                if !process_guard.process_memory.read().unwrap().is_valid_range(key, 4)
+                    || !process_guard.process_memory.read().unwrap().is_valid_range(addr, 4)
+                {
+                    return RESULT_INVALID_CURRENT_MEMORY;
+                }
+
+                let mut mem = process_guard.process_memory.write().unwrap();
+                mem.write_32(key, 1);
                 std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                 mem.write_32(addr, next_value);
             }
@@ -441,11 +451,15 @@ impl KConditionVariable {
             let address = waiting_thread_guard.get_address_key();
             let own_tag = waiting_thread_guard.get_address_key_value();
 
-            let mem = process_guard.process_memory.read().unwrap();
-            if !mem.is_valid_range(address.get(), 4) {
-                return RESULT_INVALID_CURRENT_MEMORY;
-            }
-            let previous_tag = mem.read_32(address.get());
+            let previous_tag = if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+                memory.lock().unwrap().read_32(address.get())
+            } else {
+                let mem = process_guard.process_memory.read().unwrap();
+                if !mem.is_valid_range(address.get(), 4) {
+                    return RESULT_INVALID_CURRENT_MEMORY;
+                }
+                mem.read_32(address.get())
+            };
             (address, own_tag, previous_tag)
         };
 
@@ -455,11 +469,15 @@ impl KConditionVariable {
             previous_tag | HANDLE_WAIT_MASK
         };
 
-        process_guard
-            .process_memory
-            .write()
-            .unwrap()
-            .write_32(address.get(), updated_value);
+        if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+            memory.lock().unwrap().write_32(address.get(), updated_value);
+        } else {
+            process_guard
+                .process_memory
+                .write()
+                .unwrap()
+                .write_32(address.get(), updated_value);
+        }
 
         let waiting_thread_id = waiting_thread.lock().unwrap().get_thread_id();
 

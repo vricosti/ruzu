@@ -304,8 +304,9 @@ fn main() {
         let is_64bit = process.is_64bit();
 
         let (code_base, code_size) = {
-            let mem = shared_memory.read().unwrap();
-            (mem.base, mem.data.len())
+            let code_base = process.page_table.get_code_region_start().get();
+            let code_size = process.page_table.get_code_region_size();
+            (code_base, code_size)
         };
 
         log::info!(
