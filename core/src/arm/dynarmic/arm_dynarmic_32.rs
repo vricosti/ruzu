@@ -12,6 +12,7 @@ use crate::arm::arm_interface::{
     KThread, ThreadContext,
 };
 use crate::hle::kernel::k_process::SharedProcessMemory;
+use crate::memory::memory::Memory;
 
 use rdynarmic::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
 
@@ -50,8 +51,13 @@ fn translate_halt_reason(hr: rdynarmic::halt_reason::HaltReason) -> HaltReason {
 /// Also holds a reference to CoreTiming for tick management, matching upstream's
 /// `m_parent.m_system.CoreTiming()` access pattern.
 struct DynarmicCallbacks32 {
-    /// Shared guest memory reference.
+    /// Shared guest memory reference (ProcessMemoryData).
+    /// Used as fallback when core_memory is None (tests).
     memory: SharedProcessMemory,
+    /// Core::Memory::Memory bridge (reads/writes via PageTable → DeviceMemory).
+    /// Matches upstream `Core::Memory::Memory& m_memory`.
+    /// None in tests where Memory is not wired.
+    core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
     /// SVC/SWI number from last supervisor call, shared with parent ArmDynarmic32.
     svc_swi: Arc<AtomicU32>,
     /// Whether wall clock is used (if true, ticking is disabled).
@@ -67,165 +73,169 @@ struct DynarmicCallbacks32 {
 impl DynarmicCallbacks32 {
     fn new(
         memory: SharedProcessMemory,
+        core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
         svc_swi: Arc<AtomicU32>,
         uses_wall_clock: bool,
         core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
         last_exception_address: Arc<AtomicU64>,
     ) -> Self {
-        log::info!("DynarmicCallbacks32: Arc memory ptr = {:?}, base = {:#x}",
+        log::info!("DynarmicCallbacks32: Arc memory ptr = {:?}, base = {:#x}, core_memory={}",
             std::sync::Arc::as_ptr(&memory),
-            memory.read().unwrap().base);
-        Self { memory, svc_swi, uses_wall_clock, core_timing, last_exception_address }
+            memory.read().unwrap().base,
+            if core_memory.is_some() { "wired" } else { "fallback" });
+        Self { memory, core_memory, svc_swi, uses_wall_clock, core_timing, last_exception_address }
     }
 }
 
 impl JitCallbacks for DynarmicCallbacks32 {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
-        let mem = self.memory.read().unwrap();
-        if mem.is_valid_range(vaddr, 4) {
-            Some(mem.read_32(vaddr))
+        if let Some(ref cm) = self.core_memory {
+            let m = cm.lock().unwrap();
+            if m.is_valid_virtual_address(vaddr) {
+                Some(m.read_32(vaddr))
+            } else {
+                log::warn!("DynarmicCallbacks32::memory_read_code({:#x}): unmapped, returning UDF", vaddr);
+                Some(0xE7F000F0)
+            }
         } else {
-            log::warn!("DynarmicCallbacks32::memory_read_code({:#x}): unmapped, returning UDF", vaddr);
-            Some(0xE7F000F0)
+            let mem = self.memory.read().unwrap();
+            if mem.is_valid_range(vaddr, 4) {
+                Some(mem.read_32(vaddr))
+            } else {
+                log::warn!("DynarmicCallbacks32::memory_read_code({:#x}): unmapped, returning UDF", vaddr);
+                Some(0xE7F000F0)
+            }
         }
     }
 
     fn memory_read_8(&self, vaddr: u64) -> u8 {
-        self.memory.read().unwrap().read_8(vaddr)
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().read_8(vaddr)
+        } else {
+            self.memory.read().unwrap().read_8(vaddr)
+        }
     }
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
-        self.memory.read().unwrap().read_16(vaddr)
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().read_16(vaddr)
+        } else {
+            self.memory.read().unwrap().read_16(vaddr)
+        }
     }
 
     fn memory_read_32(&self, vaddr: u64) -> u32 {
-        self.memory.read().unwrap().read_32(vaddr)
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().read_32(vaddr)
+        } else {
+            self.memory.read().unwrap().read_32(vaddr)
+        }
     }
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
-        self.memory.read().unwrap().read_64(vaddr)
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().read_64(vaddr)
+        } else {
+            self.memory.read().unwrap().read_64(vaddr)
+        }
     }
 
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
-        let mem = self.memory.read().unwrap();
-        (mem.read_64(vaddr), mem.read_64(vaddr + 8))
+        if let Some(ref cm) = self.core_memory {
+            let m = cm.lock().unwrap();
+            (m.read_64(vaddr), m.read_64(vaddr + 8))
+        } else {
+            let mem = self.memory.read().unwrap();
+            (mem.read_64(vaddr), mem.read_64(vaddr + 8))
+        }
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
-        let mut mem = self.memory.write().unwrap();
-        if !mem.is_writable(vaddr) {
-            log::trace!("JIT write8 blocked (read-only): [{:#010x}]", vaddr);
-            return;
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().write_8(vaddr, value);
+        } else {
+            self.memory.write().unwrap().write_8(vaddr, value);
         }
-        mem.write_8(vaddr, value);
     }
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
-        let mut mem = self.memory.write().unwrap();
-        if !mem.is_writable(vaddr) {
-            log::trace!("JIT write16 blocked (read-only): [{:#010x}]", vaddr);
-            return;
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().write_16(vaddr, value);
+        } else {
+            self.memory.write().unwrap().write_16(vaddr, value);
         }
-        mem.write_16(vaddr, value);
     }
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
-        let mut mem = self.memory.write().unwrap();
-        if !mem.is_writable(vaddr) {
-            log::trace!("JIT write32 blocked (read-only): [{:#010x}]", vaddr);
-            return;
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().write_32(vaddr, value);
+        } else {
+            self.memory.write().unwrap().write_32(vaddr, value);
         }
-        mem.write_32(vaddr, value);
     }
 
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
-        let mut mem = self.memory.write().unwrap();
-        if !mem.is_writable(vaddr) {
-            log::trace!("JIT write64 blocked (read-only): [{:#010x}]", vaddr);
-            return;
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().write_64(vaddr, value);
+        } else {
+            self.memory.write().unwrap().write_64(vaddr, value);
         }
-        mem.write_64(vaddr, value);
     }
 
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
-        let mut mem = self.memory.write().unwrap();
-        if !mem.is_writable(vaddr) {
-            log::trace!("JIT write128 blocked (read-only): [{:#010x}]", vaddr);
-            return;
+        if let Some(ref cm) = self.core_memory {
+            let m = cm.lock().unwrap();
+            m.write_64(vaddr, value_lo);
+            m.write_64(vaddr + 8, value_hi);
+        } else {
+            let mut mem = self.memory.write().unwrap();
+            mem.write_64(vaddr, value_lo);
+            mem.write_64(vaddr + 8, value_hi);
         }
-        mem.write_64(vaddr, value_lo);
-        mem.write_64(vaddr + 8, value_hi);
     }
 
     fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-        self.memory.read().unwrap().read_8(vaddr)
+        self.memory_read_8(vaddr)
     }
 
     fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-        self.memory.read().unwrap().read_16(vaddr)
+        self.memory_read_16(vaddr)
     }
 
     fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-        self.memory.read().unwrap().read_32(vaddr)
+        self.memory_read_32(vaddr)
     }
 
     fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-        self.memory.read().unwrap().read_64(vaddr)
+        self.memory_read_64(vaddr)
     }
 
     fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-        let mem = self.memory.read().unwrap();
-        (mem.read_64(vaddr), mem.read_64(vaddr + 8))
+        self.memory_read_128(vaddr)
     }
 
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8) -> bool {
-        let mut mem = self.memory.write().unwrap();
-        if !mem.is_writable(vaddr) {
-            log::warn!("JIT excl_write8 BLOCKED (read-only): [{:#010x}]", vaddr);
-            return false;
-        }
-        mem.write_8(vaddr, value);
+        self.memory_write_8(vaddr, value);
         true
     }
 
     fn exclusive_write_16(&mut self, vaddr: u64, value: u16) -> bool {
-        let mut mem = self.memory.write().unwrap();
-        if !mem.is_writable(vaddr) {
-            log::warn!("JIT excl_write16 BLOCKED (read-only): [{:#010x}]", vaddr);
-            return false;
-        }
-        mem.write_16(vaddr, value);
+        self.memory_write_16(vaddr, value);
         true
     }
 
     fn exclusive_write_32(&mut self, vaddr: u64, value: u32) -> bool {
-        let mut mem = self.memory.write().unwrap();
-        if !mem.is_writable(vaddr) {
-            log::warn!("JIT excl_write32 BLOCKED (read-only): [{:#010x}]", vaddr);
-            return false;
-        }
-        mem.write_32(vaddr, value);
+        self.memory_write_32(vaddr, value);
         true
     }
 
     fn exclusive_write_64(&mut self, vaddr: u64, value: u64) -> bool {
-        let mut mem = self.memory.write().unwrap();
-        if !mem.is_writable(vaddr) {
-            log::warn!("JIT excl_write64 BLOCKED (read-only): [{:#010x}]", vaddr);
-            return false;
-        }
-        mem.write_64(vaddr, value);
+        self.memory_write_64(vaddr, value);
         true
     }
 
     fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) -> bool {
-        let mut mem = self.memory.write().unwrap();
-        if !mem.is_writable(vaddr) {
-            log::warn!("JIT excl_write128 BLOCKED (read-only): [{:#010x}]", vaddr);
-            return false;
-        }
-        mem.write_64(vaddr, value_lo);
-        mem.write_64(vaddr + 8, value_hi);
+        self.memory_write_128(vaddr, value_lo, value_hi);
         true
     }
 
@@ -244,17 +254,30 @@ impl JitCallbacks for DynarmicCallbacks32 {
             "DynarmicCallbacks32::exception_raised(pc={:#x}, exception={:#x})",
             pc, exception
         );
-        let mem = self.memory.read().unwrap();
         let start = pc.saturating_sub(0x10);
         log::error!("DynarmicCallbacks32 exception window around pc={:#x}", pc);
-        for addr in (start..=pc.saturating_add(0x10)).step_by(4) {
-            if !mem.is_valid_range(addr, 4) {
-                log::error!("  [{:#010x}] <unmapped>", addr);
-                continue;
+        if let Some(ref cm) = self.core_memory {
+            let m = cm.lock().unwrap();
+            for addr in (start..=pc.saturating_add(0x10)).step_by(4) {
+                if !m.is_valid_virtual_address(addr) {
+                    log::error!("  [{:#010x}] <unmapped>", addr);
+                    continue;
+                }
+                let insn = m.read_32(addr);
+                let marker = if addr == pc { " <EXC>" } else { "" };
+                log::error!("  [{:#010x}] {:#010x}{}", addr, insn, marker);
             }
-            let insn = mem.read_32(addr);
-            let marker = if addr == pc { " <EXC>" } else { "" };
-            log::error!("  [{:#010x}] {:#010x}{}", addr, insn, marker);
+        } else {
+            let mem = self.memory.read().unwrap();
+            for addr in (start..=pc.saturating_add(0x10)).step_by(4) {
+                if !mem.is_valid_range(addr, 4) {
+                    log::error!("  [{:#010x}] <unmapped>", addr);
+                    continue;
+                }
+                let insn = mem.read_32(addr);
+                let marker = if addr == pc { " <EXC>" } else { "" };
+                log::error!("  [{:#010x}] {:#010x}{}", addr, insn, marker);
+            }
         }
     }
 
@@ -328,11 +351,13 @@ impl ArmDynarmic32 {
         core_index: usize,
         shared_memory: SharedProcessMemory,
         core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+        core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
     ) -> Self {
         let svc_swi = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
         let callbacks = DynarmicCallbacks32::new(
             shared_memory,
+            core_memory,
             svc_swi.clone(),
             uses_wall_clock,
             core_timing,

@@ -324,11 +324,12 @@ fn main() {
         let tls_page_size: u64 = 0x1000;
 
         // Log tracked memory regions for debugging.
+        // Block manager now lives in the page table (KPageTableBase).
         {
-            let mem = shared_memory.read().unwrap();
+            use ruzu_core::hle::kernel::k_memory_block::KMemoryState;
+            let bm = process.page_table.get_base().get_memory_block_manager();
             let mut count = 0;
-            for block in mem.block_manager.iter() {
-                use ruzu_core::hle::kernel::k_memory_block::KMemoryState;
+            for block in bm.iter() {
                 if block.get_state() != KMemoryState::FREE {
                     let perm = block.get_permission();
                     log::info!("  [{:#010x}..{:#010x}) size={:#x} state={:?} perm={:?}",
@@ -392,6 +393,7 @@ fn main() {
 
         // Run the CPU with SVC dispatch loop.
         // Supports both AArch32 and AArch64 via trait object.
+        let core_memory = system.memory_shared();
         let mut jit: Box<dyn ArmInterface> = if is_64bit {
             use ruzu_core::arm::dynarmic::arm_dynarmic_64::ArmDynarmic64;
             Box::new(ArmDynarmic64::new(
@@ -399,6 +401,7 @@ fn main() {
                 true, dummy_process,
                 &dummy_exclusive as &dyn std::any::Any,
                 0, shared_memory.clone(),
+                core_memory.clone(),
             ))
         } else {
             use ruzu_core::arm::dynarmic::arm_dynarmic_32::ArmDynarmic32;
@@ -407,6 +410,7 @@ fn main() {
                 true, dummy_process, // TODO: use false for single-core scheduling once rdynarmic cycle counting perf is fixed
                 &dummy_exclusive as &dyn std::any::Any,
                 0, shared_memory.clone(), system.core_timing_shared(),
+                core_memory,
             ))
         };
 

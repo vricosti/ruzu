@@ -12,6 +12,7 @@ use crate::arm::arm_interface::{
     KThread, ThreadContext,
 };
 use crate::hle::kernel::k_process::SharedProcessMemory;
+use crate::memory::memory::Memory;
 
 use rdynarmic::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
 
@@ -56,9 +57,11 @@ fn translate_halt_reason(hr: rdynarmic::halt_reason::HaltReason) -> HaltReason {
 /// Holds a shared reference to guest process memory, matching upstream's
 /// `Core::Memory::Memory& m_memory` obtained from `process->GetMemory()`.
 struct DynarmicCallbacks64 {
-    /// Shared guest memory reference.
-    /// Corresponds to upstream `m_memory` (Core::Memory::Memory&).
+    /// Shared guest memory reference (ProcessMemoryData fallback).
     memory: SharedProcessMemory,
+    /// Core::Memory::Memory bridge (reads/writes via PageTable → DeviceMemory).
+    /// Matches upstream `Core::Memory::Memory& m_memory`.
+    core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
     /// SVC number from last supervisor call, shared with parent ArmDynarmic64.
     /// Upstream: callback writes to m_parent.m_svc via back-reference.
     svc: Arc<AtomicU32>,
@@ -69,9 +72,14 @@ struct DynarmicCallbacks64 {
 }
 
 impl DynarmicCallbacks64 {
-    fn new(memory: SharedProcessMemory, svc: Arc<AtomicU32>) -> Self {
+    fn new(
+        memory: SharedProcessMemory,
+        core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+        svc: Arc<AtomicU32>,
+    ) -> Self {
         Self {
             memory,
+            core_memory,
             svc,
             tpidrro_el0: 0,
             tpidr_el0: 0,
@@ -81,130 +89,129 @@ impl DynarmicCallbacks64 {
 
 impl JitCallbacks for DynarmicCallbacks64 {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
-        // Corresponds to upstream DynarmicCallbacks64::MemoryReadCode.
-        // Reads a 32-bit instruction from guest code memory.
-        let mem = self.memory.read().unwrap();
-        if mem.is_valid_range(vaddr, 4) {
-            Some(mem.read_32(vaddr))
+        if let Some(ref cm) = self.core_memory {
+            let m = cm.lock().unwrap();
+            if m.is_valid_virtual_address(vaddr) {
+                Some(m.read_32(vaddr))
+            } else {
+                log::warn!("memory_read_code({:#x}): unmapped, returning UDF", vaddr);
+                Some(0x00000000) // A64: UDF #0
+            }
         } else {
-            // Return UDF (permanently undefined) instruction to trigger a clean
-            // exception rather than hanging when code branches to unmapped memory.
-            log::warn!("memory_read_code({:#x}): unmapped, returning UDF", vaddr);
-            Some(0x00000000) // A64: UDF #0
+            let mem = self.memory.read().unwrap();
+            if mem.is_valid_range(vaddr, 4) {
+                Some(mem.read_32(vaddr))
+            } else {
+                log::warn!("memory_read_code({:#x}): unmapped, returning UDF", vaddr);
+                Some(0x00000000)
+            }
         }
     }
 
     fn memory_read_8(&self, vaddr: u64) -> u8 {
-        let mem = self.memory.read().unwrap();
-        mem.read_8(vaddr)
+        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_8(vaddr) }
+        else { self.memory.read().unwrap().read_8(vaddr) }
     }
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
-        let mem = self.memory.read().unwrap();
-        mem.read_16(vaddr)
+        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_16(vaddr) }
+        else { self.memory.read().unwrap().read_16(vaddr) }
     }
 
     fn memory_read_32(&self, vaddr: u64) -> u32 {
-        let mem = self.memory.read().unwrap();
-        mem.read_32(vaddr)
+        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_32(vaddr) }
+        else { self.memory.read().unwrap().read_32(vaddr) }
     }
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
-        let mem = self.memory.read().unwrap();
-        mem.read_64(vaddr)
+        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_64(vaddr) }
+        else { self.memory.read().unwrap().read_64(vaddr) }
     }
 
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
-        let mem = self.memory.read().unwrap();
-        let lo = mem.read_64(vaddr);
-        let hi = mem.read_64(vaddr + 8);
-        (lo, hi)
+        if let Some(ref cm) = self.core_memory {
+            let m = cm.lock().unwrap();
+            (m.read_64(vaddr), m.read_64(vaddr + 8))
+        } else {
+            let mem = self.memory.read().unwrap();
+            (mem.read_64(vaddr), mem.read_64(vaddr + 8))
+        }
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
-        let mut mem = self.memory.write().unwrap();
-        mem.write_8(vaddr, value);
+        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_8(vaddr, value); }
+        else { self.memory.write().unwrap().write_8(vaddr, value); }
     }
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
-        let mut mem = self.memory.write().unwrap();
-        mem.write_16(vaddr, value);
+        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_16(vaddr, value); }
+        else { self.memory.write().unwrap().write_16(vaddr, value); }
     }
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
-        let mut mem = self.memory.write().unwrap();
-        mem.write_32(vaddr, value);
+        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_32(vaddr, value); }
+        else { self.memory.write().unwrap().write_32(vaddr, value); }
     }
 
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
-        let mut mem = self.memory.write().unwrap();
-        mem.write_64(vaddr, value);
+        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_64(vaddr, value); }
+        else { self.memory.write().unwrap().write_64(vaddr, value); }
     }
 
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
-        let mut mem = self.memory.write().unwrap();
-        mem.write_64(vaddr, value_lo);
-        mem.write_64(vaddr + 8, value_hi);
+        if let Some(ref cm) = self.core_memory {
+            let m = cm.lock().unwrap();
+            m.write_64(vaddr, value_lo);
+            m.write_64(vaddr + 8, value_hi);
+        } else {
+            let mut mem = self.memory.write().unwrap();
+            mem.write_64(vaddr, value_lo);
+            mem.write_64(vaddr + 8, value_hi);
+        }
     }
 
     fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-        // TODO: Wire exclusive monitor. For now, do a regular read.
-        let mem = self.memory.read().unwrap();
-        mem.read_8(vaddr)
+        self.memory_read_8(vaddr)
     }
 
     fn exclusive_read_16(&self, vaddr: u64) -> u16 {
-        let mem = self.memory.read().unwrap();
-        mem.read_16(vaddr)
+        self.memory_read_16(vaddr)
     }
 
     fn exclusive_read_32(&self, vaddr: u64) -> u32 {
-        let mem = self.memory.read().unwrap();
-        mem.read_32(vaddr)
+        self.memory_read_32(vaddr)
     }
 
     fn exclusive_read_64(&self, vaddr: u64) -> u64 {
-        let mem = self.memory.read().unwrap();
-        mem.read_64(vaddr)
+        self.memory_read_64(vaddr)
     }
 
     fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-        let mem = self.memory.read().unwrap();
-        let lo = mem.read_64(vaddr);
-        let hi = mem.read_64(vaddr + 8);
-        (lo, hi)
+        self.memory_read_128(vaddr)
     }
 
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8) -> bool {
-        // TODO: Wire exclusive monitor for proper LDXR/STXR emulation.
-        // For now, always succeed (optimistic).
-        let mut mem = self.memory.write().unwrap();
-        mem.write_8(vaddr, value);
+        self.memory_write_8(vaddr, value);
         true
     }
 
     fn exclusive_write_16(&mut self, vaddr: u64, value: u16) -> bool {
-        let mut mem = self.memory.write().unwrap();
-        mem.write_16(vaddr, value);
+        self.memory_write_16(vaddr, value);
         true
     }
 
     fn exclusive_write_32(&mut self, vaddr: u64, value: u32) -> bool {
-        let mut mem = self.memory.write().unwrap();
-        mem.write_32(vaddr, value);
+        self.memory_write_32(vaddr, value);
         true
     }
 
     fn exclusive_write_64(&mut self, vaddr: u64, value: u64) -> bool {
-        let mut mem = self.memory.write().unwrap();
-        mem.write_64(vaddr, value);
+        self.memory_write_64(vaddr, value);
         true
     }
 
     fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) -> bool {
-        let mut mem = self.memory.write().unwrap();
-        mem.write_64(vaddr, value_lo);
-        mem.write_64(vaddr + 8, value_hi);
+        self.memory_write_128(vaddr, value_lo, value_hi);
         true
     }
 
@@ -287,10 +294,11 @@ impl ArmDynarmic64 {
         _exclusive_monitor: &dyn std::any::Any,
         core_index: usize,
         shared_memory: SharedProcessMemory,
+        core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
     ) -> Self {
         // Create JIT callbacks with shared memory reference
         let svc = Arc::new(AtomicU32::new(0));
-        let callbacks = DynarmicCallbacks64::new(shared_memory, svc.clone());
+        let callbacks = DynarmicCallbacks64::new(shared_memory, core_memory, svc.clone());
 
         // Configure JIT
         // Upstream: enable_cycle_counting = !uses_wall_clock
