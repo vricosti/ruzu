@@ -881,22 +881,6 @@ impl KProcess {
             memory.lock().unwrap().zero_block(stack_base, aligned_stack_size as usize);
         }
 
-        // Also back the stack in ProcessMemoryData for JIT callbacks.
-        // (Will be removed in Phase B7.)
-        {
-            let mut mem = self.process_memory.write().unwrap();
-            let new_total = (stack_top - mem.base) as usize;
-            if new_total > mem.data.len() {
-                mem.data.resize(new_total, 0);
-            }
-
-            let stack_offset = (stack_base - mem.base) as usize;
-            let stack_len = aligned_stack_size as usize;
-            for byte in &mut mem.data[stack_offset..stack_offset + stack_len] {
-                *byte = 0;
-            }
-        }
-
         self.main_thread_stack_size = aligned_stack_size as usize;
         self.page_table
             .set_stack_region(KProcessAddress::new(stack_base), aligned_stack_size as usize);
@@ -939,22 +923,9 @@ impl KProcess {
             KMemoryPermission::USER_READ_WRITE,
         );
 
-        // Zero the TLS page in both DeviceMemory and ProcessMemoryData.
-        // (ProcessMemoryData write will be removed in Phase B7.)
+        // Zero the TLS page in DeviceMemory.
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
             memory.lock().unwrap().zero_block(page_address, THREAD_LOCAL_PAGE_SIZE);
-        }
-        {
-            let mut mem = self.process_memory.write().unwrap();
-            let page_end = page_address + THREAD_LOCAL_PAGE_SIZE as u64;
-            let new_total = (page_end - mem.base) as usize;
-            if new_total > mem.data.len() {
-                mem.data.resize(new_total, 0);
-            }
-            let page_offset = (page_address - mem.base) as usize;
-            for byte in &mut mem.data[page_offset..page_offset + THREAD_LOCAL_PAGE_SIZE] {
-                *byte = 0;
-            }
         }
 
         let mut page = KThreadLocalPage::new(KProcessAddress::new(page_address));
@@ -1210,10 +1181,8 @@ impl KProcess {
             if let Some(plr) = self.create_thread_local_region() {
                 self.plr_address = plr;
                 // Zero the PLR in guest memory (Svc::ThreadLocalRegionSize = 0x200).
-                let mut mem = self.process_memory.write().unwrap();
-                for i in 0..0x200usize {
-                    mem.write_8(plr.get() + i as u64, 0);
-                }
+                // create_thread_local_region already zeroes the full TLS page
+                // in DeviceMemory, so the PLR region is already zero.
             }
         }
 
@@ -1685,15 +1654,6 @@ impl KProcess {
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
             memory.lock().unwrap().zero_block(stack_base, stack_size);
         }
-        // Also back in ProcessMemoryData for JIT callbacks (Phase B7 removes).
-        {
-            let mut mem = self.process_memory.write().unwrap();
-            let needed = (stack_top - mem.base) as usize;
-            if needed > mem.data.len() {
-                mem.data.resize(needed, 0);
-            }
-        }
-
         // Upstream: m_page_table.SetMaxHeapSize(m_max_process_memory -
         //           (m_main_thread_stack_size + m_code_size))
         let max_heap = self.max_process_memory.saturating_sub(self.main_thread_stack_size + self.code_size);
@@ -1981,13 +1941,11 @@ impl KProcess {
     }
 
     /// Write data to process memory at the given guest address.
-    /// Writes to both DeviceMemory (via Memory) and ProcessMemoryData (fallback).
+    /// Writes to DeviceMemory via Memory.
     pub fn write_memory(&mut self, guest_addr: u64, data: &[u8]) {
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
             memory.lock().unwrap().write_block(guest_addr, data);
         }
-        let mut mem = self.process_memory.write().unwrap();
-        mem.write_block(guest_addr, data);
     }
 
     /// Load a module into process memory and apply per-segment permissions.
@@ -2022,14 +1980,8 @@ impl KProcess {
             );
         }
 
-        // Write code to DeviceMemory via Memory::write_block (through PageTable).
+        // Write code to DeviceMemory via Memory::write_block.
         // Upstream: this->GetMemory().WriteBlock(base_addr, code_set.memory.data(), ...)
-        // Also write to ProcessMemoryData for JIT callbacks that still read from there.
-        // (Phase B2 will migrate JIT to read via Memory/PageTable, then this can be removed.)
-        {
-            let mut mem = self.process_memory.write().unwrap();
-            mem.write_block(base_addr, &code_set.memory);
-        }
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
             memory.lock().unwrap().write_block(base_addr, &code_set.memory);
         }
@@ -2086,7 +2038,7 @@ impl KProcess {
     pub fn allocate_code_memory(&mut self, base: u64, size: usize) {
         {
             let mut mem = self.process_memory.write().unwrap();
-            mem.allocate(base, size);
+            mem.allocate(base, 0);
         }
         let address_space_size = if base < 0x1_0000_0000 {
             0x1_0000_0000usize
@@ -2100,7 +2052,6 @@ impl KProcess {
     }
 
     pub fn set_heap_size(&mut self, size: usize) -> (u32, KProcessAddress) {
-        let old_size = self.page_table.get_current_heap_size();
         let (result, heap_base) = self.page_table.set_heap_size(size);
         if result != RESULT_SUCCESS.get_inner_value() {
             return (result, heap_base);
@@ -2108,12 +2059,7 @@ impl KProcess {
 
         // page_table.set_heap_size() already updates the block manager
         // (grow → update NORMAL/RW, shrink → Operate(Unmap) + update FREE).
-        // We only need to clean up sparse pages on shrink.
-        if old_size > size {
-            let heap_base_u64 = heap_base.get();
-            let mut mem = self.process_memory.write().unwrap();
-            mem.clear_sparse_range(heap_base_u64 + size as u64, old_size - size);
-        }
+        // DeviceMemory handles the actual memory backing.
 
         (RESULT_SUCCESS.get_inner_value(), heap_base)
     }
@@ -2294,24 +2240,25 @@ mod tests {
     }
 
     #[test]
-    fn set_heap_size_maps_sparse_heap_region_without_resizing_contiguous_image() {
+    fn set_heap_size_maps_heap_region_in_page_table() {
         let mut process = KProcess::new();
         process.allocate_code_memory(0x200000, 0x229a000);
         process.initialize_main_thread_stack_region(0x2396000, 0x100000);
 
-        let contiguous_len_before = process.process_memory.read().unwrap().data.len();
         let (result, heap_base) = process.set_heap_size(0x78000000);
         assert_eq!(result, RESULT_SUCCESS.get_inner_value());
         assert_eq!(heap_base.get(), 0x249a000);
         assert_eq!(process.page_table.get_current_heap_size(), 0x78000000);
-        assert!(process.process_memory.read().unwrap().is_valid_range(heap_base.get(), 4));
 
-        {
-            let mut mem = process.process_memory.write().unwrap();
-            mem.write_32(heap_base.get(), 0x1234_5678);
-            assert_eq!(mem.read_32(heap_base.get()), 0x1234_5678);
-            assert_eq!(mem.data.len(), contiguous_len_before);
-        }
+        // The heap region must be tracked in the page table's block manager.
+        use crate::hle::kernel::k_memory_block::KMemoryBlock;
+        let bm = process.page_table.get_base().get_memory_block_manager();
+        let block = bm
+            .iter()
+            .find(|block: &&KMemoryBlock| block.get_address() == heap_base.get() as usize)
+            .expect("heap region must be tracked in page table's block manager");
+        assert_eq!(block.get_state(), KMemoryState::NORMAL);
+        assert_eq!(block.get_permission(), KMemoryPermission::USER_READ_WRITE);
     }
 
     #[test]
