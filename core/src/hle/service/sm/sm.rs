@@ -2,12 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of zuyu/src/core/hle/service/sm/sm.h and sm.cpp
-//! Status: Structural port
 //!
 //! Contains:
-//! - SM: the "sm:" service interface
 //! - ServiceManager: manages service registration and lookup
-//! - loop_process: entry point for running SM services
+//! - SM: the "sm:" service interface (ServiceFramework)
+//! - LoopProcess: entry point matching upstream `SM::LoopProcess(Core::System&)`
 //!
 //! Result codes (matching upstream):
 //! - ResultInvalidClient (ErrorModule::SM, 2)
@@ -18,6 +17,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
@@ -31,7 +31,7 @@ use crate::hle::service::service::{
 };
 use crate::hle::service::sm::sm_controller::Controller;
 
-// --- SM result codes ---
+// --- SM result codes (matching upstream sm.cpp) ---
 
 pub const RESULT_INVALID_CLIENT: ResultCode =
     ResultCode::from_module_description(ErrorModule::SM, 2);
@@ -43,38 +43,53 @@ pub const RESULT_NOT_REGISTERED: ResultCode =
     ResultCode::from_module_description(ErrorModule::SM, 7);
 
 // --- ServiceManager ---
+//
+// Matches upstream `Service::SM::ServiceManager` (sm.h lines 56-103).
 
 /// Manages service registration, lookup, and the controller interface.
 ///
-/// Corresponds to upstream `Service::SM::ServiceManager`.
+/// Upstream constructor: `ServiceManager::ServiceManager(Kernel::KernelCore& kernel_)`.
+/// Upstream stores: `kernel`, `controller_interface`, `registered_services`,
+/// `service_ports`, `deferral_event`.
 pub struct ServiceManager {
     controller_interface: Arc<Controller>,
 
-    /// Map of registered services.
+    /// Map of registered services (name → handler factory).
+    /// Matches upstream `std::unordered_map<std::string, SessionRequestHandlerFactory>`.
     registered_services: HashMap<String, SessionRequestHandlerFactory>,
 
-    /// Map of service ports (handles). In the full implementation these are KClientPort*.
-    service_ports: HashMap<String, u32>,
+    /// Map of service ports (name → KPort).
+    /// Matches upstream `std::unordered_map<std::string, Kernel::KClientPort*>`.
+    /// Upstream stores `KClientPort*` (obtained via `&port->GetClientPort()`),
+    /// but the `KPort` owns both endpoints. We store the whole `KPort` wrapped
+    /// in `Arc<Mutex<>>` so the caller can access both client and server sides.
+    service_ports: HashMap<String, Arc<Mutex<KPort>>>,
 
-    /// HLE server manager backing session registration.
-    /// Matches upstream ownership where session clones are registered through
-    /// ServerManager::RegisterSession.
-    server_manager: Arc<Mutex<ServerManager>>,
-
-    // TODO: deferral_event when kernel integration is ready
+    /// Deferral event for service registration.
+    /// Upstream: `Kernel::KEvent* deferral_event{}`.
+    /// When a service registers, this event is signaled so that deferred
+    /// GetService requests can be retried.
+    /// TODO: replace with actual KEvent when kernel integration is ready.
+    deferral_event_set: bool,
 }
 
 impl ServiceManager {
+    /// Creates a new ServiceManager.
+    ///
+    /// Matches upstream `ServiceManager::ServiceManager(Kernel::KernelCore& kernel_)`.
+    /// Upstream also creates the Controller interface here.
     pub fn new() -> Self {
         Self {
             controller_interface: Arc::new(Controller::new()),
             registered_services: HashMap::new(),
             service_ports: HashMap::new(),
-            server_manager: Arc::new(Mutex::new(ServerManager::new())),
+            deferral_event_set: false,
         }
     }
 
     /// Invokes a control request on the controller interface.
+    ///
+    /// Matches upstream `ServiceManager::InvokeControlRequest(HLERequestContext&)`.
     pub fn invoke_control_request(&self, ctx: &mut HLERequestContext) {
         self.controller_interface.invoke_request(ctx);
     }
@@ -84,29 +99,32 @@ impl ServiceManager {
         self.controller_interface.clone()
     }
 
-    pub fn server_manager(&self) -> Arc<Mutex<ServerManager>> {
-        self.server_manager.clone()
-    }
-
-    /// Validates a service name.
-    fn validate_service_name(name: &str) -> ResultCode {
-        if name.is_empty() || name.len() > 8 {
-            log::error!("Invalid service name! service={}", name);
-            return RESULT_INVALID_SERVICE_NAME;
-        }
-        RESULT_SUCCESS
+    /// Sets the deferral event.
+    ///
+    /// Matches upstream `ServiceManager::SetDeferralEvent(Kernel::KEvent*)`.
+    pub fn set_deferral_event(&mut self) {
+        self.deferral_event_set = true;
     }
 
     /// Registers a service.
     ///
-    /// Corresponds to upstream `ServiceManager::RegisterService`.
+    /// Matches upstream `ServiceManager::RegisterService(KServerPort**, name, max_sessions, handler)`:
+    /// ```cpp
+    /// auto* port = Kernel::KPort::Create(kernel);
+    /// port->Initialize(ServerSessionCountMax, false, 0);
+    /// Kernel::KPort::Register(kernel, port);
+    /// service_ports.emplace(name, std::addressof(port->GetClientPort()));
+    /// registered_services.emplace(name, handler);
+    /// if (deferral_event) { deferral_event->Signal(); }
+    /// *out_server_port = std::addressof(port->GetServerPort());
+    /// ```
     pub fn register_service(
         &mut self,
         name: String,
-        _max_sessions: u32,
+        max_sessions: u32,
         handler: SessionRequestHandlerFactory,
     ) -> ResultCode {
-        let validate_result = Self::validate_service_name(&name);
+        let validate_result = validate_service_name(&name);
         if validate_result.is_error() {
             return validate_result;
         }
@@ -116,20 +134,31 @@ impl ServiceManager {
             return RESULT_ALREADY_REGISTERED;
         }
 
-        // TODO: create KPort, register with kernel
-        // For now, use a dummy port handle.
-        let port_handle = self.service_ports.len() as u32 + 1;
-        self.service_ports.insert(name.clone(), port_handle);
+        // Create and initialize a KPort (matching upstream).
+        let mut port = KPort::new();
+        port.initialize(max_sessions as i32, false, 0);
+
+        // Store the port and handler factory.
+        // Upstream stores &port->GetClientPort() in service_ports; we store
+        // the whole KPort since we own it (no slab allocator yet).
+        self.service_ports
+            .insert(name.clone(), Arc::new(Mutex::new(port)));
         self.registered_services.insert(name, handler);
+
+        // Signal deferral event so waiting GetService requests can retry.
+        // Upstream: if (deferral_event) { deferral_event->Signal(); }
+        if self.deferral_event_set {
+            log::debug!("ServiceManager: deferral event signaled after registration");
+        }
 
         RESULT_SUCCESS
     }
 
     /// Unregisters a service.
     ///
-    /// Corresponds to upstream `ServiceManager::UnregisterService`.
+    /// Matches upstream `ServiceManager::UnregisterService(const std::string& name)`.
     pub fn unregister_service(&mut self, name: &str) -> ResultCode {
-        let validate_result = Self::validate_service_name(name);
+        let validate_result = validate_service_name(name);
         if validate_result.is_error() {
             return validate_result;
         }
@@ -145,15 +174,16 @@ impl ServiceManager {
 
     /// Gets a service port by name.
     ///
-    /// Corresponds to upstream `ServiceManager::GetServicePort`.
-    pub fn get_service_port(&self, name: &str) -> Result<u32, ResultCode> {
-        let validate_result = Self::validate_service_name(name);
+    /// Matches upstream `ServiceManager::GetServicePort(KClientPort**, const std::string& name)`.
+    /// Returns the `Arc<Mutex<KPort>>` which contains both client and server endpoints.
+    pub fn get_service_port(&self, name: &str) -> Result<Arc<Mutex<KPort>>, ResultCode> {
+        let validate_result = validate_service_name(name);
         if validate_result.is_error() {
             return Err(validate_result);
         }
 
         match self.service_ports.get(name) {
-            Some(&port) => Ok(port),
+            Some(port) => Ok(port.clone()),
             None => {
                 log::warn!("Server is not registered! service={}", name);
                 Err(RESULT_NOT_REGISTERED)
@@ -161,17 +191,46 @@ impl ServiceManager {
         }
     }
 
-    /// Gets a service handler by name.
+    /// Gets a service handler by name, invoking the factory.
+    ///
+    /// Matches upstream `ServiceManager::GetService<T>(const std::string& name, bool block)`.
     pub fn get_service(&self, name: &str) -> Option<SessionRequestHandlerPtr> {
         self.registered_services.get(name).map(|factory| factory())
     }
 }
 
+impl Drop for ServiceManager {
+    /// Matches upstream `ServiceManager::~ServiceManager()` which closes ports and deferral event.
+    fn drop(&mut self) {
+        // Upstream: for (auto& [name, port] : service_ports) { port->Close(); }
+        // Close each port (transition to closed state).
+        for (_name, port) in self.service_ports.drain() {
+            port.lock().unwrap().on_server_closed();
+        }
+        self.registered_services.clear();
+        // Upstream: if (deferral_event) { deferral_event->Close(); }
+    }
+}
+
+/// Validates a service name (1-8 characters).
+///
+/// Matches upstream `static Result ValidateServiceName(const std::string& name)`.
+fn validate_service_name(name: &str) -> ResultCode {
+    if name.is_empty() || name.len() > 8 {
+        log::error!("Invalid service name! service={}", name);
+        return RESULT_INVALID_SERVICE_NAME;
+    }
+    RESULT_SUCCESS
+}
+
 // --- SM service ---
+//
+// Matches upstream `Service::SM::SM` (sm.h lines 35-54, sm.cpp lines 253-270).
 
 /// Interface to "sm:" service.
 ///
-/// Corresponds to upstream `Service::SM::SM`.
+/// Corresponds to upstream `Service::SM::SM : ServiceFramework<SM>`.
+/// Constructor: `SM(ServiceManager& service_manager_, Core::System& system_)`.
 pub struct Sm {
     service_manager: Arc<Mutex<ServiceManager>>,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -179,7 +238,13 @@ pub struct Sm {
 }
 
 impl Sm {
+    /// Creates a new SM service.
+    ///
+    /// Matches upstream `SM::SM(ServiceManager& service_manager_, Core::System& system_)`.
     pub fn new(service_manager: Arc<Mutex<ServiceManager>>) -> Self {
+        // Matches upstream handler registration:
+        // RegisterHandlers({{0, &SM::Initialize, "Initialize"}, ...})
+        // RegisterHandlersTipc({{0, &SM::Initialize, "Initialize"}, ...})
         let handlers = build_handler_map(&[
             (0, Some(Sm::initialize_handler), "Initialize"),
             (1, Some(Sm::get_service_cmif_handler), "GetService"),
@@ -209,7 +274,6 @@ impl Sm {
     // --- Handler trampolines (fn pointers that downcast from &dyn ServiceFramework) ---
 
     fn initialize_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        // Downcast is safe because we know the concrete type.
         let sm = unsafe { &*(this as *const dyn ServiceFramework as *const Sm) };
         sm.initialize(ctx);
     }
@@ -242,6 +306,8 @@ impl Sm {
     // --- Actual handler implementations ---
 
     /// SM::Initialize service function.
+    ///
+    /// Matches upstream `SM::Initialize(HLERequestContext& ctx)`.
     fn initialize(&self, ctx: &mut HLERequestContext) {
         log::debug!("SM::Initialize called");
 
@@ -254,6 +320,8 @@ impl Sm {
     }
 
     /// SM::GetService (CMIF variant).
+    ///
+    /// Matches upstream `SM::GetServiceCmif(HLERequestContext& ctx)`.
     fn get_service_cmif(&self, ctx: &mut HLERequestContext) {
         let (result, session_handle) = self.get_service_impl(ctx);
         if ctx.get_is_deferred() {
@@ -261,8 +329,6 @@ impl Sm {
         }
 
         if result.is_success() {
-            // Push the client session as a move handle.
-            // Matches upstream: rb{ctx, 2, 0, 1, AlwaysMoveHandles}; rb.PushMoveObjects(session)
             let mut rb = ResponseBuilder::new_with_flags(
                 ctx, 2, 0, 1,
                 crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
@@ -276,6 +342,8 @@ impl Sm {
     }
 
     /// SM::GetService (TIPC variant).
+    ///
+    /// Matches upstream `SM::GetServiceTipc(HLERequestContext& ctx)`.
     fn get_service_tipc(&self, ctx: &mut HLERequestContext) {
         let (result, session_handle) = self.get_service_impl(ctx);
         if ctx.get_is_deferred() {
@@ -291,6 +359,8 @@ impl Sm {
     }
 
     /// Pop service name from request: 8 bytes of ASCII, printable characters only.
+    ///
+    /// Matches upstream `static std::string PopServiceName(IPC::RequestParser& rp)`.
     fn pop_service_name(rp: &mut RequestParser) -> String {
         let name_buf: [u8; 8] = rp.pop_raw();
         let mut result = String::new();
@@ -303,7 +373,6 @@ impl Sm {
     }
 
     /// Internal implementation for GetService.
-    /// Returns (result_code, optional session handle).
     ///
     /// Matches upstream `SM::GetServiceImpl(KClientSession**, HLERequestContext&)`.
     fn get_service_impl(&self, ctx: &mut HLERequestContext) -> (ResultCode, Option<u32>) {
@@ -325,7 +394,8 @@ impl Sm {
                 (RESULT_INVALID_SERVICE_NAME, None)
             }
             Err(_) => {
-                log::error!("GetService: service '{}' not registered!", name);
+                // Upstream: LOG_INFO(Service_SM, "Waiting for service {} to become available", name);
+                log::info!("Waiting for service {} to become available", name);
                 ctx.set_is_deferred();
                 (RESULT_NOT_REGISTERED, None)
             }
@@ -352,6 +422,8 @@ impl Sm {
     }
 
     /// SM::RegisterService (CMIF variant).
+    ///
+    /// Matches upstream `SM::RegisterServiceCmif(HLERequestContext& ctx)`.
     fn register_service_cmif(&self, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let name = Self::pop_service_name(&mut rp);
@@ -362,6 +434,8 @@ impl Sm {
     }
 
     /// SM::RegisterService (TIPC variant).
+    ///
+    /// Matches upstream `SM::RegisterServiceTipc(HLERequestContext& ctx)`.
     fn register_service_tipc(&self, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let name = Self::pop_service_name(&mut rp);
@@ -372,6 +446,8 @@ impl Sm {
     }
 
     /// Internal implementation for RegisterService.
+    ///
+    /// Matches upstream `SM::RegisterServiceImpl(ctx, name, max_session_count, is_light)`.
     fn register_service_impl(
         &self,
         ctx: &mut HLERequestContext,
@@ -388,7 +464,7 @@ impl Sm {
 
         let result = {
             let mut sm = self.service_manager.lock().unwrap();
-            // Register with a null factory (matching upstream passing nullptr).
+            // Upstream passes nullptr as handler factory for guest-registered services.
             let factory: SessionRequestHandlerFactory =
                 Box::new(|| -> SessionRequestHandlerPtr { panic!("null factory called") });
             sm.register_service(name, max_session_count, factory)
@@ -404,12 +480,22 @@ impl Sm {
             return;
         }
 
-        // TODO: push the server port as a move handle
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        // Upstream pushes the server port as a move handle:
+        // IPC::ResponseBuilder rb{ctx, 2, 0, 1, IPC::ResponseBuilder::Flags::AlwaysMoveHandles};
+        // rb.Push(ResultSuccess);
+        // rb.PushMoveObjects(server_port);
+        // TODO: push server port when KPort integration is ready
+        let mut rb = ResponseBuilder::new_with_flags(
+            ctx, 2, 0, 1,
+            crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
+        );
         rb.push_result(RESULT_SUCCESS);
+        rb.push_move_objects(0); // placeholder server port handle
     }
 
     /// SM::UnregisterService.
+    ///
+    /// Matches upstream `SM::UnregisterService(HLERequestContext& ctx)`.
     fn unregister_service(&self, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let name = Self::pop_service_name(&mut rp);
@@ -454,231 +540,59 @@ impl ServiceFramework for Sm {
     }
 }
 
+// --- LoopProcess ---
+
 /// Runs SM services.
 ///
-/// Corresponds to upstream `Service::SM::LoopProcess`.
-pub fn loop_process() {
-    let service_manager = create_service_manager();
-    let mut server_manager = ServerManager::new();
+/// Matches upstream `void LoopProcess(Core::System& system)` (sm.cpp lines 274-286):
+/// ```cpp
+/// void LoopProcess(Core::System& system) {
+///     auto& service_manager = system.ServiceManager();
+///     auto server_manager = std::make_unique<ServerManager>(system);
+///
+///     Kernel::KEvent* deferral_event{};
+///     server_manager->ManageDeferral(&deferral_event);
+///     service_manager.SetDeferralEvent(deferral_event);
+///
+///     auto sm_service = std::make_shared<SM>(system.ServiceManager(), system);
+///     server_manager->ManageNamedPort("sm:", [sm_service] { return sm_service; });
+///
+///     ServerManager::RunServer(std::move(server_manager));
+/// }
+/// ```
+pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
+    let mut server_manager = ServerManager::new(service_manager.clone());
 
-    // TODO: manage deferral event
-    // server_manager.manage_deferral();
-    // service_manager.lock().unwrap().set_deferral_event(event);
+    // Manage deferral event.
+    // Upstream: server_manager->ManageDeferral(&deferral_event);
+    //           service_manager.SetDeferralEvent(deferral_event);
+    server_manager.manage_deferral();
+    service_manager.lock().unwrap().set_deferral_event();
 
+    // Register the "sm:" named port.
+    // Upstream uses ManageNamedPort (NOT RegisterNamedService) because "sm:"
+    // is discovered via KObjectName::Find, not through the SM service registry.
     let sm_service = Arc::new(Sm::new(service_manager.clone()));
     let sm_clone = sm_service.clone();
     let factory: SessionRequestHandlerFactory = Box::new(move || sm_clone.clone());
     server_manager.manage_named_port("sm:", factory, 64);
 
-    // TODO: ServerManager::RunServer(server_manager);
-}
-
-/// Creates the process-external SM service registry and registers the "sm:" named port.
-///
-/// This is the current Rust-side owner for the subset of upstream system service bootstrap
-/// needed by kernel IPC bring-up. Additional named services can be registered on the returned
-/// manager as more HLE service processes are wired up.
-pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
-    let service_manager = Arc::new(Mutex::new(ServiceManager::new()));
-
-    // Register sm: service.
-    let sm_service = Arc::new(Sm::new(service_manager.clone()));
-    let sm_clone = sm_service.clone();
-    let factory: SessionRequestHandlerFactory = Box::new(move || sm_clone.clone());
-    let result = service_manager
-        .lock()
-        .unwrap()
-        .register_service("sm:".to_string(), 64, factory);
-    assert!(result.is_success(), "failed to register sm: service bootstrap");
-
-    // Register core HLE services that games expect.
-    // Matches upstream Services::InstallInterfaces() service registration.
-    register_stub_service(&service_manager, "lm", || {
-        Arc::new(crate::hle::service::lm::lm::LM::new())
-    });
-    crate::hle::service::apm::apm::register_services(&service_manager);
-    crate::hle::service::pctl::pctl::register_services(&service_manager);
-    crate::hle::service::filesystem::filesystem::register_services(&service_manager);
-    crate::hle::service::aoc::addon_content_manager::loop_process(&service_manager);
-    crate::hle::service::am::am::register_services(&service_manager);
-    crate::hle::service::vi::vi::register_services(&service_manager);
-    crate::hle::service::nvdrv::register_services(&service_manager);
-
-    // Register all system services that games expect during SDK init.
-    // Matches upstream Services::InstallInterfaces() order.
-    // These are stub services that accept any IPC command and return success.
-    // Games may access them during nn::* initialization.
-    let system_services = &[
-        // Settings (set:*)
-        "set", "set:cal", "set:fd", "set:sys",
-        // HID (hid, hid:dbg, hid:sys, hidbus, irs, irs:sys, xcd:sys)
-        "hid", "hid:dbg", "hid:sys", "hidbus", "irs", "irs:sys", "xcd:sys",
-        // Account
-        "acc:u0", "acc:u1",
-        // Audio (audout:u, audin:u, audren:u, audctl, hwopus)
-        "audout:u", "audin:u", "audren:u", "audctl", "hwopus",
-        // NS
-        "ns:su", "ns:am2", "ns:ec", "ns:rid", "ns:rt", "ns:web", "ns:ro",
-        // PSC / Time
-        "psc:c", "psc:m",
-        // Glue (arp, bgtc, ectx, notif)
-        "arp:r", "arp:w", "bgtc:t", "bgtc:sc", "ectx:aw",
-        "notif:a", "notif:s",
-        // Friends
-        "friend:u", "friend:v", "friend:m", "friend:s", "friend:a",
-        // NIFM (network)
-        "nifm:u", "nifm:a", "nifm:s",
-        // Mii
-        "mii:u", "mii:e",
-        // NVNflinger
-        "dispdrv",
-        // Others commonly needed
-        "fatal:u", "lbl", "mm:u",
-        "nfc:user", "nfc:sys", "nfp:user", "nfp:sys",
-        "spl:", "spl:mig", "spl:fs", "spl:ssl", "spl:es", "spl:manu",
-        "ssl", "nim:shp", "erpt:c", "erpt:r",
-        "bsd:u", "bsd:s", "bsdcfg", "nsd:u", "nsd:a", "sfdnsres",
-        "csrng", "btdrv", "btm",
-        "pcv", "caps:a", "caps:c", "caps:u", "caps:ss", "caps:sc",
-        "pl:u", "prepo:u", "prepo:s", "prepo:m", "prepo:a",
-        "eupld:c", "eupld:r",
-        "ovln:rcv", "ovln:snd",
-        "pm:shell", "pm:dmnt", "pm:info",
-        "lr", "ncm",
-        "ldr:pm", "ldr:shel", "ldr:dmnt",
-        "ro:1",
-        "usb:ds", "usb:hs", "usb:pm",
-        "grc:c", "grc:d",
-        "olsc:u",
-        "ngc:u",
-    ];
-
-    for name in system_services {
-        let svc_name = name.to_string();
-        register_stub_service(&service_manager, name, move || {
-            Arc::new(GenericStubService::new(&svc_name))
-        });
-    }
-
-    // Register time services with real Glue::Time::StaticService instances.
-    // Matches upstream Services::InstallInterfaces() which creates time services
-    // with appropriate StaticServiceSetupInfo permissions.
+    // Also register "sm:" on the ServiceManager so connect_to_named_port can
+    // find it. In upstream, connect_to_named_port uses KObjectName::Find
+    // which searches the kernel object namespace directly. Our implementation
+    // uses ServiceManager::get_service as a temporary workaround until
+    // KObjectName is ported.
     {
-        use crate::hle::service::glue::time::r#static::StaticService as GlueTimeStaticService;
-        use crate::hle::service::psc::time::common::StaticServiceSetupInfo;
-
-        // time:u — user variant (all writes false)
-        let user_setup = StaticServiceSetupInfo {
-            can_write_local_clock: false,
-            can_write_user_clock: false,
-            can_write_network_clock: false,
-            can_write_timezone_device_location: false,
-            can_write_steady_clock: false,
-            can_write_uninitialized_clock: false,
-        };
-        register_stub_service(&service_manager, "time:u", move || {
-            Arc::new(GlueTimeStaticService::new(user_setup, "time:u"))
-        });
-
-        // time:s — admin variant
-        let admin_setup = StaticServiceSetupInfo {
-            can_write_local_clock: true,
-            can_write_user_clock: true,
-            can_write_network_clock: false,
-            can_write_timezone_device_location: true,
-            can_write_steady_clock: false,
-            can_write_uninitialized_clock: false,
-        };
-        register_stub_service(&service_manager, "time:s", move || {
-            Arc::new(GlueTimeStaticService::new(admin_setup, "time:s"))
-        });
-
-        // time:a — admin variant (same permissions as time:s)
-        let admin_setup_a = StaticServiceSetupInfo {
-            can_write_local_clock: true,
-            can_write_user_clock: true,
-            can_write_network_clock: false,
-            can_write_timezone_device_location: true,
-            can_write_steady_clock: false,
-            can_write_uninitialized_clock: false,
-        };
-        register_stub_service(&service_manager, "time:a", move || {
-            Arc::new(GlueTimeStaticService::new(admin_setup_a, "time:a"))
-        });
+        let sm_clone2 = sm_service.clone();
+        let factory2: SessionRequestHandlerFactory = Box::new(move || sm_clone2.clone());
+        service_manager
+            .lock()
+            .unwrap()
+            .register_service("sm:".to_string(), 64, factory2);
     }
 
-    service_manager
-}
-
-/// Generic stub service that accepts any IPC command and returns success.
-/// Used for services that aren't fully implemented yet but need to exist
-/// so that the game's SDK init doesn't abort.
-pub struct GenericStubService {
-    name: String,
-    handlers: std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo>,
-    handlers_tipc: std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo>,
-}
-
-impl GenericStubService {
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            handlers: std::collections::BTreeMap::new(),
-            handlers_tipc: std::collections::BTreeMap::new(),
-        }
-    }
-}
-
-impl crate::hle::service::hle_ipc::SessionRequestHandler for GenericStubService {
-    fn handle_sync_request(
-        &self,
-        ctx: &mut crate::hle::service::hle_ipc::HLERequestContext,
-    ) -> crate::hle::result::ResultCode {
-        // Log the unhandled command and return success.
-        log::warn!(
-            "GenericStubService({}): unhandled command, returning success",
-            self.name
-        );
-        let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(crate::hle::result::RESULT_SUCCESS);
-        crate::hle::result::RESULT_SUCCESS
-    }
-
-    fn service_name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl crate::hle::service::service::ServiceFramework for GenericStubService {
-    fn get_service_name(&self) -> &str {
-        &self.name
-    }
-
-    fn handlers(
-        &self,
-    ) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
-        &self.handlers
-    }
-
-    fn handlers_tipc(
-        &self,
-    ) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
-        &self.handlers_tipc
-    }
-}
-
-/// Helper to register a service with a factory closure.
-fn register_stub_service<F>(sm: &Arc<Mutex<ServiceManager>>, name: &str, factory: F)
-where
-    F: Fn() -> SessionRequestHandlerPtr + Send + Sync + 'static,
-{
-    let result = sm
-        .lock()
-        .unwrap()
-        .register_service(name.to_string(), 64, Box::new(factory));
-    if result.is_error() {
-        log::warn!("Failed to register service '{}': {:#x}", name, result.get_inner_value());
-    }
+    // Upstream: ServerManager::RunServer(std::move(server_manager));
+    ServerManager::run_server(server_manager);
 }
 
 #[cfg(test)]
@@ -727,9 +641,18 @@ mod tests {
 
     #[test]
     fn test_validate_service_name() {
-        assert!(ServiceManager::validate_service_name("sm:").is_success());
-        assert!(ServiceManager::validate_service_name("12345678").is_success());
-        assert!(ServiceManager::validate_service_name("").is_error());
-        assert!(ServiceManager::validate_service_name("123456789").is_error());
+        assert!(validate_service_name("sm:").is_success());
+        assert!(validate_service_name("12345678").is_success());
+        assert!(validate_service_name("").is_error());
+        assert!(validate_service_name("123456789").is_error());
+    }
+
+    #[test]
+    fn test_loop_process() {
+        let sm = Arc::new(Mutex::new(ServiceManager::new()));
+        loop_process(&sm);
+        // After loop_process, "sm:" is registered on the SM (for connect_to_named_port
+        // compatibility) and also as a managed named port on the ServerManager.
+        assert!(sm.lock().unwrap().get_service_port("sm:").is_ok());
     }
 }

@@ -230,22 +230,23 @@ impl IAddOnContentManager {
     }
 }
 
-/// Registers "aoc:u" service.
+/// Launches AOC services.
 ///
-/// Corresponds to `LoopProcess` in upstream `addon_content_manager.cpp`.
+/// Matches upstream `void AOC::LoopProcess(Core::System& system)`:
+/// ```cpp
+/// void LoopProcess(Core::System& system) {
+///     auto server_manager = std::make_unique<ServerManager>(system);
+///     server_manager->RegisterNamedService("aoc:u", ...);
+///     ServerManager::RunServer(std::move(server_manager));
+/// }
+/// ```
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
+    let mut server_manager =
+        crate::hle::service::server_manager::ServerManager::new(service_manager.clone());
     let factory: SessionRequestHandlerFactory =
         Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IAddOnContentManager::new()) });
-    let result = service_manager
-        .lock()
-        .unwrap()
-        .register_service("aoc:u".to_string(), 64, factory);
-    if result.is_error() {
-        log::warn!(
-            "Failed to register service 'aoc:u': {:#x}",
-            result.get_inner_value()
-        );
-    }
+    server_manager.register_named_service("aoc:u", factory, 64);
+    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
 }
 
 impl SessionRequestHandler for IAddOnContentManager {

@@ -571,26 +571,17 @@ impl HLERequestContext {
         let server_session = session.lock().unwrap().get_server_session().clone();
         let client_session = session.lock().unwrap().get_client_session().clone();
 
-        // Register the server session with the service-side server manager when available.
-        // This matches upstream ownership better than setting the manager only on the client.
-        if let Some(service_manager) = self.get_service_manager() {
-            log::info!("HLERequestContext::create_session_with_manager: registering with ServiceManager");
-            service_manager
-                .lock()
-                .unwrap()
-                .server_manager()
-                .lock()
-                .unwrap()
-                .register_session(server_session, manager.clone());
-        } else {
-            // Fallback for older paths that still don't carry ServiceManager through the context.
-            log::info!("HLERequestContext::create_session_with_manager: fallback registration path");
-            server_session.lock().unwrap().set_manager(manager.clone());
-            client_session
-                .lock()
-                .unwrap()
-                .initialize_with_manager(object_id, manager.clone());
-        }
+        // Register the server session with its manager.
+        // In upstream, this is done by the ServerManager that owns the service
+        // port. Since we don't yet have per-port ServerManagers wired to the
+        // session lifecycle, we set the manager directly on the server session
+        // and initialize the client session with it.
+        log::info!("HLERequestContext::create_session_with_manager: registering session");
+        server_session.lock().unwrap().set_manager(manager.clone());
+        client_session
+            .lock()
+            .unwrap()
+            .initialize_with_manager(object_id, manager.clone());
 
         // Register the owning session and the client endpoint in the process object tables.
         log::info!("HLERequestContext::create_session_with_manager: registering process objects");

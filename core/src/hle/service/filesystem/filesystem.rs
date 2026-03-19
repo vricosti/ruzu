@@ -72,40 +72,39 @@ impl VfsDirectoryServiceWrapper {
     }
 }
 
-/// Named services registered by the filesystem module:
-/// - "fsp-ldr" -> FSP_LDR
-/// - "fsp:pr"  -> FSP_PR
-/// - "fsp-srv" -> FSP_SRV
+/// Launches FileSystem services.
+///
+/// Matches upstream `void FileSystem::LoopProcess(Core::System& system)`:
+/// Registers "fsp-ldr", "fsp:pr", "fsp-srv".
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
     register_services(service_manager);
 }
 
 pub fn register_services(service_manager: &Arc<Mutex<ServiceManager>>) {
-    register_named_service(service_manager, "fsp-ldr", || -> SessionRequestHandlerPtr {
-        Arc::new(super::fsp::fsp_ldr::FspLdr::new())
-    });
-    register_named_service(service_manager, "fsp:pr", || -> SessionRequestHandlerPtr {
-        Arc::new(super::fsp::fsp_pr::FspPr::new())
-    });
-    register_named_service(service_manager, "fsp-srv", || -> SessionRequestHandlerPtr {
-        Arc::new(super::fsp::fsp_srv::FspSrv::new())
-    });
-}
+    let mut server_manager =
+        crate::hle::service::server_manager::ServerManager::new(service_manager.clone());
 
-fn register_named_service<F>(service_manager: &Arc<Mutex<ServiceManager>>, name: &str, factory: F)
-where
-    F: Fn() -> SessionRequestHandlerPtr + Send + Sync + 'static,
-{
-    let boxed: SessionRequestHandlerFactory = Box::new(factory);
-    let result = service_manager
-        .lock()
-        .unwrap()
-        .register_service(name.to_string(), 64, boxed);
-    if result.is_error() {
-        log::warn!(
-            "Failed to register service '{}': {:#x}",
-            name,
-            result.get_inner_value()
-        );
-    }
+    server_manager.register_named_service(
+        "fsp-ldr",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            Arc::new(super::fsp::fsp_ldr::FspLdr::new())
+        }),
+        64,
+    );
+    server_manager.register_named_service(
+        "fsp:pr",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            Arc::new(super::fsp::fsp_pr::FspPr::new())
+        }),
+        64,
+    );
+    server_manager.register_named_service(
+        "fsp-srv",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            Arc::new(super::fsp::fsp_srv::FspSrv::new())
+        }),
+        64,
+    );
+
+    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
 }

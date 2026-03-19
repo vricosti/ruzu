@@ -18,21 +18,28 @@ use crate::hle::service::nvdrv::nvdrv_interface::NvdrvService;
 
 const NVDRV_SERVICE_NAMES: &[&str] = &["nvdrv", "nvdrv:a", "nvdrv:s", "nvdrv:t"];
 
-/// Register nvdrv services with the service manager.
-pub fn register_services(service_manager: &Arc<Mutex<ServiceManager>>) {
+/// Launches Nvidia services.
+///
+/// Matches upstream `void Nvidia::LoopProcess(Core::System& system)`.
+pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
     let module = Module::new();
+    let mut server_manager =
+        crate::hle::service::server_manager::ServerManager::new(service_manager.clone());
     for name in NVDRV_SERVICE_NAMES {
         let svc_name = name.to_string();
         let module = Arc::clone(&module);
-        let result = service_manager.lock().unwrap().register_service(
-            svc_name.clone(),
-            64,
+        server_manager.register_named_service(
+            name,
             Box::new(move || {
                 Arc::new(NvdrvService::new(Arc::clone(&module), &svc_name))
             }),
+            64,
         );
-        if result.is_error() {
-            log::warn!("Failed to register NVDRV service '{}'", name);
-        }
     }
+    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
+}
+
+/// Backward-compatible alias.
+pub fn register_services(service_manager: &Arc<Mutex<ServiceManager>>) {
+    loop_process(service_manager);
 }

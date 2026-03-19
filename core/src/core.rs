@@ -251,8 +251,39 @@ impl System {
         let mut kernel = KernelCore::new();
         kernel.set_multicore(self.is_multicore);
         kernel.initialize();
+
+        // Initialize the kernel physical memory manager with a Secure pool.
+        // Upstream traverses the memory layout tree; we reserve a region at
+        // the top of DeviceMemory DRAM to avoid collision with guest
+        // identity-mapped regions (which use low addresses).
+        {
+            use crate::device_memory::dram_memory_map;
+            use crate::hle::kernel::k_memory_manager::Pool;
+            const SECURE_POOL_OFFSET: u64 = 0xF000_0000; // 3.75 GiB into DRAM
+            const SECURE_POOL_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
+            let secure_pool_base = dram_memory_map::BASE + SECURE_POOL_OFFSET;
+            kernel
+                .memory_manager_mut()
+                .initialize_pool(Pool::SECURE, secure_pool_base, SECURE_POOL_SIZE);
+        }
+
         self.kernel = Some(kernel);
-        self.service_manager = Some(crate::hle::service::sm::sm::create_service_manager());
+
+        // Create the ServiceManager.
+        // Upstream: service_manager = std::make_shared<SM::ServiceManager>(kernel);
+        let service_manager = Arc::new(StdMutex::new(ServiceManager::new()));
+
+        // Launch all system services.
+        // Upstream: services = std::make_unique<Services>(service_manager, system, stop_token);
+        // This calls each service module's LoopProcess which registers named
+        // services on the ServiceManager via per-process ServerManagers.
+        let dm_ptr = self.device_memory.as_ref().unwrap().as_ref() as *const DeviceMemory;
+        let mm_ptr = self.kernel.as_mut().unwrap().memory_manager_mut() as *mut _;
+        let _services = crate::hle::service::services::Services::new(
+            &service_manager, dm_ptr, mm_ptr,
+        );
+
+        self.service_manager = Some(service_manager);
 
         log::info!("System: initialized (multicore={}, async_gpu={})", self.is_multicore, self.is_async_gpu);
     }
@@ -797,8 +828,10 @@ impl System {
             kernel.create_new_thread_id();
         }
         system.kernel = Some(kernel);
-        system.service_manager =
-            Some(crate::hle::service::sm::sm::create_service_manager());
+        let service_manager = Arc::new(StdMutex::new(ServiceManager::new()));
+        // Register "sm:" port so connect_to_named_port tests work.
+        crate::hle::service::sm::sm::loop_process(&service_manager);
+        system.service_manager = Some(service_manager);
         system
     }
 

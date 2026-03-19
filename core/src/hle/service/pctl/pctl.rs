@@ -9,18 +9,27 @@
 use std::sync::{Arc, Mutex};
 
 use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
+use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 
-/// LoopProcess — registers "pctl", "pctl:a", "pctl:s", "pctl:r" services.
+/// Launches PCTL services.
 ///
-/// Corresponds to `Service::PCTL::LoopProcess` in upstream pctl.cpp.
+/// Matches upstream `void PCTL::LoopProcess(Core::System& system)`:
+/// ```cpp
+/// void LoopProcess(Core::System& system) {
+///     auto server_manager = std::make_unique<ServerManager>(system);
+///     server_manager->RegisterNamedService("pctl", ...);
+///     server_manager->RegisterNamedService("pctl:a", ...);
+///     server_manager->RegisterNamedService("pctl:r", ...);
+///     server_manager->RegisterNamedService("pctl:s", ...);
+///     ServerManager::RunServer(std::move(server_manager));
+/// }
+/// ```
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
-    register_services(service_manager);
-}
+    let mut server_manager = ServerManager::new(service_manager.clone());
 
-pub fn register_services(service_manager: &Arc<Mutex<ServiceManager>>) {
     register_named_service(
-        service_manager,
+        &mut server_manager,
         "pctl",
         super::pctl_types::Capability::APPLICATION
             | super::pctl_types::Capability::SNS_POST
@@ -28,24 +37,26 @@ pub fn register_services(service_manager: &Arc<Mutex<ServiceManager>>) {
             | super::pctl_types::Capability::STEREO_VISION,
     );
     register_named_service(
-        service_manager,
+        &mut server_manager,
         "pctl:a",
         super::pctl_types::Capability::NONE,
     );
     register_named_service(
-        service_manager,
+        &mut server_manager,
         "pctl:r",
         super::pctl_types::Capability::NONE,
     );
     register_named_service(
-        service_manager,
+        &mut server_manager,
         "pctl:s",
         super::pctl_types::Capability::NONE,
     );
+
+    ServerManager::run_server(server_manager);
 }
 
 fn register_named_service(
-    service_manager: &Arc<Mutex<ServiceManager>>,
+    server_manager: &mut ServerManager,
     name: &str,
     capability: super::pctl_types::Capability,
 ) {
@@ -58,16 +69,5 @@ fn register_named_service(
             ),
         )
     });
-
-    let result = service_manager
-        .lock()
-        .unwrap()
-        .register_service(name.to_string(), 64, factory);
-    if result.is_error() {
-        log::warn!(
-            "Failed to register service '{}': {:#x}",
-            name,
-            result.get_inner_value()
-        );
-    }
+    server_manager.register_named_service(name, factory, 64);
 }
