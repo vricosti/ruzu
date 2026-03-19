@@ -124,6 +124,10 @@ impl KProcessPageTable {
         self.base.get_address_space_width()
     }
 
+    pub fn get_num_guard_pages(&self) -> usize {
+        self.base.get_num_guard_pages()
+    }
+
     pub fn get_allocate_option(&self) -> u32 {
         self.base.get_allocate_option()
     }

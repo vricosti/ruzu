@@ -1655,11 +1655,13 @@ impl KProcess {
         // space overlaps with the code region, and the page table tracks which
         // pages are free vs mapped.
         //
-        // For now, place the stack after the TLS page that contains the thread's
-        // TLR, matching the layout produced by the previous ad-hoc allocation.
-        // This is safe because the TLS page is the last page before the heap.
+        // Place the stack after the TLS page, with guard pages matching upstream.
+        // Upstream MapPages find-free uses GetNumGuardPages() which returns
+        // 1 for kernel processes, 4 for user processes.
         let tls_page = tls_address.get() & !(PAGE_SIZE as u64 - 1);
-        let stack_base = tls_page + THREAD_LOCAL_PAGE_SIZE as u64;
+        let num_guard_pages = self.page_table.get_num_guard_pages() as u64;
+        let stack_base = tls_page + THREAD_LOCAL_PAGE_SIZE as u64
+            + num_guard_pages * PAGE_SIZE as u64;
         let stack_top = stack_base + stack_size as u64;
         self.main_thread_stack_size = stack_size;
 
