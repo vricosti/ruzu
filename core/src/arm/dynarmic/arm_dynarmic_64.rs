@@ -89,21 +89,20 @@ impl DynarmicCallbacks64 {
 
 impl JitCallbacks for DynarmicCallbacks64 {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
+        // Upstream: returns std::nullopt if IsValidVirtualAddressRange fails.
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
-            if m.is_valid_virtual_address(vaddr) {
+            if m.is_valid_virtual_address_range(vaddr, 4) {
                 Some(m.read_32(vaddr))
             } else {
-                log::warn!("memory_read_code({:#x}): unmapped, returning UDF", vaddr);
-                Some(0x00000000) // A64: UDF #0
+                None
             }
         } else {
             let mem = self.memory.read().unwrap();
             if mem.is_valid_range(vaddr, 4) {
                 Some(mem.read_32(vaddr))
             } else {
-                log::warn!("memory_read_code({:#x}): unmapped, returning UDF", vaddr);
-                Some(0x00000000)
+                None
             }
         }
     }

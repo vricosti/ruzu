@@ -296,7 +296,7 @@ fn install_guest_access_fault_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = guest_access_fault_handler as usize;
-        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         let result = libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
         if result != 0 {

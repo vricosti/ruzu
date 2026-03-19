@@ -17,36 +17,36 @@ use crate::hle::service::hle_ipc::SessionRequestManager;
 
 const PORT_NAME_MAX_LENGTH: usize = 12;
 
-fn read_port_name(ctx: &SvcContext, user_name: u64) -> String {
-    let mut bytes = Vec::new();
+/// Read a null-terminated port name from guest memory.
+/// Matches upstream `ReadCString(user_name, KObjectName::NameLengthMax)` +
+/// `R_UNLESS(name[sizeof(name) - 1] == '\x00', ResultOutOfRange)`.
+fn read_port_name(ctx: &SvcContext, user_name: u64) -> Result<String, ResultCode> {
+    let mut name = [0u8; PORT_NAME_MAX_LENGTH];
     if let Some(memory) = ctx.get_memory() {
         let m = memory.lock().unwrap();
-        for i in 0..PORT_NAME_MAX_LENGTH as u64 {
-            let byte = m.read_8(user_name + i);
-            if byte == 0 {
-                break;
-            }
-            bytes.push(byte);
+        for i in 0..PORT_NAME_MAX_LENGTH {
+            name[i] = m.read_8(user_name + i as u64);
         }
     } else {
         let mem = ctx.shared_memory.read().unwrap();
-        for i in 0..PORT_NAME_MAX_LENGTH as u64 {
-            if !mem.is_valid_range(user_name + i, 1) {
-                break;
-            }
-            let byte = mem.read_8(user_name + i);
-            if byte == 0 {
-                break;
-            }
-            bytes.push(byte);
+        for i in 0..PORT_NAME_MAX_LENGTH {
+            name[i] = mem.read_8(user_name + i as u64);
         }
     }
-    String::from_utf8_lossy(&bytes).to_string()
+    // Upstream: R_UNLESS(name[sizeof(name) - 1] == '\x00', ResultOutOfRange)
+    if name[PORT_NAME_MAX_LENGTH - 1] != 0 {
+        return Err(RESULT_OUT_OF_RANGE);
+    }
+    let len = name.iter().position(|&b| b == 0).unwrap_or(PORT_NAME_MAX_LENGTH);
+    Ok(String::from_utf8_lossy(&name[..len]).to_string())
 }
 
 /// Connects to a named port.
 pub fn connect_to_named_port(ctx: &SvcContext, out: &mut Handle, user_name: u64) -> ResultCode {
-    let name = read_port_name(ctx, user_name);
+    let name = match read_port_name(ctx, user_name) {
+        Ok(n) => n,
+        Err(rc) => return rc,
+    };
     log::info!("  ConnectToNamedPort(\"{}\")", name);
 
     let Some(session_handler) = ctx.service_manager.lock().unwrap().get_service(&name) else {

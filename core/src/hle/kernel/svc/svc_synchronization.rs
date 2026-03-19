@@ -61,16 +61,22 @@ pub fn wait_synchronization(
 
     let mut process = ctx.current_process.lock().unwrap();
 
+    // Read handle array from guest memory.
+    // Upstream: R_UNLESS(GetCurrentMemory(kernel).ReadBlock(user_handles, handles.data(),
+    //                    sizeof(Handle) * num_handles), ResultInvalidPointer)
     let mut handles = Vec::with_capacity(num_handles as usize);
     if num_handles > 0 {
+        let handle_bytes = num_handles as usize * std::mem::size_of::<Handle>();
         if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
             let m = memory.lock().unwrap();
+            if !m.is_valid_virtual_address_range(user_handles, handle_bytes as u64) {
+                return RESULT_INVALID_POINTER;
+            }
             for i in 0..num_handles as usize {
                 handles.push(m.read_32(user_handles + (i * 4) as u64));
             }
         } else {
             let mem = process.process_memory.read().unwrap();
-            let handle_bytes = num_handles as usize * std::mem::size_of::<Handle>();
             if !mem.is_valid_range(user_handles, handle_bytes) {
                 return RESULT_INVALID_POINTER;
             }
