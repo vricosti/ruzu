@@ -8,7 +8,7 @@ use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{complete_sync_request, HLERequestContext};
 
 /// Makes a blocking IPC call to a service.
@@ -98,6 +98,14 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
             mem.read_32(tls_address + 48), mem.read_32(tls_address + 52),
             mem.read_32(tls_address + 56), mem.read_32(tls_address + 60),
         );
+    }
+
+    // Upstream: SendSyncRequest always returns ResultSuccess to the guest.
+    // RESULT_SESSION_CLOSED is an internal signal consumed by the kernel
+    // (KServerSession closes the session), not exposed to user code.
+    // The success response is already written to TLS by the Close handler.
+    if result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED {
+        return RESULT_SUCCESS;
     }
 
     result
