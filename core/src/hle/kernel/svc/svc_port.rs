@@ -21,22 +21,53 @@ const PORT_NAME_MAX_LENGTH: usize = 12;
 /// Matches upstream `ReadCString(user_name, KObjectName::NameLengthMax)` +
 /// `R_UNLESS(name[sizeof(name) - 1] == '\x00', ResultOutOfRange)`.
 fn read_port_name(ctx: &SvcContext, user_name: u64) -> Result<String, ResultCode> {
-    let mut name = [0u8; PORT_NAME_MAX_LENGTH];
+    // Upstream behavior:
+    //   1. ReadCString(user_name, NameLengthMax) — reads a null-terminated string
+    //   2. std::array<char, NameLengthMax> name{} — zero-initialized buffer
+    //   3. strncpy(name.data(), string_name.c_str(), NameLengthMax - 1) — copy up to 11 chars
+    //   4. R_UNLESS(name[sizeof(name) - 1] == '\x00', ResultOutOfRange)
+    //
+    // The key is that upstream reads a C string (stopping at null), then copies it
+    // into a zero-initialized buffer. So name[11] is always 0 for strings <= 11 chars.
+    // We must NOT read raw 12 bytes from guest memory — bytes after the null terminator
+    // may be non-zero garbage.
+
+    // Step 1: Read null-terminated string from guest memory (up to NameLengthMax bytes).
+    let mut raw = [0u8; PORT_NAME_MAX_LENGTH];
+    let mut string_len = PORT_NAME_MAX_LENGTH;
     if let Some(memory) = ctx.get_memory() {
         let m = memory.lock().unwrap();
         for i in 0..PORT_NAME_MAX_LENGTH {
-            name[i] = m.read_8(user_name + i as u64);
+            let b = m.read_8(user_name + i as u64);
+            raw[i] = b;
+            if b == 0 {
+                string_len = i;
+                break;
+            }
         }
     } else {
         let mem = ctx.shared_memory.read().unwrap();
         for i in 0..PORT_NAME_MAX_LENGTH {
-            name[i] = mem.read_8(user_name + i as u64);
+            let b = mem.read_8(user_name + i as u64);
+            raw[i] = b;
+            if b == 0 {
+                string_len = i;
+                break;
+            }
         }
     }
-    // Upstream: R_UNLESS(name[sizeof(name) - 1] == '\x00', ResultOutOfRange)
+
+    // Step 2: Copy into zero-initialized buffer (like upstream strncpy into name{}).
+    let mut name = [0u8; PORT_NAME_MAX_LENGTH];
+    let copy_len = string_len.min(PORT_NAME_MAX_LENGTH - 1);
+    name[..copy_len].copy_from_slice(&raw[..copy_len]);
+
+    // Step 3: Validate — upstream: R_UNLESS(name[sizeof(name) - 1] == '\x00', ResultOutOfRange)
+    // This catches strings that are exactly NameLengthMax (12) chars with no null terminator.
     if name[PORT_NAME_MAX_LENGTH - 1] != 0 {
         return Err(RESULT_OUT_OF_RANGE);
     }
+
     let len = name.iter().position(|&b| b == 0).unwrap_or(PORT_NAME_MAX_LENGTH);
     Ok(String::from_utf8_lossy(&name[..len]).to_string())
 }
@@ -50,8 +81,10 @@ pub fn connect_to_named_port(ctx: &SvcContext, out: &mut Handle, user_name: u64)
     log::info!("  ConnectToNamedPort(\"{}\")", name);
 
     let Some(session_handler) = ctx.service_manager.lock().unwrap().get_service(&name) else {
+        log::error!("  ConnectToNamedPort: service \"{}\" not found in service_manager", name);
         return RESULT_NOT_FOUND;
     };
+    log::info!("  ConnectToNamedPort: found service handler for \"{}\"", name);
 
     let session_object_id = ctx.next_object_id.fetch_add(1, Ordering::Relaxed) as u64;
     let client_session_object_id = ctx.next_object_id.fetch_add(1, Ordering::Relaxed) as u64;
@@ -78,9 +111,13 @@ pub fn connect_to_named_port(ctx: &SvcContext, out: &mut Handle, user_name: u64)
     match process.handle_table.add(client_session_object_id) {
         Ok(handle) => {
             *out = handle;
+            log::info!("  ConnectToNamedPort(\"{}\") -> success, handle={:#x}", name, handle);
             RESULT_SUCCESS
         }
-        Err(_) => RESULT_OUT_OF_HANDLES,
+        Err(_) => {
+            log::error!("  ConnectToNamedPort(\"{}\"): out of handles", name);
+            RESULT_OUT_OF_HANDLES
+        }
     }
 }
 

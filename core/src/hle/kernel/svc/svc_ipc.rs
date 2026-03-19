@@ -46,12 +46,19 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
     };
 
     // Create context with thread/memory references (matches upstream constructor).
+    // Upstream: HLERequestContext(kernel, memory, server_session, thread)
+    // where memory = client_thread->GetOwnerProcess()->GetMemory()
     let debug_memory = shared_memory.clone();
     let mut context = HLERequestContext::new_with_thread(
         current_thread,
         shared_memory,
         tls_address,
     );
+    // Set the Memory bridge for TLS access — matches upstream's
+    // memory.GetPointer(client_message) for reading the command buffer.
+    if let Some(memory) = ctx.get_memory() {
+        context.set_memory(memory);
+    }
     context.set_session_request_manager(request_manager.clone());
     context.set_service_manager(ctx.service_manager.clone());
 

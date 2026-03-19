@@ -16,6 +16,7 @@ use super::errors::{
 };
 use super::steady_clock::SteadyClock;
 use super::system_clock::SystemClock;
+use super::time_zone::TimeZone;
 use super::time_zone_service::TimeZoneService;
 
 /// IPC command IDs for StaticService.
@@ -85,6 +86,12 @@ pub struct StaticService {
     network_context: SystemClockContext,
     /// Current steady clock time point (for GetClockSnapshot).
     steady_clock_time_point: SteadyClockTimePoint,
+    /// TimeZone reference for calendar conversions in GetClockSnapshotImpl.
+    /// Matches upstream `m_time_zone` (reference to `m_time->m_time_zone`).
+    time_zone: TimeZone,
+    /// Boot instant for CalculateMonotonicSystemClockBaseTimePoint.
+    /// Matches upstream `m_system.CoreTiming().GetClockTicks()` converted to time.
+    boot_instant: std::time::Instant,
 }
 
 impl StaticService {
@@ -99,6 +106,8 @@ impl StaticService {
             user_context: SystemClockContext::default(),
             network_context: SystemClockContext::default(),
             steady_clock_time_point: SteadyClockTimePoint::default(),
+            time_zone: TimeZone::new(),
+            boot_instant: std::time::Instant::now(),
         }
     }
 
@@ -318,19 +327,18 @@ impl StaticService {
             return Err(RESULT_CLOCK_MISMATCH);
         }
 
-        // In upstream:
+        // Upstream:
         //   auto ticks = m_system.CoreTiming().GetClockTicks();
         //   auto current_time_ns = ConvertToTimeSpan(ticks).count();
         //   *out_time = (context.offset + time_point.time_point) - (current_time_ns / 1e9);
         //
-        // Without CoreTiming access, we use the steady clock time_point as the
-        // current time (which is already in seconds from the steady clock).
-        let base_time = context.offset + time_point.time_point;
-        // Subtract elapsed time (approximated as time_point itself since boot)
-        let out_time = base_time - time_point.time_point;
+        // We use elapsed wall time since boot as the CoreTiming approximation.
+        let elapsed_ns = self.boot_instant.elapsed().as_nanos() as i64;
+        let current_time_s = elapsed_ns / 1_000_000_000;
+        let out_time = (context.offset + time_point.time_point) - current_time_s;
         log::debug!(
-            "StaticService::CalculateMonotonicSystemClockBaseTimePoint: context_offset={}, out_time={}",
-            context.offset, out_time
+            "StaticService::CalculateMonotonicSystemClockBaseTimePoint: context_offset={}, elapsed_s={}, out_time={}",
+            context.offset, current_time_s, out_time
         );
         Ok(out_time)
     }
@@ -444,29 +452,24 @@ impl StaticService {
         snapshot.steady_clock_time_point = self.steady_clock_time_point;
         snapshot.is_automatic_correction_enabled = self.automatic_correction_enabled;
 
-        // Get location name from timezone
-        // TODO: Use actual TimeZone reference from TimeManager
-        let mut location_name = [0u8; 0x24];
-        location_name[0] = b'U';
-        location_name[1] = b'T';
-        location_name[2] = b'C';
-        snapshot.location_name = location_name;
+        // Get location name from timezone.
+        // Matches upstream: m_time_zone.GetLocationName(out_snapshot->location_name)
+        snapshot.location_name = self.time_zone.get_location_name().unwrap_or([0u8; 0x24]);
 
-        // Compute user_time from time_point and user_context
-        match get_time_from_time_point_and_context(
+        // Compute user_time from time_point and user_context.
+        // Matches upstream: GetTimeFromTimePointAndContext(&out_snapshot->user_time, ...)
+        snapshot.user_time = get_time_from_time_point_and_context(
             &snapshot.steady_clock_time_point,
             &snapshot.user_context,
-        ) {
-            Ok(time) => snapshot.user_time = time,
-            Err(e) => return Err(e),
-        }
+        )?;
 
-        // Compute user calendar time (UTC-only placeholder)
-        let (cal, cal_info) = Self::time_to_calendar_utc(snapshot.user_time);
+        // Compute user calendar time via TimeZone.
+        // Matches upstream: m_time_zone.ToCalendarTimeWithMyRule(user_calendar_time, ..., user_time)
+        let (cal, cal_info) = self.time_zone.to_calendar_time_with_my_rule(snapshot.user_time)?;
         snapshot.user_calendar_time = cal;
         snapshot.user_calendar_additional_time = cal_info;
 
-        // Compute network_time, defaulting to 0 on mismatch (matching upstream)
+        // Compute network_time, defaulting to 0 on mismatch (matching upstream).
         match get_time_from_time_point_and_context(
             &snapshot.steady_clock_time_point,
             &snapshot.network_context,
@@ -475,8 +478,9 @@ impl StaticService {
             Err(_) => snapshot.network_time = 0,
         }
 
-        // Compute network calendar time
-        let (cal, cal_info) = Self::time_to_calendar_utc(snapshot.network_time);
+        // Compute network calendar time via TimeZone.
+        // Matches upstream: m_time_zone.ToCalendarTimeWithMyRule(network_calendar_time, ..., network_time)
+        let (cal, cal_info) = self.time_zone.to_calendar_time_with_my_rule(snapshot.network_time)?;
         snapshot.network_calendar_time = cal;
         snapshot.network_calendar_additional_time = cal_info;
 
@@ -484,90 +488,5 @@ impl StaticService {
         snapshot.unk_ce = 0;
 
         Ok(snapshot)
-    }
-
-    /// Simple UTC time-to-calendar conversion.
-    /// Used by GetClockSnapshotImpl. Will be replaced by TimeZone.ToCalendarTimeWithMyRule
-    /// once TimeZone is fully wired.
-    fn time_to_calendar_utc(
-        time: i64,
-    ) -> (
-        super::common::CalendarTime,
-        super::common::CalendarAdditionalInfo,
-    ) {
-        let secs = time;
-        let days = secs / 86400;
-        let day_secs = secs % 86400;
-
-        let hours = (day_secs / 3600) as i8;
-        let minutes = ((day_secs % 3600) / 60) as i8;
-        let seconds = (day_secs % 60) as i8;
-
-        let mut year = 1970i64;
-        let mut remaining_days = days;
-        loop {
-            let days_in_year =
-                if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-                    366
-                } else {
-                    365
-                };
-            if remaining_days < days_in_year {
-                break;
-            }
-            remaining_days -= days_in_year;
-            year += 1;
-        }
-
-        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-        let month_days: [i64; 12] = if leap {
-            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        } else {
-            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        };
-
-        let mut month = 0i8;
-        for (i, &mdays) in month_days.iter().enumerate() {
-            if remaining_days < mdays {
-                month = (i + 1) as i8;
-                break;
-            }
-            remaining_days -= mdays;
-        }
-        if month == 0 {
-            month = 12;
-        }
-        let day = (remaining_days + 1) as i8;
-
-        let calendar = super::common::CalendarTime {
-            year: year as i16,
-            month,
-            day,
-            hour: hours,
-            minute: minutes,
-            second: seconds,
-        };
-
-        let day_of_week = ((days + 4) % 7) as i32;
-        let mut day_of_year = 0i32;
-        for i in 0..(month as usize).saturating_sub(1) {
-            day_of_year += month_days[i] as i32;
-        }
-        day_of_year += day as i32 - 1;
-
-        let mut tz_name = [0u8; 8];
-        tz_name[0] = b'U';
-        tz_name[1] = b'T';
-        tz_name[2] = b'C';
-
-        let additional = super::common::CalendarAdditionalInfo {
-            day_of_week,
-            day_of_year,
-            name: tz_name,
-            is_dst: 0,
-            ut_offset: 0,
-        };
-
-        (calendar, additional)
     }
 }

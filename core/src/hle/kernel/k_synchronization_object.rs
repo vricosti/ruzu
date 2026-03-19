@@ -1420,18 +1420,15 @@ mod tests {
             current_thread.lock().unwrap().get_state(),
             crate::hle::kernel::k_thread::ThreadState::WAITING
         );
-        assert_eq!(
-            process
-                .lock()
-                .unwrap()
-                .get_readable_event_by_object_id(2)
-                .unwrap()
-                .lock()
-                .unwrap()
-                .sync_object
-                .waiter_snapshot(&process.lock().unwrap()),
-            vec![1]
-        );
+        {
+            let process_guard = process.lock().unwrap();
+            let event = process_guard.get_readable_event_by_object_id(2).unwrap();
+            let event_guard = event.lock().unwrap();
+            assert_eq!(
+                event_guard.sync_object.waiter_snapshot(&process_guard),
+                vec![1]
+            );
+        }
     }
 
     #[test]

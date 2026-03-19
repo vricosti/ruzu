@@ -520,7 +520,7 @@ pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
         // NS
         "ns:su", "ns:am2", "ns:ec", "ns:rid", "ns:rt", "ns:web", "ns:ro",
         // PSC / Time
-        "psc:c", "psc:m", "time:u", "time:a", "time:s",
+        "psc:c", "psc:m",
         // Glue (arp, bgtc, ectx, notif)
         "arp:r", "arp:w", "bgtc:t", "bgtc:sc", "ectx:aw",
         "notif:a", "notif:s",
@@ -557,6 +557,53 @@ pub fn create_service_manager() -> Arc<Mutex<ServiceManager>> {
         let svc_name = name.to_string();
         register_stub_service(&service_manager, name, move || {
             Arc::new(GenericStubService::new(&svc_name))
+        });
+    }
+
+    // Register time services with real Glue::Time::StaticService instances.
+    // Matches upstream Services::InstallInterfaces() which creates time services
+    // with appropriate StaticServiceSetupInfo permissions.
+    {
+        use crate::hle::service::glue::time::r#static::StaticService as GlueTimeStaticService;
+        use crate::hle::service::psc::time::common::StaticServiceSetupInfo;
+
+        // time:u — user variant (all writes false)
+        let user_setup = StaticServiceSetupInfo {
+            can_write_local_clock: false,
+            can_write_user_clock: false,
+            can_write_network_clock: false,
+            can_write_timezone_device_location: false,
+            can_write_steady_clock: false,
+            can_write_uninitialized_clock: false,
+        };
+        register_stub_service(&service_manager, "time:u", move || {
+            Arc::new(GlueTimeStaticService::new(user_setup, "time:u"))
+        });
+
+        // time:s — admin variant
+        let admin_setup = StaticServiceSetupInfo {
+            can_write_local_clock: true,
+            can_write_user_clock: true,
+            can_write_network_clock: false,
+            can_write_timezone_device_location: true,
+            can_write_steady_clock: false,
+            can_write_uninitialized_clock: false,
+        };
+        register_stub_service(&service_manager, "time:s", move || {
+            Arc::new(GlueTimeStaticService::new(admin_setup, "time:s"))
+        });
+
+        // time:a — admin variant (same permissions as time:s)
+        let admin_setup_a = StaticServiceSetupInfo {
+            can_write_local_clock: true,
+            can_write_user_clock: true,
+            can_write_network_clock: false,
+            can_write_timezone_device_location: true,
+            can_write_steady_clock: false,
+            can_write_uninitialized_clock: false,
+        };
+        register_stub_service(&service_manager, "time:a", move || {
+            Arc::new(GlueTimeStaticService::new(admin_setup_a, "time:a"))
         });
     }
 

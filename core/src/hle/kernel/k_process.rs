@@ -421,10 +421,15 @@ pub struct KProcess {
     // Thread list — stubbed as Vec of thread ids
     pub thread_list: Vec<u64>,
     pub thread_objects: BTreeMap<u64, Arc<Mutex<KThread>>>,
+    /// Reverse lookup: thread_id → Arc<Mutex<KThread>>.
+    /// Avoids locking all threads to find one by thread_id (prevents deadlocks
+    /// when called while already holding a thread lock).
+    thread_objects_by_thread_id: BTreeMap<u64, Arc<Mutex<KThread>>>,
     pub session_objects: BTreeMap<u64, Arc<Mutex<KSession>>>,
     pub client_session_objects: BTreeMap<u64, Arc<Mutex<KClientSession>>>,
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
     pub readable_event_objects: BTreeMap<u64, Arc<Mutex<KReadableEvent>>>,
+    pub shared_memory_objects: BTreeMap<u64, Arc<super::k_shared_memory::KSharedMemory>>,
     pub sync_object: SynchronizationObjectState,
     pub self_reference: Option<Weak<Mutex<KProcess>>>,
     pub scheduler: Option<Weak<Mutex<KScheduler>>>,
@@ -544,10 +549,12 @@ impl KProcess {
             exception_thread_id: None,
             thread_list: Vec::new(),
             thread_objects: BTreeMap::new(),
+            thread_objects_by_thread_id: BTreeMap::new(),
             session_objects: BTreeMap::new(),
             client_session_objects: BTreeMap::new(),
             event_objects: BTreeMap::new(),
             readable_event_objects: BTreeMap::new(),
+            shared_memory_objects: BTreeMap::new(),
             sync_object: SynchronizationObjectState::new(),
             self_reference: None,
             scheduler: None,
@@ -1793,10 +1800,12 @@ impl KProcess {
 
         // Clear thread and session objects.
         self.thread_objects.clear();
+        self.thread_objects_by_thread_id.clear();
         self.session_objects.clear();
         self.client_session_objects.clear();
         self.event_objects.clear();
         self.readable_event_objects.clear();
+        self.shared_memory_objects.clear();
 
         // Perform inherited finalization.
         // Upstream: KSynchronizationObject::Finalize();
@@ -1817,12 +1826,14 @@ impl KProcess {
             (thread_guard.thread_id, thread_guard.object_id)
         };
         self.register_thread(thread_id);
+        self.thread_objects_by_thread_id.insert(thread_id, Arc::clone(&thread));
         self.thread_objects.insert(object_id, thread);
     }
 
     pub fn unregister_thread_object_by_object_id(&mut self, object_id: u64) {
         if let Some(thread) = self.thread_objects.remove(&object_id) {
             let thread_id = thread.lock().unwrap().thread_id;
+            self.thread_objects_by_thread_id.remove(&thread_id);
             self.unregister_thread(thread_id);
         }
     }
@@ -1832,10 +1843,7 @@ impl KProcess {
     }
 
     pub fn get_thread_by_thread_id(&self, thread_id: u64) -> Option<Arc<Mutex<KThread>>> {
-        self.thread_objects
-            .values()
-            .find(|thread| thread.lock().unwrap().thread_id == thread_id)
-            .cloned()
+        self.thread_objects_by_thread_id.get(&thread_id).cloned()
     }
 
     pub fn register_event_object(&mut self, object_id: u64, event: Arc<Mutex<KEvent>>) {
@@ -1898,6 +1906,21 @@ impl KProcess {
         object_id: u64,
     ) -> Option<Arc<Mutex<KReadableEvent>>> {
         self.readable_event_objects.get(&object_id).cloned()
+    }
+
+    pub fn register_shared_memory_object(
+        &mut self,
+        object_id: u64,
+        shmem: Arc<super::k_shared_memory::KSharedMemory>,
+    ) {
+        self.shared_memory_objects.insert(object_id, shmem);
+    }
+
+    pub fn get_shared_memory_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<super::k_shared_memory::KSharedMemory>> {
+        self.shared_memory_objects.get(&object_id).cloned()
     }
 
     /// Unregister a thread from this process.
