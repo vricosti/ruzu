@@ -863,10 +863,22 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         // Shared / Transfer memory
         // =====================================================================
         Some(SvcId::MapSharedMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            // IN: handle=arg32[0], address=arg32[1], size=arg32[2], perm=arg32[3]; OUT: ret=arg32[0]
+            let handle = get_arg32(args, 0);
+            let address = get_arg32(args, 1) as u64;
+            let size = get_arg32(args, 2) as u64;
+            let perm = get_arg32(args, 3);
+            let map_perm = unsafe { std::mem::transmute::<u32, crate::hle::kernel::svc::svc_types::MemoryPermission>(perm) };
+            let result = svc_shared_memory::map_shared_memory(system, handle, address, size, map_perm);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::UnmapSharedMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            // IN: handle=arg32[0], address=arg32[1], size=arg32[2]; OUT: ret=arg32[0]
+            let handle = get_arg32(args, 0);
+            let address = get_arg32(args, 1) as u64;
+            let size = get_arg32(args, 2) as u64;
+            let result = svc_shared_memory::unmap_shared_memory(system, handle, address, size);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::CreateTransferMemory) => {
             // OUT: ret=arg32[0], handle=arg32[1]

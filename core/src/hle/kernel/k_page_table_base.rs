@@ -2521,6 +2521,197 @@ impl KPageTableBase {
         );
         0
     }
+
+    // =========================================================================
+    // MapPageGroup / UnmapPageGroup
+    // =========================================================================
+
+    /// Map a KPageGroup's physical pages into the virtual address space.
+    ///
+    /// Upstream: `KPageTableBase::MapPageGroupImpl` (k_page_table_base.cpp:1623).
+    /// Iterates each block in the page group and calls Operate(Map) for each.
+    /// On failure, unmaps everything already mapped (rollback).
+    fn map_page_group_impl(
+        &mut self,
+        address: usize,
+        pg: &super::k_page_group::KPageGroup,
+        properties: KPageProperties,
+    ) -> u32 {
+        let start_address = address;
+        let mut cur_address = address;
+
+        for (i, block) in pg.iter().enumerate() {
+            // First block uses the full properties (with DisableHead);
+            // subsequent blocks use DisableMergeAttribute::None.
+            let cur_properties = if i == 0 {
+                properties
+            } else {
+                KPageProperties {
+                    perm: properties.perm,
+                    io: properties.io,
+                    uncached: properties.uncached,
+                    disable_merge_attributes: DisableMergeAttribute::NONE,
+                }
+            };
+
+            let result = self.operate(
+                cur_address,
+                block.get_num_pages(),
+                block.get_address(),
+                true,
+                cur_properties,
+                OperationType::Map,
+            );
+            if result != 0 {
+                // Rollback: unmap everything we already mapped.
+                if cur_address != start_address {
+                    let unmap_properties = KPageProperties {
+                        perm: KMemoryPermission::NONE,
+                        io: false,
+                        uncached: false,
+                        disable_merge_attributes: DisableMergeAttribute::NONE,
+                    };
+                    let _ = self.operate(
+                        start_address,
+                        (cur_address - start_address) / PAGE_SIZE,
+                        0,
+                        false,
+                        unmap_properties,
+                        OperationType::Unmap,
+                    );
+                }
+                return result;
+            }
+            cur_address += block.get_size();
+        }
+
+        0
+    }
+
+    /// Map a page group into the address space with the given state and permission.
+    ///
+    /// Upstream: `KPageTableBase::MapPageGroup(KProcessAddress addr, const KPageGroup& pg,
+    ///     KMemoryState state, KMemoryPermission perm)` (k_page_table_base.cpp:2891).
+    pub fn map_page_group(
+        &mut self,
+        addr: usize,
+        pg: &super::k_page_group::KPageGroup,
+        state: KMemoryState,
+        perm: KMemoryPermission,
+    ) -> u32 {
+        let num_pages = pg.get_num_pages();
+        let size = num_pages * PAGE_SIZE;
+
+        // Validate the address range can contain shared memory.
+        if !self.can_contain_k(addr, size, state) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        // Check that the region is currently Free with no permissions.
+        let (result, _blocks_needed) = self.check_memory_state_contiguous(
+            addr,
+            size,
+            KMemoryState::all(),
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        // Map the pages.
+        let properties = KPageProperties {
+            perm,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
+        };
+        let result = self.map_page_group_impl(addr, pg, properties);
+        if result != 0 {
+            return result;
+        }
+
+        // Update the memory block manager to track the new state.
+        self.m_memory_block_manager.update(
+            addr,
+            num_pages,
+            state,
+            perm,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NORMAL,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        0
+    }
+
+    /// Unmap a page group from the address space.
+    ///
+    /// Upstream: `KPageTableBase::UnmapPageGroup(KProcessAddress address,
+    ///     const KPageGroup& pg, KMemoryState state)` (k_page_table_base.cpp:2932).
+    pub fn unmap_page_group(
+        &mut self,
+        address: usize,
+        pg: &super::k_page_group::KPageGroup,
+        state: KMemoryState,
+    ) -> u32 {
+        let num_pages = pg.get_num_pages();
+        let size = num_pages * PAGE_SIZE;
+
+        if !self.can_contain_k(address, size, state) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        // Check that the region is currently in the expected state.
+        let (result, _blocks_needed) = self.check_memory_state_contiguous(
+            address,
+            size,
+            KMemoryState::all(),
+            state,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        // Unmap the pages.
+        let properties = KPageProperties {
+            perm: KMemoryPermission::NONE,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: DisableMergeAttribute::NONE,
+        };
+        let result = self.operate(
+            address,
+            num_pages,
+            0,
+            false,
+            properties,
+            OperationType::Unmap,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        // Update block manager back to Free.
+        self.m_memory_block_manager.update(
+            address,
+            num_pages,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NORMAL,
+        );
+
+        0
+    }
 }
 
 impl Default for KPageTableBase {

@@ -64,7 +64,12 @@ pub struct StaticService {
 }
 
 impl StaticService {
-    pub fn new(setup_info: StaticServiceSetupInfo, name: &str) -> Self {
+    pub fn new(
+        setup_info: StaticServiceSetupInfo,
+        name: &str,
+        device_memory: *const crate::device_memory::DeviceMemory,
+        memory_manager: *mut crate::hle::kernel::k_memory_manager::KMemoryManager,
+    ) -> Self {
         log::debug!("Glue::Time::StaticService::new called for '{name}'");
 
         if setup_info.can_write_local_clock
@@ -127,7 +132,11 @@ impl StaticService {
             file_timestamp_worker: FileTimestampWorker::new(),
             standard_steady_clock_resource: StandardSteadyClockResource::new(),
             time_zone_binary: Mutex::new(time_zone_binary),
-            psc_shared_memory: Mutex::new(PscSharedMemory::new()),
+            psc_shared_memory: Mutex::new(if device_memory.is_null() || memory_manager.is_null() {
+                PscSharedMemory::new_for_test()
+            } else {
+                unsafe { PscSharedMemory::new(&*device_memory, &mut *memory_manager) }
+            }),
             shared_memory_handle: Mutex::new(None),
             handlers,
             handlers_tipc: BTreeMap::new(),
@@ -176,25 +185,32 @@ impl StaticService {
             let object_id =
                 NEXT_SHMEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            // Wrap the KSharedMemory in an Arc for the process object table.
+            // Register the KSharedMemory from PscSharedMemory so that
+            // MapSharedMemory SVC can find it and map its physical pages.
+            // The Arc wraps the already-initialized KSharedMemory.
             let psc_shmem = service.psc_shared_memory.lock().unwrap();
-            let k_shmem = Arc::new(
-                crate::hle::kernel::k_shared_memory::KSharedMemory::new(),
-            );
-            // We create a minimal initialized KSharedMemory for the handle table.
-            // The actual data lives in the PscSharedMemory; the handle is what
-            // the guest uses with MapSharedMemory SVC.
-            {
-                use crate::hle::kernel::k_shared_memory::MemoryPermission;
-                let k_shmem_mut = unsafe {
-                    &mut *(Arc::as_ptr(&k_shmem) as *mut crate::hle::kernel::k_shared_memory::KSharedMemory)
-                };
-                k_shmem_mut.initialize(
-                    MemoryPermission::None,
-                    MemoryPermission::Read,
-                    psc_shmem.get_k_shared_memory().get_size(),
-                );
-            }
+            let size = psc_shmem.get_k_shared_memory().get_size();
+            drop(psc_shmem);
+
+            // Create a new KSharedMemory for the handle table that mirrors
+            // the PSC one's size. In a full implementation, this would be
+            // the same object; for now the SVC handler will look up by
+            // object_id to find the KSharedMemory registered here.
+            let k_shmem = Arc::new({
+                let mut shmem = crate::hle::kernel::k_shared_memory::KSharedMemory::new();
+                // Copy the PSC shared memory's KSharedMemory state.
+                let psc = service.psc_shared_memory.lock().unwrap();
+                // SAFETY: We copy the fields from the PSC's KSharedMemory.
+                // The physical pages and device memory pointer are shared.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        psc.get_k_shared_memory() as *const crate::hle::kernel::k_shared_memory::KSharedMemory,
+                        &mut shmem as *mut crate::hle::kernel::k_shared_memory::KSharedMemory,
+                        1,
+                    );
+                }
+                shmem
+            });
 
             process.register_shared_memory_object(object_id, k_shmem);
             let handle = process.handle_table.add(object_id).ok()?;
@@ -480,7 +496,7 @@ mod tests {
 
     #[test]
     fn get_time_zone_service_returns_glue_service_object() {
-        let service = StaticService::new(user_setup(), "time:u");
+        let service = StaticService::new(user_setup(), "time:u", std::ptr::null(), std::ptr::null_mut());
         let time_zone_service = service.get_time_zone_service().unwrap();
 
         let name = time_zone_service.get_device_location_name().unwrap();
@@ -501,7 +517,7 @@ mod tests {
     #[test]
     fn delegated_correction_queries_follow_wrapped_psc_static_service() {
         // Use admin setup so we have can_write_user_clock permission
-        let service = StaticService::new(admin_setup(), "time:a");
+        let service = StaticService::new(admin_setup(), "time:a", std::ptr::null(), std::ptr::null_mut());
         {
             let mut wrapped = service.wrapped_service.lock().unwrap();
             wrapped.set_user_clock_initialized(true);

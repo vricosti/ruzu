@@ -96,7 +96,7 @@ impl TimeManager {
         let time_zone = TimeZone::new();
 
         // SharedMemory
-        let shared_memory = SharedMemory::new();
+        let shared_memory = SharedMemory::new_for_test();
 
         // PowerStateRequestManager
         let power_state_request_manager = PowerStateRequestManager::new();

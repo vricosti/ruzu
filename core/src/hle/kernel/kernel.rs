@@ -13,6 +13,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use super::k_memory_manager::KMemoryManager;
 use super::k_thread::KThread;
 
 use super::global_scheduler_context::GlobalSchedulerContext;
@@ -70,6 +71,10 @@ pub struct KernelCore {
     // -- Host thread management --
     next_host_thread_id: AtomicU32,
 
+    // -- Memory management --
+    /// Physical memory manager. Upstream: `Impl::memory_manager`.
+    memory_manager: KMemoryManager,
+
     // -- Current thread tracking --
     // Upstream: thread_local KThread* current_thread in Impl.
     // In cooperative model, only one guest thread runs at a time.
@@ -107,6 +112,7 @@ impl KernelCore {
             registered_objects: Mutex::new(Vec::new()),
             registered_in_use_objects: Mutex::new(Vec::new()),
 
+            memory_manager: KMemoryManager::new(),
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
             current_emu_thread: None,
         }
@@ -313,6 +319,17 @@ impl KernelCore {
     /// Create a new thread ID.
     pub fn create_new_thread_id(&self) -> u64 {
         self.next_thread_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Get the memory manager.
+    /// Upstream: `KernelCore::MemoryManager()`.
+    pub fn memory_manager(&self) -> &KMemoryManager {
+        &self.memory_manager
+    }
+
+    /// Get the memory manager (mutable).
+    pub fn memory_manager_mut(&mut self) -> &mut KMemoryManager {
+        &mut self.memory_manager
     }
 
     fn initialize_physical_cores(&mut self) {
