@@ -5,11 +5,10 @@
 //! SVC handlers for port operations (ConnectToNamedPort, CreatePort, ConnectToPort, ManageNamedPort).
 
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::Ordering;
 
+use crate::core::System;
 use crate::hle::kernel::k_client_session::KClientSession;
 use crate::hle::kernel::k_session::KSession;
-use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -20,7 +19,7 @@ const PORT_NAME_MAX_LENGTH: usize = 12;
 /// Read a null-terminated port name from guest memory.
 /// Matches upstream `ReadCString(user_name, KObjectName::NameLengthMax)` +
 /// `R_UNLESS(name[sizeof(name) - 1] == '\x00', ResultOutOfRange)`.
-fn read_port_name(ctx: &SvcContext, user_name: u64) -> Result<String, ResultCode> {
+fn read_port_name(system: &System, user_name: u64) -> Result<String, ResultCode> {
     // Upstream behavior:
     //   1. ReadCString(user_name, NameLengthMax) — reads a null-terminated string
     //   2. std::array<char, NameLengthMax> name{} — zero-initialized buffer
@@ -35,7 +34,7 @@ fn read_port_name(ctx: &SvcContext, user_name: u64) -> Result<String, ResultCode
     // Step 1: Read null-terminated string from guest memory (up to NameLengthMax bytes).
     let mut raw = [0u8; PORT_NAME_MAX_LENGTH];
     let mut string_len = PORT_NAME_MAX_LENGTH;
-    if let Some(memory) = ctx.get_memory() {
+    if let Some(memory) = system.get_svc_memory() {
         let m = memory.lock().unwrap();
         for i in 0..PORT_NAME_MAX_LENGTH {
             let b = m.read_8(user_name + i as u64);
@@ -46,7 +45,7 @@ fn read_port_name(ctx: &SvcContext, user_name: u64) -> Result<String, ResultCode
             }
         }
     } else {
-        let mem = ctx.shared_memory.read().unwrap();
+        let mem = system.shared_process_memory().read().unwrap();
         for i in 0..PORT_NAME_MAX_LENGTH {
             let b = mem.read_8(user_name + i as u64);
             raw[i] = b;
@@ -73,21 +72,22 @@ fn read_port_name(ctx: &SvcContext, user_name: u64) -> Result<String, ResultCode
 }
 
 /// Connects to a named port.
-pub fn connect_to_named_port(ctx: &SvcContext, out: &mut Handle, user_name: u64) -> ResultCode {
-    let name = match read_port_name(ctx, user_name) {
+pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) -> ResultCode {
+    let name = match read_port_name(system, user_name) {
         Ok(n) => n,
         Err(rc) => return rc,
     };
     log::info!("  ConnectToNamedPort(\"{}\")", name);
 
-    let Some(session_handler) = ctx.service_manager.lock().unwrap().get_service(&name) else {
+    let service_manager = system.service_manager().unwrap();
+    let Some(session_handler) = service_manager.lock().unwrap().get_service(&name) else {
         log::error!("  ConnectToNamedPort: service \"{}\" not found in service_manager", name);
         return RESULT_NOT_FOUND;
     };
     log::info!("  ConnectToNamedPort: found service handler for \"{}\"", name);
 
-    let session_object_id = ctx.next_object_id.fetch_add(1, Ordering::Relaxed) as u64;
-    let client_session_object_id = ctx.next_object_id.fetch_add(1, Ordering::Relaxed) as u64;
+    let session_object_id = system.kernel().unwrap().create_new_object_id() as u64;
+    let client_session_object_id = system.kernel().unwrap().create_new_object_id() as u64;
 
     let request_manager = Arc::new(Mutex::new(SessionRequestManager::new()));
     request_manager
@@ -104,7 +104,7 @@ pub fn connect_to_named_port(ctx: &SvcContext, out: &mut Handle, user_name: u64)
         .unwrap()
         .initialize_with_manager(session_object_id, request_manager);
 
-    let mut process = ctx.current_process.lock().unwrap();
+    let mut process = system.current_process_arc().lock().unwrap();
     process.register_session_object(session_object_id, session);
     process.register_client_session_object(client_session_object_id, client_session);
 

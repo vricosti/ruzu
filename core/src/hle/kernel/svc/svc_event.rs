@@ -4,21 +4,20 @@
 //!
 //! SVC handlers for event operations (SignalEvent, ClearEvent, CreateEvent).
 
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use crate::core::System;
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::Handle;
-use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Signals an event.
-pub fn signal_event(ctx: &SvcContext, event_handle: Handle) -> ResultCode {
+pub fn signal_event(system: &System, event_handle: Handle) -> ResultCode {
     log::debug!("svc::SignalEvent called, event_handle=0x{:08X}", event_handle);
 
-    let mut process = ctx.current_process.lock().unwrap();
+    let mut process = system.current_process_arc().lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(event_handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -26,15 +25,16 @@ pub fn signal_event(ctx: &SvcContext, event_handle: Handle) -> ResultCode {
         return RESULT_INVALID_HANDLE;
     };
 
-    let result = event.lock().unwrap().signal(&mut process, &ctx.scheduler);
+    let scheduler = system.scheduler_arc().clone();
+    let result = event.lock().unwrap().signal(&mut process, &scheduler);
     ResultCode::new(result)
 }
 
 /// Clears an event. Tries writable event first, then readable event.
-pub fn clear_event(ctx: &SvcContext, event_handle: Handle) -> ResultCode {
+pub fn clear_event(system: &System, event_handle: Handle) -> ResultCode {
     log::trace!("svc::ClearEvent called, event_handle=0x{:08X}", event_handle);
 
-    let process = ctx.current_process.lock().unwrap();
+    let process = system.current_process_arc().lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(event_handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -50,11 +50,11 @@ pub fn clear_event(ctx: &SvcContext, event_handle: Handle) -> ResultCode {
 }
 
 /// Creates an event, returning write and read handles.
-pub fn create_event(ctx: &SvcContext, out_write: &mut Handle, out_read: &mut Handle) -> ResultCode {
+pub fn create_event(system: &System, out_write: &mut Handle, out_read: &mut Handle) -> ResultCode {
     log::debug!("svc::CreateEvent called");
 
-    let event_object_id = ctx.next_object_id.fetch_add(1, Ordering::Relaxed) as u64;
-    let readable_event_object_id = ctx.next_object_id.fetch_add(1, Ordering::Relaxed) as u64;
+    let event_object_id = system.kernel().unwrap().create_new_object_id() as u64;
+    let readable_event_object_id = system.kernel().unwrap().create_new_object_id() as u64;
 
     let event = Arc::new(Mutex::new(KEvent::new()));
     let readable_event = Arc::new(Mutex::new(KReadableEvent::new()));
@@ -62,13 +62,13 @@ pub fn create_event(ctx: &SvcContext, out_write: &mut Handle, out_read: &mut Han
     {
         let mut event_guard = event.lock().unwrap();
         let mut readable_event_guard = readable_event.lock().unwrap();
-        let process = ctx.current_process.lock().unwrap();
+        let process = system.current_process_arc().lock().unwrap();
 
         readable_event_guard.initialize(event_object_id, readable_event_object_id);
         event_guard.initialize(process.process_id, readable_event_object_id);
     }
 
-    let mut process = ctx.current_process.lock().unwrap();
+    let mut process = system.current_process_arc().lock().unwrap();
     if process.ensure_handle_table_initialized() != RESULT_SUCCESS.get_inner_value() {
         return RESULT_OUT_OF_RESOURCE;
     }
@@ -102,12 +102,13 @@ pub fn create_event(ctx: &SvcContext, out_write: &mut Handle, out_read: &mut Han
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::System;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::KThread;
-    use crate::hle::kernel::svc_dispatch::SvcContext;
-    use std::sync::atomic::{AtomicU32, AtomicU64};
 
-    fn test_context() -> SvcContext {
+    fn test_system() -> System {
+        let mut system = System::new_for_test();
+
         let process = Arc::new(Mutex::new(KProcess::new()));
         {
             let mut process_guard = process.lock().unwrap();
@@ -127,41 +128,30 @@ mod tests {
         scheduler.lock().unwrap().initialize(1, 0, 0);
         let shared_memory = process.lock().unwrap().get_shared_memory();
 
-        SvcContext {
-            shared_memory,
-            code_base: 0,
-            code_size: 0,
-            stack_base: 0,
-            stack_size: 0,
-            program_id: 1,
-            tls_base: 0,
-            current_process: process,
-            service_manager: Arc::new(Mutex::new(
-                crate::hle::service::sm::sm::ServiceManager::new(),
-            )),
-            scheduler,
-            next_thread_id: Arc::new(AtomicU64::new(2)),
-            next_object_id: Arc::new(AtomicU32::new(2)),
-            is_64bit: false,
-        }
+        system.set_current_process_arc(process);
+        system.set_scheduler_arc(scheduler);
+        system.set_shared_process_memory(shared_memory);
+        system.set_runtime_program_id(1);
+        system.set_runtime_64bit(false);
+        system
     }
 
     #[test]
     fn create_signal_and_clear_event_round_trip() {
-        let ctx = test_context();
+        let system = test_system();
         let mut write_handle = 0;
         let mut read_handle = 0;
 
         assert_eq!(
-            create_event(&ctx, &mut write_handle, &mut read_handle),
+            create_event(&system, &mut write_handle, &mut read_handle),
             RESULT_SUCCESS
         );
         assert_ne!(write_handle, 0);
         assert_ne!(read_handle, 0);
 
-        assert_eq!(signal_event(&ctx, write_handle), RESULT_SUCCESS);
+        assert_eq!(signal_event(&system, write_handle), RESULT_SUCCESS);
 
-        let process = ctx.current_process.lock().unwrap();
+        let process = system.current_process_arc().lock().unwrap();
         let readable_object_id = process.handle_table.get_object(read_handle).unwrap();
         let readable = process
             .get_readable_event_by_object_id(readable_object_id)
@@ -169,8 +159,8 @@ mod tests {
         assert!(readable.lock().unwrap().is_signaled());
         drop(process);
 
-        assert_eq!(clear_event(&ctx, read_handle), RESULT_SUCCESS);
-        let process = ctx.current_process.lock().unwrap();
+        assert_eq!(clear_event(&system, read_handle), RESULT_SUCCESS);
+        let process = system.current_process_arc().lock().unwrap();
         let readable_object_id = process.handle_table.get_object(read_handle).unwrap();
         let readable = process
             .get_readable_event_by_object_id(readable_object_id)

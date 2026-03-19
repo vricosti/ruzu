@@ -352,8 +352,6 @@ fn main() {
 
         let process = std::sync::Arc::new(std::sync::Mutex::new(process));
         process.lock().unwrap().bind_self_reference(&process);
-        let next_thread_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
-        let next_object_id = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2));
         let scheduler = std::sync::Arc::new(std::sync::Mutex::new(
             ruzu_core::hle::kernel::k_scheduler::KScheduler::new(0),
         ));
@@ -384,7 +382,7 @@ fn main() {
             ArmInterface, HaltReason, KProcess as OpaqueKProcess, KThread as OpaqueKThread,
         };
         use ruzu_core::hle::kernel::physical_core::PhysicalCoreExecutionControl;
-        use ruzu_core::hle::kernel::svc_dispatch::{self, SvcContext};
+        use ruzu_core::hle::kernel::svc_dispatch;
 
         let dummy_system: u32 = 0;
         let dummy_exclusive: u32 = 0;
@@ -419,24 +417,13 @@ fn main() {
         // Arc identity check: verify JIT and host share the same memory instance
         log::info!("Arc identity: shared_memory ptr = {:?}", std::sync::Arc::as_ptr(&shared_memory));
 
-        // Create SVC context for the kernel dispatch module.
-        let svc_ctx = SvcContext {
-            shared_memory: shared_memory.clone(),
-            code_base,
-            code_size: code_size as u64,
-            stack_base,
-            stack_size: stack_size as u64,
-            program_id: 0x0100152000022000, // MK8D title ID
-            tls_base,
-            current_process: process.clone(),
-            service_manager: system
-                .service_manager()
-                .expect("System service manager must exist after initialize"),
-            scheduler: scheduler.clone(),
-            next_thread_id: next_thread_id.clone(),
-            next_object_id: next_object_id.clone(),
-            is_64bit,
-        };
+        // Wire the runtime SVC state on System so that SVC handlers
+        // can access process, scheduler, memory, etc. via &System.
+        system.set_current_process_arc(process.clone());
+        system.set_scheduler_arc(scheduler.clone());
+        system.set_shared_process_memory(shared_memory.clone());
+        system.set_runtime_program_id(0x0100152000022000); // MK8D title ID
+        system.set_runtime_64bit(is_64bit);
 
         // Set initial context.
         // Maps to upstream ResetThreadContext32/64 in k_thread.cpp via KThread::Initialize.
@@ -487,7 +474,7 @@ fn main() {
                 &scheduler,
                 &process,
                 is_64bit,
-                &svc_ctx,
+                &system,
                 |svc_num, svc_args, ctx, svc_count, _iteration| {
                 let svc_name = svc_dispatch::SvcId::from_u32(svc_num)
                     .map(|id| format!("{:?}", id))

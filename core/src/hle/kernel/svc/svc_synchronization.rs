@@ -5,17 +5,17 @@
 //! SVC handlers for synchronization operations (CloseHandle, ResetSignal,
 //! WaitSynchronization, CancelSynchronization, SynchronizePreemptionState).
 
+use crate::core::System;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, ARGUMENT_HANDLE_COUNT_MAX};
-use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::kernel::k_synchronization_object;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Closes a handle.
-pub fn close_handle(ctx: &SvcContext, handle: Handle) -> ResultCode {
+pub fn close_handle(system: &System, handle: Handle) -> ResultCode {
     log::trace!("svc::CloseHandle closing handle 0x{:08X}", handle);
 
-    if ctx.current_process.lock().unwrap().handle_table.remove(handle) {
+    if system.current_process_arc().lock().unwrap().handle_table.remove(handle) {
         RESULT_SUCCESS
     } else {
         RESULT_INVALID_HANDLE
@@ -23,10 +23,10 @@ pub fn close_handle(ctx: &SvcContext, handle: Handle) -> ResultCode {
 }
 
 /// Clears the signaled state of an event or process.
-pub fn reset_signal(ctx: &SvcContext, handle: Handle) -> ResultCode {
+pub fn reset_signal(system: &System, handle: Handle) -> ResultCode {
     log::debug!("svc::ResetSignal called handle 0x{:08X}", handle);
 
-    let mut process = ctx.current_process.lock().unwrap();
+    let mut process = system.current_process_arc().lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -43,7 +43,7 @@ pub fn reset_signal(ctx: &SvcContext, handle: Handle) -> ResultCode {
 
 /// Wait for the given handles to synchronize, timeout after the specified nanoseconds.
 pub fn wait_synchronization(
-    ctx: &SvcContext,
+    system: &System,
     out_index: &mut i32,
     user_handles: u64,
     num_handles: i32,
@@ -59,7 +59,7 @@ pub fn wait_synchronization(
         return RESULT_OUT_OF_RANGE;
     }
 
-    let mut process = ctx.current_process.lock().unwrap();
+    let mut process = system.current_process_arc().lock().unwrap();
 
     // Read handle array from guest memory.
     // Upstream: R_UNLESS(GetCurrentMemory(kernel).ReadBlock(user_handles, handles.data(),
@@ -87,7 +87,7 @@ pub fn wait_synchronization(
         }
     }
 
-    let Some(current_thread_id) = ctx.current_thread_id() else {
+    let Some(current_thread_id) = system.current_thread_id() else {
         return RESULT_INVALID_HANDLE;
     };
     let Some(current_thread) = process.get_thread_by_thread_id(current_thread_id) else {
@@ -101,10 +101,11 @@ pub fn wait_synchronization(
         };
         object_ids.push(object_id);
     }
+    let scheduler = system.scheduler_arc().clone();
     k_synchronization_object::wait(
         &mut process,
         &current_thread,
-        &ctx.scheduler,
+        &scheduler,
         out_index,
         object_ids,
         timeout_ns,
@@ -112,10 +113,10 @@ pub fn wait_synchronization(
 }
 
 /// Resumes a thread waiting on WaitSynchronization.
-pub fn cancel_synchronization(ctx: &SvcContext, handle: Handle) -> ResultCode {
+pub fn cancel_synchronization(system: &System, handle: Handle) -> ResultCode {
     log::trace!("svc::CancelSynchronization called handle=0x{:X}", handle);
 
-    let process = ctx.current_process.lock().unwrap();
+    let process = system.current_process_arc().lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -125,7 +126,7 @@ pub fn cancel_synchronization(ctx: &SvcContext, handle: Handle) -> ResultCode {
     drop(process);
 
     thread.lock().unwrap().wait_cancel();
-    ctx.scheduler.lock().unwrap().request_schedule();
+    system.scheduler_arc().lock().unwrap().request_schedule();
     RESULT_SUCCESS
 }
 
@@ -138,16 +139,18 @@ pub fn synchronize_preemption_state() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::System;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::{KThread, ThreadState};
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
     use crate::hle::kernel::svc::svc_event;
     use crate::hle::kernel::svc::svc_thread;
     use std::sync::atomic::Ordering;
-    use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::{Arc, Mutex};
 
-    fn test_context() -> SvcContext {
+    fn test_system() -> System {
+        let mut system = System::new_for_test();
+
         let mut process = KProcess::new();
         process.process_id = 100;
         process.capabilities.core_mask = 0xF;
@@ -173,58 +176,47 @@ mod tests {
         scheduler.lock().unwrap().initialize(1, 0, 0);
         let shared_memory = process.lock().unwrap().get_shared_memory();
 
-        SvcContext {
-            shared_memory,
-            code_base: 0x200000,
-            code_size: 0x1000,
-            stack_base: 0,
-            stack_size: 0,
-            program_id: 1,
-            tls_base: 0,
-            current_process: process,
-            service_manager: Arc::new(Mutex::new(
-                crate::hle::service::sm::sm::ServiceManager::new(),
-            )),
-            scheduler,
-            next_thread_id: Arc::new(AtomicU64::new(2)),
-            next_object_id: Arc::new(AtomicU32::new(2)),
-            is_64bit: false,
-        }
+        system.set_current_process_arc(process);
+        system.set_scheduler_arc(scheduler);
+        system.set_shared_process_memory(shared_memory);
+        system.set_runtime_program_id(1);
+        system.set_runtime_64bit(false);
+        system
     }
 
     #[test]
     fn reset_signal_resets_readable_event() {
-        let ctx = test_context();
+        let system = test_system();
         let mut write_handle = 0;
         let mut read_handle = 0;
         assert_eq!(
-            svc_event::create_event(&ctx, &mut write_handle, &mut read_handle),
+            svc_event::create_event(&system, &mut write_handle, &mut read_handle),
             RESULT_SUCCESS
         );
-        assert_eq!(svc_event::signal_event(&ctx, write_handle), RESULT_SUCCESS);
-        assert_eq!(reset_signal(&ctx, read_handle), RESULT_SUCCESS);
+        assert_eq!(svc_event::signal_event(&system, write_handle), RESULT_SUCCESS);
+        assert_eq!(reset_signal(&system, read_handle), RESULT_SUCCESS);
     }
 
     #[test]
     fn wait_synchronization_returns_signaled_index() {
-        let ctx = test_context();
+        let system = test_system();
         let mut write_handle = 0;
         let mut read_handle = 0;
         assert_eq!(
-            svc_event::create_event(&ctx, &mut write_handle, &mut read_handle),
+            svc_event::create_event(&system, &mut write_handle, &mut read_handle),
             RESULT_SUCCESS
         );
-        assert_eq!(svc_event::signal_event(&ctx, write_handle), RESULT_SUCCESS);
+        assert_eq!(svc_event::signal_event(&system, write_handle), RESULT_SUCCESS);
 
         {
-            let process = ctx.current_process.lock().unwrap();
+            let process = system.current_process_arc().lock().unwrap();
             let mut mem = process.process_memory.write().unwrap();
             mem.write_32(0x200100, read_handle);
         }
 
         let mut out_index = -1;
         assert_eq!(
-            wait_synchronization(&ctx, &mut out_index, 0x200100, 1, 0),
+            wait_synchronization(&system, &mut out_index, 0x200100, 1, 0),
             RESULT_SUCCESS
         );
         assert_eq!(out_index, 0);
@@ -232,23 +224,23 @@ mod tests {
 
     #[test]
     fn wait_synchronization_timeout_zero_returns_timed_out() {
-        let ctx = test_context();
+        let system = test_system();
         let mut write_handle = 0;
         let mut read_handle = 0;
         assert_eq!(
-            svc_event::create_event(&ctx, &mut write_handle, &mut read_handle),
+            svc_event::create_event(&system, &mut write_handle, &mut read_handle),
             RESULT_SUCCESS
         );
 
         {
-            let process = ctx.current_process.lock().unwrap();
+            let process = system.current_process_arc().lock().unwrap();
             let mut mem = process.process_memory.write().unwrap();
             mem.write_32(0x200100, read_handle);
         }
 
         let mut out_index = -1;
         assert_eq!(
-            wait_synchronization(&ctx, &mut out_index, 0x200100, 1, 0),
+            wait_synchronization(&system, &mut out_index, 0x200100, 1, 0),
             RESULT_TIMED_OUT
         );
         assert_eq!(out_index, -1);
@@ -256,29 +248,29 @@ mod tests {
 
     #[test]
     fn wait_synchronization_blocks_then_wakes_on_signal() {
-        let ctx = test_context();
+        let system = test_system();
         let mut write_handle = 0;
         let mut read_handle = 0;
         assert_eq!(
-            svc_event::create_event(&ctx, &mut write_handle, &mut read_handle),
+            svc_event::create_event(&system, &mut write_handle, &mut read_handle),
             RESULT_SUCCESS
         );
 
         {
-            let process = ctx.current_process.lock().unwrap();
+            let process = system.current_process_arc().lock().unwrap();
             let mut mem = process.process_memory.write().unwrap();
             mem.write_32(0x200100, read_handle);
         }
 
         let mut out_index = -1;
         assert_eq!(
-            wait_synchronization(&ctx, &mut out_index, 0x200100, 1, -1),
+            wait_synchronization(&system, &mut out_index, 0x200100, 1, -1),
             RESULT_SUCCESS
         );
         assert_eq!(out_index, -1);
 
         let current_thread = {
-            ctx.current_process
+            system.current_process_arc()
                 .lock()
                 .unwrap()
                 .get_thread_by_thread_id(1)
@@ -286,7 +278,7 @@ mod tests {
         };
         assert_eq!(current_thread.lock().unwrap().get_state(), crate::hle::kernel::k_thread::ThreadState::WAITING);
 
-        assert_eq!(svc_event::signal_event(&ctx, write_handle), RESULT_SUCCESS);
+        assert_eq!(svc_event::signal_event(&system, write_handle), RESULT_SUCCESS);
 
         let thread = current_thread.lock().unwrap();
         assert_eq!(thread.get_state(), crate::hle::kernel::k_thread::ThreadState::RUNNABLE);
@@ -298,22 +290,22 @@ mod tests {
 
     #[test]
     fn wait_synchronization_returns_cancelled_when_wait_cancelled_is_set() {
-        let ctx = test_context();
+        let system = test_system();
         let mut write_handle = 0;
         let mut read_handle = 0;
         assert_eq!(
-            svc_event::create_event(&ctx, &mut write_handle, &mut read_handle),
+            svc_event::create_event(&system, &mut write_handle, &mut read_handle),
             RESULT_SUCCESS
         );
 
         {
-            let process = ctx.current_process.lock().unwrap();
+            let process = system.current_process_arc().lock().unwrap();
             let mut mem = process.process_memory.write().unwrap();
             mem.write_32(0x200100, read_handle);
         }
 
         let current_thread = {
-            ctx.current_process
+            system.current_process_arc()
                 .lock()
                 .unwrap()
                 .get_thread_by_thread_id(1)
@@ -323,7 +315,7 @@ mod tests {
 
         let mut out_index = 123;
         assert_eq!(
-            wait_synchronization(&ctx, &mut out_index, 0x200100, 1, -1),
+            wait_synchronization(&system, &mut out_index, 0x200100, 1, -1),
             RESULT_CANCELLED
         );
         assert_eq!(out_index, -1);
@@ -336,29 +328,29 @@ mod tests {
 
     #[test]
     fn wait_synchronization_blocks_then_wakes_on_thread_exit() {
-        let ctx = test_context();
+        let system = test_system();
 
         let mut thread_handle = 0;
         assert_eq!(
-            svc_thread::create_thread(&ctx, &mut thread_handle, 0x201000, 0x1234, 0x260000, 44, 0),
+            svc_thread::create_thread(&system, &mut thread_handle, 0x201000, 0x1234, 0x260000, 44, 0),
             RESULT_SUCCESS
         );
 
         {
-            let process = ctx.current_process.lock().unwrap();
+            let process = system.current_process_arc().lock().unwrap();
             let mut mem = process.process_memory.write().unwrap();
             mem.write_32(0x200100, thread_handle);
         }
 
-        let object_id = ctx
-            .current_process
+        let object_id = system
+            .current_process_arc()
             .lock()
             .unwrap()
             .handle_table
             .get_object(thread_handle)
             .unwrap();
-        let target_thread = ctx
-            .current_process
+        let target_thread = system
+            .current_process_arc()
             .lock()
             .unwrap()
             .get_thread_by_object_id(object_id)
@@ -366,13 +358,13 @@ mod tests {
 
         let mut out_index = -1;
         assert_eq!(
-            wait_synchronization(&ctx, &mut out_index, 0x200100, 1, -1),
+            wait_synchronization(&system, &mut out_index, 0x200100, 1, -1),
             RESULT_SUCCESS
         );
         assert_eq!(out_index, -1);
 
         let current_thread = {
-            ctx.current_process
+            system.current_process_arc()
                 .lock()
                 .unwrap()
                 .get_thread_by_thread_id(1)
@@ -399,10 +391,10 @@ mod tests {
 
     #[test]
     fn wait_synchronization_blocks_then_wakes_on_process_signal() {
-        let ctx = test_context();
+        let system = test_system();
 
         let process_handle = {
-            let mut process = ctx.current_process.lock().unwrap();
+            let mut process = system.current_process_arc().lock().unwrap();
             let process_id = process.process_id;
             process.state = crate::hle::kernel::k_process::ProcessState::RunningAttached;
             process.is_signaled = false;
@@ -410,20 +402,20 @@ mod tests {
         };
 
         {
-            let process = ctx.current_process.lock().unwrap();
+            let process = system.current_process_arc().lock().unwrap();
             let mut mem = process.process_memory.write().unwrap();
             mem.write_32(0x200100, process_handle);
         }
 
         let mut out_index = -1;
         assert_eq!(
-            wait_synchronization(&ctx, &mut out_index, 0x200100, 1, -1),
+            wait_synchronization(&system, &mut out_index, 0x200100, 1, -1),
             RESULT_SUCCESS
         );
         assert_eq!(out_index, -1);
 
         let current_thread = {
-            ctx.current_process
+            system.current_process_arc()
                 .lock()
                 .unwrap()
                 .get_thread_by_thread_id(1)
@@ -434,7 +426,7 @@ mod tests {
             crate::hle::kernel::k_thread::ThreadState::WAITING
         );
 
-        ctx.current_process.lock().unwrap().set_debug_break();
+        system.current_process_arc().lock().unwrap().set_debug_break();
 
         let thread = current_thread.lock().unwrap();
         assert_eq!(
