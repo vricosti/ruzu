@@ -60,23 +60,13 @@ impl IStorage {
         let read_len = usize::min(length as usize, output_size);
         let data = storage.backend.read_bytes(read_len, offset as usize);
 
-        if let Some(shared_memory) = ctx.get_shared_memory() {
-            let address = if !ctx.buffer_descriptor_b().is_empty() {
-                ctx.buffer_descriptor_b()[0].address()
-            } else if !ctx.buffer_descriptor_c().is_empty() {
-                ctx.buffer_descriptor_c()[0].address()
-            } else {
-                0
-            };
-
-            if address != 0 {
-                let mut mem = shared_memory.write().unwrap();
-                mem.write_block(address, &data);
-                if read_len > data.len() {
-                    mem.write_block(address + data.len() as u64, &vec![0; read_len - data.len()]);
-                }
-            }
+        // Write read data to the output buffer.
+        // Upstream: ctx.WriteBuffer(output);
+        let mut padded = data;
+        if read_len > padded.len() {
+            padded.resize(read_len, 0);
         }
+        ctx.write_buffer(&padded, 0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);

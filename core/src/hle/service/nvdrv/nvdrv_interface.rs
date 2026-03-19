@@ -227,65 +227,9 @@ impl NvdrvService {
         }
     }
 
-    fn read_buffer(ctx: &HLERequestContext, buffer_index: usize) -> Vec<u8> {
-        let Some(shared_memory) = ctx.get_shared_memory() else {
-            return Vec::new();
-        };
-
-        let size = ctx.get_read_buffer_size(buffer_index);
-        if size == 0 {
-            return Vec::new();
-        }
-
-        let address = if ctx.buffer_descriptor_a().len() > buffer_index
-            && ctx.buffer_descriptor_a()[buffer_index].size() > 0
-        {
-            ctx.buffer_descriptor_a()[buffer_index].address()
-        } else if ctx.buffer_descriptor_x().len() > buffer_index {
-            ctx.buffer_descriptor_x()[buffer_index].address()
-        } else {
-            0
-        };
-
-        if address == 0 {
-            return Vec::new();
-        }
-
-        let mem = shared_memory.read().unwrap();
-        mem.read_block(address, size).to_vec()
-    }
-
-    fn write_buffer(ctx: &HLERequestContext, buffer_index: usize, data: &[u8]) {
-        let Some(shared_memory) = ctx.get_shared_memory() else {
-            return;
-        };
-
-        let size = ctx.get_write_buffer_size(buffer_index);
-        if size == 0 {
-            return;
-        }
-
-        let address = if ctx.buffer_descriptor_b().len() > buffer_index
-            && ctx.buffer_descriptor_b()[buffer_index].size() > 0
-        {
-            ctx.buffer_descriptor_b()[buffer_index].address()
-        } else if ctx.buffer_descriptor_c().len() > buffer_index {
-            ctx.buffer_descriptor_c()[buffer_index].address()
-        } else {
-            0
-        };
-
-        if address == 0 {
-            return;
-        }
-
-        let mut mem = shared_memory.write().unwrap();
-        let write_len = data.len().min(size);
-        mem.write_block(address, &data[..write_len]);
-        if size > write_len {
-            mem.write_block(address + write_len as u64, &vec![0; size - write_len]);
-        }
-    }
+    // read_buffer / write_buffer removed — use ctx.read_buffer() / ctx.write_buffer()
+    // from HLERequestContext (matches upstream where these are methods on HLERequestContext,
+    // not on individual service classes).
 
     fn push_nv_result(ctx: &mut HLERequestContext, nv_result: NvResult) {
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -295,7 +239,7 @@ impl NvdrvService {
 
     fn open_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
-        let device_name_bytes = Self::read_buffer(ctx, 0);
+        let device_name_bytes = ctx.read_buffer(0);
         let end = device_name_bytes
             .iter()
             .position(|&b| b == 0)
@@ -315,7 +259,7 @@ impl NvdrvService {
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let command = rp.pop_raw::<Ioctl>();
-        let input = Self::read_buffer(ctx, 0);
+        let input = ctx.read_buffer(0);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
         let nv_result = service
             .interface
@@ -323,7 +267,7 @@ impl NvdrvService {
             .unwrap()
             .ioctl1(fd, command, &input, &mut output);
         if command.is_out() {
-            Self::write_buffer(ctx, 0, &output);
+            ctx.write_buffer(&output, 0);
         }
         Self::push_nv_result(ctx, nv_result);
     }
@@ -333,8 +277,8 @@ impl NvdrvService {
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let command = rp.pop_raw::<Ioctl>();
-        let input = Self::read_buffer(ctx, 0);
-        let inline_input = Self::read_buffer(ctx, 1);
+        let input = ctx.read_buffer(0);
+        let inline_input = ctx.read_buffer(1);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
         let nv_result = service
             .interface
@@ -342,7 +286,7 @@ impl NvdrvService {
             .unwrap()
             .ioctl2(fd, command, &input, &inline_input, &mut output);
         if command.is_out() {
-            Self::write_buffer(ctx, 0, &output);
+            ctx.write_buffer(&output, 0);
         }
         Self::push_nv_result(ctx, nv_result);
     }
@@ -352,7 +296,7 @@ impl NvdrvService {
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let command = rp.pop_raw::<Ioctl>();
-        let input = Self::read_buffer(ctx, 0);
+        let input = ctx.read_buffer(0);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
         let mut inline_output = vec![0; ctx.get_write_buffer_size(1)];
         let nv_result = service
@@ -361,8 +305,8 @@ impl NvdrvService {
             .unwrap()
             .ioctl3(fd, command, &input, &mut output, &mut inline_output);
         if command.is_out() {
-            Self::write_buffer(ctx, 0, &output);
-            Self::write_buffer(ctx, 1, &inline_output);
+            ctx.write_buffer(&output, 0);
+            ctx.write_buffer(&inline_output, 1);
         }
         Self::push_nv_result(ctx, nv_result);
     }
