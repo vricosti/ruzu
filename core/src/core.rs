@@ -72,6 +72,10 @@ pub struct System {
     /// Shared HLE service registry.
     service_manager: Option<Arc<std::sync::Mutex<ServiceManager>>>,
 
+    /// Filesystem controller (process registrations, factory management).
+    /// Upstream: `FileSystemController& GetFileSystemController()`.
+    filesystem_controller: Arc<StdMutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
+
     /// Device memory (emulated Switch DRAM).
     device_memory: Option<Box<DeviceMemory>>,
     /// Core::Memory::Memory bridge (maps virtual→physical→host).
@@ -184,6 +188,9 @@ impl System {
             cpu_manager: CpuManager::new(),
             kernel: None,
             service_manager: None,
+            filesystem_controller: Arc::new(StdMutex::new(
+                crate::hle::service::filesystem::filesystem::FileSystemController::new(),
+            )),
             device_memory: None,
             memory: None,
             suspend_guard: Mutex::new(()),
@@ -280,7 +287,7 @@ impl System {
         let dm_ptr = self.device_memory.as_ref().unwrap().as_ref() as *const DeviceMemory;
         let mm_ptr = self.kernel.as_mut().unwrap().memory_manager_mut() as *mut _;
         let _services = crate::hle::service::services::Services::new(
-            &service_manager, dm_ptr, mm_ptr,
+            &service_manager, dm_ptr, mm_ptr, self.filesystem_controller.clone(),
         );
 
         self.service_manager = Some(service_manager);
@@ -359,6 +366,14 @@ impl System {
         if let Some(kernel) = self.kernel_mut() {
             process.process_id = kernel.create_new_user_process_id();
         }
+
+        // Register the process with the filesystem controller.
+        // Upstream: this happens inside AppLoader_NCA::Load() (nca.cpp:77-80),
+        // but the Rust loader doesn't have a System reference, so we do it here.
+        self.filesystem_controller.lock().unwrap().register_process(
+            process.process_id,
+            process.get_program_id(),
+        );
 
         // Store the loader and process.
         self.app_loader = Some(loader);
@@ -686,6 +701,14 @@ impl System {
     /// Get the shared HLE service registry.
     pub fn service_manager(&self) -> Option<Arc<std::sync::Mutex<ServiceManager>>> {
         self.service_manager.clone()
+    }
+
+    /// Get the filesystem controller.
+    /// Upstream: `System::GetFileSystemController()`.
+    pub fn get_filesystem_controller(
+        &self,
+    ) -> Arc<StdMutex<crate::hle::service::filesystem::filesystem::FileSystemController>> {
+        self.filesystem_controller.clone()
     }
 
     /// Get a reference to the current application process.
