@@ -4,13 +4,18 @@
 //! Port of zuyu/src/core/hle/service/glue/time/static.h
 //! Port of zuyu/src/core/hle/service/glue/time/static.cpp
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::psc::time::common::{
     ClockSnapshot, StaticServiceSetupInfo, SteadyClockTimePoint, SystemClockContext, TimeType,
 };
 use crate::hle::service::psc::time::r#static as psc_static;
+use crate::hle::service::psc::time::shared_memory::SharedMemory as PscSharedMemory;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::file_timestamp_worker::FileTimestampWorker;
 use super::standard_steady_clock_resource::StandardSteadyClockResource;
@@ -48,6 +53,14 @@ pub struct StaticService {
     file_timestamp_worker: FileTimestampWorker,
     standard_steady_clock_resource: StandardSteadyClockResource,
     time_zone_binary: Mutex<TimeZoneBinary>,
+    /// The PSC shared memory backing the lock-free time reads.
+    /// Stored so we can hand out a KSharedMemory handle to the guest.
+    psc_shared_memory: Mutex<PscSharedMemory>,
+    /// Cached handle returned by GetSharedMemoryNativeHandle.
+    /// Once registered in the process handle table it does not change.
+    shared_memory_handle: Mutex<Option<u32>>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl StaticService {
@@ -85,6 +98,28 @@ impl StaticService {
         let mut time_zone_binary = TimeZoneBinary::new();
         let _ = time_zone_binary.mount();
 
+        let handlers = build_handler_map(&[
+            (commands::GET_STANDARD_USER_SYSTEM_CLOCK, None, "GetStandardUserSystemClock"),
+            (commands::GET_STANDARD_NETWORK_SYSTEM_CLOCK, None, "GetStandardNetworkSystemClock"),
+            (commands::GET_STANDARD_STEADY_CLOCK, None, "GetStandardSteadyClock"),
+            (commands::GET_TIME_ZONE_SERVICE, None, "GetTimeZoneService"),
+            (commands::GET_STANDARD_LOCAL_SYSTEM_CLOCK, None, "GetStandardLocalSystemClock"),
+            (commands::GET_EPHEMERAL_NETWORK_SYSTEM_CLOCK, None, "GetEphemeralNetworkSystemClock"),
+            (commands::GET_SHARED_MEMORY_NATIVE_HANDLE, Some(StaticService::get_shared_memory_native_handle_handler), "GetSharedMemoryNativeHandle"),
+            (commands::SET_STANDARD_STEADY_CLOCK_INTERNAL_OFFSET, None, "SetStandardSteadyClockInternalOffset"),
+            (commands::GET_STANDARD_STEADY_CLOCK_RTC_VALUE, None, "GetStandardSteadyClockRtcValue"),
+            (commands::IS_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, Some(StaticService::is_standard_user_system_clock_automatic_correction_enabled_handler), "IsStandardUserSystemClockAutomaticCorrectionEnabled"),
+            (commands::SET_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, None, "SetStandardUserSystemClockAutomaticCorrectionEnabled"),
+            (commands::GET_STANDARD_USER_SYSTEM_CLOCK_INITIAL_YEAR, None, "GetStandardUserSystemClockInitialYear"),
+            (commands::IS_STANDARD_NETWORK_SYSTEM_CLOCK_ACCURACY_SUFFICIENT, Some(StaticService::is_standard_network_system_clock_accuracy_sufficient_handler), "IsStandardNetworkSystemClockAccuracySufficient"),
+            (commands::GET_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME, None, "GetStandardUserSystemClockAutomaticCorrectionUpdatedTime"),
+            (commands::CALCULATE_MONOTONIC_SYSTEM_CLOCK_BASE_TIME_POINT, None, "CalculateMonotonicSystemClockBaseTimePoint"),
+            (commands::GET_CLOCK_SNAPSHOT, None, "GetClockSnapshot"),
+            (commands::GET_CLOCK_SNAPSHOT_FROM_SYSTEM_CLOCK_CONTEXT, None, "GetClockSnapshotFromSystemClockContext"),
+            (commands::CALCULATE_STANDARD_USER_SYSTEM_CLOCK_DIFFERENCE_BY_USER, None, "CalculateStandardUserSystemClockDifferenceByUser"),
+            (commands::CALCULATE_SPAN_BETWEEN_STANDARD_USER_SYSTEM_CLOCKS, None, "CalculateSpanBetweenStandardUserSystemClocks"),
+        ]);
+
         Self {
             service_name: name.to_string(),
             setup_info,
@@ -92,8 +127,154 @@ impl StaticService {
             file_timestamp_worker: FileTimestampWorker::new(),
             standard_steady_clock_resource: StandardSteadyClockResource::new(),
             time_zone_binary: Mutex::new(time_zone_binary),
+            psc_shared_memory: Mutex::new(PscSharedMemory::new()),
+            shared_memory_handle: Mutex::new(None),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
+
+    // =========================================================================
+    // IPC handler callbacks (ServiceFramework pattern)
+    // =========================================================================
+
+    /// GetSharedMemoryNativeHandle (cmd 20) handler.
+    ///
+    /// Returns a copy handle to the KSharedMemory backing the lock-free time
+    /// shared memory region. On first call, registers the KSharedMemory in the
+    /// process handle table and caches the handle.
+    fn get_shared_memory_native_handle_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const StaticService) };
+
+        // Check if we already have a cached handle.
+        let mut cached = service.shared_memory_handle.lock().unwrap();
+        if let Some(handle) = *cached {
+            log::debug!(
+                "Glue::Time::StaticService::GetSharedMemoryNativeHandle -> cached handle={:#x}",
+                handle
+            );
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+            return;
+        }
+
+        // First call: register the KSharedMemory in the process handle table.
+        let handle = (|| -> Option<u32> {
+            use std::sync::Arc;
+
+            let thread = ctx.get_thread()?;
+            let thread_guard = thread.lock().unwrap();
+            let parent = thread_guard.parent.as_ref()?.upgrade()?;
+            let mut process = parent.lock().unwrap();
+
+            static NEXT_SHMEM_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0x3000_0000);
+            let object_id =
+                NEXT_SHMEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // Wrap the KSharedMemory in an Arc for the process object table.
+            let psc_shmem = service.psc_shared_memory.lock().unwrap();
+            let k_shmem = Arc::new(
+                crate::hle::kernel::k_shared_memory::KSharedMemory::new(),
+            );
+            // We create a minimal initialized KSharedMemory for the handle table.
+            // The actual data lives in the PscSharedMemory; the handle is what
+            // the guest uses with MapSharedMemory SVC.
+            {
+                use crate::hle::kernel::k_shared_memory::MemoryPermission;
+                let k_shmem_mut = unsafe {
+                    &mut *(Arc::as_ptr(&k_shmem) as *mut crate::hle::kernel::k_shared_memory::KSharedMemory)
+                };
+                k_shmem_mut.initialize(
+                    MemoryPermission::None,
+                    MemoryPermission::Read,
+                    psc_shmem.get_k_shared_memory().get_size(),
+                );
+            }
+
+            process.register_shared_memory_object(object_id, k_shmem);
+            let handle = process.handle_table.add(object_id).ok()?;
+            Some(handle)
+        })();
+
+        match handle {
+            Some(h) => {
+                *cached = Some(h);
+                log::debug!(
+                    "Glue::Time::StaticService::GetSharedMemoryNativeHandle -> new handle={:#x}",
+                    h
+                );
+                let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_copy_objects(h);
+            }
+            None => {
+                log::error!(
+                    "Glue::Time::StaticService::GetSharedMemoryNativeHandle -> failed to create handle"
+                );
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+            }
+        }
+    }
+
+    /// IsStandardUserSystemClockAutomaticCorrectionEnabled (cmd 100) handler.
+    fn is_standard_user_system_clock_automatic_correction_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const StaticService) };
+        match service.is_standard_user_system_clock_automatic_correction_enabled() {
+            Ok(enabled) => {
+                log::debug!(
+                    "Glue::Time::StaticService::IsStandardUserSystemClockAutomaticCorrectionEnabled -> {}",
+                    enabled
+                );
+                let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u32(if enabled { 1 } else { 0 });
+            }
+            Err(rc) => {
+                log::warn!(
+                    "Glue::Time::StaticService::IsStandardUserSystemClockAutomaticCorrectionEnabled -> error {:?}",
+                    rc
+                );
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    /// IsStandardNetworkSystemClockAccuracySufficient (cmd 200) handler.
+    fn is_standard_network_system_clock_accuracy_sufficient_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const StaticService) };
+        match service.is_standard_network_system_clock_accuracy_sufficient() {
+            Ok(sufficient) => {
+                log::debug!(
+                    "Glue::Time::StaticService::IsStandardNetworkSystemClockAccuracySufficient -> {}",
+                    sufficient
+                );
+                let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u32(if sufficient { 1 } else { 0 });
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Business logic methods (unchanged)
+    // =========================================================================
 
     pub fn get_standard_user_system_clock(&self) -> ResultCode {
         log::debug!("Glue::Time::StaticService::GetStandardUserSystemClock called");
@@ -250,6 +431,34 @@ impl StaticService {
             .lock()
             .unwrap()
             .calculate_span_between(a, b)
+    }
+}
+
+// =============================================================================
+// ServiceFramework + SessionRequestHandler implementation
+// =============================================================================
+
+impl SessionRequestHandler for StaticService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        &self.service_name
+    }
+}
+
+impl ServiceFramework for StaticService {
+    fn get_service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
 

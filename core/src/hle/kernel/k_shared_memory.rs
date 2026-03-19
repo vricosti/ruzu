@@ -24,47 +24,75 @@ pub enum MemoryPermission {
 
 /// KSharedMemory: allows sharing memory regions between processes.
 ///
-/// Upstream inherits from KAutoObjectWithSlabHeapAndContainer.
+/// Upstream inherits from KAutoObjectWithSlabHeapAndContainer and allocates
+/// physical pages via KMemoryManager backed by DeviceMemory.
+/// Here we use a simple owned Vec<u8> as backing storage until
+/// DeviceMemory/KPageGroup/KMemoryManager are fully wired.
 pub struct KSharedMemory {
-    // m_device_memory: *mut DeviceMemory,
-    // m_owner_process: *mut KProcess,
-    // m_page_group: Option<KPageGroup>,
+    /// Owned backing storage. In upstream this would be pages allocated from
+    /// DeviceMemory via KMemoryManager, accessed through m_physical_address.
+    m_backing: Vec<u8>,
     m_owner_permission: MemoryPermission,
     m_user_permission: MemoryPermission,
-    m_physical_address: u64,
     m_size: usize,
-    // m_resource_limit: *mut KResourceLimit,
     m_is_initialized: bool,
 }
 
 impl KSharedMemory {
     pub fn new() -> Self {
         Self {
+            m_backing: Vec::new(),
             m_owner_permission: MemoryPermission::None,
             m_user_permission: MemoryPermission::None,
-            m_physical_address: 0,
             m_size: 0,
             m_is_initialized: false,
         }
     }
 
     /// Initialize the shared memory with the given parameters.
+    ///
+    /// Matches upstream `KSharedMemory::Initialize(DeviceMemory&, KProcess*, ...)`.
+    /// Upstream allocates physical pages from KMemoryManager and clears them.
+    /// Here we allocate a zeroed Vec<u8> as the backing store.
     pub fn initialize(
         &mut self,
         owner_permission: MemoryPermission,
         user_permission: MemoryPermission,
         size: usize,
     ) -> ResultCode {
-        // TODO: Allocate physical memory, create page group, etc.
+        let aligned_size = (size + 0xFFF) & !0xFFF; // Align to page size
+        self.m_backing = vec![0u8; aligned_size];
         self.m_owner_permission = owner_permission;
         self.m_user_permission = user_permission;
-        self.m_size = size; // Should be aligned to PageSize
+        self.m_size = aligned_size;
         self.m_is_initialized = true;
         ResultCode::new(0)
     }
 
     pub fn finalize(&mut self) {
-        // TODO: Close page group, release resource limit.
+        self.m_backing.clear();
+        self.m_is_initialized = false;
+    }
+
+    /// Get a raw pointer to the backing memory.
+    ///
+    /// Matches upstream `KSharedMemory::GetPointer(offset)` which returns
+    /// `m_device_memory->GetPointer<u8>(m_physical_address + offset)`.
+    pub fn get_pointer(&self, offset: usize) -> *const u8 {
+        if offset < self.m_backing.len() {
+            self.m_backing.as_ptr().wrapping_add(offset)
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    /// Get a mutable raw pointer to the backing memory.
+    pub fn get_pointer_mut(&mut self, offset: usize) -> *mut u8 {
+        if offset < self.m_backing.len() {
+            self.m_backing.as_mut_ptr().wrapping_add(offset)
+        } else {
+            std::ptr::null_mut()
+        }
     }
 
     /// Map the shared memory into a target process's address space.

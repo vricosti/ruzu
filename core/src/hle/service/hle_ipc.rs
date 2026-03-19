@@ -252,8 +252,12 @@ pub struct HLERequestContext {
 
     /// The requesting thread. Matches upstream `KThread* thread`.
     thread: Option<Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>>,
-    /// Guest memory. Matches upstream `Core::Memory::Memory& memory`.
+    /// Guest memory (legacy flat buffer, used as fallback when Memory bridge is not available).
     shared_memory: Option<crate::hle::kernel::k_process::SharedProcessMemory>,
+    /// Guest memory bridge. Matches upstream `Core::Memory::Memory& memory`.
+    /// When present, this is the authoritative path for TLS reads/writes,
+    /// matching upstream `memory.GetPointer(tls_address)`.
+    memory: Option<Arc<std::sync::Mutex<crate::memory::memory::Memory>>>,
     /// TLS address for command buffer read/write.
     /// Upstream derives this from `thread->GetTlsAddress()`.
     tls_address: u64,
@@ -301,6 +305,7 @@ impl HLERequestContext {
             cmd_buf: [0u32; ipc::COMMAND_BUFFER_LENGTH],
             thread: Some(thread),
             shared_memory: Some(shared_memory),
+            memory: None,
             tls_address,
             command_header: None,
             handle_descriptor_header: None,
@@ -337,6 +342,7 @@ impl HLERequestContext {
             cmd_buf: [0u32; ipc::COMMAND_BUFFER_LENGTH],
             thread: None,
             shared_memory: None,
+            memory: None,
             tls_address: 0,
             command_header: None,
             handle_descriptor_header: None,
@@ -477,6 +483,12 @@ impl HLERequestContext {
 
     pub fn add_domain_object(&mut self, object: SessionRequestHandlerPtr) {
         self.outgoing_domain_objects.push(object);
+    }
+
+    /// Set the Memory bridge for TLS reads/writes.
+    /// Matches upstream `Core::Memory::Memory& memory` passed to the HLERequestContext constructor.
+    pub fn set_memory(&mut self, memory: Arc<std::sync::Mutex<crate::memory::memory::Memory>>) {
+        self.memory = Some(memory);
     }
 
     pub fn set_session_request_manager(&mut self, manager: Arc<Mutex<SessionRequestManager>>) {
@@ -701,8 +713,15 @@ impl HLERequestContext {
     /// reads directly from guest memory. Falls back to the provided buffer
     /// if no memory is available (test path).
     pub fn populate_from_incoming_command_buffer(&mut self, src_cmdbuf: &[u32]) {
-        if let Some(ref mem) = self.shared_memory {
-            // Read command buffer from guest TLS memory (upstream path).
+        if let Some(ref memory) = self.memory {
+            // Read command buffer from guest TLS via Memory bridge (upstream path).
+            // Matches upstream: u32* cmd_buf = reinterpret_cast<u32*>(memory.GetPointer(tls_address))
+            let m = memory.lock().unwrap();
+            for i in 0..ipc::COMMAND_BUFFER_LENGTH {
+                self.cmd_buf[i] = m.read_32(self.tls_address + (i as u64 * 4));
+            }
+        } else if let Some(ref mem) = self.shared_memory {
+            // Fallback: read from ProcessMemoryData (test path or pre-Memory setup).
             let mem = mem.read().unwrap();
             for i in 0..ipc::COMMAND_BUFFER_LENGTH {
                 self.cmd_buf[i] = mem.read_32(self.tls_address + (i as u64 * 4));
@@ -998,14 +1017,17 @@ impl HLERequestContext {
 
         // Write the command buffer back to guest TLS memory.
         // Matches upstream: memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), write_size * sizeof(u32))
-        if let Some(ref mem) = self.shared_memory {
-            // write_size may not cover the full header+handles area if it was
-            // calculated from data_size only. Use the full COMMAND_BUFFER_LENGTH
-            // to ensure handles in the header area are written back.
-            // TODO: compute exact write size matching upstream.
-            let write_words = ipc::COMMAND_BUFFER_LENGTH;
+        let write_words = ipc::COMMAND_BUFFER_LENGTH;
+        if let Some(ref memory) = self.memory {
+            // Write via Memory bridge (upstream path).
+            let m = memory.lock().unwrap();
+            for i in 0..write_words {
+                m.write_32(self.tls_address + (i as u64 * 4), self.cmd_buf[i]);
+            }
+        } else if let Some(ref mem) = self.shared_memory {
+            // Fallback: write to ProcessMemoryData (test path or pre-Memory setup).
             let mut mem = mem.write().unwrap();
-            for i in 0..write_words.min(ipc::COMMAND_BUFFER_LENGTH) {
+            for i in 0..write_words {
                 mem.write_32(self.tls_address + (i as u64 * 4), self.cmd_buf[i]);
             }
         }
