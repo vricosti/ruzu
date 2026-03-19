@@ -20,7 +20,7 @@ use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_memory_layout::KERNEL_ASLR_ALIGNMENT;
 use super::k_memory_manager;
 use super::k_resource_limit::KResourceLimit;
-use super::svc_types::{ADDRESS_SPACE_MASK, CreateProcessFlag};
+use super::svc_types::{ADDRESS_SPACE_MASK, CreateProcessFlag, MemoryState as SvcMemoryState};
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::result::ResultCode;
 use crate::memory::memory::Memory;
@@ -290,95 +290,85 @@ impl KPageTableBase {
 
     // -- Region resolution matching upstream GetRegionAddress/GetRegionSize --
 
-    /// Get the start address for a memory region by state.
+    /// Get the start address for a memory region by SVC memory state.
     /// Matches upstream `KPageTableBase::GetRegionAddress(Svc::MemoryState)`.
-    pub fn get_region_address(&self, state: KMemoryState) -> usize {
-        let svc_state = state.bits() & KMemoryState::MASK.bits();
-        match svc_state {
-            s if s == KMemoryState::FREE.bits()
-                || s == KMemoryState::KERNEL.bits()
-                || s == KMemoryState::NORMAL.bits()
-                || s == KMemoryState::CODE_DATA.bits()
-                || s == KMemoryState::SHARED.bits()
-                || s == KMemoryState::ALIAS_CODE.bits()
-                || s == KMemoryState::ALIAS_CODE_DATA.bits()
-                || s == KMemoryState::TRANSFERRED.bits()
-                || s == KMemoryState::SHARED_TRANSFERRED.bits()
-                || s == KMemoryState::SHARED_CODE.bits()
-                || s == KMemoryState::GENERATED_CODE.bits()
-                || s == KMemoryState::CODE_OUT.bits()
-                || s == KMemoryState::COVERAGE.bits()
-                || s == KMemoryState::INSECURE.bits() =>
-            {
+    pub fn get_region_address(&self, state: SvcMemoryState) -> usize {
+        use SvcMemoryState::*;
+        match state {
+            Free | Kernel => self.m_address_space_start,
+            Normal => self.m_heap_region_start,
+            Ipc | NonSecureIpc | NonDeviceIpc => self.m_alias_region_start,
+            Stack => self.m_stack_region_start,
+            Static | ThreadLocal => self.m_kernel_map_region_start,
+            Io | Shared | AliasCode | AliasCodeData
+            | Transferred | SharedTransferred | SharedCode
+            | GeneratedCode | CodeOut | Coverage | Insecure => {
                 self.m_alias_code_region_start
             }
-            s if s == KMemoryState::CODE.bits() => self.m_code_region_start,
-            s if s == KMemoryState::STACK.bits() => self.m_stack_region_start,
-            s if s == KMemoryState::IO_MEMORY.bits()
-                || s == KMemoryState::STATIC.bits()
-                || s == KMemoryState::THREAD_LOCAL.bits() =>
-            {
-                self.m_kernel_map_region_start
-            }
-            s if s == KMemoryState::IO_REGISTER.bits()
-                =>
-            {
-                self.m_alias_region_start
-            }
+            Code | CodeData => self.m_code_region_start,
             _ => {
-                log::error!("GetRegionAddress: unknown state {:#x}", svc_state);
+                log::error!("GetRegionAddress: unknown state {:?}", state);
                 self.m_address_space_start
             }
         }
     }
 
-    /// Get the size of a memory region by state.
+    /// Get the size of a memory region by SVC memory state.
     /// Matches upstream `KPageTableBase::GetRegionSize(Svc::MemoryState)`.
-    pub fn get_region_size(&self, state: KMemoryState) -> usize {
-        let start = self.get_region_address(state);
-        let svc_state = state.bits() & KMemoryState::MASK.bits();
-        let end = match svc_state {
-            s if s == KMemoryState::FREE.bits()
-                || s == KMemoryState::NORMAL.bits()
-                || s == KMemoryState::CODE_DATA.bits()
-                || s == KMemoryState::SHARED.bits()
-                || s == KMemoryState::ALIAS_CODE.bits()
-                || s == KMemoryState::ALIAS_CODE_DATA.bits()
-                || s == KMemoryState::TRANSFERRED.bits()
-                || s == KMemoryState::SHARED_TRANSFERRED.bits()
-                || s == KMemoryState::SHARED_CODE.bits()
-                || s == KMemoryState::GENERATED_CODE.bits()
-                || s == KMemoryState::CODE_OUT.bits()
-                || s == KMemoryState::COVERAGE.bits()
-                || s == KMemoryState::INSECURE.bits()
-                || s == KMemoryState::KERNEL.bits() =>
-            {
-                self.m_alias_code_region_end
+    pub fn get_region_size(&self, state: SvcMemoryState) -> usize {
+        use SvcMemoryState::*;
+        match state {
+            Free | Kernel => self.m_address_space_end - self.m_address_space_start,
+            Normal => self.m_heap_region_end - self.m_heap_region_start,
+            Ipc | NonSecureIpc | NonDeviceIpc => {
+                self.m_alias_region_end - self.m_alias_region_start
             }
-            s if s == KMemoryState::CODE.bits() => self.m_code_region_end,
-            s if s == KMemoryState::STACK.bits() => self.m_stack_region_end,
-            s if s == KMemoryState::IO_MEMORY.bits()
-                || s == KMemoryState::STATIC.bits()
-                || s == KMemoryState::THREAD_LOCAL.bits() =>
-            {
-                self.m_kernel_map_region_end
+            Stack => self.m_stack_region_end - self.m_stack_region_start,
+            Static | ThreadLocal => {
+                self.m_kernel_map_region_end - self.m_kernel_map_region_start
             }
-            s if s == KMemoryState::IO_REGISTER.bits()
-                =>
-            {
-                self.m_alias_region_end
+            Io | Shared | AliasCode | AliasCodeData
+            | Transferred | SharedTransferred | SharedCode
+            | GeneratedCode | CodeOut | Coverage | Insecure => {
+                self.m_alias_code_region_end - self.m_alias_code_region_start
             }
-            _ => self.m_address_space_end,
-        };
-        end - start
+            Code | CodeData => self.m_code_region_end - self.m_code_region_start,
+            _ => {
+                log::error!("GetRegionSize: unknown state {:?}", state);
+                self.m_address_space_end - self.m_address_space_start
+            }
+        }
     }
 
     /// Check if an address range can be contained within a region for a given state.
-    pub fn can_contain(&self, addr: usize, size: usize, state: KMemoryState) -> bool {
+    /// Matches upstream `KPageTableBase::CanContain(KProcessAddress, size_t, Svc::MemoryState)`.
+    pub fn can_contain(&self, addr: usize, size: usize, state: SvcMemoryState) -> bool {
         let region_start = self.get_region_address(state);
         let region_size = self.get_region_size(state);
         let region_end = region_start + region_size;
         region_start <= addr && addr + size <= region_end
+    }
+
+    // -- KMemoryState convenience overloads --
+    // Upstream: inline overloads in k_page_table_base.h that cast
+    //   `static_cast<Svc::MemoryState>(state & KMemoryState::Mask)`.
+
+    fn k_state_to_svc(state: KMemoryState) -> SvcMemoryState {
+        let svc = state.bits() & KMemoryState::MASK.bits();
+        // SAFETY: all valid KMemoryState lower bytes map to valid SvcMemoryState discriminants.
+        unsafe { std::mem::transmute(svc) }
+    }
+
+    pub fn get_region_address_k(&self, state: KMemoryState) -> usize {
+        self.get_region_address(Self::k_state_to_svc(state))
+    }
+
+    pub fn get_region_size_k(&self, state: KMemoryState) -> usize {
+        self.get_region_size(Self::k_state_to_svc(state))
+    }
+
+    pub fn can_contain_k(&self, addr: usize, size: usize, state: KMemoryState) -> bool {
+        self.can_contain(addr, size, Self::k_state_to_svc(state))
     }
 
     pub fn is_in_alias_region(&self, addr: usize, size: usize) -> bool {
@@ -1672,8 +1662,8 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::MapStatic`.
     pub fn map_static(&mut self, phys_addr: u64, size: usize, perm: KMemoryPermission) -> u32 {
         let num_pages = size / PAGE_SIZE;
-        let region_start = self.get_region_address(KMemoryState::STATIC);
-        let region_size = self.get_region_size(KMemoryState::STATIC);
+        let region_start = self.get_region_address(SvcMemoryState::Static);
+        let region_size = self.get_region_size(SvcMemoryState::Static);
         let region_num_pages = region_size / PAGE_SIZE;
 
         // Find a free area in the Static region.
@@ -1706,8 +1696,8 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::MapIo`.
     pub fn map_io(&mut self, phys_addr: u64, size: usize, perm: KMemoryPermission) -> u32 {
         let num_pages = size / PAGE_SIZE;
-        let region_start = self.get_region_address(KMemoryState::IO_REGISTER);
-        let region_size = self.get_region_size(KMemoryState::IO_REGISTER);
+        let region_start = self.get_region_address(SvcMemoryState::Io);
+        let region_size = self.get_region_size(SvcMemoryState::Io);
         let region_num_pages = region_size / PAGE_SIZE;
 
         // Find a free area.
@@ -1762,7 +1752,7 @@ impl KPageTableBase {
     ) -> (u32, usize) {
         debug_assert!(alignment >= PAGE_SIZE && alignment % PAGE_SIZE == 0);
 
-        if !self.can_contain(region_start, region_num_pages * PAGE_SIZE, state) {
+        if !self.can_contain_k(region_start, region_num_pages * PAGE_SIZE, state) {
             return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), 0);
         }
         if num_pages >= region_num_pages {
@@ -1825,7 +1815,7 @@ impl KPageTableBase {
         perm: KMemoryPermission,
     ) -> u32 {
         let size = num_pages * PAGE_SIZE;
-        if !self.can_contain(addr, size, state) {
+        if !self.can_contain_k(addr, size, state) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
@@ -2068,7 +2058,7 @@ impl KPageTableBase {
     pub fn map_code_memory(&mut self, dst: usize, src: usize, size: usize) -> u32 {
         let num_pages = size / PAGE_SIZE;
 
-        if !self.can_contain(dst, size, KMemoryState::ALIAS_CODE) {
+        if !self.can_contain(dst, size, SvcMemoryState::AliasCode) {
             return svc_results::RESULT_INVALID_MEMORY_REGION.get_inner_value();
         }
 
@@ -2138,7 +2128,7 @@ impl KPageTableBase {
     pub fn unmap_code_memory(&mut self, dst: usize, src: usize, size: usize) -> u32 {
         let num_pages = size / PAGE_SIZE;
 
-        if !self.can_contain(dst, size, KMemoryState::ALIAS_CODE) {
+        if !self.can_contain(dst, size, SvcMemoryState::AliasCode) {
             return svc_results::RESULT_INVALID_MEMORY_REGION.get_inner_value();
         }
 
