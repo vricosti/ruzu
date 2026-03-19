@@ -1,324 +1,601 @@
-# Architecture
-
-Ce document explique l'architecture actuelle du lifecycle thread/process et du dispatch CPU dans `ruzu`, en particulier la logique récente autour de la terminaison coopérative.
-
-Il ne remplace pas l'upstream C++ comme source de vérité. Il décrit:
-
-- ce que fait upstream conceptuellement
-- comment le port Rust l'approxime aujourd'hui
-- où vivent les ownership boundaries dans le code Rust
-- quelles différences restent assumées ou encore temporaires
-
-## Portee
-
-Les fichiers principaux concernés sont:
-
-- [`core/src/hle/kernel/k_thread.rs`](core/src/hle/kernel/k_thread.rs)
-- [`core/src/hle/kernel/k_process.rs`](core/src/hle/kernel/k_process.rs)
-- [`core/src/hle/kernel/k_scheduler.rs`](core/src/hle/kernel/k_scheduler.rs)
-- [`core/src/hle/kernel/k_worker_task_manager.rs`](core/src/hle/kernel/k_worker_task_manager.rs)
-- [`core/src/hle/kernel/svc_dispatch.rs`](core/src/hle/kernel/svc_dispatch.rs)
-- [`core/src/hle/kernel/svc/svc_process.rs`](core/src/hle/kernel/svc/svc_process.rs)
-- [`core/src/hle/kernel/svc/svc_thread.rs`](core/src/hle/kernel/svc/svc_thread.rs)
-- [`core/src/hle/kernel/physical_core.rs`](core/src/hle/kernel/physical_core.rs)
-
-## Vue D'Ensemble
-
-Le modèle upstream n'est pas un runtime Rust coopératif. La terminaison d'un thread ou d'un process y est observée naturellement via:
-
-- les retours de SVC
-- les retours d'interruption ou de timer tick
-- la libération du scheduler lock
-- les chemins de wait/signal du noyau
-
-Dans `ruzu`, la même sémantique n'existe pas encore partout. Le port s'appuie donc sur trois frontières explicites où une terminaison demandée peut être drainée de manière centralisée:
-
-1. retour de `Yield` / sélection scheduler
-2. retour de chaque SVC dans `svc_dispatch`
-3. retour du quantum CPU dans `physical_core`
-
-Le but est de couvrir les trois grandes familles de réentrée kernel:
-
-- réentrée volontaire via SVC
-- réentrée coopérative via scheduler
-- réentrée implicite via fin de quantum CPU
-
-## Modele Upstream
-
-### Thread
-
-Upstream sépare plusieurs étapes:
-
-- `RequestTerminate()`: marque l'intention
-- `Exit()`: lance le chemin de sortie du thread courant
-- `Terminate()`: force ou attend la terminaison d'un autre thread
-- `FinishTermination()`: finalise l'état, signale l'objet de synchro, nettoie les ressources
-
-Le point important est l'ordre:
-
-- la demande de terminaison ne détruit pas immédiatement le thread
-- le thread est observé à une frontière d'ordonnancement ou de retour noyau
-- la terminaison complète n'est visible qu'après `FinishTermination()`
-
-### Process
-
-Upstream suit aussi plusieurs phases:
-
-- `Exit()` ou `Terminate()`
-- `StartTermination()`
-- `TerminateChildren(...)`
-- `DoWorkerTaskImpl()`
-- `FinishTermination()`
-
-`TerminateChildren(...)` fait deux passes:
-
-1. demander la terminaison des enfants
-2. terminer ensuite les enfants restants
-
-`DoWorkerTaskImpl()` existe pour sortir du chemin appelant immédiat et terminer le cleanup dans le bon contexte.
-
-## Adaptation Rust Actuelle
-
-### Ownership Rust
-
-Le port utilise:
-
-- `Arc<Mutex<KThread>>`
-- `Arc<Mutex<KProcess>>`
-- `Arc<Mutex<KScheduler>>`
-
-Cette forme impose une contrainte absente du C++ upstream: beaucoup d'opérations doivent éviter de réentrer pendant qu'un `MutexGuard` est encore actif.
-
-C'est la raison principale de plusieurs helpers Rust-side:
-
-- `KProcess::exit_with_current_thread(...)`
-- `KThread::terminate_thread(&Arc<Mutex<KThread>>)`
-- la queue globale `KWorkerTaskManager`
-
-Ces helpers ne cherchent pas à redessiner l'architecture. Ils existent pour préserver autant que possible l'ownership upstream malgré les contraintes de verrouillage Rust.
-
-### Self References
-
-`KThread` et `KProcess` ont maintenant une self-reference weak/upgradeable côté Rust. Cela permet:
-
-- à `KThread::exit()` de se queue lui-même comme worker task
-- à `KProcess::exit()` ou `terminate()` de reprogrammer `do_worker_task_impl()`
-
-Sans cela, le lifecycle restait trop inline et s'éloignait du modèle upstream.
-
-### KWorkerTaskManager
-
-`KWorkerTaskManager` est maintenant une vraie queue asynchrone globale.
-
-Son rôle actuel:
-
-- exécuter les fins de terminaison hors du call path immédiat
-- rapprocher `KThread::exit()` et `KProcess::exit()` du modèle upstream
-- fournir `wait_for_idle()` et `wait_for_global_idle()` pour les tests
-
-Ce que cela change:
-
-- la fin de vie n'est plus forcée inline partout
-- `do_worker_task_impl()` redevient un owner utile du cleanup process
-
-## Frontieres De Drain
-
-Le terme "drain" désigne ici: constater qu'un thread courant a `termination_requested` et déclencher son `exit()` complet à une frontière centrale de retour noyau/runtime.
-
-### 1. Frontiere Scheduler
-
-Fichier owner:
-
-- [`core/src/hle/kernel/k_scheduler.rs`](core/src/hle/kernel/k_scheduler.rs)
-
-Le helper local est:
-
-- `exit_thread_if_termination_requested(...)`
-
-Il est utilisé aujourd'hui dans:
-
-- `yield_without_core_migration(...)`
-- `wait_for_next_thread(...)`
-- `select_next_thread_id(...)` pour les tests
-
-Ce point couvre les chemins coopératifs où le thread courant repasse par le scheduler.
-
-### 2. Frontiere SVC
-
-Fichier owner:
-
-- [`core/src/hle/kernel/svc_dispatch.rs`](core/src/hle/kernel/svc_dispatch.rs)
-
-Le helper local est:
-
-- `drain_current_thread_termination(ctx)`
-
-Il est appelé une seule fois après `call32(...)` ou `call64(...)`, dans `call(...)`.
-
-C'est volontairement centralisé:
-
-- pas de duplication dans chaque handler SVC
-- ownership conservé dans le vrai owner du retour SVC
-- meilleure parité conceptuelle avec le moment où upstream relâche le scheduler lock après le handler
-
-### 3. Frontiere Quantum CPU
-
-Fichier owner:
-
-- [`core/src/hle/kernel/physical_core.rs`](core/src/hle/kernel/physical_core.rs)
-
-Le helper local est:
-
-- `drain_current_thread_termination(...)`
-
-Il est appelé dans le chemin `PhysicalCoreExecutionEvent::Halted(...)`, c'est-à-dire au retour du dispatch CPU après un quantum d'exécution guest sans SVC.
-
-Dans le modèle coopératif de `ruzu`, c'est l'équivalent le plus proche du retour d'IRQ/timer tick upstream.
-
-Après le drain:
-
-- `exit()` est déclenché
-- le scheduler reçoit `request_schedule()`
-- `handoff_after_svc(...)` est réutilisé comme frontière de bascule vers le prochain runnable
-
-Le nom du helper de handoff n'est pas encore idéal, mais l'ownership est correct: le basculement CPU suivant reste dans `physical_core`.
-
-## Lifecycle Actuel
-
-### KThread
-
-Chemin simplifié aujourd'hui:
-
-1. `request_terminate()` pose l'intention
-2. une frontière de drain observe cette intention
-3. `exit()` queue le worker task thread
-4. le worker fait `finish_termination()`
-5. le thread devient `TERMINATED` et `signaled`
-
-Différence importante avec upstream:
-
-- tous les chemins ne passent pas encore par un vrai `KSynchronizationObject::Wait()` upstream-compatible
-- certains cas restent protégés pour éviter les deadlocks sous `MutexGuard`
-
-### KProcess
-
-Chemin simplifié aujourd'hui:
-
-1. `exit()` ou `terminate()`
-2. `start_termination(...)`
-3. `terminate_children(...)`
-4. `KWorkerTaskManager` exécute `do_worker_task_impl()`
-5. `finish_termination()`
-
-`terminate_children(...)` respecte maintenant l'ownership upstream:
-
-- première passe: `request_terminate()`
-- seconde passe: terminaison effective des enfants quand c'est sûr dans le runtime coopératif
-
-La seconde passe reste plus conservatrice qu'upstream, parce qu'un thread Rust-side peut encore dépendre d'une future frontière de dispatch pour s'auto-drainer.
-
-## Pourquoi Rust Force Ces Differences
-
-Les écarts principaux ne viennent pas d'un choix de redesign, mais de contraintes mécaniques.
-
-### 1. MutexGuard Et Reentrance
-
-En C++, beaucoup de transitions se font en gardant plus de liberté sur l'ordre réel des appels.
-
-En Rust, avec `Arc<Mutex<_>>`, il faut éviter:
-
-- de rappeler une méthode qui reprend le même mutex indirectement
-- de bloquer dans `wait()` alors qu'un guard critique est encore vivant
-- de faire du cleanup profond depuis un contexte qui possède déjà l'objet parent
-
-Conséquence:
-
-- certains appels upstream doivent devenir des helpers d'orchestration
-- certaines étapes doivent être décalées vers le worker task manager
-
-### 2. Runtime Cooperatif
-
-Le runtime actuel n'interrompt pas naturellement un thread guest n'importe où comme le fait upstream via ses frontières d'ordonnancement et d'interruptions.
-
-Conséquence:
-
-- il faut introduire des points explicites de drain
-- un thread en "CPU pur" ne peut être observé qu'à la fin d'un quantum
-
-### 3. Attente De Synchronisation Incomplete
-
-Tant que `KSynchronizationObject::Wait()` et quelques morceaux scheduler/signal ne sont pas totalement au niveau upstream, certaines opérations qui seraient bloquantes en C++ doivent rester prudentes en Rust.
-
-Conséquence:
-
-- `terminate_thread(...)` existe en plus de `terminate(&mut self)`
-- `terminate_children(...)` ne bloque pas encore agressivement sur tous les états
-
-## Ce Qui Est Fidele
-
-Les points suivants sont maintenant proches de l'intention upstream:
-
-- ownership du cleanup process dans `k_process.rs`
-- ownership du retour SVC dans `svc_dispatch.rs`
-- ownership du retour de quantum CPU dans `physical_core.rs`
-- séparation entre demande de terminaison et terminaison effective
-- usage d'un worker task manager au lieu d'un cleanup totalement inline
-
-## Ce Qui Reste Different
-
-Les différences importantes encore connues sont:
-
-- le drain reste explicite et coopératif, pas implicite partout comme upstream
-- `handoff_after_svc(...)` est réutilisé aussi après la frontière CPU, ce qui est fonctionnel mais pas encore parfaitement nommé
-- certains waits/terminations sont encore plus conservateurs que l'upstream pour éviter un deadlock Rust-side
-- `KThread::Terminate()` et certaines attentes de synchro ne sont pas encore entièrement au niveau de sémantique C++
-- toutes les frontières possibles de retour au noyau ne sont pas encore câblées
-
-## Invariants Utiles Pour Les Changements Futurs
-
-Si tu modifies cette zone, garder ces invariants:
-
-- le drain doit rester centralisé par frontière majeure, pas dupliqué dans chaque handler
-- le fichier owner doit rester le vrai owner conceptuel upstream du point de retour
-- `request_terminate()` ne doit pas devenir un `exit()` immédiat
-- `finish_termination()` doit rester la transition qui rend la terminaison visible
-- le worker task manager doit rester le point de décalage pour le cleanup asynchrone
-- ne pas réintroduire de lifecycle inline qui casse l'ownership `k_process.rs` ou `k_thread.rs`
-
-## Frontieres Cibles Restantes
-
-Si d'autres écarts doivent être fermés plus tard, il faut chercher de nouveaux hooks seulement sur des frontières communes de réentrée:
-
-- retour d'exception si distinct du chemin `Halted(...)`
-- autres sorties communes du dispatch CPU
-- futurs chemins de wait/signal quand `KSynchronizationObject::Wait()` sera plus complet
-
-Il ne faut pas:
-
-- instrumenter chaque SVC individuellement
-- disperser la logique de drain dans des helpers génériques sans owner clair
-- faire porter ce comportement à des sous-systèmes mémoire ou IPC qui ne sont pas owners du dispatch
-
-## Tests De Reference
-
-Les tests qui documentent le comportement actuel sont:
-
-- `call_drains_current_thread_termination_on_svc_return`
-- `yield_exits_current_thread_when_termination_was_requested`
-- `run_loop_drains_current_thread_termination_on_halt_boundary`
-
-Ils couvrent respectivement:
-
-- la frontière SVC
-- la frontière scheduler coopérative
-- la frontière de quantum CPU
-
-## Resume
-
-Le port Rust ne reproduit pas encore toute la mécanique implicite du kernel upstream, mais il a maintenant trois points de drain centraux qui couvrent les retours majeurs:
-
-- scheduler
-- SVC
-- fin de quantum CPU
-
-La différence essentielle avec Rust est que ces frontières doivent être rendues explicites pour rester sûres sous `Arc<Mutex<_>>` et runtime coopératif, tout en gardant l'ownership des comportements dans les mêmes fichiers conceptuels que l'upstream.
+# Ruzu Emulator — Architecture Document
+
+## 1. Overview
+
+Ruzu is a Rust port of the yuzu/zuyu Nintendo Switch emulator. It executes Switch ARM guest code on an x86-64 host via a JIT compiler (rdynarmic), emulating the Switch kernel's SVC interface and HLE (High-Level Emulation) services.
+
+### Crate layout
+
+```
+ruzu/
+├── yuzu_cmd/         CLI frontend — entry point, SVC dispatch loop
+├── core/             Emulator core — kernel, services, loader, ARM interface
+│   └── src/
+│       ├── core.rs              System object, boot sequence
+│       ├── arm/                 ARM interface + JIT backends
+│       │   ├── arm_interface.rs     ArmInterface trait
+│       │   ├── dynarmic/
+│       │   │   ├── arm_dynarmic_32.rs   AArch32 JIT backend
+│       │   │   └── arm_dynarmic_64.rs   AArch64 JIT backend
+│       │   └── nce/                 Native Code Execution backend
+│       ├── hle/
+│       │   ├── kernel/              Kernel object emulation
+│       │   │   ├── k_process.rs         KProcess + ProcessMemoryData
+│       │   │   ├── k_thread.rs          KThread + ThreadContext
+│       │   │   ├── k_page_table_base.rs KPageTableBase (memory regions)
+│       │   │   ├── k_memory_block*.rs   Memory block manager
+│       │   │   ├── physical_core.rs     PhysicalCore (run loop)
+│       │   │   ├── svc_dispatch.rs      SVC dispatch (call32/call64)
+│       │   │   └── svc/                 Individual SVC handlers
+│       │   └── service/             HLE service implementations
+│       │       ├── sm/                  Service Manager (sm:)
+│       │       ├── am/                  Applet Manager (appletOE)
+│       │       ├── filesystem/          Filesystem (fsp-srv)
+│       │       ├── nvdrv/               GPU driver (nvdrv)
+│       │       └── ...
+│       ├── loader/              ROM loading (NSP, NCA, NSO)
+│       └── crypto/              Key management, AES
+├── common/           Shared utilities (fs, alignment, logging)
+├── audio_core/       Audio subsystem
+├── video_core/       GPU subsystem
+├── shader_recompiler/ Shader translation
+├── hid_core/         Input devices
+└── ...
+```
+
+External companion projects:
+- **rdynarmic** (`/home/vricosti/Dev/emulators/rdynarmic/`) — Rust port of Dynarmic ARM JIT compiler
+- **rxbyak** (`/home/vricosti/Dev/emulators/rxbyak/`) — Rust port of Xbyak x86-64 assembler
+
+---
+
+## 2. Boot Sequence
+
+```
+main()                                    yuzu_cmd/src/main.rs
+  ├─ System::new()                        core/src/core.rs
+  ├─ system.initialize()                  Sets up kernel, services, timing
+  ├─ system.load(filepath)                Loads ROM via AppLoader
+  │    ├─ VFS: open NSP/NCA file
+  │    ├─ Identify loader type
+  │    ├─ AppLoaderDeconstructedRomDirectory::load()
+  │    │    ├─ Read NPDM metadata (address space, title ID, priorities)
+  │    │    ├─ Pass 1: compute module layout (tentative addresses)
+  │    │    ├─ process.allocate_code_memory(code_base, code_size)
+  │    │    ├─ process.initialize_thread_local_region_allocation()
+  │    │    ├─ process.load_from_metadata()
+  │    │    │    ├─ initialize_for_user() → initialize_for_process()
+  │    │    │    │    └─ Sets up ASLR'd regions (alias, heap, stack, kernel_map)
+  │    │    │    ├─ KCapabilities::initialize_for_user()
+  │    │    │    └─ Generate random entropy
+  │    │    └─ Pass 2: load NSO modules into memory
+  │    │         └─ For each module: decompress, write to ProcessMemoryData,
+  │    │            update block_manager (CODE/CODE_DATA state)
+  │    └─ Return LoadParameters (priority, stack_size)
+  │
+  ├─ process.run(priority, stack_size, ...)
+  │    ├─ Create main thread TLS (create_thread_local_region)
+  │    ├─ Allocate stack (map_pages_at_address + update_region)
+  │    ├─ Set max heap size
+  │    ├─ Create main KThread (initialize_user_thread_with_tls)
+  │    │    └─ reset_thread_context32: PC=entry, SP=stack_top, R0=0
+  │    └─ Register thread in handle table
+  │
+  ├─ Create JIT (ArmDynarmic32::new)
+  │    ├─ DynarmicCallbacks32 with SharedProcessMemory
+  │    ├─ JitConfig (cycle counting, cache size, optimizations)
+  │    └─ rdynarmic::A32Jit::new(config)
+  │
+  ├─ physical_core.initialize_guest_runtime()
+  │    ├─ restore_thread_to_jit()
+  │    │    ├─ jit.set_context(thread_context)
+  │    │    └─ jit.set_tpidrro_el0(tls_address)    ← CP15 URO register
+  │    └─ Store runtime state
+  │
+  └─ physical_core.run_loop()             ← MAIN EXECUTION LOOP
+```
+
+---
+
+## 3. Memory Architecture
+
+### 3.1 Guest Address Space (AArch32 example — MK8D)
+
+```
+0x00000000 ┌──────────────────────┐
+           │  (unmapped)          │
+0x00200000 ├──────────────────────┤ ← code_base (rtld)
+           │  rtld                │  state=CODE, perm=RX
+0x00204000 │  rtld .rodata        │  state=CODE, perm=R
+0x00205000 │  rtld .data          │  state=CODE_DATA, perm=RW
+0x00206000 ├──────────────────────┤
+           │  main (text)         │  state=CODE, perm=RX
+           │  main (rodata)       │  state=CODE, perm=R
+           │  main (data)         │  state=CODE_DATA, perm=RW
+0x01512000 ├──────────────────────┤
+           │  subsdk0..subsdk4    │  (same pattern per module)
+0x01723000 ├──────────────────────┤
+           │  sdk (text+ro+data)  │
+0x02391000 ├──────────────────────┤
+           │  (gap — FREE)        │  state=FREE
+0x02395000 ├──────────────────────┤
+           │  TLS page (0x1000)   │  state=THREAD_LOCAL, perm=RW
+0x02396000 ├──────────────────────┤
+           │  Guard (4 pages)     │  state=FREE (GetNumGuardPages = 4)
+0x0239A000 ├──────────────────────┤
+           │  Stack (1 MiB)       │  state=STACK, perm=RW
+0x0249A000 ├──────────────────────┤
+           │  (FREE — available   │  state=FREE
+           │   for heap growth)   │
+0x40000000 ├──────────────────────┤ ← heap_region_start (ASLR'd)
+           │  Heap (SetHeapSize)  │  state=NORMAL, perm=RW
+           │  up to 0x78000000   │  (sparse pages — allocated on write)
+           ├──────────────────────┤
+           │  (FREE)              │
+0xFFFFFFFF └──────────────────────┘ ← 4 GiB boundary (32-bit AS)
+```
+
+### 3.2 ProcessMemoryData
+
+Defined in `core/src/hle/kernel/k_process.rs`:
+
+```rust
+pub struct ProcessMemoryData {
+    pub data: Vec<u8>,                        // Contiguous backing store
+    pub base: u64,                            // Guest base address of data[]
+    pub block_manager: KMemoryBlockManager,   // Tracks state/permissions
+    pub sparse_pages: BTreeMap<u64, Vec<u8>>, // Demand-paged backing (heap)
+}
+```
+
+Shared across the emulator as `SharedProcessMemory = Arc<RwLock<ProcessMemoryData>>`.
+
+**Contiguous data (`data: Vec<u8>`):**
+- Covers `[base, base + data.len())` — code modules, TLS, stack
+- Pre-allocated during `allocate_code_memory()` and grown during `run()` for stack
+- Direct-indexed: `offset = vaddr - base`, then `data[offset]`
+- Fast path for JIT reads/writes in the code+stack region
+
+**Sparse pages (`sparse_pages: BTreeMap<u64, Vec<u8>>`):**
+- Covers everything outside the contiguous range (primarily the heap)
+- Each entry: `page_base → Vec<u8>` of `PAGE_SIZE` (4096) bytes
+- **Read**: returns 0 if page doesn't exist (zero-initialized)
+- **Write**: creates page on first write (demand allocation)
+- Avoids allocating the full ~2 GiB heap in host memory
+
+**Read/Write path (e.g. `read_8`):**
+```
+read_8(vaddr):
+  offset = vaddr - self.base
+  if offset < data.len():
+    return data[offset]            ← fast path (contiguous)
+  else:
+    return read_sparse_8(vaddr)    ← slow path (sparse pages)
+```
+
+**Write protection:**
+```
+is_writable(vaddr):
+  block = block_manager.find_block(vaddr)
+  if block.state == FREE:
+    return true                    ← allow setup writes
+  return block.permission.contains(USER_WRITE)
+```
+
+The JIT's `DynarmicCallbacks32::memory_write_*` methods check `is_writable()` before every write. Blocked writes are silently dropped (with a trace log).
+
+### 3.3 Two Block Managers
+
+Ruzu currently has two separate `KMemoryBlockManager` instances:
+
+| | ProcessMemoryData::block_manager | KPageTableBase::m_memory_block_manager |
+|---|---|---|
+| **Location** | `k_process.rs` (field of ProcessMemoryData) | `k_page_table_base.rs` (field of KPageTableBase) |
+| **Used by** | QueryMemory SVC, `is_writable()` | `set_heap_size()`, `can_contain()`, `map_pages_at_address()` |
+| **Populated by** | NSO loader (`update_region`), `create_thread_local_region`, `run()` for stack, `set_heap_size` | `initialize_for_process()`, `map_pages_at_address()`, `set_heap_size()` |
+| **Note** | This is the one guest code observes via QueryMemory | Internal kernel tracking; not directly visible to guest |
+
+In upstream yuzu, there is a **single** `KMemoryBlockManager` inside `KPageTableBase`, and all operations (mapping, querying) go through it. The dual-manager design in ruzu is a porting artifact. Both managers must be kept in sync for any region that the guest might query.
+
+### 3.4 Memory Regions (KPageTableBase)
+
+Configured by `initialize_for_process()` with ASLR randomization:
+
+```
+m_address_space_start / m_address_space_end   // Full AS (0 — 0x100000000 for 32-bit)
+m_code_region_start / m_code_region_end       // Code modules
+m_alias_region_start / m_alias_region_end     // Alias mappings (IPC buffers)
+m_heap_region_start / m_heap_region_end       // Heap (SetHeapSize grows here)
+m_stack_region_start / m_stack_region_end     // Stack
+m_kernel_map_region_start / m_kernel_map_region_end  // Kernel-mapped (static, TLS)
+m_alias_code_region_start / m_alias_code_region_end  // Alias code region
+```
+
+`GetRegionAddress` and `GetRegionSize` map `Svc::MemoryState` values to these regions, matching upstream's switch statement exactly. Convenience overloads (`get_region_address_k`, etc.) convert from internal `KMemoryState` via `static_cast<Svc::MemoryState>(state & Mask)`, matching the inline overloads in upstream's `k_page_table_base.h`.
+
+---
+
+## 4. JIT Execution (rdynarmic)
+
+### 4.1 Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│  PhysicalCore::run_loop()                       │
+│    ├─ jit.run()  ──────────────────────────────►│
+│    │                   rdynarmic::A32Jit         │
+│    │                   ┌─────────────────────┐   │
+│    │                   │ Translate ARM → x86  │   │
+│    │                   │ Execute x86 code     │   │
+│    │                   │                      │   │
+│    │                   │ Memory access ───────┼──►│ DynarmicCallbacks32
+│    │                   │   read_code()        │   │   ├─ ProcessMemoryData::read_*
+│    │                   │   read_8/16/32/64()  │   │   └─ ProcessMemoryData::write_*
+│    │                   │   write_8/16/32/64() │   │       (with is_writable check)
+│    │                   │                      │   │
+│    │                   │ SVC instruction ─────┼──►│ call_supervisor(svc_num)
+│    │                   │   → store svc_swi    │   │   → stores in Arc<AtomicU32>
+│    │                   │   → halt with SVC    │   │
+│    │                   └─────────────────────┘   │
+│    │                                              │
+│    ◄─ HaltReason::SUPERVISOR_CALL ───────────────│
+│    │                                              │
+│    ├─ jit.get_svc_number()                       │
+│    ├─ jit.get_svc_arguments()  → args[0..7]     │
+│    ├─ svc_dispatch::call(svc_num, args, ctx)     │
+│    ├─ jit.set_svc_arguments(args)  ← results    │
+│    └─ loop back to jit.run()                     │
+└─────────────────────────────────────────────────┘
+```
+
+### 4.2 ArmDynarmic32
+
+Defined in `core/src/arm/dynarmic/arm_dynarmic_32.rs`:
+
+```rust
+pub struct ArmDynarmic32 {
+    jit: Option<rdynarmic::A32Jit>,     // The JIT instance
+    svc_swi: Arc<AtomicU32>,            // SVC number (shared with callbacks)
+    cp15_uro: u32,                      // TPIDRURO (TLS pointer for guest)
+    core_index: usize,
+    last_exception_address: Arc<AtomicU64>,
+}
+```
+
+**Context transfer** between kernel and JIT:
+
+| Direction | Method | What it transfers |
+|---|---|---|
+| Kernel → JIT | `set_context(ctx)` | R0-R15, CPSR, VFP regs, FPSCR, CP15 UPRW |
+| Kernel → JIT | `set_tpidrro_el0(val)` | CP15 URO (TLS address) |
+| JIT → Kernel | `get_context(ctx)` | Same fields in reverse |
+
+**CP15 coprocessor registers (AArch32):**
+- `CP15 C13,C0,2` (TPIDR_UPRW) — read-write thread pointer, stored in `ctx.tpidr`
+- `CP15 C13,C0,3` (TPIDR_URO) — read-only thread pointer, stores TLS address
+- When guest executes `MRC p15, 0, Rn, c13, c0, 3`, rdynarmic reads `cp15_uro` from JIT state
+
+### 4.3 DynarmicCallbacks32
+
+Implements `rdynarmic::JitCallbacks` trait:
+
+```rust
+struct DynarmicCallbacks32 {
+    memory: SharedProcessMemory,        // Arc<RwLock<ProcessMemoryData>>
+    svc_swi: Arc<AtomicU32>,           // SVC number output
+    uses_wall_clock: bool,
+    core_timing: Arc<Mutex<CoreTiming>>,
+    last_exception_address: Arc<AtomicU64>,
+}
+```
+
+Key callbacks:
+- `memory_read_code(vaddr)` → reads instruction, returns UDF (0xE7F000F0) if unmapped
+- `memory_read_*/write_*` → delegates to ProcessMemoryData with write protection
+- `call_supervisor(svc_num)` → stores SVC number in `svc_swi`
+- `add_ticks(ticks)` → advances CoreTiming (divided by NUM_CPU_CORES=4)
+- `get_ticks_remaining()` → returns CoreTiming downcount
+
+---
+
+## 5. SVC Dispatch
+
+### 5.1 Dispatch Flow
+
+```
+physical_core.rs: run_loop()
+  │
+  ├─ JIT halts with SUPERVISOR_CALL
+  │
+  ├─ jit.get_context(thread_context)     // save guest state
+  ├─ on_supervisor_call(...)             // user callback (logging in yuzu_cmd)
+  │
+  ├─ dispatch_supervisor_call()
+  │    ├─ svc_dispatch::call(svc_num, is_64bit, args, ctx)
+  │    │    └─ call32(imm, args, ctx)    // match on SvcId enum
+  │    │         ├─ SetHeapSize → svc_physical_memory
+  │    │         ├─ QueryMemory → query_memory_info()
+  │    │         ├─ SendSyncRequest → svc_ipc
+  │    │         ├─ ConnectToNamedPort → svc_port
+  │    │         └─ ...
+  │    ├─ jit.set_svc_arguments(args)    // write back results
+  │    └─ handoff_after_svc()            // thread scheduling
+  │
+  └─ loop
+```
+
+### 5.2 Argument Marshalling (AArch32)
+
+SVC arguments are passed in registers R0-R7 (mapped to `args[0..7]`).
+
+The AArch32 ABI for 64-bit values splits them across two 32-bit registers:
+
+```rust
+get_arg32(args, n) → args[n] as u32           // read r<n> as u32
+set_arg32(args, n, val)                        // write r<n>
+gather64(args, lo, hi) → lo32 | (hi32 << 32)  // read u64 from r<lo>:r<hi>
+scatter64(args, lo, hi, val)                   // write u64 to r<lo>:r<hi>
+```
+
+The layout for each SVC follows the upstream `SvcWrap_*64From32` wrappers. Example:
+
+```
+SetHeapSize:
+  IN:  size = get_arg32(args, 1)
+  OUT: result = set_arg32(args, 0), heap_addr = set_arg32(args, 1)
+
+QueryMemory:
+  IN:  info_ptr = get_arg32(args, 0), query_addr = get_arg32(args, 2)
+  OUT: result = set_arg32(args, 0), page_info = set_arg32(args, 1)
+  SIDE EFFECT: writes MemoryInfo struct to info_ptr in guest memory
+
+GetInfo:
+  IN:  info_subtype = gather64(args, 0, 3), info_type = get_arg32(args, 1),
+       handle = get_arg32(args, 2)
+  OUT: result = set_arg32(args, 0), value = scatter64(args, 1, 2)
+```
+
+### 5.3 SvcContext
+
+Passed to all SVC handlers:
+
+```rust
+pub struct SvcContext {
+    pub shared_memory: SharedProcessMemory,
+    pub code_base: u64,
+    pub code_size: u64,
+    pub stack_base: u64,
+    pub stack_size: u64,
+    pub program_id: u64,
+    pub tls_base: u64,
+    pub current_process: Arc<Mutex<KProcess>>,
+    pub service_manager: Arc<Mutex<ServiceManager>>,
+    pub scheduler: Arc<Mutex<KScheduler>>,
+    pub next_thread_id: Arc<AtomicU64>,
+    pub next_object_id: Arc<AtomicU32>,
+    pub is_64bit: bool,
+}
+```
+
+### 5.4 Key SVCs
+
+| SVC | Number | Purpose |
+|-----|--------|---------|
+| SetHeapSize | 0x01 | Grow/shrink process heap |
+| QueryMemory | 0x06 | Query memory state at address |
+| ExitProcess | 0x07 | Terminate process |
+| CreateThread | 0x08 | Create new thread |
+| SetThreadPriority | 0x0D | Set thread priority |
+| CreateTransferMemory | 0x15 | Create shared memory handle |
+| CloseHandle | 0x16 | Release kernel object handle |
+| WaitSynchronization | 0x18 | Wait on synchronization objects |
+| SignalProcessWideKey | 0x1D | Condition variable signal |
+| GetSystemTick | 0x1E | Read monotonic tick counter |
+| ConnectToNamedPort | 0x1F | Connect to service port (e.g. "sm:") |
+| SendSyncRequest | 0x21 | IPC request to service |
+| GetThreadId | 0x25 | Get thread ID |
+| Break | 0x26 | Userspace panic |
+| GetInfo | 0x29 | Query process/system info |
+
+---
+
+## 6. IPC and HLE Services
+
+### 6.1 IPC Flow
+
+```
+Guest calls SVC SendSyncRequest(handle)
+  │
+  ├─ Read IPC command from TLS buffer (guest addr = thread.tls_address)
+  │    ├─ Parse CMIF header (cmd_type, cmd_id)
+  │    └─ Extract data payload, buffer descriptors, copy/move handles
+  │
+  ├─ Lookup session object from handle table
+  │    ├─ If domain session: route by domain object ID
+  │    └─ If normal session: direct dispatch
+  │
+  ├─ Call HLE service handler method
+  │    └─ Service writes response to TLS buffer
+  │
+  └─ Return result code in r0
+```
+
+### 6.2 Service Registration
+
+Services are registered in `ServiceManager` during `System::initialize()`:
+
+```
+ServiceManager
+  ├─ "sm:" → SM (Service Manager itself)
+  ├─ "appletOE" → ApplicationProxyService (AM)
+  ├─ "apm" → APM (Performance Manager)
+  ├─ "lm" → LogManager
+  ├─ "fsp-srv" → FileSystemProxy
+  ├─ "nvdrv" → NvdrvInterface
+  ├─ "pctl:a" → ParentalControl
+  ├─ "aoc:u" → AddOnContent
+  └─ ...
+```
+
+### 6.3 Domain Sessions
+
+Some services use domain sessions (single connection, multiple sub-objects):
+
+```
+ConnectToNamedPort("sm:") → handle
+SendSyncRequest(handle, Control::ConvertCurrentObjectToDomain)
+SendSyncRequest(handle, Request::cmd=0)            → creates sub-object (domain_id=2)
+SendSyncRequest(handle, Request::cmd=1, domain=2)  → calls sub-object method
+```
+
+Used by appletOE (AM service) which creates IApplicationProxy, ICommonStateGetter, ISelfController, IWindowController, etc. as domain sub-objects.
+
+---
+
+## 7. Kernel Objects
+
+### 7.1 KProcess
+
+```rust
+pub struct KProcess {
+    pub page_table: KProcessPageTable,
+    pub process_memory: SharedProcessMemory,
+    pub handle_table: KHandleTable,
+    pub capabilities: KCapabilities,
+    pub program_id: u64,
+    pub code_address: KProcessAddress,
+    pub code_size: usize,
+    pub state: ProcessState,      // Created → Running → Terminated
+    pub entropy: [u64; 4],        // Random entropy for ASLR
+    pub max_process_memory: usize,
+    pub main_thread_stack_size: usize,
+    // ...
+}
+```
+
+**Lifecycle:** `new()` → `load_from_metadata()` → `run()` → guest executes → `terminate()`
+
+### 7.2 KThread
+
+```rust
+pub struct KThread {
+    pub thread_context: ThreadContext,     // Saved ARM register state
+    pub tls_address: KProcessAddress,      // Thread-local storage address
+    pub priority: i32,                     // 0-63
+    pub state: ThreadState,                // INITIALIZED | RUNNABLE | WAITING | TERMINATED
+    pub thread_id: u64,
+    // ...
+}
+```
+
+**ThreadContext** holds all ARM registers (R0-R28, FP, LR, SP, PC, PSTATE, V0-V31, FPCR, FPSR, TPIDR).
+
+### 7.3 Handle Table
+
+Kernel handles encode `(index, linear_id)` into a u32:
+```
+handle = (linear_id << 15) | index
+```
+
+Maps handles → kernel objects (threads, sessions, events). Used by all SVCs that take handle arguments.
+
+---
+
+## 8. Loader
+
+### 8.1 Loading Pipeline
+
+```
+NSP file
+  └─ Extract NCA files
+       ├─ Program NCA → ExeFS partition
+       │    ├─ main.npdm        → ProgramMetadata (address space, title ID)
+       │    ├─ rtld              → NSO (loaded at code_base)
+       │    ├─ main              → NSO (loaded after rtld)
+       │    ├─ subsdk0..subsdk4  → NSO (loaded sequentially)
+       │    └─ sdk               → NSO (loaded last)
+       └─ Control NCA → NACP + icons (metadata only)
+```
+
+### 8.2 Two-Pass Module Loading
+
+**Pass 1 (layout):** Iterate all modules with `load_into_process=false`, compute tentative addresses and total `code_size`.
+
+**Pass 2 (actual):** After process/page-table setup, iterate again with `load_into_process=true`:
+- Decompress NSO sections (.text, .rodata, .data) via LZ4
+- Write decompressed data to `ProcessMemoryData::data[]`
+- Call `update_region()` to register each section in the block manager:
+  - .text → state=CODE (0x03), perm=RX
+  - .rodata → state=CODE (0x03), perm=R
+  - .data → state=CODE_DATA (0x04), perm=RW
+
+### 8.3 Static Module Order
+
+```rust
+const STATIC_MODULES: &[&str] = &[
+    "rtld", "main",
+    "subsdk0", "subsdk1", "subsdk2", "subsdk3", "subsdk4",
+    "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
+    "sdk",
+];
+```
+
+For MK8D (32-bit): rtld at 0x200000, main at 0x206000, subsdk0-4 and sdk follow contiguously.
+
+---
+
+## 9. Runtime Data Flow (MK8D boot example)
+
+```
+1. rtld (runtime linker) starts at PC=0x200000
+     │
+2. rtld calls QueryMemory in a loop to discover loaded modules
+     │  → Walks address space, finds CODE/CODE_DATA/STACK/TLS/FREE blocks
+     │  → Builds module list from memory map
+     │
+3. rtld resolves symbols (__nnDetailInitLibc0) across modules
+     │
+4. rtld connects to sm: via ConnectToNamedPort SVC
+     │
+5. rtld calls GetService for: lm, apm, appletOE, aoc:u, pctl:a
+     │  → Each returns a session handle
+     │  → appletOE converted to domain, sub-objects created
+     │
+6. Game code calls SetHeapSize(0x78000000)
+     │  → Kernel allocates heap at heap_region_start (ASLR'd)
+     │  → Returns heap base address
+     │
+7. rtld calls __nnDetailInitLibc0 for each module
+     │  → Reads TPIDRURO (CP15 URO) for TLS base
+     │  → Initializes SDK runtime: heap, TLS slots, C++ statics
+     │
+8. Game opens fsp-srv (filesystem) and nvdrv (GPU driver)
+     │
+9. Game enters main loop (rendering, input, audio)
+```
+
+---
+
+## 10. Thread Lifecycle and Termination
+
+The port uses `Arc<Mutex<KThread>>` and `Arc<Mutex<KProcess>>`, which constrains termination vs upstream where reentrance is more natural.
+
+Three explicit "drain" boundaries handle termination checks:
+
+1. **Scheduler boundary** (`k_scheduler.rs`) — after yield/wait
+2. **SVC boundary** (`svc_dispatch.rs`) — after each SVC return
+3. **CPU quantum boundary** (`physical_core.rs`) — after JIT halt
+
+These cover the three families of kernel reentry: voluntary (SVC), cooperative (scheduler), implicit (quantum end). The worker task manager (`KWorkerTaskManager`) defers cleanup to avoid deadlocks under `MutexGuard`.
+
+---
+
+## 11. Known Porting Differences
+
+| Area | Upstream (C++) | Ruzu (Rust) | Impact |
+|------|---------------|-------------|--------|
+| Memory block manager | Single, in KPageTableBase | Two separate (ProcessMemoryData + KPageTableBase) | Must keep in sync |
+| Thread scheduling | Preemptive (timer IRQ) | Cooperative (SVC/quantum boundaries) | Drain points needed |
+| ASLR randomization | KSystemControl::GenerateRandomRange | SystemTime-based hash | Non-deterministic but functional |
+| KSynchronizationObject::Wait | Full implementation | Partial | Some waits are conservative |
+| GPU/Display | Full Vulkan/OpenGL/Null | Stubs | Game crashes after nvdrv init |
