@@ -111,7 +111,7 @@ fn write_lock_free<T: Copy>(counter: &mut u32, values: &mut [T; 2], value: T) {
 ///
 /// Upstream wraps a kernel `KSharedMemory` and writes directly to the
 /// mapped pointer via `m_k_shared_memory.GetPointer()`. We do the same
-/// using our KSharedMemory's Vec<u8> backing.
+/// using KSharedMemory's DeviceMemory-backed physical pages.
 pub struct SharedMemory {
     /// The kernel shared memory object backing this region.
     /// Matches upstream `Kernel::KSharedMemory& m_k_shared_memory`.
@@ -122,28 +122,55 @@ pub struct SharedMemory {
 }
 
 // SAFETY: SharedMemory is used behind Arc<Mutex<>> or single-threaded.
-// The raw pointer points into the owned KSharedMemory backing.
+// The raw pointer points into DeviceMemory which outlives all services.
 unsafe impl Send for SharedMemory {}
 unsafe impl Sync for SharedMemory {}
 
 impl SharedMemory {
-    /// Create a new SharedMemory with zeroed data.
+    /// Create a new SharedMemory backed by DeviceMemory.
     ///
     /// Corresponds to `SharedMemory::SharedMemory(Core::System&)` in upstream.
     /// Upstream: `m_k_shared_memory{m_system.Kernel().GetTimeSharedMem()}`
     /// then `m_shared_memory_ptr = reinterpret_cast<SharedMemoryStruct*>(m_k_shared_memory.GetPointer())`.
-    pub fn new() -> Self {
+    /// Create with DeviceMemory backing (production path).
+    pub fn new(
+        device_memory: &crate::device_memory::DeviceMemory,
+        memory_manager: &mut crate::hle::kernel::k_memory_manager::KMemoryManager,
+    ) -> Self {
         use crate::hle::kernel::k_shared_memory::{KSharedMemory, MemoryPermission};
 
         let mut k_shared_memory = KSharedMemory::new();
         k_shared_memory.initialize(
+            device_memory,
+            memory_manager,
             MemoryPermission::None,
             MemoryPermission::Read,
             core::mem::size_of::<SharedMemoryStruct>(),
         );
         let ptr = k_shared_memory.get_pointer_mut(0) as *mut SharedMemoryStruct;
-        // Upstream: std::memset(m_shared_memory_ptr, 0, sizeof(*m_shared_memory_ptr))
-        // Already zeroed by KSharedMemory::initialize (vec![0u8; ...])
+        Self {
+            k_shared_memory,
+            shared_memory_ptr: ptr,
+        }
+    }
+
+    /// Create with heap-backed memory (test/legacy path when DeviceMemory
+    /// is not available).
+    pub fn new_for_test() -> Self {
+        use crate::hle::kernel::k_shared_memory::KSharedMemory;
+
+        // Use a heap allocation as fallback.
+        let k_shared_memory = KSharedMemory::new();
+        // Allocate a zeroed SharedMemoryStruct on the heap.
+        let boxed = Box::new(SharedMemoryStruct {
+            steady_time_points: Default::default(),
+            local_system_clock_contexts: Default::default(),
+            network_system_clock_contexts: Default::default(),
+            automatic_corrections: Default::default(),
+            continuous_adjustment_time_points: Default::default(),
+            _pad0148: [0u8; 0xEB8],
+        });
+        let ptr = Box::into_raw(boxed);
         Self {
             k_shared_memory,
             shared_memory_ptr: ptr,
@@ -296,7 +323,7 @@ mod tests {
 
     #[test]
     fn write_and_read_local_system_context() {
-        let mut sm = SharedMemory::new();
+        let mut sm = SharedMemory::new_for_test();
         let ctx = SystemClockContext {
             offset: 12345,
             steady_time_point: SteadyClockTimePoint {
@@ -312,7 +339,7 @@ mod tests {
 
     #[test]
     fn write_and_read_automatic_correction() {
-        let mut sm = SharedMemory::new();
+        let mut sm = SharedMemory::new_for_test();
         assert!(!sm.get_automatic_correction());
         sm.set_automatic_correction(true);
         assert!(sm.get_automatic_correction());
@@ -322,7 +349,7 @@ mod tests {
 
     #[test]
     fn update_base_time_preserves_clock_source_id() {
-        let mut sm = SharedMemory::new();
+        let mut sm = SharedMemory::new_for_test();
         let source_id = [42u8; 16];
         sm.set_steady_clock_time_point(source_id, 100);
 

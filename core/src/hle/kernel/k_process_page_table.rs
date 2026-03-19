@@ -310,6 +310,31 @@ impl KProcessPageTable {
         self.base.set_memory(memory);
     }
 
+    // -- Page group mapping --
+
+    /// Map a KPageGroup into the process address space.
+    /// Upstream: `KProcessPageTable::MapPageGroup`.
+    pub fn map_page_group(
+        &mut self,
+        addr: super::k_typed_address::KProcessAddress,
+        pg: &super::k_page_group::KPageGroup,
+        state: super::k_memory_block::KMemoryState,
+        perm: KMemoryPermission,
+    ) -> u32 {
+        self.base.map_page_group(addr.get() as usize, pg, state, perm)
+    }
+
+    /// Unmap a KPageGroup from the process address space.
+    /// Upstream: `KProcessPageTable::UnmapPageGroup`.
+    pub fn unmap_page_group(
+        &mut self,
+        addr: super::k_typed_address::KProcessAddress,
+        pg: &super::k_page_group::KPageGroup,
+        state: super::k_memory_block::KMemoryState,
+    ) -> u32 {
+        self.base.unmap_page_group(addr.get() as usize, pg, state)
+    }
+
     // -- Direct base access --
 
     pub fn get_base(&self) -> &KPageTableBase {
