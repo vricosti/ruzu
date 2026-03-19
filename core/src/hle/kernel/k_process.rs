@@ -1681,6 +1681,7 @@ impl KProcess {
                 main_thread_id,
                 main_object_id,
                 is_64bit,
+                None, // init_func — will be set when CpuManager provides fiber closures
             );
             if result != RESULT_SUCCESS.get_inner_value() {
                 return Err(result);
