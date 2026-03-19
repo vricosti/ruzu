@@ -1307,6 +1307,27 @@ impl KThread {
         object_id: u64,
         is_64bit: bool,
     ) {
+        self.initialize_main_thread_with_func(
+            entry_point, stack_top, virt_core, tls_address,
+            owner, thread_id, object_id, is_64bit, None,
+        );
+    }
+
+    /// Initialize as a main thread with an optional host fiber init function.
+    /// Upstream: `InitializeThread(thread, {}, {}, {}, IdleThreadPriority, virt_core, {},
+    ///           ThreadType::Main, system.GetCpuManager().GetGuestActivateFunc())`
+    pub fn initialize_main_thread_with_func(
+        &mut self,
+        entry_point: u64,
+        stack_top: u64,
+        virt_core: i32,
+        tls_address: u64,
+        owner: &Arc<Mutex<KProcess>>,
+        thread_id: u64,
+        object_id: u64,
+        is_64bit: bool,
+        init_func: Option<Box<dyn FnOnce() + Send>>,
+    ) {
         let phys_core = virt_core;
         self.object_id = object_id;
         self.thread_type = ThreadType::Main;
@@ -1345,6 +1366,12 @@ impl KThread {
         // Upstream does NOT set thread_context.tpidr here.
         // The TLS address is stored in m_tls_address and passed to the JIT
         // via SetTpidrroEl0 (CP15 URO) during LoadContext, not via ctx.tpidr (UPRW).
+
+        // Initialize emulation parameters — create host fiber context.
+        // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
+        if let Some(func) = init_func {
+            self.host_context = Some(common::fiber::Fiber::new(func));
+        }
     }
 
     pub fn initialize_user_thread(
@@ -1358,6 +1385,28 @@ impl KThread {
         thread_id: u64,
         object_id: u64,
         is_64bit: bool,
+    ) -> u32 {
+        self.initialize_user_thread_with_init_func(
+            entry_point, arg, stack_top, prio, virt_core,
+            owner, thread_id, object_id, is_64bit, None,
+        )
+    }
+
+    /// Initialize as a user thread with an optional host fiber init function.
+    /// Upstream: `InitializeUserThread(system, thread, func, arg, user_stack_top, prio,
+    ///           virt_core, owner)` passes `system.GetCpuManager().GetGuestThreadFunc()`.
+    pub fn initialize_user_thread_with_init_func(
+        &mut self,
+        entry_point: u64,
+        arg: u64,
+        stack_top: u64,
+        prio: i32,
+        virt_core: i32,
+        owner: &Arc<Mutex<KProcess>>,
+        thread_id: u64,
+        object_id: u64,
+        is_64bit: bool,
+        init_func: Option<Box<dyn FnOnce() + Send>>,
     ) -> u32 {
         let tls_address = {
             let mut process = owner.lock().unwrap();
@@ -1381,6 +1430,7 @@ impl KThread {
             thread_id,
             object_id,
             is_64bit,
+            init_func,
         )
     }
 
@@ -1397,6 +1447,7 @@ impl KThread {
         thread_id: u64,
         object_id: u64,
         is_64bit: bool,
+        init_func: Option<Box<dyn FnOnce() + Send>>,
     ) -> u32 {
         
         let phys_core = virt_core;
@@ -1446,6 +1497,12 @@ impl KThread {
         }
         // Upstream does NOT set thread_context.tpidr here.
         // The TLS address is passed via SetTpidrroEl0 (CP15 URO) during LoadContext.
+
+        // Initialize emulation parameters — create host fiber context.
+        // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
+        if let Some(func) = init_func {
+            self.host_context = Some(common::fiber::Fiber::new(func));
+        }
 
         RESULT_SUCCESS.get_inner_value()
     }

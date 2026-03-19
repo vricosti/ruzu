@@ -179,11 +179,57 @@ impl KScheduler {
         self.state.needs_scheduling.store(true, Ordering::Relaxed);
     }
 
+    /// Initialize the switch fiber for this scheduler.
+    /// Must be called after the scheduler is wrapped in Arc<Mutex<>>.
+    ///
+    /// Upstream creates this in the KScheduler constructor:
+    /// ```cpp
+    /// m_switch_fiber = std::make_shared<Common::Fiber>([this] {
+    ///     while (true) { ScheduleImplFiber(); }
+    /// });
+    /// ```
+    /// In Rust we can't capture `self` in the constructor before the Arc exists,
+    /// so this is a separate initialization step.
+    pub fn init_switch_fiber(scheduler: &Arc<Mutex<KScheduler>>) {
+        let weak_scheduler = Arc::downgrade(scheduler);
+        let fiber = Fiber::new(Box::new(move || {
+            loop {
+                let sched = weak_scheduler
+                    .upgrade()
+                    .expect("KScheduler dropped while switch_fiber is running");
+                sched.lock().unwrap().schedule_impl_fiber_loop();
+            }
+        }));
+        scheduler.lock().unwrap().switch_fiber = Some(fiber);
+    }
+
     /// Preempt single core.
-    /// Matches upstream: disables dispatch, unloads thread, yields to switch fiber.
+    /// Matches upstream `KScheduler::PreemptSingleCore()`:
+    /// disables dispatch, unloads thread, yields to switch fiber, enables dispatch.
     pub fn preempt_single_core(&mut self) {
-        self.request_schedule();
-        // Upstream: DisableDispatch, Unload, Fiber::YieldTo(switch_fiber), EnableDispatch
+        // Upstream:
+        //   GetCurrentThread(m_kernel).DisableDispatch();
+        //   auto* thread = GetCurrentThreadPointer(m_kernel);
+        //   auto& previous_scheduler = m_kernel.Scheduler(thread->GetCurrentCore());
+        //   previous_scheduler.Unload(thread);
+        //   Common::Fiber::YieldTo(thread->GetHostContext(), *m_switch_fiber);
+        //   GetCurrentThread(m_kernel).EnableDispatch();
+
+        if let Some(ref cur_thread) = self.current_thread.as_ref().and_then(Weak::upgrade) {
+            cur_thread.lock().unwrap().disable_dispatch();
+
+            // Unload the current thread
+            self.unload(cur_thread);
+
+            // Yield to the switch fiber
+            if let Some(ref switch_fiber) = &self.switch_fiber {
+                if let Some(ref host_ctx) = cur_thread.lock().unwrap().host_context {
+                    Fiber::yield_to(Arc::downgrade(host_ctx), switch_fiber);
+                }
+            }
+
+            cur_thread.lock().unwrap().enable_dispatch();
+        }
     }
 
     /// Called when a thread first starts executing on this core.
@@ -904,6 +950,102 @@ impl KScheduler {
         if let (Some(ref cur), Some(ref switch_fiber)) = (&cur_thread, &self.switch_fiber) {
             if let Some(ref host_ctx) = cur.lock().unwrap().host_context {
                 Fiber::yield_to(Arc::downgrade(host_ctx), switch_fiber);
+            }
+        }
+    }
+
+    /// Matches upstream `KScheduler::ScheduleImplFiber()`.
+    /// This runs inside the switch fiber and handles the actual context switch:
+    /// unloads old thread, spins to acquire new thread's context_guard,
+    /// calls SwitchThread, reloads new thread, then yields back.
+    fn schedule_impl_fiber_loop(&mut self) {
+        let cur_thread = self.switch_cur_thread.as_ref().and_then(Weak::upgrade);
+        let mut highest_priority_thread = self.switch_highest_priority_thread.as_ref().and_then(Weak::upgrade);
+
+        // If we're not coming from scheduling (i.e., we came from SC preemption),
+        // skip the unload and jump straight to retry.
+        let mut need_retry = !self.switch_from_schedule;
+
+        if self.switch_from_schedule {
+            self.switch_from_schedule = false;
+
+            // Save the original thread context.
+            if let Some(ref cur) = cur_thread {
+                self.unload(cur);
+            }
+        }
+
+        // Loop until we successfully switch the thread context.
+        loop {
+            if need_retry {
+                // Clear needs_scheduling and refresh highest priority thread.
+                self.state.needs_scheduling.store(false, Ordering::Relaxed);
+                std::sync::atomic::fence(Ordering::SeqCst);
+
+                highest_priority_thread = if let Some(id) = self.state.highest_priority_thread_id {
+                    if let Some(ref gsc) = self.global_scheduler_context {
+                        gsc.lock().unwrap().get_thread_by_thread_id(id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            }
+            need_retry = false;
+
+            // If highest_priority_thread is null, switch to idle thread.
+            if highest_priority_thread.is_none() {
+                highest_priority_thread = self.idle_thread.as_ref().and_then(Weak::upgrade);
+            }
+
+            let Some(ref hpt) = highest_priority_thread else {
+                // No thread available at all — retry.
+                need_retry = true;
+                continue;
+            };
+
+            // Try to lock the highest priority thread's context_guard.
+            loop {
+                if hpt.lock().unwrap().context_guard.try_lock().is_some() {
+                    break;
+                }
+                // Context is locked by another core. Check if we need rescheduling.
+                if self.state.needs_scheduling.load(Ordering::SeqCst) {
+                    need_retry = true;
+                    break;
+                }
+            }
+            if need_retry {
+                continue;
+            }
+
+            // Switch to the highest priority thread.
+            let hpt_id = hpt.lock().unwrap().thread_id;
+            self.switch_thread_impl(hpt_id);
+
+            // Check if we need scheduling again. If so, unlock and retry.
+            if self.state.needs_scheduling.load(Ordering::SeqCst) {
+                // Unlock context_guard — drop the lock we acquired above.
+                // (parking_lot::Mutex try_lock returns a guard that auto-drops)
+                need_retry = true;
+                continue;
+            }
+
+            // Success — break out of the loop.
+            break;
+        }
+
+        // Reload the guest thread context.
+        if let Some(ref hpt) = highest_priority_thread {
+            self.reload(hpt);
+
+            // Yield back from switch_fiber to the newly scheduled thread's host_context.
+            // Upstream: Common::Fiber::YieldTo(m_switch_fiber, *highest_priority_thread->m_host_context)
+            if let Some(ref switch_fiber) = self.switch_fiber {
+                if let Some(ref host_ctx) = hpt.lock().unwrap().host_context {
+                    Fiber::yield_to(Arc::downgrade(switch_fiber), host_ctx);
+                }
             }
         }
     }

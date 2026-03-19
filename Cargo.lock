@@ -245,6 +245,7 @@ dependencies = [
  "libc",
  "log",
  "lz4_flex",
+ "parking_lot",
  "thiserror",
  "zstd",
 ]

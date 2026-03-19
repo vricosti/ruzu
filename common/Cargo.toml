@@ -11,3 +11,4 @@ bytemuck.workspace = true
 lz4_flex.workspace = true
 zstd = "0.13"
 libc = "0.2"
+parking_lot.workspace = true
