@@ -4,10 +4,10 @@
 //!
 //! SVC handlers for physical memory operations (SetHeapSize, MapPhysicalMemory, etc.).
 
+use crate::core::System;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::HEAP_SIZE_ALIGNMENT;
-use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 fn is_4kb_aligned(val: u64) -> bool {
@@ -43,7 +43,7 @@ fn validate_heap_size(size: u64) -> ResultCode {
 ///
 /// Matches upstream ownership: current process -> page table -> SetHeapSize.
 pub fn set_heap_size_current_process(
-    ctx: &SvcContext,
+    system: &System,
     out_address: &mut u64,
     size: u64,
 ) -> ResultCode {
@@ -53,7 +53,7 @@ pub fn set_heap_size_current_process(
         return validation;
     }
 
-    let (result, address) = ctx.current_process.lock().unwrap().set_heap_size(size as usize);
+    let (result, address) = system.current_process_arc().lock().unwrap().set_heap_size(size as usize);
     *out_address = address.get();
     ResultCode::new(result)
 }

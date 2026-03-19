@@ -4,6 +4,7 @@
 //!
 //! SVC handlers for address arbiter operations (WaitForAddress, SignalToAddress).
 
+use crate::hle::kernel::k_memory_layout::is_kernel_address;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -39,8 +40,9 @@ pub fn wait_for_address(
     );
 
     // Validate input.
-    // R_UNLESS(!IsKernelAddress(address), ResultInvalidCurrentMemory)
-    // TODO: IsKernelAddress check
+    if is_kernel_address(address as usize) {
+        return RESULT_INVALID_CURRENT_MEMORY;
+    }
     if address % 4 != 0 {
         return RESULT_INVALID_ADDRESS;
     }
@@ -80,7 +82,9 @@ pub fn signal_to_address(
     );
 
     // Validate input.
-    // TODO: IsKernelAddress check
+    if is_kernel_address(address as usize) {
+        return RESULT_INVALID_CURRENT_MEMORY;
+    }
     if address % 4 != 0 {
         return RESULT_INVALID_ADDRESS;
     }

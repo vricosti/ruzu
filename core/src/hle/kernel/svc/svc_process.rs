@@ -4,7 +4,7 @@
 //!
 //! SVC handlers for process operations (ExitProcess, GetProcessId, GetProcessList, etc.).
 
-use crate::hle::kernel::svc_dispatch::SvcContext;
+use crate::core::System;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
@@ -12,12 +12,12 @@ use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::ResultCode;
 
 /// Exits the current process.
-pub fn exit_process(ctx: &SvcContext) {
-    let process_id = ctx.current_process.lock().unwrap().get_process_id();
+pub fn exit_process(system: &System) {
+    let process_id = system.current_process_arc().lock().unwrap().get_process_id();
     log::info!("svc::ExitProcess called for process {}", process_id);
 
-    KProcess::exit_with_current_thread(&ctx.current_process);
-    ctx.scheduler.lock().unwrap().request_schedule();
+    KProcess::exit_with_current_thread(system.current_process_arc());
+    system.scheduler_arc().lock().unwrap().request_schedule();
 }
 
 /// Gets the ID of the specified process or a specified thread's owning process.
@@ -112,14 +112,16 @@ pub fn terminate_process(_process_handle: Handle) -> ResultCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::System;
     use crate::hle::kernel::k_process::{KProcess, ProcessState};
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::k_thread::{KThread, ThreadState};
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
-    use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::{Arc, Mutex};
 
-    fn test_context() -> SvcContext {
+    fn test_system() -> System {
+        let mut system = System::new_for_test();
+
         let process = Arc::new(Mutex::new(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
@@ -144,33 +146,22 @@ mod tests {
         }
 
         let shared_memory = process.lock().unwrap().get_shared_memory();
-        SvcContext {
-            shared_memory,
-            code_base: 0,
-            code_size: 0,
-            stack_base: 0,
-            stack_size: 0,
-            program_id: 1,
-            tls_base: 0,
-            current_process: process,
-            service_manager: Arc::new(Mutex::new(
-                crate::hle::service::sm::sm::ServiceManager::new(),
-            )),
-            scheduler,
-            next_thread_id: Arc::new(AtomicU64::new(2)),
-            next_object_id: Arc::new(AtomicU32::new(2)),
-            is_64bit: false,
-        }
+        system.set_current_process_arc(process);
+        system.set_scheduler_arc(scheduler);
+        system.set_shared_process_memory(shared_memory);
+        system.set_runtime_program_id(1);
+        system.set_runtime_64bit(false);
+        system
     }
 
     #[test]
     fn exit_process_exits_current_process_and_thread() {
-        let ctx = test_context();
+        let system = test_system();
 
-        exit_process(&ctx);
+        exit_process(&system);
         KWorkerTaskManager::wait_for_global_idle();
 
-        let process = ctx.current_process.lock().unwrap();
+        let process = system.current_process_arc().lock().unwrap();
         let current_thread = process.get_thread_by_thread_id(1).unwrap();
         assert_ne!(process.state, ProcessState::Running);
         drop(process);

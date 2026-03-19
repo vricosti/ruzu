@@ -4,7 +4,7 @@
 //!
 //! SVC handlers for IPC (Inter-Process Communication) operations.
 
-use crate::hle::kernel::svc_dispatch::SvcContext;
+use crate::core::System;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
@@ -19,15 +19,15 @@ use crate::hle::service::hle_ipc::{complete_sync_request, HLERequestContext};
 /// 3. Create HLERequestContext with thread/memory references
 /// 4. Read command buffer from TLS, dispatch to handler
 /// 5. Write response back to TLS (inside write_to_outgoing_command_buffer)
-pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode {
-    let current_thread = match ctx.current_thread() {
+pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode {
+    let current_thread = match system.current_thread() {
         Some(thread) => thread,
         None => return RESULT_INVALID_HANDLE,
     };
     let tls_address = current_thread.lock().unwrap().get_tls_address().get();
 
     let (client_session, shared_memory) = {
-        let process = ctx.current_process.lock().unwrap();
+        let process = system.current_process_arc().lock().unwrap();
         let Some(object_id) = process.handle_table.get_object(session_handle) else {
             log::error!("  SendSyncRequest: handle {:#x} not in handle table", session_handle);
             return RESULT_INVALID_HANDLE;
@@ -56,11 +56,12 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
     );
     // Set the Memory bridge for TLS access — matches upstream's
     // memory.GetPointer(client_message) for reading the command buffer.
-    if let Some(memory) = ctx.get_memory() {
+    if let Some(memory) = system.get_svc_memory() {
         context.set_memory(memory);
     }
     context.set_session_request_manager(request_manager.clone());
-    context.set_service_manager(ctx.service_manager.clone());
+    let service_manager = system.service_manager().unwrap();
+    context.set_service_manager(service_manager);
 
     // Read command buffer from TLS and parse (done inside populate).
     context.populate_from_incoming_command_buffer(&[]);
@@ -75,7 +76,7 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
 
     // Debug: if handle is 0, the game didn't receive the previous response correctly
     if session_handle == 0 {
-        if let Some(memory) = ctx.get_memory() {
+        if let Some(memory) = system.get_svc_memory() {
             let m = memory.lock().unwrap();
             log::error!(
                 "  SendSyncRequest with handle=0! TLS at send time: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
@@ -104,7 +105,7 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
 
     // Debug: dump TLS after response
     {
-        if let Some(memory) = ctx.get_memory() {
+        if let Some(memory) = system.get_svc_memory() {
             let m = memory.lock().unwrap();
             log::info!(
                 "  TLS[0..15]: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
@@ -147,19 +148,21 @@ pub fn send_sync_request(ctx: &SvcContext, session_handle: Handle) -> ResultCode
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::System;
     use crate::hle::ipc;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::{KThread, ThreadState};
     use crate::hle::kernel::k_typed_address::KProcessAddress;
     use crate::hle::kernel::svc::svc_port;
-    use crate::hle::kernel::svc_dispatch::SvcContext;
     use crate::hle::result::RESULT_SUCCESS;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::sm::sm::create_service_manager;
-    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
-    fn test_context() -> SvcContext {
+    fn test_system() -> System {
+        let mut system = System::new_for_test();
+
         let mut process = KProcess::new();
         process.process_id = 100;
         process.capabilities.core_mask = 0xF;
@@ -192,118 +195,119 @@ mod tests {
         scheduler.lock().unwrap().initialize(1, 0, 0);
         let shared_memory = process.lock().unwrap().get_shared_memory();
 
-        SvcContext {
-            shared_memory,
-            code_base: 0x200000,
-            code_size: 0x60000,
-            stack_base: 0,
-            stack_size: 0,
-            program_id: 1,
-            tls_base: 0x2395000,
-            current_process: process,
-            service_manager: create_service_manager(),
-            scheduler,
-            next_thread_id: Arc::new(AtomicU64::new(2)),
-            next_object_id: Arc::new(AtomicU32::new(2)),
-            is_64bit: false,
-        }
+        system.set_current_process_arc(process);
+        system.set_scheduler_arc(scheduler);
+        system.set_shared_process_memory(shared_memory);
+        system.set_runtime_program_id(1);
+        system.set_runtime_64bit(false);
+        system
     }
 
-    fn write_named_port(ctx: &SvcContext, address: u64, name: &str) {
-        let mut mem = ctx.shared_memory.write().unwrap();
+    fn get_tls_base(system: &System) -> u64 {
+        system.current_thread().unwrap().lock().unwrap().get_tls_address().get()
+    }
+
+    fn write_named_port(system: &System, address: u64, name: &str) {
+        let mut mem = system.shared_process_memory().write().unwrap();
         for (index, byte) in name.as_bytes().iter().copied().enumerate() {
             mem.write_8(address + index as u64, byte);
         }
         mem.write_8(address + name.len() as u64, 0);
     }
 
-    fn write_sm_initialize_request(ctx: &SvcContext) {
+    fn write_sm_initialize_request(system: &System) {
+        let tls_base = get_tls_base(system);
         let request_type = ipc::CommandType::Request as u32;
         let sfci_magic = u32::from_le_bytes([b'S', b'F', b'C', b'I']);
-        let mut mem = ctx.shared_memory.write().unwrap();
-        mem.write_32(ctx.tls_base, request_type);
-        mem.write_32(ctx.tls_base + 4, 0);
-        mem.write_32(ctx.tls_base + 0x10, sfci_magic);
-        mem.write_32(ctx.tls_base + 0x14, 0);
-        mem.write_32(ctx.tls_base + 0x18, 0);
-        mem.write_32(ctx.tls_base + 0x1C, 0);
+        let mut mem = system.shared_process_memory().write().unwrap();
+        mem.write_32(tls_base, request_type);
+        mem.write_32(tls_base + 4, 0);
+        mem.write_32(tls_base + 0x10, sfci_magic);
+        mem.write_32(tls_base + 0x14, 0);
+        mem.write_32(tls_base + 0x18, 0);
+        mem.write_32(tls_base + 0x1C, 0);
     }
 
-    fn write_sm_get_service_request(ctx: &SvcContext, name: &str) {
+    fn write_sm_get_service_request(system: &System, name: &str) {
+        let tls_base = get_tls_base(system);
         let request_type = ipc::CommandType::Request as u32;
         let sfci_magic = u32::from_le_bytes([b'S', b'F', b'C', b'I']);
         let mut name_buf = [0u8; 8];
         let copy_len = name.len().min(name_buf.len());
         name_buf[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
 
-        let mut mem = ctx.shared_memory.write().unwrap();
-        mem.write_32(ctx.tls_base, request_type);
-        mem.write_32(ctx.tls_base + 4, 0);
-        mem.write_32(ctx.tls_base + 0x10, sfci_magic);
-        mem.write_32(ctx.tls_base + 0x14, 0);
-        mem.write_32(ctx.tls_base + 0x18, 1);
-        mem.write_32(ctx.tls_base + 0x1C, 0);
-        mem.write_64(ctx.tls_base + 0x20, u64::from_le_bytes(name_buf));
+        let mut mem = system.shared_process_memory().write().unwrap();
+        mem.write_32(tls_base, request_type);
+        mem.write_32(tls_base + 4, 0);
+        mem.write_32(tls_base + 0x10, sfci_magic);
+        mem.write_32(tls_base + 0x14, 0);
+        mem.write_32(tls_base + 0x18, 1);
+        mem.write_32(tls_base + 0x1C, 0);
+        mem.write_64(tls_base + 0x20, u64::from_le_bytes(name_buf));
     }
 
-    fn write_control_query_pointer_buffer_size_request(ctx: &SvcContext) {
+    fn write_control_query_pointer_buffer_size_request(system: &System) {
+        let tls_base = get_tls_base(system);
         let control_type = ipc::CommandType::Control as u32;
         let sfci_magic = u32::from_le_bytes([b'S', b'F', b'C', b'I']);
-        let mut mem = ctx.shared_memory.write().unwrap();
-        mem.write_32(ctx.tls_base, control_type);
-        mem.write_32(ctx.tls_base + 4, 0);
-        mem.write_32(ctx.tls_base + 0x10, sfci_magic);
-        mem.write_32(ctx.tls_base + 0x14, 0);
-        mem.write_32(ctx.tls_base + 0x18, 3);
-        mem.write_32(ctx.tls_base + 0x1C, 0);
+        let mut mem = system.shared_process_memory().write().unwrap();
+        mem.write_32(tls_base, control_type);
+        mem.write_32(tls_base + 4, 0);
+        mem.write_32(tls_base + 0x10, sfci_magic);
+        mem.write_32(tls_base + 0x14, 0);
+        mem.write_32(tls_base + 0x18, 3);
+        mem.write_32(tls_base + 0x1C, 0);
     }
 
     #[test]
     fn send_sync_request_dispatches_sm_initialize_over_tls() {
-        let ctx = test_context();
+        let system = test_system();
+        let tls_base = get_tls_base(&system);
         let port_name = 0x2395800;
-        write_named_port(&ctx, port_name, "sm:");
+        write_named_port(&system, port_name, "sm:");
 
         let mut session_handle = 0;
         assert_eq!(
-            svc_port::connect_to_named_port(&ctx, &mut session_handle, port_name),
+            svc_port::connect_to_named_port(&system, &mut session_handle, port_name),
             RESULT_SUCCESS
         );
 
-        write_sm_initialize_request(&ctx);
-        assert_eq!(send_sync_request(&ctx, session_handle), RESULT_SUCCESS);
+        write_sm_initialize_request(&system);
+        assert_eq!(send_sync_request(&system, session_handle), RESULT_SUCCESS);
 
-        let mem = ctx.shared_memory.read().unwrap();
-        assert_eq!(mem.read_32(ctx.tls_base + 0x18), RESULT_SUCCESS.get_inner_value());
-        assert_eq!(mem.read_32(ctx.tls_base + 0x1C), 0);
+        let mem = system.shared_process_memory().read().unwrap();
+        assert_eq!(mem.read_32(tls_base + 0x18), RESULT_SUCCESS.get_inner_value());
+        assert_eq!(mem.read_32(tls_base + 0x1C), 0);
     }
 
     #[test]
     fn send_sync_request_dispatches_control_query_pointer_buffer_size_for_service_session() {
-        let ctx = test_context();
-        let current_thread = ctx
-            .current_process
+        let system = test_system();
+        let tls_base = get_tls_base(&system);
+        let current_thread = system
+            .current_process_arc()
             .lock()
             .unwrap()
             .get_thread_by_thread_id(1)
             .unwrap();
         let mut request_context = HLERequestContext::new_with_thread(
             current_thread,
-            ctx.shared_memory.clone(),
-            ctx.tls_base,
+            system.shared_process_memory().clone(),
+            tls_base,
         );
-        request_context.set_service_manager(ctx.service_manager.clone());
+        let service_manager = system.service_manager().unwrap();
+        request_context.set_service_manager(service_manager);
         let lm_handler: SessionRequestHandlerPtr =
             Arc::new(crate::hle::service::lm::lm::LM::new());
         let lm_handle = request_context.create_session_for_service(lm_handler).unwrap();
 
-        write_control_query_pointer_buffer_size_request(&ctx);
-        assert_eq!(send_sync_request(&ctx, lm_handle), RESULT_SUCCESS);
+        write_control_query_pointer_buffer_size_request(&system);
+        assert_eq!(send_sync_request(&system, lm_handle), RESULT_SUCCESS);
 
-        let mem = ctx.shared_memory.read().unwrap();
-        assert_eq!(mem.read_32(ctx.tls_base + 0x18), RESULT_SUCCESS.get_inner_value());
-        assert_eq!(mem.read_32(ctx.tls_base + 0x1C), 0);
-        assert_eq!(mem.read_32(ctx.tls_base + 0x20), 0x8000);
+        let mem = system.shared_process_memory().read().unwrap();
+        assert_eq!(mem.read_32(tls_base + 0x18), RESULT_SUCCESS.get_inner_value());
+        assert_eq!(mem.read_32(tls_base + 0x1C), 0);
+        assert_eq!(mem.read_32(tls_base + 0x20), 0x8000);
     }
 }
 

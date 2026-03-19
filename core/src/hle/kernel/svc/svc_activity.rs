@@ -4,10 +4,10 @@
 //!
 //! SVC handlers for thread and process activity.
 
+use crate::core::System;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
-use crate::hle::kernel::svc_dispatch::SvcContext;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Sets the thread activity.
@@ -16,7 +16,7 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 /// checks that it belongs to the current process and is not the current thread,
 /// then sets the activity.
 pub fn set_thread_activity(
-    ctx: &SvcContext,
+    system: &System,
     thread_handle: Handle,
     thread_activity: ThreadActivity,
 ) -> ResultCode {
@@ -35,10 +35,10 @@ pub fn set_thread_activity(
         return RESULT_INVALID_ENUM_VALUE;
     }
 
-    let Some(current_thread_id) = ctx.current_thread_id() else {
+    let Some(current_thread_id) = system.current_thread_id() else {
         return RESULT_INVALID_HANDLE;
     };
-    let process = ctx.current_process.lock().unwrap();
+    let process = system.current_process_arc().lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(thread_handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -70,15 +70,17 @@ pub fn set_process_activity(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::core::System;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::{KThread, SuspendType};
     use crate::hle::kernel::svc::svc_thread;
 
-    fn test_context() -> SvcContext {
+    fn test_system() -> System {
+        let mut system = System::new_for_test();
+
         let mut process = KProcess::new();
         process.capabilities.core_mask = 0xF;
         process.capabilities.priority_mask = u64::MAX;
@@ -104,41 +106,30 @@ mod tests {
 
         let shared_memory = process.lock().unwrap().get_shared_memory();
 
-        SvcContext {
-            shared_memory,
-            code_base: 0x200000,
-            code_size: 0x20000,
-            stack_base: 0x240000,
-            stack_size: 0x10000,
-            program_id: 1,
-            tls_base: 0x23f000,
-            current_process: process,
-            service_manager: Arc::new(Mutex::new(
-                crate::hle::service::sm::sm::ServiceManager::new(),
-            )),
-            scheduler,
-            next_thread_id: Arc::new(AtomicU64::new(2)),
-            next_object_id: Arc::new(AtomicU32::new(2)),
-            is_64bit: false,
-        }
+        system.set_current_process_arc(process);
+        system.set_scheduler_arc(scheduler);
+        system.set_shared_process_memory(shared_memory);
+        system.set_runtime_program_id(1);
+        system.set_runtime_64bit(false);
+        system
     }
 
     #[test]
     fn set_thread_activity_pauses_and_resumes_non_current_thread() {
-        let ctx = test_context();
+        let system = test_system();
         let mut handle = 0;
         assert_eq!(
-            svc_thread::create_thread(&ctx, &mut handle, 0x201000, 0x1234, 0x260000, 44, 0),
+            svc_thread::create_thread(&system, &mut handle, 0x201000, 0x1234, 0x260000, 44, 0),
             RESULT_SUCCESS
         );
-        assert_eq!(svc_thread::start_thread(&ctx, handle), RESULT_SUCCESS);
+        assert_eq!(svc_thread::start_thread(&system, handle), RESULT_SUCCESS);
 
         assert_eq!(
-            set_thread_activity(&ctx, handle, ThreadActivity::Paused),
+            set_thread_activity(&system, handle, ThreadActivity::Paused),
             RESULT_SUCCESS
         );
 
-        let process = ctx.current_process.lock().unwrap();
+        let process = system.current_process_arc().lock().unwrap();
         let object_id = process.handle_table.get_object(handle).unwrap();
         let thread = process.get_thread_by_object_id(object_id).unwrap();
         drop(process);
@@ -146,7 +137,7 @@ mod tests {
         assert!(thread.lock().unwrap().is_suspend_requested_type(SuspendType::Thread));
 
         assert_eq!(
-            set_thread_activity(&ctx, handle, ThreadActivity::Runnable),
+            set_thread_activity(&system, handle, ThreadActivity::Runnable),
             RESULT_SUCCESS
         );
         assert!(!thread.lock().unwrap().is_suspend_requested_type(SuspendType::Thread));

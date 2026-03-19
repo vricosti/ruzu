@@ -13,6 +13,9 @@ use crate::device_memory::DeviceMemory;
 use crate::file_sys::fs_filesystem::OpenMode;
 use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use crate::hardware_properties;
+use crate::hle::kernel::k_process::SharedProcessMemory;
+use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::kernel::k_thread::KThread;
 use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::service::sm::sm::ServiceManager;
 use crate::memory::memory::Memory;
@@ -143,6 +146,34 @@ pub struct System {
     // ── Per-core profiling data ──
     /// Dynarmic tick counters per CPU core (for profiling).
     _dynarmic_ticks: [u64; hardware_properties::NUM_CPU_CORES as usize],
+
+    // ── Runtime SVC state ──
+    // These fields are set during the bootstrap phase (after load, before JIT
+    // dispatch) and match the role of upstream `Core::System&` as passed to SVC
+    // handlers. Upstream SVC handlers receive `Core::System&` and derive
+    // process, scheduler, memory, etc. from it.
+
+    /// The current application process, wrapped for shared access.
+    /// Set by the frontend after `System::load()` returns.
+    /// Upstream: `system.CurrentProcess()`.
+    pub(crate) current_process_arc: Option<Arc<StdMutex<crate::hle::kernel::k_process::KProcess>>>,
+
+    /// The cooperative scheduler for the main core.
+    /// Upstream has per-core schedulers in the kernel; here we use one.
+    pub(crate) scheduler_arc: Option<Arc<StdMutex<KScheduler>>>,
+
+    /// Cached shared process memory (the RwLock-wrapped ProcessMemoryData).
+    /// Used as a fallback memory accessor when the Memory bridge is not set
+    /// (tests and legacy paths). Upstream equivalent: process.GetMemory().
+    pub(crate) shared_process_memory: Option<SharedProcessMemory>,
+
+    /// The title/program ID for the running application.
+    /// Upstream: `system.GetApplicationProcessProgramID()`.
+    pub(crate) runtime_program_id: u64,
+
+    /// Whether the loaded process is AArch64.
+    /// Upstream: `process.Is64Bit()`.
+    pub(crate) runtime_is_64bit: bool,
 }
 
 impl System {
@@ -178,6 +209,11 @@ impl System {
             current_process: None,
             load_parameters: None,
             _dynarmic_ticks: [0u64; hardware_properties::NUM_CPU_CORES as usize],
+            current_process_arc: None,
+            scheduler_arc: None,
+            shared_process_memory: None,
+            runtime_program_id: 0,
+            runtime_is_64bit: false,
         }
     }
 
@@ -634,6 +670,136 @@ impl System {
     /// Get the load parameters from the last successful load.
     pub fn load_parameters(&self) -> Option<&crate::loader::loader::LoadParameters> {
         self.load_parameters.as_ref()
+    }
+
+    // ── Runtime SVC state setters ──
+
+    /// Set the Arc-wrapped current process for SVC dispatch.
+    pub fn set_current_process_arc(
+        &mut self,
+        p: Arc<StdMutex<crate::hle::kernel::k_process::KProcess>>,
+    ) {
+        self.current_process_arc = Some(p);
+    }
+
+    /// Set the cooperative scheduler for SVC dispatch.
+    pub fn set_scheduler_arc(&mut self, s: Arc<StdMutex<KScheduler>>) {
+        self.scheduler_arc = Some(s);
+    }
+
+    /// Set the shared process memory for SVC fallback paths.
+    pub fn set_shared_process_memory(&mut self, m: SharedProcessMemory) {
+        self.shared_process_memory = Some(m);
+    }
+
+    /// Set the runtime program/title ID.
+    pub fn set_runtime_program_id(&mut self, id: u64) {
+        self.runtime_program_id = id;
+    }
+
+    /// Set whether the loaded process is 64-bit.
+    pub fn set_runtime_64bit(&mut self, is_64bit: bool) {
+        self.runtime_is_64bit = is_64bit;
+    }
+
+    // ── SVC accessor methods ──
+    //
+    // These match the interface that upstream SVC handlers use when given
+    // `Core::System&`. Each SVC handler calls system.Kernel(),
+    // system.CurrentProcess(), etc.
+
+    /// Get the current process Arc. Panics if not set.
+    /// Upstream: `Kernel::GetCurrentProcess(kernel)`.
+    pub fn current_process_arc(
+        &self,
+    ) -> &Arc<StdMutex<crate::hle::kernel::k_process::KProcess>> {
+        self.current_process_arc
+            .as_ref()
+            .expect("current_process_arc not set; call set_current_process_arc() first")
+    }
+
+    /// Get the scheduler Arc. Panics if not set.
+    /// Upstream: `kernel.Scheduler(core_id)`.
+    pub fn scheduler_arc(&self) -> &Arc<StdMutex<KScheduler>> {
+        self.scheduler_arc
+            .as_ref()
+            .expect("scheduler_arc not set; call set_scheduler_arc() first")
+    }
+
+    /// Get the shared process memory. Panics if not set.
+    pub fn shared_process_memory(&self) -> &SharedProcessMemory {
+        self.shared_process_memory
+            .as_ref()
+            .expect("shared_process_memory not set")
+    }
+
+    /// Get the runtime program ID.
+    pub fn runtime_program_id(&self) -> u64 {
+        self.runtime_program_id
+    }
+
+    /// Whether the current process is 64-bit.
+    pub fn runtime_is_64bit(&self) -> bool {
+        self.runtime_is_64bit
+    }
+
+    /// Get the current thread's ID via the scheduler.
+    /// Matches upstream `GetCurrentThread(kernel).GetId()`.
+    pub fn current_thread_id(&self) -> Option<u64> {
+        self.scheduler_arc
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .get_scheduler_current_thread_id()
+    }
+
+    /// Get the current thread Arc via scheduler + process.
+    /// Matches upstream `GetCurrentThread(kernel)`.
+    pub fn current_thread(&self) -> Option<Arc<StdMutex<KThread>>> {
+        let current_thread_id = self.current_thread_id()?;
+        self.current_process_arc
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .get_thread_by_thread_id(current_thread_id)
+    }
+
+    /// Get the Memory bridge for guest memory access.
+    /// Matches upstream `GetCurrentMemory(kernel)` which returns
+    /// `GetCurrentProcess(kernel).GetMemory()`.
+    /// Returns None when Memory is not wired (tests).
+    pub fn get_svc_memory(&self) -> Option<Arc<StdMutex<Memory>>> {
+        self.current_process_arc
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .page_table
+            .get_base()
+            .m_memory
+            .clone()
+    }
+
+    /// Create a minimal System for SVC handler unit tests.
+    ///
+    /// Sets up just enough state (kernel with ID counters, empty service
+    /// manager) for SVC handlers to function. Callers must still set
+    /// `current_process_arc`, `scheduler_arc`, etc.
+    pub fn new_for_test() -> Self {
+        let mut system = Self::new();
+        // Kernel (provides object/thread ID allocation). Don't call
+        // initialize() — that creates timers, physical cores, etc.
+        let kernel = KernelCore::new();
+        // Pre-advance ID counters past values that test setups manually assign
+        // to pre-existing threads (typically object_id 1..2, thread_id 1..2).
+        // This prevents collision when SVC handlers allocate new IDs.
+        for _ in 0..10 {
+            kernel.create_new_object_id();
+            kernel.create_new_thread_id();
+        }
+        system.kernel = Some(kernel);
+        system.service_manager =
+            Some(crate::hle::service::sm::sm::create_service_manager());
+        system
     }
 
     /// Initialize performance stats for a specific title.

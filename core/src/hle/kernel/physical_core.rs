@@ -9,7 +9,8 @@
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::arm::arm_interface::{ArmInterface, HaltReason, KThread as OpaqueKThread, ThreadContext};
-use crate::hle::kernel::svc_dispatch::{self, SvcArgs, SvcContext};
+use crate::core::System;
+use crate::hle::kernel::svc_dispatch::{self, SvcArgs};
 
 use super::{k_process::KProcess, k_scheduler::KScheduler, k_thread::KThread};
 #[cfg(feature = "debug-logs")]
@@ -166,9 +167,9 @@ impl PhysicalCore {
         svc_num: u32,
         is_64bit: bool,
         svc_args: &mut SvcArgs,
-        svc_context: &SvcContext,
+        system: &System,
     ) {
-        svc_dispatch::call(svc_num, is_64bit, svc_args, svc_context);
+        svc_dispatch::call(system, svc_num, is_64bit, svc_args);
         jit.set_svc_arguments(svc_args);
         log::trace!("dispatch_supervisor_call: before handoff (svc=0x{:x})", svc_num);
         self.handoff_after_svc(jit, thread_context, scheduler, process);
@@ -183,7 +184,7 @@ impl PhysicalCore {
         scheduler: &Arc<Mutex<KScheduler>>,
         process: &Arc<Mutex<KProcess>>,
         is_64bit: bool,
-        svc_context: &SvcContext,
+        system: &System,
         mut on_supervisor_call: FSvc,
         mut on_halted: FHalt,
     ) -> (u32, u32, PhysicalCoreExecutionControl)
@@ -257,7 +258,7 @@ impl PhysicalCore {
                         svc_num,
                         is_64bit,
                         &mut svc_args,
-                        svc_context,
+                        system,
                     );
                 }
                 PhysicalCoreExecutionEvent::Halted(halt_reason) => {
@@ -357,12 +358,11 @@ impl PhysicalCore {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU32, AtomicU64};
 
     use crate::arm::arm_interface::{Architecture, DebugWatchpoint, KThread as OpaqueKThread};
+    use crate::core::System;
     use crate::hle::kernel::k_thread::ThreadState;
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
-    use crate::hle::service::sm::sm::ServiceManager;
 
     use super::*;
 
@@ -437,8 +437,10 @@ mod tests {
         Arc<Mutex<KProcess>>,
         Arc<Mutex<KScheduler>>,
         Arc<Mutex<KThread>>,
-        SvcContext,
+        System,
     ) {
+        let mut system = System::new_for_test();
+
         let mut process = KProcess::new();
         process.capabilities.core_mask = 0xF;
         process.capabilities.priority_mask = u64::MAX;
@@ -476,34 +478,24 @@ mod tests {
         scheduler.lock().unwrap().initialize(1, 0, 0);
 
         let shared_memory = process.lock().unwrap().get_shared_memory();
-        let svc_context = SvcContext {
-            shared_memory,
-            code_base: 0x200000,
-            code_size: 0x20000,
-            stack_base: 0x240000,
-            stack_size: 0x10000,
-            program_id: 1,
-            tls_base: 0x23f000,
-            current_process: process.clone(),
-            service_manager: Arc::new(Mutex::new(ServiceManager::new())),
-            scheduler: scheduler.clone(),
-            next_thread_id: Arc::new(AtomicU64::new(3)),
-            next_object_id: Arc::new(AtomicU32::new(3)),
-            is_64bit: false,
-        };
+        system.set_current_process_arc(process.clone());
+        system.set_scheduler_arc(scheduler.clone());
+        system.set_shared_process_memory(shared_memory);
+        system.set_runtime_program_id(1);
+        system.set_runtime_64bit(false);
 
         (
             PhysicalCore::new(0, false),
             process,
             scheduler,
             current_thread,
-            svc_context,
+            system,
         )
     }
 
     #[test]
     fn run_loop_drains_current_thread_termination_on_halt_boundary() {
-        let (physical_core, process, scheduler, current_thread, svc_context) = test_context();
+        let (physical_core, process, scheduler, current_thread, system) = test_context();
         let mut thread_context = ThreadContext::default();
         let mut jit = TestArmInterface::new(VecDeque::from([
             HaltReason::BREAK_LOOP,
@@ -521,7 +513,7 @@ mod tests {
             &scheduler,
             &process,
             false,
-            &svc_context,
+            &system,
             |_svc_num, _svc_args, _thread_context, _svc_count, _iteration| {
                 PhysicalCoreExecutionControl::Continue
             },
