@@ -1675,13 +1675,21 @@ impl KProcess {
             log::warn!("run: stack MapPages failed ({:#x}), continuing with ad-hoc allocation", map_result);
         }
 
-        // Ensure the stack memory is backed in ProcessMemoryData.
+        // Ensure the stack memory is backed in ProcessMemoryData and
+        // registered in its block manager (so QueryMemory returns the
+        // correct state for the stack region, matching upstream).
         {
             let mut mem = self.process_memory.write().unwrap();
             let needed = (stack_top - mem.base) as usize;
             if needed > mem.data.len() {
                 mem.data.resize(needed, 0);
             }
+            mem.update_region(
+                stack_base,
+                stack_size as u64,
+                KMemoryState::STACK,
+                KMemoryPermission::USER_READ_WRITE,
+            );
         }
 
         // Upstream: m_page_table.SetMaxHeapSize(m_max_process_memory -
