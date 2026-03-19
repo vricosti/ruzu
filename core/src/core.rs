@@ -844,6 +844,185 @@ impl System {
             stats.begin_system_frame();
         }
     }
+
+    /// Run the main JIT/SVC execution loop.
+    ///
+    /// Encapsulates JIT creation, thread bootstrap, SVC dispatch, and halt
+    /// handling. Upstream, this logic lives inside CpuManager/PhysicalCore.
+    ///
+    /// Returns `(total_iterations, total_svc_count)`.
+    pub fn run_main_loop(&mut self) -> (u32, u32) {
+        use crate::arm::arm_interface::{
+            ArmInterface, HaltReason, KProcess as OpaqueKProcess, KThread as OpaqueKThread,
+            ThreadContext,
+        };
+        use crate::hle::kernel::physical_core::PhysicalCoreExecutionControl;
+
+        let process = match self.current_process.take() {
+            Some(p) => p,
+            None => {
+                log::warn!("No process loaded, skipping CPU execution");
+                return (0, 0);
+            }
+        };
+
+        let shared_memory = process.get_shared_memory();
+        let is_64bit = process.is_64bit();
+        let program_id = process.get_program_id();
+
+        let load_parameters = self
+            .load_parameters()
+            .cloned()
+            .expect("loader must provide process launch parameters");
+
+        let process = Arc::new(StdMutex::new(process));
+        process.lock().unwrap().bind_self_reference(&process);
+        let scheduler = Arc::new(StdMutex::new(
+            crate::hle::kernel::k_scheduler::KScheduler::new(0),
+        ));
+        process.lock().unwrap().attach_scheduler(&scheduler);
+        let (main_thread, _main_thread_handle, _stack_base, _stack_top) = process
+            .lock()
+            .unwrap()
+            .run(
+                load_parameters.main_thread_priority,
+                load_parameters.main_thread_stack_size as usize,
+                1,
+                1,
+                is_64bit,
+            )
+            .expect("process runtime bootstrap must succeed");
+        let tls_base = main_thread.lock().unwrap().get_tls_address().get();
+
+        let dummy_system: u32 = 0;
+        let dummy_exclusive: u32 = 0;
+        let dummy_process = unsafe {
+            &*(&dummy_system as *const u32 as *const OpaqueKProcess)
+        };
+
+        // Create the JIT (AArch32 or AArch64).
+        let core_memory = self.memory_shared();
+        let mut jit: Box<dyn ArmInterface> = if is_64bit {
+            use crate::arm::dynarmic::arm_dynarmic_64::ArmDynarmic64;
+            Box::new(ArmDynarmic64::new(
+                &dummy_system as &dyn std::any::Any,
+                true,
+                dummy_process,
+                &dummy_exclusive as &dyn std::any::Any,
+                0,
+                shared_memory.clone(),
+                self.core_timing_shared(),
+                core_memory.clone(),
+            ))
+        } else {
+            use crate::arm::dynarmic::arm_dynarmic_32::ArmDynarmic32;
+            Box::new(ArmDynarmic32::new(
+                &dummy_system as &dyn std::any::Any,
+                true,
+                dummy_process,
+                &dummy_exclusive as &dyn std::any::Any,
+                0,
+                shared_memory.clone(),
+                self.core_timing_shared(),
+                core_memory,
+            ))
+        };
+
+        // Wire the runtime SVC state on System so that SVC handlers
+        // can access process, scheduler, memory, etc. via &System.
+        self.set_current_process_arc(process.clone());
+        self.set_scheduler_arc(scheduler.clone());
+        self.set_shared_process_memory(shared_memory.clone());
+        self.set_runtime_program_id(program_id);
+        self.set_runtime_64bit(is_64bit);
+
+        // Set initial context.
+        // Maps to upstream ResetThreadContext32/64 in k_thread.cpp.
+        let mut ctx = ThreadContext::default();
+        let physical_core: *const crate::hle::kernel::physical_core::PhysicalCore = self
+            .kernel()
+            .and_then(|kernel| kernel.physical_core(0))
+            .map(|core| core as *const _)
+            .expect("kernel physical core 0 must exist after System::initialize");
+        unsafe { &*physical_core }
+            .initialize_guest_runtime(main_thread.clone(), &mut *jit, &mut ctx);
+
+        // Upstream: physical_core.cpp:158 — SetTpidrroEl0(GetInteger(thread->GetTlsAddress()))
+        jit.set_tpidrro_el0(tls_base);
+
+        // SVC dispatch loop.
+        let dummy_thread =
+            unsafe { &mut *(&mut 0u32 as *mut u32 as *mut OpaqueKThread) };
+
+        let mut total_iteration = 0u32;
+        let mut total_svc_count = 0u32;
+        loop {
+            let physical_core_ref = unsafe { &*physical_core };
+            let (iteration, svc_count, exec_control) = physical_core_ref.run_loop(
+                &mut *jit,
+                dummy_thread,
+                &mut ctx,
+                &scheduler,
+                &process,
+                is_64bit,
+                self,
+                |_svc_num, _svc_args, _ctx, _svc_count, _iteration| {
+                    PhysicalCoreExecutionControl::Continue
+                },
+                // Halt handling — maps to upstream PhysicalCore::RunThread()
+                // halt-reason analysis (physical_core.cpp:55-100).
+                |halt_reason, _exception_address, ctx, _svc_count, _iteration| {
+                    if halt_reason.contains(HaltReason::STEP_THREAD) {
+                        // Upstream: checked by debugger step state. No debugger
+                        // yet, so just continue execution.
+                        PhysicalCoreExecutionControl::Continue
+                    } else if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
+                        // Upstream: suspends the thread and notifies the debugger.
+                        log::error!(
+                            "PREFETCH_ABORT at PC={:#x}, SP={:#x}, LR={:#x}",
+                            ctx.pc, ctx.sp, ctx.lr
+                        );
+                        PhysicalCoreExecutionControl::Break
+                    } else if halt_reason.contains(HaltReason::DATA_ABORT) {
+                        // Upstream: notifies the debugger and suspends the thread.
+                        log::error!(
+                            "DATA_ABORT at PC={:#x}, SP={:#x}, LR={:#x}",
+                            ctx.pc, ctx.sp, ctx.lr
+                        );
+                        PhysicalCoreExecutionControl::Break
+                    } else if halt_reason.contains(HaltReason::BREAK_LOOP) {
+                        // Upstream: return from RunThread, causes Fiber yield
+                        // back to host thread → single-core preemption.
+                        PhysicalCoreExecutionControl::Yield
+                    } else {
+                        log::warn!(
+                            "JIT halted: {:?} at PC={:#x}, SP={:#x}",
+                            halt_reason, ctx.pc, ctx.sp
+                        );
+                        PhysicalCoreExecutionControl::Break
+                    }
+                },
+            );
+            total_iteration += iteration;
+            total_svc_count += svc_count;
+
+            match exec_control {
+                PhysicalCoreExecutionControl::Continue => continue,
+                PhysicalCoreExecutionControl::Yield => {
+                    // Upstream SingleCoreRunGuestThread: advance simulated
+                    // time, then preempt to the next core.
+                    let core_timing = self.core_timing_shared();
+                    core_timing.lock().unwrap().advance();
+                    self.get_cpu_manager_mut()
+                        .preempt_single_core(&core_timing, true);
+                    continue;
+                }
+                PhysicalCoreExecutionControl::Break => break,
+            }
+        }
+
+        (total_iteration, total_svc_count)
+    }
 }
 
 impl Default for System {
