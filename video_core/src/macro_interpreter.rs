@@ -303,6 +303,17 @@ impl MacroInterpreter {
         }
     }
 
+    /// Clear macro code starting from the given offset. Matches upstream
+    /// `MacroEngine::ClearCode` — resets code storage from the pointer onward.
+    pub fn clear_code(&mut self, offset: u32) {
+        let idx = offset as usize;
+        if idx < self.code.len() {
+            for i in idx..self.code.len() {
+                self.code[i] = 0;
+            }
+        }
+    }
+
     /// Upload a code word at the given offset (word index).
     pub fn upload_code(&mut self, offset: u32, word: u32) {
         let idx = offset as usize;
