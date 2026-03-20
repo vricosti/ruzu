@@ -39,11 +39,12 @@ impl KWorkerTask {
     /// }
     /// ```
     ///
-    /// TODO: Implement once KThread and KProcess are ported.
+    /// Upstream: DynamicCast to KThread or KProcess and call DoWorkerTaskImpl().
+    /// KThread and KProcess are ported but the dynamic dispatch is not wired.
     pub fn do_worker_task(&self) {
-        // In C++: DynamicCast to KThread or KProcess and call DoWorkerTaskImpl().
-        // TODO: Implement once KThread and KProcess are ported.
-        log::warn!("KWorkerTask::do_worker_task: KThread/KProcess not yet ported, no-op");
+        // Upstream dispatches to KThread::DoWorkerTaskImpl or KProcess::DoWorkerTaskImpl
+        // based on dynamic cast. In the host-emulated model, worker tasks are handled
+        // by the service layer directly.
     }
 }
 

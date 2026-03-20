@@ -51,7 +51,7 @@ impl Default for KSpinLock {
 }
 
 // Aliases matching upstream.
-// TODO(bunnei): Alias for now, in case we want to implement these accurately in the future.
+// Upstream has cache-line aligned and non-aligned variants; aliased here.
 pub type KAlignedSpinLock = KSpinLock;
 pub type KNotAlignedSpinLock = KSpinLock;
 

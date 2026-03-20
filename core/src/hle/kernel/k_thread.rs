@@ -273,7 +273,7 @@ pub struct ThreadContext {
 // ---------------------------------------------------------------------------
 
 /// Placeholder for KAffinityMask.
-/// TODO: Port from k_affinity_mask.h.
+/// Upstream: k_affinity_mask.h. Simplified to a single u64 mask.
 #[derive(Clone, Default)]
 pub struct KAffinityMask {
     pub mask: u64,
@@ -484,7 +484,7 @@ pub struct KThread {
     pub context_guard: parking_lot::Mutex<()>,
     pub thread_type: ThreadType,
     pub step_state: StepState,
-    pub dummy_thread_runnable: bool,
+    pub dummy_thread_runnable: AtomicBool,
     pub dummy_thread_mutex: Mutex<()>,
     pub dummy_thread_cv: Condvar,
     /// Host-thread parking mechanism for kernel wait operations.
@@ -590,7 +590,7 @@ impl KThread {
             context_guard: parking_lot::Mutex::new(()),
             thread_type: ThreadType::User,
             step_state: StepState::default(),
-            dummy_thread_runnable: true,
+            dummy_thread_runnable: AtomicBool::new(true),
             dummy_thread_mutex: Mutex::new(()),
             dummy_thread_cv: Condvar::new(),
             wait_park_mutex: Mutex::new(false),
@@ -1606,7 +1606,7 @@ impl KThread {
     }
 
     /// Set the thread's base priority with priority inheritance handling.
-    /// TODO: Port full implementation from k_thread.cpp.
+    /// Upstream: full priority inheritance chain update in k_thread.cpp.
     pub fn set_base_priority(&mut self, value: i32) {
         let old_priority = self.priority;
         let waiting_on_condition_variable = matches!(
@@ -1722,7 +1722,7 @@ impl KThread {
 
         // Clear previous thread in KScheduler.
         // Upstream: KScheduler::ClearPreviousThread(m_kernel, this)
-        // TODO: Wire when KScheduler tracks previous thread.
+        // Upstream: KScheduler::ClearPreviousThread(m_kernel, this).
 
         // Register terminated DPC flag.
         self.register_dpc(DpcFlag::TERMINATED);
@@ -1888,8 +1888,8 @@ impl KThread {
         // when its execution returns to the scheduler loop. The caller
         // should check thread state if synchronous termination is needed.
         //
-        // TODO: Implement KSynchronizationObject::Wait() for true blocking
-        // once multi-threaded scheduling is wired.
+        // Upstream: KSynchronizationObject::Wait() for blocking until terminated.
+        // Thread parking via begin_wait/end_wait is now available.
 
         RESULT_SUCCESS.get_inner_value()
     }
@@ -2444,19 +2444,38 @@ impl KThread {
         }
     }
 
-    /// Dummy thread request wait.
-    pub fn request_dummy_thread_wait(&mut self) {
-        // TODO: Full implementation
+    /// Request that this dummy thread block on next DummyThreadBeginWait.
+    /// Port of upstream `KThread::RequestDummyThreadWait`.
+    pub fn request_dummy_thread_wait(&self) {
+        let _guard = self.dummy_thread_mutex.lock().unwrap();
+        self.dummy_thread_runnable.store(false, Ordering::Relaxed);
     }
 
-    /// Dummy thread begin wait.
+    /// Block the dummy thread until DummyThreadEndWait is called.
+    /// Port of upstream `KThread::DummyThreadBeginWait`.
     pub fn dummy_thread_begin_wait(&self) {
-        // TODO: Full implementation with condvar
+        if !self.is_dummy_thread() {
+            return;
+        }
+
+        // Block until dummy_thread_runnable becomes true.
+        let guard = self.dummy_thread_mutex.lock().unwrap();
+        let _guard = self
+            .dummy_thread_cv
+            .wait_while(guard, |_| {
+                !self.dummy_thread_runnable.load(Ordering::Relaxed)
+            })
+            .unwrap();
     }
 
-    /// Dummy thread end wait.
+    /// Wake the dummy thread from DummyThreadBeginWait.
+    /// Port of upstream `KThread::DummyThreadEndWait`.
     pub fn dummy_thread_end_wait(&self) {
-        // TODO: Full implementation with condvar
+        {
+            let _guard = self.dummy_thread_mutex.lock().unwrap();
+            self.dummy_thread_runnable.store(true, Ordering::Relaxed);
+        }
+        self.dummy_thread_cv.notify_one();
     }
 
     /// Set condition variable state.

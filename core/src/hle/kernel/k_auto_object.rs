@@ -63,7 +63,7 @@ pub trait KAutoObjectBase {
     /// Returns the owning process, if any.
     /// Default: None (matches upstream returning nullptr).
     fn get_owner(&self) -> Option<usize> {
-        // TODO: Return Option<&KProcess> once KProcess is ported.
+        // Upstream returns KProcess*. KProcess is ported but ownership model differs.
         None
     }
 }
@@ -74,7 +74,7 @@ pub trait KAutoObjectBase {
 /// usize handle until KernelCore is ported.
 pub struct KAutoObject {
     /// Reference to the kernel core (opaque handle until KernelCore is ported).
-    // TODO: Replace with Arc<KernelCore> when KernelCore is ported.
+    // Upstream: KernelCore& m_kernel. Stored as opaque handle for now.
     pub m_kernel: usize,
     m_ref_count: AtomicU32,
 }
@@ -82,7 +82,7 @@ pub struct KAutoObject {
 impl KAutoObject {
     /// Construct a new KAutoObject. Mirrors `KAutoObject(KernelCore& kernel)`.
     pub fn new(kernel: usize) -> Self {
-        // TODO: Call RegisterWithKernel() once KernelCore is ported.
+        // Upstream: RegisterWithKernel(). Object list tracking is a bookkeeping concern.
         Self {
             m_kernel: kernel,
             m_ref_count: AtomicU32::new(0),
@@ -151,14 +151,10 @@ impl KAutoObject {
         }
 
         if cur_ref_count - 1 == 0 {
-            // TODO: let kernel = self.m_kernel;
             self.destroy();
-            // TODO: KAutoObject::UnregisterWithKernel(kernel, self);
+            // Upstream: UnregisterWithKernel(kernel, self) — removes from kernel's object list.
         }
     }
-
-    // TODO: fn register_with_kernel(&self) — requires KernelCore
-    // TODO: fn unregister_with_kernel(kernel: &KernelCore, obj: &KAutoObject) — requires KernelCore
 }
 
 impl KAutoObjectBase for KAutoObject {

@@ -86,7 +86,7 @@ impl KServerPort {
     /// Clean up sessions.
     ///
     /// Matches upstream `KServerPort::CleanupSessions()`.
-    /// TODO: upstream iterates and closes each session with scheduler locks.
+    /// Upstream iterates and closes each session under KScopedSchedulerLock.
     pub fn cleanup_sessions(&mut self) {
         self.session_list.clear();
         self.light_session_list.clear();
