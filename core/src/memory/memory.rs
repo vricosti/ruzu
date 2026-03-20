@@ -6,6 +6,8 @@
 //! and the DeviceMemory backing store.
 
 use common::host_memory::HostMemory;
+#[cfg(target_os = "linux")]
+use common::heap_tracker::HeapTracker;
 use common::page_table::{PageInfo, PageTable, PageType};
 
 use crate::device_memory::{dram_memory_map, DeviceMemory};
@@ -26,8 +28,12 @@ pub use common::host_memory::MemoryPermission;
 pub struct Memory {
     /// Pointer to the device memory backing store.
     device_memory: *const DeviceMemory,
-    /// Pointer to the HostMemory buffer (for Map/Unmap/Protect).
+    /// Pointer to the HostMemory buffer (used for fastmem arena base).
     buffer: *const HostMemory,
+    /// On Linux: HeapTracker wrapping HostMemory for separate heap fault handling.
+    /// Upstream: `std::optional<Common::HeapTracker> heap_tracker` + `HeapTracker* buffer`.
+    #[cfg(target_os = "linux")]
+    heap_tracker: Option<Box<HeapTracker>>,
     /// Current page table (set by SetCurrentPageTable when switching processes).
     current_page_table: *mut PageTable,
 }
@@ -46,6 +52,8 @@ impl Memory {
         Self {
             device_memory,
             buffer,
+            #[cfg(target_os = "linux")]
+            heap_tracker: None,
             current_page_table: std::ptr::null_mut(),
         }
     }
@@ -66,6 +74,15 @@ impl Memory {
             // else
             //     page_table.fastmem_arena = nullptr;
             pt.fastmem_arena = unsafe { (*self.buffer).virtual_base_pointer() };
+
+            // On Linux, create a HeapTracker wrapping the HostMemory buffer.
+            // Upstream: heap_tracker.emplace(system.DeviceMemory().buffer);
+            //           buffer = std::addressof(*heap_tracker);
+            #[cfg(target_os = "linux")]
+            {
+                let host_mem = unsafe { &mut *(self.buffer as *mut HostMemory) };
+                self.heap_tracker = Some(Box::new(HeapTracker::new(host_mem)));
+            }
         }
     }
 
@@ -116,6 +133,19 @@ impl Memory {
         );
 
         if !page_table.fastmem_arena.is_null() {
+            // Upstream: buffer->Map(base, target - DramBase, size, perms, separate_heap)
+            // On Linux, buffer is HeapTracker*; on non-Linux, buffer is HostMemory*.
+            #[cfg(target_os = "linux")]
+            if let Some(ref heap_tracker) = self.heap_tracker {
+                heap_tracker.map(
+                    base as usize,
+                    (target - dram_memory_map::BASE) as usize,
+                    size as usize,
+                    perms,
+                    separate_heap,
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
             unsafe {
                 (*self.buffer).map(
                     base as usize,
@@ -144,6 +174,11 @@ impl Memory {
         self.map_pages(page_table, base / PAGE_SIZE, size / PAGE_SIZE, 0, PageType::Unmapped);
 
         if !page_table.fastmem_arena.is_null() {
+            #[cfg(target_os = "linux")]
+            if let Some(ref heap_tracker) = self.heap_tracker {
+                heap_tracker.unmap(base as usize, size as usize, separate_heap);
+            }
+            #[cfg(not(target_os = "linux"))]
             unsafe {
                 (*self.buffer).unmap(base as usize, size as usize, separate_heap);
             }
@@ -182,13 +217,7 @@ impl Memory {
             match page_type {
                 PageType::RasterizerCachedMemory => {
                     if protect_bytes > 0 {
-                        unsafe {
-                            (*self.buffer).protect(
-                                protect_begin as usize,
-                                protect_bytes as usize,
-                                perms,
-                            );
-                        }
+                        self.protect_buffer(protect_begin as usize, protect_bytes as usize, perms);
                         protect_bytes = 0;
                     }
                 }
@@ -204,13 +233,7 @@ impl Memory {
         }
 
         if protect_bytes > 0 {
-            unsafe {
-                (*self.buffer).protect(
-                    protect_begin as usize,
-                    protect_bytes as usize,
-                    perms,
-                );
-            }
+            self.protect_buffer(protect_begin as usize, protect_bytes as usize, perms);
         }
     }
 
@@ -223,6 +246,18 @@ impl Memory {
     /// Matches upstream `Memory::Impl::GetPointerImpl`.
     ///
     /// Returns null if the page is unmapped.
+    /// Route protect calls through HeapTracker on Linux, HostMemory otherwise.
+    fn protect_buffer(&self, offset: usize, size: usize, perms: MemoryPermission) {
+        #[cfg(target_os = "linux")]
+        if let Some(ref heap_tracker) = self.heap_tracker {
+            heap_tracker.protect(offset, size, perms);
+            return;
+        }
+        unsafe {
+            (*self.buffer).protect(offset, size, perms);
+        }
+    }
+
     #[inline]
     fn get_pointer_impl(&self, vaddr: u64) -> *mut u8 {
         // AARCH64 masks the upper 16 bits of all memory accesses.
@@ -649,6 +684,26 @@ impl Memory {
             return false;
         }
         self.write_exclusive_64(vaddr + 8, value_hi, expected_hi)
+    }
+
+    /// Invalidate a separate heap fault address.
+    ///
+    /// Upstream: `Memory::InvalidateSeparateHeap(void* fault_address)` (memory.cpp:1104).
+    /// On Linux, delegates to `HeapTracker::DeferredMapSeparateHeap(fault_address)`.
+    /// On non-Linux, returns false.
+    pub fn invalidate_separate_heap(&self, fault_address: *const u8) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ref heap_tracker) = self.heap_tracker {
+                return heap_tracker.deferred_map_separate_heap(fault_address);
+            }
+            false
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = fault_address;
+            false
+        }
     }
 
     /// Internal: update page table entries for a range of pages.

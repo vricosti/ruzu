@@ -4,6 +4,10 @@
 //! Port of zuyu/src/core/arm/exclusive_monitor.h and exclusive_monitor.cpp
 //! ExclusiveMonitor for atomic operations.
 
+use crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor;
+use crate::memory::memory::Memory;
+use std::sync::{Arc, Mutex};
+
 /// Type alias for virtual addresses
 pub type VAddr = u64;
 
@@ -27,15 +31,21 @@ pub trait ExclusiveMonitor {
 
 /// Factory function for creating an exclusive monitor.
 ///
-/// Corresponds to upstream `Core::MakeExclusiveMonitor`.
-/// On supported architectures (x86_64, arm64), this would create a
-/// DynarmicExclusiveMonitor. Currently returns None as a placeholder.
+/// Corresponds to upstream `Core::MakeExclusiveMonitor` (exclusive_monitor.cpp).
+/// On x86_64/aarch64, creates a DynarmicExclusiveMonitor backed by
+/// `rdynarmic::ExclusiveMonitor`.
 pub fn make_exclusive_monitor(
-    _memory: &mut dyn std::any::Any, // TODO: Core::Memory::Memory
-    _num_cores: usize,
+    memory: Arc<Mutex<Memory>>,
+    num_cores: usize,
 ) -> Option<Box<dyn ExclusiveMonitor>> {
-    // TODO: Create DynarmicExclusiveMonitor when rdynarmic is integrated
-    // #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    // { return Some(Box::new(DynarmicExclusiveMonitor::new(memory, num_cores))); }
-    None
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        Some(Box::new(DynarmicExclusiveMonitor::new(memory, num_cores)))
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        // Upstream TODO(merry): Passthrough exclusive monitor
+        let _ = (memory, num_cores);
+        None
+    }
 }
