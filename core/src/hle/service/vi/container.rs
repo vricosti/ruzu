@@ -7,9 +7,13 @@
 //! The Container manages displays, layers, and the binder/surface flinger
 //! infrastructure. It is the central coordinator for the VI service.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::SessionRequestHandler;
+use crate::hle::service::nvnflinger::hos_binder_driver::IHosBinderDriver;
+use crate::hle::service::nvnflinger::hos_binder_driver_server::HosBinderDriverServer;
+use crate::hle::service::nvnflinger::surface_flinger::SurfaceFlinger;
 
 use super::conductor::Conductor;
 use super::display_list::DisplayList;
@@ -19,18 +23,18 @@ use super::vi_types::DisplayName;
 
 /// Container manages displays, layers, binder driver, and surface flinger.
 ///
-/// In upstream C++, the Container owns:
-/// - DisplayList (the set of displays)
-/// - LayerList (the set of layers)
-/// - IHOSBinderDriver (binder interface)
-/// - SurfaceFlinger (compositor)
-/// - SharedBufferManager
-/// - Conductor (vsync manager)
-///
-/// Full construction depends on the system service manager and nvdrv
-/// infrastructure.
+/// Upstream constructor:
+/// 1. Creates displays: Default, External, Edid, Internal, Null
+/// 2. Creates HosBinderDriverServer + SurfaceFlinger
+/// 3. Gets nvdrv module for SharedBufferManager
+/// 4. Registers all displays with SurfaceFlinger
+/// 5. Creates the Conductor (vsync manager)
 pub struct Container {
     inner: Mutex<ContainerInner>,
+    /// Binder server — shared with SurfaceFlinger and IHOSBinderDriver.
+    server: Arc<HosBinderDriverServer>,
+    /// Surface compositor.
+    surface_flinger: Arc<SurfaceFlinger>,
 }
 
 struct ContainerInner {
@@ -42,12 +46,6 @@ struct ContainerInner {
 
 impl Container {
     /// Create a new Container with the standard display set.
-    ///
-    /// In upstream, this:
-    /// 1. Creates displays: Default, External, Edid, Internal, Null
-    /// 2. Gets the binder driver from the service manager
-    /// 3. Creates the SharedBufferManager
-    /// 4. Creates the Conductor
     pub fn new() -> Self {
         let mut displays = DisplayList::default();
         let default_name = Self::make_display_name(b"Default");
@@ -67,6 +65,15 @@ impl Container {
             display_ids.push(d.get_id());
         });
 
+        // Create binder server and surface flinger (matches upstream Container constructor)
+        let server = HosBinderDriverServer::new();
+        let surface_flinger = SurfaceFlinger::new(Arc::clone(&server));
+
+        // Register all displays with the surface flinger
+        for &id in &display_ids {
+            surface_flinger.add_display(id);
+        }
+
         let conductor = Conductor::new(&display_ids);
 
         Self {
@@ -76,6 +83,8 @@ impl Container {
                 conductor: Some(conductor),
                 is_shut_down: false,
             }),
+            server,
+            surface_flinger,
         }
     }
 
@@ -86,11 +95,18 @@ impl Container {
         display_name
     }
 
+    /// Get the binder driver service.
+    /// Upstream: Container owns IHOSBinderDriver and returns it via GetBinderDriver().
+    pub fn get_binder_driver(&self) -> Arc<dyn SessionRequestHandler> {
+        Arc::new(IHosBinderDriver::new(
+            Arc::clone(&self.server),
+            Arc::clone(&self.surface_flinger),
+        ))
+    }
+
     pub fn on_terminate(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.is_shut_down = true;
-        // In upstream, this destroys all layers and removes all displays
-        // from the surface flinger.
     }
 
     pub fn open_display(&self, display_name: &DisplayName) -> Result<u64, ResultCode> {
@@ -111,12 +127,11 @@ impl Container {
         owner_aruid: u64,
     ) -> Result<u64, ResultCode> {
         let mut inner = self.inner.lock().unwrap();
-        Self::create_layer_locked(&mut inner, display_id, owner_aruid)
+        Self::create_layer_locked(&self.surface_flinger, &mut inner, display_id, owner_aruid)
     }
 
     pub fn destroy_managed_layer(&self, layer_id: u64) -> Result<(), ResultCode> {
         let mut inner = self.inner.lock().unwrap();
-        // Try to close, if open, but don't fail if not.
         let _ = Self::close_layer_locked(&mut inner, layer_id);
         Self::destroy_layer_locked(&mut inner, layer_id)
     }
@@ -133,7 +148,7 @@ impl Container {
 
     pub fn create_stray_layer(&self, display_id: u64) -> Result<(i32, u64), ResultCode> {
         let mut inner = self.inner.lock().unwrap();
-        let layer_id = Self::create_layer_locked(&mut inner, display_id, 0)?;
+        let layer_id = Self::create_layer_locked(&self.surface_flinger, &mut inner, display_id, 0)?;
         let producer_binder_id = Self::open_layer_locked(&mut inner, layer_id, 0)?;
         Ok((producer_binder_id, layer_id))
     }
@@ -149,7 +164,6 @@ impl Container {
         if inner.layers.get_layer_by_id(layer_id).is_none() {
             return Err(vi_results::RESULT_NOT_FOUND);
         }
-        // In upstream, delegates to surface_flinger.SetLayerVisibility().
         Ok(())
     }
 
@@ -158,7 +172,6 @@ impl Container {
         if inner.layers.get_layer_by_id(layer_id).is_none() {
             return Err(vi_results::RESULT_NOT_FOUND);
         }
-        // In upstream, delegates to surface_flinger.SetLayerBlending().
         Ok(())
     }
 
@@ -177,6 +190,7 @@ impl Container {
     }
 
     fn create_layer_locked(
+        surface_flinger: &Arc<SurfaceFlinger>,
         inner: &mut ContainerInner,
         display_id: u64,
         owner_aruid: u64,
@@ -185,11 +199,8 @@ impl Container {
             return Err(vi_results::RESULT_NOT_FOUND);
         }
 
-        // In upstream, creates buffer queues via surface_flinger, then creates a layer.
-        // For now, use placeholder binder IDs since full buffer queue creation
-        // depends on the SurfaceFlinger infrastructure.
-        let consumer_binder_id = 0;
-        let producer_binder_id = 0;
+        // Create buffer queues via surface flinger (matches upstream).
+        let (consumer_binder_id, producer_binder_id) = surface_flinger.create_buffer_queue();
 
         let layer = inner
             .layers

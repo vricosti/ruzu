@@ -52,15 +52,22 @@ impl SurfaceFlinger {
     /// Returns (consumer_binder_id, producer_binder_id).
     pub fn create_buffer_queue(&self) -> (i32, i32) {
         let core = BufferQueueCore::new();
-        let consumer = Arc::new(BufferQueueConsumer::new(Arc::clone(&core)));
-        let producer = Arc::new(BufferQueueProducer::new(Arc::clone(&core)));
+        let _consumer = Arc::new(BufferQueueConsumer::new(Arc::clone(&core)));
+        let _producer = Arc::new(BufferQueueProducer::new(Arc::clone(&core)));
 
-        // Register in the binder server
-        // Note: BufferQueueConsumer and BufferQueueProducer do not implement IBinder
-        // trait directly in this port. In a full port they would. For now we return
-        // sequential IDs.
-        let consumer_id = 0; // Placeholder - full port needs IBinder impl
-        let producer_id = 0; // Placeholder - full port needs IBinder impl
+        // Register stub binders in the server. In a full port, BufferQueueProducer
+        // and BufferQueueConsumer would implement IBinder directly. For now we
+        // register stub binders that handle TransactParcel calls gracefully.
+        let consumer_binder: Arc<dyn super::binder::IBinder> = Arc::new(StubBinder::new("consumer"));
+        let producer_binder: Arc<dyn super::binder::IBinder> = Arc::new(StubBinder::new("producer"));
+
+        let consumer_id = self.server.register_binder(consumer_binder);
+        let producer_id = self.server.register_binder(producer_binder);
+
+        log::info!(
+            "SurfaceFlinger::create_buffer_queue consumer_id={}, producer_id={}",
+            consumer_id, producer_id
+        );
 
         (consumer_id, producer_id)
     }
@@ -144,5 +151,49 @@ impl SurfaceFlinger {
         *out_compose_speed_scale = 1.0;
 
         true
+    }
+}
+
+/// Stub IBinder implementation for buffer queue endpoints.
+/// Returns empty parcel responses for all transactions. This allows the game
+/// to proceed through binder setup without crashing, even though no real
+/// buffer exchange occurs yet.
+struct StubBinder {
+    name: String,
+}
+
+impl StubBinder {
+    fn new(name: &str) -> Self {
+        Self { name: name.to_string() }
+    }
+}
+
+impl super::binder::IBinder for StubBinder {
+    fn transact(&self, code: u32, _parcel_data: &[u8], parcel_reply: &mut [u8], _flags: u32) {
+        log::warn!("StubBinder({}): transact code={} (STUBBED)", self.name, code);
+        // Write a minimal valid empty parcel response so the caller doesn't read garbage.
+        // Parcel format: header (16 bytes) = data_size, data_offset, objects_size, objects_offset
+        if parcel_reply.len() >= 16 {
+            // data_size = 4 (one u32 status = 0), data_offset = 16, objects_size = 0, objects_offset = 20
+            let data_size: u32 = 4;
+            let data_offset: u32 = 16;
+            let objects_size: u32 = 0;
+            let objects_offset: u32 = data_offset + data_size;
+
+            parcel_reply[0..4].copy_from_slice(&data_size.to_le_bytes());
+            parcel_reply[4..8].copy_from_slice(&data_offset.to_le_bytes());
+            parcel_reply[8..12].copy_from_slice(&objects_size.to_le_bytes());
+            parcel_reply[12..16].copy_from_slice(&objects_offset.to_le_bytes());
+
+            // Write a status word = 0 (success)
+            if parcel_reply.len() >= 20 {
+                parcel_reply[16..20].copy_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+
+    fn get_native_handle(&self, _type_id: u32) -> Option<u32> {
+        log::warn!("StubBinder({}): get_native_handle (STUBBED)", self.name);
+        None
     }
 }
