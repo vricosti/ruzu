@@ -136,6 +136,27 @@ impl FileSystemController {
         registrations.get(&process_id).map(|r| r.program_id)
     }
 
+    /// Get modification load root for a given title.
+    /// Upstream: `FileSystemController::GetModificationLoadRoot`.
+    pub fn get_modification_load_root(&self, title_id: u64) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+        log::trace!("Opening mod load root for tid={:016X}", title_id);
+        self.bis_factory.as_ref()?.get_modification_load_root(title_id)
+    }
+
+    /// Get SDMC modification load root for a given title.
+    /// Upstream: `FileSystemController::GetSDMCModificationLoadRoot`.
+    pub fn get_sdmc_modification_load_root(&self, _title_id: u64) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+        // Upstream delegates to sdmc_factory which is not yet ported.
+        None
+    }
+
+    /// Get modification dump root for a given title.
+    /// Upstream: `FileSystemController::GetModificationDumpRoot`.
+    pub fn get_modification_dump_root(&self, title_id: u64) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+        log::trace!("Opening mod dump root for tid={:016X}", title_id);
+        self.bis_factory.as_ref()?.get_modification_dump_root(title_id)
+    }
+
     pub fn create_factories(&mut self) {
         // Upstream creates SDMCFactory and BISFactory using the VfsFilesystem.
         // TODO: Wire up VfsFilesystem factories when FileSys crate is ported.

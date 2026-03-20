@@ -199,17 +199,45 @@ impl BisFactory {
     /// Open a BIS partition storage (decrypted).
     ///
     /// Corresponds to upstream `BISFactory::OpenPartitionStorage`.
-    /// Requires the full crypto pipeline (PartitionDataManager, KeyManager)
-    /// to be wired up for decryption.
+    /// Uses PartitionDataManager and KeyManager to decrypt prodinfo and
+    /// package2 partitions.
     pub fn open_partition_storage(
         &self,
-        _id: BisPartitionId,
-        _file_system: VirtualFilesystem,
+        id: BisPartitionId,
+        file_system: VirtualFilesystem,
     ) -> Option<VirtualFile> {
-        // TODO: Requires PartitionDataManager and KeyManager crypto pipeline.
-        // Upstream decrypts prodinfo and package2 partitions here.
-        log::warn!("BISFactory::OpenPartitionStorage: crypto pipeline not yet wired");
-        None
+        use crate::crypto::key_manager::KeyManager;
+        use crate::crypto::partition_data_manager::{Package2Type, PartitionDataManager};
+        use common::fs::path_util::{get_ruzu_path_string, RuzuPath};
+
+        let nand_dir_path = get_ruzu_path_string(RuzuPath::NANDDir);
+        let nand_dir = file_system.open_directory(&nand_dir_path, super::fs_filesystem::OpenMode::READ)?;
+
+        let mut pdm = PartitionDataManager::new(&nand_dir);
+
+        let keys = KeyManager::instance();
+        let mut keys_guard = keys.lock().unwrap();
+        keys_guard.populate_from_partition_data(&mut pdm);
+
+        match id {
+            BisPartitionId::CalibrationBinary => {
+                pdm.get_decrypted_prodinfo().cloned()
+            }
+            BisPartitionId::BootConfigAndPackage2Part1
+            | BisPartitionId::BootConfigAndPackage2Part2
+            | BisPartitionId::BootConfigAndPackage2Part3
+            | BisPartitionId::BootConfigAndPackage2Part4
+            | BisPartitionId::BootConfigAndPackage2Part5
+            | BisPartitionId::BootConfigAndPackage2Part6 => {
+                let new_id = (id as u8)
+                    - (BisPartitionId::BootConfigAndPackage2Part1 as u8)
+                    + (Package2Type::NormalMain as u8);
+                // Safety: new_id is within Package2Type range (0..6).
+                let pkg_type: Package2Type = unsafe { std::mem::transmute(new_id as usize) };
+                pdm.get_package2_raw(pkg_type).cloned()
+            }
+            _ => None,
+        }
     }
 
     /// Get the image (album) directory.
