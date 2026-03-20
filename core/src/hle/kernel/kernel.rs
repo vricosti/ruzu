@@ -220,8 +220,9 @@ impl KernelCore {
     }
 
     /// Close all active services.
+    /// Upstream iterates server_managers and closes each.
     pub fn close_services(&self) {
-        // TODO: Clear server managers.
+        // Server managers are not yet tracked in KernelCore; no-op until wired.
     }
 
     /// Get the global scheduler context (Arc reference).
@@ -318,7 +319,7 @@ impl KernelCore {
                 // In single-core mode, the single core thread ID maps to the
                 // current core index. Upstream reads system.GetCpuManager().CurrentCore().
                 // We return 0 as default; CpuManager.current_core rotates this.
-                // TODO: wire to actual CpuManager.current_core() when System ref is available.
+                // Upstream: system.GetCpuManager().CurrentCore(). Defaults to 0 until wired.
                 return 0;
             }
             this_id

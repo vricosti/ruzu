@@ -227,7 +227,11 @@ impl KSessionRequest {
     /// Finalize the request, releasing references.
     pub fn finalize(&mut self) {
         self.mappings.finalize();
-        // TODO: Close thread, event, server refs
+        // Upstream: Close thread, event, and server process references.
+        // Reference-counted handles are cleared here.
+        self.thread_id = None;
+        self.event_id = None;
+        self.server_process_id = None;
     }
 }
 
