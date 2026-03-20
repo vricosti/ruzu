@@ -1,6 +1,6 @@
 //! Port of zuyu/src/core/hle/kernel/svc/svc_condition_variable.cpp
-//! Status: COMPLET (stubs for kernel calls)
-//! Derniere synchro: 2026-03-11
+//! Status: COMPLET
+//! Derniere synchro: 2026-03-20
 //!
 //! SVC handlers for condition variable operations.
 
@@ -31,11 +31,16 @@ pub fn wait_process_wide_key_atomic(
     }
 
     // Convert timeout from nanoseconds to ticks.
-    let _timeout: i64 = if timeout_ns > 0 {
+    // Upstream: kernel.HardwareTimer().GetTick() + offset_tick + 2
+    let timeout: i64 = if timeout_ns > 0 {
         let offset_tick = timeout_ns;
         if offset_tick > 0 {
-            // TODO: kernel.HardwareTimer().GetTick() + offset_tick + 2
-            let t = offset_tick + 2;
+            let hardware_tick = system
+                .kernel()
+                .and_then(|k| k.hardware_timer())
+                .map(|ht| ht.lock().unwrap().get_tick())
+                .unwrap_or(0);
+            let t = hardware_tick + offset_tick + 2;
             if t <= 0 { i64::MAX } else { t }
         } else {
             i64::MAX
@@ -48,12 +53,13 @@ pub fn wait_process_wide_key_atomic(
         return RESULT_INVALID_HANDLE;
     };
 
+    // Upstream: Common::AlignDown(cv_key, sizeof(u32)) — aligns down to 4-byte boundary.
     let aligned_cv_key = cv_key & !3u64;
     let result = system
         .current_process_arc()
         .lock()
         .unwrap()
-        .wait_condition_variable(&current_thread, address, aligned_cv_key, tag, _timeout);
+        .wait_condition_variable(&current_thread, address, aligned_cv_key, tag, timeout);
 
     ResultCode::new(result)
 }
@@ -65,6 +71,7 @@ pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
         cv_key, count
     );
 
+    // Upstream: Common::AlignDown(cv_key, sizeof(u32))
     let aligned_cv_key = cv_key & !3u64;
     system.current_process_arc()
         .lock()

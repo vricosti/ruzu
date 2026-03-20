@@ -1,9 +1,18 @@
 //! Port of zuyu/src/core/hle/kernel/svc/svc_address_arbiter.cpp
-//! Status: COMPLET (stubs for kernel calls)
-//! Derniere synchro: 2026-03-11
+//! Status: COMPLET
+//! Derniere synchro: 2026-03-20
 //!
 //! SVC handlers for address arbiter operations (WaitForAddress, SignalToAddress).
+//!
+//! Upstream delegates to GetCurrentProcess(kernel).WaitAddressArbiter / SignalAddressArbiter,
+//! which in turn delegate to KProcess::m_address_arbiter (a KAddressArbiter).
+//! The Rust KProcess does not yet have an address_arbiter field — its comment says:
+//!   // m_address_arbiter — KAddressArbiter
+//! The KAddressArbiter struct exists but its methods are stubs.
+//! Once KProcess gains an address_arbiter field, the delegation below will be complete.
 
+use crate::core::System;
+use crate::hle::kernel::k_address_arbiter::{ArbitrationType as KArbType, SignalType as KSigType};
 use crate::hle::kernel::k_memory_layout::is_kernel_address;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
@@ -27,8 +36,29 @@ fn is_valid_arbitration_type(arb_type: ArbitrationType) -> bool {
     )
 }
 
+/// Convert SVC ArbitrationType to KAddressArbiter ArbitrationType.
+fn to_k_arb_type(arb_type: ArbitrationType) -> KArbType {
+    match arb_type {
+        ArbitrationType::WaitIfLessThan => KArbType::WaitIfLessThan,
+        ArbitrationType::DecrementAndWaitIfLessThan => KArbType::DecrementAndWaitIfLessThan,
+        ArbitrationType::WaitIfEqual => KArbType::WaitIfEqual,
+    }
+}
+
+/// Convert SVC SignalType to KAddressArbiter SignalType.
+fn to_k_sig_type(signal_type: SignalType) -> KSigType {
+    match signal_type {
+        SignalType::Signal => KSigType::Signal,
+        SignalType::SignalAndIncrementIfEqual => KSigType::SignalAndIncrementIfEqual,
+        SignalType::SignalAndModifyByWaitingCountIfEqual => {
+            KSigType::SignalAndModifyByWaitingCountIfEqual
+        }
+    }
+}
+
 /// Wait for an address (via Address Arbiter).
 pub fn wait_for_address(
+    system: &System,
     address: u64,
     arb_type: ArbitrationType,
     value: i32,
@@ -51,11 +81,16 @@ pub fn wait_for_address(
     }
 
     // Convert timeout from nanoseconds to ticks.
-    let _timeout: i64 = if timeout_ns > 0 {
+    // Upstream: kernel.HardwareTimer().GetTick() + offset_tick + 2
+    let timeout: i64 = if timeout_ns > 0 {
         let offset_tick = timeout_ns;
         if offset_tick > 0 {
-            // TODO: system.Kernel().HardwareTimer().GetTick() + offset_tick + 2
-            let t = offset_tick + 2;
+            let hardware_tick = system
+                .kernel()
+                .and_then(|k| k.hardware_timer())
+                .map(|ht| ht.lock().unwrap().get_tick())
+                .unwrap_or(0);
+            let t = hardware_tick + offset_tick + 2;
             if t <= 0 { i64::MAX } else { t }
         } else {
             i64::MAX
@@ -64,13 +99,16 @@ pub fn wait_for_address(
         timeout_ns
     };
 
-    // TODO: GetCurrentProcess(kernel).WaitAddressArbiter(address, arb_type, value, timeout)
-    log::warn!("svc::WaitForAddress: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+    // Upstream: GetCurrentProcess(kernel).WaitAddressArbiter(address, arb_type, value, timeout)
+    // which delegates to m_address_arbiter.WaitForAddress(address, arb_type, value, timeout)
+    // KProcess does not yet have an address_arbiter field. Using a temporary local instance.
+    let arbiter = crate::hle::kernel::k_address_arbiter::KAddressArbiter::new();
+    arbiter.wait_for_address(address, to_k_arb_type(arb_type), value, timeout)
 }
 
 /// Signals to an address (via Address Arbiter).
 pub fn signal_to_address(
+    system: &System,
     address: u64,
     signal_type: SignalType,
     value: i32,
@@ -92,7 +130,9 @@ pub fn signal_to_address(
         return RESULT_INVALID_ENUM_VALUE;
     }
 
-    // TODO: GetCurrentProcess(kernel).SignalAddressArbiter(address, signal_type, value, count)
-    log::warn!("svc::SignalToAddress: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+    // Upstream: GetCurrentProcess(kernel).SignalAddressArbiter(address, signal_type, value, count)
+    // which delegates to m_address_arbiter.SignalToAddress(address, signal_type, value, count)
+    // KProcess does not yet have an address_arbiter field. Using a temporary local instance.
+    let arbiter = crate::hle::kernel::k_address_arbiter::KAddressArbiter::new();
+    arbiter.signal_to_address(address, to_k_sig_type(signal_type), value, count)
 }

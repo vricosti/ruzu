@@ -1,6 +1,6 @@
 //! Port of zuyu/src/core/hle/kernel/svc/svc_synchronization.cpp
-//! Status: COMPLET (stubs for kernel calls)
-//! Derniere synchro: 2026-03-11
+//! Status: COMPLET
+//! Derniere synchro: 2026-03-20
 //!
 //! SVC handlers for synchronization operations (CloseHandle, ResetSignal,
 //! WaitSynchronization, CancelSynchronization, SynchronizePreemptionState).
@@ -131,9 +131,39 @@ pub fn cancel_synchronization(system: &System, handle: Handle) -> ResultCode {
 }
 
 /// Synchronizes preemption state.
-pub fn synchronize_preemption_state() {
-    // TODO: Lock scheduler, check if current thread is pinned, clear interrupt flag, unpin.
-    log::warn!("svc::SynchronizePreemptionState: kernel object access not yet implemented");
+///
+/// Upstream: Lock scheduler, check if current thread is pinned on the current core,
+/// clear interrupt flag, unpin.
+pub fn synchronize_preemption_state(system: &System) {
+    // Lock the scheduler.
+    let scheduler = system.scheduler_arc().lock().unwrap();
+
+    // Get the current core ID and current thread.
+    let core_id = match system.kernel() {
+        Some(k) => k.current_physical_core_index() as i32,
+        None => return,
+    };
+
+    let current_thread_id = match scheduler.get_scheduler_current_thread_id() {
+        Some(id) => id,
+        None => return,
+    };
+    drop(scheduler);
+
+    let mut process = system.current_process_arc().lock().unwrap();
+
+    // If the current thread is pinned, unpin it.
+    if let Some(pinned_id) = process.get_pinned_thread(core_id) {
+        if pinned_id == current_thread_id {
+            // Clear the current thread's interrupt flag.
+            if let Some(thread) = process.get_thread_by_thread_id(current_thread_id) {
+                thread.lock().unwrap().clear_interrupt_flag();
+            }
+
+            // Unpin the current thread.
+            process.unpin_current_thread(core_id, current_thread_id);
+        }
+    }
 }
 
 #[cfg(test)]
