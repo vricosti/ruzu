@@ -8,7 +8,7 @@ use common::ResultCode;
 use crate::hid_result;
 use crate::hid_types::*;
 use crate::hid_util;
-use crate::resources::applet_resource::ARUID_INDEX_MAX;
+use crate::resources::applet_resource::{DataStatusFlag, RegistrationStatus, ARUID_INDEX_MAX, SYSTEM_ARUID};
 use crate::resources::npad::npad_data::NPadData;
 use crate::resources::npad::npad_types::*;
 
@@ -19,9 +19,11 @@ pub struct NPadResource {
     default_hold_type: NpadJoyHoldType,
     ref_counter: i32,
     state: Vec<NpadState>,
+    registration_list: NpadRegistrationList,
 }
 
 struct NpadState {
+    flag: DataStatusFlag,
     aruid: u64,
     data: NPadData,
     npad_revision: NpadRevision,
@@ -30,9 +32,25 @@ struct NpadState {
 impl Default for NpadState {
     fn default() -> Self {
         Self {
+            flag: DataStatusFlag::default(),
             aruid: 0,
             data: NPadData::new(),
             npad_revision: NpadRevision::Revision0,
+        }
+    }
+}
+
+/// Registration list for NpadResource, matching AppletResource's pattern.
+struct NpadRegistrationList {
+    flag: [RegistrationStatus; ARUID_INDEX_MAX],
+    aruid: [u64; ARUID_INDEX_MAX],
+}
+
+impl Default for NpadRegistrationList {
+    fn default() -> Self {
+        Self {
+            flag: [RegistrationStatus::None; ARUID_INDEX_MAX],
+            aruid: [0u64; ARUID_INDEX_MAX],
         }
     }
 }
@@ -49,6 +67,7 @@ impl Default for NPadResource {
             default_hold_type: NpadJoyHoldType::Vertical,
             ref_counter: 0,
             state,
+            registration_list: NpadRegistrationList::default(),
         }
     }
 }
@@ -256,4 +275,117 @@ impl NPadResource {
         }
         hid_result::RESULT_ARUID_NOT_REGISTERED
     }
+
+    /// Port of NPadResource::RegisterAppletResourceUserId.
+    pub fn register_applet_resource_user_id(&mut self, aruid: u64) -> ResultCode {
+        let aruid_index = self.get_index_from_aruid(aruid);
+        if aruid_index.is_some() {
+            return hid_result::RESULT_ARUID_ALREADY_REGISTERED;
+        }
+
+        let mut data_index = None;
+        for i in 0..ARUID_INDEX_MAX {
+            if !self.state[i].flag.is_initialized() {
+                data_index = Some(i);
+                break;
+            }
+        }
+
+        let data_index = match data_index {
+            Some(idx) => idx,
+            None => return hid_result::RESULT_ARUID_NO_AVAILABLE_ENTRIES,
+        };
+
+        self.state[data_index].aruid = aruid;
+        self.state[data_index].flag.set_is_initialized(true);
+
+        // Find registration list slot
+        let mut reg_index = None;
+        for i in 0..ARUID_INDEX_MAX {
+            if self.registration_list.flag[i] == RegistrationStatus::Initialized {
+                if self.registration_list.aruid[i] != aruid {
+                    continue;
+                }
+                reg_index = Some(i);
+                break;
+            }
+            if self.registration_list.flag[i] == RegistrationStatus::None
+                || self.registration_list.flag[i] == RegistrationStatus::PendingDelete
+            {
+                reg_index = Some(i);
+                break;
+            }
+        }
+
+        if let Some(ri) = reg_index {
+            self.registration_list.flag[ri] = RegistrationStatus::Initialized;
+            self.registration_list.aruid[ri] = aruid;
+        }
+
+        ResultCode::SUCCESS
+    }
+
+    /// Port of NPadResource::UnregisterAppletResourceUserId.
+    pub fn unregister_applet_resource_user_id(&mut self, aruid: u64) {
+        let aruid_index = self.get_index_from_aruid(aruid);
+
+        self.free_applet_resource_id(aruid);
+
+        if let Some(idx) = aruid_index {
+            self.state[idx] = NpadState::default();
+            self.registration_list.flag[idx] = RegistrationStatus::PendingDelete;
+        }
+
+        for i in 0..ARUID_INDEX_MAX {
+            if self.registration_list.flag[i] == RegistrationStatus::Initialized {
+                self.active_data_aruid = self.registration_list.aruid[i];
+            }
+        }
+    }
+
+    /// Port of NPadResource::FreeAppletResourceId.
+    pub fn free_applet_resource_id(&mut self, aruid: u64) {
+        let aruid_index = match self.get_index_from_aruid(aruid) {
+            Some(idx) => idx,
+            None => return,
+        };
+
+        self.state[aruid_index].flag.set_is_assigned(false);
+    }
+
+    /// Port of NPadResource::Activate(u64 aruid).
+    pub fn activate_with_aruid(&mut self, aruid: u64) -> ResultCode {
+        let aruid_index = match self.get_index_from_aruid(aruid) {
+            Some(idx) => idx,
+            None => return ResultCode::SUCCESS,
+        };
+
+        if self.state[aruid_index].flag.is_assigned() {
+            return hid_result::RESULT_ARUID_ALREADY_REGISTERED;
+        }
+
+        self.state[aruid_index].flag.set_is_assigned(true);
+        self.state[aruid_index].data.clear_npad_system_common_policy();
+        self.state[aruid_index].npad_revision = NpadRevision::Revision0;
+
+        if self.active_data_aruid == aruid {
+            self.default_hold_type = self.active_data.get_npad_joy_hold_type();
+            self.active_data.set_npad_joy_hold_type(self.default_hold_type);
+        }
+        ResultCode::SUCCESS
+    }
+
+    /// Port of NPadResource::Activate() (no-aruid version).
+    pub fn activate(&mut self) -> ResultCode {
+        if self.ref_counter == i32::MAX - 1 {
+            return hid_result::RESULT_APPLET_RESOURCE_OVERFLOW;
+        }
+        if self.ref_counter == 0 {
+            self.register_applet_resource_user_id(SYSTEM_ARUID);
+            self.activate_with_aruid(SYSTEM_ARUID);
+        }
+        self.ref_counter += 1;
+        ResultCode::SUCCESS
+    }
+
 }
