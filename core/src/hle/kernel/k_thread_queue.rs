@@ -82,16 +82,15 @@ impl KThreadQueue {
 
     pub fn base_end_wait(&self, thread: &mut KThread, wait_result: u32) {
         // Upstream: m_hardware_timer->CancelTask(thread)
-        // Cancels any pending CoreTiming event for this thread's timer task.
-        // In our cooperative model, clearing sleep_deadline + timer_task_time
-        // achieves the same effect. When KThreadQueue gains a real
-        // KHardwareTimer reference (requires removing Copy), use CancelTask.
         thread.sleep_deadline = None;
         thread.timer_task_time = 0;
 
         thread.wait_result = wait_result;
         thread.set_state(super::k_thread::ThreadState::RUNNABLE);
         thread.clear_wait_queue();
+
+        // Unpark the host thread that is blocked in begin_wait.
+        thread.unpark_wait();
     }
 
     pub fn end_wait(&self, thread: &mut KThread, wait_result: u32) {
@@ -104,8 +103,6 @@ impl KThreadQueue {
             cancel_impl(thread);
         }
 
-        // Upstream: if (cancel_timer_task) m_hardware_timer->CancelTask(thread)
-        // See base_end_wait comment for why we clear directly.
         if cancel_timer_task {
             thread.sleep_deadline = None;
             thread.timer_task_time = 0;
@@ -114,6 +111,9 @@ impl KThreadQueue {
         thread.wait_result = wait_result;
         thread.set_state(super::k_thread::ThreadState::RUNNABLE);
         thread.clear_wait_queue();
+
+        // Unpark the host thread that is blocked in begin_wait.
+        thread.unpark_wait();
     }
 }
 

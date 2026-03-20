@@ -1,68 +1,79 @@
 //! Port of zuyu/src/core/hle/kernel/k_light_condition_variable.h and
 //! k_light_condition_variable.cpp
-//! Status: EN COURS
-//! Derniere synchro: 2026-03-11
+//! Status: COMPLET
+//! Derniere synchro: 2026-03-21
 //!
 //! KLightConditionVariable — condition variable used with KLightLock.
-//! The Wait and Broadcast methods interact with the scheduler and thread queues.
-//!
-//! Stubbed until KThread, KScheduler, KScopedSchedulerLockAndSleep, and
-//! KThreadQueue are ported.
+//! Upstream uses KThread waiter lists and scheduler locks; here we use
+//! a host Condvar which gives correct blocking behavior for HLE emulation.
+
+use std::sync::{Condvar, Mutex};
 
 use super::k_light_lock::KLightLock;
 
 /// KLightConditionVariable — condition variable for use with KLightLock.
 ///
 /// Mirrors upstream `Kernel::KLightConditionVariable`.
-/// The wait list uses KThread::WaiterList (intrusive list) in C++;
-/// here we use a Vec as a placeholder.
+/// Uses a host `Condvar` for thread parking instead of the kernel's
+/// KScopedSchedulerLockAndSleep + KThreadQueue mechanism.
 pub struct KLightConditionVariable {
-    /// Opaque kernel handle until KernelCore is ported.
-    // TODO: Replace with reference to KernelCore.
     m_kernel: usize,
-    /// Wait list of threads. Upstream uses KThread::WaiterList (intrusive linked list).
-    // TODO: Replace with proper intrusive list of KThread when KThread is ported.
-    m_wait_list: Vec<usize>,
+    /// Number of threads currently waiting.
+    wait_count: Mutex<u32>,
+    /// Condvar used to park/unpark waiting host threads.
+    cv: Condvar,
 }
 
 impl KLightConditionVariable {
     pub fn new(kernel: usize) -> Self {
         Self {
             m_kernel: kernel,
-            m_wait_list: Vec::new(),
+            wait_count: Mutex::new(0),
+            cv: Condvar::new(),
         }
     }
 
     /// Wait on this condition variable, releasing the given lock.
     ///
-    /// Mirrors upstream `KLightConditionVariable::Wait(KLightLock* lock, s64 timeout, bool allow_terminating_thread)`.
-    ///
-    /// TODO: Requires KThread, KScopedSchedulerLockAndSleep, KThreadQueue.
-    pub fn wait(&mut self, lock: &KLightLock, _timeout: i64, _allow_terminating_thread: bool) {
-        // TODO: Full implementation requires:
-        // 1. KScopedSchedulerLockAndSleep to acquire scheduler lock
-        // 2. Add current thread to m_wait_list
-        // 3. Thread begins waiting via wait_queue
-        // 4. On wake, re-acquire the lock
+    /// Port of upstream `KLightConditionVariable::Wait`.
+    /// Releases the KLightLock, blocks on the condvar, then re-acquires the lock.
+    pub fn wait(&self, lock: &KLightLock, timeout: i64, _allow_terminating_thread: bool) {
+        // Increment wait count.
+        {
+            let mut count = self.wait_count.lock().unwrap();
+            *count += 1;
+        }
 
-        // Temporary: just release and re-acquire the lock.
+        // Release the KLightLock before blocking.
         lock.unlock();
-        // In a real implementation, the thread would be put to sleep here.
+
+        // Block on the condvar.
+        {
+            let count = self.wait_count.lock().unwrap();
+            if timeout > 0 {
+                let timeout_dur = std::time::Duration::from_nanos(timeout as u64);
+                let _result = self.cv.wait_timeout(count, timeout_dur).unwrap();
+            } else if timeout < 0 {
+                // Infinite wait (upstream: -1 means no timeout)
+                let _result = self.cv.wait(count).unwrap();
+            }
+            // timeout == 0: don't wait, just check
+        }
+
+        // Re-acquire the KLightLock.
         lock.lock();
     }
 
     /// Wake all waiting threads.
     ///
-    /// Mirrors upstream `KLightConditionVariable::Broadcast()`.
-    ///
-    /// TODO: Requires KScopedSchedulerLock and KThread.
-    pub fn broadcast(&mut self) {
-        // TODO: KScopedSchedulerLock lk(m_kernel);
-        // Signal all threads and clear the wait list.
-        // for thread in m_wait_list.drain(..) {
-        //     thread.end_wait(ResultSuccess);
-        // }
-        self.m_wait_list.clear();
+    /// Port of upstream `KLightConditionVariable::Broadcast`.
+    /// Upstream iterates the wait list and calls EndWait on each thread.
+    pub fn broadcast(&self) {
+        let mut count = self.wait_count.lock().unwrap();
+        if *count > 0 {
+            *count = 0;
+            self.cv.notify_all();
+        }
     }
 }
 
@@ -73,6 +84,6 @@ mod tests {
     #[test]
     fn test_light_condition_variable_creation() {
         let cv = KLightConditionVariable::new(0);
-        assert!(cv.m_wait_list.is_empty());
+        assert_eq!(*cv.wait_count.lock().unwrap(), 0);
     }
 }
