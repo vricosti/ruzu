@@ -1986,23 +1986,11 @@ impl KProcess {
     /// The behavioral result is identical: by the time
     /// SetProcessMemoryPermission is called, the code pages are CODE.
     pub fn load_module(&mut self, code_set: CodeSet, base_addr: u64) {
-        let code_size = code_set.memory.len();
-
-        // Map the code region as CODE/NONE first — this creates PageTable
-        // entries pointing to DeviceMemory backing.
-        // Upstream: done in KProcess::Initialize via MapPages(code_address,
-        //           code_num_pages, Code, KernelRead|NotMapped).
-        // Here: done at load_module time because only now do we know the
-        //       actual code size (code_set.memory.len()).
-        if code_size > 0 {
-            let num_pages = (code_size + PAGE_SIZE - 1) / PAGE_SIZE;
-            self.page_table.map_pages_at_address(
-                KProcessAddress::new(base_addr),
-                num_pages,
-                KMemoryState::CODE,
-                KMemoryPermission::NONE,
-            );
-        }
+        // Upstream KProcess::LoadModule (k_process.cpp:1237-1261):
+        // 1. WriteBlock — copy code to memory
+        // 2. SetProcessMemoryPermission × 3 — code(RX), rodata(R), data(RW)
+        // No MapPages call here — the code region is already mapped during
+        // Initialize via MapPages(code_address, code_num_pages, Code, KernelRead|NotMapped).
 
         // Write code to DeviceMemory via Memory::write_block.
         // Upstream: this->GetMemory().WriteBlock(base_addr, code_set.memory.data(), ...)

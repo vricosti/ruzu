@@ -304,11 +304,11 @@ impl JitCallbacks for DynarmicCallbacks32 {
             "DynarmicCallbacks32::exception_raised(pc={:#x}, exception={:#x})",
             pc, exception
         );
-        let start = pc.saturating_sub(0x10);
+        let start = pc.saturating_sub(0x40);
         log::error!("DynarmicCallbacks32 exception window around pc={:#x}", pc);
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
-            for addr in (start..=pc.saturating_add(0x10)).step_by(4) {
+            for addr in (start..=pc.saturating_add(0x20)).step_by(4) {
                 if !m.is_valid_virtual_address(addr) {
                     log::error!("  [{:#010x}] <unmapped>", addr);
                     continue;
