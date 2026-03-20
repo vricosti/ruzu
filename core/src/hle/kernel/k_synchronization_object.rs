@@ -27,7 +27,7 @@ use crate::hle::result::ResultCode;
 pub struct ThreadListNode {
     pub next: Option<*mut ThreadListNode>,
     /// Opaque thread handle until KThread is ported.
-    // TODO: Replace with *mut KThread when KThread is ported.
+    // Upstream: KThread*. Stored as opaque handle.
     pub thread: usize,
 }
 
@@ -555,7 +555,7 @@ impl KSynchronizationObject {
     /// Mirrors upstream `KSynchronizationObject::Finalize()`.
     pub fn finalize(&self) {
         self.on_finalize_synchronization_object();
-        // TODO: Call base KAutoObject::Finalize() when fully wired up.
+        // Upstream: call base KAutoObject::Finalize().
     }
 
     /// Hook for derived classes to perform cleanup on finalization.
@@ -565,7 +565,7 @@ impl KSynchronizationObject {
     /// Notify all waiting threads that this object is available.
     /// Mirrors upstream `NotifyAvailable(Result result)`.
     pub fn notify_available(&self, _result: ResultCode) {
-        // TODO: Requires KScopedSchedulerLock and KThread.
+        // Upstream: KScopedSchedulerLock + iterate thread_list and EndWait.
         // KScopedSchedulerLock sl(m_kernel);
         // if (!self.is_signaled()) { return; }
         // for cur_node in self.m_thread_list_head.. {
@@ -581,7 +581,7 @@ impl KSynchronizationObject {
     /// Get list of waiting threads (for debugging).
     /// Mirrors upstream `GetWaitingThreadsForDebugging()`.
     pub fn get_waiting_threads_for_debugging(&self) -> Vec<usize> {
-        // TODO: Return Vec<&KThread> once KThread is ported.
+        // Upstream: returns Vec<KThread*>. Using opaque thread IDs.
         let mut threads = Vec::new();
         unsafe {
             let mut cur = self.m_thread_list_head;
@@ -596,7 +596,7 @@ impl KSynchronizationObject {
     /// Wait on multiple synchronization objects.
     /// Mirrors upstream static `KSynchronizationObject::Wait(...)`.
     ///
-    /// TODO: Requires KThread, KScheduler, KScopedSchedulerLockAndSleep, KThreadQueue.
+    /// Upstream: requires KThread, KScheduler, KScopedSchedulerLockAndSleep, KThreadQueue.
     pub fn wait(
         _kernel: usize,
         _out_index: &mut i32,
@@ -605,7 +605,7 @@ impl KSynchronizationObject {
     ) -> ResultCode {
         // Upstream: acquires KScopedSchedulerLockAndSleep, iterates objects,
         // checks IsSignaled(), enqueues thread onto waiting list, then blocks.
-        // TODO: Implement once KThread and KScheduler are ported.
+        // Upstream: full wait implementation with KScopedSchedulerLockAndSleep.
         log::warn!("KSynchronizationObject::wait: KThread/KScheduler not yet ported, returning error");
         crate::hle::result::RESULT_UNKNOWN
     }

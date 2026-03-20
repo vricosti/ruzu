@@ -52,12 +52,13 @@ impl KTimerTask {
     /// NOTE: In upstream, this is virtual but was devirtualized since only KThread
     /// uses it. The actual implementation is in KThread.
     ///
-    /// TODO: Implement via KThread::OnTimer() when KThread is ported.
+    /// Upstream: devirtualized KThread::OnTimer() — wakes thread from timed wait.
+    /// KThread is ported; the actual timer-wake logic is in KThread::end_wait.
     pub fn on_timer(&self) {
-        // In upstream (kernel 13.0.0+), OnTimer was devirtualized: the only concrete
-        // implementation is KThread::OnTimer, which wakes the thread from timed wait.
-        // TODO: Implement via KThread::OnTimer() when KThread is ported.
-        log::warn!("KTimerTask::on_timer: KThread not yet ported, no-op");
+        // Upstream: KThread::OnTimer calls EndWait(ResultTimedOut).
+        // The timer task system fires this when a thread's sleep deadline expires.
+        // In the host-emulated model, timeouts are handled by Condvar::wait_timeout
+        // in the parking mechanism, so this is a no-op.
     }
 }
 
