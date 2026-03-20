@@ -114,12 +114,12 @@ fn is_dir_valid_and_non_empty(dir: &Option<VirtualDir>) -> bool {
 /// Get the disabled addons list for a title from settings.
 /// Corresponds to upstream `Settings::values.disabled_addons[title_id]`.
 fn get_disabled_addons(title_id: u64) -> Vec<String> {
-    // Settings::Values is not a global singleton in ruzu; it's passed around.
-    // Since PatchManager doesn't hold a reference to Values, we access
-    // the disabled_addons via the default empty list. This matches upstream
-    // behavior when no addons have been disabled.
-    // When a global settings accessor is added, this should delegate to it.
-    Vec::new()
+    let settings = common::settings::values();
+    settings
+        .disabled_addons
+        .get(&title_id)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Apply LayeredFS patches to a RomFS file.
@@ -350,7 +350,7 @@ impl<'a> PatchManager<'a> {
             exefs = layered;
         }
 
-        if *common::settings::Values::default().dump_exefs.get_value() {
+        if *common::settings::values().dump_exefs.get_value() {
             log::info!("Dumping ExeFS for title_id={:016X}", self.title_id);
             if let Some(dump_dir) = self
                 .fs_controller
@@ -446,7 +446,7 @@ impl<'a> PatchManager<'a> {
             .collect();
         let build_id = build_id_raw.trim_end_matches('0').to_string();
 
-        if *common::settings::Values::default().dump_nso.get_value() {
+        if *common::settings::values().dump_nso.get_value() {
             log::info!(
                 "Dumping NSO for name={}, build_id={}, title_id={:016X}",
                 name,
@@ -820,10 +820,14 @@ impl<'a> PatchManager<'a> {
             ApplicationLanguage, LanguageCode as NsLanguageCode,
         };
 
-        // Upstream uses Settings::values.language_index.GetValue() which is a global.
-        // PatchManager currently does not hold a reference to Settings, so we use
-        // the default (index 1 = AmericanEnglish) matching upstream default behavior.
-        let language_code = NsLanguageCode::EN_US;
+        let language_index =
+            *common::settings::values().language_index.get_value() as u32 as usize;
+        let set_language_code =
+            crate::hle::service::set::settings_server::get_language_code_from_index(language_index);
+        // Both settings_types::LanguageCode and ns::language::LanguageCode are #[repr(u64)]
+        // with identical discriminant values — convert via the raw u64.
+        let language_code: NsLanguageCode =
+            unsafe { std::mem::transmute(set_language_code as u64) };
         let application_language = convert_to_application_language(language_code)
             .unwrap_or(ApplicationLanguage::AmericanEnglish);
 

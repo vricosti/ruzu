@@ -148,9 +148,8 @@ pub fn default_frame_layout(width: u32, height: u32) -> FramebufferLayout {
     };
 
     let window_aspect_ratio = height as f32 / width as f32;
-    // Upstream: Settings::values.aspect_ratio.GetValue() cast to AspectRatio.
-    // Settings crate is not yet wired into core; default matches upstream's default setting value.
-    let emulation_aspect_ratio = emulation_aspect_ratio(AspectRatio::Default, window_aspect_ratio);
+    let aspect = AspectRatio::from(*common::settings::values().aspect_ratio.get_value() as u32);
+    let emulation_aspect_ratio = emulation_aspect_ratio(aspect, window_aspect_ratio);
 
     let screen_window_area = Rectangle::new(0, 0, width, height);
     let mut screen = max_rectangle(&screen_window_area, emulation_aspect_ratio);
@@ -169,9 +168,7 @@ pub fn default_frame_layout(width: u32, height: u32) -> FramebufferLayout {
 ///
 /// Corresponds to upstream `Layout::FrameLayoutFromResolutionScale`.
 pub fn frame_layout_from_resolution_scale(res_scale: f32) -> FramebufferLayout {
-    // Upstream: Settings::IsDockedMode().
-    // Settings crate is not yet wired into core; false matches upstream's default (undocked).
-    let is_docked = false;
+    let is_docked = common::settings::is_docked_mode(&common::settings::values());
     let screen_width = if is_docked {
         ScreenDocked::WIDTH
     } else {

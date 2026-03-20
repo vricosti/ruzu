@@ -226,28 +226,21 @@ fn main() {
     // Apply optional per-run overrides.
     // Maps to C++ `Settings::values.program_args = program_args` and
     // `Settings::values.current_user = clamp(*selected_user, 0, 7)`.
-    //
-    // Settings::values not yet ported — log and continue.
     if let Some(ref program_args) = args.program {
-        // Upstream: Settings::values.program_args = program_args
-        log::warn!(
-            "program_args '{}' provided but Settings::values not yet ported; ignoring",
-            program_args
-        );
+        common::settings::values_mut()
+            .program_args
+            .set_value(program_args.clone());
     }
     if let Some(user_index) = args.user {
-        // Upstream: Settings::values.current_user = std::clamp(*selected_user, 0, 7)
-        let clamped = user_index.min(7);
-        log::warn!(
-            "user_index {} (clamped to {}) provided but Settings::values not yet ported; ignoring",
-            user_index,
-            clamped
-        );
+        let clamped = (user_index as i32).clamp(0, 7);
+        common::settings::values_mut()
+            .current_user
+            .set_value(clamped);
     }
 
     // Log configuration settings.
     // Matches upstream: Settings::LogSettings() called in EmuWindow constructor.
-    common::settings::log_settings(&common::settings::Values::default());
+    common::settings::log_settings(&common::settings::values());
 
     // Initialise core system.
     // Maps to C++ `Core::System system{}; system.Initialize(); system.ApplySettings()`.
@@ -312,7 +305,7 @@ fn main() {
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
         let shared_system: audio_core::SharedSystem =
             Arc::new(parking_lot::Mutex::new(ruzu_core::core::System::new()));
-        let settings = Arc::new(common::settings::Values::default());
+        let settings = Arc::new(common::settings::values().clone());
         let ac = audio_core::AudioCore::new(shared_system, settings);
         system.set_audio_core(Box::new(ac));
     }

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use log::{info, warn};
 
@@ -41,6 +42,25 @@ impl Region {
     pub fn from_index(index: u32) -> Self {
         Self::from_u32(index).unwrap_or(Self::Usa)
     }
+}
+
+// ── Global singleton ─────────────────────────────────────────────────────────
+// Matches C++ `extern Values values;` in settings.h / `Values values;` in settings.cpp.
+// Upstream accesses `Settings::values` as a plain global; here we use a
+// `LazyLock<RwLock<Values>>` to satisfy Rust's thread-safety requirements.
+
+static VALUES: LazyLock<RwLock<Values>> = LazyLock::new(|| RwLock::new(Values::default()));
+
+/// Obtain a read-only reference to the global settings.
+/// Equivalent to reading `Settings::values` in C++.
+pub fn values() -> RwLockReadGuard<'static, Values> {
+    VALUES.read().expect("Settings::values lock poisoned")
+}
+
+/// Obtain a mutable reference to the global settings.
+/// Equivalent to writing `Settings::values.field = …` in C++.
+pub fn values_mut() -> RwLockWriteGuard<'static, Values> {
+    VALUES.write().expect("Settings::values lock poisoned")
 }
 
 // ── ResolutionScalingInfo ───────────────────────────────────────────────────
@@ -88,6 +108,7 @@ impl ResolutionScalingInfo {
 
 /// The main settings container matching C++ `Settings::Values`.
 /// All emulator settings live here.
+#[derive(Clone)]
 pub struct Values {
     // ── Applet ──────────────────────────────────────────────────────────
     pub cabinet_applet_mode: Setting<AppletMode>,

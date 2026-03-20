@@ -472,7 +472,8 @@ impl ISystemSettingsServer {
 
     pub fn get_debug_mode_flag(&self) -> bool {
         log::debug!("ISystemSettingsServer::GetDebugModeFlag called");
-        // Upstream reads from Settings::values.use_debug_mode
+        // Upstream reads from GetSettingsItemValueImpl("settings_debug", "is_debug_mode_enabled").
+        // Default to false (non-debug mode).
         false
     }
 

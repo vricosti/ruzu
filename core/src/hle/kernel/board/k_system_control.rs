@@ -33,10 +33,14 @@ const MIB: usize = 1024 * KIB;
 const GIB: usize = 1024 * MIB;
 
 /// Get the memory size enum for the current configuration.
-/// TODO: Read from Settings::values.memory_layout_mode.
+/// Reads from Settings::values.memory_layout_mode.
 fn get_memory_size_for_init() -> MemorySize {
-    // Default to 4GB; should be driven by settings.
-    MemorySize::MemorySize4GB
+    use common::settings::MemoryLayout;
+    match *common::settings::values().memory_layout_mode.get_value() {
+        MemoryLayout::Memory4Gb => MemorySize::MemorySize4GB,
+        MemoryLayout::Memory6Gb => MemorySize::MemorySize6GB,
+        MemoryLayout::Memory8Gb => MemorySize::MemorySize8GB,
+    }
 }
 
 /// Get the memory arrangement for the current configuration.

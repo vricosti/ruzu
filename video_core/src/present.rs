@@ -27,7 +27,7 @@ pub enum AntiAliasing {
 /// Get the current scaling filter from settings.
 /// Upstream: reads `Settings::values.scaling_filter.GetValue()`.
 pub fn get_scaling_filter() -> ScalingFilter {
-    let settings = common::settings::Values::default();
+    let settings = common::settings::values();
     match *settings.scaling_filter.get_value() {
         common::settings_enums::ScalingFilter::NearestNeighbor => ScalingFilter::NearestNeighbor,
         common::settings_enums::ScalingFilter::Bilinear => ScalingFilter::Bilinear,
@@ -42,7 +42,7 @@ pub fn get_scaling_filter() -> ScalingFilter {
 /// Get the current anti-aliasing mode from settings.
 /// Upstream: reads `Settings::values.anti_aliasing.GetValue()`.
 pub fn get_anti_aliasing() -> AntiAliasing {
-    let settings = common::settings::Values::default();
+    let settings = common::settings::values();
     match *settings.anti_aliasing.get_value() {
         common::settings_enums::AntiAliasing::None => AntiAliasing::None,
         common::settings_enums::AntiAliasing::Fxaa => AntiAliasing::Fxaa,
