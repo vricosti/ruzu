@@ -194,9 +194,9 @@ impl KSharedMemory {
             return crate::hle::kernel::svc::svc_results::RESULT_INVALID_SIZE;
         }
 
-        // Upstream checks owner vs user permission. For the current
-        // single-process model, always use user_permission.
-        // TODO: Compare target_process pointer to m_owner_process.
+        // Upstream selects permission based on whether target_process == m_owner_process.
+        // Owner gets m_owner_permission, others get m_user_permission.
+        // No m_owner_process field is stored yet; default to user_permission.
         let _test_perm = self.m_user_permission;
 
         let pg = match &self.m_page_group {

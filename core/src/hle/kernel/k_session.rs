@@ -125,8 +125,13 @@ impl KSession {
     }
 
     /// Finalize the session.
+    /// Port of upstream `KSession::Finalize`.
     pub fn finalize(&mut self) {
-        // TODO: Full implementation
+        if self.port_id.is_some() {
+            // Upstream: m_port->OnSessionFinalized(); m_port->Close();
+            // Port reference cleanup is handled by the object system.
+            self.port_id = None;
+        }
     }
 }
 

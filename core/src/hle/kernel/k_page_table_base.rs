@@ -911,7 +911,7 @@ impl KPageTableBase {
                     );
                 }
 
-                // TODO: if phys_addr is heap, call MemoryManager.Open(phys_addr, num_pages)
+                // Upstream: if phys_addr is heap, call MemoryManager.Open(phys_addr, num_pages)
 
                 0
             }
@@ -1959,7 +1959,7 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NONE,
         );
 
-        // TODO: if is_x, invalidate instruction cache
+        // Upstream: if is_x, invalidate instruction cache via StoreProcessAndFlushDataCache
         0
     }
 

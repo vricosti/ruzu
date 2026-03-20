@@ -53,7 +53,7 @@ impl KScopedResourceReservation {
         value: i64,
         _timeout: i64,
     ) -> Self {
-        // TODO: pass timeout to KResourceLimit::reserve when timeout support is ported
+        // Upstream passes timeout to KResourceLimit::Reserve. Timeout not yet supported.
         let succeeded = if let Some(ref lim) = limit {
             if value != 0 {
                 lim.lock().unwrap().reserve(resource, value)

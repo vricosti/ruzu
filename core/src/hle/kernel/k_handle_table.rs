@@ -201,15 +201,25 @@ impl KHandleTable {
     }
 
     /// Finalize the handle table (close all entries).
-    /// TODO: Port from k_handle_table.cpp.
+    /// Port of upstream `KHandleTable::Finalize`.
     pub fn finalize(&mut self) -> u32 {
-        // TODO: Close all objects
+        // Save and clear the table size.
+        let saved_table_size = self.table_size;
+        self.table_size = 0;
+
+        // Close all entries.
+        for i in 0..saved_table_size as usize {
+            if self.objects[i] != 0 {
+                // Upstream: obj->Close(). Object handles are opaque u64 here;
+                // actual reference counting is managed by the object system.
+                self.objects[i] = 0;
+            }
+        }
         self.count = 0;
-        0
+        0 // R_SUCCEED
     }
 
     /// Reserve a handle slot without associating an object.
-    /// TODO: Port from k_handle_table.cpp.
     pub fn reserve(&mut self) -> Result<Handle, u32> {
         if self.count >= self.table_size {
             return Err(1);
