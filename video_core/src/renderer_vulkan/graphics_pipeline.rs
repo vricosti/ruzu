@@ -13,7 +13,7 @@ use log::{debug, warn};
 
 use crate::engines::maxwell_3d::{DrawCall, ShaderStageType};
 use crate::shader;
-use shader_recompiler::{CompiledShader, PipelineCache, ShaderStage};
+use shader_recompiler::{CompiledShader, PipelineCache, RuntimeInfo, ShaderStage};
 
 use super::fixed_pipeline_state::FixedPipelineState;
 
@@ -133,7 +133,8 @@ impl GraphicsPipelineCache {
             return None;
         }
 
-        let compiled = self.shader_cache.get_or_compile(&code, ShaderStage::Vertex);
+        let runtime_info = RuntimeInfo::default();
+        let compiled = self.shader_cache.get_or_compile(&code, ShaderStage::Vertex, &runtime_info);
         Some(compiled.clone())
     }
 
@@ -153,7 +154,8 @@ impl GraphicsPipelineCache {
             return None;
         }
 
-        let compiled = self.shader_cache.get_or_compile(&code, ShaderStage::Fragment);
+        let runtime_info = RuntimeInfo::default();
+        let compiled = self.shader_cache.get_or_compile(&code, ShaderStage::Fragment, &runtime_info);
         Some(compiled.clone())
     }
 

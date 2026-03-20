@@ -10,6 +10,7 @@
 use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
 use crate::ir::{self, Opcode};
+use crate::ir::types::ShaderStage;
 
 // ── Low-level per-type emit functions (called from other modules) ─────────
 
@@ -301,4 +302,115 @@ pub fn emit_set_frag_depth_inst(
 ) {
     let _val = ctx.resolve_value(inst.arg(0));
     log::trace!("SPIR-V: SetFragDepth not fully implemented (need depth output builtin)");
+}
+
+// ── System value emission (matches upstream Emit* functions) ──────────────
+
+/// Matches upstream `EmitWorkgroupId`.
+pub fn emit_workgroup_id(ctx: &mut SpirvEmitContext) -> Word {
+    ctx.builder
+        .load(ctx.u32_vec3_type, None, ctx.workgroup_id, None, vec![])
+        .unwrap()
+}
+
+/// Matches upstream `EmitLocalInvocationId`.
+pub fn emit_local_invocation_id(ctx: &mut SpirvEmitContext) -> Word {
+    ctx.builder
+        .load(ctx.u32_vec3_type, None, ctx.local_invocation_id, None, vec![])
+        .unwrap()
+}
+
+/// Matches upstream `EmitInvocationId`.
+pub fn emit_invocation_id(ctx: &mut SpirvEmitContext) -> Word {
+    ctx.builder
+        .load(ctx.u32_type, None, ctx.invocation_id, None, vec![])
+        .unwrap()
+}
+
+/// Matches upstream `EmitInvocationInfo`.
+pub fn emit_invocation_info(ctx: &mut SpirvEmitContext) -> Word {
+    match ctx.stage {
+        ShaderStage::TessellationControl | ShaderStage::TessellationEval => {
+            let loaded = ctx
+                .builder
+                .load(ctx.u32_type, None, ctx.patch_vertices_in, None, vec![])
+                .unwrap();
+            let shift = ctx.builder.constant_bit32(ctx.u32_type, 16);
+            ctx.builder
+                .shift_left_logical(ctx.u32_type, None, loaded, shift)
+                .unwrap()
+        }
+        _ => {
+            log::warn!("(STUBBED) EmitInvocationInfo called for non-tessellation stage");
+            ctx.builder.constant_bit32(ctx.u32_type, 0x00ff0000u32)
+        }
+    }
+}
+
+/// Matches upstream `EmitSampleId`.
+pub fn emit_sample_id(ctx: &mut SpirvEmitContext) -> Word {
+    ctx.builder
+        .load(ctx.u32_type, None, ctx.sample_id, None, vec![])
+        .unwrap()
+}
+
+/// Matches upstream `EmitIsHelperInvocation`.
+pub fn emit_is_helper_invocation(ctx: &mut SpirvEmitContext) -> Word {
+    ctx.builder
+        .load(ctx.bool_type, None, ctx.is_helper_invocation, None, vec![])
+        .unwrap()
+}
+
+/// Matches upstream `EmitYDirection`.
+pub fn emit_y_direction(ctx: &mut SpirvEmitContext) -> Word {
+    let value = if ctx.runtime_info.y_negate { -1.0f32 } else { 1.0f32 };
+    ctx.constant_f32(value)
+}
+
+/// Matches upstream `EmitResolutionDownFactor`.
+pub fn emit_resolution_down_factor(ctx: &mut SpirvEmitContext) -> Word {
+    if ctx.profile.unified_descriptor_binding {
+        let pointer_type = ctx
+            .builder
+            .type_pointer(None, rspirv::spirv::StorageClass::PushConstant, ctx.f32_type);
+        let index = ctx
+            .builder
+            .constant_bit32(ctx.u32_type, ctx.rescaling_downfactor_member_index);
+        let pointer = ctx
+            .builder
+            .access_chain(pointer_type, None, ctx.rescaling_push_constants, vec![index])
+            .unwrap();
+        ctx.builder
+            .load(ctx.f32_type, None, pointer, None, vec![])
+            .unwrap()
+    } else {
+        let composite = ctx
+            .builder
+            .load(ctx.f32_vec4_type, None, ctx.rescaling_uniform_constant, None, vec![])
+            .unwrap();
+        ctx.builder
+            .composite_extract(ctx.f32_type, None, composite, vec![2])
+            .unwrap()
+    }
+}
+
+/// Matches upstream `EmitRenderArea`.
+pub fn emit_render_area(ctx: &mut SpirvEmitContext) -> Word {
+    if ctx.profile.unified_descriptor_binding {
+        let pointer_type = ctx
+            .builder
+            .type_pointer(None, rspirv::spirv::StorageClass::PushConstant, ctx.f32_vec4_type);
+        let index = ctx
+            .builder
+            .constant_bit32(ctx.u32_type, ctx.render_are_member_index);
+        let pointer = ctx
+            .builder
+            .access_chain(pointer_type, None, ctx.render_area_push_constant, vec![index])
+            .unwrap();
+        ctx.builder
+            .load(ctx.f32_vec4_type, None, pointer, None, vec![])
+            .unwrap()
+    } else {
+        panic!("EmitRenderArea: non-unified descriptor binding not implemented");
+    }
 }

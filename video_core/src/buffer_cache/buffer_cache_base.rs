@@ -115,7 +115,9 @@ pub struct TextureBufferBinding {
     /// Buffer slot that backs this binding.
     pub buffer_id: BufferId,
     /// Pixel format of the texture buffer view.
-    pub format: u32, // TODO: replace with PixelFormat enum once ported
+    /// Upstream: `PixelFormat format;` — stored as u32 here because callers pass
+    /// raw format IDs from the GPU engine which are u32 throughout the buffer cache.
+    pub format: u32,
 }
 
 impl Default for TextureBufferBinding {

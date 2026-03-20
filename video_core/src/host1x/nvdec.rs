@@ -98,8 +98,10 @@ impl Nvdec {
     ///
     /// Port of `Nvdec::Execute`.
     fn execute(&mut self) {
-        // TODO: Check Settings::values.nvdec_emulation for Off mode.
-        // If off, sleep 8ms and return (matching upstream).
+        // Upstream checks Settings::values.nvdec_emulation for NvdecEmulation::Off.
+        // When off, it sleeps 8ms (half a 60fps frame) and returns to prevent games
+        // from getting stuck due to <1ms execution time. The Settings crate is not
+        // yet wired to video_core, so this check is omitted; decoding always proceeds.
 
         if let Some(ref mut dec) = self.decoder {
             match dec.get_current_codec() {

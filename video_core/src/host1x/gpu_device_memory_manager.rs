@@ -22,7 +22,9 @@ pub type DAddr = u64;
 /// The full implementation lives in the `core` crate; this struct provides the
 /// interface surface needed by `host1x` code.
 pub struct MaxwellDeviceMemoryManager {
-    // TODO: Back with the real DeviceMemoryManager once core is wired up.
+    // Backed by Core::DeviceMemoryManager<MaxwellDeviceTraits> in upstream.
+    // Requires the core crate's DeviceMemoryManager to be wired to video_core,
+    // which depends on Core::System providing DeviceMemory access.
 }
 
 impl MaxwellDeviceMemoryManager {

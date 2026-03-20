@@ -467,7 +467,7 @@ void DecodeColorValues(uvec4 modes, uint num_partitions, uint color_data_bits, o
         num_values += ((modes[i] >> 2) + 1) << 1;
     }
     // Find the largest encoding that's within color_data_bits
-    // TODO(ameerj): profile with binary search
+    // Upstream TODO(ameerj): profile with binary search
     int range = 0;
     while (++range < encoding_values.length()) {
         const uint bit_length = GetBitLength(num_values, range);
@@ -1458,7 +1458,7 @@ void main() {
         return;
     }
 
-    // TODO: Specialization constants for num_samples?
+    // Upstream TODO: Specialization constants for num_samples?
     const int num_samples = imageSamples(msaa_in);
     const ivec3 msaa_size = imageSize(msaa_in);
     const ivec3 out_size = imageSize(output_img);
@@ -1494,7 +1494,7 @@ void main() {
         return;
     }
 
-    // TODO: Specialization constants for num_samples?
+    // Upstream TODO: Specialization constants for num_samples?
     const int num_samples = imageSamples(output_msaa);
     const ivec3 msaa_size = imageSize(output_msaa);
     const ivec3 out_size = imageSize(img_in);

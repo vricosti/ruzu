@@ -8,6 +8,7 @@
 //! push constant layouts.
 
 use crate::ir;
+use crate::runtime_info::RuntimeInfo;
 use super::spirv_emit_context::SpirvEmitContext;
 
 /// Number of u32 words for texture rescaling data.
@@ -69,8 +70,9 @@ pub const RENDERAREA_LAYOUT_OFFSET: u32 = 0;
 pub fn emit_spirv(
     program: &ir::Program,
     profile: &super::super::Profile,
+    runtime_info: &RuntimeInfo,
 ) -> Vec<u32> {
-    let mut ctx = SpirvEmitContext::new(program, profile);
+    let mut ctx = SpirvEmitContext::new(program, profile, runtime_info);
     ctx.emit_program(program);
     ctx.finalize()
 }

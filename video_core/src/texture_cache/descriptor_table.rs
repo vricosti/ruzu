@@ -71,8 +71,10 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
     /// is not yet ported.
     pub fn read(&mut self, index: u32) -> (T, bool) {
         debug_assert!(index <= self.current_limit);
-        // TODO: gpu_memory.read_block_unsafe(gpu_addr + index * size_of::<T>(), &descriptor)
-        let descriptor = T::default(); // placeholder
+        // Upstream: gpu_memory->ReadBlockUnsafe(current_gpu_addr + index * sizeof(Descriptor), &descriptor, sizeof(Descriptor))
+        // Requires a reference to Tegra::MemoryManager (GPU memory manager) which is
+        // not yet wired to the texture cache. Returns default until integration.
+        let descriptor = T::default(); // placeholder — needs GPU memory read
 
         let changed = if self.is_descriptor_read(index) {
             descriptor != self.descriptors[index as usize]

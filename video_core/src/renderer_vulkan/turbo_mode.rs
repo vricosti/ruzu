@@ -73,8 +73,10 @@ impl TurboMode {
         // 3. Records a command buffer (fill buffer + bind + dispatch 64x64x1)
         // 4. Submits and waits on the fence
         //
-        // TODO: Implement full secondary device creation and compute dispatch
-        // when vulkan_common/vulkan_device infrastructure supports it.
+        // Full implementation requires: vulkan_common Device creation (CreateDevice),
+        // MemoryAllocator, BuildShader (vulkan_turbo_mode_comp_spv), and the vk
+        // wrapper types for CommandPool/CommandBuffer/Fence. These are not yet
+        // ported in the vulkan_common crate.
 
         let stop = stop_flag.clone();
         let thread_handle = std::thread::Builder::new()

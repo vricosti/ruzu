@@ -432,7 +432,10 @@ fn hash_macro_code(code: &[u32]) -> u64 {
 /// Port of the anonymous `Dump` function from `macro.cpp`.
 #[allow(dead_code)]
 fn dump(_hash: u64, _code: &[u32], _decompiled: bool) {
-    // TODO: Implement filesystem dump when Common::FS is available
+    // Upstream writes macro code to `<dump_dir>/macros/<hash>.macro` using
+    // Common::FS::GetYuzuPath(DumpDir). Only called when Settings::values.dump_macros
+    // is true. Requires Common::FS path resolution and Settings integration,
+    // neither of which is wired to video_core yet.
 }
 
 #[cfg(test)]

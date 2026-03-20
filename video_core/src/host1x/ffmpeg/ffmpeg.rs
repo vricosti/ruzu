@@ -207,8 +207,10 @@ impl DecodeApi {
         let decoder_context = DecoderContext::new(&decoder);
         self.decoder = Some(decoder);
         self.decoder_context = Some(decoder_context);
-        // TODO: Initialize hardware context and open decoder when FFmpeg bindings are available.
-        // For now, return false to indicate initialization is stubbed.
+        // Upstream opens the decoder context and optionally initializes hardware
+        // acceleration via HardwareContext. This requires FFmpeg C bindings
+        // (avcodec_open2, av_hwdevice_ctx_create, etc.) which are not linked in
+        // the current build. Returns false to indicate initialization is stubbed.
         false
     }
 

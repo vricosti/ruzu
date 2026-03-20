@@ -180,10 +180,11 @@ impl ChannelType {
 pub struct Host1x {
     syncpoint_manager: Arc<SyncpointManager>,
     frame_queue: Arc<FrameQueue>,
-    // TODO: memory_manager: MaxwellDeviceMemoryManager,
-    // TODO: gmmu_manager: MemoryManager,
-    // TODO: allocator: FlatAllocator<u32>,
-    // TODO: devices: HashMap<i32, Box<dyn CdmaPusher>>,
+    // Upstream fields not yet wired:
+    // - memory_manager: MaxwellDeviceMemoryManager — requires Core::System::DeviceMemory
+    // - gmmu_manager: MemoryManager — requires Core::System and device memory manager
+    // - allocator: FlatAllocator<u32, 0, 32> — requires Common::FlatAllocator port
+    // - devices: HashMap<i32, Box<dyn CDmaPusher>> — requires CDmaPusher trait + Nvdec/Vic integration
 }
 
 impl Host1x {
@@ -208,12 +209,15 @@ impl Host1x {
     pub fn start_device(&mut self, fd: i32, channel_type: ChannelType, _syncpt: u32) {
         match channel_type {
             ChannelType::NvDec => {
-                // TODO: Create Nvdec CDmaPusher and insert into devices map.
+                // Upstream: devices[fd] = make_unique<Nvdec>(*this, fd, syncpt, frame_queue);
+                // Requires CDmaPusher trait and Nvdec CDmaPusher constructor to be wired.
+                // For now, just open the frame queue so video frames can be queued.
                 self.frame_queue.open(fd);
                 log::info!("Started NvDec device fd={}", fd);
             }
             ChannelType::Vic => {
-                // TODO: Create Vic CDmaPusher and insert into devices map.
+                // Upstream: devices[fd] = make_unique<Vic>(*this, fd, syncpt, frame_queue);
+                // Requires CDmaPusher trait and Vic CDmaPusher constructor to be wired.
                 log::info!("Started VIC device fd={}", fd);
             }
             _ => {
@@ -229,7 +233,8 @@ impl Host1x {
     ///
     /// Port of `Host1x::StopDevice`.
     pub fn stop_device(&mut self, fd: i32, _channel_type: ChannelType) {
-        // TODO: Remove from devices map.
+        // Upstream: devices.erase(fd);
+        // Once the devices map is wired, this will remove the CDmaPusher entry.
         let _ = fd;
     }
 

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use crate::backend::Profile;
 use crate::ir;
 use crate::ir::types::ShaderStage;
+use crate::runtime_info::RuntimeInfo;
 
 /// SPIR-V emission context.
 ///
@@ -58,6 +59,24 @@ pub struct SpirvEmitContext {
     // ── GLSL.std.450 extended instruction set ─────────────────────────
     pub glsl_ext: spirv::Word,
 
+    // ── Runtime info ──────────────────────────────────────────────────
+    pub runtime_info: RuntimeInfo,
+
+    // ── System value input variables ─────────────────────────────────
+    pub workgroup_id: spirv::Word,
+    pub local_invocation_id: spirv::Word,
+    pub invocation_id: spirv::Word,
+    pub patch_vertices_in: spirv::Word,
+    pub sample_id: spirv::Word,
+    pub is_helper_invocation: spirv::Word,
+
+    // ── Rescaling / render area push constants ───────────────────────
+    pub rescaling_uniform_constant: spirv::Word,
+    pub rescaling_push_constants: spirv::Word,
+    pub rescaling_downfactor_member_index: u32,
+    pub render_area_push_constant: spirv::Word,
+    pub render_are_member_index: u32,
+
     // ── Resources ─────────────────────────────────────────────────────
     /// Constant buffer UBO variables, indexed by CB index.
     pub cbuf_vars: HashMap<u32, spirv::Word>,
@@ -75,7 +94,7 @@ pub struct SpirvEmitContext {
 
 impl SpirvEmitContext {
     /// Create a new SPIR-V emission context.
-    pub fn new(program: &ir::Program, profile: &Profile) -> Self {
+    pub fn new(program: &ir::Program, profile: &Profile, runtime_info: &RuntimeInfo) -> Self {
         let mut builder = Builder::new();
         builder.set_version(1, 5);
         builder.capability(spirv::Capability::Shader);
@@ -151,6 +170,18 @@ impl SpirvEmitContext {
             builder,
             profile: profile.clone(),
             stage: program.stage,
+            runtime_info: runtime_info.clone(),
+            workgroup_id: 0,
+            local_invocation_id: 0,
+            invocation_id: 0,
+            patch_vertices_in: 0,
+            sample_id: 0,
+            is_helper_invocation: 0,
+            rescaling_uniform_constant: 0,
+            rescaling_push_constants: 0,
+            rescaling_downfactor_member_index: 0,
+            render_area_push_constant: 0,
+            render_are_member_index: 0,
             void_type,
             bool_type,
             u32_type,
@@ -397,6 +428,95 @@ impl SpirvEmitContext {
 
             self.texture_vars.insert(desc.index, var);
         }
+
+        // System value input variables
+        if info.uses_workgroup_id {
+            let ptr_type =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::Input, self.u32_vec3_type);
+            let var = self
+                .builder
+                .variable(ptr_type, None, spirv::StorageClass::Input, None);
+            self.builder.decorate(
+                var,
+                spirv::Decoration::BuiltIn,
+                vec![Operand::BuiltIn(spirv::BuiltIn::WorkgroupId)],
+            );
+            self.workgroup_id = var;
+        }
+        if info.uses_local_invocation_id {
+            let ptr_type =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::Input, self.u32_vec3_type);
+            let var = self
+                .builder
+                .variable(ptr_type, None, spirv::StorageClass::Input, None);
+            self.builder.decorate(
+                var,
+                spirv::Decoration::BuiltIn,
+                vec![Operand::BuiltIn(spirv::BuiltIn::LocalInvocationId)],
+            );
+            self.local_invocation_id = var;
+        }
+        if info.uses_invocation_id {
+            let ptr_type =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::Input, self.u32_type);
+            let var = self
+                .builder
+                .variable(ptr_type, None, spirv::StorageClass::Input, None);
+            self.builder.decorate(
+                var,
+                spirv::Decoration::BuiltIn,
+                vec![Operand::BuiltIn(spirv::BuiltIn::InvocationId)],
+            );
+            self.invocation_id = var;
+        }
+        if info.uses_invocation_info
+            && (self.stage == ShaderStage::TessellationControl
+                || self.stage == ShaderStage::TessellationEval)
+        {
+            let ptr_type =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::Input, self.u32_type);
+            let var = self
+                .builder
+                .variable(ptr_type, None, spirv::StorageClass::Input, None);
+            self.builder.decorate(
+                var,
+                spirv::Decoration::BuiltIn,
+                vec![Operand::BuiltIn(spirv::BuiltIn::PatchVertices)],
+            );
+            self.patch_vertices_in = var;
+        }
+        if info.uses_sample_id {
+            let ptr_type =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::Input, self.u32_type);
+            let var = self
+                .builder
+                .variable(ptr_type, None, spirv::StorageClass::Input, None);
+            self.builder.decorate(
+                var,
+                spirv::Decoration::BuiltIn,
+                vec![Operand::BuiltIn(spirv::BuiltIn::SampleId)],
+            );
+            self.sample_id = var;
+        }
+        if info.uses_is_helper_invocation {
+            let ptr_type =
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::Input, self.bool_type);
+            let var = self
+                .builder
+                .variable(ptr_type, None, spirv::StorageClass::Input, None);
+            self.builder.decorate(
+                var,
+                spirv::Decoration::BuiltIn,
+                vec![Operand::BuiltIn(spirv::BuiltIn::HelperInvocation)],
+            );
+            self.is_helper_invocation = var;
+        }
     }
 
     /// Define the main() function and emit IR instructions as SPIR-V.
@@ -408,6 +528,19 @@ impl SpirvEmitContext {
         }
         for &var in self.output_vars.values() {
             interface.push(var);
+        }
+        // System value input variables
+        for &var in &[
+            self.workgroup_id,
+            self.local_invocation_id,
+            self.invocation_id,
+            self.patch_vertices_in,
+            self.sample_id,
+            self.is_helper_invocation,
+        ] {
+            if var != 0 {
+                interface.push(var);
+            }
         }
 
         // Create main function
@@ -1056,10 +1189,41 @@ impl SpirvEmitContext {
             }
 
             // System values
-            Opcode::WorkgroupId | Opcode::LocalInvocationId | Opcode::InvocationId
-            | Opcode::InvocationInfo | Opcode::IsHelperInvocation | Opcode::SampleId
-            | Opcode::YDirection | Opcode::ResolutionDownFactor | Opcode::RenderArea => {
-                // TODO: System value emission
+            Opcode::WorkgroupId => {
+                let id = super::emit_spirv_context_get_set::emit_workgroup_id(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::LocalInvocationId => {
+                let id = super::emit_spirv_context_get_set::emit_local_invocation_id(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::InvocationId => {
+                let id = super::emit_spirv_context_get_set::emit_invocation_id(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::InvocationInfo => {
+                let id = super::emit_spirv_context_get_set::emit_invocation_info(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::IsHelperInvocation => {
+                let id = super::emit_spirv_context_get_set::emit_is_helper_invocation(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::SampleId => {
+                let id = super::emit_spirv_context_get_set::emit_sample_id(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::YDirection => {
+                let id = super::emit_spirv_context_get_set::emit_y_direction(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ResolutionDownFactor => {
+                let id = super::emit_spirv_context_get_set::emit_resolution_down_factor(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::RenderArea => {
+                let id = super::emit_spirv_context_get_set::emit_render_area(self);
+                self.set_value(block_idx, inst_idx, id);
             }
 
             // Undefined values
