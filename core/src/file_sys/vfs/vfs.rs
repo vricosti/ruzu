@@ -318,8 +318,8 @@ pub trait VfsDirectory: Send + Sync {
     fn get_directory_relative(&self, path: &str) -> Option<VirtualDir> {
         let vec = path_util::split_path_components(path);
         if vec.is_empty() {
-            // TODO(DarkLordZach): Return this directory if path is '/' or similar. Can't currently
-            // because of const-ness
+            // Upstream TODO(DarkLordZach): Return this directory if path is '/' or similar.
+            // Can't currently because of const-ness
             return None;
         }
 

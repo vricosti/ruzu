@@ -4,8 +4,13 @@
 // Ported from: core/file_sys/romfs_factory.h and romfs_factory.cpp
 // RomFS factory for opening patched/unpatched RomFS images.
 
+use std::sync::Arc;
+
 use super::common_funcs::get_base_title_id_with_program_index;
+use super::content_archive::NCA;
 use super::nca_metadata::ContentRecordType;
+use super::patch_manager::PatchManager;
+use super::registered_cache::ContentProvider;
 use super::vfs::vfs_types::VirtualFile;
 
 // ============================================================================
@@ -32,26 +37,33 @@ pub enum StorageId {
 /// File system interface to the RomFS archive.
 /// Corresponds to upstream `RomFSFactory`.
 ///
-/// NOTE: Full implementation requires Loader::AppLoader, ContentProvider, and
-/// FileSystemController which are not yet ported. This provides the structural
-/// skeleton with the correct API surface.
+/// Upstream holds references to `ContentProvider` and `FileSystemController`.
 pub struct RomFSFactory {
     file: Option<VirtualFile>,
     packed_update_raw: Option<VirtualFile>,
-    base: Option<VirtualFile>,
     updatable: bool,
-    // TODO: content_provider and filesystem_controller references
+    content_provider: Option<Arc<dyn ContentProvider>>,
+    filesystem_controller: Option<Arc<std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>>,
 }
 
 impl RomFSFactory {
     /// Create a new RomFSFactory.
-    /// In the full implementation, this would read the RomFS from the app loader.
-    pub fn new(file: Option<VirtualFile>, updatable: bool) -> Self {
+    ///
+    /// Upstream constructs this from an AppLoader, a ContentProvider&, and a
+    /// FileSystemController&. We accept the base file and content_provider
+    /// directly; the AppLoader's ReadRomFS result is passed as `file`.
+    pub fn new(
+        file: Option<VirtualFile>,
+        updatable: bool,
+        content_provider: Option<Arc<dyn ContentProvider>>,
+        filesystem_controller: Option<Arc<std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>>,
+    ) -> Self {
         Self {
             file,
             packed_update_raw: None,
-            base: None,
             updatable,
+            content_provider,
+            filesystem_controller,
         }
     }
 
@@ -61,20 +73,41 @@ impl RomFSFactory {
 
     /// Open the RomFS for the current process.
     /// Corresponds to upstream `RomFSFactory::OpenCurrentProcess`.
-    pub fn open_current_process(&self, _current_process_title_id: u64) -> Option<VirtualFile> {
+    pub fn open_current_process(&self, current_process_title_id: u64) -> Option<VirtualFile> {
         if !self.updatable {
             return self.file.clone();
         }
 
-        // TODO: Implement patching once PatchManager and ContentProvider are ported.
-        self.file.clone()
+        // Upstream:
+        //   const auto nca = content_provider.GetEntry(current_process_title_id, type);
+        //   const PatchManager patch_manager{...};
+        //   return patch_manager.PatchRomFS(nca.get(), file, Program, packed_update_raw);
+        let patch_manager = PatchManager::new(current_process_title_id);
+        let base = match &self.file {
+            Some(f) => f.clone(),
+            None => return None,
+        };
+        Some(patch_manager.patch_romfs(
+            base,
+            ContentRecordType::Program,
+            self.packed_update_raw.clone(),
+            true,
+        ))
     }
 
     /// Open a patched RomFS for a given title.
     /// Corresponds to upstream `RomFSFactory::OpenPatchedRomFS`.
-    pub fn open_patched_romfs(&self, _title_id: u64, _type_: ContentRecordType) -> Option<VirtualFile> {
-        // TODO: Implement once ContentProvider and PatchManager are ported.
-        None
+    pub fn open_patched_romfs(
+        &self,
+        title_id: u64,
+        type_: ContentRecordType,
+    ) -> Option<VirtualFile> {
+        let provider = self.content_provider.as_ref()?;
+        let nca = provider.get_entry(title_id, type_)?;
+        let romfs = nca.get_romfs()?;
+
+        let patch_manager = PatchManager::new(title_id);
+        Some(patch_manager.patch_romfs(romfs, type_, None, true))
     }
 
     /// Open a patched RomFS with program index.
@@ -93,6 +126,58 @@ impl RomFSFactory {
         self.open_patched_romfs(res_title_id, type_)
     }
 
+    /// Internal helper: get the NCA entry for a given title/storage/type.
+    /// Corresponds to upstream `RomFSFactory::GetEntry`.
+    ///
+    /// Upstream dispatches based on StorageId to content_provider or
+    /// filesystem_controller caches. Since FileSystemController is not yet
+    /// ported, only StorageId::None (which uses content_provider directly)
+    /// is fully implemented.
+    fn get_entry(
+        &self,
+        title_id: u64,
+        storage: StorageId,
+        type_: ContentRecordType,
+    ) -> Option<NCA> {
+        let provider = self.content_provider.as_ref()?;
+        match storage {
+            StorageId::None => provider.get_entry(title_id, type_),
+            StorageId::NandSystem => {
+                // Upstream: filesystem_controller.GetSystemNANDContents()->GetEntry(...)
+                if let Some(ref fsc) = self.filesystem_controller {
+                    let fsc = fsc.lock().unwrap();
+                    fsc.get_system_nand_contents()?.get_entry(title_id, type_)
+                } else {
+                    None
+                }
+            }
+            StorageId::NandUser => {
+                // Upstream: filesystem_controller.GetUserNANDContents()->GetEntry(...)
+                if let Some(ref fsc) = self.filesystem_controller {
+                    let fsc = fsc.lock().unwrap();
+                    fsc.get_user_nand_contents()?.get_entry(title_id, type_)
+                } else {
+                    None
+                }
+            }
+            StorageId::SdCard => {
+                // Upstream: filesystem_controller.GetSDMCContents()->GetEntry(...)
+                // SDMC factory not yet added to FileSystemController.
+                log::warn!(
+                    "RomFSFactory::get_entry: StorageId::SdCard requires FileSystemController"
+                );
+                None
+            }
+            StorageId::Host | StorageId::GameCard => {
+                log::warn!(
+                    "RomFSFactory::get_entry: unimplemented storage_id={:02X}",
+                    storage as u8
+                );
+                None
+            }
+        }
+    }
+
     /// Open a RomFS by title ID, storage, and type.
     ///
     /// Retrieves the NCA entry from the appropriate storage and returns
@@ -101,21 +186,12 @@ impl RomFSFactory {
     /// Corresponds to upstream `RomFSFactory::Open`.
     pub fn open(
         &self,
-        _title_id: u64,
-        _storage: StorageId,
-        _type_: ContentRecordType,
+        title_id: u64,
+        storage: StorageId,
+        type_: ContentRecordType,
     ) -> Option<VirtualFile> {
-        // TODO: Implement once ContentProvider and FileSystemController are ported.
-        // Upstream dispatches based on StorageId:
-        //   None -> content_provider.GetEntry(title_id, type)
-        //   NandSystem -> filesystem_controller.GetSystemNANDContents()->GetEntry(...)
-        //   NandUser -> filesystem_controller.GetUserNANDContents()->GetEntry(...)
-        //   SdCard -> filesystem_controller.GetSDMCContents()->GetEntry(...)
-        //   Host, GameCard -> unimplemented
-        log::warn!(
-            "RomFSFactory::open: not yet implemented (requires ContentProvider)"
-        );
-        None
+        let nca = self.get_entry(title_id, storage, type_)?;
+        nca.get_romfs()
     }
 }
 
@@ -145,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let factory = RomFSFactory::new(Some(make_test_file()), true);
+        let factory = RomFSFactory::new(Some(make_test_file()), true, None);
         assert!(factory.file.is_some());
         assert!(factory.updatable);
     }
@@ -153,7 +229,7 @@ mod tests {
     #[test]
     fn test_open_current_process_not_updatable() {
         let file = make_test_file();
-        let factory = RomFSFactory::new(Some(file.clone()), false);
+        let factory = RomFSFactory::new(Some(file.clone()), false, None);
         // When not updatable, should return the file directly.
         let result = factory.open_current_process(0x0100000000001000);
         assert!(result.is_some());
@@ -161,16 +237,18 @@ mod tests {
 
     #[test]
     fn test_set_packed_update() {
-        let mut factory = RomFSFactory::new(None, false);
+        let mut factory = RomFSFactory::new(None, false, None);
         assert!(factory.packed_update_raw.is_none());
         factory.set_packed_update(make_test_file());
         assert!(factory.packed_update_raw.is_some());
     }
 
     #[test]
-    fn test_open_patched_romfs_stub() {
-        let factory = RomFSFactory::new(None, false);
-        // Currently a stub, should return None.
-        assert!(factory.open_patched_romfs(0x0100000000001000, ContentRecordType::Program).is_none());
+    fn test_open_patched_romfs_no_provider() {
+        let factory = RomFSFactory::new(None, false, None);
+        // No content provider, should return None.
+        assert!(factory
+            .open_patched_romfs(0x0100000000001000, ContentRecordType::Program)
+            .is_none());
     }
 }

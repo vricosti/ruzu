@@ -5,7 +5,9 @@
 
 use std::collections::BTreeMap;
 
+use super::content_archive::{NCA, NCAContentType};
 use super::nca_metadata::{ContentRecordType, TitleType, CNMT, ContentRecord};
+use super::vfs::vfs_concat::ConcatenatedVfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 
 // ============================================================================
@@ -463,6 +465,52 @@ impl RegisteredCache {
         ids
     }
 
+    /// Process NCA files: find Meta-type NCAs and parse their CNMTs.
+    /// Corresponds to upstream `RegisteredCache::ProcessFiles` (registered_cache.cpp).
+    ///
+    /// Upstream opens each NCA, checks it's Meta type, extracts section 0's
+    /// RomFS, finds .cnmt files, and parses them into CNMT records.
+    /// NCA::get_romfs() / NCA section access requires the crypto pipeline
+    /// (KeyManager for title key decryption) to extract section contents.
+    fn process_files(&mut self, ids: &[NcaId]) {
+        use super::vfs::vfs::VfsDirectory;
+
+        for id in ids {
+            let file = match self.get_file_at_id(id) {
+                Some(f) => f,
+                None => continue,
+            };
+
+            let nca = NCA::new(file, None);
+            if nca.get_status() != super::partition_filesystem::ResultStatus::Success
+                || nca.get_type() != NCAContentType::Meta
+            {
+                continue;
+            }
+
+            // Upstream: nca->GetSubdirectories()[0] returns section 0 as a VfsDir.
+            // NCA implements VfsDirectory; GetSubdirectories returns its sections.
+            let subdirs = nca.get_subdirectories();
+            if subdirs.is_empty() {
+                continue;
+            }
+            let section0 = &subdirs[0];
+
+            for section0_file in section0.get_files() {
+                let name = section0_file.get_name();
+                if !name.ends_with(".cnmt") {
+                    continue;
+                }
+
+                let cnmt = CNMT::from_file(&section0_file);
+                let title_id = cnmt.get_title_id();
+                self.meta.insert(title_id, cnmt);
+                self.meta_id.insert(title_id, *id);
+                break;
+            }
+        }
+    }
+
     /// Open a file or directory-concatenated file at a given path.
     /// Corresponds to upstream `RegisteredCache::OpenFileOrDirectoryConcat`.
     fn open_file_or_directory_concat(&self, path: &str) -> Option<VirtualFile> {
@@ -497,10 +545,8 @@ impl RegisteredCache {
             return None;
         }
 
-        // For now, return the first file. Full implementation would use
-        // ConcatenatedVfsFile::MakeConcatenatedFile.
-        // TODO: use vfs_concat when available
-        Some(concat.into_iter().next().unwrap())
+        let name = concat[0].get_name();
+        ConcatenatedVfsFile::make_concatenated_file(name, concat)
     }
 
     /// Get the file for a given NCA ID, trying all storage modes.
@@ -685,15 +731,7 @@ impl ContentProvider for RegisteredCache {
         self.yuzu_meta.clear();
 
         let ids = self.accumulate_files();
-
-        // Process files: look for Meta-type NCAs and parse their CNMTs.
-        // NOTE: Full implementation requires NCA parsing which depends on crypto.
-        // For now, we scan the directory structure but cannot parse NCA content
-        // without the crypto pipeline. The yuzu_meta path works since those are
-        // raw CNMT files.
-        // TODO: Process NCA files when crypto pipeline is available.
-        let _ = ids; // ids would be used with full NCA parsing
-
+        self.process_files(&ids);
         self.accumulate_yuzu_meta();
     }
 

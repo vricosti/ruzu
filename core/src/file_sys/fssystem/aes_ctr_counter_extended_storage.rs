@@ -18,6 +18,27 @@ pub trait IDecryptor: Send + Sync {
     fn decrypt(&self, buf: &mut [u8], key: &[u8; KEY_SIZE], iv: &[u8; IV_SIZE]);
 }
 
+/// Software AES-CTR decryptor using AesCipher.
+/// Corresponds to upstream `SoftwareDecryptor` (fssystem_aes_ctr_counter_extended_storage.cpp:13-18).
+pub struct SoftwareDecryptor;
+
+impl IDecryptor for SoftwareDecryptor {
+    fn decrypt(&self, buf: &mut [u8], key: &[u8; KEY_SIZE], iv: &[u8; IV_SIZE]) {
+        use crate::crypto::aes_util::{AesCipher, Mode, Op};
+        let mut cipher = AesCipher::new_128(*key, Mode::CTR);
+        cipher.set_iv(iv);
+        let mut tmp = buf.to_vec();
+        cipher.transcode(buf, &mut tmp, Op::Decrypt);
+        buf.copy_from_slice(&tmp);
+    }
+}
+
+/// Create a software decryptor.
+/// Corresponds to upstream `AesCtrCounterExtendedStorage::CreateSoftwareDecryptor`.
+pub fn create_software_decryptor() -> Box<dyn IDecryptor> {
+    Box::new(SoftwareDecryptor)
+}
+
 /// Encryption flag for entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -117,14 +138,109 @@ impl AesCtrCounterExtendedStorage {
         }
     }
 
-    /// Read from the storage. Stub: reads from underlying data storage.
-    /// TODO: implement proper AES-CTR counter extended decryption.
+    /// Read from the storage with per-entry AES-CTR decryption.
+    ///
+    /// Upstream: `AesCtrCounterExtendedStorage::Read`
+    /// (fssystem_aes_ctr_counter_extended_storage.cpp:89-186).
+    ///
+    /// 1. Read raw (encrypted) data from data_storage
+    /// 2. Find the starting bucket tree entry for the offset
+    /// 3. For each entry, if encryption_value == Encrypted:
+    ///    a. Compute counter_offset = m_counter_offset + entry_offset + data_offset
+    ///    b. Build upper_iv from entry.generation and m_secure_value
+    ///    c. MakeIv(iv, upper_iv.value, counter_offset)
+    ///    d. Decrypt data in-place using AES-128-CTR with m_key and iv
     pub fn read(&self, buffer: &mut [u8], offset: usize) -> usize {
-        if let Some(ref storage) = self.data_storage {
-            storage.read(buffer, buffer.len(), offset)
-        } else {
-            0
+        use super::aes_ctr_storage::AesCtrStorage;
+        use super::nca_header::NcaAesCtrUpperIv;
+
+        let size = buffer.len();
+        if size == 0 {
+            return 0;
         }
+
+        let data_storage = match self.data_storage {
+            Some(ref s) => s,
+            None => return 0,
+        };
+
+        // Read the raw (encrypted) data.
+        let read = data_storage.read(buffer, size, offset);
+        if read == 0 {
+            return 0;
+        }
+
+        // Find the offset in our tree.
+        let mut visitor = match self.table.find(offset as i64) {
+            Ok(v) => v,
+            Err(_) => return read,
+        };
+
+        // Prepare to decrypt in chunks per bucket tree entry.
+        let mut cur_data_offset = 0usize; // offset into buffer
+        let mut cur_offset = offset as i64;
+        let end_offset = (offset + size) as i64;
+
+        while cur_offset < end_offset {
+            // Get the current entry.
+            let cur_entry: Entry = unsafe { *visitor.get::<Entry>() };
+            let cur_entry_offset = cur_entry.get_offset();
+
+            // Get the next entry offset.
+            let next_entry_offset = if visitor.can_move_next() {
+                let _ = visitor.move_next();
+                let next: &Entry = unsafe { visitor.get::<Entry>() };
+                next.get_offset()
+            } else {
+                // Use table end offset if no more entries.
+                if let Ok(offsets) = self.table.get_offsets() {
+                    offsets.end_offset
+                } else {
+                    end_offset
+                }
+            };
+
+            // Compute the data range for this entry.
+            let data_offset_in_entry = cur_offset - cur_entry_offset;
+            let data_size_in_entry = (next_entry_offset - cur_entry_offset) - data_offset_in_entry;
+            let remaining = end_offset - cur_offset;
+            let cur_size = std::cmp::min(remaining, data_size_in_entry) as usize;
+
+            if cur_size == 0 {
+                break;
+            }
+
+            // Decrypt if entry is marked as encrypted.
+            if cur_entry.encryption_value == EntryEncryption::Encrypted as u8 {
+                if let Some(ref decryptor) = self.decryptor {
+                    // Build the IV matching upstream logic:
+                    //   counter_offset = m_counter_offset + cur_entry_offset + data_offset_in_entry
+                    //   upper_iv.generation = cur_entry.generation
+                    //   upper_iv.secure_value = m_secure_value
+                    //   MakeIv(iv, upper_iv.value, counter_offset)
+                    let counter_offset =
+                        self.counter_offset + cur_entry_offset + data_offset_in_entry;
+
+                    let mut upper_iv = NcaAesCtrUpperIv::default();
+                    upper_iv.set_generation(cur_entry.generation as u32);
+                    upper_iv.value = (upper_iv.value & 0xFFFF_FFFF)
+                        | ((self.secure_value as u64) << 32);
+
+                    let mut iv = [0u8; IV_SIZE];
+                    AesCtrStorage::make_iv(&mut iv, upper_iv.value, counter_offset);
+
+                    // Decrypt the data in-place.
+                    let buf_slice =
+                        &mut buffer[cur_data_offset..cur_data_offset + cur_size];
+                    decryptor.decrypt(buf_slice, &self.key, &iv);
+                }
+            }
+
+            cur_data_offset += cur_size;
+            cur_offset += cur_size as i64;
+        }
+
+        read
     }
 
     pub fn query_header_storage_size() -> i64 {

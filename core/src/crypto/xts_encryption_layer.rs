@@ -136,3 +136,46 @@ impl VfsFile for XtsEncryptionLayer {
         self.base_layer.rename(name)
     }
 }
+
+/// Implement the file_sys VfsFile trait so XtsEncryptionLayer can be used as a VirtualFile
+/// in the file system layer (e.g., NAX decrypted file).
+impl crate::file_sys::vfs::vfs::VfsFile for XtsEncryptionLayer {
+    fn get_name(&self) -> String {
+        self.base_layer.get_name()
+    }
+
+    fn get_size(&self) -> usize {
+        self.base_layer.get_size()
+    }
+
+    fn resize(&self, new_size: usize) -> bool {
+        self.base_layer.resize(new_size)
+    }
+
+    fn get_containing_directory(&self) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        self.base_layer.is_writable()
+    }
+
+    fn is_readable(&self) -> bool {
+        self.base_layer.is_readable()
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let read_len = length.min(data.len());
+        // Delegate to the crypto VfsFile::read which takes (data, offset).
+        <Self as VfsFile>::read(self, &mut data[..read_len], offset)
+    }
+
+    fn write(&self, data: &[u8], length: usize, offset: usize) -> usize {
+        let write_len = length.min(data.len());
+        self.base_layer.write(&data[..write_len], offset)
+    }
+
+    fn rename(&self, name: &str) -> bool {
+        self.base_layer.rename(name)
+    }
+}

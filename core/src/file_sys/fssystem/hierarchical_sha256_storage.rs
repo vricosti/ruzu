@@ -118,8 +118,9 @@ impl HierarchicalSha256Storage {
         self.hash_buffer.resize(hash_storage_size as usize, 0);
         base_storages[1].read(&mut self.hash_buffer, hash_storage_size as usize, 0);
 
-        // TODO: Verify master hash against hash of hash_buffer using SHA-256.
-        // This is deferred until the crypto pipeline is fully wired up.
+        // Upstream TODO: master hash verification is read but not checked.
+        // Upstream reads the master hash (base_storages[0]) but R_SUCCEED()s
+        // without comparing it against SHA-256(hash_buffer).
 
         Ok(())
     }
@@ -150,12 +151,9 @@ impl HierarchicalSha256Storage {
 
         // Read the data from the base storage.
         if let Some(ref bs) = self.base_storage {
-            // TODO: Validate block hash before returning data.
-            // For each block that overlaps with [offset, offset+size):
-            //   1. Read the block from base_storage
-            //   2. Compute SHA-256 of the block
-            //   3. Compare against hash_buffer entry
-            //   4. If mismatch, return error
+            // Upstream TODO: block hash validation not implemented in upstream either.
+            // Upstream Read() (fssystem_hierarchical_sha256_storage.cpp:69-80)
+            // reads directly from base_storage without hash verification.
             bs.read(buffer, size, offset)
         } else {
             0
