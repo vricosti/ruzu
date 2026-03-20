@@ -28,6 +28,7 @@ use crate::hle::kernel::svc::svc_processor;
 use crate::hle::kernel::svc::svc_shared_memory;
 use crate::hle::kernel::svc::svc_synchronization;
 use crate::hle::kernel::svc::svc_thread;
+use crate::hle::kernel::svc::svc_tick;
 
 fn drain_current_thread_termination(system: &System) {
     let current_thread = system.current_thread();
@@ -384,13 +385,6 @@ fn alloc_stub_handle(system: &System) -> u32 {
         .unwrap_or(0)
 }
 
-/// Monotonic tick counter.
-static TICK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn get_tick() -> i64 {
-    TICK_COUNTER.fetch_add(19200, std::sync::atomic::Ordering::Relaxed) as i64
-}
-
 // =============================================================================
 // QueryMemory helper
 // =============================================================================
@@ -533,7 +527,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         // =====================================================================
         Some(SvcId::ExitProcess) => {
             // IN: (none); OUT: (none)
-            svc_exception::break_execution(0, 0, 0);
+            svc_exception::break_execution(system, 0, 0, 0);
             log::info!("  ExitProcess called");
         }
         Some(SvcId::GetProcessId) => {
@@ -670,7 +664,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::GetCurrentProcessorNumber) => {
             // IN: (none); OUT: ret=arg32[0]
-            set_arg32(args, 0, svc_processor::get_current_processor_number() as u32);
+            set_arg32(args, 0, svc_processor::get_current_processor_number(system) as u32);
         }
         Some(SvcId::GetThreadId) => {
             // IN: handle=arg32[1]; OUT: ret=arg32[0], tid=scatter64[1,2]
@@ -775,6 +769,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::WaitForAddress) => {
             let result = svc_address_arbiter::wait_for_address(
+                system,
                 get_arg32(args, 0) as u64,
                 unsafe { std::mem::transmute(get_arg32(args, 1)) },
                 get_arg32(args, 2) as i32,
@@ -784,6 +779,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::SignalToAddress) => {
             let result = svc_address_arbiter::signal_to_address(
+                system,
                 get_arg32(args, 0) as u64,
                 unsafe { std::mem::transmute(get_arg32(args, 1)) },
                 get_arg32(args, 2) as i32,
@@ -809,7 +805,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         // =====================================================================
         Some(SvcId::GetSystemTick) => {
             // IN: (none); OUT: tick=scatter64[0,1]
-            let tick = get_tick();
+            let tick = svc_tick::get_system_tick(system);
             scatter64(args, 0, 1, tick as u64);
         }
 
@@ -950,7 +946,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 }
             }
 
-            svc_exception::break_execution(reason, info1, info2);
+            svc_exception::break_execution(system, reason, info1, info2);
         }
         Some(SvcId::OutputDebugString) => {
             // IN: str=arg32[0], len=arg32[1]; OUT: ret=arg32[0]
@@ -1345,14 +1341,14 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetCurrentProcessorNumber) => {
-            set_arg64(args, 0, svc_processor::get_current_processor_number() as u64);
+            set_arg64(args, 0, svc_processor::get_current_processor_number(system) as u64);
         }
         Some(SvcId::CloseHandle) => {
             let result = svc_synchronization::close_handle(system, get_arg64(args, 0) as u32);
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetSystemTick) => {
-            set_arg64(args, 0, get_tick() as u64);
+            set_arg64(args, 0, svc_tick::get_system_tick(system) as u64);
         }
         Some(SvcId::ConnectToNamedPort) => {
             let mut out = 0;
@@ -1378,7 +1374,7 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             let reason = get_arg64(args, 0) as u32;
             let info1 = get_arg64(args, 1);
             let info2 = get_arg64(args, 2);
-            svc_exception::break_execution(reason, info1, info2);
+            svc_exception::break_execution(system, reason, info1, info2);
         }
         Some(SvcId::OutputDebugString) => {
             let str_ptr = get_arg64(args, 0);

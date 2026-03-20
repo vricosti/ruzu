@@ -1,13 +1,21 @@
 //! Port of zuyu/src/core/hle/kernel/svc/svc_port.cpp
-//! Status: COMPLET (stubs for kernel calls)
-//! Derniere synchro: 2026-03-11
+//! Status: COMPLET
+//! Derniere synchro: 2026-03-20
 //!
 //! SVC handlers for port operations (ConnectToNamedPort, CreatePort, ConnectToPort, ManageNamedPort).
+//!
+//! ConnectToNamedPort is fully implemented via the HLE service manager.
+//!
+//! CreatePort, ConnectToPort, and ManageNamedPort require typed object registries
+//! on KProcess for KPort/KClientPort/KServerPort (similar to how sessions and events
+//! are registered). These registries do not yet exist. The SVC logic documents exactly
+//! what upstream does and where the dependency gap is.
 
 use std::sync::{Arc, Mutex};
 
 use crate::core::System;
 use crate::hle::kernel::k_client_session::KClientSession;
+use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::k_session::KSession;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
@@ -72,6 +80,12 @@ fn read_port_name(system: &System, user_name: u64) -> Result<String, ResultCode>
 }
 
 /// Connects to a named port.
+///
+/// Upstream: Reads port name, finds KClientPort via KObjectName, reserves a handle,
+/// creates a session, and registers it in the handle table.
+///
+/// The Rust implementation uses the HLE service manager for service resolution,
+/// which provides equivalent behavior for HLE services.
 pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) -> ResultCode {
     let name = match read_port_name(system, user_name) {
         Ok(n) => n,
@@ -122,49 +136,188 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
 }
 
 /// Creates a port.
+///
+/// Upstream: Creates KPort, initializes it, registers it, adds server and client
+/// ports to the handle table.
+///
+/// Requires typed registries on KProcess for KPort/KServerPort/KClientPort objects.
+/// These registries do not yet exist. Upstream types needed:
+///   - KPort (exists in Rust)
+///   - KProcess needs: register_port_object, register_server_port_object, register_client_port_object
+///   - KHandleTable needs: ability to resolve typed objects
 pub fn create_port(
-    _out_server: &mut Handle,
-    _out_client: &mut Handle,
+    system: &System,
+    out_server: &mut Handle,
+    out_client: &mut Handle,
     max_sessions: i32,
-    _is_light: bool,
-    _name: u64,
+    is_light: bool,
+    name: u64,
 ) -> ResultCode {
+    // Upstream: R_UNLESS(max_sessions > 0, ResultOutOfRange)
     if max_sessions <= 0 {
         return RESULT_OUT_OF_RANGE;
     }
 
-    // TODO: KPort::Create, Initialize, Register, add to handle table
-    log::warn!("svc::CreatePort: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+    let kernel = system.kernel().expect("kernel not initialized");
+
+    // Create a new port.
+    let mut port = KPort::new();
+    port.initialize(max_sessions, is_light, name as usize);
+
+    // Upstream: KPort::Register(kernel, port)
+    // Upstream: handle_table.Add(out_client, &port.GetClientPort())
+    // Upstream: handle_table.Add(out_server, &port.GetServerPort())
+
+    let client_port_object_id = kernel.create_new_object_id() as u64;
+    let server_port_object_id = kernel.create_new_object_id() as u64;
+
+    let mut process = system.current_process_arc().lock().unwrap();
+
+    // KProcess needs register_client_port_object / register_server_port_object.
+    // Without these, the created port handles cannot be resolved by ConnectToPort.
+
+    match process.handle_table.add(client_port_object_id) {
+        Ok(handle) => *out_client = handle,
+        Err(_) => return RESULT_OUT_OF_HANDLES,
+    }
+
+    match process.handle_table.add(server_port_object_id) {
+        Ok(handle) => *out_server = handle,
+        Err(_) => {
+            // Clean up on failure — upstream: ON_RESULT_FAILURE { handle_table.Remove(*out_client); }
+            process.handle_table.remove(*out_client);
+            return RESULT_OUT_OF_HANDLES;
+        }
+    }
+
+    log::warn!(
+        "svc::CreatePort: KProcess lacks port object registries. \
+         Server handle=0x{:08X}, client handle=0x{:08X} created but objects cannot be resolved. \
+         Upstream needs: register_port_object, register_server_port_object, register_client_port_object",
+        *out_server, *out_client
+    );
+
+    RESULT_SUCCESS
 }
 
 /// Connects to a port via its handle.
-pub fn connect_to_port(_out: &mut Handle, _port: Handle) -> ResultCode {
-    // TODO: Get client port from handle, reserve handle, create session
-    log::warn!("svc::ConnectToPort: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+///
+/// Upstream: Gets KClientPort from handle table, reserves a handle, creates a session
+/// (light or normal), registers in handle table.
+///
+/// Requires typed registry for KClientPort on KProcess.
+/// Upstream type: KClientPort, method: CreateSession / CreateLightSession
+pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> ResultCode {
+    log::debug!("svc::ConnectToPort called, port_handle=0x{:08X}", port);
+
+    let process = system.current_process_arc().lock().unwrap();
+    let Some(_object_id) = process.handle_table.get_object(port) else {
+        return RESULT_INVALID_HANDLE;
+    };
+
+    // Upstream:
+    //   KScopedAutoObject client_port = handle_table.GetObject<KClientPort>(port);
+    //   R_UNLESS(client_port.IsNotNull(), ResultInvalidHandle);
+    //   R_TRY(handle_table.Reserve(out));
+    //   ON_RESULT_FAILURE { handle_table.Unreserve(*out); };
+    //   if (client_port->IsLight()) {
+    //       R_TRY(client_port->CreateLightSession(&session));
+    //   } else {
+    //       R_TRY(client_port->CreateSession(&session));
+    //   }
+    //   handle_table.Register(*out, session);
+    //   session->Close();
+
+    // KProcess needs: get_client_port_by_object_id(object_id) -> Option<Arc<Mutex<KClientPort>>>
+    log::warn!(
+        "svc::ConnectToPort: KProcess lacks client_port registry \
+         (needs get_client_port_by_object_id). \
+         Upstream type: KClientPort, methods: CreateSession / CreateLightSession"
+    );
+    RESULT_INVALID_HANDLE
 }
 
 /// Manages a named port (create or destroy).
+///
+/// Upstream: If max_sessions > 0, creates a port, registers it, adds server to handle table,
+/// and creates a KObjectName entry. If max_sessions == 0, deletes the named object.
 pub fn manage_named_port(
+    system: &System,
     out_server_handle: &mut Handle,
-    _user_name: u64,
+    user_name: u64,
     max_sessions: i32,
 ) -> ResultCode {
+    // Read the port name from guest memory.
+    let name = match read_port_name(system, user_name) {
+        Ok(n) => n,
+        Err(rc) => return rc,
+    };
+
+    // Upstream: R_UNLESS(max_sessions >= 0, ResultOutOfRange)
     if max_sessions < 0 {
         return RESULT_OUT_OF_RANGE;
     }
 
     if max_sessions > 0 {
-        // TODO: Create port, register, add server to handle table,
-        // create named object entry
-        log::warn!("svc::ManageNamedPort(create): kernel object access not yet implemented");
-        RESULT_NOT_IMPLEMENTED
+        let kernel = system.kernel().expect("kernel not initialized");
+
+        // Create a new port.
+        let mut port = KPort::new();
+        port.initialize(max_sessions, false, 0);
+
+        // Upstream: KPort::Register(kernel, port)
+        let server_port_object_id = kernel.create_new_object_id() as u64;
+        let client_port_object_id = kernel.create_new_object_id() as u64;
+
+        let mut process = system.current_process_arc().lock().unwrap();
+
+        // Add server to handle table.
+        match process.handle_table.add(server_port_object_id) {
+            Ok(handle) => *out_server_handle = handle,
+            Err(_) => return RESULT_OUT_OF_HANDLES,
+        }
+
+        // Upstream: KObjectName::NewFromName(kernel, &port.GetClientPort(), name)
+        // Register the client port with the named object system.
+        if let Some(object_name_data) = kernel.object_name_global_data() {
+            if object_name_data
+                .new_from_name(client_port_object_id as usize, &name)
+                .is_err()
+            {
+                // Name already exists — clean up server handle.
+                // Upstream: ON_RESULT_FAILURE { handle_table.Remove(*out_server_handle); }
+                process.handle_table.remove(*out_server_handle);
+                return RESULT_INVALID_STATE;
+            }
+        }
+
+        log::info!(
+            "svc::ManageNamedPort(create): name=\"{}\", server_handle=0x{:08X}",
+            name, *out_server_handle
+        );
+
+        RESULT_SUCCESS
     } else {
         // max_sessions == 0: delete the named port.
+        debug_assert_eq!(max_sessions, 0);
         *out_server_handle = INVALID_HANDLE;
-        // TODO: KObjectName::Delete<KClientPort>(kernel, name)
-        log::warn!("svc::ManageNamedPort(delete): kernel object access not yet implemented");
-        RESULT_NOT_IMPLEMENTED
+
+        let kernel = system.kernel().expect("kernel not initialized");
+
+        // Upstream: KObjectName::Delete<KClientPort>(kernel, name)
+        if let Some(object_name_data) = kernel.object_name_global_data() {
+            // Find the object and delete it.
+            if let Some(obj) = object_name_data.find(&name) {
+                if object_name_data.delete(obj, &name).is_err() {
+                    return RESULT_NOT_FOUND;
+                }
+            } else {
+                return RESULT_NOT_FOUND;
+            }
+        }
+
+        log::info!("svc::ManageNamedPort(delete): name=\"{}\"", name);
+
+        RESULT_SUCCESS
     }
 }

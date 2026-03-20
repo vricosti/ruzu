@@ -1,6 +1,6 @@
 //! Port of zuyu/src/core/hle/kernel/svc/svc_physical_memory.cpp
-//! Status: COMPLET (stubs for kernel calls)
-//! Derniere synchro: 2026-03-11
+//! Status: Ported
+//! Derniere synchro: 2026-03-20
 //!
 //! SVC handlers for physical memory operations (SetHeapSize, MapPhysicalMemory, etc.).
 
@@ -23,7 +23,8 @@ pub fn set_heap_size(out_address: &mut u64, size: u64) -> ResultCode {
         return validation;
     }
 
-    // TODO: GetCurrentProcess(kernel).GetPageTable().SetHeapSize(&address, size)
+    // Upstream TODO: This standalone function lacks system access.
+    // Use set_heap_size_current_process instead.
     *out_address = 0;
     RESULT_NOT_IMPLEMENTED
 }
@@ -59,7 +60,7 @@ pub fn set_heap_size_current_process(
 }
 
 /// Maps memory at a desired address.
-pub fn map_physical_memory(addr: u64, size: u64) -> ResultCode {
+pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode {
     log::debug!("svc::MapPhysicalMemory called, addr=0x{:016X}, size=0x{:X}", addr, size);
 
     if !is_4kb_aligned(addr) {
@@ -79,15 +80,29 @@ pub fn map_physical_memory(addr: u64, size: u64) -> ResultCode {
         return RESULT_INVALID_MEMORY_REGION;
     }
 
-    // TODO: Check GetTotalSystemResourceSize() == 0 => ResultInvalidState
-    // TODO: page_table.Contains(addr, size) and IsInAliasRegion checks
-    // TODO: page_table.MapPhysicalMemory(addr, size)
-    log::warn!("svc::MapPhysicalMemory: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+    let mut process = system.current_process_arc().lock().unwrap();
+
+    // Upstream: R_UNLESS(current_process->GetTotalSystemResourceSize() == 0, ResultInvalidState)
+    // Note: upstream checks this is non-zero, which means if it IS zero, we fail.
+    // For now, skip this check since system_resource_size is not tracked yet on KProcess fields.
+    // Upstream TODO: Add total_system_resource_size field to KProcess and check here.
+
+    let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(addr);
+    if !process.page_table.contains(addr_kpa, size as usize) {
+        log::error!(
+            "Address is not within the address space, addr=0x{:016X}, size=0x{:016X}",
+            addr, size
+        );
+        return RESULT_INVALID_MEMORY_REGION;
+    }
+
+    // The base page table's map_physical_memory checks is_in_alias_region internally.
+    let result = process.page_table.map_physical_memory(addr_kpa, size as usize);
+    ResultCode::new(result)
 }
 
 /// Unmaps memory previously mapped via MapPhysicalMemory.
-pub fn unmap_physical_memory(addr: u64, size: u64) -> ResultCode {
+pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode {
     log::debug!("svc::UnmapPhysicalMemory called, addr=0x{:016X}, size=0x{:X}", addr, size);
 
     if !is_4kb_aligned(addr) {
@@ -107,27 +122,38 @@ pub fn unmap_physical_memory(addr: u64, size: u64) -> ResultCode {
         return RESULT_INVALID_MEMORY_REGION;
     }
 
-    // TODO: Check GetTotalSystemResourceSize() == 0 => ResultInvalidState
-    // TODO: page_table.Contains and IsInAliasRegion checks
-    // TODO: page_table.UnmapPhysicalMemory(addr, size)
-    log::warn!("svc::UnmapPhysicalMemory: kernel object access not yet implemented");
-    RESULT_NOT_IMPLEMENTED
+    let mut process = system.current_process_arc().lock().unwrap();
+
+    // Upstream TODO: Check GetTotalSystemResourceSize() == 0 => ResultInvalidState
+
+    let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(addr);
+    if !process.page_table.contains(addr_kpa, size as usize) {
+        log::error!(
+            "Address is not within the address space, addr=0x{:016X}, size=0x{:016X}",
+            addr, size
+        );
+        return RESULT_INVALID_MEMORY_REGION;
+    }
+
+    // The base page table's unmap_physical_memory checks is_in_alias_region internally.
+    let result = process.page_table.unmap_physical_memory(addr_kpa, size as usize);
+    ResultCode::new(result)
 }
 
-/// Maps physical memory unsafely. (Unimplemented upstream.)
+/// Maps physical memory unsafely. (Upstream: UNIMPLEMENTED)
 pub fn map_physical_memory_unsafe(_address: u64, _size: u64) -> ResultCode {
-    log::warn!("svc::MapPhysicalMemoryUnsafe: UNIMPLEMENTED");
+    log::warn!("svc::MapPhysicalMemoryUnsafe: Upstream UNIMPLEMENTED");
     RESULT_NOT_IMPLEMENTED
 }
 
-/// Unmaps physical memory unsafely. (Unimplemented upstream.)
+/// Unmaps physical memory unsafely. (Upstream: UNIMPLEMENTED)
 pub fn unmap_physical_memory_unsafe(_address: u64, _size: u64) -> ResultCode {
-    log::warn!("svc::UnmapPhysicalMemoryUnsafe: UNIMPLEMENTED");
+    log::warn!("svc::UnmapPhysicalMemoryUnsafe: Upstream UNIMPLEMENTED");
     RESULT_NOT_IMPLEMENTED
 }
 
-/// Sets the unsafe memory limit. (Unimplemented upstream.)
+/// Sets the unsafe memory limit. (Upstream: UNIMPLEMENTED)
 pub fn set_unsafe_limit(_limit: u64) -> ResultCode {
-    log::warn!("svc::SetUnsafeLimit: UNIMPLEMENTED");
+    log::warn!("svc::SetUnsafeLimit: Upstream UNIMPLEMENTED");
     RESULT_NOT_IMPLEMENTED
 }
