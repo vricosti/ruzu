@@ -1,6 +1,6 @@
 //! Port of zuyu/src/core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h
-//! Status: EN COURS
-//! Derniere synchro: 2026-03-16
+//! Status: COMPLET
+//! Derniere synchro: 2026-03-21
 //!
 //! KScopedSchedulerLockAndSleep — RAII guard that locks the scheduler and
 //! optionally registers a timer task on drop.
