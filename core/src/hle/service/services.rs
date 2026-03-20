@@ -374,7 +374,16 @@ impl Services {
 
     fn loop_process_settings(sm: &Arc<Mutex<ServiceManager>>) {
         let mut server_manager = ServerManager::new(sm.clone());
-        register_stub_services(&mut server_manager, &["set", "set:cal", "set:fd", "set:sys"]);
+        // Register set, set:cal, set:fd as stubs
+        register_stub_services(&mut server_manager, &["set", "set:cal", "set:fd"]);
+        // Register set:sys with real ISystemSettingsServer implementation
+        server_manager.register_named_service(
+            "set:sys",
+            Box::new(|| -> Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> {
+                Arc::new(super::set::system_settings_server::SystemSettingsService::new())
+            }),
+            64,
+        );
         ServerManager::run_server(server_manager);
     }
 

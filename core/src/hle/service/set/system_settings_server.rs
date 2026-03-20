@@ -5,7 +5,13 @@
 //!
 //! ISystemSettingsServer service ("set:sys").
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::settings_types::*;
 
 /// Settings file version, matching upstream SETTINGS_VERSION.
@@ -24,29 +30,30 @@ pub struct SettingsHeader {
     pub reserved: u32,
 }
 
-/// IPC command table for ISystemSettingsServer ("set:sys").
+/// IPC command IDs for ISystemSettingsServer ("set:sys").
+/// Matches upstream system_settings_server.cpp lines 94-303.
 pub mod commands {
     pub const SET_LANGUAGE_CODE: u32 = 0;
     pub const GET_FIRMWARE_VERSION: u32 = 3;
     pub const GET_FIRMWARE_VERSION2: u32 = 4;
     pub const GET_LOCK_SCREEN_FLAG: u32 = 7;
     pub const SET_LOCK_SCREEN_FLAG: u32 = 8;
-    pub const GET_EXTERNAL_STEADY_CLOCK_SOURCE_ID: u32 = 9;
-    pub const SET_EXTERNAL_STEADY_CLOCK_SOURCE_ID: u32 = 10;
-    pub const GET_USER_SYSTEM_CLOCK_CONTEXT: u32 = 17;
-    pub const SET_USER_SYSTEM_CLOCK_CONTEXT: u32 = 18;
-    pub const GET_ACCOUNT_SETTINGS: u32 = 19;
-    pub const SET_ACCOUNT_SETTINGS: u32 = 20;
+    pub const GET_EXTERNAL_STEADY_CLOCK_SOURCE_ID: u32 = 13;
+    pub const SET_EXTERNAL_STEADY_CLOCK_SOURCE_ID: u32 = 14;
+    pub const GET_USER_SYSTEM_CLOCK_CONTEXT: u32 = 15;
+    pub const SET_USER_SYSTEM_CLOCK_CONTEXT: u32 = 16;
+    pub const GET_ACCOUNT_SETTINGS: u32 = 17;
+    pub const SET_ACCOUNT_SETTINGS: u32 = 18;
     pub const GET_EULA_VERSIONS: u32 = 21;
     pub const SET_EULA_VERSIONS: u32 = 22;
     pub const GET_COLOR_SET_ID: u32 = 23;
     pub const SET_COLOR_SET_ID: u32 = 24;
-    pub const GET_NOTIFICATION_SETTINGS: u32 = 25;
-    pub const SET_NOTIFICATION_SETTINGS: u32 = 26;
-    pub const GET_ACCOUNT_NOTIFICATION_SETTINGS: u32 = 27;
-    pub const SET_ACCOUNT_NOTIFICATION_SETTINGS: u32 = 28;
-    pub const GET_VIBRATION_MASTER_VOLUME: u32 = 29;
-    pub const SET_VIBRATION_MASTER_VOLUME: u32 = 30;
+    pub const GET_NOTIFICATION_SETTINGS: u32 = 29;
+    pub const SET_NOTIFICATION_SETTINGS: u32 = 30;
+    pub const GET_ACCOUNT_NOTIFICATION_SETTINGS: u32 = 31;
+    pub const SET_ACCOUNT_NOTIFICATION_SETTINGS: u32 = 32;
+    pub const GET_VIBRATION_MASTER_VOLUME: u32 = 35;
+    pub const SET_VIBRATION_MASTER_VOLUME: u32 = 36;
     pub const GET_SETTINGS_ITEM_VALUE_SIZE: u32 = 37;
     pub const GET_SETTINGS_ITEM_VALUE: u32 = 38;
     pub const GET_TV_SETTINGS: u32 = 39;
@@ -57,8 +64,8 @@ pub mod commands {
     pub const SET_SPEAKER_AUTO_MUTE_FLAG: u32 = 46;
     pub const GET_QUEST_FLAG: u32 = 47;
     pub const SET_QUEST_FLAG: u32 = 48;
-    pub const GET_DEVICE_TIME_ZONE_LOCATION_NAME: u32 = 49;
-    pub const SET_DEVICE_TIME_ZONE_LOCATION_NAME: u32 = 50;
+    pub const GET_DEVICE_TIME_ZONE_LOCATION_NAME: u32 = 53;
+    pub const SET_DEVICE_TIME_ZONE_LOCATION_NAME: u32 = 54;
     pub const SET_REGION_CODE: u32 = 57;
     pub const GET_NETWORK_SYSTEM_CLOCK_CONTEXT: u32 = 58;
     pub const SET_NETWORK_SYSTEM_CLOCK_CONTEXT: u32 = 59;
@@ -67,19 +74,19 @@ pub mod commands {
     pub const GET_DEBUG_MODE_FLAG: u32 = 62;
     pub const GET_PRIMARY_ALBUM_STORAGE: u32 = 63;
     pub const SET_PRIMARY_ALBUM_STORAGE: u32 = 64;
-    pub const GET_BATTERY_LOT: u32 = 68;
-    pub const GET_SERIAL_NUMBER: u32 = 69;
-    pub const GET_NFC_ENABLE_FLAG: u32 = 70;
-    pub const SET_NFC_ENABLE_FLAG: u32 = 71;
-    pub const GET_SLEEP_SETTINGS: u32 = 73;
-    pub const SET_SLEEP_SETTINGS: u32 = 74;
-    pub const GET_WIRELESS_LAN_ENABLE_FLAG: u32 = 75;
-    pub const SET_WIRELESS_LAN_ENABLE_FLAG: u32 = 76;
-    pub const GET_INITIAL_LAUNCH_SETTINGS: u32 = 77;
-    pub const SET_INITIAL_LAUNCH_SETTINGS: u32 = 78;
-    pub const GET_DEVICE_NICK_NAME: u32 = 79;
-    pub const SET_DEVICE_NICK_NAME: u32 = 80;
-    pub const GET_PRODUCT_MODEL: u32 = 81;
+    pub const GET_BATTERY_LOT: u32 = 67;
+    pub const GET_SERIAL_NUMBER: u32 = 68;
+    pub const GET_NFC_ENABLE_FLAG: u32 = 69;
+    pub const SET_NFC_ENABLE_FLAG: u32 = 70;
+    pub const GET_SLEEP_SETTINGS: u32 = 71;
+    pub const SET_SLEEP_SETTINGS: u32 = 72;
+    pub const GET_WIRELESS_LAN_ENABLE_FLAG: u32 = 73;
+    pub const SET_WIRELESS_LAN_ENABLE_FLAG: u32 = 74;
+    pub const GET_INITIAL_LAUNCH_SETTINGS: u32 = 75;
+    pub const SET_INITIAL_LAUNCH_SETTINGS: u32 = 76;
+    pub const GET_DEVICE_NICK_NAME: u32 = 77;
+    pub const SET_DEVICE_NICK_NAME: u32 = 78;
+    pub const GET_PRODUCT_MODEL: u32 = 79;
     pub const GET_BLUETOOTH_ENABLE_FLAG: u32 = 88;
     pub const SET_BLUETOOTH_ENABLE_FLAG: u32 = 89;
     pub const GET_MII_AUTHOR_ID: u32 = 90;
@@ -87,30 +94,30 @@ pub mod commands {
     pub const SET_AUTO_UPDATE_ENABLE_FLAG: u32 = 96;
     pub const GET_BATTERY_PERCENTAGE_FLAG: u32 = 99;
     pub const SET_BATTERY_PERCENTAGE_FLAG: u32 = 100;
-    pub const SET_EXTERNAL_STEADY_CLOCK_INTERNAL_OFFSET: u32 = 124;
-    pub const GET_EXTERNAL_STEADY_CLOCK_INTERNAL_OFFSET: u32 = 125;
-    pub const GET_PUSH_NOTIFICATION_ACTIVITY_MODE_ON_SLEEP: u32 = 126;
-    pub const SET_PUSH_NOTIFICATION_ACTIVITY_MODE_ON_SLEEP: u32 = 127;
-    pub const GET_ERROR_REPORT_SHARE_PERMISSION: u32 = 130;
-    pub const SET_ERROR_REPORT_SHARE_PERMISSION: u32 = 131;
-    pub const GET_APPLET_LAUNCH_FLAGS: u32 = 140;
-    pub const SET_APPLET_LAUNCH_FLAGS: u32 = 141;
-    pub const GET_KEYBOARD_LAYOUT: u32 = 152;
-    pub const SET_KEYBOARD_LAYOUT: u32 = 153;
-    pub const GET_DEVICE_TIME_ZONE_LOCATION_UPDATED_TIME: u32 = 162;
-    pub const SET_DEVICE_TIME_ZONE_LOCATION_UPDATED_TIME: u32 = 163;
-    pub const GET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME: u32 = 168;
-    pub const SET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME: u32 = 169;
-    pub const GET_CHINESE_TRADITIONAL_INPUT_METHOD: u32 = 195;
-    pub const GET_HOME_MENU_SCHEME: u32 = 200;
-    pub const GET_HOME_MENU_SCHEME_MODEL: u32 = 201;
-    pub const GET_TOUCH_SCREEN_MODE: u32 = 203;
-    pub const GET_PLATFORM_REGION: u32 = 207;
-    pub const SET_PLATFORM_REGION: u32 = 208;
-    pub const SET_TOUCH_SCREEN_MODE: u32 = 211;
-    pub const GET_FIELD_TESTING_FLAG: u32 = 215;
-    pub const GET_PANEL_CRC_MODE: u32 = 216;
-    pub const SET_PANEL_CRC_MODE: u32 = 217;
+    pub const SET_EXTERNAL_STEADY_CLOCK_INTERNAL_OFFSET: u32 = 105;
+    pub const GET_EXTERNAL_STEADY_CLOCK_INTERNAL_OFFSET: u32 = 106;
+    pub const GET_PUSH_NOTIFICATION_ACTIVITY_MODE_ON_SLEEP: u32 = 120;
+    pub const SET_PUSH_NOTIFICATION_ACTIVITY_MODE_ON_SLEEP: u32 = 121;
+    pub const GET_ERROR_REPORT_SHARE_PERMISSION: u32 = 124;
+    pub const SET_ERROR_REPORT_SHARE_PERMISSION: u32 = 125;
+    pub const GET_APPLET_LAUNCH_FLAGS: u32 = 126;
+    pub const SET_APPLET_LAUNCH_FLAGS: u32 = 127;
+    pub const GET_KEYBOARD_LAYOUT: u32 = 136;
+    pub const SET_KEYBOARD_LAYOUT: u32 = 137;
+    pub const GET_DEVICE_TIME_ZONE_LOCATION_UPDATED_TIME: u32 = 150;
+    pub const SET_DEVICE_TIME_ZONE_LOCATION_UPDATED_TIME: u32 = 151;
+    pub const GET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME: u32 = 152;
+    pub const SET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME: u32 = 153;
+    pub const GET_CHINESE_TRADITIONAL_INPUT_METHOD: u32 = 170;
+    pub const GET_HOME_MENU_SCHEME: u32 = 174;
+    pub const GET_PLATFORM_REGION: u32 = 183;
+    pub const SET_PLATFORM_REGION: u32 = 184;
+    pub const GET_HOME_MENU_SCHEME_MODEL: u32 = 185;
+    pub const GET_TOUCH_SCREEN_MODE: u32 = 187;
+    pub const SET_TOUCH_SCREEN_MODE: u32 = 188;
+    pub const GET_FIELD_TESTING_FLAG: u32 = 201;
+    pub const GET_PANEL_CRC_MODE: u32 = 203;
+    pub const SET_PANEL_CRC_MODE: u32 = 204;
 }
 
 /// ISystemSettingsServer — "set:sys" service.
@@ -741,6 +748,379 @@ pub fn get_firmware_version_impl(
     out.display_title[..title.len()].copy_from_slice(title);
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// ServiceFramework wiring — makes ISystemSettingsServer a real IPC service
+// ---------------------------------------------------------------------------
+
+/// IPC-facing service wrapper for set:sys.
+/// Holds ISystemSettingsServer behind a Mutex for interior mutability
+/// (handlers receive &dyn ServiceFramework, not &mut self).
+pub struct SystemSettingsService {
+    inner: Mutex<ISystemSettingsServer>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl SystemSettingsService {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(ISystemSettingsServer::new()),
+            handlers: build_handler_map(&[
+                // Commands called by MK8D during init (matching upstream IDs)
+                (commands::GET_FIRMWARE_VERSION, Some(Self::get_firmware_version_handler), "GetFirmwareVersion"),
+                (commands::GET_FIRMWARE_VERSION2, Some(Self::get_firmware_version2_handler), "GetFirmwareVersion2"),
+                (commands::GET_EXTERNAL_STEADY_CLOCK_SOURCE_ID, Some(Self::get_external_steady_clock_source_id_handler), "GetExternalSteadyClockSourceId"),
+                (commands::SET_EXTERNAL_STEADY_CLOCK_SOURCE_ID, Some(Self::set_external_steady_clock_source_id_handler), "SetExternalSteadyClockSourceId"),
+                (commands::GET_USER_SYSTEM_CLOCK_CONTEXT, Some(Self::get_user_system_clock_context_handler), "GetUserSystemClockContext"),
+                (commands::SET_USER_SYSTEM_CLOCK_CONTEXT, Some(Self::set_user_system_clock_context_handler), "SetUserSystemClockContext"),
+                (commands::GET_VIBRATION_MASTER_VOLUME, Some(Self::get_vibration_master_volume_handler), "GetVibrationMasterVolume"),
+                (commands::SET_VIBRATION_MASTER_VOLUME, Some(Self::set_vibration_master_volume_handler), "SetVibrationMasterVolume"),
+                (commands::GET_DEVICE_TIME_ZONE_LOCATION_NAME, Some(Self::get_device_time_zone_location_name_handler), "GetDeviceTimeZoneLocationName"),
+                (commands::SET_DEVICE_TIME_ZONE_LOCATION_NAME, Some(Self::set_device_time_zone_location_name_handler), "SetDeviceTimeZoneLocationName"),
+                (commands::GET_NETWORK_SYSTEM_CLOCK_CONTEXT, Some(Self::get_network_system_clock_context_handler), "GetNetworkSystemClockContext"),
+                (commands::SET_NETWORK_SYSTEM_CLOCK_CONTEXT, Some(Self::set_network_system_clock_context_handler), "SetNetworkSystemClockContext"),
+                (commands::IS_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, Some(Self::is_user_system_clock_automatic_correction_enabled_handler), "IsUserSystemClockAutomaticCorrectionEnabled"),
+                (commands::SET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, Some(Self::set_user_system_clock_automatic_correction_enabled_handler), "SetUserSystemClockAutomaticCorrectionEnabled"),
+                (commands::GET_DEVICE_TIME_ZONE_LOCATION_UPDATED_TIME, Some(Self::get_device_time_zone_location_updated_time_handler), "GetDeviceTimeZoneLocationUpdatedTime"),
+                (commands::SET_DEVICE_TIME_ZONE_LOCATION_UPDATED_TIME, Some(Self::set_device_time_zone_location_updated_time_handler), "SetDeviceTimeZoneLocationUpdatedTime"),
+                (commands::GET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME, Some(Self::get_user_system_clock_automatic_correction_updated_time_handler), "GetUserSystemClockAutomaticCorrectionUpdatedTime"),
+                (commands::SET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME, Some(Self::set_user_system_clock_automatic_correction_updated_time_handler), "SetUserSystemClockAutomaticCorrectionUpdatedTime"),
+                (commands::GET_COLOR_SET_ID, Some(Self::get_color_set_id_handler), "GetColorSetId"),
+                (commands::SET_COLOR_SET_ID, Some(Self::set_color_set_id_handler), "SetColorSetId"),
+                (commands::GET_TOUCH_SCREEN_MODE, Some(Self::get_touch_screen_mode_handler), "GetTouchScreenMode"),
+                (commands::SET_TOUCH_SCREEN_MODE, Some(Self::set_touch_screen_mode_handler), "SetTouchScreenMode"),
+                (commands::GET_DEBUG_MODE_FLAG, Some(Self::get_debug_mode_flag_handler), "GetDebugModeFlag"),
+                (commands::GET_PRODUCT_MODEL, Some(Self::get_product_model_handler), "GetProductModel"),
+                (commands::SET_EXTERNAL_STEADY_CLOCK_INTERNAL_OFFSET, Some(Self::set_external_steady_clock_internal_offset_handler), "SetExternalSteadyClockInternalOffset"),
+                (commands::GET_EXTERNAL_STEADY_CLOCK_INTERNAL_OFFSET, Some(Self::get_external_steady_clock_internal_offset_handler), "GetExternalSteadyClockInternalOffset"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    // --- IPC handlers: each reads params, calls inner, writes response ---
+
+    fn get_firmware_version_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let inner = svc.inner.lock().unwrap();
+        let fw = inner.get_firmware_version();
+        log::info!("ISystemSettingsServer::GetFirmwareVersion -> {}.{}.{}", fw.major, fw.minor, fw.micro);
+        // FirmwareVersionFormat is 0x100 bytes, written to output buffer
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&fw as *const FirmwareVersionFormat as *const u8, std::mem::size_of::<FirmwareVersionFormat>())
+        };
+        ctx.write_buffer(bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_firmware_version2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        Self::get_firmware_version_handler(this, ctx);
+    }
+
+    fn get_external_steady_clock_source_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let inner = svc.inner.lock().unwrap();
+        let id = inner.get_external_steady_clock_source_id();
+        let id_str = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            id[0],id[1],id[2],id[3], id[4],id[5], id[6],id[7], id[8],id[9], id[10],id[11],id[12],id[13],id[14],id[15]);
+        log::info!("ISystemSettingsServer::GetExternalSteadyClockSourceId -> {}", id_str);
+        // UUID is 16 bytes, returned inline in response
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        // Push 16 bytes as 4 u32s
+        for i in 0..4 {
+            let word = u32::from_le_bytes([id[i*4], id[i*4+1], id[i*4+2], id[i*4+3]]);
+            rb.push_u32(word);
+        }
+    }
+
+    fn set_external_steady_clock_source_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let mut id = [0u8; 16];
+        for i in 0..4 {
+            let word = rp.pop_u32();
+            id[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+        }
+        let id_str = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            id[0],id[1],id[2],id[3], id[4],id[5], id[6],id[7], id[8],id[9], id[10],id[11],id[12],id[13],id[14],id[15]);
+        log::info!("ISystemSettingsServer::SetExternalSteadyClockSourceId({})", id_str);
+        svc.inner.lock().unwrap().set_external_steady_clock_source_id(id);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_user_system_clock_context_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let inner = svc.inner.lock().unwrap();
+        let context = inner.get_user_system_clock_context();
+        log::info!("ISystemSettingsServer::GetUserSystemClockContext called");
+        let mut rb = ResponseBuilder::new(ctx, 2 + 8, 0, 0); // 0x20 bytes = 8 u32s
+        rb.push_result(RESULT_SUCCESS);
+        for i in 0..8 {
+            let word = u32::from_le_bytes([context[i*4], context[i*4+1], context[i*4+2], context[i*4+3]]);
+            rb.push_u32(word);
+        }
+    }
+
+    fn set_user_system_clock_context_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let mut context = [0u8; 0x20];
+        for i in 0..8 {
+            let word = rp.pop_u32();
+            context[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+        }
+        log::info!("ISystemSettingsServer::SetUserSystemClockContext called");
+        svc.inner.lock().unwrap().set_user_system_clock_context(context);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_vibration_master_volume_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let vol = svc.inner.lock().unwrap().get_vibration_master_volume();
+        log::info!("ISystemSettingsServer::GetVibrationMasterVolume -> {}", vol);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(vol.to_bits());
+    }
+
+    fn set_vibration_master_volume_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let vol = rp.pop_f32();
+        log::info!("ISystemSettingsServer::SetVibrationMasterVolume({})", vol);
+        svc.inner.lock().unwrap().set_vibration_master_volume(vol);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_device_time_zone_location_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let name = svc.inner.lock().unwrap().get_device_time_zone_location_name();
+        let name_str = std::str::from_utf8(&name).unwrap_or("").trim_end_matches('\0');
+        log::info!("ISystemSettingsServer::GetDeviceTimeZoneLocationName -> \"{}\"", name_str);
+        // LocationName is 0x24 bytes = 9 u32s
+        let mut rb = ResponseBuilder::new(ctx, 2 + 9, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        for i in 0..9 {
+            let start = i * 4;
+            let end = (start + 4).min(0x24);
+            let mut word_bytes = [0u8; 4];
+            let len = end - start;
+            word_bytes[..len].copy_from_slice(&name[start..end]);
+            rb.push_u32(u32::from_le_bytes(word_bytes));
+        }
+    }
+
+    fn set_device_time_zone_location_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let mut name = [0u8; 0x24];
+        for i in 0..9 {
+            let word = rp.pop_u32();
+            let start = i * 4;
+            let end = (start + 4).min(0x24);
+            name[start..end].copy_from_slice(&word.to_le_bytes()[..end-start]);
+        }
+        let name_str = std::str::from_utf8(&name).unwrap_or("").trim_end_matches('\0');
+        log::info!("ISystemSettingsServer::SetDeviceTimeZoneLocationName(\"{}\")", name_str);
+        svc.inner.lock().unwrap().set_device_time_zone_location_name(name);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_network_system_clock_context_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let context = svc.inner.lock().unwrap().get_network_system_clock_context();
+        log::info!("ISystemSettingsServer::GetNetworkSystemClockContext called");
+        let mut rb = ResponseBuilder::new(ctx, 2 + 8, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        for i in 0..8 {
+            let word = u32::from_le_bytes([context[i*4], context[i*4+1], context[i*4+2], context[i*4+3]]);
+            rb.push_u32(word);
+        }
+    }
+
+    fn set_network_system_clock_context_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let mut context = [0u8; 0x20];
+        for i in 0..8 {
+            let word = rp.pop_u32();
+            context[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+        }
+        log::info!("ISystemSettingsServer::SetNetworkSystemClockContext called");
+        svc.inner.lock().unwrap().set_network_system_clock_context(context);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn is_user_system_clock_automatic_correction_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let enabled = svc.inner.lock().unwrap().is_user_system_clock_automatic_correction_enabled();
+        log::info!("ISystemSettingsServer::IsUserSystemClockAutomaticCorrectionEnabled -> {}", enabled);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(enabled as u32);
+    }
+
+    fn set_user_system_clock_automatic_correction_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let enabled = rp.pop_bool();
+        log::info!("ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionEnabled({})", enabled);
+        svc.inner.lock().unwrap().set_user_system_clock_automatic_correction_enabled(enabled);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_device_time_zone_location_updated_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let time = svc.inner.lock().unwrap().get_device_time_zone_location_updated_time();
+        log::info!("ISystemSettingsServer::GetDeviceTimeZoneLocationUpdatedTime called");
+        // SteadyClockTimePoint is 0x18 bytes = 6 u32s
+        let mut rb = ResponseBuilder::new(ctx, 2 + 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        for i in 0..6 {
+            let word = u32::from_le_bytes([time[i*4], time[i*4+1], time[i*4+2], time[i*4+3]]);
+            rb.push_u32(word);
+        }
+    }
+
+    fn set_device_time_zone_location_updated_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let mut time = [0u8; 0x18];
+        for i in 0..6 {
+            let word = rp.pop_u32();
+            time[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+        }
+        log::info!("ISystemSettingsServer::SetDeviceTimeZoneLocationUpdatedTime called");
+        svc.inner.lock().unwrap().set_device_time_zone_location_updated_time(time);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_user_system_clock_automatic_correction_updated_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let time = svc.inner.lock().unwrap().get_user_system_clock_automatic_correction_updated_time();
+        log::info!("ISystemSettingsServer::GetUserSystemClockAutomaticCorrectionUpdatedTime called");
+        let mut rb = ResponseBuilder::new(ctx, 2 + 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        for i in 0..6 {
+            let word = u32::from_le_bytes([time[i*4], time[i*4+1], time[i*4+2], time[i*4+3]]);
+            rb.push_u32(word);
+        }
+    }
+
+    fn set_user_system_clock_automatic_correction_updated_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let mut time = [0u8; 0x18];
+        for i in 0..6 {
+            let word = rp.pop_u32();
+            time[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+        }
+        log::info!("ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionUpdatedTime called");
+        svc.inner.lock().unwrap().set_user_system_clock_automatic_correction_updated_time(time);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_color_set_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let id = svc.inner.lock().unwrap().get_color_set_id();
+        log::debug!("ISystemSettingsServer::GetColorSetId -> {:?}", id);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(id as u32);
+    }
+
+    fn set_color_set_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let id = rp.pop_u32();
+        log::debug!("ISystemSettingsServer::SetColorSetId({})", id);
+        svc.inner.lock().unwrap().set_color_set_id(unsafe { std::mem::transmute(id) });
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_touch_screen_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mode = svc.inner.lock().unwrap().get_touch_screen_mode();
+        log::info!("ISystemSettingsServer::GetTouchScreenMode -> {:?}", mode);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(mode as u32);
+    }
+
+    fn set_touch_screen_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let mode = rp.pop_u32();
+        log::debug!("ISystemSettingsServer::SetTouchScreenMode({})", mode);
+        svc.inner.lock().unwrap().set_touch_screen_mode(unsafe { std::mem::transmute(mode) });
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_debug_mode_flag_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISystemSettingsServer::GetDebugModeFlag -> false");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(0); // false
+    }
+
+    fn get_product_model_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISystemSettingsServer::GetProductModel -> 1 (NX)");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(1); // ProductModel::NX
+    }
+
+    fn set_external_steady_clock_internal_offset_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let offset = rp.pop_i64();
+        log::info!("ISystemSettingsServer::SetExternalSteadyClockInternalOffset({})", offset);
+        svc.inner.lock().unwrap().set_external_steady_clock_internal_offset(offset);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_external_steady_clock_internal_offset_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let offset = svc.inner.lock().unwrap().get_external_steady_clock_internal_offset();
+        log::info!("ISystemSettingsServer::GetExternalSteadyClockInternalOffset -> {}", offset);
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(offset as u64);
+    }
+}
+
+impl SessionRequestHandler for SystemSettingsService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        ServiceFramework::get_service_name(self)
+    }
+}
+
+impl ServiceFramework for SystemSettingsService {
+    fn get_service_name(&self) -> &str { "set:sys" }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
 }
 
 #[cfg(test)]
