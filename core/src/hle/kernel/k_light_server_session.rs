@@ -42,25 +42,34 @@ impl KLightServerSession {
     }
 
     /// Enqueue a request from a thread.
-    /// Matches upstream `KLightServerSession::OnRequest`.
-    /// TODO: Port from k_light_server_session.cpp.
+    /// Port of upstream `KLightServerSession::OnRequest`.
+    /// Upstream adds the thread to the request list and wakes the server thread.
+    /// Full implementation requires KScopedSchedulerLock and thread BeginWait/EndWait.
     pub fn on_request(&mut self, request_thread_id: u64) -> u32 {
         self.request_list.push_back(request_thread_id);
-        // TODO: Signal
+        // Upstream: if m_server_thread != nullptr, m_server_thread->EndWait(ResultSuccess)
+        // Blocked by scheduler integration.
         0 // ResultSuccess
     }
 
     /// Reply and receive.
-    /// TODO: Port from k_light_server_session.cpp.
+    /// Port of upstream `KLightServerSession::ReplyAndReceive`.
+    /// Full implementation requires scheduler locks and thread blocking.
     pub fn reply_and_receive(&mut self, _data: &mut [u32]) -> u32 {
-        // TODO: Full implementation
+        // Try to receive a pending request.
+        if let Some(thread_id) = self.request_list.pop_front() {
+            self.current_request_thread_id = Some(thread_id);
+            return 0; // ResultSuccess — request received
+        }
+        // No pending requests. Upstream would block the server thread here.
+        // Blocked by scheduler integration.
         0
     }
 
     /// Called when the client side is closed.
-    /// TODO: Port from k_light_server_session.cpp.
+    /// Port of upstream `KLightServerSession::OnClientClosed`.
     pub fn on_client_closed(&mut self) {
-        // TODO: Full implementation
+        self.cleanup_requests();
     }
 
     /// Clean up pending requests.

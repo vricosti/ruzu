@@ -65,28 +65,43 @@ impl KServerSession {
     }
 
     /// Called when the client side is closed.
+    /// Port of upstream `KServerSession::OnClientClosed`.
+    /// Upstream signals the session and wakes waiting threads.
     pub fn on_client_closed(&mut self) {
-        // TODO: Full implementation — wake waiters, clean up requests
+        // Upstream: KScopedSchedulerLock + notify waiters of session closure.
+        // Without scheduler integration, just clean up pending requests.
+        self.cleanup_requests();
     }
 
     /// Enqueue a request.
-    /// Matches upstream `KServerSession::OnRequest`.
+    /// Port of upstream `KServerSession::OnRequest`.
     pub fn on_request(&mut self, request_id: u64) -> u32 {
         self.request_list.push_back(request_id);
-        // TODO: Signal the server session to wake the event loop
+        // Upstream: this->Signal() to wake the event loop.
+        // The HLE service layer handles dispatching via SessionRequestManager.
         0 // ResultSuccess
     }
 
-    /// Send a reply.
+    /// Send a reply to the current request.
+    /// Port of upstream `KServerSession::SendReply` (simplified for HLE).
+    /// Full kernel IPC message translation requires KProcessPageTable and message buffers.
     pub fn send_reply(&mut self) -> u32 {
-        // TODO: Full implementation
-        0
+        if let Some(_request_id) = self.current_request_id.take() {
+            // Upstream: translate reply message, end request thread wait.
+            // HLE services handle reply via SessionRequestManager.
+        }
+        0 // ResultSuccess
     }
 
-    /// Receive a request.
+    /// Receive the next pending request.
+    /// Port of upstream `KServerSession::ReceiveRequest` (simplified for HLE).
     pub fn receive_request(&mut self) -> u32 {
-        // TODO: Full implementation
-        0
+        if let Some(request_id) = self.request_list.pop_front() {
+            self.current_request_id = Some(request_id);
+            return 0; // ResultSuccess
+        }
+        // No pending requests. Upstream would block via scheduler.
+        1 // Would need to return ResultNotFound or similar
     }
 
     /// Clean up pending requests.

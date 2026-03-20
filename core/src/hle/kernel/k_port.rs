@@ -150,7 +150,7 @@ impl KPort {
     /// }
     /// ```
     pub fn on_client_closed(&mut self) {
-        // TODO: KScopedSchedulerLock
+        // Upstream: KScopedSchedulerLock sl{m_kernel};
         if self.state == PortState::Normal {
             self.state = PortState::ClientClosed;
         }
@@ -166,7 +166,7 @@ impl KPort {
     /// }
     /// ```
     pub fn on_server_closed(&mut self) {
-        // TODO: KScopedSchedulerLock
+        // Upstream: KScopedSchedulerLock sl{m_kernel};
         if self.state == PortState::Normal {
             self.state = PortState::ServerClosed;
         }
@@ -184,7 +184,7 @@ impl KPort {
     /// }
     /// ```
     pub fn enqueue_session(&mut self, session_id: u64) -> ResultCode {
-        // TODO: KScopedSchedulerLock
+        // Upstream: KScopedSchedulerLock sl{m_kernel};
         if self.state != PortState::Normal {
             return RESULT_PORT_CLOSED;
         }
@@ -196,7 +196,7 @@ impl KPort {
     ///
     /// Matches upstream `KPort::EnqueueSession(KLightServerSession*)`.
     pub fn enqueue_light_session(&mut self, session_id: u64) -> ResultCode {
-        // TODO: KScopedSchedulerLock
+        // Upstream: KScopedSchedulerLock sl{m_kernel};
         if self.state != PortState::Normal {
             return RESULT_PORT_CLOSED;
         }

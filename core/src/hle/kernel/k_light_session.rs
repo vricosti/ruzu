@@ -76,21 +76,30 @@ impl KLightSession {
     }
 
     /// Called when the server side is closed.
-    /// TODO: Port from k_light_session.cpp.
+    /// Port of upstream `KLightSession::OnServerClosed`.
     pub fn on_server_closed(&mut self) {
-        self.state = LightSessionState::ServerClosed;
+        if self.state == LightSessionState::Normal {
+            self.state = LightSessionState::ServerClosed;
+            // Upstream: m_client.OnServerClosed() + this->Close()
+        }
     }
 
     /// Called when the client side is closed.
-    /// TODO: Port from k_light_session.cpp.
+    /// Port of upstream `KLightSession::OnClientClosed`.
     pub fn on_client_closed(&mut self) {
-        self.state = LightSessionState::ClientClosed;
+        if self.state == LightSessionState::Normal {
+            self.state = LightSessionState::ClientClosed;
+            // Upstream: m_server.OnClientClosed() + this->Close()
+        }
     }
 
     /// Finalize the light session.
-    /// TODO: Port from k_light_session.cpp.
+    /// Port of upstream `KLightSession::Finalize`.
     pub fn finalize(&mut self) {
-        // TODO: Full implementation
+        if self.port_id.is_some() {
+            // Upstream: m_port->OnSessionFinalized(); m_port->Close();
+            self.port_id = None;
+        }
     }
 }
 
