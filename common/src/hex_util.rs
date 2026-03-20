@@ -46,18 +46,18 @@ pub fn hex_string_to_vector(s: &str, little_endian: bool) -> Vec<u8> {
 /// Converts a hex string to a fixed-size byte array.
 ///
 /// Panics if the string is too short (less than `N * 2` characters).
-pub fn hex_string_to_array<const N: usize>(s: &str) -> [u8; N] {
+pub const fn hex_string_to_array<const N: usize>(s: &str) -> [u8; N] {
     assert!(
         s.len() >= N * 2,
-        "Invalid string size: expected at least {} chars, got {}",
-        N * 2,
-        s.len()
+        "Invalid string size for hex_string_to_array",
     );
 
     let bytes = s.as_bytes();
     let mut out = [0u8; N];
-    for i in 0..N {
+    let mut i = 0;
+    while i < N {
         out[i] = (to_hex_nibble(bytes[i * 2]) << 4) | to_hex_nibble(bytes[i * 2 + 1]);
+        i += 1;
     }
     out
 }
