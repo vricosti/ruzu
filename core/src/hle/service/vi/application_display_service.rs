@@ -65,12 +65,12 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 100 / 103: GetRelayService / GetIndirectDisplayTransactionService
-    fn get_relay_service(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::warn!("IApplicationDisplayService::GetRelayService (STUBBED)");
-        let sub: Arc<dyn SessionRequestHandler> = Arc::new(
-            super::vi::ViStubService::new("IHOSBinderDriver"),
-        );
-        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
+    /// Returns the real IHOSBinderDriver from the Container.
+    fn get_relay_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        log::info!("IApplicationDisplayService::GetRelayService called");
+        let binder_driver = svc.container.get_binder_driver();
+        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, binder_driver);
     }
 
     /// cmd 101: GetSystemDisplayService
