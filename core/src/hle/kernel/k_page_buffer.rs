@@ -16,9 +16,12 @@ impl KPageBufferSlabHeap {
         Self
     }
 
-    /// Stubbed: depends on Core::System for slab heap initialization.
+    /// Initialize the page buffer slab heap.
+    /// Upstream allocates physical memory from KMemoryManager and initializes
+    /// KPageBuffer::InitializeSlabHeap. In the host-emulated model, page
+    /// buffers are allocated from host memory on demand.
     pub fn initialize(&mut self) {
-        // TODO: implement when slab heap infrastructure is ported.
+        log::debug!("KPageBufferSlabHeap::initialize (host-emulated)");
     }
 }
 

@@ -2,6 +2,8 @@
 //! Status: Stubbed
 //! Derniere synchro: 2026-03-11
 
+use std::sync::Mutex;
+
 use super::k_memory_block::PAGE_SIZE;
 use super::k_page_bitmap::KPageBitmap;
 
@@ -18,6 +20,7 @@ const _: () = assert!(std::mem::size_of::<PageBuffer>() == PAGE_SIZE);
 /// Manages a region of virtual memory for dynamic slab allocations.
 /// Stubbed: uses a Vec<u8> for backing memory instead of actual kernel VA mapping.
 pub struct KDynamicPageManager {
+    lock: Mutex<()>,
     page_bitmap: KPageBitmap,
     used: usize,
     peak: usize,
@@ -31,6 +34,7 @@ pub struct KDynamicPageManager {
 impl KDynamicPageManager {
     pub fn new() -> Self {
         Self {
+            lock: Mutex::new(()),
             page_bitmap: KPageBitmap::new(),
             used: 0,
             peak: 0,
@@ -92,6 +96,81 @@ impl KDynamicPageManager {
         }
 
         Ok(())
+    }
+
+    /// Get a mutable pointer into backing memory at the given virtual address.
+    /// Port of upstream `GetPointer<T>`.
+    pub fn get_pointer_mut(&mut self, addr: u64) -> &mut [u8] {
+        let offset = (addr - self.address) as usize;
+        &mut self.backing_memory[offset..]
+    }
+
+    /// Get a read-only pointer into backing memory at the given virtual address.
+    pub fn get_pointer(&self, addr: u64) -> &[u8] {
+        let offset = (addr - self.address) as usize;
+        &self.backing_memory[offset..]
+    }
+
+    /// Allocate a single page.
+    /// Port of upstream `KDynamicPageManager::Allocate()`.
+    /// Returns the offset (as a virtual address) of the allocated page, or None.
+    pub fn allocate(&mut self) -> Option<u64> {
+        let _lock = self.lock.lock().unwrap();
+
+        // Find a free block.
+        let soffset = self.page_bitmap.find_free_block(true);
+        if soffset < 0 {
+            return None;
+        }
+        let offset = soffset as usize;
+
+        // Update tracking.
+        self.page_bitmap.clear_bit(offset);
+        self.used += 1;
+        if self.used > self.peak {
+            self.peak = self.used;
+        }
+
+        // Return the address of the allocated page.
+        Some(self.aligned_address + (offset * PAGE_SIZE) as u64)
+    }
+
+    /// Allocate a contiguous range of pages.
+    /// Port of upstream `KDynamicPageManager::Allocate(size_t count)`.
+    pub fn allocate_count(&mut self, count: usize) -> Option<u64> {
+        let _lock = self.lock.lock().unwrap();
+
+        let soffset = self.page_bitmap.find_free_range(count);
+        if soffset < 0 {
+            return None;
+        }
+        let offset = soffset as usize;
+
+        self.page_bitmap.clear_range(offset, count);
+        self.used += count;
+        if self.used > self.peak {
+            self.peak = self.used;
+        }
+
+        Some(self.aligned_address + (offset * PAGE_SIZE) as u64)
+    }
+
+    /// Free a previously allocated page.
+    /// Port of upstream `KDynamicPageManager::Free`.
+    pub fn free(&mut self, page_addr: u64) {
+        // Zero the page.
+        let page_offset = (page_addr - self.address) as usize;
+        if page_offset + PAGE_SIZE <= self.backing_memory.len() {
+            self.backing_memory[page_offset..page_offset + PAGE_SIZE].fill(0);
+        }
+
+        let _lock = self.lock.lock().unwrap();
+
+        // Set the bit for the free page.
+        let offset = ((page_addr - self.aligned_address) / PAGE_SIZE as u64) as usize;
+        self.page_bitmap.set_bit(offset);
+
+        self.used -= 1;
     }
 }
 
