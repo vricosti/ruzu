@@ -111,10 +111,11 @@ impl ProfileSelectApplet for DefaultProfileSelectApplet {
     ) {
         // Upstream: creates a Service::Account::ProfileManager and returns
         // manager.GetUser(Settings::values.current_user.GetValue()).
-        // ProfileManager and Settings are not yet wired into this crate.
-        // Returning a default UUID matches upstream's fallback when
-        // the user index yields no profile (value_or(Common::UUID{})).
-        log::info!("called, selecting current user instead of prompting...");
+        // Settings::values.current_user is available via common::settings::values(),
+        // but ProfileManager is not yet ported. Returning a default UUID matches
+        // upstream's fallback when the user index yields no profile (value_or(Common::UUID{})).
+        let _current_user = *common::settings::values().current_user.get_value();
+        log::info!("called, selecting current user {} instead of prompting...", _current_user);
         callback(Some(0u128));
     }
 }

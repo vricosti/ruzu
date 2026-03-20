@@ -199,7 +199,7 @@ impl Stick {
         status.x.properties = STICK_PROPERTIES;
         status.y.properties = STICK_PROPERTIES;
 
-        if *common::settings::Values::default().emulate_analog_keyboard.get_value() {
+        if *common::settings::values().emulate_analog_keyboard.get_value() {
             let now = std::time::Instant::now();
             let angle = self.get_angle(now);
             status.x.raw_value = angle.cos() * self.amplitude;

@@ -364,7 +364,6 @@ impl EmuWindowSdl2 {
     /// Applies the current fullscreen mode setting.
     ///
     /// Maps to C++ `EmuWindow_SDL2::Fullscreen`.
-    /// Uses borderless fullscreen as default since Settings not yet ported.
     pub(crate) fn fullscreen(&self) {
         if self.render_window.is_null() {
             return;
@@ -373,13 +372,15 @@ impl EmuWindowSdl2 {
         //   Exclusive  -> SDL_WINDOW_FULLSCREEN (with desktop-mode size first)
         //   Borderless -> SDL_WINDOW_FULLSCREEN_DESKTOP
         //   fallback   -> SDL_MaximizeWindow
-        //
-        // Settings not yet ported; default to borderless fullscreen.
+        let fullscreen_mode = *common::settings::values().fullscreen_mode.get_value();
+        let sdl_flag = match fullscreen_mode {
+            common::settings::FullscreenMode::Exclusive => {
+                sdl::SDL_WindowFlags::SDL_WINDOW_FULLSCREEN as u32
+            }
+            _ => sdl::SDL_WindowFlags::SDL_WINDOW_FULLSCREEN_DESKTOP as u32,
+        };
         let ret = unsafe {
-            sdl::SDL_SetWindowFullscreen(
-                self.render_window,
-                sdl::SDL_WindowFlags::SDL_WINDOW_FULLSCREEN_DESKTOP as u32,
-            )
+            sdl::SDL_SetWindowFullscreen(self.render_window, sdl_flag)
         };
         if ret != 0 {
             let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();

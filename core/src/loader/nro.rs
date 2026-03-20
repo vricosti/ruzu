@@ -284,10 +284,30 @@ impl AppLoaderNro {
         }
 
         // Upstream: append program arguments to data segment if program_args is non-empty.
-        // Settings::values.program_args is not yet wired; skip to match upstream module layout.
-        // When wired, this should check `!Settings::values.program_args.GetValue().empty()`,
-        // resize program_image by NSO_ARGUMENT_DATA_ALLOCATION_SIZE, write NsoArgumentHeader
-        // and arg data at the end, and add NSO_ARGUMENT_DATA_ALLOCATION_SIZE to DataSegment().size.
+        let program_args = common::settings::values().program_args.get_value().clone();
+        if !program_args.is_empty() {
+            codeset.segments[2].size += NSO_ARGUMENT_DATA_ALLOCATION_SIZE;
+            let arg_header = NsoArgumentHeader {
+                allocated_size: NSO_ARGUMENT_DATA_ALLOCATION_SIZE,
+                actual_size: program_args.len() as u32,
+                _padding: [0u8; 0x18],
+            };
+            let end_offset = program_image.len();
+            program_image.resize(
+                program_image.len() + NSO_ARGUMENT_DATA_ALLOCATION_SIZE as usize,
+                0,
+            );
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &arg_header as *const NsoArgumentHeader as *const u8,
+                    program_image[end_offset..].as_mut_ptr(),
+                    std::mem::size_of::<NsoArgumentHeader>(),
+                );
+            }
+            let arg_data_start = end_offset + std::mem::size_of::<NsoArgumentHeader>();
+            program_image[arg_data_start..arg_data_start + program_args.len()]
+                .copy_from_slice(program_args.as_bytes());
+        }
 
         // Default .bss to NRO header bss size if MOD0 section doesn't exist
         let mut bss_size = page_align_size(nro_header.bss_size);

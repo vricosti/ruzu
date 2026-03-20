@@ -269,11 +269,9 @@ impl System {
         let memory = unsafe { Memory::new(dm_ptr, buffer_ptr) };
         self.memory = Some(Arc::new(StdMutex::new(memory)));
 
-        // Read configuration from settings
+        // Read configuration from settings.
         // In C++: is_multicore = Settings::values.use_multi_core.GetValue()
-        // For now, default to false (single-core). The caller can override.
-        // self.is_multicore = Settings::values.use_multi_core...;
-        // self.extended_memory_layout = ...;
+        self.is_multicore = *common::settings::values().use_multi_core.get_value();
 
         self.core_timing.lock().unwrap().set_multicore(self.is_multicore);
         // In C++: core_timing.Initialize([&system]() { system.RegisterHostThread(); });
@@ -343,7 +341,7 @@ impl System {
 
         // 1. TelemetrySession
         // Upstream: telemetry_session = std::make_unique<Core::TelemetrySession>();
-        let settings = common::settings::Values::default();
+        let settings = common::settings::values();
         self.telemetry_session = Some(crate::telemetry_session::TelemetrySession::new(&settings));
 
         // 2. Host1x core — created by the frontend via set_host1x_core() after load()

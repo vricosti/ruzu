@@ -224,7 +224,7 @@ impl MappingFactory {
         // Upstream: if (!Settings::values.enable_udp_controller && engine == "cemuhookudp"
         //               && type != Motion) return false;
         {
-            let settings = common::settings::Values::default();
+            let settings = common::settings::values();
             if !*settings.enable_udp_controller.get_value()
                 && data.engine == "cemuhookudp"
                 && data.r#type != crate::input_engine::EngineInputType::Motion

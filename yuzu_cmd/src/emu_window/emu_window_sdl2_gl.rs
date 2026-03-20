@@ -145,7 +145,12 @@ impl EmuWindowSdl2Gl {
             sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_BLUE_SIZE, 8);
             sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_ALPHA_SIZE, 0);
             sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
-            // Note: renderer_debug flag from Settings not yet ported.
+            if *common::settings::values().renderer_debug.get_value() {
+                sdl::SDL_GL_SetAttribute(
+                    sdl::SDL_GLattr::SDL_GL_CONTEXT_FLAGS,
+                    sdl::SDL_GLcontextFlag::SDL_GL_CONTEXT_DEBUG_FLAG as i32,
+                );
+            }
             sdl::SDL_GL_SetSwapInterval(0);
         }
 

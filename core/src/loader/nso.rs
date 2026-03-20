@@ -291,8 +291,7 @@ impl AppLoaderNso {
 
         // Upstream: arguments are added BEFORE BSS, matching upstream ordering.
         // Upstream condition: `should_pass_arguments && !Settings::values.program_args.GetValue().empty()`
-        // Program arguments are populated from Settings::values.program_args when available.
-        let program_args = String::new(); // Settings::values.program_args equivalent
+        let program_args = common::settings::values().program_args.get_value().clone();
         if should_pass_arguments && !program_args.is_empty() {
             code_set.data_segment_mut().size += NSO_ARGUMENT_DATA_ALLOCATION_SIZE;
             let arg_header = NsoArgumentHeader {
