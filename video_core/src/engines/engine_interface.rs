@@ -46,6 +46,22 @@ pub trait EngineInterface: Send {
 
     /// Internal sink consumption — override in concrete engines.
     fn consume_sink_impl(&mut self);
+
+    /// Access the execution mask. The DmaPusher uses this to decide whether
+    /// a method should be executed immediately or deferred to the sink.
+    fn execution_mask(&self) -> &[bool];
+
+    /// Push a (method, value) pair onto the method sink for deferred processing.
+    fn push_method_sink(&mut self, method: u32, value: u32);
+
+    /// Set the current DMA segment address.
+    fn set_current_dma_segment(&mut self, segment: GPUVAddr);
+
+    /// Get the current dirty flag.
+    fn current_dirty(&self) -> bool;
+
+    /// Set the current dirty flag.
+    fn set_current_dirty(&mut self, dirty: bool);
 }
 
 /// State common to all engines that implement `EngineInterface`.

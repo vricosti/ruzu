@@ -142,6 +142,93 @@ impl GpuMemoryManager {
         }
     }
 
+    /// Translate a GPU VA to a CPU/guest physical address.
+    /// Upstream: `MemoryManager::GpuToCpuAddress(gpu_addr)`.
+    /// This is the primary API used by buffer_cache, texture_cache, and engines.
+    pub fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
+        self.translate(gpu_addr)
+    }
+
+    /// Check if a GPU VA range is fully mapped and contiguous in CPU space.
+    /// Upstream: `MemoryManager::IsContinuousRange(gpu_addr, size)`.
+    pub fn is_continuous_range(&self, gpu_addr: u64, size: u64) -> bool {
+        if size == 0 {
+            return true;
+        }
+        let first_cpu = match self.translate(gpu_addr) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        let mut offset = PAGE_SIZE;
+        while offset < size {
+            let expected = first_cpu + offset;
+            match self.translate(gpu_addr + offset) {
+                Some(addr) if addr == expected => {}
+                _ => return false,
+            }
+            offset += PAGE_SIZE;
+        }
+        true
+    }
+
+    /// Check if a GPU VA range is fully mapped (each page has a valid entry).
+    /// Upstream: `MemoryManager::IsFullyMappedRange(gpu_addr, size)`.
+    pub fn is_fully_mapped_range(&self, gpu_addr: u64, size: u64) -> bool {
+        let mut offset = 0u64;
+        while offset < size {
+            if self.translate(gpu_addr + offset).is_none() {
+                return false;
+            }
+            offset += PAGE_SIZE;
+        }
+        true
+    }
+
+    /// Check if a GPU VA range fits within a single page (granular access).
+    /// Upstream: `MemoryManager::IsGranularRange(gpu_addr, size)`.
+    pub fn is_granular_range(&self, gpu_addr: u64, size: u64) -> bool {
+        let start_page = gpu_addr >> PAGE_BITS;
+        let end_page = (gpu_addr + size - 1) >> PAGE_BITS;
+        start_page == end_page
+    }
+
+    /// Read a block of data from GPU VA space into a buffer.
+    /// Upstream: `MemoryManager::ReadBlock(gpu_src, output, size)`.
+    pub fn read_block(&self, gpu_src: u64, output: &mut [u8], read_cpu: &dyn Fn(u64, &mut [u8])) {
+        self.read(gpu_src, output, read_cpu);
+    }
+
+    /// Read a block (unsafe variant — no cache flush).
+    /// Upstream: `MemoryManager::ReadBlockUnsafe(gpu_src, output, size)`.
+    pub fn read_block_unsafe(&self, gpu_src: u64, output: &mut [u8], read_cpu: &dyn Fn(u64, &mut [u8])) {
+        self.read(gpu_src, output, read_cpu);
+    }
+
+    /// Write a block of data from a buffer to GPU VA space.
+    /// Upstream: `MemoryManager::WriteBlock(gpu_dest, input, size)`.
+    pub fn write_block(&self, gpu_dest: u64, input: &[u8], write_cpu: &mut dyn FnMut(u64, &[u8])) {
+        self.write(gpu_dest, input, write_cpu);
+    }
+
+    /// Write a block (unsafe variant — no cache invalidation).
+    /// Upstream: `MemoryManager::WriteBlockUnsafe(gpu_dest, input, size)`.
+    pub fn write_block_unsafe(&self, gpu_dest: u64, input: &[u8], write_cpu: &mut dyn FnMut(u64, &[u8])) {
+        self.write(gpu_dest, input, write_cpu);
+    }
+
+    /// Flush a region (notify rasterizer to write back).
+    /// Upstream: `MemoryManager::FlushRegion(gpu_addr, size)`.
+    /// Requires rasterizer binding — no-op until bound.
+    pub fn flush_region(&self, _gpu_addr: u64, _size: u64) {
+        // Upstream: calls rasterizer->FlushRegion() if bound.
+    }
+
+    /// Invalidate a region (notify rasterizer to discard cache).
+    /// Upstream: `MemoryManager::InvalidateRegion(gpu_addr, size)`.
+    pub fn invalidate_region(&self, _gpu_addr: u64, _size: u64) {
+        // Upstream: calls rasterizer->InvalidateRegion() if bound.
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────
 
     fn l0_index(gpu_va: u64) -> usize {
