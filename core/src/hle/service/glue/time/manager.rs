@@ -90,6 +90,17 @@ impl TimeManager {
         }
         let set_sys_svc = set_sys_ref.unwrap();
 
+        // === Mount TimeZoneBinary ===
+        // Upstream: res = m_time_zone_binary.Mount();
+        {
+            use crate::hle::service::glue::time::time_zone_binary::TimeZoneBinary;
+            let mut tz_binary = TimeZoneBinary::new();
+            let res = tz_binary.mount();
+            if res.is_error() {
+                log::error!("TimeManager: TimeZoneBinary::Mount failed!");
+            }
+        }
+
         // === SetupStandardSteadyClockCore ===
         // Upstream: m_set_sys->GetExternalSteadyClockSourceId(&id)
         {

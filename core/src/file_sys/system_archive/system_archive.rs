@@ -105,9 +105,14 @@ pub fn synthesize_system_archive(title_id: u64) -> Option<VirtualFile> {
     let supplier = desc.supplier?;
     let dir = supplier()?;
 
-    // TODO: Convert the VirtualDir to a RomFS VirtualFile using CreateRomFS.
-    // For now, return None as RomFS creation is not yet wired up.
-    let _ = dir;
-    log::info!("    - System archive supplier returned data, but RomFS creation is pending.");
-    None
+    // Convert the VirtualDir to a RomFS binary image.
+    // Matches upstream: CreateRomFS(dir)
+    let romfs = crate::file_sys::romfs::create_romfs(Some(dir), None);
+    if romfs.is_none() {
+        log::error!("    - System archive RomFS creation failed!");
+        return None;
+    }
+
+    log::info!("    - System archive generation successful!");
+    romfs
 }
