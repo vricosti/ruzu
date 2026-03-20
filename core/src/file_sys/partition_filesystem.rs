@@ -295,7 +295,7 @@ impl VfsDirectory for PartitionFilesystem {
     }
 
     fn get_parent_directory(&self) -> Option<VirtualDir> {
-        // TODO(DarkLordZach): Add support for nested containers.
+        // Upstream TODO(DarkLordZach): Add support for nested containers.
         None
     }
 

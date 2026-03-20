@@ -6,15 +6,15 @@
 //
 // Filesystem abstraction for filesystem access. The upstream implementation
 // wraps a VfsDirectoryServiceWrapper backend and delegates all Do* methods
-// to it. Since we don't yet have the full service wrapper, Do* methods that
-// require it return RESULT_NOT_IMPLEMENTED. Public methods include upstream
-// validation logic (size checks, mode checks, null checks).
+// to it. Public methods include upstream validation logic (size checks,
+// mode checks, null checks).
 
 use crate::file_sys::errors;
 use crate::file_sys::fs_filesystem::{
     CreateOption, DirectoryEntryType, OpenDirectoryMode, OpenMode,
 };
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
+use crate::hle::service::filesystem::filesystem::VfsDirectoryServiceWrapper;
 use common::ResultCode;
 
 /// Query ID for filesystem operations.
@@ -34,15 +34,19 @@ pub enum QueryId {
 /// The upstream implementation wraps a `VfsDirectoryServiceWrapper` backend.
 /// Full delegation requires the service wrapper port; for now, Do* methods
 /// that require it return RESULT_NOT_IMPLEMENTED.
+/// Filesystem abstraction for filesystem access.
+/// Corresponds to upstream `FileSys::Fsa::IFileSystem`.
+///
+/// The upstream implementation wraps a `VfsDirectoryServiceWrapper` backend
+/// and delegates all Do* methods to it.
 pub struct IFileSystem {
-    // TODO: Replace with VfsDirectoryServiceWrapper once service/filesystem is ported.
-    _backend: Option<VirtualDir>,
+    backend: VfsDirectoryServiceWrapper,
 }
 
 impl IFileSystem {
-    pub fn new(backend: VirtualDir) -> Self {
+    pub fn new(backing: VirtualDir) -> Self {
         Self {
-            _backend: Some(backend),
+            backend: VfsDirectoryServiceWrapper::new(backing),
         }
     }
 
@@ -206,58 +210,48 @@ impl IFileSystem {
     // These correspond to the upstream private virtual Do* methods.
     // They delegate to the backend service wrapper when available.
 
-    fn do_create_file(&self, _path: &str, _size: i64, _flags: i32) -> Result<(), ResultCode> {
-        // TODO: backend.CreateFile(path, size)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+    fn do_create_file(&self, path: &str, size: i64, _flags: i32) -> Result<(), ResultCode> {
+        self.backend.create_file(path, size as u64)
     }
 
-    fn do_delete_file(&self, _path: &str) -> Result<(), ResultCode> {
-        // TODO: backend.DeleteFile(path)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+    fn do_delete_file(&self, path: &str) -> Result<(), ResultCode> {
+        self.backend.delete_file(path)
     }
 
-    fn do_create_directory(&self, _path: &str) -> Result<(), ResultCode> {
-        // TODO: backend.CreateDirectory(path)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+    fn do_create_directory(&self, path: &str) -> Result<(), ResultCode> {
+        self.backend.create_directory(path)
     }
 
-    fn do_delete_directory(&self, _path: &str) -> Result<(), ResultCode> {
-        // TODO: backend.DeleteDirectory(path)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+    fn do_delete_directory(&self, path: &str) -> Result<(), ResultCode> {
+        self.backend.delete_directory(path)
     }
 
-    fn do_delete_directory_recursively(&self, _path: &str) -> Result<(), ResultCode> {
-        // TODO: backend.DeleteDirectoryRecursively(path)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+    fn do_delete_directory_recursively(&self, path: &str) -> Result<(), ResultCode> {
+        self.backend.delete_directory_recursively(path)
     }
 
-    fn do_rename_file(&self, _old_path: &str, _new_path: &str) -> Result<(), ResultCode> {
-        // TODO: backend.RenameFile(old_path, new_path)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+    fn do_rename_file(&self, old_path: &str, new_path: &str) -> Result<(), ResultCode> {
+        self.backend.rename_file(old_path, new_path)
     }
 
-    fn do_rename_directory(&self, _old_path: &str, _new_path: &str) -> Result<(), ResultCode> {
-        // TODO: backend.RenameDirectory(old_path, new_path)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+    fn do_rename_directory(&self, old_path: &str, new_path: &str) -> Result<(), ResultCode> {
+        self.backend.rename_directory(old_path, new_path)
     }
 
-    fn do_get_entry_type(&self, _path: &str) -> Result<DirectoryEntryType, ResultCode> {
-        // TODO: backend.GetEntryType(path)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+    fn do_get_entry_type(&self, path: &str) -> Result<DirectoryEntryType, ResultCode> {
+        self.backend.get_entry_type(path)
     }
 
-    fn do_open_file(&self, _path: &str, _mode: OpenMode) -> Result<VirtualFile, ResultCode> {
-        // TODO: backend.OpenFile(path, mode)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+    fn do_open_file(&self, path: &str, mode: OpenMode) -> Result<VirtualFile, ResultCode> {
+        self.backend.open_file(path, mode)
     }
 
     fn do_open_directory(
         &self,
-        _path: &str,
+        path: &str,
         _mode: OpenDirectoryMode,
     ) -> Result<VirtualDir, ResultCode> {
-        // TODO: backend.OpenDirectory(path)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+        self.backend.open_directory(path)
     }
 
     fn do_commit(&self) -> Result<(), ResultCode> {
@@ -272,9 +266,8 @@ impl IFileSystem {
         Err(errors::RESULT_NOT_IMPLEMENTED)
     }
 
-    fn do_clean_directory_recursively(&self, _path: &str) -> Result<(), ResultCode> {
-        // TODO: backend.CleanDirectoryRecursively(path)
-        Err(errors::RESULT_NOT_IMPLEMENTED)
+    fn do_clean_directory_recursively(&self, path: &str) -> Result<(), ResultCode> {
+        self.backend.clean_directory_recursively(path)
     }
 
     fn do_query_entry(&self, _query: QueryId, _path: &str) -> Result<Vec<u8>, ResultCode> {

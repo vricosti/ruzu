@@ -51,6 +51,47 @@ pub trait VfsFile: Send + Sync {
 /// Type alias for a shared virtual file.
 pub type VirtualFile = Arc<dyn VfsFile>;
 
+/// Adapter wrapping a `file_sys::vfs::vfs::VfsFile` as a `crypto::encryption_layer::VfsFile`.
+/// Bridges the two VfsFile traits so crypto layers can operate on file_sys VirtualFiles.
+pub struct FsVfsFileAdapter {
+    inner: crate::file_sys::vfs::vfs_types::VirtualFile,
+}
+
+impl FsVfsFileAdapter {
+    pub fn new(inner: crate::file_sys::vfs::vfs_types::VirtualFile) -> Self {
+        Self { inner }
+    }
+}
+
+impl VfsFile for FsVfsFileAdapter {
+    fn read(&self, data: &mut [u8], offset: usize) -> usize {
+        let len = data.len();
+        self.inner.read(data, len, offset)
+    }
+    fn get_name(&self) -> String {
+        self.inner.get_name()
+    }
+    fn get_size(&self) -> usize {
+        self.inner.get_size()
+    }
+    fn resize(&self, new_size: usize) -> bool {
+        self.inner.resize(new_size)
+    }
+    fn is_writable(&self) -> bool {
+        self.inner.is_writable()
+    }
+    fn is_readable(&self) -> bool {
+        self.inner.is_readable()
+    }
+    fn write(&self, data: &[u8], offset: usize) -> usize {
+        let len = data.len();
+        self.inner.write(data, len, offset)
+    }
+    fn rename(&self, name: &str) -> bool {
+        self.inner.rename(name)
+    }
+}
+
 /// Base encryption layer that wraps a VirtualFile and delegates non-crypto
 /// methods to the underlying file. Port of Core::Crypto::EncryptionLayer.
 pub struct EncryptionLayerBase {

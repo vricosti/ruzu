@@ -10,8 +10,11 @@ use std::sync::Arc;
 
 use super::content_archive::NCA;
 use super::vfs::vfs::VfsFile;
+use super::vfs::vfs_offset::OffsetVfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
-use crate::crypto::key_manager::{Key128, Key256};
+use crate::crypto::aes_util::{AesCipher, Mode, Op};
+use crate::crypto::key_manager::{self, Key128, Key256, KeyManager};
+use crate::crypto::xts_encryption_layer::XtsEncryptionLayer;
 use crate::loader::loader::ResultStatus;
 
 /// NAX header padding size — data starts at this offset.
@@ -130,7 +133,7 @@ impl Nax {
     /// Parse the NAX header and attempt decryption.
     ///
     /// Corresponds to upstream `NAX::Parse`.
-    fn parse(&mut self, _path: &str) -> ResultStatus {
+    fn parse(&mut self, path: &str) -> ResultStatus {
         // Read the header.
         let header_size = std::mem::size_of::<NaxHeader>();
         let mut header_bytes = vec![0u8; header_size];
@@ -140,7 +143,6 @@ impl Nax {
         }
 
         // Safety: NaxHeader is repr(C) with no padding requirements beyond what we ensure.
-        // Copy bytes into the header struct.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 header_bytes.as_ptr(),
@@ -159,20 +161,87 @@ impl Nax {
             return ResultStatus::ErrorIncorrectNAXFileSize;
         }
 
-        // Key derivation and HMAC validation requires:
-        // 1. KeyManager::DeriveSDSeedLazy()
-        // 2. DeriveSDKeys() to get sd_keys
-        // 3. HMAC-SHA256 computation for key derivation
-        // 4. AES-ECB decryption of key area
-        // 5. HMAC-SHA256 validation
-        // 6. XTS decryption layer
-        //
-        // These operations depend on the full crypto pipeline being wired up.
-        // For now, return an error indicating key derivation is needed.
-        //
-        // TODO: Wire up full crypto pipeline when KeyManager SD key derivation
-        // and AES/HMAC operations are available.
-        ResultStatus::ErrorNAXKeyDerivationFailed
+        // Derive SD keys via KeyManager, matching upstream.
+        let keys_arc = KeyManager::instance();
+        let mut keys = keys_arc.lock().unwrap();
+        keys.derive_sd_seed_lazy();
+
+        let mut sd_keys = [Key256::default(); 2];
+        if let Err(_) = key_manager::derive_sd_keys(&mut sd_keys, &mut keys) {
+            return ResultStatus::ErrorNAXKeyDerivationFailed;
+        }
+
+        // Save original encrypted key area for retry.
+        let enc_keys = self.header.key_area;
+
+        // Try both SD key indices (0 = Save, 1 = NCA).
+        let mut found_index = None;
+        for i in 0..2usize {
+            // Derive NAX keys via HMAC-SHA256(sd_keys[i][..16], path).
+            let nax_keys = match hmac_sha256_nax_keys(&sd_keys[i][..16], path.as_bytes()) {
+                Some(k) => k,
+                None => return ResultStatus::ErrorNAXKeyHMACFailed,
+            };
+
+            // Reset key_area to encrypted state before each attempt.
+            self.header.key_area = enc_keys;
+
+            // AES-ECB decrypt each key in the key area.
+            for j in 0..2 {
+                let mut cipher = AesCipher::new_128(nax_keys[j], Mode::ECB);
+                let mut decrypted = [0u8; 16];
+                cipher.transcode(&enc_keys[j], &mut decrypted, Op::Decrypt);
+                self.header.key_area[j] = decrypted;
+            }
+
+            // HMAC-SHA256 validation: HMAC(sd_keys[i][16..32], header.magic..+0x60).
+            // The upstream validates header bytes from &magic (offset 0x20) for 0x60 bytes.
+            let header_validation_data = &header_bytes[0x20..0x80]; // magic through end = 0x60 bytes
+            let validation = match hmac_sha256(&sd_keys[i][0x10..0x20], header_validation_data) {
+                Some(v) => v,
+                None => return ResultStatus::ErrorNAXValidationHMACFailed,
+            };
+
+            if self.header.hmac == validation {
+                found_index = Some(i);
+                break;
+            }
+        }
+
+        let i = match found_index {
+            Some(idx) => idx,
+            None => return ResultStatus::ErrorNAXKeyDerivationFailed,
+        };
+
+        self.content_type = if i == 0 {
+            NaxContentType::Save
+        } else {
+            NaxContentType::Nca
+        };
+
+        // Build the final XTS key from the decrypted key_area (two Key128 = one Key256).
+        let mut final_key = Key256::default();
+        final_key[..16].copy_from_slice(&self.header.key_area[0]);
+        final_key[16..].copy_from_slice(&self.header.key_area[1]);
+
+        // Create an offset view of the encrypted file (skip the NAX header).
+        let enc_file: VirtualFile = Arc::new(OffsetVfsFile::new(
+            self.file.clone(),
+            self.header.file_size as usize,
+            NAX_HEADER_PADDING_SIZE as usize,
+            String::new(),
+        ));
+
+        // Wrap in XtsEncryptionLayer for transparent AES-XTS decryption.
+        // Upstream: self.dec_file = make_shared<XTSEncryptionLayer>(enc_file, final_key);
+        // Bridge the file_sys VirtualFile to crypto VirtualFile via FsVfsFileAdapter,
+        // then wrap in XtsEncryptionLayer which implements file_sys::vfs::VfsFile.
+        let crypto_file: crate::crypto::encryption_layer::VirtualFile =
+            Arc::new(crate::crypto::encryption_layer::FsVfsFileAdapter::new(enc_file));
+        self.dec_file = Some(Arc::new(XtsEncryptionLayer::new(crypto_file, final_key))
+            as std::sync::Arc<dyn crate::file_sys::vfs::vfs::VfsFile>);
+
+        ResultStatus::Success
     }
 
     /// Get the parse status.
@@ -266,6 +335,56 @@ fn sha256_hash(data: &[u8]) -> [u8; 32] {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);
     hash
+}
+
+/// Compute HMAC-SHA256.
+/// Implements RFC 2104 using SHA-256.
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    const BLOCK_SIZE: usize = 64;
+
+    // If key is longer than block size, hash it first.
+    let normalized_key = if key.len() > BLOCK_SIZE {
+        let h = sha256_hash(key);
+        h.to_vec()
+    } else {
+        key.to_vec()
+    };
+
+    // Pad key to block size.
+    let mut k_ipad = [0x36u8; BLOCK_SIZE];
+    let mut k_opad = [0x5cu8; BLOCK_SIZE];
+    for (i, &b) in normalized_key.iter().enumerate() {
+        k_ipad[i] ^= b;
+        k_opad[i] ^= b;
+    }
+
+    // Inner hash: H(k_ipad || data)
+    let mut inner = Sha256::new();
+    inner.update(&k_ipad);
+    inner.update(data);
+    let inner_hash = inner.finalize();
+
+    // Outer hash: H(k_opad || inner_hash)
+    let mut outer = Sha256::new();
+    outer.update(&k_opad);
+    outer.update(&inner_hash);
+    let result = outer.finalize();
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    Some(out)
+}
+
+/// Compute HMAC-SHA256 and return the result as two Key128 NAX keys (32 bytes = 2 x 16).
+/// Corresponds to upstream `CalculateHMAC256` used for NAX key derivation.
+fn hmac_sha256_nax_keys(key: &[u8], data: &[u8]) -> Option<[Key128; 2]> {
+    let hash = hmac_sha256(key, data)?;
+    let mut keys = [[0u8; 16]; 2];
+    keys[0].copy_from_slice(&hash[..16]);
+    keys[1].copy_from_slice(&hash[16..]);
+    Some(keys)
 }
 
 /// Convert a byte slice to a hex string.

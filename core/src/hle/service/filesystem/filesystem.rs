@@ -5,9 +5,20 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use common::fs::path_util::{self, DirectorySeparator};
+use common::ResultCode;
+
+use crate::file_sys::errors;
+use crate::file_sys::fs_filesystem::{DirectoryEntryType, OpenMode};
+use crate::file_sys::vfs::vfs_offset::OffsetVfsFile;
+use crate::file_sys::vfs::vfs_types::{FileTimeStampRaw, VirtualDir, VirtualFile};
 use crate::hle::result::RESULT_SUCCESS;
-use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
+use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 use crate::hle::service::sm::sm::ServiceManager;
+
+/// Port of upstream `ResultUnknown` (result.h:250) — `common::ResultCode(UINT32_MAX)`.
+/// Used as a fallback error code in VfsDirectoryServiceWrapper methods.
+const RESULT_UNKNOWN: ResultCode = ResultCode(u32::MAX);
 
 /// Port of Service::FileSystem::ContentStorageId
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +56,10 @@ struct Registration {
 /// Upstream: filesystem.h:64-146, filesystem.cpp.
 pub struct FileSystemController {
     registrations: Mutex<BTreeMap<ProcessId, Registration>>,
+    /// BIS factory for NAND system/user content.
+    /// Upstream: `std::unique_ptr<FileSys::BISFactory> bis_factory`.
+    bis_factory: Option<crate::file_sys::bis_factory::BisFactory>,
     // sdmc_factory: Option<SDMCFactory>,
-    // bis_factory: Option<BISFactory>,
     // gamecard: Option<XCI>,
     // gamecard_registered: Option<RegisteredCache>,
     // gamecard_placeholder: Option<PlaceholderCache>,
@@ -56,7 +69,37 @@ impl FileSystemController {
     pub fn new() -> Self {
         Self {
             registrations: Mutex::new(BTreeMap::new()),
+            bis_factory: None,
         }
+    }
+
+    /// Set the BIS factory (called during system initialization).
+    pub fn set_bis_factory(&mut self, factory: crate::file_sys::bis_factory::BisFactory) {
+        self.bis_factory = Some(factory);
+    }
+
+    /// Get the System NAND RegisteredCache.
+    /// Upstream: `FileSystemController::GetSystemNANDContents()`.
+    pub fn get_system_nand_contents(&self) -> Option<&crate::file_sys::registered_cache::RegisteredCache> {
+        self.bis_factory.as_ref()?.get_system_nand_contents()
+    }
+
+    /// Get the User NAND RegisteredCache.
+    /// Upstream: `FileSystemController::GetUserNANDContents()`.
+    pub fn get_user_nand_contents(&self) -> Option<&crate::file_sys::registered_cache::RegisteredCache> {
+        self.bis_factory.as_ref()?.get_user_nand_contents()
+    }
+
+    /// Get the System NAND content directory.
+    /// Upstream: `FileSystemController::GetSystemNANDContentDirectory()`.
+    pub fn get_system_nand_content_directory(&self) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+        self.bis_factory.as_ref()?.get_system_nand_content_directory()
+    }
+
+    /// Get the User NAND content directory.
+    /// Upstream: `FileSystemController::GetUserNANDContentDirectory()`.
+    pub fn get_user_nand_content_directory(&self) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+        self.bis_factory.as_ref()?.get_user_nand_content_directory()
     }
 
     /// Port of upstream `FileSystemController::RegisterProcess` (filesystem.cpp:298-311).
@@ -104,16 +147,295 @@ impl FileSystemController {
     }
 }
 
+/// Port of upstream static `GetDirectoryRelativeWrapped` (filesystem.cpp:33-39).
+///
+/// Resolves a directory path relative to `base`, treating empty / "." / "/" / "\\"
+/// as the base directory itself.
+fn get_directory_relative_wrapped(base: &VirtualDir, dir_name: &str) -> Option<VirtualDir> {
+    let dir_name = path_util::sanitize_path(dir_name, DirectorySeparator::ForwardSlash);
+    if dir_name.is_empty() || dir_name == "." || dir_name == "/" || dir_name == "\\" {
+        return Some(Arc::clone(base));
+    }
+    base.get_directory_relative(&dir_name)
+}
+
 /// Port of Service::FileSystem::VfsDirectoryServiceWrapper
 ///
 /// Wraps a VfsDirectory with Result-returning methods for use with Switch services.
 pub struct VfsDirectoryServiceWrapper {
-    // backing: VirtualDir,
+    backing: VirtualDir,
 }
 
 impl VfsDirectoryServiceWrapper {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(backing: VirtualDir) -> Self {
+        Self { backing }
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::GetName` (filesystem.cpp:47-49).
+    pub fn get_name(&self) -> String {
+        self.backing.get_name()
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::CreateFile` (filesystem.cpp:51-73).
+    pub fn create_file(&self, path: &str, size: u64) -> Result<(), ResultCode> {
+        let path = path_util::sanitize_path(path, DirectorySeparator::ForwardSlash);
+        let dir = get_directory_relative_wrapped(&self.backing, &path_util::get_parent_path(&path))
+            .ok_or(errors::RESULT_PATH_NOT_FOUND)?;
+
+        if self.get_entry_type(&path).is_ok() {
+            return Err(errors::RESULT_PATH_ALREADY_EXISTS);
+        }
+
+        let filename = path_util::get_filename(&path);
+        let file = dir
+            .create_file(filename)
+            // Upstream TODO(DarkLordZach): Find a better error code for this
+            .ok_or(RESULT_UNKNOWN)?;
+        if !file.resize(size as usize) {
+            // Upstream TODO(DarkLordZach): Find a better error code for this
+            return Err(RESULT_UNKNOWN);
+        }
+        Ok(())
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::DeleteFile` (filesystem.cpp:75-92).
+    pub fn delete_file(&self, path: &str) -> Result<(), ResultCode> {
+        let path = path_util::sanitize_path(path, DirectorySeparator::ForwardSlash);
+        if path.is_empty() {
+            // Upstream TODO(DarkLordZach): Why do games call this and what should it do?
+            // Works as is but...
+            return Ok(());
+        }
+
+        let dir = get_directory_relative_wrapped(&self.backing, &path_util::get_parent_path(&path))
+            .ok_or(errors::RESULT_PATH_NOT_FOUND)?;
+        let filename = path_util::get_filename(&path);
+        if dir.get_file(filename).is_none() {
+            return Err(errors::RESULT_PATH_NOT_FOUND);
+        }
+        if !dir.delete_file(filename) {
+            // Upstream TODO(DarkLordZach): Find a better error code for this
+            return Err(RESULT_UNKNOWN);
+        }
+        Ok(())
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::CreateDirectory` (filesystem.cpp:94-112).
+    ///
+    /// NOTE: This is inaccurate behavior. CreateDirectory is not recursive.
+    /// CreateDirectory should return PathNotFound if the parent directory does not exist.
+    /// This is here temporarily in order to have UMM "work" in the meantime.
+    /// Upstream TODO (Morph): Remove this when a hardware test verifies the correct behavior.
+    pub fn create_directory(&self, path: &str) -> Result<(), ResultCode> {
+        let path = path_util::sanitize_path(path, DirectorySeparator::ForwardSlash);
+        let components = path_util::split_path_components_copy(&path);
+        let mut relative_path = String::new();
+        for component in &components {
+            relative_path = path_util::sanitize_path(
+                &format!("{}/{}", relative_path, component),
+                DirectorySeparator::ForwardSlash,
+            );
+            if self.backing.create_subdirectory(&relative_path).is_none() {
+                // Upstream TODO(DarkLordZach): Find a better error code for this
+                return Err(RESULT_UNKNOWN);
+            }
+        }
+        Ok(())
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::DeleteDirectory` (filesystem.cpp:114-122).
+    pub fn delete_directory(&self, path: &str) -> Result<(), ResultCode> {
+        let path = path_util::sanitize_path(path, DirectorySeparator::ForwardSlash);
+        let dir = get_directory_relative_wrapped(&self.backing, &path_util::get_parent_path(&path))
+            .ok_or(RESULT_UNKNOWN)?;
+        let filename = path_util::get_filename(&path);
+        if !dir.delete_subdirectory(filename) {
+            // Upstream TODO(DarkLordZach): Find a better error code for this
+            return Err(RESULT_UNKNOWN);
+        }
+        Ok(())
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::DeleteDirectoryRecursively`
+    /// (filesystem.cpp:124-132).
+    pub fn delete_directory_recursively(&self, path: &str) -> Result<(), ResultCode> {
+        let path = path_util::sanitize_path(path, DirectorySeparator::ForwardSlash);
+        let dir = get_directory_relative_wrapped(&self.backing, &path_util::get_parent_path(&path))
+            .ok_or(RESULT_UNKNOWN)?;
+        let filename = path_util::get_filename(&path);
+        if !dir.delete_subdirectory_recursive(filename) {
+            // Upstream TODO(DarkLordZach): Find a better error code for this
+            return Err(RESULT_UNKNOWN);
+        }
+        Ok(())
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::CleanDirectoryRecursively`
+    /// (filesystem.cpp:134-144).
+    pub fn clean_directory_recursively(&self, path: &str) -> Result<(), ResultCode> {
+        let sanitized_path = path_util::sanitize_path(path, DirectorySeparator::ForwardSlash);
+        let dir = get_directory_relative_wrapped(
+            &self.backing,
+            &path_util::get_parent_path(&sanitized_path),
+        )
+        .ok_or(RESULT_UNKNOWN)?;
+        let filename = path_util::get_filename(&sanitized_path);
+        if !dir.clean_subdirectory_recursive(filename) {
+            // Upstream TODO(DarkLordZach): Find a better error code for this
+            return Err(RESULT_UNKNOWN);
+        }
+        Ok(())
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::RenameFile` (filesystem.cpp:146-187).
+    pub fn rename_file(&self, src_path: &str, dest_path: &str) -> Result<(), ResultCode> {
+        let src_path = path_util::sanitize_path(src_path, DirectorySeparator::ForwardSlash);
+        let dest_path = path_util::sanitize_path(dest_path, DirectorySeparator::ForwardSlash);
+        let src = self.backing.get_file_relative(&src_path);
+        let dst = self.backing.get_file_relative(&dest_path);
+
+        if path_util::get_parent_path(&src_path) == path_util::get_parent_path(&dest_path) {
+            // Use more-optimized vfs implementation rename.
+            let src = src.ok_or(errors::RESULT_PATH_NOT_FOUND)?;
+
+            if let Some(ref dst) = dst {
+                let full_path = dst.get_full_path();
+                if std::path::Path::new(&full_path).exists() {
+                    log::error!(
+                        "File at new_path={} already exists",
+                        full_path
+                    );
+                    return Err(errors::RESULT_PATH_ALREADY_EXISTS);
+                }
+            }
+
+            let dest_filename = path_util::get_filename(&dest_path);
+            if !src.rename(dest_filename) {
+                // Upstream TODO(DarkLordZach): Find a better error code for this
+                return Err(RESULT_UNKNOWN);
+            }
+            return Ok(());
+        }
+
+        // Move by hand -- Upstream TODO(DarkLordZach): Optimize
+        let src = src.ok_or(errors::RESULT_PATH_NOT_FOUND)?;
+        self.create_file(&dest_path, src.get_size() as u64)?;
+
+        let dest = self
+            .backing
+            .get_file_relative(&dest_path)
+            .expect("Newly created file with success cannot be found.");
+
+        let bytes = src.read_all_bytes();
+        assert_eq!(
+            dest.write_bytes(&bytes, 0),
+            src.get_size(),
+            "Could not write all of the bytes but everything else has succeeded."
+        );
+
+        let src_filename = path_util::get_filename(&src_path);
+        let src_dir = src
+            .get_containing_directory()
+            .ok_or(RESULT_UNKNOWN)?;
+        if !src_dir.delete_file(src_filename) {
+            // Upstream TODO(DarkLordZach): Find a better error code for this
+            return Err(RESULT_UNKNOWN);
+        }
+
+        Ok(())
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::RenameDirectory` (filesystem.cpp:189-213).
+    pub fn rename_directory(&self, src_path: &str, dest_path: &str) -> Result<(), ResultCode> {
+        let src_path = path_util::sanitize_path(src_path, DirectorySeparator::ForwardSlash);
+        let dest_path = path_util::sanitize_path(dest_path, DirectorySeparator::ForwardSlash);
+        let src = get_directory_relative_wrapped(&self.backing, &src_path);
+
+        if path_util::get_parent_path(&src_path) == path_util::get_parent_path(&dest_path) {
+            // Use more-optimized vfs implementation rename.
+            let src = src.ok_or(errors::RESULT_PATH_NOT_FOUND)?;
+            let dest_filename = path_util::get_filename(&dest_path);
+            if !src.rename(dest_filename) {
+                // Upstream TODO(DarkLordZach): Find a better error code for this
+                return Err(RESULT_UNKNOWN);
+            }
+            return Ok(());
+        }
+
+        // Upstream TODO(DarkLordZach): Implement renaming across the tree (move).
+        panic!(
+            "Could not rename directory with path \"{}\" to new path \"{}\" because parent dirs \
+             don't match -- UNIMPLEMENTED",
+            src_path, dest_path
+        );
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::OpenFile` (filesystem.cpp:215-236).
+    pub fn open_file(&self, path: &str, mode: OpenMode) -> Result<VirtualFile, ResultCode> {
+        let path = path_util::sanitize_path(path, DirectorySeparator::ForwardSlash);
+        let npath = path.trim_start_matches(|c| c == '/' || c == '\\');
+
+        let file = self
+            .backing
+            .get_file_relative(npath)
+            .ok_or(errors::RESULT_PATH_NOT_FOUND)?;
+
+        if mode == OpenMode::ALLOW_APPEND {
+            let size = file.get_size();
+            Ok(Arc::new(OffsetVfsFile::new(
+                file,
+                size,
+                0,
+                String::new(),
+            )))
+        } else {
+            Ok(file)
+        }
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::OpenDirectory` (filesystem.cpp:238-248).
+    pub fn open_directory(&self, path: &str) -> Result<VirtualDir, ResultCode> {
+        let path = path_util::sanitize_path(path, DirectorySeparator::ForwardSlash);
+        let dir = get_directory_relative_wrapped(&self.backing, &path)
+            // Upstream TODO(DarkLordZach): Find a better error code for this
+            .ok_or(errors::RESULT_PATH_NOT_FOUND)?;
+        Ok(dir)
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::GetEntryType` (filesystem.cpp:250-276).
+    pub fn get_entry_type(&self, path: &str) -> Result<DirectoryEntryType, ResultCode> {
+        let path = path_util::sanitize_path(path, DirectorySeparator::ForwardSlash);
+        let dir = get_directory_relative_wrapped(&self.backing, &path_util::get_parent_path(&path))
+            .ok_or(errors::RESULT_PATH_NOT_FOUND)?;
+
+        let filename = path_util::get_filename(&path);
+        // Upstream TODO(Subv): Some games use the '/' path, find out what this means.
+        if filename.is_empty() {
+            return Ok(DirectoryEntryType::Directory);
+        }
+
+        if dir.get_file(filename).is_some() {
+            return Ok(DirectoryEntryType::File);
+        }
+
+        if dir.get_subdirectory(filename).is_some() {
+            return Ok(DirectoryEntryType::Directory);
+        }
+
+        Err(errors::RESULT_PATH_NOT_FOUND)
+    }
+
+    /// Port of upstream `VfsDirectoryServiceWrapper::GetFileTimeStampRaw`
+    /// (filesystem.cpp:278-292).
+    pub fn get_file_time_stamp_raw(&self, path: &str) -> Result<FileTimeStampRaw, ResultCode> {
+        let dir = get_directory_relative_wrapped(&self.backing, &path_util::get_parent_path(path))
+            .ok_or(errors::RESULT_PATH_NOT_FOUND)?;
+
+        // Check that the entry exists
+        self.get_entry_type(path)?;
+
+        let filename = path_util::get_filename(path);
+        Ok(dir.get_file_time_stamp(filename))
     }
 }
 

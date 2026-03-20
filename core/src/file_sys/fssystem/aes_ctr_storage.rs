@@ -154,11 +154,14 @@ impl AesCtrStorage {
         let mut ctr = self.iv;
         add_counter(&mut ctr, (offset / BLOCK_SIZE) as u64);
 
-        // TODO: Encrypt using AES-CTR before writing.
-        // For now, write the raw data.
-        let _ = ctr;
-
-        self.base_storage.write(buffer, size, offset)
+        // Encrypt data before writing, matching upstream AesCtrStorage::Write.
+        let mut encrypted = vec![0u8; size];
+        {
+            let mut cipher = self.cipher.lock();
+            cipher.set_iv(&ctr);
+            cipher.transcode(&buffer[..size], &mut encrypted, Op::Encrypt);
+        }
+        self.base_storage.write(&encrypted, size, offset)
     }
 }
 
