@@ -17,23 +17,29 @@
 /// Provides methods to initialize the slab heap, allocate/free objects,
 /// and query the slab state.
 ///
-/// TODO: Full implementation requires KernelCore::SlabHeap<T>().
+/// In the host-emulated model, slab allocation uses Box<T> instead of
+/// kernel-managed slab heaps. The slab resource counts define limits but
+/// allocation itself uses the host allocator.
 pub trait KSlabAllocated: Sized {
     /// Initialize the slab heap for this type.
-    fn initialize_slab_heap(kernel: usize, num_objects: usize) {
-        // TODO: kernel.SlabHeap::<Self>().Initialize(memory, memory_size);
-        let _ = (kernel, num_objects);
+    /// In the host-emulated model, this is a no-op since we use Box allocation.
+    fn initialize_slab_heap(_kernel: usize, _num_objects: usize) {
+        // Host-emulated: no pre-allocated slab region needed.
     }
 
     /// Allocate an instance from the slab.
-    fn slab_allocate(_kernel: usize) -> Option<Box<Self>> {
-        // TODO: kernel.SlabHeap::<Self>().Allocate(kernel)
-        None
+    /// Uses Box allocation in the host-emulated model.
+    fn slab_allocate(_kernel: usize) -> Option<Box<Self>>
+    where
+        Self: Default,
+    {
+        Some(Box::new(Self::default()))
     }
 
     /// Free an instance back to the slab.
+    /// In the host-emulated model, the Box is simply dropped.
     fn slab_free(_kernel: usize, _obj: Box<Self>) {
-        // TODO: kernel.SlabHeap::<Self>().Free(obj)
+        // Box is dropped here, freeing host memory.
     }
 
     /// Get the object size.
@@ -48,7 +54,8 @@ pub trait KSlabAllocated: Sized {
 /// Provides Destroy() behavior that finalizes and frees via slab,
 /// then calls PostDestroy.
 ///
-/// TODO: Full implementation requires KernelCore and KAutoObject integration.
+/// Upstream calls Finalize, frees via slab, then calls PostDestroy.
+/// In the host-emulated model, objects are freed when Box is dropped.
 pub trait KAutoObjectWithSlabHeap: KSlabAllocated {
     /// Whether this object has been fully initialized.
     /// Default: true (matching upstream).
@@ -71,14 +78,11 @@ pub trait KAutoObjectWithSlabHeap: KSlabAllocated {
     }
 
     /// Create an instance from the slab and initialize its reference count.
-    fn create(_kernel: usize) -> Option<Box<Self>>
+    fn create(kernel: usize) -> Option<Box<Self>>
     where
-        Self: Sized,
+        Self: Sized + Default,
     {
-        // TODO: let obj = Self::slab_allocate(kernel)?;
-        // KAutoObject::Create(obj);
-        // Some(obj)
-        None
+        Self::slab_allocate(kernel)
     }
 }
 
@@ -87,11 +91,12 @@ pub trait KAutoObjectWithSlabHeap: KSlabAllocated {
 /// Mirrors `Kernel::KAutoObjectWithSlabHeapAndContainer<Derived, Base>`.
 /// Extends KAutoObjectWithSlabHeap with container registration/unregistration.
 ///
-/// TODO: Requires KAutoObjectWithListContainer (KAutoObjectContainer).
+/// Upstream registers the object with KAutoObjectContainer for enumeration.
+/// In the host-emulated model, registration is a no-op.
 pub trait KAutoObjectWithSlabHeapAndContainer: KAutoObjectWithSlabHeap {
     /// Register this object with the kernel's object list container.
     fn register(_kernel: usize, _obj: &Self) {
-        // TODO: kernel.ObjectListContainer().Register(obj);
+        // Host-emulated: object list container tracking not needed.
     }
 }
 

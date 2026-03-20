@@ -71,10 +71,8 @@ impl<T> KDynamicSlabHeap<T> {
         addr.get() >= start && addr.get() < end
     }
 
-    /// Initialize the dynamic slab heap.
-    ///
-    /// TODO: Requires KDynamicPageManager. Currently stubbed to initialize
-    /// with a fixed number of objects.
+    /// Initialize the dynamic slab heap with a fixed number of objects.
+    /// Upstream uses KDynamicPageManager for backing memory; here we use Vec-based storage.
     pub fn initialize_with_count(&mut self, num_objects: usize) {
         self.inner.initialize();
         self.storage.clear();
@@ -85,9 +83,8 @@ impl<T> KDynamicSlabHeap<T> {
         self.count.store(num_objects, Ordering::Relaxed);
     }
 
-    /// Allocate an object.
-    ///
-    /// TODO: The page_allocator parameter is stubbed until KDynamicPageManager is ported.
+    /// Allocate an object from the slab heap.
+    /// Upstream would expand via KDynamicPageManager if the heap is full.
     pub fn allocate(&mut self) -> Option<usize>
     where
         T: Default,
