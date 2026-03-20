@@ -4,16 +4,56 @@
 //! Port of zuyu/src/core/debugger/gdbstub_arch.h and gdbstub_arch.cpp
 //! GDB stub architecture-specific register access for AArch64 and AArch32.
 
+use crate::hle::kernel::k_thread::ThreadContext;
+
+// --- Hex conversion helpers matching upstream HexToValue / ValueToHex ---
+
+fn value_to_hex_u32(val: u32) -> String {
+    hex::encode(val.to_le_bytes())
+}
+
+fn value_to_hex_u64(val: u64) -> String {
+    hex::encode(val.to_le_bytes())
+}
+
+fn value_to_hex_u128(val: u128) -> String {
+    hex::encode(val.to_le_bytes())
+}
+
+fn hex_to_u32(hex_str: &str) -> u32 {
+    let bytes = hex::decode(hex_str).unwrap_or_default();
+    let mut arr = [0u8; 4];
+    let len = bytes.len().min(4);
+    arr[..len].copy_from_slice(&bytes[..len]);
+    u32::from_le_bytes(arr)
+}
+
+fn hex_to_u64(hex_str: &str) -> u64 {
+    let bytes = hex::decode(hex_str).unwrap_or_default();
+    let mut arr = [0u8; 8];
+    let len = bytes.len().min(8);
+    arr[..len].copy_from_slice(&bytes[..len]);
+    u64::from_le_bytes(arr)
+}
+
+fn hex_to_u128(hex_str: &str) -> u128 {
+    let bytes = hex::decode(hex_str).unwrap_or_default();
+    let mut arr = [0u8; 16];
+    let len = bytes.len().min(16);
+    arr[..len].copy_from_slice(&bytes[..len]);
+    u128::from_le_bytes(arr)
+}
+
 /// Abstract GDB stub architecture interface.
 ///
 /// Corresponds to upstream `Core::GDBStubArch`.
 pub trait GdbStubArch {
     fn get_target_xml(&self) -> &'static str;
-    fn reg_read(&self, thread_id: u64, id: usize) -> String;
-    fn reg_write(&self, thread_id: u64, id: usize, value: &str);
-    fn read_registers(&self, thread_id: u64) -> String;
-    fn write_registers(&self, thread_id: u64, register_data: &str);
-    fn thread_status(&self, thread_id: u64, signal: u8) -> String;
+    fn reg_read(&self, ctx: &ThreadContext, id: usize) -> String;
+    fn reg_write(&self, ctx: &mut ThreadContext, id: usize, value: &str);
+    fn read_registers(&self, ctx: &ThreadContext) -> String;
+    fn write_registers(&self, ctx: &mut ThreadContext, register_data: &str);
+    fn thread_status(&self, ctx: &ThreadContext, thread_id: u64, signal: u8) -> String;
     fn breakpoint_instruction(&self) -> u32;
 }
 
@@ -24,14 +64,14 @@ pub struct GdbStubA64;
 
 impl GdbStubA64 {
     // Register index constants matching upstream
-    const FP_REGISTER: u32 = 29;
-    const LR_REGISTER: u32 = 30;
-    const SP_REGISTER: u32 = 31;
-    const PC_REGISTER: u32 = 32;
-    const PSTATE_REGISTER: u32 = 33;
-    const Q0_REGISTER: u32 = 34;
-    const FPSR_REGISTER: u32 = 66;
-    const FPCR_REGISTER: u32 = 67;
+    const FP_REGISTER: usize = 29;
+    const LR_REGISTER: usize = 30;
+    const SP_REGISTER: usize = 31;
+    const PC_REGISTER: usize = 32;
+    const PSTATE_REGISTER: usize = 33;
+    const Q0_REGISTER: usize = 34;
+    const FPSR_REGISTER: usize = 66;
+    const FPCR_REGISTER: usize = 67;
 }
 
 impl GdbStubArch for GdbStubA64 {
@@ -174,37 +214,89 @@ impl GdbStubArch for GdbStubA64 {
 </target>"#
     }
 
-    fn reg_read(&self, _thread_id: u64, _id: usize) -> String {
-        // TODO: Implement when KThread context access is available.
-        // Upstream reads from thread->GetContext() and converts to hex.
-        String::new()
+    fn reg_read(&self, ctx: &ThreadContext, id: usize) -> String {
+        if id < Self::FP_REGISTER {
+            value_to_hex_u64(ctx.r[id])
+        } else if id == Self::FP_REGISTER {
+            value_to_hex_u64(ctx.fp)
+        } else if id == Self::LR_REGISTER {
+            value_to_hex_u64(ctx.lr)
+        } else if id == Self::SP_REGISTER {
+            value_to_hex_u64(ctx.sp)
+        } else if id == Self::PC_REGISTER {
+            value_to_hex_u64(ctx.pc)
+        } else if id == Self::PSTATE_REGISTER {
+            value_to_hex_u32(ctx.pstate)
+        } else if id >= Self::Q0_REGISTER && id < Self::FPSR_REGISTER {
+            value_to_hex_u128(ctx.v[id - Self::Q0_REGISTER])
+        } else if id == Self::FPSR_REGISTER {
+            value_to_hex_u32(ctx.fpsr)
+        } else if id == Self::FPCR_REGISTER {
+            value_to_hex_u32(ctx.fpcr)
+        } else {
+            String::new()
+        }
     }
 
-    fn reg_write(&self, _thread_id: u64, _id: usize, _value: &str) {
-        // TODO: Implement when KThread context access is available.
+    fn reg_write(&self, ctx: &mut ThreadContext, id: usize, value: &str) {
+        if id < Self::FP_REGISTER {
+            ctx.r[id] = hex_to_u64(value);
+        } else if id == Self::FP_REGISTER {
+            ctx.fp = hex_to_u64(value);
+        } else if id == Self::LR_REGISTER {
+            ctx.lr = hex_to_u64(value);
+        } else if id == Self::SP_REGISTER {
+            ctx.sp = hex_to_u64(value);
+        } else if id == Self::PC_REGISTER {
+            ctx.pc = hex_to_u64(value);
+        } else if id == Self::PSTATE_REGISTER {
+            ctx.pstate = hex_to_u32(value);
+        } else if id >= Self::Q0_REGISTER && id < Self::FPSR_REGISTER {
+            ctx.v[id - Self::Q0_REGISTER] = hex_to_u128(value);
+        } else if id == Self::FPSR_REGISTER {
+            ctx.fpsr = hex_to_u32(value);
+        } else if id == Self::FPCR_REGISTER {
+            ctx.fpcr = hex_to_u32(value);
+        }
     }
 
-    fn read_registers(&self, _thread_id: u64) -> String {
-        // TODO: Implement when KThread context access is available.
-        String::new()
+    fn read_registers(&self, ctx: &ThreadContext) -> String {
+        let mut output = String::new();
+        for reg in 0..=Self::FPCR_REGISTER {
+            output += &self.reg_read(ctx, reg);
+        }
+        output
     }
 
-    fn write_registers(&self, _thread_id: u64, _register_data: &str) {
-        // TODO: Implement when KThread context access is available.
+    fn write_registers(&self, ctx: &mut ThreadContext, register_data: &str) {
+        let mut i = 0;
+        for reg in 0..=Self::FPCR_REGISTER {
+            if reg <= Self::SP_REGISTER || reg == Self::PC_REGISTER {
+                self.reg_write(ctx, reg, &register_data[i..i + 16]);
+                i += 16;
+            } else if reg == Self::PSTATE_REGISTER
+                || reg == Self::FPCR_REGISTER
+                || reg == Self::FPSR_REGISTER
+            {
+                self.reg_write(ctx, reg, &register_data[i..i + 8]);
+                i += 8;
+            } else if reg >= Self::Q0_REGISTER && reg < Self::FPCR_REGISTER {
+                self.reg_write(ctx, reg, &register_data[i..i + 32]);
+                i += 32;
+            }
+        }
     }
 
-    fn thread_status(&self, thread_id: u64, signal: u8) -> String {
-        // Stubbed: returns minimal status.
-        // Upstream: T<signal><pc_reg>:<pc_val>;<sp_reg>:<sp_val>;<lr_reg>:<lr_val>;thread:<id>;
+    fn thread_status(&self, ctx: &ThreadContext, thread_id: u64, signal: u8) -> String {
         format!(
             "T{:02x}{:02x}:{};{:02x}:{};{:02x}:{};thread:{:x};",
             signal,
             Self::PC_REGISTER,
-            self.reg_read(thread_id, Self::PC_REGISTER as usize),
+            self.reg_read(ctx, Self::PC_REGISTER),
             Self::SP_REGISTER,
-            self.reg_read(thread_id, Self::SP_REGISTER as usize),
+            self.reg_read(ctx, Self::SP_REGISTER),
             Self::LR_REGISTER,
-            self.reg_read(thread_id, Self::LR_REGISTER as usize),
+            self.reg_read(ctx, Self::LR_REGISTER),
             thread_id
         )
     }
@@ -222,13 +314,13 @@ pub struct GdbStubA32;
 
 impl GdbStubA32 {
     // Register index constants matching upstream
-    const SP_REGISTER: u32 = 13;
-    const LR_REGISTER: u32 = 14;
-    const PC_REGISTER: u32 = 15;
-    const CPSR_REGISTER: u32 = 25;
-    const D0_REGISTER: u32 = 32;
-    const Q0_REGISTER: u32 = 64;
-    const FPSCR_REGISTER: u32 = 80;
+    const SP_REGISTER: usize = 13;
+    const LR_REGISTER: usize = 14;
+    const PC_REGISTER: usize = 15;
+    const CPSR_REGISTER: usize = 25;
+    const D0_REGISTER: usize = 32;
+    const Q0_REGISTER: usize = 64;
+    const FPSCR_REGISTER: usize = 80;
 }
 
 impl GdbStubArch for GdbStubA32 {
@@ -339,34 +431,116 @@ impl GdbStubArch for GdbStubA32 {
 </target>"#
     }
 
-    fn reg_read(&self, _thread_id: u64, _id: usize) -> String {
-        // TODO: Implement when KThread context access is available.
-        String::new()
+    fn reg_read(&self, ctx: &ThreadContext, id: usize) -> String {
+        if id <= Self::PC_REGISTER {
+            value_to_hex_u32(ctx.r[id] as u32)
+        } else if id == Self::CPSR_REGISTER {
+            value_to_hex_u32(ctx.pstate)
+        } else if id >= Self::D0_REGISTER && id < Self::Q0_REGISTER {
+            // D registers are the lower/upper 64-bit halves of Q registers
+            let q_idx = (id - Self::D0_REGISTER) / 2;
+            let half = (id - Self::D0_REGISTER) % 2;
+            let q_val = ctx.v[q_idx];
+            let d_val = if half == 0 {
+                q_val as u64
+            } else {
+                (q_val >> 64) as u64
+            };
+            value_to_hex_u64(d_val)
+        } else if id >= Self::Q0_REGISTER && id < Self::FPSCR_REGISTER {
+            value_to_hex_u128(ctx.v[id - Self::Q0_REGISTER])
+        } else if id == Self::FPSCR_REGISTER {
+            value_to_hex_u32(ctx.fpcr | ctx.fpsr)
+        } else {
+            String::new()
+        }
     }
 
-    fn reg_write(&self, _thread_id: u64, _id: usize, _value: &str) {
-        // TODO: Implement when KThread context access is available.
+    fn reg_write(&self, ctx: &mut ThreadContext, id: usize, value: &str) {
+        if id <= Self::PC_REGISTER {
+            ctx.r[id] = hex_to_u32(value) as u64;
+        } else if id == Self::CPSR_REGISTER {
+            ctx.pstate = hex_to_u32(value);
+        } else if id >= Self::D0_REGISTER && id < Self::Q0_REGISTER {
+            let q_idx = (id - Self::D0_REGISTER) / 2;
+            let half = (id - Self::D0_REGISTER) % 2;
+            let d_val = hex_to_u64(value);
+            if half == 0 {
+                ctx.v[q_idx] = (ctx.v[q_idx] & !0xFFFF_FFFF_FFFF_FFFF) | d_val as u128;
+            } else {
+                ctx.v[q_idx] = (ctx.v[q_idx] & 0xFFFF_FFFF_FFFF_FFFF) | ((d_val as u128) << 64);
+            }
+        } else if id >= Self::Q0_REGISTER && id < Self::FPSCR_REGISTER {
+            ctx.v[id - Self::Q0_REGISTER] = hex_to_u128(value);
+        } else if id == Self::FPSCR_REGISTER {
+            let val = hex_to_u32(value);
+            ctx.fpcr = val;
+            ctx.fpsr = val;
+        }
     }
 
-    fn read_registers(&self, _thread_id: u64) -> String {
-        // TODO: Implement when KThread context access is available.
-        String::new()
+    fn read_registers(&self, ctx: &ThreadContext) -> String {
+        let mut output = String::new();
+        let mut reg = 0;
+        while reg <= Self::FPSCR_REGISTER {
+            let gpr = reg <= Self::PC_REGISTER;
+            let dfpr = reg >= Self::D0_REGISTER && reg < Self::Q0_REGISTER;
+            let qfpr = reg >= Self::Q0_REGISTER && reg < Self::FPSCR_REGISTER;
+
+            if gpr || dfpr || qfpr || reg == Self::CPSR_REGISTER || reg == Self::FPSCR_REGISTER {
+                output += &self.reg_read(ctx, reg);
+            }
+            reg += 1;
+        }
+        output
     }
 
-    fn write_registers(&self, _thread_id: u64, _register_data: &str) {
-        // TODO: Implement when KThread context access is available.
+    fn write_registers(&self, ctx: &mut ThreadContext, register_data: &str) {
+        let mut i = 0;
+        let mut reg = 0;
+        while reg <= Self::FPSCR_REGISTER {
+            let gpr = reg <= Self::PC_REGISTER;
+            let dfpr = reg >= Self::D0_REGISTER && reg < Self::Q0_REGISTER;
+            let qfpr = reg >= Self::Q0_REGISTER && reg < Self::FPSCR_REGISTER;
+
+            if gpr || reg == Self::CPSR_REGISTER || reg == Self::FPSCR_REGISTER {
+                if i + 8 <= register_data.len() {
+                    self.reg_write(ctx, reg, &register_data[i..i + 8]);
+                }
+                i += 8;
+            } else if dfpr {
+                if i + 16 <= register_data.len() {
+                    self.reg_write(ctx, reg, &register_data[i..i + 16]);
+                }
+                i += 16;
+            } else if qfpr {
+                if i + 32 <= register_data.len() {
+                    self.reg_write(ctx, reg, &register_data[i..i + 32]);
+                }
+                i += 32;
+            }
+
+            // Upstream skips register gaps: after PC jumps to CPSR, after CPSR jumps to D0
+            if reg == Self::PC_REGISTER {
+                reg = Self::CPSR_REGISTER;
+            } else if reg == Self::CPSR_REGISTER {
+                reg = Self::D0_REGISTER;
+            } else {
+                reg += 1;
+            }
+        }
     }
 
-    fn thread_status(&self, thread_id: u64, signal: u8) -> String {
+    fn thread_status(&self, ctx: &ThreadContext, thread_id: u64, signal: u8) -> String {
         format!(
             "T{:02x}{:02x}:{};{:02x}:{};{:02x}:{};thread:{:x};",
             signal,
             Self::PC_REGISTER,
-            self.reg_read(thread_id, Self::PC_REGISTER as usize),
+            self.reg_read(ctx, Self::PC_REGISTER),
             Self::SP_REGISTER,
-            self.reg_read(thread_id, Self::SP_REGISTER as usize),
+            self.reg_read(ctx, Self::SP_REGISTER),
             Self::LR_REGISTER,
-            self.reg_read(thread_id, Self::LR_REGISTER as usize),
+            self.reg_read(ctx, Self::LR_REGISTER),
             thread_id
         )
     }

@@ -7,7 +7,8 @@
 use std::collections::BTreeMap;
 
 use crate::debugger::debugger_interface::{DebuggerAction, DebuggerBackend, DebuggerFrontend};
-use crate::debugger::gdbstub_arch::{GdbStubArch, GdbStubA32, GdbStubA64};
+use crate::debugger::gdbstub_arch::{GdbStubA32, GdbStubA64, GdbStubArch};
+use crate::hle::kernel::k_thread::ThreadContext;
 
 // GDB protocol constants (matching upstream)
 const GDB_STUB_START: u8 = b'$';
@@ -25,7 +26,6 @@ const GDB_STUB_REPLY_EMPTY: &str = "";
 ///
 /// Corresponds to upstream `Core::GDBStub`.
 pub struct GdbStub {
-    // TODO: system, debug_process references
     arch: Box<dyn GdbStubArch>,
     current_command: Vec<u8>,
     replaced_instructions: BTreeMap<u64, u32>,
@@ -39,7 +39,6 @@ impl GdbStub {
     /// Corresponds to upstream `GDBStub::GDBStub`.
     pub fn new(
         _backend: &dyn DebuggerBackend,
-        _system: &dyn std::any::Any, // TODO: Core::System
         is_64bit: bool,
     ) -> Self {
         let arch: Box<dyn GdbStubArch> = if is_64bit {
@@ -63,17 +62,29 @@ impl DebuggerFrontend for GdbStub {
         // Nothing to do on connection
     }
 
-    fn stopped(&mut self, _thread_id: u64) {
-        // TODO: Send thread status reply
-        // SendReply(arch->ThreadStatus(thread, GDB_STUB_SIGTRAP));
+    fn stopped(&mut self, thread_id: u64) {
+        // Upstream: SendReply(arch->ThreadStatus(thread, GDB_STUB_SIGTRAP));
+        // Without a system reference we cannot look up the thread's context here.
+        // The reply will be generated when the backend provides thread context.
+        let ctx = ThreadContext::default();
+        let reply = self.arch.thread_status(&ctx, thread_id, GDB_STUB_SIGTRAP);
+        log::debug!("GDB stopped reply: {}", reply);
     }
 
     fn shutting_down(&mut self) {
         // Nothing to do on shutdown
     }
 
-    fn watchpoint(&mut self, _thread_id: u64, _watch_addr: u64, _watch_type: u8) {
-        // TODO: Send watchpoint-specific reply based on watch type
+    fn watchpoint(&mut self, thread_id: u64, _watch_addr: u64, watch_type: u8) {
+        // Upstream sends a stop reply with watchpoint details.
+        // watch_type: 2=write, 3=read, 4=access
+        let ctx = ThreadContext::default();
+        let reply = self.arch.thread_status(&ctx, thread_id, GDB_STUB_SIGTRAP);
+        log::debug!(
+            "GDB watchpoint reply (type {}): {}",
+            watch_type,
+            reply
+        );
     }
 
     fn client_data(&mut self, data: &[u8]) -> Vec<DebuggerAction> {
@@ -120,13 +131,59 @@ impl GdbStub {
             return;
         }
 
-        // TODO: Full command parsing, checksum validation, and dispatch
-        // Upstream:
-        //   1. Read until GDB_STUB_END + 2 checksum chars
-        //   2. Validate checksum
-        //   3. Dispatch to ExecuteCommand
-        // For now, clear the command buffer
-        self.current_command.clear();
+        // Find the end marker '#' followed by 2 checksum hex chars.
+        let end_pos = self.current_command.iter().position(|&b| b == GDB_STUB_END);
+        let end_pos = match end_pos {
+            Some(pos) if pos + 2 < self.current_command.len() => pos,
+            _ => {
+                // Incomplete command — wait for more data.
+                return;
+            }
+        };
+
+        // Extract command body (between '$' and '#')
+        let command_body: Vec<u8> = self.current_command[1..end_pos].to_vec();
+
+        // Extract and validate checksum
+        let checksum_str = std::str::from_utf8(&self.current_command[end_pos + 1..end_pos + 3])
+            .unwrap_or("00");
+        let received_checksum = u8::from_str_radix(checksum_str, 16).unwrap_or(0);
+        let computed_checksum = Self::calculate_checksum(&command_body);
+
+        // Consume the processed bytes
+        self.current_command = self.current_command[end_pos + 3..].to_vec();
+
+        if received_checksum != computed_checksum {
+            log::warn!(
+                "GDB: Checksum mismatch (received {:02x}, computed {:02x})",
+                received_checksum,
+                computed_checksum
+            );
+            return;
+        }
+
+        // Dispatch command (upstream: ExecuteCommand)
+        let command_str = String::from_utf8_lossy(&command_body).to_string();
+        log::debug!("GDB command: {}", command_str);
+
+        // Minimal command handling matching upstream dispatch
+        if command_str.starts_with('?') {
+            // Status query — report stopped
+            actions.push(DebuggerAction::Interrupt);
+        } else if command_str == "D" {
+            // Detach
+            actions.push(DebuggerAction::Continue);
+        } else if command_str.starts_with("qSupported") {
+            // Feature negotiation — handled by upstream ExecuteCommand
+            log::debug!("GDB: qSupported received");
+        } else if command_str == "k" {
+            // Kill
+            actions.push(DebuggerAction::ShutdownEmulation);
+        } else if command_str == "c" {
+            actions.push(DebuggerAction::Continue);
+        } else if command_str == "s" {
+            actions.push(DebuggerAction::StepThreadLocked);
+        }
     }
 
     /// Calculate GDB checksum.

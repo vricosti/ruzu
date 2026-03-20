@@ -38,10 +38,9 @@ impl TelemetrySession {
 
     /// Add initial telemetry info when starting up a title.
     ///
-    /// In the C++ version this takes AppLoader, FileSystemController, and ContentProvider
-    /// references. Those types are not yet ported, so this simplified version takes
-    /// the program ID, program name, and settings Values directly.
-    /// TODO: Replace with full signature once AppLoader/FSC/ContentProvider are ported.
+    /// Upstream `AddInitialInfo` takes `AppLoader&`, `FileSystemController&`, and
+    /// `ContentProvider&` to extract the program ID and name. This simplified version
+    /// takes program_id and program_name directly; reads settings from the global singleton.
     pub fn add_initial_info_basic(
         &mut self,
         program_id: u64,

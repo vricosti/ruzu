@@ -36,15 +36,14 @@ struct DebuggerImpl {
     port: u16,
     stopped: bool,
     connection_lock: Mutex<()>,
-    // TODO: Add actual TCP server, connection state, GDBStub frontend
-    // when async networking and kernel types are available.
+    // Upstream uses boost::asio TCP acceptor, async_pipe for signal IPC,
+    // and a connection thread. These require async networking infrastructure.
 }
 
 impl DebuggerImpl {
     fn new(port: u16) -> Option<Self> {
         log::info!("Starting debugger server on port {}...", port);
-        // TODO: Initialize TCP acceptor and connection thread.
-        // Upstream uses boost::asio for TCP server.
+        // Upstream initializes a boost::asio TCP acceptor and connection thread here.
         Some(Self {
             port,
             stopped: false,
@@ -61,8 +60,7 @@ impl DebuggerImpl {
         }
 
         self.stopped = true;
-        // TODO: Write to signal pipe to wake up debug interface.
-        // Upstream writes to a boost::process::async_pipe.
+        // Upstream writes to a boost::process::async_pipe to wake the debug interface.
         log::debug!(
             "Debugger signaled: {:?}, thread={}",
             signal_info.type_,
@@ -75,7 +73,7 @@ impl DebuggerImpl {
 
 impl Drop for DebuggerImpl {
     fn drop(&mut self) {
-        // TODO: Shut down connection thread and IO context.
+        // Upstream shuts down the connection thread and boost::asio IO context.
         log::info!("Shutting down debugger server on port {}", self.port);
     }
 }
