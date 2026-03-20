@@ -1009,6 +1009,31 @@ impl KProcess {
         self.pinned_threads[core_id as usize] = None;
     }
 
+    /// Pin the current thread on the given core.
+    ///
+    /// Upstream: `KProcess::PinCurrentThread()` (k_process.cpp:1068-1084).
+    /// Upstream gets core_id and thread from the kernel via GetCurrentCoreId/GetCurrentThreadPointer.
+    /// In ruzu, the caller passes them explicitly since KProcess has no kernel reference.
+    ///
+    /// The caller must also call `thread.pin(core_id)` on the KThread separately,
+    /// since KProcess stores thread IDs (not references) in pinned_threads.
+    pub fn pin_current_thread(&mut self, core_id: i32, thread_id: u64, is_termination_requested: bool) {
+        if !is_termination_requested {
+            self.pin_thread(core_id, thread_id);
+            // Upstream: KScheduler::SetSchedulerUpdateNeeded(m_kernel)
+            // The caller (KInterruptManager) must notify the scheduler.
+        }
+    }
+
+    /// Unpin the current thread on the given core.
+    ///
+    /// Upstream: `KProcess::UnpinCurrentThread()` (k_process.cpp:1086-1099).
+    /// The caller must also call `thread.unpin()` on the KThread separately.
+    pub fn unpin_current_thread(&mut self, core_id: i32, thread_id: u64) {
+        self.unpin_thread_on_core(core_id, thread_id);
+        // Upstream: KScheduler::SetSchedulerUpdateNeeded(m_kernel)
+    }
+
     /// Initialize for a user process.
     /// Port of upstream `KProcess::Initialize(params, user_caps, res_limit, pool, aslr_space_start)`
     /// (the 5-arg overload at k_process.cpp:353-454).

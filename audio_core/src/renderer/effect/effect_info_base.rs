@@ -587,7 +587,7 @@ impl EffectInfoBase {
             let reference = self.workbuffers[0].get_reference(false);
             let size = self.workbuffers[0].get_size();
             if reference != 0 && size > 0 {
-                // TODO: invalidate DSP cache once pool tracking is fully modeled.
+                // Upstream: "// Invalidate DSP cache" — not implemented in C++ either.
             }
         }
         0

@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::k_memory_manager::KMemoryManager;
+use super::k_scheduler::KScheduler;
 use super::k_thread::KThread;
 
 use super::global_scheduler_context::GlobalSchedulerContext;
@@ -24,6 +25,14 @@ use super::k_object_name::KObjectNameGlobalData;
 use super::physical_core::PhysicalCore;
 use crate::core_timing::CoreTiming;
 use crate::hardware_properties;
+
+/// Thread-local host thread ID.
+/// Upstream: `static inline thread_local u8 host_thread_id = UINT8_MAX` in KernelCore::Impl.
+/// Core threads get IDs 0..NUM_CPU_CORES-1. Other host threads get IDs >= NUM_CPU_CORES.
+/// UINT8_MAX (255) means "not yet registered".
+std::thread_local! {
+    static HOST_THREAD_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
 
 /// Constants from the upstream KernelCore::Impl.
 const APPLICATION_MEMORY_BLOCK_SLAB_HEAP_SIZE: usize = 20000;
@@ -54,6 +63,11 @@ pub struct KernelCore {
     object_name_global_data: Option<KObjectNameGlobalData>,
 
     // -- Physical cores and schedulers --
+    /// Per-core KScheduler instances.
+    /// Upstream: `std::array<std::unique_ptr<Kernel::KScheduler>, NUM_CPU_CORES> schedulers`.
+    schedulers: Vec<Arc<Mutex<KScheduler>>>,
+    /// Per-core PhysicalCore instances.
+    /// Upstream: `std::array<std::unique_ptr<Kernel::PhysicalCore>, NUM_CPU_CORES> cores`.
     cores: Vec<PhysicalCore>,
 
     // -- Slab resource counts --
@@ -70,6 +84,9 @@ pub struct KernelCore {
 
     // -- Host thread management --
     next_host_thread_id: AtomicU32,
+    /// In single-core mode, the host thread ID of the single core thread.
+    /// Upstream: `u32 single_core_thread_id{}` in Impl.
+    single_core_thread_id: AtomicU32,
 
     // -- Memory management --
     /// Physical memory manager. Upstream: `Impl::memory_manager`.
@@ -104,6 +121,7 @@ impl KernelCore {
             global_scheduler_context: None,
             object_name_global_data: None,
 
+            schedulers: Vec::new(),
             cores: Vec::new(),
 
             slab_resource_counts: KSlabResourceCounts::create_default(),
@@ -114,6 +132,7 @@ impl KernelCore {
 
             memory_manager: KMemoryManager::new(),
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
+            single_core_thread_id: AtomicU32::new(0),
             current_emu_thread: None,
         }
     }
@@ -184,6 +203,9 @@ impl KernelCore {
 
         self.object_name_global_data = None;
 
+        // Upstream: schedulers[core_id].reset() per core.
+        self.schedulers.clear();
+
         if let Some(ref container) = self.global_object_list_container {
             container.finalize();
         }
@@ -208,8 +230,99 @@ impl KernelCore {
     }
 
     /// Get a physical core by index.
+    /// Upstream: `KernelCore::PhysicalCore(id)`.
     pub fn physical_core(&self, id: usize) -> Option<&PhysicalCore> {
         self.cores.get(id)
+    }
+
+    /// Get a physical core mutably by index.
+    pub fn physical_core_mut(&mut self, id: usize) -> Option<&mut PhysicalCore> {
+        self.cores.get_mut(id)
+    }
+
+    /// Get a per-core scheduler by index.
+    /// Upstream: `KernelCore::Scheduler(id)` (kernel.cpp:924).
+    pub fn scheduler(&self, id: usize) -> Option<&Arc<Mutex<KScheduler>>> {
+        self.schedulers.get(id)
+    }
+
+    /// Get the scheduler for the calling host thread's core.
+    /// Upstream: `KernelCore::CurrentScheduler()` (kernel.cpp:956-963).
+    /// Returns None if called from a non-core thread.
+    pub fn current_scheduler(&self) -> Option<&Arc<Mutex<KScheduler>>> {
+        let core_id = self.get_current_host_thread_id();
+        if core_id >= hardware_properties::NUM_CPU_CORES {
+            return None;
+        }
+        self.schedulers.get(core_id as usize)
+    }
+
+    /// Get the physical core index for the calling host thread.
+    /// Upstream: `KernelCore::CurrentPhysicalCoreIndex()` (kernel.cpp:940-946).
+    pub fn current_physical_core_index(&self) -> usize {
+        let core_id = self.get_current_host_thread_id();
+        if core_id >= hardware_properties::NUM_CPU_CORES {
+            return (hardware_properties::NUM_CPU_CORES - 1) as usize;
+        }
+        core_id as usize
+    }
+
+    /// Get the physical core for the calling host thread.
+    /// Upstream: `KernelCore::CurrentPhysicalCore()` (kernel.cpp:948).
+    pub fn current_physical_core(&self) -> &PhysicalCore {
+        &self.cores[self.current_physical_core_index()]
+    }
+
+    /// Get the physical core for the calling host thread (mutable).
+    pub fn current_physical_core_mut(&mut self) -> &mut PhysicalCore {
+        let idx = self.current_physical_core_index();
+        &mut self.cores[idx]
+    }
+
+    /// Register a CPU core thread by setting the thread-local host thread ID.
+    /// Upstream: `KernelCore::RegisterCoreThread(core_id)` (kernel.cpp:1032).
+    /// Must be called from the host thread that will run this core.
+    pub fn register_core_thread(&self, core_id: usize) {
+        assert!(core_id < hardware_properties::NUM_CPU_CORES as usize);
+        let this_id = core_id as u32;
+        HOST_THREAD_ID.with(|id| {
+            assert_eq!(id.get(), u32::MAX, "host thread already registered");
+            id.set(this_id);
+        });
+        if !self.is_multicore {
+            self.single_core_thread_id.store(this_id, Ordering::Relaxed);
+        }
+    }
+
+    /// Register a host thread (non-core) by allocating the next host thread ID.
+    /// Upstream: `KernelCore::RegisterHostThread(existing_thread)` (kernel.cpp:1036).
+    pub fn register_host_thread(&self) {
+        HOST_THREAD_ID.with(|id| {
+            if id.get() == u32::MAX {
+                let new_id = self.next_host_thread_id.fetch_add(1, Ordering::Relaxed);
+                id.set(new_id);
+            }
+        });
+    }
+
+    /// Get the host thread ID for the calling thread.
+    /// Upstream: `Impl::GetCurrentHostThreadID()` (kernel.cpp:403-409).
+    /// In single-core mode, if the calling thread is the single core thread,
+    /// returns the current core index from CpuManager instead of the raw ID.
+    fn get_current_host_thread_id(&self) -> u32 {
+        HOST_THREAD_ID.with(|id| {
+            let this_id = id.get();
+            if !self.is_multicore
+                && this_id == self.single_core_thread_id.load(Ordering::Relaxed)
+            {
+                // In single-core mode, the single core thread ID maps to the
+                // current core index. Upstream reads system.GetCpuManager().CurrentCore().
+                // We return 0 as default; CpuManager.current_core rotates this.
+                // TODO: wire to actual CpuManager.current_core() when System ref is available.
+                return 0;
+            }
+            this_id
+        })
     }
 
     /// Get the hardware timer (Arc reference).
@@ -332,10 +445,28 @@ impl KernelCore {
         &mut self.memory_manager
     }
 
+    /// Initialize physical cores and per-core schedulers.
+    ///
+    /// Upstream: `Impl::InitializePhysicalCores()` (kernel.cpp:192-211).
+    /// Creates KScheduler + PhysicalCore for each core, then initializes
+    /// each scheduler with main/idle threads.
     fn initialize_physical_cores(&mut self) {
+        self.schedulers.clear();
         self.cores.clear();
         for i in 0..hardware_properties::NUM_CPU_CORES as usize {
+            let core_id = i as i32;
+
+            let scheduler = Arc::new(Mutex::new(KScheduler::new(core_id)));
+            self.schedulers.push(scheduler);
             self.cores.push(PhysicalCore::new(i, self.is_multicore));
+
+            // Upstream creates main_thread and idle_thread per core here via
+            // KThread::Create + InitializeMainThread / InitializeIdleThread,
+            // then calls schedulers[i]->Initialize(main_thread, idle_thread, core).
+            // Those threads require a fully wired KProcess and kernel, so we
+            // defer scheduler initialization to when threads are available.
+            // The caller must call scheduler.lock().unwrap().initialize(main_id, idle_id, core)
+            // once per-core threads are created.
         }
     }
 }

@@ -95,19 +95,18 @@ When reviewing a Rust file, a maintainer should be able to answer:
 
 If the answer is unclear, the port is not structured well enough.
 
-### 3. Intermediate progress is allowed, but temporary shortcuts must be unwound
+### 3. No stubs, no shortcuts — implement before moving on
 
-During the port, temporary shortcuts may be used to unblock progress.
+Temporary shortcuts, stubs, and `todo!()` placeholders are **not allowed**.
 
-Examples:
+If a method or subsystem is needed, implement it fully against upstream before proceeding to dependent work. Do not leave placeholder bodies, log-only stubs, or partial implementations with the intent to "come back later".
 
-- stubbing out a complex platform-specific function
-- using a simplified implementation while other crates depend on the interface
-- keeping a placeholder module with `todo!()` bodies
+If a function cannot be implemented yet because its dependencies do not exist in Rust:
 
-But these shortcuts must be treated as debt, not design.
+- Implement the dependencies first.
+- If the dependency chain is too deep, raise it explicitly rather than stubbing.
 
-Before calling a subsystem "ported", unwind the shortcut and restore parity.
+Do not create dead code paths that log a message and return a dummy value. Every method must either match upstream behavior or not exist yet.
 
 ### 4. Tests are necessary but not sufficient
 
@@ -293,9 +292,9 @@ Use focused module tests while iterating, then `cargo test -p <crate>` before co
 
 These are all mistakes that already occurred or are easy to repeat.
 
-### Anti-pattern 1: "Flatten now, split later" without actually splitting later
+### Anti-pattern 1: "Flatten now, split later" or "stub now, implement later"
 
-This leads to giant central files, hidden ownership, and difficult review. Only flatten temporarily if you are committed to unwinding it.
+This leads to giant central files, hidden ownership, dead code, and difficult review. Do not flatten or stub. Implement correctly the first time.
 
 ### Anti-pattern 2: Treating dispatcher files as owners
 
@@ -307,7 +306,7 @@ If constants belong to a specific upstream file, keep them in the corresponding 
 
 ### Anti-pattern 4: Replacing upstream lifecycle with a Rust convenience lifecycle
 
-Examples: eager initialization where upstream initializes lazily, preemptive cleanup that upstream performs later. If you diverge for temporary practicality, mark it and come back.
+Examples: eager initialization where upstream initializes lazily, preemptive cleanup that upstream performs later. Do not diverge — implement the correct lifecycle from the start.
 
 ### Anti-pattern 5: Using "tests pass" to justify structural divergence
 

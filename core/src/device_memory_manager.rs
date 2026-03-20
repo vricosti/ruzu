@@ -46,15 +46,144 @@ pub trait DeviceInterface {
 /// Using an opaque wrapper for now.
 pub struct MemoryInterface;
 
+/// Linked-list entry for multi-mapped device pages.
+/// Matches upstream `MultiAddressContainer::Entry`.
+#[derive(Default)]
+struct MultiEntry {
+    next_entry: u32,
+    value: u32,
+}
+
+/// Container for tracking multiple device pages that map to the same physical page.
+/// Uses a linked-list approach with a free-list for entry reuse.
+///
+/// Matches upstream `MultiAddressContainer` (device_memory_manager.inc:24-123).
+struct MultiAddressContainer {
+    storage: Vec<MultiEntry>,
+    free_entries: VecDeque<u32>,
+}
+
+impl MultiAddressContainer {
+    fn new() -> Self {
+        Self {
+            storage: Vec::new(),
+            free_entries: VecDeque::new(),
+        }
+    }
+
+    /// Gather all device page values starting from a linked-list entry.
+    /// Upstream: `MultiAddressContainer::GatherValues` (device_memory_manager.inc:29-46).
+    fn gather_values(&self, start_entry: u32, buffer: &mut ScratchBuffer<u32>) {
+        buffer.resize_destructive(0);
+        let mut index = 0usize;
+
+        let mut iter_entry = start_entry;
+        let current = &self.storage[(iter_entry - 1) as usize];
+        buffer.resize(index + 1);
+        buffer[index] = current.value;
+        index += 1;
+
+        let mut next = current.next_entry;
+        while next != 0 {
+            iter_entry = next;
+            let current = &self.storage[(iter_entry - 1) as usize];
+            buffer.resize(index + 1);
+            buffer[index] = current.value;
+            index += 1;
+            next = current.next_entry;
+        }
+    }
+
+    /// Register a single value, returning its entry ID (1-based).
+    /// Upstream: `MultiAddressContainer::Register(u32 value)` (device_memory_manager.inc:48-50).
+    fn register(&mut self, value: u32) -> u32 {
+        self.register_impl(value)
+    }
+
+    /// Chain a value to an existing entry list.
+    /// Upstream: `MultiAddressContainer::Register(u32 value, u32 start_entry)` (device_memory_manager.inc:52-61).
+    fn register_chained(&mut self, value: u32, start_entry: u32) {
+        let entry_id = self.register_impl(value);
+        // Walk to end of chain.
+        let mut iter_entry = start_entry;
+        loop {
+            let next = self.storage[(iter_entry - 1) as usize].next_entry;
+            if next == 0 {
+                break;
+            }
+            iter_entry = next;
+        }
+        self.storage[(iter_entry - 1) as usize].next_entry = entry_id;
+    }
+
+    /// Remove a value from a chain. Returns (more_entries_remain, new_start_entry).
+    /// Upstream: `MultiAddressContainer::Unregister` (device_memory_manager.inc:63-90).
+    fn unregister(&mut self, value: u32, start_entry: u32) -> (bool, u32) {
+        let mut iter_entry = start_entry;
+        let mut previous_idx: Option<u32> = None;
+        let mut count = 0usize;
+
+        // Find the entry with matching value.
+        while self.storage[(iter_entry - 1) as usize].value != value {
+            count += 1;
+            previous_idx = Some(iter_entry);
+            iter_entry = self.storage[(iter_entry - 1) as usize].next_entry;
+        }
+
+        let next_entry = self.storage[(iter_entry - 1) as usize].next_entry;
+        let more_than_one_remaining;
+        let mut result_start = start_entry;
+
+        if next_entry != 0 {
+            let next_has_more = self.storage[(next_entry - 1) as usize].next_entry != 0;
+            more_than_one_remaining = next_has_more || previous_idx.is_some();
+        } else {
+            more_than_one_remaining = false;
+        }
+
+        if let Some(prev) = previous_idx {
+            self.storage[(prev - 1) as usize].next_entry = next_entry;
+        } else {
+            result_start = next_entry;
+        }
+
+        self.free_entries.push_back(iter_entry);
+        (more_than_one_remaining || count > 1, result_start)
+    }
+
+    /// Release an entry and return its value.
+    /// Upstream: `MultiAddressContainer::ReleaseEntry` (device_memory_manager.inc:92-96).
+    fn release_entry(&mut self, start_entry: u32) -> u32 {
+        let value = self.storage[(start_entry - 1) as usize].value;
+        self.free_entries.push_back(start_entry);
+        value
+    }
+
+    fn register_impl(&mut self, value: u32) -> u32 {
+        let entry_id = self.get_new_entry();
+        let entry = &mut self.storage[(entry_id - 1) as usize];
+        entry.next_entry = 0;
+        entry.value = value;
+        entry_id
+    }
+
+    fn get_new_entry(&mut self) -> u32 {
+        if let Some(id) = self.free_entries.pop_front() {
+            return id;
+        }
+        self.storage.push(MultiEntry::default());
+        self.storage.len() as u32
+    }
+}
+
 /// Internal allocator for device memory manager.
 /// Corresponds to `DeviceMemoryManagerAllocator<DTraits>` in C++.
 ///
 /// The C++ implementation uses `Common::FlatAllocator<DAddr, 0, device_virtual_bits>`
 /// as `main_allocator` plus a `MultiAddressContainer` for multi-mapped device pages.
-/// Here we wrap `common::address_space::FlatAllocator` (which operates on u32
-/// internally but is sufficient since device_virtual_bits <= 34).
 struct DeviceMemoryManagerAllocator {
     main_allocator: common::address_space::FlatAllocator,
+    multi_dev_address: MultiAddressContainer,
 }
 
 /// Counter type for page cache tracking.
@@ -197,6 +326,7 @@ impl<Traits: DeviceMemoryManagerTraits> DeviceMemoryManager<Traits> {
                 Self::FIRST_ADDRESS,
                 Self::MAX_DEVICE_AREA,
             ),
+            multi_dev_address: MultiAddressContainer::new(),
         };
 
         Self {
@@ -554,11 +684,23 @@ impl<Traits: DeviceMemoryManagerTraits> DeviceMemoryManager<Traits> {
             address | ((asid.id as u64) << Self::ASID_START_BIT);
     }
 
-    fn inner_gather_device_addresses(&self, buffer: &mut ScratchBuffer<u32>, _address: u64) {
-        // TODO: Implement multi-mapping gather.
-        // This is called when a physical page has multiple device page mappings.
-        // For now, clear the buffer.
-        buffer.resize_destructive(0);
+    /// Gather all device addresses that map to a single physical address.
+    ///
+    /// Upstream: `DeviceMemoryManager::InnerGatherDeviceAddresses`
+    /// (device_memory_manager.inc:320-331).
+    fn inner_gather_device_addresses(&self, buffer: &mut ScratchBuffer<u32>, address: u64) {
+        let phys_addr = (address >> Self::PAGE_BITS) as usize;
+        // Upstream: std::scoped_lock lk(mapping_guard);
+        // In Rust, the caller provides exclusive access via &self/&mut self.
+        let backing = self.compressed_device_addr[phys_addr];
+        if (backing >> Self::MULTI_FLAG_BITS) != 0 {
+            self.allocator
+                .multi_dev_address
+                .gather_values(backing & Self::MULTI_MASK, buffer);
+            return;
+        }
+        buffer.resize(1);
+        buffer[0] = backing;
     }
 
     fn walk_block<F>(

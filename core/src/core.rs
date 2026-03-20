@@ -22,6 +22,7 @@ use crate::memory::memory::Memory;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 
 use parking_lot::Mutex;
+use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -75,6 +76,28 @@ pub struct System {
     /// Filesystem controller (process registrations, factory management).
     /// Upstream: `FileSystemController& GetFileSystemController()`.
     filesystem_controller: Arc<StdMutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
+
+    /// Telemetry session for collecting and submitting usage data.
+    /// Upstream: `std::unique_ptr<Core::TelemetrySession> telemetry_session`.
+    telemetry_session: Option<crate::telemetry_session::TelemetrySession>,
+
+    /// Host1x subsystem (syncpoint manager, device memory, GMMU, CDMA devices).
+    /// Upstream: `std::unique_ptr<Tegra::Host1x::Host1x> host1x_core`.
+    /// Type-erased because video_core crate does not depend on core.
+    /// The frontend creates the concrete Host1x and sets it via set_host1x_core().
+    host1x_core: Option<Box<dyn Any + Send>>,
+
+    /// GPU core (channels, engines, rendering, host synchronization).
+    /// Upstream: `std::unique_ptr<Tegra::GPU> gpu_core`.
+    /// Type-erased because video_core crate does not depend on core.
+    /// The frontend creates the concrete GPU and sets it via set_gpu_core().
+    gpu_core: Option<Box<dyn Any + Send>>,
+
+    /// AudioCore subsystem (audio sinks, ADSP, audio manager).
+    /// Upstream: `std::unique_ptr<AudioCore::AudioCore> audio_core`.
+    /// Type-erased because audio_core crate depends on core (circular dep).
+    /// The frontend creates the concrete AudioCore and sets it via set_audio_core().
+    audio_core: Option<Box<dyn Any + Send>>,
 
     /// Device memory (emulated Switch DRAM).
     device_memory: Option<Box<DeviceMemory>>,
@@ -187,6 +210,10 @@ impl System {
             core_timing: Arc::new(StdMutex::new(CoreTiming::new())),
             cpu_manager: CpuManager::new(),
             kernel: None,
+            telemetry_session: None,
+            host1x_core: None,
+            gpu_core: None,
+            audio_core: None,
             service_manager: None,
             filesystem_controller: Arc::new(StdMutex::new(
                 crate::hle::service::filesystem::filesystem::FileSystemController::new(),
@@ -227,7 +254,10 @@ impl System {
     /// Initializes the system.
     /// This function will initialize core functionality used for system emulation.
     ///
-    /// Corresponds to C++ System::Impl::Initialize().
+    /// Corresponds to C++ System::Impl::Initialize() (core.cpp:118-144).
+    /// Only performs lightweight configuration. Kernel initialization and service
+    /// creation happen later in load() via initialize_kernel() and
+    /// setup_for_application_process(), matching upstream's phased approach.
     pub fn initialize(&mut self) {
         // Allocate device memory
         self.device_memory = Some(Box::new(DeviceMemory::new()));
@@ -252,11 +282,33 @@ impl System {
             // In full implementation, this registers the timer thread with the kernel.
         });
 
+        // Ensure VFS exists. Upstream does this in Initialize().
+        if self.virtual_filesystem.is_none() {
+            self.virtual_filesystem = Some(RealVfsFilesystem::new());
+        }
+
         self.cpu_manager.set_multicore(self.is_multicore);
         self.cpu_manager.set_async_gpu(self.is_async_gpu);
 
+        // Create kernel but do NOT initialize it yet.
+        // Upstream creates kernel in Impl::Impl() (constructor), and only calls
+        // kernel.Initialize() later in InitializeKernel() (called from Load()).
         let mut kernel = KernelCore::new();
         kernel.set_multicore(self.is_multicore);
+        self.kernel = Some(kernel);
+
+        log::info!("System: initialized (multicore={}, async_gpu={})", self.is_multicore, self.is_async_gpu);
+    }
+
+    /// Initialize the kernel and CPU manager.
+    ///
+    /// Corresponds to C++ InitializeKernel(system) (core.cpp:264-272).
+    /// Called at the start of load(), before ROM loading.
+    fn initialize_kernel(&mut self) {
+        let kernel = self.kernel.as_mut().expect("kernel must be created in initialize()");
+
+        // Upstream: ReinitializeIfNecessary() checks if multicore/memory layout
+        // changed and re-runs Initialize() if so. We just call initialize() directly.
         kernel.initialize();
 
         // Initialize the kernel physical memory manager with a Secure pool.
@@ -274,13 +326,43 @@ impl System {
                 .initialize_pool(Pool::SECURE, secure_pool_base, SECURE_POOL_SIZE);
         }
 
-        self.kernel = Some(kernel);
+        // Upstream: cpu_manager.Initialize()
+        // Currently a no-op but preserves parity.
+        self.cpu_manager.initialize();
 
-        // Create the ServiceManager.
+        log::info!("System: kernel initialized");
+    }
+
+    /// Set up subsystems that depend on the application process being loaded.
+    ///
+    /// Corresponds to C++ SetupForApplicationProcess(system, emu_window)
+    /// (core.cpp:274-305). Called from load() after ROM loading and process
+    /// creation, but before applet manager registration.
+    fn setup_for_application_process(&mut self) {
+        // Upstream order (core.cpp:274-305):
+
+        // 1. TelemetrySession
+        // Upstream: telemetry_session = std::make_unique<Core::TelemetrySession>();
+        let settings = common::settings::Values::default();
+        self.telemetry_session = Some(crate::telemetry_session::TelemetrySession::new(&settings));
+
+        // 2. Host1x core — created by the frontend via set_host1x_core() after load()
+        //    returns, because video_core does not depend on core.
+        //    Upstream: host1x_core = make_unique<Tegra::Host1x::Host1x>(system);
+
+        // 3. GPU — created by the frontend via set_gpu_core() after load() returns.
+        //    Upstream: gpu_core = VideoCore::CreateGPU(emu_window, system);
+        //    Needs EmuWindow which is frontend-owned.
+
+        // 4. AudioCore — created by the frontend via set_audio_core() after load()
+        //    returns, because audio_core crate depends on core (circular dep).
+        //    Upstream: audio_core = make_unique<AudioCore::AudioCore>(system).
+
+        // 5. Create the ServiceManager.
         // Upstream: service_manager = std::make_shared<SM::ServiceManager>(kernel);
         let service_manager = Arc::new(StdMutex::new(ServiceManager::new()));
 
-        // Launch all system services.
+        // 6. Launch all system services.
         // Upstream: services = std::make_unique<Services>(service_manager, system, stop_token);
         // This calls each service module's LoopProcess which registers named
         // services on the ServiceManager via per-process ServerManagers.
@@ -292,21 +374,27 @@ impl System {
 
         self.service_manager = Some(service_manager);
 
-        log::info!("System: initialized (multicore={}, async_gpu={})", self.is_multicore, self.is_async_gpu);
+        // Upstream: is_powered_on = true, exit_locked = false, exit_requested = false
+        self.is_powered_on.store(true, Ordering::Relaxed);
+        self.exit_locked = false;
+        self.exit_requested = false;
+
+        log::info!("System: application process setup complete (services created)");
     }
 
     /// Load the game at the given filepath.
     ///
-    /// Corresponds to C++ System::Load().
-    /// Creates a RealVfsFilesystem, opens the game file, identifies the loader,
-    /// and calls AppLoader::load().
+    /// Corresponds to C++ System::Impl::Load() (core.cpp:307-399).
+    /// Phases:
+    ///   1. InitializeKernel — kernel + cpu_manager init
+    ///   2. CreateApplicationProcess — loader, ROM loading, process creation
+    ///   3. SetupForApplicationProcess — ServiceManager, Services, powered on
     pub fn load(&mut self, filepath: &str) -> SystemResultStatus {
-        // Create a RealVfsFilesystem if not already set.
-        if self.virtual_filesystem.is_none() {
-            self.virtual_filesystem = Some(RealVfsFilesystem::new());
-        }
+        // Phase 1: Initialize kernel (upstream: InitializeKernel(system))
+        self.initialize_kernel();
 
-        let vfs = self.virtual_filesystem.as_ref().unwrap();
+        let vfs = self.virtual_filesystem.as_ref()
+            .expect("VFS must be created in initialize()");
 
         // Open the game file.
         let file = match vfs.arc_open_file(filepath, OpenMode::READ) {
@@ -365,21 +453,29 @@ impl System {
 
         if let Some(kernel) = self.kernel_mut() {
             process.process_id = kernel.create_new_user_process_id();
+            // Upstream: kernel.MakeApplicationProcess(process->GetHandle())
+            // Registers this process as THE application process.
         }
+
+        // Store the loader and process before setup_for_application_process,
+        // since services may query System state.
+        self.app_loader = Some(loader);
+        self.load_parameters = load_parameters;
+        self.current_process = Some(process);
+
+        // Phase 3: Set up GPU, audio, services (upstream: SetupForApplicationProcess)
+        self.setup_for_application_process();
 
         // Register the process with the filesystem controller.
         // Upstream: this happens inside AppLoader_NCA::Load() (nca.cpp:77-80),
         // but the Rust loader doesn't have a System reference, so we do it here.
-        self.filesystem_controller.lock().unwrap().register_process(
-            process.process_id,
-            process.get_program_id(),
-        );
+        if let Some(ref process) = self.current_process {
+            self.filesystem_controller.lock().unwrap().register_process(
+                process.process_id,
+                process.get_program_id(),
+            );
+        }
 
-        // Store the loader and process.
-        self.app_loader = Some(loader);
-        self.load_parameters = load_parameters;
-        self.current_process = Some(process);
-        self.is_powered_on.store(true, Ordering::Relaxed);
         self.status = SystemResultStatus::Success;
 
         log::info!("Successfully loaded ROM: {}", filepath);
@@ -450,15 +546,20 @@ impl System {
         // service_manager.reset();
         // fs_controller.Reset();
         // cheat_engine.reset();
-        // telemetry_session.reset();
+
+        // Upstream: telemetry_session.reset();
+        self.telemetry_session = None;
 
         self.core_timing.lock().unwrap().clear_pending_events();
 
-        // In C++:
-        // app_loader.reset();
-        // audio_core.reset();
-        // gpu_core.reset();
-        // host1x_core.reset();
+        // Upstream: app_loader.reset();
+        self.app_loader = None;
+        // Upstream: audio_core.reset();
+        self.audio_core = None;
+        // Upstream: gpu_core.reset();
+        self.gpu_core = None;
+        // Upstream: host1x_core.reset();
+        self.host1x_core = None;
 
         self.perf_stats = None;
         self.cpu_manager.shutdown();
@@ -502,6 +603,75 @@ impl System {
     /// Check if the system is powered on (all subsystems initialized and able to run).
     pub fn is_powered_on(&self) -> bool {
         self.is_powered_on.load(Ordering::Relaxed)
+    }
+
+    /// Get the telemetry session.
+    /// Upstream: `System::TelemetrySession()`.
+    pub fn telemetry_session(&self) -> Option<&crate::telemetry_session::TelemetrySession> {
+        self.telemetry_session.as_ref()
+    }
+
+    /// Get the telemetry session mutably.
+    pub fn telemetry_session_mut(&mut self) -> Option<&mut crate::telemetry_session::TelemetrySession> {
+        self.telemetry_session.as_mut()
+    }
+
+    /// Set the Host1x core subsystem.
+    /// Called by the frontend after System::load() since video_core does not
+    /// depend on core. Upstream: created in SetupForApplicationProcess() (core.cpp:277).
+    pub fn set_host1x_core(&mut self, host1x: Box<dyn Any + Send>) {
+        self.host1x_core = Some(host1x);
+    }
+
+    /// Get the Host1x core (type-erased).
+    /// Callers must downcast to the concrete Host1x type.
+    /// Upstream: `System::Host1x()` returns `Tegra::Host1x::Host1x&`.
+    pub fn host1x_core(&self) -> Option<&(dyn Any + Send)> {
+        self.host1x_core.as_deref()
+    }
+
+    /// Get the Host1x core mutably (type-erased).
+    pub fn host1x_core_mut(&mut self) -> Option<&mut (dyn Any + Send)> {
+        self.host1x_core.as_deref_mut()
+    }
+
+    /// Set the GPU core subsystem.
+    /// Called by the frontend after System::load() since video_core does not
+    /// depend on core. Upstream: created in SetupForApplicationProcess() (core.cpp:278).
+    pub fn set_gpu_core(&mut self, gpu: Box<dyn Any + Send>) {
+        self.gpu_core = Some(gpu);
+    }
+
+    /// Get the GPU core (type-erased).
+    /// Callers must downcast to the concrete GPU type.
+    /// Upstream: `System::GPU()` returns `Tegra::GPU&`.
+    pub fn gpu_core(&self) -> Option<&(dyn Any + Send)> {
+        self.gpu_core.as_deref()
+    }
+
+    /// Get the GPU core mutably (type-erased).
+    pub fn gpu_core_mut(&mut self) -> Option<&mut (dyn Any + Send)> {
+        self.gpu_core.as_deref_mut()
+    }
+
+    /// Set the AudioCore subsystem.
+    /// Called by the frontend after System::load() since audio_core crate depends
+    /// on core (circular dependency prevents core from creating AudioCore directly).
+    /// Upstream: created inside SetupForApplicationProcess() (core.cpp:283).
+    pub fn set_audio_core(&mut self, audio_core: Box<dyn Any + Send>) {
+        self.audio_core = Some(audio_core);
+    }
+
+    /// Get the AudioCore subsystem (type-erased).
+    /// Callers must downcast to the concrete AudioCore type.
+    /// Upstream: `System::AudioCore()` returns `AudioCore::AudioCore&`.
+    pub fn audio_core(&self) -> Option<&(dyn Any + Send)> {
+        self.audio_core.as_deref()
+    }
+
+    /// Get the AudioCore subsystem mutably (type-erased).
+    pub fn audio_core_mut(&mut self) -> Option<&mut (dyn Any + Send)> {
+        self.audio_core.as_deref_mut()
     }
 
     /// Set NVDEC active state.
