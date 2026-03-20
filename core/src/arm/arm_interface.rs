@@ -98,7 +98,7 @@ pub enum Architecture {
 /// Generic ARMv8 CPU interface
 ///
 /// Corresponds to upstream `Core::ArmInterface`.
-pub trait ArmInterface {
+pub trait ArmInterface: Send {
     /// Perform any backend-specific initialization.
     fn initialize(&mut self) {}
 
