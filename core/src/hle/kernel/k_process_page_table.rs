@@ -59,7 +59,7 @@ impl KProcessPageTable {
     }
 
     pub fn finalize(&mut self) {
-        // TODO: delegate to base.finalize()
+        self.base.finalize();
     }
 
     // -- Region getters delegating to base --
@@ -217,8 +217,10 @@ impl KProcessPageTable {
         self.base.contains_range(addr.get() as usize, size)
     }
 
-    pub fn get_physical_address(&self, _address: KProcessAddress) -> Option<KPhysicalAddress> {
-        None // TODO
+    pub fn get_physical_address(&self, address: KProcessAddress) -> Option<KPhysicalAddress> {
+        // In the host-emulated model, virtual and physical addresses are identity-mapped.
+        // Upstream queries the page table implementation for the actual physical mapping.
+        Some(KPhysicalAddress::new(address.get()))
     }
 
     /// Upstream: `bool CanContain(KProcessAddress addr, size_t size, KMemoryState state) const`.

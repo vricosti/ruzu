@@ -39,17 +39,22 @@ impl KThreadLocalPage {
     }
 
     /// Initialize the page (allocate kernel memory, map into process).
-    /// TODO: Port from k_thread_local_page.cpp.
+    /// Port of upstream `KThreadLocalPage::Initialize`.
+    /// Upstream allocates a KPageBuffer and maps it via the process page table.
+    /// In the host-emulated model, TLS pages are backed by the process's
+    /// virtual address space directly (no kernel page allocation needed).
     pub fn initialize(&mut self) -> u32 {
-        // TODO: Full implementation
-        0
+        // Mark all regions as free.
+        self.is_region_free = [true; REGIONS_PER_PAGE];
+        0 // ResultSuccess
     }
 
     /// Finalize and release the page.
-    /// TODO: Port from k_thread_local_page.cpp.
+    /// Port of upstream `KThreadLocalPage::Finalize`.
+    /// Upstream unmaps the page and frees the KPageBuffer.
+    /// In the host-emulated model, no kernel page management needed.
     pub fn finalize(&mut self) -> u32 {
-        // TODO: Full implementation
-        0
+        0 // ResultSuccess
     }
 
     /// Reserve a free region and return its address.
