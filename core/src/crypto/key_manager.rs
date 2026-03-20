@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
 use common::hex_util::hex_string_to_array;
 
-use super::sha_util::Sha256Hash;
+// sha_util::Sha256Hash type used indirectly via sha256() calls
 
 /// A 128-bit (16 byte) key, used for AES-128.
 pub type Key128 = [u8; 16];
@@ -118,6 +118,34 @@ pub enum Ticket {
     },
 }
 
+/// Read TicketData from raw bytes at the given offset by raw memcpy.
+/// Upstream does `std::memcpy(&ticket, raw_data.data(), sizeof(ticket))` which
+/// copies the entire struct. We parse just the TicketData at the data offset.
+fn read_ticket_data(raw_data: &[u8], data_offset: usize) -> TicketData {
+    let td_size = std::mem::size_of::<TicketData>();
+    let mut ticket_data = TicketData::default();
+    if raw_data.len() >= data_offset + td_size {
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(
+                &mut ticket_data as *mut TicketData as *mut u8,
+                td_size,
+            )
+        };
+        dst.copy_from_slice(&raw_data[data_offset..data_offset + td_size]);
+    } else if raw_data.len() > data_offset {
+        // Partial copy - some tools provide short ticket data
+        let available = raw_data.len() - data_offset;
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(
+                &mut ticket_data as *mut TicketData as *mut u8,
+                td_size,
+            )
+        };
+        dst[..available].copy_from_slice(&raw_data[data_offset..]);
+    }
+    ticket_data
+}
+
 impl Ticket {
     pub fn is_valid(&self) -> bool {
         !matches!(self, Ticket::Invalid)
@@ -165,6 +193,7 @@ impl Ticket {
     }
 
     /// Read a ticket from raw bytes.
+    /// Corresponds to upstream `Ticket::Read(std::span<const u8>)`.
     pub fn read_from_bytes(raw_data: &[u8]) -> Self {
         if raw_data.len() < std::mem::size_of::<u32>() {
             log::warn!(
@@ -181,22 +210,87 @@ impl Ticket {
             raw_data[3],
         ]);
 
-        // TODO: Full ticket deserialization matching upstream Ticket::Read
-        // For now, return Invalid for unrecognized types
         match sig_type_val {
-            0x10004 | 0x10003 => {
-                // RSA-2048 SHA256 / SHA1 - most common in practice
-                // Minimal parsing: extract what we need
-                if raw_data.len() < 0x400 {
-                    return Ticket::Invalid;
+            // RSA-4096 types
+            0x10000 | 0x10003 => {
+                let sig_type = if sig_type_val == 0x10000 {
+                    SignatureType::RSA4096SHA1
+                } else {
+                    SignatureType::RSA4096SHA256
+                };
+                // 4 (sig_type) + 0x200 (sig) + 0x3C (pad) + sizeof(TicketData)
+                let data_offset = 4 + 0x200 + 0x3C;
+                let ticket_data = read_ticket_data(raw_data, data_offset);
+                let mut sig_data = [0u8; 0x200];
+                let sig_end = (4 + 0x200).min(raw_data.len());
+                let copy_len = sig_end.saturating_sub(4);
+                sig_data[..copy_len].copy_from_slice(&raw_data[4..4 + copy_len]);
+                let mut padding = [0u8; 0x3C];
+                let pad_start = 4 + 0x200;
+                let pad_end = (pad_start + 0x3C).min(raw_data.len());
+                let pad_len = pad_end.saturating_sub(pad_start);
+                if pad_len > 0 {
+                    padding[..pad_len].copy_from_slice(&raw_data[pad_start..pad_start + pad_len]);
                 }
-                let mut data = TicketData::default();
-                // TODO: Properly deserialize TicketData from raw bytes
+                Ticket::RSA4096 {
+                    sig_type,
+                    sig_data,
+                    _padding: padding,
+                    data: ticket_data,
+                }
+            }
+            // RSA-2048 types
+            0x10001 | 0x10004 => {
+                let sig_type = if sig_type_val == 0x10001 {
+                    SignatureType::RSA2048SHA1
+                } else {
+                    SignatureType::RSA2048SHA256
+                };
+                let data_offset = 4 + 0x100 + 0x3C;
+                let ticket_data = read_ticket_data(raw_data, data_offset);
+                let mut sig_data = [0u8; 0x100];
+                let sig_end = (4 + 0x100).min(raw_data.len());
+                let copy_len = sig_end.saturating_sub(4);
+                sig_data[..copy_len].copy_from_slice(&raw_data[4..4 + copy_len]);
+                let mut padding = [0u8; 0x3C];
+                let pad_start = 4 + 0x100;
+                let pad_end = (pad_start + 0x3C).min(raw_data.len());
+                let pad_len = pad_end.saturating_sub(pad_start);
+                if pad_len > 0 {
+                    padding[..pad_len].copy_from_slice(&raw_data[pad_start..pad_start + pad_len]);
+                }
                 Ticket::RSA2048 {
-                    sig_type: SignatureType::RSA2048SHA256,
-                    sig_data: [0u8; 0x100],
-                    _padding: [0u8; 0x3C],
-                    data,
+                    sig_type,
+                    sig_data,
+                    _padding: padding,
+                    data: ticket_data,
+                }
+            }
+            // ECDSA types
+            0x10002 | 0x10005 => {
+                let sig_type = if sig_type_val == 0x10002 {
+                    SignatureType::ECDSASHA1
+                } else {
+                    SignatureType::ECDSASHA256
+                };
+                let data_offset = 4 + 0x3C + 0x40;
+                let ticket_data = read_ticket_data(raw_data, data_offset);
+                let mut sig_data = [0u8; 0x3C];
+                let sig_end = (4 + 0x3C).min(raw_data.len());
+                let copy_len = sig_end.saturating_sub(4);
+                sig_data[..copy_len].copy_from_slice(&raw_data[4..4 + copy_len]);
+                let mut padding = [0u8; 0x40];
+                let pad_start = 4 + 0x3C;
+                let pad_end = (pad_start + 0x40).min(raw_data.len());
+                let pad_len = pad_end.saturating_sub(pad_start);
+                if pad_len > 0 {
+                    padding[..pad_len].copy_from_slice(&raw_data[pad_start..pad_start + pad_len]);
+                }
+                Ticket::ECDSA {
+                    sig_type,
+                    sig_data,
+                    _padding: padding,
+                    data: ticket_data,
                 }
             }
             _ => {
@@ -207,6 +301,19 @@ impl Ticket {
                 Ticket::Invalid
             }
         }
+    }
+
+    /// Get the total size of the ticket in bytes.
+    /// Corresponds to upstream `Ticket::GetSize`.
+    pub fn get_size(&self) -> u64 {
+        let sig_type = match self.get_signature_type() {
+            Some(st) => st,
+            None => return 0,
+        };
+        std::mem::size_of::<u32>() as u64
+            + get_signature_type_data_size(sig_type)
+            + get_signature_type_padding_size(sig_type)
+            + std::mem::size_of::<TicketData>() as u64
     }
 }
 
@@ -430,6 +537,26 @@ fn find_256_by_name(name: &str) -> Option<(S256KeyType, u64, u64)> {
     None
 }
 
+/// Reverse lookup: find the static name for a 128-bit key index.
+fn find_128_name_by_index(id: S128KeyType, field1: u64, field2: u64) -> Option<&'static str> {
+    for &(name, kt, f1, f2) in S128_FILE_ID {
+        if kt == id && f1 == field1 && f2 == field2 {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Reverse lookup: find the static name for a 256-bit key index.
+fn find_256_name_by_index(id: S256KeyType, field1: u64, field2: u64) -> Option<&'static str> {
+    for &(name, kt, f1, f2) in S256_FILE_ID {
+        if kt == id && f1 == field1 && f2 == field2 {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Resolve the keys directory. Uses the common path manager (RuzuPath::KeysDir).
 /// Also searches fallback locations used by yuzu/suyu for user convenience.
 fn resolve_keys_dir() -> PathBuf {
@@ -568,7 +695,83 @@ impl KeyManager {
         if self.s128_keys.contains_key(&idx) {
             return;
         }
-        // TODO: WriteKeyToFile logic
+
+        // WriteKeyToFile for title keys
+        if id == S128KeyType::Titlekey {
+            let mut rights_id = [0u8; 16];
+            rights_id[..8].copy_from_slice(&field2.to_le_bytes());
+            rights_id[8..].copy_from_slice(&field1.to_le_bytes());
+            self.write_key_to_file(
+                KeyCategory::Title,
+                &common::hex_util::hex_to_string(&rights_id, false),
+                &key,
+            );
+        }
+
+        // Determine category
+        let category = match id {
+            S128KeyType::Keyblob
+            | S128KeyType::KeyblobMAC
+            | S128KeyType::TSEC
+            | S128KeyType::SecureBoot
+            | S128KeyType::SDSeed
+            | S128KeyType::BIS => KeyCategory::Console,
+            _ => KeyCategory::Standard,
+        };
+
+        // Try fixed name lookup
+        if let Some(name) = find_128_name_by_index(id, field1, field2) {
+            self.write_key_to_file(category, name, &key);
+        }
+
+        // Variable-length key names
+        match id {
+            S128KeyType::KeyArea => {
+                let kak_names = [
+                    "key_area_key_application_",
+                    "key_area_key_ocean_",
+                    "key_area_key_system_",
+                ];
+                if (field2 as usize) < kak_names.len() {
+                    self.write_key_to_file(
+                        category,
+                        &format!("{}{:02X}", kak_names[field2 as usize], field1),
+                        &key,
+                    );
+                }
+            }
+            S128KeyType::Master => {
+                self.write_key_to_file(category, &format!("master_key_{:02X}", field1), &key);
+            }
+            S128KeyType::Package1 => {
+                self.write_key_to_file(category, &format!("package1_key_{:02X}", field1), &key);
+            }
+            S128KeyType::Package2 => {
+                self.write_key_to_file(category, &format!("package2_key_{:02X}", field1), &key);
+            }
+            S128KeyType::Titlekek => {
+                self.write_key_to_file(category, &format!("titlekek_{:02X}", field1), &key);
+            }
+            S128KeyType::Keyblob => {
+                self.write_key_to_file(category, &format!("keyblob_key_{:02X}", field1), &key);
+            }
+            S128KeyType::KeyblobMAC => {
+                self.write_key_to_file(
+                    category,
+                    &format!("keyblob_mac_key_{:02X}", field1),
+                    &key,
+                );
+            }
+            S128KeyType::Source if field1 == SourceKeyType::Keyblob as u64 => {
+                self.write_key_to_file(
+                    category,
+                    &format!("keyblob_key_source_{:02X}", field2),
+                    &key,
+                );
+            }
+            _ => {}
+        }
+
         self.s128_keys.insert(idx, key);
     }
 
@@ -584,7 +787,12 @@ impl KeyManager {
         if self.s256_keys.contains_key(&idx) {
             return;
         }
-        // TODO: WriteKeyToFile logic
+
+        // Try fixed name lookup
+        if let Some(name) = find_256_name_by_index(id, field1, field2) {
+            self.write_key_to_file(KeyCategory::Standard, name, &key);
+        }
+
         self.s256_keys.insert(idx, key);
     }
 
@@ -614,32 +822,369 @@ impl KeyManager {
         }
     }
 
+    /// Check if key derivation is necessary.
+    /// Corresponds to upstream `KeyManager::BaseDeriveNecessary`.
     pub fn base_derive_necessary(&self) -> bool {
-        // TODO: Full implementation checking all necessary keys
-        !self.has_key_256(S256KeyType::Header, 0, 0)
+        if !self.has_key_256(S256KeyType::Header, 0, 0) {
+            return true;
+        }
+
+        for i in 0..CURRENT_CRYPTO_REVISION as u64 {
+            if !self.has_key_128(S128KeyType::Master, i, 0)
+                || !self.has_key_128(
+                    S128KeyType::KeyArea,
+                    i,
+                    KeyAreaKeyType::Application as u64,
+                )
+                || !self.has_key_128(S128KeyType::KeyArea, i, KeyAreaKeyType::Ocean as u64)
+                || !self.has_key_128(S128KeyType::KeyArea, i, KeyAreaKeyType::System as u64)
+                || !self.has_key_128(S128KeyType::Titlekek, i, 0)
+            {
+                return true;
+            }
+        }
+
+        false
     }
 
+    /// Full key derivation pipeline.
+    /// Corresponds to upstream `KeyManager::DeriveBase`.
     pub fn derive_base(&mut self) {
-        // TODO: Full key derivation pipeline from upstream DeriveBase
         if !self.base_derive_necessary() {
             return;
         }
-        // Stub: actual derivation requires SecureBoot + TSEC keys + keyblobs
+
+        if !self.has_key_128(S128KeyType::SecureBoot, 0, 0)
+            || !self.has_key_128(S128KeyType::TSEC, 0, 0)
+        {
+            return;
+        }
+
+        // Copy BIS keys between partitions 2 and 3 if one is missing
+        let has_bis = |this: &Self, id: u64| {
+            this.has_key_128(S128KeyType::BIS, id, BISKeyType::Crypto as u64)
+                && this.has_key_128(S128KeyType::BIS, id, BISKeyType::Tweak as u64)
+        };
+
+        if has_bis(self, 2) && !has_bis(self, 3) {
+            let crypto = self.get_key_128(S128KeyType::BIS, 2, BISKeyType::Crypto as u64);
+            let tweak = self.get_key_128(S128KeyType::BIS, 2, BISKeyType::Tweak as u64);
+            self.set_key_128(S128KeyType::BIS, crypto, 3, BISKeyType::Crypto as u64);
+            self.set_key_128(S128KeyType::BIS, tweak, 3, BISKeyType::Tweak as u64);
+        } else if has_bis(self, 3) && !has_bis(self, 2) {
+            let crypto = self.get_key_128(S128KeyType::BIS, 3, BISKeyType::Crypto as u64);
+            let tweak = self.get_key_128(S128KeyType::BIS, 3, BISKeyType::Tweak as u64);
+            self.set_key_128(S128KeyType::BIS, crypto, 2, BISKeyType::Crypto as u64);
+            self.set_key_128(S128KeyType::BIS, tweak, 2, BISKeyType::Tweak as u64);
+        }
+
+        // Find which revisions have keyblob sources and encrypted keyblobs
+        let mut revisions = [false; 32];
+        for i in 0..32 {
+            revisions[i] = self.has_key_128(
+                S128KeyType::Source,
+                SourceKeyType::Keyblob as u64,
+                i as u64,
+            ) && self.encrypted_keyblobs[i] != [0u8; 0xB0];
+        }
+
+        if !revisions.iter().any(|&b| b) {
+            return;
+        }
+
+        let sbk = self.get_key_128(S128KeyType::SecureBoot, 0, 0);
+        let tsec = self.get_key_128(S128KeyType::TSEC, 0, 0);
+
+        for i in 0..32 {
+            if !revisions[i] {
+                continue;
+            }
+
+            // Derive keyblob key
+            let source = self.get_key_128(
+                S128KeyType::Source,
+                SourceKeyType::Keyblob as u64,
+                i as u64,
+            );
+            let key = derive_keyblob_key(&sbk, &tsec, source);
+            self.set_key_128(S128KeyType::Keyblob, key, i as u64, 0);
+
+            // Derive keyblob MAC key
+            if !self.has_key_128(S128KeyType::Source, SourceKeyType::KeyblobMAC as u64, 0) {
+                continue;
+            }
+            let mac_source =
+                self.get_key_128(S128KeyType::Source, SourceKeyType::KeyblobMAC as u64, 0);
+            let mac_key = derive_keyblob_mac_key(&key, &mac_source);
+            self.set_key_128(S128KeyType::KeyblobMAC, mac_key, i as u64, 0);
+
+            // Verify CMAC
+            let cmac = calculate_cmac(&self.encrypted_keyblobs[i][0x10..0x10 + 0xA0], &mac_key);
+            if cmac != self.encrypted_keyblobs[i][..0x10] {
+                continue;
+            }
+
+            // Decrypt keyblob
+            if self.keyblobs[i] == [0u8; 0x90] {
+                self.keyblobs[i] = decrypt_keyblob(&self.encrypted_keyblobs[i], &key);
+                self.write_key_to_file(
+                    KeyCategory::Console,
+                    &format!("keyblob_{:02X}", i),
+                    &self.keyblobs[i],
+                );
+            }
+
+            // Extract package1 key (at offset 0x80 in keyblob)
+            let mut package1 = [0u8; 16];
+            package1.copy_from_slice(&self.keyblobs[i][0x80..0x90]);
+            self.set_key_128(S128KeyType::Package1, package1, i as u64, 0);
+
+            // Derive master key
+            if self.has_key_128(S128KeyType::Source, SourceKeyType::Master as u64, 0) {
+                let master_source =
+                    self.get_key_128(S128KeyType::Source, SourceKeyType::Master as u64, 0);
+                let master = derive_master_key(&self.keyblobs[i], &master_source);
+                self.set_key_128(S128KeyType::Master, master, i as u64, 0);
+            }
+        }
+
+        // Find which revisions have master keys
+        let mut master_revisions = [false; 32];
+        for i in 0..32 {
+            master_revisions[i] = self.has_key_128(S128KeyType::Master, i as u64, 0);
+        }
+
+        if !master_revisions.iter().any(|&b| b) {
+            return;
+        }
+
+        // Derive general purpose keys for each revision
+        for i in 0..32 {
+            if !master_revisions[i] {
+                continue;
+            }
+            self.derive_general_purpose_keys(i);
+        }
+
+        // Derive header key
+        if self.has_key_128(S128KeyType::Master, 0, 0)
+            && self.has_key_128(
+                S128KeyType::Source,
+                SourceKeyType::AESKeyGeneration as u64,
+                0,
+            )
+            && self.has_key_128(
+                S128KeyType::Source,
+                SourceKeyType::AESKekGeneration as u64,
+                0,
+            )
+            && self.has_key_128(S128KeyType::Source, SourceKeyType::HeaderKek as u64, 0)
+            && self.has_key_256(S256KeyType::HeaderSource, 0, 0)
+        {
+            let header_kek = generate_key_encryption_key(
+                self.get_key_128(S128KeyType::Source, SourceKeyType::HeaderKek as u64, 0),
+                self.get_key_128(S128KeyType::Master, 0, 0),
+                self.get_key_128(
+                    S128KeyType::Source,
+                    SourceKeyType::AESKekGeneration as u64,
+                    0,
+                ),
+                self.get_key_128(
+                    S128KeyType::Source,
+                    SourceKeyType::AESKeyGeneration as u64,
+                    0,
+                ),
+            );
+            self.set_key_128(S128KeyType::HeaderKek, header_kek, 0, 0);
+
+            let mut header_cipher = super::aes_util::AesCipher::new_128(
+                header_kek,
+                super::aes_util::Mode::ECB,
+            );
+            let mut out = self.get_key_256(S256KeyType::HeaderSource, 0, 0);
+            let src = out;
+            header_cipher.transcode(&src, &mut out, super::aes_util::Op::Decrypt);
+            self.set_key_256(S256KeyType::Header, out, 0, 0);
+        }
     }
 
+    /// Derive ETicket keys from partition data and content provider.
+    /// Corresponds to upstream `KeyManager::DeriveETicket`.
     pub fn derive_e_ticket(
         &mut self,
-        _data: &mut super::partition_data_manager::PartitionDataManager,
+        data: &mut super::partition_data_manager::PartitionDataManager,
+        provider: &dyn crate::file_sys::registered_cache::ContentProvider,
     ) {
-        // TODO: Full ETicket derivation from upstream DeriveETicket
+        // ETicket keys - get ES title (0x0100000000000033)
+        let es = match provider.get_entry(
+            0x0100000000000033,
+            crate::file_sys::nca_metadata::ContentRecordType::Program,
+        ) {
+            Some(nca) => nca,
+            None => return,
+        };
+
+        let exefs = match es.get_exefs() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let main_file = match exefs.get_file("main") {
+            Some(f) => f,
+            None => return,
+        };
+
+        let bytes = main_file.read_all_bytes();
+
+        // Search for eticket source keys
+        let eticket_source_hashes: [[u8; 0x20]; 2] = [
+            hex_string_to_array("B71DB271DC338DF380AA2C4335EF8873B1AFD408E80B3582D8719FC81C5E511C"),
+            hex_string_to_array("E8965A187D30E57869F562D04383C996DE487BBA5761363D2D4D32391866A85C"),
+        ];
+
+        let eticket_kek =
+            super::partition_data_manager::find_key_from_hex16(&bytes, eticket_source_hashes[0]);
+        let eticket_kekek =
+            super::partition_data_manager::find_key_from_hex16(&bytes, eticket_source_hashes[1]);
+
+        let seed3 = data.get_rsa_kek_seed3();
+        let mask0 = data.get_rsa_kek_mask0();
+
+        if eticket_kek != [0u8; 16] {
+            self.set_key_128(
+                S128KeyType::Source,
+                eticket_kek,
+                SourceKeyType::ETicketKek as u64,
+                0,
+            );
+        }
+        if eticket_kekek != [0u8; 16] {
+            self.set_key_128(
+                S128KeyType::Source,
+                eticket_kekek,
+                SourceKeyType::ETicketKekek as u64,
+                0,
+            );
+        }
+        if seed3 != [0u8; 16] {
+            self.set_key_128(
+                S128KeyType::RSAKek,
+                seed3,
+                RSAKekType::Seed3 as u64,
+                0,
+            );
+        }
+        if mask0 != [0u8; 16] {
+            self.set_key_128(
+                S128KeyType::RSAKek,
+                mask0,
+                RSAKekType::Mask0 as u64,
+                0,
+            );
+        }
+
+        if eticket_kek == [0u8; 16]
+            || eticket_kekek == [0u8; 16]
+            || seed3 == [0u8; 16]
+            || mask0 == [0u8; 16]
+        {
+            return;
+        }
+
+        // rsa_oaep_kek = seed3 ^ mask0
+        let mut rsa_oaep_kek = [0u8; 16];
+        for i in 0..16 {
+            rsa_oaep_kek[i] = seed3[i] ^ mask0[i];
+        }
+        if rsa_oaep_kek == [0u8; 16] {
+            return;
+        }
+
+        self.set_key_128(
+            S128KeyType::Source,
+            rsa_oaep_kek,
+            SourceKeyType::RSAOaepKekGeneration as u64,
+            0,
+        );
+
+        // Derive ETicket RSA Kek
+        let master_00 = self.get_key_128(S128KeyType::Master, 0, 0);
+        let mut temp_kek = [0u8; 16];
+        let mut temp_kekek = [0u8; 16];
+        let mut eticket_final = [0u8; 16];
+
+        let mut es_master =
+            super::aes_util::AesCipher::new_128(master_00, super::aes_util::Mode::ECB);
+        es_master.transcode(
+            &rsa_oaep_kek,
+            &mut temp_kek,
+            super::aes_util::Op::Decrypt,
+        );
+        let mut es_kekek =
+            super::aes_util::AesCipher::new_128(temp_kek, super::aes_util::Mode::ECB);
+        es_kekek.transcode(
+            &eticket_kekek,
+            &mut temp_kekek,
+            super::aes_util::Op::Decrypt,
+        );
+        let mut es_kek =
+            super::aes_util::AesCipher::new_128(temp_kekek, super::aes_util::Mode::ECB);
+        es_kek.transcode(
+            &eticket_kek,
+            &mut eticket_final,
+            super::aes_util::Op::Decrypt,
+        );
+
+        if eticket_final == [0u8; 16] {
+            return;
+        }
+
+        self.set_key_128(S128KeyType::ETicketRSAKek, eticket_final, 0, 0);
+
+        // Decrypt PRODINFO and get eticket extended kek
+        data.decrypt_prodinfo(self.get_bis_key(0));
+
+        self.eticket_extended_kek = data.get_eticket_extended_kek();
+        self.write_key_to_file(
+            KeyCategory::Console,
+            "eticket_extended_kek",
+            &self.eticket_extended_kek,
+        );
+        self.derive_e_ticket_rsa_key();
+        self.populate_tickets();
     }
 
+    /// Populate tickets from NAND save files.
+    /// Corresponds to upstream `KeyManager::PopulateTickets`.
     pub fn populate_tickets(&mut self) {
         if self.ticket_databases_loaded {
             return;
         }
         self.ticket_databases_loaded = true;
-        // TODO: Read ticket databases from NAND saves
+
+        let mut tickets = Vec::new();
+
+        let nand_dir = get_ruzu_path(RuzuPath::NANDDir);
+
+        let system_save_e1_path = nand_dir.join("system/save/80000000000000e1");
+        if system_save_e1_path.exists() {
+            if let Ok(data) = std::fs::read(&system_save_e1_path) {
+                let blob = get_ticketblob(&data);
+                tickets.extend(blob);
+            }
+        }
+
+        let system_save_e2_path = nand_dir.join("system/save/80000000000000e2");
+        if system_save_e2_path.exists() {
+            if let Ok(data) = std::fs::read(&system_save_e2_path) {
+                let blob = get_ticketblob(&data);
+                tickets.extend(blob);
+            }
+        }
+
+        for ticket in &tickets {
+            self.add_ticket(ticket);
+        }
     }
 
     pub fn synthesize_tickets(&mut self) {
@@ -655,11 +1200,183 @@ impl KeyManager {
         }
     }
 
+    /// Populate keys from partition data.
+    /// Corresponds to upstream `KeyManager::PopulateFromPartitionData`.
     pub fn populate_from_partition_data(
         &mut self,
-        _data: &mut super::partition_data_manager::PartitionDataManager,
+        data: &mut super::partition_data_manager::PartitionDataManager,
     ) {
-        // TODO: Full implementation from upstream PopulateFromPartitionData
+        if !self.base_derive_necessary() {
+            return;
+        }
+
+        if !data.has_boot0() {
+            return;
+        }
+
+        // Extract encrypted keyblobs from BOOT0
+        for i in 0..self.encrypted_keyblobs.len() {
+            if self.encrypted_keyblobs[i] != [0u8; 0xB0] {
+                continue;
+            }
+            self.encrypted_keyblobs[i] = data.get_encrypted_keyblob(i);
+            self.write_key_to_file(
+                KeyCategory::Console,
+                &format!("encrypted_keyblob_{:02X}", i),
+                &self.encrypted_keyblobs[i],
+            );
+        }
+
+        // Set key sources from partition data
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_package2_key_source(),
+            SourceKeyType::Package2 as u64,
+            0,
+        );
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_aes_kek_generation_source(),
+            SourceKeyType::AESKekGeneration as u64,
+            0,
+        );
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_titlekek_source(),
+            SourceKeyType::Titlekek as u64,
+            0,
+        );
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_master_key_source(),
+            SourceKeyType::Master as u64,
+            0,
+        );
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_keyblob_mac_key_source(),
+            SourceKeyType::KeyblobMAC as u64,
+            0,
+        );
+
+        let max_keyblob =
+            super::partition_data_manager::PartitionDataManager::max_keyblob_source_hash();
+        for i in 0..max_keyblob as usize {
+            self.set_key_wrapped_128(
+                S128KeyType::Source,
+                data.get_keyblob_key_source(i),
+                SourceKeyType::Keyblob as u64,
+                i as u64,
+            );
+        }
+
+        if data.has_fuses() {
+            self.set_key_wrapped_128(
+                S128KeyType::SecureBoot,
+                data.get_secure_boot_key(),
+                0,
+                0,
+            );
+        }
+
+        self.derive_base();
+
+        // Find latest master key
+        let mut latest_master = [0u8; 16];
+        for i in (0..=0x1Fi8).rev() {
+            let key = self.get_key_128(S128KeyType::Master, i as u64, 0);
+            if key != [0u8; 16] {
+                latest_master = key;
+                break;
+            }
+        }
+
+        // Get TZ master keys
+        let masters = data.get_tz_master_keys(latest_master);
+        for i in 0..masters.len() {
+            if masters[i] != [0u8; 16]
+                && !self.has_key_128(S128KeyType::Master, i as u64, 0)
+            {
+                self.set_key_128(S128KeyType::Master, masters[i], i as u64, 0);
+            }
+        }
+
+        self.derive_base();
+
+        if !data.has_package2_default() {
+            return;
+        }
+
+        // Decrypt Package2
+        let mut package2_keys = [[0u8; 16]; 0x20];
+        for i in 0..package2_keys.len() {
+            if self.has_key_128(S128KeyType::Package2, i as u64, 0) {
+                package2_keys[i] =
+                    self.get_key_128(S128KeyType::Package2, i as u64, 0);
+            }
+        }
+        data.decrypt_package2(
+            &package2_keys,
+            super::partition_data_manager::Package2Type::NormalMain,
+        );
+
+        // Extract key sources from decrypted Package2
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_key_area_key_application_source_default(),
+            SourceKeyType::KeyAreaKey as u64,
+            KeyAreaKeyType::Application as u64,
+        );
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_key_area_key_ocean_source_default(),
+            SourceKeyType::KeyAreaKey as u64,
+            KeyAreaKeyType::Ocean as u64,
+        );
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_key_area_key_system_source_default(),
+            SourceKeyType::KeyAreaKey as u64,
+            KeyAreaKeyType::System as u64,
+        );
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_sd_kek_source_default(),
+            SourceKeyType::SDKek as u64,
+            0,
+        );
+        self.set_key_wrapped_256(
+            S256KeyType::SDKeySource,
+            data.get_sd_save_key_source_default(),
+            SDKeyType::Save as u64,
+            0,
+        );
+        self.set_key_wrapped_256(
+            S256KeyType::SDKeySource,
+            data.get_sd_nca_key_source_default(),
+            SDKeyType::NCA as u64,
+            0,
+        );
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_header_kek_source_default(),
+            SourceKeyType::HeaderKek as u64,
+            0,
+        );
+        self.set_key_wrapped_256(
+            S256KeyType::HeaderSource,
+            data.get_header_key_source_default(),
+            0,
+            0,
+        );
+        self.set_key_wrapped_128(
+            S128KeyType::Source,
+            data.get_aes_key_generation_source_default(),
+            SourceKeyType::AESKeyGeneration as u64,
+            0,
+        );
+
+        self.derive_base();
     }
 
     pub fn get_common_tickets(&self) -> &BTreeMap<u128, Ticket> {
@@ -670,12 +1387,48 @@ impl KeyManager {
         &self.personal_tickets
     }
 
+    /// Add a ticket to the key manager.
+    /// Corresponds to upstream `KeyManager::AddTicket`.
     pub fn add_ticket(&mut self, ticket: &Ticket) -> bool {
         if !ticket.is_valid() {
             log::warn!("Attempted to add invalid ticket.");
             return false;
         }
-        // TODO: Full ticket addition logic
+
+        let data = ticket.get_data().unwrap();
+        let rid = &data.rights_id;
+
+        // Convert rights_id bytes to u128 (two u64s, matching upstream memcpy)
+        let rights_id_lo = u64::from_le_bytes([
+            rid[0], rid[1], rid[2], rid[3], rid[4], rid[5], rid[6], rid[7],
+        ]);
+        let rights_id_hi = u64::from_le_bytes([
+            rid[8], rid[9], rid[10], rid[11], rid[12], rid[13], rid[14], rid[15],
+        ]);
+        let rights_id_u128 = ((rights_id_hi as u128) << 64) | (rights_id_lo as u128);
+
+        if data.key_type == TitleKeyType::Common {
+            self.common_tickets
+                .insert(rights_id_u128, ticket.clone());
+        } else {
+            self.personal_tickets
+                .insert(rights_id_u128, ticket.clone());
+        }
+
+        if self.has_key_128(S128KeyType::Titlekey, rights_id_hi, rights_id_lo) {
+            log::debug!(
+                "Skipping parsing title key from ticket for known rights ID {:016X}{:016X}.",
+                rights_id_hi,
+                rights_id_lo
+            );
+            return true;
+        }
+
+        let key = match self.parse_ticket_title_key(ticket) {
+            Some(k) => k,
+            None => return false,
+        };
+        self.set_key_128(S128KeyType::Titlekey, key, rights_id_hi, rights_id_lo);
         true
     }
 
@@ -935,6 +1688,87 @@ impl KeyManager {
         }
     }
 
+    /// Parse the title key from a ticket.
+    /// Corresponds to upstream `KeyManager::ParseTicketTitleKey`.
+    pub fn parse_ticket_title_key(&self, ticket: &Ticket) -> Option<Key128> {
+        if !ticket.is_valid() {
+            log::warn!("Attempted to parse title key of invalid ticket.");
+            return None;
+        }
+
+        let data = ticket.get_data().unwrap();
+
+        if data.rights_id == [0u8; 16] {
+            log::warn!("Attempted to parse title key of ticket with no rights ID.");
+            return None;
+        }
+
+        if is_all_zero(&data.issuer) {
+            log::warn!("Attempted to parse title key of ticket with invalid issuer.");
+            return None;
+        }
+
+        if data.issuer[0] != b'R'
+            || data.issuer[1] != b'o'
+            || data.issuer[2] != b'o'
+            || data.issuer[3] != b't'
+        {
+            log::warn!("Parsing ticket with non-standard certificate authority.");
+        }
+
+        if data.key_type == TitleKeyType::Common {
+            return Some(data.title_key_common());
+        }
+
+        // Personalized ticket - requires RSA OAEP decryption
+        if self.eticket_rsa_keypair == RsaKeyPair::default() {
+            log::warn!(
+                "Skipping personalized ticket title key parsing due to missing ETicket RSA key-pair."
+            );
+            return None;
+        }
+
+        // RSA modular exponentiation: M = S^D mod N
+        // Using manual big integer arithmetic since we can't add crate deps.
+        let d_bytes = &self.eticket_rsa_keypair.decryption_key;
+        let n_bytes = &self.eticket_rsa_keypair.modulus;
+        let s_bytes = &data.title_key_block;
+
+        let d = bytes_to_bignum(d_bytes);
+        let n = bytes_to_bignum(n_bytes);
+        let s = bytes_to_bignum(s_bytes);
+
+        let m = mod_exp(&s, &d, &n);
+        let rsa_step = bignum_to_bytes_256(&m);
+
+        let m_0 = rsa_step[0];
+        let mut m_1 = [0u8; 0x20];
+        m_1.copy_from_slice(&rsa_step[0x01..0x21]);
+        let mut m_2 = [0u8; 0xDF];
+        m_2.copy_from_slice(&rsa_step[0x21..0x100]);
+
+        if m_0 != 0 {
+            return None;
+        }
+
+        // MGF1 operations for OAEP unpadding
+        let mgf1_m2 = mgf1::<0x20, 0xDF>(&m_2);
+        for i in 0..0x20 {
+            m_1[i] ^= mgf1_m2[i];
+        }
+        let mgf1_m1 = mgf1::<0xDF, 0x20>(&m_1);
+        for i in 0..0xDF {
+            m_2[i] ^= mgf1_m1[i];
+        }
+
+        let offset = find_ticket_offset(&m_2)?;
+        assert!(offset > 0);
+
+        let mut key_temp = [0u8; 16];
+        key_temp.copy_from_slice(&m_2[offset as usize..offset as usize + 16]);
+        Some(key_temp)
+    }
+
     pub fn are_keys_loaded(&self) -> bool {
         !self.s128_keys.is_empty() && !self.s256_keys.is_empty()
     }
@@ -953,12 +1787,138 @@ impl KeyManager {
         self.set_key_256(id, key, field1, field2);
     }
 
-    fn derive_general_purpose_keys(&mut self, _crypto_revision: usize) {
-        // TODO: Full implementation from upstream DeriveGeneralPurposeKeys
+    /// Derive general purpose keys for a given crypto revision.
+    /// Corresponds to upstream `KeyManager::DeriveGeneralPurposeKeys`.
+    fn derive_general_purpose_keys(&mut self, crypto_revision: usize) {
+        let kek_generation_source =
+            self.get_key_128(S128KeyType::Source, SourceKeyType::AESKekGeneration as u64, 0);
+        let key_generation_source =
+            self.get_key_128(S128KeyType::Source, SourceKeyType::AESKeyGeneration as u64, 0);
+
+        if self.has_key_128(S128KeyType::Master, crypto_revision as u64, 0) {
+            for kak_type in [
+                KeyAreaKeyType::Application,
+                KeyAreaKeyType::Ocean,
+                KeyAreaKeyType::System,
+            ] {
+                if self.has_key_128(
+                    S128KeyType::Source,
+                    SourceKeyType::KeyAreaKey as u64,
+                    kak_type as u64,
+                ) {
+                    let source = self.get_key_128(
+                        S128KeyType::Source,
+                        SourceKeyType::KeyAreaKey as u64,
+                        kak_type as u64,
+                    );
+                    let kek = generate_key_encryption_key(
+                        source,
+                        self.get_key_128(S128KeyType::Master, crypto_revision as u64, 0),
+                        kek_generation_source,
+                        key_generation_source,
+                    );
+                    self.set_key_128(
+                        S128KeyType::KeyArea,
+                        kek,
+                        crypto_revision as u64,
+                        kak_type as u64,
+                    );
+                }
+            }
+
+            let master_key =
+                self.get_key_128(S128KeyType::Master, crypto_revision as u64, 0);
+            let mut master_cipher =
+                super::aes_util::AesCipher::new_128(master_key, super::aes_util::Mode::ECB);
+
+            for key_type in [SourceKeyType::Titlekek, SourceKeyType::Package2] {
+                if self.has_key_128(S128KeyType::Source, key_type as u64, 0) {
+                    let source =
+                        self.get_key_128(S128KeyType::Source, key_type as u64, 0);
+                    let mut key = [0u8; 16];
+                    master_cipher.transcode(&source, &mut key, super::aes_util::Op::Decrypt);
+                    let target_type = if key_type == SourceKeyType::Titlekek {
+                        S128KeyType::Titlekek
+                    } else {
+                        S128KeyType::Package2
+                    };
+                    self.set_key_128(target_type, key, crypto_revision as u64, 0);
+                }
+            }
+        }
     }
 
+    /// Derive the ETicket RSA key from the extended KEK.
+    /// Corresponds to upstream `KeyManager::DeriveETicketRSAKey`.
     fn derive_e_ticket_rsa_key(&mut self) {
-        // TODO: Full implementation from upstream DeriveETicketRSAKey
+        if is_all_zero(&self.eticket_extended_kek)
+            || !self.has_key_128(S128KeyType::ETicketRSAKek, 0, 0)
+        {
+            return;
+        }
+
+        let eticket_final = self.get_key_128(S128KeyType::ETicketRSAKek, 0, 0);
+
+        let extended_iv = &self.eticket_extended_kek[..0x10];
+        let mut extended_dec = [0u8; 0x230];
+        let mut rsa_cipher =
+            super::aes_util::AesCipher::new_128(eticket_final, super::aes_util::Mode::CTR);
+        rsa_cipher.set_iv(extended_iv);
+        rsa_cipher.transcode(
+            &self.eticket_extended_kek[0x10..0x10 + 0x230],
+            &mut extended_dec,
+            super::aes_util::Op::Decrypt,
+        );
+
+        self.eticket_rsa_keypair.decryption_key[..0x100]
+            .copy_from_slice(&extended_dec[..0x100]);
+        self.eticket_rsa_keypair.modulus[..0x100]
+            .copy_from_slice(&extended_dec[0x100..0x200]);
+        self.eticket_rsa_keypair.exponent
+            .copy_from_slice(&extended_dec[0x200..0x204]);
+    }
+
+    /// Write a key to the appropriate auto-generated key file.
+    /// Corresponds to upstream `KeyManager::WriteKeyToFile`.
+    fn write_key_to_file(&self, category: KeyCategory, keyname: &str, key: &[u8]) {
+        let keys_dir = get_ruzu_path(RuzuPath::KeysDir);
+
+        let filename = match category {
+            KeyCategory::Standard => {
+                if self.dev_mode {
+                    "dev.keys_autogenerated"
+                } else {
+                    "prod.keys_autogenerated"
+                }
+            }
+            KeyCategory::Title => "title.keys_autogenerated",
+            KeyCategory::Console => "console.keys_autogenerated",
+        };
+
+        let path = keys_dir.join(filename);
+        let add_info_text = !path.exists();
+
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        use std::io::Write;
+        if add_info_text {
+            let _ = write!(
+                file,
+                "# This file is autogenerated by Ruzu\n\
+                 # It serves to store keys that were automatically generated from the normal keys\n\
+                 # If you are experiencing issues involving keys, it may help to delete this file\n"
+            );
+        }
+
+        let hex = common::hex_util::hex_to_string(key, false);
+        let _ = write!(file, "\n{} = {}", keyname, hex);
     }
 }
 
@@ -970,52 +1930,551 @@ impl Default for KeyManager {
 
 // ---- Free functions matching upstream ----
 
+/// Current crypto revision constant.
+const CURRENT_CRYPTO_REVISION: u64 = 0x5;
+
+/// Check if all bytes in a slice are zero.
+fn is_all_zero(data: &[u8]) -> bool {
+    data.iter().all(|&b| b == 0)
+}
+
 /// Generate a key encryption key. Port of upstream GenerateKeyEncryptionKey.
+/// Three-step AES-ECB decrypt chain.
 pub fn generate_key_encryption_key(
-    _source: Key128,
-    _master: Key128,
-    _kek_seed: Key128,
-    _key_seed: Key128,
+    source: Key128,
+    master: Key128,
+    kek_seed: Key128,
+    key_seed: Key128,
 ) -> Key128 {
-    // TODO: Full implementation using AES-ECB cipher chain
-    [0u8; 16]
+    use super::aes_util::{AesCipher, Mode, Op};
+
+    let mut out = [0u8; 16];
+
+    let mut cipher1 = AesCipher::new_128(master, Mode::ECB);
+    cipher1.transcode(&kek_seed, &mut out, Op::Decrypt);
+
+    let mut cipher2 = AesCipher::new_128(out, Mode::ECB);
+    cipher2.transcode(&source, &mut out, Op::Decrypt);
+
+    if key_seed != [0u8; 16] {
+        let mut cipher3 = AesCipher::new_128(out, Mode::ECB);
+        cipher3.transcode(&key_seed, &mut out, Op::Decrypt);
+    }
+
+    out
 }
 
 /// Derive a keyblob key. Port of upstream DeriveKeyblobKey.
-pub fn derive_keyblob_key(_sbk: &Key128, _tsec: &Key128, _source: Key128) -> Key128 {
-    // TODO: Full implementation using AES-ECB cipher chain
-    [0u8; 16]
+/// Two AES-ECB decrypts: tsec decrypts source in-place, then sbk decrypts source in-place.
+pub fn derive_keyblob_key(sbk: &Key128, tsec: &Key128, mut source: Key128) -> Key128 {
+    use super::aes_util::{AesCipher, Mode, Op};
+
+    let mut tsec_cipher = AesCipher::new_128(*tsec, Mode::ECB);
+    let src = source;
+    tsec_cipher.transcode(&src, &mut source, Op::Decrypt);
+
+    let mut sbk_cipher = AesCipher::new_128(*sbk, Mode::ECB);
+    let src = source;
+    sbk_cipher.transcode(&src, &mut source, Op::Decrypt);
+
+    source
 }
 
 /// Derive a keyblob MAC key. Port of upstream DeriveKeyblobMACKey.
-pub fn derive_keyblob_mac_key(_keyblob_key: &Key128, _mac_source: &Key128) -> Key128 {
-    // TODO: Full implementation
-    [0u8; 16]
+/// Single AES-ECB decrypt.
+pub fn derive_keyblob_mac_key(keyblob_key: &Key128, mac_source: &Key128) -> Key128 {
+    use super::aes_util::{AesCipher, Mode, Op};
+
+    let mut mac_cipher = AesCipher::new_128(*keyblob_key, Mode::ECB);
+    let mut mac_key = [0u8; 16];
+    mac_cipher.transcode(mac_source, &mut mac_key, Op::Decrypt);
+    mac_key
 }
 
 /// Derive a master key from a keyblob. Port of upstream DeriveMasterKey.
-pub fn derive_master_key(_keyblob: &[u8; 0x90], _master_source: &Key128) -> Key128 {
-    // TODO: Full implementation
-    [0u8; 16]
+/// Copy first 16 bytes from keyblob as master_root, AES-ECB decrypt master_source.
+pub fn derive_master_key(keyblob: &[u8; 0x90], master_source: &Key128) -> Key128 {
+    use super::aes_util::{AesCipher, Mode, Op};
+
+    let mut master_root = [0u8; 16];
+    master_root.copy_from_slice(&keyblob[..16]);
+
+    let mut master_cipher = AesCipher::new_128(master_root, Mode::ECB);
+    let mut master = [0u8; 16];
+    master_cipher.transcode(master_source, &mut master, Op::Decrypt);
+    master
 }
 
 /// Decrypt a keyblob. Port of upstream DecryptKeyblob.
-pub fn decrypt_keyblob(_encrypted_keyblob: &[u8; 0xB0], _key: &Key128) -> [u8; 0x90] {
-    // TODO: Full implementation using AES-CTR
-    [0u8; 0x90]
+/// AES-CTR decrypt: IV is encrypted_keyblob[0x10..0x20], decrypt encrypted_keyblob[0x20..0x20+0x90].
+pub fn decrypt_keyblob(encrypted_keyblob: &[u8; 0xB0], key: &Key128) -> [u8; 0x90] {
+    use super::aes_util::{AesCipher, Mode, Op};
+
+    let mut keyblob = [0u8; 0x90];
+    let mut cipher = AesCipher::new_128(*key, Mode::CTR);
+    cipher.set_iv(&encrypted_keyblob[0x10..0x20]);
+    cipher.transcode(&encrypted_keyblob[0x20..0x20 + 0x90], &mut keyblob, Op::Decrypt);
+    keyblob
+}
+
+/// Calculate AES-128-CMAC. Port of upstream CalculateCMAC.
+/// Manual implementation using AES-ECB (RFC 4493).
+fn calculate_cmac(source: &[u8], key: &Key128) -> [u8; 16] {
+    use super::aes_util::{AesCipher, Mode, Op};
+
+    // Step 1: Generate subkeys
+    let mut cipher = AesCipher::new_128(*key, Mode::ECB);
+    let zero_block = [0u8; 16];
+    let mut l = [0u8; 16];
+    cipher.transcode(&zero_block, &mut l, Op::Encrypt);
+
+    // Generate K1
+    let mut k1 = [0u8; 16];
+    let msb = l[0] & 0x80;
+    for i in 0..15 {
+        k1[i] = (l[i] << 1) | (l[i + 1] >> 7);
+    }
+    k1[15] = l[15] << 1;
+    if msb != 0 {
+        k1[15] ^= 0x87;
+    }
+
+    // Generate K2
+    let mut k2 = [0u8; 16];
+    let msb = k1[0] & 0x80;
+    for i in 0..15 {
+        k2[i] = (k1[i] << 1) | (k1[i + 1] >> 7);
+    }
+    k2[15] = k1[15] << 1;
+    if msb != 0 {
+        k2[15] ^= 0x87;
+    }
+
+    // Step 2: Process message
+    let n = if source.is_empty() {
+        1
+    } else {
+        (source.len() + 15) / 16
+    };
+    let flag = !source.is_empty() && (source.len() % 16 == 0);
+
+    let mut m_last = [0u8; 16];
+    if flag {
+        // Complete block - XOR with K1
+        let last_start = (n - 1) * 16;
+        for i in 0..16 {
+            m_last[i] = source[last_start + i] ^ k1[i];
+        }
+    } else {
+        // Incomplete block - pad and XOR with K2
+        let last_start = (n - 1) * 16;
+        let remaining = source.len() - last_start;
+        let mut padded = [0u8; 16];
+        padded[..remaining].copy_from_slice(&source[last_start..]);
+        padded[remaining] = 0x80;
+        for i in 0..16 {
+            m_last[i] = padded[i] ^ k2[i];
+        }
+    }
+
+    // Step 3: CBC-MAC
+    let mut x = [0u8; 16];
+    let mut y = [0u8; 16];
+
+    for i in 0..n - 1 {
+        let block_start = i * 16;
+        for j in 0..16 {
+            y[j] = x[j] ^ source[block_start + j];
+        }
+        let src = y;
+        cipher.transcode(&src, &mut x, Op::Encrypt);
+    }
+
+    // Last block
+    for j in 0..16 {
+        y[j] = x[j] ^ m_last[j];
+    }
+    let mut t = [0u8; 16];
+    cipher.transcode(&y, &mut t, Op::Encrypt);
+
+    t
 }
 
 /// Attempt to derive the SD seed. Port of upstream DeriveSDSeed.
+/// Reads system save 8000000000000043 and Nintendo/Contents/private from NAND/SDMC.
 pub fn derive_sd_seed() -> Option<Key128> {
-    // TODO: Read from system save 8*43 and private file
-    None
+    let system_save_43_path =
+        get_ruzu_path(RuzuPath::NANDDir).join("system/save/8000000000000043");
+
+    let save_43_data = std::fs::read(&system_save_43_path).ok()?;
+
+    let sd_private_path =
+        get_ruzu_path(RuzuPath::SDMCDir).join("Nintendo/Contents/private");
+
+    let sd_private_data = std::fs::read(&sd_private_path).ok()?;
+
+    if sd_private_data.len() < 0x10 {
+        return None;
+    }
+
+    let mut private_seed = [0u8; 0x10];
+    private_seed.copy_from_slice(&sd_private_data[..0x10]);
+
+    // Search for private_seed in save_43
+    let mut offset = None;
+    for i in 0..save_43_data.len().saturating_sub(0x10) {
+        if save_43_data[i..i + 0x10] == private_seed {
+            offset = Some(i);
+            break;
+        }
+    }
+
+    let offset = offset?;
+    let seed_offset = offset + 0x10;
+    if seed_offset + 0x10 > save_43_data.len() {
+        return None;
+    }
+
+    let mut seed = [0u8; 16];
+    seed.copy_from_slice(&save_43_data[seed_offset..seed_offset + 0x10]);
+    Some(seed)
 }
 
 /// Derive SD keys. Port of upstream DeriveSDKeys.
 pub fn derive_sd_keys(
-    _sd_keys: &mut [Key256; 2],
-    _keys: &mut KeyManager,
+    sd_keys: &mut [Key256; 2],
+    keys: &mut KeyManager,
 ) -> Result<(), &'static str> {
-    // TODO: Full implementation
-    Err("Not implemented")
+    if !keys.has_key_128(S128KeyType::Source, SourceKeyType::SDKek as u64, 0) {
+        return Err("ErrorMissingSDKEKSource");
+    }
+    if !keys.has_key_128(S128KeyType::Source, SourceKeyType::AESKekGeneration as u64, 0) {
+        return Err("ErrorMissingAESKEKGenerationSource");
+    }
+    if !keys.has_key_128(S128KeyType::Source, SourceKeyType::AESKeyGeneration as u64, 0) {
+        return Err("ErrorMissingAESKeyGenerationSource");
+    }
+
+    let sd_kek_source =
+        keys.get_key_128(S128KeyType::Source, SourceKeyType::SDKek as u64, 0);
+    let aes_kek_gen =
+        keys.get_key_128(S128KeyType::Source, SourceKeyType::AESKekGeneration as u64, 0);
+    let aes_key_gen =
+        keys.get_key_128(S128KeyType::Source, SourceKeyType::AESKeyGeneration as u64, 0);
+    let master_00 = keys.get_key_128(S128KeyType::Master, 0, 0);
+    let sd_kek =
+        generate_key_encryption_key(sd_kek_source, master_00, aes_kek_gen, aes_key_gen);
+    keys.set_key_128(S128KeyType::SDKek, sd_kek, 0, 0);
+
+    if !keys.has_key_128(S128KeyType::SDSeed, 0, 0) {
+        return Err("ErrorMissingSDSeed");
+    }
+    let sd_seed = keys.get_key_128(S128KeyType::SDSeed, 0, 0);
+
+    if !keys.has_key_256(S256KeyType::SDKeySource, SDKeyType::Save as u64, 0) {
+        return Err("ErrorMissingSDSaveKeySource");
+    }
+    if !keys.has_key_256(S256KeyType::SDKeySource, SDKeyType::NCA as u64, 0) {
+        return Err("ErrorMissingSDNCAKeySource");
+    }
+
+    let mut sd_key_sources = [
+        keys.get_key_256(S256KeyType::SDKeySource, SDKeyType::Save as u64, 0),
+        keys.get_key_256(S256KeyType::SDKeySource, SDKeyType::NCA as u64, 0),
+    ];
+
+    // XOR sources with seed
+    for source in sd_key_sources.iter_mut() {
+        for i in 0..source.len() {
+            source[i] ^= sd_seed[i & 0xF];
+        }
+    }
+
+    // Decrypt with sd_kek
+    let mut cipher = super::aes_util::AesCipher::new_128(sd_kek, super::aes_util::Mode::ECB);
+    for (i, source) in sd_key_sources.iter().enumerate() {
+        cipher.transcode(source, &mut sd_keys[i], super::aes_util::Op::Decrypt);
+    }
+
+    keys.set_key_256(
+        S256KeyType::SDKey,
+        sd_keys[0],
+        SDKeyType::Save as u64,
+        0,
+    );
+    keys.set_key_256(
+        S256KeyType::SDKey,
+        sd_keys[1],
+        SDKeyType::NCA as u64,
+        0,
+    );
+
+    Ok(())
+}
+
+/// Extract tickets from a raw ticket save file.
+/// Corresponds to upstream `GetTicketblob`.
+fn get_ticketblob(buffer: &[u8]) -> Vec<Ticket> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset + 4 < buffer.len() {
+        // Look for RSA-2048 SHA256 signature type: 0x00010004 (little-endian: 04 00 01 00)
+        if buffer[offset] == 0x04
+            && buffer[offset + 1] == 0x00
+            && buffer[offset + 2] == 0x01
+            && buffer[offset + 3] == 0x00
+        {
+            // RSA2048 ticket size: 4 + 0x100 + 0x3C + sizeof(TicketData)
+            let ticket_size = 4 + 0x100 + 0x3C + std::mem::size_of::<TicketData>();
+            if offset + ticket_size <= buffer.len() {
+                let ticket = Ticket::read_from_bytes(&buffer[offset..offset + ticket_size]);
+                offset += ticket_size;
+                if ticket.is_valid() {
+                    out.push(ticket);
+                }
+            } else {
+                break;
+            }
+        } else {
+            offset += 1;
+        }
+    }
+    out
+}
+
+/// MGF1 (Mask Generation Function 1) using SHA-256.
+/// Corresponds to upstream `MGF1<target_size, in_size>`.
+fn mgf1<const TARGET_SIZE: usize, const IN_SIZE: usize>(seed: &[u8; IN_SIZE]) -> [u8; TARGET_SIZE] {
+    let mut seed_exp = vec![0u8; IN_SIZE + 4];
+    seed_exp[..IN_SIZE].copy_from_slice(seed);
+
+    let mut out_vec = Vec::new();
+    let mut i = 0u32;
+    while out_vec.len() < TARGET_SIZE {
+        seed_exp[IN_SIZE + 3] = i as u8;
+        let hash = super::sha_util::sha256(&seed_exp);
+        out_vec.extend_from_slice(&hash);
+        i += 1;
+    }
+
+    let mut target = [0u8; TARGET_SIZE];
+    target.copy_from_slice(&out_vec[..TARGET_SIZE]);
+    target
+}
+
+/// Find the ticket offset in OAEP-decoded data.
+/// Corresponds to upstream `FindTicketOffset`.
+fn find_ticket_offset(data: &[u8]) -> Option<u64> {
+    for i in 0x20..data.len().saturating_sub(0x10) {
+        if data[i] == 0x01 {
+            return Some((i + 1) as u64);
+        } else if data[i] != 0x00 {
+            return None;
+        }
+    }
+    None
+}
+
+// ---- Simple big integer operations for RSA ----
+// These are needed for personalized ticket parsing.
+// Using a minimal manual implementation to avoid adding crate dependencies.
+
+/// A simple big integer represented as a vector of u32 limbs (little-endian).
+type BigNum = Vec<u32>;
+
+/// Convert big-endian bytes to BigNum (little-endian u32 limbs).
+fn bytes_to_bignum(bytes: &[u8]) -> BigNum {
+    // Pad to multiple of 4
+    let padded_len = (bytes.len() + 3) / 4 * 4;
+    let mut padded = vec![0u8; padded_len];
+    padded[padded_len - bytes.len()..].copy_from_slice(bytes);
+
+    let num_limbs = padded_len / 4;
+    let mut result = Vec::with_capacity(num_limbs);
+    for i in (0..num_limbs).rev() {
+        let offset = i * 4;
+        let limb = u32::from_be_bytes([
+            padded[offset],
+            padded[offset + 1],
+            padded[offset + 2],
+            padded[offset + 3],
+        ]);
+        result.push(limb);
+    }
+
+    // Remove leading zeros
+    while result.len() > 1 && *result.last().unwrap() == 0 {
+        result.pop();
+    }
+    result
+}
+
+/// Convert BigNum to 256-byte big-endian output.
+fn bignum_to_bytes_256(n: &BigNum) -> [u8; 0x100] {
+    let mut result = [0u8; 0x100];
+    for (i, &limb) in n.iter().enumerate() {
+        let bytes = limb.to_be_bytes();
+        let offset = 0x100 - (i + 1) * 4;
+        if offset < 0x100 {
+            let end = (offset + 4).min(0x100);
+            let start_byte = 4 - (end - offset);
+            result[offset..end].copy_from_slice(&bytes[start_byte..]);
+        }
+    }
+    result
+}
+
+/// Compare two BigNums.
+fn bignum_cmp(a: &BigNum, b: &BigNum) -> std::cmp::Ordering {
+    if a.len() != b.len() {
+        return a.len().cmp(&b.len());
+    }
+    for i in (0..a.len()).rev() {
+        if a[i] != b[i] {
+            return a[i].cmp(&b[i]);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Subtract b from a (a >= b assumed). Returns a - b.
+fn bignum_sub(a: &BigNum, b: &BigNum) -> BigNum {
+    let mut result = Vec::with_capacity(a.len());
+    let mut borrow: u64 = 0;
+    for i in 0..a.len() {
+        let ai = a[i] as u64;
+        let bi = if i < b.len() { b[i] as u64 } else { 0 };
+        let diff = ai.wrapping_sub(bi).wrapping_sub(borrow);
+        result.push(diff as u32);
+        borrow = if ai < bi + borrow { 1 } else { 0 };
+    }
+    while result.len() > 1 && *result.last().unwrap() == 0 {
+        result.pop();
+    }
+    result
+}
+
+/// Multiply BigNum by a single u32 and add.
+#[allow(dead_code)]
+fn bignum_mul_add(a: &BigNum, b: u32, shift: usize) -> BigNum {
+    let mut result = vec![0u32; shift];
+    let mut carry: u64 = 0;
+    for &limb in a.iter() {
+        let prod = limb as u64 * b as u64 + carry;
+        result.push(prod as u32);
+        carry = prod >> 32;
+    }
+    if carry > 0 {
+        result.push(carry as u32);
+    }
+    while result.len() > 1 && *result.last().unwrap() == 0 {
+        result.pop();
+    }
+    result
+}
+
+/// BigNum addition.
+#[allow(dead_code)]
+fn bignum_add(a: &BigNum, b: &BigNum) -> BigNum {
+    let len = a.len().max(b.len());
+    let mut result = Vec::with_capacity(len + 1);
+    let mut carry: u64 = 0;
+    for i in 0..len {
+        let ai = if i < a.len() { a[i] as u64 } else { 0 };
+        let bi = if i < b.len() { b[i] as u64 } else { 0 };
+        let sum = ai + bi + carry;
+        result.push(sum as u32);
+        carry = sum >> 32;
+    }
+    if carry > 0 {
+        result.push(carry as u32);
+    }
+    result
+}
+
+/// BigNum modular reduction: a mod m.
+fn bignum_mod(a: &BigNum, m: &BigNum) -> BigNum {
+    if bignum_cmp(a, m) == std::cmp::Ordering::Less {
+        return a.clone();
+    }
+
+    // Simple schoolbook division
+    let mut remainder = vec![0u32; 1];
+    let a_bits = a.len() * 32;
+
+    for bit_idx in (0..a_bits).rev() {
+        // Shift remainder left by 1 bit
+        let mut carry = 0u32;
+        for limb in remainder.iter_mut() {
+            let new_carry = *limb >> 31;
+            *limb = (*limb << 1) | carry;
+            carry = new_carry;
+        }
+        if carry > 0 {
+            remainder.push(carry);
+        }
+
+        // Set LSB from a
+        let limb_idx = bit_idx / 32;
+        let bit_pos = bit_idx % 32;
+        if limb_idx < a.len() && (a[limb_idx] >> bit_pos) & 1 == 1 {
+            remainder[0] |= 1;
+        }
+
+        // If remainder >= m, subtract
+        if bignum_cmp(&remainder, m) != std::cmp::Ordering::Less {
+            remainder = bignum_sub(&remainder, m);
+        }
+    }
+
+    while remainder.len() > 1 && *remainder.last().unwrap() == 0 {
+        remainder.pop();
+    }
+    remainder
+}
+
+/// Modular exponentiation: base^exp mod modulus.
+/// Uses square-and-multiply algorithm.
+fn mod_exp(base: &BigNum, exp: &BigNum, modulus: &BigNum) -> BigNum {
+    if modulus.len() == 1 && modulus[0] == 1 {
+        return vec![0];
+    }
+
+    let mut result = vec![1u32];
+    let mut base = bignum_mod(base, modulus);
+
+    let exp_bits = exp.len() * 32;
+
+    for bit_idx in 0..exp_bits {
+        let limb_idx = bit_idx / 32;
+        let bit_pos = bit_idx % 32;
+
+        if limb_idx < exp.len() && (exp[limb_idx] >> bit_pos) & 1 == 1 {
+            // result = (result * base) mod modulus
+            result = bignum_mul_mod(&result, &base, modulus);
+        }
+        // base = (base * base) mod modulus
+        base = bignum_mul_mod(&base, &base, modulus);
+    }
+
+    result
+}
+
+/// Multiply two BigNums and reduce mod m.
+fn bignum_mul_mod(a: &BigNum, b: &BigNum, m: &BigNum) -> BigNum {
+    // Simple schoolbook multiplication
+    let mut result = vec![0u32; a.len() + b.len() + 1];
+    for i in 0..a.len() {
+        let mut carry: u64 = 0;
+        for j in 0..b.len() {
+            let prod = a[i] as u64 * b[j] as u64 + result[i + j] as u64 + carry;
+            result[i + j] = prod as u32;
+            carry = prod >> 32;
+        }
+        result[i + b.len()] += carry as u32;
+    }
+    while result.len() > 1 && *result.last().unwrap() == 0 {
+        result.pop();
+    }
+    bignum_mod(&result, m)
 }
