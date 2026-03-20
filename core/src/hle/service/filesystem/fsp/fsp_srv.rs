@@ -179,17 +179,11 @@ impl FspSrv {
             .get_manager()
             .map_or(false, |m| m.lock().unwrap().is_domain());
         if is_domain {
-            // ResponseBuilder with 1 "move object" allocates the domain object ID slot.
-            // We then manually write 0 to that slot instead of adding a real domain handler.
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
             rb.push_result(ResultCode::new(error));
-            // Write null domain object ID (0) at the domain_offset position.
-            let domain_offset = ctx.domain_offset as usize;
-            if domain_offset > 0 && domain_offset - 1 < crate::hle::ipc::COMMAND_BUFFER_LENGTH {
-                ctx.cmd_buf[domain_offset - 1] = 0;
-            }
-            // Clear outgoing_domain_objects so WriteToOutgoingCommandBuffer doesn't
-            // try to register a handler.
+            // Add a null domain object — WriteToOutgoingCommandBuffer will write 0
+            // to the domain object ID slot, matching upstream behavior.
+            ctx.add_null_domain_object();
         } else {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(ResultCode::new(error));

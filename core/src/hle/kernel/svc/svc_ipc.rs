@@ -100,8 +100,11 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     // Dispatch to service handler.
     let result = complete_sync_request(&request_manager, &mut context);
 
-    // write_to_outgoing_command_buffer writes back to TLS (upstream path).
-    // It's already called inside handle_sync_request_impl via ServiceFramework.
+    // Write response back to TLS. For Session/Domain dispatches, this is also
+    // called inside handle_sync_request_impl, but for CloseVirtualHandle and
+    // StubSuccess paths the response is only in cmd_buf and needs to be flushed.
+    // Calling it again for Session/Domain is safe — it just re-writes the same data.
+    context.write_to_outgoing_command_buffer();
 
     // Debug: dump TLS after response
     {
