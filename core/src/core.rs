@@ -1000,10 +1000,15 @@ impl System {
                         // yet, so just continue execution.
                         PhysicalCoreExecutionControl::Continue
                     } else if halt_reason.contains(HaltReason::PREFETCH_ABORT) {
-                        // Upstream: suspends the thread and notifies the debugger.
                         log::error!(
                             "PREFETCH_ABORT at PC={:#x}, SP={:#x}, LR={:#x}",
                             ctx.pc, ctx.sp, ctx.lr
+                        );
+                        log::error!(
+                            "  R0={:#x} R1={:#x} R2={:#x} R3={:#x} R4={:#x} R5={:#x} R6={:#x} R7={:#x} R8={:#x} R9={:#x} R10={:#x} R11={:#x} R12={:#x}",
+                            ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3],
+                            ctx.r[4], ctx.r[5], ctx.r[6], ctx.r[7],
+                            ctx.r[8], ctx.r[9], ctx.r[10], ctx.r[11], ctx.r[12]
                         );
                         PhysicalCoreExecutionControl::Break
                     } else if halt_reason.contains(HaltReason::DATA_ABORT) {
