@@ -284,7 +284,7 @@ pub struct HLERequestContext {
 
     pub(crate) outgoing_move_objects: Vec<Handle>,
     pub(crate) outgoing_copy_objects: Vec<Handle>,
-    outgoing_domain_objects: Vec<SessionRequestHandlerPtr>,
+    outgoing_domain_objects: Vec<Option<SessionRequestHandlerPtr>>,
 
     command: u32,
     pid: u64,
@@ -488,7 +488,15 @@ impl HLERequestContext {
     }
 
     pub fn add_domain_object(&mut self, object: SessionRequestHandlerPtr) {
-        self.outgoing_domain_objects.push(object);
+        self.outgoing_domain_objects.push(Some(object));
+    }
+
+    /// Add a null domain object entry. Upstream writes domain object ID = 0 for nullptr
+    /// OutInterface parameters (e.g., when a command returns an error but the method
+    /// signature has Out<SharedPointer<T>>). The response layout is compile-time fixed,
+    /// so the slot must always be present.
+    pub fn add_null_domain_object(&mut self) {
+        self.outgoing_domain_objects.push(None);
     }
 
     /// Set the Memory bridge for TLS reads/writes.
@@ -1175,11 +1183,19 @@ impl HLERequestContext {
             let domain_objects = std::mem::take(&mut self.outgoing_domain_objects);
             for object in domain_objects {
                 if current_offset < ipc::COMMAND_BUFFER_LENGTH {
-                    if let Some(manager) = &self.manager {
-                        manager.lock().unwrap().append_domain_handler(object);
-                        let count = manager.lock().unwrap().domain_handler_count();
-                        self.cmd_buf[current_offset] = count as u32;
+                    // Matches upstream hle_ipc.cpp:301-307:
+                    // if (object) { AppendDomainHandler; cmd_buf = count; }
+                    // else { cmd_buf = 0; }
+                    if let Some(handler) = object {
+                        if let Some(manager) = &self.manager {
+                            manager.lock().unwrap().append_domain_handler(handler);
+                            let count = manager.lock().unwrap().domain_handler_count();
+                            self.cmd_buf[current_offset] = count as u32;
+                        } else {
+                            self.cmd_buf[current_offset] = 0;
+                        }
                     } else {
+                        // Null domain object — write 0 as the domain object ID.
                         self.cmd_buf[current_offset] = 0;
                     }
                     current_offset += 1;
