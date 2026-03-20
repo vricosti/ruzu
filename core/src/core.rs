@@ -341,8 +341,7 @@ impl System {
 
         // 1. TelemetrySession
         // Upstream: telemetry_session = std::make_unique<Core::TelemetrySession>();
-        let settings = common::settings::values();
-        self.telemetry_session = Some(crate::telemetry_session::TelemetrySession::new(&settings));
+        self.telemetry_session = Some(crate::telemetry_session::TelemetrySession::new());
 
         // 2. Host1x core — created by the frontend via set_host1x_core() after load()
         //    returns, because video_core does not depend on core.
