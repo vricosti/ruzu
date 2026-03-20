@@ -426,7 +426,7 @@ impl TouchResource {
         }
 
         if !is_touch_enabled && out_finger_map.finger_count > 0 && current_touch.entry_count > 0 {
-            // TODO: upstream also has a TODO here
+            // Upstream TODO: not yet implemented in C++ upstream
         }
 
         // Zero out unused entries

@@ -213,6 +213,17 @@ pub trait ContentProvider: Send + Sync {
         title_id: Option<u64>,
     ) -> Vec<ContentProviderEntry>;
 
+    /// Construct an NCA from the raw entry file.
+    /// Corresponds to upstream `ContentProvider::GetEntry`.
+    fn get_entry(
+        &self,
+        title_id: u64,
+        record_type: ContentRecordType,
+    ) -> Option<super::content_archive::NCA> {
+        let raw = self.get_entry_raw(title_id, record_type)?;
+        Some(super::content_archive::NCA::new(raw, None))
+    }
+
     fn has_entry_by_provider_entry(&self, entry: ContentProviderEntry) -> bool {
         self.has_entry(entry.title_id, entry.record_type)
     }

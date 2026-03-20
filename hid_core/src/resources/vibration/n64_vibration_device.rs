@@ -68,7 +68,7 @@ impl NpadN64VibrationDevice {
             return ResultCode::SUCCESS;
         }
         // Upstream: check volume, if volume <= 0 then pattern = 0
-        // TODO: SendVibrationNotificationPattern
+        // Upstream TODO: SendVibrationNotificationPattern — not yet implemented in C++ upstream
         ResultCode::SUCCESS
     }
 

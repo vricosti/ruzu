@@ -38,7 +38,12 @@ pub struct ResourceManager {
     applet_resource: Option<Arc<Mutex<AppletResource>>>,
     handheld_config: Option<Arc<Mutex<HandheldConfig>>>,
     firmware_settings: Option<Arc<HidFirmwareSettings>>,
-    // TODO: Add all resource fields (npad, debug_pad, mouse, keyboard, etc.)
+    // Upstream holds shared_ptr to all HID resource objects:
+    // npad, debug_pad, mouse, debug_mouse, keyboard, unique_pad, home_button, sleep_button,
+    // capture_button, digitizer, palma, six_axis, seven_six_axis, console_six_axis,
+    // touch_screen, touch_resource, touch_driver, gesture.
+    // These require their respective resource types to be ported. Fields should be added
+    // here as each resource is ported.
 }
 
 impl ResourceManager {
@@ -70,7 +75,10 @@ impl ResourceManager {
         self.applet_resource.clone()
     }
 
-    // TODO: Add all getter methods for resources (get_capture_button, get_npad, etc.)
+    // Upstream has getter methods for all resources: GetCaptureButton, GetConsoleSixAxis,
+    // GetDebugMouse, GetDebugPad, GetDigitizer, GetGesture, GetHomeButton, GetKeyboard,
+    // GetMouse, GetNpad, GetPalma, GetSevenSixAxis, GetSixAxis, GetSleepButton,
+    // GetTouchScreen, GetUniquePad. These should be added as each resource is ported.
 
     pub fn create_applet_resource(&self, aruid: u64) -> ResultCode {
         if aruid == SYSTEM_ARUID {
@@ -78,7 +86,8 @@ impl ResourceManager {
             if result.is_error() {
                 return result;
             }
-            // TODO: GetNpad()->ActivateNpadResource()
+            // Upstream calls GetNpad()->ActivateNpadResource() here.
+            // Requires NPad resource integration which is not yet available.
             return ResultCode::SUCCESS;
         }
 
@@ -87,10 +96,12 @@ impl ResourceManager {
             return result;
         }
 
-        // Homebrew doesn't try to activate some controllers, so we activate them by default
-        // TODO: npad->Activate(); six_axis->Activate(); touch_screen->Activate(); gesture->Activate();
+        // Homebrew doesn't try to activate some controllers, so we activate them by default.
+        // Upstream calls: npad->Activate(), six_axis->Activate(), touch_screen->Activate(),
+        // gesture->Activate(). Requires these resource types to be ported.
 
-        // TODO: GetNpad()->ActivateNpadResource(aruid)
+        // Upstream calls GetNpad()->ActivateNpadResource(aruid).
+        // Requires NPad resource integration which is not yet available.
         ResultCode::SUCCESS
     }
 
@@ -128,7 +139,8 @@ impl ResourceManager {
             if result.is_error() {
                 return result;
             }
-            // TODO: npad->RegisterAppletResourceUserId(aruid)
+            // Upstream calls npad->RegisterAppletResourceUserId(aruid).
+            // Requires NPad resource integration which is not yet available.
         }
         ResultCode::SUCCESS
     }
@@ -138,7 +150,8 @@ impl ResourceManager {
         if let Some(ref resource) = self.applet_resource {
             resource.lock().unregister_applet_resource_user_id(aruid);
         }
-        // TODO: npad->UnregisterAppletResourceUserId(aruid)
+        // Upstream calls npad->UnregisterAppletResourceUserId(aruid).
+        // Requires NPad resource integration which is not yet available.
     }
 
     pub fn free_applet_resource_id(&self, aruid: u64) {
@@ -146,7 +159,8 @@ impl ResourceManager {
         if let Some(ref resource) = self.applet_resource {
             resource.lock().free_applet_resource_id(aruid);
         }
-        // TODO: npad->FreeAppletResourceId(aruid)
+        // Upstream calls npad->FreeAppletResourceId(aruid).
+        // Requires NPad resource integration which is not yet available.
     }
 
     pub fn enable_input(&self, aruid: u64, is_enabled: bool) {
@@ -181,7 +195,9 @@ impl ResourceManager {
         let _lock = self.shared_mutex.write();
         if let Some(ref resource) = self.applet_resource {
             let _has_changed = resource.lock().set_aruid_valid_for_vibration(aruid, is_enabled);
-            // TODO: if has_changed, update vibration devices
+            // Upstream: if has_changed, iterates npad->GetAllVibrationDevices() (but the
+            // loop body is an upstream TODO). Also checks vibration_handler session aruid.
+            // Requires NPad vibration device integration which is not yet available.
         }
         ResultCode::SUCCESS
     }
@@ -252,21 +268,27 @@ impl ResourceManager {
     }
 
     pub fn update_controllers(&self, _ns_late: Duration) {
-        // TODO: debug_pad->OnUpdate, digitizer->OnUpdate, unique_pad->OnUpdate,
-        //       palma->OnUpdate, home_button->OnUpdate, sleep_button->OnUpdate,
-        //       capture_button->OnUpdate
+        // Upstream calls: debug_pad->OnUpdate, digitizer->OnUpdate, unique_pad->OnUpdate,
+        // palma->OnUpdate, home_button->OnUpdate, sleep_button->OnUpdate,
+        // capture_button->OnUpdate, passing core_timing to each.
+        // Requires these resource types to be ported.
     }
 
     pub fn update_npad(&self, _ns_late: Duration) {
-        // TODO: npad->OnUpdate
+        // Upstream calls npad->OnUpdate(core_timing).
+        // Requires NPad resource integration which is not yet available.
     }
 
     pub fn update_mouse_keyboard(&self, _ns_late: Duration) {
-        // TODO: mouse->OnUpdate, debug_mouse->OnUpdate, keyboard->OnUpdate
+        // Upstream calls: mouse->OnUpdate, debug_mouse->OnUpdate, keyboard->OnUpdate,
+        // passing core_timing to each.
+        // Requires these resource types to be ported.
     }
 
     pub fn update_motion(&self, _ns_late: Duration) {
-        // TODO: six_axis->OnUpdate, seven_six_axis->OnUpdate, console_six_axis->OnUpdate
+        // Upstream calls: six_axis->OnUpdate, seven_six_axis->OnUpdate,
+        // console_six_axis->OnUpdate, passing core_timing to each.
+        // Requires these resource types to be ported.
     }
 
     fn initialize_handheld_config(&mut self) {
@@ -285,18 +307,27 @@ impl ResourceManager {
     }
 
     fn initialize_hid_common_sampler(&mut self) {
-        // TODO: Create all HID common samplers (debug_pad, mouse, keyboard, npad, etc.)
+        // Upstream creates: debug_pad, mouse, debug_mouse, keyboard, unique_pad, npad,
+        // home_button, sleep_button, capture_button, digitizer, palma, six_axis.
+        // Then wires them to applet_resource, shared_mutex, handheld_config, input_event,
+        // and schedules looping timing events (npad_update, default_update, mouse_keyboard_update,
+        // motion_update). Requires these resource types and CoreTiming to be ported.
     }
 
     fn initialize_touch_screen_sampler(&mut self) {
-        // TODO: Create touch screen sampler resources
+        // Upstream creates: touch_resource, touch_driver, touch_screen, gesture.
+        // Sets up a touch_update_event looping timer and wires touch_resource to
+        // touch_driver, applet_resource, input_event, handheld_config, and timer_event.
+        // Requires these resource types and CoreTiming to be ported.
     }
 
     fn initialize_console_six_axis_sampler(&mut self) {
-        // TODO: Create console six axis sampler resources
+        // Upstream creates: console_six_axis, seven_six_axis.
+        // Wires console_six_axis to applet_resource and shared_mutex.
+        // Requires these resource types to be ported.
     }
 
     fn initialize_ahid_sampler(&mut self) {
-        // TODO
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 }

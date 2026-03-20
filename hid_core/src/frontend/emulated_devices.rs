@@ -59,7 +59,11 @@ impl EmulatedDevices {
     }
 
     pub fn unload_input(&mut self) {
-        // TODO: reset all input devices
+        // Upstream (emulated_devices.cpp UnloadInput) resets mouse_button_devices,
+        // mouse_stick_device, mouse_wheel_devices, keyboard_devices, and
+        // keyboard_modifier_devices by calling .reset() on each
+        // std::unique_ptr<Common::Input::InputDevice>. Depends on Common::Input::InputDevice
+        // from zuyu/src/common/input.h.
     }
 
     pub fn enable_configuration(&mut self) {
@@ -76,17 +80,21 @@ impl EmulatedDevices {
     }
 
     pub fn reload_input(&mut self) {
-        // TODO: In upstream C++, this creates input devices for keyboard, mouse and ring controller
-        // from Common::Input::CreateInputDevice and sets up callbacks.
-        // Requires Common::Input integration.
+        // Upstream (emulated_devices.cpp ReloadInput) creates devices via
+        // Common::Input::CreateInputDevice for: mouse_button_devices (per-button with
+        // engine:mouse,port:1,pad:0), mouse_stick_device (axis_x:0,axis_y:1),
+        // mouse_wheel_devices (axis:2..N), keyboard_devices (engine:keyboard,port:1,pad:0
+        // per key_index), keyboard_modifier_devices (engine:keyboard,port:1,pad:1 per
+        // key_index). Then sets callbacks: SetMouseButton, SetMouseAnalog, SetMouseWheel,
+        // SetKeyboardButton, SetKeyboardModifier on each device. Depends on
+        // Common::Input::CreateInputDevice from zuyu/src/common/input.h.
         log::debug!("EmulatedDevices::reload_input called");
     }
 
     pub fn reload_from_settings(&mut self) {
-        // TODO: In upstream C++, this reads keyboard/mouse mappings from Settings::values
-        // and calls reload_input.
-        // Requires Settings integration.
+        // Upstream (emulated_devices.cpp ReloadFromSettings) simply calls ReloadInput().
         log::debug!("EmulatedDevices::reload_from_settings called");
+        self.reload_input();
     }
 
     pub fn save_current_config(&mut self) {

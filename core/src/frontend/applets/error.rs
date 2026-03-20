@@ -9,7 +9,9 @@ use super::applet::Applet;
 /// Result code type.
 ///
 /// Corresponds to upstream `Result` (core/hle/result.h).
-/// TODO: Import from hle::result when available.
+/// Local definition; hle::result::ResultCode exists but uses a different
+/// representation. This type is kept here for the applet interface until
+/// the error applet is wired to the HLE service layer.
 #[derive(Debug, Clone, Copy)]
 pub struct ResultCode {
     pub raw: u32,

@@ -232,11 +232,13 @@ impl RingController {
     }
 
     pub fn on_init(&mut self) {
-        // TODO: input->SetPollingMode(RightIndex, Ring)
+        // Upstream calls input->SetPollingMode(EmulatedDeviceIndex::RightIndex, PollingMode::Ring).
+        // Requires EmulatedController integration which is not yet wired up to RingController.
     }
 
     pub fn on_release(&mut self) {
-        // TODO: input->SetPollingMode(RightIndex, Active)
+        // Upstream calls input->SetPollingMode(EmulatedDeviceIndex::RightIndex, PollingMode::Active).
+        // Requires EmulatedController integration which is not yet wired up to RingController.
     }
 
     pub fn on_update(&mut self) {
@@ -250,8 +252,10 @@ impl RingController {
             return;
         }
 
-        // TODO: Increment multitasking counters from motion and sensor data
-        // TODO: Handle JoyPollingMode::SixAxisSensorEnable with ring lifo data
+        // Upstream increments multitasking counters from motion and sensor data,
+        // then handles JoyPollingMode::SixAxisSensorEnable by writing ring lifo data
+        // (RingConData from GetSensorValue) into transfer_memory via system.ApplicationMemory().
+        // This requires kernel memory write support (ApplicationMemory) which is not yet available.
         log::error!("Polling mode not fully supported {:?}", self.base.polling_mode);
     }
 
@@ -279,13 +283,15 @@ impl RingController {
             | RingConCommands::ReadRepCount
             | RingConCommands::ReadTotalPushCount => {
                 assert!(data.len() == 0x4, "data.size is not 0x4 bytes");
-                // TODO: send_command_async_event->Signal()
+                // Upstream signals send_command_async_event here.
+                // Requires kernel event (KEvent) integration which is not yet available.
                 true
             }
             RingConCommands::ResetRepCount => {
                 assert!(data.len() == 0x4, "data.size is not 0x4 bytes");
                 self.total_rep_count = 0;
-                // TODO: send_command_async_event->Signal()
+                // Upstream signals send_command_async_event here.
+                // Requires kernel event (KEvent) integration which is not yet available.
                 true
             }
             RingConCommands::SaveCalData => {
@@ -305,14 +311,16 @@ impl RingController {
                     self.user_calibration.zero.crc =
                         u16::from_le_bytes([data[14], data[15]]);
                 }
-                // TODO: send_command_async_event->Signal()
+                // Upstream signals send_command_async_event here.
+                // Requires kernel event (KEvent) integration which is not yet available.
                 true
             }
             _ => {
                 log::error!("Command not implemented {:?}", self.command);
                 self.command = RingConCommands::Error;
                 // Signal a reply to avoid softlocking the game
-                // TODO: send_command_async_event->Signal()
+                // Upstream signals send_command_async_event here.
+                // Requires kernel event (KEvent) integration which is not yet available.
                 false
             }
         }

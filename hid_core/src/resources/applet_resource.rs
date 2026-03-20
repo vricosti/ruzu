@@ -124,7 +124,7 @@ impl AppletResource {
         // For now we mark as assigned since we don't have the kernel shared memory.
 
         self.data[index].flag.set_is_assigned(true);
-        // TODO: InitializeSixAxisControllerConfig(false);
+        // Upstream TODO: InitializeSixAxisControllerConfig(false) — not yet implemented in C++ upstream
         self.active_aruid = aruid;
         ResultCode::SUCCESS
     }
@@ -172,7 +172,7 @@ impl AppletResource {
                 data_index = i;
                 break;
             }
-            // TODO: Don't Handle pending delete here
+            // Upstream TODO: Don't handle pending delete here — upstream note preserved as-is
             if self.registration_list.flag[i] == RegistrationStatus::None
                 || self.registration_list.flag[i] == RegistrationStatus::PendingDelete
             {
@@ -257,7 +257,7 @@ impl AppletResource {
     }
 
     fn destroy_seven_six_axis_transfer_memory(&mut self) -> ResultCode {
-        // TODO
+        // Upstream TODO: not yet implemented in C++ upstream
         ResultCode::SUCCESS
     }
 

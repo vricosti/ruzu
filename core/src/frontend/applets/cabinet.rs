@@ -4,10 +4,14 @@
 //! Port of zuyu/src/core/frontend/applets/cabinet.h and cabinet.cpp
 //! Cabinet (Amiibo) applet interface.
 
+use std::sync::Arc;
+use parking_lot::Mutex;
+
 use super::applet::Applet;
+use crate::hle::service::nfc::common::device::NfcDevice;
 
 /// Corresponds to upstream `Service::NFP::CabinetMode`.
-/// TODO: Import from hle::service::nfp when available.
+/// Local definition until hle::service::nfp types are ported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum CabinetMode {
@@ -24,7 +28,7 @@ impl Default for CabinetMode {
 }
 
 /// Corresponds to upstream `Service::NFP::TagInfo`.
-/// TODO: Import from hle::service::nfp when available.
+/// Local definition until hle::service::nfp types are ported.
 #[derive(Debug, Clone)]
 pub struct TagInfo {
     pub uuid: [u8; 10],
@@ -49,7 +53,7 @@ impl Default for TagInfo {
 }
 
 /// Corresponds to upstream `Service::NFP::RegisterInfo`.
-/// TODO: Import from hle::service::nfp when available.
+/// Local definition until hle::service::nfp types are ported.
 #[derive(Debug, Clone)]
 pub struct RegisterInfo {
     // Placeholder - full struct from nfp_types.h
@@ -87,7 +91,7 @@ pub trait CabinetApplet: Applet {
         &self,
         callback: CabinetCallback,
         parameters: &CabinetParameters,
-        // TODO: nfp_device: Arc<Mutex<NfcDevice>> when available
+        nfp_device: Arc<Mutex<NfcDevice>>,
     );
 }
 
@@ -105,6 +109,7 @@ impl CabinetApplet for DefaultCabinetApplet {
         &self,
         callback: CabinetCallback,
         _parameters: &CabinetParameters,
+        _nfp_device: Arc<Mutex<NfcDevice>>,
     ) {
         log::warn!("(STUBBED) called");
         callback(false, String::new());

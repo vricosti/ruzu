@@ -65,7 +65,7 @@ impl TouchScreenDriver {
 
     /// Port of TouchDriver::ProcessTouchScreenAutoTune.
     pub fn process_touch_screen_auto_tune(&self) {
-        // TODO: upstream is also empty
+        // Upstream TODO: not yet implemented in C++ upstream (empty body)
     }
 
     /// Port of TouchDriver::WaitForDummyInput.

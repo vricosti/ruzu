@@ -7,7 +7,7 @@
 use super::applet::Applet;
 
 /// Corresponds to upstream `Service::AM::Frontend::WebExitReason`.
-/// TODO: Import from hle::service::am when available.
+/// Local definition until hle::service::am::frontend types are ported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum WebExitReason {

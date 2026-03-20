@@ -11,7 +11,8 @@
 use crate::hid_types::NpadButton;
 
 pub struct InputInterpreter {
-    // TODO: npad: Arc<Mutex<NPad>>,
+    // Upstream holds a shared_ptr<NPad> obtained from the HID server's ResourceManager.
+    // Requires NPad resource integration which is not yet wired up.
     /// Stores 9 consecutive button states polled from HID.
     button_states: [NpadButton; 9],
     previous_index: usize,
@@ -29,9 +30,8 @@ impl InputInterpreter {
 
     /// Gets a button state from HID and inserts it into the array of button states.
     pub fn poll_input(&mut self) {
-        // TODO: In the upstream C++, this calls npad->GetAndResetPressState()
-        // to get the current button state from the NPad resource.
-        // Requires NPad integration.
+        // Upstream calls npad->GetAndResetPressState() to get the current button state.
+        // Requires NPad resource integration which is not yet wired up.
         // For now, just advance the indices (no actual input).
         self.previous_index = self.current_index;
         self.current_index = (self.current_index + 1) % self.button_states.len();

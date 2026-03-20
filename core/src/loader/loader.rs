@@ -8,16 +8,22 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use crate::file_sys::registered_cache::ContentProvider;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
+use crate::hle::service::filesystem::filesystem::FileSystemController;
 
-// TODO: System and NACP are not yet ported. Use opaque placeholder types.
-// Upstream: Core::System, FileSys::NACP
 // KProcess is re-exported from the kernel module below.
 
-/// Opaque placeholder for Core::System (not yet fully ported).
-pub struct System;
+/// Minimal bridge for Core::System, carrying only the subsystem references that
+/// loaders need.  Upstream `Core::System` is a monolith; here we expose only
+/// the content provider (for update-NCA lookups) and the filesystem controller
+/// (for process registration).
+pub struct System {
+    pub content_provider: Option<Arc<Mutex<dyn ContentProvider>>>,
+    pub filesystem_controller: Option<Arc<Mutex<FileSystemController>>>,
+}
 
 pub use crate::hle::kernel::k_process::KProcess;
 
@@ -435,14 +441,14 @@ fn get_file_loader(
         FileType::NRO => Some(Box::new(super::nro::AppLoaderNro::new(file))),
         FileType::NCA => Some(Box::new(super::nca::AppLoaderNca::new(file))),
         FileType::XCI => {
-            // TODO: XCI loader requires FileSystemController and ContentProvider
-            // which are not yet ported. Creating with placeholder.
+            // XCI loader requires FileSystemController and ContentProvider
+            // for full NCA extraction. Created with stub until those are ported.
             Some(Box::new(super::xci::AppLoaderXci::new(file, _program_id, _program_index)))
         }
         FileType::NAX => Some(Box::new(super::nax::AppLoaderNax::new(file))),
         FileType::NSP => {
-            // TODO: NSP loader requires FileSystemController and ContentProvider
-            // which are not yet ported. Creating with placeholder.
+            // NSP loader requires FileSystemController and ContentProvider
+            // for control NCA parsing. Created with stub until those are ported.
             Some(Box::new(super::nsp::AppLoaderNsp::new(file, _program_id, _program_index)))
         }
         FileType::KIP => Some(Box::new(super::kip::AppLoaderKip::new(file))),

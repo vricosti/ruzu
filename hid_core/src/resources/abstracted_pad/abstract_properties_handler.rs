@@ -92,15 +92,15 @@ impl NpadAbstractPropertiesHandler {
     }
 
     pub fn update_device_type(&mut self) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     pub fn update_device_color(&mut self) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     pub fn update_footer_attributes(&mut self) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     pub fn update_all_device_properties(&mut self) {
@@ -119,7 +119,7 @@ impl NpadAbstractPropertiesHandler {
     }
 
     pub fn get_style_set(&self, _aruid: u64) -> NpadStyleSet {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
         NpadStyleSet::NONE
     }
 
