@@ -365,10 +365,9 @@ pub struct ArmDynarmic32 {
     // to avoid circular dependency with System which owns the ARM backends.
     // When System stabilizes, this can be replaced with a reference.
 
-    // Upstream holds `DynarmicExclusiveMonitor& m_exclusive_monitor` for wiring
-    // exclusive memory operations through the JIT. Currently exclusive ops are
-    // handled directly in the JitCallbacks. When rdynarmic::ExclusiveMonitor is
-    // integrated, this should store a reference to DynarmicExclusiveMonitor.
+    /// Upstream: `DynarmicExclusiveMonitor& m_exclusive_monitor`.
+    /// Passed to JitConfig::global_monitor for cross-core LDXR/STXR synchronization.
+    exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
 
     /// Core index for this CPU
     core_index: usize,
@@ -401,7 +400,7 @@ impl ArmDynarmic32 {
         _system: &dyn std::any::Any,
         uses_wall_clock: bool,
         _process: &KProcess,
-        _exclusive_monitor: &dyn std::any::Any,
+        exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
         core_index: usize,
         shared_memory: SharedProcessMemory,
         core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
@@ -424,6 +423,12 @@ impl ArmDynarmic32 {
             code_cache_size: 512 * 1024 * 1024,
             optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
             unsafe_optimizations: false,
+            global_monitor: if exclusive_monitor.is_null() {
+                None
+            } else {
+                // Pass the inner rdynarmic::ExclusiveMonitor to the JIT.
+                Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
+            },
         };
 
         let jit = match rdynarmic::A32Jit::new(config) {
@@ -439,6 +444,7 @@ impl ArmDynarmic32 {
 
         Self {
             base: ArmInterfaceBase::new(uses_wall_clock),
+            exclusive_monitor,
             core_index,
             svc_swi,
             halted_watchpoint: None,
@@ -492,6 +498,11 @@ impl ArmDynarmic32 {
         s | c
     }
 }
+
+// SAFETY: ArmDynarmic32 holds raw pointers to long-lived objects
+// (exclusive_monitor, watchpoints) that are valid for the lifetime of the process.
+// The JIT is single-threaded per core — only one thread runs each ArmDynarmic32.
+unsafe impl Send for ArmDynarmic32 {}
 
 impl ArmInterface for ArmDynarmic32 {
     fn run_thread(&mut self, _thread: &mut KThread) -> HaltReason {

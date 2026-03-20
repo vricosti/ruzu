@@ -1092,39 +1092,24 @@ impl System {
             .expect("process runtime bootstrap must succeed");
         let tls_base = main_thread.lock().unwrap().get_tls_address().get();
 
-        let dummy_system: u32 = 0;
-        let dummy_exclusive: u32 = 0;
-        let dummy_process = unsafe {
-            &*(&dummy_system as *const u32 as *const OpaqueKProcess)
-        };
+        // Initialize ARM interfaces on the process (JIT + exclusive monitor).
+        // Upstream: KProcess::InitializeInterfaces() (k_process.cpp:1263-1291).
+        // Creates the exclusive monitor and one ARM JIT per core, owned by KProcess.
+        {
+            let core_memory = self.memory_shared();
+            let core_timing = self.core_timing_shared();
+            process.lock().unwrap().initialize_interfaces(
+                core_memory.unwrap(),
+                shared_memory.clone(),
+                core_timing,
+            );
+        }
 
-        // Create the JIT (AArch32 or AArch64).
-        let core_memory = self.memory_shared();
-        let mut jit: Box<dyn ArmInterface> = if is_64bit {
-            use crate::arm::dynarmic::arm_dynarmic_64::ArmDynarmic64;
-            Box::new(ArmDynarmic64::new(
-                &dummy_system as &dyn std::any::Any,
-                true,
-                dummy_process,
-                &dummy_exclusive as &dyn std::any::Any,
-                0,
-                shared_memory.clone(),
-                self.core_timing_shared(),
-                core_memory.clone(),
-            ))
-        } else {
-            use crate::arm::dynarmic::arm_dynarmic_32::ArmDynarmic32;
-            Box::new(ArmDynarmic32::new(
-                &dummy_system as &dyn std::any::Any,
-                true,
-                dummy_process,
-                &dummy_exclusive as &dyn std::any::Any,
-                0,
-                shared_memory.clone(),
-                self.core_timing_shared(),
-                core_memory,
-            ))
-        };
+        // Get core 0's ARM interface from the process for the main execution loop.
+        // Upstream: PhysicalCore gets this via process->GetArmInterface(core_index).
+        let mut jit_holder = process.lock().unwrap().arm_interfaces[0].take()
+            .expect("ARM interface must exist after initialize_interfaces");
+        let jit: &mut dyn ArmInterface = jit_holder.as_mut();
 
         // Wire the runtime SVC state on System so that SVC handlers
         // can access process, scheduler, memory, etc. via &System.

@@ -371,6 +371,16 @@ pub struct KProcess {
     pub page_table: KProcessPageTable,
     pub used_kernel_memory_size: std::sync::atomic::AtomicUsize,
 
+    /// Exclusive monitor for multi-core LDXR/STXR synchronization.
+    /// Upstream: `std::unique_ptr<Core::ExclusiveMonitor> m_exclusive_monitor` (k_process.h:130).
+    /// Created in `initialize_interfaces()` via `make_exclusive_monitor(memory, NUM_CPU_CORES)`.
+    pub exclusive_monitor: Option<Box<crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor>>,
+
+    /// Per-core ARM JIT interfaces.
+    /// Upstream: `std::array<std::unique_ptr<Core::ArmInterface>, NUM_CPU_CORES> m_arm_interfaces`.
+    /// Created in `initialize_interfaces()` — ArmDynarmic64 for 64-bit processes, ArmDynarmic32 for 32-bit.
+    pub arm_interfaces: [Option<Box<dyn crate::arm::arm_interface::ArmInterface>>; NUM_CPU_CORES as usize],
+
     // -- Thread-local page trees (stubbed as Vecs) --
     // In upstream these are intrusive red-black trees of KThreadLocalPage.
     // Use a Vec for now while keeping ownership in KProcess.
@@ -499,6 +509,8 @@ impl KProcess {
         Self {
             page_table: KProcessPageTable::new(),
             used_kernel_memory_size: std::sync::atomic::AtomicUsize::new(0),
+            exclusive_monitor: None,
+            arm_interfaces: [const { None }; NUM_CPU_CORES as usize],
             thread_local_pages: Vec::new(),
             next_thread_local_page_address: 0,
             ideal_core_id: 0,
@@ -629,6 +641,87 @@ impl KProcess {
     pub fn is_64bit(&self) -> bool {
         // Svc::CreateProcessFlag::Is64Bit = bit 0
         (self.flags & 1) != 0
+    }
+
+    /// Initialize ARM interfaces and exclusive monitor.
+    ///
+    /// Upstream: `KProcess::InitializeInterfaces()` (k_process.cpp:1263-1291).
+    /// Creates the exclusive monitor and one ARM JIT per core.
+    pub fn initialize_interfaces(
+        &mut self,
+        memory: std::sync::Arc<std::sync::Mutex<crate::memory::memory::Memory>>,
+        shared_memory: crate::hle::kernel::k_process::SharedProcessMemory,
+        core_timing: std::sync::Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+    ) {
+        use crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor;
+        use crate::hardware_properties;
+
+        // Create exclusive monitor.
+        // Upstream: m_exclusive_monitor = MakeExclusiveMonitor(GetMemory(), NUM_CPU_CORES);
+        let monitor = DynarmicExclusiveMonitor::new(
+            memory.clone(),
+            hardware_properties::NUM_CPU_CORES as usize,
+        );
+        self.exclusive_monitor = Some(Box::new(monitor));
+
+        // Register SIGSEGV handler for JIT execution.
+        crate::arm::dynarmic::arm_dynarmic::ScopedJitExecution::register_handler();
+
+        // Create one ARM JIT per core.
+        let em_ptr = self.exclusive_monitor.as_mut().unwrap().as_mut()
+            as *mut DynarmicExclusiveMonitor;
+
+        let dummy_system: u32 = 0;
+        let dummy_process = unsafe {
+            &*(&dummy_system as *const u32
+                as *const crate::arm::arm_interface::KProcess)
+        };
+
+        for i in 0..hardware_properties::NUM_CPU_CORES as usize {
+            let jit: Box<dyn crate::arm::arm_interface::ArmInterface> = if self.is_64bit() {
+                use crate::arm::dynarmic::arm_dynarmic_64::ArmDynarmic64;
+                Box::new(ArmDynarmic64::new(
+                    &dummy_system as &dyn std::any::Any,
+                    true, // uses_wall_clock
+                    dummy_process,
+                    em_ptr,
+                    i,
+                    shared_memory.clone(),
+                    core_timing.clone(),
+                    Some(memory.clone()),
+                ))
+            } else {
+                use crate::arm::dynarmic::arm_dynarmic_32::ArmDynarmic32;
+                Box::new(ArmDynarmic32::new(
+                    &dummy_system as &dyn std::any::Any,
+                    true, // uses_wall_clock
+                    dummy_process,
+                    em_ptr,
+                    i,
+                    shared_memory.clone(),
+                    core_timing.clone(),
+                    Some(memory.clone()),
+                ))
+            };
+            self.arm_interfaces[i] = Some(jit);
+        }
+
+        log::info!(
+            "KProcess: initialized {} ARM {} interfaces with exclusive monitor",
+            hardware_properties::NUM_CPU_CORES,
+            if self.is_64bit() { "AArch64" } else { "AArch32" }
+        );
+    }
+
+    /// Get the ARM interface for a specific core.
+    /// Upstream: `KProcess::GetArmInterface(core_index)` (k_process.h:486).
+    pub fn get_arm_interface(&self, core_index: usize) -> Option<&Box<dyn crate::arm::arm_interface::ArmInterface>> {
+        self.arm_interfaces[core_index].as_ref()
+    }
+
+    /// Get the ARM interface for a specific core (mutable).
+    pub fn get_arm_interface_mut(&mut self, core_index: usize) -> Option<&mut Box<dyn crate::arm::arm_interface::ArmInterface>> {
+        self.arm_interfaces[core_index].as_mut()
     }
 
     pub fn get_entry_point(&self) -> KProcessAddress {
