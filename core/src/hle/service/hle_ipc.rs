@@ -32,6 +32,14 @@ pub trait SessionRequestHandler: Send + Sync {
     fn service_name(&self) -> &str {
         std::any::type_name::<Self>()
     }
+
+    /// Downcast support for service-to-service direct handler access.
+    /// Matches upstream `ServiceManager::GetService<T>()` which returns
+    /// a typed `shared_ptr<T>` to the handler object.
+    /// Default implementation panics — override for types that need downcasting.
+    fn as_any(&self) -> &dyn std::any::Any {
+        panic!("as_any() not implemented for {}", self.service_name())
+    }
 }
 
 pub type SessionRequestHandlerPtr = Arc<dyn SessionRequestHandler>;

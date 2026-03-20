@@ -245,6 +245,10 @@ fn main() {
         );
     }
 
+    // Log configuration settings.
+    // Matches upstream: Settings::LogSettings() called in EmuWindow constructor.
+    common::settings::log_settings(&common::settings::Values::default());
+
     // Initialise core system.
     // Maps to C++ `Core::System system{}; system.Initialize(); system.ApplySettings()`.
     let mut system = ruzu_core::core::System::new();
