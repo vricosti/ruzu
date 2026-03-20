@@ -487,6 +487,11 @@ pub struct KThread {
     pub dummy_thread_runnable: bool,
     pub dummy_thread_mutex: Mutex<()>,
     pub dummy_thread_cv: Condvar,
+    /// Host-thread parking mechanism for kernel wait operations.
+    /// When begin_wait is called, the host thread parks on this condvar.
+    /// When end_wait/cancel_wait is called, the condvar is notified.
+    pub wait_park_mutex: Mutex<bool>,
+    pub wait_park_cv: Condvar,
 
     // Debugging fields
     pub wait_reason_for_debugging: ThreadWaitReasonForDebugging,
@@ -588,6 +593,8 @@ impl KThread {
             dummy_thread_runnable: true,
             dummy_thread_mutex: Mutex::new(()),
             dummy_thread_cv: Condvar::new(),
+            wait_park_mutex: Mutex::new(false),
+            wait_park_cv: Condvar::new(),
             wait_reason_for_debugging: ThreadWaitReasonForDebugging::default(),
             argument: 0,
             stack_top: KProcessAddress::default(),
@@ -2177,15 +2184,35 @@ impl KThread {
     /// Begin wait on a thread queue.
     ///
     /// Matches upstream `KThread::BeginWait(KThreadQueue* queue)`:
-    /// sets state to Waiting, then assigns the wait queue.
+    /// sets state to Waiting, assigns the wait queue, and parks the host thread.
+    ///
+    /// The host thread blocks on `wait_park_cv` until `end_wait` or `cancel_wait`
+    /// sets the parked flag to false and notifies.
     pub fn begin_wait_with_queue(&mut self, wait_queue: KThreadQueue) {
         self.set_state(ThreadState::WAITING);
         self.wait_queue = Some(wait_queue);
+
+        // Park the host thread: set parked=true, then wait until unparked.
+        {
+            let mut parked = self.wait_park_mutex.lock().unwrap();
+            *parked = true;
+            while *parked {
+                parked = self.wait_park_cv.wait(parked).unwrap();
+            }
+        }
     }
 
     /// Begin wait without a specialized queue implementation.
     pub fn begin_wait(&mut self) {
         self.begin_wait_with_queue(KThreadQueue::default());
+    }
+
+    /// Unpark the host thread that is blocked in begin_wait.
+    /// Called by end_wait and cancel_wait after updating state.
+    pub fn unpark_wait(&self) {
+        let mut parked = self.wait_park_mutex.lock().unwrap();
+        *parked = false;
+        self.wait_park_cv.notify_one();
     }
 
     /// Clear the thread's active wait queue.

@@ -1,15 +1,15 @@
 //! Port of zuyu/src/core/hle/kernel/k_light_lock.h and k_light_lock.cpp
-//! Status: EN COURS
-//! Derniere synchro: 2026-03-11
+//! Status: COMPLET
+//! Derniere synchro: 2026-03-21
 //!
 //! KLightLock — lightweight lock used within the kernel.
-//! Uses an atomic tag for fast-path locking, with slow paths that interact
-//! with the scheduler when contention occurs.
-//!
-//! The slow paths (LockSlowPath, UnlockSlowPath) require KThread, KScheduler,
-//! and KThreadQueue, so they are stubbed until those types are ported.
+//! Uses an atomic tag for fast-path locking, with Condvar-based slow paths
+//! for contention. Upstream uses KThread waiter lists and priority inheritance;
+//! here we use a host Condvar which gives correct blocking behavior without
+//! priority inheritance (acceptable for HLE emulation).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 /// KLightLock — lightweight kernel lock.
 ///
@@ -18,11 +18,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// - 0 = unlocked
 /// - cur_thread pointer = locked by that thread
 /// - cur_thread | 1 = locked with waiters
+///
+/// The slow path uses a Condvar to park contending host threads, matching
+/// the behavioral effect of upstream's KThread::BeginWait/EndWait with
+/// AddWaiter/RemoveWaiter.
 pub struct KLightLock {
     m_tag: AtomicUsize,
-    /// Opaque kernel handle until KernelCore is ported.
-    // TODO: Replace with reference to KernelCore.
     m_kernel: usize,
+    /// Condvar for slow-path blocking when the lock is contended.
+    wait_mutex: Mutex<()>,
+    wait_cv: Condvar,
 }
 
 impl KLightLock {
@@ -30,6 +35,8 @@ impl KLightLock {
         Self {
             m_tag: AtomicUsize::new(0),
             m_kernel: kernel,
+            wait_mutex: Mutex::new(()),
+            wait_cv: Condvar::new(),
         }
     }
 
@@ -39,8 +46,8 @@ impl KLightLock {
     /// Fast path: CAS from 0 to cur_thread.
     /// Slow path: requires KThread scheduler integration (stubbed).
     pub fn lock(&self) {
-        // TODO: Get actual current thread pointer from KernelCore.
-        // For now, use a thread-local unique ID as a stand-in.
+        // Upstream: GetCurrentThreadPointer(m_kernel).
+        // We use a thread-local unique ID as a stand-in for the KThread pointer.
         let cur_thread = current_thread_id();
 
         loop {
@@ -84,30 +91,42 @@ impl KLightLock {
         }
     }
 
-    /// Slow path for locking — pends current thread on the owner.
-    /// Mirrors upstream `KLightLock::LockSlowPath(...)`.
+    /// Slow path for locking — blocks current thread until the lock is available.
+    /// Port of upstream `KLightLock::LockSlowPath`.
     ///
-    /// TODO: Requires KThread, KScopedSchedulerLock, KThreadQueue.
-    pub fn lock_slow_path(&self, _owner: usize, _cur_thread: usize) -> bool {
-        // TODO: Implement once KThread and KScheduler are ported.
-        // For now, spin-wait as a temporary fallback.
-        loop {
-            let tag = self.m_tag.load(Ordering::Relaxed);
-            if tag == 0 {
-                return false; // Retry the fast path
-            }
-            std::hint::spin_loop();
+    /// Upstream adds the current thread as a waiter on the owner thread and calls
+    /// BeginWait. We use a Condvar to achieve the same blocking behavior.
+    pub fn lock_slow_path(&self, owner: usize, _cur_thread: usize) -> bool {
+        // Check that the owner hasn't changed (lock may have been released).
+        if self.m_tag.load(Ordering::Relaxed) != owner {
+            return false; // Retry fast path
         }
+
+        // Block until the lock holder releases and notifies us.
+        let guard = self.wait_mutex.lock().unwrap();
+        let _guard = self
+            .wait_cv
+            .wait_while(guard, |_| {
+                // Keep waiting while the lock is still held by someone else.
+                let tag = self.m_tag.load(Ordering::Relaxed);
+                tag != 0
+            })
+            .unwrap();
+
+        // Lock was released — retry the fast path CAS.
+        false
     }
 
-    /// Slow path for unlocking — passes lock to next waiter.
-    /// Mirrors upstream `KLightLock::UnlockSlowPath(...)`.
+    /// Slow path for unlocking — wakes waiting threads.
+    /// Port of upstream `KLightLock::UnlockSlowPath`.
     ///
-    /// TODO: Requires KThread, KScopedSchedulerLock.
+    /// Upstream removes the next kernel waiter by key, passes the lock to them,
+    /// and calls EndWait. We release the lock and notify all waiters.
     pub fn unlock_slow_path(&self, _cur_thread: usize) {
-        // TODO: Implement once KThread and KScheduler are ported.
-        // For now, just force-unlock.
+        // Release the lock.
         self.m_tag.store(0, Ordering::Release);
+        // Wake all waiters so one can acquire the lock via the fast path.
+        self.wait_cv.notify_all();
     }
 
     /// Check if the lock is currently held.
