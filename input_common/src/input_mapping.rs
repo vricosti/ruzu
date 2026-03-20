@@ -220,12 +220,18 @@ impl MappingFactory {
         if data.engine == "mouse" && data.pad.port != 0 {
             return false;
         }
-        // To prevent mapping with two devices we disable any UDP except motion
-        // TODO: Check Settings::values.enable_udp_controller when settings are ported
-        // if !Settings::values.enable_udp_controller && data.engine == "cemuhookudp"
-        //     && data.r#type != EngineInputType::Motion {
-        //     return false;
-        // }
+        // To prevent mapping with two devices we disable any UDP except motion.
+        // Upstream: if (!Settings::values.enable_udp_controller && engine == "cemuhookudp"
+        //               && type != Motion) return false;
+        {
+            let settings = common::settings::Values::default();
+            if !*settings.enable_udp_controller.get_value()
+                && data.engine == "cemuhookudp"
+                && data.r#type != crate::input_engine::EngineInputType::Motion
+            {
+                return false;
+            }
+        }
         // The following drivers don't need to be mapped
         if data.engine == "touch_from_button" {
             return false;

@@ -146,15 +146,16 @@ impl Android {
         Vec::new()
     }
 
-    /// Port of Android::GetAnalogMappingForDevice (override)
+    /// Port of Android::GetAnalogMappingForDevice (override).
+    /// Upstream uses Android JNI to query device axes — excluded from port per CLAUDE.md
+    /// (Android JNI integration is platform-specific with no Rust equivalent).
     pub fn get_analog_mapping_for_device(&self, _params: &ParamPackage) -> AnalogMapping {
-        // TODO: Port analog mapping logic (involves Settings::NativeAnalog values)
         HashMap::new()
     }
 
-    /// Port of Android::GetButtonMappingForDevice (override)
+    /// Port of Android::GetButtonMappingForDevice (override).
+    /// Upstream uses Android JNI to query device keys — excluded from port per CLAUDE.md.
     pub fn get_button_mapping_for_device(&self, _params: &ParamPackage) -> ButtonMapping {
-        // TODO: Port button mapping logic (involves Settings::NativeButton values)
         HashMap::new()
     }
 

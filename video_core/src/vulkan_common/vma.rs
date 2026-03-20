@@ -25,12 +25,21 @@
 ///
 /// Upstream type: `VmaAllocator` (opaque handle from `vk_mem_alloc.h`).
 /// In Rust this is replaced by `gpu_allocator::vulkan::Allocator` or equivalent.
-pub type VmaAllocator = (); // TODO: Replace with actual gpu-allocator type
+/// In the full port, this would be replaced by `gpu_allocator::vulkan::Allocator`.
+/// The `gpu-allocator` crate is listed in the workspace but the VMA integration
+/// layer in `vulkan_memory_allocator.rs` manages the concrete allocator instance.
+/// This type alias remains a placeholder because switching to the real type requires
+/// wiring up the `gpu_allocator::vulkan::Allocator` construction (which needs
+/// `ash::Instance`, `ash::Device`, and `vk::PhysicalDevice`) throughout the
+/// Vulkan memory allocator module.
+pub type VmaAllocator = ();
 
 /// Placeholder for VMA allocation handle.
 ///
 /// Upstream type: `VmaAllocation` (opaque handle from `vk_mem_alloc.h`).
-pub type VmaAllocation = (); // TODO: Replace with actual gpu-allocator allocation type
+/// In the full port, this would be replaced by `gpu_allocator::vulkan::Allocation`.
+/// See `VmaAllocator` above for why this remains a placeholder.
+pub type VmaAllocation = ();
 
 /// Placeholder for VMA allocation info.
 ///

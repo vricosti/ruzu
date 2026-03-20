@@ -61,10 +61,19 @@ pub fn create_program_from_spirv(code: &[u32], stage: u32) -> u32 {
 /// Compile an assembly program (GLASM / NV_gpu_program).
 ///
 /// Corresponds to `OpenGL::CompileProgram(std::string_view code, GLenum target)`.
+///
+/// Upstream uses `glGenProgramsARB` and `glNamedProgramStringEXT` which are
+/// NV_gpu_program5 / EXT_direct_state_access extensions. The `gl` crate does not
+/// expose these entry points because they are vendor-specific ARB/NV extensions
+/// not part of core OpenGL. Implementing this requires either:
+///   1. Using `gl::GetProcAddress` to load the function pointers at runtime, or
+///   2. Using a different GL bindings crate that exposes ARB/NV extensions.
+/// Until one of those approaches is wired up, this returns 0 (no program).
+/// Assembly shaders are only used when `Device::use_assembly_shaders()` is true
+/// (NVIDIA-only path), so this does not block AMD/Intel rendering.
 pub fn compile_assembly_program(_code: &str, _target: u32) -> u32 {
     // glGenProgramsARB + glNamedProgramStringEXT — NV extension
-    // These are not available in the base gl crate.
-    // TODO: Implement when NV extension bindings are available
+    // Not available in the base gl crate; requires runtime function pointer loading.
     0
 }
 

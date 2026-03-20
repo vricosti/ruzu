@@ -221,6 +221,30 @@ pub enum Value {
 }
 
 impl Value {
+    /// Get the IR type of this value.
+    /// Upstream: `Value::Type()` (value.h).
+    /// For instruction references, returns Opaque (the actual type depends on the
+    /// producing instruction's opcode return type).
+    pub fn ir_type(&self) -> super::types::Type {
+        use super::types::Type;
+        match self {
+            Value::Inst(_) => Type::Opaque,
+            Value::Reg(_) => Type::Reg,
+            Value::Pred(_) => Type::Pred,
+            Value::Attribute(_) => Type::Attribute,
+            Value::Patch(_) => Type::Patch,
+            Value::ImmU1(_) => Type::U1,
+            Value::ImmU8(_) => Type::U8,
+            Value::ImmU16(_) => Type::U16,
+            Value::ImmU32(_) => Type::U32,
+            Value::ImmU64(_) => Type::U64,
+            Value::ImmF16(_) => Type::F16,
+            Value::ImmF32(_) => Type::F32,
+            Value::ImmF64(_) => Type::F64,
+            Value::Void => Type::Void,
+        }
+    }
+
     /// Whether this value is an instruction reference.
     pub fn is_inst(&self) -> bool {
         matches!(self, Value::Inst(_))
