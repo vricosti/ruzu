@@ -707,7 +707,7 @@ void main() {
     vec4 base = texture(color_texture, vec2(frag_tex_coord)) * weight[0];
     vec2 tex_offset = 1.0f / textureSize(color_texture, 0);
 
-    // TODO(Blinkhawk): This code can be optimized through shader group instructions.
+    // Upstream TODO(Blinkhawk): This code can be optimized through shader group instructions.
     vec4 horizontal = blurHorizontal(color_texture, frag_tex_coord, tex_offset);
     vec4 vertical = blurVertical(color_texture, frag_tex_coord, tex_offset);
     vec4 diagonalA = blurDiagonal(color_texture, frag_tex_coord, tex_offset);

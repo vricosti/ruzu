@@ -6,6 +6,8 @@
 //! GPU-accelerated block-linear swizzle parameter generation for 2D and 3D
 //! textures.
 
+use crate::surface::bytes_per_block;
+
 use super::image_info::ImageInfo;
 use super::types::*;
 
@@ -119,10 +121,11 @@ pub fn make_block_linear_swizzle_3d_params(
 
 // ── Internal helpers ───────────────────────────────────────────────────
 
-/// Placeholder: bytes per block for a given pixel format.
-/// TODO: Replace with proper `VideoCore::Surface::BytesPerBlock` once ported.
-fn bytes_per_block_for_format(_format: super::format_lookup_table::PixelFormat) -> u32 {
-    4 // default — must be replaced
+/// Bytes per block for a given pixel format.
+///
+/// Delegates to `VideoCore::Surface::BytesPerBlock` (ported in `surface.rs`).
+fn bytes_per_block_for_format(format: super::format_lookup_table::PixelFormat) -> u32 {
+    bytes_per_block(format)
 }
 
 fn align_up_log2(value: u32, alignment_log2: u32) -> u32 {

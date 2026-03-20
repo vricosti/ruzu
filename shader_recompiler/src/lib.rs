@@ -51,3 +51,4 @@ pub mod varying_state;
 pub use backend::Profile as BackendProfile;
 pub use pipeline_cache::{compile_shader, CompiledShader, PipelineCache, ShaderKey};
 pub use ir::types::ShaderStage;
+pub use runtime_info::RuntimeInfo;

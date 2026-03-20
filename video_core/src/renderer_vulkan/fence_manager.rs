@@ -42,7 +42,8 @@ impl InnerFence {
         // Get the current tick so we can wait for it
         self.wait_tick = current_tick;
         // In upstream: scheduler.Flush();
-        // TODO: Wire to scheduler when integration is complete
+        // Requires Scheduler integration (InnerFence holds &Scheduler in upstream;
+        // here we pass the tick externally until the Scheduler is wired).
     }
 
     /// Port of `InnerFence::IsSignaled`.
@@ -64,7 +65,8 @@ impl InnerFence {
             return;
         }
         // In upstream: scheduler.Wait(wait_tick);
-        // TODO: Wire to scheduler when integration is complete
+        // Requires Scheduler integration (InnerFence holds &Scheduler in upstream;
+        // here we pass the tick externally until the Scheduler is wired).
     }
 
     /// Returns the tick this fence is waiting for.

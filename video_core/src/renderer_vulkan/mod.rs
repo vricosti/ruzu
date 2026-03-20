@@ -374,9 +374,15 @@ impl RasterizerVulkan {
     }
 
     /// Clear framebuffer.
+    ///
+    /// Upstream uses vkCmdClearAttachments with scissor rects, render target
+    /// format introspection, and blit_image fallback for partial color masks.
+    /// Full implementation requires: TextureCache (UpdateRenderTargets, GetFramebuffer,
+    /// IsRescaling), QueryCache (NotifySegment, CounterEnable), Settings (resolution_info),
+    /// Scheduler (RequestRenderpass, Record), and BlitImage (ClearColor).
+    /// These subsystems are not yet wired in the Vulkan renderer.
     pub fn clear(&mut self, _draw: &DrawCall) {
-        // TODO: implement clear via vkCmdClearAttachments
-        trace!("RasterizerVulkan: clear (stub)");
+        trace!("RasterizerVulkan: clear (stub — requires TextureCache/Scheduler/BlitImage integration)");
     }
 
     /// Periodic work dispatch (zuyu: 7 draws → dispatch, 4096 → flush).

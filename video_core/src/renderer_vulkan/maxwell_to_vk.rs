@@ -205,7 +205,7 @@ pub mod sampler {
                     // we can hack this by sending an invalid enumeration.
                     vk::SamplerAddressMode::from_raw(0xcafe)
                 } else {
-                    // TODO: Emulate GL_CLAMP properly on other vendors
+                    // Upstream TODO(Rodrigo): Emulate GL_CLAMP properly on other vendors
                     match tex_filter {
                         TextureFilter::Nearest => vk::SamplerAddressMode::CLAMP_TO_EDGE,
                         TextureFilter::Linear => vk::SamplerAddressMode::CLAMP_TO_BORDER,
@@ -306,7 +306,8 @@ pub fn primitive_topology(topology: PrimitiveTopology) -> vk::PrimitiveTopology 
             vk::PrimitiveTopology::TRIANGLE_STRIP_WITH_ADJACENCY
         }
         PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip => {
-            // TODO: Use VK_PRIMITIVE_TOPOLOGY_QUAD_LIST_EXT whenever it releases
+            // Upstream TODO: Use VK_PRIMITIVE_TOPOLOGY_QUAD_LIST_EXT/VK_PRIMITIVE_TOPOLOGY_QUAD_STRIP_EXT
+            // whenever it releases
             vk::PrimitiveTopology::TRIANGLE_LIST
         }
         PrimitiveTopology::Patches => vk::PrimitiveTopology::PATCH_LIST,

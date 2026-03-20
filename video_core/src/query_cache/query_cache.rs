@@ -103,7 +103,10 @@ impl StreamerOps for GuestStreamer {
         }
         self.pending_sync.clear();
         if !sync_values.is_empty() {
-            // TODO: call runtime.sync_values(sync_values) when runtime is wired up
+            // Upstream: runtime.template SyncValues<SyncValuesStruct>(sync_values);
+            // Requires the runtime (backend-specific query cache runtime) to be
+            // wired via the Traits template parameter. The runtime writes sync_values
+            // back to guest memory addresses.
             let _ = sync_values;
         }
     }

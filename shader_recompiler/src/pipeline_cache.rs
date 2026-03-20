@@ -20,6 +20,7 @@ use super::ir::basic_block::Block;
 use super::ir::program::{Program, ShaderInfo};
 use super::ir::types::ShaderStage;
 use super::ir_opt;
+use super::runtime_info::RuntimeInfo;
 
 /// Key for looking up a cached shader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,6 +74,7 @@ impl PipelineCache {
         &mut self,
         code: &[u64],
         stage: ShaderStage,
+        runtime_info: &RuntimeInfo,
     ) -> &CompiledShader {
         let key = ShaderKey {
             code_hash: hash_code(code),
@@ -80,7 +82,7 @@ impl PipelineCache {
         };
 
         if !self.cache.contains_key(&key) {
-            let compiled = compile_shader(code, stage, &self.profile);
+            let compiled = compile_shader(code, stage, &self.profile, runtime_info);
             self.cache.insert(key, compiled);
         }
 
@@ -117,7 +119,7 @@ impl PipelineCache {
 /// This is the main entry point for the shader recompiler pipeline:
 /// Maxwell binary → decode opcodes → build CFG → structured CF
 /// → translate to IR → optimize → emit SPIR-V.
-pub fn compile_shader(code: &[u64], stage: ShaderStage, profile: &Profile) -> CompiledShader {
+pub fn compile_shader(code: &[u64], stage: ShaderStage, profile: &Profile, runtime_info: &RuntimeInfo) -> CompiledShader {
     log::debug!(
         "Compiling {:?} shader ({} instructions)",
         stage,
@@ -152,7 +154,7 @@ pub fn compile_shader(code: &[u64], stage: ShaderStage, profile: &Profile) -> Co
     ir_opt::optimize(&mut program);
 
     // Step 5: Emit SPIR-V.
-    let spirv_words = backend::emit_spirv(&program, profile);
+    let spirv_words = backend::emit_spirv(&program, profile, runtime_info);
     log::debug!(
         "  SPIR-V: {} words, {} cbuf descriptors, {} tex descriptors",
         spirv_words.len(),
@@ -211,7 +213,8 @@ mod tests {
     fn test_compile_empty_shader() {
         let profile = Profile::default();
         let code: Vec<u64> = vec![];
-        let compiled = compile_shader(&code, ShaderStage::Vertex, &profile);
+        let runtime_info = RuntimeInfo::default();
+        let compiled = compile_shader(&code, ShaderStage::Vertex, &profile, &runtime_info);
         assert!(!compiled.spirv_words.is_empty()); // Should produce valid SPIR-V header at minimum
         assert_eq!(compiled.stage, ShaderStage::Vertex);
     }
@@ -222,12 +225,13 @@ mod tests {
         let code: Vec<u64> = vec![0x0000_0000_0000_0000]; // NOP-like instruction
         assert!(!cache.contains(&code, ShaderStage::Fragment));
 
-        let _compiled = cache.get_or_compile(&code, ShaderStage::Fragment);
+        let runtime_info = RuntimeInfo::default();
+        let _compiled = cache.get_or_compile(&code, ShaderStage::Fragment, &runtime_info);
         assert!(cache.contains(&code, ShaderStage::Fragment));
         assert_eq!(cache.len(), 1);
 
         // Second lookup should hit cache
-        let _compiled2 = cache.get_or_compile(&code, ShaderStage::Fragment);
+        let _compiled2 = cache.get_or_compile(&code, ShaderStage::Fragment, &runtime_info);
         assert_eq!(cache.len(), 1);
     }
 }

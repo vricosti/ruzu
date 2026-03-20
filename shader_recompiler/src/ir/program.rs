@@ -129,6 +129,18 @@ pub struct ShaderInfo {
     pub local_memory_size: u32,
     /// Shared memory size in bytes.
     pub shared_memory_size: u32,
+    /// Whether the shader reads WorkgroupId.
+    pub uses_workgroup_id: bool,
+    /// Whether the shader reads LocalInvocationId.
+    pub uses_local_invocation_id: bool,
+    /// Whether the shader reads InvocationId.
+    pub uses_invocation_id: bool,
+    /// Whether the shader reads InvocationInfo (tessellation patch vertex count).
+    pub uses_invocation_info: bool,
+    /// Whether the shader reads SampleId.
+    pub uses_sample_id: bool,
+    /// Whether the shader reads IsHelperInvocation.
+    pub uses_is_helper_invocation: bool,
 }
 
 impl ShaderInfo {

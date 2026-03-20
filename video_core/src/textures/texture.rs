@@ -925,8 +925,8 @@ impl TscEntry {
 
     /// Port of `TSCEntry::BorderColor()`.
     ///
-    /// TODO: Handle SRGB correctly. Using SRGB conversion breaks shadows in
-    /// some games (Xenoblade), matching upstream's commented-out behavior.
+    /// Upstream TODO: Handle SRGB correctly. Using SRGB conversion breaks shadows in
+    /// some games (Xenoblade). Upstream has the sRGB conversion commented out.
     pub fn computed_border_color(&self) -> [f32; 4] {
         self.border_color()
     }
