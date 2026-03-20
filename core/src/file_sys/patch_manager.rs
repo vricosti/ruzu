@@ -4,8 +4,11 @@
 // Ported from: core/file_sys/patch_manager.h / .cpp
 
 use super::common_funcs::get_base_title_id;
+use super::content_archive::NCA;
+use super::control_metadata::{LANGUAGE_NAMES, NACP};
 use super::nca_metadata::ContentRecordType;
 use super::registered_cache::{get_update_title_id, ContentProvider, ContentProviderEntry};
+use super::romfs::extract_romfs;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 
 // ============================================================================
@@ -194,9 +197,21 @@ impl PatchManager {
                         if nso_build_id == this_build_id {
                             out.push(file);
                         }
+                    } else if ext == "pchtxt" {
+                        let compiler = super::ips_layer::IpSwitchCompiler::new(file.clone());
+                        if !compiler.is_valid() {
+                            continue;
+                        }
+                        let this_build_id: String = compiler
+                            .get_build_id()
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect();
+                        let this_build_id = format!("{:0<64}", this_build_id);
+                        if nso_build_id == this_build_id {
+                            out.push(file);
+                        }
                     }
-                    // IPSwitch (.pchtxt) files would need the IPSwitchCompiler
-                    // which is not yet ported. Skip for now.
                 }
             }
         }
@@ -280,6 +295,71 @@ impl PatchManager {
     pub fn get_game_version(&self) -> Option<u32> {
         // TODO: requires ContentProvider
         None
+    }
+
+    /// Parse a control NCA to extract NACP metadata and icon file.
+    /// Corresponds to upstream `PatchManager::ParseControlNCA`.
+    ///
+    /// Returns `(Option<NACP>, Option<VirtualFile>)` — the NACP and icon file.
+    pub fn parse_control_nca(&self, nca: &NCA) -> (Option<NACP>, Option<VirtualFile>) {
+        let base_romfs = match nca.get_romfs() {
+            Some(romfs) => romfs,
+            None => return (None, None),
+        };
+
+        let romfs = self.patch_romfs(base_romfs, ContentRecordType::Control, None, true);
+
+        let extracted = match extract_romfs(Some(romfs)) {
+            Some(dir) => dir,
+            None => return (None, None),
+        };
+
+        let nacp_file = extracted
+            .get_file("control.nacp")
+            .or_else(|| extracted.get_file("Control.nacp"));
+
+        let nacp = nacp_file.map(|f| NACP::from_file(&f));
+
+        // Determine icon language priority from settings.
+        // Upstream reads Settings::values.language_index and converts through
+        // Set::GetLanguageCodeFromIndex -> NS::ConvertToApplicationLanguage ->
+        // NS::GetApplicationLanguagePriorityList to build a priority-ordered
+        // language name list for icon lookup.
+        use crate::hle::service::ns::language::{
+            convert_to_application_language, get_application_language_priority_list,
+            ApplicationLanguage, LanguageCode as NsLanguageCode,
+        };
+
+        // Map settings language_index to NS LanguageCode.
+        // Upstream uses Settings::values.language_index.GetValue() which is a global.
+        // PatchManager currently does not hold a reference to Settings, so we use
+        // the default (index 1 = AmericanEnglish) matching upstream default behavior.
+        let language_code = NsLanguageCode::EN_US;
+        let application_language = convert_to_application_language(language_code)
+            .unwrap_or(ApplicationLanguage::AmericanEnglish);
+
+        let mut priority_language_names: Vec<&str> = LANGUAGE_NAMES.to_vec();
+        if let Some(priority_list) = get_application_language_priority_list(application_language) {
+            for i in 0..priority_language_names.len().min(priority_list.len()) {
+                let language_index = priority_list[i] as u8 as usize;
+                if language_index < LANGUAGE_NAMES.len() {
+                    priority_language_names[i] = LANGUAGE_NAMES[language_index];
+                } else {
+                    log::warn!("Invalid language index {}", language_index);
+                }
+            }
+        }
+
+        let mut icon_file: Option<VirtualFile> = None;
+        for language in &priority_language_names {
+            let filename = format!("icon_{}.dat", language);
+            if let Some(file) = extracted.get_file(&filename) {
+                icon_file = Some(file);
+                break;
+            }
+        }
+
+        (nacp, icon_file)
     }
 
     /// Patch RomFS with updates and LayeredFS.

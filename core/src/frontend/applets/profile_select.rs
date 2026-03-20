@@ -9,13 +9,13 @@ use super::applet::Applet;
 /// UUID type (128-bit).
 ///
 /// Corresponds to upstream `Common::UUID`.
-/// TODO: Import from common::uuid when available.
+/// Placeholder alias: when `common::uuid::Uuid` is ported, replace this type alias.
 pub type Uuid = u128;
 
 /// UI mode for profile selection.
 ///
 /// Corresponds to upstream `Service::AM::Frontend::UiMode`.
-/// TODO: Import from hle::service::am when available.
+/// Local definition until hle::service::am::frontend types are ported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
 pub enum UiMode {
@@ -39,7 +39,7 @@ pub enum UiMode {
 /// Display options for user selection.
 ///
 /// Corresponds to upstream `Service::AM::Frontend::UiSettingsDisplayOptions`.
-/// TODO: Import from hle::service::am when available.
+/// Local definition until hle::service::am::frontend types are ported.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UiSettingsDisplayOptions {
     pub raw: u32,
@@ -48,7 +48,7 @@ pub struct UiSettingsDisplayOptions {
 /// Purpose of user selection.
 ///
 /// Corresponds to upstream `Service::AM::Frontend::UserSelectionPurpose`.
-/// TODO: Import from hle::service::am when available.
+/// Local definition until hle::service::am::frontend types are ported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
 pub enum UserSelectionPurpose {
@@ -109,8 +109,11 @@ impl ProfileSelectApplet for DefaultProfileSelectApplet {
         callback: SelectProfileCallback,
         _parameters: &ProfileSelectParameters,
     ) {
-        // TODO: Upstream creates a ProfileManager and returns the current user.
-        // For now, return a default UUID.
+        // Upstream: creates a Service::Account::ProfileManager and returns
+        // manager.GetUser(Settings::values.current_user.GetValue()).
+        // ProfileManager and Settings are not yet wired into this crate.
+        // Returning a default UUID matches upstream's fallback when
+        // the user index yields no profile (value_or(Common::UUID{})).
         log::info!("called, selecting current user instead of prompting...");
         callback(Some(0u128));
     }

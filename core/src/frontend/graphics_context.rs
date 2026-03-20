@@ -19,8 +19,12 @@ pub trait GraphicsContext {
 
     /// Gets the GPU driver library (used by Android only).
     /// Returns None by default.
+    ///
+    /// Upstream returns `std::shared_ptr<Common::DynamicLibrary>`.
+    /// Android JNI integration is excluded from this port (see CLAUDE.md exceptions),
+    /// so the return type is `Option<()>` as a placeholder. No callers exist in
+    /// the non-Android frontend.
     fn get_driver_library(&self) -> Option<()> {
-        // TODO: Return Option<Arc<DynamicLibrary>> when needed
         None
     }
 }

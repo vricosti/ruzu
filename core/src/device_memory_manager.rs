@@ -42,8 +42,11 @@ pub trait DeviceInterface {
     fn on_pages_cached(&self, addr: u64, size: usize, delta: i32);
 }
 
-/// TODO: Forward reference to Core::Memory::Memory (not yet ported).
-/// Using an opaque wrapper for now.
+/// Forward reference to Core::Memory::Memory.
+/// Core::Memory::Memory is ported in memory/memory.rs but uses raw pointers
+/// for integration. This opaque type is used as the registered process
+/// memory interface; actual memory operations go through the page table
+/// and DeviceMemory directly.
 pub struct MemoryInterface;
 
 /// Linked-list entry for multi-mapped device pages.

@@ -89,30 +89,30 @@ impl NpadAbstractButtonHandler {
     // Upstream C++ also has TODO stubs for these.
 
     fn update_npad_fullkey_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_handheld_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_joycon_dual_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_joycon_left_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_joycon_right_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_system_ext_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_palma_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 }

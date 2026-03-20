@@ -406,7 +406,10 @@ impl System {
         };
 
         // Get the appropriate loader for this file type.
-        let mut loader_system = crate::loader::loader::System;
+        let mut loader_system = crate::loader::loader::System {
+            content_provider: None, // ContentProvider is not yet created at System level.
+            filesystem_controller: Some(self.filesystem_controller.clone()),
+        };
         let loader = crate::loader::loader::get_loader(&mut loader_system, file, 0, 0);
 
         let mut loader = match loader {
@@ -467,8 +470,10 @@ impl System {
         self.setup_for_application_process();
 
         // Register the process with the filesystem controller.
-        // Upstream: this happens inside AppLoader_NCA::Load() (nca.cpp:77-80),
-        // but the Rust loader doesn't have a System reference, so we do it here.
+        // Upstream: this happens inside each loader's Load() (e.g. nca.cpp:77-80),
+        // but in the Rust port the process_id is assigned after Load() returns
+        // (see kernel.create_new_user_process_id() above), so registration must
+        // happen here instead.
         if let Some(ref process) = self.current_process {
             self.filesystem_controller.lock().unwrap().register_process(
                 process.process_id,

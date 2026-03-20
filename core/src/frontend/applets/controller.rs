@@ -97,10 +97,15 @@ impl ControllerApplet for DefaultControllerApplet {
             parameters.min_players as usize
         };
 
-        // TODO: Upstream disconnects handheld, then iterates over available controllers,
-        // connecting the minimum required players with the highest-priority controller type.
-        // This requires HIDCore integration.
-        // For now, just log and accept.
+        // Upstream holds a reference to HID::HIDCore and performs:
+        // 1. Disconnect handheld controller
+        // 2. For each controller index 0..available_controllers-2:
+        //    a. Disconnect the controller
+        //    b. If index < min_supported_players, connect with priority:
+        //       ProController > DualJoycons > Left/Right Joycon > Handheld
+        // This requires HIDCore integration (hid_core crate) which is not yet
+        // wired into the frontend applet layer. The callback(true) below matches
+        // upstream's final call after successful reconfiguration.
         let _ = min_supported_players;
 
         callback(true);

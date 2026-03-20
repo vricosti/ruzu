@@ -5,11 +5,32 @@
 //!
 //! NAX (Nintendo Aes Xts) loader.
 
+use crate::crypto::key_manager::KeyManager;
+use crate::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::xts_archive::Nax;
 
 use super::loader::{
     AppLoader, FileType, FileTypeIdentifier, KProcess, LoadResult, Modules, ResultStatus, System,
 };
+use super::nca::AppLoaderNca;
+
+// ============================================================================
+// IdentifyTypeImpl — anonymous-namespace helper
+// ============================================================================
+
+/// Maps to upstream anonymous-namespace `IdentifyTypeImpl(const FileSys::NAX&)`.
+fn identify_type_impl(nax: &Nax) -> FileType {
+    if nax.get_status() != ResultStatus::Success {
+        return FileType::Error;
+    }
+
+    let nca = nax.as_nca();
+    match nca {
+        Some(nca) if nca.get_status() == FsResultStatus::Success => FileType::NAX,
+        _ => FileType::Error,
+    }
+}
 
 // ============================================================================
 // AppLoaderNax
@@ -21,9 +42,8 @@ use super::loader::{
 pub struct AppLoaderNax {
     file: VirtualFile,
     is_loaded: bool,
-    // TODO: Replace with actual types when ported:
-    // nax: Option<FileSys::NAX>,
-    // nca_loader: Option<AppLoaderNca>,
+    nax: Nax,
+    nca_loader: Option<AppLoaderNca>,
 }
 
 impl FileTypeIdentifier for AppLoaderNax {
@@ -31,34 +51,8 @@ impl FileTypeIdentifier for AppLoaderNax {
     ///
     /// Maps to upstream `AppLoader_NAX::IdentifyType`.
     fn identify_type(nax_file: &VirtualFile) -> FileType {
-        // TODO: Full implementation requires FileSys::NAX to parse the file
-        // and attempt to convert to NCA.
-        // Upstream logic:
-        //   const FileSys::NAX nax(nax_file);
-        //   return IdentifyTypeImpl(nax);
-        //
-        // Where IdentifyTypeImpl checks:
-        //   if (nax.GetStatus() != ResultStatus::Success) return FileType::Error;
-        //   const auto nca = nax.AsNCA();
-        //   if (nca == nullptr || nca->GetStatus() != ResultStatus::Success)
-        //       return FileType::Error;
-        //   return FileType::NAX;
-
-        // NAX files have a specific header. Without the crypto subsystem,
-        // we can check for the NAX0 magic.
-        if nax_file.get_size() < 0x4 {
-            return FileType::Error;
-        }
-        let mut magic = [0u8; 4];
-        if nax_file.read(&mut magic, 4, 0) != 4 {
-            return FileType::Error;
-        }
-        // NAX files start with "NAX0" magic
-        if &magic == b"NAX0" {
-            return FileType::NAX;
-        }
-
-        FileType::Error
+        let nax = Nax::new(nax_file.clone());
+        identify_type_impl(&nax)
     }
 }
 
@@ -66,64 +60,120 @@ impl AppLoaderNax {
     /// Create a new NAX loader.
     ///
     /// Maps to upstream `AppLoader_NAX::AppLoader_NAX`.
+    ///
+    /// Upstream: creates `FileSys::NAX` from file, then creates
+    /// `AppLoader_NCA` from `nax->GetDecrypted()`.
     pub fn new(file: VirtualFile) -> Self {
-        // TODO: Upstream creates FileSys::NAX from file, then creates
-        // AppLoader_NCA from nax->GetDecrypted().
+        let nax = Nax::new(file.clone());
+        let nca_loader = nax.get_decrypted().map(AppLoaderNca::new);
         Self {
             file,
             is_loaded: false,
+            nax,
+            nca_loader,
         }
     }
 }
 
 impl AppLoader for AppLoaderNax {
     /// Maps to upstream `AppLoader_NAX::GetFileType`.
-    ///
-    /// Unlike most loaders which just call IdentifyType on self.file,
-    /// upstream calls IdentifyTypeImpl(*nax) using the parsed NAX object.
     fn get_file_type(&self) -> FileType {
-        // TODO: Should use IdentifyTypeImpl with the parsed NAX object.
-        Self::identify_type(&self.file)
+        identify_type_impl(&self.nax)
     }
 
     /// Maps to upstream `AppLoader_NAX::Load`.
-    fn load(&mut self, _process: &mut KProcess, _system: &mut System) -> LoadResult {
+    fn load(&mut self, process: &mut KProcess, system: &mut System) -> LoadResult {
         if self.is_loaded {
             return (ResultStatus::ErrorAlreadyLoaded, None);
         }
 
-        // TODO: Full implementation requires:
-        // - FileSys::NAX status check
-        // - Conversion to NCA (nax->AsNCA())
-        // - Key file existence check
-        // - Delegate to nca_loader->Load()
+        let nax_status = self.nax.get_status();
+        if nax_status != ResultStatus::Success {
+            return (nax_status, None);
+        }
 
-        log::warn!("NAX loader: Load not fully implemented (requires FileSys::NAX)");
-        (ResultStatus::ErrorNotImplemented, None)
+        let nca = self.nax.as_nca();
+        match nca {
+            None => {
+                if !KeyManager::key_file_exists(false) {
+                    return (ResultStatus::ErrorMissingProductionKeyFile, None);
+                }
+                (ResultStatus::ErrorNAXInconvertibleToNCA, None)
+            }
+            Some(nca) => {
+                let nca_status = nca.get_status();
+                if nca_status != FsResultStatus::Success {
+                    return (map_fs_status(nca_status), None);
+                }
+
+                let nca_loader = match self.nca_loader.as_mut() {
+                    Some(loader) => loader,
+                    None => return (ResultStatus::ErrorNAXInconvertibleToNCA, None),
+                };
+
+                let result = nca_loader.load(process, system);
+                if result.0 != ResultStatus::Success {
+                    return result;
+                }
+
+                self.is_loaded = true;
+                result
+            }
+        }
     }
 
-    fn read_rom_fs(&self, _out_file: &mut Option<VirtualFile>) -> ResultStatus {
-        // TODO: Delegates to nca_loader.
-        ResultStatus::ErrorNotImplemented
+    /// Maps to upstream `AppLoader_NAX::ReadRomFS`.
+    fn read_rom_fs(&self, out_file: &mut Option<VirtualFile>) -> ResultStatus {
+        match &self.nca_loader {
+            Some(loader) => loader.read_rom_fs(out_file),
+            None => ResultStatus::ErrorNotImplemented,
+        }
     }
 
-    fn read_program_id(&self, _out_program_id: &mut u64) -> ResultStatus {
-        // TODO: Delegates to nca_loader.
-        ResultStatus::ErrorNotImplemented
+    /// Maps to upstream `AppLoader_NAX::ReadProgramId`.
+    fn read_program_id(&self, out_program_id: &mut u64) -> ResultStatus {
+        match &self.nca_loader {
+            Some(loader) => loader.read_program_id(out_program_id),
+            None => ResultStatus::ErrorNotImplemented,
+        }
     }
 
-    fn read_banner(&self, _buffer: &mut Vec<u8>) -> ResultStatus {
-        // TODO: Delegates to nca_loader.
-        ResultStatus::ErrorNotImplemented
+    /// Maps to upstream `AppLoader_NAX::ReadBanner`.
+    fn read_banner(&self, buffer: &mut Vec<u8>) -> ResultStatus {
+        match &self.nca_loader {
+            Some(loader) => loader.read_banner(buffer),
+            None => ResultStatus::ErrorNotImplemented,
+        }
     }
 
-    fn read_logo(&self, _buffer: &mut Vec<u8>) -> ResultStatus {
-        // TODO: Delegates to nca_loader.
-        ResultStatus::ErrorNotImplemented
+    /// Maps to upstream `AppLoader_NAX::ReadLogo`.
+    fn read_logo(&self, buffer: &mut Vec<u8>) -> ResultStatus {
+        match &self.nca_loader {
+            Some(loader) => loader.read_logo(buffer),
+            None => ResultStatus::ErrorNotImplemented,
+        }
     }
 
-    fn read_nso_modules(&self, _modules: &mut Modules) -> ResultStatus {
-        // TODO: Delegates to nca_loader.
-        ResultStatus::ErrorNotImplemented
+    /// Maps to upstream `AppLoader_NAX::ReadNSOModules`.
+    fn read_nso_modules(&self, modules: &mut Modules) -> ResultStatus {
+        match &self.nca_loader {
+            Some(loader) => loader.read_nso_modules(modules),
+            None => ResultStatus::ErrorNotImplemented,
+        }
+    }
+}
+
+/// Map file_sys ResultStatus to loader ResultStatus.
+fn map_fs_status(fs: FsResultStatus) -> ResultStatus {
+    match fs {
+        FsResultStatus::Success => ResultStatus::Success,
+        FsResultStatus::ErrorBadNCAHeader => ResultStatus::ErrorBadNCAHeader,
+        FsResultStatus::ErrorMissingKeyAreaKey => ResultStatus::ErrorMissingKeyAreaKey,
+        FsResultStatus::ErrorMissingTitlekey => ResultStatus::ErrorMissingTitlekey,
+        FsResultStatus::ErrorMissingTitlekek => ResultStatus::ErrorMissingTitlekek,
+        FsResultStatus::ErrorMissingBKTRBaseRomFS => ResultStatus::ErrorNotImplemented,
+        FsResultStatus::ErrorNullFile => ResultStatus::ErrorNullFile,
+        FsResultStatus::ErrorNSPMissingProgramNCA => ResultStatus::ErrorNSPMissingProgramNCA,
+        _ => ResultStatus::ErrorNotImplemented,
     }
 }

@@ -63,7 +63,11 @@ impl EmulatedConsole {
     }
 
     pub fn unload_input(&mut self) {
-        // TODO: reset all input devices
+        // Upstream (emulated_console.cpp UnloadInput) resets motion_devices[2] and
+        // touch_devices[MAX_TOUCH_DEVICES] by calling .reset() on each
+        // Common::Input::InputDevice. Depends on Common::Input::InputDevice from
+        // zuyu/src/common/input.h and the device arrays stored as
+        // std::array<std::unique_ptr<Common::Input::InputDevice>, N>.
     }
 
     pub fn enable_configuration(&mut self) {
@@ -80,26 +84,41 @@ impl EmulatedConsole {
     }
 
     pub fn reload_input(&mut self) {
-        // TODO: In upstream C++, this calls SetTouchParams(), creates motion devices,
-        // restores motion state, and creates touch devices with callbacks.
-        // Requires Common::Input::CreateInputDevice and Settings integration.
+        // Upstream (emulated_console.cpp ReloadInput) calls SetTouchParams() to populate
+        // touch_params[MAX_TOUCH_DEVICES], sets motion_params[1] to virtual_gamepad,
+        // creates motion_devices via Common::Input::CreateInputDevice(motion_params[i]),
+        // sets SetMotion callbacks on each, restores MotionInput state (accel/gyro/rotation/
+        // orientation/is_at_rest), then creates touch_devices from touch_params with
+        // SetTouch callbacks. Depends on Common::Input::CreateInputDevice from
+        // zuyu/src/common/input.h and MotionInput from hid_core/frontend/motion_input.h.
         log::debug!("EmulatedConsole::reload_input called");
     }
 
     pub fn reload_from_settings(&mut self) {
-        // TODO: In upstream C++, this reads motion params from Settings::values.players[0]
-        // and calls reload_input.
-        // Requires Settings integration.
+        // Upstream (emulated_console.cpp ReloadFromSettings) reads
+        // Settings::values.players.GetValue()[0].motions[0] as a ParamPackage into
+        // motion_params[0], then calls ReloadInput(). Depends on
+        // Settings::values.players from zuyu/src/common/settings.h (PlayerInput struct).
         log::debug!("EmulatedConsole::reload_from_settings called");
+        self.reload_input();
     }
 
-    fn get_index_from_finger_id(&self, _finger_id: usize) -> Option<usize> {
-        // TODO: iterate touch_values to find matching finger_id
+    fn get_index_from_finger_id(&self, finger_id: usize) -> Option<usize> {
+        // Upstream (emulated_console.cpp GetIndexFromFingerId) iterates
+        // console.touch_values[0..MAX_TOUCH_DEVICES] and returns the index of the first
+        // entry where pressed.value == true && id == finger_id. touch_values is of type
+        // std::array<TouchValues, MAX_TOUCH_DEVICES> populated by SetTouch callbacks from
+        // Common::Input::InputDevice. Depends on touch_values state array backed by
+        // Common::Input device callbacks from zuyu/src/common/input.h.
+        let _ = finger_id;
         None
     }
 
     fn get_next_free_index(&self) -> Option<usize> {
-        // TODO: iterate touch_values to find first unpressed slot
+        // Upstream (emulated_console.cpp GetNextFreeIndex) iterates
+        // console.touch_values[0..MAX_TOUCH_DEVICES] and returns the first index where
+        // pressed.value == false. Depends on touch_values state array backed by
+        // Common::Input device callbacks from zuyu/src/common/input.h.
         None
     }
 

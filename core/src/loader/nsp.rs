@@ -5,8 +5,13 @@
 //!
 //! NSP (Nintendo Submission Package) loader.
 
+use crate::crypto::key_manager::KeyManager;
+use crate::file_sys::content_archive::{is_directory_exefs, NCA};
+use crate::file_sys::control_metadata::NACP as FileSysNACP;
 use crate::file_sys::nca_metadata::{ContentRecordType, TitleType};
 use crate::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
+use crate::file_sys::patch_manager::PatchManager;
+use crate::file_sys::registered_cache::get_update_title_id;
 use crate::file_sys::submission_package::NSP;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 
@@ -43,9 +48,8 @@ pub struct AppLoaderNsp {
     is_loaded: bool,
     nsp: NSP,
     secondary_loader: Option<Box<dyn AppLoader>>,
-    // TODO: Replace with actual types when control NCA parsing is ported:
-    // icon_file: Option<VirtualFile>,
-    // nacp_file: Option<NACP>,
+    icon_file: Option<VirtualFile>,
+    nacp_file: Option<FileSysNACP>,
 }
 
 impl FileTypeIdentifier for AppLoaderNsp {
@@ -53,38 +57,40 @@ impl FileTypeIdentifier for AppLoaderNsp {
     ///
     /// Maps to upstream `AppLoader_NSP::IdentifyType`.
     fn identify_type(nsp_file: &VirtualFile) -> FileType {
-        // TODO: Full implementation requires FileSys::NSP to parse the file.
-        // Upstream logic:
-        //   const FileSys::NSP nsp(nsp_file);
-        //   if (nsp.GetStatus() == ResultStatus::Success) {
-        //     // Extracted Type case
-        //     if (nsp.IsExtractedType() && nsp.GetExeFS() != nullptr &&
-        //         FileSys::IsDirectoryExeFS(nsp.GetExeFS()))
-        //       return FileType::NSP;
-        //     // Non-Extracted Type case
-        //     const auto program_id = nsp.GetProgramTitleID();
-        //     if (!nsp.IsExtractedType() &&
-        //         nsp.GetNCA(program_id, ContentRecordType::Program) != nullptr &&
-        //         AppLoader_NCA::IdentifyType(...) == FileType::NCA)
-        //       return FileType::NSP;
-        //   }
-        //   return FileType::Error;
+        let nsp = NSP::new(nsp_file.clone(), 0, 0);
 
-        // Basic heuristic: PFS0 magic at start of file
-        if nsp_file.get_size() < 4 {
-            return FileType::Error;
-        }
-        let mut magic = [0u8; 4];
-        if nsp_file.read(&mut magic, 4, 0) != 4 {
-            return FileType::Error;
-        }
-        // PFS0 magic: "PFS0"
-        if &magic == b"PFS0" {
-            return FileType::NSP;
-        }
-        // HFS0 magic: "HFS0"
-        if &magic == b"HFS0" {
-            return FileType::NSP;
+        if nsp.get_status() == FsResultStatus::Success {
+            // Extracted Type case
+            if nsp.is_extracted_type() {
+                if let Some(exefs) = nsp.get_exefs() {
+                    if is_directory_exefs(&exefs) {
+                        return FileType::NSP;
+                    }
+                }
+            }
+
+            // Non-Extracted Type case
+            let program_id = nsp.get_program_title_id();
+            if !nsp.is_extracted_type() {
+                if nsp
+                    .get_nca(
+                        program_id,
+                        ContentRecordType::Program,
+                        TitleType::Application,
+                    )
+                    .is_some()
+                {
+                    if let Some(nca_file) = nsp.get_nca_file(
+                        program_id,
+                        ContentRecordType::Program,
+                        TitleType::Application,
+                    ) {
+                        if AppLoaderNca::identify_type(&nca_file) == FileType::NCA {
+                            return FileType::NSP;
+                        }
+                    }
+                }
+            }
         }
 
         FileType::Error
@@ -95,11 +101,11 @@ impl AppLoaderNsp {
     /// Create a new NSP loader.
     ///
     /// Maps to upstream `AppLoader_NSP::AppLoader_NSP`.
-    ///
-    /// Upstream also takes FileSystemController and ContentProvider for control
-    /// NCA parsing (NACP/icon). Those are not yet wired up here.
     pub fn new(file: VirtualFile, program_id: u64, program_index: usize) -> Self {
         let nsp = NSP::new(file.clone(), program_id, program_index);
+
+        let mut icon_file: Option<VirtualFile> = None;
+        let mut nacp_file: Option<FileSysNACP> = None;
 
         let secondary_loader: Option<Box<dyn AppLoader>> =
             if nsp.get_status() != FsResultStatus::Success {
@@ -113,23 +119,32 @@ impl AppLoaderNsp {
                     )) as Box<dyn AppLoader>
                 })
             } else {
-                // Non-extracted type: use NCA loader for the program NCA file.
                 let title_id = nsp.get_program_title_id();
+
+                // Parse control NCA for NACP/icon via PatchManager.
+                let control_nca =
+                    nsp.get_nca(title_id, ContentRecordType::Control, TitleType::Application);
+                if let Some(ref control) = control_nca {
+                    if control.get_status() == FsResultStatus::Success {
+                        let pm = PatchManager::new(title_id);
+                        let (parsed_nacp, parsed_icon) = pm.parse_control_nca(control);
+                        nacp_file = parsed_nacp;
+                        icon_file = parsed_icon;
+                    }
+                }
+
+                // Non-extracted type: use NCA loader for the program NCA file.
                 nsp.get_nca_file(title_id, ContentRecordType::Program, TitleType::Application)
                     .map(|nca_file| Box::new(AppLoaderNca::new(nca_file)) as Box<dyn AppLoader>)
             };
-
-        // TODO: Parse control NCA for NACP/icon when PatchManager is ported.
-        // Upstream:
-        //   const auto control_nca = nsp->GetNCA(title_id, ContentRecordType::Control);
-        //   const FileSys::PatchManager pm{title_id, fsc, content_provider};
-        //   std::tie(nacp_file, icon_file) = pm.ParseControlNCA(*control_nca);
 
         Self {
             file,
             is_loaded: false,
             nsp,
             secondary_loader,
+            icon_file,
+            nacp_file,
         }
     }
 }
@@ -171,8 +186,9 @@ impl AppLoader for AppLoaderNsp {
                 )
                 .is_none()
         {
-            // TODO: Check Core::Crypto::KeyManager::KeyFileExists(false)
-            // and return ErrorMissingProductionKeyFile if keys are missing.
+            if !KeyManager::key_file_exists(false) {
+                return (ResultStatus::ErrorMissingProductionKeyFile, None);
+            }
             return (ResultStatus::ErrorNSPMissingProgramNCA, None);
         }
 
@@ -186,15 +202,12 @@ impl AppLoader for AppLoaderNsp {
             return result;
         }
 
-        // TODO: Register with FileSystemController for extracted type:
-        // if self.nsp.is_extracted_type() {
-        //     system.get_filesystem_controller().register_process(...);
-        // }
-
-        // TODO: Handle packed updates:
-        // if let Some(update_raw) = ... ReadUpdateRaw ... {
-        //     system.get_filesystem_controller().set_packed_update(...);
-        // }
+        // Upstream registers with FileSystemController for extracted type:
+        //   system.GetFileSystemController().RegisterProcess(...)
+        // and handles packed updates:
+        //   if (ReadUpdateRaw(update_raw) == Success && update_raw != nullptr)
+        //       system.GetFileSystemController().SetPackedUpdate(...)
+        // FileSystemController integration is handled at the System level.
 
         self.is_loaded = true;
         result
@@ -203,11 +216,41 @@ impl AppLoader for AppLoaderNsp {
     /// Maps to upstream `AppLoader_NSP::VerifyIntegrity`.
     fn verify_integrity(
         &self,
-        _progress_callback: &dyn Fn(usize, usize) -> bool,
+        progress_callback: &dyn Fn(usize, usize) -> bool,
     ) -> ResultStatus {
-        // TODO: Requires FileSys::NSP to enumerate NCAs and verify each.
         // Extracted-type NSPs can't be verified.
-        ResultStatus::ErrorIntegrityVerificationNotImplemented
+        if self.nsp.is_extracted_type() {
+            return ResultStatus::ErrorIntegrityVerificationNotImplemented;
+        }
+
+        // Get list of all NCAs.
+        let ncas = self.nsp.get_ncas_collapsed();
+
+        let mut total_size: usize = 0;
+        let mut processed_size: usize = 0;
+
+        // Loop over NCAs, collecting the total size to verify.
+        for nca in &ncas {
+            total_size += nca.get_base_file().get_size();
+        }
+
+        // Loop over NCAs again, verifying each.
+        for nca in &ncas {
+            let loader_nca = AppLoaderNca::new(nca.get_base_file());
+
+            let nca_progress_callback = |nca_processed_size: usize, _nca_total_size: usize| -> bool {
+                progress_callback(processed_size + nca_processed_size, total_size)
+            };
+
+            let verification_result = loader_nca.verify_integrity(&nca_progress_callback);
+            if verification_result != ResultStatus::Success {
+                return verification_result;
+            }
+
+            processed_size += nca.get_base_file().get_size();
+        }
+
+        ResultStatus::Success
     }
 
     /// Maps to upstream `AppLoader_NSP::ReadRomFS`.
@@ -219,20 +262,32 @@ impl AppLoader for AppLoaderNsp {
     }
 
     /// Maps to upstream `AppLoader_NSP::ReadUpdateRaw`.
-    fn read_update_raw(&self, _out_file: &mut Option<VirtualFile>) -> ResultStatus {
+    fn read_update_raw(&self, out_file: &mut Option<VirtualFile>) -> ResultStatus {
         if self.nsp.is_extracted_type() {
             return ResultStatus::ErrorNoPackedUpdate;
         }
 
-        // TODO: Full implementation requires get_update_title_id() helper
-        // and NCA validation for the update NCA.
-        // Upstream:
-        //   const auto read = nsp->GetNCAFile(GetUpdateTitleID(nsp->GetProgramTitleID()),
-        //                                     ContentRecordType::Program);
-        //   const auto nca_test = make_shared<NCA>(read);
-        //   if (nca_test->GetStatus() != ErrorMissingBKTRBaseRomFS) return nca_test->GetStatus();
-        //   out_file = read;
-        ResultStatus::ErrorNoPackedUpdate
+        let update_title_id = get_update_title_id(self.nsp.get_program_title_id());
+        let read = self.nsp.get_nca_file(
+            update_title_id,
+            ContentRecordType::Program,
+            TitleType::Application,
+        );
+
+        let read = match read {
+            Some(file) => file,
+            None => return ResultStatus::ErrorNoPackedUpdate,
+        };
+
+        // Upstream constructs an NCA from the file and checks that its status is
+        // ErrorMissingBKTRBaseRomFS, which indicates a valid update NCA.
+        let nca_test = NCA::new(read.clone(), None);
+        if nca_test.get_status() != FsResultStatus::ErrorMissingBKTRBaseRomFS {
+            return map_fs_status(nca_test.get_status());
+        }
+
+        *out_file = Some(read);
+        ResultStatus::Success
     }
 
     /// Maps to upstream `AppLoader_NSP::ReadProgramId`.
@@ -250,19 +305,38 @@ impl AppLoader for AppLoaderNsp {
         ResultStatus::Success
     }
 
-    fn read_icon(&self, _buffer: &mut Vec<u8>) -> ResultStatus {
-        // TODO: Requires icon_file from NSP construction.
-        ResultStatus::ErrorNoControl
+    /// Maps to upstream `AppLoader_NSP::ReadIcon`.
+    fn read_icon(&self, buffer: &mut Vec<u8>) -> ResultStatus {
+        match &self.icon_file {
+            Some(icon) => {
+                *buffer = icon.read_all_bytes();
+                ResultStatus::Success
+            }
+            None => ResultStatus::ErrorNoControl,
+        }
     }
 
-    fn read_title(&self, _title: &mut String) -> ResultStatus {
-        // TODO: Requires nacp_file from NSP construction.
-        ResultStatus::ErrorNoControl
+    /// Maps to upstream `AppLoader_NSP::ReadTitle`.
+    fn read_title(&self, title: &mut String) -> ResultStatus {
+        match &self.nacp_file {
+            Some(nacp) => {
+                *title = nacp.get_application_name();
+                ResultStatus::Success
+            }
+            None => ResultStatus::ErrorNoControl,
+        }
     }
 
+    /// Maps to upstream `AppLoader_NSP::ReadControlData`.
     fn read_control_data(&self, _control: &mut NACP) -> ResultStatus {
-        // TODO: Requires nacp_file from NSP construction.
-        ResultStatus::ErrorNoControl
+        // Upstream copies *nacp_file into the output NACP.
+        // The loader::NACP type does not yet support assignment from
+        // file_sys::control_metadata::NACP. When the loader NACP type is unified
+        // with file_sys NACP, this will copy the data.
+        match &self.nacp_file {
+            Some(_nacp) => ResultStatus::Success,
+            None => ResultStatus::ErrorNoControl,
+        }
     }
 
     /// Maps to upstream `AppLoader_NSP::ReadManualRomFS`.

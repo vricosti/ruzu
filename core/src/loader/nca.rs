@@ -6,7 +6,9 @@
 //! NCA (Nintendo Content Archive) loader.
 
 use crate::file_sys::content_archive::{NCAContentType, NCA};
+use crate::file_sys::nca_metadata::ContentRecordType;
 use crate::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
+use crate::file_sys::registered_cache::{get_update_title_id, ContentProvider};
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 
 use super::deconstructed_rom_directory::AppLoaderDeconstructedRomDirectory;
@@ -66,27 +68,19 @@ impl FileTypeIdentifier for AppLoaderNca {
     /// Identifies whether or not the given file is an NCA file.
     ///
     /// Maps to upstream `AppLoader_NCA::IdentifyType`.
+    ///
+    /// Upstream constructs `FileSys::NCA(nca_file)` and checks
+    /// `nca.GetStatus() == Success && nca.GetType() == Program`.
+    /// NCA headers are encrypted; proper identification requires the crypto
+    /// key infrastructure (which is ported in FileSys::NCA). We construct an NCA
+    /// and check status + content type.
     fn identify_type(nca_file: &VirtualFile) -> FileType {
-        // TODO: Full implementation requires FileSys::NCA to parse the file
-        // and check NCA status and content type.
-        // For now, do a basic magic check on the NCA header.
-        // NCA files have a complex encrypted header; proper identification
-        // requires crypto key support (FileSys::NCA constructor).
-        //
-        // Upstream logic:
-        //   const FileSys::NCA nca(nca_file);
-        //   if (nca.GetStatus() == ResultStatus::Success &&
-        //       nca.GetType() == FileSys::NCAContentType::Program)
-        //       return FileType::NCA;
-        //   return FileType::Error;
-
-        // Placeholder: check file size is reasonable for an NCA
-        if nca_file.get_size() < 0x400 {
-            return FileType::Error;
+        let nca = NCA::new(nca_file.clone(), None);
+        if nca.get_status() == FsResultStatus::Success
+            && nca.get_type() == NCAContentType::Program
+        {
+            return FileType::NCA;
         }
-
-        // NCA identification requires crypto infrastructure not yet ported.
-        // Return Error for now; the GetLoader fallback will use filename-based detection.
         FileType::Error
     }
 }
@@ -126,16 +120,25 @@ impl AppLoader for AppLoaderNca {
             return (ResultStatus::ErrorNCANotProgram, None);
         }
 
-        let exefs = self.nca.get_exefs();
+        let mut exefs = self.nca.get_exefs();
         if exefs.is_none() {
             log::info!("No ExeFS found in NCA, looking for ExeFS from update");
 
-            // TODO: This NCA may be a sparse base of an installed title.
-            // Try to fetch the ExeFS from the installed update via
-            // system.get_content_provider().get_entry(get_update_title_id(...), Program).
-            // For now, return ErrorNoExeFS since content provider integration
-            // is not yet wired up.
-            return (ResultStatus::ErrorNoExeFS, None);
+            // Upstream: const auto& installed = system.GetContentProvider();
+            //           const auto update_nca = installed.GetEntry(
+            //               FileSys::GetUpdateTitleID(nca->GetTitleId()), Program);
+            if let Some(ref cp) = system.content_provider {
+                let cp_guard = cp.lock().unwrap();
+                let update_title_id = get_update_title_id(self.nca.get_title_id());
+                let update_nca = cp_guard.get_entry(update_title_id, ContentRecordType::Program);
+                if let Some(update) = update_nca {
+                    exefs = update.get_exefs();
+                }
+            }
+
+            if exefs.is_none() {
+                return (ResultStatus::ErrorNoExeFS, None);
+            }
         }
 
         let exefs = exefs.unwrap();
@@ -151,9 +154,20 @@ impl AppLoader for AppLoaderNca {
             return load_result;
         }
 
-        // TODO: Register with FileSystemController:
-        // system.get_filesystem_controller().register_process(
-        //     process.get_process_id(), nca.get_title_id(), ...);
+        // Upstream: system.GetFileSystemController().RegisterProcess(
+        //     process.GetProcessId(), nca->GetTitleId(),
+        //     make_shared<RomFSFactory>(*this, system.GetContentProvider(),
+        //                               system.GetFileSystemController()));
+        // In the Rust port, process_id is assigned after Load() returns (in
+        // core.rs), so RegisterProcess is called there instead.  RomFSFactory
+        // construction is also deferred until the factory types accept the
+        // content_provider/filesystem_controller references.
+        if let Some(ref fsc) = system.filesystem_controller {
+            fsc.lock().unwrap().register_process(
+                process.process_id,
+                self.nca.get_title_id(),
+            );
+        }
 
         self.directory_loader = Some(dir_loader);
         self.is_loaded = true;

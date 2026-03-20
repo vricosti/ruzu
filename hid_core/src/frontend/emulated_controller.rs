@@ -203,7 +203,14 @@ impl EmulatedController {
     }
 
     pub fn unload_input(&mut self) {
-        // TODO: reset all input devices
+        // Upstream (emulated_controller.cpp UnloadInput) sets is_initialized = false, then
+        // resets all device arrays by calling .reset() on each unique_ptr:
+        // button_devices, stick_devices, motion_devices, trigger_devices, battery_devices,
+        // output_devices, tas_button_devices, tas_stick_devices, virtual_button_devices,
+        // virtual_stick_devices, virtual_motion_devices, camera_devices, ring_analog_devices,
+        // nfc_devices. Each is a std::unique_ptr<Common::Input::InputDevice> from
+        // zuyu/src/common/input.h. Depends on Common::Input::InputDevice arrays.
+        self.is_initialized = false;
     }
 
     pub fn enable_configuration(&mut self) {
@@ -223,7 +230,9 @@ impl EmulatedController {
     }
 
     pub fn reset_system_buttons(&mut self) {
-        // TODO: reset home and capture button states to false
+        let _lock = self.mutex.lock();
+        self.home_button_state = HomeButtonState::default();
+        self.capture_button_state = CaptureButtonState::default();
     }
 
     pub fn is_configuring_mode(&self) -> bool {
@@ -231,16 +240,28 @@ impl EmulatedController {
     }
 
     pub fn reload_input(&mut self) {
-        // TODO: In the upstream C++, this creates Common::Input devices from parameters,
-        // sets up callbacks, and restores motion/button/stick state.
-        // Requires Common::Input::CreateInputDevice and Settings integration.
+        // Upstream (emulated_controller.cpp ReloadInput) creates input devices via
+        // Common::Input::CreateInputDevice for each parameter set (button_params,
+        // stick_params, motion_params, trigger_params, battery_params, camera_params,
+        // ring_params, nfc_params), plus TAS and virtual device variants using TAS_UUID
+        // and VIRTUAL_UUID. Sets callbacks (SetButton, SetStick, SetTrigger, SetMotion,
+        // SetBattery, SetCamera, SetRingAnalog, SetNfc) on each device. Also creates
+        // output_devices[OUTPUT_DEVICES_SIZE] for vibration/LED/polling. Finally restores
+        // motion state via MotionInput::ResetRotations/ResetQuaternion. Depends on
+        // Common::Input::CreateInputDevice from zuyu/src/common/input.h and
+        // Settings::values.players from zuyu/src/common/settings.h.
         log::debug!("EmulatedController::reload_input called for {:?}", self.npad_id_type);
     }
 
     pub fn reload_from_settings(&mut self) {
-        // TODO: In the upstream C++, this reads player settings, maps controller type,
-        // builds parameter packages for buttons/sticks/motions, and calls reload_input.
-        // Requires Settings::values.players integration.
+        // Upstream (emulated_controller.cpp ReloadFromSettings) reads player config from
+        // Settings::values.players.GetValue()[player_index] where player_index is derived
+        // from npad_id_type via NpadIdTypeToIndex. Maps Settings::ControllerType to
+        // NpadStyleIndex via MapSettingsTypeToNPad, then populates button_params,
+        // stick_params, motion_params from player.buttons/analogs/motions ParamPackage
+        // strings. Calls SetNpadStyleIndex, connect/disconnect based on player.connected,
+        // then ReloadInput(). Depends on Settings::values.players (PlayerInput struct)
+        // from zuyu/src/common/settings.h and NpadIdTypeToIndex from hid_core/hid_util.h.
         log::debug!("EmulatedController::reload_from_settings called for {:?}", self.npad_id_type);
     }
 

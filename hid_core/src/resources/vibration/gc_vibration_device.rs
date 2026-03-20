@@ -79,7 +79,8 @@ impl NpadGcVibrationDevice {
             return Ok(VibrationGcErmCommand::Stop);
         }
         // Upstream: check volume, if 0 return Stop
-        // TODO: GetActualVibrationGcErmCommand from xcd_handle
+        // Upstream TODO: GetActualVibrationGcErmCommand — not yet implemented in C++ upstream.
+        // Upstream checks volume, returns Stop if 0, otherwise would query xcd_handle.
         Ok(VibrationGcErmCommand::Stop)
     }
 

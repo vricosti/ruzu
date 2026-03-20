@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use super::content_archive::NCA;
 use super::vfs::vfs::VfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::crypto::key_manager::{Key128, Key256};
@@ -182,6 +183,17 @@ impl Nax {
     /// Get the decrypted file, if parsing and decryption succeeded.
     pub fn get_decrypted(&self) -> Option<VirtualFile> {
         self.dec_file.clone()
+    }
+
+    /// Create an NCA from the decrypted file, if the content type is NCA.
+    ///
+    /// Corresponds to upstream `NAX::AsNCA`.
+    pub fn as_nca(&self) -> Option<NCA> {
+        if self.content_type == NaxContentType::Nca {
+            self.get_decrypted().map(|dec| NCA::new(dec, None))
+        } else {
+            None
+        }
     }
 
     /// Get the content type (Save or NCA).

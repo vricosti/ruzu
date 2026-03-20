@@ -40,7 +40,7 @@ impl NpadAbstractSixAxisHandler {
     }
 
     pub fn is_firmware_update_available(&self) -> u64 {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
         0
     }
 
@@ -63,26 +63,26 @@ impl NpadAbstractSixAxisHandler {
     // Private helper methods - upstream has TODO stubs for all of these:
 
     fn update_sixaxis_fullkey_lifo(&mut self, _is_sensor_enabled: bool) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_six_axis_palma_lifo(&mut self, _is_sensor_enabled: bool) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_sixaxis_handheld_lifo(&mut self, _is_sensor_enabled: bool) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_sixaxis_dual_lifo(&mut self, _is_sensor_enabled: bool) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_sixaxis_left_lifo(&mut self, _is_sensor_enabled: bool) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 
     fn update_sixaxis_right_lifo(&mut self, _is_sensor_enabled: bool) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 }

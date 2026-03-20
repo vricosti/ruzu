@@ -8,6 +8,7 @@
 //! Switch game dumps. The path should be a "main" NSO in a directory that
 //! contains the other standard ExeFS NSOs (rtld, sdk, etc.).
 
+use crate::file_sys::control_metadata::NACP;
 use crate::file_sys::program_metadata::ProgramMetadata;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::hle::result::RESULT_SUCCESS;
@@ -40,7 +41,8 @@ pub struct AppLoaderDeconstructedRomDirectory {
     file: Option<VirtualFile>,
     dir: Option<VirtualDir>,
     is_loaded: bool,
-    // TODO: metadata: FileSys::ProgramMetadata — requires ProgramMetadata to be ported.
+    // ProgramMetadata is loaded on-demand during Load() rather than stored,
+    // matching how upstream re-reads it in Load() after patching.
     romfs: Option<VirtualFile>,
     icon_data: Vec<u8>,
     name: String,
@@ -69,8 +71,7 @@ impl FileTypeIdentifier for AppLoaderDeconstructedRomDirectory {
 /// Check if a directory is an ExeFS directory.
 ///
 /// Maps to upstream `FileSys::IsDirectoryExeFS`.
-/// TODO: Use the actual implementation from file_sys::content_archive when it's
-/// wired into the module tree.
+/// Inline implementation matching upstream: checks for "main" and "main.npdm" files.
 fn is_directory_exefs(dir: &VirtualDir) -> bool {
     // An ExeFS directory contains "main" and "main.npdm" files.
     let has_main = dir.get_file("main").is_some();
@@ -83,18 +84,25 @@ impl AppLoaderDeconstructedRomDirectory {
     ///
     /// Maps to upstream `AppLoader_DeconstructedRomDirectory(VirtualFile, bool)`.
     pub fn new_from_file(file: VirtualFile) -> Self {
-        let title_id = 0u64;
+        let mut title_id = 0u64;
         let mut icon_data = Vec::new();
-        let name = String::new();
+        let mut name = String::new();
 
-        // Try to read metadata from the containing directory
+        // Try to read metadata from the containing directory.
+        // Matches upstream constructor behavior.
         if let Some(file_dir) = file.get_containing_directory() {
-            // Title ID from main.npdm
-            // TODO: Parse ProgramMetadata from npdm file when ported.
-            let _npdm = file_dir.get_file("main.npdm");
+            // Title ID: parse main.npdm to get title ID.
+            // Upstream: `metadata.Load(npdm)` then `title_id = metadata.GetTitleID()`.
+            if let Some(npdm) = file_dir.get_file("main.npdm") {
+                let mut metadata = ProgramMetadata::new();
+                let res = metadata.load(npdm);
+                if res == crate::file_sys::partition_filesystem::ResultStatus::Success {
+                    title_id = metadata.get_title_id();
+                }
+            }
 
             // Icon: look for icon_<language>.dat
-            // TODO: Use FileSys::LANGUAGE_NAMES when ported.
+            // Inline language name list matching upstream FileSys::LANGUAGE_NAMES.
             let language_names = [
                 "AmericanEnglish",
                 "BritishEnglish",
@@ -133,14 +141,19 @@ impl AppLoaderDeconstructedRomDirectory {
                 }
             }
 
-            // Metadata: look for control.nacp or any .nacp file
-            // TODO: Parse FileSys::NACP when ported.
-            let _nacp_file = file_dir.get_file("control.nacp").or_else(|| {
+            // Metadata: look for control.nacp or any .nacp file.
+            // Upstream: `FileSys::NACP nacp(nacp_file); name = nacp.GetApplicationName();`
+            let nacp_file = file_dir.get_file("control.nacp").or_else(|| {
                 file_dir
                     .get_files()
                     .into_iter()
                     .find(|f| f.get_extension() == "nacp")
             });
+
+            if let Some(nacp_file) = nacp_file {
+                let nacp = NACP::from_file(&nacp_file);
+                name = nacp.get_application_name();
+            }
         }
 
         Self {
@@ -221,16 +234,26 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
         let mut metadata = ProgramMetadata::new();
         let result = metadata.load(npdm_file);
         if result != PfsResultStatus::Success {
-            // Map PFS result status to loader result status for NPDM errors
+            // Map FileSys ResultStatus to Loader ResultStatus.
+            // Upstream: both share the same ResultStatus enum, so the mapping
+            // is identity. In Rust they are separate enums; map by name.
             let loader_status = match result {
-                PfsResultStatus::ErrorBadNCAHeader => ResultStatus::ErrorBadNPDMHeader,
+                PfsResultStatus::ErrorBadNPDMHeader => ResultStatus::ErrorBadNPDMHeader,
+                PfsResultStatus::ErrorBadACIDHeader => ResultStatus::ErrorBadACIDHeader,
+                PfsResultStatus::ErrorBadACIHeader => ResultStatus::ErrorBadACIHeader,
+                PfsResultStatus::ErrorBadFileAccessControl => ResultStatus::ErrorBadFileAccessControl,
+                PfsResultStatus::ErrorBadFileAccessHeader => ResultStatus::ErrorBadFileAccessHeader,
+                PfsResultStatus::ErrorBadKernelCapabilityDescriptors => {
+                    ResultStatus::ErrorBadKernelCapabilityDescriptors
+                }
                 _ => ResultStatus::ErrorBadNPDMHeader,
             };
             return (loader_status, None);
         }
 
-        // TODO: PatchManager::PatchExeFS when override_update is set
-        // TODO: Reload metadata after patching
+        // Upstream: PatchManager::PatchExeFS when override_update is set,
+        // then reload metadata from potentially-patched npdm.
+        // PatchManager is a separate subsystem; ExeFS patching is skipped.
 
         metadata.print();
         self.title_id = metadata.get_title_id();
@@ -301,18 +324,20 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
             &metadata,
             code_size,
             0, // aslr_space_start — upstream passes this from KProcess::Create
-            false, // is_hbl
+            self.is_hbl,
         );
         if process_setup_result != RESULT_SUCCESS.get_inner_value() {
-            return (ResultStatus::ErrorBadNPDMHeader, None);
+            return (ResultStatus::ErrorUnableToParseKernelMetadata, None);
         }
 
         // ====================================================================
         // Pass 2: Actual loading (load_into_process = true)
         // ====================================================================
         // Maps to upstream second loop with `LoadModule(..., true, ...)`.
+        // Upstream: `const VAddr base_address{GetInteger(process.GetEntryPoint())};`
         self.modules.clear();
-        let mut next_load_addr: u64 = code_base;
+        let base_address: u64 = process.get_entry_point().get();
+        let mut next_load_addr: u64 = base_address;
 
         for &module_name in STATIC_MODULES {
             let module_file = match dir.get_file(module_name) {

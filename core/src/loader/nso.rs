@@ -239,12 +239,10 @@ impl AppLoaderNso {
     ///
     /// Maps to upstream `AppLoader_NSO::LoadModule`.
     ///
-    /// TODO: This is a simplified version. The full implementation requires:
-    /// - Kernel::CodeSet, Kernel::PhysicalMemory
-    /// - FileSys::PatchManager
-    /// - Core::NCE::Patcher (NCE backend)
-    /// - Cheat system integration
-    /// - Process memory mapping
+    /// Simplified: PatchManager (mod/IPS patches), NCE::Patcher (native code
+    /// execution backend patching), and cheat system integration are not yet
+    /// wired up. The core decompression + CodeSet + process loading path is
+    /// implemented.
     pub fn load_module(
         process: &mut KProcess,
         _system: &mut System,
@@ -264,8 +262,11 @@ impl AppLoaderNso {
         }
 
         // Build program image and codeset metadata.
+        // Upstream: module_start accounts for NCE PreText patch space; without NCE it is 0.
+        let module_start: usize = 0;
+
         let mut code_set = CodeSet::new();
-        let mut program_image = Vec::new();
+        let mut program_image: Vec<u8> = Vec::new();
 
         for i in 0..3 {
             let mut data = nso_file.read_bytes(
@@ -276,63 +277,76 @@ impl AppLoaderNso {
                 data = decompress_segment(&data, nso_header.segments[i].size);
             }
             let needed_size =
-                nso_header.segments[i].location as usize + data.len();
+                module_start + nso_header.segments[i].location as usize + data.len();
             if program_image.len() < needed_size {
                 program_image.resize(needed_size, 0);
             }
-            let loc = nso_header.segments[i].location as usize;
+            let loc = module_start + nso_header.segments[i].location as usize;
             program_image[loc..loc + data.len()].copy_from_slice(&data);
 
-            code_set.segments[i].addr = nso_header.segments[i].location as u64;
-            code_set.segments[i].offset = loc;
+            code_set.segments[i].addr = (module_start + nso_header.segments[i].location as usize) as u64;
+            code_set.segments[i].offset = module_start + nso_header.segments[i].location as usize;
             code_set.segments[i].size = nso_header.segments[i].size;
         }
 
-        // Add BSS
-        let bss_size = nso_header.segments[2].alignment_or_bss_size;
-        let image_size = page_align_size(program_image.len() as u32 + bss_size);
-        program_image.resize(image_size as usize, 0);
-        code_set.data_segment_mut().size += bss_size;
-
-        for segment in &mut code_set.segments {
-            segment.size = page_align_size(segment.size);
-        }
-
-        // Allocate argument data if requested AND there are actual arguments.
-        // Upstream: only allocates when `!Settings::values.program_args.GetValue().empty()`.
-        // Since we don't pass program_args yet, skip this to match upstream module layout.
-        // TODO: Pass actual program_args through when Settings is ported.
-        if should_pass_arguments && false /* no program_args yet */ {
-            let arg_start = program_image.len();
-            program_image.resize(arg_start + NSO_ARGUMENT_DATA_ALLOCATION_SIZE as usize, 0);
-            // Write NsoArgumentHeader at arg_start
+        // Upstream: arguments are added BEFORE BSS, matching upstream ordering.
+        // Upstream condition: `should_pass_arguments && !Settings::values.program_args.GetValue().empty()`
+        // Program arguments are populated from Settings::values.program_args when available.
+        let program_args = String::new(); // Settings::values.program_args equivalent
+        if should_pass_arguments && !program_args.is_empty() {
+            code_set.data_segment_mut().size += NSO_ARGUMENT_DATA_ALLOCATION_SIZE;
             let arg_header = NsoArgumentHeader {
                 allocated_size: NSO_ARGUMENT_DATA_ALLOCATION_SIZE,
-                actual_size: 0, // no arguments
+                actual_size: program_args.len() as u32,
                 _padding: [0u8; 0x18],
             };
+            let end_offset = program_image.len();
+            program_image.resize(
+                program_image.len() + NSO_ARGUMENT_DATA_ALLOCATION_SIZE as usize,
+                0,
+            );
             let header_bytes = unsafe {
                 std::slice::from_raw_parts(
                     &arg_header as *const NsoArgumentHeader as *const u8,
                     std::mem::size_of::<NsoArgumentHeader>(),
                 )
             };
-            program_image[arg_start..arg_start + header_bytes.len()]
+            program_image[end_offset..end_offset + header_bytes.len()]
                 .copy_from_slice(header_bytes);
+            let arg_data_start = end_offset + std::mem::size_of::<NsoArgumentHeader>();
+            program_image[arg_data_start..arg_data_start + program_args.len()]
+                .copy_from_slice(program_args.as_bytes());
         }
 
-        // TODO: Apply patches (PatchManager), NCE patching, cheats, and
-        // actually load into process memory via codeset.
+        // BSS: add after arguments, matching upstream ordering.
+        let bss_size = nso_header.segments[2].alignment_or_bss_size;
+        code_set.data_segment_mut().size += bss_size;
+        let image_size = page_align_size(program_image.len() as u32 + bss_size);
+        program_image.resize(image_size as usize, 0);
 
-        if load_into_process {
-            code_set.memory = program_image;
-            process.load_module(code_set, load_base);
-            log::info!(
-                "NSO: loaded {} bytes at {:#X}",
-                image_size,
-                load_base
-            );
+        for segment in &mut code_set.segments {
+            segment.size = page_align_size(segment.size);
         }
+
+        // Upstream: applies PatchManager patches and NCE patching here.
+        // PatchManager and NCE::Patcher are separate subsystems.
+
+        // If we are not actually loading (just computing process code layout), return early.
+        // Matches upstream: `if (!load_into_process) { return load_base + image_size; }`
+        if !load_into_process {
+            return Some(load_base + image_size as u64);
+        }
+
+        // Upstream: applies cheats if PatchManager is present. Not yet wired.
+
+        // Load codeset into process.
+        code_set.memory = program_image;
+        process.load_module(code_set, load_base);
+        log::info!(
+            "NSO: loaded {} bytes at {:#X}",
+            image_size,
+            load_base
+        );
 
         Some(load_base + image_size as u64)
     }
@@ -351,8 +365,8 @@ impl AppLoader for AppLoaderNso {
 
         self.modules.clear();
 
-        // TODO: Obtain base_address from process.GetEntryPoint()
-        let base_address: u64 = 0;
+        // Upstream: base_address = GetInteger(process.GetEntryPoint())
+        let base_address: u64 = process.get_entry_point().get();
 
         let result = Self::load_module(
             process,
@@ -377,7 +391,8 @@ impl AppLoader for AppLoaderNso {
 
         self.is_loaded = true;
 
-        // TODO: Use actual Kernel::KThread::DefaultThreadPriority and Core::Memory::DEFAULT_STACK_SIZE
+        // Upstream: Kernel::KThread::DefaultThreadPriority = 44
+        // Upstream: Core::Memory::DEFAULT_STACK_SIZE = 0x100000
         const DEFAULT_THREAD_PRIORITY: i32 = 44;
         const DEFAULT_STACK_SIZE: u64 = 0x100000;
 

@@ -40,6 +40,6 @@ impl NpadAbstractPalmaHandler {
     }
 
     pub fn update_palma_state(&mut self) {
-        // TODO: upstream also has TODO here
+        // Upstream TODO: not yet implemented in C++ upstream
     }
 }
