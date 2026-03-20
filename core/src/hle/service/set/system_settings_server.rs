@@ -758,7 +758,10 @@ pub fn get_firmware_version_impl(
 /// Holds ISystemSettingsServer behind a Mutex for interior mutability
 /// (handlers receive &dyn ServiceFramework, not &mut self).
 pub struct SystemSettingsService {
-    inner: Mutex<ISystemSettingsServer>,
+    /// Inner settings state. Public for direct service-to-service access,
+    /// matching upstream where services call methods directly on handler objects
+    /// via ServiceManager::GetService<T>().
+    pub inner: Mutex<ISystemSettingsServer>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -1115,6 +1118,7 @@ impl SessionRequestHandler for SystemSettingsService {
     fn service_name(&self) -> &str {
         ServiceFramework::get_service_name(self)
     }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 impl ServiceFramework for SystemSettingsService {

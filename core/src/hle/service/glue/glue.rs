@@ -59,6 +59,15 @@ pub fn loop_process(
     register_stub(&mut server_manager, "notif:a");
     register_stub(&mut server_manager, "notif:s");
 
+    // Create the Glue::Time::TimeManager, matching upstream constructor.
+    // This makes direct calls to time:m and set:sys via ServiceManager.
+    {
+        use crate::hle::service::glue::time::manager::TimeManager;
+        let mut time_manager = TimeManager::new(service_manager.clone());
+        time_manager.initialize();
+        log::info!("Glue::LoopProcess: TimeManager initialized");
+    }
+
     // Time services — upstream creates a shared TimeManager and passes it
     // to each StaticService instance.
     {

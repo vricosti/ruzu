@@ -193,9 +193,33 @@ impl ServiceManager {
 
     /// Gets a service handler by name, invoking the factory.
     ///
-    /// Matches upstream `ServiceManager::GetService<T>(const std::string& name, bool block)`.
+    /// Matches upstream `ServiceManager::GetService<T>(const std::string& name, bool block)`
+    /// with `block=false`.
     pub fn get_service(&self, name: &str) -> Option<SessionRequestHandlerPtr> {
         self.registered_services.get(name).map(|factory| factory())
+    }
+
+    /// Gets a service handler by name, blocking until registered.
+    ///
+    /// Matches upstream `ServiceManager::GetService<T>(name, true)` which polls
+    /// every 100ms until the service appears.
+    /// Returns None only if timeout expires.
+    pub fn get_service_blocking(
+        sm: &Arc<std::sync::Mutex<Self>>,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Option<SessionRequestHandlerPtr> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(handler) = sm.lock().unwrap().get_service(name) {
+                return Some(handler);
+            }
+            if start.elapsed() >= timeout {
+                log::error!("ServiceManager::get_service_blocking: timeout waiting for '{}'", name);
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 }
 

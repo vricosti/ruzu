@@ -389,7 +389,18 @@ impl Services {
 
     fn loop_process_psc(sm: &Arc<Mutex<ServiceManager>>) {
         let mut server_manager = ServerManager::new(sm.clone());
+        // psc:c, psc:m as stubs
         register_stub_services(&mut server_manager, &["psc:c", "psc:m"]);
+        // time:m — real PSC::Time::ServiceManager
+        server_manager.register_named_service(
+            "time:m",
+            Box::new(|| -> Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> {
+                Arc::new(super::psc::time::service_manager::TimeServiceManager::new())
+            }),
+            64,
+        );
+        // time:su, time:al as stubs for now
+        register_stub_services(&mut server_manager, &["time:su", "time:al"]);
         ServerManager::run_server(server_manager);
     }
 
