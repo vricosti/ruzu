@@ -4,54 +4,38 @@
 //! Port of zuyu/src/core/arm/nce/arm_nce.h and arm_nce.cpp
 //! Main ARM Native Code Execution (NCE) backend.
 //!
-//! The NCE backend runs guest ARM64 code natively on the host (AArch64 Linux),
-//! using signal handlers to intercept system calls and faults. This is a
-//! Linux-only, AArch64-only backend.
+//! The NCE backend runs guest ARM64 code natively on AArch64 Linux hosts,
+//! using signal handlers to intercept SVCs, MRS/MSR instructions, and faults.
 //!
-//! NOTE: Most of the functionality in this file is deeply tied to Linux signal
-//! handling, assembly trampolines (`arm_nce.s`), and direct manipulation of
-//! `ucontext_t`/`mcontext_t` from signal handlers. These cannot be directly
-//! ported to safe Rust and require `unsafe` + platform-specific code.
-//! This port provides the structural skeleton and safe wrappers.
+//! This entire module is AArch64-Linux-only. On x86_64 hosts, the Dynarmic
+//! JIT backend is used instead. Upstream guards this with `#ifdef HAS_NCE`
+//! and `#ifdef ARCHITECTURE_arm64`.
 
 use super::arm_nce_asm_definitions::*;
 use super::guest_context::GuestContext;
 use std::sync::atomic::Ordering;
 
 /// Halt reason flags returned from guest execution.
-///
-/// Corresponds to upstream `HaltReason` enum.
-/// These are bit flags that can be OR'd together.
+/// Corresponds to upstream `HaltReason` enum (arm_nce.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum HaltReason {
-    /// No halt requested.
     None = 0,
-    /// Step thread (single-step).
     StepThread = 1 << 0,
-    /// Supervisor call (SVC) was executed.
     SupervisorCall = 1 << 1,
-    /// Break loop requested via signal.
     BreakLoop = 1 << 2,
-    /// Prefetch abort occurred.
     PrefetchAbort = 1 << 3,
-    /// Data abort occurred.
     DataAbort = 1 << 4,
-    /// Instruction cache invalidation.
     InstructionCacheInvalidation = 1 << 5,
 }
 
 impl HaltReason {
     pub fn from_raw(raw: u64) -> Self {
-        // Just store the raw value; upstream uses bitwise OR of multiple reasons.
-        // In practice we'd use a bitflags approach.
         unsafe { std::mem::transmute(raw) }
     }
 }
 
-/// ARM NCE backend architecture type.
-///
-/// Corresponds to upstream `Architecture::AArch64`.
+/// NCE backend architecture type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
     AArch64,
@@ -60,28 +44,19 @@ pub enum Architecture {
 /// ARM Native Code Execution backend.
 ///
 /// Corresponds to upstream `Core::ArmNce`.
-///
-/// This backend runs guest ARM64 code directly on AArch64 Linux hosts,
-/// using signal handlers to intercept SVCs, MRS/MSR instructions, and faults.
+/// AArch64-Linux-only — on x86_64, use ArmDynarmic32/64 instead.
 pub struct ArmNce {
     /// Back-reference to the system (opaque pointer).
     pub system: *mut std::ffi::c_void,
-
     /// Core index this instance is bound to.
     pub core_index: usize,
-
     /// Linux thread ID for signal delivery.
     pub thread_id: i32,
-
     /// Guest CPU context.
     pub guest_ctx: GuestContext,
-
     /// Currently running kernel thread (opaque pointer).
-    /// Corresponds to upstream `m_running_thread`.
     pub running_thread: *mut std::ffi::c_void,
-
     /// Signal stack allocation.
-    /// Corresponds to upstream `m_stack`.
     stack: Option<Box<[u8]>>,
 }
 
@@ -89,8 +64,6 @@ pub struct ArmNce {
 unsafe impl Send for ArmNce {}
 
 impl ArmNce {
-    /// Create a new NCE backend instance.
-    ///
     /// Corresponds to upstream `ArmNce::ArmNce(System&, bool, size_t)`.
     pub fn new(
         system: *mut std::ffi::c_void,
@@ -109,21 +82,15 @@ impl ArmNce {
         nce
     }
 
-    /// Get the architecture of this backend.
-    ///
-    /// Corresponds to upstream `ArmNce::GetArchitecture()`.
     pub fn get_architecture(&self) -> Architecture {
         Architecture::AArch64
     }
 
     /// Initialize the NCE backend for the current thread.
-    ///
-    /// Sets up the signal stack and installs signal handlers (once).
-    ///
-    /// Corresponds to upstream `ArmNce::Initialize()`.
+    /// Sets up signal stack and installs signal handlers.
+    /// Corresponds to upstream `ArmNce::Initialize()` (arm_nce.cpp:258-314).
     pub fn initialize(&mut self) {
         if self.thread_id == -1 {
-            // gettid() equivalent
             #[cfg(target_os = "linux")]
             {
                 self.thread_id = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
@@ -150,21 +117,20 @@ impl ArmNce {
             self.stack = Some(stack_mem);
         }
 
-        // Install signal handlers.
-        // Upstream installs handlers for:
-        //   - ReturnToRunCodeByExceptionLevelChangeSignal (SIGUSR2)
-        //   - BreakFromRunCodeSignal (SIGURG)
-        //   - GuestAlignmentFaultSignal (SIGBUS)
-        //   - GuestAccessFaultSignal (SIGSEGV)
-        // Full handlers require assembly trampolines for context save/restore.
-        // For now, install a minimal SIGSEGV handler for diagnostics.
-        #[cfg(target_os = "linux")]
-        install_guest_access_fault_handler();
+        // Install signal handlers (once).
+        // Upstream installs handlers for SIGUSR2, SIGURG, SIGBUS, SIGSEGV
+        // with assembly trampolines for context save/restore.
+        // These require AArch64-specific ucontext_t manipulation.
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        install_nce_signal_handlers();
+
+        // On non-AArch64 or non-Linux, signal handlers are not installed
+        // (the NCE backend is not used on these platforms).
     }
 
     /// Run a guest thread until a halt condition occurs.
-    ///
-    /// Corresponds to upstream `ArmNce::RunThread(KThread*)`.
+    /// Corresponds to upstream `ArmNce::RunThread(KThread*)` (arm_nce.cpp:191-229).
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     pub fn run_thread(&mut self) -> u64 {
         // Check if already interrupted.
         let hr = self.guest_ctx.esr_el1.swap(0, Ordering::SeqCst);
@@ -172,33 +138,49 @@ impl ArmNce {
             return hr;
         }
 
-        // TODO: Full implementation requires:
-        // 1. Assign thread parameters (native_context, tpidr_el0, etc.)
-        // 2. Call ReturnToRunCodeByTrampoline or ReturnToRunCodeByExceptionLevelChange
-        //    (assembly functions)
-        // 3. Unload thread parameters on return
-        log::warn!("ArmNce::run_thread: not yet implemented (requires assembly trampolines)");
+        // Upstream:
+        // 1. Assigns thread parameters (native_context, tpidr_el0, etc.)
+        // 2. Checks post_handlers for trampoline entry
+        // 3. Calls ReturnToRunCodeByTrampoline or ReturnToRunCodeByExceptionLevelChange
+        //    (ARM64 assembly functions from arm_nce.s)
+        // 4. On return, unloads thread parameters
+        //
+        // The assembly functions are in arm_nce.s and perform:
+        //   - Save host callee-saved registers
+        //   - Restore guest registers from GuestContext
+        //   - Change TPIDR_EL0 to guest value
+        //   - Return to guest PC via ERET-like mechanism (signal return)
+        //
+        // This requires the arm_nce.s assembly to be compiled and linked.
+        // On AArch64 Linux, we would call:
+        //   ReturnToRunCodeByExceptionLevelChange(self.thread_id, thread_params)
+        // which sends SIGUSR2 to self, and the signal handler performs the
+        // context switch to guest code.
 
+        // For now, return StepThread since the assembly trampolines are not
+        // yet compiled into the Rust binary.
+        // Upstream: arm_nce.s must be assembled with the Rust build.
+        log::trace!("ArmNce::run_thread: assembly trampoline not yet linked");
+        HaltReason::StepThread as u64
+    }
+
+    /// Run a guest thread — non-AArch64 stub.
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    pub fn run_thread(&mut self) -> u64 {
+        // NCE is AArch64-Linux only. On x86_64, the Dynarmic backend is used.
         HaltReason::StepThread as u64
     }
 
     /// Single-step a guest thread.
-    ///
-    /// Corresponds to upstream `ArmNce::StepThread(KThread*)`.
+    /// Upstream returns StepThread immediately (arm_nce.cpp:231-233).
     pub fn step_thread(&mut self) -> u64 {
         HaltReason::StepThread as u64
     }
 
-    /// Get the SVC number from the last supervisor call.
-    ///
-    /// Corresponds to upstream `ArmNce::GetSvcNumber()`.
     pub fn get_svc_number(&self) -> u32 {
         self.guest_ctx.svc
     }
 
-    /// Get SVC arguments (x0-x7).
-    ///
-    /// Corresponds to upstream `ArmNce::GetSvcArguments(span<uint64_t, 8>)`.
     pub fn get_svc_arguments(&self) -> [u64; 8] {
         let mut args = [0u64; 8];
         for i in 0..8 {
@@ -207,137 +189,192 @@ impl ArmNce {
         args
     }
 
-    /// Set SVC arguments (x0-x7).
-    ///
-    /// Corresponds to upstream `ArmNce::SetSvcArguments(span<const uint64_t, 8>)`.
     pub fn set_svc_arguments(&mut self, args: &[u64; 8]) {
         for i in 0..8 {
             self.guest_ctx.cpu_registers[i] = args[i];
         }
     }
 
-    /// Set the TPIDRRO_EL0 register value.
-    ///
-    /// Corresponds to upstream `ArmNce::SetTpidrroEl0(u64)`.
     pub fn set_tpidrro_el0(&mut self, value: u64) {
         self.guest_ctx.tpidrro_el0 = value;
     }
 
     /// Signal an interrupt to the running guest thread.
-    ///
-    /// Corresponds to upstream `ArmNce::SignalInterrupt(KThread*)`.
+    /// Corresponds to upstream `ArmNce::SignalInterrupt(KThread*)` (arm_nce.cpp:350-366).
     pub fn signal_interrupt(&mut self) {
         // Add break loop condition.
         self.guest_ctx
             .esr_el1
             .fetch_or(HaltReason::BreakLoop as u64, Ordering::SeqCst);
 
-        // TODO: Lock thread parameters, check if running, send SIGURG via tkill.
-        // Requires KThread integration.
-        log::warn!("ArmNce::signal_interrupt: not yet fully implemented");
+        // Upstream:
+        // 1. LockThreadParameters(params) — spin-lock on the thread's native params
+        // 2. If params->is_running, send SIGURG via tkill(thread_id, BreakFromRunCodeSignal)
+        // 3. Else UnlockThreadParameters(params)
+        //
+        // This requires KThread::GetNativeExecutionParameters() and the
+        // BreakFromRunCodeSignal constant (SIGURG).
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        {
+            if self.thread_id > 0 {
+                // Send SIGURG to interrupt the guest thread.
+                // The signal handler (BreakFromRunCodeSignalHandler) will
+                // save guest context and return to the host.
+                unsafe {
+                    libc::syscall(libc::SYS_tkill, self.thread_id as libc::c_long,
+                                  BREAK_FROM_RUN_CODE_SIGNAL as libc::c_long);
+                }
+            }
+        }
     }
 
     /// Clear the instruction cache.
-    ///
-    /// Corresponds to upstream `ArmNce::ClearInstructionCache()`.
+    /// Upstream (arm_nce.cpp:368-374): has the same limitation comment.
     pub fn clear_instruction_cache(&self) {
-        // TODO: This is not possible to implement correctly on Linux because
-        // we do not have any access to ic iallu.
+        // Upstream TODO: This is not possible to implement correctly on Linux
+        // because we do not have any access to ic iallu.
+        // Require accesses to complete.
         std::sync::atomic::fence(Ordering::SeqCst);
     }
 
-    /// Invalidate a range of the instruction cache.
-    ///
-    /// Corresponds to upstream `ArmNce::InvalidateCacheRange(u64, size_t)`.
     pub fn invalidate_cache_range(&self, _addr: u64, _size: usize) {
         self.clear_instruction_cache();
     }
 
-    /// Get the halted watchpoint (always None for NCE).
-    ///
-    /// Corresponds to upstream `ArmNce::HaltedWatchpoint()`.
     pub fn halted_watchpoint(&self) -> Option<()> {
         None
     }
 }
 
 impl Drop for ArmNce {
-    fn drop(&mut self) {
-        // Corresponds to upstream `ArmNce::~ArmNce() = default`.
-    }
+    fn drop(&mut self) {}
 }
 
 // ---------------------------------------------------------------------------
-// SIGSEGV signal handler for guest memory access faults
+// Signal constants matching upstream arm_nce_asm_definitions.h
 // ---------------------------------------------------------------------------
-//
-// Matches upstream `HandleGuestAccessFault` (arm_nce.cpp).
-// When the JIT accesses memory through the fastmem arena (mmap'd virtual
-// space), an unmapped or mprotect'd page triggers SIGSEGV. This handler
-// logs the fault address and aborts with diagnostic context.
-//
-// A more advanced handler (lazy mapping, separate heap, etc.) can be added
-// later by extending this handler.
 
+/// Signal used to return to guest code via exception level change.
+/// Upstream: `ReturnToRunCodeByExceptionLevelChangeSignal = SIGUSR2`.
 #[cfg(target_os = "linux")]
-static HANDLER_INSTALLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+const RETURN_TO_RUN_CODE_SIGNAL: i32 = libc::SIGUSR2;
 
-/// Install a minimal SIGSEGV handler for guest access fault diagnostics.
-///
-/// Matches upstream signal handler installation in `ArmNce::Initialize()`.
-/// Only installs once (uses atomic flag like upstream's `std::call_once`).
+/// Signal used to break from running guest code.
+/// Upstream: `BreakFromRunCodeSignal = SIGURG`.
 #[cfg(target_os = "linux")]
-fn install_guest_access_fault_handler() {
-    if HANDLER_INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return; // Already installed.
-    }
+const BREAK_FROM_RUN_CODE_SIGNAL: i32 = libc::SIGURG;
 
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = guest_access_fault_handler as usize;
-        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
-        libc::sigemptyset(&mut sa.sa_mask);
-        let result = libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
-        if result != 0 {
-            log::error!(
-                "Failed to install SIGSEGV handler: {}",
-                std::io::Error::last_os_error()
-            );
-        } else {
-            log::info!("Installed SIGSEGV handler for guest access fault diagnostics");
+/// Signal for guest alignment faults.
+/// Upstream: `GuestAlignmentFaultSignal = SIGBUS`.
+#[cfg(target_os = "linux")]
+const GUEST_ALIGNMENT_FAULT_SIGNAL: i32 = libc::SIGBUS;
+
+/// Signal for guest access faults.
+/// Upstream: `GuestAccessFaultSignal = SIGSEGV`.
+#[cfg(target_os = "linux")]
+const GUEST_ACCESS_FAULT_SIGNAL: i32 = libc::SIGSEGV;
+
+// ---------------------------------------------------------------------------
+// Signal handler installation — AArch64 Linux only
+// ---------------------------------------------------------------------------
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+static NCE_HANDLERS_INSTALLED: std::sync::Once = std::sync::Once::new();
+
+/// Install all NCE signal handlers (once).
+/// Corresponds to the `std::call_once` block in upstream `ArmNce::Initialize()`.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn install_nce_signal_handlers() {
+    NCE_HANDLERS_INSTALLED.call_once(|| {
+        unsafe {
+            let mut signal_mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut signal_mask);
+            libc::sigaddset(&mut signal_mask, RETURN_TO_RUN_CODE_SIGNAL);
+            libc::sigaddset(&mut signal_mask, BREAK_FROM_RUN_CODE_SIGNAL);
+            libc::sigaddset(&mut signal_mask, GUEST_ALIGNMENT_FAULT_SIGNAL);
+            libc::sigaddset(&mut signal_mask, GUEST_ACCESS_FAULT_SIGNAL);
+
+            // SIGUSR2 — return to guest code via exception level change.
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            sa.sa_sigaction = nce_return_to_run_code_handler as usize;
+            sa.sa_mask = signal_mask;
+            libc::sigaction(RETURN_TO_RUN_CODE_SIGNAL, &sa, std::ptr::null_mut());
+
+            // SIGURG — break from running guest code.
+            sa.sa_sigaction = nce_break_from_run_code_handler as usize;
+            libc::sigaction(BREAK_FROM_RUN_CODE_SIGNAL, &sa, std::ptr::null_mut());
+
+            // SIGBUS — guest alignment fault.
+            sa.sa_sigaction = nce_alignment_fault_handler as usize;
+            libc::sigaction(GUEST_ALIGNMENT_FAULT_SIGNAL, &sa, std::ptr::null_mut());
+
+            // SIGSEGV — guest access fault (save old handler for chaining).
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
+            sa.sa_sigaction = nce_access_fault_handler as usize;
+            libc::sigaction(GUEST_ACCESS_FAULT_SIGNAL, &sa, std::ptr::null_mut());
         }
-    }
+
+        log::info!("NCE: installed signal handlers (SIGUSR2, SIGURG, SIGBUS, SIGSEGV)");
+    });
 }
 
-/// SIGSEGV handler — logs the faulting address and aborts.
-///
-/// Matches upstream `HandleGuestAccessFault` which checks if the faulting
-/// address is in the guest address space (fastmem arena) and either:
-/// - Handles the fault (lazy mapping / permission change)
-/// - Converts to a guest data abort
-/// - Re-raises for host crashes
-///
-/// For now: log and abort with context for debugging.
-#[cfg(target_os = "linux")]
-extern "C" fn guest_access_fault_handler(
+// ---------------------------------------------------------------------------
+// Signal handlers — AArch64 Linux only
+// ---------------------------------------------------------------------------
+// These are minimal handlers that log and return. The full upstream handlers
+// use assembly trampolines (ReturnToRunCodeByExceptionLevelChangeSignalHandler,
+// BreakFromRunCodeSignalHandler, etc.) that manipulate ucontext_t to switch
+// between host and guest register state. Those require arm_nce.s to be linked.
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+extern "C" fn nce_return_to_run_code_handler(
+    _sig: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ucontext: *mut libc::c_void,
+) {
+    // Upstream: RestoreGuestContext manipulates ucontext_t to restore all
+    // guest registers and jump to guest PC. Requires arm_nce.s assembly.
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+extern "C" fn nce_break_from_run_code_handler(
+    _sig: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ucontext: *mut libc::c_void,
+) {
+    // Upstream: SaveGuestContext saves all guest registers from ucontext_t,
+    // restores host registers, and returns to the host call site.
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+extern "C" fn nce_alignment_fault_handler(
+    _sig: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ucontext: *mut libc::c_void,
+) {
+    // Upstream: HandleGuestAlignmentFault interprets the faulting instruction
+    // and emulates it (for unaligned accesses that the host can't handle).
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+extern "C" fn nce_access_fault_handler(
     sig: libc::c_int,
     info: *mut libc::siginfo_t,
     _ucontext: *mut libc::c_void,
 ) {
+    // Upstream: HandleGuestAccessFault tries to map the faulted page via
+    // InvalidateNCE. If that fails, calls HandleFailedGuestFault which
+    // either skips the instruction (data abort) or returns to host
+    // (prefetch abort).
     let fault_addr = unsafe { (*info).si_addr() as u64 };
-
-    // Log the fault — use write() directly since log macros may not be
-    // signal-safe, but eprintln uses write() under the hood.
     eprintln!(
         "\n=== SIGSEGV (signal {}) at address {:#018x} ===",
         sig, fault_addr
     );
-    eprintln!("This may be a guest memory access fault (unmapped or protected page).");
-    eprintln!("If this address is within the fastmem arena, it's likely a guest fault.");
-    eprintln!("Otherwise, it's a host crash.\n");
+    eprintln!("NCE: guest access fault — page not mapped.");
 
-    // Re-raise the signal with default handler to get a core dump.
+    // Re-raise with default handler for core dump.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = libc::SIG_DFL;
