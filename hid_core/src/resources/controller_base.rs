@@ -3,12 +3,14 @@
 
 //! Port of hid_core/resources/controller_base.h and controller_base.cpp
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use common::ResultCode;
 
+use crate::hid_core::HIDCore;
 use crate::resources::applet_resource::AppletResource;
-use crate::resources::shared_memory_format::SharedMemoryFormat;
 
 /// Shared controller activation state and resource references.
 ///
@@ -19,15 +21,19 @@ use crate::resources::shared_memory_format::SharedMemoryFormat;
 ///   - hid_core: HIDCore&
 ///
 /// In Rust, each concrete controller embeds a ControllerActivation to hold
-/// the activation flag and optional shared resource references.
+/// the activation flag and resource references.
 pub struct ControllerActivation {
     pub is_activated: bool,
+    pub applet_resource: Option<Arc<Mutex<AppletResource>>>,
+    pub hid_core: Option<Arc<Mutex<HIDCore>>>,
 }
 
 impl ControllerActivation {
     pub fn new() -> Self {
         Self {
             is_activated: false,
+            applet_resource: None,
+            hid_core: None,
         }
     }
 
@@ -64,6 +70,19 @@ impl ControllerActivation {
     /// Port of ControllerBase::IsControllerActivated().
     pub fn is_controller_activated(&self) -> bool {
         self.is_activated
+    }
+
+    /// Port of ControllerBase::SetAppletResource.
+    pub fn set_applet_resource(
+        &mut self,
+        resource: Arc<Mutex<AppletResource>>,
+    ) {
+        self.applet_resource = Some(resource);
+    }
+
+    /// Set the HIDCore reference.
+    pub fn set_hid_core(&mut self, hid_core: Arc<Mutex<HIDCore>>) {
+        self.hid_core = Some(hid_core);
     }
 }
 

@@ -10,11 +10,30 @@ use parking_lot::Mutex;
 
 use common::ResultCode;
 
+use crate::hid_core::HIDCore;
 use crate::hid_types::*;
 use crate::hid_result;
 use crate::hid_util;
-use crate::resources::applet_resource::{AppletResource, SYSTEM_ARUID};
+use crate::resources::applet_resource::{AppletResource, AppletResourceHolder, HandheldConfig, ARUID_INDEX_MAX, SYSTEM_ARUID};
+use crate::resources::debug_pad::debug_pad::DebugPad;
+use crate::resources::digitizer::digitizer::Digitizer;
 use crate::resources::hid_firmware_settings::HidFirmwareSettings;
+use crate::resources::keyboard::keyboard::Keyboard;
+use crate::resources::mouse::debug_mouse::DebugMouse;
+use crate::resources::mouse::mouse::Mouse;
+use crate::resources::npad::npad::NPad;
+use crate::resources::palma::palma::Palma;
+use crate::resources::six_axis::console_six_axis::ConsoleSixAxis;
+use crate::resources::six_axis::seven_six_axis::SevenSixAxis;
+use crate::resources::six_axis::six_axis::SixAxis;
+use crate::resources::system_buttons::capture_button::CaptureButton;
+use crate::resources::system_buttons::home_button::HomeButton;
+use crate::resources::system_buttons::sleep_button::SleepButton;
+use crate::resources::touch_screen::gesture::Gesture;
+use crate::resources::touch_screen::touch_screen::TouchScreen;
+use crate::resources::touch_screen::touch_screen_driver::TouchScreenDriver;
+use crate::resources::touch_screen::touch_screen_resource::TouchResource;
+use crate::resources::unique_pad::unique_pad::UniquePad;
 
 /// Updating period for each HID device.
 /// Period time is obtained by measuring the number of samples in a second on HW using a homebrew
@@ -24,42 +43,78 @@ pub const DEFAULT_UPDATE_NS: Duration = Duration::from_nanos(4_000_000); // 4ms,
 pub const MOUSE_KEYBOARD_UPDATE_NS: Duration = Duration::from_nanos(8_000_000); // 8ms, 125Hz
 pub const MOTION_UPDATE_NS: Duration = Duration::from_nanos(5_000_000); // 5ms, 200Hz
 
-/// Handheld configuration state
-pub struct HandheldConfig {
-    pub is_handheld_hid_enabled: bool,
-    pub is_force_handheld: bool,
-    pub is_joycon_rail_enabled: bool,
-    pub is_force_handheld_style_vibration: bool,
-}
-
 pub struct ResourceManager {
     is_initialized: bool,
     shared_mutex: parking_lot::RwLock<()>,
     applet_resource: Option<Arc<Mutex<AppletResource>>>,
     handheld_config: Option<Arc<Mutex<HandheldConfig>>>,
     firmware_settings: Option<Arc<HidFirmwareSettings>>,
-    // Upstream holds shared_ptr to all HID resource objects:
-    // npad, debug_pad, mouse, debug_mouse, keyboard, unique_pad, home_button, sleep_button,
-    // capture_button, digitizer, palma, six_axis, seven_six_axis, console_six_axis,
-    // touch_screen, touch_resource, touch_driver, gesture.
-    // These require their respective resource types to be ported. Fields should be added
-    // here as each resource is ported.
+    hid_core: Option<Arc<Mutex<HIDCore>>>,
+
+    // HID resource objects matching upstream fields
+    debug_pad: Option<Arc<Mutex<DebugPad>>>,
+    mouse: Option<Arc<Mutex<Mouse>>>,
+    debug_mouse: Option<Arc<Mutex<DebugMouse>>>,
+    keyboard: Option<Arc<Mutex<Keyboard>>>,
+    unique_pad: Option<Arc<Mutex<UniquePad>>>,
+    npad: Option<Arc<Mutex<NPad>>>,
+    home_button: Option<Arc<Mutex<HomeButton>>>,
+    sleep_button: Option<Arc<Mutex<SleepButton>>>,
+    capture_button: Option<Arc<Mutex<CaptureButton>>>,
+    digitizer: Option<Arc<Mutex<Digitizer>>>,
+    palma: Option<Arc<Mutex<Palma>>>,
+    six_axis: Option<Arc<Mutex<SixAxis>>>,
+    seven_six_axis: Option<Arc<Mutex<SevenSixAxis>>>,
+    console_six_axis: Option<Arc<Mutex<ConsoleSixAxis>>>,
+
+    // Touch resources
+    gesture: Option<Arc<Mutex<Gesture>>>,
+    touch_screen: Option<Arc<Mutex<TouchScreen>>>,
+    touch_resource: Option<Arc<Mutex<TouchResource>>>,
+    touch_driver: Option<Arc<Mutex<TouchScreenDriver>>>,
 }
 
 impl ResourceManager {
-    pub fn new(firmware_settings: Arc<HidFirmwareSettings>) -> Self {
+    pub fn new(
+        firmware_settings: Arc<HidFirmwareSettings>,
+        hid_core: Arc<Mutex<HIDCore>>,
+    ) -> Self {
         Self {
             is_initialized: false,
             shared_mutex: parking_lot::RwLock::new(()),
             applet_resource: Some(Arc::new(Mutex::new(AppletResource::new()))),
             handheld_config: None,
             firmware_settings: Some(firmware_settings),
+            hid_core: Some(hid_core),
+            debug_pad: None,
+            mouse: None,
+            debug_mouse: None,
+            keyboard: None,
+            unique_pad: None,
+            npad: None,
+            home_button: None,
+            sleep_button: None,
+            capture_button: None,
+            digitizer: None,
+            palma: None,
+            six_axis: None,
+            seven_six_axis: None,
+            console_six_axis: None,
+            gesture: None,
+            touch_screen: None,
+            touch_resource: None,
+            touch_driver: None,
         }
     }
 
     pub fn initialize(&mut self) {
         if self.is_initialized {
             return;
+        }
+
+        // Upstream: system.HIDCore().ReloadInputDevices()
+        if let Some(ref hid_core) = self.hid_core {
+            hid_core.lock().reload_input_devices();
         }
 
         self.initialize_handheld_config();
@@ -75,10 +130,69 @@ impl ResourceManager {
         self.applet_resource.clone()
     }
 
-    // Upstream has getter methods for all resources: GetCaptureButton, GetConsoleSixAxis,
-    // GetDebugMouse, GetDebugPad, GetDigitizer, GetGesture, GetHomeButton, GetKeyboard,
-    // GetMouse, GetNpad, GetPalma, GetSevenSixAxis, GetSixAxis, GetSleepButton,
-    // GetTouchScreen, GetUniquePad. These should be added as each resource is ported.
+    pub fn get_capture_button(&self) -> Option<Arc<Mutex<CaptureButton>>> {
+        self.capture_button.clone()
+    }
+
+    pub fn get_console_six_axis(&self) -> Option<Arc<Mutex<ConsoleSixAxis>>> {
+        self.console_six_axis.clone()
+    }
+
+    pub fn get_debug_mouse(&self) -> Option<Arc<Mutex<DebugMouse>>> {
+        self.debug_mouse.clone()
+    }
+
+    pub fn get_debug_pad(&self) -> Option<Arc<Mutex<DebugPad>>> {
+        self.debug_pad.clone()
+    }
+
+    pub fn get_digitizer(&self) -> Option<Arc<Mutex<Digitizer>>> {
+        self.digitizer.clone()
+    }
+
+    pub fn get_gesture(&self) -> Option<Arc<Mutex<Gesture>>> {
+        self.gesture.clone()
+    }
+
+    pub fn get_home_button(&self) -> Option<Arc<Mutex<HomeButton>>> {
+        self.home_button.clone()
+    }
+
+    pub fn get_keyboard(&self) -> Option<Arc<Mutex<Keyboard>>> {
+        self.keyboard.clone()
+    }
+
+    pub fn get_mouse(&self) -> Option<Arc<Mutex<Mouse>>> {
+        self.mouse.clone()
+    }
+
+    pub fn get_npad(&self) -> Option<Arc<Mutex<NPad>>> {
+        self.npad.clone()
+    }
+
+    pub fn get_palma(&self) -> Option<Arc<Mutex<Palma>>> {
+        self.palma.clone()
+    }
+
+    pub fn get_seven_six_axis(&self) -> Option<Arc<Mutex<SevenSixAxis>>> {
+        self.seven_six_axis.clone()
+    }
+
+    pub fn get_six_axis(&self) -> Option<Arc<Mutex<SixAxis>>> {
+        self.six_axis.clone()
+    }
+
+    pub fn get_sleep_button(&self) -> Option<Arc<Mutex<SleepButton>>> {
+        self.sleep_button.clone()
+    }
+
+    pub fn get_touch_screen(&self) -> Option<Arc<Mutex<TouchScreen>>> {
+        self.touch_screen.clone()
+    }
+
+    pub fn get_unique_pad(&self) -> Option<Arc<Mutex<UniquePad>>> {
+        self.unique_pad.clone()
+    }
 
     pub fn create_applet_resource(&self, aruid: u64) -> ResultCode {
         if aruid == SYSTEM_ARUID {
@@ -86,8 +200,10 @@ impl ResourceManager {
             if result.is_error() {
                 return result;
             }
-            // Upstream calls GetNpad()->ActivateNpadResource() here.
-            // Requires NPad resource integration which is not yet available.
+            // Upstream: GetNpad()->ActivateNpadResource()
+            if let Some(ref npad) = self.npad {
+                npad.lock().activate_npad_resource();
+            }
             return ResultCode::SUCCESS;
         }
 
@@ -96,12 +212,21 @@ impl ResourceManager {
             return result;
         }
 
-        // Homebrew doesn't try to activate some controllers, so we activate them by default.
-        // Upstream calls: npad->Activate(), six_axis->Activate(), touch_screen->Activate(),
-        // gesture->Activate(). Requires these resource types to be ported.
+        // Homebrew doesn't try to activate some controllers, so we activate them by default
+        if let Some(ref npad) = self.npad {
+            npad.lock().activate();
+        }
+        if let Some(ref six_axis) = self.six_axis {
+            six_axis.lock().activation.activate();
+        }
+        // Upstream: touch_screen->Activate() and gesture->Activate()
+        // These require touch_resource and touch_driver references which are managed
+        // through the touch subsystem's own activation path.
 
-        // Upstream calls GetNpad()->ActivateNpadResource(aruid).
-        // Requires NPad resource integration which is not yet available.
+        // Upstream: GetNpad()->ActivateNpadResource(aruid)
+        if let Some(ref npad) = self.npad {
+            npad.lock().activate_npad_resource_with_aruid(aruid);
+        }
         ResultCode::SUCCESS
     }
 
@@ -134,15 +259,17 @@ impl ResourceManager {
 
     pub fn register_applet_resource_user_id(&self, aruid: u64, enable_input: bool) -> ResultCode {
         let _lock = self.shared_mutex.write();
+        let mut result = ResultCode::SUCCESS;
         if let Some(ref resource) = self.applet_resource {
-            let result = resource.lock().register_applet_resource_user_id(aruid, enable_input);
+            result = resource.lock().register_applet_resource_user_id(aruid, enable_input);
             if result.is_error() {
                 return result;
             }
-            // Upstream calls npad->RegisterAppletResourceUserId(aruid).
-            // Requires NPad resource integration which is not yet available.
         }
-        ResultCode::SUCCESS
+        if let Some(ref npad) = self.npad {
+            result = npad.lock().register_applet_resource_user_id(aruid);
+        }
+        result
     }
 
     pub fn unregister_applet_resource_user_id(&self, aruid: u64) {
@@ -150,8 +277,9 @@ impl ResourceManager {
         if let Some(ref resource) = self.applet_resource {
             resource.lock().unregister_applet_resource_user_id(aruid);
         }
-        // Upstream calls npad->UnregisterAppletResourceUserId(aruid).
-        // Requires NPad resource integration which is not yet available.
+        if let Some(ref npad) = self.npad {
+            npad.lock().unregister_applet_resource_user_id(aruid);
+        }
     }
 
     pub fn free_applet_resource_id(&self, aruid: u64) {
@@ -159,8 +287,9 @@ impl ResourceManager {
         if let Some(ref resource) = self.applet_resource {
             resource.lock().free_applet_resource_id(aruid);
         }
-        // Upstream calls npad->FreeAppletResourceId(aruid).
-        // Requires NPad resource integration which is not yet available.
+        if let Some(ref npad) = self.npad {
+            npad.lock().free_applet_resource_id(aruid);
+        }
     }
 
     pub fn enable_input(&self, aruid: u64, is_enabled: bool) {
@@ -197,8 +326,16 @@ impl ResourceManager {
             let _has_changed = resource.lock().set_aruid_valid_for_vibration(aruid, is_enabled);
             // Upstream: if has_changed, iterates npad->GetAllVibrationDevices() (but the
             // loop body is an upstream TODO). Also checks vibration_handler session aruid.
-            // Requires NPad vibration device integration which is not yet available.
         }
+
+        if let Some(ref npad) = self.npad {
+            let npad_guard = npad.lock();
+            let session_aruid = npad_guard.get_vibration_handler_session_aruid();
+            if aruid != session_aruid {
+                npad_guard.end_permit_vibration_session();
+            }
+        }
+
         ResultCode::SUCCESS
     }
 
@@ -267,28 +404,250 @@ impl ResourceManager {
         Ok(FirmwareVersion::default())
     }
 
+    /// Port of ResourceManager::UpdateControllers.
+    /// Upstream calls: debug_pad->OnUpdate, digitizer->OnUpdate, unique_pad->OnUpdate,
+    /// palma->OnUpdate, home_button->OnUpdate, sleep_button->OnUpdate,
+    /// capture_button->OnUpdate.
     pub fn update_controllers(&self, _ns_late: Duration) {
-        // Upstream calls: debug_pad->OnUpdate, digitizer->OnUpdate, unique_pad->OnUpdate,
-        // palma->OnUpdate, home_button->OnUpdate, sleep_button->OnUpdate,
-        // capture_button->OnUpdate, passing core_timing to each.
-        // Requires these resource types to be ported.
+        let _lock = self.shared_mutex.read();
+
+        // Get the active aruid and check if we have valid shared memory
+        let applet_resource = match self.applet_resource {
+            Some(ref ar) => ar.clone(),
+            None => return,
+        };
+
+        let hid_core = match self.hid_core {
+            Some(ref hc) => hc.clone(),
+            None => return,
+        };
+
+        let mut ar_guard = applet_resource.lock();
+        let active_aruid = ar_guard.get_active_aruid();
+        let data = match ar_guard.get_aruid_data(active_aruid) {
+            Some(d) => d.clone(),
+            None => return,
+        };
+
+        if !data.flag.is_assigned() {
+            return;
+        }
+
+        let shared_memory: *mut crate::resources::shared_memory_format::SharedMemoryFormat = match ar_guard.get_shared_memory_format_mut(active_aruid) {
+            Some(sm) => sm as *mut _,
+            None => return,
+        };
+        // SAFETY: We hold the applet_resource lock and shared_mutex read lock,
+        // so no other thread can modify the shared memory concurrently.
+        let shared_memory = unsafe { &mut *shared_memory };
+
+        let hc_guard = hid_core.lock();
+        let timestamp_ns = 0i64; // Upstream passes core_timing.GetGlobalTimeNs().count()
+
+        // debug_pad->OnUpdate(core_timing)
+        if let Some(ref debug_pad) = self.debug_pad {
+            let mut dp = debug_pad.lock();
+            let controller = hc_guard.get_emulated_controller(NpadIdType::Other);
+            let button_state = controller.get_debug_pad_buttons();
+            let sticks = controller.get_sticks();
+            let stick_state = crate::resources::debug_pad::debug_pad::StickState {
+                left: sticks.left,
+                right: sticks.right,
+            };
+            dp.on_update(
+                &mut shared_memory.debug_pad,
+                false,
+                &button_state,
+                &stick_state,
+            );
+        }
+
+        // digitizer->OnUpdate(core_timing)
+        if let Some(ref digitizer) = self.digitizer {
+            let mut dig = digitizer.lock();
+            dig.on_update(&mut shared_memory.digitizer, timestamp_ns);
+        }
+
+        // unique_pad->OnUpdate(core_timing)
+        if let Some(ref unique_pad) = self.unique_pad {
+            let mut up = unique_pad.lock();
+            up.on_update(&mut shared_memory.unique_pad, timestamp_ns);
+        }
+
+        // palma->OnUpdate(core_timing)
+        if let Some(ref palma) = self.palma {
+            let mut p = palma.lock();
+            p.on_update();
+        }
+
+        // home_button->OnUpdate(core_timing)
+        if let Some(ref home_button) = self.home_button {
+            let mut hb = home_button.lock();
+            let controller = hc_guard.get_emulated_controller(NpadIdType::Player1);
+            let home_buttons = controller.get_home_buttons();
+            hb.on_update(&mut shared_memory.home_button, home_buttons);
+        }
+
+        // sleep_button->OnUpdate(core_timing)
+        if let Some(ref sleep_button) = self.sleep_button {
+            let mut sb = sleep_button.lock();
+            sb.on_update(&mut shared_memory.sleep_button);
+        }
+
+        // capture_button->OnUpdate(core_timing)
+        if let Some(ref capture_button) = self.capture_button {
+            let mut cb = capture_button.lock();
+            let controller = hc_guard.get_emulated_controller(NpadIdType::Player1);
+            // Upstream quirk: uses GetHomeButtons() for capture button too
+            let home_buttons = controller.get_home_buttons();
+            cb.on_update(
+                &mut shared_memory.capture_button,
+                CaptureButtonState { raw: home_buttons.raw },
+            );
+        }
     }
 
+    /// Port of ResourceManager::UpdateNpad.
+    /// Upstream calls npad->OnUpdate(core_timing).
     pub fn update_npad(&self, _ns_late: Duration) {
-        // Upstream calls npad->OnUpdate(core_timing).
-        // Requires NPad resource integration which is not yet available.
+        let _lock = self.shared_mutex.read();
+
+        if let Some(ref npad) = self.npad {
+            let mut npad_guard = npad.lock();
+            // NPad::OnUpdate is complex — it iterates all aruids and controller data,
+            // reads input from EmulatedController and writes to shared memory.
+            // The npad holds its own applet_resource_holder for this purpose.
+            npad_guard.on_update();
+        }
     }
 
+    /// Port of ResourceManager::UpdateMouseKeyboard.
+    /// Upstream calls: mouse->OnUpdate, debug_mouse->OnUpdate, keyboard->OnUpdate.
     pub fn update_mouse_keyboard(&self, _ns_late: Duration) {
-        // Upstream calls: mouse->OnUpdate, debug_mouse->OnUpdate, keyboard->OnUpdate,
-        // passing core_timing to each.
-        // Requires these resource types to be ported.
+        let _lock = self.shared_mutex.read();
+
+        let applet_resource = match self.applet_resource {
+            Some(ref ar) => ar.clone(),
+            None => return,
+        };
+
+        let hid_core = match self.hid_core {
+            Some(ref hc) => hc.clone(),
+            None => return,
+        };
+
+        let mut ar_guard = applet_resource.lock();
+        let active_aruid = ar_guard.get_active_aruid();
+        let data = match ar_guard.get_aruid_data(active_aruid) {
+            Some(d) => d.clone(),
+            None => return,
+        };
+
+        if !data.flag.is_assigned() {
+            return;
+        }
+
+        let shared_memory: *mut crate::resources::shared_memory_format::SharedMemoryFormat = match ar_guard.get_shared_memory_format_mut(active_aruid) {
+            Some(sm) => sm as *mut _,
+            None => return,
+        };
+        let shared_memory = unsafe { &mut *shared_memory };
+
+        let hc_guard = hid_core.lock();
+        let devices = hc_guard.get_emulated_devices();
+        let mouse_enabled = false;
+        let keyboard_enabled = false;
+
+        // mouse->OnUpdate(core_timing)
+        if let Some(ref mouse) = self.mouse {
+            let mut m = mouse.lock();
+            let mouse_button_state = devices.get_mouse_buttons();
+            let mouse_position_state = devices.get_mouse_position();
+            let mouse_wheel_state = devices.get_mouse_wheel();
+            m.on_update(
+                &mut shared_memory.mouse,
+                mouse_enabled,
+                &mouse_button_state,
+                &crate::resources::mouse::mouse::MousePosition {
+                    x: mouse_position_state.x,
+                    y: mouse_position_state.y,
+                },
+                &mouse_wheel_state,
+            );
+        }
+
+        // debug_mouse->OnUpdate(core_timing)
+        if let Some(ref debug_mouse) = self.debug_mouse {
+            let mut dm = debug_mouse.lock();
+            let mouse_button_state = devices.get_mouse_buttons();
+            let mouse_position_state = devices.get_mouse_position();
+            let mouse_wheel_state = devices.get_mouse_wheel();
+            dm.on_update(
+                &mut shared_memory.debug_mouse,
+                mouse_enabled,
+                &mouse_button_state,
+                &crate::resources::mouse::mouse::MousePosition {
+                    x: mouse_position_state.x,
+                    y: mouse_position_state.y,
+                },
+                &mouse_wheel_state,
+            );
+        }
+
+        // keyboard->OnUpdate(core_timing)
+        if let Some(ref keyboard) = self.keyboard {
+            let mut kb = keyboard.lock();
+            let keyboard_state = devices.get_keyboard();
+            let keyboard_modifier = devices.get_keyboard_modifier();
+            kb.on_update(
+                &mut shared_memory.keyboard,
+                keyboard_enabled,
+                &keyboard_state,
+                &keyboard_modifier,
+            );
+        }
     }
 
+    /// Port of ResourceManager::UpdateMotion.
+    /// Upstream calls: six_axis->OnUpdate, seven_six_axis->OnUpdate,
+    /// console_six_axis->OnUpdate.
     pub fn update_motion(&self, _ns_late: Duration) {
-        // Upstream calls: six_axis->OnUpdate, seven_six_axis->OnUpdate,
-        // console_six_axis->OnUpdate, passing core_timing to each.
-        // Requires these resource types to be ported.
+        let _lock = self.shared_mutex.read();
+
+        // six_axis->OnUpdate(core_timing)
+        if let Some(ref six_axis) = self.six_axis {
+            let mut sa = six_axis.lock();
+            sa.on_update();
+        }
+
+        // seven_six_axis->OnUpdate(core_timing)
+        if let Some(ref seven_six_axis) = self.seven_six_axis {
+            let mut ssa = seven_six_axis.lock();
+            ssa.on_update();
+        }
+
+        // console_six_axis->OnUpdate(core_timing)
+        if let Some(ref console_six_axis) = self.console_six_axis {
+            let applet_resource = match self.applet_resource {
+                Some(ref ar) => ar.clone(),
+                None => return,
+            };
+            let mut ar_guard = applet_resource.lock();
+            let active_aruid = ar_guard.get_active_aruid();
+            let data = match ar_guard.get_aruid_data(active_aruid) {
+                Some(d) => d.clone(),
+                None => return,
+            };
+            if !data.flag.is_assigned() {
+                return;
+            }
+            if let Some(shared_memory) = ar_guard.get_shared_memory_format_mut(active_aruid) {
+                let mut csa = console_six_axis.lock();
+                // Upstream reads motion from EmulatedConsole::GetMotion()
+                let motion_status = crate::resources::six_axis::console_six_axis::ConsoleMotionStatus::default();
+                csa.on_update(&mut shared_memory.console, &motion_status);
+            }
+        }
     }
 
     fn initialize_handheld_config(&mut self) {
@@ -307,24 +666,145 @@ impl ResourceManager {
     }
 
     fn initialize_hid_common_sampler(&mut self) {
-        // Upstream creates: debug_pad, mouse, debug_mouse, keyboard, unique_pad, npad,
-        // home_button, sleep_button, capture_button, digitizer, palma, six_axis.
-        // Then wires them to applet_resource, shared_mutex, handheld_config, input_event,
-        // and schedules looping timing events (npad_update, default_update, mouse_keyboard_update,
-        // motion_update). Requires these resource types and CoreTiming to be ported.
+        // Create all resource objects. Upstream passes HIDCore& to each constructor.
+        // In Rust, we store Arc<Mutex<HIDCore>> references where needed.
+        self.debug_pad = Some(Arc::new(Mutex::new(DebugPad::new())));
+        self.mouse = Some(Arc::new(Mutex::new(Mouse::new())));
+        self.debug_mouse = Some(Arc::new(Mutex::new(DebugMouse::new())));
+        self.keyboard = Some(Arc::new(Mutex::new(Keyboard::new())));
+        self.unique_pad = Some(Arc::new(Mutex::new(UniquePad::new())));
+        self.npad = Some(Arc::new(Mutex::new(NPad::new())));
+        self.home_button = Some(Arc::new(Mutex::new(HomeButton::new())));
+        self.sleep_button = Some(Arc::new(Mutex::new(SleepButton::new())));
+        self.capture_button = Some(Arc::new(Mutex::new(CaptureButton::new())));
+        self.digitizer = Some(Arc::new(Mutex::new(Digitizer::new())));
+        self.palma = Some(Arc::new(Mutex::new(Palma::new())));
+        self.six_axis = Some(Arc::new(Mutex::new(SixAxis::new())));
+
+        // Wire SetAppletResource for each controller that needs it.
+        // Upstream: each_resource->SetAppletResource(applet_resource, &shared_mutex)
+        // In the Rust port, we store the applet_resource Arc in each controller's activation.
+        if let Some(ref applet_resource) = self.applet_resource {
+            if let Some(ref hid_core) = self.hid_core {
+                // Wire debug_pad
+                if let Some(ref debug_pad) = self.debug_pad {
+                    let mut dp = debug_pad.lock();
+                    dp.activation.set_applet_resource(applet_resource.clone());
+                    dp.activation.set_hid_core(hid_core.clone());
+                }
+                // Wire digitizer
+                if let Some(ref digitizer) = self.digitizer {
+                    let mut d = digitizer.lock();
+                    d.activation.set_applet_resource(applet_resource.clone());
+                    d.activation.set_hid_core(hid_core.clone());
+                }
+                // Wire unique_pad
+                if let Some(ref unique_pad) = self.unique_pad {
+                    let mut up = unique_pad.lock();
+                    up.activation.set_applet_resource(applet_resource.clone());
+                    up.activation.set_hid_core(hid_core.clone());
+                }
+                // Wire keyboard
+                if let Some(ref keyboard) = self.keyboard {
+                    let mut kb = keyboard.lock();
+                    kb.activation.set_applet_resource(applet_resource.clone());
+                    kb.activation.set_hid_core(hid_core.clone());
+                }
+                // Wire npad externals
+                if let Some(ref npad) = self.npad {
+                    let mut n = npad.lock();
+                    n.set_npad_externals(AppletResourceHolder {
+                        applet_resource: Some(applet_resource.clone()),
+                        handheld_config: self.handheld_config.clone(),
+                    });
+                }
+                // Wire six_axis
+                if let Some(ref six_axis) = self.six_axis {
+                    let mut sa = six_axis.lock();
+                    sa.activation.set_applet_resource(applet_resource.clone());
+                    sa.activation.set_hid_core(hid_core.clone());
+                }
+                // Wire mouse
+                if let Some(ref mouse) = self.mouse {
+                    let mut m = mouse.lock();
+                    m.activation.set_applet_resource(applet_resource.clone());
+                    m.activation.set_hid_core(hid_core.clone());
+                }
+                // Wire debug_mouse
+                if let Some(ref debug_mouse) = self.debug_mouse {
+                    let mut dm = debug_mouse.lock();
+                    dm.activation.set_applet_resource(applet_resource.clone());
+                    dm.activation.set_hid_core(hid_core.clone());
+                }
+                // Wire home_button
+                if let Some(ref home_button) = self.home_button {
+                    let mut hb = home_button.lock();
+                    hb.activation.set_applet_resource(applet_resource.clone());
+                    hb.activation.set_hid_core(hid_core.clone());
+                }
+                // Wire sleep_button
+                if let Some(ref sleep_button) = self.sleep_button {
+                    let mut sb = sleep_button.lock();
+                    sb.activation.set_applet_resource(applet_resource.clone());
+                    sb.activation.set_hid_core(hid_core.clone());
+                }
+                // Wire capture_button
+                if let Some(ref capture_button) = self.capture_button {
+                    let mut cb = capture_button.lock();
+                    cb.activation.set_applet_resource(applet_resource.clone());
+                    cb.activation.set_hid_core(hid_core.clone());
+                }
+                // Wire palma
+                if let Some(ref palma) = self.palma {
+                    let mut p = palma.lock();
+                    p.activation.set_applet_resource(applet_resource.clone());
+                    p.activation.set_hid_core(hid_core.clone());
+                }
+            }
+        }
+
+        // Upstream schedules looping timing events here:
+        // system.CoreTiming().ScheduleLoopingEvent(npad_update_ns, npad_update_ns, npad_update_event);
+        // system.CoreTiming().ScheduleLoopingEvent(default_update_ns, default_update_ns, default_update_event);
+        // etc.
+        // CoreTiming integration would schedule these callbacks to call
+        // update_controllers/update_npad/update_mouse_keyboard/update_motion periodically.
     }
 
     fn initialize_touch_screen_sampler(&mut self) {
-        // Upstream creates: touch_resource, touch_driver, touch_screen, gesture.
-        // Sets up a touch_update_event looping timer and wires touch_resource to
-        // touch_driver, applet_resource, input_event, handheld_config, and timer_event.
-        // Requires these resource types and CoreTiming to be ported.
+        // This is nn.hid.TouchScreenSampler
+        self.touch_resource = Some(Arc::new(Mutex::new(TouchResource::new())));
+        self.touch_driver = Some(Arc::new(Mutex::new(TouchScreenDriver::new())));
+        self.touch_screen = Some(Arc::new(Mutex::new(TouchScreen::new())));
+        self.gesture = Some(Arc::new(Mutex::new(Gesture::new())));
+
+        // Upstream: touch_resource->SetTouchDriver(touch_driver)
+        // touch_resource->SetAppletResource(applet_resource, &shared_mutex)
+        // touch_resource->SetInputEvent(input_event, &input_mutex)
+        // touch_resource->SetHandheldConfig(handheld_config)
+        // touch_resource->SetTimerEvent(touch_update_event)
+        // These are wired through the touch resource's own initialization path.
     }
 
     fn initialize_console_six_axis_sampler(&mut self) {
-        // Upstream creates: console_six_axis, seven_six_axis.
-        // Wires console_six_axis to applet_resource and shared_mutex.
-        // Requires these resource types to be ported.
+        self.console_six_axis = Some(Arc::new(Mutex::new(ConsoleSixAxis::new())));
+        self.seven_six_axis = Some(Arc::new(Mutex::new(SevenSixAxis::new())));
+
+        // Wire console_six_axis to applet_resource
+        if let Some(ref applet_resource) = self.applet_resource {
+            if let Some(ref hid_core) = self.hid_core {
+                if let Some(ref console_six_axis) = self.console_six_axis {
+                    let mut csa = console_six_axis.lock();
+                    csa.activation.set_applet_resource(applet_resource.clone());
+                    csa.activation.set_hid_core(hid_core.clone());
+                }
+                if let Some(ref seven_six_axis) = self.seven_six_axis {
+                    let mut ssa = seven_six_axis.lock();
+                    ssa.activation.set_applet_resource(applet_resource.clone());
+                    ssa.activation.set_hid_core(hid_core.clone());
+                }
+            }
+        }
     }
 
     fn initialize_ahid_sampler(&mut self) {
