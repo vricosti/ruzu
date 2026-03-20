@@ -8,15 +8,22 @@ use crate::hardware_properties;
 
 use bitflags::bitflags;
 
-// Forward-declared opaque types for not-yet-ported dependencies
-// TODO: Replace with real types when kernel crate is wired up
+// Forward-declared opaque types matching C++ forward declarations.
+// These serve the same purpose as `class KThread;` / `class KProcess;`
+// in upstream headers. The ArmInterface trait uses these as opaque
+// pointers in run_thread/step_thread/signal_interrupt signatures.
+// At runtime, real `hle::kernel::k_thread::KThread` /
+// `hle::kernel::k_process::KProcess` instances are transmuted through
+// these types. We cannot use the real types directly because that would
+// create a circular dependency: KThread uses ThreadContext from this
+// module, and this module would need KThread.
 
-/// Opaque type representing Kernel::KThread
+/// Opaque type representing Kernel::KThread (forward declaration).
 pub struct KThread {
     _private: (),
 }
 
-/// Opaque type representing Kernel::KProcess
+/// Opaque type representing Kernel::KProcess (forward declaration).
 pub struct KProcess {
     _private: (),
 }
@@ -173,8 +180,23 @@ impl ArmInterfaceBase {
             "Symbol"
         );
         log::error!("");
-        // TODO: Call get_backtrace_from_context and log entries
-        // when the debug module's backtrace functions are fully wired up.
+        // Upstream: calls debug::get_backtrace_from_context(process, ctx) and logs each.
+        // Transmute the opaque KProcess to the real type to access memory/page table.
+        let real_process = unsafe {
+            &*(_process as *const KProcess
+                as *const crate::hle::kernel::k_process::KProcess)
+        };
+        let entries = crate::arm::debug::get_backtrace_from_context(real_process, ctx);
+        for entry in &entries {
+            log::error!(
+                "{:20}{:#20X}{:#20X}{:#20X}{}",
+                entry.module,
+                entry.address,
+                entry.original_address,
+                entry.offset,
+                entry.name,
+            );
+        }
     }
 
     /// Matches upstream `ArmInterface::MatchingWatchpoint`.

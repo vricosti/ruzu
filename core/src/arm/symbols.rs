@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::memory::memory::Memory;
+
 /// Type alias for virtual addresses
 pub type VAddr = u64;
 
@@ -24,15 +26,25 @@ const MOD0_MAGIC: u32 = u32::from_le_bytes([b'M', b'O', b'D', b'0']);
 /// Get symbols from memory at a given base address.
 ///
 /// Corresponds to upstream `Core::Symbols::GetSymbols(VAddr, Memory&, bool)`.
+///
+/// Upstream creates a `ReadBytes` lambda that calls `memory.ReadBlock(base + offset, ptr, size)`
+/// to read from guest memory, then passes it to the templated `GetSymbols<Word, ELFSymbol>`.
 pub fn get_symbols_from_memory(
-    _base: VAddr,
-    _memory: &dyn std::any::Any, // TODO: Core::Memory::Memory
-    _is_64: bool,
+    base: VAddr,
+    memory: &Memory,
+    is_64: bool,
 ) -> Symbols {
-    // TODO: Implement when Memory trait is available.
-    // Upstream reads MOD0 header, walks dynamic section to find strtab/symtab,
-    // then extracts symbol names and addresses.
-    Symbols::new()
+    let read_bytes = |offset: usize, size: usize| -> Vec<u8> {
+        let mut buf = vec![0u8; size];
+        memory.read_block(base + offset as u64, &mut buf);
+        buf
+    };
+
+    if is_64 {
+        get_symbols_impl::<u64>(&read_bytes)
+    } else {
+        get_symbols_impl::<u32>(&read_bytes)
+    }
 }
 
 /// Get symbols from a byte slice.

@@ -2,115 +2,118 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of zuyu/src/core/arm/dynarmic/dynarmic_exclusive_monitor.h and .cpp
-//! Dynarmic exclusive monitor implementation wrapping Dynarmic::ExclusiveMonitor.
+//! Dynarmic exclusive monitor implementation wrapping rdynarmic::ExclusiveMonitor.
 
 use crate::arm::exclusive_monitor::{ExclusiveMonitor, VAddr};
+use crate::memory::memory::Memory;
+use std::sync::{Arc, Mutex};
 
 /// Dynarmic-backed exclusive monitor.
 ///
 /// Corresponds to upstream `Core::DynarmicExclusiveMonitor`.
-///
-/// In the C++ version, this wraps `Dynarmic::ExclusiveMonitor` and delegates
-/// to `Memory::Read*` / `Memory::WriteExclusive*` for the actual memory operations.
-///
-/// Until rdynarmic is integrated, this is a structural placeholder.
+/// Wraps `rdynarmic::ExclusiveMonitor` and delegates to `Memory` for
+/// the actual memory operations in the read/write callbacks.
 pub struct DynarmicExclusiveMonitor {
-    // TODO: Replace with actual Dynarmic::ExclusiveMonitor when rdynarmic is integrated
-    // monitor: dynarmic::ExclusiveMonitor,
-    // memory: &mut Memory,
-    _core_count: usize,
+    monitor: rdynarmic::ExclusiveMonitor,
+    memory: Arc<Mutex<Memory>>,
 }
 
 impl DynarmicExclusiveMonitor {
     /// Create a new DynarmicExclusiveMonitor.
     ///
-    /// Corresponds to upstream constructor.
-    pub fn new(
-        _memory: &mut dyn std::any::Any, // TODO: Core::Memory::Memory
-        core_count: usize,
-    ) -> Self {
+    /// Upstream: `DynarmicExclusiveMonitor(Memory::Memory& memory, size_t core_count)`
+    pub fn new(memory: Arc<Mutex<Memory>>, core_count: usize) -> Self {
         Self {
-            _core_count: core_count,
+            monitor: rdynarmic::ExclusiveMonitor::new(core_count),
+            memory,
         }
+    }
+
+    /// Get the underlying rdynarmic ExclusiveMonitor (for JIT backend integration).
+    pub fn get_monitor(&mut self) -> &mut rdynarmic::ExclusiveMonitor {
+        &mut self.monitor
     }
 }
 
 impl ExclusiveMonitor for DynarmicExclusiveMonitor {
-    fn exclusive_read8(&mut self, _core_index: usize, _addr: VAddr) -> u8 {
-        // monitor.ReadAndMark<u8>(core_index, addr, || memory.Read8(addr))
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::exclusive_read8: not integrated, returning 0");
-        0
+    fn exclusive_read8(&mut self, core_index: usize, addr: VAddr) -> u8 {
+        let mem = self.memory.clone();
+        self.monitor.read_and_mark(core_index, addr, || {
+            mem.lock().unwrap().read_8(addr)
+        })
     }
 
-    fn exclusive_read16(&mut self, _core_index: usize, _addr: VAddr) -> u16 {
-        // monitor.ReadAndMark<u16>(core_index, addr, || memory.Read16(addr))
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::exclusive_read16: not integrated, returning 0");
-        0
+    fn exclusive_read16(&mut self, core_index: usize, addr: VAddr) -> u16 {
+        let mem = self.memory.clone();
+        self.monitor.read_and_mark(core_index, addr, || {
+            mem.lock().unwrap().read_16(addr)
+        })
     }
 
-    fn exclusive_read32(&mut self, _core_index: usize, _addr: VAddr) -> u32 {
-        // monitor.ReadAndMark<u32>(core_index, addr, || memory.Read32(addr))
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::exclusive_read32: not integrated, returning 0");
-        0
+    fn exclusive_read32(&mut self, core_index: usize, addr: VAddr) -> u32 {
+        let mem = self.memory.clone();
+        self.monitor.read_and_mark(core_index, addr, || {
+            mem.lock().unwrap().read_32(addr)
+        })
     }
 
-    fn exclusive_read64(&mut self, _core_index: usize, _addr: VAddr) -> u64 {
-        // monitor.ReadAndMark<u64>(core_index, addr, || memory.Read64(addr))
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::exclusive_read64: not integrated, returning 0");
-        0
+    fn exclusive_read64(&mut self, core_index: usize, addr: VAddr) -> u64 {
+        let mem = self.memory.clone();
+        self.monitor.read_and_mark(core_index, addr, || {
+            mem.lock().unwrap().read_64(addr)
+        })
     }
 
-    fn exclusive_read128(&mut self, _core_index: usize, _addr: VAddr) -> u128 {
-        // monitor.ReadAndMark<u128>(core_index, addr, || {
-        //     let lo = memory.Read64(addr);
-        //     let hi = memory.Read64(addr + 8);
-        //     (hi as u128) << 64 | lo as u128
-        // })
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::exclusive_read128: not integrated, returning 0");
-        0
+    fn exclusive_read128(&mut self, core_index: usize, addr: VAddr) -> u128 {
+        let mem = self.memory.clone();
+        self.monitor.read_and_mark(core_index, addr, || {
+            let m = mem.lock().unwrap();
+            let lo = m.read_64(addr) as u128;
+            let hi = m.read_64(addr + 8) as u128;
+            (hi << 64) | lo
+        })
     }
 
-    fn clear_exclusive(&mut self, _core_index: usize) {
-        // monitor.ClearProcessor(core_index)
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::clear_exclusive: not integrated, no-op");
+    fn clear_exclusive(&mut self, core_index: usize) {
+        self.monitor.clear_processor(core_index);
     }
 
-    fn exclusive_write8(&mut self, _core_index: usize, _vaddr: VAddr, _value: u8) -> bool {
-        // monitor.DoExclusiveOperation<u8>(core_index, vaddr, |expected| {
-        //     memory.WriteExclusive8(vaddr, value, expected)
-        // })
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::exclusive_write8: not integrated, returning false");
-        false
+    fn exclusive_write8(&mut self, core_index: usize, vaddr: VAddr, value: u8) -> bool {
+        let mem = self.memory.clone();
+        self.monitor.do_exclusive_operation(core_index, vaddr, |expected: u8| {
+            mem.lock().unwrap().write_exclusive_8(vaddr, value, expected)
+        })
     }
 
-    fn exclusive_write16(&mut self, _core_index: usize, _vaddr: VAddr, _value: u16) -> bool {
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::exclusive_write16: not integrated, returning false");
-        false
+    fn exclusive_write16(&mut self, core_index: usize, vaddr: VAddr, value: u16) -> bool {
+        let mem = self.memory.clone();
+        self.monitor.do_exclusive_operation(core_index, vaddr, |expected: u16| {
+            mem.lock().unwrap().write_exclusive_16(vaddr, value, expected)
+        })
     }
 
-    fn exclusive_write32(&mut self, _core_index: usize, _vaddr: VAddr, _value: u32) -> bool {
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::exclusive_write32: not integrated, returning false");
-        false
+    fn exclusive_write32(&mut self, core_index: usize, vaddr: VAddr, value: u32) -> bool {
+        let mem = self.memory.clone();
+        self.monitor.do_exclusive_operation(core_index, vaddr, |expected: u32| {
+            mem.lock().unwrap().write_exclusive_32(vaddr, value, expected)
+        })
     }
 
-    fn exclusive_write64(&mut self, _core_index: usize, _vaddr: VAddr, _value: u64) -> bool {
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::exclusive_write64: not integrated, returning false");
-        false
+    fn exclusive_write64(&mut self, core_index: usize, vaddr: VAddr, value: u64) -> bool {
+        let mem = self.memory.clone();
+        self.monitor.do_exclusive_operation(core_index, vaddr, |expected: u64| {
+            mem.lock().unwrap().write_exclusive_64(vaddr, value, expected)
+        })
     }
 
-    fn exclusive_write128(&mut self, _core_index: usize, _vaddr: VAddr, _value: u128) -> bool {
-        // TODO: Requires rdynarmic integration
-        log::warn!("DynarmicExclusiveMonitor::exclusive_write128: not integrated, returning false");
-        false
+    fn exclusive_write128(&mut self, core_index: usize, vaddr: VAddr, value: u128) -> bool {
+        let mem = self.memory.clone();
+        self.monitor.do_exclusive_operation(core_index, vaddr, |expected: u128| {
+            let value_lo = value as u64;
+            let value_hi = (value >> 64) as u64;
+            let expected_lo = expected as u64;
+            let expected_hi = (expected >> 64) as u64;
+            mem.lock().unwrap().write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
+        })
     }
 }

@@ -129,11 +129,14 @@ impl Patcher {
         // instruction of the module (placeholder, filled in during relocation).
         patcher.patch_instructions.push(0);
 
-        // TODO: Emit save_context and load_context helper functions.
-        // Upstream uses oaknut to generate ARM64 assembly for:
-        //   - WriteSaveContext(): saves all guest registers to GuestContext
-        //   - WriteLoadContext(): restores all guest registers from GuestContext
-        // These are called by the SVC trampoline.
+        // Upstream emits save_context and load_context helper functions using oaknut
+        // (ARM64 code generator):
+        //   - WriteSaveContext(): saves all guest GPRs/vectors to GuestContext struct
+        //   - WriteLoadContext(): restores all guest GPRs/vectors from GuestContext struct
+        // These are called by the SVC trampoline to save/restore guest state when
+        // transitioning to/from host code.
+        // Requires: oaknut-equivalent ARM64 code generation library for Rust.
+        // NCE is AArch64-host-only; on x86_64 hosts this entire module is unused.
 
         patcher
     }
@@ -179,7 +182,8 @@ impl Patcher {
                     patch_offset: self.patch_instructions.len() * 4,
                     module_offset: this_offset,
                 });
-                // TODO: self.write_svc_trampoline(next_offset, svc.get_value());
+                // Upstream: self.write_svc_trampoline(next_offset, svc.get_value());
+                // Requires oaknut-equivalent ARM64 code generation.
                 log::trace!("Patcher: SVC #{} at offset {:#x}", svc.get_value(), this_offset);
                 continue;
             }
@@ -194,7 +198,8 @@ impl Patcher {
                     patch_offset: self.patch_instructions.len() * 4,
                     module_offset: this_offset,
                 });
-                // TODO: self.write_mrs_handler(next_offset, dest_reg, src_reg);
+                // Upstream: self.write_mrs_handler(next_offset, dest_reg, src_reg);
+                // Requires oaknut-equivalent ARM64 code generation.
                 log::trace!("Patcher: MRS TPIDR at offset {:#x}", this_offset);
                 continue;
             }
@@ -205,7 +210,8 @@ impl Patcher {
                     patch_offset: self.patch_instructions.len() * 4,
                     module_offset: this_offset,
                 });
-                // TODO: self.write_cntpct_handler(next_offset, dest_reg);
+                // Upstream: self.write_cntpct_handler(next_offset, dest_reg);
+                // Requires oaknut-equivalent ARM64 code generation.
                 log::trace!("Patcher: MRS CNTPCT at offset {:#x}", this_offset);
                 continue;
             }
@@ -222,7 +228,8 @@ impl Patcher {
                     patch_offset: self.patch_instructions.len() * 4,
                     module_offset: this_offset,
                 });
-                // TODO: self.write_msr_handler(next_offset, src_reg);
+                // Upstream: self.write_msr_handler(next_offset, src_reg);
+                // Requires oaknut-equivalent ARM64 code generation.
                 log::trace!("Patcher: MSR TPIDR at offset {:#x}", this_offset);
                 continue;
             }
@@ -285,8 +292,12 @@ impl Patcher {
         let module_idx = self.relocate_module_index;
         self.relocate_module_index += 1;
 
-        // TODO: Apply relocations (branch instructions between module and patch).
-        // This requires writing ARM64 branch instructions at the relocation offsets.
+        // Upstream applies relocations by writing ARM64 B (branch) instructions at
+        // each relocation offset using oaknut::CodeGenerator. For PreText mode, the
+        // branch offset is `rel.patch_offset - patch_size - rel.module_offset`; for
+        // PostData mode it is `total_program_size - rel.module_offset + rel.patch_offset`.
+        // Requires: oaknut-equivalent ARM64 code generation library for Rust.
+        // NCE is AArch64-host-only; on x86_64 hosts this entire module is unused.
 
         // Convert exclusive instructions to ordered variants.
         let text_start = _code_offset;

@@ -372,11 +372,15 @@ impl JitCallbacks for DynarmicCallbacks64 {
 pub struct ArmDynarmic64 {
     pub base: ArmInterfaceBase,
 
-    // TODO: Replace with actual System reference
-    // m_system: &System,
+    // Upstream holds `System& m_system` for accessing CoreTiming, DebuggerEnabled,
+    // Settings, etc. Currently these are passed individually (core_timing, uses_wall_clock)
+    // to avoid circular dependency with System which owns the ARM backends.
+    // When System stabilizes, this can be replaced with a reference.
 
-    // TODO: Replace with actual DynarmicExclusiveMonitor reference
-    // m_exclusive_monitor: &DynarmicExclusiveMonitor,
+    // Upstream holds `DynarmicExclusiveMonitor& m_exclusive_monitor` for wiring
+    // exclusive memory operations through the JIT. Currently exclusive ops are
+    // handled directly in the JitCallbacks. When rdynarmic::ExclusiveMonitor is
+    // integrated, this should store a reference to DynarmicExclusiveMonitor.
 
     /// Core index for this CPU
     core_index: usize,
