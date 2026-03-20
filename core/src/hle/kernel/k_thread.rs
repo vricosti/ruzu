@@ -690,6 +690,92 @@ impl KThread {
         self.thread_type == ThreadType::User || self.parent.is_some()
     }
 
+    /// Get the host fiber context for this thread.
+    /// Upstream: `KThread::GetHostContext()` (k_thread.h:266).
+    /// Used by CpuManager::RunThread and ShutdownThread for fiber switching.
+    pub fn get_host_context(&self) -> Option<&Arc<common::fiber::Fiber>> {
+        self.host_context.as_ref()
+    }
+
+    /// Set the host fiber context for this thread.
+    pub fn set_host_context(&mut self, ctx: Arc<common::fiber::Fiber>) {
+        self.host_context = Some(ctx);
+    }
+
+    /// Read the user-mode disable count from the thread's TLS region in guest memory.
+    ///
+    /// Upstream: `KThread::GetUserDisableCount()` (k_thread.cpp:552-560).
+    /// The ThreadLocalRegion layout:
+    ///   offset 0x000: message_buffer[0x100]
+    ///   offset 0x100: disable_count (u16)
+    ///   offset 0x102: interrupt_flag (u16)
+    pub fn get_user_disable_count(&self) -> u16 {
+        if !self.is_user_thread() {
+            return 0;
+        }
+        let tls_addr = self.tls_address.get();
+        if tls_addr == 0 {
+            return 0;
+        }
+        // ThreadLocalRegion::disable_count is at offset 0x100.
+        const DISABLE_COUNT_OFFSET: u64 = 0x100;
+        let addr = tls_addr + DISABLE_COUNT_OFFSET;
+
+        if let Some(parent) = self.parent.as_ref().and_then(|w| w.upgrade()) {
+            let process = parent.lock().unwrap();
+            let memory = process.get_shared_memory();
+            let mem = memory.read().unwrap();
+            mem.read_16(addr)
+        } else {
+            0
+        }
+    }
+
+    /// Set the interrupt flag in the thread's TLS region in guest memory.
+    ///
+    /// Upstream: `KThread::SetInterruptFlag()` (k_thread.cpp:562-570).
+    pub fn set_interrupt_flag(&self) {
+        if !self.is_user_thread() {
+            return;
+        }
+        let tls_addr = self.tls_address.get();
+        if tls_addr == 0 {
+            return;
+        }
+        // ThreadLocalRegion::interrupt_flag is at offset 0x102.
+        const INTERRUPT_FLAG_OFFSET: u64 = 0x102;
+        let addr = tls_addr + INTERRUPT_FLAG_OFFSET;
+
+        if let Some(parent) = self.parent.as_ref().and_then(|w| w.upgrade()) {
+            let mut process = parent.lock().unwrap();
+            let memory = process.get_shared_memory();
+            let mut mem = memory.write().unwrap();
+            mem.write_16(addr, 1);
+        }
+    }
+
+    /// Clear the interrupt flag in the thread's TLS region in guest memory.
+    ///
+    /// Upstream: `KThread::ClearInterruptFlag()` (k_thread.cpp:572-580).
+    pub fn clear_interrupt_flag(&self) {
+        if !self.is_user_thread() {
+            return;
+        }
+        let tls_addr = self.tls_address.get();
+        if tls_addr == 0 {
+            return;
+        }
+        const INTERRUPT_FLAG_OFFSET: u64 = 0x102;
+        let addr = tls_addr + INTERRUPT_FLAG_OFFSET;
+
+        if let Some(parent) = self.parent.as_ref().and_then(|w| w.upgrade()) {
+            let mut process = parent.lock().unwrap();
+            let memory = process.get_shared_memory();
+            let mut mem = memory.write().unwrap();
+            mem.write_16(addr, 0);
+        }
+    }
+
     pub fn get_suspend_flags(&self) -> u32 {
         self.suspend_allowed_flags & self.suspend_request_flags
     }

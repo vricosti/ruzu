@@ -15,9 +15,11 @@ path = "src/main.rs"
 [dependencies]
 common = { workspace = true }
 ruzu_core = { package = "core", path = "../core" }
+audio_core = { path = "../audio_core" }
 video_core = { workspace = true }
 input_common = { workspace = true }
 frontend_common = { workspace = true }
+parking_lot.workspace = true
 sdl2 = { workspace = true }
 gl = { workspace = true }
 ash = { workspace = true }

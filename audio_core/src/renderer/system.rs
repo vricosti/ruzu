@@ -938,6 +938,7 @@ impl System {
         self.core
             .lock()
             .core_timing()
+            .lock().unwrap()
             .get_global_time_ns()
             .as_nanos() as u64
     }

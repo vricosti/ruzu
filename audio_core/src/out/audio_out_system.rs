@@ -179,6 +179,7 @@ impl System {
                 .system
                 .lock()
                 .core_timing()
+                .lock().unwrap()
                 .get_global_time_ns()
                 .as_nanos() as u64;
             if self
@@ -228,6 +229,7 @@ impl System {
             .system
             .lock()
             .core_timing()
+            .lock().unwrap()
             .get_global_time_ns()
             .as_nanos() as u64;
         let signal = self

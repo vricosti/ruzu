@@ -289,6 +289,34 @@ fn main() {
         std::process::exit(-1);
     }
 
+    // Create video/audio subsystems that upstream creates in SetupForApplicationProcess().
+    // These are created here in the frontend because video_core and audio_core crates
+    // cannot be dependencies of core (circular dependency). Upstream order:
+    // 1. TelemetrySession — created inside core's setup_for_application_process()
+    // 2. Host1x
+    // 3. GPU
+    // 4. AudioCore
+    {
+        use std::sync::Arc;
+
+        // Host1x (upstream core.cpp:277): host1x_core = make_unique<Host1x>(system)
+        let host1x = video_core::host1x::host1x::Host1x::new();
+        system.set_host1x_core(Box::new(host1x));
+
+        // GPU (upstream core.cpp:278): gpu_core = VideoCore::CreateGPU(emu_window, system)
+        // Full GPU initialization requires EmuWindow (renderer binding). For now, create
+        // the GPU struct; renderer will be bound later when the window is available.
+        let gpu = video_core::gpu::Gpu::new(false, true);
+        system.set_gpu_core(Box::new(gpu));
+
+        // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
+        let shared_system: audio_core::SharedSystem =
+            Arc::new(parking_lot::Mutex::new(ruzu_core::core::System::new()));
+        let settings = Arc::new(common::settings::Values::default());
+        let ac = audio_core::AudioCore::new(shared_system, settings);
+        system.set_audio_core(Box::new(ac));
+    }
+
     // Start emulation.
     // Maps to C++ `system.Run()`.
     system.run();

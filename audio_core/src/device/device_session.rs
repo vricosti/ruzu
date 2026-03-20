@@ -130,7 +130,7 @@ impl DeviceSession {
                 self.thread_event = Some(self.make_thread_event(stream.clone()));
             }
             if let Some(thread_event) = &self.thread_event {
-                self.system.lock().core_timing_mut().schedule_looping_event(
+                self.system.lock().core_timing().lock().unwrap().schedule_looping_event(
                     Duration::ZERO,
                     INCREMENT_TIME,
                     thread_event,
@@ -150,7 +150,7 @@ impl DeviceSession {
             if let Some(thread_event) = &self.thread_event {
                 self.system
                     .lock()
-                    .core_timing_mut()
+                    .core_timing().lock().unwrap()
                     .unschedule_event(thread_event, UnscheduleEventType::NoWait);
             }
         }
@@ -423,7 +423,7 @@ mod tests {
         stream.lock().process_audio_out_and_render(&mut rendered, 2);
 
         session.start();
-        let _ = system.lock().core_timing_mut().advance();
+        let _ = system.lock().core_timing().lock().unwrap().advance();
 
         assert!(session.get_played_sample_count() >= 2);
     }
