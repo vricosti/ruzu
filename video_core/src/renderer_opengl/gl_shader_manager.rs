@@ -48,8 +48,23 @@ impl ProgramManager {
         unsafe {
             gl::CreateProgramPipelines(1, &mut pipeline);
         }
-        // TODO: Enable GL_COMPUTE_PROGRAM_NV if device.use_assembly_shaders()
-        // TODO: Create lmem warmup program if device.has_lmem_perf_bug()
+        // Upstream: if (device.UseAssemblyShaders()) { glEnable(GL_COMPUTE_PROGRAM_NV); }
+        // GL_COMPUTE_PROGRAM_NV (0x90FB) is an NV extension enum not exposed by the gl crate.
+        // Assembly shader support requires NV-specific function pointers (see gl_shader_util.rs).
+        // Until those are loaded via runtime GetProcAddress, this is a no-op.
+        if _device.use_assembly_shaders() {
+            const GL_COMPUTE_PROGRAM_NV: u32 = 0x90FB;
+            unsafe {
+                gl::Enable(GL_COMPUTE_PROGRAM_NV);
+            }
+        }
+
+        // Upstream: if (device.HasLmemPerfBug()) { lmem_warmup_program = CreateProgram(...); }
+        // HasLmemPerfBug is not yet ported to gl_device::Device. When it is added, this
+        // should create the warmup program from OPENGL_LMEM_WARMUP_COMP. For now, the
+        // lmem_warmup_program stays 0 (no warmup needed).
+        let lmem_warmup_program = 0;
+
         Self {
             pipeline,
             is_pipeline_bound: false,
@@ -57,7 +72,7 @@ impl ProgramManager {
             current_stage_mask: 0,
             current_programs: [0; NUM_STAGES],
             current_assembly_compute_program: 0,
-            lmem_warmup_program: 0,
+            lmem_warmup_program,
         }
     }
 

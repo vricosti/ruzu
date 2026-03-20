@@ -17,7 +17,39 @@ use common::announce_multiplayer_room::GameInfo;
 use network::announce_multiplayer_session::AnnounceMultiplayerSession;
 use network::network::RoomNetwork;
 use network::room::{BanList, IpBanList, UsernameBanList, DEFAULT_ROOM_PORT, MAX_CONCURRENT_CONNECTIONS};
-use network::verify_user::{Backend, NullBackend};
+use network::verify_user::{Backend, NullBackend, UserData};
+
+// ---------------------------------------------------------------------------
+// VerifyUserJwt wrapper — bridges web_service and network crates
+// ---------------------------------------------------------------------------
+
+/// Wrapper around `web_service::verify_user_jwt::VerifyUserJwt` that implements
+/// the `network::verify_user::Backend` trait. This glue lives in dedicated_room
+/// because web_service cannot depend on network (circular dependency).
+/// Upstream: `WebService::VerifyUserJWT` implements `Network::VerifyUser::Backend`.
+struct VerifyUserJwtBackend {
+    inner: web_service::verify_user_jwt::VerifyUserJwt,
+}
+
+impl VerifyUserJwtBackend {
+    fn new(host: &str) -> Self {
+        Self {
+            inner: web_service::verify_user_jwt::VerifyUserJwt::new(host),
+        }
+    }
+}
+
+impl Backend for VerifyUserJwtBackend {
+    fn load_user_data(&self, verify_uid: &str, token: &str) -> UserData {
+        let ws_data = self.inner.load_user_data(verify_uid, token);
+        UserData {
+            username: ws_data.username,
+            display_name: ws_data.display_name,
+            avatar_url: ws_data.avatar_url,
+            moderator: ws_data.moderator,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants (from yuzu_room.cpp)
@@ -445,17 +477,11 @@ fn main() {
         (Vec::new(), Vec::new())
     };
 
-    // Build verify backend
-    // NOTE: ENABLE_WEB_SERVICE equivalent: we always use NullBackend here
-    // since web_service::VerifyUserJwt does not implement network::verify_user::Backend
-    // (the web_service crate does not depend on network to avoid a circular dep).
-    // TODO: wire up VerifyUserJwt once the trait impl is added to web_service.
+    // Build verify backend.
+    // Upstream: uses WebService::VerifyUserJWT when ENABLE_WEB_SERVICE is defined.
+    // The VerifyUserJwtBackend wrapper bridges web_service and network crates.
     let verify_backend: Box<dyn Backend> = if announce {
-        // TODO: replace with web_service::VerifyUserJwt when available
-        log::info!(
-            "yuzu Web Services announce enabled but VerifyUserJwt is not yet wired; using NullBackend"
-        );
-        Box::new(NullBackend)
+        Box::new(VerifyUserJwtBackend::new(&web_api_url))
     } else {
         Box::new(NullBackend)
     };

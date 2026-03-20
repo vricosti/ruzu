@@ -115,6 +115,13 @@ impl Type {
         (self as u32) >= (Type::U32x2 as u32)
     }
 
+    /// Check if two types are compatible.
+    /// Upstream: `AreTypesCompatible(Type lhs, Type rhs)` (type.cpp:33-35).
+    /// Types are compatible if they're equal or either is Opaque.
+    pub fn is_compatible_with(self, other: Type) -> bool {
+        self == other || self == Type::Opaque || other == Type::Opaque
+    }
+
     /// Bit width of scalar types (0 for non-scalar).
     pub fn bit_width(self) -> u32 {
         match self {

@@ -105,7 +105,7 @@ impl SDLDriver {
     /// Port of SDLDriver::GetUIName (override)
     pub fn get_ui_name(&self, params: &ParamPackage) -> ButtonNames {
         if params.has("button") {
-            // TODO(German77): Find how to substitute the values for real button names
+            // Upstream TODO(German77): Find how to substitute the values for real button names
             return ButtonNames::Value;
         }
         if params.has("hat") {

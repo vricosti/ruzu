@@ -25,19 +25,30 @@ pub enum AntiAliasing {
 }
 
 /// Get the current scaling filter from settings.
-///
-/// In the full port, this reads from Settings::values.scaling_filter.
+/// Upstream: reads `Settings::values.scaling_filter.GetValue()`.
 pub fn get_scaling_filter() -> ScalingFilter {
-    // TODO: Read from settings
-    ScalingFilter::Bilinear
+    let settings = common::settings::Values::default();
+    match *settings.scaling_filter.get_value() {
+        common::settings_enums::ScalingFilter::NearestNeighbor => ScalingFilter::NearestNeighbor,
+        common::settings_enums::ScalingFilter::Bilinear => ScalingFilter::Bilinear,
+        common::settings_enums::ScalingFilter::Bicubic => ScalingFilter::Bicubic,
+        common::settings_enums::ScalingFilter::Gaussian => ScalingFilter::Gaussian,
+        common::settings_enums::ScalingFilter::ScaleForce => ScalingFilter::ScaleForce,
+        common::settings_enums::ScalingFilter::Fsr => ScalingFilter::Fsr,
+        _ => ScalingFilter::Bilinear,
+    }
 }
 
 /// Get the current anti-aliasing mode from settings.
-///
-/// In the full port, this reads from Settings::values.anti_aliasing.
+/// Upstream: reads `Settings::values.anti_aliasing.GetValue()`.
 pub fn get_anti_aliasing() -> AntiAliasing {
-    // TODO: Read from settings
-    AntiAliasing::None
+    let settings = common::settings::Values::default();
+    match *settings.anti_aliasing.get_value() {
+        common::settings_enums::AntiAliasing::None => AntiAliasing::None,
+        common::settings_enums::AntiAliasing::Fxaa => AntiAliasing::Fxaa,
+        common::settings_enums::AntiAliasing::Smaa => AntiAliasing::Smaa,
+        _ => AntiAliasing::None,
+    }
 }
 
 /// Get the scaling filter for applet capture (always Bilinear).

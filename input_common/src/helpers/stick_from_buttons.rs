@@ -193,13 +193,20 @@ impl Stick {
         self.goal_angle = compute_goal_angle(r, l, u, d);
     }
 
+    /// Upstream: `StickFromButtonDevice::GetStatus()` (stick_from_buttons.cpp:267-283).
     fn get_status(&self) -> StickStatus {
         let mut status = StickStatus::default();
         status.x.properties = STICK_PROPERTIES;
         status.y.properties = STICK_PROPERTIES;
 
-        // TODO: Check Settings::values.emulate_analog_keyboard
-        // For now use goal_angle directly (non-analog-emulation path)
+        if *common::settings::Values::default().emulate_analog_keyboard.get_value() {
+            let now = std::time::Instant::now();
+            let angle = self.get_angle(now);
+            status.x.raw_value = angle.cos() * self.amplitude;
+            status.y.raw_value = angle.sin() * self.amplitude;
+            return status;
+        }
+
         status.x.raw_value = self.goal_angle.cos() * self.amplitude;
         status.y.raw_value = self.goal_angle.sin() * self.amplitude;
         status

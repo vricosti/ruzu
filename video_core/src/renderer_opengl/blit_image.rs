@@ -7,6 +7,8 @@
 
 use super::gl_shader_manager::ProgramManager;
 use super::gl_shader_util::create_program_from_source;
+use crate::host_shaders::fragment_shaders::BLIT_COLOR_FLOAT_FRAG;
+use crate::host_shaders::vertex_shaders::FULL_SCREEN_TRIANGLE_VERT;
 
 /// Offset2D for region specification.
 #[derive(Clone, Copy, Debug, Default)]
@@ -43,10 +45,13 @@ impl BlitImageHelper {
     ///
     /// Corresponds to `BlitImageHelper::BlitImageHelper()`.
     pub fn new(_program_manager: &ProgramManager) -> Self {
-        // TODO: Load host shaders (FULL_SCREEN_TRIANGLE_VERT, BLIT_COLOR_FLOAT_FRAG)
+        let full_screen_vert =
+            create_program_from_source(FULL_SCREEN_TRIANGLE_VERT, gl::VERTEX_SHADER);
+        let blit_color_to_color_frag =
+            create_program_from_source(BLIT_COLOR_FLOAT_FRAG, gl::FRAGMENT_SHADER);
         Self {
-            full_screen_vert: 0,
-            blit_color_to_color_frag: 0,
+            full_screen_vert,
+            blit_color_to_color_frag,
         }
     }
 

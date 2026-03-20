@@ -27,15 +27,26 @@ pub fn verification_pass(program: &Program) {
     validate_phi_nodes(program);
 }
 
+/// Validate argument types against opcode metadata.
+/// Upstream: `ValidateTypes` (verification_pass.cpp:14-31).
 fn validate_types(program: &Program) {
     for block in &program.blocks {
         for inst in &block.instructions {
             if inst.opcode == crate::ir::opcodes::Opcode::Phi {
                 continue;
             }
-            // TODO: Validate argument types against opcode metadata
-            let _meta = inst.opcode.meta();
-            // For each argument, check IR::AreTypesCompatible(arg.Type(), expected)
+            let meta = inst.opcode.meta();
+            let num_args = inst.args.len().min(meta.arg_types.len());
+            for i in 0..num_args {
+                let actual = inst.args[i].ir_type();
+                let expected = meta.arg_types[i];
+                if !actual.is_compatible_with(expected) {
+                    log::error!(
+                        "Type mismatch in {:?}: arg {} is {:?}, expected {:?}",
+                        inst.opcode, i, actual, expected
+                    );
+                }
+            }
         }
     }
 }

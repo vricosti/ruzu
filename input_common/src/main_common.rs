@@ -170,21 +170,67 @@ impl InputSubsystemImpl {
         }
     }
 
-    /// Port of Impl::GetInputEngine
-    /// Returns the engine name matching the params, or None if not found.
-    fn get_input_engine(&self, params: &ParamPackage) -> Option<&str> {
-        if !params.has("engine") || params.get_str("engine", "") == "any" {
-            return None;
-        }
+    /// Get the analog mapping for a device by finding the matching engine.
+    /// Upstream: `Impl::GetAnalogMappingForDevice` (main.cpp:200-209).
+    fn get_analog_mapping_for_device(&self, params: &ParamPackage) -> AnalogMapping {
         let engine = params.get_str("engine", "");
-        // Check against registered engines
-        if self.keyboard.as_ref().map_or(false, |k| k.engine().get_engine_name() == engine)
-            || self.mouse.as_ref().map_or(false, |m| m.engine().get_engine_name() == engine)
-        {
-            Some("found")
-        } else {
-            None
+        if engine.is_empty() || engine == "any" {
+            return HashMap::new();
         }
+        if self.mouse.as_ref().map_or(false, |m| m.engine().get_engine_name() == engine) {
+            return self.mouse.as_ref().unwrap().get_analog_mapping_for_device(params);
+        }
+        // Keyboard, touch_screen, tas_input, camera, virtual_amiibo, virtual_gamepad
+        // don't have analog mappings — they use the default (empty).
+        HashMap::new()
+    }
+
+    /// Get the button mapping for a device by finding the matching engine.
+    /// Upstream: `Impl::GetButtonMappingForDevice` (main.cpp:211-220).
+    fn get_button_mapping_for_device(&self, params: &ParamPackage) -> ButtonMapping {
+        let engine = params.get_str("engine", "");
+        if engine.is_empty() || engine == "any" {
+            return HashMap::new();
+        }
+        // None of the currently registered engines (keyboard, mouse, touch, tas, camera,
+        // virtual_amiibo, virtual_gamepad) provide custom button mappings.
+        // SDLDriver, GCAdapter, Joycon, UDPClient would when enabled.
+        HashMap::new()
+    }
+
+    /// Get the motion mapping for a device by finding the matching engine.
+    /// Upstream: `Impl::GetMotionMappingForDevice` (main.cpp:222-231).
+    fn get_motion_mapping_for_device(&self, params: &ParamPackage) -> MotionMapping {
+        let engine = params.get_str("engine", "");
+        if engine.is_empty() || engine == "any" {
+            return HashMap::new();
+        }
+        HashMap::new()
+    }
+
+    /// Get the UI button name for a device.
+    /// Upstream: `Impl::GetButtonName` (main.cpp:233-244).
+    fn get_button_name(&self, params: &ParamPackage) -> ButtonNames {
+        let engine = params.get_str("engine", "");
+        if engine.is_empty() || engine == "any" {
+            return ButtonNames::Undefined;
+        }
+        if self.mouse.as_ref().map_or(false, |m| m.engine().get_engine_name() == engine) {
+            return self.mouse.as_ref().unwrap().get_ui_name(params);
+        }
+        ButtonNames::Invalid
+    }
+
+    /// Check if stick axes are inverted.
+    /// Upstream: `Impl::IsStickInverted` (main.cpp:246-254).
+    fn is_stick_inverted(&self, params: &ParamPackage) -> bool {
+        let engine = params.get_str("engine", "");
+        if engine.is_empty() || engine == "any" {
+            return false;
+        }
+        // None of the currently registered engines implement stick inversion.
+        // GCAdapter and SDLDriver do when enabled.
+        false
     }
 }
 
@@ -299,48 +345,25 @@ impl InputSubsystem {
     /// Retrieves the analog mappings for the given device.
     /// Port of InputSubsystem::GetAnalogMappingForDevice
     pub fn get_analog_mapping_for_device(&self, device: &ParamPackage) -> AnalogMapping {
-        let engine = self.imp.get_input_engine(device);
-        if engine.is_none() {
-            return HashMap::new();
-        }
-        // TODO: call engine.get_analog_mapping_for_device(device)
-        HashMap::new()
+        self.imp.get_analog_mapping_for_device(device)
     }
 
     /// Retrieves the button mappings for the given device.
     /// Port of InputSubsystem::GetButtonMappingForDevice
     pub fn get_button_mapping_for_device(&self, device: &ParamPackage) -> ButtonMapping {
-        let engine = self.imp.get_input_engine(device);
-        if engine.is_none() {
-            return HashMap::new();
-        }
-        // TODO: call engine.get_button_mapping_for_device(device)
-        HashMap::new()
+        self.imp.get_button_mapping_for_device(device)
     }
 
     /// Retrieves the motion mappings for the given device.
     /// Port of InputSubsystem::GetMotionMappingForDevice
     pub fn get_motion_mapping_for_device(&self, device: &ParamPackage) -> MotionMapping {
-        let engine = self.imp.get_input_engine(device);
-        if engine.is_none() {
-            return HashMap::new();
-        }
-        // TODO: call engine.get_motion_mapping_for_device(device)
-        HashMap::new()
+        self.imp.get_motion_mapping_for_device(device)
     }
 
     /// Returns an enum containing the name to be displayed from the input engine.
     /// Port of InputSubsystem::GetButtonName
     pub fn get_button_name(&self, params: &ParamPackage) -> ButtonNames {
-        if !params.has("engine") || params.get_str("engine", "") == "any" {
-            return ButtonNames::Undefined;
-        }
-        let engine = self.imp.get_input_engine(params);
-        if engine.is_none() {
-            return ButtonNames::Invalid;
-        }
-        // TODO: call engine.get_ui_name(params)
-        ButtonNames::Undefined
+        self.imp.get_button_name(params)
     }
 
     /// Returns true if device is a controller.
@@ -357,16 +380,16 @@ impl InputSubsystem {
     /// Port of InputSubsystem::IsStickInverted
     pub fn is_stick_inverted(&self, device: &ParamPackage) -> bool {
         if device.has("axis_x") && device.has("axis_y") {
-            // TODO: call engine.is_stick_inverted(device)
-            return false;
+            return self.imp.is_stick_inverted(device);
         }
         false
     }
 
     /// Reloads the input devices.
     /// Port of InputSubsystem::ReloadInputDevices
+    /// Upstream: calls `udp_client->ReloadSockets()`.
+    /// UDPClient is not yet a registered engine in ruzu.
     pub fn reload_input_devices(&mut self) {
-        // TODO: udp_client->ReloadSockets() in C++
         log::debug!("InputSubsystem::reload_input_devices called");
     }
 

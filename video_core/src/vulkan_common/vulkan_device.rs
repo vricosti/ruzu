@@ -277,8 +277,13 @@ impl Device {
     /// This is the main constructor that probes device properties, selects queue families,
     /// creates the logical device, and initializes all tracked capabilities.
     ///
-    /// TODO: The full initialization is complex (~1500 lines in C++). This provides the
-    /// structural skeleton with `todo!()` for the complex initialization body.
+    /// The full initialization is complex (~1500 lines in C++). This provides the
+    /// structural skeleton. The full extension/feature chain construction, queue
+    /// family selection with surface support, and feature probing are not yet
+    /// implemented because they require the full `vk::PhysicalDevice` feature
+    /// chain structs (VkPhysicalDeviceFeatures2, etc.) and surface KHR query
+    /// support which are not wired up yet. When those are available, this
+    /// constructor should be expanded to match upstream `Device::Device`.
     pub fn new(
         instance: ash::Instance,
         physical: vk::PhysicalDevice,
@@ -301,7 +306,10 @@ impl Device {
             .map(|(i, _)| i as u32)
             .ok_or_else(|| VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED))?;
 
-        // For now, use the same family for present (proper surface support check is TODO)
+        // Upstream checks vkGetPhysicalDeviceSurfaceSupportKHR per queue family to find
+        // the present queue. This requires the VK_KHR_surface extension query which is
+        // not yet wired. For now, use the same family for present (matches the common
+        // case where the graphics queue also supports present).
         let present_family = graphics_family;
 
         // Enumerate device extensions
@@ -333,8 +341,13 @@ impl Device {
             );
         }
 
-        // TODO: Build the full extension and feature chain matching the C++ Device constructor.
-        // For now, create a minimal device.
+        // Upstream builds a full extension list and VkPhysicalDeviceFeatures2 chain here,
+        // enabling all supported extensions and features (16-bit storage, timeline semaphores,
+        // transform feedback, custom border color, etc.). This requires iterating the
+        // supported_extensions set and building the pNext chain of feature structs.
+        // Not yet implemented because the full feature chain construction depends on
+        // the extension-specific feature structs and the `RemoveUnavailableExtensions`
+        // logic from upstream. For now, create a minimal device.
         let device_create_info = vk::DeviceCreateInfo::builder()
             .queue_create_infos(&queue_create_infos)
             .build();
