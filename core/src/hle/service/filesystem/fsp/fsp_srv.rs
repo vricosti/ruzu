@@ -171,6 +171,31 @@ impl FspSrv {
         srv
     }
 
+    /// Push an error response for a command that has Out<SharedPointer<T>> in domain mode.
+    /// In domain mode, the response always includes a domain object ID slot (0 for null),
+    /// matching upstream CMIF serialization where response layout is compile-time fixed.
+    fn push_error_with_null_interface(ctx: &mut HLERequestContext, error: u32) {
+        let is_domain = ctx
+            .get_manager()
+            .map_or(false, |m| m.lock().unwrap().is_domain());
+        if is_domain {
+            // ResponseBuilder with 1 "move object" allocates the domain object ID slot.
+            // We then manually write 0 to that slot instead of adding a real domain handler.
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+            rb.push_result(ResultCode::new(error));
+            // Write null domain object ID (0) at the domain_offset position.
+            let domain_offset = ctx.domain_offset as usize;
+            if domain_offset > 0 && domain_offset - 1 < crate::hle::ipc::COMMAND_BUFFER_LENGTH {
+                ctx.cmd_buf[domain_offset - 1] = 0;
+            }
+            // Clear outgoing_domain_objects so WriteToOutgoingCommandBuffer doesn't
+            // try to register a handler.
+        } else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(ResultCode::new(error));
+        }
+    }
+
     fn push_interface_response(ctx: &mut HLERequestContext, object: Arc<dyn SessionRequestHandler>) {
         let is_domain = ctx
             .get_manager()
@@ -270,8 +295,13 @@ impl FspSrv {
             program_id
         );
 
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(ResultCode::new(RESULT_TARGET_NOT_FOUND.raw()));
+        // Upstream: this command has Out<SharedPointer<IStorage>> in its signature.
+        // In domain mode, the response ALWAYS includes a domain object ID slot
+        // (containing 0 for null) even on error, because the response layout is
+        // computed from the method signature at compile time.
+        // Without this, the game reads past the result expecting a domain object ID,
+        // gets garbage, and eventually crashes.
+        Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
     }
 
     fn set_global_access_log_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
