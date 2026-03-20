@@ -191,7 +191,11 @@ impl XCI {
             xci.ncas = nsp.get_ncas_collapsed();
 
             let prog_tid = nsp.get_program_title_id();
-            // TODO: xci.program = nsp.get_nca(prog_tid, ContentRecordType::Program)
+            xci.program = nsp.get_nca(
+                prog_tid,
+                super::nca_metadata::ContentRecordType::Program,
+                super::nca_metadata::TitleType::Application,
+            );
             xci.program_nca_status = nsp.get_program_status();
             if xci.program_nca_status == ResultStatus::ErrorNSPMissingProgramNCA {
                 xci.program_nca_status = ResultStatus::ErrorXCIMissingProgramNCA;
@@ -199,7 +203,19 @@ impl XCI {
             xci.secure_partition = Some(nsp);
         }
 
-        // TODO: AddNCAFromPartition(Normal), AddNCAFromPartition(Logo)
+        let result = xci.add_nca_from_partition(XCIPartition::Normal);
+        if result != ResultStatus::Success {
+            xci.status = result;
+            return xci;
+        }
+
+        if xci.get_format_version() >= 0x2 {
+            let result = xci.add_nca_from_partition(XCIPartition::Logo);
+            if result != ResultStatus::Success {
+                xci.status = result;
+                return xci;
+            }
+        }
 
         xci.status = ResultStatus::Success;
         xci
@@ -363,6 +379,44 @@ impl XCI {
         let len = out.len();
         self.file.read(&mut out, len, GAMECARD_CERTIFICATE_OFFSET as usize);
         out
+    }
+
+    /// Add NCAs from a non-secure partition (Normal, Logo).
+    /// Corresponds to upstream `XCI::AddNCAFromPartition`.
+    fn add_nca_from_partition(&mut self, part: XCIPartition) -> ResultStatus {
+        let partition_index = part as usize;
+        let partition = match self.get_partition(part) {
+            Some(p) => p,
+            None => return ResultStatus::ErrorXCIMissingPartition,
+        };
+
+        for partition_file in partition.get_files() {
+            if partition_file.get_extension() != "nca" {
+                continue;
+            }
+
+            let nca = Arc::new(NCA::new(partition_file, None));
+            if nca.is_update() {
+                continue;
+            }
+            if nca.get_type() == NCAContentType::Program {
+                self.program_nca_status = nca.get_status();
+            }
+            if nca.get_status() == ResultStatus::Success {
+                self.ncas.push(nca);
+            } else {
+                let error_id = nca.get_status() as u16;
+                log::error!(
+                    "Could not load NCA {}/{}, failed with error code {:04X} ({:?})",
+                    PARTITION_NAMES[partition_index],
+                    nca.get_name(),
+                    error_id,
+                    nca.get_status()
+                );
+            }
+        }
+
+        ResultStatus::Success
     }
 
     fn try_read_header(&mut self) -> ResultStatus {

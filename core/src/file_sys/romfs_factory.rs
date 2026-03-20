@@ -49,10 +49,35 @@ pub struct RomFSFactory {
 impl RomFSFactory {
     /// Create a new RomFSFactory.
     ///
-    /// Upstream constructs this from an AppLoader, a ContentProvider&, and a
-    /// FileSystemController&. We accept the base file and content_provider
-    /// directly; the AppLoader's ReadRomFS result is passed as `file`.
+    /// Matches upstream `RomFSFactory::RomFSFactory(AppLoader&, ContentProvider&,
+    /// FileSystemController&)` (romfs_factory.cpp:15-22).
+    /// Reads the RomFS and updatable flag from the AppLoader.
     pub fn new(
+        app_loader: &dyn crate::loader::loader::AppLoader,
+        content_provider: Arc<dyn ContentProvider>,
+        filesystem_controller: Arc<std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
+    ) -> Self {
+        // Upstream: app_loader.ReadRomFS(file)
+        let mut file = None;
+        if app_loader.read_rom_fs(&mut file) != crate::loader::loader::ResultStatus::Success {
+            log::warn!("Unable to read base RomFS");
+        }
+
+        // Upstream: updatable = app_loader.IsRomFSUpdatable()
+        let updatable = app_loader.is_rom_fs_updatable();
+
+        Self {
+            file,
+            packed_update_raw: None,
+            updatable,
+            content_provider: Some(content_provider),
+            filesystem_controller: Some(filesystem_controller),
+        }
+    }
+
+    /// Create a RomFSFactory with explicit file/updatable args (for tests and
+    /// cases where the AppLoader is not available).
+    pub fn new_with_file(
         file: Option<VirtualFile>,
         updatable: bool,
         content_provider: Option<Arc<dyn ContentProvider>>,
@@ -82,11 +107,18 @@ impl RomFSFactory {
         //   const auto nca = content_provider.GetEntry(current_process_title_id, type);
         //   const PatchManager patch_manager{...};
         //   return patch_manager.PatchRomFS(nca.get(), file, Program, packed_update_raw);
-        let patch_manager = PatchManager::new(current_process_title_id);
         let base = match &self.file {
             Some(f) => f.clone(),
             None => return None,
         };
+        let fs_ctrl = self.filesystem_controller.as_ref()?;
+        let fs_ctrl_guard = fs_ctrl.lock().unwrap();
+        let content_prov = self.content_provider.as_ref()?;
+        let patch_manager = PatchManager::new(
+            current_process_title_id,
+            &fs_ctrl_guard,
+            content_prov.as_ref(),
+        );
         Some(patch_manager.patch_romfs(
             base,
             ContentRecordType::Program,
@@ -106,7 +138,13 @@ impl RomFSFactory {
         let nca = provider.get_entry(title_id, type_)?;
         let romfs = nca.get_romfs()?;
 
-        let patch_manager = PatchManager::new(title_id);
+        let fs_ctrl = self.filesystem_controller.as_ref()?;
+        let fs_ctrl_guard = fs_ctrl.lock().unwrap();
+        let patch_manager = PatchManager::new(
+            title_id,
+            &fs_ctrl_guard,
+            provider.as_ref(),
+        );
         Some(patch_manager.patch_romfs(romfs, type_, None, true))
     }
 
@@ -221,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let factory = RomFSFactory::new(Some(make_test_file()), true, None);
+        let factory = RomFSFactory::new_with_file(Some(make_test_file()), true, None, None);
         assert!(factory.file.is_some());
         assert!(factory.updatable);
     }
@@ -229,7 +267,7 @@ mod tests {
     #[test]
     fn test_open_current_process_not_updatable() {
         let file = make_test_file();
-        let factory = RomFSFactory::new(Some(file.clone()), false, None);
+        let factory = RomFSFactory::new_with_file(Some(file.clone()), false, None, None);
         // When not updatable, should return the file directly.
         let result = factory.open_current_process(0x0100000000001000);
         assert!(result.is_some());
@@ -237,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_set_packed_update() {
-        let mut factory = RomFSFactory::new(None, false, None);
+        let mut factory = RomFSFactory::new_with_file(None, false, None, None);
         assert!(factory.packed_update_raw.is_none());
         factory.set_packed_update(make_test_file());
         assert!(factory.packed_update_raw.is_some());
@@ -245,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_open_patched_romfs_no_provider() {
-        let factory = RomFSFactory::new(None, false, None);
+        let factory = RomFSFactory::new_with_file(None, false, None, None);
         // No content provider, should return None.
         assert!(factory
             .open_patched_romfs(0x0100000000001000, ContentRecordType::Program)

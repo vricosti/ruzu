@@ -126,7 +126,7 @@ impl AppLoaderNsp {
                     nsp.get_nca(title_id, ContentRecordType::Control, TitleType::Application);
                 if let Some(ref control) = control_nca {
                     if control.get_status() == FsResultStatus::Success {
-                        let pm = PatchManager::new(title_id);
+                        let pm = PatchManager::new_without_deps(title_id);
                         let (parsed_nacp, parsed_icon) = pm.parse_control_nca(control);
                         nacp_file = parsed_nacp;
                         icon_file = parsed_icon;

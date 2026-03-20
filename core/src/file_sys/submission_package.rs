@@ -117,8 +117,25 @@ impl NSP {
     }
 
     pub fn get_extracted_title_id(&self) -> u64 {
-        // TODO: Implement ProgramMetadata loading
-        0
+        let exefs = match self.get_exefs() {
+            Some(e) => e,
+            None => return 0,
+        };
+        if !is_directory_exefs(&exefs) {
+            return 0;
+        }
+
+        let npdm_file = match exefs.get_file("main.npdm") {
+            Some(f) => f,
+            None => return 0,
+        };
+
+        let mut meta = super::program_metadata::ProgramMetadata::default();
+        if meta.load(npdm_file) == ResultStatus::Success {
+            meta.get_title_id()
+        } else {
+            0
+        }
     }
 
     pub fn get_program_title_ids(&self) -> Vec<u64> {
@@ -190,11 +207,24 @@ impl NSP {
     }
 
     fn set_ticket_keys(&mut self, files: &[VirtualFile]) {
+        let keys = crate::crypto::key_manager::KeyManager::instance();
+        let mut keys_guard = keys.lock().unwrap();
         for ticket_file in files {
             if ticket_file.get_extension() != "tik" {
                 continue;
             }
-            // TODO: Process ticket keys once crypto module is ported
+
+            let size = ticket_file.get_size();
+            let mut raw_data = vec![0u8; size];
+            ticket_file.read(&mut raw_data, size, 0);
+
+            let ticket = crate::crypto::key_manager::Ticket::read_from_bytes(&raw_data);
+            if !keys_guard.add_ticket(&ticket) {
+                log::warn!(
+                    "Could not load NSP ticket {}",
+                    ticket_file.get_name()
+                );
+            }
         }
     }
 
