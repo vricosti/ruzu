@@ -182,21 +182,11 @@ impl SessionRequestManager {
             }
         }
 
-        if self.is_domain() {
-            // Domain session but no domain header. This is normal for Control commands
-            // (e.g., CloneCurrentObject, QueryPointerBufferSize) which don't go through
-            // domain dispatch. For Request commands, this means the domain header parsing
-            // failed — stub the response to avoid leaving request data in TLS.
-            let cmd_type = context.get_command_type();
-            if cmd_type == ipc::CommandType::Request || cmd_type == ipc::CommandType::RequestWithContext {
-                log::warn!(
-                    "Domain session but no domain header for Request, cmd={}, stubbing response",
-                    context.get_command(),
-                );
-                return PreparedSyncRequest::StubSuccess;
-            }
-            // Control/Close commands: fall through to session handler as normal
-        }
+        // If domain but no domain header, fall through to session handler.
+        // Matches upstream hle_ipc.cpp:62-63: "If there is no domain header,
+        // the regular session handler is used"
+        // This is normal for Control commands and also happens for certain
+        // Request messages that the session handler dispatches directly.
 
         match &self.session_handler {
             Some(handler) => PreparedSyncRequest::Session(handler.clone()),
