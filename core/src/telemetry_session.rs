@@ -28,11 +28,11 @@ pub struct TelemetrySession {
 
 impl TelemetrySession {
     /// Create a new telemetry session.
-    /// Takes a reference to the settings Values to cache the enable_telemetry flag.
-    pub fn new(vals: &settings::Values) -> Self {
+    /// Reads `enable_telemetry` from the global settings singleton.
+    pub fn new() -> Self {
         Self {
             field_collection: FieldCollection::new(),
-            enable_telemetry: *vals.enable_telemetry.get_value(),
+            enable_telemetry: *settings::values().enable_telemetry.get_value(),
         }
     }
 
@@ -46,8 +46,8 @@ impl TelemetrySession {
         &mut self,
         program_id: u64,
         program_name: Option<&str>,
-        vals: &settings::Values,
     ) {
+        let vals = settings::values();
         // Log one-time top-level information
         self.add_field(FieldType::None, "TelemetryId", FieldValue::U64(get_telemetry_id()));
 
@@ -159,7 +159,7 @@ impl TelemetrySession {
         self.add_field(
             field_type,
             "System_UseDockedMode",
-            FieldValue::Bool(settings::is_docked_mode(vals)),
+            FieldValue::Bool(settings::is_docked_mode(&vals)),
         );
     }
 

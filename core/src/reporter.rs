@@ -23,33 +23,16 @@ pub enum PlayReportType {
     System = 3,
 }
 
-/// TODO: Forward reference to Core::System (not yet available as a full dependency).
-/// Using an opaque type for now.
-pub struct System {
-    // Placeholder fields - will be replaced when System is wired up
-    _private: (),
-}
-
-impl System {
-    /// Placeholder - returns the application process program ID.
-    pub fn get_application_process_program_id(&self) -> u64 {
-        0 // TODO: Wire to actual System
-    }
-}
-
-/// TODO: Forward reference to Service::HLERequestContext.
-pub struct HleRequestContext {
-    _private: (),
-}
-
 /// Reporter for generating and saving various report types.
 ///
 /// Corresponds to the C++ `Reporter` class. Reports are saved as JSON files
 /// in the log directory, organized by report type.
+///
+/// Upstream holds a `System&` reference; here the reporter is standalone and
+/// reads `Settings::values.reporting_services` on each call, matching upstream
+/// `IsReportingEnabled()` which reads from the global `Settings::values`.
 pub struct Reporter {
-    /// Reference to the system instance (not yet wired up).
-    /// TODO: Replace with proper system reference when available.
-    reporting_enabled: bool,
+    _private: (),
 }
 
 // --- Private helper functions (matching anonymous namespace in C++) ---
@@ -188,12 +171,9 @@ fn get_full_data_auto(timestamp: &str, title_id: u64) -> serde_json::Value {
 
 impl Reporter {
     /// Create a new Reporter.
-    /// In C++ this takes a System& reference. Here we take a reference to
-    /// settings Values to read the reporting_services flag.
-    pub fn new(vals: &settings::Values) -> Self {
-        let reporter = Self {
-            reporting_enabled: *vals.reporting_services.get_value(),
-        };
+    /// Upstream takes a `System&`; here we just clear the FS access log on construction.
+    pub fn new() -> Self {
+        let reporter = Self { _private: () };
         reporter.clear_fs_access_log();
         reporter
     }
@@ -394,6 +374,34 @@ impl Reporter {
         }
     }
 
+    /// Save a report for an unimplemented HLE function.
+    /// Corresponds to upstream `Reporter::SaveUnimplementedFunctionReport`.
+    pub fn save_unimplemented_function_report(
+        &self,
+        title_id: u64,
+        command_id: u32,
+        name: &str,
+        service_name: &str,
+    ) {
+        if !self.is_reporting_enabled() {
+            return;
+        }
+
+        let timestamp = get_timestamp();
+        let mut out = get_full_data_auto(&timestamp, title_id);
+
+        out["function"] = serde_json::json!({
+            "command_id": command_id,
+            "function_name": name,
+            "service_name": service_name,
+        });
+
+        save_to_file(
+            &out,
+            &get_path("unimpl_func_report", title_id, &timestamp),
+        );
+    }
+
     /// Save a user-initiated debug report.
     pub fn save_user_report(&self, title_id: u64) {
         if !self.is_reporting_enabled() {
@@ -423,8 +431,12 @@ impl Reporter {
     }
 
     fn is_reporting_enabled(&self) -> bool {
-        self.reporting_enabled
+        *settings::values().reporting_services.get_value()
     }
 }
 
-// Note: No Default impl since Reporter requires &Values at construction.
+impl Default for Reporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
