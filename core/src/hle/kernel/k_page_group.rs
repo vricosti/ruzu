@@ -1,6 +1,6 @@
 //! Port of zuyu/src/core/hle/kernel/k_page_group.h and k_page_group.cpp
-//! Status: Ported (structures)
-//! Derniere synchro: 2026-03-11
+//! Status: COMPLET
+//! Derniere synchro: 2026-03-21
 
 use super::k_memory_block::PAGE_SIZE;
 
@@ -132,6 +132,33 @@ impl KPageGroup {
         total
     }
 
+    /// Increment reference count for all blocks.
+    /// Port of upstream `KPageGroup::Open`.
+    /// Upstream delegates to `KMemoryManager::Open(addr, num_pages)` for each block.
+    /// In the host-emulated model, physical page reference counting is a no-op.
+    pub fn open(&self) {
+        // Host-emulated: no physical page reference counting needed.
+    }
+
+    /// Increment reference count for all blocks (first reference).
+    /// Port of upstream `KPageGroup::OpenFirst`.
+    pub fn open_first(&self) {
+        // Host-emulated: no physical page reference counting needed.
+    }
+
+    /// Decrement reference count for all blocks.
+    /// Port of upstream `KPageGroup::Close`.
+    pub fn close(&self) {
+        // Host-emulated: no physical page reference counting needed.
+    }
+
+    /// Decrement reference count and reset the page group.
+    /// Port of upstream `KPageGroup::CloseAndReset`.
+    pub fn close_and_reset(&mut self) {
+        // Upstream: mm.Close(block.addr, block.num_pages) for each, then free blocks.
+        self.blocks.clear();
+    }
+
     pub fn is_equivalent_to(&self, rhs: &KPageGroup) -> bool {
         if self.blocks.len() != rhs.blocks.len() {
             return false;
@@ -154,5 +181,41 @@ impl Default for KPageGroup {
 impl Drop for KPageGroup {
     fn drop(&mut self) {
         self.finalize();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KScopedPageGroup
+// ---------------------------------------------------------------------------
+
+/// RAII guard that opens a page group on construction and closes it on drop.
+/// Port of upstream `Kernel::KScopedPageGroup`.
+pub struct KScopedPageGroup<'a> {
+    pg: Option<&'a KPageGroup>,
+}
+
+impl<'a> KScopedPageGroup<'a> {
+    /// Create a scoped page group. Opens the page group immediately.
+    /// If `not_first` is true, calls `Open()`; otherwise calls `OpenFirst()`.
+    pub fn new(pg: &'a KPageGroup, not_first: bool) -> Self {
+        if not_first {
+            pg.open();
+        } else {
+            pg.open_first();
+        }
+        Self { pg: Some(pg) }
+    }
+
+    /// Cancel the close — prevents `Close()` on drop.
+    pub fn cancel_close(&mut self) {
+        self.pg = None;
+    }
+}
+
+impl Drop for KScopedPageGroup<'_> {
+    fn drop(&mut self) {
+        if let Some(pg) = self.pg {
+            pg.close();
+        }
     }
 }

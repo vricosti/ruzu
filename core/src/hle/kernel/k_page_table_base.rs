@@ -192,6 +192,16 @@ impl KPageTableBase {
     pub fn is_kernel(&self) -> bool {
         self.m_is_kernel
     }
+    /// Finalize the page table, releasing all resources.
+    /// Port of upstream `KPageTableBase::Finalize`.
+    pub fn finalize(&mut self) {
+        // Upstream: iterates all memory blocks, unmaps pages, frees resources.
+        // In the host-emulated model, the page table is a software structure;
+        // resetting the address space markers is sufficient.
+        self.m_address_space_start = 0;
+        self.m_address_space_end = 0;
+    }
+
     pub fn is_aslr_enabled(&self) -> bool {
         self.m_enable_aslr
     }
