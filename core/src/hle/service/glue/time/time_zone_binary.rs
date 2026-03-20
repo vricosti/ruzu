@@ -6,9 +6,11 @@
 //!
 //! TimeZoneBinary: mount and read operations for timezone data from the system archive.
 
+use crate::file_sys::romfs;
+use crate::file_sys::system_archive::system_archive;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::psc::time::common::{LocationName, RuleVersion};
-use crate::hle::service::psc::time::errors::RESULT_FAILED;
 
 /// Title ID for the timezone binary system archive.
 ///
@@ -31,8 +33,9 @@ pub struct TimeZoneBinary {
 
     /// Whether the binary has been mounted successfully.
     mounted: bool,
-    // TODO: time_zone_binary_romfs (FileSys::VirtualDir)
-    // Requires filesystem integration
+    /// The mounted RomFS directory tree.
+    /// Corresponds to `time_zone_binary_romfs` in upstream.
+    time_zone_binary_romfs: Option<VirtualDir>,
 }
 
 impl TimeZoneBinary {
@@ -41,6 +44,7 @@ impl TimeZoneBinary {
             time_zone_scratch_space: vec![0u8; 0x2800],
             mount_result: ResultCode(1), // ResultUnknown
             mounted: false,
+            time_zone_binary_romfs: None,
         }
     }
 
@@ -57,17 +61,33 @@ impl TimeZoneBinary {
     /// Mount the timezone binary from NAND or synthesize it.
     ///
     /// Corresponds to `TimeZoneBinary::Mount` in upstream.
+    /// Upstream flow:
+    /// 1. Try to get NCA from NAND via filesystem controller
+    /// 2. Extract RomFS from NCA
+    /// 3. Fall back to SynthesizeSystemArchive(TimeZoneBinaryId)
+    /// 4. Extract the synthesized RomFS
     pub fn mount(&mut self) -> ResultCode {
         self.reset();
 
-        // TODO: Full implementation requires:
-        // 1. Get NAND contents via filesystem controller
-        // 2. Look up NCA by TimeZoneBinaryId
-        // 3. Extract RomFS
-        // 4. Fall back to synthesized system archive if needed
-        //
-        // For now, mark as mounted with a stub implementation
-        log::warn!("TimeZoneBinary::Mount (STUBBED) - no real filesystem access");
+        // Try to synthesize the system archive (fallback path, same as upstream
+        // when NAND NCA is not available).
+        let romfs_file = system_archive::synthesize_system_archive(TIME_ZONE_BINARY_ID);
+
+        if let Some(romfs_file) = romfs_file {
+            // Extract the RomFS binary into a VirtualDir tree.
+            // Matches upstream: FileSys::ExtractRomFS(romfs)
+            let extracted = romfs::extract_romfs(Some(romfs_file));
+            if let Some(dir) = extracted {
+                self.time_zone_binary_romfs = Some(dir);
+                self.mount_result = RESULT_SUCCESS;
+                self.mounted = true;
+                return RESULT_SUCCESS;
+            }
+        }
+
+        // If synthesis or extraction failed, still mark as mounted
+        // with empty data so the system can proceed.
+        log::warn!("TimeZoneBinary::Mount: synthesis/extraction failed, using empty fallback");
         self.mount_result = RESULT_SUCCESS;
         self.mounted = true;
         RESULT_SUCCESS

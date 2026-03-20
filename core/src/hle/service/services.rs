@@ -511,6 +511,26 @@ impl Services {
         register_stub_services(&mut server_manager, &[
             "ns:su", "ns:am2", "ns:ec", "ns:rid", "ns:rt", "ns:web", "ns:ro",
         ]);
+        // pl:s and pl:u — real IPlatformServiceManager with font synthesis.
+        // Matches upstream NS::LoopProcess which creates IPlatformServiceManager
+        // immediately (not lazily), so font synthesis happens during service startup.
+        // Upstream: make_shared<IPlatformServiceManager>(system, "pl:s")
+        let pl_u: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
+            Arc::new(super::ns::platform_service_manager::IPlatformServiceManager::new());
+        let pl_u_clone = Arc::clone(&pl_u);
+        server_manager.register_named_service(
+            "pl:u",
+            Box::new(move || pl_u_clone.clone()),
+            64,
+        );
+        let pl_s: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
+            Arc::new(super::ns::platform_service_manager::IPlatformServiceManager::new());
+        let pl_s_clone = Arc::clone(&pl_s);
+        server_manager.register_named_service(
+            "pl:s",
+            Box::new(move || pl_s_clone.clone()),
+            64,
+        );
         ServerManager::run_server(server_manager);
     }
 
