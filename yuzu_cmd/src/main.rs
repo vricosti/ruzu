@@ -305,8 +305,7 @@ fn main() {
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
         let shared_system: audio_core::SharedSystem =
             Arc::new(parking_lot::Mutex::new(ruzu_core::core::System::new()));
-        let settings = Arc::new(common::settings::values().clone());
-        let ac = audio_core::AudioCore::new(shared_system, settings);
+        let ac = audio_core::AudioCore::new(shared_system);
         system.set_audio_core(Box::new(ac));
     }
 

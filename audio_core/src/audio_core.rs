@@ -3,7 +3,6 @@ use crate::audio_manager::AudioManager;
 use crate::sink::sink::{new_sink_handle, SinkHandle};
 use crate::sink::sink_details::create_sink_from_id;
 use crate::SharedSystem;
-use common::settings::Values;
 use std::sync::Arc;
 
 pub struct AudioCore {
@@ -14,8 +13,8 @@ pub struct AudioCore {
 }
 
 impl AudioCore {
-    pub fn new(system: SharedSystem, settings: Arc<Values>) -> Self {
-        let (output_sink, input_sink) = Self::create_sinks(&settings);
+    pub fn new(system: SharedSystem) -> Self {
+        let (output_sink, input_sink) = Self::create_sinks();
         let adsp = ADSP::new(system, output_sink.clone());
         Self {
             audio_manager: Arc::new(AudioManager::new()),
@@ -47,7 +46,8 @@ impl AudioCore {
         &self.adsp
     }
 
-    fn create_sinks(settings: &Values) -> (SinkHandle, SinkHandle) {
+    fn create_sinks() -> (SinkHandle, SinkHandle) {
+        let settings = common::settings::values();
         let sink_id = *settings.sink_id.get_value();
         let output_id = settings.audio_output_device_id.get_value().clone();
         let input_id = settings.audio_input_device_id.get_value().clone();
