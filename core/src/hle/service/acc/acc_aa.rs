@@ -24,9 +24,14 @@ pub struct AccAA {
 }
 
 impl AccAA {
-    pub fn new() -> Self {
+    /// Matches upstream `AccAA(shared_ptr<Module>, shared_ptr<ProfileManager>, System&)`.
+    pub fn new(
+        module: std::sync::Arc<super::acc::Module>,
+        profile_manager: std::sync::Arc<std::sync::Mutex<super::profile_manager::ProfileManager>>,
+        system: crate::core::SystemRef,
+    ) -> Self {
         Self {
-            interface: super::acc::Interface::new("acc:aa"),
+            interface: super::acc::Interface::new(module, profile_manager, system, "acc:aa"),
         }
     }
 }

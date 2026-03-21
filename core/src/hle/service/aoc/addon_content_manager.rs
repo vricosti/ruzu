@@ -48,6 +48,7 @@ pub mod commands {
 ///
 /// Corresponds to `IAddOnContentManager` in upstream `addon_content_manager.h`.
 pub struct IAddOnContentManager {
+    system: crate::core::SystemRef,
     add_on_content: Vec<u64>,
     // TODO: service_context, aoc_change_event
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -55,7 +56,7 @@ pub struct IAddOnContentManager {
 }
 
 impl IAddOnContentManager {
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Self {
         let handlers = build_handler_map(&[
             (
                 commands::COUNT_ADD_ON_CONTENT,
@@ -84,6 +85,7 @@ impl IAddOnContentManager {
             ),
         ]);
         Self {
+            system,
             add_on_content: Vec::new(),
             handlers,
             handlers_tipc: BTreeMap::new(),
@@ -244,7 +246,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
     let mut server_manager =
         crate::hle::service::server_manager::ServerManager::new(crate::core::SystemRef::null());
     let factory: SessionRequestHandlerFactory =
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IAddOnContentManager::new()) });
+        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IAddOnContentManager::new(crate::core::SystemRef::null())) });
     server_manager.register_named_service("aoc:u", factory, 64);
     crate::hle::service::server_manager::ServerManager::run_server(server_manager);
 }

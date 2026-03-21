@@ -57,6 +57,7 @@ pub mod session_commands {
 ///
 /// Corresponds to `PSM` in upstream psm.h / psm.cpp.
 pub struct PSM {
+    system: crate::core::SystemRef,
     /// Battery charge percentage (stubbed to 100%).
     battery_charge_percentage: u32,
     /// Charger type.
@@ -64,8 +65,9 @@ pub struct PSM {
 }
 
 impl PSM {
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Self {
         Self {
+            system,
             battery_charge_percentage: 100,
             charger_type: ChargerType::Charger,
         }

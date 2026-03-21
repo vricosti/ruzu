@@ -58,6 +58,7 @@ impl IParentalControlServiceFactory {
         };
         let service: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
             Arc::new(super::parental_control_service::IParentalControlService::new(
+                crate::core::SystemRef::null(),
                 factory.capability,
             ));
 

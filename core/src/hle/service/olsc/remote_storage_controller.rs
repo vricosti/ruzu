@@ -14,11 +14,13 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 /// |-----|------------------|--------------------------|
 /// | 22  | GetSecondarySave | GetSecondarySave         |
 /// (All other commands are nullptr / unimplemented)
-pub struct IRemoteStorageController;
+pub struct IRemoteStorageController {
+    system: crate::core::SystemRef,
+}
 
 impl IRemoteStorageController {
-    pub fn new() -> Self {
-        IRemoteStorageController
+    pub fn new(system: crate::core::SystemRef) -> Self {
+        IRemoteStorageController { system }
     }
 
     /// Cmd 22: GetSecondarySave

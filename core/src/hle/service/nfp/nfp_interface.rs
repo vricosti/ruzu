@@ -69,14 +69,16 @@ pub mod commands {
 /// Corresponds to `Interface` in upstream nfp_interface.h / nfp_interface.cpp.
 /// Extends NfcInterface with NFP-specific methods (amiibo data management).
 pub struct Interface {
+    system: crate::core::SystemRef,
     name: String,
     device_state: DeviceState,
     // In upstream this holds a DeviceManager reference
 }
 
 impl Interface {
-    pub fn new(name: &str) -> Self {
+    pub fn new(system: crate::core::SystemRef, name: &str) -> Self {
         Self {
+            system,
             name: name.to_string(),
             device_state: DeviceState::Initialized,
         }

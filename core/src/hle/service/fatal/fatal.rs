@@ -174,13 +174,14 @@ impl Module {
 ///
 /// Corresponds to `Module::Interface` in upstream fatal.h / fatal.cpp.
 pub struct Interface {
+    pub system: crate::core::SystemRef,
     pub module: std::sync::Arc<Module>,
     pub name: &'static str,
 }
 
 impl Interface {
-    pub fn new(module: std::sync::Arc<Module>, name: &'static str) -> Self {
-        Self { module, name }
+    pub fn new(system: crate::core::SystemRef, module: std::sync::Arc<Module>, name: &'static str) -> Self {
+        Self { system, module, name }
     }
 
     /// ThrowFatal (cmd 0).
