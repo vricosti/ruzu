@@ -53,7 +53,13 @@ impl DisplayLayerManager {
     }
 
     pub fn finalize(&mut self) {
-        // TODO: destroy managed layers via VI service
+        // Upstream calls m_manager_display_service->DestroyManagedLayer() for each
+        // managed display layer and recording layer, then destroys the shared layer
+        // session if buffer sharing was enabled. This requires VI
+        // IManagerDisplayService integration which is not yet available.
+        // Once VI services are wired, this should iterate managed_display_layers
+        // and managed_display_recording_layers calling DestroyManagedLayer on each,
+        // then call DestroySharedLayerSession if buffer_sharing_enabled.
         self.managed_display_layers.clear();
         self.managed_display_recording_layers.clear();
     }
@@ -63,7 +69,11 @@ impl DisplayLayerManager {
             return;
         }
         self.visible = visible;
-        // TODO: update VI layer visibility
+        // Upstream calls m_manager_display_service->SetLayerVisibility() for the
+        // system_shared_layer_id (if nonzero) and for each managed_display_layer.
+        // This requires VI IManagerDisplayService integration which is not yet
+        // available. Once wired, iterate managed_display_layers and the shared
+        // layer calling SetLayerVisibility(visible, layer_id) on each.
     }
 
     pub fn get_window_visibility(&self) -> bool {

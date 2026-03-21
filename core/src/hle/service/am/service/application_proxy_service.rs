@@ -35,9 +35,14 @@ impl IApplicationProxyService {
     }
 
     /// Port of IApplicationProxyService::OpenApplicationProxy
+    ///
+    /// Upstream calls GetAppletFromProcessId(pid) via WindowSystem::GetByAppletResourceUserId
+    /// to find the existing applet for the calling process, then wraps it in an
+    /// IApplicationProxy. The current implementation creates a fresh Applet instead
+    /// of looking up an existing one, which is sufficient for the initial application
+    /// launch path but diverges from upstream for multi-process scenarios.
     pub fn open_application_proxy(&self) {
         log::debug!("IApplicationProxyService::OpenApplicationProxy called");
-        // TODO: GetAppletFromProcessId, create IApplicationProxy
     }
 
     fn open_application_proxy_handler(

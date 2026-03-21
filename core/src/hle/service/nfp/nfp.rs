@@ -161,9 +161,11 @@ impl ISystemManager {
     }
 
     /// CreateSystemInterface (cmd 0).
-    pub fn create_system_interface(&self) {
+    ///
+    /// Upstream creates an ISystem (which derives from Interface with name "NFP:ISystem").
+    pub fn create_system_interface(&self) -> super::nfp_interface::Interface {
         log::debug!("ISystemManager::create_system_interface called");
-        // TODO: Return ISystem interface.
+        super::nfp_interface::Interface::new(crate::core::SystemRef::null(), "ISystem")
     }
 }
 
@@ -178,9 +180,11 @@ impl IDebugManager {
     }
 
     /// CreateDebugInterface (cmd 0).
-    pub fn create_debug_interface(&self) {
+    ///
+    /// Upstream creates an IDebug (which derives from Interface with name "NFP:IDebug").
+    pub fn create_debug_interface(&self) -> super::nfp_interface::Interface {
         log::debug!("IDebugManager::create_debug_interface called");
-        // TODO: Return IDebug interface.
+        super::nfp_interface::Interface::new(crate::core::SystemRef::null(), "IDebug")
     }
 }
 

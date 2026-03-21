@@ -226,11 +226,17 @@ impl PlayReport {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
         let mut rp = RequestParser::new(ctx);
         let process_id = rp.pop_u64();
+
+        let data1 = ctx.read_buffer_a(0);
+        let data2 = ctx.read_buffer_x(0);
+
         log::debug!(
-            "PlayReport({})::SaveReportOld called, process_id={:016X}",
-            service.name, process_id
+            "PlayReport({})::SaveReportOld called, process_id={:016X}, data1_size={:016X}, data2_size={:016X}",
+            service.name, process_id, data1.len(), data2.len()
         );
-        // TODO: read buffers A(0) and X(0), forward to reporter
+
+        service.save_report(PlayReportType::Old, 0, process_id, &data1, &data2);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -240,10 +246,17 @@ impl PlayReport {
         let mut rp = RequestParser::new(ctx);
         let user_id = rp.pop_raw::<u128>();
         let process_id = rp.pop_u64();
+
+        let data1 = ctx.read_buffer_a(0);
+        let data2 = ctx.read_buffer_x(0);
+
         log::debug!(
-            "PlayReport({})::SaveReportWithUserOld called, user_id={:032X}, process_id={:016X}",
-            service.name, user_id, process_id
+            "PlayReport({})::SaveReportWithUserOld called, user_id={:032X}, process_id={:016X}, data1_size={:016X}, data2_size={:016X}",
+            service.name, user_id, process_id, data1.len(), data2.len()
         );
+
+        service.save_report_with_user(PlayReportType::Old, 0, user_id, process_id, &data1, &data2);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -252,10 +265,17 @@ impl PlayReport {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
         let mut rp = RequestParser::new(ctx);
         let process_id = rp.pop_u64();
+
+        let data1 = ctx.read_buffer_a(0);
+        let data2 = ctx.read_buffer_x(0);
+
         log::debug!(
-            "PlayReport({})::SaveReportOld2 called, process_id={:016X}",
-            service.name, process_id
+            "PlayReport({})::SaveReportOld2 called, process_id={:016X}, data1_size={:016X}, data2_size={:016X}",
+            service.name, process_id, data1.len(), data2.len()
         );
+
+        service.save_report(PlayReportType::Old2, 0, process_id, &data1, &data2);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -265,10 +285,17 @@ impl PlayReport {
         let mut rp = RequestParser::new(ctx);
         let user_id = rp.pop_raw::<u128>();
         let process_id = rp.pop_u64();
+
+        let data1 = ctx.read_buffer_a(0);
+        let data2 = ctx.read_buffer_x(0);
+
         log::debug!(
-            "PlayReport({})::SaveReportWithUserOld2 called, user_id={:032X}, process_id={:016X}",
-            service.name, user_id, process_id
+            "PlayReport({})::SaveReportWithUserOld2 called, user_id={:032X}, process_id={:016X}, data1_size={:016X}, data2_size={:016X}",
+            service.name, user_id, process_id, data1.len(), data2.len()
         );
+
+        service.save_report_with_user(PlayReportType::Old2, 0, user_id, process_id, &data1, &data2);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -277,10 +304,17 @@ impl PlayReport {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
         let mut rp = RequestParser::new(ctx);
         let process_id = rp.pop_u64();
+
+        let data1 = ctx.read_buffer_a(0);
+        let data2 = ctx.read_buffer_x(0);
+
         log::debug!(
-            "PlayReport({})::SaveReport called, process_id={:016X}",
-            service.name, process_id
+            "PlayReport({})::SaveReport called, process_id={:016X}, data1_size={:016X}, data2_size={:016X}",
+            service.name, process_id, data1.len(), data2.len()
         );
+
+        service.save_report(PlayReportType::New, 0, process_id, &data1, &data2);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -290,10 +324,17 @@ impl PlayReport {
         let mut rp = RequestParser::new(ctx);
         let user_id = rp.pop_raw::<u128>();
         let process_id = rp.pop_u64();
+
+        let data1 = ctx.read_buffer_a(0);
+        let data2 = ctx.read_buffer_x(0);
+
         log::debug!(
-            "PlayReport({})::SaveReportWithUser called, user_id={:032X}, process_id={:016X}",
-            service.name, user_id, process_id
+            "PlayReport({})::SaveReportWithUser called, user_id={:032X}, process_id={:016X}, data1_size={:016X}, data2_size={:016X}",
+            service.name, user_id, process_id, data1.len(), data2.len()
         );
+
+        service.save_report_with_user(PlayReportType::New, 0, user_id, process_id, &data1, &data2);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -302,10 +343,17 @@ impl PlayReport {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
         let mut rp = RequestParser::new(ctx);
         let title_id = rp.pop_u64();
+
+        let data1 = ctx.read_buffer_a(0);
+        let data2 = ctx.read_buffer_x(0);
+
         log::debug!(
-            "PlayReport({})::SaveSystemReport called, title_id={:016X}",
-            service.name, title_id
+            "PlayReport({})::SaveSystemReport called, title_id={:016X}, data1_size={:016X}, data2_size={:016X}",
+            service.name, title_id, data1.len(), data2.len()
         );
+
+        service.save_system_report(title_id, &data1, &data2);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -315,10 +363,17 @@ impl PlayReport {
         let mut rp = RequestParser::new(ctx);
         let user_id = rp.pop_raw::<u128>();
         let title_id = rp.pop_u64();
+
+        let data1 = ctx.read_buffer_a(0);
+        let data2 = ctx.read_buffer_x(0);
+
         log::debug!(
-            "PlayReport({})::SaveSystemReportWithUser called, user_id={:032X}, title_id={:016X}",
-            service.name, user_id, title_id
+            "PlayReport({})::SaveSystemReportWithUser called, user_id={:032X}, title_id={:016X}, data1_size={:016X}, data2_size={:016X}",
+            service.name, user_id, title_id, data1.len(), data2.len()
         );
+
+        service.save_system_report_with_user(user_id, title_id, &data1, &data2);
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }

@@ -28,12 +28,22 @@ impl IStaticService {
     }
 
     /// Cmd 0: GetDatabaseService
+    ///
+    /// Upstream creates an IDatabaseService instance with the shared MiiManager,
+    /// is_system flag, and system reference. IDatabaseService provides 26+ commands
+    /// for Mii CRUD operations (IsUpdated, GetCount, Get, BuildRandom, BuildDefault,
+    /// AddOrReplace, Delete, etc.) backed by MiiManager and DatabaseSessionMetadata.
+    ///
+    /// Requires IDatabaseService to be ported as a full ServiceFramework with
+    /// MiiManager integration. The MiiManager and supporting types (CharInfo,
+    /// StoreData, CoreData, Ver3StoreData) exist in mii_manager.rs and mii_types.rs
+    /// but the IDatabaseService IPC wrapper has not been created yet.
     pub fn get_database_service(&self) -> ResultCode {
         log::debug!(
             "IStaticService::get_database_service called, is_system={}",
             self.is_system
         );
-        // TODO: create IDatabaseService
+        log::warn!("(STUBBED) GetDatabaseService -- IDatabaseService not yet ported");
         RESULT_SUCCESS
     }
 }

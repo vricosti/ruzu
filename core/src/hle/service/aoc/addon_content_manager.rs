@@ -110,30 +110,89 @@ impl IAddOnContentManager {
         }
     }
 
-    /// Stubbed: CountAddOnContent (cmd 2)
+    /// CountAddOnContent (cmd 2).
+    ///
+    /// Upstream counts how many AOC title IDs in `add_on_content` match the current
+    /// application's base title ID, respecting the "DLC" disabled-addons setting.
     pub fn count_add_on_content(&self, _process_id: u64) -> u32 {
         log::debug!("IAddOnContentManager::count_add_on_content called");
-        // TODO: implement with actual content provider
-        0
+        let current = self.system.get().runtime_program_id();
+        let disabled = common::settings::values()
+            .disabled_addons
+            .get(&current)
+            .cloned()
+            .unwrap_or_default();
+        if disabled.iter().any(|s| s == "DLC") {
+            return 0;
+        }
+        self.add_on_content
+            .iter()
+            .filter(|&&tid| {
+                crate::file_sys::common_funcs::get_base_title_id(tid) == current
+            })
+            .count() as u32
     }
 
-    /// Stubbed: ListAddOnContent (cmd 3)
+    /// ListAddOnContent (cmd 3).
+    ///
+    /// Upstream collects AOC IDs matching the current title, applies offset/count,
+    /// and writes them to the output buffer. Respects "DLC" disabled-addons setting.
     pub fn list_add_on_content(
         &self,
-        _offset: u32,
-        _count: u32,
+        offset: u32,
+        count: u32,
         _process_id: u64,
     ) -> (u32, Vec<u32>) {
-        log::debug!("IAddOnContentManager::list_add_on_content called");
-        // TODO: implement with actual content provider
-        (0, Vec::new())
+        log::debug!(
+            "IAddOnContentManager::list_add_on_content called, offset={}, count={}",
+            offset,
+            count
+        );
+        let current =
+            crate::file_sys::common_funcs::get_base_title_id(self.system.get().runtime_program_id());
+        let disabled = common::settings::values()
+            .disabled_addons
+            .get(&current)
+            .cloned()
+            .unwrap_or_default();
+        let mut out: Vec<u32> = Vec::new();
+        if !disabled.iter().any(|s| s == "DLC") {
+            for &content_id in &self.add_on_content {
+                if crate::file_sys::common_funcs::get_base_title_id(content_id) != current {
+                    continue;
+                }
+                out.push(crate::file_sys::common_funcs::get_aoc_id(content_id) as u32);
+            }
+        }
+        if (offset as usize) > out.len() {
+            // Upstream returns ResultUnknown when offset > out.size()
+            return (0, Vec::new());
+        }
+        let result_count = std::cmp::min(out.len() - offset as usize, count as usize) as u32;
+        let result_entries: Vec<u32> = out
+            .into_iter()
+            .skip(offset as usize)
+            .take(result_count as usize)
+            .collect();
+        (result_count, result_entries)
     }
 
-    /// Stubbed: GetAddOnContentBaseId (cmd 5)
+    /// GetAddOnContentBaseId (cmd 5).
+    ///
+    /// Upstream uses PatchManager to get control metadata and reads DLC base title ID.
+    /// If control metadata is unavailable, falls back to `GetAOCBaseTitleID(title_id)`.
     pub fn get_add_on_content_base_id(&self, _process_id: u64) -> u64 {
         log::debug!("IAddOnContentManager::get_add_on_content_base_id called");
-        // TODO: implement with actual title ID lookup
-        0
+        let title_id = self.system.get().runtime_program_id();
+        // Upstream: PatchManager pm{title_id, system.GetFileSystemController(), system.GetContentProvider()};
+        // const auto res = pm.GetControlMetadata();
+        // if (res.first == nullptr) { return GetAOCBaseTitleID(title_id); }
+        // return res.first->GetDLCBaseTitleId();
+        //
+        // PatchManager::GetControlMetadata requires FileSystemController and ContentProvider
+        // integration that is not yet wired at the system level. Fall back to the
+        // no-metadata path which computes the AOC base title ID arithmetically.
+        crate::file_sys::common_funcs::get_aoc_base_title_id(title_id)
     }
 
     /// Stubbed: PrepareAddOnContent (cmd 7)
