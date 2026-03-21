@@ -6,7 +6,10 @@
 //! StandardUserSystemClockCore: user-facing system clock that coordinates between
 //! local and network system clocks.
 
+use std::sync::Arc;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::os::event::Event;
 use crate::hle::service::psc::time::common::{SteadyClockTimePoint, SystemClockContext};
 use crate::hle::service::psc::time::errors::RESULT_NOT_IMPLEMENTED;
 use super::standard_local_system_clock_core::StandardLocalSystemClockCore;
@@ -20,7 +23,9 @@ use super::standard_network_system_clock_core::StandardNetworkSystemClockCore;
 pub struct StandardUserSystemClockCore {
     automatic_correction: bool,
     time_point: SteadyClockTimePoint,
-    // TODO: Kernel::KEvent for signaling when wired to kernel
+    /// Kernel event signaled when automatic correction changes.
+    /// Corresponds to `Kernel::KEvent* m_event` in upstream.
+    event: Arc<Event>,
 }
 
 impl StandardUserSystemClockCore {
@@ -28,6 +33,7 @@ impl StandardUserSystemClockCore {
         Self {
             automatic_correction: false,
             time_point: SteadyClockTimePoint::default(),
+            event: Arc::new(Event::new()),
         }
     }
 
@@ -104,6 +110,6 @@ impl StandardUserSystemClockCore {
 
     pub fn set_time_point_and_signal(&mut self, time_point: &SteadyClockTimePoint) {
         self.time_point = *time_point;
-        // TODO: m_event->Signal() when KEvent is wired
+        self.event.signal();
     }
 }

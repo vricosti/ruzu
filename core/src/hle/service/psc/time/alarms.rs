@@ -7,9 +7,10 @@
 //! Timer-based alarm system that triggers power state requests when
 //! the steady clock reaches a configured alert time.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::os::event::Event;
 use super::errors::RESULT_CLOCK_UNINITIALIZED;
 use super::power_state_request_manager::PowerStateRequestManager;
 
@@ -55,7 +56,9 @@ pub struct Alarm {
     linked: bool,
     /// Alarm type.
     alarm_type: AlarmType,
-    // TODO: Kernel::KEvent* m_event for signaling
+    /// Kernel event for signaling when this alarm fires.
+    /// Corresponds to `Kernel::KEvent* m_event` in upstream.
+    event: Arc<Event>,
     // TODO: nn::psc::sf::IPmStateLock for Lock()
 }
 
@@ -73,6 +76,7 @@ impl Alarm {
             alert_time: 0,
             linked: false,
             alarm_type,
+            event: Arc::new(Event::new()),
         }
     }
 
@@ -96,7 +100,7 @@ impl Alarm {
     ///
     /// Corresponds to `Alarm::Signal()` in upstream.
     pub fn signal(&self) {
-        // TODO: m_event->Signal()
+        self.event.signal();
         log::debug!("Alarm::Signal (type={:?})", self.alarm_type);
     }
 
@@ -122,7 +126,9 @@ struct AlarmEntry {
 /// Corresponds to `Alarms` class in upstream alarms.h.
 pub struct Alarms {
     inner: Mutex<AlarmsInner>,
-    // TODO: Kernel::KEvent* m_event for closest-alarm-updated signaling
+    /// Kernel event signaled when the closest alarm changes.
+    /// Corresponds to `Kernel::KEvent* m_event` in upstream.
+    event: Arc<Event>,
 }
 
 struct AlarmsInner {
@@ -151,6 +157,7 @@ impl Alarms {
                 steady_clock_initialized: false,
                 get_raw_time,
             }),
+            event: Arc::new(Event::new()),
         }
     }
 
@@ -204,7 +211,7 @@ impl Alarms {
         alarm.linked = true;
 
         // Signal the closest-alarm-updated event
-        // TODO: m_event->Signal()
+        self.event.signal();
 
         RESULT_SUCCESS
     }
@@ -223,7 +230,10 @@ impl Alarms {
             .retain(|e| e.alert_time != alarm.get_alert_time() || e.priority != alarm.get_priority());
         alarm.linked = false;
 
-        // TODO: UpdateClosestAndSignal
+        // Upstream calls UpdateClosestAndSignal here, which reschedules the
+        // CoreTiming timer event based on the new closest alarm. Requires
+        // CoreTiming integration to implement fully.
+        self.event.signal();
     }
 
     /// Check all alarms against the current steady clock time and signal
@@ -256,14 +266,18 @@ impl Alarms {
         }
 
         for priority in &triggered_priorities {
-            // In upstream, each alarm's Signal() and Lock() are called
-            // TODO: Signal the alarm's KEvent
+            // In upstream, each alarm's Signal() and Lock() are called.
+            // The individual alarm events are signaled via Alarm::signal() when
+            // alarms are stored directly; here we signal via the power state manager.
             power_state_manager.update_pending_power_state_request_priority(*priority);
         }
 
         power_state_manager.signal_power_state_request_availability();
 
-        // TODO: UpdateClosestAndSignal
+        // Upstream calls UpdateClosestAndSignal here, which reschedules the
+        // CoreTiming timer event based on the new closest alarm. Requires
+        // CoreTiming integration to implement fully.
+        self.event.signal();
     }
 
     /// Get the closest (soonest) alarm.
