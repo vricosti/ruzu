@@ -52,12 +52,14 @@ impl KDeviceAddressSpace {
     pub fn post_destroy(_arg: usize) {}
 
     pub fn attach(&self, _device_name: u32) -> ResultCode {
-        // TODO: m_table.Attach(device_name, m_space_address, m_space_size)
+        // Upstream: m_table.Attach(device_name, m_space_address, m_space_size)
+        // NOTE: Also commented out in upstream C++ — returns R_SUCCEED() without doing work.
         ResultCode::new(0)
     }
 
     pub fn detach(&self, _device_name: u32) -> ResultCode {
-        // TODO: m_table.Detach(device_name)
+        // Upstream: m_table.Detach(device_name)
+        // NOTE: Also commented out in upstream C++ — returns R_SUCCEED() without doing work.
         ResultCode::new(0)
     }
 
@@ -81,25 +83,45 @@ impl KDeviceAddressSpace {
         self.map(_process_address, _size, _device_address, _option, true)
     }
 
+    /// Unmap a device address range.
+    /// Port of upstream `KDeviceAddressSpace::Unmap`.
+    /// Upstream validates address range, locks pages, then calls m_table.Unmap
+    /// (currently commented out in upstream too).
     pub fn unmap(
         &self,
         _process_address: u64,
-        _size: usize,
-        _device_address: u64,
+        size: usize,
+        device_address: u64,
     ) -> ResultCode {
-        // TODO: Implement once KProcessPageTable is available.
+        // Validate address range.
+        if !(self.m_space_address <= device_address
+            && device_address + size as u64 - 1 <= self.m_space_address + self.m_space_size - 1)
+        {
+            return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY;
+        }
+        // Upstream: m_table.Unmap — also commented out in upstream C++.
         ResultCode::new(0)
     }
 
+    /// Map a device address range.
+    /// Port of upstream `KDeviceAddressSpace::Map`.
+    /// Upstream validates address range, decodes options, locks pages, then calls
+    /// m_table.Map (currently commented out in upstream too).
     fn map(
         &self,
         _process_address: u64,
-        _size: usize,
-        _device_address: u64,
+        size: usize,
+        device_address: u64,
         _option: u32,
         _is_aligned: bool,
     ) -> ResultCode {
-        // TODO: Implement once KProcessPageTable/KDevicePageTable are available.
+        // Validate address range.
+        if !(self.m_space_address <= device_address
+            && device_address + size as u64 - 1 <= self.m_space_address + self.m_space_size - 1)
+        {
+            return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY;
+        }
+        // Upstream: m_table.Map — also commented out in upstream C++.
         ResultCode::new(0)
     }
 }

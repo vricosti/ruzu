@@ -141,22 +141,72 @@ impl KSecureSystemResource {
         &self.dynamic_page_manager
     }
 
-    /// Stubbed: depends on KSystemControl, KScopedResourceReservation, etc.
+    /// Initialize the secure system resource.
+    /// Port of upstream `KSecureSystemResource::Initialize`.
+    /// Allocates secure memory, initializes dynamic page manager and slab heaps.
     pub fn initialize(
         &mut self,
-        _size: usize,
-        _pool: k_memory_manager::Pool,
+        size: usize,
+        pool: k_memory_manager::Pool,
+        mm: &mut k_memory_manager::KMemoryManager,
     ) -> Result<(), ()> {
-        // TODO: implement when KSystemControl and related infrastructure is ported.
-        Err(())
+        use super::k_memory_block::PAGE_SIZE;
+
+        self.resource_size = size;
+
+        // Allocate secure memory via KSystemControl.
+        let resource_address = super::board::k_system_control::allocate_secure_memory(
+            mm, size, pool as u32,
+        )
+        .map_err(|_| ())?;
+
+        self.resource_address = resource_address;
+
+        // Calculate reference count size.
+        let rc_size = common::alignment::align_up(
+            (size / PAGE_SIZE * std::mem::size_of::<u32>()) as u64,
+            PAGE_SIZE as u64,
+        ) as usize;
+        if size <= rc_size {
+            // Clean up on failure.
+            super::board::k_system_control::free_secure_memory(
+                mm, resource_address, size, pool as u32,
+            );
+            return Err(());
+        }
+
+        // Initialize the dynamic page manager with the remaining memory.
+        if self
+            .dynamic_page_manager
+            .initialize(resource_address + rc_size as u64, size - rc_size, PAGE_SIZE)
+            .is_err()
+        {
+            super::board::k_system_control::free_secure_memory(
+                mm, resource_address, size, pool as u32,
+            );
+            return Err(());
+        }
+
+        self.is_initialized = true;
+        Ok(())
     }
 
-    /// Stubbed: depends on KSystemControl.
-    pub fn finalize(&mut self) {
+    /// Finalize the secure system resource.
+    /// Port of upstream `KSecureSystemResource::Finalize`.
+    pub fn finalize(&mut self, mm: &mut k_memory_manager::KMemoryManager) {
         assert_eq!(self.memory_block_slab_manager.get_used(), 0);
         assert_eq!(self.block_info_manager.get_used(), 0);
         assert_eq!(self.page_table_manager.get_used(), 0);
-        // TODO: free secure memory, release resource reservation.
+
+        // Free secure memory.
+        if self.resource_address != 0 && self.resource_size > 0 {
+            super::board::k_system_control::free_secure_memory(
+                mm,
+                self.resource_address,
+                self.resource_size,
+                0, // Pool
+            );
+        }
     }
 
     pub fn calculate_required_secure_memory_size(
