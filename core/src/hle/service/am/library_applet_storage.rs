@@ -72,5 +72,10 @@ pub fn create_storage(data: Vec<u8>) -> Box<dyn LibraryAppletStorage> {
     Box::new(BufferLibraryAppletStorage::new(data))
 }
 
-// TODO: TransferMemoryLibraryAppletStorage and HandleLibraryAppletStorage
-// require kernel KTransferMemory integration
+// Upstream defines two additional LibraryAppletStorage implementations:
+//   - TransferMemoryLibraryAppletStorage: backed by KTransferMemory, implements Read/Write
+//     by mapping the transfer memory into the process address space.
+//   - HandleLibraryAppletStorage: wraps a KTransferMemory handle for direct handle passing
+//     via IPC (PushCopyObjects).
+// Both require KTransferMemory (exists at kernel/k_transfer_memory.rs) to be wired into the
+// IPC framework with copy handle support. Blocked on IPC copy handle integration.
