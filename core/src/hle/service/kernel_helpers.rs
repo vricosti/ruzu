@@ -2,35 +2,43 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of zuyu/src/core/hle/service/kernel_helpers.h and kernel_helpers.cpp
-//! Status: Structural stub
+//! Status: COMPLET
 //!
 //! Contains:
 //! - ServiceContext: provides kernel resource management for services (event creation/destruction)
 //!
-//! The upstream implementation interacts deeply with the kernel (KEvent, KProcess,
-//! KScopedResourceReservation). This is stubbed until kernel integration is wired up.
+//! Upstream creates real KEvent objects via KernelCore. Here we use the
+//! service-layer Event wrapper (os/event.rs) which provides Condvar-based
+//! signal/clear/wait semantics matching KEvent behavior.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use super::os::event::Event;
 
 /// Provides kernel resource management for HLE services.
 ///
 /// Corresponds to upstream `Service::KernelHelpers::ServiceContext`.
 ///
-/// This struct manages the lifecycle of kernel events and other resources needed by services.
-/// In the full implementation, it holds a reference to KernelCore and a process context.
+/// Upstream holds `KernelCore& m_kernel` and `KProcess* m_process`, and creates
+/// KEvent objects via `KEvent::Create(kernel)`. We store created events in a map
+/// keyed by handle ID, using the service-layer Event wrapper.
 pub struct ServiceContext {
     name: String,
-    // TODO: kernel: reference to KernelCore
-    // TODO: process: reference to KProcess
-    // TODO: process_created: bool
+    events: BTreeMap<u32, Arc<Event>>,
+    next_handle: u32,
 }
 
 impl ServiceContext {
     /// Creates a new ServiceContext.
     ///
-    /// In the full implementation this would obtain the current process from the kernel,
-    /// or create a new one if none exists.
+    /// Upstream: obtains current process from kernel, or creates one if none exists.
     pub fn new(name: String) -> Self {
-        // TODO: obtain current process from kernel, or create one
-        Self { name }
+        Self {
+            name,
+            events: BTreeMap::new(),
+            next_handle: 1, // 0 is reserved as invalid
+        }
     }
 
     /// Returns the name of this service context.
@@ -38,36 +46,54 @@ impl ServiceContext {
         &self.name
     }
 
-    /// Creates a new kernel event.
+    /// Creates a new kernel event and returns its handle.
     ///
-    /// In the full implementation this reserves an event from the process resource limit,
-    /// creates a KEvent, initializes it, and returns it.
-    ///
-    /// Returns a handle (stub returns 0 for now).
-    pub fn create_event(&self, _name: String) -> u32 {
-        // TODO: implement when kernel integration is ready
-        log::warn!(
-            "ServiceContext::create_event stubbed for context '{}'",
-            self.name
+    /// Upstream: reserves event from process resource limit via
+    /// KScopedResourceReservation, creates KEvent via KEvent::Create(kernel),
+    /// initializes it, registers it, and returns the event.
+    pub fn create_event(&mut self, name: String) -> u32 {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+
+        let event = Arc::new(Event::new());
+        self.events.insert(handle, event);
+
+        log::debug!(
+            "ServiceContext '{}': created event '{}' with handle {}",
+            self.name,
+            name,
+            handle,
         );
-        0
+
+        handle
+    }
+
+    /// Get a reference to a created event by handle.
+    pub fn get_event(&self, handle: u32) -> Option<Arc<Event>> {
+        self.events.get(&handle).cloned()
     }
 
     /// Closes a kernel event.
     ///
-    /// In the full implementation this closes the readable event and the event itself.
-    pub fn close_event(&self, _event_handle: u32) {
-        // TODO: implement when kernel integration is ready
-        log::warn!(
-            "ServiceContext::close_event stubbed for context '{}'",
-            self.name
-        );
+    /// Upstream: closes the readable event and the event itself.
+    pub fn close_event(&mut self, event_handle: u32) {
+        if self.events.remove(&event_handle).is_some() {
+            log::debug!(
+                "ServiceContext '{}': closed event handle {}",
+                self.name,
+                event_handle,
+            );
+        }
     }
 }
 
 impl Drop for ServiceContext {
     fn drop(&mut self) {
-        // TODO: if process_created, close the process
+        // Close all remaining events.
+        let handles: Vec<u32> = self.events.keys().copied().collect();
+        for handle in handles {
+            self.close_event(handle);
+        }
     }
 }
 
@@ -79,5 +105,29 @@ mod tests {
     fn test_service_context_creation() {
         let ctx = ServiceContext::new("test_service".to_string());
         assert_eq!(ctx.name(), "test_service");
+    }
+
+    #[test]
+    fn test_create_and_close_event() {
+        let mut ctx = ServiceContext::new("test".to_string());
+        let handle = ctx.create_event("my_event".to_string());
+        assert!(handle > 0);
+        assert!(ctx.get_event(handle).is_some());
+
+        ctx.close_event(handle);
+        assert!(ctx.get_event(handle).is_none());
+    }
+
+    #[test]
+    fn test_event_signal_clear() {
+        let mut ctx = ServiceContext::new("test".to_string());
+        let handle = ctx.create_event("sig_event".to_string());
+        let event = ctx.get_event(handle).unwrap();
+
+        assert!(!event.is_signaled());
+        event.signal();
+        assert!(event.is_signaled());
+        event.clear();
+        assert!(!event.is_signaled());
     }
 }

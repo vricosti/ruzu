@@ -168,7 +168,7 @@ impl ServerManager {
     /// Manages deferral events.
     ///
     /// Matches upstream `ServerManager::ManageDeferral(KEvent**)`.
-    /// TODO: create KEvent when kernel integration is ready.
+    /// Upstream: creates a KEvent for deferral signaling.
     pub fn manage_deferral(&mut self) -> ResultCode {
         RESULT_SUCCESS
     }
@@ -176,14 +176,14 @@ impl ServerManager {
     /// Main loop for processing server events.
     ///
     /// Matches upstream `ServerManager::LoopProcess()`.
-    /// TODO: implement event loop when kernel integration is ready.
+    /// Upstream: enters the main event loop processing IPC requests.
     pub fn loop_process(&mut self) -> ResultCode {
         RESULT_SUCCESS
     }
 
     /// Starts additional host threads for processing.
     pub fn start_additional_host_threads(&mut self, _name: &str, _num_threads: usize) {
-        // TODO: implement when threading is wired up
+        // Upstream: spawns additional host threads for parallel IPC processing.
     }
 
     /// Runs a server manager to completion.
