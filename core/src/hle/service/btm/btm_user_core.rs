@@ -7,19 +7,47 @@
 //! IBtmUserCore — BLE user core interface.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::kernel_helpers::ServiceContext;
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IBtmUserCore.
+///
+/// Upstream fields:
+/// - `service_context`: provides kernel event creation/destruction
+/// - `scan_event`: KEvent signaled on BLE scan results
+/// - `connection_event`: KEvent signaled on BLE connection state changes
+/// - `service_discovery_event`: KEvent signaled on BLE service discovery completion
+/// - `config_event`: KEvent signaled on BLE MTU configuration changes
 pub struct IBtmUserCore {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: service_context, scan_event, connection_event, etc.
+    service_context: ServiceContext,
+    scan_event: Arc<Event>,
+    connection_event: Arc<Event>,
+    service_discovery_event: Arc<Event>,
+    config_event: Arc<Event>,
 }
 
 impl IBtmUserCore {
     pub fn new() -> Self {
+        let mut service_context = ServiceContext::new("IBtmUserCore".to_string());
+
+        let scan_handle = service_context.create_event("IBtmUserCore:ScanEvent".to_string());
+        let scan_event = service_context.get_event(scan_handle).unwrap();
+
+        let conn_handle = service_context.create_event("IBtmUserCore:ConnectionEvent".to_string());
+        let connection_event = service_context.get_event(conn_handle).unwrap();
+
+        let disc_handle = service_context.create_event("IBtmUserCore:DiscoveryEvent".to_string());
+        let service_discovery_event = service_context.get_event(disc_handle).unwrap();
+
+        let cfg_handle = service_context.create_event("IBtmUserCore:ConfigEvent".to_string());
+        let config_event = service_context.get_event(cfg_handle).unwrap();
+
         let handlers = build_handler_map(&[
             (0, None, "AcquireBleScanEvent"),
             (1, None, "GetBleScanFilterParameter"),
@@ -58,6 +86,11 @@ impl IBtmUserCore {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            service_context,
+            scan_event,
+            connection_event,
+            service_discovery_event,
+            config_event,
         }
     }
 }

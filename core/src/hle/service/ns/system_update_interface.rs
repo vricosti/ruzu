@@ -84,10 +84,11 @@ impl ISystemUpdateInterface {
     /// OpenSystemUpdateControl (cmd 1).
     ///
     /// Corresponds to upstream `ISystemUpdateInterface::OpenSystemUpdateControl`.
-    pub fn open_system_update_control(&self) -> Result<(), ResultCode> {
+    pub fn open_system_update_control(
+        &self,
+    ) -> Result<super::system_update_control::ISystemUpdateControl, ResultCode> {
         log::warn!("(STUBBED) OpenSystemUpdateControl called");
-        // TODO: Create and return ISystemUpdateControl
-        Ok(())
+        Ok(super::system_update_control::ISystemUpdateControl::new())
     }
 }
 

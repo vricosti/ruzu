@@ -115,8 +115,11 @@ impl Services {
         let dm_addr = device_memory as usize;
         let mm_addr = memory_manager as usize;
 
-        // Upstream: system.GetFileSystemController().CreateFactories(...);
-        // TODO: wire filesystem controller
+        // Upstream: system.GetFileSystemController().CreateFactories(*system.GetFilesystem(), false);
+        {
+            let mut fsc = filesystem_controller.lock().unwrap();
+            fsc.create_factories();
+        }
 
         // ── Host core processes (upstream: .detach()) ──
         // kernel.RunOnHostCoreProcess("audio",      [&] { Audio::LoopProcess(system); }).detach();

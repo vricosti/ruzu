@@ -38,9 +38,17 @@ impl IApplicationCreator {
     }
 
     /// Port of IApplicationCreator::CreateApplication
+    ///
+    /// Upstream calls CreateGuestApplication which:
+    /// 1. Retrieves the program NCA from ContentProviderUnion
+    /// 2. Calls CreateApplicationProcess to get a Process + control data + loader
+    /// 3. Creates an Applet with the process, sets program_id/applet_id/type/mode
+    /// 4. Tracks the applet via WindowSystem::TrackApplet
+    /// 5. Returns an IApplicationAccessor wrapping the applet
+    ///
+    /// Requires ContentProviderUnion, NCA/Loader, and process creation infrastructure.
     pub fn create_application(&self, _application_id: u64) {
-        log::info!("(STUBBED) CreateApplication called");
-        // TODO: CreateGuestApplication
+        log::info!("(STUBBED) CreateApplication called -- requires ContentProviderUnion and Loader infrastructure");
     }
 }
 

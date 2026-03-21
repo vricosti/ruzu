@@ -7,19 +7,38 @@
 //! IBtmSystemCore — Bluetooth system core interface.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::kernel_helpers::ServiceContext;
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IBtmSystemCore.
+///
+/// Upstream fields:
+/// - `service_context`: provides kernel event creation/destruction
+/// - `radio_event`: KEvent signaled on radio state changes
+/// - `audio_device_connection_event`: KEvent signaled on audio device connection changes
+/// - `m_set_sys`: shared pointer to ISystemSettingsServer (not yet wired)
 pub struct IBtmSystemCore {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: service_context, radio_event, audio_device_connection_event
+    service_context: ServiceContext,
+    radio_event: Arc<Event>,
+    audio_device_connection_event: Arc<Event>,
 }
 
 impl IBtmSystemCore {
     pub fn new() -> Self {
+        let mut service_context = ServiceContext::new("IBtmSystemCore".to_string());
+
+        let radio_handle = service_context.create_event("IBtmSystemCore::RadioEvent".to_string());
+        let radio_event = service_context.get_event(radio_handle).unwrap();
+
+        let audio_handle = service_context.create_event("IBtmSystemCore::AudioDeviceConnectionEvent".to_string());
+        let audio_device_connection_event = service_context.get_event(audio_handle).unwrap();
+
         let handlers = build_handler_map(&[
             (0, None, "StartGamepadPairing"),
             (1, None, "CancelGamepadPairing"),
@@ -50,6 +69,9 @@ impl IBtmSystemCore {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            service_context,
+            radio_event,
+            audio_device_connection_event,
         }
     }
 

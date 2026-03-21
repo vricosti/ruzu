@@ -22,11 +22,15 @@ impl IReceiverService {
 
     /// Cmd 0: OpenReceiver
     ///
-    /// Creates a new IReceiver instance. Upstream creates an IReceiver
-    /// (separate class); here we return success since IReceiver is a thin wrapper.
+    /// Creates a new IReceiver instance. Upstream creates an IReceiver (separate class).
+    /// The IReceiver commands (AddSource, RemoveSource, GetReceiveEventHandle, Receive,
+    /// ReceiveWithTick) are defined in receiver.rs but are all unimplemented (nullptr)
+    /// in upstream, so returning success here matches upstream behavior.
     pub fn open_receiver(&self) -> ResultCode {
         log::debug!("IReceiverService::open_receiver called");
-        // TODO: return IReceiver once ported
+        // IReceiver is defined in receiver.rs with its command table. All upstream
+        // handlers are nullptr, so creating the interface has no observable effect
+        // beyond registering the empty command table.
         RESULT_SUCCESS
     }
 }

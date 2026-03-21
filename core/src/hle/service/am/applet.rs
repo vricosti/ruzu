@@ -105,6 +105,9 @@ pub struct Applet {
     pub sleep_lock_event_handle: Option<Handle>,
     pub state_changed_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub state_changed_event_handle: Option<Handle>,
+
+    // HID registration — upstream: HidRegistration hid_registration
+    pub hid_registration: super::hid_registration::HidRegistration,
 }
 
 impl Applet {
@@ -174,6 +177,7 @@ impl Applet {
             sleep_lock_event_handle: None,
             state_changed_event: None,
             state_changed_event_handle: None,
+            hid_registration: super::hid_registration::HidRegistration::new(&Process::new(), None),
         }
     }
 
@@ -302,8 +306,9 @@ impl Applet {
             return;
         }
         self.is_interactible = interactible;
-        // NOTE: upstream calls hid_registration.EnableAppletToGetInput(interactible && !lifecycle_manager.GetExitRequested())
-        // HID registration is not yet wired; depends on IHidServer integration.
+        self.hid_registration.enable_applet_to_get_input(
+            interactible && !self.lifecycle_manager.get_exit_requested(),
+        );
     }
 
     pub fn ensure_state_changed_event(&mut self, ctx: &HLERequestContext) -> Option<Handle> {

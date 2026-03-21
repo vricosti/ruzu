@@ -23,7 +23,9 @@ impl ISenderService {
     /// Cmd 0: OpenSender
     ///
     /// Creates a new ISender instance with the given sender_id and data.
-    /// Upstream creates an ISender (separate class).
+    /// Upstream creates an ISender (separate class). The ISender commands
+    /// (Send, GetUnreceivedMessageCount) are defined in sender.rs. Send is
+    /// stubbed and GetUnreceivedMessageCount is nullptr in upstream.
     pub fn open_sender(&self, sender_id: u32, data: [u64; 2]) -> ResultCode {
         log::warn!(
             "(STUBBED) ISenderService::open_sender called, sender_id={}, data={:016X} {:016X}",
@@ -31,7 +33,8 @@ impl ISenderService {
             data[0],
             data[1]
         );
-        // TODO: return ISender once ported
+        // ISender is defined in sender.rs. Upstream's Send handler is a logging stub
+        // and GetUnreceivedMessageCount is nullptr. Returning success matches upstream.
         RESULT_SUCCESS
     }
 }

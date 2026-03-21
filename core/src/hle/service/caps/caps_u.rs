@@ -116,8 +116,18 @@ impl IAlbumApplicationService {
                 return Err(result);
             }
         }
-        // TODO: manager.get_album_file_list with content_type/posix_time filtering
-        Ok(0)
+        let manager = self.manager.lock().unwrap();
+        let (result, count) = manager.get_album_file_list_aafe(
+            out_entries,
+            content_type,
+            start_posix_time,
+            end_posix_time,
+            aruid,
+        );
+        if !result.is_success() {
+            return Err(result);
+        }
+        Ok(count)
     }
 
     /// GetAlbumFileList3AaeAruid (cmd 142).
@@ -151,8 +161,18 @@ impl IAlbumApplicationService {
                 return Err(result);
             }
         }
-        // TODO: manager.get_album_file_list with content_type/datetime filtering
-        Ok(0)
+        let manager = self.manager.lock().unwrap();
+        let (result, count) = manager.get_album_file_list_aae(
+            out_entries,
+            content_type,
+            start_date_time,
+            end_date_time,
+            aruid,
+        );
+        if !result.is_success() {
+            return Err(result);
+        }
+        Ok(count)
     }
 }
 
