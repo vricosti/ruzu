@@ -15,9 +15,13 @@
 use std::collections::VecDeque;
 
 use common::div_ceil::div_ceil;
+use common::lru_cache::LeastRecentlyUsedCache;
+use common::range_sets::RangeSet;
 use common::slot_vector::{SlotId, SlotVector};
 use common::types::VAddr;
 use parking_lot::Mutex;
+
+use crate::delayed_destruction_ring::DelayedDestructionRing;
 
 use super::buffer_base::BufferBase;
 use super::buffer_cache_base::*;
@@ -91,10 +95,9 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     memory_tracker: MemoryTrackerBase<DT>,
 
     // -- GPU-modified range tracking --
-    // TODO: use common::range_sets::RangeSet once ported
-    uncommitted_gpu_modified_ranges: Vec<(VAddr, VAddr)>,
-    gpu_modified_ranges: Vec<(VAddr, VAddr)>,
-    committed_gpu_modified_ranges: VecDeque<Vec<(VAddr, VAddr)>>,
+    uncommitted_gpu_modified_ranges: RangeSet,
+    gpu_modified_ranges: RangeSet,
+    committed_gpu_modified_ranges: VecDeque<RangeSet>,
 
     // -- Async buffer downloads --
     pending_downloads: VecDeque<Vec<BufferCopy>>,
@@ -104,6 +107,19 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     immediate_buffer_alloc: Vec<u8>,
 
     // -- LRU / GC state --
+    /// LRU cache tracking buffer access order for garbage collection.
+    ///
+    /// Upstream: `Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache`
+    /// where `LRUItemParams::ObjectType = BufferId` and `LRUItemParams::TickType = u64`.
+    /// We use `i64` here because the Rust LRU cache requires `K: Into<i64>` for
+    /// its `for_each_item_below` comparison. frame_tick values fit in i64.
+    lru_cache: LeastRecentlyUsedCache<BufferId, i64>,
+
+    /// Deferred destruction ring for buffers removed from the cache.
+    ///
+    /// Upstream: `DelayedDestructionRing<Buffer, 8> delayed_destruction_ring`
+    delayed_destruction_ring: DelayedDestructionRing<BufferBase, 8>,
+
     frame_tick: u64,
     total_used_memory: u64,
     minimum_memory: u64,
@@ -131,9 +147,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             page_table: vec![SlotId::invalid(); PAGE_TABLE_SIZE],
             last_index_count: 0,
             memory_tracker: MemoryTrackerBase::new(device_tracker),
-            uncommitted_gpu_modified_ranges: Vec::new(),
-            gpu_modified_ranges: Vec::new(),
+            uncommitted_gpu_modified_ranges: RangeSet::new(),
+            gpu_modified_ranges: RangeSet::new(),
             committed_gpu_modified_ranges: VecDeque::new(),
+            lru_cache: LeastRecentlyUsedCache::new(),
+            delayed_destruction_ring: DelayedDestructionRing::new(),
             pending_downloads: VecDeque::new(),
             immediate_buffer_capacity: 0,
             immediate_buffer_alloc: Vec::new(),
@@ -199,7 +217,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         self.frame_tick += 1;
 
-        // TODO: delayed_destruction_ring.Tick() — not yet ported.
+        self.delayed_destruction_ring.tick();
         // TODO: async_buffers_death_ring cleanup — requires runtime staging buffer free.
     }
 
@@ -213,7 +231,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     pub fn write_memory(&mut self, device_addr: VAddr, size: u64) {
         if self.memory_tracker.is_region_gpu_modified(device_addr, size) {
             self.clear_download(device_addr, size);
-            Self::range_subtract(&mut self.gpu_modified_ranges, device_addr, size);
+            self.gpu_modified_ranges.subtract(device_addr, size as usize);
         }
         self.memory_tracker.mark_region_as_cpu_modified(device_addr, size);
     }
@@ -753,7 +771,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 let device_addr_end = (device_addr + size as u64 + 63) & !63u64;
                 let new_size = device_addr_end - device_addr_start;
                 self.clear_download(device_addr_start, new_size);
-                Self::range_subtract(&mut self.gpu_modified_ranges, device_addr_start, new_size);
+                self.gpu_modified_ranges.subtract(device_addr_start, new_size as usize);
             }
             _ => {}
         }
@@ -775,18 +793,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Return true when there are uncommitted buffers to be downloaded.
     pub fn has_uncommitted_flushes(&self) -> bool {
-        !self.uncommitted_gpu_modified_ranges.is_empty()
+        !self.uncommitted_gpu_modified_ranges.empty()
     }
 
     /// Accumulate current uncommitted ranges into committed.
     ///
     /// Upstream: `BufferCache<P>::AccumulateFlushes`
     pub fn accumulate_flushes(&mut self) {
-        if self.uncommitted_gpu_modified_ranges.is_empty() {
+        if self.uncommitted_gpu_modified_ranges.empty() {
             return;
         }
         // Move uncommitted ranges into a new committed slot.
-        let ranges = std::mem::take(&mut self.uncommitted_gpu_modified_ranges);
+        let ranges = std::mem::replace(&mut self.uncommitted_gpu_modified_ranges, RangeSet::new());
         self.committed_gpu_modified_ranges.push_back(ranges);
     }
 
@@ -886,17 +904,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Return true when a device region is GPU-modified.
     ///
     /// Upstream: `BufferCache<P>::IsRegionGpuModified`
-    ///
-    /// NOTE: Upstream iterates `gpu_modified_ranges` (a RangeSet) via ForEachInRange.
-    /// We approximate with a linear scan over our Vec-based range list.
     pub fn is_region_gpu_modified(&self, addr: VAddr, size: usize) -> bool {
-        let end = addr + size as u64;
-        for &(start, range_end) in &self.gpu_modified_ranges {
-            if start < end && addr < range_end {
-                return true;
-            }
-        }
-        false
+        let mut found = false;
+        self.gpu_modified_ranges.for_each_in_range(addr, size, |_start, _end| {
+            found = true;
+        });
+        found
     }
 
     /// Return true when a region is registered in the cache.
@@ -1030,40 +1043,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     }
 
     // -----------------------------------------------------------------------
-    // Range-set helpers (Vec-based approximation of Common::RangeSet)
+    // Range-set helpers — no longer needed; using common::range_sets::RangeSet directly.
     // -----------------------------------------------------------------------
-
-    /// Add a range `[addr, addr+size)` to a range list.
-    ///
-    /// This is a simplified approximation of `RangeSet::Add`. Ranges are
-    /// stored unsorted and may overlap; `is_region_gpu_modified` handles
-    /// overlap detection via linear scan.
-    fn range_add(ranges: &mut Vec<(VAddr, VAddr)>, addr: VAddr, size: u64) {
-        ranges.push((addr, addr + size));
-    }
-
-    /// Remove all parts of `[addr, addr+size)` from a range list.
-    ///
-    /// This is a simplified approximation of `RangeSet::Subtract`.
-    fn range_subtract(ranges: &mut Vec<(VAddr, VAddr)>, addr: VAddr, size: u64) {
-        let end = addr + size;
-        let mut new_ranges = Vec::with_capacity(ranges.len());
-        for &(s, e) in ranges.iter() {
-            if e <= addr || s >= end {
-                // No overlap — keep as is.
-                new_ranges.push((s, e));
-            } else {
-                // Partial overlap — keep the parts outside [addr, end).
-                if s < addr {
-                    new_ranges.push((s, addr));
-                }
-                if e > end {
-                    new_ranges.push((end, e));
-                }
-            }
-        }
-        *ranges = new_ranges;
-    }
 
     // -----------------------------------------------------------------------
     // Private helpers — operations
@@ -1080,10 +1061,24 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let ticks_to_destroy: u64 = if aggressive_gc { 60 } else { 120 };
         let num_iterations: usize = if aggressive_gc { 64 } else { 32 };
 
-        // Collect buffer IDs whose LRU age exceeds the threshold.
-        // TODO: replace with lru_cache.ForEachItemBelow once LRU cache is ported.
-        // For now we do nothing — we cannot iterate by age without the LRU cache.
-        let _ = (ticks_to_destroy, num_iterations);
+        // Upstream: lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, clean_up)
+        // The callback downloads buffer memory and then deletes the buffer,
+        // stopping after num_iterations buffers.
+        let tick_threshold = self.frame_tick.saturating_sub(ticks_to_destroy) as i64;
+        let mut remaining = num_iterations;
+        let mut to_delete: Vec<BufferId> = Vec::new();
+        self.lru_cache.for_each_item_below(tick_threshold, |buffer_id| {
+            if remaining == 0 {
+                return true; // stop
+            }
+            remaining -= 1;
+            to_delete.push(buffer_id);
+            false // continue
+        });
+        for buffer_id in to_delete {
+            self.download_buffer_memory(buffer_id);
+            self.delete_buffer(buffer_id, false);
+        }
     }
 
     fn bind_host_index_buffer(&mut self) {
@@ -1778,12 +1773,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     fn mark_written_buffer(&mut self, _buffer_id: BufferId, device_addr: VAddr, size: u32) {
         self.memory_tracker
             .mark_region_as_gpu_modified(device_addr, size as u64);
-        Self::range_add(&mut self.gpu_modified_ranges, device_addr, size as u64);
-        Self::range_add(
-            &mut self.uncommitted_gpu_modified_ranges,
-            device_addr,
-            size as u64,
-        );
+        self.gpu_modified_ranges.add(device_addr, size as usize);
+        self.uncommitted_gpu_modified_ranges.add(device_addr, size as usize);
     }
 
     /// Find or create a buffer covering `[device_addr, device_addr+size)`.
@@ -1976,13 +1967,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         if insert {
             self.total_used_memory += (size + 1023) as u64 & !1023u64; // AlignUp(size, 1024)
-            // TODO: lru_cache.Insert — not yet ported; set_lru_id to a placeholder.
-            // We use frame_tick as a monotonic stand-in for now.
-            self.slot_buffers[buffer_id].set_lru_id(self.frame_tick as usize);
+            let lru_id = self.lru_cache.insert(buffer_id, self.frame_tick as i64);
+            self.slot_buffers[buffer_id].set_lru_id(lru_id);
         } else {
             let aligned = (size + 1023) as u64 & !1023u64;
             self.total_used_memory = self.total_used_memory.saturating_sub(aligned);
-            // TODO: lru_cache.Free — not yet ported.
+            let lru_id = self.slot_buffers[buffer_id].get_lru_id();
+            self.lru_cache.free(lru_id);
         }
 
         let device_addr_end = device_addr_begin + size as u64;
@@ -2003,7 +1994,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Upstream: `BufferCache<P>::TouchBuffer`
     fn touch_buffer(&mut self, buffer_id: BufferId) {
         if buffer_id != NULL_BUFFER_ID && buffer_id.is_valid() {
-            // TODO: lru_cache.Touch(buffer.getLRUID(), frame_tick) — not yet ported.
+            let lru_id = self.slot_buffers[buffer_id].get_lru_id();
+            self.lru_cache.touch(lru_id, self.frame_tick as i64);
         }
     }
 
@@ -2136,22 +2128,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mut largest_copy: u64 = 0;
 
         for (device_addr_out, range_size) in download_ranges {
-            // Iterate GPU-modified sub-ranges (approximation without RangeSet).
-            let range_end = device_addr_out + range_size;
-            // Collect matching gpu_modified_ranges sub-intervals.
-            let sub_intervals: Vec<(VAddr, VAddr)> = self
-                .gpu_modified_ranges
-                .iter()
-                .filter_map(|&(s, e)| {
-                    let new_start = s.max(device_addr_out);
-                    let new_end = e.min(range_end);
-                    if new_start < new_end {
-                        Some((new_start, new_end))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            // Iterate GPU-modified sub-ranges using RangeSet::for_each_in_range.
+            let mut sub_intervals: Vec<(VAddr, VAddr)> = Vec::new();
+            self.gpu_modified_ranges.for_each_in_range(
+                device_addr_out,
+                range_size as usize,
+                |new_start, new_end| {
+                    sub_intervals.push((new_start, new_end));
+                },
+            );
 
             for (new_start, new_end) in sub_intervals {
                 let new_offset = new_start - buffer_addr;
@@ -2166,7 +2151,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
 
             self.clear_download(device_addr_out, range_size);
-            Self::range_subtract(&mut self.gpu_modified_ranges, device_addr_out, range_size);
+            self.gpu_modified_ranges.subtract(device_addr_out, range_size as usize);
         }
 
         if total_size_bytes == 0 {
@@ -2247,8 +2232,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
 
         self.unregister(buffer_id);
-        // TODO: delayed_destruction_ring.Push — not yet ported; just erase immediately.
-        self.slot_buffers.erase(buffer_id);
+        let buffer = self.slot_buffers.take(buffer_id);
+        self.delayed_destruction_ring.push(buffer);
     }
 
     /// Build a storage buffer binding from a GPU virtual SSBO address.
@@ -2337,10 +2322,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::ClearDownload`
     fn clear_download(&mut self, base_addr: VAddr, size: u64) {
-        // async_downloads.DeleteAll — not yet ported (no RangeSet).
-        Self::range_subtract(&mut self.uncommitted_gpu_modified_ranges, base_addr, size);
+        // TODO: async_downloads.DeleteAll — requires OverlapRangeSet field.
+        self.uncommitted_gpu_modified_ranges.subtract(base_addr, size as usize);
         for range_set in self.committed_gpu_modified_ranges.iter_mut() {
-            Self::range_subtract(range_set, base_addr, size);
+            range_set.subtract(base_addr, size as usize);
         }
     }
 
@@ -2356,7 +2341,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         _inlined_buffer: &[u8],
     ) {
         self.clear_download(dest_address, copy_size as u64);
-        Self::range_subtract(&mut self.gpu_modified_ranges, dest_address, copy_size as u64);
+        self.gpu_modified_ranges.subtract(dest_address, copy_size);
 
         let buffer_id = self.find_buffer(dest_address, copy_size as u32);
         self.synchronize_buffer(buffer_id, dest_address, copy_size as u32);
@@ -2484,7 +2469,7 @@ mod tests {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
         // Add something to uncommitted ranges.
-        cache.uncommitted_gpu_modified_ranges.push((0x1000, 0x2000));
+        cache.uncommitted_gpu_modified_ranges.add(0x1000, 0x1000);
         assert!(cache.has_uncommitted_flushes());
         cache.accumulate_flushes();
         assert!(!cache.has_uncommitted_flushes());
@@ -2534,17 +2519,21 @@ mod tests {
 
     #[test]
     fn test_range_subtract() {
-        let mut ranges = vec![(0u64, 100u64)];
-        BufferCache::<TestParams, DummyTracker>::range_subtract(&mut ranges, 20, 30);
-        // Should split into (0, 20) and (50, 100).
-        assert_eq!(ranges, vec![(0, 20), (50, 100)]);
+        let mut rs = RangeSet::new();
+        rs.add(0, 100);
+        rs.subtract(20, 30);
+        // Should split into [0, 20) and [50, 100).
+        let mut result = Vec::new();
+        rs.for_each(|s, e| result.push((s, e)));
+        assert_eq!(result, vec![(0, 20), (50, 100)]);
     }
 
     #[test]
     fn test_range_subtract_full_removal() {
-        let mut ranges = vec![(10u64, 50u64)];
-        BufferCache::<TestParams, DummyTracker>::range_subtract(&mut ranges, 0, 100);
-        assert!(ranges.is_empty());
+        let mut rs = RangeSet::new();
+        rs.add(10, 40);
+        rs.subtract(0, 100);
+        assert!(rs.empty());
     }
 
     #[test]
