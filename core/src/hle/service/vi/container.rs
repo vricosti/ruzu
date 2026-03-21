@@ -30,6 +30,7 @@ use super::vi_types::DisplayName;
 /// 4. Registers all displays with SurfaceFlinger
 /// 5. Creates the Conductor (vsync manager)
 pub struct Container {
+    system: crate::core::SystemRef,
     inner: Mutex<ContainerInner>,
     /// Binder server — shared with SurfaceFlinger and IHOSBinderDriver.
     server: Arc<HosBinderDriverServer>,
@@ -46,7 +47,7 @@ struct ContainerInner {
 
 impl Container {
     /// Create a new Container with the standard display set.
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Self {
         let mut displays = DisplayList::default();
         let default_name = Self::make_display_name(b"Default");
         let external_name = Self::make_display_name(b"External");
@@ -77,6 +78,7 @@ impl Container {
         let conductor = Conductor::new(&display_ids);
 
         Self {
+            system,
             inner: Mutex::new(ContainerInner {
                 displays,
                 layers: LayerList::default(),

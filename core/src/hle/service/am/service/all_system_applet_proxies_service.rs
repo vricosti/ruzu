@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::applet::Applet;
+use crate::hle::service::am::window_system::WindowSystem;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -23,13 +24,13 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 410: GetSystemAppletControllerForDebug (unimplemented)
 /// - 1000: GetDebugFunctions (unimplemented)
 pub struct IAllSystemAppletProxiesService {
-    // TODO: WindowSystem reference
+    window_system: Arc<Mutex<WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IAllSystemAppletProxiesService {
-    pub fn new() -> Self {
+    pub fn new(window_system: Arc<Mutex<WindowSystem>>) -> Self {
         let handlers = build_handler_map(&[
             (100, Some(Self::open_system_applet_proxy_handler), "OpenSystemAppletProxy"),
             (200, Some(Self::open_library_applet_proxy_old_handler), "OpenLibraryAppletProxyOld"),
@@ -41,6 +42,7 @@ impl IAllSystemAppletProxiesService {
             (1000, None, "GetDebugFunctions"),
         ]);
         Self {
+            window_system,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -101,32 +103,44 @@ impl IAllSystemAppletProxiesService {
     }
 
     fn open_system_applet_proxy_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAllSystemAppletProxiesService) };
         log::debug!("IAllSystemAppletProxiesService::OpenSystemAppletProxy");
         let applet = Self::create_applet(ctx);
-        let proxy = Arc::new(super::system_applet_proxy::ISystemAppletProxy::new(applet));
+        let proxy = Arc::new(super::system_applet_proxy::ISystemAppletProxy::new(
+            applet,
+            service.window_system.clone(),
+        ));
         Self::push_interface_response(ctx, proxy);
     }
 
     fn open_library_applet_proxy_old_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAllSystemAppletProxiesService) };
         log::debug!("IAllSystemAppletProxiesService::OpenLibraryAppletProxyOld");
         let applet = Self::create_applet(ctx);
-        let proxy = Arc::new(super::library_applet_proxy::ILibraryAppletProxy::new(applet));
+        let proxy = Arc::new(super::library_applet_proxy::ILibraryAppletProxy::new(
+            applet,
+            service.window_system.clone(),
+        ));
         Self::push_interface_response(ctx, proxy);
     }
 
     fn open_library_applet_proxy_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAllSystemAppletProxiesService) };
         log::debug!("IAllSystemAppletProxiesService::OpenLibraryAppletProxy");
         let applet = Self::create_applet(ctx);
-        let proxy = Arc::new(super::library_applet_proxy::ILibraryAppletProxy::new(applet));
+        let proxy = Arc::new(super::library_applet_proxy::ILibraryAppletProxy::new(
+            applet,
+            service.window_system.clone(),
+        ));
         Self::push_interface_response(ctx, proxy);
     }
 }

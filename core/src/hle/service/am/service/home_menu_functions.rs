@@ -5,6 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/home_menu_functions.cpp
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -28,13 +29,18 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 200: LaunchDevMenu (unimplemented)
 /// - 1000: SetLastApplicationExitReason (unimplemented)
 pub struct IHomeMenuFunctions {
-    // TODO: WindowSystem reference, Applet reference, ServiceContext, Event
+    applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
+    window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
+    // TODO: ServiceContext, Event
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IHomeMenuFunctions {
-    pub fn new() -> Self {
+    pub fn new(
+        applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
+        window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
+    ) -> Self {
         let handlers = build_handler_map(&[
             (10, Some(Self::request_to_get_foreground_handler), "RequestToGetForeground"),
             (11, Some(Self::lock_foreground_handler), "LockForeground"),
@@ -57,6 +63,8 @@ impl IHomeMenuFunctions {
             (1000, None, "SetLastApplicationExitReason"),
         ]);
         Self {
+            applet,
+            window_system,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -65,11 +73,12 @@ impl IHomeMenuFunctions {
     /// Port of IHomeMenuFunctions::RequestToGetForeground
     /// Upstream calls m_window_system.RequestHomeMenuToGetForeground() then R_SUCCEED.
     fn request_to_get_foreground_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
         log::info!("IHomeMenuFunctions::RequestToGetForeground called");
-        // TODO: call window_system.request_home_menu_to_get_foreground() when available
+        service.window_system.lock().unwrap().request_home_menu_to_get_foreground();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -77,9 +86,10 @@ impl IHomeMenuFunctions {
 
     /// Port of IHomeMenuFunctions::LockForeground
     /// Upstream calls m_window_system.RequestLockHomeMenuIntoForeground() then R_SUCCEED.
-    fn lock_foreground_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn lock_foreground_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
         log::info!("IHomeMenuFunctions::LockForeground called");
-        // TODO: call window_system.request_lock_home_menu_into_foreground() when available
+        service.window_system.lock().unwrap().request_lock_home_menu_into_foreground();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -87,9 +97,10 @@ impl IHomeMenuFunctions {
 
     /// Port of IHomeMenuFunctions::UnlockForeground
     /// Upstream calls m_window_system.RequestUnlockHomeMenuIntoForeground() then R_SUCCEED.
-    fn unlock_foreground_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn unlock_foreground_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
         log::info!("IHomeMenuFunctions::UnlockForeground called");
-        // TODO: call window_system.request_unlock_home_menu_into_foreground() when available
+        service.window_system.lock().unwrap().request_unlock_home_menu_into_foreground();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);

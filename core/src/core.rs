@@ -408,8 +408,9 @@ impl System {
         // services on the ServiceManager via per-process ServerManagers.
         let dm_ptr = self.device_memory.as_ref().unwrap().as_ref() as *const DeviceMemory;
         let mm_ptr = self.kernel.as_mut().unwrap().memory_manager_mut() as *mut _;
+        let system_ref = SystemRef::from_ref(self);
         let _services = crate::hle::service::services::Services::new(
-            &service_manager, dm_ptr, mm_ptr, self.filesystem_controller.clone(),
+            &service_manager, system_ref, dm_ptr, mm_ptr, self.filesystem_controller.clone(),
         );
 
         self.service_manager = Some(service_manager);

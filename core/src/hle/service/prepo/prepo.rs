@@ -35,34 +35,34 @@ pub struct PlayReport {
 impl PlayReport {
     pub fn new(name: &str) -> Self {
         let handlers = build_handler_map(&[
-            (10100, None, "SaveReportOld"),
-            (10101, None, "SaveReportWithUserOld"),
-            (10102, None, "SaveReportOld2"),
-            (10103, None, "SaveReportWithUserOld2"),
-            (10104, None, "SaveReport"),
-            (10105, None, "SaveReportWithUser"),
+            (10100, Some(PlayReport::save_report_old_handler), "SaveReportOld"),
+            (10101, Some(PlayReport::save_report_with_user_old_handler), "SaveReportWithUserOld"),
+            (10102, Some(PlayReport::save_report_old2_handler), "SaveReportOld2"),
+            (10103, Some(PlayReport::save_report_with_user_old2_handler), "SaveReportWithUserOld2"),
+            (10104, Some(PlayReport::save_report_new_handler), "SaveReport"),
+            (10105, Some(PlayReport::save_report_with_user_new_handler), "SaveReportWithUser"),
             (10200, Some(PlayReport::request_immediate_transmission_handler), "RequestImmediateTransmission"),
             (10300, Some(PlayReport::get_transmission_status_handler), "GetTransmissionStatus"),
             (10400, Some(PlayReport::get_system_session_id_handler), "GetSystemSessionId"),
-            (20100, None, "SaveSystemReport"),
-            (20101, None, "SaveSystemReportWithUser"),
-            (20200, None, "SetOperationMode"),
-            (30100, None, "ClearStorage"),
-            (30200, None, "ClearStatistics"),
-            (30300, None, "GetStorageUsage"),
-            (30400, None, "GetStatistics"),
-            (30401, None, "GetThroughputHistory"),
-            (30500, None, "GetLastUploadError"),
-            (30600, None, "GetApplicationUploadSummary"),
-            (40100, None, "IsUserAgreementCheckEnabled"),
-            (40101, None, "SetUserAgreementCheckEnabled"),
-            (50100, None, "ReadAllApplicationReportFiles"),
-            (90100, None, "ReadAllReportFiles"),
-            (90101, None, "Unknown90101"),
-            (90102, None, "Unknown90102"),
-            (90200, None, "GetStatistics"),
-            (90201, None, "GetThroughputHistory"),
-            (90300, None, "GetLastUploadError"),
+            (20100, Some(PlayReport::save_system_report_handler), "SaveSystemReport"),
+            (20101, Some(PlayReport::save_system_report_with_user_handler), "SaveSystemReportWithUser"),
+            (20200, Some(PlayReport::stub_handler), "SetOperationMode"),
+            (30100, Some(PlayReport::stub_handler), "ClearStorage"),
+            (30200, Some(PlayReport::stub_handler), "ClearStatistics"),
+            (30300, Some(PlayReport::stub_handler), "GetStorageUsage"),
+            (30400, Some(PlayReport::stub_handler), "GetStatistics"),
+            (30401, Some(PlayReport::stub_handler), "GetThroughputHistory"),
+            (30500, Some(PlayReport::stub_handler), "GetLastUploadError"),
+            (30600, Some(PlayReport::stub_handler), "GetApplicationUploadSummary"),
+            (40100, Some(PlayReport::stub_handler), "IsUserAgreementCheckEnabled"),
+            (40101, Some(PlayReport::stub_handler), "SetUserAgreementCheckEnabled"),
+            (50100, Some(PlayReport::stub_handler), "ReadAllApplicationReportFiles"),
+            (90100, Some(PlayReport::stub_handler), "ReadAllReportFiles"),
+            (90101, Some(PlayReport::stub_handler), "Unknown90101"),
+            (90102, Some(PlayReport::stub_handler), "Unknown90102"),
+            (90200, Some(PlayReport::stub_handler), "GetStatistics"),
+            (90201, Some(PlayReport::stub_handler), "GetThroughputHistory"),
+            (90300, Some(PlayReport::stub_handler), "GetLastUploadError"),
         ]);
 
         Self {
@@ -175,6 +175,115 @@ impl PlayReport {
     }
 
     // --- Handler bridge functions ---
+
+    /// Stub handler for nullptr entries -- logs STUBBED and returns success.
+    fn stub_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let cmd = ctx.get_command();
+        log::warn!("(STUBBED) PlayReport command {}", cmd);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn save_report_old_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        let mut rp = RequestParser::new(ctx);
+        let process_id = rp.pop_u64();
+        log::debug!(
+            "PlayReport({})::SaveReportOld called, process_id={:016X}",
+            service.name, process_id
+        );
+        // TODO: read buffers A(0) and X(0), forward to reporter
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn save_report_with_user_old_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        let mut rp = RequestParser::new(ctx);
+        let user_id = rp.pop_raw::<u128>();
+        let process_id = rp.pop_u64();
+        log::debug!(
+            "PlayReport({})::SaveReportWithUserOld called, user_id={:032X}, process_id={:016X}",
+            service.name, user_id, process_id
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn save_report_old2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        let mut rp = RequestParser::new(ctx);
+        let process_id = rp.pop_u64();
+        log::debug!(
+            "PlayReport({})::SaveReportOld2 called, process_id={:016X}",
+            service.name, process_id
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn save_report_with_user_old2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        let mut rp = RequestParser::new(ctx);
+        let user_id = rp.pop_raw::<u128>();
+        let process_id = rp.pop_u64();
+        log::debug!(
+            "PlayReport({})::SaveReportWithUserOld2 called, user_id={:032X}, process_id={:016X}",
+            service.name, user_id, process_id
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn save_report_new_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        let mut rp = RequestParser::new(ctx);
+        let process_id = rp.pop_u64();
+        log::debug!(
+            "PlayReport({})::SaveReport called, process_id={:016X}",
+            service.name, process_id
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn save_report_with_user_new_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        let mut rp = RequestParser::new(ctx);
+        let user_id = rp.pop_raw::<u128>();
+        let process_id = rp.pop_u64();
+        log::debug!(
+            "PlayReport({})::SaveReportWithUser called, user_id={:032X}, process_id={:016X}",
+            service.name, user_id, process_id
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn save_system_report_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        let mut rp = RequestParser::new(ctx);
+        let title_id = rp.pop_u64();
+        log::debug!(
+            "PlayReport({})::SaveSystemReport called, title_id={:016X}",
+            service.name, title_id
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn save_system_report_with_user_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        let mut rp = RequestParser::new(ctx);
+        let user_id = rp.pop_raw::<u128>();
+        let title_id = rp.pop_u64();
+        log::debug!(
+            "PlayReport({})::SaveSystemReportWithUser called, user_id={:032X}, title_id={:016X}",
+            service.name, user_id, title_id
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
 
     fn request_immediate_transmission_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };

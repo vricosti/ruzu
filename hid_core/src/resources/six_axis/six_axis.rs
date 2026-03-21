@@ -244,6 +244,26 @@ impl SixAxis {
         Ok(sixaxis.fusion)
     }
 
+    /// Port of SixAxis::LoadSixAxisSensorCalibrationParameter.
+    /// Returns a reference to the calibration data for the given handle.
+    pub fn get_sixaxis_calibration(
+        &self,
+        sixaxis_handle: &SixAxisSensorHandle,
+    ) -> &[u8; 0x744] {
+        let sixaxis = self.get_sixaxis_state(sixaxis_handle);
+        &sixaxis.calibration
+    }
+
+    /// Port of SixAxis::GetSixAxisSensorIcInformation.
+    /// Returns a reference to the IC information data for the given handle.
+    pub fn get_sixaxis_ic_information(
+        &self,
+        sixaxis_handle: &SixAxisSensorHandle,
+    ) -> &[u8; 0xC8] {
+        let sixaxis = self.get_sixaxis_state(sixaxis_handle);
+        &sixaxis.ic_information
+    }
+
     fn get_sixaxis_state(&self, sixaxis_handle: &SixAxisSensorHandle) -> &SixaxisParameters {
         let controller = self.get_controller_from_handle(sixaxis_handle);
         match sixaxis_handle.npad_type {

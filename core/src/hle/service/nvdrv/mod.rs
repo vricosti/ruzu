@@ -10,9 +10,8 @@ pub mod nvdrv;
 pub mod nvdrv_interface;
 pub mod nvmemp;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::hle::service::sm::sm::ServiceManager;
 use crate::hle::service::nvdrv::nvdrv::Module;
 use crate::hle::service::nvdrv::nvdrv_interface::NvdrvService;
 
@@ -21,10 +20,10 @@ const NVDRV_SERVICE_NAMES: &[&str] = &["nvdrv", "nvdrv:a", "nvdrv:s", "nvdrv:t"]
 /// Launches Nvidia services.
 ///
 /// Matches upstream `void Nvidia::LoopProcess(Core::System& system)`.
-pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
-    let module = Module::new();
+pub fn loop_process(system: crate::core::SystemRef) {
+    let module = Module::new(system);
     let mut server_manager =
-        crate::hle::service::server_manager::ServerManager::new(crate::core::SystemRef::null());
+        crate::hle::service::server_manager::ServerManager::new(system);
     for name in NVDRV_SERVICE_NAMES {
         let svc_name = name.to_string();
         let module = Arc::clone(&module);
@@ -40,6 +39,6 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
 }
 
 /// Backward-compatible alias.
-pub fn register_services(service_manager: &Arc<Mutex<ServiceManager>>) {
-    loop_process(service_manager);
+pub fn register_services(system: crate::core::SystemRef) {
+    loop_process(system);
 }

@@ -9,6 +9,7 @@
 //!   - pctl_results.h
 //!   - pctl_types.h
 
+#[allow(invalid_reference_casting)]
 pub mod parental_control_service;
 pub mod parental_control_service_factory;
 pub mod pctl;

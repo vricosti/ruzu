@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -96,6 +96,31 @@ pub mod commands {
     pub const IS_ALL_FEATURES_DISABLED: u32 = 1603;
     pub const DELETE_FROM_FREE_COMMUNICATION_APPLICATION_LIST_FOR_DEBUG: u32 = 1901;
     pub const CLEAR_FREE_COMMUNICATION_APPLICATION_LIST_FOR_DEBUG: u32 = 1902;
+    pub const GET_EXEMPT_APPLICATION_LIST_COUNT_FOR_DEBUG: u32 = 1903;
+    pub const GET_EXEMPT_APPLICATION_LIST_FOR_DEBUG: u32 = 1904;
+    pub const UPDATE_EXEMPT_APPLICATION_LIST_FOR_DEBUG: u32 = 1905;
+    pub const ADD_TO_EXEMPT_APPLICATION_LIST_FOR_DEBUG: u32 = 1906;
+    pub const DELETE_FROM_EXEMPT_APPLICATION_LIST_FOR_DEBUG: u32 = 1907;
+    pub const CLEAR_EXEMPT_APPLICATION_LIST_FOR_DEBUG: u32 = 1908;
+    pub const DELETE_PAIRING: u32 = 1941;
+    pub const SET_PLAY_TIMER_SETTINGS_FOR_DEBUG: u32 = 1951;
+    pub const GET_PLAY_TIMER_SPENT_TIME_FOR_TEST: u32 = 1952;
+    pub const SET_PLAY_TIMER_ALARM_DISABLED_FOR_DEBUG: u32 = 1953;
+    pub const REQUEST_PAIRING_ASYNC: u32 = 2001;
+    pub const FINISH_REQUEST_PAIRING: u32 = 2002;
+    pub const AUTHORIZE_PAIRING_ASYNC: u32 = 2003;
+    pub const FINISH_AUTHORIZE_PAIRING: u32 = 2004;
+    pub const RETRIEVE_PAIRING_INFO_ASYNC: u32 = 2005;
+    pub const FINISH_RETRIEVE_PAIRING_INFO: u32 = 2006;
+    pub const UNLINK_PAIRING_ASYNC: u32 = 2007;
+    pub const FINISH_UNLINK_PAIRING: u32 = 2008;
+    pub const GET_ACCOUNT_MII_IMAGE_ASYNC: u32 = 2009;
+    pub const FINISH_GET_ACCOUNT_MII_IMAGE: u32 = 2010;
+    pub const GET_ACCOUNT_MII_IMAGE_CONTENT_TYPE_ASYNC: u32 = 2011;
+    pub const FINISH_GET_ACCOUNT_MII_IMAGE_CONTENT_TYPE: u32 = 2012;
+    pub const SYNCHRONIZE_PARENTAL_CONTROL_SETTINGS_ASYNC: u32 = 2013;
+    pub const FINISH_SYNCHRONIZE_PARENTAL_CONTROL_SETTINGS: u32 = 2014;
+    pub const FINISH_SYNCHRONIZE_PARENTAL_CONTROL_SETTINGS_WITH_LAST_UPDATED: u32 = 2015;
     pub const REQUEST_UPDATE_EXEMPTION_LIST_ASYNC: u32 = 2016;
 }
 
@@ -139,39 +164,117 @@ pub struct IParentalControlService {
 }
 
 impl IParentalControlService {
+    /// Stub handler for nullptr entries -- logs STUBBED and returns RESULT_SUCCESS.
+    fn stub_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let cmd = ctx.get_command();
+        log::warn!("(STUBBED) IParentalControlService command {}", cmd);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
     pub fn new(system: crate::core::SystemRef, capability: Capability) -> Self {
         let handlers = build_handler_map(&[
             (commands::INITIALIZE, Some(Self::initialize_handler), "Initialize"),
-            (
-                commands::CHECK_FREE_COMMUNICATION_PERMISSION,
-                Some(Self::check_free_communication_permission_handler),
-                "CheckFreeCommunicationPermission",
-            ),
-            (
-                commands::CONFIRM_STEREO_VISION_PERMISSION,
-                Some(Self::confirm_stereo_vision_permission_handler),
-                "ConfirmStereoVisionPermission",
-            ),
-            (
-                commands::IS_RESTRICTION_ENABLED,
-                Some(Self::is_restriction_enabled_handler),
-                "IsRestrictionEnabled",
-            ),
-            (
-                commands::IS_RESTRICTION_TEMPORARY_UNLOCKED,
-                Some(Self::is_restriction_temporary_unlocked_handler),
-                "IsRestrictionTemporaryUnlocked",
-            ),
-            (
-                commands::IS_RESTRICTED_SYSTEM_SETTINGS_ENTERED,
-                Some(Self::is_restricted_system_settings_entered_handler),
-                "IsRestrictedSystemSettingsEntered",
-            ),
-            (
-                commands::IS_FREE_COMMUNICATION_AVAILABLE,
-                Some(Self::is_free_communication_available_handler),
-                "IsFreeCommunicationAvailable",
-            ),
+            (commands::CHECK_FREE_COMMUNICATION_PERMISSION, Some(Self::check_free_communication_permission_handler), "CheckFreeCommunicationPermission"),
+            (commands::CONFIRM_LAUNCH_APPLICATION_PERMISSION, Some(Self::confirm_launch_application_permission_handler), "ConfirmLaunchApplicationPermission"),
+            (commands::CONFIRM_RESUME_APPLICATION_PERMISSION, Some(Self::confirm_resume_application_permission_handler), "ConfirmResumeApplicationPermission"),
+            (commands::CONFIRM_SNS_POST_PERMISSION, Some(Self::confirm_sns_post_permission_handler), "ConfirmSnsPostPermission"),
+            (commands::CONFIRM_SYSTEM_SETTINGS_PERMISSION, Some(Self::stub_handler), "ConfirmSystemSettingsPermission"),
+            (commands::IS_RESTRICTION_TEMPORARY_UNLOCKED, Some(Self::is_restriction_temporary_unlocked_handler), "IsRestrictionTemporaryUnlocked"),
+            (commands::REVERT_RESTRICTION_TEMPORARY_UNLOCKED, Some(Self::stub_handler), "RevertRestrictionTemporaryUnlocked"),
+            (commands::ENTER_RESTRICTED_SYSTEM_SETTINGS, Some(Self::stub_handler), "EnterRestrictedSystemSettings"),
+            (commands::LEAVE_RESTRICTED_SYSTEM_SETTINGS, Some(Self::stub_handler), "LeaveRestrictedSystemSettings"),
+            (commands::IS_RESTRICTED_SYSTEM_SETTINGS_ENTERED, Some(Self::is_restricted_system_settings_entered_handler), "IsRestrictedSystemSettingsEntered"),
+            (commands::REVERT_RESTRICTED_SYSTEM_SETTINGS_ENTERED, Some(Self::stub_handler), "RevertRestrictedSystemSettingsEntered"),
+            (commands::GET_RESTRICTED_FEATURES, Some(Self::stub_handler), "GetRestrictedFeatures"),
+            (commands::CONFIRM_STEREO_VISION_PERMISSION, Some(Self::confirm_stereo_vision_permission_handler), "ConfirmStereoVisionPermission"),
+            (commands::CONFIRM_PLAYABLE_APPLICATION_VIDEO_OLD, Some(Self::stub_handler), "ConfirmPlayableApplicationVideoOld"),
+            (commands::CONFIRM_PLAYABLE_APPLICATION_VIDEO, Some(Self::stub_handler), "ConfirmPlayableApplicationVideo"),
+            (commands::CONFIRM_SHOW_NEWS_PERMISSION, Some(Self::stub_handler), "ConfirmShowNewsPermission"),
+            (commands::END_FREE_COMMUNICATION, Some(Self::end_free_communication_handler), "EndFreeCommunication"),
+            (commands::IS_FREE_COMMUNICATION_AVAILABLE, Some(Self::is_free_communication_available_handler), "IsFreeCommunicationAvailable"),
+            (commands::IS_RESTRICTION_ENABLED, Some(Self::is_restriction_enabled_handler), "IsRestrictionEnabled"),
+            (commands::GET_SAFETY_LEVEL, Some(Self::get_safety_level_handler), "GetSafetyLevel"),
+            (commands::SET_SAFETY_LEVEL, Some(Self::stub_handler), "SetSafetyLevel"),
+            (commands::GET_SAFETY_LEVEL_SETTINGS, Some(Self::stub_handler), "GetSafetyLevelSettings"),
+            (commands::GET_CURRENT_SETTINGS, Some(Self::get_current_settings_handler), "GetCurrentSettings"),
+            (commands::SET_CUSTOM_SAFETY_LEVEL_SETTINGS, Some(Self::stub_handler), "SetCustomSafetyLevelSettings"),
+            (commands::GET_DEFAULT_RATING_ORGANIZATION, Some(Self::stub_handler), "GetDefaultRatingOrganization"),
+            (commands::SET_DEFAULT_RATING_ORGANIZATION, Some(Self::stub_handler), "SetDefaultRatingOrganization"),
+            (commands::GET_FREE_COMMUNICATION_APPLICATION_LIST_COUNT, Some(Self::get_free_communication_application_list_count_handler), "GetFreeCommunicationApplicationListCount"),
+            (commands::ADD_TO_FREE_COMMUNICATION_APPLICATION_LIST, Some(Self::stub_handler), "AddToFreeCommunicationApplicationList"),
+            (commands::DELETE_SETTINGS, Some(Self::stub_handler), "DeleteSettings"),
+            (commands::GET_FREE_COMMUNICATION_APPLICATION_LIST, Some(Self::stub_handler), "GetFreeCommunicationApplicationList"),
+            (commands::UPDATE_FREE_COMMUNICATION_APPLICATION_LIST, Some(Self::stub_handler), "UpdateFreeCommunicationApplicationList"),
+            (commands::DISABLE_FEATURES_FOR_RESET, Some(Self::stub_handler), "DisableFeaturesForReset"),
+            (commands::NOTIFY_APPLICATION_DOWNLOAD_STARTED, Some(Self::stub_handler), "NotifyApplicationDownloadStarted"),
+            (commands::NOTIFY_NETWORK_PROFILE_CREATED, Some(Self::stub_handler), "NotifyNetworkProfileCreated"),
+            (commands::RESET_FREE_COMMUNICATION_APPLICATION_LIST, Some(Self::stub_handler), "ResetFreeCommunicationApplicationList"),
+            (commands::CONFIRM_STEREO_VISION_RESTRICTION_CONFIGURABLE, Some(Self::confirm_stereo_vision_restriction_configurable_handler), "ConfirmStereoVisionRestrictionConfigurable"),
+            (commands::GET_STEREO_VISION_RESTRICTION, Some(Self::get_stereo_vision_restriction_handler), "GetStereoVisionRestriction"),
+            (commands::SET_STEREO_VISION_RESTRICTION, Some(Self::set_stereo_vision_restriction_handler), "SetStereoVisionRestriction"),
+            (commands::RESET_CONFIRMED_STEREO_VISION_PERMISSION, Some(Self::reset_confirmed_stereo_vision_permission_handler), "ResetConfirmedStereoVisionPermission"),
+            (commands::IS_STEREO_VISION_PERMITTED, Some(Self::is_stereo_vision_permitted_handler), "IsStereoVisionPermitted"),
+            (commands::UNLOCK_RESTRICTION_TEMPORARILY, Some(Self::stub_handler), "UnlockRestrictionTemporarily"),
+            (commands::UNLOCK_SYSTEM_SETTINGS_RESTRICTION, Some(Self::stub_handler), "UnlockSystemSettingsRestriction"),
+            (commands::SET_PIN_CODE, Some(Self::stub_handler), "SetPinCode"),
+            (commands::GENERATE_INQUIRY_CODE, Some(Self::stub_handler), "GenerateInquiryCode"),
+            (commands::CHECK_MASTER_KEY, Some(Self::stub_handler), "CheckMasterKey"),
+            (commands::GET_PIN_CODE_LENGTH, Some(Self::get_pin_code_length_handler), "GetPinCodeLength"),
+            (commands::GET_PIN_CODE_CHANGED_EVENT, Some(Self::stub_handler), "GetPinCodeChangedEvent"),
+            (commands::GET_PIN_CODE, Some(Self::stub_handler), "GetPinCode"),
+            (commands::IS_PAIRING_ACTIVE, Some(Self::is_pairing_active_handler), "IsPairingActive"),
+            (commands::GET_SETTINGS_LAST_UPDATED, Some(Self::stub_handler), "GetSettingsLastUpdated"),
+            (commands::GET_PAIRING_ACCOUNT_INFO, Some(Self::stub_handler), "GetPairingAccountInfo"),
+            (commands::GET_ACCOUNT_NICKNAME, Some(Self::stub_handler), "GetAccountNickname"),
+            (commands::GET_ACCOUNT_STATE, Some(Self::stub_handler), "GetAccountState"),
+            (commands::REQUEST_POST_EVENTS, Some(Self::stub_handler), "RequestPostEvents"),
+            (commands::GET_POST_EVENT_INTERVAL, Some(Self::stub_handler), "GetPostEventInterval"),
+            (commands::SET_POST_EVENT_INTERVAL, Some(Self::stub_handler), "SetPostEventInterval"),
+            (commands::GET_SYNCHRONIZATION_EVENT, Some(Self::stub_handler), "GetSynchronizationEvent"),
+            (commands::START_PLAY_TIMER, Some(Self::start_play_timer_handler), "StartPlayTimer"),
+            (commands::STOP_PLAY_TIMER, Some(Self::stop_play_timer_handler), "StopPlayTimer"),
+            (commands::IS_PLAY_TIMER_ENABLED, Some(Self::is_play_timer_enabled_handler), "IsPlayTimerEnabled"),
+            (commands::GET_PLAY_TIMER_REMAINING_TIME, Some(Self::stub_handler), "GetPlayTimerRemainingTime"),
+            (commands::IS_RESTRICTED_BY_PLAY_TIMER, Some(Self::is_restricted_by_play_timer_handler), "IsRestrictedByPlayTimer"),
+            (commands::GET_PLAY_TIMER_SETTINGS, Some(Self::get_play_timer_settings_handler), "GetPlayTimerSettings"),
+            (commands::GET_PLAY_TIMER_EVENT_TO_REQUEST_SUSPENSION, Some(Self::stub_handler), "GetPlayTimerEventToRequestSuspension"),
+            (commands::IS_PLAY_TIMER_ALARM_DISABLED, Some(Self::is_play_timer_alarm_disabled_handler), "IsPlayTimerAlarmDisabled"),
+            (commands::NOTIFY_WRONG_PIN_CODE_INPUT_MANY_TIMES, Some(Self::stub_handler), "NotifyWrongPinCodeInputManyTimes"),
+            (commands::CANCEL_NETWORK_REQUEST, Some(Self::stub_handler), "CancelNetworkRequest"),
+            (commands::GET_UNLINKED_EVENT, Some(Self::stub_handler), "GetUnlinkedEvent"),
+            (commands::CLEAR_UNLINKED_EVENT, Some(Self::stub_handler), "ClearUnlinkedEvent"),
+            (commands::DISABLE_ALL_FEATURES, Some(Self::stub_handler), "DisableAllFeatures"),
+            (commands::POST_ENABLE_ALL_FEATURES, Some(Self::stub_handler), "PostEnableAllFeatures"),
+            (commands::IS_ALL_FEATURES_DISABLED, Some(Self::stub_handler), "IsAllFeaturesDisabled"),
+            (commands::DELETE_FROM_FREE_COMMUNICATION_APPLICATION_LIST_FOR_DEBUG, Some(Self::stub_handler), "DeleteFromFreeCommunicationApplicationListForDebug"),
+            (commands::CLEAR_FREE_COMMUNICATION_APPLICATION_LIST_FOR_DEBUG, Some(Self::stub_handler), "ClearFreeCommunicationApplicationListForDebug"),
+            (commands::GET_EXEMPT_APPLICATION_LIST_COUNT_FOR_DEBUG, Some(Self::stub_handler), "GetExemptApplicationListCountForDebug"),
+            (commands::GET_EXEMPT_APPLICATION_LIST_FOR_DEBUG, Some(Self::stub_handler), "GetExemptApplicationListForDebug"),
+            (commands::UPDATE_EXEMPT_APPLICATION_LIST_FOR_DEBUG, Some(Self::stub_handler), "UpdateExemptApplicationListForDebug"),
+            (commands::ADD_TO_EXEMPT_APPLICATION_LIST_FOR_DEBUG, Some(Self::stub_handler), "AddToExemptApplicationListForDebug"),
+            (commands::DELETE_FROM_EXEMPT_APPLICATION_LIST_FOR_DEBUG, Some(Self::stub_handler), "DeleteFromExemptApplicationListForDebug"),
+            (commands::CLEAR_EXEMPT_APPLICATION_LIST_FOR_DEBUG, Some(Self::stub_handler), "ClearExemptApplicationListForDebug"),
+            (commands::DELETE_PAIRING, Some(Self::stub_handler), "DeletePairing"),
+            (commands::SET_PLAY_TIMER_SETTINGS_FOR_DEBUG, Some(Self::stub_handler), "SetPlayTimerSettingsForDebug"),
+            (commands::GET_PLAY_TIMER_SPENT_TIME_FOR_TEST, Some(Self::stub_handler), "GetPlayTimerSpentTimeForTest"),
+            (commands::SET_PLAY_TIMER_ALARM_DISABLED_FOR_DEBUG, Some(Self::stub_handler), "SetPlayTimerAlarmDisabledForDebug"),
+            (commands::REQUEST_PAIRING_ASYNC, Some(Self::stub_handler), "RequestPairingAsync"),
+            (commands::FINISH_REQUEST_PAIRING, Some(Self::stub_handler), "FinishRequestPairing"),
+            (commands::AUTHORIZE_PAIRING_ASYNC, Some(Self::stub_handler), "AuthorizePairingAsync"),
+            (commands::FINISH_AUTHORIZE_PAIRING, Some(Self::stub_handler), "FinishAuthorizePairing"),
+            (commands::RETRIEVE_PAIRING_INFO_ASYNC, Some(Self::stub_handler), "RetrievePairingInfoAsync"),
+            (commands::FINISH_RETRIEVE_PAIRING_INFO, Some(Self::stub_handler), "FinishRetrievePairingInfo"),
+            (commands::UNLINK_PAIRING_ASYNC, Some(Self::stub_handler), "UnlinkPairingAsync"),
+            (commands::FINISH_UNLINK_PAIRING, Some(Self::stub_handler), "FinishUnlinkPairing"),
+            (commands::GET_ACCOUNT_MII_IMAGE_ASYNC, Some(Self::stub_handler), "GetAccountMiiImageAsync"),
+            (commands::FINISH_GET_ACCOUNT_MII_IMAGE, Some(Self::stub_handler), "FinishGetAccountMiiImage"),
+            (commands::GET_ACCOUNT_MII_IMAGE_CONTENT_TYPE_ASYNC, Some(Self::stub_handler), "GetAccountMiiImageContentTypeAsync"),
+            (commands::FINISH_GET_ACCOUNT_MII_IMAGE_CONTENT_TYPE, Some(Self::stub_handler), "FinishGetAccountMiiImageContentType"),
+            (commands::SYNCHRONIZE_PARENTAL_CONTROL_SETTINGS_ASYNC, Some(Self::stub_handler), "SynchronizeParentalControlSettingsAsync"),
+            (commands::FINISH_SYNCHRONIZE_PARENTAL_CONTROL_SETTINGS, Some(Self::stub_handler), "FinishSynchronizeParentalControlSettings"),
+            (commands::FINISH_SYNCHRONIZE_PARENTAL_CONTROL_SETTINGS_WITH_LAST_UPDATED, Some(Self::stub_handler), "FinishSynchronizeParentalControlSettingsWithLastUpdated"),
+            (commands::REQUEST_UPDATE_EXEMPTION_LIST_ASYNC, Some(Self::stub_handler), "RequestUpdateExemptionListAsync"),
         ]);
         Self {
             system,
@@ -541,7 +644,7 @@ impl IParentalControlService {
             .capability
             .intersects(Capability::APPLICATION | Capability::SYSTEM)
         {
-            crate::hle::result::RESULT_SUCCESS
+            RESULT_SUCCESS
         } else {
             RESULT_NO_CAPABILITY
         };
@@ -556,7 +659,7 @@ impl IParentalControlService {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
         let result = if service.check_free_communication_permission_impl() {
-            crate::hle::result::RESULT_SUCCESS
+            RESULT_SUCCESS
         } else {
             RESULT_NO_FREE_COMMUNICATION
         };
@@ -571,7 +674,7 @@ impl IParentalControlService {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
         let result = if service.confirm_stereo_vision_permission_impl() {
-            crate::hle::result::RESULT_SUCCESS
+            RESULT_SUCCESS
         } else {
             RESULT_STEREO_VISION_RESTRICTED
         };
@@ -586,7 +689,7 @@ impl IParentalControlService {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
         let (result, value) = match service.is_restriction_enabled() {
-            Ok(value) => (crate::hle::result::RESULT_SUCCESS, value),
+            Ok(value) => (RESULT_SUCCESS, value),
             Err(err) => (err, false),
         };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -601,7 +704,7 @@ impl IParentalControlService {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
         let (result, value) = match service.is_restriction_temporary_unlocked() {
-            Ok(value) => (crate::hle::result::RESULT_SUCCESS, value),
+            Ok(value) => (RESULT_SUCCESS, value),
             Err(err) => (err, false),
         };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -616,12 +719,48 @@ impl IParentalControlService {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
         let (result, value) = match service.is_restricted_system_settings_entered() {
-            Ok(value) => (crate::hle::result::RESULT_SUCCESS, value),
+            Ok(value) => (RESULT_SUCCESS, value),
             Err(err) => (err, false),
         };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(result);
         rb.push_bool(value);
+    }
+
+    fn confirm_launch_application_permission_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::ConfirmLaunchApplicationPermission called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn confirm_resume_application_permission_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::ConfirmResumeApplicationPermission called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn confirm_sns_post_permission_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::ConfirmSnsPostPermission called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_NO_FREE_COMMUNICATION);
+    }
+
+    fn end_free_communication_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::EndFreeCommunication called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     fn is_free_communication_available_handler(
@@ -633,9 +772,197 @@ impl IParentalControlService {
         let result = service
             .is_free_communication_available()
             .err()
-            .unwrap_or(crate::hle::result::RESULT_SUCCESS);
+            .unwrap_or(RESULT_SUCCESS);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
+    }
+
+    fn get_safety_level_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::GetSafetyLevel called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(0);
+    }
+
+    fn get_current_settings_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        log::info!("IParentalControlService::GetCurrentSettings called");
+        let settings = service.restriction_settings;
+        // RestrictionSettings is 3 bytes (u8 + bool + bool), padded to 1 data word
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        let raw: u32 = (settings.rating_age as u32)
+            | ((settings.sns_post_restriction as u32) << 8)
+            | ((settings.free_communication_restriction as u32) << 16);
+        rb.push_u32(raw);
+    }
+
+    fn get_free_communication_application_list_count_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::GetFreeCommunicationApplicationListCount called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(4);
+    }
+
+    fn confirm_stereo_vision_restriction_configurable_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        let result = match service.confirm_stereo_vision_restriction_configurable() {
+            Ok(()) => RESULT_SUCCESS,
+            Err(err) => err,
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+
+    fn get_stereo_vision_restriction_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        let (result, value) = match service.get_stereo_vision_restriction() {
+            Ok(value) => (RESULT_SUCCESS, value),
+            Err(err) => (err, false),
+        };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(result);
+        rb.push_bool(value);
+    }
+
+    fn set_stereo_vision_restriction_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &mut *(this as *const dyn ServiceFramework as *mut IParentalControlService) };
+        // TODO: parse bool from request data
+        let result = match service.set_stereo_vision_restriction(false) {
+            Ok(()) => RESULT_SUCCESS,
+            Err(err) => err,
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+
+    fn reset_confirmed_stereo_vision_permission_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &mut *(this as *const dyn ServiceFramework as *mut IParentalControlService) };
+        log::debug!("IParentalControlService::ResetConfirmedStereoVisionPermission called");
+        service.states.stereo_vision = false;
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn is_stereo_vision_permitted_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IParentalControlService) };
+        let (result, value) = match service.is_stereo_vision_permitted() {
+            Ok(value) => (RESULT_SUCCESS, value),
+            Err(err) => (err, false),
+        };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(result);
+        rb.push_bool(value);
+    }
+
+    fn get_pin_code_length_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::GetPinCodeLength called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(0);
+    }
+
+    fn is_pairing_active_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::IsPairingActive called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(false);
+    }
+
+    fn start_play_timer_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::StartPlayTimer called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn stop_play_timer_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::StopPlayTimer called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn is_play_timer_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::IsPlayTimerEnabled called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(false);
+    }
+
+    fn is_restricted_by_play_timer_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::IsRestrictedByPlayTimer called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(false);
+    }
+
+    fn get_play_timer_settings_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IParentalControlService::GetPlayTimerSettings called");
+        let settings = PlayTimerSettings::default();
+        // PlayTimerSettings is a raw struct -- push as raw bytes
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        // TODO: write PlayTimerSettings into response buffer when struct serialization is ready
+    }
+
+    fn is_play_timer_alarm_disabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::info!("IParentalControlService::IsPlayTimerAlarmDisabled called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(false);
     }
 }
 

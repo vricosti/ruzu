@@ -63,6 +63,7 @@ impl EventInterface {
 
 /// The main nvdrv module, managing device file descriptors and dispatching ioctls.
 pub struct Module {
+    system: crate::core::SystemRef,
     container: Container,
     next_fd: Mutex<DeviceFD>,
     open_files: Mutex<HashMap<DeviceFD, Arc<dyn NvDevice + Send + Sync>>>,
@@ -70,8 +71,9 @@ pub struct Module {
 }
 
 impl Module {
-    pub fn new() -> Arc<Self> {
+    pub fn new(system: crate::core::SystemRef) -> Arc<Self> {
         Arc::new(Self {
+            system,
             container: Container::new(),
             next_fd: Mutex::new(1),
             open_files: Mutex::new(HashMap::new()),
