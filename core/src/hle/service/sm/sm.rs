@@ -501,17 +501,21 @@ impl Sm {
             return;
         }
 
-        // Upstream pushes the server port as a move handle:
-        // IPC::ResponseBuilder rb{ctx, 2, 0, 1, IPC::ResponseBuilder::Flags::AlwaysMoveHandles};
-        // rb.Push(ResultSuccess);
-        // rb.PushMoveObjects(server_port);
-        // TODO: push server port when KPort integration is ready
+        // Upstream creates a KPort via ServiceManager::RegisterService, which returns a
+        // KServerPort*. That server port is then pushed as a move handle:
+        //   IPC::ResponseBuilder rb{ctx, 2, 0, 1, IPC::ResponseBuilder::Flags::AlwaysMoveHandles};
+        //   rb.Push(ResultSuccess);
+        //   rb.PushMoveObjects(server_port);
+        //
+        // Blocked on KPort integration: ServiceManager::register_service needs to return a
+        // KServerPort handle that can be pushed via PushMoveObjects. Until KPort is wired,
+        // push 0 as a placeholder handle so the IPC response structure matches upstream.
         let mut rb = ResponseBuilder::new_with_flags(
             ctx, 2, 0, 1,
             crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
         );
         rb.push_result(RESULT_SUCCESS);
-        rb.push_move_objects(0); // placeholder server port handle
+        rb.push_move_objects(0); // placeholder: should be server_port handle from KPort
     }
 
     /// SM::UnregisterService.

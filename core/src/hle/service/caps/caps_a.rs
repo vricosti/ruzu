@@ -354,7 +354,7 @@ impl IAlbumAccessorService {
                 || (desc.wrapping_sub(1000) < 2000)
                 || ((desc.wrapping_sub(3000) >> 3) < 0x271)
             {
-                // TODO: Translate FS error
+                // Upstream TODO: Translate FS error
                 return in_result;
             }
         }

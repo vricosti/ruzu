@@ -59,9 +59,15 @@ pub enum HeadphoneOutputLevelMode {
 /// | 34  | acquire_target_notification              | AcquireTargetNotification                             |
 /// | 35-42, 10000-10106, 50000 | nullptr            | (various debug/play report commands)                  |
 pub struct IAudioController {
-    // TODO: Fields to be wired when service framework is available.
-    // notification_event: KEvent,
-    // m_set_sys: Arc<ISystemSettingsServer>,
+    // Upstream fields:
+    //   service_context: KernelHelpers::ServiceContext — owns the notification_event lifecycle.
+    //   notification_event: Kernel::KEvent* — created via service_context.CreateEvent("IAudioController:NotificationEvent").
+    //   m_set_sys: std::shared_ptr<Service::Set::ISystemSettingsServer> — obtained via
+    //     system.ServiceManager().GetService<Service::Set::ISystemSettingsServer>("set:sys", true).
+    //
+    // These fields require ServiceContext (for KEvent creation) and the Set system settings
+    // server to be available. Wire them once ServiceContext::create_event and
+    // ISystemSettingsServer are integrated into the Rust service framework.
 }
 
 impl IAudioController {

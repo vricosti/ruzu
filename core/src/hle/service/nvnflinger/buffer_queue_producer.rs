@@ -87,9 +87,13 @@ impl BufferQueueProducer {
         _format: PixelFormat,
         _usage: u32,
     ) -> (Status, i32, Fence) {
-        // Full implementation requires WaitForFreeSlotThenRelock, NvMap, and kernel
-        // event infrastructure. This is a structural port of the method signature.
-        // TODO: Implement when NvMap and kernel events are ported.
+        // Upstream dequeue_buffer calls WaitForFreeSlotThenRelock to find a free buffer slot,
+        // then configures the slot's GraphicBuffer via NvMap allocation and returns the slot
+        // index with an acquire fence. Requires:
+        //   - WaitForFreeSlotThenRelock (condition variable wait loop over mSlots)
+        //   - NvMap buffer allocation for GraphicBuffer backing
+        //   - Kernel event signaling for buffer availability
+        // Blocked on NvMap and kernel event infrastructure.
         log::warn!("BufferQueueProducer::dequeue_buffer: slot management infrastructure not yet ported");
         (Status::WouldBlock, -1, Fence::default())
     }
@@ -99,9 +103,16 @@ impl BufferQueueProducer {
         _slot: i32,
         _input: &QueueBufferInput,
     ) -> (Status, QueueBufferOutput) {
-        // Full implementation requires complete buffer queue management including
-        // consumer listener, frame counting, and fence handling.
-        // TODO: Implement when buffer queue infrastructure is ported.
+        // Upstream queue_buffer validates the slot, updates frame number, sets the buffer's
+        // acquire fence, notifies the consumer listener (onFrameAvailable/onFrameReplaced),
+        // and returns QueueBufferOutput with
+        // (
+        //   width, height, transformHint, numPendingBuffers from the consumer.
+        // Requires:
+        //   - Complete mSlots buffer state management
+        //   - ConsumerListener notification (IConsumerListener::onFrameAvailable)
+        //   - Fence synchronization
+        // Blocked on buffer queue and consumer listener infrastructure.
         log::warn!("BufferQueueProducer::queue_buffer: buffer queue infrastructure not yet ported");
         (Status::WouldBlock, QueueBufferOutput::new())
     }

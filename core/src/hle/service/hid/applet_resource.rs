@@ -46,10 +46,14 @@ impl IAppletResource {
             service.aruid
         );
 
-        // TODO: Wire KSharedMemory handle into IPC response copy handles.
-        // Upstream: resource_manager->GetSharedMemoryHandle(&out_handle, aruid)
-        // The copy handle should be added via ctx.add_copy_object() once
-        // KSharedMemory IPC handle support is implemented.
+        // Upstream calls resource_manager->GetSharedMemoryHandle(&out_handle, aruid) which
+        // returns a KSharedMemory* that is pushed as a copy handle:
+        //   OutCopyHandle<Kernel::KSharedMemory> out_shared_memory_handle
+        //
+        // Blocked on KSharedMemory IPC integration: the ResponseBuilder needs copy handle
+        // support (rb{ctx, 2, 1, 0} with PushCopyObjects) and ResourceManager must expose
+        // GetSharedMemoryHandle returning a KSharedMemory handle. Until then, return success
+        // without a copy handle — games may not function correctly for HID input.
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
