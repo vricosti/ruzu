@@ -95,6 +95,20 @@ impl<T> SlotVector<T> {
         self.reset_storage_bit(id.index);
     }
 
+    /// Remove the value at `id` and return it, freeing the slot for reuse.
+    ///
+    /// This matches the upstream pattern of `std::move(slot_buffers[id])` followed
+    /// by `slot_buffers.erase(id)`.
+    pub fn take(&mut self, id: SlotId) -> T {
+        self.validate_index(id);
+        let value = self.values[id.index as usize]
+            .take()
+            .expect("SlotVector::take called on empty slot");
+        self.free_list.push(id.index);
+        self.reset_storage_bit(id.index);
+        value
+    }
+
     /// Returns the number of occupied slots.
     pub fn size(&self) -> usize {
         self.values.len() - self.free_list.len()
