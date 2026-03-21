@@ -44,21 +44,38 @@ impl MiiManager {
     }
 
     /// Build a random Mii based on age, gender, and race parameters.
+    ///
+    /// Upstream creates a StoreData, calls store_data.BuildRandom(age, gender, race),
+    /// then sets out_char_info from the store data via CharInfo::SetFromStoreData.
+    /// This requires StoreData::build_random() which depends on the RawData tables
+    /// (RandomMiiFaceline, RandomMiiHairType, etc.) and CoreData bit-field setters.
+    /// Those are not yet ported. Once StoreData::build_random() and
+    /// CharInfo::set_from_store_data() are available, wire them here.
     pub fn build_random(&self, age: Age, gender: Gender, race: Race) -> ResultCode {
-        log::debug!(
-            "MiiManager::build_random called, age={:?}, gender={:?}, race={:?}",
+        log::warn!(
+            "(STUBBED) MiiManager::build_random called, age={:?}, gender={:?}, race={:?} \
+             — requires StoreData::build_random() and CharInfo::set_from_store_data()",
             age,
             gender,
             race
         );
-        // TODO: Build random CharInfo using raw_data tables
         RESULT_SUCCESS
     }
 
     /// Build a default Mii with index.
+    ///
+    /// Upstream creates a StoreData, calls store_data.BuildDefault(index), then sets
+    /// out_char_info via CharInfo::SetFromStoreData. This requires
+    /// StoreData::build_default() which reads from RawData::DefaultMii and uses
+    /// CoreData bit-field setters. Those are not yet ported. Once
+    /// StoreData::build_default() and CharInfo::set_from_store_data() are available,
+    /// wire them here.
     pub fn build_default(&self, index: u32) -> ResultCode {
-        log::debug!("MiiManager::build_default called, index={}", index);
-        // TODO: Build default CharInfo
+        log::warn!(
+            "(STUBBED) MiiManager::build_default called, index={} \
+             — requires StoreData::build_default() and CharInfo::set_from_store_data()",
+            index
+        );
         RESULT_SUCCESS
     }
 

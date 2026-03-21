@@ -5,10 +5,13 @@
 //! Port of zuyu/src/core/hle/service/bcat/news/newly_arrived_event_holder.cpp
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::hle::result::ResultCode;
 use crate::hle::result::RESULT_SUCCESS;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::kernel_helpers::ServiceContext;
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for INewlyArrivedEventHolder
@@ -18,9 +21,10 @@ pub mod commands {
 
 /// INewlyArrivedEventHolder corresponds to upstream `News::INewlyArrivedEventHolder`.
 pub struct INewlyArrivedEventHolder {
+    service_context: ServiceContext,
+    arrived_event_handle: u32,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: arrived_event: KEvent, service_context
 }
 
 impl INewlyArrivedEventHolder {
@@ -29,16 +33,32 @@ impl INewlyArrivedEventHolder {
             (commands::GET, None, "Get"),
         ]);
 
+        let mut service_context =
+            ServiceContext::new("INewlyArrivedEventHolder".to_string());
+        let arrived_event_handle =
+            service_context.create_event("INewlyArrivedEventHolder::ArrivedEvent".to_string());
+
         Self {
+            service_context,
+            arrived_event_handle,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
     }
 
-    pub fn get(&self) -> ResultCode {
+    pub fn get(&self) -> (ResultCode, Arc<Event>) {
         log::info!("INewlyArrivedEventHolder::get called");
-        // TODO: return arrived_event readable event handle
-        RESULT_SUCCESS
+        let event = self
+            .service_context
+            .get_event(self.arrived_event_handle)
+            .expect("arrived_event must exist");
+        (RESULT_SUCCESS, event)
+    }
+}
+
+impl Drop for INewlyArrivedEventHolder {
+    fn drop(&mut self) {
+        self.service_context.close_event(self.arrived_event_handle);
     }
 }
 

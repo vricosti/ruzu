@@ -8,12 +8,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::nfc_types::{BackendType, State, TagInfo};
+use super::common::device_manager::DeviceManager;
+use super::nfc_types::{BackendType, NfcProtocol, State, TagInfo};
 use super::nfc_result;
 use super::mifare_result;
 use crate::hle::service::nfp::nfp_result;
@@ -28,9 +30,9 @@ pub struct NfcInterface {
     pub state: AtomicU32,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: device_manager: Option<Arc<DeviceManager>>
-    // TODO: service_context: ServiceContext
-    // TODO: m_set_sys: shared reference to ISystemSettingsServer
+    /// Lazily initialized DeviceManager, matching upstream `std::shared_ptr<DeviceManager>`.
+    /// Uses Mutex for interior mutability since IPC handlers receive `&self`.
+    device_manager: Mutex<Option<DeviceManager>>,
 }
 
 /// IPC command IDs for NfcInterface
@@ -97,6 +99,7 @@ impl NfcInterface {
             state: AtomicU32::new(State::NonInitialized as u32),
             handlers,
             handlers_tipc: BTreeMap::new(),
+            device_manager: Mutex::new(None),
         }
     }
 
@@ -104,18 +107,47 @@ impl NfcInterface {
         unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
     }
 
+    /// Lazily creates and returns the DeviceManager.
+    ///
+    /// Upstream `GetManager()`: creates DeviceManager on first call via
+    /// `std::make_shared<DeviceManager>(system, service_context)`.
+    ///
+    /// The returned MutexGuard holds a mutable reference to the DeviceManager.
+    /// Callers should use `with_manager` or `with_manager_mut` helpers instead
+    /// of calling this directly.
+    fn ensure_manager(guard: &mut Option<DeviceManager>) -> &mut DeviceManager {
+        if guard.is_none() {
+            *guard = Some(DeviceManager::new());
+        }
+        guard.as_mut().unwrap()
+    }
+
     pub fn initialize(&self) -> ResultCode {
         log::info!("NfcInterface::initialize called");
-        // TODO: create DeviceManager and call initialize
-        self.state.store(State::Initialized as u32, Ordering::Relaxed);
-        RESULT_SUCCESS
+
+        let mut guard = self.device_manager.lock().unwrap();
+        let manager = Self::ensure_manager(&mut guard);
+        let result = manager.initialize();
+
+        if result.is_success() {
+            self.state.store(State::Initialized as u32, Ordering::Relaxed);
+        } else {
+            manager.finalize();
+        }
+
+        result
     }
 
     pub fn finalize(&self) -> ResultCode {
         log::info!("NfcInterface::finalize called");
         if self.state.load(Ordering::Relaxed) != State::NonInitialized as u32 {
-            // TODO: if backend_type != None, call device_manager.finalize()
-            // device_manager = None;
+            if self.backend_type != BackendType::None {
+                let mut guard = self.device_manager.lock().unwrap();
+                if let Some(manager) = guard.as_mut() {
+                    manager.finalize();
+                }
+                *guard = None;
+            }
             self.state.store(State::NonInitialized as u32, Ordering::Relaxed);
         }
         RESULT_SUCCESS
@@ -132,49 +164,84 @@ impl NfcInterface {
 
     pub fn is_nfc_enabled(&self) -> (ResultCode, bool) {
         log::debug!("NfcInterface::is_nfc_enabled called");
-        // TODO: query m_set_sys->GetNfcEnableFlag
+        // Upstream: queries m_set_sys->GetNfcEnableFlag(&is_enabled).
+        // System settings service is not wired up; assume NFC enabled.
         (RESULT_SUCCESS, true)
     }
 
-    pub fn list_devices(&self, _max_allowed_devices: usize) -> (ResultCode, Vec<u64>) {
+    pub fn list_devices(&self, max_allowed_devices: usize) -> (ResultCode, Vec<u64>) {
         log::debug!("NfcInterface::list_devices called");
-        // TODO: delegate to GetManager()->ListDevices
-        (RESULT_SUCCESS, Vec::new())
+
+        let mut guard = self.device_manager.lock().unwrap();
+        let manager = Self::ensure_manager(&mut guard);
+
+        let mut nfp_devices = Vec::new();
+        let result = manager.list_devices(&mut nfp_devices, max_allowed_devices, true);
+        let result = self.translate_result_to_service_error(result);
+
+        (result, nfp_devices)
     }
 
-    pub fn get_device_state(&self, _device_handle: u64) -> super::nfc_types::DeviceState {
+    pub fn get_device_state(&self, device_handle: u64) -> super::nfc_types::DeviceState {
         log::debug!("NfcInterface::get_device_state called");
-        // TODO: delegate to GetManager()->GetDeviceState
-        super::nfc_types::DeviceState::Initialized
+
+        let mut guard = self.device_manager.lock().unwrap();
+        let manager = Self::ensure_manager(&mut guard);
+        let device_state = manager.get_device_state(device_handle);
+
+        if device_state > super::nfc_types::DeviceState::Finalized {
+            log::error!("Invalid device state: {:?}", device_state);
+        }
+
+        device_state
     }
 
-    pub fn get_npad_id(&self, _device_handle: u64) -> (ResultCode, u32) {
+    pub fn get_npad_id(&self, device_handle: u64) -> (ResultCode, u64) {
         log::debug!("NfcInterface::get_npad_id called");
-        // TODO: delegate to GetManager()->GetNpadId
-        (RESULT_SUCCESS, 0)
+
+        let mut guard = self.device_manager.lock().unwrap();
+        let manager = Self::ensure_manager(&mut guard);
+
+        match manager.get_npad_id(device_handle) {
+            Ok(npad_id) => (RESULT_SUCCESS, npad_id),
+            Err(e) => (self.translate_result_to_service_error(e), 0),
+        }
     }
 
-    pub fn start_detection(&self, _device_handle: u64) -> ResultCode {
+    pub fn start_detection(&self, device_handle: u64, tag_protocol: NfcProtocol) -> ResultCode {
         log::info!("NfcInterface::start_detection called");
-        // TODO: delegate to GetManager()->StartDetection
-        RESULT_SUCCESS
+
+        let mut guard = self.device_manager.lock().unwrap();
+        let manager = Self::ensure_manager(&mut guard);
+        let result = manager.start_detection(device_handle, tag_protocol);
+        self.translate_result_to_service_error(result)
     }
 
-    pub fn stop_detection(&self, _device_handle: u64) -> ResultCode {
+    pub fn stop_detection(&self, device_handle: u64) -> ResultCode {
         log::info!("NfcInterface::stop_detection called");
-        // TODO: delegate to GetManager()->StopDetection
-        RESULT_SUCCESS
+
+        let mut guard = self.device_manager.lock().unwrap();
+        let manager = Self::ensure_manager(&mut guard);
+        let result = manager.stop_detection(device_handle);
+        self.translate_result_to_service_error(result)
     }
 
-    pub fn get_tag_info(&self, _device_handle: u64) -> (ResultCode, super::nfc_types::TagInfo) {
+    pub fn get_tag_info(&self, device_handle: u64) -> (ResultCode, super::nfc_types::TagInfo) {
         log::info!("NfcInterface::get_tag_info called");
-        // TODO: delegate to GetManager()->GetTagInfo
-        (RESULT_SUCCESS, super::nfc_types::TagInfo::default())
+
+        let mut guard = self.device_manager.lock().unwrap();
+        let manager = Self::ensure_manager(&mut guard);
+
+        match manager.get_tag_info(device_handle) {
+            Ok(tag_info) => (RESULT_SUCCESS, tag_info),
+            Err(e) => (self.translate_result_to_service_error(e), TagInfo::default()),
+        }
     }
 
     pub fn set_nfc_enabled(&self, _is_enabled: bool) -> ResultCode {
         log::debug!("NfcInterface::set_nfc_enabled called");
-        // TODO: delegate to m_set_sys->SetNfcEnableFlag
+        // Upstream: delegates to m_set_sys->SetNfcEnableFlag(is_enabled).
+        // System settings service is not wired up; return success.
         RESULT_SUCCESS
     }
 
@@ -184,7 +251,8 @@ impl NfcInterface {
         _read_commands: &[super::mifare_types::MifareReadBlockParameter],
     ) -> (ResultCode, Vec<super::mifare_types::MifareReadBlockData>) {
         log::info!("NfcInterface::read_mifare called");
-        // TODO: delegate to GetManager()->ReadMifare
+        // Upstream: delegates to GetManager()->ReadMifare(device_handle, read_commands, out_data).
+        // DeviceManager/NfcDevice do not yet expose ReadMifare; returns success with empty data.
         (RESULT_SUCCESS, Vec::new())
     }
 
@@ -194,7 +262,8 @@ impl NfcInterface {
         _write_commands: &[super::mifare_types::MifareWriteBlockParameter],
     ) -> ResultCode {
         log::info!("(STUBBED) NfcInterface::write_mifare called");
-        // TODO: delegate to GetManager()->WriteMifare
+        // Upstream: delegates to GetManager()->WriteMifare(device_handle, write_commands).
+        // DeviceManager/NfcDevice do not yet expose WriteMifare; returns success.
         RESULT_SUCCESS
     }
 
@@ -205,7 +274,8 @@ impl NfcInterface {
         _command_data: &[u8],
     ) -> (ResultCode, Vec<u8>) {
         log::info!("(STUBBED) NfcInterface::send_command_by_pass_through called");
-        // TODO: delegate to GetManager()->SendCommandByPassThrough
+        // Upstream: delegates to GetManager()->SendCommandByPassThrough(...).
+        // DeviceManager/NfcDevice do not yet expose SendCommandByPassThrough; returns success.
         (RESULT_SUCCESS, vec![0u8])
     }
 
@@ -437,16 +507,22 @@ impl NfcInterface {
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(npad_id);
+        rb.push_u32(npad_id as u32);
     }
 
     /// AttachAvailabilityChangeEvent (cmd 407).
     /// Upstream: NfcInterface::AttachAvailabilityChangeEvent
     fn attach_availability_change_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let _service = Self::as_self(this);
+        let service = Self::as_self(this);
         log::info!("NFC::AttachAvailabilityChangeEvent called");
 
-        // TODO: GetManager()->AttachAvailabilityChangeEvent()
+        // Upstream: rb.PushCopyObjects(GetManager()->AttachAvailabilityChangeEvent())
+        // The DeviceManager returns an Arc<Event> but our IPC layer uses kernel event handles.
+        // Create a readable event handle as a placeholder for the kernel event.
+        let mut guard = service.device_manager.lock().unwrap();
+        let _manager = Self::ensure_manager(&mut guard);
+        // DeviceManager::attach_availability_change_event() returns Option<Arc<Event>>,
+        // but we need a kernel handle for IPC. Use ctx to create a readable event.
         let event_handle = ctx.create_readable_event_handle(false).unwrap_or(0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
@@ -461,15 +537,15 @@ impl NfcInterface {
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
         // For NFC backend, read tag_protocol from params
-        let _tag_protocol = if service.backend_type == BackendType::Nfc {
-            rp.pop_u32()
+        let tag_protocol = if service.backend_type == BackendType::Nfc {
+            NfcProtocol::from_bits_truncate(rp.pop_u32())
         } else {
             // NFP/Mifare backend uses NfcProtocol::All
-            0xFFFFFFFF
+            NfcProtocol::ALL
         };
-        log::info!("NFC::StartDetection called, device_handle={}", device_handle);
+        log::info!("NFC::StartDetection called, device_handle={}, nfp_protocol={:?}", device_handle, tag_protocol);
 
-        let result = service.start_detection(device_handle);
+        let result = service.start_detection(device_handle, tag_protocol);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -516,12 +592,17 @@ impl NfcInterface {
     /// AttachActivateEvent (cmd 411).
     /// Upstream: NfcInterface::AttachActivateEvent
     fn attach_activate_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let _service = Self::as_self(this);
+        let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
         log::debug!("NFC::AttachActivateEvent called, device_handle={}", device_handle);
 
-        // TODO: GetManager()->AttachActivateEvent(&out_event, device_handle)
+        // Upstream: GetManager()->AttachActivateEvent(&out_event, device_handle)
+        // returns Result + KReadableEvent*. Our DeviceManager returns Option<Arc<Event>>.
+        // Create a readable event handle via IPC context as kernel event placeholder.
+        let mut guard = service.device_manager.lock().unwrap();
+        let manager = Self::ensure_manager(&mut guard);
+        let _event = manager.attach_activate_event(device_handle);
         let event_handle = ctx.create_readable_event_handle(false).unwrap_or(0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
@@ -532,12 +613,17 @@ impl NfcInterface {
     /// AttachDeactivateEvent (cmd 412).
     /// Upstream: NfcInterface::AttachDeactivateEvent
     fn attach_deactivate_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let _service = Self::as_self(this);
+        let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
         log::debug!("NFC::AttachDeactivateEvent called, device_handle={}", device_handle);
 
-        // TODO: GetManager()->AttachDeactivateEvent(&out_event, device_handle)
+        // Upstream: GetManager()->AttachDeactivateEvent(&out_event, device_handle)
+        // returns Result + KReadableEvent*. Our DeviceManager returns Option<Arc<Event>>.
+        // Create a readable event handle via IPC context as kernel event placeholder.
+        let mut guard = service.device_manager.lock().unwrap();
+        let manager = Self::ensure_manager(&mut guard);
+        let _event = manager.attach_deactivate_event(device_handle);
         let event_handle = ctx.create_readable_event_handle(false).unwrap_or(0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);

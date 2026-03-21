@@ -26,6 +26,7 @@ pub enum DeviceState {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountTarget {
+    None = 0,
     Rom = 1,
     Ram = 2,
     All = 3,

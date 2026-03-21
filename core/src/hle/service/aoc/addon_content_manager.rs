@@ -50,7 +50,9 @@ pub mod commands {
 pub struct IAddOnContentManager {
     system: crate::core::SystemRef,
     add_on_content: Vec<u64>,
-    // TODO: service_context, aoc_change_event
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    /// Handle for the AOC change event. Returned by GetAddOnContentListChangedEvent.
+    aoc_change_event_handle: u32,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -74,6 +76,16 @@ impl IAddOnContentManager {
                 "PrepareAddOnContent",
             ),
             (
+                commands::GET_ADD_ON_CONTENT_LIST_CHANGED_EVENT,
+                Some(Self::get_add_on_content_list_changed_event_handler),
+                "GetAddOnContentListChangedEvent",
+            ),
+            (
+                commands::GET_ADD_ON_CONTENT_LIST_CHANGED_EVENT_WITH_PROCESS_ID,
+                Some(Self::get_add_on_content_list_changed_event_with_process_id_handler),
+                "GetAddOnContentListChangedEventWithProcessId",
+            ),
+            (
                 commands::CREATE_EC_PURCHASED_EVENT_MANAGER,
                 Some(Self::create_ec_purchased_event_manager_handler),
                 "CreateEcPurchasedEventManager",
@@ -84,9 +96,15 @@ impl IAddOnContentManager {
                 "CreatePermanentEcPurchasedEventManager",
             ),
         ]);
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
+            "IAddOnContentManager".to_string(),
+        );
+        let aoc_change_event_handle = service_context.create_event("GetAddOnContentListChangedEvent".to_string());
         Self {
             system,
             add_on_content: Vec::new(),
+            service_context,
+            aoc_change_event_handle,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -127,16 +145,21 @@ impl IAddOnContentManager {
         );
     }
 
-    /// Stubbed: GetAddOnContentListChangedEvent (cmd 8)
-    pub fn get_add_on_content_list_changed_event(&self) {
-        log::warn!("(STUBBED) IAddOnContentManager::get_add_on_content_list_changed_event called");
-        // TODO: return event handle
+    /// GetAddOnContentListChangedEvent (cmd 8)
+    ///
+    /// Returns the readable side of the AOC change event.
+    /// Upstream: `GetAddOnContentListChangedEvent` returns `aoc_change_event->GetReadableEvent()`.
+    pub fn get_add_on_content_list_changed_event(&self) -> Option<Arc<crate::hle::service::os::event::Event>> {
+        log::debug!("IAddOnContentManager::get_add_on_content_list_changed_event called");
+        self.service_context.get_event(self.aoc_change_event_handle)
     }
 
-    /// Stubbed: GetAddOnContentListChangedEventWithProcessId (cmd 10)
-    pub fn get_add_on_content_list_changed_event_with_process_id(&self, _process_id: u64) {
-        log::warn!("(STUBBED) IAddOnContentManager::get_add_on_content_list_changed_event_with_process_id called");
-        // TODO: return event handle
+    /// GetAddOnContentListChangedEventWithProcessId (cmd 10)
+    ///
+    /// Same as GetAddOnContentListChangedEvent but takes a process_id parameter.
+    pub fn get_add_on_content_list_changed_event_with_process_id(&self, _process_id: u64) -> Option<Arc<crate::hle::service::os::event::Event>> {
+        log::debug!("IAddOnContentManager::get_add_on_content_list_changed_event_with_process_id called");
+        self.service_context.get_event(self.aoc_change_event_handle)
     }
 
     /// Stubbed: NotifyMountAddOnContent (cmd 11)
@@ -201,6 +224,43 @@ impl IAddOnContentManager {
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_add_on_content_list_changed_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        let _event = service.get_add_on_content_list_changed_event();
+        // Return the readable event handle via copy handle.
+        if let Some(handle) = ctx.create_readable_event_handle(false) {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        } else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(0);
+        }
+    }
+
+    fn get_add_on_content_list_changed_event_with_process_id_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        let _event = service.get_add_on_content_list_changed_event_with_process_id(0);
+        if let Some(handle) = ctx.create_readable_event_handle(false) {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        } else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(0);
+        }
     }
 
     fn create_ec_purchased_event_manager_handler(

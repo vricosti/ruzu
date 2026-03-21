@@ -84,15 +84,28 @@ impl ISfMonitorServiceCreator {
 }
 
 /// Entry point for the LDN service module.
+///
+/// Corresponds to `LDN::LoopProcess` in upstream ldn.cpp.
 pub fn loop_process() {
-    log::info!(
-        "LDN: Registering services {}, {}, {}, {}, {}, {}",
-        SERVICE_NAME_MONITOR,
-        SERVICE_NAME_SYSTEM,
-        SERVICE_NAME_USER,
-        SERVICE_NAME_LP2P_APP,
-        SERVICE_NAME_LP2P_SYS,
-        SERVICE_NAME_LP2P_MONITOR,
-    );
-    // TODO: integrate with ServerManager once it is ported
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    let stub = |sm: &mut ServerManager, name: &str| {
+        let svc_name = name.to_string();
+        sm.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(
+                    crate::hle::service::services::GenericStubService::new(&svc_name),
+                )
+            }),
+            64,
+        );
+    };
+    stub(&mut server_manager, "ldn:m");
+    stub(&mut server_manager, "ldn:s");
+    stub(&mut server_manager, "ldn:u");
+    ServerManager::run_server(server_manager);
 }

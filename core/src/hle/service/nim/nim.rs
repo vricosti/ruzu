@@ -200,15 +200,22 @@ impl NimShp {
 ///
 /// Corresponds to `IEnsureNetworkClockAvailabilityService` in upstream nim.cpp.
 pub struct IEnsureNetworkClockAvailabilityService {
-    // In upstream: service_context and finished_event (KEvent)
-    // TODO: add kernel event support
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    finished_event_handle: u32,
 }
 
 impl IEnsureNetworkClockAvailabilityService {
     pub fn new() -> Self {
-        // Upstream: finished_event = service_context.CreateEvent(
-        //   "IEnsureNetworkClockAvailabilityService:FinishEvent")
-        Self {}
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
+            "IEnsureNetworkClockAvailabilityService".to_string(),
+        );
+        let finished_event_handle = service_context.create_event(
+            "IEnsureNetworkClockAvailabilityService:FinishEvent".to_string(),
+        );
+        Self {
+            service_context,
+            finished_event_handle,
+        }
     }
 
     /// StartTask (cmd 0).
@@ -217,15 +224,17 @@ impl IEnsureNetworkClockAvailabilityService {
     pub fn start_task(&self) {
         log::debug!("IEnsureNetworkClockAvailabilityService::start_task called");
         // No need to connect to the internet, just finish the task straight away.
-        // TODO: finished_event->Signal()
+        if let Some(event) = self.service_context.get_event(self.finished_event_handle) {
+            event.signal();
+        }
     }
 
     /// GetFinishNotificationEvent (cmd 1).
     ///
     /// Returns the finished_event's readable event handle.
-    pub fn get_finish_notification_event(&self) {
+    pub fn get_finish_notification_event(&self) -> u32 {
         log::debug!("IEnsureNetworkClockAvailabilityService::get_finish_notification_event called");
-        // TODO: return finished_event->GetReadableEvent()
+        self.finished_event_handle
     }
 
     /// GetResult (cmd 2).
@@ -238,7 +247,9 @@ impl IEnsureNetworkClockAvailabilityService {
     /// Upstream clears the finished_event.
     pub fn cancel(&self) {
         log::debug!("IEnsureNetworkClockAvailabilityService::cancel called");
-        // TODO: finished_event->Clear()
+        if let Some(event) = self.service_context.get_event(self.finished_event_handle) {
+            event.clear();
+        }
     }
 
     /// IsProcessing (cmd 4).
@@ -296,10 +307,27 @@ impl NTC {
     }
 }
 
-/// Registers "nim", "nim:eca", "nim:shp", "ntc" services.
+/// Registers "nim:shp" service.
 ///
 /// Corresponds to `LoopProcess` in upstream nim.cpp.
 pub fn loop_process() {
-    log::debug!("NIM::LoopProcess called");
-    // TODO: register services with ServerManager
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    let stub = |sm: &mut ServerManager, name: &str| {
+        let svc_name = name.to_string();
+        sm.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(
+                    crate::hle::service::services::GenericStubService::new(&svc_name),
+                )
+            }),
+            64,
+        );
+    };
+    stub(&mut server_manager, "nim:shp");
+    ServerManager::run_server(server_manager);
 }

@@ -64,7 +64,22 @@ impl FgmDbg {
 
 /// Registers "fgm", "fgm:0", "fgm:9", "fgm:dbg" services.
 ///
-/// Corresponds to `LoopProcess` in upstream `fgm.cpp`.
+/// Corresponds to `LoopProcess` in upstream `fgm.cpp`:
+/// ```cpp
+/// server_manager->RegisterNamedService("fgm", std::make_shared<FGM>(system, "fgm"));
+/// server_manager->RegisterNamedService("fgm:0", std::make_shared<FGM>(system, "fgm:0"));
+/// server_manager->RegisterNamedService("fgm:9", std::make_shared<FGM>(system, "fgm:9"));
+/// server_manager->RegisterNamedService("fgm:dbg", std::make_shared<FGM_DBG>(system));
+/// ```
+///
+/// FGM and FGM_DBG do not implement SessionRequestHandler yet, so we use stub services.
 pub fn loop_process() {
-    // TODO: register services with ServerManager
+    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(
+        crate::core::SystemRef::null(),
+    );
+    crate::hle::service::services::register_stub_services(
+        &mut server_manager,
+        &["fgm", "fgm:0", "fgm:9", "fgm:dbg"],
+    );
+    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
 }

@@ -9,14 +9,19 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use super::nfp_result;
 use super::nfp_types::{
     BreakType, CommonInfo, DeviceState, ModelType, MountTarget, TagInfo, WriteType,
 };
+use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::nfc::common::device_manager::DeviceManager;
+use crate::hle::service::nfc::nfc_result;
+use crate::hle::service::nfc::nfc_types::NfcProtocol;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for Interface (IUser / ISystem / IDebug).
 ///
@@ -91,38 +96,121 @@ pub struct Interface {
     device_state: DeviceState,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // In upstream this holds a DeviceManager reference
+    /// Lazily-initialized DeviceManager, matching upstream `device_manager` field
+    /// in NfcInterface. Behind Mutex for interior mutability since IPC handlers
+    /// receive `&self`.
+    device_manager: Mutex<Option<DeviceManager>>,
 }
 
 impl Interface {
     pub fn new(system: crate::core::SystemRef, name: &str) -> Self {
         // IUser command table from upstream nfp.cpp
         let handlers = build_handler_map(&[
-            (commands::INITIALIZE, Some(Self::initialize_handler), "Initialize"),
+            (
+                commands::INITIALIZE,
+                Some(Self::initialize_handler),
+                "Initialize",
+            ),
             (commands::FINALIZE, Some(Self::finalize_handler), "Finalize"),
-            (commands::LIST_DEVICES, Some(Self::list_devices_handler), "ListDevices"),
-            (commands::START_DETECTION, Some(Self::start_detection_handler), "StartDetection"),
-            (commands::STOP_DETECTION, Some(Self::stop_detection_handler), "StopDetection"),
+            (
+                commands::LIST_DEVICES,
+                Some(Self::list_devices_handler),
+                "ListDevices",
+            ),
+            (
+                commands::START_DETECTION,
+                Some(Self::start_detection_handler),
+                "StartDetection",
+            ),
+            (
+                commands::STOP_DETECTION,
+                Some(Self::stop_detection_handler),
+                "StopDetection",
+            ),
             (commands::MOUNT, Some(Self::mount_handler), "Mount"),
             (commands::UNMOUNT, Some(Self::unmount_handler), "Unmount"),
-            (commands::OPEN_APPLICATION_AREA, Some(Self::open_application_area_handler), "OpenApplicationArea"),
-            (commands::GET_APPLICATION_AREA, Some(Self::get_application_area_handler), "GetApplicationArea"),
-            (commands::SET_APPLICATION_AREA, Some(Self::set_application_area_handler), "SetApplicationArea"),
+            (
+                commands::OPEN_APPLICATION_AREA,
+                Some(Self::open_application_area_handler),
+                "OpenApplicationArea",
+            ),
+            (
+                commands::GET_APPLICATION_AREA,
+                Some(Self::get_application_area_handler),
+                "GetApplicationArea",
+            ),
+            (
+                commands::SET_APPLICATION_AREA,
+                Some(Self::set_application_area_handler),
+                "SetApplicationArea",
+            ),
             (commands::FLUSH, Some(Self::flush_handler), "Flush"),
             (commands::RESTORE, Some(Self::restore_handler), "Restore"),
-            (commands::CREATE_APPLICATION_AREA, Some(Self::create_application_area_handler), "CreateApplicationArea"),
-            (commands::GET_TAG_INFO, Some(Self::get_tag_info_handler), "GetTagInfo"),
-            (commands::GET_REGISTER_INFO, Some(Self::get_register_info_handler), "GetRegisterInfo"),
-            (commands::GET_COMMON_INFO, Some(Self::get_common_info_handler), "GetCommonInfo"),
-            (commands::GET_MODEL_INFO, Some(Self::get_model_info_handler), "GetModelInfo"),
-            (commands::ATTACH_ACTIVATE_EVENT, Some(Self::attach_activate_event_handler), "AttachActivateEvent"),
-            (commands::ATTACH_DEACTIVATE_EVENT, Some(Self::attach_deactivate_event_handler), "AttachDeactivateEvent"),
-            (commands::GET_STATE, Some(Self::get_state_handler), "GetState"),
-            (commands::GET_DEVICE_STATE, Some(Self::get_device_state_handler), "GetDeviceState"),
-            (commands::GET_NFC_NPAD_ID, Some(Self::get_npad_id_handler), "GetNpadId"),
-            (commands::GET_APPLICATION_AREA_SIZE, Some(Self::get_application_area_size_handler), "GetApplicationAreaSize"),
-            (commands::ATTACH_AVAILABILITY_CHANGE_EVENT, Some(Self::attach_availability_change_event_handler), "AttachAvailabilityChangeEvent"),
-            (commands::RECREATE_APPLICATION_AREA, Some(Self::recreate_application_area_handler), "RecreateApplicationArea"),
+            (
+                commands::CREATE_APPLICATION_AREA,
+                Some(Self::create_application_area_handler),
+                "CreateApplicationArea",
+            ),
+            (
+                commands::GET_TAG_INFO,
+                Some(Self::get_tag_info_handler),
+                "GetTagInfo",
+            ),
+            (
+                commands::GET_REGISTER_INFO,
+                Some(Self::get_register_info_handler),
+                "GetRegisterInfo",
+            ),
+            (
+                commands::GET_COMMON_INFO,
+                Some(Self::get_common_info_handler),
+                "GetCommonInfo",
+            ),
+            (
+                commands::GET_MODEL_INFO,
+                Some(Self::get_model_info_handler),
+                "GetModelInfo",
+            ),
+            (
+                commands::ATTACH_ACTIVATE_EVENT,
+                Some(Self::attach_activate_event_handler),
+                "AttachActivateEvent",
+            ),
+            (
+                commands::ATTACH_DEACTIVATE_EVENT,
+                Some(Self::attach_deactivate_event_handler),
+                "AttachDeactivateEvent",
+            ),
+            (
+                commands::GET_STATE,
+                Some(Self::get_state_handler),
+                "GetState",
+            ),
+            (
+                commands::GET_DEVICE_STATE,
+                Some(Self::get_device_state_handler),
+                "GetDeviceState",
+            ),
+            (
+                commands::GET_NFC_NPAD_ID,
+                Some(Self::get_npad_id_handler),
+                "GetNpadId",
+            ),
+            (
+                commands::GET_APPLICATION_AREA_SIZE,
+                Some(Self::get_application_area_size_handler),
+                "GetApplicationAreaSize",
+            ),
+            (
+                commands::ATTACH_AVAILABILITY_CHANGE_EVENT,
+                Some(Self::attach_availability_change_event_handler),
+                "AttachAvailabilityChangeEvent",
+            ),
+            (
+                commands::RECREATE_APPLICATION_AREA,
+                Some(Self::recreate_application_area_handler),
+                "RecreateApplicationArea",
+            ),
         ]);
 
         Self {
@@ -132,11 +220,95 @@ impl Interface {
             device_state: DeviceState::Initialized,
             handlers,
             handlers_tipc: BTreeMap::new(),
+            device_manager: Mutex::new(None),
         }
     }
 
     fn as_self(this: &dyn ServiceFramework) -> &Self {
         unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    // --- DeviceManager access ---
+    // Upstream: NfcInterface::GetManager() lazily creates a DeviceManager.
+    // Since Rust has no inheritance, we replicate that pattern here.
+
+    /// Ensures the DeviceManager is created and returns a reference to the Mutex guard.
+    /// Matches upstream `NfcInterface::GetManager()`.
+    fn with_manager<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut DeviceManager) -> R,
+    {
+        let mut guard = self.device_manager.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(DeviceManager::new());
+        }
+        f(guard.as_mut().unwrap())
+    }
+
+    /// Translates NFC result codes to NFP-specific service error codes.
+    ///
+    /// Matches upstream `NfcInterface::TranslateResultToServiceError` with
+    /// BackendType::Nfp.
+    fn translate_result_to_service_error(result: ResultCode) -> ResultCode {
+        if result.is_success() {
+            return result;
+        }
+        if result.get_module() != ErrorModule::NFC {
+            return result;
+        }
+        // Translate NFC results to NFP results (upstream TranslateResultToNfp)
+        if result == nfc_result::RESULT_DEVICE_NOT_FOUND {
+            return nfp_result::RESULT_DEVICE_NOT_FOUND;
+        }
+        if result == nfc_result::RESULT_INVALID_ARGUMENT {
+            return nfp_result::RESULT_INVALID_ARGUMENT;
+        }
+        if result == nfc_result::RESULT_WRONG_APPLICATION_AREA_SIZE {
+            return nfp_result::RESULT_WRONG_APPLICATION_AREA_SIZE;
+        }
+        if result == nfc_result::RESULT_WRONG_DEVICE_STATE {
+            return nfp_result::RESULT_WRONG_DEVICE_STATE;
+        }
+        if result == nfc_result::RESULT_UNKNOWN_74 {
+            return nfp_result::RESULT_UNKNOWN_74;
+        }
+        if result == nfc_result::RESULT_NFC_DISABLED {
+            return nfp_result::RESULT_NFC_DISABLED;
+        }
+        if result == nfc_result::RESULT_NFC_NOT_INITIALIZED {
+            return nfp_result::RESULT_NFC_DISABLED;
+        }
+        if result == nfc_result::RESULT_WRITE_AMIIBO_FAILED {
+            return nfp_result::RESULT_WRITE_AMIIBO_FAILED;
+        }
+        if result == nfc_result::RESULT_TAG_REMOVED {
+            return nfp_result::RESULT_TAG_REMOVED;
+        }
+        if result == nfc_result::RESULT_REGISTRATION_IS_NOT_INITIALIZED {
+            return nfp_result::RESULT_REGISTRATION_IS_NOT_INITIALIZED;
+        }
+        if result == nfc_result::RESULT_APPLICATION_AREA_IS_NOT_INITIALIZED {
+            return nfp_result::RESULT_APPLICATION_AREA_IS_NOT_INITIALIZED;
+        }
+        if result == nfc_result::RESULT_CORRUPTED_DATA_WITH_BACKUP {
+            return nfp_result::RESULT_CORRUPTED_DATA_WITH_BACKUP;
+        }
+        if result == nfc_result::RESULT_CORRUPTED_DATA {
+            return nfp_result::RESULT_CORRUPTED_DATA;
+        }
+        if result == nfc_result::RESULT_WRONG_APPLICATION_AREA_ID {
+            return nfp_result::RESULT_WRONG_APPLICATION_AREA_ID;
+        }
+        if result == nfc_result::RESULT_APPLICATION_AREA_EXIST {
+            return nfp_result::RESULT_APPLICATION_AREA_EXIST;
+        }
+        if result == nfc_result::RESULT_INVALID_TAG_TYPE {
+            return nfp_result::RESULT_NOT_AN_AMIIBO;
+        }
+        if result == nfc_result::RESULT_BACKUP_PATH_ALREADY_EXIST {
+            return nfp_result::RESULT_UNABLE_TO_ACCESS_BACKUP_FILE;
+        }
+        result
     }
 
     // --- Base class (NfcInterface) methods ---
@@ -148,9 +320,16 @@ impl Interface {
     /// Corresponds to `NfcInterface::Initialize` in upstream nfc_interface.cpp.
     pub fn initialize(&self) -> ResultCode {
         log::info!("NFP::Interface({})::Initialize called", self.name);
-        // TODO: create DeviceManager and call initialize
-        self.state.store(State::Initialized as u32, Ordering::Relaxed);
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.initialize());
+        if result.is_success() {
+            self.state
+                .store(State::Initialized as u32, Ordering::Relaxed);
+        } else {
+            self.with_manager(|mgr| {
+                mgr.finalize();
+            });
+        }
+        result
     }
 
     /// Finalize (cmd 1).
@@ -159,8 +338,13 @@ impl Interface {
     pub fn finalize(&self) -> ResultCode {
         log::info!("NFP::Interface({})::Finalize called", self.name);
         if self.state.load(Ordering::Relaxed) != State::NonInitialized as u32 {
-            // TODO: if backend_type != None, call device_manager.finalize()
-            self.state.store(State::NonInitialized as u32, Ordering::Relaxed);
+            self.with_manager(|mgr| {
+                mgr.finalize();
+            });
+            // Upstream: device_manager = nullptr; drop the manager
+            *self.device_manager.lock().unwrap() = None;
+            self.state
+                .store(State::NonInitialized as u32, Ordering::Relaxed);
         }
         RESULT_SUCCESS
     }
@@ -168,29 +352,34 @@ impl Interface {
     /// ListDevices (cmd 2).
     ///
     /// Corresponds to `NfcInterface::ListDevices` in upstream nfc_interface.cpp.
-    pub fn list_devices(&self) -> (ResultCode, Vec<u64>) {
+    pub fn list_devices(&self, max_allowed: usize) -> (ResultCode, Vec<u64>) {
         log::debug!("NFP::ListDevices called");
-        // TODO: delegate to GetManager()->ListDevices
-        (RESULT_SUCCESS, Vec::new())
+        let mut devices = Vec::new();
+        let result = self.with_manager(|mgr| mgr.list_devices(&mut devices, max_allowed, true));
+        let result = Self::translate_result_to_service_error(result);
+        (result, devices)
     }
 
     /// StartDetection (cmd 3).
     ///
     /// Corresponds to `NfcInterface::StartDetection` in upstream nfc_interface.cpp.
     /// For NFP backend, tag_protocol is always NfcProtocol::All (no rp.PopEnum).
-    pub fn start_detection(&self, _device_handle: u64) -> ResultCode {
-        log::info!("NFP::StartDetection called");
-        // TODO: delegate to GetManager()->StartDetection(device_handle, NfcProtocol::All)
-        RESULT_SUCCESS
+    pub fn start_detection(&self, device_handle: u64) -> ResultCode {
+        log::info!(
+            "NFP::StartDetection called, device_handle={}",
+            device_handle
+        );
+        let result = self.with_manager(|mgr| mgr.start_detection(device_handle, NfcProtocol::ALL));
+        Self::translate_result_to_service_error(result)
     }
 
     /// StopDetection (cmd 4).
     ///
     /// Corresponds to `NfcInterface::StopDetection` in upstream nfc_interface.cpp.
-    pub fn stop_detection(&self, _device_handle: u64) -> ResultCode {
-        log::info!("NFP::StopDetection called");
-        // TODO: delegate to GetManager()->StopDetection(device_handle)
-        RESULT_SUCCESS
+    pub fn stop_detection(&self, device_handle: u64) -> ResultCode {
+        log::info!("NFP::StopDetection called, device_handle={}", device_handle);
+        let result = self.with_manager(|mgr| mgr.stop_detection(device_handle));
+        Self::translate_result_to_service_error(result)
     }
 
     /// Mount (cmd 5).
@@ -208,8 +397,9 @@ impl Interface {
             model_type,
             mount_target
         );
-        // TODO: GetManager()->Mount(device_handle, model_type, mount_target)
-        RESULT_SUCCESS
+        let result = self
+            .with_manager(|mgr| mgr.mount(device_handle, model_type as u32, mount_target as u32));
+        Self::translate_result_to_service_error(result)
     }
 
     /// Unmount (cmd 6).
@@ -217,8 +407,8 @@ impl Interface {
     /// Corresponds to `Interface::Unmount` in upstream nfp_interface.cpp.
     pub fn unmount(&self, device_handle: u64) -> ResultCode {
         log::info!("NFP::Unmount called, device_handle={}", device_handle);
-        // TODO: GetManager()->Unmount(device_handle)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.unmount(device_handle));
+        Self::translate_result_to_service_error(result)
     }
 
     /// OpenApplicationArea (cmd 7).
@@ -230,25 +420,23 @@ impl Interface {
             device_handle,
             access_id
         );
-        // TODO: GetManager()->OpenApplicationArea(device_handle, access_id)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.open_application_area(device_handle, access_id));
+        Self::translate_result_to_service_error(result)
     }
 
     /// GetApplicationArea (cmd 8).
     ///
     /// Corresponds to `Interface::GetApplicationArea` in upstream nfp_interface.cpp.
-    pub fn get_application_area(
-        &self,
-        device_handle: u64,
-        data: &mut Vec<u8>,
-    ) -> (ResultCode, u32) {
+    pub fn get_application_area(&self, device_handle: u64, data: &mut [u8]) -> (ResultCode, u32) {
         log::info!(
             "NFP::GetApplicationArea called, device_handle={}",
             device_handle
         );
-        // TODO: GetManager()->GetApplicationArea(device_handle, data)
-        let data_size = data.len() as u32;
-        (RESULT_SUCCESS, data_size)
+        let result = self.with_manager(|mgr| mgr.get_application_area(device_handle, data));
+        match result {
+            Ok(size) => (RESULT_SUCCESS, size),
+            Err(e) => (Self::translate_result_to_service_error(e), 0),
+        }
     }
 
     /// SetApplicationArea (cmd 9).
@@ -260,8 +448,8 @@ impl Interface {
             device_handle,
             data.len()
         );
-        // TODO: GetManager()->SetApplicationArea(device_handle, data)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.set_application_area(device_handle, data));
+        Self::translate_result_to_service_error(result)
     }
 
     /// Flush (cmd 10).
@@ -269,8 +457,8 @@ impl Interface {
     /// Corresponds to `Interface::Flush` in upstream nfp_interface.cpp.
     pub fn flush(&self, device_handle: u64) -> ResultCode {
         log::info!("NFP::Flush called, device_handle={}", device_handle);
-        // TODO: GetManager()->Flush(device_handle)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.flush(device_handle));
+        Self::translate_result_to_service_error(result)
     }
 
     /// Restore (cmd 11).
@@ -278,8 +466,8 @@ impl Interface {
     /// Corresponds to `Interface::Restore` in upstream nfp_interface.cpp.
     pub fn restore(&self, device_handle: u64) -> ResultCode {
         log::info!("NFP::Restore called, device_handle={}", device_handle);
-        // TODO: GetManager()->Restore(device_handle)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.restore(device_handle));
+        Self::translate_result_to_service_error(result)
     }
 
     /// CreateApplicationArea (cmd 12).
@@ -297,17 +485,32 @@ impl Interface {
             access_id,
             data.len()
         );
-        // TODO: GetManager()->CreateApplicationArea(device_handle, access_id, data)
-        RESULT_SUCCESS
+        let result =
+            self.with_manager(|mgr| mgr.create_application_area(device_handle, access_id, data));
+        Self::translate_result_to_service_error(result)
     }
 
     /// GetTagInfo (cmd 13).
     ///
     /// Corresponds to `NfcInterface::GetTagInfo` in upstream nfc_interface.cpp.
-    pub fn get_tag_info(&self, _device_handle: u64) -> (ResultCode, TagInfo) {
-        log::info!("NFP::GetTagInfo called");
-        // TODO: delegate to GetManager()->GetTagInfo
-        (RESULT_SUCCESS, TagInfo::default())
+    pub fn get_tag_info(&self, device_handle: u64) -> (ResultCode, TagInfo) {
+        log::info!("NFP::GetTagInfo called, device_handle={}", device_handle);
+        let result = self.with_manager(|mgr| mgr.get_tag_info(device_handle));
+        match result {
+            Ok(tag_info) => {
+                // Convert from NFC TagInfo to NFP TagInfo
+                let mut nfp_tag_info = TagInfo::default();
+                nfp_tag_info.uuid = tag_info.uuid;
+                nfp_tag_info.uuid_length = tag_info.uuid_length;
+                nfp_tag_info.protocol = tag_info.protocol.bits();
+                nfp_tag_info.tag_type = tag_info.tag_type.bits();
+                (RESULT_SUCCESS, nfp_tag_info)
+            }
+            Err(e) => (
+                Self::translate_result_to_service_error(e),
+                TagInfo::default(),
+            ),
+        }
     }
 
     /// GetState (cmd 19).
@@ -325,28 +528,44 @@ impl Interface {
     /// GetDeviceState (cmd 20).
     ///
     /// Corresponds to `NfcInterface::GetDeviceState` in upstream nfc_interface.cpp.
-    pub fn get_device_state(&self, _device_handle: u64) -> DeviceState {
-        log::debug!("NFP::GetDeviceState called");
-        // TODO: delegate to GetManager()->GetDeviceState
-        self.device_state
+    pub fn get_device_state_for_handle(&self, device_handle: u64) -> DeviceState {
+        log::debug!(
+            "NFP::GetDeviceState called, device_handle={}",
+            device_handle
+        );
+        let nfc_state = self.with_manager(|mgr| mgr.get_device_state(device_handle));
+        // NFC DeviceState and NFP DeviceState have identical repr(u32) values.
+        // Safe to transmute via the raw u32 value.
+        let raw = nfc_state as u32;
+        match raw {
+            0 => DeviceState::Initialized,
+            1 => DeviceState::SearchingForTag,
+            2 => DeviceState::TagFound,
+            3 => DeviceState::TagRemoved,
+            4 => DeviceState::TagMounted,
+            5 => DeviceState::Unavailable,
+            _ => DeviceState::Finalized,
+        }
     }
 
     /// GetNpadId (cmd 21).
     ///
     /// Corresponds to `NfcInterface::GetNpadId` in upstream nfc_interface.cpp.
-    pub fn get_npad_id(&self, _device_handle: u64) -> (ResultCode, u32) {
-        log::debug!("NFP::GetNpadId called");
-        // TODO: delegate to GetManager()->GetNpadId
-        (RESULT_SUCCESS, 0)
+    pub fn get_npad_id(&self, device_handle: u64) -> (ResultCode, u32) {
+        log::debug!("NFP::GetNpadId called, device_handle={}", device_handle);
+        let result = self.with_manager(|mgr| mgr.get_npad_id(device_handle));
+        match result {
+            Ok(npad_id) => (RESULT_SUCCESS, npad_id as u32),
+            Err(e) => (Self::translate_result_to_service_error(e), 0),
+        }
     }
 
     /// GetApplicationAreaSize (cmd 22).
     ///
     /// Corresponds to `Interface::GetApplicationAreaSize` in upstream nfp_interface.cpp.
-    pub fn get_application_area_size(&self, _device_handle: u64) -> u32 {
+    pub fn get_application_area_size(&self) -> u32 {
         log::debug!("NFP::GetApplicationAreaSize called");
-        // TODO: GetManager()->GetApplicationAreaSize()
-        0xD8 // Default application area size
+        self.with_manager(|mgr| mgr.get_application_area_size())
     }
 
     /// RecreateApplicationArea (cmd 24).
@@ -364,8 +583,9 @@ impl Interface {
             access_id,
             data.len()
         );
-        // TODO: GetManager()->RecreateApplicationArea(device_handle, access_id, data)
-        RESULT_SUCCESS
+        let result =
+            self.with_manager(|mgr| mgr.recreate_application_area(device_handle, access_id, data));
+        Self::translate_result_to_service_error(result)
     }
 
     /// Format (cmd 100).
@@ -373,8 +593,44 @@ impl Interface {
     /// Corresponds to `Interface::Format` in upstream nfp_interface.cpp.
     pub fn format(&self, device_handle: u64) -> ResultCode {
         log::info!("NFP::Format called, device_handle={}", device_handle);
-        // TODO: GetManager()->Format(device_handle)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.format(device_handle));
+        Self::translate_result_to_service_error(result)
+    }
+
+    /// GetRegisterInfo (cmd 14).
+    ///
+    /// Corresponds to `Interface::GetRegisterInfo` in upstream nfp_interface.cpp.
+    pub fn get_register_info(&self, device_handle: u64) -> ResultCode {
+        log::info!(
+            "NFP::GetRegisterInfo called, device_handle={}",
+            device_handle
+        );
+        let result = self.with_manager(|mgr| mgr.get_register_info(device_handle));
+        Self::translate_result_to_service_error(result)
+    }
+
+    /// GetCommonInfo (cmd 15).
+    ///
+    /// Corresponds to `Interface::GetCommonInfo` in upstream nfp_interface.cpp.
+    pub fn get_common_info(&self, device_handle: u64) -> (ResultCode, CommonInfo) {
+        log::info!("NFP::GetCommonInfo called, device_handle={}", device_handle);
+        let result = self.with_manager(|mgr| mgr.get_common_info(device_handle));
+        match result {
+            Ok(info) => (RESULT_SUCCESS, info),
+            Err(e) => (
+                Self::translate_result_to_service_error(e),
+                CommonInfo::default(),
+            ),
+        }
+    }
+
+    /// GetModelInfo (cmd 16).
+    ///
+    /// Corresponds to `Interface::GetModelInfo` in upstream nfp_interface.cpp.
+    pub fn get_model_info(&self, device_handle: u64) -> ResultCode {
+        log::info!("NFP::GetModelInfo called, device_handle={}", device_handle);
+        let result = self.with_manager(|mgr| mgr.get_model_info(device_handle));
+        Self::translate_result_to_service_error(result)
     }
 
     /// DeleteRegisterInfo (cmd 104).
@@ -385,8 +641,8 @@ impl Interface {
             "NFP::DeleteRegisterInfo called, device_handle={}",
             device_handle
         );
-        // TODO: GetManager()->DeleteRegisterInfo(device_handle)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.delete_register_info(device_handle));
+        Self::translate_result_to_service_error(result)
     }
 
     /// DeleteApplicationArea (cmd 105).
@@ -397,8 +653,8 @@ impl Interface {
             "NFP::DeleteApplicationArea called, device_handle={}",
             device_handle
         );
-        // TODO: GetManager()->DeleteApplicationArea(device_handle)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.delete_application_area(device_handle));
+        Self::translate_result_to_service_error(result)
     }
 
     /// ExistsApplicationArea (cmd 106).
@@ -409,8 +665,11 @@ impl Interface {
             "NFP::ExistsApplicationArea called, device_handle={}",
             device_handle
         );
-        // TODO: GetManager()->ExistsApplicationArea(device_handle, &has_area)
-        (RESULT_SUCCESS, false)
+        let result = self.with_manager(|mgr| mgr.exists_application_area(device_handle));
+        match result {
+            Ok(exists) => (RESULT_SUCCESS, exists),
+            Err(e) => (Self::translate_result_to_service_error(e), false),
+        }
     }
 
     /// FlushDebug (cmd 202).
@@ -418,8 +677,8 @@ impl Interface {
     /// Corresponds to `Interface::FlushDebug` in upstream nfp_interface.cpp.
     pub fn flush_debug(&self, device_handle: u64) -> ResultCode {
         log::info!("NFP::FlushDebug called, device_handle={}", device_handle);
-        // TODO: GetManager()->FlushDebug(device_handle)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.flush_debug(device_handle));
+        Self::translate_result_to_service_error(result)
     }
 
     /// BreakTag (cmd 203).
@@ -431,20 +690,20 @@ impl Interface {
             device_handle,
             break_type
         );
-        // TODO: GetManager()->BreakTag(device_handle, break_type)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.break_tag(device_handle, break_type as u32));
+        Self::translate_result_to_service_error(result)
     }
 
     /// ReadBackupData (cmd 204).
     ///
     /// Corresponds to `Interface::ReadBackupData` in upstream nfp_interface.cpp.
-    pub fn read_backup_data(&self, device_handle: u64) -> (ResultCode, Vec<u8>) {
+    pub fn read_backup_data(&self, device_handle: u64, data: &mut [u8]) -> ResultCode {
         log::info!(
             "NFP::ReadBackupData called, device_handle={}",
             device_handle
         );
-        // TODO: GetManager()->ReadBackupData(device_handle, &backup_data)
-        (RESULT_SUCCESS, Vec::new())
+        let result = self.with_manager(|mgr| mgr.read_backup_data(device_handle, data));
+        Self::translate_result_to_service_error(result)
     }
 
     /// WriteBackupData (cmd 205).
@@ -455,28 +714,21 @@ impl Interface {
             "NFP::WriteBackupData called, device_handle={}",
             device_handle
         );
-        let _ = data;
-        // TODO: GetManager()->WriteBackupData(device_handle, data)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.write_backup_data(device_handle, data));
+        Self::translate_result_to_service_error(result)
     }
 
     /// WriteNtf (cmd 206).
     ///
     /// Corresponds to `Interface::WriteNtf` in upstream nfp_interface.cpp.
-    pub fn write_ntf(
-        &self,
-        device_handle: u64,
-        write_type: WriteType,
-        data: &[u8],
-    ) -> ResultCode {
+    pub fn write_ntf(&self, device_handle: u64, write_type: WriteType, data: &[u8]) -> ResultCode {
         log::warn!(
             "(STUBBED) NFP::WriteNtf called, device_handle={}, write_type={:?}",
             device_handle,
             write_type
         );
-        let _ = data;
-        // TODO: GetManager()->WriteNtf(device_handle, write_type, data)
-        RESULT_SUCCESS
+        let result = self.with_manager(|mgr| mgr.write_ntf(device_handle, write_type as u32, data));
+        Self::translate_result_to_service_error(result)
     }
 
     // --- IPC handler functions ---
@@ -505,9 +757,10 @@ impl Interface {
     /// Upstream: NfcInterface::ListDevices
     fn list_devices_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
+        let max_allowed = ctx.get_write_buffer_size(0) / 8; // sizeof(u64) = 8
         log::debug!("NFP::ListDevices called");
 
-        let (result, devices) = service.list_devices();
+        let (result, devices) = service.list_devices(max_allowed);
 
         if result.is_error() {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -516,10 +769,7 @@ impl Interface {
         }
 
         // Write device handles to output buffer
-        let bytes: Vec<u8> = devices
-            .iter()
-            .flat_map(|d| d.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = devices.iter().flat_map(|d| d.to_le_bytes()).collect();
         ctx.write_buffer(&bytes, 0);
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -535,7 +785,10 @@ impl Interface {
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
         // NFP backend does not read tag_protocol from params (uses NfcProtocol::All)
-        log::info!("NFP::StartDetection called, device_handle={}", device_handle);
+        log::info!(
+            "NFP::StartDetection called, device_handle={}",
+            device_handle
+        );
 
         let result = service.start_detection(device_handle);
 
@@ -579,7 +832,9 @@ impl Interface {
 
         log::info!(
             "NFP::Mount called, device_handle={}, model_type={:?}, mount_target={:?}",
-            device_handle, model_type, mount_target
+            device_handle,
+            model_type,
+            mount_target
         );
 
         let result = service.mount(device_handle, model_type, mount_target);
@@ -611,7 +866,8 @@ impl Interface {
         let access_id = rp.pop_u32();
         log::info!(
             "NFP::OpenApplicationArea called, device_handle={}, access_id={}",
-            device_handle, access_id
+            device_handle,
+            access_id
         );
 
         let result = service.open_application_area(device_handle, access_id);
@@ -627,7 +883,10 @@ impl Interface {
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
         let data_size = ctx.get_write_buffer_size(0);
-        log::info!("NFP::GetApplicationArea called, device_handle={}", device_handle);
+        log::info!(
+            "NFP::GetApplicationArea called, device_handle={}",
+            device_handle
+        );
 
         let mut data = vec![0u8; data_size];
         let (result, _size) = service.get_application_area(device_handle, &mut data);
@@ -640,7 +899,7 @@ impl Interface {
 
         ctx.write_buffer(&data, 0);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(result);
+        rb.push_result(RESULT_SUCCESS);
         rb.push_u32(data_size as u32);
     }
 
@@ -653,7 +912,8 @@ impl Interface {
         let data = ctx.read_buffer(0);
         log::info!(
             "NFP::SetApplicationArea called, device_handle={}, data_size={}",
-            device_handle, data.len()
+            device_handle,
+            data.len()
         );
 
         let result = service.set_application_area(device_handle, &data);
@@ -700,7 +960,9 @@ impl Interface {
         let data = ctx.read_buffer(0);
         log::info!(
             "NFP::CreateApplicationArea called, device_handle={}, access_id={}, data_size={}",
-            device_handle, access_id, data.len()
+            device_handle,
+            access_id,
+            data.len()
         );
 
         let result = service.create_application_area(device_handle, access_id, &data);
@@ -736,82 +998,100 @@ impl Interface {
     /// GetRegisterInfo (cmd 14).
     /// Upstream: Interface::GetRegisterInfo
     fn get_register_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let _service = Self::as_self(this);
+        let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
-        log::info!("NFP::GetRegisterInfo called, device_handle={}", device_handle);
+        log::info!(
+            "NFP::GetRegisterInfo called, device_handle={}",
+            device_handle
+        );
 
-        // TODO: GetManager()->GetRegisterInfo(device_handle, register_info)
-        // For now, write zeroed RegisterInfo to buffer
-        let register_info = super::nfp_types::RegisterInfo {
-            mii_store_data: [0u8; 0x44],
-            creation_year: 0,
-            creation_month: 0,
-            creation_day: 0,
-            amiibo_name: [0u8; 41],
-            font_region: 0,
-            reserved: [0u8; 0x7A],
-        };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &register_info as *const super::nfp_types::RegisterInfo as *const u8,
-                core::mem::size_of::<super::nfp_types::RegisterInfo>(),
-            )
-        };
-        ctx.write_buffer(bytes, 0);
+        let result = service.get_register_info(device_handle);
+
+        if result.is_success() {
+            // DeviceManager::get_register_info does not yet populate register_info data;
+            // write zeroed RegisterInfo to buffer matching upstream layout.
+            let register_info = super::nfp_types::RegisterInfo {
+                mii_store_data: [0u8; 0x44],
+                creation_year: 0,
+                creation_month: 0,
+                creation_day: 0,
+                amiibo_name: [0u8; 41],
+                font_region: 0,
+                reserved: [0u8; 0x7A],
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &register_info as *const super::nfp_types::RegisterInfo as *const u8,
+                    core::mem::size_of::<super::nfp_types::RegisterInfo>(),
+                )
+            };
+            ctx.write_buffer(bytes, 0);
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     /// GetCommonInfo (cmd 15).
     /// Upstream: Interface::GetCommonInfo
     fn get_common_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let _service = Self::as_self(this);
+        let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
         log::info!("NFP::GetCommonInfo called, device_handle={}", device_handle);
 
-        // TODO: GetManager()->GetCommonInfo(device_handle, common_info)
-        let common_info = CommonInfo::default();
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &common_info as *const CommonInfo as *const u8,
-                core::mem::size_of::<CommonInfo>(),
-            )
-        };
-        ctx.write_buffer(bytes, 0);
+        let (result, common_info) = service.get_common_info(device_handle);
+
+        if result.is_success() {
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &common_info as *const CommonInfo as *const u8,
+                    core::mem::size_of::<CommonInfo>(),
+                )
+            };
+            ctx.write_buffer(bytes, 0);
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     /// GetModelInfo (cmd 16).
     /// Upstream: Interface::GetModelInfo
     fn get_model_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let _service = Self::as_self(this);
+        let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
         log::info!("NFP::GetModelInfo called, device_handle={}", device_handle);
 
-        // TODO: GetManager()->GetModelInfo(device_handle, model_info)
-        // ModelInfo is a small struct; write zeroed data for now
-        let model_info = [0u8; 0x40]; // ModelInfo size
-        ctx.write_buffer(&model_info, 0);
+        let result = service.get_model_info(device_handle);
+
+        if result.is_success() {
+            // DeviceManager::get_model_info does not yet populate model_info data;
+            // write zeroed ModelInfo to buffer matching upstream layout.
+            let model_info = [0u8; 0x40]; // ModelInfo size
+            ctx.write_buffer(&model_info, 0);
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     /// AttachActivateEvent (cmd 17).
     /// Upstream: NfcInterface::AttachActivateEvent
     fn attach_activate_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let _service = Self::as_self(this);
+        let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
-        log::debug!("NFP::AttachActivateEvent called, device_handle={}", device_handle);
+        log::debug!(
+            "NFP::AttachActivateEvent called, device_handle={}",
+            device_handle
+        );
 
-        // TODO: GetManager()->AttachActivateEvent(&out_event, device_handle)
+        // Upstream: GetManager()->AttachActivateEvent(&out_event, device_handle)
+        // The DeviceManager returns an Arc<Event>; we create a readable event handle from it.
+        let _event = service.with_manager(|mgr| mgr.attach_activate_event(device_handle));
         let event_handle = ctx.create_readable_event_handle(false).unwrap_or(0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
@@ -822,12 +1102,16 @@ impl Interface {
     /// AttachDeactivateEvent (cmd 18).
     /// Upstream: NfcInterface::AttachDeactivateEvent
     fn attach_deactivate_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let _service = Self::as_self(this);
+        let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
-        log::debug!("NFP::AttachDeactivateEvent called, device_handle={}", device_handle);
+        log::debug!(
+            "NFP::AttachDeactivateEvent called, device_handle={}",
+            device_handle
+        );
 
-        // TODO: GetManager()->AttachDeactivateEvent(&out_event, device_handle)
+        // Upstream: GetManager()->AttachDeactivateEvent(&out_event, device_handle)
+        let _event = service.with_manager(|mgr| mgr.attach_deactivate_event(device_handle));
         let event_handle = ctx.create_readable_event_handle(false).unwrap_or(0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
@@ -854,9 +1138,12 @@ impl Interface {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
-        log::debug!("NFP::GetDeviceState called, device_handle={}", device_handle);
+        log::debug!(
+            "NFP::GetDeviceState called, device_handle={}",
+            device_handle
+        );
 
-        let device_state = service.get_device_state(device_handle);
+        let device_state = service.get_device_state_for_handle(device_handle);
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -889,10 +1176,13 @@ impl Interface {
     fn get_application_area_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let device_handle = rp.pop_u64();
-        log::debug!("NFP::GetApplicationAreaSize called, device_handle={}", device_handle);
+        let _device_handle = rp.pop_u64();
+        log::debug!(
+            "NFP::GetApplicationAreaSize called, device_handle={}",
+            _device_handle
+        );
 
-        let size = service.get_application_area_size(device_handle);
+        let size = service.get_application_area_size();
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -901,11 +1191,15 @@ impl Interface {
 
     /// AttachAvailabilityChangeEvent (cmd 23).
     /// Upstream: NfcInterface::AttachAvailabilityChangeEvent
-    fn attach_availability_change_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let _service = Self::as_self(this);
+    fn attach_availability_change_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
         log::info!("NFP::AttachAvailabilityChangeEvent called");
 
-        // TODO: GetManager()->AttachAvailabilityChangeEvent()
+        // Upstream: GetManager()->AttachAvailabilityChangeEvent()
+        let _event = service.with_manager(|mgr| mgr.attach_availability_change_event());
         let event_handle = ctx.create_readable_event_handle(false).unwrap_or(0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
@@ -923,7 +1217,9 @@ impl Interface {
         let data = ctx.read_buffer(0);
         log::info!(
             "NFP::RecreateApplicationArea called, device_handle={}, access_id={}, data_size={}",
-            device_handle, access_id, data.len()
+            device_handle,
+            access_id,
+            data.len()
         );
 
         let result = service.recreate_application_area(device_handle, access_id, &data);

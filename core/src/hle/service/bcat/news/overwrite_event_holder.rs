@@ -5,10 +5,13 @@
 //! Port of zuyu/src/core/hle/service/bcat/news/overwrite_event_holder.cpp
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::hle::result::ResultCode;
 use crate::hle::result::RESULT_SUCCESS;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::kernel_helpers::ServiceContext;
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for IOverwriteEventHolder
@@ -18,9 +21,10 @@ pub mod commands {
 
 /// IOverwriteEventHolder corresponds to upstream `News::IOverwriteEventHolder`.
 pub struct IOverwriteEventHolder {
+    service_context: ServiceContext,
+    overwrite_event_handle: u32,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: overwrite_event: KEvent, service_context
 }
 
 impl IOverwriteEventHolder {
@@ -29,16 +33,32 @@ impl IOverwriteEventHolder {
             (commands::GET, None, "Get"),
         ]);
 
+        let mut service_context =
+            ServiceContext::new("IOverwriteEventHolder".to_string());
+        let overwrite_event_handle =
+            service_context.create_event("IOverwriteEventHolder::OverwriteEvent".to_string());
+
         Self {
+            service_context,
+            overwrite_event_handle,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
     }
 
-    pub fn get(&self) -> ResultCode {
+    pub fn get(&self) -> (ResultCode, Arc<Event>) {
         log::info!("IOverwriteEventHolder::get called");
-        // TODO: return overwrite_event readable event handle
-        RESULT_SUCCESS
+        let event = self
+            .service_context
+            .get_event(self.overwrite_event_handle)
+            .expect("overwrite_event must exist");
+        (RESULT_SUCCESS, event)
+    }
+}
+
+impl Drop for IOverwriteEventHolder {
+    fn drop(&mut self) {
+        self.service_context.close_event(self.overwrite_event_handle);
     }
 }
 

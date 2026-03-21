@@ -7,10 +7,12 @@
 //! IAlbumApplicationService — "caps:u".
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use super::caps_manager::AlbumManager;
 use super::caps_types::{
     AlbumFileDateTime, AlbumStorage, ApplicationAlbumEntry, ApplicationAlbumFileEntry,
     ContentType, ShimLibraryVersion,
@@ -42,11 +44,11 @@ pub mod commands {
 pub struct IAlbumApplicationService {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: AlbumManager reference
+    manager: Arc<Mutex<AlbumManager>>,
 }
 
 impl IAlbumApplicationService {
-    pub fn new() -> Self {
+    pub fn new(album_manager: Arc<Mutex<AlbumManager>>) -> Self {
         let handlers = build_handler_map(&[
             (32, None, "SetShimLibraryVersion"),
             (102, None, "GetAlbumFileList0AafeAruidDeprecated"),
@@ -67,6 +69,7 @@ impl IAlbumApplicationService {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            manager: album_manager,
         }
     }
 
@@ -106,8 +109,14 @@ impl IAlbumApplicationService {
             aruid,
         );
 
-        // TODO: manager.is_album_mounted(AlbumStorage::Sd)?;
-        // TODO: manager.get_album_file_list(...)
+        {
+            let mut manager = self.manager.lock().unwrap();
+            let result = manager.is_album_mounted(AlbumStorage::Sd);
+            if !result.is_success() {
+                return Err(result);
+            }
+        }
+        // TODO: manager.get_album_file_list with content_type/posix_time filtering
         Ok(0)
     }
 
@@ -135,8 +144,14 @@ impl IAlbumApplicationService {
             aruid,
         );
 
-        // TODO: manager.is_album_mounted(AlbumStorage::Sd)?;
-        // TODO: manager.get_album_file_list(...)
+        {
+            let mut manager = self.manager.lock().unwrap();
+            let result = manager.is_album_mounted(AlbumStorage::Sd);
+            if !result.is_success() {
+                return Err(result);
+            }
+        }
+        // TODO: manager.get_album_file_list with content_type/datetime filtering
         Ok(0)
     }
 }

@@ -538,7 +538,22 @@ impl ServiceFramework for RoInterface {
 ///
 /// Corresponds to `Service::RO::LoopProcess` in upstream ro.cpp.
 pub fn loop_process() {
-    log::debug!("RO::LoopProcess called");
-    // TODO: Create shared RoContext and register "ldr:ro" (NrrKind::User)
-    // and "ro:1" (NrrKind::JitPlugin) with ServerManager.
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    let stub_names = &["ldr:ro", "ro:1"];
+    for &name in stub_names {
+        let svc_name = name.to_string();
+        server_manager.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+            }),
+            16,
+        );
+    }
+
+    ServerManager::run_server(server_manager);
 }

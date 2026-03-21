@@ -11,6 +11,7 @@ use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 
 use super::am_types::*;
+use super::applet_data_broker::AppletDataBroker;
 use super::lifecycle_manager::LifecycleManager;
 
 /// Stub for the Applet struct.
@@ -66,7 +67,8 @@ pub struct Applet {
     pub user_channel_launch_parameter: std::collections::VecDeque<Vec<u8>>,
     pub preselected_user_launch_parameter: std::collections::VecDeque<Vec<u8>>,
 
-    // Caller applet (stubbed - would be Weak<Applet> in full impl)
+    // Caller applet
+    pub caller_applet_broker: Option<Arc<AppletDataBroker>>,
     pub is_completed: bool,
 
     // Self state
@@ -94,6 +96,8 @@ pub struct Applet {
     pub library_applet_launchable_event_handle: Option<Handle>,
     pub sleep_lock_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub sleep_lock_event_handle: Option<Handle>,
+    pub state_changed_event: Option<Arc<Mutex<KReadableEvent>>>,
+    pub state_changed_event_handle: Option<Handle>,
 }
 
 impl Applet {
@@ -133,6 +137,7 @@ impl Applet {
             request_exit_to_library_applet_at_execute_next_program_enabled: false,
             user_channel_launch_parameter: std::collections::VecDeque::new(),
             preselected_user_launch_parameter: std::collections::VecDeque::new(),
+            caller_applet_broker: None,
             is_completed: false,
             exit_locked: false,
             fatal_section_count: 0,
@@ -156,6 +161,8 @@ impl Applet {
             library_applet_launchable_event_handle: None,
             sleep_lock_event: None,
             sleep_lock_event_handle: None,
+            state_changed_event: None,
+            state_changed_event_handle: None,
         }
     }
 
@@ -284,12 +291,28 @@ impl Applet {
             return;
         }
         self.is_interactible = interactible;
-        // TODO: hid_registration.enable_applet_to_get_input(interactible && !lifecycle_manager.get_exit_requested())
+        // NOTE: upstream calls hid_registration.EnableAppletToGetInput(interactible && !lifecycle_manager.GetExitRequested())
+        // HID registration is not yet wired; depends on IHidServer integration.
+    }
+
+    pub fn ensure_state_changed_event(&mut self, ctx: &HLERequestContext) -> Option<Handle> {
+        Self::ensure_persistent_readable_event(
+            ctx,
+            &mut self.state_changed_event,
+            &mut self.state_changed_event_handle,
+            false,
+        )
+    }
+
+    pub fn signal_state_changed_event(&mut self, process: &mut KProcess) {
+        if let Some(event) = self.state_changed_event.as_ref() {
+            Self::signal_persistent_readable_event(process, event);
+        }
     }
 
     /// Port of Applet::OnProcessTerminatedLocked
-    pub fn on_process_terminated_locked(&mut self) {
+    pub fn on_process_terminated_locked(&mut self, process: &mut KProcess) {
         self.is_completed = true;
-        // TODO: state_changed_event.signal()
+        self.signal_state_changed_event(process);
     }
 }

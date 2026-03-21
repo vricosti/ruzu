@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::pctl_results::*;
 use super::pctl_types::{
@@ -304,7 +304,9 @@ impl IParentalControlService {
         if !self.settings.is_free_communication_default_on {
             return true;
         }
-        // TODO: Check for blacklisted/exempted applications.
+        // Upstream TODO(ogniK): Check for blacklisted/exempted applications. Return false can
+        // happen here but as we don't have multiprocess support yet, we can just assume our
+        // application is valid for the time being.
         true
     }
 
@@ -351,8 +353,26 @@ impl IParentalControlService {
             return Err(RESULT_NO_CAPABILITY);
         }
 
-        // TODO: Recovery flag initialization for pctl:r
-        // TODO: Get program_id from system, read control metadata, fill application_info
+        // Upstream TODO(ogniK): Recovery flag initialization for pctl:r
+
+        // Upstream reads program_id via system.GetApplicationProcessProgramID(), then uses
+        // PatchManager::GetControlMetadata() to populate application_info with age_rating and
+        // parental_control_flag from the NACP. PatchManager is not yet ported, so we populate
+        // application_info with the program_id but leave age_rating/parental_control_flag at
+        // defaults (zeroed), which effectively disables parental restrictions.
+        let program_id = if !self.system.is_null() {
+            self.system.get().runtime_program_id()
+        } else {
+            0
+        };
+        if program_id != 0 {
+            self.states.application_info = ApplicationInfo {
+                application_id: program_id,
+                age_rating: [0u8; 32],
+                parental_control_flag: 0,
+                capability: self.capability.bits(),
+            };
+        }
         self.states.tid_from_event = 0;
         self.states.launch_time_valid = false;
         self.states.is_suspended = false;
@@ -849,8 +869,9 @@ impl IParentalControlService {
     ) {
         let service =
             unsafe { &mut *(this as *const dyn ServiceFramework as *mut IParentalControlService) };
-        // TODO: parse bool from request data
-        let result = match service.set_stereo_vision_restriction(false) {
+        let mut rp = RequestParser::new(ctx);
+        let is_restricted = rp.pop_bool();
+        let result = match service.set_stereo_vision_restriction(is_restricted) {
             Ok(()) => RESULT_SUCCESS,
             Err(err) => err,
         };
@@ -949,10 +970,10 @@ impl IParentalControlService {
     ) {
         log::warn!("(STUBBED) IParentalControlService::GetPlayTimerSettings called");
         let settings = PlayTimerSettings::default();
-        // PlayTimerSettings is a raw struct -- push as raw bytes
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        // PlayTimerSettings is 0x34 bytes = 13 u32 words. Response: 2 (header) + 13 (data) = 15.
+        let mut rb = ResponseBuilder::new(ctx, 15, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        // TODO: write PlayTimerSettings into response buffer when struct serialization is ready
+        rb.push_raw(&settings);
     }
 
     fn is_play_timer_alarm_disabled_handler(

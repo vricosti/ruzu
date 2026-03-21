@@ -253,8 +253,10 @@ impl Sfdnsres {
             parameters.process_id
         );
 
-        // TODO: If use_nsd_resolve is true, pass the name through NSD::Resolve
-        // before looking up.
+        // Upstream: if use_nsd_resolve is true, the hostname should be passed through
+        // NSD::Resolve before DNS lookup. NSD service integration is not yet available
+        // in the Rust port, so we skip this step (matching upstream's effective behavior
+        // since NSD::Resolve is also a stub in upstream for most titles).
 
         let host_buffer = ctx.read_buffer(0);
         let host = common::string_util::string_from_buffer(&host_buffer);

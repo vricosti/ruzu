@@ -104,5 +104,22 @@ impl ClkrstA {
 ///
 /// Corresponds to `LoopProcess` in upstream `pcv.cpp`.
 pub fn loop_process() {
-    // TODO: register services with ServerManager
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    let stub_names = &["pcv", "clkrst", "clkrst:i", "clkrst:a"];
+    for &name in stub_names {
+        let svc_name = name.to_string();
+        server_manager.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+            }),
+            16,
+        );
+    }
+
+    ServerManager::run_server(server_manager);
 }

@@ -88,23 +88,33 @@ pub mod btdrv_commands {
 ///
 /// Corresponds to `IBluetoothUser` in upstream btdrv.cpp.
 pub struct IBluetoothUser {
-    // In upstream: service_context and register_event (KEvent)
-    // TODO: add when kernel event support is available
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    /// Handle for the register event. Returned by RegisterBleEvent.
+    register_event_handle: u32,
 }
 
 impl IBluetoothUser {
     pub fn new() -> Self {
-        // Upstream creates register_event = service_context.CreateEvent("BT:RegisterEvent")
-        Self {}
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
+            "bt".to_string(),
+        );
+        let register_event_handle =
+            service_context.create_event("BT:RegisterEvent".to_string());
+        Self {
+            service_context,
+            register_event_handle,
+        }
     }
 
     /// RegisterBleEvent (cmd 9).
     ///
     /// Corresponds to `IBluetoothUser::RegisterBleEvent` in upstream btdrv.cpp.
     /// Returns the register_event's readable event handle.
-    pub fn register_ble_event(&self) {
+    pub fn register_ble_event(
+        &self,
+    ) -> Option<std::sync::Arc<crate::hle::service::os::event::Event>> {
         log::warn!("(STUBBED) IBluetoothUser::register_ble_event called");
-        // TODO: return register_event->GetReadableEvent()
+        self.service_context.get_event(self.register_event_handle)
     }
 }
 
@@ -131,6 +141,14 @@ impl IBluetoothDriver {
 ///
 /// Corresponds to `LoopProcess` in upstream btdrv.cpp.
 pub fn loop_process() {
+    use crate::hle::service::server_manager::ServerManager;
+
     log::debug!("BtDrv::LoopProcess called");
-    // TODO: register "btdrv" -> IBluetoothDriver and "bt" -> IBluetoothUser with ServerManager
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    crate::hle::service::services::register_stub_services(
+        &mut server_manager,
+        &["btdrv", "bt"],
+    );
+    ServerManager::run_server(server_manager);
 }

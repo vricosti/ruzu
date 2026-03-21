@@ -31,7 +31,8 @@ const _: () = assert!(std::mem::size_of::<CradleDeviceInfo>() == 0x10);
 /// - 4: GetUpdateProgressInfo (unimplemented)
 /// - 5: GetLastInternalResult (unimplemented)
 pub struct ICradleFirmwareUpdater {
-    // TODO: ServiceContext, Event
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    cradle_device_info_event_handle: u32,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -42,11 +43,19 @@ impl ICradleFirmwareUpdater {
             (0, Some(Self::start_update_handler), "StartUpdate"),
             (1, Some(Self::finish_update_handler), "FinishUpdate"),
             (2, Some(Self::get_cradle_device_info_handler), "GetCradleDeviceInfo"),
-            (3, None, "GetCradleDeviceInfoChangeEvent"),
+            (3, Some(Self::get_cradle_device_info_change_event_handler), "GetCradleDeviceInfoChangeEvent"),
             (4, None, "GetUpdateProgressInfo"),
             (5, None, "GetLastInternalResult"),
         ]);
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
+            "ICradleFirmwareUpdater".to_string(),
+        );
+        let cradle_device_info_event_handle = service_context.create_event(
+            "ICradleFirmwareUpdater:CradleDeviceInfoChangeEvent".to_string(),
+        );
         Self {
+            service_context,
+            cradle_device_info_event_handle,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -91,6 +100,21 @@ impl ICradleFirmwareUpdater {
         let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_raw(&info);
+    }
+
+    /// Port of ICradleFirmwareUpdater::GetCradleDeviceInfoChangeEvent
+    /// Upstream returns m_cradle_device_info_event.GetHandle() as a copy handle.
+    fn get_cradle_device_info_change_event_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) ICradleFirmwareUpdater::GetCradleDeviceInfoChangeEvent called");
+
+        if let Some(handle) = ctx.create_readable_event_handle(false) {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        }
     }
 }
 

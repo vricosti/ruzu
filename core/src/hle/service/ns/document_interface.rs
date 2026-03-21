@@ -27,10 +27,11 @@ pub mod commands {
 pub struct IDocumentInterface {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
+    system: crate::core::SystemRef,
 }
 
 impl IDocumentInterface {
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Self {
         let handlers = build_handler_map(&[
             (commands::GET_APPLICATION_CONTENT_PATH, None, "GetApplicationContentPath"),
             (commands::RESOLVE_APPLICATION_CONTENT_PATH, None, "ResolveApplicationContentPath"),
@@ -39,6 +40,7 @@ impl IDocumentInterface {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            system,
         }
     }
 
@@ -66,8 +68,7 @@ impl IDocumentInterface {
         _caller_program_id: u64,
     ) -> Result<u64, ResultCode> {
         log::warn!("(STUBBED) GetRunningApplicationProgramId called");
-        // TODO: return system.get_application_process_program_id()
-        Ok(0)
+        Ok(self.system.get().runtime_program_id())
     }
 }
 

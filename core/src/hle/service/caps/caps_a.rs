@@ -7,10 +7,12 @@
 //! IAlbumAccessorService — "caps:a".
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ErrorModule, ResultCode};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use super::caps_manager::AlbumManager;
 use super::caps_result::*;
 use super::caps_types::{
     AlbumEntry, AlbumFileId, AlbumStorage, LoadAlbumScreenShotImageOutput, ScreenShotDecodeOption,
@@ -67,11 +69,11 @@ pub mod commands {
 pub struct IAlbumAccessorService {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: AlbumManager reference
+    manager: Arc<Mutex<AlbumManager>>,
 }
 
 impl IAlbumAccessorService {
-    pub fn new() -> Self {
+    pub fn new(album_manager: Arc<Mutex<AlbumManager>>) -> Self {
         let handlers = build_handler_map(&[
             (0, None, "GetAlbumFileCount"),
             (1, None, "GetAlbumFileList"),
@@ -117,6 +119,7 @@ impl IAlbumAccessorService {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            manager: album_manager,
         }
     }
 
@@ -130,9 +133,14 @@ impl IAlbumAccessorService {
     ) -> Result<u64, ResultCode> {
         log::info!("GetAlbumFileList called, storage={:?}", storage);
 
-        // TODO: manager.get_album_file_list(out_entries, storage, 0)
-        // For now return 0 entries.
-        Ok(0)
+        let manager = self.manager.lock().unwrap();
+        let (result, count) = manager.get_album_file_list(out_entries, storage, 0);
+        let result = self.translate_result(result);
+        if result.is_success() {
+            Ok(count)
+        } else {
+            Err(result)
+        }
     }
 
     /// DeleteAlbumFile (cmd 3).
@@ -146,8 +154,14 @@ impl IAlbumAccessorService {
             file_id.content_type,
         );
 
-        // TODO: manager.delete_album_file(file_id)
-        Ok(())
+        let mut manager = self.manager.lock().unwrap();
+        let result = manager.delete_album_file(&file_id);
+        let result = self.translate_result(result);
+        if result.is_success() {
+            Ok(())
+        } else {
+            Err(result)
+        }
     }
 
     /// IsAlbumMounted (cmd 5).
@@ -156,9 +170,15 @@ impl IAlbumAccessorService {
     pub fn is_album_mounted(&self, storage: AlbumStorage) -> Result<bool, ResultCode> {
         log::info!("IsAlbumMounted called, storage={:?}", storage);
 
-        // TODO: manager.is_album_mounted(storage)
-        // For now, always return true.
-        Ok(true)
+        let mut manager = self.manager.lock().unwrap();
+        let result = manager.is_album_mounted(storage);
+        let is_mounted = result.is_success();
+        let result = self.translate_result(result);
+        if result.is_success() {
+            Ok(is_mounted)
+        } else {
+            Err(result)
+        }
     }
 
     /// Unknown18 (cmd 18).
@@ -185,8 +205,14 @@ impl IAlbumAccessorService {
             flags,
         );
 
-        // TODO: manager.get_album_file_list(out_entries, storage, flags)
-        Ok(0)
+        let manager = self.manager.lock().unwrap();
+        let (result, count) = manager.get_album_file_list(out_entries, storage, flags);
+        let result = self.translate_result(result);
+        if result.is_success() {
+            Ok(count)
+        } else {
+            Err(result)
+        }
     }
 
     /// GetAutoSavingStorage (cmd 401).
@@ -195,8 +221,14 @@ impl IAlbumAccessorService {
     pub fn get_auto_saving_storage(&self) -> Result<bool, ResultCode> {
         log::warn!("(STUBBED) GetAutoSavingStorage called");
 
-        // TODO: manager.get_auto_saving_storage()
-        Ok(false)
+        let manager = self.manager.lock().unwrap();
+        let (result, is_autosaving) = manager.get_auto_saving_storage();
+        let result = self.translate_result(result);
+        if result.is_success() {
+            Ok(is_autosaving)
+        } else {
+            Err(result)
+        }
     }
 
     /// LoadAlbumScreenShotImageEx1 (cmd 1002).
@@ -217,9 +249,19 @@ impl IAlbumAccessorService {
             decoder_options.flags,
         );
 
-        // TODO: manager.load_album_screen_shot_image(out_image_output, out_image, file_id, decoder_options)
-        let _ = (out_image_output, out_image);
-        Ok(())
+        let manager = self.manager.lock().unwrap();
+        let result = manager.load_album_screen_shot_image(
+            out_image_output,
+            out_image,
+            file_id,
+            decoder_options,
+        );
+        let result = self.translate_result(result);
+        if result.is_success() {
+            Ok(())
+        } else {
+            Err(result)
+        }
     }
 
     /// LoadAlbumScreenShotThumbnailImageEx1 (cmd 1003).
@@ -240,9 +282,19 @@ impl IAlbumAccessorService {
             decoder_options.flags,
         );
 
-        // TODO: manager.load_album_screen_shot_thumbnail(out_image_output, out_image, file_id, decoder_options)
-        let _ = (out_image_output, out_image);
-        Ok(())
+        let manager = self.manager.lock().unwrap();
+        let result = manager.load_album_screen_shot_thumbnail(
+            out_image_output,
+            out_image,
+            file_id,
+            decoder_options,
+        );
+        let result = self.translate_result(result);
+        if result.is_success() {
+            Ok(())
+        } else {
+            Err(result)
+        }
     }
 
     /// TranslateResult — translates internal capture result codes to public ones.

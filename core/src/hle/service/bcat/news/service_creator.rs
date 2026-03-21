@@ -5,10 +5,16 @@
 //! Port of zuyu/src/core/hle/service/bcat/news/service_creator.cpp
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use super::newly_arrived_event_holder::INewlyArrivedEventHolder;
+use super::news_data_service::INewsDataService;
+use super::news_database_service::INewsDatabaseService;
+use super::news_service::INewsService;
+use super::overwrite_event_holder::IOverwriteEventHolder;
 
 /// IPC command IDs for News::IServiceCreator
 pub mod commands {
@@ -45,34 +51,38 @@ impl IServiceCreator {
         }
     }
 
-    pub fn create_news_service(&self) -> ResultCode {
+    pub fn create_news_service(&self) -> (ResultCode, Arc<INewsService>) {
         log::info!("News::IServiceCreator::create_news_service called");
-        // TODO: create INewsService
-        RESULT_SUCCESS
+        let service = Arc::new(INewsService::new());
+        (RESULT_SUCCESS, service)
     }
 
-    pub fn create_newly_arrived_event_holder(&self) -> ResultCode {
+    pub fn create_newly_arrived_event_holder(
+        &self,
+    ) -> (ResultCode, Arc<INewlyArrivedEventHolder>) {
         log::info!("News::IServiceCreator::create_newly_arrived_event_holder called");
-        // TODO: create INewlyArrivedEventHolder
-        RESULT_SUCCESS
+        let service = Arc::new(INewlyArrivedEventHolder::new());
+        (RESULT_SUCCESS, service)
     }
 
-    pub fn create_news_data_service(&self) -> ResultCode {
+    pub fn create_news_data_service(&self) -> (ResultCode, Arc<INewsDataService>) {
         log::info!("News::IServiceCreator::create_news_data_service called");
-        // TODO: create INewsDataService
-        RESULT_SUCCESS
+        let service = Arc::new(INewsDataService::new());
+        (RESULT_SUCCESS, service)
     }
 
-    pub fn create_news_database_service(&self) -> ResultCode {
+    pub fn create_news_database_service(&self) -> (ResultCode, Arc<INewsDatabaseService>) {
         log::info!("News::IServiceCreator::create_news_database_service called");
-        // TODO: create INewsDatabaseService
-        RESULT_SUCCESS
+        let service = Arc::new(INewsDatabaseService::new());
+        (RESULT_SUCCESS, service)
     }
 
-    pub fn create_overwrite_event_holder(&self) -> ResultCode {
+    pub fn create_overwrite_event_holder(
+        &self,
+    ) -> (ResultCode, Arc<IOverwriteEventHolder>) {
         log::info!("News::IServiceCreator::create_overwrite_event_holder called");
-        // TODO: create IOverwriteEventHolder
-        RESULT_SUCCESS
+        let service = Arc::new(IOverwriteEventHolder::new());
+        (RESULT_SUCCESS, service)
     }
 }
 

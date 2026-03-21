@@ -82,14 +82,22 @@ pub mod user_commands {
 ///
 /// Corresponds to `INpnsSystem` in upstream npns.cpp.
 pub struct INpnsSystem {
-    // In upstream: service_context and get_receive_event (KEvent)
-    // TODO: add when kernel event support is available
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    /// Handle for the receive event. Returned by GetReceiveEvent.
+    receive_event_handle: u32,
 }
 
 impl INpnsSystem {
     pub fn new() -> Self {
-        // Upstream creates get_receive_event = service_context.CreateEvent("npns:s:GetReceiveEvent")
-        Self {}
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
+            "npns:s".to_string(),
+        );
+        let receive_event_handle =
+            service_context.create_event("npns:s:GetReceiveEvent".to_string());
+        Self {
+            service_context,
+            receive_event_handle,
+        }
     }
 
     /// ListenTo (cmd 2).
@@ -106,9 +114,11 @@ impl INpnsSystem {
     ///
     /// Corresponds to `INpnsSystem::GetReceiveEvent` in upstream npns.cpp.
     /// Returns the get_receive_event's readable event handle.
-    pub fn get_receive_event(&self) {
+    pub fn get_receive_event(
+        &self,
+    ) -> Option<std::sync::Arc<crate::hle::service::os::event::Event>> {
         log::warn!("(STUBBED) INpnsSystem::get_receive_event called");
-        // TODO: return get_receive_event->GetReadableEvent()
+        self.service_context.get_event(self.receive_event_handle)
     }
 }
 
@@ -128,6 +138,24 @@ impl INpnsUser {
 ///
 /// Corresponds to `LoopProcess` in upstream npns.cpp.
 pub fn loop_process() {
-    log::debug!("NPNS::LoopProcess called");
-    // TODO: register services with ServerManager
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    let stub = |sm: &mut ServerManager, name: &str| {
+        let svc_name = name.to_string();
+        sm.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(
+                    crate::hle::service::services::GenericStubService::new(&svc_name),
+                )
+            }),
+            64,
+        );
+    };
+    stub(&mut server_manager, "npns:s");
+    stub(&mut server_manager, "npns:u");
+    ServerManager::run_server(server_manager);
 }

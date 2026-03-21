@@ -136,6 +136,10 @@ pub struct FspSrv {
     access_log_program_index: std::sync::Mutex<u32>,
     access_log_mode: std::sync::Mutex<AccessLogMode>,
     program_id: std::sync::Mutex<u64>,
+    /// Upstream: `std::shared_ptr<SaveDataController> save_data_controller`.
+    save_data_controller: std::sync::Mutex<Option<super::super::save_data_controller::SaveDataController>>,
+    /// Upstream: `std::shared_ptr<RomFsController> romfs_controller`.
+    romfs_controller: std::sync::Mutex<Option<super::super::romfs_controller::RomFsController>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -148,6 +152,8 @@ impl FspSrv {
             access_log_program_index: std::sync::Mutex::new(0),
             access_log_mode: std::sync::Mutex::new(AccessLogMode::None),
             program_id: std::sync::Mutex::new(0),
+            save_data_controller: std::sync::Mutex::new(None),
+            romfs_controller: std::sync::Mutex::new(None),
             handlers: build_handler_map(&[
                 (1, Some(Self::set_current_process_handler), "SetCurrentProcess"),
                 (18, Some(Self::open_sd_card_file_system_handler), "OpenSdCardFileSystem"),
@@ -219,14 +225,16 @@ impl FspSrv {
         *service.current_process_id.lock().unwrap() = pid;
 
         // Upstream: fsc.OpenProcess(&program_id, &save_data_controller, &romfs_controller, pid)
-        let program_id = service
+        let result = service
             .fsc
             .as_ref()
             .and_then(|fsc| fsc.lock().unwrap().open_process(pid));
 
-        match program_id {
-            Some(program_id) => {
+        match result {
+            Some((program_id, save_data_ctrl, romfs_ctrl)) => {
                 *service.program_id.lock().unwrap() = program_id;
+                *service.save_data_controller.lock().unwrap() = Some(save_data_ctrl);
+                *service.romfs_controller.lock().unwrap() = Some(romfs_ctrl);
                 log::info!(
                     "FspSrv::SetCurrentProcess: pid={:#x}, program_id={:#018x}",
                     pid, program_id,

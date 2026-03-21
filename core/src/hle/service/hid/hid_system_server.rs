@@ -274,7 +274,8 @@ impl IHidSystemServer {
 
         log::debug!("(STUBBED) GetNpadFullKeyGripColor called, npad_id={}", npad_id);
 
-        // TODO: Get colors from Npad
+        // Upstream also has a TODO here: "Get colors from Npad"
+        // Default-initialized NpadColor (all zeros) matches upstream stub behavior.
         let left_color: u32 = 0;
         let right_color: u32 = 0;
 
@@ -667,51 +668,74 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::SetVibrationMasterVolume (cmd 510)
-    fn set_vibration_master_volume_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_vibration_master_volume_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let master_volume = rp.pop_f32();
 
         log::info!("SetVibrationMasterVolume called, volume={}", master_volume);
 
-        // TODO: forward to resource_manager->GetNpad()->GetVibrationHandler()->SetVibrationMasterVolume
+        let result = if let Some(npad) = server.resource_manager.lock().get_npad() {
+            to_ipc_result(npad.lock().set_vibration_master_volume(master_volume))
+        } else {
+            RESULT_SUCCESS
+        };
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     /// Upstream: IHidSystemServer::GetVibrationMasterVolume (cmd 511)
-    fn get_vibration_master_volume_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::info!("GetVibrationMasterVolume called");
+    fn get_vibration_master_volume_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
 
-        // TODO: forward to resource_manager->GetNpad()->GetVibrationHandler()->GetVibrationMasterVolume
-        let master_volume: f32 = 1.0;
+        let (result, master_volume) = if let Some(npad) = server.resource_manager.lock().get_npad() {
+            match npad.lock().get_vibration_master_volume() {
+                Ok(vol) => (RESULT_SUCCESS, vol),
+                Err(e) => (to_ipc_result(e), 0.0f32),
+            }
+        } else {
+            (RESULT_SUCCESS, 1.0f32)
+        };
+
+        log::info!("GetVibrationMasterVolume called, volume={}", master_volume);
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
         rb.push_f32(master_volume);
     }
 
     /// Upstream: IHidSystemServer::BeginPermitVibrationSession (cmd 512)
-    fn begin_permit_vibration_session_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn begin_permit_vibration_session_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
 
-        log::info!(
-            "BeginPermitVibrationSession called, aruid={}",
-            aruid
-        );
+        log::info!("BeginPermitVibrationSession called, aruid={}", aruid);
 
-        // TODO: forward to resource_manager->GetNpad()->GetVibrationHandler()->BeginPermitVibrationSession
+        let result = if let Some(npad) = server.resource_manager.lock().get_npad() {
+            to_ipc_result(npad.lock().begin_permit_vibration_session(aruid))
+        } else {
+            RESULT_SUCCESS
+        };
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     /// Upstream: IHidSystemServer::EndPermitVibrationSession (cmd 513)
-    fn end_permit_vibration_session_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn end_permit_vibration_session_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         log::info!("EndPermitVibrationSession called");
 
-        // TODO: forward to resource_manager->GetNpad()->GetVibrationHandler()->EndPermitVibrationSession
+        let result = if let Some(npad) = server.resource_manager.lock().get_npad() {
+            to_ipc_result(npad.lock().end_permit_vibration_session())
+        } else {
+            RESULT_SUCCESS
+        };
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     /// Upstream: nullptr (cmd 514)

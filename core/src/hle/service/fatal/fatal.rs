@@ -129,14 +129,18 @@ pub fn generate_error_report(title_id: u64, error_code: u32, info: &FatalInfo) {
     }
 
     log::error!("{}", crash_report);
-
-    // TODO: system.GetReporter().SaveCrashReport(...)
 }
 
 /// Process a fatal error according to the error type policy.
 ///
 /// Corresponds to `ThrowFatalError` in upstream fatal.cpp.
-pub fn throw_fatal_error(title_id: u64, error_code: u32, fatal_type: FatalType, info: &FatalInfo) {
+pub fn throw_fatal_error(
+    title_id: u64,
+    error_code: u32,
+    fatal_type: FatalType,
+    info: &FatalInfo,
+    reporter: Option<&crate::reporter::Reporter>,
+) {
     log::error!(
         "Threw fatal error type {:?} with error code 0x{:X}",
         fatal_type,
@@ -146,6 +150,14 @@ pub fn throw_fatal_error(title_id: u64, error_code: u32, fatal_type: FatalType, 
     match fatal_type {
         FatalType::ErrorReportAndScreen => {
             generate_error_report(title_id, error_code, info);
+            if let Some(reporter) = reporter {
+                reporter.save_crash_report(
+                    title_id, error_code, info.set_flags, info.program_entry_point,
+                    info.sp, info.pc, info.pstate, info.afsr0, info.afsr1,
+                    info.esr, info.far, &info.registers, &info.backtrace,
+                    info.backtrace_size, info.arch.as_str(), info.unk10,
+                );
+            }
             // Since we have no fatal:u error screen, just assert in debug
             debug_assert!(false, "Fatal error screen would be shown here");
         }
@@ -155,6 +167,14 @@ pub fn throw_fatal_error(title_id: u64, error_code: u32, fatal_type: FatalType, 
         }
         FatalType::ErrorReport => {
             generate_error_report(title_id, error_code, info);
+            if let Some(reporter) = reporter {
+                reporter.save_crash_report(
+                    title_id, error_code, info.set_flags, info.program_entry_point,
+                    info.sp, info.pc, info.pstate, info.afsr0, info.afsr1,
+                    info.esr, info.far, &info.registers, &info.backtrace,
+                    info.backtrace_size, info.arch.as_str(), info.unk10,
+                );
+            }
         }
     }
 }
@@ -189,7 +209,12 @@ impl Interface {
     /// Corresponds to `Module::Interface::ThrowFatal` in upstream fatal.cpp.
     pub fn throw_fatal(&self, error_code: u32) {
         log::error!("fatal ThrowFatal called");
-        throw_fatal_error(0, error_code, FatalType::ErrorScreen, &FatalInfo::default());
+        let reporter = if !self.system.is_null() {
+            Some(self.system.get_reporter().as_ref())
+        } else {
+            None
+        };
+        throw_fatal_error(0, error_code, FatalType::ErrorScreen, &FatalInfo::default(), reporter);
     }
 
     /// ThrowFatalWithPolicy (cmd 1).
@@ -197,7 +222,12 @@ impl Interface {
     /// Corresponds to `Module::Interface::ThrowFatalWithPolicy` in upstream fatal.cpp.
     pub fn throw_fatal_with_policy(&self, error_code: u32, fatal_type: FatalType) {
         log::error!("fatal ThrowFatalWithPolicy called");
-        throw_fatal_error(0, error_code, fatal_type, &FatalInfo::default());
+        let reporter = if !self.system.is_null() {
+            Some(self.system.get_reporter().as_ref())
+        } else {
+            None
+        };
+        throw_fatal_error(0, error_code, fatal_type, &FatalInfo::default(), reporter);
     }
 
     /// ThrowFatalWithCpuContext (cmd 2).
@@ -225,7 +255,12 @@ impl Interface {
             );
         }
 
-        throw_fatal_error(0, error_code, fatal_type, &info);
+        let reporter = if !self.system.is_null() {
+            Some(self.system.get_reporter().as_ref())
+        } else {
+            None
+        };
+        throw_fatal_error(0, error_code, fatal_type, &info, reporter);
     }
 }
 

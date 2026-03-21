@@ -97,5 +97,23 @@ impl ServiceFramework for Friend {
 ///
 /// Corresponds to `LoopProcess` in upstream `friend.cpp`.
 pub fn loop_process() {
-    // TODO: register services with ServerManager
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let module = Arc::new(super::friend::Module);
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    for &name in &["friend:a", "friend:m", "friend:s", "friend:u", "friend:v"] {
+        let m = module.clone();
+        server_manager.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(Friend::new(crate::core::SystemRef::null(), m.clone(), name))
+            }),
+            64,
+        );
+    }
+
+    ServerManager::run_server(server_manager);
 }

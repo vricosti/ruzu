@@ -46,10 +46,13 @@ pub struct BgtcT;
 impl BgtcT {
     pub fn new() -> Self { Self }
 
-    pub fn open_task_service(&self) -> ResultCode {
+    /// Opens and returns an ITaskService instance.
+    ///
+    /// Upstream creates an ITaskService via PushIpcInterface. All ITaskService
+    /// handlers are nullptr in upstream (unimplemented).
+    pub fn open_task_service(&self) -> (ResultCode, ITaskService) {
         log::debug!("BGTC_T::open_task_service called");
-        // TODO: create ITaskService
-        RESULT_SUCCESS
+        (RESULT_SUCCESS, ITaskService::new())
     }
 }
 

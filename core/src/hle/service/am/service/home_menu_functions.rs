@@ -31,7 +31,8 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 pub struct IHomeMenuFunctions {
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
     window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
-    // TODO: ServiceContext, Event
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    pop_from_general_channel_event_handle: u32,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -46,7 +47,7 @@ impl IHomeMenuFunctions {
             (11, Some(Self::lock_foreground_handler), "LockForeground"),
             (12, Some(Self::unlock_foreground_handler), "UnlockForeground"),
             (20, None, "PopFromGeneralChannel"),
-            (21, None, "GetPopFromGeneralChannelEvent"), // Needs event handle support
+            (21, Some(Self::get_pop_from_general_channel_event_handler), "GetPopFromGeneralChannelEvent"),
             (30, None, "GetHomeButtonWriterLockAccessor"),
             (31, None, "GetWriterLockAccessorEx"),
             (40, None, "IsSleepEnabled"),
@@ -62,9 +63,17 @@ impl IHomeMenuFunctions {
             (200, None, "LaunchDevMenu"),
             (1000, None, "SetLastApplicationExitReason"),
         ]);
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
+            "IHomeMenuFunctions".to_string(),
+        );
+        let pop_from_general_channel_event_handle = service_context.create_event(
+            "IHomeMenuFunctions:PopFromGeneralChannelEvent".to_string(),
+        );
         Self {
             applet,
             window_system,
+            service_context,
+            pop_from_general_channel_event_handle,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -104,6 +113,22 @@ impl IHomeMenuFunctions {
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// Port of IHomeMenuFunctions::GetPopFromGeneralChannelEvent
+    /// Upstream returns m_pop_from_general_channel_event.GetHandle() as a copy handle.
+    fn get_pop_from_general_channel_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let _service = unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
+        log::info!("IHomeMenuFunctions::GetPopFromGeneralChannelEvent called");
+
+        if let Some(handle) = ctx.create_readable_event_handle(false) {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        }
     }
 
     /// Port of IHomeMenuFunctions::IsRebootEnabled

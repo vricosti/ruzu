@@ -488,5 +488,19 @@ impl ServiceFramework for LBL {
 ///
 /// Corresponds to `LoopProcess` in upstream `lbl.cpp`.
 pub fn loop_process() {
-    // TODO: register "lbl" -> LBL with ServerManager
+    use std::sync::Arc;
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    server_manager.register_named_service(
+        "lbl",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            Arc::new(LBL::new())
+        }),
+        64,
+    );
+
+    ServerManager::run_server(server_manager);
 }

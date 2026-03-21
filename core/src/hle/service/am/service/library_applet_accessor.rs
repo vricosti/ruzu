@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::hle::result::ResultCode;
+use crate::hle::service::am::applet_data_broker::AppletDataBroker;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
@@ -33,13 +34,17 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 160: GetIndirectLayerConsumerHandle
 pub struct ILibraryAppletAccessor {
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
-    // TODO: AppletDataBroker reference
+    /// Matches upstream `const std::shared_ptr<AppletDataBroker> m_broker`.
+    broker: Arc<AppletDataBroker>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ILibraryAppletAccessor {
-    pub fn new(applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
+    pub fn new(
+        broker: Arc<AppletDataBroker>,
+        applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
+    ) -> Self {
         let handlers = build_handler_map(&[
             (0, None, "GetAppletStateChangedEvent"),
             (1, None, "IsCompleted"),
@@ -63,6 +68,7 @@ impl ILibraryAppletAccessor {
         ]);
         Self {
             applet,
+            broker,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }

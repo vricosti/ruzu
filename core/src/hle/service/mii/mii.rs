@@ -39,7 +39,27 @@ impl IStaticService {
 }
 
 /// Entry point for the Mii service module.
+///
+/// Corresponds to `Mii::LoopProcess` in upstream mii.cpp.
 pub fn loop_process() {
-    log::info!("Mii: Registering services {} and {}", SERVICE_NAME_E, SERVICE_NAME_U);
-    // TODO: integrate with ServerManager once it is ported
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    let stub = |sm: &mut ServerManager, name: &str| {
+        let svc_name = name.to_string();
+        sm.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(
+                    crate::hle::service::services::GenericStubService::new(&svc_name),
+                )
+            }),
+            64,
+        );
+    };
+    stub(&mut server_manager, "mii:u");
+    stub(&mut server_manager, "mii:e");
+    ServerManager::run_server(server_manager);
 }

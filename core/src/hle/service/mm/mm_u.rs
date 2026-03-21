@@ -187,5 +187,16 @@ impl ServiceFramework for MmU {
 ///
 /// Corresponds to `LoopProcess` in upstream `mm_u.cpp`.
 pub fn loop_process() {
-    // TODO: register "mm:u" -> MmU with ServerManager
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    server_manager.register_named_service(
+        "mm:u",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(MmU::new())
+        }),
+        64,
+    );
+    ServerManager::run_server(server_manager);
 }

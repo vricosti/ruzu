@@ -93,6 +93,12 @@ impl SystemRef {
         assert!(!self.0.is_null(), "SystemRef is null");
         unsafe { &*self.0 }
     }
+
+    /// Get a reference to the Reporter.
+    /// Upstream: `system.GetReporter()`.
+    pub fn get_reporter(&self) -> &Arc<crate::reporter::Reporter> {
+        &self.get().reporter
+    }
 }
 
 /// Type used for the frontend to designate a callback for System to exit the application.
@@ -237,6 +243,10 @@ pub struct System {
     /// (tests and legacy paths). Upstream equivalent: process.GetMemory().
     pub(crate) shared_process_memory: Option<SharedProcessMemory>,
 
+    /// Reporter for saving telemetry/crash/error reports.
+    /// Upstream: `system.GetReporter()`.
+    pub reporter: Arc<crate::reporter::Reporter>,
+
     /// The title/program ID for the running application.
     /// Upstream: `system.GetApplicationProcessProgramID()`.
     pub(crate) runtime_program_id: u64,
@@ -289,6 +299,7 @@ impl System {
             current_process_arc: None,
             scheduler_arc: None,
             shared_process_memory: None,
+            reporter: Arc::new(crate::reporter::Reporter::new()),
             runtime_program_id: 0,
             runtime_is_64bit: false,
         }
@@ -326,6 +337,11 @@ impl System {
         // Ensure VFS exists. Upstream does this in Initialize().
         if self.virtual_filesystem.is_none() {
             self.virtual_filesystem = Some(RealVfsFilesystem::new());
+        }
+
+        // Provide the VFS to the filesystem controller so it can create SaveDataFactory instances.
+        if let Some(ref vfs) = self.virtual_filesystem {
+            self.filesystem_controller.lock().unwrap().set_filesystem(vfs.clone());
         }
 
         self.cpu_manager.set_multicore(self.is_multicore);
@@ -516,9 +532,14 @@ impl System {
         // (see kernel.create_new_user_process_id() above), so registration must
         // happen here instead.
         if let Some(ref process) = self.current_process {
+            // Upstream passes a RomFSFactory constructed from the app_loader,
+            // content_provider, and filesystem_controller. Content provider is
+            // not yet wired at the System level, so we pass None for now.
+            // When content_provider is available, construct RomFSFactory here.
             self.filesystem_controller.lock().unwrap().register_process(
                 process.process_id,
                 process.get_program_id(),
+                None, // romfs_factory — requires content_provider
             );
         }
 

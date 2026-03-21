@@ -141,22 +141,50 @@ impl IScanRequest {
 }
 
 /// IRequest.
+///
+/// Upstream: holds `service_context`, `event1`, `event2`.
+/// `event1` is signaled on state transitions via `UpdateState`.
 pub struct IRequest {
     state: RequestState,
-    // TODO: service_context, event1, event2
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    event1_handle: u32,
+    event2_handle: u32,
 }
 
 impl IRequest {
     pub fn new() -> Self {
+        let mut service_context =
+            crate::hle::service::kernel_helpers::ServiceContext::new("IRequest".to_string());
+        let event1_handle = service_context.create_event("IRequest:Event1".to_string());
+        let event2_handle = service_context.create_event("IRequest:Event2".to_string());
         Self {
             state: RequestState::NotSubmitted,
+            service_context,
+            event1_handle,
+            event2_handle,
+        }
+    }
+
+    /// Returns the event handles for `GetSystemEventReadableHandles`.
+    ///
+    /// Upstream: `GetSystemEventReadableHandles` pushes both event readable events as copy objects.
+    pub fn get_system_event_readable_handles(&self) -> (u32, u32) {
+        log::warn!("(STUBBED) IRequest::get_system_event_readable_handles called");
+        (self.event1_handle, self.event2_handle)
+    }
+
+    /// Upstream: `UpdateState` sets state and signals `event1`.
+    fn update_state(&mut self, new_state: RequestState) {
+        self.state = new_state;
+        if let Some(event) = self.service_context.get_event(self.event1_handle) {
+            event.signal();
         }
     }
 
     pub fn submit(&mut self) {
         log::debug!("(STUBBED) IRequest::submit called");
         if self.state == RequestState::NotSubmitted {
-            self.state = RequestState::OnHold;
+            self.update_state(RequestState::OnHold);
         }
     }
 
@@ -166,10 +194,23 @@ impl IRequest {
 
     pub fn get_result(&mut self) -> ResultCode {
         log::debug!("(STUBBED) IRequest::get_result called");
-        // Simplified: assume network available
+        // Upstream checks Network::GetHostIPv4Address(); we assume connection is available.
+        let has_connection = true;
         match self.state {
+            RequestState::NotSubmitted => {
+                if has_connection {
+                    crate::hle::result::RESULT_SUCCESS
+                } else {
+                    RESULT_NETWORK_COMMUNICATION_DISABLED
+                }
+            }
             RequestState::OnHold => {
-                self.state = RequestState::Accepted;
+                if has_connection {
+                    self.update_state(RequestState::Accepted);
+                } else {
+                    // RequestState::Invalid maps to NotSubmitted (value 1) upstream
+                    self.update_state(RequestState::NotSubmitted);
+                }
                 RESULT_PENDING_CONNECTION
             }
             _ => crate::hle::result::RESULT_SUCCESS,
@@ -186,6 +227,14 @@ impl IRequest {
 
     pub fn set_connection_confirmation_option(&self) {
         log::warn!("(STUBBED) IRequest::set_connection_confirmation_option called");
+    }
+}
+
+impl Drop for IRequest {
+    /// Upstream: `~IRequest` closes both events via `service_context.CloseEvent`.
+    fn drop(&mut self) {
+        self.service_context.close_event(self.event1_handle);
+        self.service_context.close_event(self.event2_handle);
     }
 }
 
@@ -218,9 +267,26 @@ impl NetworkInterface {
     }
 }
 
-/// Registers "nifm:a", "nifm:s", "nifm:u" services.
+/// Registers "nifm:u", "nifm:a", "nifm:s" services.
 ///
 /// Corresponds to `LoopProcess` in upstream `nifm.cpp`.
 pub fn loop_process() {
-    // TODO: register services with ServerManager
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    let stub_names = &["nifm:u", "nifm:a", "nifm:s"];
+    for &name in stub_names {
+        let svc_name = name.to_string();
+        server_manager.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+            }),
+            16,
+        );
+    }
+
+    ServerManager::run_server(server_manager);
 }

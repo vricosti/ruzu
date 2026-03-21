@@ -55,7 +55,21 @@ impl BpcR {
 
 /// Registers "bpc" and "bpc:r" services.
 ///
-/// Corresponds to `LoopProcess` in upstream `bpc.cpp`.
+/// Corresponds to `LoopProcess` in upstream `bpc.cpp`:
+/// ```cpp
+/// server_manager->RegisterNamedService("bpc", std::make_shared<BPC>(system));
+/// server_manager->RegisterNamedService("bpc:r", std::make_shared<BPC_R>(system));
+/// ```
+///
+/// Neither BPC nor BPC_R implement SessionRequestHandler yet (all commands are
+/// nullptr in upstream), so we use stub services.
 pub fn loop_process() {
-    // TODO: register "bpc" -> BPC and "bpc:r" -> BpcR with ServerManager
+    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(
+        crate::core::SystemRef::null(),
+    );
+    crate::hle::service::services::register_stub_services(
+        &mut server_manager,
+        &["bpc", "bpc:r"],
+    );
+    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
 }

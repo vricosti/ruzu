@@ -10,6 +10,8 @@ use common::ResultCode;
 
 use crate::file_sys::errors;
 use crate::file_sys::fs_filesystem::{DirectoryEntryType, OpenMode};
+use crate::file_sys::romfs_factory::RomFSFactory;
+use crate::file_sys::savedata_factory::SaveDataFactory;
 use crate::file_sys::vfs::vfs_offset::OffsetVfsFile;
 use crate::file_sys::vfs::vfs_types::{FileTimeStampRaw, VirtualDir, VirtualFile};
 use crate::hle::result::RESULT_SUCCESS;
@@ -46,8 +48,8 @@ pub type ProgramId = u64;
 /// Port of upstream `FileSystemController::Registration` (filesystem.h:129-133).
 struct Registration {
     program_id: ProgramId,
-    // romfs_factory: Option<Arc<RomFSFactory>>,    // TODO: wire once RomFSFactory is ported
-    // save_data_factory: Option<Arc<SaveDataFactory>>, // TODO: wire once SaveDataFactory is ported
+    romfs_factory: Option<Arc<RomFSFactory>>,
+    save_data_factory: Option<Arc<Mutex<SaveDataFactory>>>,
 }
 
 /// Port of Service::FileSystem::FileSystemController
@@ -59,6 +61,9 @@ pub struct FileSystemController {
     /// BIS factory for NAND system/user content.
     /// Upstream: `std::unique_ptr<FileSys::BISFactory> bis_factory`.
     bis_factory: Option<crate::file_sys::bis_factory::BisFactory>,
+    /// Virtual filesystem reference for creating factories.
+    /// Upstream: `Core::System::GetFilesystem()`.
+    vfs: Option<Arc<crate::file_sys::vfs::vfs_real::RealVfsFilesystem>>,
     // sdmc_factory: Option<SDMCFactory>,
     // gamecard: Option<XCI>,
     // gamecard_registered: Option<RegisteredCache>,
@@ -70,7 +75,13 @@ impl FileSystemController {
         Self {
             registrations: Mutex::new(BTreeMap::new()),
             bis_factory: None,
+            vfs: None,
         }
+    }
+
+    /// Set the virtual filesystem reference.
+    pub fn set_filesystem(&mut self, vfs: Arc<crate::file_sys::vfs::vfs_real::RealVfsFilesystem>) {
+        self.vfs = Some(vfs);
     }
 
     /// Set the BIS factory (called during system initialization).
@@ -105,19 +116,20 @@ impl FileSystemController {
     /// Port of upstream `FileSystemController::RegisterProcess` (filesystem.cpp:298-311).
     ///
     /// Called by the NCA/NRO loader after loading a process. Stores the
-    /// process_id → program_id mapping so that FSP_SRV::SetCurrentProcess
-    /// can resolve the program_id from the kernel process ID.
+    /// process_id → program_id mapping and associated RomFS/SaveData factories
+    /// so that FSP_SRV::SetCurrentProcess can resolve controllers.
     pub fn register_process(
         &self,
         process_id: ProcessId,
         program_id: ProgramId,
-        // romfs_factory: Arc<RomFSFactory>,  // TODO: pass once ported
+        romfs_factory: Option<Arc<RomFSFactory>>,
     ) -> u32 {
+        let save_data_factory = self.create_save_data_factory(program_id);
         let mut registrations = self.registrations.lock().unwrap();
         registrations.insert(process_id, Registration {
             program_id,
-            // romfs_factory: Some(romfs_factory),
-            // save_data_factory: Some(self.create_save_data_factory(program_id)),
+            romfs_factory,
+            save_data_factory,
         });
         log::debug!(
             "FileSystemController::RegisterProcess: process_id={:#x}, program_id={:#018x}",
@@ -129,11 +141,51 @@ impl FileSystemController {
     /// Port of upstream `FileSystemController::OpenProcess` (filesystem.cpp:313-328).
     ///
     /// Looks up the registration for `process_id` and returns the associated
-    /// program_id. Upstream also returns SaveDataController and RomFsController;
-    /// those are stubbed until the factory types are ported.
-    pub fn open_process(&self, process_id: ProcessId) -> Option<ProgramId> {
+    /// program_id, SaveDataController, and RomFsController.
+    pub fn open_process(
+        &self,
+        process_id: ProcessId,
+    ) -> Option<(
+        ProgramId,
+        super::save_data_controller::SaveDataController,
+        super::romfs_controller::RomFsController,
+    )> {
         let registrations = self.registrations.lock().unwrap();
-        registrations.get(&process_id).map(|r| r.program_id)
+        let reg = registrations.get(&process_id)?;
+        let save_data_controller = match &reg.save_data_factory {
+            Some(factory) => {
+                super::save_data_controller::SaveDataController::with_factory(factory.clone())
+            }
+            None => super::save_data_controller::SaveDataController::new(),
+        };
+        let romfs_controller = match &reg.romfs_factory {
+            Some(factory) => {
+                super::romfs_controller::RomFsController::with_factory(reg.program_id, factory.clone())
+            }
+            None => super::romfs_controller::RomFsController::new(reg.program_id),
+        };
+        Some((reg.program_id, save_data_controller, romfs_controller))
+    }
+
+    /// Port of upstream `FileSystemController::CreateSaveDataFactory` (filesystem.cpp:347-357).
+    ///
+    /// Creates a SaveDataFactory for the given program_id using the NAND save directory.
+    fn create_save_data_factory(&self, program_id: ProgramId) -> Option<Arc<Mutex<SaveDataFactory>>> {
+        use crate::file_sys::fs_filesystem::OpenMode;
+        use common::fs::path_util::{get_ruzu_path_string, RuzuPath};
+
+        // Upstream: auto vfs = system.GetFilesystem();
+        //           auto nand_directory = vfs->OpenDirectory(NANDDir, ReadWrite);
+        let vfs = self.vfs.as_ref()?;
+        let nand_path = get_ruzu_path_string(RuzuPath::NANDDir);
+        let nand_directory: VirtualDir = Arc::new(
+            crate::file_sys::vfs::vfs_real::RealVfsDirectory::new(
+                vfs.clone(),
+                nand_path,
+                OpenMode::READ_WRITE,
+            ),
+        );
+        Some(Arc::new(Mutex::new(SaveDataFactory::new(program_id, nand_directory))))
     }
 
     /// Get modification load root for a given title.
@@ -157,10 +209,20 @@ impl FileSystemController {
         self.bis_factory.as_ref()?.get_modification_dump_root(title_id)
     }
 
+    /// Get BCAT directory for a given title.
+    /// Upstream: `FileSystemController::GetBCATDirectory`.
+    pub fn get_bcat_directory(&self, title_id: u64) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+        log::trace!("Opening BCAT root for tid={:016X}", title_id);
+        self.bis_factory.as_ref()?.get_bcat_directory(title_id)
+    }
+
     pub fn create_factories(&mut self) {
         // Upstream creates SDMCFactory and BISFactory using the VfsFilesystem.
-        // TODO: Wire up VfsFilesystem factories when FileSys crate is ported.
-        log::warn!("FileSystemController::create_factories: VfsFilesystem not yet ported, skipping");
+        // BISFactory is created via set_bis_factory(); SDMCFactory is not yet ported.
+        if self.bis_factory.is_none() {
+            log::warn!("FileSystemController::create_factories: BISFactory not yet set");
+        }
+        // SDMCFactory creation would go here once ported.
     }
 
     pub fn reset(&mut self) {

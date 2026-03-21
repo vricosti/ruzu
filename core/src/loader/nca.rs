@@ -166,6 +166,7 @@ impl AppLoader for AppLoaderNca {
             fsc.lock().unwrap().register_process(
                 process.process_id,
                 self.nca.get_title_id(),
+                None, // romfs_factory — constructed in core.rs when content_provider is available
             );
         }
 
