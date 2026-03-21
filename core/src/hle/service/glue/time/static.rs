@@ -371,8 +371,10 @@ impl StaticService {
         log::debug!(
             "Glue::Time::StaticService::GetStandardUserSystemClockInitialYear called"
         );
-        // TODO: Delegate to set:sys GetSettingsItemValueImpl once ISystemSettingsServer
-        // is wired. Default initial year in upstream settings is 2019.
+        // Upstream delegates to m_set_sys->GetSettingsItemValueImpl<s32>(
+        // "time", "standard_user_clock_initial_year"). The ISystemSettingsServer
+        // (set:sys) service is not yet wired. The default value in upstream
+        // settings is 2019.
         Ok(2019)
     }
 

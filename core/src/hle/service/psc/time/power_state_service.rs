@@ -6,7 +6,10 @@
 //!
 //! IPowerStateRequestHandler: handles power state requests for "time:p".
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use std::sync::Arc;
+
+use crate::hle::service::os::event::Event;
+use super::power_state_request_manager::PowerStateRequestManager;
 
 /// IPC command IDs for IPowerStateRequestHandler.
 ///
@@ -19,18 +22,19 @@ pub mod commands {
 /// IPowerStateRequestHandler service.
 ///
 /// Corresponds to `IPowerStateRequestHandler` in upstream power_state_service.h.
+/// Upstream holds a reference to `PowerStateRequestManager&
+/// m_power_state_request_manager` and delegates all operations to it.
 pub struct PowerStateRequestHandler {
-    /// Whether a power state request is pending.
-    pending: bool,
-    /// Priority of the pending request.
-    priority: u32,
+    /// Reference to the power state request manager.
+    /// Corresponds to `PowerStateRequestManager& m_power_state_request_manager`
+    /// in upstream.
+    power_state_request_manager: Arc<PowerStateRequestManager>,
 }
 
 impl PowerStateRequestHandler {
-    pub fn new() -> Self {
+    pub fn new(power_state_request_manager: Arc<PowerStateRequestManager>) -> Self {
         Self {
-            pending: false,
-            priority: 0,
+            power_state_request_manager,
         }
     }
 
@@ -38,31 +42,21 @@ impl PowerStateRequestHandler {
     ///
     /// Corresponds to `IPowerStateRequestHandler::GetPowerStateRequestEventReadableHandle`
     /// in upstream power_state_service.cpp.
-    pub fn get_power_state_request_event_readable_handle(&self) -> ResultCode {
+    /// Upstream returns `&m_power_state_request_manager.GetReadableEvent()`.
+    /// We return the event Arc for the caller to hand out as a copy handle.
+    pub fn get_power_state_request_event_readable_handle(&self) -> Arc<Event> {
         log::debug!("IPowerStateRequestHandler::GetPowerStateRequestEventReadableHandle called");
-        // TODO: Return the readable event from power_state_request_manager
-        RESULT_SUCCESS
+        self.power_state_request_manager.get_event()
     }
 
     /// GetAndClearPowerStateRequest (cmd 1).
     ///
     /// Corresponds to `IPowerStateRequestHandler::GetAndClearPowerStateRequest`
     /// in upstream power_state_service.cpp.
-    pub fn get_and_clear_power_state_request(&mut self) -> (bool, u32) {
+    /// Delegates to the PowerStateRequestManager.
+    pub fn get_and_clear_power_state_request(&self) -> (bool, u32) {
         log::debug!("IPowerStateRequestHandler::GetAndClearPowerStateRequest called");
-        if self.pending {
-            let priority = self.priority;
-            self.pending = false;
-            self.priority = 0;
-            (true, priority)
-        } else {
-            (false, 0)
-        }
-    }
-
-    /// Set a pending power state request (used by the power state request manager).
-    pub fn set_power_state_request(&mut self, priority: u32) {
-        self.pending = true;
-        self.priority = priority;
+        self.power_state_request_manager
+            .get_and_clear_power_state_request()
     }
 }

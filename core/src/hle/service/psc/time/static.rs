@@ -220,8 +220,10 @@ impl StaticService {
     /// Corresponds to `StaticService::GetSharedMemoryNativeHandle` in upstream.
     /// Returns the kernel shared memory handle for lock-free time reads.
     ///
-    /// TODO: Requires KSharedMemory from the kernel. Currently returns
-    /// RESULT_NOT_IMPLEMENTED.
+    /// Upstream returns `&m_shared_memory.GetKSharedMemory()`. The
+    /// Glue::Time::StaticService handles this at the IPC handler level
+    /// (registering KSharedMemory in the process handle table). This PSC-level
+    /// wrapper is not called directly; the Glue layer bypasses it.
     pub fn get_shared_memory_native_handle(&self) -> ResultCode {
         log::debug!(
             "PSC::Time::StaticService::GetSharedMemoryNativeHandle called. Not implemented!"
@@ -272,8 +274,18 @@ impl StaticService {
             return RESULT_PERMISSION_DENIED;
         }
         self.automatic_correction_enabled = automatic_correction;
-        // TODO: m_shared_memory.SetAutomaticCorrection(automatic_correction)
-        // TODO: get current time point from steady clock, call set_time_point_and_signal
+        // Upstream calls m_shared_memory.SetAutomaticCorrection(automatic_correction)
+        // and then gets the current steady clock time point to call
+        // m_user_system_clock.SetTimePointAndSignal(time_point) followed by
+        // m_user_system_clock.GetEvent().Signal().
+        //
+        // The SharedMemory and clock core references are held by
+        // Glue::Time::StaticService (which wraps this PSC service). The Glue
+        // layer is responsible for calling shared_memory.set_automatic_correction()
+        // and updating the time point via the TimeManager. Here we only update
+        // the local automatic_correction_time_point with the current steady
+        // clock time point since that is the data this service owns.
+        self.automatic_correction_time_point = self.steady_clock_time_point;
         RESULT_SUCCESS
     }
 

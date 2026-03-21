@@ -24,8 +24,12 @@ impl PmStateChangeHandler {
     ///
     /// Corresponds to `PmStateChangeHandler::PmStateChangeHandler(AlarmWorker&)` in upstream.
     /// The AlarmWorker reference is managed externally (by TimeWorker).
+    ///
+    /// Upstream also has a comment: "Initialize IPmModule, dependent on Rtc and Fs".
+    /// The IPmModule initialization depends on the PSC power management module
+    /// which handles RTC and filesystem power state notifications. This is not
+    /// yet ported; on real hardware it would register for PM state change callbacks.
     pub fn new() -> Self {
-        // TODO: Initialize IPmModule, dependent on Rtc and Fs
         Self { priority: 0 }
     }
 }
