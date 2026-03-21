@@ -5,7 +5,9 @@
 //! Memory freezer that prevents games from writing new values to certain addresses.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use crate::memory::memory::Memory;
 
 /// Type alias for virtual addresses.
 pub type VAddr = u64;
@@ -29,27 +31,39 @@ pub struct Entry {
 /// memory locations.
 ///
 /// Corresponds to upstream `Tools::Freezer`.
+/// Upstream stores `CoreTiming&` and `Memory&`. We store `Arc<Mutex<Memory>>`.
+/// CoreTiming event scheduling is replaced with a simple active flag — the caller
+/// (typically the debug UI) triggers frame_callback periodically.
 pub struct Freezer {
     active: AtomicBool,
     entries: Mutex<Vec<Entry>>,
-    // TODO: event: shared_ptr<Core::Timing::EventType>
-    // TODO: core_timing: &CoreTiming
-    // TODO: memory: &Memory
+    memory: Option<Arc<Mutex<Memory>>>,
 }
 
 impl Freezer {
     /// Create a new Freezer.
     ///
     /// Corresponds to upstream `Freezer::Freezer(CoreTiming&, Memory&)`.
-    pub fn new(
-        // TODO: core_timing: &CoreTiming,
-        // TODO: memory: &Memory,
-    ) -> Self {
-        // TODO: Create timing event and schedule at MEMORY_FREEZER_NS
+    pub fn new() -> Self {
         Self {
             active: AtomicBool::new(false),
             entries: Mutex::new(Vec::new()),
+            memory: None,
         }
+    }
+
+    /// Create a new Freezer with a memory reference.
+    pub fn with_memory(memory: Arc<Mutex<Memory>>) -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            entries: Mutex::new(Vec::new()),
+            memory: Some(memory),
+        }
+    }
+
+    /// Set the memory reference.
+    pub fn set_memory(&mut self, memory: Arc<Mutex<Memory>>) {
+        self.memory = Some(memory);
     }
 
     /// Enables or disables the entire memory freezer.
@@ -60,7 +74,8 @@ impl Freezer {
             // Was not previously active, now activating
             if is_active {
                 self.fill_entry_reads();
-                // TODO: core_timing.schedule_event(MEMORY_FREEZER_NS, event);
+                // Upstream: core_timing.schedule_event(MEMORY_FREEZER_NS, event);
+                // In our model, the caller triggers frame_callback periodically.
                 log::debug!("Memory freezer activated!");
             }
         } else {
@@ -91,9 +106,7 @@ impl Freezer {
     pub fn freeze(&self, address: VAddr, width: u32) -> u64 {
         let mut entries = self.entries.lock().unwrap();
 
-        // TODO: Read current value from memory
-        // let current_value = memory_read_width(&self.memory, width, address);
-        let current_value = 0u64;
+        let current_value = self.memory_read_width(width, address);
 
         entries.push(Entry {
             address,
@@ -169,24 +182,21 @@ impl Freezer {
     /// Frame callback: enforce frozen values by writing them back to memory.
     ///
     /// Corresponds to upstream `Freezer::FrameCallback`.
-    fn frame_callback(&self, _ns_late: u64) {
+    pub fn frame_callback(&self) {
         if !self.is_active() {
-            log::debug!("Memory freezer has been deactivated, ending callback events.");
             return;
         }
 
         let entries = self.entries.lock().unwrap();
         for entry in entries.iter() {
-            log::debug!(
+            log::trace!(
                 "Enforcing memory freeze at address={:016X}, value={:016X}, width={:02X}",
                 entry.address,
                 entry.value,
                 entry.width
             );
-            // TODO: memory_write_width(&self.memory, entry.width, entry.address, entry.value);
+            self.memory_write_width(entry.width, entry.address, entry.value);
         }
-
-        // TODO: core_timing.schedule_event(MEMORY_FREEZER_NS - ns_late, event);
     }
 
     /// Update all entry values from memory.
@@ -195,52 +205,50 @@ impl Freezer {
     fn fill_entry_reads(&self) {
         let mut entries = self.entries.lock().unwrap();
         log::debug!("Updating memory freeze entries to current values.");
-        for _entry in entries.iter_mut() {
-            // TODO: entry.value = memory_read_width(&self.memory, entry.width, entry.address);
+        for entry in entries.iter_mut() {
+            entry.value = self.memory_read_width(entry.width, entry.address);
+        }
+    }
+
+    /// Read memory at a given address with the specified width.
+    /// Port of upstream anonymous `MemoryReadWidth`.
+    fn memory_read_width(&self, width: u32, addr: VAddr) -> u64 {
+        let Some(ref memory) = self.memory else {
+            return 0;
+        };
+        let mem = memory.lock().unwrap();
+        match width {
+            1 => mem.read_8(addr) as u64,
+            2 => mem.read_16(addr) as u64,
+            4 => mem.read_32(addr) as u64,
+            8 => mem.read_64(addr),
+            _ => {
+                log::error!("Invalid memory width: {}", width);
+                0
+            }
+        }
+    }
+
+    /// Write memory at a given address with the specified width.
+    /// Port of upstream anonymous `MemoryWriteWidth`.
+    fn memory_write_width(&self, width: u32, addr: VAddr, value: u64) {
+        let Some(ref memory) = self.memory else {
+            return;
+        };
+        let mem = memory.lock().unwrap();
+        match width {
+            1 => mem.write_8(addr, value as u8),
+            2 => mem.write_16(addr, value as u16),
+            4 => mem.write_32(addr, value as u32),
+            8 => mem.write_64(addr, value),
+            _ => log::error!("Invalid memory width: {}", width),
         }
     }
 }
 
-impl Drop for Freezer {
-    fn drop(&mut self) {
-        // TODO: core_timing.unschedule_event(event);
-    }
-}
-
-/// Read memory at a given address with the specified width.
-///
-/// Corresponds to upstream anonymous `MemoryReadWidth`.
-#[allow(dead_code)]
-fn memory_read_width(
-    _memory: &dyn std::any::Any, // TODO: Core::Memory::Memory
-    width: u32,
-    _addr: VAddr,
-) -> u64 {
-    match width {
-        1 => 0, // TODO: memory.read8(addr)
-        2 => 0, // TODO: memory.read16(addr)
-        4 => 0, // TODO: memory.read32(addr)
-        8 => 0, // TODO: memory.read64(addr)
-        _ => unreachable!("Invalid memory width: {}", width),
-    }
-}
-
-/// Write memory at a given address with the specified width.
-///
-/// Corresponds to upstream anonymous `MemoryWriteWidth`.
-#[allow(dead_code)]
-fn memory_write_width(
-    _memory: &dyn std::any::Any, // TODO: Core::Memory::Memory
-    width: u32,
-    _addr: VAddr,
-    _value: u64,
-) {
-    match width {
-        1 => {} // TODO: memory.write8(addr, value as u8)
-        2 => {} // TODO: memory.write16(addr, value as u16)
-        4 => {} // TODO: memory.write32(addr, value as u32)
-        8 => {} // TODO: memory.write64(addr, value)
-        _ => unreachable!("Invalid memory width: {}", width),
+impl Default for Freezer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -271,8 +279,10 @@ mod tests {
         let freezer = Freezer::new();
         freezer.freeze(0x1000, 4);
         freezer.set_frozen_value(0x1000, 42);
+
         let entry = freezer.get_entry(0x1000).unwrap();
         assert_eq!(entry.value, 42);
+        assert_eq!(entry.width, 4);
     }
 
     #[test]
