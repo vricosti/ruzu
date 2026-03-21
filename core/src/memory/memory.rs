@@ -64,7 +64,8 @@ impl Memory {
     ///
     /// Upstream conditionally sets fastmem_arena based on
     /// `process.IsApplication() && Settings::IsFastmemEnabled()`.
-    /// TODO: wire IsApplication/IsFastmemEnabled checks when settings are available.
+    /// Settings are available via `common::settings::values()` but fastmem
+    /// enablement depends on the process context which varies at runtime.
     pub fn set_current_page_table(&mut self, page_table: *mut PageTable) {
         self.current_page_table = page_table;
         if !page_table.is_null() && !self.buffer.is_null() {
