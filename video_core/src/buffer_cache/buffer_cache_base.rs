@@ -371,8 +371,8 @@ impl Default for OverlapResult {
 /// This is a backend-agnostic handle returned by `BufferCacheRuntime::upload_staging_buffer`
 /// and `BufferCacheRuntime::download_staging_buffer`.
 pub struct StagingBufferRef {
-    /// Opaque buffer handle (backend interprets this).
-    pub buffer: u64,
+    /// Opaque buffer handle (backend interprets this as a buffer ID for copy operations).
+    pub buffer: BufferId,
     /// Offset within the staging buffer.
     pub offset: u64,
     /// Mapped host-visible memory span for CPU access.
@@ -601,6 +601,251 @@ pub trait BufferCacheRuntime {
     ) -> Option<Vec<u8>> {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// GpuMemoryAccess trait — GPU address translation
+// ---------------------------------------------------------------------------
+
+/// Trait for GPU virtual address translation and memory reads.
+///
+/// Upstream: these operations are performed via `gpu_memory` (a `Tegra::MemoryManager*`)
+/// which is set per-channel. The buffer cache calls:
+/// - `GpuToCpuAddress(gpu_addr)` — translate GPU VA to device/CPU address
+/// - `Read<T>(gpu_addr)` — read a typed value from GPU VA space
+/// - `IsWithinGPUAddressRange(gpu_addr)` — bounds check
+/// - `MaxContinuousRange(gpu_addr, size)` — find max mapped range
+/// - `GetMemoryLayoutSize(gpu_addr)` — get mapped size from an address
+pub trait GpuMemoryAccess {
+    /// Translate a GPU virtual address to a device (CPU) address.
+    ///
+    /// Upstream: `gpu_memory->GpuToCpuAddress(gpu_addr)`
+    fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64>;
+
+    /// Read a `u64` from GPU virtual address space.
+    ///
+    /// Upstream: `gpu_memory->Read<u64>(gpu_addr)`
+    fn read_u64(&self, gpu_addr: u64) -> Option<u64>;
+
+    /// Read a `u32` from GPU virtual address space.
+    ///
+    /// Upstream: `gpu_memory->Read<u32>(gpu_addr)`
+    fn read_u32(&self, gpu_addr: u64) -> Option<u32>;
+
+    /// Check if a GPU address is within the valid address range.
+    ///
+    /// Upstream: `gpu_memory->IsWithinGPUAddressRange(gpu_addr)`
+    fn is_within_gpu_address_range(&self, gpu_addr: u64) -> bool;
+
+    /// Return the maximum continuous mapped range from `gpu_addr`.
+    ///
+    /// Upstream: `gpu_memory->MaxContinuousRange(gpu_addr, size)`
+    fn max_continuous_range(&self, gpu_addr: u64, size: u64) -> u64;
+
+    /// Return the total mapped size starting from a GPU address.
+    ///
+    /// Upstream: `gpu_memory->GetMemoryLayoutSize(gpu_addr)`
+    fn get_memory_layout_size(&self, gpu_addr: u64) -> u64;
+}
+
+// ---------------------------------------------------------------------------
+// DeviceMemoryAccess trait — host CPU memory read/write
+// ---------------------------------------------------------------------------
+
+/// Trait for reading/writing guest physical (device) memory.
+///
+/// Upstream: these operations are performed via `device_memory`
+/// (a `Tegra::MaxwellDeviceMemoryManager&`).
+pub trait DeviceMemoryAccess {
+    /// Get a pointer to guest memory at `device_addr`.
+    ///
+    /// Upstream: `device_memory.GetPointer<u8>(device_addr)`
+    /// Returns None if the address is not directly accessible.
+    fn get_pointer(&self, device_addr: u64) -> Option<*const u8>;
+
+    /// Read a block of bytes from guest memory.
+    ///
+    /// Upstream: `device_memory.ReadBlockUnsafe(device_addr, dst, size)`
+    fn read_block_unsafe(&self, device_addr: u64, dst: &mut [u8]);
+
+    /// Write a block of bytes to guest memory.
+    ///
+    /// Upstream: `device_memory.WriteBlockUnsafe(device_addr, src, size)`
+    fn write_block_unsafe(&self, device_addr: u64, src: &[u8]);
+}
+
+// ---------------------------------------------------------------------------
+// DrawIndirectParams — draw indirect state
+// ---------------------------------------------------------------------------
+
+/// Parameters for indirect draw calls.
+///
+/// Upstream: `Tegra::Engines::DrawManager::IndirectParams`
+#[derive(Debug, Clone, Copy)]
+pub struct DrawIndirectParams {
+    /// GPU address of the indirect buffer.
+    pub indirect_start_address: u64,
+    /// GPU address of the count buffer.
+    pub count_start_address: u64,
+    /// Total size of the indirect buffer in bytes.
+    pub buffer_size: u64,
+    /// Maximum number of draw calls.
+    pub max_draw_counts: u32,
+    /// Stride between draw commands.
+    pub stride: u32,
+    /// Whether to include a count buffer.
+    pub include_count: bool,
+}
+
+// ---------------------------------------------------------------------------
+// ConstBufferInfo — per-stage constant buffer binding from engine state
+// ---------------------------------------------------------------------------
+
+/// Information about a bound constant buffer from the Maxwell3D engine.
+///
+/// Upstream: `Tegra::Engines::Maxwell3D::State::ConstBufferInfo`
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConstBufferInfo {
+    /// GPU virtual address of the constant buffer.
+    pub address: u64,
+    /// Size of the constant buffer in bytes.
+    pub size: u32,
+    /// Whether the constant buffer is enabled.
+    pub enabled: bool,
+}
+
+/// Information needed from the compute engine's launch description.
+///
+/// Upstream: `kepler_compute->launch_description`
+#[derive(Debug, Clone)]
+pub struct ComputeLaunchInfo {
+    /// Bitmask of enabled constant buffers.
+    pub const_buffer_enable_mask: u32,
+    /// Constant buffer configurations (address + size).
+    pub const_buffer_config: Vec<ComputeConstBufferConfig>,
+}
+
+/// A single compute constant buffer configuration.
+///
+/// Upstream: `Tegra::Engines::KeplerCompute::LaunchDescription::ConstBufferConfig`
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ComputeConstBufferConfig {
+    /// GPU virtual address of the constant buffer.
+    pub address: u64,
+    /// Size in bytes.
+    pub size: u32,
+}
+
+/// Index buffer reference from the draw state.
+///
+/// Upstream: `maxwell3d->draw_manager->GetDrawState().index_buffer`
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexBufferRef {
+    /// GPU virtual address of the start of the index buffer.
+    pub start_address: u64,
+    /// GPU virtual address of the end of the index buffer.
+    pub end_address: u64,
+    /// Number of indices.
+    pub count: u32,
+    /// First index offset.
+    pub first: u32,
+    /// Bytes per index element (1, 2, or 4).
+    pub format_size_in_bytes: u32,
+}
+
+/// Vertex stream register from Maxwell3D.
+///
+/// Upstream: `maxwell3d->regs.vertex_streams[index]`
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VertexStreamInfo {
+    /// GPU virtual address (computed from address_high:address_low).
+    pub address: u64,
+    /// Stride in bytes.
+    pub stride: u32,
+    /// Whether the stream is enabled (0 = disabled).
+    pub enable: u32,
+}
+
+/// Vertex stream limit from Maxwell3D.
+///
+/// Upstream: `maxwell3d->regs.vertex_stream_limits[index]`
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VertexStreamLimit {
+    /// GPU virtual address of the end of the vertex buffer + 1.
+    pub address: u64,
+}
+
+/// Transform feedback buffer binding from Maxwell3D.
+///
+/// Upstream: `maxwell3d->regs.transform_feedback.buffers[index]`
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransformFeedbackBufferInfo {
+    /// GPU virtual address.
+    pub address: u64,
+    /// Start offset within the buffer.
+    pub start_offset: u32,
+    /// Size of the transform feedback buffer in bytes.
+    pub size: u32,
+    /// Whether this buffer is enabled (0 = disabled).
+    pub enable: u32,
+}
+
+/// Aggregated engine state snapshot used by the buffer cache.
+///
+/// The buffer cache reads engine state at specific points during buffer updates.
+/// Rather than holding a reference to the engine, callers provide this snapshot.
+pub trait EngineState {
+    // -- Index buffer --
+
+    /// Return the current index buffer reference from the draw state.
+    fn get_index_buffer(&self) -> IndexBufferRef;
+
+    /// Return the inline index draw data, if any.
+    fn get_inline_index_draw_indexes(&self) -> &[u8];
+
+    // -- Dirty flags --
+
+    /// Check if a dirty flag is set.
+    fn is_dirty(&self, flag: DirtyFlag) -> bool;
+
+    /// Clear a dirty flag.
+    fn clear_dirty(&mut self, flag: DirtyFlag);
+
+    // -- Vertex streams --
+
+    /// Return vertex stream info for a given index.
+    fn get_vertex_stream(&self, index: u32) -> VertexStreamInfo;
+
+    /// Return vertex stream limit for a given index.
+    fn get_vertex_stream_limit(&self, index: u32) -> VertexStreamLimit;
+
+    // -- Transform feedback --
+
+    /// Whether transform feedback is enabled.
+    fn is_transform_feedback_enabled(&self) -> bool;
+
+    /// Return transform feedback buffer info for a given index.
+    fn get_transform_feedback_buffer(&self, index: u32) -> TransformFeedbackBufferInfo;
+
+    // -- Const buffers (graphics) --
+
+    /// Return const buffer info for a shader stage and cbuf index.
+    fn get_const_buffer(&self, stage: usize, cbuf_index: u32) -> ConstBufferInfo;
+
+    // -- Compute launch description --
+
+    /// Return compute launch info (const buffer enable mask + configs).
+    fn get_compute_launch_info(&self) -> ComputeLaunchInfo;
+}
+
+/// Dirty flags used by the buffer cache.
+///
+/// Upstream: `VideoCommon::Dirty::*` flags used in `maxwell3d->dirty.flags[]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyFlag {
+    IndexBuffer,
+    VertexBuffers,
+    VertexBuffer(u32), // VertexBuffer0 + index
 }
 
 #[cfg(test)]
