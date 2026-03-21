@@ -22,10 +22,12 @@ pub mod commands {
 /// IECommerceInterface.
 ///
 /// Corresponds to `IECommerceInterface` in upstream.
-pub struct IECommerceInterface;
+pub struct IECommerceInterface {
+    system: crate::core::SystemRef,
+}
 
 impl IECommerceInterface {
-    pub fn new() -> Self {
-        Self
+    pub fn new(system: crate::core::SystemRef) -> Self {
+        Self { system }
     }
 }

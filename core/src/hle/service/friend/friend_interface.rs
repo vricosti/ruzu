@@ -20,13 +20,15 @@ pub mod commands {
 ///
 /// Corresponds to `Friend` (derived from `Module::Interface`) in upstream `friend_interface.h`.
 pub struct Friend {
+    system: crate::core::SystemRef,
     module: Arc<Module>,
     name: String,
 }
 
 impl Friend {
-    pub fn new(module: Arc<Module>, name: &str) -> Self {
+    pub fn new(system: crate::core::SystemRef, module: Arc<Module>, name: &str) -> Self {
         Self {
+            system,
             module,
             name: name.to_string(),
         }

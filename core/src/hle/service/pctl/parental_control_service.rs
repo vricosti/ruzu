@@ -128,6 +128,7 @@ struct ParentalControlSettings {
 ///
 /// Corresponds to `IParentalControlService` in upstream parental_control_service.h.
 pub struct IParentalControlService {
+    system: crate::core::SystemRef,
     states: States,
     settings: ParentalControlSettings,
     restriction_settings: RestrictionSettings,
@@ -138,7 +139,7 @@ pub struct IParentalControlService {
 }
 
 impl IParentalControlService {
-    pub fn new(capability: Capability) -> Self {
+    pub fn new(system: crate::core::SystemRef, capability: Capability) -> Self {
         let handlers = build_handler_map(&[
             (commands::INITIALIZE, Some(Self::initialize_handler), "Initialize"),
             (
@@ -173,6 +174,7 @@ impl IParentalControlService {
             ),
         ]);
         Self {
+            system,
             states: States::default(),
             settings: ParentalControlSettings::default(),
             restriction_settings: RestrictionSettings::default(),

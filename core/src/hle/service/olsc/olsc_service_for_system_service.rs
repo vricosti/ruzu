@@ -54,11 +54,13 @@ pub mod commands {
 /// IOlscServiceForSystemService ("olsc:s").
 ///
 /// Corresponds to `IOlscServiceForSystemService` in upstream olsc_service_for_system_service.cpp.
-pub struct IOlscServiceForSystemService;
+pub struct IOlscServiceForSystemService {
+    system: crate::core::SystemRef,
+}
 
 impl IOlscServiceForSystemService {
-    pub fn new() -> Self {
-        IOlscServiceForSystemService
+    pub fn new(system: crate::core::SystemRef) -> Self {
+        Self { system }
     }
 
     /// Cmd 0: OpenTransferTaskListController
@@ -74,7 +76,7 @@ impl IOlscServiceForSystemService {
     /// Corresponds to `IOlscServiceForSystemService::OpenRemoteStorageController` in upstream.
     pub fn open_remote_storage_controller(&self) -> (ResultCode, IRemoteStorageController) {
         log::info!("IOlscServiceForSystemService::open_remote_storage_controller called");
-        (RESULT_SUCCESS, IRemoteStorageController::new())
+        (RESULT_SUCCESS, IRemoteStorageController::new(self.system))
     }
 
     /// Cmd 2: OpenDaemonController
@@ -99,6 +101,6 @@ impl IOlscServiceForSystemService {
     /// Upstream returns shared_from_this(); we create a new instance since state is minimal.
     pub fn clone_service(&self) -> (ResultCode, IOlscServiceForSystemService) {
         log::info!("IOlscServiceForSystemService::clone_service called");
-        (RESULT_SUCCESS, IOlscServiceForSystemService::new())
+        (RESULT_SUCCESS, IOlscServiceForSystemService::new(self.system))
     }
 }

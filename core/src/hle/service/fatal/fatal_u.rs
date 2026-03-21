@@ -31,7 +31,7 @@ impl FatalU {
     pub fn new(module: Arc<super::fatal::Module>) -> Self {
         log::debug!("fatal:u created");
         Self {
-            interface: super::fatal::Interface::new(module, "fatal:u"),
+            interface: super::fatal::Interface::new(crate::core::SystemRef::null(), module, "fatal:u"),
         }
     }
 }

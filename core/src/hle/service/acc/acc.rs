@@ -6,7 +6,7 @@
 //!
 //! Account module and Interface base class.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::profile_manager::{ProfileManager, ProfileBase, UserData, UserIdArray, MAX_USERS};
 
@@ -43,14 +43,25 @@ pub struct Module;
 ///
 /// Corresponds to `Module::Interface` in upstream `acc.h`.
 pub struct Interface {
+    pub system: crate::core::SystemRef,
+    pub module: Arc<Module>,
+    pub profile_manager: Arc<Mutex<ProfileManager>>,
     pub service_name: String,
     pub application_info: ApplicationInfo,
-    // TODO: module, profile_manager references
 }
 
 impl Interface {
-    pub fn new(name: &str) -> Self {
+    /// Matches upstream `Module::Interface(shared_ptr<Module>, shared_ptr<ProfileManager>, System&, const char*)`.
+    pub fn new(
+        module: Arc<Module>,
+        profile_manager: Arc<Mutex<ProfileManager>>,
+        system: crate::core::SystemRef,
+        name: &str,
+    ) -> Self {
         Self {
+            system,
+            module,
+            profile_manager,
             service_name: name.to_string(),
             application_info: ApplicationInfo::default(),
         }
