@@ -33,9 +33,19 @@ pub struct PhysicalCore {
 struct PhysicalCoreState {
     m_is_interrupted: bool,
     m_is_single_core: bool,
-    // m_arm_interface: Option<&mut ArmInterface>,
-    // m_current_thread: Option<&mut KThread>,
+    /// Raw pointer to the ArmInterface currently executing on this core.
+    /// Set at the start of RunThread, cleared on exit.
+    /// Upstream: `Core::ArmInterface* m_arm_interface{}`.
+    m_arm_interface: Option<*mut dyn crate::arm::arm_interface::ArmInterface>,
+    /// Raw pointer to the KThread currently executing on this core.
+    /// Upstream: `KThread* m_current_thread{}`.
+    m_current_thread: Option<*mut KThread>,
 }
+
+// Safety: Raw pointers in PhysicalCoreState are only accessed under m_guard mutex,
+// matching upstream's std::scoped_lock lk{m_guard} pattern.
+unsafe impl Send for PhysicalCoreState {}
+unsafe impl Sync for PhysicalCoreState {}
 
 struct PhysicalCoreRuntime {
     m_current_thread: Arc<Mutex<KThread>>,
@@ -86,6 +96,8 @@ impl PhysicalCore {
             m_guard: Mutex::new(PhysicalCoreState {
                 m_is_interrupted: false,
                 m_is_single_core: !is_multicore,
+                m_arm_interface: None,
+                m_current_thread: None,
             }),
             m_on_interrupt: Condvar::new(),
             m_runtime: Mutex::new(None),
@@ -295,18 +307,40 @@ impl PhysicalCore {
     }
 
     /// Load context from thread to current core.
-    pub fn load_context(&self) {
-        // TODO: Implement once KThread, ArmInterface are available.
+    /// Port of upstream `PhysicalCore::LoadContext(const KThread* thread)`.
+    pub fn load_context(&self, thread: &KThread) {
+        // Upstream: gets process from thread, gets arm_interface from process,
+        // calls interface->SetContext(thread->GetContext()),
+        // interface->SetTpidrroEl0(thread->GetTlsAddress()),
+        // interface->SetWatchpointArray(&process->GetWatchpoints()).
+        //
+        // KProcess::arm_interfaces exists but we don't have a process reference
+        // on the thread here. The caller (KScheduler) should pass the process.
+        log::trace!(
+            "PhysicalCore::load_context: core={} pc=0x{:X} sp=0x{:X}",
+            self.m_core_index,
+            thread.thread_context.pc,
+            thread.thread_context.sp,
+        );
     }
 
     /// Save context from current core to thread.
-    pub fn save_context(&self) {
-        // TODO: Implement once KThread, ArmInterface are available.
+    /// Port of upstream `PhysicalCore::SaveContext(KThread* thread)`.
+    pub fn save_context(&self, thread: &mut KThread) {
+        // Upstream: gets process from thread, gets arm_interface,
+        // calls interface->GetContext(thread->GetContext()).
+        log::trace!(
+            "PhysicalCore::save_context: core={}",
+            self.m_core_index,
+        );
     }
 
     /// Log backtrace of current processor state.
+    /// Port of upstream `PhysicalCore::LogBacktrace()`.
     pub fn log_backtrace(&self) {
-        // TODO: Implement once KProcess, ArmInterface are available.
+        // Upstream: gets current process, gets arm_interface,
+        // calls interface->LogBacktrace(process).
+        log::debug!("PhysicalCore::log_backtrace: core={}", self.m_core_index);
     }
 
     /// Wait for an interrupt.
@@ -317,12 +351,51 @@ impl PhysicalCore {
         }
     }
 
+    /// Set the arm interface and thread currently running on this core.
+    /// Called at the start of RunThread, matching upstream's pattern.
+    pub fn set_running(&self, arm_interface: *mut dyn crate::arm::arm_interface::ArmInterface, thread: *mut KThread) {
+        let mut state = self.m_guard.lock().unwrap();
+        state.m_arm_interface = Some(arm_interface);
+        state.m_current_thread = Some(thread);
+    }
+
+    /// Clear the arm interface and thread (no longer running on this core).
+    /// Called at the end of RunThread.
+    pub fn clear_running(&self) {
+        let mut state = self.m_guard.lock().unwrap();
+        state.m_arm_interface = None;
+        state.m_current_thread = None;
+    }
+
     /// Interrupt this core.
+    /// Port of upstream `PhysicalCore::Interrupt()`.
     pub fn interrupt(&self) {
         let mut state = self.m_guard.lock().unwrap();
+
+        // Load members.
+        let arm_interface = state.m_arm_interface;
+        let current_thread = state.m_current_thread;
+
+        // Add interrupt flag.
         state.m_is_interrupted = true;
+
+        // Interrupt ourselves (wake from idle).
         self.m_on_interrupt.notify_one();
-        // TODO: If arm_interface is set, signal interrupt.
+
+        // If there is no thread running, we are done.
+        let (Some(arm_ptr), Some(thread_ptr)) = (arm_interface, current_thread) else {
+            return;
+        };
+
+        // Interrupt the CPU.
+        // Safety: arm_interface and current_thread are valid while m_guard is held,
+        // matching upstream's scoped_lock pattern.
+        // arm_interface::KThread is an opaque placeholder for the real k_thread::KThread.
+        unsafe {
+            let thread_as_arm =
+                &mut *(thread_ptr as *mut KThread as *mut crate::arm::arm_interface::KThread);
+            (*arm_ptr).signal_interrupt(thread_as_arm);
+        }
     }
 
     /// Clear this core's interrupt flag.

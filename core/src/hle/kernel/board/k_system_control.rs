@@ -157,14 +157,63 @@ pub fn calculate_required_secure_memory_size(size: usize, _pool: u32) -> usize {
 }
 
 /// Allocate secure memory.
-pub fn allocate_secure_memory(_size: usize, _pool: u32) -> ResultCode {
-    // TODO: Implement once KMemoryManager is available.
-    ResultCode::new(0)
+/// Port of upstream `KSystemControl::AllocateSecureMemory`.
+/// Allocates contiguous physical memory from the specified pool via KMemoryManager.
+pub fn allocate_secure_memory(
+    mm: &mut super::super::k_memory_manager::KMemoryManager,
+    size: usize,
+    pool: u32,
+) -> Result<u64, crate::hle::result::ResultCode> {
+    use super::super::k_memory_block::PAGE_SIZE;
+    use super::super::k_memory_manager::{Direction, Pool};
+
+    // Applet secure memory is handled separately.
+    assert!(pool != Pool::Applet as u32, "Applet secure memory not implemented");
+
+    // Determine alignment.
+    let alignment = if pool == Pool::System as u32 {
+        PAGE_SIZE
+    } else {
+        SECURE_ALIGNMENT
+    };
+
+    // Validate alignment.
+    if size % alignment != 0 {
+        return Err(crate::hle::kernel::svc::svc_results::RESULT_INVALID_SIZE);
+    }
+
+    // Allocate the memory.
+    let num_pages = size / PAGE_SIZE;
+    let option = super::super::k_memory_manager::KMemoryManager::encode_option(
+        unsafe { std::mem::transmute::<u32, Pool>(pool) },
+        Direction::FromFront,
+    );
+    let paddr = mm.allocate_and_open_continuous(num_pages, alignment / PAGE_SIZE, option);
+    if paddr == 0 {
+        return Err(crate::hle::kernel::svc::svc_results::RESULT_OUT_OF_MEMORY);
+    }
+
+    Ok(paddr)
 }
 
 /// Free secure memory.
-pub fn free_secure_memory(_address: u64, _size: usize, _pool: u32) {
-    // TODO: Implement once KMemoryManager is available.
+/// Port of upstream `KSystemControl::FreeSecureMemory`.
+pub fn free_secure_memory(
+    mm: &mut super::super::k_memory_manager::KMemoryManager,
+    address: u64,
+    size: usize,
+    pool: u32,
+) {
+    use super::super::k_memory_block::PAGE_SIZE;
+
+    assert!(pool != 2, "Applet secure memory not implemented");
+
+    let alignment = if pool == 0 { PAGE_SIZE } else { SECURE_ALIGNMENT };
+    assert!(address as usize % alignment == 0);
+    assert!(size % alignment == 0);
+
+    // Close the secure region's pages.
+    mm.close(address, size / PAGE_SIZE);
 }
 
 /// Get the insecure memory pool identifier.

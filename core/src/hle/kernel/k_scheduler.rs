@@ -1108,7 +1108,7 @@ impl KScheduler {
     pub fn unload_thread(&self, thread: &Arc<Mutex<KThread>>) {
         // Upstream: m_kernel.PhysicalCore(m_core_id).SaveContext(thread)
         if let Some(core) = self.physical_cores.get(self.core_id as usize) {
-            core.save_context();
+            core.save_context(&mut thread.lock().unwrap());
         }
 
         // Unlock context guard if thread is not terminated.
@@ -1124,10 +1124,10 @@ impl KScheduler {
 
     /// Matches upstream `KScheduler::Reload(KThread*)`.
     /// Restores guest context.
-    pub fn reload_thread(&self, _thread: &Arc<Mutex<KThread>>) {
+    pub fn reload_thread(&self, thread: &Arc<Mutex<KThread>>) {
         // Upstream: m_kernel.PhysicalCore(m_core_id).LoadContext(thread)
         if let Some(core) = self.physical_cores.get(self.core_id as usize) {
-            core.load_context();
+            core.load_context(&thread.lock().unwrap());
         }
     }
 
