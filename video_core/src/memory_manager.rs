@@ -229,6 +229,55 @@ impl GpuMemoryManager {
         // Upstream: calls rasterizer->InvalidateRegion() if bound.
     }
 
+    /// Check if a GPU address is within the valid address range.
+    ///
+    /// Upstream: `MemoryManager::IsWithinGPUAddressRange(gpu_addr)`
+    pub fn is_within_gpu_address_range(&self, gpu_addr: u64) -> bool {
+        gpu_addr < GPU_VA_SIZE
+    }
+
+    /// Return the maximum continuous range of mapped GPU memory starting at `gpu_addr`.
+    ///
+    /// Upstream: `MemoryManager::MaxContinuousRange(gpu_addr, size)`
+    /// Walks pages forward from `gpu_addr` until an unmapped page is found or `size` is reached.
+    pub fn max_continuous_range(&self, gpu_addr: u64, size: u64) -> u64 {
+        let mut remaining = size;
+        let mut current = gpu_addr;
+        while remaining > 0 {
+            if self.translate(current).is_none() {
+                break;
+            }
+            let page_offset = current & (PAGE_SIZE - 1);
+            let chunk = std::cmp::min(remaining, PAGE_SIZE - page_offset);
+            current += chunk;
+            remaining -= chunk;
+        }
+        size - remaining
+    }
+
+    /// Return the total mapped size starting from a GPU address.
+    ///
+    /// Upstream: `MemoryManager::GetMemoryLayoutSize(gpu_addr)`
+    /// Returns the continuous mapped range size from `gpu_addr`.
+    pub fn get_memory_layout_size(&self, gpu_addr: u64) -> u64 {
+        // Walk pages until we hit an unmapped page or end of address space.
+        let mut total = 0u64;
+        let mut current = gpu_addr;
+        loop {
+            if current >= GPU_VA_SIZE {
+                break;
+            }
+            if self.translate(current).is_none() {
+                break;
+            }
+            let page_offset = current & (PAGE_SIZE - 1);
+            let chunk = PAGE_SIZE - page_offset;
+            total += chunk;
+            current += chunk;
+        }
+        total
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────
 
     fn l0_index(gpu_va: u64) -> usize {
