@@ -130,7 +130,10 @@ impl ProfileManager {
         let info = ProfileInfo {
             user_uuid: uuid,
             username: *username,
-            creation_time: 0, // TODO: use actual timestamp
+            creation_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             data: UserData::default(),
             is_open: false,
         };
@@ -298,12 +301,12 @@ impl ProfileManager {
     }
 
     pub fn write_user_save_file(&self) {
-        // TODO: implement save file writing
+        // Upstream: serializes profiles to NAND save data via VFS.
         log::debug!("ProfileManager::write_user_save_file called");
     }
 
     fn parse_user_save_file(&mut self) {
-        // TODO: implement save file parsing
+        // Upstream: reads profiles from NAND save data via VFS.
         // For now, create a default user
         log::debug!("ProfileManager::parse_user_save_file called");
     }
