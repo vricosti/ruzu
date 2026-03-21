@@ -759,9 +759,8 @@ pub fn match_and_execute_one_instruction<M: MemoryAccess>(
     _sp: &mut u64,
     _pc: &u64,
 ) -> Option<u64> {
-    // TODO: Implement instruction decoding and dispatch.
     // Upstream reads the instruction at pc, decodes it via Dynarmic::A64::Decode,
-    // and calls the matching visitor method. If handled, returns pc + 4.
+    // and calls the matching visitor method. Requires rdynarmic A64 decoder integration.
     log::warn!("MatchAndExecuteOneInstruction: not yet implemented (no A64 decoder)");
     None
 }

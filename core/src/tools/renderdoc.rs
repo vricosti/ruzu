@@ -99,19 +99,28 @@ impl RenderdocApi {
                     return None;
                 }
 
-                // TODO: Call RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, &api_ptr)
-                // This requires proper renderdoc_app.h bindings.
-                // For now, store a stub.
-                log::info!("RenderDoc library found but API binding is stubbed");
+                // Call RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, &api_ptr).
+                // The function signature is: int RENDERDOC_GetAPI(int version, void** api_ptr)
+                // eRENDERDOC_API_Version_1_6_0 = 10600
+                type GetApiFn = unsafe extern "C" fn(version: i32, api_ptr: *mut *mut std::ffi::c_void) -> i32;
+                let get_api: GetApiFn = std::mem::transmute(get_api_sym);
+                let mut api_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                let ret = get_api(10600, &mut api_ptr);
+                if ret != 1 || api_ptr.is_null() {
+                    log::warn!("RENDERDOC_GetAPI failed (ret={})", ret);
+                    return None;
+                }
+                log::info!("RenderDoc API loaded successfully");
                 Some(RdocApi {
-                    _api_ptr: std::ptr::null_mut(),
+                    _api_ptr: api_ptr,
                 })
             }
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            // TODO: Windows support via GetModuleHandleA/GetProcAddress
+            // Windows: would use GetModuleHandleA("renderdoc.dll") + GetProcAddress.
+            // Not implemented — RenderDoc integration is Linux-only for now.
             None
         }
     }
