@@ -83,17 +83,25 @@ impl Module {
 
 /// IFriendService.
 pub struct IFriendService {
-    // TODO: service_context, completion_event
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    completion_event_handle: u32,
 }
 
 impl IFriendService {
     pub fn new() -> Self {
-        Self {}
+        let mut service_context =
+            crate::hle::service::kernel_helpers::ServiceContext::new("IFriendService".to_string());
+        let completion_event_handle =
+            service_context.create_event("IFriendService:CompletionEvent".to_string());
+        Self {
+            service_context,
+            completion_event_handle,
+        }
     }
 
-    pub fn get_completion_event(&self) {
+    pub fn get_completion_event(&self) -> u32 {
         log::debug!("IFriendService::get_completion_event called");
-        // TODO: return event handle
+        self.completion_event_handle
     }
 
     pub fn get_friend_list(&self, _friend_offset: u32, _uuid: u128, _pid: u64) -> u32 {
@@ -158,7 +166,8 @@ pub struct INotificationService {
     uuid: u128,
     notifications: VecDeque<SizedNotificationInfo>,
     states: NotificationStates,
-    // TODO: service_context, notification_event
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    notification_event_handle: u32,
 }
 
 struct NotificationStates {
@@ -168,6 +177,11 @@ struct NotificationStates {
 
 impl INotificationService {
     pub fn new(uuid: u128) -> Self {
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
+            "INotificationService".to_string(),
+        );
+        let notification_event_handle =
+            service_context.create_event("INotificationService:NotifyEvent".to_string());
         Self {
             uuid,
             notifications: VecDeque::new(),
@@ -175,12 +189,14 @@ impl INotificationService {
                 has_updated_friends: false,
                 has_received_friend_request: false,
             },
+            service_context,
+            notification_event_handle,
         }
     }
 
-    pub fn get_event(&self) {
+    pub fn get_event(&self) -> u32 {
         log::debug!("INotificationService::get_event called");
-        // TODO: return event handle
+        self.notification_event_handle
     }
 
     pub fn clear(&mut self) {

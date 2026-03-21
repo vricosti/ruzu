@@ -9,6 +9,7 @@
 //! management, station connections, and LAN discovery.
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use super::lan_discovery::LANDiscovery;
 use super::ldn_types::{State, DisconnectReason};
 
 /// IPC command table for IUserLocalCommunicationService.
@@ -46,20 +47,21 @@ use super::ldn_types::{State, DisconnectReason};
 /// | 402 | Initialize2                      | Initialize2                       |
 pub struct IUserLocalCommunicationService {
     is_initialized: bool,
+    lan_discovery: LANDiscovery,
 }
 
 impl IUserLocalCommunicationService {
     pub fn new() -> Self {
         Self {
             is_initialized: false,
+            lan_discovery: LANDiscovery::new(),
         }
     }
 
     /// Cmd 0: GetState
     pub fn get_state(&self) -> (ResultCode, State) {
         let state = if self.is_initialized {
-            // TODO: return lan_discovery.GetState() once LANDiscovery is wired
-            State::AccessPointCreated
+            self.lan_discovery.get_state()
         } else {
             State::Error
         };
@@ -70,8 +72,7 @@ impl IUserLocalCommunicationService {
     /// Cmd 3: GetDisconnectReason
     pub fn get_disconnect_reason(&self) -> (ResultCode, DisconnectReason) {
         log::info!("IUserLocalCommunicationService::get_disconnect_reason called");
-        // TODO: return lan_discovery.GetDisconnectReason()
-        (RESULT_SUCCESS, DisconnectReason::None)
+        (RESULT_SUCCESS, self.lan_discovery.get_disconnect_reason())
     }
 
     /// Cmd 104: SetWirelessControllerRestriction
@@ -93,9 +94,18 @@ impl IUserLocalCommunicationService {
     }
 
     /// Cmd 400: Initialize
+    ///
+    /// Upstream checks Network::GetSelectedNetworkInterface() and binds a room_member
+    /// callback before calling lan_discovery.Initialize(). The network interface check
+    /// and room_member binding are not yet wired (depends on internal_network and
+    /// Network::RoomNetwork integration). For now we initialize the LAN discovery
+    /// directly.
     pub fn initialize(&mut self, _aruid: u64) -> ResultCode {
         log::info!("IUserLocalCommunicationService::initialize called");
-        // TODO: Wire network interface check and LAN discovery initialization
+        // Upstream: checks Network::GetSelectedNetworkInterface(), returns
+        // ResultAirplaneModeEnabled if unavailable, then binds room_member callback.
+        // Those dependencies are not yet available; proceed with LAN discovery init.
+        self.lan_discovery.initialize();
         self.is_initialized = true;
         RESULT_SUCCESS
     }
@@ -103,9 +113,9 @@ impl IUserLocalCommunicationService {
     /// Cmd 401: Finalize
     pub fn finalize(&mut self) -> ResultCode {
         log::info!("IUserLocalCommunicationService::finalize called");
+        // Upstream: unbinds room_member callback here. Not yet wired.
         self.is_initialized = false;
-        // TODO: lan_discovery.Finalize()
-        RESULT_SUCCESS
+        self.lan_discovery.finalize()
     }
 
     /// Cmd 402: Initialize2

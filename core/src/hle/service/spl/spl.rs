@@ -228,25 +228,24 @@ impl SplManu {
 ///
 /// Corresponds to `Service::SPL::LoopProcess` in upstream spl_module.cpp.
 pub fn loop_process() {
-    log::debug!("SPL::LoopProcess called");
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
-    let module = Arc::new(ModuleInterface::new("spl:", None));
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
 
-    let _csrng = super::csrng::Csrng::new(None);
-    let _spl = Spl::new(module.clone());
-    let _spl_mig = SplMig::new(module.clone());
-    let _spl_fs = SplFs::new(module.clone());
-    let _spl_ssl = SplSsl::new(module.clone());
-    let _spl_es = SplEs::new(module.clone());
-    let _spl_manu = SplManu::new(module);
+    let stub_names = &[
+        "csrng", "spl:", "spl:mig", "spl:fs", "spl:ssl", "spl:es", "spl:manu",
+    ];
+    for &name in stub_names {
+        let svc_name = name.to_string();
+        server_manager.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+            }),
+            16,
+        );
+    }
 
-    // TODO: Register with ServerManager when server infrastructure is available:
-    // server_manager.register_named_service("csrng", csrng);
-    // server_manager.register_named_service("spl:", spl);
-    // server_manager.register_named_service("spl:mig", spl_mig);
-    // server_manager.register_named_service("spl:fs", spl_fs);
-    // server_manager.register_named_service("spl:ssl", spl_ssl);
-    // server_manager.register_named_service("spl:es", spl_es);
-    // server_manager.register_named_service("spl:manu", spl_manu);
-    // server_manager.run_server();
+    ServerManager::run_server(server_manager);
 }

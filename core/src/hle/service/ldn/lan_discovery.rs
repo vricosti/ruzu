@@ -119,9 +119,17 @@ impl LANDiscovery {
     }
 
     pub fn destroy_network(&mut self) -> ResultCode {
-        // TODO: send disconnect packets
-        self.state = State::AccessPointOpened;
+        // Upstream sends Network::LDNPacketType::DestroyNetwork to each connected client
+        // via SendPacket(). Network packet sending is not yet wired (depends on
+        // internal_network layer). Log the intent for debugging.
+        for client_ip in &self.connected_clients {
+            log::info!(
+                "LANDiscovery::destroy_network: would send DestroyNetwork packet to {:?}",
+                client_ip
+            );
+        }
         self.reset_stations();
+        self.state = State::AccessPointOpened;
         RESULT_SUCCESS
     }
 

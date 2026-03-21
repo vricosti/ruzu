@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::am::am_types::{AppletId, AppletIdentityInfo, LibraryAppletMode};
+use crate::hle::service::am::applet_data_broker::AppletDataBroker;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
@@ -55,13 +56,17 @@ impl Default for ErrorContext {
 /// ILibraryAppletSelfAccessor service.
 pub struct ILibraryAppletSelfAccessor {
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
-    // TODO: AppletDataBroker reference
+    /// Matches upstream `const std::shared_ptr<AppletDataBroker> m_broker`.
+    /// Obtained from `m_applet->caller_applet_broker`.
+    broker: Option<Arc<AppletDataBroker>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ILibraryAppletSelfAccessor {
     pub fn new(applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
+        // Upstream: m_broker{m_applet->caller_applet_broker}
+        let broker = applet.lock().unwrap().caller_applet_broker.clone();
         let handlers = build_handler_map(&[
             (0, None, "PopInData"),
             (1, None, "PushOutData"),
@@ -102,6 +107,7 @@ impl ILibraryAppletSelfAccessor {
         ]);
         Self {
             applet,
+            broker,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }

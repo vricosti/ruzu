@@ -7,6 +7,7 @@
 //! PSM service ("psm") and IPsmSession.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -189,31 +190,34 @@ impl ServiceFramework for PSM {
 ///
 /// Corresponds to `IPsmSession` in upstream psm.cpp.
 pub struct IPsmSession {
-    should_signal_charger_type: bool,
-    should_signal_power_supply: bool,
-    should_signal_battery_voltage: bool,
-    should_signal: bool,
-    // In upstream: service_context and state_change_event (KEvent)
-    // TODO: add kernel event support
+    should_signal_charger_type: AtomicBool,
+    should_signal_power_supply: AtomicBool,
+    should_signal_battery_voltage: AtomicBool,
+    should_signal: AtomicBool,
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    state_change_event_handle: u32,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IPsmSession {
     pub fn new() -> Self {
-        // Upstream: state_change_event = service_context.CreateEvent("IPsmSession::state_change_event")
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new("IPsmSession".to_string());
+        let state_change_event_handle = service_context.create_event("IPsmSession::state_change_event".to_string());
         let handlers = build_handler_map(&[
-            (session_commands::BIND_STATE_CHANGE_EVENT, None, "BindStateChangeEvent"),
-            (session_commands::UNBIND_STATE_CHANGE_EVENT, None, "UnbindStateChangeEvent"),
-            (session_commands::SET_CHARGER_TYPE_CHANGE_EVENT_ENABLED, None, "SetChargerTypeChangeEventEnabled"),
-            (session_commands::SET_POWER_SUPPLY_CHANGE_EVENT_ENABLED, None, "SetPowerSupplyChangeEventEnabled"),
-            (session_commands::SET_BATTERY_VOLTAGE_STATE_CHANGE_EVENT_ENABLED, None, "SetBatteryVoltageStateChangeEventEnabled"),
+            (session_commands::BIND_STATE_CHANGE_EVENT, Some(IPsmSession::bind_state_change_event_handler), "BindStateChangeEvent"),
+            (session_commands::UNBIND_STATE_CHANGE_EVENT, Some(IPsmSession::unbind_state_change_event_handler), "UnbindStateChangeEvent"),
+            (session_commands::SET_CHARGER_TYPE_CHANGE_EVENT_ENABLED, Some(IPsmSession::set_charger_type_change_event_enabled_handler), "SetChargerTypeChangeEventEnabled"),
+            (session_commands::SET_POWER_SUPPLY_CHANGE_EVENT_ENABLED, Some(IPsmSession::set_power_supply_change_event_enabled_handler), "SetPowerSupplyChangeEventEnabled"),
+            (session_commands::SET_BATTERY_VOLTAGE_STATE_CHANGE_EVENT_ENABLED, Some(IPsmSession::set_battery_voltage_state_change_event_enabled_handler), "SetBatteryVoltageStateChangeEventEnabled"),
         ]);
         Self {
-            should_signal_charger_type: false,
-            should_signal_power_supply: false,
-            should_signal_battery_voltage: false,
-            should_signal: false,
+            should_signal_charger_type: AtomicBool::new(false),
+            should_signal_power_supply: AtomicBool::new(false),
+            should_signal_battery_voltage: AtomicBool::new(false),
+            should_signal: AtomicBool::new(false),
+            service_context,
+            state_change_event_handle,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -223,59 +227,60 @@ impl IPsmSession {
     ///
     /// Corresponds to `IPsmSession::BindStateChangeEvent` in upstream psm.cpp.
     /// Sets should_signal = true and returns the state_change_event handle.
-    pub fn bind_state_change_event(&mut self) {
+    pub fn bind_state_change_event(&self) {
         log::debug!("IPsmSession::bind_state_change_event called");
-        self.should_signal = true;
-        // TODO: return state_change_event->GetReadableEvent()
+        self.should_signal.store(true, Ordering::Relaxed);
     }
 
     /// UnbindStateChangeEvent (cmd 1).
     ///
     /// Corresponds to `IPsmSession::UnbindStateChangeEvent` in upstream psm.cpp.
-    pub fn unbind_state_change_event(&mut self) {
+    pub fn unbind_state_change_event(&self) {
         log::debug!("IPsmSession::unbind_state_change_event called");
-        self.should_signal = false;
+        self.should_signal.store(false, Ordering::Relaxed);
     }
 
     /// SetChargerTypeChangeEventEnabled (cmd 2).
     ///
     /// Corresponds to `IPsmSession::SetChargerTypeChangeEventEnabled` in upstream psm.cpp.
-    pub fn set_charger_type_change_event_enabled(&mut self, state: bool) {
+    pub fn set_charger_type_change_event_enabled(&self, state: bool) {
         log::debug!(
             "IPsmSession::set_charger_type_change_event_enabled called, state={}",
             state
         );
-        self.should_signal_charger_type = state;
+        self.should_signal_charger_type.store(state, Ordering::Relaxed);
     }
 
     /// SetPowerSupplyChangeEventEnabled (cmd 3).
     ///
     /// Corresponds to `IPsmSession::SetPowerSupplyChangeEventEnabled` in upstream psm.cpp.
-    pub fn set_power_supply_change_event_enabled(&mut self, state: bool) {
+    pub fn set_power_supply_change_event_enabled(&self, state: bool) {
         log::debug!(
             "IPsmSession::set_power_supply_change_event_enabled called, state={}",
             state
         );
-        self.should_signal_power_supply = state;
+        self.should_signal_power_supply.store(state, Ordering::Relaxed);
     }
 
     /// SetBatteryVoltageStateChangeEventEnabled (cmd 4).
     ///
     /// Corresponds to `IPsmSession::SetBatteryVoltageStateChangeEventEnabled` in upstream psm.cpp.
-    pub fn set_battery_voltage_state_change_event_enabled(&mut self, state: bool) {
+    pub fn set_battery_voltage_state_change_event_enabled(&self, state: bool) {
         log::debug!(
             "IPsmSession::set_battery_voltage_state_change_event_enabled called, state={}",
             state
         );
-        self.should_signal_battery_voltage = state;
+        self.should_signal_battery_voltage.store(state, Ordering::Relaxed);
     }
 
     /// Signal charger type changed (internal helper).
     ///
     /// Corresponds to `IPsmSession::SignalChargerTypeChanged` in upstream psm.cpp.
     pub fn signal_charger_type_changed(&self) {
-        if self.should_signal && self.should_signal_charger_type {
-            // TODO: state_change_event->Signal()
+        if self.should_signal.load(Ordering::Relaxed) && self.should_signal_charger_type.load(Ordering::Relaxed) {
+            if let Some(event) = self.service_context.get_event(self.state_change_event_handle) {
+                event.signal();
+            }
         }
     }
 
@@ -283,8 +288,10 @@ impl IPsmSession {
     ///
     /// Corresponds to `IPsmSession::SignalPowerSupplyChanged` in upstream psm.cpp.
     pub fn signal_power_supply_changed(&self) {
-        if self.should_signal && self.should_signal_power_supply {
-            // TODO: state_change_event->Signal()
+        if self.should_signal.load(Ordering::Relaxed) && self.should_signal_power_supply.load(Ordering::Relaxed) {
+            if let Some(event) = self.service_context.get_event(self.state_change_event_handle) {
+                event.signal();
+            }
         }
     }
 
@@ -292,9 +299,80 @@ impl IPsmSession {
     ///
     /// Corresponds to `IPsmSession::SignalBatteryVoltageStateChanged` in upstream psm.cpp.
     pub fn signal_battery_voltage_state_changed(&self) {
-        if self.should_signal && self.should_signal_battery_voltage {
-            // TODO: state_change_event->Signal()
+        if self.should_signal.load(Ordering::Relaxed) && self.should_signal_battery_voltage.load(Ordering::Relaxed) {
+            if let Some(event) = self.service_context.get_event(self.state_change_event_handle) {
+                event.signal();
+            }
         }
+    }
+
+    // --- Handler bridge functions ---
+
+    fn bind_state_change_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
+        service.bind_state_change_event();
+
+        if let Some(handle) = ctx.create_readable_event_handle(false) {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        } else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(0);
+        }
+    }
+
+    fn unbind_state_change_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
+        service.unbind_state_change_event();
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_charger_type_change_event_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
+        let mut rp = RequestParser::new(ctx);
+        let state = rp.pop_bool();
+        service.set_charger_type_change_event_enabled(state);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_power_supply_change_event_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
+        let mut rp = RequestParser::new(ctx);
+        let state = rp.pop_bool();
+        service.set_power_supply_change_event_enabled(state);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_battery_voltage_state_change_event_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
+        let mut rp = RequestParser::new(ctx);
+        let state = rp.pop_bool();
+        service.set_battery_voltage_state_change_event_enabled(state);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 }
 

@@ -48,7 +48,23 @@ impl ServiceFramework for GRC {
 
 /// Registers "grc:c" service.
 ///
-/// Corresponds to `LoopProcess` in upstream `grc.cpp`.
+/// Corresponds to `LoopProcess` in upstream `grc.cpp`:
+/// ```cpp
+/// server_manager->RegisterNamedService("grc:c", std::make_shared<GRC>(system));
+/// ```
 pub fn loop_process() {
-    // TODO: register "grc:c" -> GRC with ServerManager
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    server_manager.register_named_service(
+        "grc:c",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(GRC::new())
+        }),
+        16,
+    );
+
+    ServerManager::run_server(server_manager);
 }

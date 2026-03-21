@@ -6,11 +6,25 @@
 
 use std::collections::BTreeMap;
 
+use crate::file_sys::vfs::vfs::{VfsDirectory, VfsFile};
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::bcat_result;
 use super::bcat_types::*;
+
+/// The digest is only used to determine if a file is unique compared to others of the same name.
+/// Since the algorithm isn't ever checked in game, MD5 is safe.
+fn digest_file(file: &VirtualFile) -> BcatDigest {
+    use md5::Digest;
+    let mut out = BcatDigest::default();
+    let bytes = file.read_all_bytes();
+    // Upstream uses mbedtls_md5_ret. We use the md-5 crate equivalent.
+    let result = md5::Md5::digest(&bytes);
+    out.copy_from_slice(&result);
+    out
+}
 
 /// IPC command IDs for IDeliveryCacheDirectoryService
 pub mod commands {
@@ -21,14 +35,14 @@ pub mod commands {
 
 /// IDeliveryCacheDirectoryService corresponds to upstream `IDeliveryCacheDirectoryService`.
 pub struct IDeliveryCacheDirectoryService {
-    // TODO: root: VirtualDir, current_dir: Option<VirtualDir>
-    pub has_open_dir: bool,
+    root: VirtualDir,
+    current_dir: Option<VirtualDir>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IDeliveryCacheDirectoryService {
-    pub fn new() -> Self {
+    pub fn new(root: VirtualDir) -> Self {
         let handlers = build_handler_map(&[
             (commands::OPEN, None, "Open"),
             (commands::READ, None, "Read"),
@@ -36,45 +50,84 @@ impl IDeliveryCacheDirectoryService {
         ]);
 
         Self {
-            has_open_dir: false,
+            root,
+            current_dir: None,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
     }
 
     pub fn open(&mut self, dir_name_raw: &DirectoryName) -> ResultCode {
-        log::debug!("IDeliveryCacheDirectoryService::open called");
+        let dir_name = common::string_util::string_from_fixed_zero_terminated_buffer(
+            dir_name_raw,
+            dir_name_raw.len(),
+        );
+
+        log::debug!(
+            "IDeliveryCacheDirectoryService::open called, dir_name={}",
+            dir_name
+        );
 
         let dir_verify = super::bcat_util::verify_name_valid_dir(dir_name_raw);
         if dir_verify.is_error() {
             return dir_verify;
         }
-        if self.has_open_dir {
+        if self.current_dir.is_some() {
             return bcat_result::RESULT_ENTITY_ALREADY_OPEN;
         }
-        // TODO: look up directory in VFS
-        bcat_result::RESULT_FAILED_OPEN_ENTITY
+
+        let dir = match self.root.get_subdirectory(&dir_name) {
+            Some(d) => d,
+            None => return bcat_result::RESULT_FAILED_OPEN_ENTITY,
+        };
+
+        self.current_dir = Some(dir);
+
+        RESULT_SUCCESS
     }
 
     pub fn read(
         &self,
-        _out_buffer: &mut [DeliveryCacheDirectoryEntry],
+        out_buffer: &mut [DeliveryCacheDirectoryEntry],
     ) -> (ResultCode, i32) {
-        log::debug!("IDeliveryCacheDirectoryService::read called");
-        if !self.has_open_dir {
-            return (bcat_result::RESULT_NO_OPEN_ENTRY, 0);
+        log::debug!(
+            "IDeliveryCacheDirectoryService::read called, write_size={:016X}",
+            out_buffer.len()
+        );
+
+        let current_dir = match &self.current_dir {
+            Some(d) => d,
+            None => return (bcat_result::RESULT_NO_OPEN_ENTRY, 0),
+        };
+
+        let files = current_dir.get_files();
+        let count = std::cmp::min(files.len(), out_buffer.len()) as i32;
+
+        for i in 0..count as usize {
+            let file = &files[i];
+            let mut name = FileName::default();
+            let file_name = file.get_name();
+            let file_name_bytes = file_name.as_bytes();
+            let copy_len = std::cmp::min(file_name_bytes.len(), name.len());
+            name[..copy_len].copy_from_slice(&file_name_bytes[..copy_len]);
+
+            out_buffer[i] = DeliveryCacheDirectoryEntry {
+                name,
+                size: file.get_size() as u64,
+                digest: digest_file(file),
+            };
         }
-        // TODO: read entries from current_dir
-        (RESULT_SUCCESS, 0)
+
+        (RESULT_SUCCESS, count)
     }
 
     pub fn get_count(&self) -> (ResultCode, i32) {
         log::debug!("IDeliveryCacheDirectoryService::get_count called");
-        if !self.has_open_dir {
-            return (bcat_result::RESULT_NO_OPEN_ENTRY, 0);
+
+        match &self.current_dir {
+            Some(d) => (RESULT_SUCCESS, d.get_files().len() as i32),
+            None => (bcat_result::RESULT_NO_OPEN_ENTRY, 0),
         }
-        // TODO: return current_dir file count
-        (RESULT_SUCCESS, 0)
     }
 }
 

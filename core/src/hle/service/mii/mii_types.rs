@@ -112,3 +112,152 @@ pub type Nickname = [u16; MAX_NAME_SIZE + 1];
 
 /// CreateId is a UUID (128-bit).
 pub type CreateId = u128;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FacelineColor {
+    Beige = 0,
+    WarmBeige = 1,
+    Natural = 2,
+    Honey = 3,
+    Chestnut = 4,
+    Porcelain = 5,
+    Ivory = 6,
+    WarmIvory = 7,
+    Almond = 8,
+    Espresso = 9,
+}
+
+impl FacelineColor {
+    pub const MAX: u8 = FacelineColor::Espresso as u8;
+    pub const COUNT: usize = (Self::MAX as usize) + 1;
+}
+
+impl Default for FacelineColor {
+    fn default() -> Self {
+        FacelineColor::Beige
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommonColor {
+    // For simplicity common colors aren't listed
+    Max = 99,
+}
+
+impl CommonColor {
+    pub const COUNT: usize = 100;
+}
+
+impl Default for CommonColor {
+    fn default() -> Self {
+        CommonColor::Max
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlassType {
+    None = 0,
+    Oval = 1,
+    Wayfarer = 2,
+    Rectangle = 3,
+    TopRimless = 4,
+    Rounded = 5,
+    Oversized = 6,
+    CatEye = 7,
+    Square = 8,
+    BottomRimless = 9,
+    SemiOpaqueRounded = 10,
+    SemiOpaqueCatEye = 11,
+    SemiOpaqueOval = 12,
+    SemiOpaqueRectangle = 13,
+    SemiOpaqueAviator = 14,
+    OpaqueRounded = 15,
+    OpaqueCatEye = 16,
+    OpaqueOval = 17,
+    OpaqueRectangle = 18,
+    OpaqueAviator = 19,
+}
+
+impl GlassType {
+    pub const MAX: u8 = GlassType::OpaqueAviator as u8;
+    pub const COUNT: usize = (Self::MAX as usize) + 1;
+}
+
+impl Default for GlassType {
+    fn default() -> Self {
+        GlassType::None
+    }
+}
+
+/// Default Mii configuration data.
+/// Maps to upstream `Service::Mii::DefaultMii` in mii_types.h.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct DefaultMii {
+    pub face_type: u32,
+    pub face_color: u32,
+    pub face_wrinkle: u32,
+    pub face_makeup: u32,
+    pub hair_type: u32,
+    pub hair_color: u32,
+    pub hair_flip: u32,
+    pub eye_type: u32,
+    pub eye_color: u32,
+    pub eye_scale: u32,
+    pub eye_aspect: u32,
+    pub eye_rotate: u32,
+    pub eye_x: u32,
+    pub eye_y: u32,
+    pub eyebrow_type: u32,
+    pub eyebrow_color: u32,
+    pub eyebrow_scale: u32,
+    pub eyebrow_aspect: u32,
+    pub eyebrow_rotate: u32,
+    pub eyebrow_x: u32,
+    pub eyebrow_y: u32,
+    pub nose_type: u32,
+    pub nose_scale: u32,
+    pub nose_y: u32,
+    pub mouth_type: u32,
+    pub mouth_color: u32,
+    pub mouth_scale: u32,
+    pub mouth_aspect: u32,
+    pub mouth_y: u32,
+    pub mustache_type: u32,
+    pub beard_type: u32,
+    pub beard_color: u32,
+    pub mustache_scale: u32,
+    pub mustache_y: u32,
+    pub glasses_type: u32,
+    pub glasses_color: u32,
+    pub glasses_scale: u32,
+    pub glasses_y: u32,
+    pub mole_type: u32,
+    pub mole_scale: u32,
+    pub mole_x: u32,
+    pub mole_y: u32,
+    pub height: u32,
+    pub weight: u32,
+    pub gender: u32,
+    pub favorite_color: u32,
+    pub region_move: u32,
+    pub font_region: u32,
+    pub r#type: u32,
+    pub nickname: DefaultMiiNickname,
+}
+
+// Upstream Nickname in DefaultMii is std::array<char16_t, 10> = 20 bytes.
+pub type DefaultMiiNickname = [u16; MAX_NAME_SIZE];
+
+// static_assert equivalent: sizeof(DefaultMii) == 0xd8
+const _: () = assert!(std::mem::size_of::<DefaultMii>() == 0xd8);
+
+impl Default for DefaultMii {
+    fn default() -> Self {
+        // Safety: all-zeros is valid for this repr(C) struct of u32 + [u16; 10]
+        unsafe { std::mem::zeroed() }
+    }
+}

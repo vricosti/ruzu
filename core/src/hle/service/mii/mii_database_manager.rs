@@ -27,8 +27,17 @@ impl DatabaseManager {
 
     /// Initialize the database manager.
     /// Loads the database from the save data filesystem.
+    ///
+    /// Upstream mounts save data at NAND/system/save/8000000000000030, reads
+    /// MiiDatabase.dat into the NintendoFigurineDatabase struct, and validates
+    /// the CRC. Filesystem save data mounting (Common::FS / VfsRealDirectory)
+    /// is not yet wired for Mii save data. For now, start with an empty database.
+    /// When the filesystem layer supports Mii save data paths, load the database
+    /// file here.
     pub fn initialize(&mut self) -> ResultCode {
-        // TODO: Load from filesystem
+        log::debug!(
+            "DatabaseManager::initialize: filesystem load not yet wired, starting with empty database"
+        );
         self.database = NintendoFigurineDatabase::new();
         RESULT_SUCCESS
     }
@@ -59,8 +68,15 @@ impl DatabaseManager {
     }
 
     /// Save the database to the filesystem.
+    ///
+    /// Upstream writes the NintendoFigurineDatabase struct to MiiDatabase.dat
+    /// in the mounted save data directory. Filesystem save data writing is not
+    /// yet wired for Mii save data. When available, serialize self.database
+    /// to the save file here.
     pub fn save_database(&mut self) -> ResultCode {
-        // TODO: Save to filesystem
+        log::debug!(
+            "DatabaseManager::save_database: filesystem save not yet wired, marking clean"
+        );
         self.is_dirty = false;
         RESULT_SUCCESS
     }

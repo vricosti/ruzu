@@ -451,7 +451,7 @@ pub struct RealVfsDirectory {
 }
 
 impl RealVfsDirectory {
-    fn new(base: Arc<RealVfsFilesystem>, path: String, perms: OpenMode) -> Self {
+    pub fn new(base: Arc<RealVfsFilesystem>, path: String, perms: OpenMode) -> Self {
         let cleaned = path_util::remove_trailing_slash(&path).to_string();
         let parent_path = path_util::get_parent_path(&cleaned);
         let path_components = path_util::split_path_components_copy(&cleaned);

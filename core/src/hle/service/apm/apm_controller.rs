@@ -118,8 +118,11 @@ impl Controller {
     }
 
     pub fn get_current_performance_mode(&self) -> PerformanceMode {
-        // TODO: check Settings::IsDockedMode()
-        PerformanceMode::Normal
+        if common::settings::is_docked_mode(&common::settings::values()) {
+            PerformanceMode::Boost
+        } else {
+            PerformanceMode::Normal
+        }
     }
 
     pub fn get_current_performance_configuration(
@@ -135,6 +138,7 @@ impl Controller {
 
     fn set_clock_speed(&self, mhz: u32) {
         log::debug!("Controller::set_clock_speed called, mhz={:#08x}", mhz);
-        // TODO: signal core_timing to change clock speed
+        // Upstream TODO(DarkLordZach): Actually signal core_timing to change clock speed.
+        // Upstream leaves this unimplemented as well — no core_timing integration exists.
     }
 }

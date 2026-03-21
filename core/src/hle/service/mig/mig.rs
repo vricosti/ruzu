@@ -52,9 +52,27 @@ impl ServiceFramework for MigUsr {
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
 }
 
-/// Registers "mig:user" service.
+/// Registers "mig:usr" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `mig.cpp`.
 pub fn loop_process() {
-    // TODO: register "mig:user" -> MigUsr with ServerManager
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    let stub = |sm: &mut ServerManager, name: &str| {
+        let svc_name = name.to_string();
+        sm.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(
+                    crate::hle::service::services::GenericStubService::new(&svc_name),
+                )
+            }),
+            64,
+        );
+    };
+    stub(&mut server_manager, "mig:usr");
+    ServerManager::run_server(server_manager);
 }

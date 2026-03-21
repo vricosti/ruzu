@@ -7,10 +7,12 @@
 //! IScreenShotApplicationService — "caps:su".
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use super::caps_manager::AlbumManager;
 use super::caps_types::{
     AlbumReportOption, ApplicationAlbumEntry, ApplicationData, ScreenShotAttribute,
     ShimLibraryVersion,
@@ -38,11 +40,11 @@ pub struct IScreenShotApplicationService {
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     /// Internal buffer for CaptureAndSaveScreenshot.
     image_data: Vec<u8>,
-    // TODO: AlbumManager reference
+    manager: Arc<Mutex<AlbumManager>>,
 }
 
 impl IScreenShotApplicationService {
-    pub fn new() -> Self {
+    pub fn new(album_manager: Arc<Mutex<AlbumManager>>) -> Self {
         let handlers = build_handler_map(&[
             (32, None, "SetShimLibraryVersion"),
             (201, None, "SaveScreenShot"),
@@ -55,6 +57,7 @@ impl IScreenShotApplicationService {
             handlers,
             handlers_tipc: BTreeMap::new(),
             image_data: vec![0u8; SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * BYTES_PER_PIXEL],
+            manager: album_manager,
         }
     }
 
@@ -91,10 +94,21 @@ impl IScreenShotApplicationService {
             aruid,
         );
 
-        // TODO: manager.flip_vertically_on_write(false);
-        // TODO: manager.save_screen_shot(...)
-        let entry = ApplicationAlbumEntry::default();
-        Ok(entry)
+        let mut manager = self.manager.lock().unwrap();
+        manager.flip_vertically_on_write(false);
+        let mut entry = ApplicationAlbumEntry::default();
+        let result = manager.save_screen_shot(
+            &mut entry,
+            _attribute,
+            report_option,
+            image_data_buffer,
+            aruid,
+        );
+        if result.is_success() {
+            Ok(entry)
+        } else {
+            Err(result)
+        }
     }
 
     /// SaveScreenShotEx1 (cmd 205).
@@ -115,10 +129,22 @@ impl IScreenShotApplicationService {
             aruid,
         );
 
-        // TODO: manager.flip_vertically_on_write(false);
-        // TODO: manager.save_screen_shot(...)
-        let entry = ApplicationAlbumEntry::default();
-        Ok(entry)
+        let mut manager = self.manager.lock().unwrap();
+        manager.flip_vertically_on_write(false);
+        let mut entry = ApplicationAlbumEntry::default();
+        let result = manager.save_screen_shot_with_app_data(
+            &mut entry,
+            _attribute,
+            report_option,
+            _app_data_buffer,
+            image_data_buffer,
+            aruid,
+        );
+        if result.is_success() {
+            Ok(entry)
+        } else {
+            Err(result)
+        }
     }
 
     /// CaptureAndSaveScreenshot — captures the current framebuffer and saves it.
@@ -143,7 +169,18 @@ impl IScreenShotApplicationService {
             i += BYTES_PER_PIXEL;
         }
 
-        // TODO: Call manager.save_screen_shot with the converted data.
+        // Call manager.save_screen_shot with the converted data.
+        let attribute = ScreenShotAttribute::default();
+        let mut entry = ApplicationAlbumEntry::default();
+        let mut manager = self.manager.lock().unwrap();
+        manager.flip_vertically_on_write(false);
+        let _result = manager.save_screen_shot(
+            &mut entry,
+            &attribute,
+            _report_option,
+            &self.image_data,
+            0, // aruid placeholder
+        );
     }
 }
 

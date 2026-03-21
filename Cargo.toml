@@ -50,6 +50,7 @@ ctr = "0.9"
 cipher = "0.4"
 sha2 = "0.10"
 hex = "0.4"
+md-5 = "0.10"
 
 # Compression
 lz4_flex = "0.11"

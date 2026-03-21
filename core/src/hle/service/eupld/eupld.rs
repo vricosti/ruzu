@@ -45,7 +45,21 @@ impl ErrorUploadRequest {
 
 /// Registers "eupld:c" and "eupld:r" services.
 ///
-/// Corresponds to `LoopProcess` in upstream `eupld.cpp`.
+/// Corresponds to `LoopProcess` in upstream `eupld.cpp`:
+/// ```cpp
+/// server_manager->RegisterNamedService("eupld:c", std::make_shared<ErrorUploadContext>(system));
+/// server_manager->RegisterNamedService("eupld:r", std::make_shared<ErrorUploadRequest>(system));
+/// ```
+///
+/// Neither ErrorUploadContext nor ErrorUploadRequest implement SessionRequestHandler yet,
+/// so we use stub services.
 pub fn loop_process() {
-    // TODO: register services with ServerManager
+    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(
+        crate::core::SystemRef::null(),
+    );
+    crate::hle::service::services::register_stub_services(
+        &mut server_manager,
+        &["eupld:c", "eupld:r"],
+    );
+    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
 }

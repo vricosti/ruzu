@@ -167,12 +167,22 @@ pub struct Linger {
 ///
 /// Corresponds to `Service::Sockets::LoopProcess` in upstream sockets.cpp.
 pub fn loop_process() {
-    log::debug!("Sockets::LoopProcess called");
-    // TODO: Register socket services with ServerManager:
-    //   "bsd:s" -> BSD
-    //   "bsd:u" -> BSD
-    //   "bsdcfg" -> BSDCFG
-    //   "nsd:a" -> NSD
-    //   "nsd:u" -> NSD
-    //   "sfdnsres" -> SFDNSRES
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    let stub_names = &["bsd:u", "bsd:s", "bsdcfg", "nsd:u", "nsd:a", "sfdnsres"];
+    for &name in stub_names {
+        let svc_name = name.to_string();
+        server_manager.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+            }),
+            16,
+        );
+    }
+
+    ServerManager::run_server(server_manager);
 }

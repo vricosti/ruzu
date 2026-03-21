@@ -91,7 +91,10 @@ impl IContentManagementInterface {
     /// Corresponds to upstream `IContentManagementInterface::GetTotalSpaceSize`.
     pub fn get_total_space_size(&self, storage_id: u8) -> Result<i64, ResultCode> {
         log::info!("(STUBBED) GetTotalSpaceSize called, storage_id={}", storage_id);
-        // TODO: system.get_file_system_controller().get_total_space_size(storage_id)
+        // Upstream: system.GetFileSystemController().GetTotalSpaceSize(storage_id)
+        // FileSystemController::get_total_space_size is not yet ported — it requires
+        // sdmc_factory/bis_factory integration to query real filesystem sizes.
+        // Return 32 GiB stub matching the stubbed upstream behavior in the emulator.
         Ok(32 * 1024 * 1024 * 1024) // 32 GiB stub
     }
 
@@ -100,7 +103,10 @@ impl IContentManagementInterface {
     /// Corresponds to upstream `IContentManagementInterface::GetFreeSpaceSize`.
     pub fn get_free_space_size(&self, storage_id: u8) -> Result<i64, ResultCode> {
         log::info!("(STUBBED) GetFreeSpaceSize called, storage_id={}", storage_id);
-        // TODO: system.get_file_system_controller().get_free_space_size(storage_id)
+        // Upstream: system.GetFileSystemController().GetFreeSpaceSize(storage_id)
+        // FileSystemController::get_free_space_size is not yet ported — it requires
+        // sdmc_factory/bis_factory integration to query real filesystem sizes.
+        // Return 16 GiB stub matching the stubbed upstream behavior in the emulator.
         Ok(16 * 1024 * 1024 * 1024) // 16 GiB stub
     }
 }

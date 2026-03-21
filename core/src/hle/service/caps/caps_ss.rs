@@ -7,10 +7,12 @@
 //! IScreenShotService — "caps:ss".
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use super::caps_manager::AlbumManager;
 use super::caps_types::{
     AlbumFileId, AlbumReportOption, ApplicationAlbumEntry, ScreenShotAttribute,
 };
@@ -32,11 +34,11 @@ pub mod commands {
 pub struct IScreenShotService {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: AlbumManager reference
+    manager: Arc<Mutex<AlbumManager>>,
 }
 
 impl IScreenShotService {
-    pub fn new() -> Self {
+    pub fn new(album_manager: Arc<Mutex<AlbumManager>>) -> Self {
         let handlers = build_handler_map(&[
             (201, None, "SaveScreenShot"),
             (202, None, "SaveEditedScreenShot"),
@@ -50,6 +52,7 @@ impl IScreenShotService {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            manager: album_manager,
         }
     }
 
@@ -70,10 +73,21 @@ impl IScreenShotService {
             aruid,
         );
 
-        // TODO: manager.flip_vertically_on_write(false);
-        // TODO: manager.save_screen_shot(...)
-        let entry = ApplicationAlbumEntry::default();
-        Ok(entry)
+        let mut manager = self.manager.lock().unwrap();
+        manager.flip_vertically_on_write(false);
+        let mut entry = ApplicationAlbumEntry::default();
+        let result = manager.save_screen_shot(
+            &mut entry,
+            _attribute,
+            report_option,
+            image_data_buffer,
+            aruid,
+        );
+        if result.is_success() {
+            Ok(entry)
+        } else {
+            Err(result)
+        }
     }
 
     /// SaveEditedScreenShotEx1 (cmd 206).
@@ -106,10 +120,20 @@ impl IScreenShotService {
             thumbnail_image_data_buffer.len(),
         );
 
-        // TODO: manager.flip_vertically_on_write(false);
-        // TODO: manager.save_edited_screen_shot(...)
-        let entry = ApplicationAlbumEntry::default();
-        Ok(entry)
+        let mut manager = self.manager.lock().unwrap();
+        manager.flip_vertically_on_write(false);
+        let mut entry = ApplicationAlbumEntry::default();
+        let result = manager.save_edited_screen_shot(
+            &mut entry,
+            _attribute,
+            file_id,
+            image_data_buffer,
+        );
+        if result.is_success() {
+            Ok(entry)
+        } else {
+            Err(result)
+        }
     }
 }
 

@@ -31,7 +31,8 @@ pub mod commands {
 ///
 /// Corresponds to `IPurchaseEventManager` in upstream `purchase_event_manager.h`.
 pub struct IPurchaseEventManager {
-    // TODO: service_context, purchased_event
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    purchased_event_handle: u32,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -49,8 +50,19 @@ impl IPurchaseEventManager {
                 Some(Self::pop_purchased_product_info_with_uid_handler),
                 "PopPurchasedProductInfoWithUid",
             ),
+            (
+                commands::GET_PURCHASED_EVENT,
+                Some(Self::get_purchased_event_handler),
+                "GetPurchasedEvent",
+            ),
         ]);
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
+            "IPurchaseEventManager".to_string(),
+        );
+        let purchased_event_handle = service_context.create_event("purchased_event".to_string());
         Self {
+            service_context,
+            purchased_event_handle,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -72,10 +84,9 @@ impl IPurchaseEventManager {
         );
     }
 
-    /// Stubbed: GetPurchasedEvent (cmd 2)
+    /// GetPurchasedEvent (cmd 2) — returns the purchased event readable handle.
     pub fn get_purchased_event(&self) {
         log::warn!("IPurchaseEventManager::get_purchased_event called");
-        // TODO: return event handle
     }
 
     /// Stubbed: PopPurchasedProductInfo (cmd 3)
@@ -88,6 +99,24 @@ impl IPurchaseEventManager {
     pub fn pop_purchased_product_info_with_uid(&self) -> Result<(), ResultCode> {
         log::debug!("(STUBBED) IPurchaseEventManager::pop_purchased_product_info_with_uid called");
         Err(RESULT_NO_PURCHASED_PRODUCT_INFO_AVAILABLE)
+    }
+
+    fn get_purchased_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IPurchaseEventManager) };
+        service.get_purchased_event();
+        if let Some(handle) = ctx.create_readable_event_handle(false) {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(crate::hle::result::RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        } else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(crate::hle::result::RESULT_SUCCESS);
+            rb.push_copy_objects(0);
+        }
     }
 
     fn pop_purchased_product_info_handler(

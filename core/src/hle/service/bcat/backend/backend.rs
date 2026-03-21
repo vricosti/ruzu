@@ -8,8 +8,12 @@
 //! BcatBackend trait: abstract backend for BCAT functionality.
 //! NullBcatBackend: no-op backend implementation.
 
+use std::sync::Arc;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::bcat::bcat_types::*;
+use crate::hle::service::kernel_helpers::ServiceContext;
+use crate::hle::service::os::event::Event;
 
 /// ProgressServiceBackend manages progress signaling for BCAT downloads.
 ///
@@ -17,15 +21,34 @@ use crate::hle::service::bcat::bcat_types::*;
 pub struct ProgressServiceBackend {
     pub impl_data: DeliveryCacheProgressImpl,
     pub event_name: String,
-    // TODO: update_event: KEvent
+    service_context: ServiceContext,
+    update_event_handle: u32,
 }
 
 impl ProgressServiceBackend {
     pub fn new(event_name: &str) -> Self {
+        let mut service_context = ServiceContext::new("ProgressServiceBackend".to_string());
+        let update_event_handle = service_context.create_event(
+            format!("ProgressServiceBackend:UpdateEvent:{}", event_name),
+        );
         Self {
             impl_data: DeliveryCacheProgressImpl::default(),
             event_name: event_name.to_string(),
+            service_context,
+            update_event_handle,
         }
+    }
+
+    /// Get the update event (readable event).
+    /// Corresponds to upstream `ProgressServiceBackend::GetEvent()`.
+    pub fn get_event(&self) -> Arc<Event> {
+        self.service_context
+            .get_event(self.update_event_handle)
+            .expect("update_event must exist")
+    }
+
+    pub fn get_impl(&self) -> &DeliveryCacheProgressImpl {
+        &self.impl_data
     }
 
     pub fn set_total_size(&mut self, size: u64) {
@@ -89,12 +112,16 @@ impl ProgressServiceBackend {
         self.signal_update();
     }
 
-    pub fn get_impl(&self) -> &DeliveryCacheProgressImpl {
-        &self.impl_data
-    }
-
     fn signal_update(&self) {
-        // TODO: signal update_event
+        if let Some(event) = self.service_context.get_event(self.update_event_handle) {
+            event.signal();
+        }
+    }
+}
+
+impl Drop for ProgressServiceBackend {
+    fn drop(&mut self) {
+        self.service_context.close_event(self.update_event_handle);
     }
 }
 

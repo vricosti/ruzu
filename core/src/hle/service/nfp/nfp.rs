@@ -188,7 +188,14 @@ impl IDebugManager {
 ///
 /// Corresponds to `Service::NFP::LoopProcess` in upstream nfp.cpp.
 pub fn loop_process() {
+    use crate::hle::service::server_manager::ServerManager;
+
     log::debug!("NFP::LoopProcess called");
-    // TODO: Create IUserManager, ISystemManager, IDebugManager and register
-    // with ServerManager.
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    crate::hle::service::services::register_stub_services(
+        &mut server_manager,
+        &["nfp:user", "nfp:sys", "nfp:dbg"],
+    );
+    ServerManager::run_server(server_manager);
 }

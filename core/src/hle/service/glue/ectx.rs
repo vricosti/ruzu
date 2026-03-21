@@ -25,10 +25,12 @@ pub struct EctxAW;
 impl EctxAW {
     pub fn new() -> Self { Self }
 
-    pub fn create_context_registrar(&self) -> ResultCode {
+    /// Creates and returns an IContextRegistrar instance.
+    ///
+    /// Upstream creates an IContextRegistrar via PushIpcInterface.
+    pub fn create_context_registrar(&self) -> (ResultCode, IContextRegistrar) {
         log::debug!("ECTX_AW::create_context_registrar called");
-        // TODO: create IContextRegistrar
-        RESULT_SUCCESS
+        (RESULT_SUCCESS, IContextRegistrar::new())
     }
 }
 

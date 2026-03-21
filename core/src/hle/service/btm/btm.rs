@@ -137,8 +137,52 @@ impl ServiceFramework for IBtm {
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
 }
 
-/// LoopProcess — registers "btm", "btm:dbg", "btm:sys", "btm:u".
+/// Registers "btm", "btm:dbg", "btm:sys", "btm:u" services.
+///
+/// Matches upstream `BTM::LoopProcess(Core::System& system)` in btm.cpp:
+/// ```cpp
+/// server_manager->RegisterNamedService("btm", std::make_shared<IBtm>(system));
+/// server_manager->RegisterNamedService("btm:dbg", std::make_shared<IBtmDebug>(system));
+/// server_manager->RegisterNamedService("btm:sys", std::make_shared<IBtmSystem>(system));
+/// server_manager->RegisterNamedService("btm:u", std::make_shared<IBtmUser>(system));
+/// ```
 pub fn loop_process() {
-    log::debug!("BTM::LoopProcess called");
-    // TODO: Register btm services with ServerManager
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    server_manager.register_named_service(
+        "btm",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(IBtm::new())
+        }),
+        16,
+    );
+
+    server_manager.register_named_service(
+        "btm:dbg",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(super::btm_debug::IBtmDebug::new())
+        }),
+        16,
+    );
+
+    server_manager.register_named_service(
+        "btm:sys",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(super::btm_system::IBtmSystem::new())
+        }),
+        16,
+    );
+
+    server_manager.register_named_service(
+        "btm:u",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(super::btm_user::IBtmUser::new())
+        }),
+        16,
+    );
+
+    ServerManager::run_server(server_manager);
 }

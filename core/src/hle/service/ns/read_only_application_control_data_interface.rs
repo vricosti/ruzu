@@ -96,8 +96,8 @@ impl IReadOnlyApplicationControlDataInterface {
             application_id
         );
 
-        // TODO: Read NACP + icon from PatchManager.
-        // For now, zero-fill the NACP area (0x4000 bytes) as a stub.
+        // Upstream reads NACP + icon via PatchManager::GetControlMetadata().
+        // PatchManager is not yet ported; zero-fill the NACP area as a stub.
         const NACP_SIZE: usize = 0x4000;
         if out_buffer.len() < NACP_SIZE {
             log::error!(
@@ -127,7 +127,9 @@ impl IReadOnlyApplicationControlDataInterface {
         );
 
         // Default to AmericanEnglish.
-        // TODO: Properly implement language priority list matching upstream.
+        // Upstream uses ns::language.cpp ConvertToApplicationLanguage + priority list.
+        // Full language priority matching is not yet ported; this approximation
+        // covers the common case (AmericanEnglish) and falls back to first supported.
         if supported_languages == 0 || (supported_languages & (1 << 0)) != 0 {
             return Ok(ApplicationLanguage::AmericanEnglish);
         }

@@ -29,7 +29,8 @@ use super::cradle_firmware_updater::ICradleFirmwareUpdater;
 /// - 15: GetHdcpAuthenticationFailedEvent
 /// - 30: OpenCradleFirmwareUpdater
 pub struct IGlobalStateController {
-    // TODO: ServiceContext, Event fields
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    hdcp_authentication_failed_event_handle: u32,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -52,14 +53,22 @@ impl IGlobalStateController {
             (12, None, "SetDefaultHomeButtonLongPressTime"),
             (13, None, "UpdateDefaultDisplayResolution"),
             (14, Some(Self::should_sleep_on_boot_handler), "ShouldSleepOnBoot"),
-            (15, None, "GetHdcpAuthenticationFailedEvent"), // Needs event handle support
+            (15, Some(Self::get_hdcp_authentication_failed_event_handler), "GetHdcpAuthenticationFailedEvent"),
             (
                 30,
                 Some(Self::open_cradle_firmware_updater_handler),
                 "OpenCradleFirmwareUpdater",
             ),
         ]);
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
+            "IGlobalStateController".to_string(),
+        );
+        let hdcp_authentication_failed_event_handle = service_context.create_event(
+            "IGlobalStateController:HdcpAuthenticationFailedEvent".to_string(),
+        );
         Self {
+            service_context,
+            hdcp_authentication_failed_event_handle,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -106,6 +115,21 @@ impl IGlobalStateController {
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(false);
+    }
+
+    /// Port of IGlobalStateController::GetHdcpAuthenticationFailedEvent
+    /// Upstream returns m_hdcp_authentication_failed_event.GetHandle() as a copy handle.
+    fn get_hdcp_authentication_failed_event_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::info!("IGlobalStateController::GetHdcpAuthenticationFailedEvent called");
+
+        if let Some(handle) = ctx.create_readable_event_handle(false) {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        }
     }
 
     /// Port of IGlobalStateController::OpenCradleFirmwareUpdater

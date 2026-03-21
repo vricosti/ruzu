@@ -5,11 +5,16 @@
 //! Port of zuyu/src/core/hle/service/bcat/delivery_cache_storage_service.cpp
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use crate::file_sys::vfs::vfs::VfsDirectory;
+use crate::file_sys::vfs::vfs_types::VirtualDir;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::bcat_types::DirectoryName;
+use super::delivery_cache_file_service::IDeliveryCacheFileService;
+use super::delivery_cache_directory_service::IDeliveryCacheDirectoryService;
 
 /// IPC command IDs for IDeliveryCacheStorageService
 pub mod commands {
@@ -20,7 +25,7 @@ pub mod commands {
 
 /// IDeliveryCacheStorageService corresponds to upstream `IDeliveryCacheStorageService`.
 pub struct IDeliveryCacheStorageService {
-    // TODO: root: VirtualDir
+    root: VirtualDir,
     pub entries: Vec<DirectoryName>,
     pub next_read_index: usize,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -28,7 +33,7 @@ pub struct IDeliveryCacheStorageService {
 }
 
 impl IDeliveryCacheStorageService {
-    pub fn new() -> Self {
+    pub fn new(root: VirtualDir) -> Self {
         let handlers = build_handler_map(&[
             (commands::CREATE_FILE_SERVICE, None, "CreateFileService"),
             (commands::CREATE_DIRECTORY_SERVICE, None, "CreateDirectoryService"),
@@ -36,6 +41,7 @@ impl IDeliveryCacheStorageService {
         ]);
 
         Self {
+            root,
             entries: Vec::new(),
             next_read_index: 0,
             handlers,
@@ -43,16 +49,16 @@ impl IDeliveryCacheStorageService {
         }
     }
 
-    pub fn create_file_service(&self) -> ResultCode {
+    pub fn create_file_service(&self) -> (ResultCode, Arc<IDeliveryCacheFileService>) {
         log::debug!("IDeliveryCacheStorageService::create_file_service called");
-        // TODO: create IDeliveryCacheFileService
-        RESULT_SUCCESS
+        let service = Arc::new(IDeliveryCacheFileService::new(self.root.clone()));
+        (RESULT_SUCCESS, service)
     }
 
-    pub fn create_directory_service(&self) -> ResultCode {
+    pub fn create_directory_service(&self) -> (ResultCode, Arc<IDeliveryCacheDirectoryService>) {
         log::debug!("IDeliveryCacheStorageService::create_directory_service called");
-        // TODO: create IDeliveryCacheDirectoryService
-        RESULT_SUCCESS
+        let service = Arc::new(IDeliveryCacheDirectoryService::new(self.root.clone()));
+        (RESULT_SUCCESS, service)
     }
 
     pub fn enumerate_delivery_cache_directory(

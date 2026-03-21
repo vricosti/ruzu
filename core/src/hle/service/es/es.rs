@@ -6,6 +6,8 @@
 //! ETicket service ("es").
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use crate::crypto::key_manager::{KeyManager, Key128, S128KeyType, Ticket, TicketData};
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -19,11 +21,63 @@ pub const ERROR_INVALID_ARGUMENT: ResultCode =
 pub const ERROR_INVALID_RIGHTS_ID: ResultCode =
     ResultCode::from_module_description(ErrorModule::ETicket, 3);
 
+/// Serialize a Ticket to raw bytes, matching the upstream C++ memory layout.
+///
+/// Upstream `ctx.WriteBuffer(&ticket, write_size)` writes the raw struct bytes.
+/// This function produces the same byte layout: sig_type (4 LE bytes) + sig_data + padding + TicketData.
+fn ticket_to_bytes(ticket: &Ticket) -> Vec<u8> {
+    match ticket {
+        Ticket::Invalid => Vec::new(),
+        Ticket::RSA4096 { sig_type, sig_data, _padding, data } => {
+            let mut buf = Vec::with_capacity(0x500);
+            buf.extend_from_slice(&(*sig_type as u32).to_le_bytes());
+            buf.extend_from_slice(sig_data);
+            buf.extend_from_slice(_padding);
+            let data_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    data as *const TicketData as *const u8,
+                    std::mem::size_of::<TicketData>(),
+                )
+            };
+            buf.extend_from_slice(data_bytes);
+            buf
+        }
+        Ticket::RSA2048 { sig_type, sig_data, _padding, data } => {
+            let mut buf = Vec::with_capacity(0x400);
+            buf.extend_from_slice(&(*sig_type as u32).to_le_bytes());
+            buf.extend_from_slice(sig_data);
+            buf.extend_from_slice(_padding);
+            let data_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    data as *const TicketData as *const u8,
+                    std::mem::size_of::<TicketData>(),
+                )
+            };
+            buf.extend_from_slice(data_bytes);
+            buf
+        }
+        Ticket::ECDSA { sig_type, sig_data, _padding, data } => {
+            let mut buf = Vec::with_capacity(0x340);
+            buf.extend_from_slice(&(*sig_type as u32).to_le_bytes());
+            buf.extend_from_slice(sig_data);
+            buf.extend_from_slice(_padding);
+            let data_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    data as *const TicketData as *const u8,
+                    std::mem::size_of::<TicketData>(),
+                )
+            };
+            buf.extend_from_slice(data_bytes);
+            buf
+        }
+    }
+}
+
 /// ETicket service ("es").
 pub struct ETicket {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: KeyManager reference
+    keys: Arc<Mutex<KeyManager>>,
 }
 
 impl ETicket {
@@ -115,75 +169,252 @@ impl ETicket {
             (3002, None, "Unknown3002"),
         ]);
 
+        let keys = KeyManager::instance();
+
+        // Populate and synthesize tickets on construction, matching upstream constructor.
+        {
+            let mut km = keys.lock().unwrap();
+            km.populate_tickets();
+            km.synthesize_tickets();
+        }
+
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            keys,
         }
     }
 
-    /// Stubbed: ImportTicket (cmd 1)
-    pub fn import_ticket(&self, _raw_ticket: &[u8], _cert: &[u8]) -> Result<(), ResultCode> {
-        log::warn!("(STUBBED) ETicket::import_ticket called");
-        // TODO: implement with KeyManager
+    /// ImportTicket (cmd 1)
+    ///
+    /// Corresponds to upstream `ETicket::ImportTicket`.
+    pub fn import_ticket(&self, raw_ticket: &[u8], _cert: &[u8]) -> Result<(), ResultCode> {
+        let ticket = Ticket::read_from_bytes(raw_ticket);
+        if !ticket.is_valid() {
+            log::error!("The input buffer is not large enough!");
+            return Err(ERROR_INVALID_ARGUMENT);
+        }
+
+        let mut km = self.keys.lock().unwrap();
+        if !km.add_ticket(&ticket) {
+            log::error!("The ticket could not be imported!");
+            return Err(ERROR_INVALID_ARGUMENT);
+        }
+
         Ok(())
     }
 
-    /// Stubbed: GetTitleKey (cmd 8)
-    pub fn get_title_key(&self, _rights_id: u128) -> Result<[u8; 16], ResultCode> {
-        log::warn!("(STUBBED) ETicket::get_title_key called");
-        // TODO: implement with KeyManager
-        Err(ERROR_INVALID_RIGHTS_ID)
+    /// Check if a rights ID is valid (non-zero).
+    /// Corresponds to upstream `ETicket::CheckRightsId`.
+    fn check_rights_id(rights_id: u128) -> bool {
+        if rights_id == 0 {
+            log::error!("The rights ID was invalid!");
+            return false;
+        }
+        true
     }
 
-    /// Stubbed: CountCommonTicket (cmd 9)
+    /// GetTitleKey (cmd 8)
+    ///
+    /// Corresponds to upstream `ETicket::GetTitleKey`.
+    pub fn get_title_key(&self, rights_id: u128) -> Result<Key128, ResultCode> {
+        // Upstream u128 is std::array<u64,2> where [0] is low, [1] is high.
+        let rights_id_lo = rights_id as u64;
+        let rights_id_hi = (rights_id >> 64) as u64;
+
+        log::debug!(
+            "ETicket::get_title_key called, rights_id={:016X}{:016X}",
+            rights_id_hi,
+            rights_id_lo
+        );
+
+        if !Self::check_rights_id(rights_id) {
+            return Err(ERROR_INVALID_RIGHTS_ID);
+        }
+
+        let km = self.keys.lock().unwrap();
+        let key = km.get_key_128(S128KeyType::Titlekey, rights_id_hi, rights_id_lo);
+
+        if key == [0u8; 16] {
+            log::error!(
+                "The titlekey doesn't exist in the KeyManager or the rights ID was invalid!"
+            );
+            return Err(ERROR_INVALID_RIGHTS_ID);
+        }
+
+        Ok(key)
+    }
+
+    /// CountCommonTicket (cmd 9)
+    ///
+    /// Corresponds to upstream `ETicket::CountCommonTicket`.
     pub fn count_common_ticket(&self) -> u32 {
         log::debug!("ETicket::count_common_ticket called");
-        0
+        let km = self.keys.lock().unwrap();
+        km.get_common_tickets().len() as u32
     }
 
-    /// Stubbed: CountPersonalizedTicket (cmd 10)
+    /// CountPersonalizedTicket (cmd 10)
+    ///
+    /// Corresponds to upstream `ETicket::CountPersonalizedTicket`.
     pub fn count_personalized_ticket(&self) -> u32 {
         log::debug!("ETicket::count_personalized_ticket called");
-        0
+        let km = self.keys.lock().unwrap();
+        km.get_personalized_tickets().len() as u32
     }
 
-    /// Stubbed: ListCommonTicketRightsIds (cmd 11)
-    pub fn list_common_ticket_rights_ids(&self) -> (u32, Vec<u128>) {
-        log::debug!("ETicket::list_common_ticket_rights_ids called");
-        (0, Vec::new())
+    /// ListCommonTicketRightsIds (cmd 11)
+    ///
+    /// Corresponds to upstream `ETicket::ListCommonTicketRightsIds`.
+    pub fn list_common_ticket_rights_ids(&self, max_entries: usize) -> (u32, Vec<u128>) {
+        let mut km = self.keys.lock().unwrap();
+        let mut out_entries = 0usize;
+        if !km.get_common_tickets().is_empty() {
+            out_entries = max_entries;
+        }
+        log::debug!(
+            "ETicket::list_common_ticket_rights_ids called, entries={:016X}",
+            out_entries
+        );
+
+        km.populate_tickets();
+        let ids: Vec<u128> = km.get_common_tickets().keys().copied().collect();
+        out_entries = ids.len().min(out_entries);
+        let truncated = ids[..out_entries].to_vec();
+        (out_entries as u32, truncated)
     }
 
-    /// Stubbed: ListPersonalizedTicketRightsIds (cmd 12)
-    pub fn list_personalized_ticket_rights_ids(&self) -> (u32, Vec<u128>) {
-        log::debug!("ETicket::list_personalized_ticket_rights_ids called");
-        (0, Vec::new())
+    /// ListPersonalizedTicketRightsIds (cmd 12)
+    ///
+    /// Corresponds to upstream `ETicket::ListPersonalizedTicketRightsIds`.
+    pub fn list_personalized_ticket_rights_ids(&self, max_entries: usize) -> (u32, Vec<u128>) {
+        let mut km = self.keys.lock().unwrap();
+        let mut out_entries = 0usize;
+        if !km.get_personalized_tickets().is_empty() {
+            out_entries = max_entries;
+        }
+        log::debug!(
+            "ETicket::list_personalized_ticket_rights_ids called, entries={:016X}",
+            out_entries
+        );
+
+        km.populate_tickets();
+        let ids: Vec<u128> = km.get_personalized_tickets().keys().copied().collect();
+        out_entries = ids.len().min(out_entries);
+        let truncated = ids[..out_entries].to_vec();
+        (out_entries as u32, truncated)
     }
 
-    /// Stubbed: GetCommonTicketSize (cmd 14)
-    pub fn get_common_ticket_size(&self, _rights_id: u128) -> Result<u64, ResultCode> {
-        log::debug!("ETicket::get_common_ticket_size called");
-        Err(ERROR_INVALID_RIGHTS_ID)
+    /// GetCommonTicketSize (cmd 14)
+    ///
+    /// Corresponds to upstream `ETicket::GetCommonTicketSize`.
+    pub fn get_common_ticket_size(&self, rights_id: u128) -> Result<u64, ResultCode> {
+        let rights_id_lo = rights_id as u64;
+        let rights_id_hi = (rights_id >> 64) as u64;
+        log::debug!(
+            "ETicket::get_common_ticket_size called, rights_id={:016X}{:016X}",
+            rights_id_hi,
+            rights_id_lo
+        );
+
+        if !Self::check_rights_id(rights_id) {
+            return Err(ERROR_INVALID_RIGHTS_ID);
+        }
+
+        let km = self.keys.lock().unwrap();
+        let ticket = km
+            .get_common_tickets()
+            .get(&rights_id)
+            .ok_or(ERROR_INVALID_RIGHTS_ID)?;
+        Ok(ticket.get_size())
     }
 
-    /// Stubbed: GetPersonalizedTicketSize (cmd 15)
-    pub fn get_personalized_ticket_size(&self, _rights_id: u128) -> Result<u64, ResultCode> {
-        log::debug!("ETicket::get_personalized_ticket_size called");
-        Err(ERROR_INVALID_RIGHTS_ID)
+    /// GetPersonalizedTicketSize (cmd 15)
+    ///
+    /// Corresponds to upstream `ETicket::GetPersonalizedTicketSize`.
+    pub fn get_personalized_ticket_size(&self, rights_id: u128) -> Result<u64, ResultCode> {
+        let rights_id_lo = rights_id as u64;
+        let rights_id_hi = (rights_id >> 64) as u64;
+        log::debug!(
+            "ETicket::get_personalized_ticket_size called, rights_id={:016X}{:016X}",
+            rights_id_hi,
+            rights_id_lo
+        );
+
+        if !Self::check_rights_id(rights_id) {
+            return Err(ERROR_INVALID_RIGHTS_ID);
+        }
+
+        let km = self.keys.lock().unwrap();
+        let ticket = km
+            .get_personalized_tickets()
+            .get(&rights_id)
+            .ok_or(ERROR_INVALID_RIGHTS_ID)?;
+        Ok(ticket.get_size())
     }
 
-    /// Stubbed: GetCommonTicketData (cmd 16)
-    pub fn get_common_ticket_data(&self, _rights_id: u128) -> Result<(u64, Vec<u8>), ResultCode> {
-        log::debug!("ETicket::get_common_ticket_data called");
-        Err(ERROR_INVALID_RIGHTS_ID)
+    /// GetCommonTicketData (cmd 16)
+    ///
+    /// Corresponds to upstream `ETicket::GetCommonTicketData`.
+    pub fn get_common_ticket_data(
+        &self,
+        rights_id: u128,
+        write_buffer_size: u64,
+    ) -> Result<(u64, Vec<u8>), ResultCode> {
+        let rights_id_lo = rights_id as u64;
+        let rights_id_hi = (rights_id >> 64) as u64;
+        log::debug!(
+            "ETicket::get_common_ticket_data called, rights_id={:016X}{:016X}",
+            rights_id_hi,
+            rights_id_lo
+        );
+
+        if !Self::check_rights_id(rights_id) {
+            return Err(ERROR_INVALID_RIGHTS_ID);
+        }
+
+        let km = self.keys.lock().unwrap();
+        let ticket = km
+            .get_common_tickets()
+            .get(&rights_id)
+            .ok_or(ERROR_INVALID_RIGHTS_ID)?;
+
+        let ticket_bytes = ticket_to_bytes(ticket);
+        let write_size = (ticket.get_size()).min(write_buffer_size);
+        let data = ticket_bytes[..write_size as usize].to_vec();
+        Ok((write_size, data))
     }
 
-    /// Stubbed: GetPersonalizedTicketData (cmd 17)
+    /// GetPersonalizedTicketData (cmd 17)
+    ///
+    /// Corresponds to upstream `ETicket::GetPersonalizedTicketData`.
     pub fn get_personalized_ticket_data(
         &self,
-        _rights_id: u128,
+        rights_id: u128,
+        write_buffer_size: u64,
     ) -> Result<(u64, Vec<u8>), ResultCode> {
-        log::debug!("ETicket::get_personalized_ticket_data called");
-        Err(ERROR_INVALID_RIGHTS_ID)
+        let rights_id_lo = rights_id as u64;
+        let rights_id_hi = (rights_id >> 64) as u64;
+        log::debug!(
+            "ETicket::get_personalized_ticket_data called, rights_id={:016X}{:016X}",
+            rights_id_hi,
+            rights_id_lo
+        );
+
+        if !Self::check_rights_id(rights_id) {
+            return Err(ERROR_INVALID_RIGHTS_ID);
+        }
+
+        let km = self.keys.lock().unwrap();
+        let ticket = km
+            .get_personalized_tickets()
+            .get(&rights_id)
+            .ok_or(ERROR_INVALID_RIGHTS_ID)?;
+
+        let ticket_bytes = ticket_to_bytes(ticket);
+        let write_size = (ticket.get_size()).min(write_buffer_size);
+        let data = ticket_bytes[..write_size as usize].to_vec();
+        Ok((write_size, data))
     }
 
     fn import_ticket_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -237,7 +468,8 @@ impl ETicket {
 
     fn list_common_ticket_rights_ids_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const ETicket) };
-        let (count, ids) = svc.list_common_ticket_rights_ids();
+        let max_entries = ctx.get_write_buffer_size(0) / std::mem::size_of::<u128>();
+        let (count, ids) = svc.list_common_ticket_rights_ids(max_entries);
         if !ids.is_empty() {
             let id_bytes = unsafe {
                 std::slice::from_raw_parts(
@@ -254,7 +486,8 @@ impl ETicket {
 
     fn list_personalized_ticket_rights_ids_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const ETicket) };
-        let (count, ids) = svc.list_personalized_ticket_rights_ids();
+        let max_entries = ctx.get_write_buffer_size(0) / std::mem::size_of::<u128>();
+        let (count, ids) = svc.list_personalized_ticket_rights_ids(max_entries);
         if !ids.is_empty() {
             let id_bytes = unsafe {
                 std::slice::from_raw_parts(
@@ -307,7 +540,8 @@ impl ETicket {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const ETicket) };
         let mut rp = RequestParser::new(ctx);
         let rights_id = rp.pop_raw::<u128>();
-        match svc.get_common_ticket_data(rights_id) {
+        let write_buffer_size = ctx.get_write_buffer_size(0) as u64;
+        match svc.get_common_ticket_data(rights_id, write_buffer_size) {
             Ok((size, data)) => {
                 ctx.write_buffer(&data, 0);
                 let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
@@ -325,7 +559,8 @@ impl ETicket {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const ETicket) };
         let mut rp = RequestParser::new(ctx);
         let rights_id = rp.pop_raw::<u128>();
-        match svc.get_personalized_ticket_data(rights_id) {
+        let write_buffer_size = ctx.get_write_buffer_size(0) as u64;
+        match svc.get_personalized_ticket_data(rights_id, write_buffer_size) {
             Ok((size, data)) => {
                 ctx.write_buffer(&data, 0);
                 let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
@@ -357,5 +592,19 @@ impl ServiceFramework for ETicket {
 ///
 /// Corresponds to `LoopProcess` in upstream `es.cpp`.
 pub fn loop_process() {
-    // TODO: register "es" -> ETicket with ServerManager
+    use std::sync::Arc;
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    server_manager.register_named_service(
+        "es",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            Arc::new(ETicket::new())
+        }),
+        64,
+    );
+
+    ServerManager::run_server(server_manager);
 }

@@ -10,8 +10,26 @@
 ///
 /// Corresponds to `Service::JIT::LoopProcess` in upstream jit.cpp.
 pub fn loop_process() {
-    log::debug!("JIT::LoopProcess called");
-    // TODO: Register jit:u with ServerManager
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    let stub = |sm: &mut ServerManager, name: &str| {
+        let svc_name = name.to_string();
+        sm.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(
+                    crate::hle::service::services::GenericStubService::new(&svc_name),
+                )
+            }),
+            64,
+        );
+    };
+    stub(&mut server_manager, "jit:u");
+
+    ServerManager::run_server(server_manager);
 }
 
 /// IPC command table for IJitEnvironment.

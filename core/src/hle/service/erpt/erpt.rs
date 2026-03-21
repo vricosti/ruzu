@@ -127,8 +127,21 @@ impl ErrorReportSession {
 
 /// Registers "erpt:c" and "erpt:r" services.
 ///
-/// Corresponds to `LoopProcess` in upstream erpt.cpp.
+/// Corresponds to `LoopProcess` in upstream erpt.cpp:
+/// ```cpp
+/// server_manager->RegisterNamedService("erpt:c", std::make_shared<ErrorReportContext>(system));
+/// server_manager->RegisterNamedService("erpt:r", std::make_shared<ErrorReportSession>(system));
+/// ```
+///
+/// Neither ErrorReportContext nor ErrorReportSession implement SessionRequestHandler yet,
+/// so we use stub services.
 pub fn loop_process() {
-    log::debug!("ERPT::LoopProcess called");
-    // TODO: register services with ServerManager
+    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(
+        crate::core::SystemRef::null(),
+    );
+    crate::hle::service::services::register_stub_services(
+        &mut server_manager,
+        &["erpt:c", "erpt:r"],
+    );
+    crate::hle::service::server_manager::ServerManager::run_server(server_manager);
 }

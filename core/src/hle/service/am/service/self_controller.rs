@@ -334,17 +334,18 @@ impl ISelfController {
     }
 
     /// CreateManagedDisplayLayer (cmd 40).
-    /// Matches upstream: locks applet, creates display layer, returns layer_id.
-    /// TODO: implement DisplayLayerManager. For now returns dummy layer_id=1.
+    /// Upstream calls `m_applet->display_layer_manager.CreateManagedDisplayLayer(&layer_id)`.
+    /// DisplayLayerManager is not yet implemented; returns a dummy layer_id=1 to allow
+    /// applets to proceed past initialization. This is sufficient for games that do not
+    /// depend on actual display layer management.
     fn create_managed_display_layer_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::info!("CreateManagedDisplayLayer called");
-        // TODO: applet.display_layer_manager.CreateManagedDisplayLayer(out_layer_id)
+        log::warn!("(STUBBED) CreateManagedDisplayLayer: returning dummy layer_id=1; DisplayLayerManager not yet implemented");
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u64(1); // layer_id = 1
+        rb.push_u64(1); // dummy layer_id until DisplayLayerManager is ported
     }
 
     /// SetIdleTimeDetectionExtension (cmd 62).

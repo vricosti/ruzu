@@ -7,10 +7,12 @@
 //! IAlbumControlService — "caps:c".
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use super::caps_manager::AlbumManager;
 use super::caps_types::ShimLibraryVersion;
 
 /// IPC command table for IAlbumControlService.
@@ -44,11 +46,11 @@ pub mod commands {
 pub struct IAlbumControlService {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: AlbumManager reference
+    manager: Arc<Mutex<AlbumManager>>,
 }
 
 impl IAlbumControlService {
-    pub fn new() -> Self {
+    pub fn new(album_manager: Arc<Mutex<AlbumManager>>) -> Self {
         let handlers = build_handler_map(&[
             (1, None, "CaptureRawImage"),
             (2, None, "CaptureRawImageWithTimeout"),
@@ -74,6 +76,7 @@ impl IAlbumControlService {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            manager: album_manager,
         }
     }
 

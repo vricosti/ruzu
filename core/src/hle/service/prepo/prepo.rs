@@ -6,10 +6,12 @@
 //! PlayReport service -- "prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u".
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::reporter;
 
 /// Play report type, matching upstream Reporter::PlayReportType.
 ///
@@ -28,12 +30,13 @@ pub enum PlayReportType {
 /// Corresponds to `PlayReport` in upstream prepo.cpp.
 pub struct PlayReport {
     name: String,
+    reporter: Arc<reporter::Reporter>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl PlayReport {
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str, reporter: Arc<reporter::Reporter>) -> Self {
         let handlers = build_handler_map(&[
             (10100, Some(PlayReport::save_report_old_handler), "SaveReportOld"),
             (10101, Some(PlayReport::save_report_with_user_old_handler), "SaveReportWithUserOld"),
@@ -67,6 +70,7 @@ impl PlayReport {
 
         Self {
             name: name.to_string(),
+            reporter,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -78,6 +82,7 @@ impl PlayReport {
     pub fn save_report(
         &self,
         report_type: PlayReportType,
+        title_id: u64,
         process_id: u64,
         data1: &[u8],
         data2: &[u8],
@@ -90,7 +95,18 @@ impl PlayReport {
             data1.len(),
             data2.len()
         );
-        // TODO: forward to reporter via system.GetReporter().SavePlayReport(...)
+        let reporter_type = match report_type {
+            PlayReportType::Old => reporter::PlayReportType::Old,
+            PlayReportType::Old2 => reporter::PlayReportType::Old2,
+            PlayReportType::New => reporter::PlayReportType::New,
+            PlayReportType::System => reporter::PlayReportType::System,
+        };
+        let data: Vec<&[u8]> = if data2.is_empty() {
+            vec![data1]
+        } else {
+            vec![data1, data2]
+        };
+        self.reporter.save_play_report(reporter_type, title_id, &data, Some(process_id), None);
     }
 
     /// SaveReportWithUser -- saves a play report with a user ID.
@@ -99,6 +115,7 @@ impl PlayReport {
     pub fn save_report_with_user(
         &self,
         report_type: PlayReportType,
+        title_id: u64,
         user_id: u128,
         process_id: u64,
         data1: &[u8],
@@ -113,7 +130,18 @@ impl PlayReport {
             data1.len(),
             data2.len()
         );
-        // TODO: forward to reporter via system.GetReporter().SavePlayReport(...)
+        let reporter_type = match report_type {
+            PlayReportType::Old => reporter::PlayReportType::Old,
+            PlayReportType::Old2 => reporter::PlayReportType::Old2,
+            PlayReportType::New => reporter::PlayReportType::New,
+            PlayReportType::System => reporter::PlayReportType::System,
+        };
+        let data: Vec<&[u8]> = if data2.is_empty() {
+            vec![data1]
+        } else {
+            vec![data1, data2]
+        };
+        self.reporter.save_play_report(reporter_type, title_id, &data, Some(process_id), Some(user_id));
     }
 
     /// RequestImmediateTransmission (cmd 10200).
@@ -150,7 +178,12 @@ impl PlayReport {
             data1.len(),
             data2.len()
         );
-        // TODO: forward to reporter
+        let data: Vec<&[u8]> = if data2.is_empty() {
+            vec![data1]
+        } else {
+            vec![data1, data2]
+        };
+        self.reporter.save_play_report(reporter::PlayReportType::System, title_id, &data, None, None);
     }
 
     /// SaveSystemReportWithUser (cmd 20101).
@@ -171,7 +204,12 @@ impl PlayReport {
             data1.len(),
             data2.len()
         );
-        // TODO: forward to reporter
+        let data: Vec<&[u8]> = if data2.is_empty() {
+            vec![data1]
+        } else {
+            vec![data1, data2]
+        };
+        self.reporter.save_play_report(reporter::PlayReportType::System, title_id, &data, None, Some(user_id));
     }
 
     // --- Handler bridge functions ---
@@ -326,6 +364,25 @@ impl ServiceFramework for PlayReport {
 ///
 /// Corresponds to `LoopProcess` in upstream prepo.cpp.
 pub fn loop_process() {
+    use crate::hle::service::server_manager::ServerManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+
     log::debug!("PlayReport::LoopProcess called");
-    // TODO: register services with ServerManager
+
+    let reporter = Arc::new(crate::reporter::Reporter::new());
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    for &name in &["prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u"] {
+        let r = reporter.clone();
+        let n = name.to_string();
+        server_manager.register_named_service(
+            name,
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(PlayReport::new(&n, r.clone()))
+            }),
+            64,
+        );
+    }
+
+    ServerManager::run_server(server_manager);
 }

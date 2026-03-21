@@ -7,12 +7,14 @@
 //! IBcatService: main BCAT service interface.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::bcat_types::*;
-use super::backend::ProgressServiceBackend;
+use super::backend::{BcatBackend, ProgressServiceBackend};
+use super::delivery_cache_progress_service::IDeliveryCacheProgressService;
 
 /// IPC command IDs for IBcatService
 pub mod commands {
@@ -46,14 +48,14 @@ pub mod commands {
 
 /// IBcatService corresponds to `IBcatService` in upstream `bcat_service.h`.
 pub struct IBcatService {
+    backend: Arc<Mutex<dyn BcatBackend + Send>>,
     pub progress: [ProgressServiceBackend; 2], // Normal, Directory
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    // TODO: backend reference
 }
 
 impl IBcatService {
-    pub fn new() -> Self {
+    pub fn new(backend: Arc<Mutex<dyn BcatBackend + Send>>) -> Self {
         let handlers = build_handler_map(&[
             (commands::REQUEST_SYNC_DELIVERY_CACHE, None, "RequestSyncDeliveryCache"),
             (commands::REQUEST_SYNC_DELIVERY_CACHE_WITH_DIRECTORY_NAME, None, "RequestSyncDeliveryCacheWithDirectoryName"),
@@ -84,6 +86,7 @@ impl IBcatService {
         ]);
 
         Self {
+            backend,
             progress: [
                 ProgressServiceBackend::new("Normal"),
                 ProgressServiceBackend::new("Directory"),
@@ -93,20 +96,62 @@ impl IBcatService {
         }
     }
 
-    pub fn request_sync_delivery_cache(&mut self) -> ResultCode {
+    pub fn request_sync_delivery_cache(
+        &mut self,
+    ) -> (ResultCode, Arc<IDeliveryCacheProgressService>) {
         log::debug!("IBcatService::request_sync_delivery_cache called");
-        // TODO: call backend.synchronize and create IDeliveryCacheProgressService
-        self.progress[SyncType::Normal as usize].finish_download(RESULT_SUCCESS);
-        RESULT_SUCCESS
+
+        let progress_backend = &mut self.progress[SyncType::Normal as usize];
+        // Upstream calls backend.Synchronize with title info and progress backend.
+        // We call the backend synchronize here.
+        {
+            let mut backend = self.backend.lock().unwrap();
+            backend.synchronize(
+                TitleIdVersion {
+                    title_id: 0, // Would come from system.GetApplicationProcessProgramID()
+                    build_id: 0, // Would come from system.GetApplicationProcessBuildID()
+                },
+                progress_backend,
+            );
+        }
+
+        let event = progress_backend.get_event();
+        let impl_data = progress_backend.get_impl().clone();
+        let service = Arc::new(IDeliveryCacheProgressService::new(event, impl_data));
+        (RESULT_SUCCESS, service)
     }
 
     pub fn request_sync_delivery_cache_with_directory_name(
         &mut self,
-        _name: &DirectoryName,
-    ) -> ResultCode {
-        log::debug!("IBcatService::request_sync_delivery_cache_with_directory_name called");
-        self.progress[SyncType::Directory as usize].finish_download(RESULT_SUCCESS);
-        RESULT_SUCCESS
+        name_raw: &DirectoryName,
+    ) -> (ResultCode, Arc<IDeliveryCacheProgressService>) {
+        let name = common::string_util::string_from_fixed_zero_terminated_buffer(
+            name_raw,
+            name_raw.len(),
+        );
+
+        log::debug!(
+            "IBcatService::request_sync_delivery_cache_with_directory_name called, name={}",
+            name
+        );
+
+        let progress_backend = &mut self.progress[SyncType::Directory as usize];
+        {
+            let mut backend = self.backend.lock().unwrap();
+            backend.synchronize_directory(
+                TitleIdVersion {
+                    title_id: 0,
+                    build_id: 0,
+                },
+                name,
+                progress_backend,
+            );
+        }
+
+        let event = progress_backend.get_event();
+        let impl_data = progress_backend.get_impl().clone();
+        let service = Arc::new(IDeliveryCacheProgressService::new(event, impl_data));
+        (RESULT_SUCCESS, service)
     }
 
     pub fn set_passphrase(&self, application_id: u64, passphrase_buffer: &[u8]) -> ResultCode {
@@ -120,7 +165,15 @@ impl IBcatService {
         if passphrase_buffer.len() > 0x40 {
             return super::bcat_result::RESULT_INVALID_ARGUMENT;
         }
-        // TODO: copy passphrase to backend
+
+        let mut passphrase = Passphrase::default();
+        let copy_len = std::cmp::min(passphrase.len(), passphrase_buffer.len());
+        passphrase[..copy_len].copy_from_slice(&passphrase_buffer[..copy_len]);
+
+        self.backend
+            .lock()
+            .unwrap()
+            .set_passphrase(application_id, &passphrase);
         RESULT_SUCCESS
     }
 
@@ -137,7 +190,13 @@ impl IBcatService {
         if application_id == 0 {
             return super::bcat_result::RESULT_INVALID_ARGUMENT;
         }
-        // TODO: call backend.clear
+        if !self.backend.lock().unwrap().clear(application_id) {
+            // Upstream: FileSys::ResultPermissionDenied — module FS(2), description 6400
+            return ResultCode::from_module_description(
+                crate::hle::result::ErrorModule::FS,
+                6400,
+            );
+        }
         RESULT_SUCCESS
     }
 
