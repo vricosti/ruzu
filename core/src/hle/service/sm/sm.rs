@@ -67,10 +67,7 @@ pub struct ServiceManager {
 
     /// Deferral event for service registration.
     /// Upstream: `Kernel::KEvent* deferral_event{}`.
-    /// When a service registers, this event is signaled so that deferred
-    /// GetService requests can be retried.
-    /// TODO: replace with actual KEvent when kernel integration is ready.
-    deferral_event_set: bool,
+    deferral_event: Option<Arc<crate::hle::service::os::event::Event>>,
 }
 
 impl ServiceManager {
@@ -83,7 +80,7 @@ impl ServiceManager {
             controller_interface: Arc::new(Controller::new()),
             registered_services: HashMap::new(),
             service_ports: HashMap::new(),
-            deferral_event_set: false,
+            deferral_event: None,
         }
     }
 
@@ -102,8 +99,8 @@ impl ServiceManager {
     /// Sets the deferral event.
     ///
     /// Matches upstream `ServiceManager::SetDeferralEvent(Kernel::KEvent*)`.
-    pub fn set_deferral_event(&mut self) {
-        self.deferral_event_set = true;
+    pub fn set_deferral_event(&mut self, event: Option<Arc<crate::hle::service::os::event::Event>>) {
+        self.deferral_event = event;
     }
 
     /// Registers a service.
@@ -146,8 +143,8 @@ impl ServiceManager {
         self.registered_services.insert(name, handler);
 
         // Signal deferral event so waiting GetService requests can retry.
-        // Upstream: if (deferral_event) { deferral_event->Signal(); }
-        if self.deferral_event_set {
+        if let Some(ref event) = self.deferral_event {
+            event.signal();
             log::debug!("ServiceManager: deferral event signaled after registration");
         }
 
@@ -232,7 +229,7 @@ impl Drop for ServiceManager {
             port.lock().unwrap().on_server_closed();
         }
         self.registered_services.clear();
-        // Upstream: if (deferral_event) { deferral_event->Close(); }
+        self.deferral_event = None;
     }
 }
 
@@ -584,28 +581,28 @@ impl ServiceFramework for Sm {
 ///     ServerManager::RunServer(std::move(server_manager));
 /// }
 /// ```
-pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
-    let mut server_manager = ServerManager::new(service_manager.clone());
+pub fn loop_process(
+    service_manager: &Arc<Mutex<ServiceManager>>,
+    system: crate::core::SystemRef,
+) {
+    let mut server_manager = ServerManager::new(system);
 
     // Manage deferral event.
     // Upstream: server_manager->ManageDeferral(&deferral_event);
     //           service_manager.SetDeferralEvent(deferral_event);
-    server_manager.manage_deferral();
-    service_manager.lock().unwrap().set_deferral_event();
+    let (_result, deferral_event) = server_manager.manage_deferral();
+    service_manager.lock().unwrap().set_deferral_event(deferral_event);
 
     // Register the "sm:" named port.
-    // Upstream uses ManageNamedPort (NOT RegisterNamedService) because "sm:"
-    // is discovered via KObjectName::Find, not through the SM service registry.
+    // Upstream: ManageNamedPort creates a KPort and registers it via
+    // KObjectName::NewFromName so ConnectToNamedPort can find it.
     let sm_service = Arc::new(Sm::new(service_manager.clone()));
     let sm_clone = sm_service.clone();
     let factory: SessionRequestHandlerFactory = Box::new(move || sm_clone.clone());
     server_manager.manage_named_port("sm:", factory, 64);
 
-    // Also register "sm:" on the ServiceManager so connect_to_named_port can
-    // find it. In upstream, connect_to_named_port uses KObjectName::Find
-    // which searches the kernel object namespace directly. Our implementation
-    // uses ServiceManager::get_service as a temporary workaround until
-    // KObjectName is ported.
+    // Also register in ServiceManager so get_service("sm:") works
+    // for internal HLE lookups (ConnectToNamedPort also checks ServiceManager).
     {
         let sm_clone2 = sm_service.clone();
         let factory2: SessionRequestHandlerFactory = Box::new(move || sm_clone2.clone());

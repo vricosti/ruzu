@@ -476,7 +476,7 @@ pub fn register_services(
     fsc: Arc<Mutex<FileSystemController>>,
 ) {
     let mut server_manager =
-        crate::hle::service::server_manager::ServerManager::new(service_manager.clone());
+        crate::hle::service::server_manager::ServerManager::new(crate::core::SystemRef::null());
 
     server_manager.register_named_service(
         "fsp-ldr",

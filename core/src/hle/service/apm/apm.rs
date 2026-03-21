@@ -39,7 +39,7 @@ impl Module {
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
     let module = Arc::new(Module::new());
     let controller = Arc::new(Mutex::new(super::apm_controller::Controller::new()));
-    let mut server_manager = ServerManager::new(service_manager.clone());
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
 
     let factory: SessionRequestHandlerFactory = {
         let module = module.clone();

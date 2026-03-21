@@ -1068,7 +1068,8 @@ impl System {
         system.kernel = Some(kernel);
         let service_manager = Arc::new(StdMutex::new(ServiceManager::new()));
         // Register "sm:" port so connect_to_named_port tests work.
-        crate::hle::service::sm::sm::loop_process(&service_manager);
+        let sys_ref = SystemRef::from_ref(&system);
+        crate::hle::service::sm::sm::loop_process(&service_manager, sys_ref);
         system.service_manager = Some(service_manager);
         system
     }

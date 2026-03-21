@@ -217,3 +217,34 @@ The following upstream code is Linux-only in ruzu. The Windows code paths are no
 
 ### Binary layout verification
 - PASS: no raw serialized structs are owned in this file.
+
+
+## Misc
+//Translate outgoing copy objects handles.
+//Upstream: handle_table.Add() for proper KAutoObject translation.
+//For now, skip past — handles were written by push_move_objects/push_copy_objects.
+//why is it different ? Would it be possible to be closer to upstream ?  
+
+  Upstream: PushCopyObjects pushes a KAutoObject* into outgoing_copy_objects. Then WriteToOutgoingCommandBuffer calls handle_table.Add(object) to get a handle and
+  writes it to cmd_buf.
+
+  Ours: push_copy_objects takes a u32 handle directly, writes it to cmd_buf immediately, AND pushes it to outgoing_copy_objects. Then WriteToOutgoingCommandBuffer just
+  skips past.
+
+  The difference: upstream defers handle creation to WriteToOutgoingCommandBuffer, we do it eagerly in push_copy_objects. This is because upstream services create
+  kernel objects (like KEvent) and push the object reference, while our services already have handle numbers.
+
+  To match upstream exactly, we'd need:
+  1. Change outgoing_copy_objects: Vec<u32> to Vec<Arc<dyn Any>> (kernel objects)
+  2. push_copy_objects stores the kernel object, not a handle
+  3. WriteToOutgoingCommandBuffer calls handle_table.Add() to create the handle
+
+  But this requires the handle table to accept arbitrary kernel objects. Our KHandleTable stores u64 opaque handles, not KAutoObject trait objects.
+
+  The behavioral result is identical — the guest receives the same handle value in the same IPC buffer position. The difference is architectural: we resolve handles
+  early, upstream resolves them late. Both produce the same guest-visible result.
+
+  Making it closer to upstream would require:
+  1. A KAutoObject trait with Open()/Close() methods
+  2. KHandleTable::Add(&dyn KAutoObject) -> Handle
+  3. All services push trait objects instead of pre-resolved handles

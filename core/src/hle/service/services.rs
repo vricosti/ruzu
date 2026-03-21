@@ -139,7 +139,7 @@ impl Services {
         // ── Guest core processes (upstream: blocking) ──
         // kernel.RunOnGuestCoreProcess("sm", ...) is called FIRST.
         // SM::LoopProcess registers the "sm:" port via ManageNamedPort.
-        crate::hle::service::sm::sm::loop_process(service_manager);
+        crate::hle::service::sm::sm::loop_process(service_manager, crate::core::SystemRef::null());
 
         // kernel.RunOnGuestCoreProcess("account",    [&] { Account::LoopProcess(system); });
         Self::loop_process_account(service_manager);
@@ -248,7 +248,7 @@ impl Services {
     // Services that are still stubs use `register_stub_services` below.
 
     fn loop_process_audio(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &[
             "audout:u", "audin:u", "audren:u", "audctl", "hwopus",
         ]);
@@ -263,19 +263,19 @@ impl Services {
     }
 
     fn loop_process_jit(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["jit:u"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_ldn(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["ldn:m", "ldn:s", "ldn:u"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_loader(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["ldr:pm", "ldr:shel", "ldr:dmnt"]);
         ServerManager::run_server(server_manager);
     }
@@ -285,7 +285,7 @@ impl Services {
     }
 
     fn loop_process_bsdsocket(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &[
             "bsd:u", "bsd:s", "bsdcfg", "nsd:u", "nsd:a", "sfdnsres",
         ]);
@@ -297,37 +297,37 @@ impl Services {
     }
 
     fn loop_process_account(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["acc:u0", "acc:u1"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_bcat(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["bcat:a", "bcat:u", "bcat:m", "bcat:s"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_bpc(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["bpc:r", "bpc:sf"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_btdrv(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["btdrv"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_btm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["btm", "btm:dbg", "btm:sys", "btm:u"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_capsrv(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &[
             "caps:a", "caps:c", "caps:u", "caps:ss", "caps:sc", "caps:su",
         ]);
@@ -335,37 +335,37 @@ impl Services {
     }
 
     fn loop_process_erpt(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["erpt:c", "erpt:r"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_es(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["es"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_eupld(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["eupld:c", "eupld:r"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_fatal(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["fatal:u"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_fgm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["fgm", "fgm:0", "fgm:9"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_friends(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &[
             "friend:u", "friend:v", "friend:m", "friend:s", "friend:a",
         ]);
@@ -373,7 +373,7 @@ impl Services {
     }
 
     fn loop_process_settings(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         // Register set, set:cal, set:fd as stubs
         register_stub_services(&mut server_manager, &["set", "set:cal", "set:fd"]);
         // Register set:sys with real ISystemSettingsServer implementation
@@ -388,7 +388,7 @@ impl Services {
     }
 
     fn loop_process_psc(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         // psc:c, psc:m as stubs
         register_stub_services(&mut server_manager, &["psc:c", "psc:m"]);
         // time:m — real PSC::Time::ServiceManager
@@ -405,13 +405,13 @@ impl Services {
     }
 
     fn loop_process_grc(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["grc:c", "grc:d"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_hid(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &[
             "hid", "hid:dbg", "hid:sys", "hidbus", "irs", "irs:sys", "xcd:sys",
         ]);
@@ -419,14 +419,14 @@ impl Services {
     }
 
     fn loop_process_lbl(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["lbl"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_lm(sm: &Arc<Mutex<ServiceManager>>) {
         // LM has a real implementation.
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         let factory: SessionRequestHandlerFactory = Box::new(|| {
             Arc::new(crate::hle::service::lm::lm::LM::new())
         });
@@ -435,79 +435,79 @@ impl Services {
     }
 
     fn loop_process_mig(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["mig:usr"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_mii(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["mii:u", "mii:e"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_mm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["mm:u"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_mnpp(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["mnpp:app"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_nvnflinger(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["dispdrv"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_ncm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["lr", "ncm"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_nfc(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["nfc:user", "nfc:sys"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_nfp(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["nfp:user", "nfp:sys"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_ngc(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["ngc:u"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_nifm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["nifm:u", "nifm:a", "nifm:s"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_nim(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["nim:shp"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_npns(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["npns:s", "npns:u"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_ns(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &[
             "ns:su", "ns:am2", "ns:ec", "ns:rid", "ns:rt", "ns:web", "ns:ro",
         ]);
@@ -535,31 +535,31 @@ impl Services {
     }
 
     fn loop_process_olsc(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["olsc:u"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_omm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["omm"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_pcie(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["pcie"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_pcv(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["pcv"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_prepo(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &[
             "prepo:u", "prepo:s", "prepo:m", "prepo:a",
         ]);
@@ -567,25 +567,25 @@ impl Services {
     }
 
     fn loop_process_pm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["pm:shell", "pm:dmnt", "pm:info"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_ptm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["ptm"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_ro(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["ro:1"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_spl(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &[
             "csrng",
             "spl:", "spl:mig", "spl:fs", "spl:ssl", "spl:es", "spl:manu",
@@ -594,13 +594,13 @@ impl Services {
     }
 
     fn loop_process_ssl(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["ssl"]);
         ServerManager::run_server(server_manager);
     }
 
     fn loop_process_usb(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(sm.clone());
+        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
         register_stub_services(&mut server_manager, &["usb:ds", "usb:hs", "usb:pm"]);
         ServerManager::run_server(server_manager);
     }

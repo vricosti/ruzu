@@ -19,7 +19,7 @@ use crate::hle::service::sm::sm::ServiceManager;
 /// In the C++ version, this creates a WindowSystem, ButtonPoller,
 /// EventObserver, and registers the two named services.
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
-    let mut server_manager = ServerManager::new(service_manager.clone());
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
 
     let factory: SessionRequestHandlerFactory = Box::new(|| -> SessionRequestHandlerPtr {
         Arc::new(super::service::application_proxy_service::IApplicationProxyService::new())
