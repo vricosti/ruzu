@@ -8,6 +8,7 @@ debug-logs = []
 
 [dependencies]
 common = { path = "../common" }
+hid_core = { path = "../hid_core" }
 aes.workspace = true
 bitflags.workspace = true
 cipher.workspace = true

@@ -6,7 +6,11 @@
 //!
 //! IAlbumApplicationService — "caps:u".
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::caps_types::{
     AlbumFileDateTime, AlbumStorage, ApplicationAlbumEntry, ApplicationAlbumFileEntry,
     ContentType, ShimLibraryVersion,
@@ -36,12 +40,34 @@ pub mod commands {
 ///
 /// Corresponds to `IAlbumApplicationService` in upstream caps_u.h / caps_u.cpp.
 pub struct IAlbumApplicationService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     // TODO: AlbumManager reference
 }
 
 impl IAlbumApplicationService {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (32, None, "SetShimLibraryVersion"),
+            (102, None, "GetAlbumFileList0AafeAruidDeprecated"),
+            (103, None, "DeleteAlbumFileByAruid"),
+            (104, None, "GetAlbumFileSizeByAruid"),
+            (105, None, "DeleteAlbumFileByAruidForDebug"),
+            (110, None, "LoadAlbumScreenShotImageByAruid"),
+            (120, None, "LoadAlbumScreenShotThumbnailImageByAruid"),
+            (130, None, "PrecheckToCreateContentsByAruid"),
+            (140, None, "GetAlbumFileList1AafeAruidDeprecated"),
+            (141, None, "GetAlbumFileList2AafeUidAruidDeprecated"),
+            (142, None, "GetAlbumFileList3AaeAruid"),
+            (143, None, "GetAlbumFileList4AaeUidAruid"),
+            (144, None, "GetAllAlbumFileList3AaeAruid"),
+            (60002, None, "OpenAccessorSessionForApplication"),
+        ]);
+
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// SetShimLibraryVersion (cmd 32).
@@ -112,5 +138,29 @@ impl IAlbumApplicationService {
         // TODO: manager.is_album_mounted(AlbumStorage::Sd)?;
         // TODO: manager.get_album_file_list(...)
         Ok(0)
+    }
+}
+
+impl SessionRequestHandler for IAlbumApplicationService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "caps:u"
+    }
+}
+
+impl ServiceFramework for IAlbumApplicationService {
+    fn get_service_name(&self) -> &str {
+        "caps:u"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

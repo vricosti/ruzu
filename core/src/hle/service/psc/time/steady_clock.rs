@@ -6,7 +6,11 @@
 //!
 //! ISteadyClock: provides steady clock time point queries.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::common::SteadyClockTimePoint;
 use super::errors::{
     RESULT_CLOCK_UNINITIALIZED, RESULT_NOT_IMPLEMENTED, RESULT_PERMISSION_DENIED,
@@ -38,10 +42,21 @@ pub struct SteadyClock {
     current_time_point: SteadyClockTimePoint,
     setup_result: ResultCode,
     rtc_reset_detected: bool,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl SteadyClock {
     pub fn new(can_write_steady_clock: bool, can_write_uninitialized_clock: bool) -> Self {
+        let handlers = build_handler_map(&[
+            (commands::GET_CURRENT_TIME_POINT, None, "GetCurrentTimePoint"),
+            (commands::GET_TEST_OFFSET, None, "GetTestOffset"),
+            (commands::SET_TEST_OFFSET, None, "SetTestOffset"),
+            (commands::GET_RTC_VALUE, None, "GetRtcValue"),
+            (commands::IS_RTC_RESET_DETECTED, None, "IsRtcResetDetected"),
+            (commands::GET_SETUP_RESULT_VALUE, None, "GetSetupResultValue"),
+            (commands::GET_INTERNAL_OFFSET, None, "GetInternalOffset"),
+        ]);
         Self {
             can_write_steady_clock,
             can_write_uninitialized_clock,
@@ -51,6 +66,8 @@ impl SteadyClock {
             current_time_point: SteadyClockTimePoint::default(),
             setup_result: RESULT_SUCCESS,
             rtc_reset_detected: false,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -173,5 +190,29 @@ impl SteadyClock {
             self.internal_offset
         );
         Ok(self.internal_offset)
+    }
+}
+
+impl SessionRequestHandler for SteadyClock {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ISteadyClock"
+    }
+}
+
+impl ServiceFramework for SteadyClock {
+    fn get_service_name(&self) -> &str {
+        "ISteadyClock"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

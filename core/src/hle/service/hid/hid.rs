@@ -2,6 +2,15 @@
 //!
 //! Entry point for the HID service module.
 
+use std::sync::Arc;
+
+use hid_core::hid_core::HIDCore;
+use hid_core::resource_manager::ResourceManager;
+use hid_core::resources::hid_firmware_settings::HidFirmwareSettings;
+
+use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
+use crate::hle::service::server_manager::ServerManager;
+
 /// Named services registered by the HID module:
 /// - "hid"      -> IHidServer
 /// - "hid:dbg"  -> IHidDebugServer
@@ -11,9 +20,77 @@
 /// - "irs:sys"  -> IRS_SYS
 /// - "xcd:sys"  -> XCD_SYS
 pub fn loop_process() {
-    // Upstream creates ResourceManager and HidFirmwareSettings, initializes
-    // ResourceManager, then registers: "hid", "hid:dbg", "hid:sys", "hidbus",
-    // "irs", "irs:sys", "xcd:sys" with the ServerManager.
-    // TODO: Wire up to ServerManager when service framework is ported.
-    log::warn!("HID::loop_process: ServerManager not yet ported, services not registered");
+    let firmware_settings = Arc::new(HidFirmwareSettings::new());
+    let hid_core = Arc::new(parking_lot::Mutex::new(HIDCore::new()));
+    let resource_manager = Arc::new(parking_lot::Mutex::new(
+        ResourceManager::new(firmware_settings.clone(), hid_core),
+    ));
+
+    resource_manager.lock().initialize();
+
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+
+    // "hid" -> IHidServer
+    {
+        let rm = resource_manager.clone();
+        let fw = firmware_settings.clone();
+        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
+            Arc::new(super::hid_server::IHidServer::new(rm.clone(), fw.clone()))
+        });
+        server_manager.register_named_service("hid", factory, 64);
+    }
+
+    // "hid:dbg" -> IHidDebugServer
+    {
+        let rm = resource_manager.clone();
+        let fw = firmware_settings.clone();
+        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
+            Arc::new(super::hid_debug_server::IHidDebugServer::new(rm.clone(), fw.clone()))
+        });
+        server_manager.register_named_service("hid:dbg", factory, 64);
+    }
+
+    // "hid:sys" -> IHidSystemServer
+    {
+        let rm = resource_manager.clone();
+        let fw = firmware_settings.clone();
+        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
+            Arc::new(super::hid_system_server::IHidSystemServer::new(rm.clone(), fw.clone()))
+        });
+        server_manager.register_named_service("hid:sys", factory, 64);
+    }
+
+    // "hidbus" -> Hidbus
+    {
+        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
+            Arc::new(super::hidbus::Hidbus::new())
+        });
+        server_manager.register_named_service("hidbus", factory, 64);
+    }
+
+    // "irs" -> IRS
+    {
+        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
+            Arc::new(super::irs::Irs::new())
+        });
+        server_manager.register_named_service("irs", factory, 64);
+    }
+
+    // "irs:sys" -> IRS_SYS
+    {
+        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
+            Arc::new(super::irs::IrsSys::new())
+        });
+        server_manager.register_named_service("irs:sys", factory, 64);
+    }
+
+    // "xcd:sys" -> XCD_SYS
+    {
+        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
+            Arc::new(super::xcd::XcdSys::new())
+        });
+        server_manager.register_named_service("xcd:sys", factory, 64);
+    }
+
+    ServerManager::run_server(server_manager);
 }

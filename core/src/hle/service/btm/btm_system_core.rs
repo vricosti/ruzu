@@ -6,33 +6,51 @@
 //!
 //! IBtmSystemCore — Bluetooth system core interface.
 
+use std::collections::BTreeMap;
 use crate::hle::result::ResultCode;
-
-/// IPC command table for IBtmSystemCore.
-pub mod commands {
-    pub const START_GAMEPAD_PAIRING: u32 = 0;
-    pub const CANCEL_GAMEPAD_PAIRING: u32 = 1;
-    pub const CLEAR_GAMEPAD_PAIRING_DATABASE: u32 = 2;
-    pub const GET_PAIRED_GAMEPAD_COUNT: u32 = 3;
-    pub const ENABLE_RADIO: u32 = 4;
-    pub const DISABLE_RADIO: u32 = 5;
-    pub const IS_RADIO_ENABLED: u32 = 6;
-    pub const ACQUIRE_RADIO_EVENT: u32 = 7;
-    pub const ACQUIRE_AUDIO_DEVICE_CONNECTION_EVENT: u32 = 14;
-    pub const GET_CONNECTED_AUDIO_DEVICES: u32 = 17;
-    pub const GET_PAIRED_AUDIO_DEVICES: u32 = 20;
-    pub const REQUEST_AUDIO_DEVICE_CONNECTION_REJECTION: u32 = 22;
-    pub const CANCEL_AUDIO_DEVICE_CONNECTION_REJECTION: u32 = 23;
-}
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IBtmSystemCore.
 pub struct IBtmSystemCore {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     // TODO: service_context, radio_event, audio_device_connection_event
 }
 
 impl IBtmSystemCore {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (0, None, "StartGamepadPairing"),
+            (1, None, "CancelGamepadPairing"),
+            (2, None, "ClearGamepadPairingDatabase"),
+            (3, None, "GetPairedGamepadCount"),
+            (4, None, "EnableRadio"),
+            (5, None, "DisableRadio"),
+            (6, None, "IsRadioEnabled"),
+            (7, None, "AcquireRadioEvent"),
+            (8, None, "AcquireGamepadPairingEvent"),
+            (9, None, "IsGamepadPairingStarted"),
+            (10, None, "StartAudioDeviceDiscovery"),
+            (11, None, "StopAudioDeviceDiscovery"),
+            (12, None, "IsDiscoveryingAudioDevice"),
+            (13, None, "GetDiscoveredAudioDevice"),
+            (14, None, "AcquireAudioDeviceConnectionEvent"),
+            (15, None, "ConnectAudioDevice"),
+            (16, None, "IsConnectingAudioDevice"),
+            (17, None, "GetConnectedAudioDevices"),
+            (18, None, "DisconnectAudioDevice"),
+            (19, None, "AcquirePairedAudioDeviceInfoChangedEvent"),
+            (20, None, "GetPairedAudioDevices"),
+            (21, None, "RemoveAudioDevicePairing"),
+            (22, None, "RequestAudioDeviceConnectionRejection"),
+            (23, None, "CancelAudioDeviceConnectionRejection"),
+        ]);
+
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// StartGamepadPairing (cmd 0).
@@ -52,4 +70,17 @@ impl IBtmSystemCore {
         log::debug!("IBtmSystemCore::is_radio_enabled (STUBBED) called");
         (ResultCode::new(0), true)
     }
+}
+
+impl SessionRequestHandler for IBtmSystemCore {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str { "IBtmSystemCore" }
+}
+
+impl ServiceFramework for IBtmSystemCore {
+    fn get_service_name(&self) -> &str { "IBtmSystemCore" }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
 }

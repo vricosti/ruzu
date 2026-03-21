@@ -6,7 +6,11 @@
 //!
 //! IDocumentInterface — document-related operations for NS.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IDocumentInterface.
 ///
@@ -20,11 +24,22 @@ pub mod commands {
 /// IDocumentInterface.
 ///
 /// Corresponds to `IDocumentInterface` in upstream.
-pub struct IDocumentInterface;
+pub struct IDocumentInterface {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl IDocumentInterface {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (commands::GET_APPLICATION_CONTENT_PATH, None, "GetApplicationContentPath"),
+            (commands::RESOLVE_APPLICATION_CONTENT_PATH, None, "ResolveApplicationContentPath"),
+            (commands::GET_RUNNING_APPLICATION_PROGRAM_ID, None, "GetRunningApplicationProgramId"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// ResolveApplicationContentPath (cmd 23).
@@ -53,5 +68,29 @@ impl IDocumentInterface {
         log::warn!("(STUBBED) GetRunningApplicationProgramId called");
         // TODO: return system.get_application_process_program_id()
         Ok(0)
+    }
+}
+
+impl SessionRequestHandler for IDocumentInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ns::IDocumentInterface"
+    }
+}
+
+impl ServiceFramework for IDocumentInterface {
+    fn get_service_name(&self) -> &str {
+        "ns::IDocumentInterface"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

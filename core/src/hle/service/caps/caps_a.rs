@@ -6,7 +6,11 @@
 //!
 //! IAlbumAccessorService — "caps:a".
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ErrorModule, ResultCode};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::caps_result::*;
 use super::caps_types::{
     AlbumEntry, AlbumFileId, AlbumStorage, LoadAlbumScreenShotImageOutput, ScreenShotDecodeOption,
@@ -61,12 +65,59 @@ pub mod commands {
 ///
 /// Corresponds to `IAlbumAccessorService` in upstream caps_a.h / caps_a.cpp.
 pub struct IAlbumAccessorService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     // TODO: AlbumManager reference
 }
 
 impl IAlbumAccessorService {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (0, None, "GetAlbumFileCount"),
+            (1, None, "GetAlbumFileList"),
+            (2, None, "LoadAlbumFile"),
+            (3, None, "DeleteAlbumFile"),
+            (4, None, "StorageCopyAlbumFile"),
+            (5, None, "IsAlbumMounted"),
+            (6, None, "GetAlbumUsage"),
+            (7, None, "GetAlbumFileSize"),
+            (8, None, "LoadAlbumFileThumbnail"),
+            (9, None, "LoadAlbumScreenShotImage"),
+            (10, None, "LoadAlbumScreenShotThumbnailImage"),
+            (11, None, "GetAlbumEntryFromApplicationAlbumEntry"),
+            (12, None, "LoadAlbumScreenShotImageEx"),
+            (13, None, "LoadAlbumScreenShotThumbnailImageEx"),
+            (14, None, "LoadAlbumScreenShotImageEx0"),
+            (15, None, "GetAlbumUsage3"),
+            (16, None, "GetAlbumMountResult"),
+            (17, None, "GetAlbumUsage16"),
+            (18, None, "Unknown18"),
+            (19, None, "Unknown19"),
+            (100, None, "GetAlbumFileCountEx0"),
+            (101, None, "GetAlbumFileListEx0"),
+            (202, None, "SaveEditedScreenShot"),
+            (301, None, "GetLastThumbnail"),
+            (302, None, "GetLastOverlayMovieThumbnail"),
+            (401, None, "GetAutoSavingStorage"),
+            (501, None, "GetRequiredStorageSpaceSizeToCopyAll"),
+            (1001, None, "LoadAlbumScreenShotThumbnailImageEx0"),
+            (1002, None, "LoadAlbumScreenShotImageEx1"),
+            (1003, None, "LoadAlbumScreenShotThumbnailImageEx1"),
+            (8001, None, "ForceAlbumUnmounted"),
+            (8002, None, "ResetAlbumMountStatus"),
+            (8011, None, "RefreshAlbumCache"),
+            (8012, None, "GetAlbumCache"),
+            (8013, None, "GetAlbumCacheEx"),
+            (8021, None, "GetAlbumEntryFromApplicationAlbumEntryAruid"),
+            (10011, None, "SetInternalErrorConversionEnabled"),
+            (50000, None, "LoadMakerNoteInfoForDebug"),
+            (60002, None, "OpenAccessorSession"),
+        ]);
+
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// GetAlbumFileList (cmd 1).
@@ -257,5 +308,29 @@ impl IAlbumAccessorService {
         }
 
         in_result
+    }
+}
+
+impl SessionRequestHandler for IAlbumAccessorService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "caps:a"
+    }
+}
+
+impl ServiceFramework for IAlbumAccessorService {
+    fn get_service_name(&self) -> &str {
+        "caps:a"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

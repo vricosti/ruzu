@@ -6,11 +6,17 @@
 //!
 //! SFDNSRES service — DNS resolution ("sfdnsres").
 
+use std::collections::BTreeMap;
+
 use super::sockets::{Domain, Errno};
 use super::sockets_translate::{
     get_addr_info_error_string, get_addr_info_error_to_errno, get_addr_info_error_to_netdb_error,
     GetAddrInfoError, NetDbError, SockAddrIn,
 };
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for SFDNSRES.
 ///
@@ -82,11 +88,36 @@ pub struct GetAddrInfoWithOptionsOutput {
 /// SFDNSRES service.
 ///
 /// Corresponds to `SFDNSRES` in upstream sfdnsres.h / sfdnsres.cpp.
-pub struct Sfdnsres;
+pub struct Sfdnsres {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl Sfdnsres {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (0, None, "SetDnsAddressesPrivateRequest"),
+            (1, None, "GetDnsAddressPrivateRequest"),
+            (2, None, "GetHostByNameRequest"),
+            (3, None, "GetHostByAddrRequest"),
+            (4, None, "GetHostStringErrorRequest"),
+            (5, Some(Sfdnsres::get_gai_string_error_handler), "GetGaiStringErrorRequest"),
+            (6, None, "GetAddrInfoRequest"),
+            (7, None, "GetNameInfoRequest"),
+            (8, None, "RequestCancelHandleRequest"),
+            (9, None, "CancelRequest"),
+            (10, None, "GetHostByNameRequestWithOptions"),
+            (11, None, "GetHostByAddrRequestWithOptions"),
+            (12, None, "GetAddrInfoRequestWithOptions"),
+            (13, None, "GetNameInfoRequestWithOptions"),
+            (14, Some(Sfdnsres::resolver_set_option_request_handler), "ResolverSetOptionRequest"),
+            (15, None, "ResolverGetOptionRequest"),
+        ]);
+
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// Append a value as raw bytes to a buffer.
@@ -315,5 +346,49 @@ impl Sfdnsres {
     pub fn resolver_set_option_request(&self) -> i32 {
         log::warn!("ResolverSetOptionRequest (STUBBED) called");
         0 // bsd errno = success
+    }
+
+    fn get_gai_string_error_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let gai_errno = rp.pop_i32();
+
+        let result = Sfdnsres::get_gai_string_error(gai_errno);
+        ctx.write_buffer(result.as_bytes(), 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn resolver_set_option_request_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Sfdnsres) };
+        let bsd_errno = svc.resolver_set_option_request();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(bsd_errno);
+    }
+}
+
+impl SessionRequestHandler for Sfdnsres {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "sfdnsres"
+    }
+}
+
+impl ServiceFramework for Sfdnsres {
+    fn get_service_name(&self) -> &str {
+        "sfdnsres"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

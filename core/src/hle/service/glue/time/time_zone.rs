@@ -7,9 +7,12 @@
 //! TimeZoneService: glue-layer timezone service that wraps PSC::Time::TimeZoneService
 //! and adds timezone binary file loading support.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use crate::hle::service::psc::time::common::{
     CalendarAdditionalInfo, CalendarTime, LocationName, RuleVersion, SteadyClockTimePoint,
 };
@@ -30,13 +33,13 @@ pub mod commands {
     pub const LOAD_TIME_ZONE_RULE: u32 = 4;
     pub const GET_TIME_ZONE_RULE_VERSION: u32 = 5;
     pub const GET_DEVICE_LOCATION_NAME_AND_UPDATED_TIME: u32 = 6;
-    pub const SET_DEVICE_LOCATION_NAME_WITH_TIME_ZONE_BINARY: u32 = 7;
+    pub const SET_DEVICE_LOCATION_NAME_WITH_TIME_ZONE_RULE: u32 = 7;
     pub const PARSE_TIME_ZONE_BINARY: u32 = 8;
-    pub const GET_DEVICE_LOCATION_NAME_OPERATION_EVENT_READ_ONLY: u32 = 9;
-    pub const TO_CALENDAR_TIME: u32 = 20;
-    pub const TO_CALENDAR_TIME_WITH_MY_RULE: u32 = 21;
-    pub const TO_POSIX_TIME: u32 = 100;
-    pub const TO_POSIX_TIME_WITH_MY_RULE: u32 = 101;
+    pub const GET_DEVICE_LOCATION_NAME_OPERATION_EVENT_READABLE_HANDLE: u32 = 20;
+    pub const TO_CALENDAR_TIME: u32 = 100;
+    pub const TO_CALENDAR_TIME_WITH_MY_RULE: u32 = 101;
+    pub const TO_POSIX_TIME: u32 = 201;
+    pub const TO_POSIX_TIME_WITH_MY_RULE: u32 = 202;
 }
 
 /// Glue-layer TimeZoneService.
@@ -58,9 +61,30 @@ pub struct TimeZoneService {
     time_zone_binary: Mutex<TimeZoneBinary>,
     /// Mutex for location changes. Upstream: `m_mutex`.
     mutex: Mutex<()>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl TimeZoneService {
+    fn build_handlers() -> BTreeMap<u32, FunctionInfo> {
+        build_handler_map(&[
+            (commands::GET_DEVICE_LOCATION_NAME, None, "GetDeviceLocationName"),
+            (commands::SET_DEVICE_LOCATION_NAME, None, "SetDeviceLocationName"),
+            (commands::GET_TOTAL_LOCATION_NAME_COUNT, None, "GetTotalLocationNameCount"),
+            (commands::LOAD_LOCATION_NAME_LIST, None, "LoadLocationNameList"),
+            (commands::LOAD_TIME_ZONE_RULE, None, "LoadTimeZoneRule"),
+            (commands::GET_TIME_ZONE_RULE_VERSION, None, "GetTimeZoneRuleVersion"),
+            (commands::GET_DEVICE_LOCATION_NAME_AND_UPDATED_TIME, None, "GetDeviceLocationNameAndUpdatedTime"),
+            (commands::SET_DEVICE_LOCATION_NAME_WITH_TIME_ZONE_RULE, None, "SetDeviceLocationNameWithTimeZoneRule"),
+            (commands::PARSE_TIME_ZONE_BINARY, None, "ParseTimeZoneBinary"),
+            (commands::GET_DEVICE_LOCATION_NAME_OPERATION_EVENT_READABLE_HANDLE, None, "GetDeviceLocationNameOperationEventReadableHandle"),
+            (commands::TO_CALENDAR_TIME, None, "ToCalendarTime"),
+            (commands::TO_CALENDAR_TIME_WITH_MY_RULE, None, "ToCalendarTimeWithMyRule"),
+            (commands::TO_POSIX_TIME, None, "ToPosixTime"),
+            (commands::TO_POSIX_TIME_WITH_MY_RULE, None, "ToPosixTimeWithMyRule"),
+        ])
+    }
+
     pub fn new(can_write_timezone_device_location: bool) -> Self {
         let mut tz_binary = TimeZoneBinary::new();
         let _ = tz_binary.mount();
@@ -71,6 +95,8 @@ impl TimeZoneService {
             )),
             time_zone_binary: Mutex::new(tz_binary),
             mutex: Mutex::new(()),
+            handlers: Self::build_handlers(),
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -85,6 +111,8 @@ impl TimeZoneService {
             wrapped_service: Mutex::new(wrapped_service),
             time_zone_binary: Mutex::new(time_zone_binary),
             mutex: Mutex::new(()),
+            handlers: Self::build_handlers(),
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -287,5 +315,29 @@ impl TimeZoneService {
             return Ok(0);
         }
         Ok(out_times[0])
+    }
+}
+
+impl SessionRequestHandler for TimeZoneService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ITimeZoneService"
+    }
+}
+
+impl ServiceFramework for TimeZoneService {
+    fn get_service_name(&self) -> &str {
+        "ITimeZoneService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

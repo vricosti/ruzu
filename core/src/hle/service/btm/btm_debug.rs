@@ -6,25 +6,52 @@
 //!
 //! IBtmDebug — "btm:dbg".
 
-/// IPC command table for IBtmDebug (all stubs).
-pub mod commands {
-    pub const ACQUIRE_DISCOVERY_EVENT: u32 = 0;
-    pub const START_DISCOVERY: u32 = 1;
-    pub const CANCEL_DISCOVERY: u32 = 2;
-    pub const GET_DEVICE_PROPERTY: u32 = 3;
-    pub const CREATE_BOND: u32 = 4;
-    pub const CANCEL_BOND: u32 = 5;
-    pub const SET_TSI_MODE: u32 = 6;
-    pub const GENERAL_TEST: u32 = 7;
-    pub const HID_CONNECT: u32 = 8;
-    pub const GENERAL_GET: u32 = 9;
-}
+use std::collections::BTreeMap;
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IBtmDebug.
-pub struct IBtmDebug;
+pub struct IBtmDebug {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl IBtmDebug {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (0, None, "AcquireDiscoveryEvent"),
+            (1, None, "StartDiscovery"),
+            (2, None, "CancelDiscovery"),
+            (3, None, "GetDeviceProperty"),
+            (4, None, "CreateBond"),
+            (5, None, "CancelBond"),
+            (6, None, "SetTsiMode"),
+            (7, None, "GeneralTest"),
+            (8, None, "HidConnect"),
+            (9, None, "GeneralGet"),
+            (10, None, "GetGattClientDisconnectionReason"),
+            (11, None, "GetBleConnectionParameter"),
+            (12, None, "GetBleConnectionParameterRequest"),
+            (13, None, "Unknown13"),
+        ]);
+
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
+}
+
+impl SessionRequestHandler for IBtmDebug {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str { "btm:dbg" }
+}
+
+impl ServiceFramework for IBtmDebug {
+    fn get_service_name(&self) -> &str { "btm:dbg" }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
 }

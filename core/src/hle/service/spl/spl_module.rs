@@ -6,7 +6,11 @@
 //!
 //! Module::Interface — SPL general service interface with GetConfig implementation.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::spl_results;
 use super::spl_types::ConfigItem;
 
@@ -35,18 +39,37 @@ pub mod commands {
 ///
 /// Corresponds to `Module::Interface` in upstream spl_module.h / spl_module.cpp.
 pub struct ModuleInterface {
+    name: String,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     rng_seed: u32,
 }
 
 impl ModuleInterface {
-    pub fn new(rng_seed: Option<u32>) -> Self {
+    pub fn new(name: &str, rng_seed: Option<u32>) -> Self {
         let seed = rng_seed.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as u32)
                 .unwrap_or(0)
         });
-        Self { rng_seed: seed }
+
+        let handlers = build_handler_map(&[
+            (0, None, "GetConfig"),
+            (1, None, "ModularExponentiate"),
+            (5, None, "SetConfig"),
+            (7, None, "GenerateRandomBytes"),
+            (11, None, "IsDevelopment"),
+            (24, None, "SetBootReason"),
+            (25, None, "GetBootReason"),
+        ]);
+
+        Self {
+            name: name.to_string(),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+            rng_seed: seed,
+        }
     }
 
     /// GetConfig (cmd 0).
@@ -173,5 +196,29 @@ impl ModuleInterface {
     pub fn get_boot_reason(&self) -> ResultCode {
         log::warn!("GetBootReason is not implemented!");
         spl_results::RESULT_SECURE_MONITOR_NOT_IMPLEMENTED
+    }
+}
+
+impl SessionRequestHandler for ModuleInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl ServiceFramework for ModuleInterface {
+    fn get_service_name(&self) -> &str {
+        &self.name
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

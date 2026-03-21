@@ -7,7 +7,11 @@
 //! Interface -- NFP interface for amiibo operations.
 //! This is the concrete NFP service that extends NfcInterface (NFC base).
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::nfp_types::{
     BreakType, DeviceState, ModelType, MountTarget, WriteType,
 };
@@ -72,15 +76,48 @@ pub struct Interface {
     system: crate::core::SystemRef,
     name: String,
     device_state: DeviceState,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     // In upstream this holds a DeviceManager reference
 }
 
 impl Interface {
     pub fn new(system: crate::core::SystemRef, name: &str) -> Self {
+        // IUser command table from upstream nfp.cpp
+        let handlers = build_handler_map(&[
+            (commands::INITIALIZE, None, "Initialize"),
+            (commands::FINALIZE, None, "Finalize"),
+            (commands::LIST_DEVICES, None, "ListDevices"),
+            (commands::START_DETECTION, None, "StartDetection"),
+            (commands::STOP_DETECTION, None, "StopDetection"),
+            (commands::MOUNT, None, "Mount"),
+            (commands::UNMOUNT, None, "Unmount"),
+            (commands::OPEN_APPLICATION_AREA, None, "OpenApplicationArea"),
+            (commands::GET_APPLICATION_AREA, None, "GetApplicationArea"),
+            (commands::SET_APPLICATION_AREA, None, "SetApplicationArea"),
+            (commands::FLUSH, None, "Flush"),
+            (commands::RESTORE, None, "Restore"),
+            (commands::CREATE_APPLICATION_AREA, None, "CreateApplicationArea"),
+            (commands::GET_TAG_INFO, None, "GetTagInfo"),
+            (commands::GET_REGISTER_INFO, None, "GetRegisterInfo"),
+            (commands::GET_COMMON_INFO, None, "GetCommonInfo"),
+            (commands::GET_MODEL_INFO, None, "GetModelInfo"),
+            (commands::ATTACH_ACTIVATE_EVENT, None, "AttachActivateEvent"),
+            (commands::ATTACH_DEACTIVATE_EVENT, None, "AttachDeactivateEvent"),
+            (commands::GET_STATE, None, "GetState"),
+            (commands::GET_DEVICE_STATE, None, "GetDeviceState"),
+            (commands::GET_NFC_NPAD_ID, None, "GetNpadId"),
+            (commands::GET_APPLICATION_AREA_SIZE, None, "GetApplicationAreaSize"),
+            (commands::ATTACH_AVAILABILITY_CHANGE_EVENT, None, "AttachAvailabilityChangeEvent"),
+            (commands::RECREATE_APPLICATION_AREA, None, "RecreateApplicationArea"),
+        ]);
+
         Self {
             system,
             name: name.to_string(),
             device_state: DeviceState::Initialized,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -352,5 +389,29 @@ impl Interface {
     /// GetDeviceState (cmd 20).
     pub fn get_device_state(&self) -> DeviceState {
         self.device_state
+    }
+}
+
+impl SessionRequestHandler for Interface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl ServiceFramework for Interface {
+    fn get_service_name(&self) -> &str {
+        &self.name
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

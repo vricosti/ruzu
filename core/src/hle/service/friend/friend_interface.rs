@@ -6,7 +6,12 @@
 //!
 //! Friend interface service ("friend:a", "friend:m", "friend:s", "friend:u", "friend:v").
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::friend::Module;
 
 /// IPC command IDs for Friend interface
@@ -23,14 +28,24 @@ pub struct Friend {
     system: crate::core::SystemRef,
     module: Arc<Module>,
     name: String,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl Friend {
     pub fn new(system: crate::core::SystemRef, module: Arc<Module>, name: &str) -> Self {
+        let handlers = build_handler_map(&[
+            (commands::CREATE_FRIEND_SERVICE, None, "CreateFriendService"),
+            (commands::CREATE_NOTIFICATION_SERVICE, None, "CreateNotificationService"),
+            (commands::CREATE_DAEMON_SUSPEND_SESSION_SERVICE, None, "CreateDaemonSuspendSessionService"),
+        ]);
+
         Self {
             system,
             module,
             name: name.to_string(),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -51,6 +66,30 @@ impl Friend {
             uuid
         );
         super::friend::INotificationService::new(uuid)
+    }
+}
+
+impl SessionRequestHandler for Friend {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl ServiceFramework for Friend {
+    fn get_service_name(&self) -> &str {
+        &self.name
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
 

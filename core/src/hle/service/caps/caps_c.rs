@@ -6,7 +6,11 @@
 //!
 //! IAlbumControlService — "caps:c".
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::caps_types::ShimLibraryVersion;
 
 /// IPC command table for IAlbumControlService.
@@ -38,12 +42,39 @@ pub mod commands {
 ///
 /// Corresponds to `IAlbumControlService` in upstream caps_c.h / caps_c.cpp.
 pub struct IAlbumControlService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     // TODO: AlbumManager reference
 }
 
 impl IAlbumControlService {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (1, None, "CaptureRawImage"),
+            (2, None, "CaptureRawImageWithTimeout"),
+            (33, None, "SetShimLibraryVersion"),
+            (1001, None, "RequestTakingScreenShot"),
+            (1002, None, "RequestTakingScreenShotWithTimeout"),
+            (1011, None, "NotifyTakingScreenShotRefused"),
+            (2001, None, "NotifyAlbumStorageIsAvailable"),
+            (2002, None, "NotifyAlbumStorageIsUnavailable"),
+            (2011, None, "RegisterAppletResourceUserId"),
+            (2012, None, "UnregisterAppletResourceUserId"),
+            (2013, None, "GetApplicationIdFromAruid"),
+            (2014, None, "CheckApplicationIdRegistered"),
+            (2101, None, "GenerateCurrentAlbumFileId"),
+            (2102, None, "GenerateApplicationAlbumEntry"),
+            (2201, None, "SaveAlbumScreenShotFile"),
+            (2202, None, "SaveAlbumScreenShotFileEx"),
+            (2301, None, "SetOverlayScreenShotThumbnailData"),
+            (2302, None, "SetOverlayMovieThumbnailData"),
+            (60001, None, "OpenControlSession"),
+        ]);
+
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// SetShimLibraryVersion (cmd 33).
@@ -60,5 +91,29 @@ impl IAlbumControlService {
             aruid,
         );
         Ok(())
+    }
+}
+
+impl SessionRequestHandler for IAlbumControlService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "caps:c"
+    }
+}
+
+impl ServiceFramework for IAlbumControlService {
+    fn get_service_name(&self) -> &str {
+        "caps:c"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

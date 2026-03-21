@@ -6,7 +6,12 @@
 //!
 //! ISettingsServer service ("set").
 
-use crate::hle::result::{ErrorModule, ResultCode};
+use std::collections::BTreeMap;
+
+use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::key_code_map::*;
 use super::settings_types::{
     KeyboardLayout, Language, LanguageCode, SystemRegionCode, AVAILABLE_LANGUAGE_CODES,
@@ -105,15 +110,36 @@ pub struct ISettingsServer {
     quest_flag: bool,
     /// Device name (from settings).
     device_name: String,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ISettingsServer {
+    fn build_handlers() -> BTreeMap<u32, FunctionInfo> {
+        build_handler_map(&[
+            (commands::GET_LANGUAGE_CODE, Some(Self::get_language_code_handler), "GetLanguageCode"),
+            (commands::GET_AVAILABLE_LANGUAGE_CODES, Some(Self::get_available_language_codes_handler), "GetAvailableLanguageCodes"),
+            (commands::MAKE_LANGUAGE_CODE, Some(Self::make_language_code_handler), "MakeLanguageCode"),
+            (commands::GET_AVAILABLE_LANGUAGE_CODE_COUNT, Some(Self::get_available_language_code_count_handler), "GetAvailableLanguageCodeCount"),
+            (commands::GET_REGION_CODE, Some(Self::get_region_code_handler), "GetRegionCode"),
+            (commands::GET_AVAILABLE_LANGUAGE_CODES2, Some(Self::get_available_language_codes2_handler), "GetAvailableLanguageCodes2"),
+            (commands::GET_AVAILABLE_LANGUAGE_CODE_COUNT2, Some(Self::get_available_language_code_count2_handler), "GetAvailableLanguageCodeCount2"),
+            (commands::GET_KEY_CODE_MAP, Some(Self::get_key_code_map_handler), "GetKeyCodeMap"),
+            (commands::GET_QUEST_FLAG, Some(Self::get_quest_flag_handler), "GetQuestFlag"),
+            (commands::GET_KEY_CODE_MAP2, Some(Self::get_key_code_map2_handler), "GetKeyCodeMap2"),
+            (commands::GET_FIRMWARE_VERSION_FOR_DEBUG, None, "GetFirmwareVersionForDebug"),
+            (commands::GET_DEVICE_NICK_NAME, Some(Self::get_device_nick_name_handler), "GetDeviceNickName"),
+        ])
+    }
+
     pub fn new() -> Self {
         Self {
             language_index: 1,
             region_index: 1,
             quest_flag: false,
             device_name: "yuzu".to_string(),
+            handlers: Self::build_handlers(),
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -129,6 +155,8 @@ impl ISettingsServer {
             region_index,
             quest_flag,
             device_name,
+            handlers: Self::build_handlers(),
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -244,6 +272,148 @@ impl ISettingsServer {
         let len = bytes.len().min(out.len());
         out[..len].copy_from_slice(&bytes[..len]);
         out
+    }
+
+    // --- Handler bridge functions ---
+
+    fn get_language_code_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let code = service.get_language_code();
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(code as u64);
+    }
+
+    fn get_available_language_codes_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let max_entries = ctx.get_write_buffer_size(0) / std::mem::size_of::<LanguageCode>();
+        let (count, codes) = service.get_available_language_codes(max_entries);
+
+        let bytes: Vec<u8> = codes.iter().flat_map(|c| (*c as u64).to_le_bytes()).collect();
+        ctx.write_buffer(&bytes, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(count);
+    }
+
+    fn make_language_code_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let mut rp = RequestParser::new(ctx);
+        let language = rp.pop_u32();
+
+        match service.make_language_code(language) {
+            Ok(code) => {
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u64(code as u64);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn get_available_language_code_count_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let count = service.get_available_language_code_count();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(count);
+    }
+
+    fn get_region_code_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let region = service.get_region_code();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(region as u32);
+    }
+
+    fn get_available_language_codes2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let max_entries = ctx.get_write_buffer_size(0) / std::mem::size_of::<LanguageCode>();
+        let (count, codes) = service.get_available_language_codes2(max_entries);
+
+        let bytes: Vec<u8> = codes.iter().flat_map(|c| (*c as u64).to_le_bytes()).collect();
+        ctx.write_buffer(&bytes, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(count);
+    }
+
+    fn get_available_language_code_count2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let count = service.get_available_language_code_count2();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(count);
+    }
+
+    fn get_key_code_map_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let map = service.get_key_code_map();
+        ctx.write_buffer(&map, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_quest_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let flag = service.get_quest_flag();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(flag);
+    }
+
+    fn get_key_code_map2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let map = service.get_key_code_map2();
+        ctx.write_buffer(&map, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_device_nick_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let name = service.get_device_nick_name();
+        ctx.write_buffer(&name, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for ISettingsServer {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "set"
+    }
+}
+
+impl ServiceFramework for ISettingsServer {
+    fn get_service_name(&self) -> &str {
+        "set"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
 

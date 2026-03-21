@@ -5,22 +5,45 @@
 //!
 //! GRC service ("grc:c"). All commands are unimplemented stubs.
 
-/// IPC command IDs for GRC
-pub mod commands {
-    pub const OPEN_CONTINUOUS_RECORDER: u32 = 1;
-    pub const OPEN_GAME_MOVIE_TRIMMER: u32 = 2;
-    pub const OPEN_OFFSCREEN_RECORDER: u32 = 3;
-    pub const CREATE_MOVIE_MAKER: u32 = 101;
-    pub const SET_OFFSCREEN_RECORDING_MARKER: u32 = 9903;
-}
+use std::collections::BTreeMap;
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// GRC service ("grc:c"). All stubs.
-pub struct GRC;
+pub struct GRC {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl GRC {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (1, None, "OpenContinuousRecorder"),
+            (2, None, "OpenGameMovieTrimmer"),
+            (3, None, "OpenOffscreenRecorder"),
+            (101, None, "CreateMovieMaker"),
+            (9903, None, "SetOffscreenRecordingMarker"),
+        ]);
+
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
+}
+
+impl SessionRequestHandler for GRC {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str { "grc:c" }
+}
+
+impl ServiceFramework for GRC {
+    fn get_service_name(&self) -> &str { "grc:c" }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
 }
 
 /// Registers "grc:c" service.

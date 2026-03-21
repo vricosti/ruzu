@@ -6,7 +6,11 @@
 //!
 //! IReadOnlyApplicationControlDataInterface — reads NACP and icon data.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Application control source.
 ///
@@ -57,11 +61,24 @@ pub mod commands {
 /// IReadOnlyApplicationControlDataInterface.
 ///
 /// Corresponds to `IReadOnlyApplicationControlDataInterface` in upstream.
-pub struct IReadOnlyApplicationControlDataInterface;
+pub struct IReadOnlyApplicationControlDataInterface {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl IReadOnlyApplicationControlDataInterface {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (commands::GET_APPLICATION_CONTROL_DATA, None, "GetApplicationControlData"),
+            (commands::GET_APPLICATION_DESIRED_LANGUAGE, None, "GetApplicationDesiredLanguage"),
+            (commands::CONVERT_APPLICATION_LANGUAGE_TO_LANGUAGE_CODE, None, "ConvertApplicationLanguageToLanguageCode"),
+            (commands::CONVERT_LANGUAGE_CODE_TO_APPLICATION_LANGUAGE, None, "ConvertLanguageCodeToApplicationLanguage"),
+            (commands::SELECT_APPLICATION_DESIRED_LANGUAGE, None, "SelectApplicationDesiredLanguage"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// GetApplicationControlData (cmd 0).
@@ -159,5 +176,29 @@ impl IReadOnlyApplicationControlDataInterface {
         };
 
         Ok(language_code as u64)
+    }
+}
+
+impl SessionRequestHandler for IReadOnlyApplicationControlDataInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ns::IReadOnlyApplicationControlDataInterface"
+    }
+}
+
+impl ServiceFramework for IReadOnlyApplicationControlDataInterface {
+    fn get_service_name(&self) -> &str {
+        "ns::IReadOnlyApplicationControlDataInterface"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

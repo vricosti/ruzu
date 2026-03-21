@@ -251,6 +251,11 @@ impl<'a> ResponseBuilder<'a> {
         self.push_u8(value as u8);
     }
 
+    /// Push a f32 value.
+    pub fn push_f32(&mut self, value: f32) {
+        self.push_u32(value.to_bits());
+    }
+
     /// Push a i32 value.
     pub fn push_i32(&mut self, value: i32) {
         self.push_u32(value as u32);

@@ -6,7 +6,11 @@
 //!
 //! IContentManagementInterface — content management operations for NS.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::ns_types::{ApplicationOccupiedSize, ApplicationOccupiedSizeEntity};
 
 /// IPC command table for IContentManagementInterface.
@@ -26,11 +30,27 @@ pub mod commands {
 /// IContentManagementInterface.
 ///
 /// Corresponds to `IContentManagementInterface` in upstream.
-pub struct IContentManagementInterface;
+pub struct IContentManagementInterface {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl IContentManagementInterface {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (commands::CALCULATE_APPLICATION_OCCUPIED_SIZE, None, "CalculateApplicationOccupiedSize"),
+            (commands::CHECK_SD_CARD_MOUNT_STATUS, None, "CheckSdCardMountStatus"),
+            (commands::GET_TOTAL_SPACE_SIZE, None, "GetTotalSpaceSize"),
+            (commands::GET_FREE_SPACE_SIZE, None, "GetFreeSpaceSize"),
+            (commands::COUNT_APPLICATION_CONTENT_META, None, "CountApplicationContentMeta"),
+            (commands::LIST_APPLICATION_CONTENT_META_STATUS, None, "ListApplicationContentMetaStatus"),
+            (commands::LIST_APPLICATION_CONTENT_META_STATUS_WITH_RIGHTS_CHECK, None, "ListApplicationContentMetaStatusWithRightsCheck"),
+            (commands::IS_ANY_APPLICATION_RUNNING, None, "IsAnyApplicationRunning"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// CalculateApplicationOccupiedSize (cmd 11).
@@ -82,5 +102,29 @@ impl IContentManagementInterface {
         log::info!("(STUBBED) GetFreeSpaceSize called, storage_id={}", storage_id);
         // TODO: system.get_file_system_controller().get_free_space_size(storage_id)
         Ok(16 * 1024 * 1024 * 1024) // 16 GiB stub
+    }
+}
+
+impl SessionRequestHandler for IContentManagementInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ns::IContentManagementInterface"
+    }
+}
+
+impl ServiceFramework for IContentManagementInterface {
+    fn get_service_name(&self) -> &str {
+        "ns::IContentManagementInterface"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

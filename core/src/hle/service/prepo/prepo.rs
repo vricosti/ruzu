@@ -5,6 +5,12 @@
 //!
 //! PlayReport service -- "prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u".
 
+use std::collections::BTreeMap;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// Play report type, matching upstream Reporter::PlayReportType.
 ///
 /// Corresponds to `Core::Reporter::PlayReportType` used in upstream prepo.cpp.
@@ -17,51 +23,52 @@ pub enum PlayReportType {
     System = 3,
 }
 
-/// IPC command IDs for PlayReport.
-///
-/// Corresponds to the function table in `PlayReport` constructor (upstream prepo.cpp).
-pub mod commands {
-    pub const SAVE_REPORT_OLD: u32 = 10100;
-    pub const SAVE_REPORT_WITH_USER_OLD: u32 = 10101;
-    pub const SAVE_REPORT_OLD2: u32 = 10102;
-    pub const SAVE_REPORT_WITH_USER_OLD2: u32 = 10103;
-    pub const SAVE_REPORT: u32 = 10104;
-    pub const SAVE_REPORT_WITH_USER: u32 = 10105;
-    pub const REQUEST_IMMEDIATE_TRANSMISSION: u32 = 10200;
-    pub const GET_TRANSMISSION_STATUS: u32 = 10300;
-    pub const GET_SYSTEM_SESSION_ID: u32 = 10400;
-    pub const SAVE_SYSTEM_REPORT: u32 = 20100;
-    pub const SAVE_SYSTEM_REPORT_WITH_USER: u32 = 20101;
-    pub const SET_OPERATION_MODE: u32 = 20200;
-    pub const CLEAR_STORAGE: u32 = 30100;
-    pub const CLEAR_STATISTICS: u32 = 30200;
-    pub const GET_STORAGE_USAGE: u32 = 30300;
-    pub const GET_STATISTICS: u32 = 30400;
-    pub const GET_THROUGHPUT_HISTORY: u32 = 30401;
-    pub const GET_LAST_UPLOAD_ERROR: u32 = 30500;
-    pub const GET_APPLICATION_UPLOAD_SUMMARY: u32 = 30600;
-    pub const IS_USER_AGREEMENT_CHECK_ENABLED: u32 = 40100;
-    pub const SET_USER_AGREEMENT_CHECK_ENABLED: u32 = 40101;
-    pub const READ_ALL_APPLICATION_REPORT_FILES: u32 = 50100;
-    pub const READ_ALL_REPORT_FILES: u32 = 90100;
-    pub const UNKNOWN_90101: u32 = 90101;
-    pub const UNKNOWN_90102: u32 = 90102;
-    pub const GET_STATISTICS_90200: u32 = 90200;
-    pub const GET_THROUGHPUT_HISTORY_90201: u32 = 90201;
-    pub const GET_LAST_UPLOAD_ERROR_90300: u32 = 90300;
-}
-
 /// PlayReport service ("prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u").
 ///
 /// Corresponds to `PlayReport` in upstream prepo.cpp.
 pub struct PlayReport {
     name: String,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl PlayReport {
     pub fn new(name: &str) -> Self {
+        let handlers = build_handler_map(&[
+            (10100, None, "SaveReportOld"),
+            (10101, None, "SaveReportWithUserOld"),
+            (10102, None, "SaveReportOld2"),
+            (10103, None, "SaveReportWithUserOld2"),
+            (10104, None, "SaveReport"),
+            (10105, None, "SaveReportWithUser"),
+            (10200, Some(PlayReport::request_immediate_transmission_handler), "RequestImmediateTransmission"),
+            (10300, Some(PlayReport::get_transmission_status_handler), "GetTransmissionStatus"),
+            (10400, Some(PlayReport::get_system_session_id_handler), "GetSystemSessionId"),
+            (20100, None, "SaveSystemReport"),
+            (20101, None, "SaveSystemReportWithUser"),
+            (20200, None, "SetOperationMode"),
+            (30100, None, "ClearStorage"),
+            (30200, None, "ClearStatistics"),
+            (30300, None, "GetStorageUsage"),
+            (30400, None, "GetStatistics"),
+            (30401, None, "GetThroughputHistory"),
+            (30500, None, "GetLastUploadError"),
+            (30600, None, "GetApplicationUploadSummary"),
+            (40100, None, "IsUserAgreementCheckEnabled"),
+            (40101, None, "SetUserAgreementCheckEnabled"),
+            (50100, None, "ReadAllApplicationReportFiles"),
+            (90100, None, "ReadAllReportFiles"),
+            (90101, None, "Unknown90101"),
+            (90102, None, "Unknown90102"),
+            (90200, None, "GetStatistics"),
+            (90201, None, "GetThroughputHistory"),
+            (90300, None, "GetLastUploadError"),
+        ]);
+
         Self {
             name: name.to_string(),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -166,6 +173,44 @@ impl PlayReport {
         );
         // TODO: forward to reporter
     }
+
+    // --- Handler bridge functions ---
+
+    fn request_immediate_transmission_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        service.request_immediate_transmission();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_transmission_status_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        let status = service.get_transmission_status();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(status);
+    }
+
+    fn get_system_session_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
+        let id = service.get_system_session_id();
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(id);
+    }
+}
+
+impl SessionRequestHandler for PlayReport {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str { &self.name }
+}
+
+impl ServiceFramework for PlayReport {
+    fn get_service_name(&self) -> &str { &self.name }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
 }
 
 /// Registers "prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u" services.

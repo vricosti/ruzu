@@ -3,9 +3,73 @@
 
 //! Port of zuyu/src/core/hle/service/vi/manager_root_service.cpp/.h
 
-pub const IMANAGER_ROOT_SERVICE_COMMANDS: &[(u32, bool, &str)] = &[
-    (2, true, "GetDisplayService"),
-    (3, false, "GetDisplayServiceWithProxyNameExchange"),
-    (100, false, "AllocateProcessHeapBlock"),
-    (101, false, "FreeProcessHeapBlock"),
-];
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+use super::container::Container;
+use super::service_creator;
+use super::vi_types::{Permission, Policy};
+
+pub struct IManagerRootService {
+    container: Arc<Container>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IManagerRootService {
+    pub fn new(container: Arc<Container>) -> Self {
+        Self {
+            container,
+            handlers: build_handler_map(&[
+                (2, Some(Self::get_display_service), "GetDisplayService"),
+                (3, Some(Self::get_display_service), "GetDisplayServiceWithProxyNameExchange"),
+                (100, None, "PrepareFatal"),
+                (101, None, "ShowFatal"),
+                (102, None, "DrawFatalRectangle"),
+                (103, None, "DrawFatalText32"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn get_display_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let root = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        log::debug!("IManagerRootService::GetDisplayService called");
+
+        let policy = Policy::User;
+
+        match service_creator::get_application_display_service(Permission::Manager, policy) {
+            Ok(()) => {
+                let display_service = super::application_display_service::IApplicationDisplayService::new(
+                    Arc::clone(&root.container),
+                );
+                let sub: Arc<dyn SessionRequestHandler> = Arc::new(display_service);
+                super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
+            }
+            Err(_) => {
+                log::error!("GetDisplayService: permission denied");
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(super::vi_results::RESULT_PERMISSION_DENIED);
+            }
+        }
+    }
+}
+
+impl SessionRequestHandler for IManagerRootService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        ServiceFramework::get_service_name(self)
+    }
+}
+
+impl ServiceFramework for IManagerRootService {
+    fn get_service_name(&self) -> &str { "vi:m" }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+}

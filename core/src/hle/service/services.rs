@@ -410,12 +410,8 @@ impl Services {
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_hid(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
-        register_stub_services(&mut server_manager, &[
-            "hid", "hid:dbg", "hid:sys", "hidbus", "irs", "irs:sys", "xcd:sys",
-        ]);
-        ServerManager::run_server(server_manager);
+    fn loop_process_hid(_sm: &Arc<Mutex<ServiceManager>>) {
+        crate::hle::service::hid::hid::loop_process();
     }
 
     fn loop_process_lbl(sm: &Arc<Mutex<ServiceManager>>) {
