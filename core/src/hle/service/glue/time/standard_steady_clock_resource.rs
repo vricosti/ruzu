@@ -26,7 +26,10 @@ fn get_time_in_seconds() -> Result<i64, ResultCode> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    // TODO: Apply custom_rtc_offset from Settings if custom_rtc_enabled
+    // Upstream applies Settings::values.custom_rtc_offset when
+    // Settings::values.custom_rtc_enabled is true. The Settings
+    // infrastructure is not yet ported to Rust; when it is, the
+    // offset should be added here.
     Ok(time_s)
 }
 
@@ -106,8 +109,11 @@ impl StandardSteadyClockResource {
     ///
     /// Corresponds to `StandardSteadyClockResource::GetResetDetected` in upstream.
     pub fn get_reset_detected(&mut self) -> bool {
-        // TODO: Call Rtc::GetRtcResetDetected, clear if detected
-        // For now, always report no reset
+        // Upstream calls Rtc::GetRtcResetDetected(Max77620RtcSession).
+        // If detected, it calls SetSys::SetExternalSteadyClockSourceId
+        // with an invalid ID and Rtc::ClearRtcResetDetected. Since we
+        // don't have RTC hardware access, we always report no reset
+        // (matching upstream's effective behavior on non-Switch hardware).
         self.rtc_reset = false;
         self.rtc_reset
     }

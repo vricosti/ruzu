@@ -130,7 +130,13 @@ impl TimeZoneService {
         if rc.is_error() {
             return rc;
         }
-        // TODO: get current time point from steady clock and call set_time_point
+        // Upstream gets the current time point from m_clock_core (StandardSteadyClockCore)
+        // and calls m_time_zone.SetTimePoint(time_point). The steady clock core
+        // reference is not wired into this service yet; the Glue layer's
+        // TimeZoneService is the one that actually sets the time point after
+        // calling SetDeviceLocationNameWithTimeZoneRule (see upstream
+        // glue/time/time_zone.cpp). When the PSC service is called directly,
+        // the time point remains unchanged.
         RESULT_SUCCESS
     }
 

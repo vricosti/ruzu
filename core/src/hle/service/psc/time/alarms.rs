@@ -59,7 +59,10 @@ pub struct Alarm {
     /// Kernel event for signaling when this alarm fires.
     /// Corresponds to `Kernel::KEvent* m_event` in upstream.
     event: Arc<Event>,
-    // TODO: nn::psc::sf::IPmStateLock for Lock()
+    // Upstream holds an `nn::psc::sf::IPmStateLock` for Lock(). That
+    // interface depends on the PSC power management module which is not
+    // yet ported. Lock() is a no-op in upstream as well (the lock
+    // service reference is never initialized).
 }
 
 impl Alarm {
@@ -106,9 +109,11 @@ impl Alarm {
 
     /// Lock this alarm (for power state management).
     ///
-    /// Corresponds to `Alarm::Lock()` in upstream (stubbed there too).
+    /// Corresponds to `Alarm::Lock()` in upstream.
+    /// Upstream checks `if (m_lock_service) { m_lock_service->Lock(); }` but
+    /// the lock service reference is never initialized, so this is effectively
+    /// a no-op in upstream as well.
     pub fn lock(&self) -> ResultCode {
-        // TODO: if m_lock_service { m_lock_service->Lock() }
         RESULT_SUCCESS
     }
 }
@@ -230,9 +235,10 @@ impl Alarms {
             .retain(|e| e.alert_time != alarm.get_alert_time() || e.priority != alarm.get_priority());
         alarm.linked = false;
 
-        // Upstream calls UpdateClosestAndSignal here, which reschedules the
-        // CoreTiming timer event based on the new closest alarm. Requires
-        // CoreTiming integration to implement fully.
+        // Upstream calls UpdateClosestAndSignal here, which updates the
+        // m_closest_alarm pointer and signals the event if any alarms remain.
+        // We signal the event unconditionally (matching upstream behavior
+        // when the list is non-empty; when empty, the signal is harmless).
         self.event.signal();
     }
 
@@ -274,9 +280,8 @@ impl Alarms {
 
         power_state_manager.signal_power_state_request_availability();
 
-        // Upstream calls UpdateClosestAndSignal here, which reschedules the
-        // CoreTiming timer event based on the new closest alarm. Requires
-        // CoreTiming integration to implement fully.
+        // Upstream calls UpdateClosestAndSignal, which updates
+        // m_closest_alarm and signals the event if alarms remain.
         self.event.signal();
     }
 

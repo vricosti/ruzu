@@ -52,6 +52,11 @@ impl PowerStateRequestManager {
         }
     }
 
+    /// Get the event (for GetReadableEvent in upstream).
+    pub fn get_event(&self) -> Arc<Event> {
+        Arc::clone(&self.event)
+    }
+
     /// Update the pending request priority.
     ///
     /// If a request is already pending, takes the max of old and new priorities.

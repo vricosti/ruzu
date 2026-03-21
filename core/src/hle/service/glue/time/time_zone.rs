@@ -7,11 +7,17 @@
 //! TimeZoneService: glue-layer timezone service that wraps PSC::Time::TimeZoneService
 //! and adds timezone binary file loading support.
 
+use std::sync::Mutex;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::psc::time::common::{
-    CalendarAdditionalInfo, CalendarTime, LocationName, RuleVersion,
+    CalendarAdditionalInfo, CalendarTime, LocationName, RuleVersion, SteadyClockTimePoint,
 };
-use crate::hle::service::psc::time::errors::RESULT_PERMISSION_DENIED;
+use crate::hle::service::psc::time::errors::{RESULT_PERMISSION_DENIED, RESULT_TIME_ZONE_NOT_FOUND};
+use crate::hle::service::psc::time::time_zone::TzRule;
+use crate::hle::service::psc::time::time_zone_service::TimeZoneService as PscTimeZoneService;
+
+use super::time_zone_binary::TimeZoneBinary;
 
 /// IPC command IDs for Glue::Time::TimeZoneService.
 ///
@@ -37,93 +43,198 @@ pub mod commands {
 ///
 /// Corresponds to `Glue::Time::TimeZoneService` in upstream glue/time/time_zone.h.
 /// Wraps `PSC::Time::TimeZoneService` and adds timezone binary support.
+///
+/// Upstream holds:
+/// - `m_wrapped_service` (shared_ptr<PSC::Time::TimeZoneService>)
+/// - `m_file_timestamp_worker` (FileTimestampWorker&)
+/// - `m_time_zone_binary` (TimeZoneBinary&)
+/// - `m_operation_event` (OperationEvent)
+/// - `m_set_sys` (shared_ptr<Set::ISystemSettingsServer>)
 pub struct TimeZoneService {
     can_write_timezone_device_location: bool,
-    // TODO: references to FileTimestampWorker, TimeZoneBinary, PSC::Time::TimeZoneService
+    /// Wrapped PSC timezone service. Upstream: `m_wrapped_service`.
+    wrapped_service: Mutex<PscTimeZoneService>,
+    /// TimeZone binary data provider. Upstream: `m_time_zone_binary`.
+    time_zone_binary: Mutex<TimeZoneBinary>,
+    /// Mutex for location changes. Upstream: `m_mutex`.
+    mutex: Mutex<()>,
 }
 
 impl TimeZoneService {
     pub fn new(can_write_timezone_device_location: bool) -> Self {
+        let mut tz_binary = TimeZoneBinary::new();
+        let _ = tz_binary.mount();
         Self {
             can_write_timezone_device_location,
+            wrapped_service: Mutex::new(PscTimeZoneService::new(
+                can_write_timezone_device_location,
+            )),
+            time_zone_binary: Mutex::new(tz_binary),
+            mutex: Mutex::new(()),
+        }
+    }
+
+    /// Create with an existing wrapped PSC service and timezone binary.
+    pub fn with_wrapped(
+        can_write_timezone_device_location: bool,
+        wrapped_service: PscTimeZoneService,
+        time_zone_binary: TimeZoneBinary,
+    ) -> Self {
+        Self {
+            can_write_timezone_device_location,
+            wrapped_service: Mutex::new(wrapped_service),
+            time_zone_binary: Mutex::new(time_zone_binary),
+            mutex: Mutex::new(()),
         }
     }
 
     /// GetDeviceLocationName (cmd 0).
     ///
     /// Corresponds to `TimeZoneService::GetDeviceLocationName` in upstream.
+    /// Delegates to `m_wrapped_service->GetDeviceLocationName`.
     pub fn get_device_location_name(&self) -> Result<LocationName, ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::GetDeviceLocationName called");
-        // Default location: "UTC"
-        let mut name: LocationName = [0u8; 0x24];
-        name[0] = b'U';
-        name[1] = b'T';
-        name[2] = b'C';
-        Ok(name)
+        self.wrapped_service
+            .lock()
+            .unwrap()
+            .get_device_location_name()
     }
 
     /// SetDeviceLocationName (cmd 1).
     ///
     /// Corresponds to `TimeZoneService::SetDeviceLocationName` in upstream.
-    pub fn set_device_location_name(&self, _name: &LocationName) -> ResultCode {
+    /// Upstream validates the name against TimeZoneBinary, loads the rule,
+    /// updates the PSC service, updates filesystem time, and saves to settings.
+    pub fn set_device_location_name(&self, name: &LocationName) -> ResultCode {
         log::debug!("Glue::Time::TimeZoneService::SetDeviceLocationName called");
         if !self.can_write_timezone_device_location {
             return RESULT_PERMISSION_DENIED;
         }
-        // TODO: Load timezone binary for the new location, update PSC timezone service
+
+        let tz_binary = self.time_zone_binary.lock().unwrap();
+        if !tz_binary.is_valid(name) {
+            return RESULT_TIME_ZONE_NOT_FOUND;
+        }
+        drop(tz_binary);
+
+        let _lock = self.mutex.lock().unwrap();
+
+        let mut tz_binary = self.time_zone_binary.lock().unwrap();
+        let binary = match tz_binary.get_time_zone_rule(name) {
+            Ok(b) => b,
+            Err(rc) => return rc,
+        };
+        drop(tz_binary);
+
+        let mut wrapped = self.wrapped_service.lock().unwrap();
+        let rc = wrapped.set_device_location_name_with_time_zone_rule(name, &binary);
+        if rc.is_error() {
+            return rc;
+        }
+
+        // Upstream also calls m_file_timestamp_worker.SetFilesystemPosixTime(),
+        // saves to set:sys, and signals operation events. Settings service
+        // integration is not yet wired.
+
         RESULT_SUCCESS
     }
 
     /// GetTotalLocationNameCount (cmd 2).
     ///
     /// Corresponds to `TimeZoneService::GetTotalLocationNameCount` in upstream.
-    pub fn get_total_location_name_count(&self) -> Result<i32, ResultCode> {
+    /// Delegates to `m_wrapped_service->GetTotalLocationNameCount`.
+    pub fn get_total_location_name_count(&self) -> Result<u32, ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::GetTotalLocationNameCount called");
-        // TODO: Delegate to m_wrapped_service
-        Ok(1) // At least UTC
+        self.wrapped_service
+            .lock()
+            .unwrap()
+            .get_total_location_name_count()
     }
 
     /// LoadLocationNameList (cmd 3).
     ///
     /// Corresponds to `TimeZoneService::LoadLocationNameList` in upstream.
+    /// Upstream delegates to `m_time_zone_binary.GetTimeZoneLocationList`.
     pub fn load_location_name_list(
         &self,
-        _index: i32,
+        index: u32,
     ) -> Result<Vec<LocationName>, ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::LoadLocationNameList called");
-        // TODO: Load from timezone binary
-        let mut utc: LocationName = [0u8; 0x24];
-        utc[0] = b'U';
-        utc[1] = b'T';
-        utc[2] = b'C';
-        Ok(vec![utc])
+        let _lock = self.mutex.lock().unwrap();
+        let mut tz_binary = self.time_zone_binary.lock().unwrap();
+        // Upstream passes out_names.size() as max_names; we use a reasonable default.
+        tz_binary.get_time_zone_location_list(100, index)
+    }
+
+    /// LoadTimeZoneRule (cmd 4).
+    ///
+    /// Corresponds to `TimeZoneService::LoadTimeZoneRule` in upstream.
+    /// Upstream loads the binary from TimeZoneBinary and calls
+    /// `m_wrapped_service->ParseTimeZoneBinary(out_rule, binary)`.
+    pub fn load_time_zone_rule(&self, name: &LocationName) -> Result<TzRule, ResultCode> {
+        log::debug!("Glue::Time::TimeZoneService::LoadTimeZoneRule called");
+        let _lock = self.mutex.lock().unwrap();
+        let mut tz_binary = self.time_zone_binary.lock().unwrap();
+        let binary = tz_binary.get_time_zone_rule(name)?;
+        drop(tz_binary);
+
+        let wrapped = self.wrapped_service.lock().unwrap();
+        let mut rule = TzRule::default();
+        let rc = wrapped.parse_time_zone_binary(&mut rule, &binary);
+        if rc.is_error() {
+            return Err(rc);
+        }
+        Ok(rule)
     }
 
     /// GetTimeZoneRuleVersion (cmd 5).
     ///
     /// Corresponds to `TimeZoneService::GetTimeZoneRuleVersion` in upstream.
+    /// Delegates to `m_wrapped_service->GetTimeZoneRuleVersion`.
     pub fn get_time_zone_rule_version(&self) -> Result<RuleVersion, ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::GetTimeZoneRuleVersion called");
-        // TODO: Delegate to m_wrapped_service
-        Ok([0u8; 0x10])
+        self.wrapped_service
+            .lock()
+            .unwrap()
+            .get_time_zone_rule_version()
+    }
+
+    /// GetDeviceLocationNameAndUpdatedTime (cmd 6).
+    ///
+    /// Corresponds to `TimeZoneService::GetDeviceLocationNameAndUpdatedTime` in upstream.
+    /// Delegates to `m_wrapped_service->GetDeviceLocationNameAndUpdatedTime`.
+    pub fn get_device_location_name_and_updated_time(
+        &self,
+    ) -> Result<(LocationName, SteadyClockTimePoint), ResultCode> {
+        log::debug!(
+            "Glue::Time::TimeZoneService::GetDeviceLocationNameAndUpdatedTime called"
+        );
+        self.wrapped_service
+            .lock()
+            .unwrap()
+            .get_device_location_name_and_updated_time()
     }
 
     /// ToCalendarTime (cmd 20).
     ///
     /// Corresponds to `TimeZoneService::ToCalendarTime` in upstream.
+    /// Delegates to `m_wrapped_service->ToCalendarTime`.
     pub fn to_calendar_time(
         &self,
         time: i64,
-        _rule: &[u8],
+        rule: &TzRule,
     ) -> Result<(CalendarTime, CalendarAdditionalInfo), ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::ToCalendarTime: time={}", time);
-        // TODO: Delegate to m_wrapped_service
-        Ok((CalendarTime::default(), CalendarAdditionalInfo::default()))
+        self.wrapped_service
+            .lock()
+            .unwrap()
+            .to_calendar_time(time, rule)
     }
 
     /// ToCalendarTimeWithMyRule (cmd 21).
     ///
     /// Corresponds to `TimeZoneService::ToCalendarTimeWithMyRule` in upstream.
+    /// Delegates to `m_wrapped_service->ToCalendarTimeWithMyRule`.
     pub fn to_calendar_time_with_my_rule(
         &self,
         time: i64,
@@ -132,125 +243,49 @@ impl TimeZoneService {
             "Glue::Time::TimeZoneService::ToCalendarTimeWithMyRule: time={}",
             time
         );
-        // Simple UTC conversion
-        // seconds since epoch -> CalendarTime
-        let secs = time;
-        let days = secs / 86400;
-        let day_secs = secs % 86400;
-
-        let hours = (day_secs / 3600) as i8;
-        let minutes = ((day_secs % 3600) / 60) as i8;
-        let seconds = (day_secs % 60) as i8;
-
-        // Simplified date calculation (not handling all edge cases)
-        // This is a rough approximation for UTC
-        let mut year = 1970i16;
-        let mut remaining_days = days;
-        loop {
-            let days_in_year = if is_leap_year(year as i32) { 366 } else { 365 };
-            if remaining_days < days_in_year {
-                break;
-            }
-            remaining_days -= days_in_year;
-            year += 1;
-        }
-
-        let leap = is_leap_year(year as i32);
-        let month_days: [i64; 12] = if leap {
-            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        } else {
-            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        };
-
-        let mut month = 0i8;
-        for (i, &mdays) in month_days.iter().enumerate() {
-            if remaining_days < mdays {
-                month = (i + 1) as i8;
-                break;
-            }
-            remaining_days -= mdays;
-        }
-        if month == 0 {
-            month = 12;
-        }
-        let day = (remaining_days + 1) as i8;
-
-        let calendar = CalendarTime {
-            year,
-            month,
-            day,
-            hour: hours,
-            minute: minutes,
-            second: seconds,
-        };
-
-        let day_of_week = ((days + 4) % 7) as i32; // Jan 1, 1970 was Thursday (4)
-        let mut day_of_year = 0i32;
-        for i in 0..(month as usize - 1) {
-            day_of_year += month_days[i] as i32;
-        }
-        day_of_year += day as i32 - 1;
-
-        let mut tz_name = [0u8; 8];
-        tz_name[0] = b'U';
-        tz_name[1] = b'T';
-        tz_name[2] = b'C';
-
-        let additional = CalendarAdditionalInfo {
-            day_of_week,
-            day_of_year,
-            name: tz_name,
-            is_dst: 0,
-            ut_offset: 0,
-        };
-
-        Ok((calendar, additional))
+        self.wrapped_service
+            .lock()
+            .unwrap()
+            .to_calendar_time_with_my_rule(time)
     }
 
     /// ToPosixTime (cmd 100).
     ///
     /// Corresponds to `TimeZoneService::ToPosixTime` in upstream.
+    /// Delegates to `m_wrapped_service->ToPosixTime`.
     pub fn to_posix_time(
         &self,
-        _calendar: &CalendarTime,
-        _rule: &[u8],
+        calendar: &CalendarTime,
+        rule: &TzRule,
     ) -> Result<i64, ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::ToPosixTime called");
-        // TODO: Delegate to m_wrapped_service
-        Ok(0)
+        let mut out_times = [0i64; 2];
+        let count = self
+            .wrapped_service
+            .lock()
+            .unwrap()
+            .to_posix_time(&mut out_times, calendar, rule)?;
+        if count == 0 {
+            return Ok(0);
+        }
+        Ok(out_times[0])
     }
 
     /// ToPosixTimeWithMyRule (cmd 101).
     ///
     /// Corresponds to `TimeZoneService::ToPosixTimeWithMyRule` in upstream.
+    /// Delegates to `m_wrapped_service->ToPosixTimeWithMyRule`.
     pub fn to_posix_time_with_my_rule(&self, calendar: &CalendarTime) -> Result<i64, ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::ToPosixTimeWithMyRule called");
-        // Simple UTC conversion: CalendarTime -> seconds since epoch
-        let year = calendar.year as i32;
-        let mut days: i64 = 0;
-        for y in 1970..year {
-            days += if is_leap_year(y) { 366 } else { 365 };
+        let mut out_times = [0i64; 2];
+        let count = self
+            .wrapped_service
+            .lock()
+            .unwrap()
+            .to_posix_time_with_my_rule(&mut out_times, calendar)?;
+        if count == 0 {
+            return Ok(0);
         }
-
-        let leap = is_leap_year(year);
-        let month_days: [i64; 12] = if leap {
-            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        } else {
-            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        };
-        for i in 0..(calendar.month as usize).saturating_sub(1) {
-            days += month_days[i];
-        }
-        days += (calendar.day as i64) - 1;
-
-        let secs = days * 86400
-            + calendar.hour as i64 * 3600
-            + calendar.minute as i64 * 60
-            + calendar.second as i64;
-        Ok(secs)
+        Ok(out_times[0])
     }
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }

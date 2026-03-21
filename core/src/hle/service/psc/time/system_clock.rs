@@ -6,7 +6,10 @@
 //!
 //! ISystemClock: provides system clock time queries and modifications.
 
+use std::sync::Arc;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::os::event::Event;
 use super::common::SystemClockContext;
 use super::errors::{RESULT_CLOCK_UNINITIALIZED, RESULT_PERMISSION_DENIED};
 
@@ -31,6 +34,9 @@ pub struct SystemClock {
     initialized: bool,
     context: SystemClockContext,
     current_time: i64,
+    /// Lazily created operation event.
+    /// Upstream: `std::unique_ptr<OperationEvent> m_operation_event`.
+    operation_event: Option<Arc<Event>>,
 }
 
 impl SystemClock {
@@ -41,6 +47,7 @@ impl SystemClock {
             initialized: false,
             context: SystemClockContext::default(),
             current_time: 0,
+            operation_event: None,
         }
     }
 
@@ -115,9 +122,14 @@ impl SystemClock {
     /// GetOperationEventReadableHandle (cmd 4).
     ///
     /// Corresponds to `SystemClock::GetOperationEventReadableHandle` in upstream system_clock.cpp.
-    pub fn get_operation_event_readable_handle(&self) -> ResultCode {
+    /// Upstream lazily creates an OperationEvent, links it to the clock core,
+    /// and returns the readable event handle. We lazily create an Event and
+    /// return a reference to it.
+    pub fn get_operation_event_readable_handle(&mut self) -> Arc<Event> {
         log::debug!("SystemClock::GetOperationEventReadableHandle called");
-        // TODO: Create operation event, link to clock core, return readable event handle
-        RESULT_SUCCESS
+        let event = self
+            .operation_event
+            .get_or_insert_with(|| Arc::new(Event::new()));
+        Arc::clone(event)
     }
 }

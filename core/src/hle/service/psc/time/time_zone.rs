@@ -16,10 +16,16 @@ use super::common::{
 };
 use super::errors::RESULT_TIME_ZONE_NOT_FOUND;
 
-/// Placeholder for Tz::Rule. Will be replaced with actual timezone rule data.
+/// Placeholder for Tz::Rule.
+///
+/// Upstream uses the external `tz` library's `Tz::Rule` struct which contains
+/// parsed POSIX timezone binary data (transition times, type indices, UTC
+/// offsets, DST flags, abbreviation strings). A full port requires either
+/// binding to the C tz library or reimplementing its binary parser and
+/// localtime_rz / mktime_tzname functions. Until then, this stores the raw
+/// binary data and the conversion methods use a UTC-only fallback.
 #[derive(Debug, Clone, Default)]
 pub struct TzRule {
-    // TODO: Port Tz::Rule structure from upstream tz library
     _data: Vec<u8>,
 }
 
@@ -91,15 +97,17 @@ impl TimeZone {
     }
 
     /// Convert a POSIX time to calendar time using the given rule.
-    /// TODO: Implement using a Rust tz library when available.
+    ///
+    /// Upstream delegates to `Tz::localtime_rz` which applies timezone
+    /// transition rules from the parsed binary. Without the tz library
+    /// binding, this performs a UTC-only conversion (offset=0, no DST).
     pub fn to_calendar_time(
         &self,
         time: i64,
         _rule: &TzRule,
     ) -> Result<(CalendarTime, CalendarAdditionalInfo), ResultCode> {
         let _lock = self.mutex.lock().unwrap();
-        // TODO: Implement actual timezone conversion using tz rules
-        // For now, return a basic UTC conversion
+        // UTC-only conversion; see to_calendar_time doc comment.
         let secs = time;
         let days = secs / 86400;
         let remaining = secs % 86400;
@@ -107,8 +115,8 @@ impl TimeZone {
         let minute = ((remaining % 3600) / 60) as i8;
         let second = (remaining % 60) as i8;
 
-        // Simple days-to-date conversion (not accounting for leap years properly yet)
-        // This is a placeholder; real implementation needs tz rule application
+        // Days-to-date conversion (UTC only; a full implementation would
+        // apply the tz rule's UTC offsets and DST transitions).
         let mut y = 1970i64;
         let mut d = days;
         loop {
@@ -173,24 +181,32 @@ impl TimeZone {
     }
 
     /// Parse a timezone binary for the given location name.
+    ///
+    /// Upstream calls `ParseBinaryImpl` which invokes `Tz::ParseTimeZoneBinary`
+    /// to parse the POSIX TZif binary into a `Tz::Rule`. Without the tz library
+    /// binding, we store the raw binary data. The UTC-only fallback conversions
+    /// do not consult the rule data.
     pub fn parse_binary(&mut self, name: &LocationName, binary: &[u8]) -> ResultCode {
         let _lock = self.mutex.lock().unwrap();
         self.location = *name;
-        // TODO: Parse the binary into self.my_rule using tz library
         self.my_rule._data = binary.to_vec();
         RESULT_SUCCESS
     }
 
     /// Parse a timezone binary into an output rule.
+    ///
+    /// See `parse_binary` for details on tz library dependency.
     pub fn parse_binary_into(&self, rule: &mut TzRule, binary: &[u8]) -> ResultCode {
         let _lock = self.mutex.lock().unwrap();
-        // TODO: Parse the binary into rule using tz library
         rule._data = binary.to_vec();
         RESULT_SUCCESS
     }
 
     /// Convert calendar time to POSIX time using the given rule.
-    /// TODO: Implement using a Rust tz library when available.
+    ///
+    /// Upstream delegates to `Tz::mktime_tzname` which uses timezone
+    /// transition rules. Without the tz library binding, this performs
+    /// a UTC-only conversion.
     pub fn to_posix_time(
         &self,
         out_times: &mut [i64],
@@ -198,12 +214,12 @@ impl TimeZone {
         _rule: &TzRule,
     ) -> Result<u32, ResultCode> {
         let _lock = self.mutex.lock().unwrap();
-        // Basic UTC-only conversion (placeholder)
+        // UTC-only conversion; see to_posix_time doc comment.
         if out_times.is_empty() {
             return Ok(0);
         }
 
-        // Simple calendar to epoch conversion (UTC only, placeholder)
+        // Calendar to epoch conversion (UTC only).
         let y = calendar.year as i64;
         let m = calendar.month as i64;
         let d = calendar.day as i64;
