@@ -81,12 +81,16 @@ pub struct IApplicationFunctions {
     /// Reference to the applet.
     /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
     applet: std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>,
+    /// Reference to the System, matching upstream `Core::System& m_system`.
+    system: crate::core::SystemRef,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IApplicationFunctions {
-    pub fn new(applet: std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
+    pub fn new(
+        applet: std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>,
+    ) -> Self {
         let handlers = build_handler_map(&[
             (1, Some(Self::pop_launch_parameter_handler), "PopLaunchParameter"),
             (20, Some(Self::ensure_save_data_handler), "EnsureSaveData"),
@@ -107,6 +111,7 @@ impl IApplicationFunctions {
         ]);
         Self {
             applet,
+            system: crate::core::SystemRef::null(),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -132,14 +137,18 @@ impl IApplicationFunctions {
 
     /// Port of IApplicationFunctions::BeginBlockingHomeButtonShortAndLongPressed
     pub fn begin_blocking_home_button_short_and_long_pressed(&self, _unused: i64) {
-        log::warn!("(STUBBED) BeginBlockingHomeButtonShortAndLongPressed called");
-        // TODO: lock applet, set home_button_long_pressed_blocked/short_pressed_blocked = true
+        log::debug!("BeginBlockingHomeButtonShortAndLongPressed called");
+        let mut applet = self.applet.lock().unwrap();
+        applet.home_button_long_pressed_blocked = true;
+        applet.home_button_short_pressed_blocked = true;
     }
 
     /// Port of IApplicationFunctions::EndBlockingHomeButtonShortAndLongPressed
     pub fn end_blocking_home_button_short_and_long_pressed(&self) {
-        log::warn!("(STUBBED) EndBlockingHomeButtonShortAndLongPressed called");
-        // TODO: lock applet, set home_button_long_pressed_blocked/short_pressed_blocked = false
+        log::debug!("EndBlockingHomeButtonShortAndLongPressed called");
+        let mut applet = self.applet.lock().unwrap();
+        applet.home_button_long_pressed_blocked = false;
+        applet.home_button_short_pressed_blocked = false;
     }
 
     /// Port of IApplicationFunctions::IsGamePlayRecordingSupported
@@ -164,9 +173,18 @@ impl IApplicationFunctions {
     }
 
     /// Port of IApplicationFunctions::ExecuteProgram
-    pub fn execute_program(&self, _kind: ProgramSpecifyKind, _value: u64) {
-        log::warn!("(STUBBED) ExecuteProgram called");
-        // TODO: copy user channel, system.ExecuteProgram(value)
+    pub fn execute_program(&self, _kind: ProgramSpecifyKind, value: u64) {
+        log::info!("ExecuteProgram called with kind={:?}, value={}", _kind, value);
+        if !self.system.is_null() {
+            self.system.get().execute_program(value as usize);
+        } else {
+            log::error!("ExecuteProgram: no System reference");
+        }
+    }
+
+    /// Set the System reference, matching upstream constructor pattern.
+    pub fn set_system(&mut self, system: crate::core::SystemRef) {
+        self.system = system;
     }
 
     /// Port of IApplicationFunctions::GetPreviousProgramIndex
@@ -177,8 +195,9 @@ impl IApplicationFunctions {
 
     /// Port of IApplicationFunctions::PrepareForJit
     pub fn prepare_for_jit(&self) {
-        log::warn!("(STUBBED) PrepareForJit called");
-        // TODO: lock applet, set jit_service_launched = true
+        log::debug!("PrepareForJit called");
+        let mut applet = self.applet.lock().unwrap();
+        applet.jit_service_launched = true;
     }
 
     fn notify_running_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

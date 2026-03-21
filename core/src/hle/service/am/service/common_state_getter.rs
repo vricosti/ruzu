@@ -140,8 +140,11 @@ impl ICommonStateGetter {
     /// Port of ICommonStateGetter::GetOperationMode
     pub fn get_operation_mode(&self) -> OperationMode {
         log::debug!("GetOperationMode called");
-        // TODO: Settings::IsDockedMode()
-        OperationMode::Handheld
+        if common::settings::is_docked_mode(&common::settings::values()) {
+            OperationMode::Docked
+        } else {
+            OperationMode::Handheld
+        }
     }
 
     /// Port of ICommonStateGetter::IsVrModeEnabled
@@ -166,9 +169,11 @@ impl ICommonStateGetter {
     /// Port of ICommonStateGetter::GetDefaultDisplayResolution
     pub fn get_default_display_resolution(&self) -> (i32, i32) {
         log::debug!("GetDefaultDisplayResolution called");
-        // TODO: check Settings::IsDockedMode()
-        // Undocked: 1280x720, Docked: 1920x1080
-        (1280, 720)
+        if common::settings::is_docked_mode(&common::settings::values()) {
+            (1920, 1080)
+        } else {
+            (1280, 720)
+        }
     }
 
     /// Port of ICommonStateGetter::GetBuiltInDisplayType

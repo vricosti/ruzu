@@ -52,6 +52,49 @@ pub enum SystemResultStatus {
 /// the application using a specified program index.
 pub type ExecuteProgramCallback = Box<dyn Fn(usize) + Send>;
 
+/// A non-owning reference to System, mirroring upstream's `Core::System&`.
+///
+/// System is stack-allocated in main() and outlives all services. This is the
+/// same lifetime guarantee upstream relies on. Services store `SystemRef` the
+/// same way upstream stores `System& m_system`.
+///
+/// # Safety
+/// The System pointed to must outlive all holders of SystemRef. This is
+/// guaranteed by construction: System is created in main() before services,
+/// and services are destroyed (via System::shutdown/drop) before System.
+#[derive(Clone, Copy)]
+pub struct SystemRef(*const System);
+
+unsafe impl Send for SystemRef {}
+unsafe impl Sync for SystemRef {}
+
+impl SystemRef {
+    /// Create a SystemRef from a reference to System.
+    pub fn from_ref(system: &System) -> Self {
+        Self(system as *const System)
+    }
+
+    /// Create a null SystemRef (for default initialization).
+    pub fn null() -> Self {
+        Self(std::ptr::null())
+    }
+
+    /// Check if this is a null reference.
+    pub fn is_null(&self) -> bool {
+        self.0.is_null()
+    }
+
+    /// Access the System reference.
+    ///
+    /// # Safety
+    /// Caller must ensure the System is still alive. This is guaranteed
+    /// by the construction contract (System outlives all services).
+    pub fn get(&self) -> &System {
+        assert!(!self.0.is_null(), "SystemRef is null");
+        unsafe { &*self.0 }
+    }
+}
+
 /// Type used for the frontend to designate a callback for System to exit the application.
 pub type ExitCallback = Box<dyn Fn() + Send>;
 
