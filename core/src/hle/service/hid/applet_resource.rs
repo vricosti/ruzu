@@ -27,10 +27,29 @@ pub struct IAppletResource {
 impl IAppletResource {
     /// Upstream: IAppletResource::GetSharedMemoryHandle
     /// Returns the shared memory handle for the applet resource.
-    /// TODO: Full implementation requires kernel shared memory support.
-    fn get_shared_memory_handle(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("(STUBBED) IAppletResource::GetSharedMemoryHandle called");
+    ///
+    /// Upstream calls resource_manager->GetSharedMemoryHandle(out_shared_memory_handle, aruid)
+    /// which returns a KSharedMemory* via the applet_resource subsystem.
+    ///
+    /// Full implementation requires:
+    /// 1. ResourceManager::get_shared_memory_handle(aruid) -> KSharedMemory
+    /// 2. KSharedMemory to be returned as a copy handle in the IPC response
+    ///
+    /// Currently stubbed: KSharedMemory handle plumbing through IPC response
+    /// copy handles is not yet wired. The response returns success without a
+    /// handle, which allows the service to be instantiated without crashing.
+    fn get_shared_memory_handle(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAppletResource) };
+        log::debug!(
+            "(STUBBED) IAppletResource::GetSharedMemoryHandle called, aruid={}",
+            service.aruid
+        );
 
+        // TODO: Wire KSharedMemory handle into IPC response copy handles.
+        // Upstream: resource_manager->GetSharedMemoryHandle(&out_handle, aruid)
+        // The copy handle should be added via ctx.add_copy_object() once
+        // KSharedMemory IPC handle support is implemented.
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }

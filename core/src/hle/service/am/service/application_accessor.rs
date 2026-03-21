@@ -88,21 +88,33 @@ impl IApplicationAccessor {
     }
 
     /// Port of IApplicationAccessor::Start
+    /// Upstream: m_applet->process->Run()
     pub fn start(&self) {
         log::info!("IApplicationAccessor::Start called");
-        // TODO: m_applet->process->Run()
+        let mut applet = self.applet.lock().unwrap();
+        applet.process.run();
     }
 
     /// Port of IApplicationAccessor::RequestExit
+    /// Upstream: checks exit_locked; if locked, requests exit via lifecycle_manager
+    /// and updates suspension state; otherwise terminates the process directly.
     pub fn request_exit(&self) {
         log::info!("IApplicationAccessor::RequestExit called");
-        // TODO: check exit_locked, lifecycle_manager.RequestExit()
+        let mut applet = self.applet.lock().unwrap();
+        if applet.exit_locked {
+            applet.lifecycle_manager.request_exit();
+            applet.update_suspension_state_locked(true);
+        } else {
+            applet.process.terminate();
+        }
     }
 
     /// Port of IApplicationAccessor::Terminate
+    /// Upstream: m_applet->process->Terminate()
     pub fn terminate(&self) {
         log::info!("IApplicationAccessor::Terminate called");
-        // TODO: m_applet->process->Terminate()
+        let mut applet = self.applet.lock().unwrap();
+        applet.process.terminate();
     }
 
     /// Port of IApplicationAccessor::CheckRightsEnvironmentAvailable

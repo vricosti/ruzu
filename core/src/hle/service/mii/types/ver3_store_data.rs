@@ -30,3 +30,29 @@ impl Default for Ver3StoreData {
 }
 
 const _: () = assert!(core::mem::size_of::<Ver3StoreData>() == 0x60);
+
+/// NfpStoreDataExtension stores additional Mii color/type data for NFP.
+///
+/// Corresponds to `NfpStoreDataExtension` in upstream ver3_store_data.h.
+/// Size: 0x8 bytes.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct NfpStoreDataExtension {
+    pub faceline_color: u8,
+    pub hair_color: u8,
+    pub eye_color: u8,
+    pub eyebrow_color: u8,
+    pub mouth_color: u8,
+    pub beard_color: u8,
+    pub glass_color: u8,
+    pub glass_type: u8,
+}
+
+impl Default for NfpStoreDataExtension {
+    fn default() -> Self {
+        // SAFETY: NfpStoreDataExtension is repr(C) and all-zeros is valid
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<NfpStoreDataExtension>() == 0x8);

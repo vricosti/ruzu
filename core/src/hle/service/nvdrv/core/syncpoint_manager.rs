@@ -182,9 +182,10 @@ impl SyncpointManager {
             return 0;
         }
 
-        // TODO: In the C++ code:
-        // syncpoint.counter_min = host1x.GetSyncpointManager().GetHostSyncpointValue(id);
-        // For now, just return the current value.
+        // Upstream reads the hardware syncpoint value via:
+        //   syncpoint.counter_min = host1x.GetSyncpointManager().GetHostSyncpointValue(id);
+        // This synchronises the software counter_min with the GPU's current syncpoint
+        // value. Until Host1x integration is available, return the current software value.
         syncpoint.counter_min.load(Ordering::Relaxed)
     }
 

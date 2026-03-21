@@ -4,24 +4,25 @@
 //! Port of zuyu/src/core/hle/service/am/applet.h
 //! Port of zuyu/src/core/hle/service/am/applet.cpp
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
+use crate::hle::service::os::process::Process;
 
 use super::am_types::*;
 use super::applet_data_broker::AppletDataBroker;
+use super::display_layer_manager::DisplayLayerManager;
 use super::lifecycle_manager::LifecycleManager;
 
-/// Stub for the Applet struct.
-/// Many fields reference external crate types (Process, Event, HidRegistration, etc.)
-/// that are not yet wired. These are represented as placeholders.
+/// Port of the Applet struct from upstream applet.h.
 pub struct Applet {
     // Lifecycle manager
     pub lifecycle_manager: LifecycleManager,
 
-    // Process state (stubbed)
+    // Process — upstream: std::unique_ptr<Process> process
+    pub process: Process,
     pub is_process_running: bool,
 
     // Creation state
@@ -35,6 +36,9 @@ pub struct Applet {
     pub previous_screenshot_permission: ScreenshotPermission,
 
     pub screen_shot_identity: AppletIdentityInfo,
+
+    // vi state — upstream: DisplayLayerManager display_layer_manager
+    pub display_layer_manager: DisplayLayerManager,
 
     // Applet common functions
     pub terminate_result: u32,
@@ -67,8 +71,11 @@ pub struct Applet {
     pub user_channel_launch_parameter: std::collections::VecDeque<Vec<u8>>,
     pub preselected_user_launch_parameter: std::collections::VecDeque<Vec<u8>>,
 
-    // Caller applet
+    // Caller applet — upstream: std::weak_ptr<Applet> caller_applet
+    pub caller_applet: Weak<Mutex<Applet>>,
     pub caller_applet_broker: Option<Arc<AppletDataBroker>>,
+    // Child applets — upstream: std::list<std::shared_ptr<Applet>> child_applets
+    pub child_applets: Vec<Arc<Mutex<Applet>>>,
     pub is_completed: bool,
 
     // Self state
@@ -104,6 +111,7 @@ impl Applet {
     pub fn new(is_application: bool) -> Self {
         Self {
             lifecycle_manager: LifecycleManager::new(is_application),
+            process: Process::new(),
             is_process_running: false,
             applet_id: AppletId::default(),
             aruid: AppletResourceUserId::default(),
@@ -114,6 +122,7 @@ impl Applet {
             previous_program_index: -1,
             previous_screenshot_permission: ScreenshotPermission::Enable,
             screen_shot_identity: AppletIdentityInfo::default(),
+            display_layer_manager: DisplayLayerManager::new(),
             terminate_result: 0,
             display_logical_width: 0,
             display_logical_height: 0,
@@ -137,7 +146,9 @@ impl Applet {
             request_exit_to_library_applet_at_execute_next_program_enabled: false,
             user_channel_launch_parameter: std::collections::VecDeque::new(),
             preselected_user_launch_parameter: std::collections::VecDeque::new(),
+            caller_applet: Weak::new(),
             caller_applet_broker: None,
+            child_applets: Vec::new(),
             is_completed: false,
             exit_locked: false,
             fatal_section_count: 0,

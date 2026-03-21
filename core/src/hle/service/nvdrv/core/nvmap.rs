@@ -266,9 +266,13 @@ impl NvMap {
                 }
             }
 
-            // If not in unmap queue, would need to allocate SMMU space and map.
-            // TODO: Full SMMU mapping requires host1x integration.
-            // For now, use the CPU address as a placeholder d_address if not already set.
+            // Upstream allocates SMMU address space via host1x.Allocator() and maps
+            // through host1x.GMMU().Map(). It handles two cases:
+            //   1. low_area_pin: allocates from a small-page region via host1x.Allocator()
+            //   2. normal pin: allocates from the big-page SMMU allocator
+            // Both map the handle's backing memory into the GPU address space.
+            // Until Host1x GMMU integration is available, use the CPU address as a
+            // placeholder device address so that pinning still returns a valid address.
             if inner.d_address == 0 && inner.address != 0 {
                 inner.d_address = inner.address;
             }
@@ -356,9 +360,10 @@ impl NvMap {
                         }
                         *unmap_queue = new_queue;
 
-                        // TODO: Full SMMU unmap requires host1x integration
-                        // host1x.GMMU().Unmap(...)
-                        // host1x.Allocator().Free(...)
+                        // Upstream calls UnmapHandle which:
+                        //   host1x.GMMU().Unmap(pin_virt_address, aligned_size)
+                        //   host1x.Allocator().Free(pin_virt_address, aligned_size)
+                        // Until Host1x GMMU integration is available, just clear the addresses.
                         inner.pin_virt_address = 0;
                         inner.d_address = 0;
                         inner.in_heap = false;

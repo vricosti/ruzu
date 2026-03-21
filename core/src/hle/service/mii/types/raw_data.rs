@@ -8,7 +8,7 @@
 //! These are large lookup tables extracted from the Mii sysmodule.
 
 use super::super::mii_types::{
-    CommonColor, DefaultMii, FacelineColor, GlassType,
+    CommonColor, DefaultMii, FacelineColor, GlassType, Nickname,
 };
 
 // ---- Helper macro for constructing [u32; 47] with trailing zeros ----
@@ -194,18 +194,18 @@ pub const EYEBROW_ROTATE_LOOKUP: [u8; 24] = [
 
 // ---- Helper function to make a DefaultMii nickname from a string ----
 
-const fn make_nickname(chars: &[u16]) -> [u16; 10] {
-    let mut result = [0u16; 10];
+const fn make_nickname(chars: &[u16]) -> Nickname {
+    let mut result = Nickname { data: [0u16; 10] };
     let mut i = 0;
     while i < chars.len() && i < 10 {
-        result[i] = chars[i];
+        result.data[i] = chars[i];
         i += 1;
     }
     result
 }
 
 // "no name" as UTF-16
-const NO_NAME: [u16; 10] = make_nickname(&[b'n' as u16, b'o' as u16, b' ' as u16, b'n' as u16, b'a' as u16, b'm' as u16, b'e' as u16]);
+const NO_NAME: Nickname = make_nickname(&[b'n' as u16, b'o' as u16, b' ' as u16, b'n' as u16, b'a' as u16, b'm' as u16, b'e' as u16]);
 
 // ---- BaseMii ----
 

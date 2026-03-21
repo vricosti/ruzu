@@ -13,6 +13,7 @@ aes.workspace = true
 bitflags.workspace = true
 cipher.workspace = true
 ctr.workspace = true
+hmac.workspace = true
 hex.workspace = true
 libc = "0.2"
 log.workspace = true

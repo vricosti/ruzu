@@ -10,6 +10,7 @@
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::mii_database_manager::DatabaseManager;
 use super::mii_types::{Age, Gender, Race};
+use super::types::store_data::StoreData;
 
 /// MiiManager coordinates Mii operations.
 pub struct MiiManager {
@@ -47,36 +48,19 @@ impl MiiManager {
     ///
     /// Upstream creates a StoreData, calls store_data.BuildRandom(age, gender, race),
     /// then sets out_char_info from the store data via CharInfo::SetFromStoreData.
-    /// This requires StoreData::build_random() which depends on the RawData tables
-    /// (RandomMiiFaceline, RandomMiiHairType, etc.) and CoreData bit-field setters.
-    /// Those are not yet ported. Once StoreData::build_random() and
-    /// CharInfo::set_from_store_data() are available, wire them here.
-    pub fn build_random(&self, age: Age, gender: Gender, race: Race) -> ResultCode {
-        log::warn!(
-            "(STUBBED) MiiManager::build_random called, age={:?}, gender={:?}, race={:?} \
-             — requires StoreData::build_random() and CharInfo::set_from_store_data()",
-            age,
-            gender,
-            race
-        );
-        RESULT_SUCCESS
+    pub fn build_random(&self, age: Age, gender: Gender, race: Race) -> StoreData {
+        let mut store_data = StoreData::new();
+        store_data.build_random(age, gender, race);
+        store_data
     }
 
     /// Build a default Mii with index.
     ///
-    /// Upstream creates a StoreData, calls store_data.BuildDefault(index), then sets
-    /// out_char_info via CharInfo::SetFromStoreData. This requires
-    /// StoreData::build_default() which reads from RawData::DefaultMii and uses
-    /// CoreData bit-field setters. Those are not yet ported. Once
-    /// StoreData::build_default() and CharInfo::set_from_store_data() are available,
-    /// wire them here.
-    pub fn build_default(&self, index: u32) -> ResultCode {
-        log::warn!(
-            "(STUBBED) MiiManager::build_default called, index={} \
-             — requires StoreData::build_default() and CharInfo::set_from_store_data()",
-            index
-        );
-        RESULT_SUCCESS
+    /// Upstream creates a StoreData, calls store_data.BuildDefault(index).
+    pub fn build_default(&self, index: u32) -> StoreData {
+        let mut store_data = StoreData::new();
+        store_data.build_default(index);
+        store_data
     }
 
     /// Check if the database was broken and cleared.
