@@ -5,32 +5,89 @@
 //! Port of zuyu/src/core/hle/service/os/multi_wait.cpp
 //!
 //! MultiWait — waits on multiple synchronization objects.
+//! Upstream wraps svcWaitSynchronization/KSynchronizationObject::Wait.
 
 use super::multi_wait_holder::MultiWaitHolder;
 
 /// MultiWait — manages a list of MultiWaitHolders to wait on.
 ///
-/// Corresponds to `MultiWait` in upstream multi_wait.h / multi_wait.cpp.
+/// Upstream stores an intrusive list of MultiWaitHolder and calls
+/// svcWaitSynchronization on all their native handles.
 pub struct MultiWait {
-    wait_list: Vec<*mut MultiWaitHolder>,
+    holders: Vec<*mut MultiWaitHolder>,
 }
+
+// Safety: MultiWait holders are managed by the service layer on a single thread.
+unsafe impl Send for MultiWait {}
+unsafe impl Sync for MultiWait {}
 
 impl MultiWait {
     pub fn new() -> Self {
         Self {
-            wait_list: Vec::new(),
+            holders: Vec::new(),
         }
     }
 
-    /// WaitAny — block until any holder is signaled.
-    pub fn wait_any(&self) -> Option<*mut MultiWaitHolder> {
-        // TODO: implement with kernel synchronization
-        None
+    /// Link a holder to this MultiWait.
+    pub fn link_holder(&mut self, holder: *mut MultiWaitHolder) {
+        unsafe {
+            (*holder).link_to_multi_wait();
+        }
+        self.holders.push(holder);
     }
 
-    /// TryWaitAny — non-blocking check.
+    /// Unlink a holder from this MultiWait.
+    pub fn unlink_holder(&mut self, holder: *mut MultiWaitHolder) {
+        unsafe {
+            (*holder).unlink_from_multi_wait();
+        }
+        self.holders.retain(|&h| h != holder);
+    }
+
+    /// WaitAny — block until any holder is signaled, return the signaled holder.
+    /// Port of upstream `MultiWait::WaitAny()`.
+    /// Upstream calls svcWaitSynchronization on all holder handles.
+    pub fn wait_any(&self) -> Option<*mut MultiWaitHolder> {
+        // Check if any holder is already signaled.
+        for &holder in &self.holders {
+            unsafe {
+                if (*holder).is_signaled() {
+                    return Some(holder);
+                }
+            }
+        }
+
+        // If no holder is signaled, block-wait.
+        // Upstream: svcWaitSynchronization(handles, count, timeout).
+        // We poll with a short sleep to avoid busy-waiting.
+        loop {
+            for &holder in &self.holders {
+                unsafe {
+                    if (*holder).is_signaled() {
+                        return Some(holder);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+
+    /// TryWaitAny — non-blocking check, return the first signaled holder if any.
+    /// Port of upstream `MultiWait::TryWaitAny()`.
     pub fn try_wait_any(&self) -> Option<*mut MultiWaitHolder> {
-        // TODO: implement with kernel synchronization
+        for &holder in &self.holders {
+            unsafe {
+                if (*holder).is_signaled() {
+                    return Some(holder);
+                }
+            }
+        }
         None
+    }
+}
+
+impl Default for MultiWait {
+    fn default() -> Self {
+        Self::new()
     }
 }
