@@ -1,3 +1,20 @@
+## 2026-03-21 — Windows-only code not ported
+
+### Not ported (Windows platform)
+
+The following upstream code is Linux-only in ruzu. The Windows code paths are not ported because ruzu targets Linux first:
+
+- **`core/src/internal_network/network_interface.rs`** — `GetAdaptersAddresses` Windows API for enumerating network interfaces. Linux uses `getifaddrs` (fully ported).
+- **`core/src/internal_network/sockets.rs`** — `WSASocket`/`WSAStartup`/`WSACleanup` Windows socket creation. Linux uses `libc::socket` (fully ported).
+- **`core/src/tools/renderdoc.rs`** — `GetModuleHandleA`/`GetProcAddress` for loading RenderDoc on Windows. Linux uses `dlopen`/`dlsym` (fully ported).
+- **`core/src/hle/service/ssl/ssl_backend_schannel.rs`** — Windows Schannel SSL backend. Linux uses OpenSSL (fully ported).
+
+### Not ported (multiplayer network room)
+
+- **`core/src/internal_network/socket_proxy.rs`** — `ProxySocket` that tunnels traffic through the multiplayer room network (`Network::RoomMember`). Requires the room networking system which is not yet ported. The `ProxySocket` struct exists but send/receive/decompress methods are stubs.
+
+---
+
 ## 2026-03-19 — core/src/hle/service/hle_ipc.rs — ReadBuffer / WriteBuffer zero-copy divergence
 
 ### Intentional differences

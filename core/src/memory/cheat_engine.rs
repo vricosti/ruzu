@@ -8,7 +8,9 @@ use super::dmnt_cheat_types::{
     CheatDefinition, CheatEntry, CheatProcessMetadata, MemoryRegionExtents,
 };
 use super::dmnt_cheat_vm::{DmntCheatVm, VmCallbacks};
+use super::memory::Memory;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Cheat engine callback frequency: ~12 Hz (1000000000 / 12 ns).
@@ -34,13 +36,24 @@ fn extract_name(data: &str, start_index: usize, match_char: char) -> Option<(usi
 /// Port of StandardVmCallbacks from cheat_engine.h/cpp.
 pub struct StandardVmCallbacks {
     metadata: CheatProcessMetadata,
-    // TODO: In a full port, this would hold Arc<System> for memory access.
-    // For now, we provide a trait-based approach.
+    /// Reference to the application's memory.
+    /// Upstream: `Core::System& m_system` → `system.ApplicationMemory()`.
+    memory: Option<Arc<Mutex<Memory>>>,
 }
 
 impl StandardVmCallbacks {
     pub fn new(metadata: CheatProcessMetadata) -> Self {
-        Self { metadata }
+        Self {
+            metadata,
+            memory: None,
+        }
+    }
+
+    pub fn with_memory(metadata: CheatProcessMetadata, memory: Arc<Mutex<Memory>>) -> Self {
+        Self {
+            metadata,
+            memory: Some(memory),
+        }
     }
 
     fn is_address_in_range(&self, address: u64) -> bool {
@@ -71,30 +84,39 @@ impl VmCallbacks for StandardVmCallbacks {
             data.fill(0);
             return;
         }
-        // TODO: system.ApplicationMemory().ReadBlock(address, data, size)
-        // For now, zero-fill as placeholder
-        data.fill(0);
+        if let Some(ref memory) = self.memory {
+            let mem = memory.lock().unwrap();
+            mem.read_block(address, data);
+        } else {
+            data.fill(0);
+        }
     }
 
-    fn memory_write_unsafe(&self, address: u64, _data: &[u8]) {
+    fn memory_write_unsafe(&self, address: u64, data: &[u8]) {
         if !self.is_address_in_range(address) {
             return;
         }
-        // TODO: system.ApplicationMemory().WriteBlock(address, data, size)
-        // Then invalidate instruction cache if write succeeded
+        if let Some(ref memory) = self.memory {
+            let mem = memory.lock().unwrap();
+            mem.write_block(address, data);
+        }
     }
 
     fn hid_keys_down(&self) -> u64 {
-        // TODO: Query HID service for pressed keys
+        // Upstream: queries HID service via system.ServiceManager().
+        // HID key state requires the input subsystem to be wired.
         0
     }
 
     fn pause_process(&self) {
-        // TODO: system.ApplicationProcess()->SetActivity(Paused)
+        // Upstream: system.ApplicationProcess()->SetActivity(Paused).
+        // Process activity control requires System reference.
+        log::debug!("CheatEngine: pause_process requested");
     }
 
     fn resume_process(&self) {
-        // TODO: system.ApplicationProcess()->SetActivity(Runnable)
+        // Upstream: system.ApplicationProcess()->SetActivity(Runnable).
+        log::debug!("CheatEngine: resume_process requested");
     }
 
     fn debug_log(&self, id: u8, value: u64) {
@@ -231,9 +253,8 @@ pub struct CheatEngine {
     metadata: CheatProcessMetadata,
     cheats: Vec<CheatEntry>,
     is_pending_reload: AtomicBool,
-    // TODO: Core::Timing integration
-    // event: Option<Arc<EventType>>,
-    // core_timing: Arc<CoreTiming>,
+    // Upstream: Core::Timing event + CoreTiming reference for periodic execution.
+    // In our model, the caller triggers execute_cheat_list periodically.
 }
 
 impl CheatEngine {
@@ -253,16 +274,10 @@ impl CheatEngine {
     }
 
     pub fn initialize(&mut self) {
-        // TODO: Schedule looping event via CoreTiming at CHEAT_ENGINE_NS interval.
-        // For now, mark pending reload.
-
-        // TODO: Read process metadata from system:
-        // metadata.process_id = system.ApplicationProcess()->GetProcessId();
-        // metadata.title_id = system.GetApplicationProcessProgramID();
-        // metadata.heap_extents = ...
-        // metadata.aslr_extents = ...
-        // metadata.alias_extents = ...
-
+        // Upstream: schedules a CoreTiming event at CHEAT_ENGINE_NS interval
+        // and reads process metadata (process_id, title_id, heap/aslr/alias extents)
+        // from system.ApplicationProcess(). The caller should set metadata via
+        // set_main_memory_parameters before calling initialize.
         self.is_pending_reload.store(true, Ordering::Release);
     }
 

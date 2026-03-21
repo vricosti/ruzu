@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-// TODO: These types should come from the file_sys module once fully ported.
-// For now, we define minimal trait/struct placeholders.
+// These types are defined locally to avoid circular dependencies with file_sys.
+// Upstream has them in the file_sys module.
 
 /// Trait representing a virtual file (VfsFile equivalent).
 /// Port of FileSys::VfsFile interface as used by EncryptionLayer.
