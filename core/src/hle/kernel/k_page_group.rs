@@ -2,7 +2,10 @@
 //! Status: COMPLET
 //! Derniere synchro: 2026-03-21
 
+use std::sync::{Arc, Mutex};
+
 use super::k_memory_block::PAGE_SIZE;
+use super::k_memory_manager::KMemoryManager;
 
 // ---------------------------------------------------------------------------
 // KBlockInfo
@@ -82,14 +85,33 @@ const _: () = assert!(std::mem::size_of::<KBlockInfo>() <= 0x10);
 
 /// Port of Kernel::KPageGroup.
 ///
-/// Uses a Vec<KBlockInfo> instead of an intrusive linked list.
+/// Upstream holds `KernelCore& m_kernel` and `KBlockInfoManager* m_manager`.
+/// We use a Vec<KBlockInfo> instead of slab-allocated intrusive list, and
+/// store an optional Arc<Mutex<KMemoryManager>> for Open/Close reference counting.
 pub struct KPageGroup {
     blocks: Vec<KBlockInfo>,
+    /// Reference to the memory manager for physical page reference counting.
+    /// Upstream accesses this via m_kernel.MemoryManager().
+    memory_manager: Option<Arc<Mutex<KMemoryManager>>>,
 }
 
 impl KPageGroup {
+    /// Create a page group without a memory manager reference.
+    /// Open/Close/CloseAndReset will skip reference counting.
     pub fn new() -> Self {
-        Self { blocks: Vec::new() }
+        Self {
+            blocks: Vec::new(),
+            memory_manager: None,
+        }
+    }
+
+    /// Create a page group with a memory manager reference.
+    /// Matches upstream `KPageGroup(KernelCore& kernel, KBlockInfoManager* m)`.
+    pub fn with_memory_manager(mm: Arc<Mutex<KMemoryManager>>) -> Self {
+        Self {
+            blocks: Vec::new(),
+            memory_manager: Some(mm),
+        }
     }
 
     pub fn finalize(&mut self) {
@@ -134,28 +156,47 @@ impl KPageGroup {
 
     /// Increment reference count for all blocks.
     /// Port of upstream `KPageGroup::Open`.
-    /// Upstream delegates to `KMemoryManager::Open(addr, num_pages)` for each block.
-    /// In the host-emulated model, physical page reference counting is a no-op.
+    /// Delegates to `KMemoryManager::Open(addr, num_pages)` for each block.
     pub fn open(&self) {
-        // Host-emulated: no physical page reference counting needed.
+        if let Some(ref mm) = self.memory_manager {
+            let mut mm = mm.lock().unwrap();
+            for block in &self.blocks {
+                mm.open(block.get_address(), block.get_num_pages());
+            }
+        }
     }
 
     /// Increment reference count for all blocks (first reference).
     /// Port of upstream `KPageGroup::OpenFirst`.
     pub fn open_first(&self) {
-        // Host-emulated: no physical page reference counting needed.
+        if let Some(ref mm) = self.memory_manager {
+            let mut mm = mm.lock().unwrap();
+            for block in &self.blocks {
+                mm.open(block.get_address(), block.get_num_pages());
+            }
+        }
     }
 
     /// Decrement reference count for all blocks.
     /// Port of upstream `KPageGroup::Close`.
     pub fn close(&self) {
-        // Host-emulated: no physical page reference counting needed.
+        if let Some(ref mm) = self.memory_manager {
+            let mut mm = mm.lock().unwrap();
+            for block in &self.blocks {
+                mm.close(block.get_address(), block.get_num_pages());
+            }
+        }
     }
 
     /// Decrement reference count and reset the page group.
     /// Port of upstream `KPageGroup::CloseAndReset`.
     pub fn close_and_reset(&mut self) {
-        // Upstream: mm.Close(block.addr, block.num_pages) for each, then free blocks.
+        if let Some(ref mm) = self.memory_manager {
+            let mut mm = mm.lock().unwrap();
+            for block in &self.blocks {
+                mm.close(block.get_address(), block.get_num_pages());
+            }
+        }
         self.blocks.clear();
     }
 

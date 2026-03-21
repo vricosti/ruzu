@@ -180,6 +180,78 @@ impl PageTable {
         self.current_address_space_width_in_bits
     }
 
+    /// Map a range of pages to a physical address with a given page type.
+    /// Port of upstream `Memory::Impl::MapPages`.
+    ///
+    /// - `base_page`: starting page index (not byte address)
+    /// - `num_pages`: number of pages to map
+    /// - `target`: physical address to map to (0 for unmap)
+    /// - `page_type`: the type to set for these pages
+    /// Map a range of pages to a physical address with a given page type.
+    /// Port of upstream `Memory::Impl::MapPages`.
+    ///
+    /// - `base_page`: starting page index (not byte address)
+    /// - `num_pages`: number of pages to map
+    /// - `target`: physical address to map to (0 for unmap)
+    /// - `page_type`: the type to set for these pages
+    /// - `host_ptr`: host pointer base for Memory-type mappings
+    pub fn map_pages(
+        &mut self,
+        base_page: usize,
+        num_pages: usize,
+        target: u64,
+        page_type: PageType,
+        host_ptr: usize,
+    ) {
+        let end = base_page + num_pages;
+        assert!(
+            end <= self.pointers.size(),
+            "out of range mapping at {:016X}",
+            base_page
+        );
+
+        if target == 0 {
+            assert!(
+                page_type != PageType::Memory,
+                "Mapping memory page without a pointer @ {:016x}",
+                base_page * self.page_size
+            );
+            for page in base_page..end {
+                self.pointers[page].store(0, page_type);
+                self.backing_addr[page] = 0;
+                self.blocks[page] = 0;
+            }
+        } else {
+            for (i, page) in (base_page..end).enumerate() {
+                let offset_ptr = host_ptr.wrapping_sub(page * self.page_size);
+                self.pointers[page].store(offset_ptr, page_type);
+                self.backing_addr[page] = target;
+                self.blocks[page] = target + (i * self.page_size) as u64;
+            }
+        }
+    }
+
+    /// Unmap a range of pages, setting them to Unmapped type.
+    /// Port of upstream `Memory::Impl::UnmapRegion` (page table portion).
+    ///
+    /// - `base_address`: byte address to start unmapping
+    /// - `size`: number of bytes to unmap
+    pub fn unmap_region(&mut self, base_address: u64, size: u64) {
+        assert!(
+            size & (self.page_size as u64 - 1) == 0,
+            "non-page aligned size: {:016X}",
+            size
+        );
+        assert!(
+            base_address & (self.page_size as u64 - 1) == 0,
+            "non-page aligned base: {:016X}",
+            base_address
+        );
+        let base_page = (base_address / self.page_size as u64) as usize;
+        let num_pages = (size / self.page_size as u64) as usize;
+        self.map_pages(base_page, num_pages, 0, PageType::Unmapped, 0);
+    }
+
     /// Get the physical address for a virtual address.
     pub fn get_physical_address(&self, virt_addr: u64) -> Option<u64> {
         if virt_addr > (1u64 << self.get_address_space_bits()) {
