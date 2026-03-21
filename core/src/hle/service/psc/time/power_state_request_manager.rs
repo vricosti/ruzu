@@ -6,7 +6,9 @@
 //! PowerStateRequestManager: manages power state change requests with priority
 //! tracking. Uses a kernel event for signaling availability.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use crate::hle::service::os::event::Event;
 
 /// PowerStateRequestManager tracks pending and available power state requests.
 ///
@@ -21,8 +23,9 @@ use std::sync::Mutex;
 ///      clears the kernel event.
 pub struct PowerStateRequestManager {
     inner: Mutex<PowerStateRequestManagerInner>,
-    // TODO: Kernel::KEvent* m_event — will be wired once kernel event
-    // infrastructure is available. For now, signal/clear are no-ops.
+    /// Kernel event for signaling power state request availability.
+    /// Upstream: `Kernel::KEvent* m_event`.
+    event: Arc<Event>,
 }
 
 struct PowerStateRequestManagerInner {
@@ -45,6 +48,7 @@ impl PowerStateRequestManager {
                 has_available_request: false,
                 available_request_priority: 0,
             }),
+            event: Arc::new(Event::new()),
         }
     }
 
@@ -76,7 +80,7 @@ impl PowerStateRequestManager {
             }
             inner.has_pending_request = false;
             inner.available_request_priority = inner.pending_request_priority;
-            // TODO: m_event->Signal()
+            self.event.signal();
         }
     }
 
@@ -93,7 +97,7 @@ impl PowerStateRequestManager {
         if inner.has_available_request {
             priority = inner.available_request_priority;
             inner.has_available_request = false;
-            // TODO: m_event->Clear()
+            self.event.clear();
         }
         (had_request, priority)
     }

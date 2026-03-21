@@ -5,7 +5,10 @@
 //! Port of zuyu/src/core/hle/service/acc/async_context.cpp
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::os::event::Event;
 
 /// IPC command IDs for IAsyncContext
 pub mod commands {
@@ -27,19 +30,22 @@ pub trait AsyncContext {
 /// Base implementation shared by all IAsyncContext types.
 pub struct AsyncContextBase {
     pub is_complete: AtomicBool,
-    // TODO: completion_event: KEvent, service_context
+    /// Completion event, signaled when the async operation finishes.
+    /// Upstream: `Kernel::KEvent* m_event`.
+    pub completion_event: Arc<Event>,
 }
 
 impl AsyncContextBase {
     pub fn new() -> Self {
         Self {
             is_complete: AtomicBool::new(false),
+            completion_event: Arc::new(Event::new()),
         }
     }
 
     pub fn mark_complete(&self) {
         self.is_complete.store(true, Ordering::Release);
-        // TODO: signal completion_event
+        self.completion_event.signal();
     }
 
     pub fn has_done(&self) -> bool {
@@ -48,7 +54,13 @@ impl AsyncContextBase {
 
     pub fn get_system_event(&self) -> ResultCode {
         log::debug!("IAsyncContext::get_system_event called");
-        // TODO: return completion_event readable event
+        // Upstream: returns the readable event handle.
+        // The event itself is available via self.completion_event.
         RESULT_SUCCESS
+    }
+
+    /// Get a reference to the completion event (for IPC handle return).
+    pub fn get_event(&self) -> Arc<Event> {
+        self.completion_event.clone()
     }
 }
