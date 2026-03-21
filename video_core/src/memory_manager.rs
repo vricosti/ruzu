@@ -268,6 +268,49 @@ impl GpuMemoryManager {
             None => INVALID_ENTRY,
         }
     }
+
+    /// Read a value of type `T` from GPU virtual address space.
+    ///
+    /// Upstream: `template <typename T> T MemoryManager::Read(GPUVAddr addr) const`
+    ///
+    /// Reads `size_of::<T>()` bytes starting at `gpu_addr`, translating through the
+    /// page table page-by-page and using `read_cpu_mem` to access guest physical memory.
+    /// Returns `None` if the first page is unmapped.
+    ///
+    /// The type `T` must be `Copy` and have no padding (caller's responsibility).
+    pub fn read_value<T: Copy>(
+        &self,
+        gpu_addr: u64,
+        read_cpu_mem: &dyn Fn(u64, &mut [u8]),
+    ) -> Option<T> {
+        let size = std::mem::size_of::<T>();
+        // Safety: we're reading into a zeroed byte buffer then transmuting.
+        // This matches upstream's memcpy-based Read<T>.
+        let mut bytes = vec![0u8; size];
+        // Check that the first page is mapped (upstream asserts on failure).
+        if self.translate(gpu_addr).is_none() {
+            return None;
+        }
+        self.read(gpu_addr, &mut bytes, read_cpu_mem);
+        // Safety: T is Copy and we have exactly size_of::<T>() bytes.
+        let value = unsafe { std::ptr::read(bytes.as_ptr() as *const T) };
+        Some(value)
+    }
+
+    /// Write a value of type `T` to GPU virtual address space.
+    ///
+    /// Upstream: `template <typename T> void MemoryManager::Write(GPUVAddr addr, T data)`
+    pub fn write_value<T: Copy>(
+        &self,
+        gpu_addr: u64,
+        data: T,
+        write_cpu_mem: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        let size = std::mem::size_of::<T>();
+        let bytes =
+            unsafe { std::slice::from_raw_parts(&data as *const T as *const u8, size) };
+        self.write(gpu_addr, bytes, write_cpu_mem);
+    }
 }
 
 impl Default for GpuMemoryManager {

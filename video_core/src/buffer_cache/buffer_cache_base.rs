@@ -361,6 +361,248 @@ impl Default for OverlapResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// StagingBufferRef — staging buffer allocation handle
+// ---------------------------------------------------------------------------
+
+/// A reference to a staging buffer allocation.
+///
+/// Upstream: `StagingBufferRef` (Vulkan) / `StagingBufferMap` (OpenGL).
+/// This is a backend-agnostic handle returned by `BufferCacheRuntime::upload_staging_buffer`
+/// and `BufferCacheRuntime::download_staging_buffer`.
+pub struct StagingBufferRef {
+    /// Opaque buffer handle (backend interprets this).
+    pub buffer: u64,
+    /// Offset within the staging buffer.
+    pub offset: u64,
+    /// Mapped host-visible memory span for CPU access.
+    pub mapped_span: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// BufferCacheRuntime trait — the Runtime template parameter interface
+// ---------------------------------------------------------------------------
+
+/// Trait replacing the C++ `Runtime` type parameter used by `BufferCache<P>`.
+///
+/// Each rendering backend (OpenGL, Vulkan, Null) provides a concrete
+/// implementation of this trait. The upstream C++ uses duck-typing via the
+/// template parameter `P::Runtime`; in Rust we formalize the interface as a trait.
+///
+/// Method signatures are derived from the union of methods called on `runtime`
+/// in upstream `buffer_cache.h` (template method implementations).
+pub trait BufferCacheRuntime {
+    // -- Frame lifecycle --
+
+    /// Called once per frame to allow the runtime to reclaim resources.
+    ///
+    /// Upstream: `Runtime::TickFrame(SlotVector<Buffer>&)`
+    fn tick_frame(&mut self);
+
+    /// Whether the runtime can report actual device memory usage.
+    ///
+    /// Upstream: `Runtime::CanReportMemoryUsage()`
+    fn can_report_memory_usage(&self) -> bool;
+
+    /// Return the amount of device-local memory available.
+    ///
+    /// Upstream: `Runtime::GetDeviceLocalMemory()`
+    fn get_device_local_memory(&self) -> u64;
+
+    /// Return current device memory usage in bytes.
+    ///
+    /// Upstream: `Runtime::GetDeviceMemoryUsage()`
+    fn get_device_memory_usage(&self) -> u64;
+
+    /// Return the alignment requirement for storage buffer offsets.
+    ///
+    /// Upstream: `Runtime::GetStorageBufferAlignment()`
+    fn get_storage_buffer_alignment(&self) -> u32;
+
+    /// Wait for all pending GPU operations to complete.
+    ///
+    /// Upstream: `Runtime::Finish()`
+    fn finish(&mut self);
+
+    // -- Staging buffers --
+
+    /// Allocate a staging buffer for CPU→GPU upload.
+    ///
+    /// Upstream: `Runtime::UploadStagingBuffer(size)`
+    fn upload_staging_buffer(&mut self, size: u64) -> StagingBufferRef;
+
+    /// Allocate a staging buffer for GPU→CPU download.
+    ///
+    /// Upstream: `Runtime::DownloadStagingBuffer(size, deferred)`
+    fn download_staging_buffer(&mut self, size: u64, deferred: bool) -> StagingBufferRef;
+
+    /// Free a deferred staging buffer.
+    ///
+    /// Upstream: `Runtime::FreeDeferredStagingBuffer(ref)`
+    fn free_deferred_staging_buffer(&mut self, buffer: &mut StagingBufferRef);
+
+    /// Whether uploads to `buffer` with given `copies` can be reordered.
+    ///
+    /// Upstream: `Runtime::CanReorderUpload(buffer, copies)`
+    fn can_reorder_upload(&self, buffer_id: BufferId, copies: &[BufferCopy]) -> bool;
+
+    // -- Copy / Clear --
+
+    /// Insert a barrier before a batch of copy operations.
+    ///
+    /// Upstream: `Runtime::PreCopyBarrier()`
+    fn pre_copy_barrier(&mut self);
+
+    /// Insert a barrier after a batch of copy operations.
+    ///
+    /// Upstream: `Runtime::PostCopyBarrier()`
+    fn post_copy_barrier(&mut self);
+
+    /// Copy data between two buffers.
+    ///
+    /// Upstream: `Runtime::CopyBuffer(dst, src, copies, barrier, can_reorder_upload)`
+    fn copy_buffer(
+        &mut self,
+        dst_buffer: BufferId,
+        src_buffer: BufferId,
+        copies: &[BufferCopy],
+        barrier: bool,
+        can_reorder_upload: bool,
+    );
+
+    /// Clear a buffer region to a uniform value.
+    ///
+    /// Upstream: `Runtime::ClearBuffer(buffer, offset, size, value)`
+    fn clear_buffer(&mut self, buffer: BufferId, offset: u32, size: u64, value: u32);
+
+    // -- Index buffer binding --
+
+    /// Bind an index buffer for draw calls.
+    ///
+    /// Upstream: `Runtime::BindIndexBuffer(buffer, offset, size)`
+    fn bind_index_buffer(&mut self, buffer: BufferId, offset: u32, size: u32);
+
+    // -- Vertex buffer binding --
+
+    /// Bind vertex buffers collected in `HostBindings`.
+    ///
+    /// Upstream: `Runtime::BindVertexBuffers(host_bindings)`
+    fn bind_vertex_buffers(&mut self, bindings: &HostBindings);
+
+    // -- Uniform buffer binding (graphics) --
+
+    /// Bind a graphics-stage uniform buffer.
+    ///
+    /// Upstream (OpenGL): `Runtime::BindUniformBuffer(stage, binding_index, buffer, offset, size)`
+    /// Upstream (Vulkan): `Runtime::BindUniformBuffer(buffer, offset, size)`
+    fn bind_uniform_buffer(
+        &mut self,
+        stage: usize,
+        binding_index: u32,
+        buffer: BufferId,
+        offset: u32,
+        size: u32,
+    );
+
+    // -- Storage buffer binding (graphics) --
+
+    /// Bind a graphics-stage storage buffer.
+    ///
+    /// Upstream (OpenGL): `Runtime::BindStorageBuffer(stage, binding_index, buffer, offset, size, is_written)`
+    /// Upstream (Vulkan): `Runtime::BindStorageBuffer(buffer, offset, size, is_written)`
+    fn bind_storage_buffer(
+        &mut self,
+        stage: usize,
+        binding_index: u32,
+        buffer: BufferId,
+        offset: u32,
+        size: u32,
+        is_written: bool,
+    );
+
+    // -- Texture / Image buffer binding --
+
+    /// Bind a texture buffer view.
+    ///
+    /// Upstream: `Runtime::BindTextureBuffer(buffer, offset, size, format)`
+    fn bind_texture_buffer(&mut self, buffer: BufferId, offset: u32, size: u32, format: u32);
+
+    /// Bind an image buffer view (separate from texture on some backends).
+    ///
+    /// Upstream: `Runtime::BindImageBuffer(buffer, offset, size, format)`
+    fn bind_image_buffer(&mut self, buffer: BufferId, offset: u32, size: u32, format: u32);
+
+    // -- Transform feedback --
+
+    /// Bind transform feedback buffers.
+    ///
+    /// Upstream: `Runtime::BindTransformFeedbackBuffers(host_bindings)`
+    fn bind_transform_feedback_buffers(&mut self, bindings: &HostBindings);
+
+    // -- Compute buffer binding --
+
+    /// Bind a compute-stage uniform buffer.
+    ///
+    /// Upstream: `Runtime::BindComputeUniformBuffer(binding_index, buffer, offset, size)`
+    fn bind_compute_uniform_buffer(
+        &mut self,
+        binding_index: u32,
+        buffer: BufferId,
+        offset: u32,
+        size: u32,
+    );
+
+    /// Bind a compute-stage storage buffer.
+    ///
+    /// Upstream: `Runtime::BindComputeStorageBuffer(binding_index, buffer, offset, size, is_written)`
+    fn bind_compute_storage_buffer(
+        &mut self,
+        binding_index: u32,
+        buffer: BufferId,
+        offset: u32,
+        size: u32,
+        is_written: bool,
+    );
+
+    // -- OpenGL-specific fast uniform buffer path --
+
+    /// Whether the runtime supports `glBufferSubData`-like fast path.
+    ///
+    /// Upstream (OpenGL): `Runtime::HasFastBufferSubData()`
+    fn has_fast_buffer_sub_data(&self) -> bool {
+        false
+    }
+
+    /// Whether non-zero uniform buffer offsets are supported.
+    ///
+    /// Upstream (OpenGL): `Runtime::SupportsNonZeroUniformOffset()`
+    fn supports_non_zero_uniform_offset(&self) -> bool {
+        true
+    }
+
+    /// Bind a fast uniform buffer (OpenGL assembly shader path).
+    ///
+    /// Upstream (OpenGL): `Runtime::BindFastUniformBuffer(stage, binding_index, size)`
+    fn bind_fast_uniform_buffer(&mut self, _stage: usize, _binding_index: u32, _size: u32) {}
+
+    /// Push data into a fast uniform buffer (OpenGL path).
+    ///
+    /// Upstream (OpenGL): `Runtime::PushFastUniformBuffer(stage, binding_index, data)`
+    fn push_fast_uniform_buffer(&mut self, _stage: usize, _binding_index: u32, _data: &[u8]) {}
+
+    /// Bind a mapped uniform buffer, returning a host-visible span to write into.
+    ///
+    /// Upstream (OpenGL): `Runtime::BindMappedUniformBuffer(stage, binding_index, size)`
+    fn bind_mapped_uniform_buffer(
+        &mut self,
+        _stage: usize,
+        _binding_index: u32,
+        _size: u32,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

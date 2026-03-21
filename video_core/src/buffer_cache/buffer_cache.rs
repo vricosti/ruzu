@@ -82,6 +82,14 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     // -- Channel state (upstream inherits from ChannelSetupCaches) --
     pub channel_state: Option<Box<BufferCacheChannelInfo>>,
 
+    // -- Backend runtime --
+    /// The backend runtime that performs actual GPU operations (bind, copy, clear, etc.).
+    ///
+    /// Upstream: `Runtime& runtime` — stored as a non-owning reference.
+    /// In Rust we use `Option<Box<dyn BufferCacheRuntime>>` for flexibility;
+    /// `None` when no runtime is bound yet (e.g., during tests).
+    runtime: Option<Box<dyn BufferCacheRuntime>>,
+
     // -- Slot storage --
     slot_buffers: SlotVector<BufferBase>,
 
@@ -143,6 +151,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         Self {
             mutex: Mutex::new(()),
             channel_state: None,
+            runtime: None,
             slot_buffers,
             page_table: vec![SlotId::invalid(); PAGE_TABLE_SIZE],
             last_index_count: 0,
@@ -163,6 +172,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             tmp_buffer: Vec::new(),
             _params: std::marker::PhantomData,
         }
+    }
+
+    /// Set the backend runtime for this buffer cache.
+    ///
+    /// Upstream: `BufferCache(... Runtime& runtime_)` — runtime is bound at construction.
+    /// In Rust the runtime can be set after construction for flexibility.
+    pub fn set_runtime(&mut self, runtime: Box<dyn BufferCacheRuntime>) {
+        self.runtime = Some(runtime);
     }
 
     // -----------------------------------------------------------------------
@@ -208,8 +225,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             };
         }
 
-        // TODO: runtime.TickFrame(slot_buffers) — runtime not yet available.
-        // TODO: total_used_memory = runtime.GetDeviceMemoryUsage() if CanReportMemoryUsage.
+        if let Some(ref mut rt) = self.runtime {
+            rt.tick_frame();
+            if rt.can_report_memory_usage() {
+                self.total_used_memory = rt.get_device_memory_usage();
+            }
+        }
 
         if self.total_used_memory >= self.minimum_memory {
             self.run_garbage_collector();
@@ -1096,7 +1117,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // Touch and synchronize.
         self.touch_buffer(buffer_id);
         self.synchronize_buffer(buffer_id, device_addr, size);
-        // TODO: runtime.BindIndexBuffer — not yet available.
+
+        let offset = self.slot_buffers[buffer_id].offset(device_addr);
+        if let Some(ref mut rt) = self.runtime {
+            rt.bind_index_buffer(buffer_id, offset, size);
+        }
     }
 
     fn bind_host_vertex_buffers(&mut self) {
@@ -1108,11 +1133,25 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let bindings: Vec<Binding> = cs.vertex_buffers.to_vec();
         drop(cs);
 
-        for binding in bindings {
+        let mut host_bindings = HostBindings::default();
+        for (index, binding) in bindings.iter().enumerate() {
+            if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
+                continue;
+            }
             self.touch_buffer(binding.buffer_id);
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
+
+            let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            host_bindings.buffer_ids.push(binding.buffer_id);
+            host_bindings.offsets.push(offset as u64);
+            host_bindings.sizes.push(binding.size as u64);
+            host_bindings.strides.push(0); // Stride comes from engine state — not yet available.
+            host_bindings.min_index = host_bindings.min_index.min(index as u32);
+            host_bindings.max_index = host_bindings.max_index.max(index as u32);
         }
-        // TODO: runtime.BindVertexBuffers — not yet available.
+        if let Some(ref mut rt) = self.runtime {
+            rt.bind_vertex_buffers(&host_bindings);
+        }
     }
 
     fn bind_host_draw_indirect_buffers(&mut self) {
@@ -1280,8 +1319,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
             }
         }
-        // TODO: runtime.BindUniformBuffer — not yet available.
-        let _ = (offset, size, binding_index);
+        if let Some(ref mut rt) = self.runtime {
+            rt.bind_uniform_buffer(stage, binding_index, binding.buffer_id, offset, size);
+        }
     }
 
     fn bind_host_graphics_storage_buffers(&mut self, stage: usize) {
@@ -1311,8 +1351,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if is_written {
                 self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
             }
-            // TODO: runtime.BindStorageBuffer — not yet available.
-            let _ = binding_index;
+
+            let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            if let Some(ref mut rt) = self.runtime {
+                rt.bind_storage_buffer(
+                    stage,
+                    binding_index,
+                    binding.buffer_id,
+                    offset,
+                    binding.size,
+                    is_written,
+                );
+            }
             if P::NEEDS_BIND_STORAGE_INDEX {
                 binding_index += 1;
             }
@@ -1348,8 +1398,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if is_written {
                 self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
             }
-            let _is_image = P::SEPARATE_IMAGE_BUFFER_BINDINGS && ((image_mask >> idx) & 1) != 0;
-            // TODO: runtime.BindTextureBuffer / BindImageBuffer — not yet available.
+            let is_image = P::SEPARATE_IMAGE_BUFFER_BINDINGS && ((image_mask >> idx) & 1) != 0;
+
+            let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            if let Some(ref mut rt) = self.runtime {
+                if is_image {
+                    rt.bind_image_buffer(binding.buffer_id, offset, binding.size, binding.format);
+                } else {
+                    rt.bind_texture_buffer(binding.buffer_id, offset, binding.size, binding.format);
+                }
+            }
 
             idx += 1;
             bits >>= 1;
@@ -1373,7 +1431,28 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             self.touch_buffer(binding.buffer_id);
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
             self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
-            // TODO: runtime.BindTransformFeedbackBuffers — not yet available.
+        }
+
+        // Build HostBindings and bind them all at once (matching upstream pattern).
+        let Some(ref cs) = self.channel_state else {
+            return;
+        };
+        let mut host_bindings = HostBindings::default();
+        for (index, binding) in cs.transform_feedback_buffers.iter().enumerate() {
+            if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
+                continue;
+            }
+            let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            host_bindings.buffer_ids.push(binding.buffer_id);
+            host_bindings.offsets.push(offset as u64);
+            host_bindings.sizes.push(binding.size as u64);
+            host_bindings.strides.push(0);
+            host_bindings.min_index = host_bindings.min_index.min(index as u32);
+            host_bindings.max_index = host_bindings.max_index.max(index as u32);
+        }
+        drop(cs);
+        if let Some(ref mut rt) = self.runtime {
+            rt.bind_transform_feedback_buffers(&host_bindings);
         }
     }
 
@@ -1411,11 +1490,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 binding.size
             };
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, size);
-            // TODO: runtime.BindComputeUniformBuffer — not yet available.
+
+            let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            if let Some(ref mut rt) = self.runtime {
+                rt.bind_compute_uniform_buffer(binding_index, binding.buffer_id, offset, size);
+            }
             if P::NEEDS_BIND_UNIFORM_INDEX {
                 binding_index += 1;
             }
-            let _ = binding_index;
 
             idx += 1;
             bits >>= 1;
@@ -1447,11 +1529,20 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if is_written {
                 self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
             }
-            // TODO: runtime.BindComputeStorageBuffer — not yet available.
+
+            let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            if let Some(ref mut rt) = self.runtime {
+                rt.bind_compute_storage_buffer(
+                    binding_index,
+                    binding.buffer_id,
+                    offset,
+                    binding.size,
+                    is_written,
+                );
+            }
             if P::NEEDS_BIND_STORAGE_INDEX {
                 binding_index += 1;
             }
-            let _ = binding_index;
 
             idx += 1;
             bits >>= 1;
@@ -1482,8 +1573,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if is_written {
                 self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
             }
-            let _is_image = P::SEPARATE_IMAGE_BUFFER_BINDINGS && ((image_mask >> idx) & 1) != 0;
-            // TODO: runtime.BindTextureBuffer / BindImageBuffer — not yet available.
+            let is_image = P::SEPARATE_IMAGE_BUFFER_BINDINGS && ((image_mask >> idx) & 1) != 0;
+
+            let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            if let Some(ref mut rt) = self.runtime {
+                if is_image {
+                    rt.bind_image_buffer(binding.buffer_id, offset, binding.size, binding.format);
+                } else {
+                    rt.bind_texture_buffer(binding.buffer_id, offset, binding.size, binding.format);
+                }
+            }
 
             idx += 1;
             bits >>= 1;
@@ -1907,8 +2006,20 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             let score = self.slot_buffers[overlap_id].stream_score() + 1;
             self.slot_buffers[new_buffer_id].increase_stream_score(score);
         }
-        // TODO: runtime.CopyBuffer(new_buffer, overlap, copies, true) — not yet available.
-        // Data transfer from overlap to new_buffer is skipped for now.
+
+        // Copy data from the overlap buffer into the new buffer.
+        let overlap_start = self.slot_buffers[overlap_id].cpu_addr();
+        let overlap_size = self.slot_buffers[overlap_id].size_bytes() as u64;
+        let new_start = self.slot_buffers[new_buffer_id].cpu_addr();
+        let dst_offset = overlap_start.saturating_sub(new_start);
+        let copies = [BufferCopy {
+            src_offset: 0,
+            dst_offset,
+            size: overlap_size,
+        }];
+        if let Some(ref mut rt) = self.runtime {
+            rt.copy_buffer(new_buffer_id, overlap_id, &copies, true, false);
+        }
         self.delete_buffer(overlap_id, true);
     }
 
@@ -1929,7 +2040,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let size = (overlap.end - overlap.begin) as u32;
 
         let new_buffer_id = self.slot_buffers.insert(BufferBase::new(overlap.begin, size as u64));
-        // TODO: runtime.ClearBuffer(new_buffer, 0, size_bytes, 0) — not yet available.
+        if let Some(ref mut rt) = self.runtime {
+            rt.clear_buffer(new_buffer_id, 0, size as u64, 0);
+        }
 
         let overlap_ids: Vec<BufferId> = overlap.ids.clone();
         let has_stream_leap = overlap.has_stream_leap;
@@ -2075,14 +2188,24 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// NOTE: runtime.UploadStagingBuffer and runtime.CopyBuffer are not yet available.
     fn mapped_upload_memory(
         &mut self,
-        _buffer_id: BufferId,
-        _total_size_bytes: u64,
-        _copies: &mut [BufferCopy],
+        buffer_id: BufferId,
+        total_size_bytes: u64,
+        copies: &mut [BufferCopy],
     ) {
         if !P::USE_MEMORY_MAPS {
             return;
         }
-        // TODO: runtime.UploadStagingBuffer, device_memory.ReadBlockUnsafe, runtime.CopyBuffer.
+        if let Some(ref mut rt) = self.runtime {
+            let staging = rt.upload_staging_buffer(total_size_bytes);
+            // TODO: device_memory.ReadBlockUnsafe — fill staging.mapped_span with CPU data.
+            // For now the staging buffer contents are uninitialized (zeros).
+            // Adjust copy src_offsets to be relative to staging buffer offset.
+            for copy in copies.iter_mut() {
+                copy.src_offset += staging.offset;
+            }
+            let can_reorder = rt.can_reorder_upload(buffer_id, copies);
+            rt.copy_buffer(buffer_id, NULL_BUFFER_ID, copies, true, can_reorder);
+        }
     }
 
     /// Download buffer memory back to the CPU (full buffer).
@@ -2346,8 +2469,23 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let buffer_id = self.find_buffer(dest_address, copy_size as u32);
         self.synchronize_buffer(buffer_id, dest_address, copy_size as u32);
 
-        // TODO: USE_MEMORY_MAPS_FOR_UPLOADS path: runtime.UploadStagingBuffer + CopyBuffer.
-        // TODO: non-mapped path: buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer).
+        if P::USE_MEMORY_MAPS_FOR_UPLOADS {
+            if let Some(ref mut rt) = self.runtime {
+                let mut staging = rt.upload_staging_buffer(copy_size as u64);
+                // Copy inlined data into staging buffer.
+                let len = copy_size.min(staging.mapped_span.len());
+                staging.mapped_span[..len].copy_from_slice(&_inlined_buffer[..len]);
+
+                let offset = self.slot_buffers[buffer_id].offset(dest_address);
+                let copies = [BufferCopy {
+                    src_offset: staging.offset,
+                    dst_offset: offset as u64,
+                    size: copy_size as u64,
+                }];
+                rt.copy_buffer(buffer_id, NULL_BUFFER_ID, &copies, true, false);
+            }
+        }
+        // TODO: non-mapped path: buffer.ImmediateUpload — requires per-buffer upload support.
     }
 }
 
