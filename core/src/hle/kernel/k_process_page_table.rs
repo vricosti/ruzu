@@ -310,6 +310,20 @@ impl KProcessPageTable {
         self.base.unlock_for_ipc_user_buffer(addr.get() as usize, size)
     }
 
+    // -- Code memory mapping --
+
+    /// Map code memory: copies src pages to dst, reprotects src.
+    /// Upstream: `KProcessPageTable::MapCodeMemory`.
+    pub fn map_code_memory(&mut self, dst: KProcessAddress, src: KProcessAddress, size: usize) -> u32 {
+        self.base.map_code_memory(dst.get() as usize, src.get() as usize, size)
+    }
+
+    /// Unmap code memory: unmaps dst, restores src permissions.
+    /// Upstream: `KProcessPageTable::UnmapCodeMemory`.
+    pub fn unmap_code_memory(&mut self, dst: KProcessAddress, src: KProcessAddress, size: usize) -> u32 {
+        self.base.unmap_code_memory(dst.get() as usize, src.get() as usize, size)
+    }
+
     // -- Memory bridge --
 
     /// Set the Memory bridge on the underlying KPageTableBase.

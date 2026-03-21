@@ -232,9 +232,10 @@ impl NPad {
 
     /// Port of NPad::GetLastActiveNpad.
     /// Upstream delegates to hid_core.GetLastActiveController().
-    /// Since we don't have a direct hid_core reference here, return Player1 as default.
+    /// NPad needs a reference to HidCore (which has get_last_active_controller())
+    /// but that wiring is not yet in place. Returns Player1 as a safe default until
+    /// NPad receives an HidCore reference matching upstream's constructor signature.
     pub fn get_last_active_npad(&self) -> (ResultCode, NpadIdType) {
-        // TODO: forward to hid_core.get_last_active_controller() when wired
         (ResultCode::SUCCESS, NpadIdType::Player1)
     }
 
@@ -253,18 +254,24 @@ impl NPad {
     }
 
     /// Port of NPad::SetNpadSystemExtStateEnabled.
+    /// Upstream additionally iterates abstracted_pads and calls
+    /// abstracted_pad->EnableAppletToGetInput(aruid) on success.
+    /// AbstractedPad integration is not yet wired up.
     pub fn set_npad_system_ext_state_enabled(&mut self, aruid: u64, is_enabled: bool) -> ResultCode {
         let result = self.npad_resource.set_npad_system_ext_state_enabled(aruid, is_enabled);
         if result.is_success() {
-            // Upstream: TODO: abstracted_pad->EnableAppletToGetInput(aruid)
+            // Upstream: for (auto& abstract_pad : abstracted_pads) {
+            //     abstract_pad->EnableAppletToGetInput(aruid);
+            // }
+            // Requires AbstractedPad array to be stored in NPad.
         }
         result
     }
 
     /// Port of NPad::EnableAppletToGetInput.
+    /// Upstream iterates abstracted_pads and calls EnableAppletToGetInput(aruid).
+    /// Requires AbstractedPad array to be stored in NPad, which is not yet wired up.
     pub fn enable_applet_to_get_input(&mut self, _aruid: u64) {
-        // Upstream iterates abstracted_pads and calls EnableAppletToGetInput(aruid).
-        // TODO: implement when abstracted_pads are wired up
     }
 
     pub fn npad_resource(&self) -> &NPadResource {

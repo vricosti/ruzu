@@ -4,6 +4,8 @@
 //! Port of zuyu/src/core/hle/service/glue/arp.h
 //! Port of zuyu/src/core/hle/service/glue/arp.cpp
 
+use std::sync::{Arc, Mutex};
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::errors;
 use super::glue_manager::{ARPManager, ApplicationLaunchProperty};
@@ -39,15 +41,18 @@ pub mod registrar_commands {
 /// ARP_R service ("arp:r").
 ///
 /// Corresponds to `ARP_R` in upstream `arp.h`.
+/// Upstream: explicit ARP_R(Core::System& system_, const ARPManager& manager_)
 pub struct ArpR {
     pub service_name: &'static str,
-    // TODO: reference to ARPManager
+    /// Reference to the shared ARPManager — upstream: const ARPManager& manager
+    pub manager: Arc<Mutex<ARPManager>>,
 }
 
 impl ArpR {
-    pub fn new() -> Self {
+    pub fn new(manager: Arc<Mutex<ARPManager>>) -> Self {
         Self {
             service_name: "arp:r",
+            manager,
         }
     }
 }
@@ -55,15 +60,18 @@ impl ArpR {
 /// ARP_W service ("arp:w").
 ///
 /// Corresponds to `ARP_W` in upstream `arp.h`.
+/// Upstream: explicit ARP_W(Core::System& system_, ARPManager& manager_)
 pub struct ArpW {
     pub service_name: &'static str,
-    // TODO: reference to ARPManager
+    /// Reference to the shared ARPManager — upstream: ARPManager& manager
+    pub manager: Arc<Mutex<ARPManager>>,
 }
 
 impl ArpW {
-    pub fn new() -> Self {
+    pub fn new(manager: Arc<Mutex<ARPManager>>) -> Self {
         Self {
             service_name: "arp:w",
+            manager,
         }
     }
 }

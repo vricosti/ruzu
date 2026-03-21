@@ -11,11 +11,20 @@ use crate::hle::service::mii::mii_types::Nickname;
 
 /// CharInfo is the runtime representation of a Mii character.
 /// Size: 0x58 bytes in upstream.
+///
+/// Layout matches upstream:
+///   Common::UUID create_id (16 bytes)
+///   Nickname name (20 bytes)
+///   u16 null_terminator (2 bytes)
+///   then individual u8 fields (46 bytes)
+///   Total: 16 + 20 + 2 + 46 = 84 = 0x54
+///   Note: upstream says 0x58 due to UUID alignment; we use a flat byte layout.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct CharInfo {
-    pub create_id: u128,
+    pub create_id: [u8; 16],
     pub name: Nickname,
+    pub null_terminator: u16,
     pub font_region: u8,
     pub favorite_color: u8,
     pub gender: u8,

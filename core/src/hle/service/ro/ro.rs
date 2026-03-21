@@ -7,9 +7,15 @@
 //! RO service — read-only module loading ("ldr:ro" and "ro:1").
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use sha2::{Digest, Sha256};
+
+use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use super::ro_nro_utils;
 use super::ro_results;
 use super::ro_types::{ModuleId, NroHeader, NrrHeader, NrrKind};
 
@@ -72,6 +78,8 @@ struct ProcessContext {
     nrr_in_use: [bool; MAX_NRR_INFOS],
     nro_infos: Vec<NroInfo>,
     nrr_infos: Vec<NrrInfo>,
+    /// Upstream: `Kernel::KProcess* m_process`.
+    process: Option<Arc<Mutex<KProcess>>>,
     process_id: u64,
     in_use: bool,
 }
@@ -83,6 +91,7 @@ impl Default for ProcessContext {
             nrr_in_use: [false; MAX_NRR_INFOS],
             nro_infos: (0..MAX_NRO_INFOS).map(|_| NroInfo::default()).collect(),
             nrr_infos: (0..MAX_NRR_INFOS).map(|_| NrrInfo::default()).collect(),
+            process: None,
             process_id: INVALID_PROCESS_ID,
             in_use: false,
         }
@@ -91,7 +100,9 @@ impl Default for ProcessContext {
 
 impl ProcessContext {
     /// Initialize the context for a process.
-    fn initialize(&mut self, process_id: u64) {
+    ///
+    /// Corresponds to `ProcessContext::Initialize` in upstream.
+    fn initialize(&mut self, process: Option<Arc<Mutex<KProcess>>>, process_id: u64) {
         assert!(!self.in_use);
 
         self.nro_in_use = [false; MAX_NRO_INFOS];
@@ -103,11 +114,14 @@ impl ProcessContext {
             *info = NrrInfo::default();
         }
 
+        self.process = process;
         self.process_id = process_id;
         self.in_use = true;
     }
 
     /// Finalize (release) the context.
+    ///
+    /// Corresponds to `ProcessContext::Finalize` in upstream.
     fn finalize(&mut self) {
         assert!(self.in_use);
 
@@ -120,8 +134,13 @@ impl ProcessContext {
             *info = NrrInfo::default();
         }
 
+        self.process = None;
         self.process_id = INVALID_PROCESS_ID;
         self.in_use = false;
+    }
+
+    fn get_process(&self) -> Option<&Arc<Mutex<KProcess>>> {
+        self.process.as_ref()
     }
 
     fn get_process_id(&self) -> u64 {
@@ -184,17 +203,45 @@ impl ProcessContext {
 
     /// Validate that the NRO hash is present in a registered NRR.
     ///
-    /// Note: Actual memory read + SHA-256 requires kernel/memory integration.
+    /// Corresponds to `ProcessContext::ValidateHasNroHash` in upstream ro.cpp.
+    /// Reads NRO data from process memory, computes SHA-256, and searches NRR hash lists.
     fn validate_has_nro_hash(
         &self,
-        _base_address: u64,
-        _nro_header: &NroHeader,
+        base_address: u64,
+        nro_header: &NroHeader,
     ) -> Result<(), ResultCode> {
-        // TODO: Calculate SHA-256 hash of NRO data from process memory,
-        // then search all in-use NRR hash lists.
-        // This requires kernel memory read support.
-        log::warn!("validate_has_nro_hash: hash validation not yet implemented, allowing");
-        Ok(())
+        // Calculate hash.
+        let hash: Sha256Hash = {
+            let size = nro_header.get_size() as u64;
+
+            let process_arc = self.process.as_ref()
+                .ok_or(ro_results::RESULT_INVALID_PROCESS)?;
+            let process = process_arc.lock().unwrap();
+            let mem = process.process_memory.read().unwrap();
+            let nro_data = mem.read_bytes(base_address, size as usize);
+
+            let mut hasher = Sha256::new();
+            hasher.update(&nro_data);
+            let result = hasher.finalize();
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&result);
+            hash
+        };
+
+        for i in 0..MAX_NRR_INFOS {
+            // Ensure we only check NRRs that are in use.
+            if !self.nrr_in_use[i] {
+                continue;
+            }
+
+            // Locate the hash within the hash list.
+            if self.nrr_infos[i].hashes.iter().any(|h| *h == hash) {
+                // The hash is valid!
+                return Ok(());
+            }
+        }
+
+        Err(ro_results::RESULT_NOT_AUTHORIZED)
     }
 
     /// Validate an NRO header and check constraints.
@@ -202,11 +249,23 @@ impl ProcessContext {
     /// Corresponds to `ProcessContext::ValidateNro` in upstream ro.cpp.
     fn validate_nro(
         &self,
-        _base_address: u64,
+        base_address: u64,
         expected_nro_size: u64,
         expected_bss_size: u64,
-        header: &NroHeader,
     ) -> Result<(ModuleId, u64, u64, u64), ResultCode> {
+        // Ensure we have a process to work on.
+        let process_arc = self.process.as_ref()
+            .ok_or(ro_results::RESULT_INVALID_PROCESS)?;
+
+        // Read the NRO header from process memory.
+        let header: NroHeader = {
+            let process = process_arc.lock().unwrap();
+            let mem = process.process_memory.read().unwrap();
+            let header_bytes = mem.read_bytes(base_address, std::mem::size_of::<NroHeader>());
+            assert!(header_bytes.len() >= std::mem::size_of::<NroHeader>());
+            unsafe { std::ptr::read_unaligned(header_bytes.as_ptr() as *const NroHeader) }
+        };
+
         // Validate magic.
         if !header.is_magic_valid() {
             return Err(ro_results::RESULT_INVALID_NRO);
@@ -268,6 +327,9 @@ impl ProcessContext {
             return Err(ro_results::RESULT_INVALID_NRO);
         }
 
+        // Verify NRO hash.
+        self.validate_has_nro_hash(base_address, &header)?;
+
         // Check if NRO has already been loaded.
         let module_id = header.get_module_id();
         if self.get_nro_info_index_by_module_id(module_id).is_ok() {
@@ -321,6 +383,10 @@ fn validate_address_and_size(address: u64, size: u64) -> Result<(), ResultCode> 
 /// Corresponds to `RoContext` in upstream ro.cpp.
 pub struct RoContext {
     process_contexts: Vec<ProcessContext>,
+    /// Upstream: `std::mt19937_64 generate_random`.
+    /// We use a simple counter-based approach; the exact PRNG is not critical
+    /// for correctness (upstream uses it only for ASLR trial addresses).
+    random_state: u64,
 }
 
 impl RoContext {
@@ -329,20 +395,38 @@ impl RoContext {
             process_contexts: (0..MAX_SESSIONS)
                 .map(|_| ProcessContext::default())
                 .collect(),
+            random_state: 0,
         }
+    }
+
+    /// Simple PRNG matching upstream's mt19937_64 usage pattern.
+    /// Used only for ASLR address randomization in MapProcessCodeMemory.
+    fn generate_random(&mut self) -> u64 {
+        // Use a simple xorshift64* — the exact distribution doesn't matter,
+        // only that we produce different trial addresses.
+        let mut x = self.random_state.wrapping_add(0x9E3779B97F4A7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+        x ^= x >> 31;
+        self.random_state = x;
+        x
     }
 
     /// Register a process.
     ///
     /// Corresponds to `RoContext::RegisterProcess` in upstream.
-    pub fn register_process(&mut self, process_id: u64) -> Result<usize, ResultCode> {
+    pub fn register_process(
+        &mut self,
+        process: Option<Arc<Mutex<KProcess>>>,
+        process_id: u64,
+    ) -> Result<usize, ResultCode> {
         // Check if a process context already exists.
         if self.get_context_index_by_process_id(process_id).is_some() {
             return Err(ro_results::RESULT_INVALID_SESSION);
         }
 
         // Allocate a context.
-        let context_id = self.allocate_context(process_id);
+        let context_id = self.allocate_context(process, process_id);
         Ok(context_id)
     }
 
@@ -386,19 +470,52 @@ impl RoContext {
         // Check we have space for a new NRR.
         let nrr_index = context.get_free_nrr_info_index()?;
 
-        // TODO: Read NRR header from process memory and populate hashes.
-        // This requires kernel memory read support.
+        // Ensure we have a valid process to read from.
+        let process_arc = context.get_process()
+            .ok_or(ro_results::RESULT_INVALID_PROCESS)?
+            .clone();
+
+        // Read NRR header from process memory.
+        let (num_hashes, hashes_offset) = {
+            let process = process_arc.lock().unwrap();
+            let mem = process.process_memory.read().unwrap();
+            let header_bytes = mem.read_bytes(nrr_address, std::mem::size_of::<NrrHeader>());
+            assert!(header_bytes.len() >= std::mem::size_of::<NrrHeader>());
+            let header: NrrHeader = unsafe {
+                std::ptr::read_unaligned(header_bytes.as_ptr() as *const NrrHeader)
+            };
+            (header.get_num_hashes() as usize, header.get_hashes_offset())
+        };
 
         // Set NRR info.
         context.nrr_in_use[nrr_index] = true;
         context.nrr_infos[nrr_index].nrr_heap_address = nrr_address;
         context.nrr_infos[nrr_index].nrr_heap_size = nrr_size;
-        context.nrr_infos[nrr_index].hashes.clear();
+
+        // Read NRR hash list from process memory.
+        let hash_data_size = std::mem::size_of::<Sha256Hash>() * num_hashes;
+        let mut hashes = Vec::with_capacity(num_hashes);
+        if hash_data_size > 0 {
+            let process = process_arc.lock().unwrap();
+            let mem = process.process_memory.read().unwrap();
+            let hash_bytes = mem.read_bytes(
+                nrr_address + hashes_offset as u64,
+                hash_data_size,
+            );
+            for i in 0..num_hashes {
+                let offset = i * 32;
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&hash_bytes[offset..offset + 32]);
+                hashes.push(hash);
+            }
+        }
+        context.nrr_infos[nrr_index].hashes = hashes;
 
         log::debug!(
-            "RegisterModuleInfo: registered NRR at address={:#x}, size={:#x}",
+            "RegisterModuleInfo: registered NRR at address={:#x}, size={:#x}, num_hashes={}",
             nrr_address,
-            nrr_size
+            nrr_size,
+            num_hashes,
         );
 
         Ok(())
@@ -430,6 +547,133 @@ impl RoContext {
         Ok(())
     }
 
+    /// Map NRO module memory.
+    ///
+    /// Corresponds to `RoContext::MapManualLoadModuleMemory` in upstream.
+    pub fn map_manual_load_module_memory(
+        &mut self,
+        context_id: usize,
+        nro_address: u64,
+        nro_size: u64,
+        bss_address: u64,
+        bss_size: u64,
+    ) -> Result<u64, ResultCode> {
+        let context = &mut self.process_contexts[context_id];
+
+        // Validate address/size.
+        validate_address_and_non_zero_size(nro_address, nro_size)?;
+        validate_address_and_size(bss_address, bss_size)?;
+
+        let total_size = nro_size + bss_size;
+        if total_size < nro_size {
+            return Err(ro_results::RESULT_INVALID_SIZE);
+        }
+        if total_size < bss_size {
+            return Err(ro_results::RESULT_INVALID_SIZE);
+        }
+
+        // Check we have space for a new NRO.
+        let nro_index = context.get_free_nro_info_index()?;
+        context.nro_infos[nro_index].nro_heap_address = nro_address;
+        context.nro_infos[nro_index].nro_heap_size = nro_size;
+        context.nro_infos[nro_index].bss_heap_address = bss_address;
+        context.nro_infos[nro_index].bss_heap_size = bss_size;
+
+        // Get the process for page table operations.
+        let process_arc = context.get_process()
+            .ok_or(ro_results::RESULT_INVALID_PROCESS)?
+            .clone();
+
+        // Map the NRO.
+        // We need to create a random generator closure that captures our state.
+        // Since self is borrowed mutably for context, we use a local random state.
+        let mut random_state = self.random_state;
+        let mut gen_random = move || -> u64 {
+            let mut x = random_state.wrapping_add(0x9E3779B97F4A7C15);
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+            x ^= x >> 31;
+            random_state = x;
+            x
+        };
+
+        let base_address = {
+            let mut process = process_arc.lock().unwrap();
+            ro_nro_utils::map_nro(
+                &mut process,
+                nro_address,
+                nro_size,
+                bss_address,
+                bss_size,
+                &mut gen_random,
+            )
+        };
+
+        // Update the random state.
+        // (We consumed some random values in the closure.)
+        self.random_state = gen_random();
+
+        let base_address = match base_address {
+            Ok(addr) => addr,
+            Err(e) => return Err(e),
+        };
+
+        // Re-borrow context after the map operation.
+        let context = &mut self.process_contexts[context_id];
+        context.nro_infos[nro_index].base_address = base_address;
+
+        // Validate the NRO (parsing region extents).
+        let (module_id, rx_size, ro_size, rw_size) =
+            match context.validate_nro(base_address, nro_size, bss_size) {
+                Ok(result) => result,
+                Err(e) => {
+                    // On validation failure, unmap the NRO.
+                    let mut process = process_arc.lock().unwrap();
+                    let _ = ro_nro_utils::unmap_nro(
+                        &mut process,
+                        base_address,
+                        nro_address,
+                        nro_size,
+                        bss_address,
+                        bss_size,
+                    );
+                    return Err(e);
+                }
+            };
+
+        // Set NRO perms.
+        {
+            let mut process = process_arc.lock().unwrap();
+            ro_nro_utils::set_nro_perms(
+                &mut process,
+                base_address,
+                rx_size,
+                ro_size,
+                rw_size + bss_size,
+            ).map_err(|e| {
+                // On permission failure, unmap the NRO.
+                let _ = ro_nro_utils::unmap_nro(
+                    &mut process,
+                    base_address,
+                    nro_address,
+                    nro_size,
+                    bss_address,
+                    bss_size,
+                );
+                e
+            })?;
+        }
+
+        // Re-borrow context after the permission operation.
+        let context = &mut self.process_contexts[context_id];
+        context.nro_in_use[nro_index] = true;
+        context.nro_infos[nro_index].module_id = module_id;
+        context.nro_infos[nro_index].code_size = rx_size + ro_size;
+        context.nro_infos[nro_index].rw_size = rw_size;
+
+        Ok(base_address)
+    }
+
     /// Unmap NRO module memory.
     ///
     /// Corresponds to `RoContext::UnmapManualLoadModuleMemory` in upstream.
@@ -450,14 +694,31 @@ impl RoContext {
         let nro_index = context.get_nro_info_index_by_address(nro_address)?;
 
         // Save backup and clear (Nintendo does this unconditionally).
-        let _nro_backup = context.nro_infos[nro_index].clone();
+        let nro_backup = context.nro_infos[nro_index].clone();
         context.nro_in_use[nro_index] = false;
         context.nro_infos[nro_index] = NroInfo::default();
 
-        // TODO: UnmapNro using backup info (requires kernel page table).
-        log::warn!("unmap_manual_load_module_memory: kernel unmap not yet implemented");
+        // Get the process for unmapping.
+        let process_arc = context.get_process()
+            .cloned();
 
-        Ok(())
+        // Unmap using backup info.
+        if let Some(process_arc) = process_arc {
+            let mut process = process_arc.lock().unwrap();
+            ro_nro_utils::unmap_nro(
+                &mut process,
+                nro_backup.base_address,
+                nro_backup.nro_heap_address,
+                nro_backup.code_size + nro_backup.rw_size,
+                nro_backup.bss_heap_address,
+                nro_backup.bss_heap_size,
+            )
+        } else {
+            // No process available — upstream would still attempt the unmap
+            // but we can't without a process reference.
+            log::warn!("unmap_manual_load_module_memory: no process reference available for unmap");
+            Ok(())
+        }
     }
 
     // Private context helpers.
@@ -471,10 +732,14 @@ impl RoContext {
         None
     }
 
-    fn allocate_context(&mut self, process_id: u64) -> usize {
+    fn allocate_context(
+        &mut self,
+        process: Option<Arc<Mutex<KProcess>>>,
+        process_id: u64,
+    ) -> usize {
         for i in 0..MAX_SESSIONS {
             if self.process_contexts[i].is_free() {
-                self.process_contexts[i].initialize(process_id);
+                self.process_contexts[i].initialize(process, process_id);
                 return i;
             }
         }
