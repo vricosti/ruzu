@@ -26,12 +26,20 @@
 /// - 100: SetApplicationCoreUsageMode (unimplemented)
 /// - 300: GetCurrentApplicationId
 pub struct IAppletCommonFunctions {
-    // TODO: Applet reference
+    applet: Option<std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>>,
 }
 
 impl IAppletCommonFunctions {
     pub fn new() -> Self {
-        Self {}
+        Self { applet: None }
+    }
+
+    pub fn with_applet(
+        applet: std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>,
+    ) -> Self {
+        Self {
+            applet: Some(applet),
+        }
     }
 
     /// Port of IAppletCommonFunctions::SetHomeButtonDoubleClickEnabled
@@ -47,14 +55,20 @@ impl IAppletCommonFunctions {
 
     /// Port of IAppletCommonFunctions::SetCpuBoostRequestPriority
     pub fn set_cpu_boost_request_priority(&self, _priority: i32) {
-        log::warn!("(STUBBED) SetCpuBoostRequestPriority called");
-        // TODO: lock applet, set applet.cpu_boost_request_priority = priority
+        log::debug!("SetCpuBoostRequestPriority called with priority={}", _priority);
+        if let Some(ref applet) = self.applet {
+            applet.lock().unwrap().cpu_boost_request_priority = _priority;
+        }
     }
 
     /// Port of IAppletCommonFunctions::GetCurrentApplicationId
     pub fn get_current_application_id(&self) -> u64 {
-        log::warn!("(STUBBED) GetCurrentApplicationId called");
-        // TODO: system.GetApplicationProcessProgramID() & !0xFFF
-        0
+        let program_id = if let Some(ref applet) = self.applet {
+            applet.lock().unwrap().program_id
+        } else {
+            0
+        };
+        log::debug!("GetCurrentApplicationId: {:016X}", program_id & !0xFFF);
+        program_id & !0xFFF
     }
 }
