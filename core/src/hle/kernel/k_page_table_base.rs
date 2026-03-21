@@ -194,12 +194,46 @@ impl KPageTableBase {
     }
     /// Finalize the page table, releasing all resources.
     /// Port of upstream `KPageTableBase::Finalize`.
+    ///
+    /// Upstream flow:
+    /// 1. FinalizeProcess() — calls unknown Nintendo OnFinalize hooks
+    /// 2. Iterates all memory blocks via m_memory_block_manager.Finalize(callback):
+    ///    - For each block with mapped physical pages, creates a KPageGroup
+    ///    - Calls CloseAndReset to decrement physical page reference counts
+    ///    - Unmaps fastmem arena mappings via DeviceMemory buffer
+    /// 3. Releases unsafe/insecure mapped memory resource limits
     pub fn finalize(&mut self) {
-        // Upstream: iterates all memory blocks, unmaps pages, frees resources.
-        // In the host-emulated model, the page table is a software structure;
-        // resetting the address space markers is sufficient.
-        self.m_address_space_start = 0;
-        self.m_address_space_end = 0;
+        // Iterate all memory blocks and unmap their pages from the page table.
+        // Upstream: m_memory_block_manager.Finalize(slab_manager, block_callback)
+        // where block_callback does:
+        //   1. Unmap from fastmem arena: buffer.Unmap(addr, size, false)
+        //   2. Create KPageGroup from physical pages via MakePageGroup
+        //   3. Call pg.CloseAndReset() to decrement physical page reference counts
+        if let Some(ref mut impl_) = self.m_impl {
+            // Collect block addresses first to avoid borrow conflict.
+            let blocks: Vec<(u64, u64)> = self
+                .m_memory_block_manager
+                .iter()
+                .map(|block| (block.get_address() as u64, block.get_size() as u64))
+                .collect();
+
+            for (addr, size) in blocks {
+                if size > 0 {
+                    // Unmap pages from the page table (sets entries to Unmapped).
+                    impl_.unmap_region(addr, size);
+                }
+            }
+
+            // Release the page table backing memory.
+            impl_.resize(0, 0);
+        }
+        self.m_impl = None;
+
+        // Finalize the memory block manager — iterates all blocks and frees them.
+        self.m_memory_block_manager.finalize();
+
+        // Clear the memory reference.
+        self.m_memory = None;
     }
 
     pub fn is_aslr_enabled(&self) -> bool {

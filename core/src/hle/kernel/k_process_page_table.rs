@@ -218,9 +218,15 @@ impl KProcessPageTable {
     }
 
     pub fn get_physical_address(&self, address: KProcessAddress) -> Option<KPhysicalAddress> {
-        // In the host-emulated model, virtual and physical addresses are identity-mapped.
-        // Upstream queries the page table implementation for the actual physical mapping.
-        Some(KPhysicalAddress::new(address.get()))
+        // Query the page table implementation for the physical address.
+        // Upstream: m_impl->GetPhysicalAddress(virt_addr)
+        if let Some(ref impl_) = self.base.m_impl {
+            impl_
+                .get_physical_address(address.get())
+                .map(KPhysicalAddress::new)
+        } else {
+            None
+        }
     }
 
     /// Upstream: `bool CanContain(KProcessAddress addr, size_t size, KMemoryState state) const`.
