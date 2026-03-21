@@ -37,6 +37,7 @@ pub enum Type {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Unspecified,
+    ICMP,
     TCP,
     UDP,
 }

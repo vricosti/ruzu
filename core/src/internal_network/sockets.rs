@@ -173,6 +173,7 @@ impl SocketBase for Socket {
             };
             let native_proto = match protocol {
                 Protocol::Unspecified => 0,
+                Protocol::ICMP => libc::IPPROTO_ICMP,
                 Protocol::TCP => libc::IPPROTO_TCP,
                 Protocol::UDP => libc::IPPROTO_UDP,
             };

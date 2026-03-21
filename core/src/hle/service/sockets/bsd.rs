@@ -10,6 +10,13 @@ use super::sockets::{
     Domain, Errno, FcntlCmd, Linger, OptName, PollEvents, PollFD, Protocol, ShutdownHow,
     SockAddrIn, SocketLevel, Type,
 };
+use crate::internal_network::network::{
+    Domain as NetDomain, Errno as NetErrno, Protocol as NetProtocol, ShutdownHow as NetShutdownHow,
+    SockAddrIn as NetSockAddrIn, Type as NetType,
+};
+use crate::internal_network::sockets::{
+    self as net_sockets, Socket, SocketBase,
+};
 
 /// Maximum number of file descriptors.
 ///
@@ -102,12 +109,131 @@ fn is_connection_based(ty: Type) -> bool {
     }
 }
 
+// --- Translation helpers between guest (service) and internal (network) types ---
+
+/// Translate guest Domain to internal Domain.
+///
+/// Corresponds to `Translate(Domain)` in upstream sockets_translate.cpp.
+fn translate_domain(domain: Domain) -> NetDomain {
+    match domain {
+        Domain::Unspecified => NetDomain::Unspecified,
+        Domain::INET => NetDomain::INET,
+    }
+}
+
+/// Translate internal Domain to guest Domain.
+fn translate_domain_back(domain: Option<NetDomain>) -> u8 {
+    match domain {
+        Some(NetDomain::INET) => Domain::INET as u8,
+        _ => Domain::Unspecified as u8,
+    }
+}
+
+/// Translate guest Type to internal Type.
+fn translate_type(ty: Type) -> NetType {
+    match ty {
+        Type::Unspecified => NetType::Unspecified,
+        Type::STREAM => NetType::STREAM,
+        Type::DGRAM => NetType::DGRAM,
+        Type::RAW => NetType::RAW,
+        Type::SEQPACKET => NetType::SEQPACKET,
+    }
+}
+
+/// Translate guest Protocol to internal Protocol.
+fn translate_protocol(protocol: Protocol) -> NetProtocol {
+    match protocol {
+        Protocol::Unspecified => NetProtocol::Unspecified,
+        Protocol::ICMP => NetProtocol::ICMP,
+        Protocol::TCP => NetProtocol::TCP,
+        Protocol::UDP => NetProtocol::UDP,
+    }
+}
+
+/// Translate guest SockAddrIn to internal SockAddrIn.
+///
+/// Corresponds to `Translate(SockAddrIn)` in upstream sockets_translate.cpp.
+/// Note: portno byte-swap matches upstream (big-endian to host).
+fn translate_sockaddr_to_network(value: &SockAddrIn) -> NetSockAddrIn {
+    // Note: 6 is incorrect, but can be passed by homebrew (because libnx sets
+    // sin_len to 6 when deserializing getaddrinfo results).
+    assert!(
+        value.len == 0
+            || value.len == std::mem::size_of::<SockAddrIn>() as u8
+            || value.len == 6
+    );
+
+    let domain = match value.family {
+        2 => NetDomain::INET,
+        _ => NetDomain::Unspecified,
+    };
+
+    NetSockAddrIn {
+        family: Some(domain),
+        ip: value.ip,
+        portno: (value.portno >> 8) | (value.portno << 8),
+    }
+}
+
+/// Translate internal SockAddrIn to guest SockAddrIn.
+///
+/// Corresponds to `Translate(Network::SockAddrIn)` in upstream sockets_translate.cpp.
+fn translate_sockaddr_from_network(value: &NetSockAddrIn) -> SockAddrIn {
+    SockAddrIn {
+        len: std::mem::size_of::<SockAddrIn>() as u8,
+        family: translate_domain_back(value.family),
+        portno: (value.portno >> 8) | (value.portno << 8),
+        ip: value.ip,
+        zeroes: [0u8; 8],
+    }
+}
+
+/// Translate internal Errno to guest Errno.
+///
+/// Corresponds to `Translate(Network::Errno)` in upstream sockets_translate.cpp.
+fn translate_errno(value: NetErrno) -> Errno {
+    match value {
+        NetErrno::Success => Errno::SUCCESS,
+        NetErrno::Badf => Errno::BADF,
+        NetErrno::Again => Errno::AGAIN,
+        NetErrno::Inval => Errno::INVAL,
+        NetErrno::Mfile => Errno::MFILE,
+        NetErrno::Pipe => Errno::PIPE,
+        NetErrno::Connrefused => Errno::CONNREFUSED,
+        NetErrno::Notconn => Errno::NOTCONN,
+        NetErrno::Timedout => Errno::TIMEDOUT,
+        NetErrno::Connaborted => Errno::CONNABORTED,
+        NetErrno::Connreset => Errno::CONNRESET,
+        NetErrno::Inprogress => Errno::INPROGRESS,
+        _ => {
+            log::warn!("Unimplemented errno={:?}", value);
+            Errno::SUCCESS
+        }
+    }
+}
+
+/// Translate an (i32, NetErrno) pair to (i32, Errno).
+///
+/// Corresponds to `Translate(std::pair<s32, Network::Errno>)` in upstream.
+fn translate_result(value: (i32, NetErrno)) -> (i32, Errno) {
+    (value.0, translate_errno(value.1))
+}
+
+/// Translate guest ShutdownHow to internal ShutdownHow.
+fn translate_shutdown_how(how: ShutdownHow) -> NetShutdownHow {
+    match how {
+        ShutdownHow::RD => NetShutdownHow::RD,
+        ShutdownHow::WR => NetShutdownHow::WR,
+        ShutdownHow::RDWR => NetShutdownHow::RDWR,
+    }
+}
+
 /// Per-file-descriptor state.
 ///
 /// Corresponds to `BSD::FileDescriptor` in upstream bsd.h.
 pub struct FileDescriptor {
-    /// Platform socket (abstracted -- in upstream this is a shared_ptr<SocketBase>).
-    pub socket_fd: i32,
+    /// Platform socket (corresponds to upstream shared_ptr<SocketBase>).
+    pub socket: Box<dyn SocketBase>,
     pub flags: i32,
     pub is_connection_based: bool,
 }
@@ -203,8 +329,18 @@ impl Bsd {
 
         log::info!("New socket fd={}", fd);
 
+        let mut socket = Socket::new();
+        let errno = socket.initialize(
+            translate_domain(domain),
+            translate_type(ty),
+            translate_protocol(protocol),
+        );
+        if errno != NetErrno::Success {
+            return (-1, translate_errno(errno));
+        }
+
         self.file_descriptors[fd as usize] = Some(FileDescriptor {
-            socket_fd: fd, // placeholder -- real impl would create platform socket
+            socket: Box::new(socket),
             flags: 0,
             is_connection_based: is_connection_based(ty),
         });
@@ -274,8 +410,26 @@ impl Bsd {
             }
         }
 
-        // TODO: Actually perform poll via network layer
-        // For now, return 0 ready fds
+        // Build host poll fds using the real socket file descriptors
+        let mut host_pollfds: Vec<net_sockets::PollFD> = fds
+            .iter()
+            .map(|pollfd| {
+                let descriptor = self.file_descriptors[pollfd.fd as usize].as_ref().unwrap();
+                net_sockets::PollFD {
+                    fd: descriptor.socket.get_fd(),
+                    events: pollfd.events,
+                    revents: 0,
+                }
+            })
+            .collect();
+
+        let result = net_sockets::poll(&mut host_pollfds, timeout);
+
+        // Copy revents back
+        for (i, host_pollfd) in host_pollfds.iter().enumerate() {
+            fds[i].revents = host_pollfd.revents;
+        }
+
         unsafe {
             std::ptr::copy_nonoverlapping(
                 fds.as_ptr() as *const u8,
@@ -284,13 +438,13 @@ impl Bsd {
             );
         }
 
-        (0, Errno::SUCCESS)
+        translate_result(result)
     }
 
     /// AcceptImpl -- accept a connection.
     ///
     /// Corresponds to `BSD::AcceptImpl` in upstream bsd.cpp.
-    pub fn accept_impl(&mut self, fd: i32, _write_buffer: &mut Vec<u8>) -> (i32, Errno) {
+    pub fn accept_impl(&mut self, fd: i32, write_buffer: &mut Vec<u8>) -> (i32, Errno) {
         if !self.is_file_descriptor_valid(fd) {
             return (-1, Errno::BADF);
         }
@@ -301,70 +455,155 @@ impl Bsd {
             return (-1, Errno::MFILE);
         }
 
-        // TODO: Actually accept via network layer
-        log::warn!("(STUBBED) BSD::AcceptImpl fd={}", fd);
-        (-1, Errno::AGAIN)
+        let is_conn_based = self.file_descriptors[fd as usize]
+            .as_ref()
+            .unwrap()
+            .is_connection_based;
+
+        let (result, bsd_errno) = self.file_descriptors[fd as usize]
+            .as_mut()
+            .unwrap()
+            .socket
+            .accept();
+
+        if bsd_errno != NetErrno::Success {
+            return (-1, translate_errno(bsd_errno));
+        }
+
+        let accept_result = result;
+        let guest_addr_in = translate_sockaddr_from_network(&accept_result.sockaddr_in);
+
+        // Write the guest address to the write buffer
+        let addr_size = std::mem::size_of::<SockAddrIn>();
+        write_buffer.resize(addr_size, 0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &guest_addr_in as *const SockAddrIn as *const u8,
+                write_buffer.as_mut_ptr(),
+                addr_size,
+            );
+        }
+
+        self.file_descriptors[new_fd as usize] = Some(FileDescriptor {
+            socket: accept_result.socket.unwrap(),
+            flags: 0,
+            is_connection_based: is_conn_based,
+        });
+
+        (new_fd, Errno::SUCCESS)
     }
 
     /// BindImpl -- bind a socket to an address.
     ///
     /// Corresponds to `BSD::BindImpl` in upstream bsd.cpp.
-    pub fn bind_impl(&self, fd: i32, addr: &[u8]) -> Errno {
+    pub fn bind_impl(&mut self, fd: i32, addr: &[u8]) -> Errno {
         if !self.is_file_descriptor_valid(fd) {
             return Errno::BADF;
         }
         assert!(addr.len() == std::mem::size_of::<SockAddrIn>());
-        // TODO: Actually bind via network layer
-        log::warn!("(STUBBED) BSD::BindImpl fd={}", fd);
-        Errno::SUCCESS
+
+        let mut guest_addr = SockAddrIn::default();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                addr.as_ptr(),
+                &mut guest_addr as *mut SockAddrIn as *mut u8,
+                std::mem::size_of::<SockAddrIn>(),
+            );
+        }
+        let net_addr = translate_sockaddr_to_network(&guest_addr);
+
+        let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
+        translate_errno(descriptor.socket.bind(net_addr))
     }
 
     /// ConnectImpl -- connect to remote address.
     ///
     /// Corresponds to `BSD::ConnectImpl` in upstream bsd.cpp.
-    pub fn connect_impl(&self, fd: i32, addr: &[u8]) -> Errno {
+    pub fn connect_impl(&mut self, fd: i32, addr: &[u8]) -> Errno {
         if !self.is_file_descriptor_valid(fd) {
             return Errno::BADF;
         }
         assert!(addr.len() == std::mem::size_of::<SockAddrIn>());
-        // TODO: Actually connect via network layer
-        log::warn!("(STUBBED) BSD::ConnectImpl fd={}", fd);
-        Errno::SUCCESS
+
+        let mut guest_addr = SockAddrIn::default();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                addr.as_ptr(),
+                &mut guest_addr as *mut SockAddrIn as *mut u8,
+                std::mem::size_of::<SockAddrIn>(),
+            );
+        }
+        let net_addr = translate_sockaddr_to_network(&guest_addr);
+
+        let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
+        translate_errno(descriptor.socket.connect(net_addr))
     }
 
     /// GetPeerNameImpl
     ///
     /// Corresponds to `BSD::GetPeerNameImpl` in upstream bsd.cpp.
-    pub fn get_peer_name_impl(&self, fd: i32, _write_buffer: &mut Vec<u8>) -> Errno {
+    pub fn get_peer_name_impl(&self, fd: i32, write_buffer: &mut Vec<u8>) -> Errno {
         if !self.is_file_descriptor_valid(fd) {
             return Errno::BADF;
         }
-        // TODO: Actually get peer name via network layer
-        log::warn!("(STUBBED) BSD::GetPeerNameImpl fd={}", fd);
-        Errno::SUCCESS
+
+        let descriptor = self.file_descriptors[fd as usize].as_ref().unwrap();
+        let (addr_in, bsd_errno) = descriptor.socket.get_peer_name();
+        if bsd_errno != NetErrno::Success {
+            return translate_errno(bsd_errno);
+        }
+
+        let guest_addr_in = translate_sockaddr_from_network(&addr_in);
+        let addr_size = std::mem::size_of::<SockAddrIn>();
+        assert!(write_buffer.len() >= addr_size);
+        write_buffer.resize(addr_size, 0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &guest_addr_in as *const SockAddrIn as *const u8,
+                write_buffer.as_mut_ptr(),
+                addr_size,
+            );
+        }
+        translate_errno(bsd_errno)
     }
 
     /// GetSockNameImpl
     ///
     /// Corresponds to `BSD::GetSockNameImpl` in upstream bsd.cpp.
-    pub fn get_sock_name_impl(&self, fd: i32, _write_buffer: &mut Vec<u8>) -> Errno {
+    pub fn get_sock_name_impl(&self, fd: i32, write_buffer: &mut Vec<u8>) -> Errno {
         if !self.is_file_descriptor_valid(fd) {
             return Errno::BADF;
         }
-        // TODO: Actually get sock name via network layer
-        log::warn!("(STUBBED) BSD::GetSockNameImpl fd={}", fd);
-        Errno::SUCCESS
+
+        let descriptor = self.file_descriptors[fd as usize].as_ref().unwrap();
+        let (addr_in, bsd_errno) = descriptor.socket.get_sock_name();
+        if bsd_errno != NetErrno::Success {
+            return translate_errno(bsd_errno);
+        }
+
+        let guest_addr_in = translate_sockaddr_from_network(&addr_in);
+        let addr_size = std::mem::size_of::<SockAddrIn>();
+        assert!(write_buffer.len() >= addr_size);
+        write_buffer.resize(addr_size, 0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &guest_addr_in as *const SockAddrIn as *const u8,
+                write_buffer.as_mut_ptr(),
+                addr_size,
+            );
+        }
+        translate_errno(bsd_errno)
     }
 
     /// ListenImpl -- listen on a socket.
     ///
     /// Corresponds to `BSD::ListenImpl` in upstream bsd.cpp.
-    pub fn listen_impl(&self, fd: i32, _backlog: i32) -> Errno {
+    pub fn listen_impl(&mut self, fd: i32, backlog: i32) -> Errno {
         if !self.is_file_descriptor_valid(fd) {
             return Errno::BADF;
         }
-        // TODO: Actually listen via network layer
-        Errno::SUCCESS
+        let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
+        translate_errno(descriptor.socket.listen(backlog))
     }
 
     /// FcntlImpl -- file control operations.
@@ -384,8 +623,10 @@ impl Bsd {
             }
             FcntlCmd::SETFL => {
                 let enable = (arg & FLAG_O_NONBLOCK) != 0;
-                // TODO: descriptor.socket->SetNonBlock(enable)
-                let _ = enable;
+                let bsd_errno = translate_errno(descriptor.socket.set_non_block(enable));
+                if bsd_errno != Errno::SUCCESS {
+                    return (-1, bsd_errno);
+                }
                 descriptor.flags = arg;
                 (0, Errno::SUCCESS)
             }
@@ -411,15 +652,21 @@ impl Bsd {
             return Errno::SUCCESS;
         }
 
+        let descriptor = self.file_descriptors[fd as usize].as_ref().unwrap();
+
         match optname {
             OptName::ERROR => {
-                // Return SUCCESS as the pending error (no real socket)
-                if optval.len() != std::mem::size_of::<Errno>() {
-                    return Errno::INVAL;
+                let (pending_err, getsockopt_err) = descriptor.socket.get_pending_error();
+                if getsockopt_err == NetErrno::Success {
+                    let translated_pending_err = translate_errno(pending_err);
+                    if optval.len() != std::mem::size_of::<Errno>() {
+                        return Errno::INVAL;
+                    }
+                    optval.resize(std::mem::size_of::<Errno>(), 0);
+                    let err_val = translated_pending_err as u32;
+                    optval[..4].copy_from_slice(&err_val.to_ne_bytes());
                 }
-                let success = Errno::SUCCESS as u32;
-                optval[..4].copy_from_slice(&success.to_ne_bytes());
-                Errno::SUCCESS
+                translate_errno(getsockopt_err)
             }
             _ => {
                 log::warn!("Unimplemented optname={:?}", optname);
@@ -432,7 +679,7 @@ impl Bsd {
     ///
     /// Corresponds to `BSD::SetSockOptImpl` in upstream bsd.cpp.
     pub fn set_sock_opt_impl(
-        &self,
+        &mut self,
         fd: i32,
         level: u32,
         optname: OptName,
@@ -447,6 +694,8 @@ impl Bsd {
             return Errno::SUCCESS;
         }
 
+        let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
+
         if optname == OptName::LINGER {
             assert!(optval.len() == std::mem::size_of::<Linger>());
             let mut linger = Linger::default();
@@ -458,8 +707,9 @@ impl Bsd {
                 );
             }
             assert!(linger.onoff == 0 || linger.onoff == 1);
-            // TODO: socket->SetLinger(...)
-            return Errno::SUCCESS;
+            return translate_errno(
+                descriptor.socket.set_linger(linger.onoff != 0, linger.linger),
+            );
         }
 
         assert!(optval.len() == std::mem::size_of::<u32>());
@@ -468,35 +718,20 @@ impl Bsd {
         match optname {
             OptName::REUSEADDR => {
                 assert!(value == 0 || value == 1);
-                // TODO: socket->SetReuseAddr(value != 0)
-                Errno::SUCCESS
+                translate_errno(descriptor.socket.set_reuse_addr(value != 0))
             }
             OptName::KEEPALIVE => {
                 assert!(value == 0 || value == 1);
-                // TODO: socket->SetKeepAlive(value != 0)
-                Errno::SUCCESS
+                translate_errno(descriptor.socket.set_keep_alive(value != 0))
             }
             OptName::BROADCAST => {
                 assert!(value == 0 || value == 1);
-                // TODO: socket->SetBroadcast(value != 0)
-                Errno::SUCCESS
+                translate_errno(descriptor.socket.set_broadcast(value != 0))
             }
-            OptName::SNDBUF => {
-                // TODO: socket->SetSndBuf(value)
-                Errno::SUCCESS
-            }
-            OptName::RCVBUF => {
-                // TODO: socket->SetRcvBuf(value)
-                Errno::SUCCESS
-            }
-            OptName::SNDTIMEO => {
-                // TODO: socket->SetSndTimeo(value)
-                Errno::SUCCESS
-            }
-            OptName::RCVTIMEO => {
-                // TODO: socket->SetRcvTimeo(value)
-                Errno::SUCCESS
-            }
+            OptName::SNDBUF => translate_errno(descriptor.socket.set_snd_buf(value)),
+            OptName::RCVBUF => translate_errno(descriptor.socket.set_rcv_buf(value)),
+            OptName::SNDTIMEO => translate_errno(descriptor.socket.set_snd_timeo(value)),
+            OptName::RCVTIMEO => translate_errno(descriptor.socket.set_rcv_timeo(value)),
             OptName::NOSIGPIPE => {
                 log::warn!("(STUBBED) setting NOSIGPIPE to {}", value);
                 Errno::SUCCESS
@@ -511,24 +746,24 @@ impl Bsd {
     /// ShutdownImpl
     ///
     /// Corresponds to `BSD::ShutdownImpl` in upstream bsd.cpp.
-    pub fn shutdown_impl(&self, fd: i32, how: i32) -> Errno {
+    pub fn shutdown_impl(&mut self, fd: i32, how: i32) -> Errno {
         if !self.is_file_descriptor_valid(fd) {
             return Errno::BADF;
         }
-        let _host_how = match how {
+        let host_how = match how {
             0 => ShutdownHow::RD,
             1 => ShutdownHow::WR,
             2 => ShutdownHow::RDWR,
             _ => return Errno::INVAL,
         };
-        // TODO: socket->Shutdown(host_how)
-        Errno::SUCCESS
+        let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
+        translate_errno(descriptor.socket.shutdown(translate_shutdown_how(host_how)))
     }
 
     /// RecvImpl
     ///
     /// Corresponds to `BSD::RecvImpl` in upstream bsd.cpp.
-    pub fn recv_impl(&mut self, fd: i32, mut flags: u32, _message: &mut Vec<u8>) -> (i32, Errno) {
+    pub fn recv_impl(&mut self, fd: i32, mut flags: u32, message: &mut Vec<u8>) -> (i32, Errno) {
         if !self.is_file_descriptor_valid(fd) {
             return (-1, Errno::BADF);
         }
@@ -539,17 +774,16 @@ impl Bsd {
         if (flags & FLAG_MSG_DONTWAIT) != 0 {
             flags &= !FLAG_MSG_DONTWAIT;
             if (descriptor.flags & FLAG_O_NONBLOCK) == 0 {
-                // TODO: descriptor.socket->SetNonBlock(true)
+                descriptor.socket.set_non_block(true);
             }
         }
 
-        // TODO: Actually recv via network layer
-        let ret = 0i32;
-        let bsd_errno = Errno::SUCCESS;
+        let (ret, bsd_errno) =
+            translate_result(descriptor.socket.recv(flags as i32, message.as_mut_slice()));
 
         // Restore original state
         if (descriptor.flags & FLAG_O_NONBLOCK) == 0 {
-            // TODO: descriptor.socket->SetNonBlock(false)
+            descriptor.socket.set_non_block(false);
         }
 
         (ret, bsd_errno)
@@ -562,7 +796,7 @@ impl Bsd {
         &mut self,
         fd: i32,
         mut flags: u32,
-        _message: &mut Vec<u8>,
+        message: &mut Vec<u8>,
         addr: &mut Vec<u8>,
     ) -> (i32, Errno) {
         if !self.is_file_descriptor_valid(fd) {
@@ -571,26 +805,54 @@ impl Bsd {
 
         let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
 
-        if descriptor.is_connection_based {
+        let mut addr_in = NetSockAddrIn::default();
+        let use_addr = if descriptor.is_connection_based {
             // Connection based file descriptors (e.g. TCP) zero addr
             addr.clear();
-        }
+            false
+        } else {
+            true
+        };
 
         // Apply MSG_DONTWAIT flag
         if (flags & FLAG_MSG_DONTWAIT) != 0 {
             flags &= !FLAG_MSG_DONTWAIT;
             if (descriptor.flags & FLAG_O_NONBLOCK) == 0 {
-                // TODO: descriptor.socket->SetNonBlock(true)
+                descriptor.socket.set_non_block(true);
             }
         }
 
-        // TODO: Actually recvfrom via network layer
-        let ret = 0i32;
-        let bsd_errno = Errno::SUCCESS;
+        let p_addr_in = if use_addr {
+            Some(&mut addr_in)
+        } else {
+            None
+        };
+
+        let (ret, bsd_errno) = translate_result(
+            descriptor
+                .socket
+                .recv_from(flags as i32, message.as_mut_slice(), p_addr_in),
+        );
 
         // Restore original state
         if (descriptor.flags & FLAG_O_NONBLOCK) == 0 {
-            // TODO: descriptor.socket->SetNonBlock(false)
+            descriptor.socket.set_non_block(false);
+        }
+
+        if use_addr {
+            if ret < 0 {
+                addr.clear();
+            } else {
+                assert!(addr.len() == std::mem::size_of::<SockAddrIn>());
+                let guest_addr = translate_sockaddr_from_network(&addr_in);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &guest_addr as *const SockAddrIn as *const u8,
+                        addr.as_mut_ptr(),
+                        std::mem::size_of::<SockAddrIn>(),
+                    );
+                }
+            }
         }
 
         (ret, bsd_errno)
@@ -599,32 +861,49 @@ impl Bsd {
     /// SendImpl
     ///
     /// Corresponds to `BSD::SendImpl` in upstream bsd.cpp.
-    pub fn send_impl(&self, fd: i32, _flags: u32, message: &[u8]) -> (i32, Errno) {
+    pub fn send_impl(&mut self, fd: i32, flags: u32, message: &[u8]) -> (i32, Errno) {
         if !self.is_file_descriptor_valid(fd) {
             return (-1, Errno::BADF);
         }
-        // TODO: Actually send via network layer
-        (message.len() as i32, Errno::SUCCESS)
+        let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
+        translate_result(descriptor.socket.send(message, flags as i32))
     }
 
     /// SendToImpl
     ///
     /// Corresponds to `BSD::SendToImpl` in upstream bsd.cpp.
     pub fn send_to_impl(
-        &self,
+        &mut self,
         fd: i32,
-        _flags: u32,
+        flags: u32,
         message: &[u8],
         addr: &[u8],
     ) -> (i32, Errno) {
         if !self.is_file_descriptor_valid(fd) {
             return (-1, Errno::BADF);
         }
-        if !addr.is_empty() {
+
+        let p_addr_in = if !addr.is_empty() {
             assert!(addr.len() == std::mem::size_of::<SockAddrIn>());
-        }
-        // TODO: Actually sendto via network layer
-        (message.len() as i32, Errno::SUCCESS)
+            let mut guest_addr = SockAddrIn::default();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    addr.as_ptr(),
+                    &mut guest_addr as *mut SockAddrIn as *mut u8,
+                    std::mem::size_of::<SockAddrIn>(),
+                );
+            }
+            Some(translate_sockaddr_to_network(&guest_addr))
+        } else {
+            None
+        };
+
+        let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
+        translate_result(
+            descriptor
+                .socket
+                .send_to(flags, message, p_addr_in.as_ref()),
+        )
     }
 
     /// CloseImpl -- close a file descriptor.
@@ -634,10 +913,21 @@ impl Bsd {
         if !self.is_file_descriptor_valid(fd) {
             return Errno::BADF;
         }
-        // TODO: socket->Close()
+
+        let bsd_errno = translate_errno(
+            self.file_descriptors[fd as usize]
+                .as_mut()
+                .unwrap()
+                .socket
+                .close(),
+        );
+        if bsd_errno != Errno::SUCCESS {
+            return bsd_errno;
+        }
+
         log::info!("Close socket fd={}", fd);
         self.file_descriptors[fd as usize] = None;
-        Errno::SUCCESS
+        bsd_errno
     }
 
     /// DuplicateSocketImpl -- duplicate a file descriptor.
@@ -654,12 +944,29 @@ impl Bsd {
             return Err(Errno::MFILE);
         }
 
-        // Copy the file descriptor state (upstream copies the shared_ptr)
+        // Upstream copies the shared_ptr (shared ownership). In Rust we create a new Socket
+        // wrapping the same underlying fd via Socket::from_fd. Note: this means the two
+        // FileDescriptors share the same OS fd, matching upstream shared_ptr semantics.
         let src = self.file_descriptors[fd as usize].as_ref().unwrap();
+        let src_fd_val = src.socket.get_fd();
+        // Duplicate the OS-level file descriptor so both can close independently
+        #[cfg(unix)]
+        let new_os_fd = unsafe { libc::dup(src_fd_val) };
+        #[cfg(not(unix))]
+        let new_os_fd = -1;
+
+        if new_os_fd < 0 {
+            log::error!("Failed to dup socket fd");
+            return Err(Errno::BADF);
+        }
+
+        let src_flags = src.flags;
+        let src_is_conn = src.is_connection_based;
+
         self.file_descriptors[new_fd as usize] = Some(FileDescriptor {
-            socket_fd: src.socket_fd,
-            flags: src.flags,
-            is_connection_based: src.is_connection_based,
+            socket: Box::new(Socket::from_fd(new_os_fd)),
+            flags: src_flags,
+            is_connection_based: src_is_conn,
         });
 
         Ok(new_fd)
@@ -669,11 +976,17 @@ impl Bsd {
     ///
     /// Corresponds to `BSD::GetSocket` in upstream bsd.cpp.
     /// Used by SSL service to access BSD sockets.
-    pub fn get_socket(&self, fd: i32) -> Option<i32> {
+    pub fn get_socket(&self, fd: i32) -> Option<&dyn SocketBase> {
         if !self.is_file_descriptor_valid(fd) {
             return None;
         }
-        Some(self.file_descriptors[fd as usize].as_ref().unwrap().socket_fd)
+        Some(
+            self.file_descriptors[fd as usize]
+                .as_ref()
+                .unwrap()
+                .socket
+                .as_ref(),
+        )
     }
 
     /// EventFd -- create event fd (stubbed).
@@ -690,10 +1003,10 @@ impl Bsd {
     /// OnProxyPacketReceived -- handle incoming proxy packet.
     ///
     /// Corresponds to `BSD::OnProxyPacketReceived` in upstream bsd.cpp.
-    pub fn on_proxy_packet_received(&self, _packet: &[u8]) {
-        for optional_descriptor in self.file_descriptors.iter() {
-            if let Some(_descriptor) = optional_descriptor {
-                // TODO: descriptor.socket->HandleProxyPacket(packet)
+    pub fn on_proxy_packet_received(&mut self, packet: &crate::internal_network::network::ProxyPacket) {
+        for optional_descriptor in self.file_descriptors.iter_mut() {
+            if let Some(descriptor) = optional_descriptor {
+                descriptor.socket.handle_proxy_packet(packet);
             }
         }
     }
