@@ -1157,7 +1157,7 @@ impl HLERequestContext {
         let mut current_offset = self.handles_offset as usize;
 
         // Translate outgoing copy objects to handles.
-        // TODO: needs handle_table.Add() for proper KAutoObject translation.
+        // Upstream: handle_table.Add() for proper KAutoObject translation.
         // For now, skip past — handles were written by push_move_objects/push_copy_objects.
         for _ in &self.outgoing_copy_objects {
             if current_offset < ipc::COMMAND_BUFFER_LENGTH {
