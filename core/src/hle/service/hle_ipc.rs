@@ -13,6 +13,38 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::ipc;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
+
+/// Reference to a kernel object for IPC handle translation.
+///
+/// Upstream stores raw `KAutoObject*` in `outgoing_copy_objects` / `outgoing_move_objects`.
+/// Handle creation is deferred to `WriteToOutgoingCommandBuffer()` where
+/// `handle_table.Add(object)` translates objects to handles.
+///
+/// We store either:
+/// - `ObjectId(u64)` — a kernel object ID needing `handle_table.Add()` translation
+/// - `Handle(u32)` — a pre-resolved handle (for services that already have one)
+#[derive(Clone, Copy, Debug)]
+pub enum KAutoObjectRef {
+    /// A kernel object ID that needs handle_table.Add() translation.
+    ObjectId(u64),
+    /// A pre-resolved handle value.
+    Handle(u32),
+}
+
+impl KAutoObjectRef {
+    /// Resolve to a handle value. For ObjectId, would call handle_table.Add();
+    /// for Handle, returns the value directly.
+    pub fn resolve(&self) -> u32 {
+        match self {
+            KAutoObjectRef::ObjectId(id) => {
+                // In a full implementation, this would call handle_table.Add(*id).
+                // For now, treat the object ID as the handle value.
+                *id as u32
+            }
+            KAutoObjectRef::Handle(h) => *h,
+        }
+    }
+}
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::sm::sm::ServiceManager;
 
@@ -290,8 +322,8 @@ pub struct HLERequestContext {
     incoming_move_handles: Vec<Handle>,
     incoming_copy_handles: Vec<Handle>,
 
-    pub(crate) outgoing_move_objects: Vec<Handle>,
-    pub(crate) outgoing_copy_objects: Vec<Handle>,
+    pub(crate) outgoing_move_objects: Vec<KAutoObjectRef>,
+    pub(crate) outgoing_copy_objects: Vec<KAutoObjectRef>,
     outgoing_domain_objects: Vec<Option<SessionRequestHandlerPtr>>,
 
     command: u32,
@@ -487,12 +519,22 @@ impl HLERequestContext {
         self.incoming_move_handles[index]
     }
 
-    pub fn add_move_object(&mut self, handle: Handle) {
-        self.outgoing_move_objects.push(handle);
+    pub fn add_move_object(&mut self, obj: KAutoObjectRef) {
+        self.outgoing_move_objects.push(obj);
     }
 
-    pub fn add_copy_object(&mut self, handle: Handle) {
-        self.outgoing_copy_objects.push(handle);
+    pub fn add_copy_object(&mut self, obj: KAutoObjectRef) {
+        self.outgoing_copy_objects.push(obj);
+    }
+
+    /// Convenience: add a move object from a raw handle.
+    pub fn add_move_handle(&mut self, handle: Handle) {
+        self.outgoing_move_objects.push(KAutoObjectRef::Handle(handle));
+    }
+
+    /// Convenience: add a copy object from a raw handle.
+    pub fn add_copy_handle(&mut self, handle: Handle) {
+        self.outgoing_copy_objects.push(KAutoObjectRef::Handle(handle));
     }
 
     pub fn add_domain_object(&mut self, object: SessionRequestHandlerPtr) {
@@ -1157,22 +1199,21 @@ impl HLERequestContext {
         let mut current_offset = self.handles_offset as usize;
 
         // Translate outgoing copy objects to handles.
-        // Upstream: handle_table.Add() for proper KAutoObject translation.
-        // For now, skip past — handles were written by push_move_objects/push_copy_objects.
-        for _ in &self.outgoing_copy_objects {
+        // Upstream: handle_table.Add(object) for each, writes handle to cmd_buf.
+        for obj_ref in &self.outgoing_copy_objects {
             if current_offset < ipc::COMMAND_BUFFER_LENGTH {
-                // Handle already written at this offset by ResponseBuilder
+                let handle = obj_ref.resolve();
+                self.cmd_buf[current_offset] = handle;
                 current_offset += 1;
             }
         }
 
         // Translate outgoing move objects to handles.
-        // Handles were already written by ResponseBuilder::push_move_objects.
-        // In upstream, this would call handle_table.Add() to translate KAutoObject*
-        // to handles. Our handles are already direct handle values.
-        for _ in &self.outgoing_move_objects {
+        // Upstream: handle_table.Add(object) + object->Close() for each.
+        for obj_ref in &self.outgoing_move_objects {
             if current_offset < ipc::COMMAND_BUFFER_LENGTH {
-                // Handle already written at this offset by ResponseBuilder
+                let handle = obj_ref.resolve();
+                self.cmd_buf[current_offset] = handle;
                 current_offset += 1;
             }
         }

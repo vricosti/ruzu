@@ -201,34 +201,25 @@ impl<'a> ResponseBuilder<'a> {
         self.push_u32(0);
     }
 
-    /// Push a copy handle into the handle descriptor area.
+    /// Push a copy handle into the outgoing copy objects list.
     ///
-    /// Matches upstream `ResponseBuilder::PushCopyObjects`.
-    /// Copy handles are written at handles_offset + copy_index.
+    /// Matches upstream `ResponseBuilder::PushCopyObjects(O* ptr)`.
+    /// Upstream stores the KAutoObject* pointer; handle creation is deferred
+    /// to WriteToOutgoingCommandBuffer() where handle_table.Add() is called.
+    /// We store a KAutoObjectRef; handle resolution happens in WriteToOutgoing.
     pub fn push_copy_objects(&mut self, handle: u32) {
-        let offset = self.context.handles_offset as usize;
-        let copy_index = self.context.outgoing_copy_objects.len();
-        let target = offset + copy_index;
-        if target < ipc::COMMAND_BUFFER_LENGTH {
-            self.context.cmd_buf[target] = handle;
-        }
-        self.context.outgoing_copy_objects.push(handle);
+        use super::hle_ipc::KAutoObjectRef;
+        self.context.outgoing_copy_objects.push(KAutoObjectRef::Handle(handle));
     }
 
-    /// Push a move handle into the handle descriptor area.
+    /// Push a move handle into the outgoing move objects list.
     ///
-    /// Matches upstream `ResponseBuilder::PushMoveObjects`.
-    /// The handle is written at handles_offset + num_copy + move_index.
+    /// Matches upstream `ResponseBuilder::PushMoveObjects(O* ptr)`.
+    /// Upstream stores the KAutoObject* pointer and calls object->Close()
+    /// after handle_table.Add() in WriteToOutgoingCommandBuffer().
     pub fn push_move_objects(&mut self, handle: u32) {
-        let offset = self.context.handles_offset as usize + self.num_handles_to_copy as usize;
-        // Find the next free move handle slot
-        // For simplicity, use outgoing_move_objects count as the index
-        let move_index = self.context.outgoing_move_objects.len();
-        let target = offset + move_index;
-        if target < ipc::COMMAND_BUFFER_LENGTH {
-            self.context.cmd_buf[target] = handle;
-        }
-        self.context.outgoing_move_objects.push(handle);
+        use super::hle_ipc::KAutoObjectRef;
+        self.context.outgoing_move_objects.push(KAutoObjectRef::Handle(handle));
     }
 
     /// Push a u32 value.
