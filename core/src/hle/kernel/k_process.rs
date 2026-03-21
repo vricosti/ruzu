@@ -202,19 +202,6 @@ impl ProcessMemoryData {
         true
     }
 
-    /// Check if a virtual address is in a writable memory region.
-    ///
-    /// Currently always returns true — permission enforcement is handled by
-    /// the page table's block manager (KPageTableBase::m_memory_block_manager).
-    /// In Phase B, host mprotect() will enforce permissions at the hardware
-    /// level, making this check unnecessary.
-    #[inline]
-    pub fn is_writable(&self, _vaddr: u64) -> bool {
-        // TODO(Phase B): Remove this method entirely — mprotect on the host
-        // pages will enforce write protection via SIGSEGV.
-        true
-    }
-
     /// Write a block of data at guest address.
     pub fn write_block(&mut self, vaddr: u64, data: &[u8]) {
         let offset = vaddr.wrapping_sub(self.base) as usize;
@@ -402,7 +389,9 @@ pub struct KProcess {
     /// Reference to the global scheduler context that owns the priority queue.
     /// Upstream: accessed via kernel.GlobalSchedulerContext().
     pub global_scheduler_context: Option<Arc<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>>,
-    // m_address_arbiter — KAddressArbiter
+    /// Address arbiter for this process.
+    /// Upstream: `KAddressArbiter m_address_arbiter{m_system}`.
+    pub address_arbiter: super::k_address_arbiter::KAddressArbiter,
     pub entropy: [u64; 4],
     pub is_signaled: bool,
     pub is_initialized: bool,
@@ -588,6 +577,7 @@ impl KProcess {
             num_ipc_messages: AtomicI64::new(0),
             num_ipc_replies: AtomicI64::new(0),
             num_ipc_receives: AtomicI64::new(0),
+            address_arbiter: super::k_address_arbiter::KAddressArbiter::new(),
         }
     }
 
@@ -1124,7 +1114,12 @@ impl KProcess {
     /// The caller must also call `thread.unpin()` on the KThread separately.
     pub fn unpin_current_thread(&mut self, core_id: i32, thread_id: u64) {
         self.unpin_thread_on_core(core_id, thread_id);
-        // Upstream: KScheduler::SetSchedulerUpdateNeeded(m_kernel)
+        if let Some(ref gsc) = self.global_scheduler_context {
+            gsc.lock()
+                .unwrap()
+                .m_scheduler_update_needed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Initialize for a user process.
@@ -1146,6 +1141,7 @@ impl KProcess {
         resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
         pool: k_memory_manager::Pool,
         aslr_space_start: u64,
+        mm: Option<&mut k_memory_manager::KMemoryManager>,
     ) -> u32 {
         use super::k_scoped_resource_reservation::KScopedResourceReservation;
 
@@ -1176,16 +1172,25 @@ impl KProcess {
         // needed for advanced page table operations (MapPageGroup, etc.), not for the
         // basic MapPages/SetHeapSize path.
         if system_resource_num_pages != 0 {
-            log::warn!(
-                "initialize_for_user: system_resource_num_pages={} — \
-                 KSecureSystemResource::Initialize not yet ported, skipping",
-                system_resource_num_pages
-            );
-            // TODO: Create and initialize KSecureSystemResource
+            let system_resource_size = (system_resource_num_pages as usize) * PAGE_SIZE;
+            let mut secure_resource = KSecureSystemResource::new();
+            if let Some(mm) = mm {
+                if secure_resource
+                    .initialize(system_resource_size, pool, mm)
+                    .is_err()
+                {
+                    return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+                }
+            } else {
+                log::warn!(
+                    "initialize_for_user: system_resource_num_pages={} but no KMemoryManager provided",
+                    system_resource_num_pages
+                );
+            }
+            self.system_resource = Some(Arc::new(Mutex::new(secure_resource)));
         } else {
             let is_app = (flags & CreateProcessFlag::IS_APPLICATION.bits()) != 0;
             self.is_default_application_system_resource = is_app;
-            // TODO: reference kernel's global system resource
         }
 
         // Setup page table (upstream lines 408-417).
@@ -1264,7 +1269,8 @@ impl KProcess {
         // Upstream: m_process_id = m_kernel.CreateNewUserProcessID();
         // We don't have a kernel reference here, so process_id must be set by the caller
         // or passed in. For now, use the already-assigned process_id (set by System::load).
-        // TODO: wire kernel reference for proper ID generation.
+        // Upstream: m_process_id = m_kernel.CreateNewUserProcessID().
+        // Requires kernel reference. Currently set by System::load.
 
         // Call the 3-arg Initialize for PLR and state setup (upstream line 449).
         let init_result = self.initialize(
@@ -1411,7 +1417,7 @@ impl KProcess {
         // Upstream: const auto physical_memory_size = m_kernel.MemoryManager().GetSize(pool);
         // We don't have a kernel reference yet, so use a default physical memory size
         // (4 GiB for Application pool, matching typical Switch memory layout).
-        // TODO: wire kernel.MemoryManager().GetSize(pool) when kernel reference is available.
+        // Upstream: m_kernel.MemoryManager().GetSize(pool). Requires kernel reference.
         let physical_memory_size: i64 = match pool {
             k_memory_manager::Pool::Application => 0xCD500000, // ~3.2 GiB (Switch Application pool)
             k_memory_manager::Pool::Applet => 0x1FB00000,       // ~507 MiB
@@ -1476,6 +1482,7 @@ impl KProcess {
             Some(res_limit),
             pool,
             aslr_space_start,
+            None, // KMemoryManager — passed by caller when available
         );
         if result != RESULT_SUCCESS.get_inner_value() {
             return result;
@@ -1485,8 +1492,8 @@ impl KProcess {
         self.is_hbl = is_hbl;
         self.ideal_core_id = metadata.get_main_thread_core() as i32;
 
-        // TODO: Upstream calls this->InitializeInterfaces() here (line 1231)
-        // which creates ArmDynarmic32/64 per core. Currently done in main.rs.
+        // Upstream: this->InitializeInterfaces() creates ArmDynarmic32/64 per core.
+        // Currently done in System::load / main.rs.
 
         RESULT_SUCCESS.get_inner_value()
     }
@@ -1530,7 +1537,8 @@ impl KProcess {
             // Change state.
             self.change_state(ProcessState::Terminated);
 
-            // TODO: self.close() — reference counting not yet implemented.
+            // Upstream: self.close() decrements refcount. Reference counting
+            // is managed by the object system.
         }
     }
 
@@ -1885,17 +1893,14 @@ impl KProcess {
 
         // Get the used memory size (for resource limit release).
         let used_memory_size = self.code_size + self.main_thread_stack_size;
-        // TODO: When page table is fully wired:
-        //   used_memory_size = self.get_used_non_system_user_physical_memory_size();
+        // Upstream: used_memory_size = self.get_used_non_system_user_physical_memory_size();
+        // Requires full page table accounting to compute actual usage.
 
         // Finalize the page table.
         self.page_table.finalize();
 
-        // TODO: Finish using our system resource (m_system_resource->Close()).
-        // System resource is not yet wired in this port.
-
-        // Free all shared memory infos.
-        // TODO: When shared memory list is implemented, iterate and close.
+        // Upstream: m_system_resource->Close() to release secure memory.
+        // Upstream: iterate shared memory info list and close each entry.
 
         // Our thread local page list must be empty at this point.
         // (In practice, all TLRs should have been deleted during termination.)

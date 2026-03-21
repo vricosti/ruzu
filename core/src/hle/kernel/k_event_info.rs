@@ -109,7 +109,7 @@ impl Default for EventInfoData {
 /// Debug event information, used by KDebug to track debug events.
 ///
 /// Upstream this is slab-allocated and an intrusive list node. The intrusive
-/// list integration is TODO.
+/// list integration uses Vec instead of intrusive nodes.
 #[derive(Debug, Clone, Default)]
 pub struct KEventInfo {
     pub event: DebugEvent,

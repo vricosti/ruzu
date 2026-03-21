@@ -8,7 +8,7 @@
 /// Tracks a reference to a KSharedMemory attached to a process.
 ///
 /// Upstream this is a slab-allocated intrusive list node. Here we use a
-/// plain struct; the intrusive list and slab allocator are TODO.
+/// plain struct; the intrusive list uses Vec instead of slab-allocated nodes.
 pub struct KSharedMemoryInfo {
     /// Index or identifier of the associated shared memory (placeholder for pointer).
     m_shared_memory: usize,
