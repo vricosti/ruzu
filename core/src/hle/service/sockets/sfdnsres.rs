@@ -40,6 +40,18 @@ pub mod commands {
     pub const RESOLVER_GET_OPTION_REQUEST: u32 = 15;
 }
 
+/// Input parameters for GetHostByNameRequest / GetAddrInfoRequest.
+///
+/// Corresponds to `InputParameters` struct in upstream GetHostByNameRequestImpl / GetAddrInfoRequestImpl.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct DnsInputParameters {
+    pub use_nsd_resolve: u8,
+    pub _pad: [u8; 3],
+    pub cancel_handle: u32,
+    pub process_id: u64,
+}
+
 /// Output from GetHostByNameRequest.
 ///
 /// Corresponds to `OutputParameters` in `GetHostByNameRequest` upstream.
@@ -98,17 +110,17 @@ impl Sfdnsres {
         let handlers = build_handler_map(&[
             (0, None, "SetDnsAddressesPrivateRequest"),
             (1, None, "GetDnsAddressPrivateRequest"),
-            (2, None, "GetHostByNameRequest"),
+            (2, Some(Sfdnsres::get_host_by_name_request_handler), "GetHostByNameRequest"),
             (3, None, "GetHostByAddrRequest"),
             (4, None, "GetHostStringErrorRequest"),
             (5, Some(Sfdnsres::get_gai_string_error_handler), "GetGaiStringErrorRequest"),
-            (6, None, "GetAddrInfoRequest"),
+            (6, Some(Sfdnsres::get_addr_info_request_handler), "GetAddrInfoRequest"),
             (7, None, "GetNameInfoRequest"),
             (8, None, "RequestCancelHandleRequest"),
             (9, None, "CancelRequest"),
-            (10, None, "GetHostByNameRequestWithOptions"),
+            (10, Some(Sfdnsres::get_host_by_name_request_with_options_handler), "GetHostByNameRequestWithOptions"),
             (11, None, "GetHostByAddrRequestWithOptions"),
-            (12, None, "GetAddrInfoRequestWithOptions"),
+            (12, Some(Sfdnsres::get_addr_info_request_with_options_handler), "GetAddrInfoRequestWithOptions"),
             (13, None, "GetNameInfoRequestWithOptions"),
             (14, Some(Sfdnsres::resolver_set_option_request_handler), "ResolverSetOptionRequest"),
             (15, None, "ResolverGetOptionRequest"),
@@ -175,9 +187,21 @@ impl Sfdnsres {
     /// Common implementation for GetHostByNameRequest / GetHostByNameRequestWithOptions.
     ///
     /// Corresponds to `GetHostByNameRequestImpl` in upstream sfdnsres.cpp.
-    pub fn get_host_by_name_impl(
-        host: &str,
-    ) -> (u32, GetAddrInfoError) {
+    fn get_host_by_name_request_impl(ctx: &mut HLERequestContext) -> (u32, GetAddrInfoError) {
+        let mut rp = RequestParser::new(ctx);
+        let parameters: DnsInputParameters = rp.pop_raw();
+
+        log::warn!(
+            "called with ignored parameters: use_nsd_resolve={}, cancel_handle={}, process_id={}",
+            parameters.use_nsd_resolve,
+            parameters.cancel_handle,
+            parameters.process_id
+        );
+
+        let host_buffer = ctx.read_buffer(0);
+        let host = common::string_util::string_from_buffer(&host_buffer);
+        // For now, ignore options, which are in input buffer 1 for GetHostByNameRequestWithOptions.
+
         // Prevent resolution of Nintendo servers.
         if host.contains("srv.nintendo.net") {
             log::warn!(
@@ -203,9 +227,9 @@ impl Sfdnsres {
                     return (0, GetAddrInfoError::NODATA);
                 }
 
-                let data = Self::serialize_addr_info_as_host_ent(&ipv4_addrs, host);
+                let data = Self::serialize_addr_info_as_host_ent(&ipv4_addrs, &host);
                 let data_size = data.len() as u32;
-                // TODO: Write data to output buffer via IPC context.
+                ctx.write_buffer(&data, 0);
                 (data_size, GetAddrInfoError::SUCCESS)
             }
             Err(e) => {
@@ -218,10 +242,23 @@ impl Sfdnsres {
     /// Common implementation for GetAddrInfoRequest / GetAddrInfoRequestWithOptions.
     ///
     /// Corresponds to `GetAddrInfoRequestImpl` in upstream sfdnsres.cpp.
-    pub fn get_addr_info_impl(
-        host: &str,
-        _service: Option<&str>,
-    ) -> (u32, GetAddrInfoError) {
+    fn get_addr_info_request_impl(ctx: &mut HLERequestContext) -> (u32, GetAddrInfoError) {
+        let mut rp = RequestParser::new(ctx);
+        let parameters: DnsInputParameters = rp.pop_raw();
+
+        log::warn!(
+            "called with ignored parameters: use_nsd_resolve={}, cancel_handle={}, process_id={}",
+            parameters.use_nsd_resolve,
+            parameters.cancel_handle,
+            parameters.process_id
+        );
+
+        // TODO: If use_nsd_resolve is true, pass the name through NSD::Resolve
+        // before looking up.
+
+        let host_buffer = ctx.read_buffer(0);
+        let host = common::string_util::string_from_buffer(&host_buffer);
+
         // Prevent resolution of Nintendo servers.
         if host.contains("srv.nintendo.net") {
             log::warn!(
@@ -231,9 +268,22 @@ impl Sfdnsres {
             return (0, GetAddrInfoError::AGAIN);
         }
 
+        let service: Option<String> = if ctx.can_read_buffer(1) {
+            let service_buffer = ctx.read_buffer(1);
+            Some(common::string_util::string_from_buffer(&service_buffer))
+        } else {
+            None
+        };
+
+        // Serialized hints are also passed in a buffer, but are ignored for now.
+
         // Attempt DNS resolution.
         use std::net::ToSocketAddrs;
-        let lookup = format!("{}:0", host);
+        let lookup = if let Some(ref svc) = service {
+            format!("{}:{}", host, svc)
+        } else {
+            format!("{}:0", host)
+        };
         match lookup.to_socket_addrs() {
             Ok(addrs) => {
                 let ipv4_addrs: Vec<std::net::SocketAddrV4> = addrs
@@ -247,9 +297,9 @@ impl Sfdnsres {
                     return (0, GetAddrInfoError::NODATA);
                 }
 
-                let data = Self::serialize_addr_info(&ipv4_addrs, host);
+                let data = Self::serialize_addr_info(&ipv4_addrs, &host);
                 let data_size = data.len() as u32;
-                // TODO: Write data to output buffer via IPC context.
+                ctx.write_buffer(&data, 0);
                 (data_size, GetAddrInfoError::SUCCESS)
             }
             Err(e) => {
@@ -346,6 +396,86 @@ impl Sfdnsres {
     pub fn resolver_set_option_request(&self) -> i32 {
         log::warn!("ResolverSetOptionRequest (STUBBED) called");
         0 // bsd errno = success
+    }
+
+    // -----------------------------------------------------------------------
+    // IPC handler bridge functions
+    // -----------------------------------------------------------------------
+
+    /// GetHostByNameRequest (cmd 2).
+    ///
+    /// Corresponds to `SFDNSRES::GetHostByNameRequest` in upstream sfdnsres.cpp.
+    fn get_host_by_name_request_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let (data_size, emu_gai_err) = Sfdnsres::get_host_by_name_request_impl(ctx);
+
+        let output = GetHostByNameOutput {
+            netdb_error: get_addr_info_error_to_netdb_error(emu_gai_err) as i32,
+            bsd_errno: get_addr_info_error_to_errno(emu_gai_err) as u32,
+            data_size,
+        };
+
+        let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&output);
+    }
+
+    /// GetHostByNameRequestWithOptions (cmd 10).
+    ///
+    /// Corresponds to `SFDNSRES::GetHostByNameRequestWithOptions` in upstream sfdnsres.cpp.
+    fn get_host_by_name_request_with_options_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let (data_size, emu_gai_err) = Sfdnsres::get_host_by_name_request_impl(ctx);
+
+        let output = GetHostByNameWithOptionsOutput {
+            data_size,
+            netdb_error: get_addr_info_error_to_netdb_error(emu_gai_err) as i32,
+            bsd_errno: get_addr_info_error_to_errno(emu_gai_err) as u32,
+        };
+
+        let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&output);
+    }
+
+    /// GetAddrInfoRequest (cmd 6).
+    ///
+    /// Corresponds to `SFDNSRES::GetAddrInfoRequest` in upstream sfdnsres.cpp.
+    fn get_addr_info_request_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let (data_size, emu_gai_err) = Sfdnsres::get_addr_info_request_impl(ctx);
+
+        let output = GetAddrInfoOutput {
+            bsd_errno: get_addr_info_error_to_errno(emu_gai_err) as u32,
+            gai_error: emu_gai_err as i32,
+            data_size,
+        };
+
+        let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&output);
+    }
+
+    /// GetAddrInfoRequestWithOptions (cmd 12).
+    ///
+    /// Corresponds to `SFDNSRES::GetAddrInfoRequestWithOptions` in upstream sfdnsres.cpp.
+    fn get_addr_info_request_with_options_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        // Additional options are ignored.
+        let (data_size, emu_gai_err) = Sfdnsres::get_addr_info_request_impl(ctx);
+
+        let output = GetAddrInfoWithOptionsOutput {
+            data_size,
+            gai_error: emu_gai_err as i32,
+            netdb_error: get_addr_info_error_to_netdb_error(emu_gai_err) as i32,
+            bsd_errno: get_addr_info_error_to_errno(emu_gai_err) as u32,
+        };
+
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&output);
     }
 
     fn get_gai_string_error_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

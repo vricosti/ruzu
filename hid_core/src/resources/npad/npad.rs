@@ -217,6 +217,56 @@ impl NPad {
         self.vibration.end_permit_vibration_session()
     }
 
+    /// Port of NPad::AssigningSingleOnSlSrPress.
+    pub fn assigning_single_on_sl_sr_press(&mut self, aruid: u64, is_enabled: bool) -> ResultCode {
+        let is_currently_enabled = match self.npad_resource.is_assigning_single_on_sl_sr_press_enabled(aruid) {
+            Ok(v) => v,
+            Err(e) => return ResultCode(e.raw()),
+        };
+        if is_enabled != is_currently_enabled {
+            let result = self.npad_resource.set_assigning_single_on_sl_sr_press(aruid, is_enabled);
+            return result;
+        }
+        ResultCode::SUCCESS
+    }
+
+    /// Port of NPad::GetLastActiveNpad.
+    /// Upstream delegates to hid_core.GetLastActiveController().
+    /// Since we don't have a direct hid_core reference here, return Player1 as default.
+    pub fn get_last_active_npad(&self) -> (ResultCode, NpadIdType) {
+        // TODO: forward to hid_core.get_last_active_controller() when wired
+        (ResultCode::SUCCESS, NpadIdType::Player1)
+    }
+
+    /// Port of NPad::GetMaskedSupportedNpadStyleSet.
+    pub fn get_masked_supported_npad_style_set(&self, aruid: u64) -> (ResultCode, NpadStyleSet) {
+        match self.npad_resource.get_masked_supported_npad_style_set(aruid) {
+            Ok(style_set) => (ResultCode::SUCCESS, style_set),
+            Err(e) => {
+                if e == hid_result::RESULT_UNDEFINED_STYLESET {
+                    (ResultCode::SUCCESS, NpadStyleSet::NONE)
+                } else {
+                    (ResultCode(e.raw()), NpadStyleSet::NONE)
+                }
+            }
+        }
+    }
+
+    /// Port of NPad::SetNpadSystemExtStateEnabled.
+    pub fn set_npad_system_ext_state_enabled(&mut self, aruid: u64, is_enabled: bool) -> ResultCode {
+        let result = self.npad_resource.set_npad_system_ext_state_enabled(aruid, is_enabled);
+        if result.is_success() {
+            // Upstream: TODO: abstracted_pad->EnableAppletToGetInput(aruid)
+        }
+        result
+    }
+
+    /// Port of NPad::EnableAppletToGetInput.
+    pub fn enable_applet_to_get_input(&mut self, _aruid: u64) {
+        // Upstream iterates abstracted_pads and calls EnableAppletToGetInput(aruid).
+        // TODO: implement when abstracted_pads are wired up
+    }
+
     pub fn npad_resource(&self) -> &NPadResource {
         &self.npad_resource
     }

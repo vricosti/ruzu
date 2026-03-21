@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::am_types::FocusState;
 use crate::hle::service::am::applet::Applet;
+use crate::hle::service::am::window_system::WindowSystem;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -17,16 +18,17 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// IPC command table for IApplicationProxyService ("appletOE"):
 /// - 0: OpenApplicationProxy
 pub struct IApplicationProxyService {
-    // TODO: WindowSystem reference
+    window_system: Arc<Mutex<WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IApplicationProxyService {
-    pub fn new() -> Self {
+    pub fn new(window_system: Arc<Mutex<WindowSystem>>) -> Self {
         let handlers =
             build_handler_map(&[(0, Some(Self::open_application_proxy_handler), "OpenApplicationProxy")]);
         Self {
+            window_system,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -70,7 +72,10 @@ impl IApplicationProxyService {
                 applet_guard.program_id
             );
         }
-        let proxy = Arc::new(super::application_proxy::IApplicationProxy::new(applet));
+        let proxy = Arc::new(super::application_proxy::IApplicationProxy::new(
+            applet,
+            service.window_system.clone(),
+        ));
         let is_domain = ctx
             .get_manager()
             .map_or(false, |manager| manager.lock().unwrap().is_domain());

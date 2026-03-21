@@ -7,12 +7,11 @@
 //! vi:u, vi:s, vi:m root services.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use crate::hle::service::sm::sm::ServiceManager;
 
 use super::application_root_service::IApplicationRootService;
 use super::container::Container;
@@ -145,11 +144,11 @@ impl ServiceFramework for ViManagerRootService {
 ///
 /// Matches upstream `void VI::LoopProcess(Core::System& system, std::stop_token token)`.
 /// Creates a shared Container, then registers vi:u, vi:s, vi:m.
-pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
-    let container = Arc::new(Container::new());
+pub fn loop_process(system: crate::core::SystemRef) {
+    let container = Arc::new(Container::new(system));
 
     let mut server_manager =
-        crate::hle::service::server_manager::ServerManager::new(crate::core::SystemRef::null());
+        crate::hle::service::server_manager::ServerManager::new(system);
 
     // vi:u — IApplicationRootService (cmd 0 = GetDisplayService)
     let container_u = Arc::clone(&container);
@@ -185,6 +184,6 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
 }
 
 /// Backward-compatible alias.
-pub fn register_services(service_manager: &Arc<Mutex<ServiceManager>>) {
-    loop_process(service_manager);
+pub fn register_services(system: crate::core::SystemRef) {
+    loop_process(system);
 }

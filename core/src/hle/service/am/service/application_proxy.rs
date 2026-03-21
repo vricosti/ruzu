@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::applet::Applet;
+use crate::hle::service::am::window_system::WindowSystem;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -27,14 +28,17 @@ pub struct IApplicationProxy {
     /// Reference to the applet.
     /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
     applet: Arc<Mutex<Applet>>,
+    /// Reference to the window system.
+    /// Matches upstream `WindowSystem& m_window_system`.
+    window_system: Arc<Mutex<WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IApplicationProxy {
-    /// Create with an applet reference.
-    /// Matches upstream: `IApplicationProxy(Core::System&, std::shared_ptr<Applet>)`
-    pub fn new(applet: Arc<Mutex<Applet>>) -> Self {
+    /// Create with an applet and window system reference.
+    /// Matches upstream: `IApplicationProxy(Core::System&, std::shared_ptr<Applet>, Kernel::KProcess*, WindowSystem&)`
+    pub fn new(applet: Arc<Mutex<Applet>>, window_system: Arc<Mutex<WindowSystem>>) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::get_common_state_getter_handler), "GetCommonStateGetter"),
             (1, Some(Self::get_self_controller_handler), "GetSelfController"),
@@ -60,6 +64,7 @@ impl IApplicationProxy {
         ]);
         Self {
             applet,
+            window_system,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -122,27 +127,33 @@ impl IApplicationProxy {
         Self::push_interface_response(ctx, Arc::new(super::audio_controller::IAudioController::new()));
     }
 
-    fn get_display_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        Self::push_interface_response(ctx, Arc::new(super::display_controller::IDisplayController::new()));
+    fn get_display_controller_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
+        Self::push_interface_response(ctx, Arc::new(super::display_controller::IDisplayController::new(proxy.applet.clone())));
     }
 
     fn get_process_winding_controller_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::process_winding_controller::IProcessWindingController::new()),
+            Arc::new(super::process_winding_controller::IProcessWindingController::new(proxy.applet.clone())),
         );
     }
 
     fn get_library_applet_creator_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::library_applet_creator::ILibraryAppletCreator::new()),
+            Arc::new(super::library_applet_creator::ILibraryAppletCreator::new(
+                proxy.applet.clone(),
+                proxy.window_system.clone(),
+            )),
         );
     }
 

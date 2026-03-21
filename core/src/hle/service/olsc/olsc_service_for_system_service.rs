@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::daemon_controller::IDaemonController;
@@ -90,66 +91,75 @@ pub struct IOlscServiceForSystemService {
 }
 
 impl IOlscServiceForSystemService {
+    /// Stub handler for nullptr entries -- logs STUBBED and returns RESULT_SUCCESS.
+    fn stub_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let cmd = ctx.get_command();
+        log::warn!("(STUBBED) IOlscServiceForSystemService command {}", cmd);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
     pub fn new(system: crate::core::SystemRef) -> Self {
+        let s = Some(Self::stub_handler as fn(&dyn ServiceFramework, &mut HLERequestContext));
         let handlers = build_handler_map(&[
-            (0, None, "OpenTransferTaskListController"),
-            (1, None, "OpenRemoteStorageController"),
-            (2, None, "OpenDaemonController"),
-            (10, None, "Unknown10"),
-            (11, None, "Unknown11"),
-            (12, None, "Unknown12"),
-            (13, None, "Unknown13"),
-            (100, None, "ListLastTransferTaskErrorInfo"),
-            (101, None, "GetLastErrorInfoCount"),
-            (102, None, "RemoveLastErrorInfoOld"),
-            (103, None, "GetLastErrorInfo"),
-            (104, None, "GetLastErrorEventHolder"),
-            (105, None, "GetLastTransferTaskErrorInfo"),
-            (200, None, "GetDataTransferPolicyInfo"),
-            (201, None, "RemoveDataTransferPolicyInfo"),
-            (202, None, "UpdateDataTransferPolicyOld"),
-            (203, None, "UpdateDataTransferPolicy"),
-            (204, None, "CleanupDataTransferPolicyInfo"),
-            (205, None, "RequestDataTransferPolicy"),
-            (300, None, "GetAutoTransferSeriesInfo"),
-            (301, None, "UpdateAutoTransferSeriesInfo"),
-            (400, None, "CleanupSaveDataArchiveInfoType1"),
-            (900, None, "CleanupTransferTask"),
-            (902, None, "CleanupSeriesInfoType0"),
-            (903, None, "CleanupSaveDataArchiveInfoType0"),
-            (904, None, "CleanupApplicationAutoTransferSetting"),
-            (905, None, "CleanupErrorHistory"),
-            (906, None, "SetLastError"),
-            (907, None, "AddSaveDataArchiveInfoType0"),
-            (908, None, "RemoveSeriesInfoType0"),
-            (909, None, "GetSeriesInfoType0"),
-            (910, None, "RemoveLastErrorInfo"),
-            (911, None, "CleanupSeriesInfoType1"),
-            (912, None, "RemoveSeriesInfoType1"),
-            (913, None, "GetSeriesInfoType1"),
-            (1000, None, "UpdateIssueOld"),
-            (1010, None, "Unknown1010"),
-            (1011, None, "ListIssueInfoOld"),
-            (1012, None, "GetIssueOld"),
-            (1013, None, "GetIssue2Old"),
-            (1014, None, "GetIssue3Old"),
-            (1020, None, "RepairIssueOld"),
-            (1021, None, "RepairIssueWithUserIdOld"),
-            (1022, None, "RepairIssue2Old"),
-            (1023, None, "RepairIssue3Old"),
-            (1024, None, "Unknown1024"),
-            (1100, None, "UpdateIssue"),
-            (1110, None, "Unknown1110"),
-            (1111, None, "ListIssueInfo"),
-            (1112, None, "GetIssue"),
-            (1113, None, "GetIssue2"),
-            (1114, None, "GetIssue3"),
-            (1120, None, "RepairIssue"),
-            (1121, None, "RepairIssueWithUserId"),
-            (1122, None, "RepairIssue2"),
-            (1123, None, "RepairIssue3"),
-            (1124, None, "Unknown1124"),
-            (10000, None, "CloneService"),
+            (0, Some(Self::open_transfer_task_list_controller_handler), "OpenTransferTaskListController"),
+            (1, Some(Self::open_remote_storage_controller_handler), "OpenRemoteStorageController"),
+            (2, Some(Self::open_daemon_controller_handler), "OpenDaemonController"),
+            (10, s, "Unknown10"),
+            (11, s, "Unknown11"),
+            (12, s, "Unknown12"),
+            (13, s, "Unknown13"),
+            (100, s, "ListLastTransferTaskErrorInfo"),
+            (101, s, "GetLastErrorInfoCount"),
+            (102, s, "RemoveLastErrorInfoOld"),
+            (103, s, "GetLastErrorInfo"),
+            (104, s, "GetLastErrorEventHolder"),
+            (105, s, "GetLastTransferTaskErrorInfo"),
+            (200, Some(Self::get_data_transfer_policy_info_handler), "GetDataTransferPolicyInfo"),
+            (201, s, "RemoveDataTransferPolicyInfo"),
+            (202, s, "UpdateDataTransferPolicyOld"),
+            (203, s, "UpdateDataTransferPolicy"),
+            (204, s, "CleanupDataTransferPolicyInfo"),
+            (205, s, "RequestDataTransferPolicy"),
+            (300, s, "GetAutoTransferSeriesInfo"),
+            (301, s, "UpdateAutoTransferSeriesInfo"),
+            (400, s, "CleanupSaveDataArchiveInfoType1"),
+            (900, s, "CleanupTransferTask"),
+            (902, s, "CleanupSeriesInfoType0"),
+            (903, s, "CleanupSaveDataArchiveInfoType0"),
+            (904, s, "CleanupApplicationAutoTransferSetting"),
+            (905, s, "CleanupErrorHistory"),
+            (906, s, "SetLastError"),
+            (907, s, "AddSaveDataArchiveInfoType0"),
+            (908, s, "RemoveSeriesInfoType0"),
+            (909, s, "GetSeriesInfoType0"),
+            (910, s, "RemoveLastErrorInfo"),
+            (911, s, "CleanupSeriesInfoType1"),
+            (912, s, "RemoveSeriesInfoType1"),
+            (913, s, "GetSeriesInfoType1"),
+            (1000, s, "UpdateIssueOld"),
+            (1010, s, "Unknown1010"),
+            (1011, s, "ListIssueInfoOld"),
+            (1012, s, "GetIssueOld"),
+            (1013, s, "GetIssue2Old"),
+            (1014, s, "GetIssue3Old"),
+            (1020, s, "RepairIssueOld"),
+            (1021, s, "RepairIssueWithUserIdOld"),
+            (1022, s, "RepairIssue2Old"),
+            (1023, s, "RepairIssue3Old"),
+            (1024, s, "Unknown1024"),
+            (1100, s, "UpdateIssue"),
+            (1110, s, "Unknown1110"),
+            (1111, s, "ListIssueInfo"),
+            (1112, s, "GetIssue"),
+            (1113, s, "GetIssue2"),
+            (1114, s, "GetIssue3"),
+            (1120, s, "RepairIssue"),
+            (1121, s, "RepairIssueWithUserId"),
+            (1122, s, "RepairIssue2"),
+            (1123, s, "RepairIssue3"),
+            (1124, s, "Unknown1124"),
+            (10000, Some(Self::clone_service_handler), "CloneService"),
         ]);
 
         Self {
@@ -198,6 +208,59 @@ impl IOlscServiceForSystemService {
     pub fn clone_service(&self) -> (ResultCode, IOlscServiceForSystemService) {
         log::info!("IOlscServiceForSystemService::clone_service called");
         (RESULT_SUCCESS, IOlscServiceForSystemService::new(self.system))
+    }
+
+    // --- Handler bridge functions ---
+
+    fn open_transfer_task_list_controller_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::info!("IOlscServiceForSystemService::OpenTransferTaskListController called");
+        // TODO: create ITransferTaskListController and return as domain/session object
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn open_remote_storage_controller_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::info!("IOlscServiceForSystemService::OpenRemoteStorageController called");
+        // TODO: create IRemoteStorageController and return as domain/session object
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn open_daemon_controller_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::info!("IOlscServiceForSystemService::OpenDaemonController called");
+        // TODO: create IDaemonController and return as domain/session object
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_data_transfer_policy_info_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) IOlscServiceForSystemService::GetDataTransferPolicyInfo called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        // out_policy_info: u16, packed into u32 word
+        rb.push_u32(0);
+    }
+
+    fn clone_service_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::info!("IOlscServiceForSystemService::CloneService called");
+        // TODO: return shared_from_this equivalent as domain/session object
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 }
 

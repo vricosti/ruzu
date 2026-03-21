@@ -231,9 +231,100 @@ impl NPadResource {
     pub fn set_assigning_single_on_sl_sr_press(&mut self, aruid: u64, is_enabled: bool) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             self.state[idx].data.set_assigning_single_on_sl_sr_press(is_enabled);
+            if self.active_data_aruid == aruid {
+                self.active_data.set_assigning_single_on_sl_sr_press(is_enabled);
+            }
             return ResultCode::SUCCESS;
         }
         hid_result::RESULT_ARUID_NOT_REGISTERED
+    }
+
+    /// Port of NPadResource::IsAssigningSingleOnSlSrPressEnabled.
+    pub fn is_assigning_single_on_sl_sr_press_enabled(&self, aruid: u64) -> Result<bool, ResultCode> {
+        if let Some(idx) = self.get_index_from_aruid(aruid) {
+            return Ok(self.state[idx].data.get_assigning_single_on_sl_sr_press());
+        }
+        Err(hid_result::RESULT_ARUID_NOT_REGISTERED)
+    }
+
+    /// Port of NPadResource::GetMaskedSupportedNpadStyleSet.
+    pub fn get_masked_supported_npad_style_set(&self, aruid: u64) -> Result<NpadStyleSet, ResultCode> {
+        if aruid == SYSTEM_ARUID {
+            return Ok(
+                NpadStyleSet::FULLKEY
+                    | NpadStyleSet::HANDHELD
+                    | NpadStyleSet::JOY_DUAL
+                    | NpadStyleSet::JOY_LEFT
+                    | NpadStyleSet::JOY_RIGHT
+                    | NpadStyleSet::PALMA
+                    | NpadStyleSet::SYSTEM_EXT
+                    | NpadStyleSet::SYSTEM,
+            );
+        }
+
+        if let Some(idx) = self.get_index_from_aruid(aruid) {
+            let data = &self.state[idx].data;
+            if !data.get_npad_status().is_supported_styleset_set() {
+                return Err(hid_result::RESULT_UNDEFINED_STYLESET);
+            }
+
+            let mut out_style_set = data.get_supported_npad_style_set();
+
+            let mask = match self.state[idx].npad_revision {
+                NpadRevision::Revision1 => {
+                    NpadStyleSet::FULLKEY
+                        | NpadStyleSet::HANDHELD
+                        | NpadStyleSet::JOY_DUAL
+                        | NpadStyleSet::JOY_LEFT
+                        | NpadStyleSet::JOY_RIGHT
+                        | NpadStyleSet::GC
+                        | NpadStyleSet::PALMA
+                        | NpadStyleSet::SYSTEM_EXT
+                        | NpadStyleSet::SYSTEM
+                }
+                NpadRevision::Revision2 => {
+                    NpadStyleSet::FULLKEY
+                        | NpadStyleSet::HANDHELD
+                        | NpadStyleSet::JOY_DUAL
+                        | NpadStyleSet::JOY_LEFT
+                        | NpadStyleSet::JOY_RIGHT
+                        | NpadStyleSet::GC
+                        | NpadStyleSet::PALMA
+                        | NpadStyleSet::LARK
+                        | NpadStyleSet::SYSTEM_EXT
+                        | NpadStyleSet::SYSTEM
+                }
+                NpadRevision::Revision3 => {
+                    NpadStyleSet::FULLKEY
+                        | NpadStyleSet::HANDHELD
+                        | NpadStyleSet::JOY_DUAL
+                        | NpadStyleSet::JOY_LEFT
+                        | NpadStyleSet::JOY_RIGHT
+                        | NpadStyleSet::GC
+                        | NpadStyleSet::PALMA
+                        | NpadStyleSet::LARK
+                        | NpadStyleSet::HANDHELD_LARK
+                        | NpadStyleSet::LUCIA
+                        | NpadStyleSet::LAGOON
+                        | NpadStyleSet::LAGER
+                        | NpadStyleSet::SYSTEM_EXT
+                        | NpadStyleSet::SYSTEM
+                }
+                _ => {
+                    NpadStyleSet::FULLKEY
+                        | NpadStyleSet::HANDHELD
+                        | NpadStyleSet::JOY_DUAL
+                        | NpadStyleSet::JOY_LEFT
+                        | NpadStyleSet::JOY_RIGHT
+                        | NpadStyleSet::SYSTEM_EXT
+                        | NpadStyleSet::SYSTEM
+                }
+            };
+
+            out_style_set = out_style_set & mask;
+            return Ok(out_style_set);
+        }
+        Err(hid_result::RESULT_NPAD_NOT_CONNECTED)
     }
 
     pub fn get_home_protection_enabled(

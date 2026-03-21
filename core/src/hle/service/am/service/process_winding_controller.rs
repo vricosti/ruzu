@@ -5,6 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/process_winding_controller.cpp
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -15,24 +16,31 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 0: GetLaunchReason
 /// - 11: OpenCallingLibraryApplet
 pub struct IProcessWindingController {
-    // TODO: Applet reference
+    applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IProcessWindingController {
-    pub fn new() -> Self {
+    pub fn new(applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
         let handlers = build_handler_map(&[(0, Some(Self::get_launch_reason_handler), "GetLaunchReason")]);
         Self {
+            applet,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
     }
 
-    fn get_launch_reason_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_launch_reason_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IProcessWindingController) };
+        let applet = service.applet.lock().unwrap();
+        let launch_reason = applet.launch_reason;
+        drop(applet);
+
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0);
+        // AppletProcessLaunchReason is a repr(C) u32-sized struct; push as raw u32
+        rb.push_u32(unsafe { std::mem::transmute::<_, u32>(launch_reason) });
     }
 }
 

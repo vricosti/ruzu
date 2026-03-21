@@ -5,6 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/library_applet_self_accessor.cpp
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::am::am_types::{AppletId, AppletIdentityInfo, LibraryAppletMode};
@@ -53,13 +54,14 @@ impl Default for ErrorContext {
 
 /// ILibraryAppletSelfAccessor service.
 pub struct ILibraryAppletSelfAccessor {
-    // TODO: Applet, AppletDataBroker references
+    applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
+    // TODO: AppletDataBroker reference
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ILibraryAppletSelfAccessor {
-    pub fn new() -> Self {
+    pub fn new(applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
         let handlers = build_handler_map(&[
             (0, None, "PopInData"),
             (1, None, "PushOutData"),
@@ -99,6 +101,7 @@ impl ILibraryAppletSelfAccessor {
             (160, None, "Cmd160"),
         ]);
         Self {
+            applet,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }

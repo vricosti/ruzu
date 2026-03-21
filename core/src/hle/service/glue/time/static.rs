@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::psc::time::common::{
     ClockSnapshot, StaticServiceSetupInfo, SteadyClockTimePoint, SystemClockContext, TimeType,
 };
@@ -104,25 +104,25 @@ impl StaticService {
         let _ = time_zone_binary.mount();
 
         let handlers = build_handler_map(&[
-            (commands::GET_STANDARD_USER_SYSTEM_CLOCK, None, "GetStandardUserSystemClock"),
-            (commands::GET_STANDARD_NETWORK_SYSTEM_CLOCK, None, "GetStandardNetworkSystemClock"),
-            (commands::GET_STANDARD_STEADY_CLOCK, None, "GetStandardSteadyClock"),
-            (commands::GET_TIME_ZONE_SERVICE, None, "GetTimeZoneService"),
-            (commands::GET_STANDARD_LOCAL_SYSTEM_CLOCK, None, "GetStandardLocalSystemClock"),
-            (commands::GET_EPHEMERAL_NETWORK_SYSTEM_CLOCK, None, "GetEphemeralNetworkSystemClock"),
+            (commands::GET_STANDARD_USER_SYSTEM_CLOCK, Some(StaticService::get_standard_user_system_clock_handler), "GetStandardUserSystemClock"),
+            (commands::GET_STANDARD_NETWORK_SYSTEM_CLOCK, Some(StaticService::get_standard_network_system_clock_handler), "GetStandardNetworkSystemClock"),
+            (commands::GET_STANDARD_STEADY_CLOCK, Some(StaticService::get_standard_steady_clock_handler), "GetStandardSteadyClock"),
+            (commands::GET_TIME_ZONE_SERVICE, Some(StaticService::get_time_zone_service_handler), "GetTimeZoneService"),
+            (commands::GET_STANDARD_LOCAL_SYSTEM_CLOCK, Some(StaticService::get_standard_local_system_clock_handler), "GetStandardLocalSystemClock"),
+            (commands::GET_EPHEMERAL_NETWORK_SYSTEM_CLOCK, Some(StaticService::get_ephemeral_network_system_clock_handler), "GetEphemeralNetworkSystemClock"),
             (commands::GET_SHARED_MEMORY_NATIVE_HANDLE, Some(StaticService::get_shared_memory_native_handle_handler), "GetSharedMemoryNativeHandle"),
-            (commands::SET_STANDARD_STEADY_CLOCK_INTERNAL_OFFSET, None, "SetStandardSteadyClockInternalOffset"),
-            (commands::GET_STANDARD_STEADY_CLOCK_RTC_VALUE, None, "GetStandardSteadyClockRtcValue"),
+            (commands::SET_STANDARD_STEADY_CLOCK_INTERNAL_OFFSET, Some(StaticService::set_standard_steady_clock_internal_offset_handler), "SetStandardSteadyClockInternalOffset"),
+            (commands::GET_STANDARD_STEADY_CLOCK_RTC_VALUE, Some(StaticService::get_standard_steady_clock_rtc_value_handler), "GetStandardSteadyClockRtcValue"),
             (commands::IS_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, Some(StaticService::is_standard_user_system_clock_automatic_correction_enabled_handler), "IsStandardUserSystemClockAutomaticCorrectionEnabled"),
-            (commands::SET_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, None, "SetStandardUserSystemClockAutomaticCorrectionEnabled"),
-            (commands::GET_STANDARD_USER_SYSTEM_CLOCK_INITIAL_YEAR, None, "GetStandardUserSystemClockInitialYear"),
+            (commands::SET_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, Some(StaticService::set_standard_user_system_clock_automatic_correction_enabled_handler), "SetStandardUserSystemClockAutomaticCorrectionEnabled"),
+            (commands::GET_STANDARD_USER_SYSTEM_CLOCK_INITIAL_YEAR, Some(StaticService::get_standard_user_system_clock_initial_year_handler), "GetStandardUserSystemClockInitialYear"),
             (commands::IS_STANDARD_NETWORK_SYSTEM_CLOCK_ACCURACY_SUFFICIENT, Some(StaticService::is_standard_network_system_clock_accuracy_sufficient_handler), "IsStandardNetworkSystemClockAccuracySufficient"),
-            (commands::GET_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME, None, "GetStandardUserSystemClockAutomaticCorrectionUpdatedTime"),
-            (commands::CALCULATE_MONOTONIC_SYSTEM_CLOCK_BASE_TIME_POINT, None, "CalculateMonotonicSystemClockBaseTimePoint"),
-            (commands::GET_CLOCK_SNAPSHOT, None, "GetClockSnapshot"),
-            (commands::GET_CLOCK_SNAPSHOT_FROM_SYSTEM_CLOCK_CONTEXT, None, "GetClockSnapshotFromSystemClockContext"),
-            (commands::CALCULATE_STANDARD_USER_SYSTEM_CLOCK_DIFFERENCE_BY_USER, None, "CalculateStandardUserSystemClockDifferenceByUser"),
-            (commands::CALCULATE_SPAN_BETWEEN_STANDARD_USER_SYSTEM_CLOCKS, None, "CalculateSpanBetweenStandardUserSystemClocks"),
+            (commands::GET_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME, Some(StaticService::get_standard_user_system_clock_automatic_correction_updated_time_handler), "GetStandardUserSystemClockAutomaticCorrectionUpdatedTime"),
+            (commands::CALCULATE_MONOTONIC_SYSTEM_CLOCK_BASE_TIME_POINT, Some(StaticService::calculate_monotonic_system_clock_base_time_point_handler), "CalculateMonotonicSystemClockBaseTimePoint"),
+            (commands::GET_CLOCK_SNAPSHOT, Some(StaticService::get_clock_snapshot_handler), "GetClockSnapshot"),
+            (commands::GET_CLOCK_SNAPSHOT_FROM_SYSTEM_CLOCK_CONTEXT, Some(StaticService::get_clock_snapshot_from_system_clock_context_handler), "GetClockSnapshotFromSystemClockContext"),
+            (commands::CALCULATE_STANDARD_USER_SYSTEM_CLOCK_DIFFERENCE_BY_USER, Some(StaticService::calculate_standard_user_system_clock_difference_by_user_handler), "CalculateStandardUserSystemClockDifferenceByUser"),
+            (commands::CALCULATE_SPAN_BETWEEN_STANDARD_USER_SYSTEM_CLOCKS, Some(StaticService::calculate_span_between_handler), "CalculateSpanBetweenStandardUserSystemClocks"),
         ]);
 
         Self {
@@ -146,6 +146,112 @@ impl StaticService {
     // =========================================================================
     // IPC handler callbacks (ServiceFramework pattern)
     // =========================================================================
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const StaticService) }
+    }
+
+    /// Helper to create a sub-service and push it as a domain object or move handle.
+    fn push_sub_service(
+        ctx: &mut HLERequestContext,
+        sub_service: std::sync::Arc<dyn SessionRequestHandler>,
+    ) {
+        let is_domain = ctx
+            .get_manager()
+            .map_or(false, |manager| manager.lock().unwrap().is_domain());
+        let move_handle = if is_domain {
+            0
+        } else {
+            ctx.create_session_for_service(sub_service.clone())
+                .unwrap_or(0)
+        };
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        if is_domain {
+            ctx.add_domain_object(sub_service);
+        } else {
+            rb.push_move_objects(move_handle);
+        }
+    }
+
+    /// GetStandardUserSystemClock (cmd 0) handler.
+    ///
+    /// Upstream delegates to m_wrapped_service->GetStandardUserSystemClock().
+    fn get_standard_user_system_clock_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        log::debug!("Glue::Time::StaticService::GetStandardUserSystemClock called");
+        let sub = service.wrapped_service.lock().unwrap().get_standard_user_system_clock();
+        Self::push_sub_service(ctx, std::sync::Arc::new(sub));
+    }
+
+    /// GetStandardNetworkSystemClock (cmd 1) handler.
+    fn get_standard_network_system_clock_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        log::debug!("Glue::Time::StaticService::GetStandardNetworkSystemClock called");
+        let sub = service.wrapped_service.lock().unwrap().get_standard_network_system_clock();
+        Self::push_sub_service(ctx, std::sync::Arc::new(sub));
+    }
+
+    /// GetStandardSteadyClock (cmd 2) handler.
+    fn get_standard_steady_clock_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        log::debug!("Glue::Time::StaticService::GetStandardSteadyClock called");
+        let sub = service.wrapped_service.lock().unwrap().get_standard_steady_clock();
+        Self::push_sub_service(ctx, std::sync::Arc::new(sub));
+    }
+
+    /// GetTimeZoneService (cmd 3) handler.
+    ///
+    /// Unlike the other sub-service commands, upstream creates a Glue::Time::TimeZoneService
+    /// rather than delegating to the PSC wrapped service.
+    fn get_time_zone_service_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        log::debug!("Glue::Time::StaticService::GetTimeZoneService called");
+        match service.get_time_zone_service() {
+            Ok(sub) => {
+                Self::push_sub_service(ctx, std::sync::Arc::new(sub));
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    /// GetStandardLocalSystemClock (cmd 4) handler.
+    fn get_standard_local_system_clock_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        log::debug!("Glue::Time::StaticService::GetStandardLocalSystemClock called");
+        let sub = service.wrapped_service.lock().unwrap().get_standard_local_system_clock();
+        Self::push_sub_service(ctx, std::sync::Arc::new(sub));
+    }
+
+    /// GetEphemeralNetworkSystemClock (cmd 5) handler.
+    fn get_ephemeral_network_system_clock_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        log::debug!("Glue::Time::StaticService::GetEphemeralNetworkSystemClock called");
+        let sub = service.wrapped_service.lock().unwrap().get_ephemeral_network_system_clock();
+        Self::push_sub_service(ctx, std::sync::Arc::new(sub));
+    }
 
     /// GetSharedMemoryNativeHandle (cmd 20) handler.
     ///
@@ -280,6 +386,274 @@ impl StaticService {
                 let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
                 rb.push_u32(if sufficient { 1 } else { 0 });
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    /// SetStandardSteadyClockInternalOffset (cmd 50) handler.
+    fn set_standard_steady_clock_internal_offset_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let offset_ns = rp.pop_i64();
+        let rc = service.set_standard_steady_clock_internal_offset(offset_ns);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(rc);
+    }
+
+    /// GetStandardSteadyClockRtcValue (cmd 51) handler.
+    fn get_standard_steady_clock_rtc_value_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        match service.get_standard_steady_clock_rtc_value() {
+            Ok(rtc_value) => {
+                log::debug!(
+                    "Glue::Time::StaticService::GetStandardSteadyClockRtcValue -> {}",
+                    rtc_value
+                );
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i64(rtc_value);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    /// SetStandardUserSystemClockAutomaticCorrectionEnabled (cmd 101) handler.
+    fn set_standard_user_system_clock_automatic_correction_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let automatic_correction = rp.pop_bool();
+        log::debug!(
+            "Glue::Time::StaticService::SetStandardUserSystemClockAutomaticCorrectionEnabled: {}",
+            automatic_correction
+        );
+        let rc = service
+            .set_standard_user_system_clock_automatic_correction_enabled(automatic_correction);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(rc);
+    }
+
+    /// GetStandardUserSystemClockInitialYear (cmd 102) handler.
+    fn get_standard_user_system_clock_initial_year_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        match service.get_standard_user_system_clock_initial_year() {
+            Ok(year) => {
+                log::debug!(
+                    "Glue::Time::StaticService::GetStandardUserSystemClockInitialYear -> {}",
+                    year
+                );
+                let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i32(year);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    /// GetStandardUserSystemClockAutomaticCorrectionUpdatedTime (cmd 201) handler.
+    fn get_standard_user_system_clock_automatic_correction_updated_time_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        match service.get_standard_user_system_clock_automatic_correction_updated_time() {
+            Ok(time_point) => {
+                log::debug!(
+                    "Glue::Time::StaticService::GetStandardUserSystemClockAutomaticCorrectionUpdatedTime -> {:?}",
+                    time_point
+                );
+                let mut rb = ResponseBuilder::new(
+                    ctx,
+                    2 + (core::mem::size_of::<SteadyClockTimePoint>() / 4) as u32,
+                    0,
+                    0,
+                );
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_raw(&time_point);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    /// CalculateMonotonicSystemClockBaseTimePoint (cmd 300) handler.
+    fn calculate_monotonic_system_clock_base_time_point_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let context: SystemClockContext = rp.pop_raw();
+        match service.calculate_monotonic_system_clock_base_time_point(&context) {
+            Ok(time) => {
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i64(time);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    /// GetClockSnapshot (cmd 400) handler.
+    fn get_clock_snapshot_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let type_val = rp.pop_u32();
+        let type_ = match type_val {
+            0 => TimeType::UserSystemClock,
+            1 => TimeType::NetworkSystemClock,
+            2 => TimeType::LocalSystemClock,
+            _ => TimeType::UserSystemClock,
+        };
+        match service.get_clock_snapshot(type_) {
+            Ok(snapshot) => {
+                let snapshot_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(
+                        &snapshot as *const ClockSnapshot as *const u8,
+                        core::mem::size_of::<ClockSnapshot>(),
+                    )
+                };
+                ctx.write_buffer(snapshot_bytes, 0);
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    /// GetClockSnapshotFromSystemClockContext (cmd 401) handler.
+    fn get_clock_snapshot_from_system_clock_context_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let type_val = rp.pop_u32();
+        let type_ = match type_val {
+            0 => TimeType::UserSystemClock,
+            1 => TimeType::NetworkSystemClock,
+            2 => TimeType::LocalSystemClock,
+            _ => TimeType::UserSystemClock,
+        };
+
+        let user_context: SystemClockContext = rp.pop_raw();
+        let network_context: SystemClockContext = rp.pop_raw();
+
+        match service.get_clock_snapshot_from_system_clock_context(
+            type_,
+            &user_context,
+            &network_context,
+        ) {
+            Ok(snapshot) => {
+                let snapshot_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(
+                        &snapshot as *const ClockSnapshot as *const u8,
+                        core::mem::size_of::<ClockSnapshot>(),
+                    )
+                };
+                ctx.write_buffer(snapshot_bytes, 0);
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    /// CalculateStandardUserSystemClockDifferenceByUser (cmd 500) handler.
+    fn calculate_standard_user_system_clock_difference_by_user_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+
+        let buf_a = ctx.read_buffer(0);
+        let buf_b = ctx.read_buffer(1);
+
+        let a: ClockSnapshot = if buf_a.len() >= core::mem::size_of::<ClockSnapshot>() {
+            unsafe { core::ptr::read(buf_a.as_ptr() as *const ClockSnapshot) }
+        } else {
+            ClockSnapshot::default()
+        };
+        let b: ClockSnapshot = if buf_b.len() >= core::mem::size_of::<ClockSnapshot>() {
+            unsafe { core::ptr::read(buf_b.as_ptr() as *const ClockSnapshot) }
+        } else {
+            ClockSnapshot::default()
+        };
+
+        match service.calculate_standard_user_system_clock_difference_by_user(&a, &b) {
+            Ok(diff) => {
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i64(diff);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    /// CalculateSpanBetween (cmd 501) handler.
+    fn calculate_span_between_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+
+        let buf_a = ctx.read_buffer(0);
+        let buf_b = ctx.read_buffer(1);
+
+        let a: ClockSnapshot = if buf_a.len() >= core::mem::size_of::<ClockSnapshot>() {
+            unsafe { core::ptr::read(buf_a.as_ptr() as *const ClockSnapshot) }
+        } else {
+            ClockSnapshot::default()
+        };
+        let b: ClockSnapshot = if buf_b.len() >= core::mem::size_of::<ClockSnapshot>() {
+            unsafe { core::ptr::read(buf_b.as_ptr() as *const ClockSnapshot) }
+        } else {
+            ClockSnapshot::default()
+        };
+
+        match service.calculate_span_between(&a, &b) {
+            Ok(time) => {
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i64(time);
             }
             Err(rc) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);

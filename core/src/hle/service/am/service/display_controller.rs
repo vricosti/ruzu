@@ -5,6 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/display_controller.cpp
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -41,13 +42,13 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 27: ReleaseCallerAppletCaptureSharedBuffer
 /// - 28: TakeScreenShotOfOwnLayerEx (unimplemented)
 pub struct IDisplayController {
-    // TODO: Applet reference
+    applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IDisplayController {
-    pub fn new() -> Self {
+    pub fn new(applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
         let handlers = build_handler_map(&[
             (7, Some(Self::get_caller_applet_capture_image_ex_handler), "GetCallerAppletCaptureImageEx"),
             (8, Some(Self::take_screen_shot_of_own_layer_handler), "TakeScreenShotOfOwnLayer"),
@@ -57,6 +58,7 @@ impl IDisplayController {
             (23, Some(Self::release_last_application_capture_shared_buffer_handler), "ReleaseLastApplicationCaptureSharedBuffer"),
         ]);
         Self {
+            applet,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }

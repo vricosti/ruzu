@@ -107,6 +107,7 @@ impl Services {
     /// need DeviceMemory backing (e.g. time services).
     pub fn new(
         service_manager: &Arc<Mutex<ServiceManager>>,
+        system: crate::core::SystemRef,
         device_memory: *const crate::device_memory::DeviceMemory,
         memory_manager: *mut crate::hle::kernel::k_memory_manager::KMemoryManager,
         filesystem_controller: Arc<Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
@@ -132,9 +133,9 @@ impl Services {
         Self::loop_process_jit(service_manager);
         Self::loop_process_ldn(service_manager);
         Self::loop_process_loader(service_manager);
-        Self::loop_process_nvservices(service_manager);
+        Self::loop_process_nvservices(service_manager, system);
         Self::loop_process_bsdsocket(service_manager);
-        Self::loop_process_vi(service_manager);
+        Self::loop_process_vi(service_manager, system);
 
         // ── Guest core processes (upstream: blocking) ──
         // kernel.RunOnGuestCoreProcess("sm", ...) is called FIRST.
@@ -280,8 +281,8 @@ impl Services {
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_nvservices(sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::nvdrv::loop_process(sm);
+    fn loop_process_nvservices(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::nvdrv::loop_process(system);
     }
 
     fn loop_process_bsdsocket(sm: &Arc<Mutex<ServiceManager>>) {
@@ -292,8 +293,8 @@ impl Services {
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_vi(sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::vi::vi::loop_process(sm);
+    fn loop_process_vi(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::vi::vi::loop_process(system);
     }
 
     fn loop_process_account(sm: &Arc<Mutex<ServiceManager>>) {
@@ -634,7 +635,7 @@ mod tests {
         let fsc = Arc::new(Mutex::new(
             crate::hle::service::filesystem::filesystem::FileSystemController::new(),
         ));
-        let _services = Services::new(&sm, std::ptr::null(), std::ptr::null_mut(), fsc);
+        let _services = Services::new(&sm, crate::core::SystemRef::null(), std::ptr::null(), std::ptr::null_mut(), fsc);
 
         // Verify some services are registered.
         let sm_lock = sm.lock().unwrap();
