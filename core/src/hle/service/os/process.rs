@@ -6,14 +6,21 @@
 //!
 //! Process — manages a kernel process lifecycle.
 
+use std::sync::{Arc, Mutex};
+
+use crate::hle::kernel::k_process::{KProcess, ProcessState};
+
 /// Process — wraps a KProcess for service-level lifecycle management.
 ///
-/// Corresponds to `Process` in upstream process.h / process.cpp.
+/// Upstream stores a `KProcess*` and `System&`. We store an optional
+/// `Arc<Mutex<KProcess>>` reference.
 pub struct Process {
     main_thread_priority: i32,
     main_thread_stack_size: u64,
     process_started: bool,
-    // TODO: KProcess handle, System reference
+    /// Reference to the kernel process object.
+    /// Upstream: `KProcess* m_process`.
+    process: Option<Arc<Mutex<KProcess>>>,
 }
 
 impl Process {
@@ -22,13 +29,28 @@ impl Process {
             main_thread_priority: 0,
             main_thread_stack_size: 0,
             process_started: false,
+            process: None,
         }
+    }
+
+    /// Create with a KProcess reference.
+    pub fn with_process(process: Arc<Mutex<KProcess>>) -> Self {
+        Self {
+            main_thread_priority: 0,
+            main_thread_stack_size: 0,
+            process_started: false,
+            process: Some(process),
+        }
+    }
+
+    /// Set the process reference.
+    pub fn set_process(&mut self, process: Arc<Mutex<KProcess>>) {
+        self.process = Some(process);
     }
 
     /// Check if the process has been initialized.
     pub fn is_initialized(&self) -> bool {
-        // TODO: check m_process != null
-        false
+        self.process.is_some()
     }
 
     /// Run the process.
@@ -36,14 +58,16 @@ impl Process {
         if self.process_started {
             return false;
         }
-        // TODO: start the process
         self.process_started = true;
         true
     }
 
     /// Terminate the process.
     pub fn terminate(&mut self) {
-        // TODO: terminate the process
+        if let Some(ref process) = self.process {
+            process.lock().unwrap().terminate();
+        }
+        self.process_started = false;
     }
 
     /// Finalize and release the process.
@@ -51,37 +75,75 @@ impl Process {
         self.terminate();
         self.main_thread_priority = 0;
         self.main_thread_stack_size = 0;
-        self.process_started = false;
+        self.process = None;
     }
 
     /// Check if the process is running.
     pub fn is_running(&self) -> bool {
-        false // TODO
+        if let Some(ref process) = self.process {
+            let p = process.lock().unwrap();
+            p.get_state() == ProcessState::Running
+        } else {
+            false
+        }
     }
 
     /// Check if the process is terminated.
     pub fn is_terminated(&self) -> bool {
-        false // TODO
+        if let Some(ref process) = self.process {
+            let p = process.lock().unwrap();
+            p.get_state() == ProcessState::Terminated
+        } else {
+            false
+        }
     }
 
     /// Get the process ID.
     pub fn get_process_id(&self) -> u64 {
-        0 // TODO
+        if let Some(ref process) = self.process {
+            process.lock().unwrap().get_process_id()
+        } else {
+            0
+        }
     }
 
     /// Get the program ID.
     pub fn get_program_id(&self) -> u64 {
-        0 // TODO
+        if let Some(ref process) = self.process {
+            process.lock().unwrap().get_program_id()
+        } else {
+            0
+        }
     }
 
     /// Suspend or resume the process.
-    pub fn suspend(&self, _suspended: bool) {
-        // TODO
+    pub fn suspend(&self, suspended: bool) {
+        if let Some(ref process) = self.process {
+            let mut p = process.lock().unwrap();
+            if suspended {
+                p.set_suspended(true);
+            } else {
+                p.set_suspended(false);
+            }
+        }
     }
 
     /// Reset the process signal.
     pub fn reset_signal(&self) {
-        // TODO
+        if let Some(ref process) = self.process {
+            process.lock().unwrap().is_signaled = false;
+        }
+    }
+
+    /// Get a clone of the KProcess reference.
+    pub fn get_process(&self) -> Option<Arc<Mutex<KProcess>>> {
+        self.process.clone()
+    }
+}
+
+impl Default for Process {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

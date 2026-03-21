@@ -6,17 +6,38 @@
 //!
 //! MultiWaitHolder — holds a synchronization object for MultiWait.
 
+use super::event::Event;
+use std::sync::Arc;
+
 /// MultiWaitHolder — holds a native synchronization object handle.
 ///
-/// Corresponds to `MultiWaitHolder` in upstream multi_wait_holder.h / multi_wait_holder.cpp.
+/// Upstream stores a native kernel handle and linkage into the parent
+/// MultiWait's intrusive list. We store an optional Event reference
+/// and a linked flag.
 pub struct MultiWaitHolder {
     user_data: usize,
-    // TODO: native_handle, list linkage, multi_wait reference
+    /// The event this holder is waiting on (if any).
+    event: Option<Arc<Event>>,
+    /// Whether this holder is currently linked to a MultiWait.
+    is_linked: bool,
 }
 
 impl MultiWaitHolder {
     pub fn new() -> Self {
-        Self { user_data: 0 }
+        Self {
+            user_data: 0,
+            event: None,
+            is_linked: false,
+        }
+    }
+
+    /// Create a holder wrapping an Event.
+    pub fn from_event(event: Arc<Event>) -> Self {
+        Self {
+            user_data: 0,
+            event: Some(event),
+            is_linked: false,
+        }
     }
 
     /// Set user data associated with this holder.
@@ -29,13 +50,33 @@ impl MultiWaitHolder {
         self.user_data
     }
 
+    /// Check if the held object is signaled.
+    pub fn is_signaled(&self) -> bool {
+        if let Some(ref event) = self.event {
+            event.is_signaled()
+        } else {
+            false
+        }
+    }
+
     /// Link this holder to a MultiWait.
     pub fn link_to_multi_wait(&mut self) {
-        // TODO: implement list linkage
+        self.is_linked = true;
     }
 
     /// Unlink this holder from its MultiWait.
     pub fn unlink_from_multi_wait(&mut self) {
-        // TODO: implement list unlinkage
+        self.is_linked = false;
+    }
+
+    /// Check if currently linked.
+    pub fn is_linked(&self) -> bool {
+        self.is_linked
+    }
+}
+
+impl Default for MultiWaitHolder {
+    fn default() -> Self {
+        Self::new()
     }
 }
