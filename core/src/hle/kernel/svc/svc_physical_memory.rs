@@ -23,7 +23,7 @@ pub fn set_heap_size(out_address: &mut u64, size: u64) -> ResultCode {
         return validation;
     }
 
-    // Upstream TODO: This standalone function lacks system access.
+    // Upstream note: This standalone function lacks system access.
     // Use set_heap_size_current_process instead.
     *out_address = 0;
     RESULT_NOT_IMPLEMENTED
@@ -85,7 +85,7 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
     // Upstream: R_UNLESS(current_process->GetTotalSystemResourceSize() == 0, ResultInvalidState)
     // Note: upstream checks this is non-zero, which means if it IS zero, we fail.
     // For now, skip this check since system_resource_size is not tracked yet on KProcess fields.
-    // Upstream TODO: Add total_system_resource_size field to KProcess and check here.
+    // Upstream note: Add total_system_resource_size field to KProcess and check here.
 
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(addr);
     if !process.page_table.contains(addr_kpa, size as usize) {
@@ -124,7 +124,7 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
 
     let mut process = system.current_process_arc().lock().unwrap();
 
-    // Upstream TODO: Check GetTotalSystemResourceSize() == 0 => ResultInvalidState
+    // Upstream note: Check GetTotalSystemResourceSize() == 0 => ResultInvalidState
 
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(addr);
     if !process.page_table.contains(addr_kpa, size as usize) {

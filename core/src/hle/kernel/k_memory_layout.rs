@@ -3,7 +3,7 @@
 //! Derniere synchro: 2026-03-11
 
 use super::k_memory_block::PAGE_SIZE;
-use super::k_memory_region::{KMemoryRegion, KMemoryRegionTree};
+use super::k_memory_region::{DerivedRegionExtents, KMemoryRegion, KMemoryRegionTree};
 use super::k_memory_region_type::*;
 
 // ---------------------------------------------------------------------------
@@ -198,6 +198,13 @@ impl KMemoryLayout {
             } else {
                 0
             }
+    }
+
+    /// Get the physical extents of main memory (DRAM).
+    /// Port of upstream `KMemoryLayout::GetMainMemoryPhysicalExtents()`.
+    pub fn get_main_memory_physical_extents(&self) -> DerivedRegionExtents {
+        self.m_physical_tree
+            .get_derived_region_extents(K_MEMORY_REGION_TYPE_DRAM)
     }
 
     pub fn get_total_and_kernel_memory_sizes(&self) -> (usize, usize) {
