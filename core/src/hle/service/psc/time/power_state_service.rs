@@ -6,9 +6,13 @@
 //!
 //! IPowerStateRequestHandler: handles power state requests for "time:p".
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::os::event::Event;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::power_state_request_manager::PowerStateRequestManager;
 
 /// IPC command IDs for IPowerStateRequestHandler.
@@ -29,12 +33,20 @@ pub struct PowerStateRequestHandler {
     /// Corresponds to `PowerStateRequestManager& m_power_state_request_manager`
     /// in upstream.
     power_state_request_manager: Arc<PowerStateRequestManager>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl PowerStateRequestHandler {
     pub fn new(power_state_request_manager: Arc<PowerStateRequestManager>) -> Self {
+        let handlers = build_handler_map(&[
+            (commands::GET_POWER_STATE_REQUEST_EVENT_READABLE_HANDLE, None, "GetPowerStateRequestEventReadableHandle"),
+            (commands::GET_AND_CLEAR_POWER_STATE_REQUEST, None, "GetAndClearPowerStateRequest"),
+        ]);
         Self {
             power_state_request_manager,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -58,5 +70,29 @@ impl PowerStateRequestHandler {
         log::debug!("IPowerStateRequestHandler::GetAndClearPowerStateRequest called");
         self.power_state_request_manager
             .get_and_clear_power_state_request()
+    }
+}
+
+impl SessionRequestHandler for PowerStateRequestHandler {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "time:p"
+    }
+}
+
+impl ServiceFramework for PowerStateRequestHandler {
+    fn get_service_name(&self) -> &str {
+        "time:p"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

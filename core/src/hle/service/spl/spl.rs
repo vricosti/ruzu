@@ -230,7 +230,7 @@ impl SplManu {
 pub fn loop_process() {
     log::debug!("SPL::LoopProcess called");
 
-    let module = Arc::new(ModuleInterface::new(None));
+    let module = Arc::new(ModuleInterface::new("spl:", None));
 
     let _csrng = super::csrng::Csrng::new(None);
     let _spl = Spl::new(module.clone());

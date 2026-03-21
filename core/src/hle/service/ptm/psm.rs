@@ -6,6 +6,14 @@
 //!
 //! PSM service ("psm") and IPsmSession.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// Charger type enum.
 ///
 /// Corresponds to charger_type values used in upstream psm.cpp.
@@ -62,14 +70,39 @@ pub struct PSM {
     battery_charge_percentage: u32,
     /// Charger type.
     charger_type: ChargerType,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl PSM {
     pub fn new(system: crate::core::SystemRef) -> Self {
+        let handlers = build_handler_map(&[
+            (commands::GET_BATTERY_CHARGE_PERCENTAGE, Some(PSM::get_battery_charge_percentage_handler), "GetBatteryChargePercentage"),
+            (commands::GET_CHARGER_TYPE, Some(PSM::get_charger_type_handler), "GetChargerType"),
+            (commands::ENABLE_BATTERY_CHARGING, None, "EnableBatteryCharging"),
+            (commands::DISABLE_BATTERY_CHARGING, None, "DisableBatteryCharging"),
+            (commands::IS_BATTERY_CHARGING_ENABLED, None, "IsBatteryChargingEnabled"),
+            (commands::ACQUIRE_CONTROLLER_POWER_SUPPLY, None, "AcquireControllerPowerSupply"),
+            (commands::RELEASE_CONTROLLER_POWER_SUPPLY, None, "ReleaseControllerPowerSupply"),
+            (commands::OPEN_SESSION, Some(PSM::open_session_handler), "OpenSession"),
+            (commands::ENABLE_ENOUGH_POWER_CHARGE_EMULATION, None, "EnableEnoughPowerChargeEmulation"),
+            (commands::DISABLE_ENOUGH_POWER_CHARGE_EMULATION, None, "DisableEnoughPowerChargeEmulation"),
+            (commands::ENABLE_FAST_BATTERY_CHARGING, None, "EnableFastBatteryCharging"),
+            (commands::DISABLE_FAST_BATTERY_CHARGING, None, "DisableFastBatteryCharging"),
+            (commands::GET_BATTERY_VOLTAGE_STATE, None, "GetBatteryVoltageState"),
+            (commands::GET_RAW_BATTERY_CHARGE_PERCENTAGE, None, "GetRawBatteryChargePercentage"),
+            (commands::IS_ENOUGH_POWER_SUPPLIED, None, "IsEnoughPowerSupplied"),
+            (commands::GET_BATTERY_AGE_PERCENTAGE, None, "GetBatteryAgePercentage"),
+            (commands::GET_BATTERY_CHARGE_INFO_EVENT, None, "GetBatteryChargeInfoEvent"),
+            (commands::GET_BATTERY_CHARGE_INFO_FIELDS, None, "GetBatteryChargeInfoFields"),
+            (commands::GET_BATTERY_CHARGE_CALIBRATED_EVENT, None, "GetBatteryChargeCalibratedEvent"),
+        ]);
         Self {
             system,
             battery_charge_percentage: 100,
             charger_type: ChargerType::Charger,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -96,6 +129,60 @@ impl PSM {
         log::debug!("PSM::open_session called");
         IPsmSession::new()
     }
+
+    // --- Handler bridge functions ---
+
+    fn get_battery_charge_percentage_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PSM) };
+        let percentage = service.get_battery_charge_percentage();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(percentage);
+    }
+
+    fn get_charger_type_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PSM) };
+        let charger = service.get_charger_type();
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(charger as u32);
+    }
+
+    fn open_session_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const PSM) };
+        let session = Arc::new(service.open_session());
+        let handle = ctx.create_session_for_service(session).unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_move_objects(handle);
+    }
+}
+
+impl SessionRequestHandler for PSM {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "psm"
+    }
+}
+
+impl ServiceFramework for PSM {
+    fn get_service_name(&self) -> &str {
+        "psm"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// IPsmSession -- per-session battery/charger event interface.
@@ -108,16 +195,27 @@ pub struct IPsmSession {
     should_signal: bool,
     // In upstream: service_context and state_change_event (KEvent)
     // TODO: add kernel event support
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IPsmSession {
     pub fn new() -> Self {
         // Upstream: state_change_event = service_context.CreateEvent("IPsmSession::state_change_event")
+        let handlers = build_handler_map(&[
+            (session_commands::BIND_STATE_CHANGE_EVENT, None, "BindStateChangeEvent"),
+            (session_commands::UNBIND_STATE_CHANGE_EVENT, None, "UnbindStateChangeEvent"),
+            (session_commands::SET_CHARGER_TYPE_CHANGE_EVENT_ENABLED, None, "SetChargerTypeChangeEventEnabled"),
+            (session_commands::SET_POWER_SUPPLY_CHANGE_EVENT_ENABLED, None, "SetPowerSupplyChangeEventEnabled"),
+            (session_commands::SET_BATTERY_VOLTAGE_STATE_CHANGE_EVENT_ENABLED, None, "SetBatteryVoltageStateChangeEventEnabled"),
+        ]);
         Self {
             should_signal_charger_type: false,
             should_signal_power_supply: false,
             should_signal_battery_voltage: false,
             should_signal: false,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -197,5 +295,29 @@ impl IPsmSession {
         if self.should_signal && self.should_signal_battery_voltage {
             // TODO: state_change_event->Signal()
         }
+    }
+}
+
+impl SessionRequestHandler for IPsmSession {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "psm::IPsmSession"
+    }
+}
+
+impl ServiceFramework for IPsmSession {
+    fn get_service_name(&self) -> &str {
+        "psm::IPsmSession"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

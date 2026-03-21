@@ -4,11 +4,14 @@
 //! Port of zuyu/src/core/hle/service/acc/async_context.h
 //! Port of zuyu/src/core/hle/service/acc/async_context.cpp
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::os::event::Event;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for IAsyncContext
 pub mod commands {
@@ -33,13 +36,24 @@ pub struct AsyncContextBase {
     /// Completion event, signaled when the async operation finishes.
     /// Upstream: `Kernel::KEvent* m_event`.
     pub completion_event: Arc<Event>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl AsyncContextBase {
     pub fn new() -> Self {
+        let handlers = build_handler_map(&[
+            (0, None, "GetSystemEvent"),
+            (1, None, "Cancel"),
+            (2, None, "HasDone"),
+            (3, None, "GetResult"),
+        ]);
+
         Self {
             is_complete: AtomicBool::new(false),
             completion_event: Arc::new(Event::new()),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -62,5 +76,29 @@ impl AsyncContextBase {
     /// Get a reference to the completion event (for IPC handle return).
     pub fn get_event(&self) -> Arc<Event> {
         self.completion_event.clone()
+    }
+}
+
+impl SessionRequestHandler for AsyncContextBase {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "acc::IAsyncContext"
+    }
+}
+
+impl ServiceFramework for AsyncContextBase {
+    fn get_service_name(&self) -> &str {
+        "acc::IAsyncContext"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

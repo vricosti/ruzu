@@ -4,7 +4,11 @@
 //! Port of zuyu/src/core/hle/service/bcat/news/service_creator.h
 //! Port of zuyu/src/core/hle/service/bcat/news/service_creator.cpp
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for News::IServiceCreator
 pub mod commands {
@@ -19,13 +23,25 @@ pub mod commands {
 pub struct IServiceCreator {
     pub permissions: u32,
     pub service_name: String,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IServiceCreator {
     pub fn new(permissions: u32, name: &str) -> Self {
+        let handlers = build_handler_map(&[
+            (commands::CREATE_NEWS_SERVICE, None, "CreateNewsService"),
+            (commands::CREATE_NEWLY_ARRIVED_EVENT_HOLDER, None, "CreateNewlyArrivedEventHolder"),
+            (commands::CREATE_NEWS_DATA_SERVICE, None, "CreateNewsDataService"),
+            (commands::CREATE_NEWS_DATABASE_SERVICE, None, "CreateNewsDatabaseService"),
+            (commands::CREATE_OVERWRITE_EVENT_HOLDER, None, "CreateOverwriteEventHolder"),
+        ]);
+
         Self {
             permissions,
             service_name: name.to_string(),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -57,5 +73,29 @@ impl IServiceCreator {
         log::info!("News::IServiceCreator::create_overwrite_event_holder called");
         // TODO: create IOverwriteEventHolder
         RESULT_SUCCESS
+    }
+}
+
+impl SessionRequestHandler for IServiceCreator {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        &self.service_name
+    }
+}
+
+impl ServiceFramework for IServiceCreator {
+    fn get_service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

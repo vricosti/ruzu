@@ -5,6 +5,12 @@
 //!
 //! IFirmwareDebugSettingsServer service ("set:fd").
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// IPC command table for IFirmwareDebugSettingsServer ("set:fd").
 ///
 /// Corresponds to the function table in upstream firmware_debug_settings_server.cpp.
@@ -25,11 +31,28 @@ pub mod commands {
 ///
 /// Corresponds to `IFirmwareDebugSettingsServer` in upstream.
 /// All IPC commands are unimplemented (nullptr) in upstream, matching here.
-pub struct IFirmwareDebugSettingsServer;
+pub struct IFirmwareDebugSettingsServer {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl IFirmwareDebugSettingsServer {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (commands::SET_SETTINGS_ITEM_VALUE, None, "SetSettingsItemValue"),
+            (commands::RESET_SETTINGS_ITEM_VALUE, None, "ResetSettingsItemValue"),
+            (commands::CREATE_SETTINGS_ITEM_KEY_ITERATOR, None, "CreateSettingsItemKeyIterator"),
+            (commands::READ_SETTINGS, None, "ReadSettings"),
+            (commands::RESET_SETTINGS, None, "ResetSettings"),
+            (commands::SET_WEB_INSPECTOR_FLAG, None, "SetWebInspectorFlag"),
+            (commands::SET_ALLOWED_SSL_HOSTS, None, "SetAllowedSslHosts"),
+            (commands::SET_HOST_FS_MOUNT_POINT, None, "SetHostFsMountPoint"),
+            (commands::SET_MEMORY_USAGE_RATE_FLAG, None, "SetMemoryUsageRateFlag"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// SetSettingsItemValue (cmd 2) - not implemented upstream.
@@ -75,5 +98,29 @@ impl IFirmwareDebugSettingsServer {
     /// SetMemoryUsageRateFlag (cmd 23) - not implemented upstream.
     pub fn set_memory_usage_rate_flag(&self, _flag: bool) {
         log::warn!("IFirmwareDebugSettingsServer::SetMemoryUsageRateFlag not implemented");
+    }
+}
+
+impl SessionRequestHandler for IFirmwareDebugSettingsServer {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "set:fd"
+    }
+}
+
+impl ServiceFramework for IFirmwareDebugSettingsServer {
+    fn get_service_name(&self) -> &str {
+        "set:fd"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

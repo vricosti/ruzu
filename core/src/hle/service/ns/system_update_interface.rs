@@ -6,7 +6,11 @@
 //!
 //! ISystemUpdateInterface — "ns:su" service.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::ns_types::BackgroundNetworkUpdateState;
 
 /// IPC command table for ISystemUpdateInterface.
@@ -35,11 +39,36 @@ pub mod commands {
 /// ISystemUpdateInterface.
 ///
 /// Corresponds to `ISystemUpdateInterface` in upstream.
-pub struct ISystemUpdateInterface;
+pub struct ISystemUpdateInterface {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl ISystemUpdateInterface {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (commands::GET_BACKGROUND_NETWORK_UPDATE_STATE, None, "GetBackgroundNetworkUpdateState"),
+            (commands::OPEN_SYSTEM_UPDATE_CONTROL, None, "OpenSystemUpdateControl"),
+            (commands::NOTIFY_EX_FAT_DRIVER_REQUIRED, None, "NotifyExFatDriverRequired"),
+            (commands::CLEAR_EX_FAT_DRIVER_STATUS_FOR_DEBUG, None, "ClearExFatDriverStatusForDebug"),
+            (commands::REQUEST_BACKGROUND_NETWORK_UPDATE, None, "RequestBackgroundNetworkUpdate"),
+            (commands::NOTIFY_BACKGROUND_NETWORK_UPDATE, None, "NotifyBackgroundNetworkUpdate"),
+            (commands::NOTIFY_EX_FAT_DRIVER_DOWNLOADED_FOR_DEBUG, None, "NotifyExFatDriverDownloadedForDebug"),
+            (commands::GET_SYSTEM_UPDATE_NOTIFICATION_EVENT_FOR_CONTENT_DELIVERY, None, "GetSystemUpdateNotificationEventForContentDelivery"),
+            (commands::NOTIFY_SYSTEM_UPDATE_FOR_CONTENT_DELIVERY, None, "NotifySystemUpdateForContentDelivery"),
+            (commands::PREPARE_SHUTDOWN, None, "PrepareShutdown"),
+            (commands::UNKNOWN_12, None, "Unknown12"),
+            (commands::UNKNOWN_13, None, "Unknown13"),
+            (commands::UNKNOWN_14, None, "Unknown14"),
+            (commands::UNKNOWN_15, None, "Unknown15"),
+            (commands::DESTROY_SYSTEM_UPDATE_TASK, None, "DestroySystemUpdateTask"),
+            (commands::REQUEST_SEND_SYSTEM_UPDATE, None, "RequestSendSystemUpdate"),
+            (commands::GET_SEND_SYSTEM_UPDATE_PROGRESS, None, "GetSendSystemUpdateProgress"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// GetBackgroundNetworkUpdateState (cmd 0).
@@ -59,5 +88,29 @@ impl ISystemUpdateInterface {
         log::warn!("(STUBBED) OpenSystemUpdateControl called");
         // TODO: Create and return ISystemUpdateControl
         Ok(())
+    }
+}
+
+impl SessionRequestHandler for ISystemUpdateInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ns::ISystemUpdateInterface"
+    }
+}
+
+impl ServiceFramework for ISystemUpdateInterface {
+    fn get_service_name(&self) -> &str {
+        "ns::ISystemUpdateInterface"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

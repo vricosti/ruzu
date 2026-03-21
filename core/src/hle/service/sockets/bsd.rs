@@ -6,10 +6,16 @@
 //!
 //! BSD socket service -- "bsd:u" and "bsd:s".
 
+use std::collections::BTreeMap;
+
 use super::sockets::{
     Domain, Errno, FcntlCmd, Linger, OptName, PollEvents, PollFD, Protocol, ShutdownHow,
     SockAddrIn, SocketLevel, Type,
 };
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use crate::internal_network::network::{
     Domain as NetDomain, Errno as NetErrno, Protocol as NetProtocol, ShutdownHow as NetShutdownHow,
     SockAddrIn as NetSockAddrIn, Type as NetType,
@@ -248,13 +254,54 @@ pub struct FileDescriptor {
 ///
 /// Corresponds to `BSD` in upstream bsd.h / bsd.cpp.
 pub struct Bsd {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     file_descriptors: [Option<FileDescriptor>; MAX_FD],
     is_privileged: bool,
 }
 
 impl Bsd {
     pub fn new(is_privileged: bool) -> Self {
+        let handlers = build_handler_map(&[
+            (0, Some(Bsd::register_client_handler), "RegisterClient"),
+            (1, Some(Bsd::start_monitoring_handler), "StartMonitoring"),
+            (2, Some(Bsd::socket_handler), "Socket"),
+            (3, Some(Bsd::socket_handler), "SocketExempt"),
+            (4, None, "Open"),
+            (5, Some(Bsd::select_handler), "Select"),
+            (6, Some(Bsd::poll_handler), "Poll"),
+            (7, None, "Sysctl"),
+            (8, Some(Bsd::recv_handler), "Recv"),
+            (9, Some(Bsd::recv_from_handler), "RecvFrom"),
+            (10, Some(Bsd::send_handler), "Send"),
+            (11, Some(Bsd::send_to_handler), "SendTo"),
+            (12, Some(Bsd::accept_handler), "Accept"),
+            (13, Some(Bsd::bind_handler), "Bind"),
+            (14, Some(Bsd::connect_handler), "Connect"),
+            (15, Some(Bsd::get_peer_name_handler), "GetPeerName"),
+            (16, Some(Bsd::get_sock_name_handler), "GetSockName"),
+            (17, Some(Bsd::get_sock_opt_handler), "GetSockOpt"),
+            (18, Some(Bsd::listen_handler), "Listen"),
+            (19, None, "Ioctl"),
+            (20, Some(Bsd::fcntl_handler), "Fcntl"),
+            (21, Some(Bsd::set_sock_opt_handler), "SetSockOpt"),
+            (22, Some(Bsd::shutdown_handler), "Shutdown"),
+            (23, None, "ShutdownAllSockets"),
+            (24, Some(Bsd::write_handler), "Write"),
+            (25, Some(Bsd::read_handler), "Read"),
+            (26, Some(Bsd::close_handler), "Close"),
+            (27, Some(Bsd::duplicate_socket_handler), "DuplicateSocket"),
+            (28, None, "GetResourceStatistics"),
+            (29, None, "RecvMMsg"),
+            (30, None, "SendMMsg"),
+            (31, Some(Bsd::event_fd_handler), "EventFd"),
+            (32, None, "RegisterResourceStatisticsName"),
+            (33, None, "Initialize2"),
+        ]);
+
         Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
             file_descriptors: std::array::from_fn(|_| None),
             is_privileged,
         }
@@ -1010,16 +1057,408 @@ impl Bsd {
             }
         }
     }
+
+    /// Build a standard errno IPC response.
+    ///
+    /// Corresponds to `BSD::BuildErrnoResponse(HLERequestContext&, Errno)` in upstream.
+    fn build_errno_response_ipc(ctx: &mut HLERequestContext, bsd_errno: Errno) {
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(if bsd_errno == Errno::SUCCESS { 0 } else { -1 });
+        rb.push_u32(bsd_errno as u32);
+    }
+
+    fn register_client_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) BSD::RegisterClient called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(0); // bsd errno
+    }
+
+    fn start_monitoring_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) BSD::StartMonitoring called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn socket_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let domain = rp.pop_u32();
+        let ty = rp.pop_u32();
+        let protocol = rp.pop_u32();
+
+        let (fd, bsd_errno) = bsd.socket_impl(
+            unsafe { std::mem::transmute(domain) },
+            unsafe { std::mem::transmute(ty) },
+            unsafe { std::mem::transmute(protocol) },
+        );
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(fd);
+        rb.push_u32(bsd_errno as u32);
+    }
+
+    fn select_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("(STUBBED) BSD::Select called");
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(0); // ret
+        rb.push_u32(0); // bsd errno
+    }
+
+    fn poll_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let nfds = rp.pop_i32();
+        let timeout = rp.pop_i32();
+
+        let read_buffer = ctx.read_buffer(0);
+        let write_size = ctx.get_write_buffer_size(0);
+        let mut write_buffer = vec![0u8; write_size];
+
+        let (ret, bsd_errno) = bsd.poll_impl(&mut write_buffer, &read_buffer, nfds, timeout);
+
+        ctx.write_buffer(&write_buffer, 0);
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(ret);
+        rb.push_u32(bsd_errno as u32);
+    }
+
+    fn accept_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+
+        let mut write_buffer = vec![0u8; ctx.get_write_buffer_size(0)];
+        let (ret, bsd_errno) = bsd.accept_impl(fd, &mut write_buffer);
+
+        ctx.write_buffer(&write_buffer, 0);
+        let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(ret);
+        rb.push_u32(bsd_errno as u32);
+        rb.push_u32(write_buffer.len() as u32);
+    }
+
+    fn bind_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let addr = ctx.read_buffer(0);
+        let bsd_errno = bsd.bind_impl(fd, &addr);
+        Bsd::build_errno_response_ipc(ctx, bsd_errno);
+    }
+
+    fn connect_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let addr = ctx.read_buffer(0);
+        let bsd_errno = bsd.connect_impl(fd, &addr);
+        Bsd::build_errno_response_ipc(ctx, bsd_errno);
+    }
+
+    fn get_peer_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &*(this as *const dyn ServiceFramework as *const Bsd) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+
+        let mut write_buffer = vec![0u8; ctx.get_write_buffer_size(0)];
+        let bsd_errno = bsd.get_peer_name_impl(fd, &mut write_buffer);
+
+        ctx.write_buffer(&write_buffer, 0);
+        let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(if bsd_errno != Errno::SUCCESS { -1 } else { 0 });
+        rb.push_u32(bsd_errno as u32);
+        rb.push_u32(write_buffer.len() as u32);
+    }
+
+    fn get_sock_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &*(this as *const dyn ServiceFramework as *const Bsd) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+
+        let mut write_buffer = vec![0u8; ctx.get_write_buffer_size(0)];
+        let bsd_errno = bsd.get_sock_name_impl(fd, &mut write_buffer);
+
+        ctx.write_buffer(&write_buffer, 0);
+        let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(if bsd_errno != Errno::SUCCESS { -1 } else { 0 });
+        rb.push_u32(bsd_errno as u32);
+        rb.push_u32(write_buffer.len() as u32);
+    }
+
+    fn get_sock_opt_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &*(this as *const dyn ServiceFramework as *const Bsd) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let level = rp.pop_u32();
+        let optname_raw = rp.pop_u32();
+        let optname: OptName = unsafe { std::mem::transmute(optname_raw) };
+
+        let mut optval = vec![0u8; ctx.get_write_buffer_size(0)];
+        let err = bsd.get_sock_opt_impl(fd, level, optname, &mut optval);
+
+        ctx.write_buffer(&optval, 0);
+        let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(if err == Errno::SUCCESS { 0 } else { -1 });
+        rb.push_u32(err as u32);
+        rb.push_u32(optval.len() as u32);
+    }
+
+    fn listen_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let backlog = rp.pop_i32();
+        let bsd_errno = bsd.listen_impl(fd, backlog);
+        Bsd::build_errno_response_ipc(ctx, bsd_errno);
+    }
+
+    fn fcntl_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let cmd = rp.pop_i32();
+        let arg = rp.pop_i32();
+
+        let (ret, bsd_errno) = bsd.fcntl_impl(fd, unsafe { std::mem::transmute(cmd) }, arg);
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(ret);
+        rb.push_u32(bsd_errno as u32);
+    }
+
+    fn set_sock_opt_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let level = rp.pop_u32();
+        let optname_raw = rp.pop_u32();
+        let optname: OptName = unsafe { std::mem::transmute(optname_raw) };
+        let optval = ctx.read_buffer(0);
+        let bsd_errno = bsd.set_sock_opt_impl(fd, level, optname, &optval);
+        Bsd::build_errno_response_ipc(ctx, bsd_errno);
+    }
+
+    fn shutdown_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let how = rp.pop_i32();
+        let bsd_errno = bsd.shutdown_impl(fd, how);
+        Bsd::build_errno_response_ipc(ctx, bsd_errno);
+    }
+
+    fn recv_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let flags = rp.pop_u32();
+
+        let mut message = vec![0u8; ctx.get_write_buffer_size(0)];
+        let (ret, bsd_errno) = bsd.recv_impl(fd, flags, &mut message);
+
+        ctx.write_buffer(&message, 0);
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(ret);
+        rb.push_u32(bsd_errno as u32);
+    }
+
+    fn recv_from_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let flags = rp.pop_u32();
+
+        let mut message = vec![0u8; ctx.get_write_buffer_size(0)];
+        let mut addr = vec![0u8; ctx.get_write_buffer_size(1)];
+        let (ret, bsd_errno) = bsd.recv_from_impl(fd, flags, &mut message, &mut addr);
+
+        ctx.write_buffer(&message, 0);
+        ctx.write_buffer(&addr, 1);
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(ret);
+        rb.push_u32(bsd_errno as u32);
+    }
+
+    fn send_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let flags = rp.pop_u32();
+
+        let message = ctx.read_buffer(0);
+        let (ret, bsd_errno) = bsd.send_impl(fd, flags, &message);
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(ret);
+        rb.push_u32(bsd_errno as u32);
+    }
+
+    fn send_to_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let flags = rp.pop_u32();
+
+        let message = ctx.read_buffer(0);
+        let addr = ctx.read_buffer(1);
+        let (ret, bsd_errno) = bsd.send_to_impl(fd, flags, &message, &addr);
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(ret);
+        rb.push_u32(bsd_errno as u32);
+    }
+
+    fn write_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+
+        let message = ctx.read_buffer(0);
+        let (ret, bsd_errno) = bsd.send_impl(fd, 0, &message);
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(ret);
+        rb.push_u32(bsd_errno as u32);
+    }
+
+    fn read_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) BSD::Read called");
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(0); // ret
+        rb.push_u32(0); // bsd errno
+    }
+
+    fn close_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let bsd_errno = bsd.close_impl(fd);
+        Bsd::build_errno_response_ipc(ctx, bsd_errno);
+    }
+
+    fn duplicate_socket_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let fd = rp.pop_i32();
+        let _reserved = rp.pop_u64();
+
+        let (ret, bsd_errno) = match bsd.duplicate_socket_impl(fd) {
+            Ok(new_fd) => (new_fd, Errno::SUCCESS),
+            Err(err) => (0, err),
+        };
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(ret);
+        rb.push_u32(bsd_errno as u32);
+    }
+
+    fn event_fd_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let initval = rp.pop_u64();
+        let flags = rp.pop_u32();
+        log::warn!("(STUBBED) BSD::EventFd called, initval={}, flags={}", initval, flags);
+        Bsd::build_errno_response_ipc(ctx, Errno::SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for Bsd {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        if self.is_privileged { "bsd:s" } else { "bsd:u" }
+    }
+}
+
+impl ServiceFramework for Bsd {
+    fn get_service_name(&self) -> &str {
+        if self.is_privileged { "bsd:s" } else { "bsd:u" }
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// BSDCFG service.
 ///
 /// Corresponds to `BSDCFG` in upstream bsd.h / bsd.cpp.
 /// All commands are nullptr (unimplemented) in upstream.
-pub struct BsdCfg;
+pub struct BsdCfg {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl BsdCfg {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (0, None, "SetIfUp"),
+            (1, None, "SetIfUpWithEvent"),
+            (2, None, "CancelIf"),
+            (3, None, "SetIfDown"),
+            (4, None, "GetIfState"),
+            (5, None, "DhcpRenew"),
+            (6, None, "AddStaticArpEntry"),
+            (7, None, "RemoveArpEntry"),
+            (8, None, "LookupArpEntry"),
+            (9, None, "LookupArpEntry2"),
+            (10, None, "ClearArpEntries"),
+            (11, None, "ClearArpEntries2"),
+            (12, None, "PrintArpEntries"),
+            (13, None, "Unknown13"),
+            (14, None, "Unknown14"),
+            (15, None, "Unknown15"),
+        ]);
+
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BsdCfg {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "bsdcfg"
+    }
+}
+
+impl ServiceFramework for BsdCfg {
+    fn get_service_name(&self) -> &str {
+        "bsdcfg"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

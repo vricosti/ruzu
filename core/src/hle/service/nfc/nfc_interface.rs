@@ -6,7 +6,11 @@
 //!
 //! NfcInterface: base service class for NFC, NFP, and Mifare backends.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::nfc_types::{BackendType, State};
 use super::nfc_result;
 use super::mifare_result;
@@ -20,6 +24,8 @@ pub struct NfcInterface {
     pub service_name: String,
     pub backend_type: BackendType,
     pub state: State,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     // TODO: device_manager: Option<Arc<DeviceManager>>
     // TODO: service_context: ServiceContext
     // TODO: m_set_sys: shared reference to ISystemSettingsServer
@@ -56,10 +62,38 @@ pub mod commands {
 
 impl NfcInterface {
     pub fn new(name: &str, service_backend: BackendType) -> Self {
+        // IUser command table from upstream nfc.cpp
+        let handlers = build_handler_map(&[
+            (commands::INITIALIZE_OLD, None, "InitializeOld"),
+            (commands::FINALIZE_OLD, None, "FinalizeOld"),
+            (commands::GET_STATE_OLD, None, "GetStateOld"),
+            (commands::IS_NFC_ENABLED_OLD, None, "IsNfcEnabledOld"),
+            (commands::INITIALIZE, None, "Initialize"),
+            (commands::FINALIZE, None, "Finalize"),
+            (commands::GET_STATE, None, "GetState"),
+            (commands::IS_NFC_ENABLED, None, "IsNfcEnabled"),
+            (commands::LIST_DEVICES, None, "ListDevices"),
+            (commands::GET_DEVICE_STATE, None, "GetDeviceState"),
+            (commands::GET_NPAD_ID, None, "GetNpadId"),
+            (commands::ATTACH_AVAILABILITY_CHANGE_EVENT, None, "AttachAvailabilityChangeEvent"),
+            (commands::START_DETECTION, None, "StartDetection"),
+            (commands::STOP_DETECTION, None, "StopDetection"),
+            (commands::GET_TAG_INFO, None, "GetTagInfo"),
+            (commands::ATTACH_ACTIVATE_EVENT, None, "AttachActivateEvent"),
+            (commands::ATTACH_DEACTIVATE_EVENT, None, "AttachDeactivateEvent"),
+            (commands::READ_MIFARE, None, "ReadMifare"),
+            (commands::WRITE_MIFARE, None, "WriteMifare"),
+            (commands::SEND_COMMAND_BY_PASS_THROUGH, None, "SendCommandByPassThrough"),
+            (1301, None, "KeepPassThroughSession"),
+            (1302, None, "ReleasePassThroughSession"),
+        ]);
+
         Self {
             service_name: name.to_string(),
             backend_type: service_backend,
             state: State::NonInitialized,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -166,6 +200,11 @@ impl NfcInterface {
 
     pub fn get_backend_type(&self) -> BackendType {
         self.backend_type
+    }
+
+    /// Returns a reference to the handler map.
+    pub fn get_handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
     }
 
     /// Translates NFC result codes to the appropriate backend-specific codes.
@@ -276,5 +315,29 @@ impl NfcInterface {
         }
         log::warn!("NFC Mifare result conversion not handled");
         result
+    }
+}
+
+impl SessionRequestHandler for NfcInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        &self.service_name
+    }
+}
+
+impl ServiceFramework for NfcInterface {
+    fn get_service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

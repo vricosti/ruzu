@@ -4,7 +4,11 @@
 //! Port of zuyu/src/core/hle/service/bcat/delivery_cache_storage_service.h
 //! Port of zuyu/src/core/hle/service/bcat/delivery_cache_storage_service.cpp
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::bcat_types::DirectoryName;
 
 /// IPC command IDs for IDeliveryCacheStorageService
@@ -19,13 +23,23 @@ pub struct IDeliveryCacheStorageService {
     // TODO: root: VirtualDir
     pub entries: Vec<DirectoryName>,
     pub next_read_index: usize,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IDeliveryCacheStorageService {
     pub fn new() -> Self {
+        let handlers = build_handler_map(&[
+            (commands::CREATE_FILE_SERVICE, None, "CreateFileService"),
+            (commands::CREATE_DIRECTORY_SERVICE, None, "CreateDirectoryService"),
+            (commands::ENUMERATE_DELIVERY_CACHE_DIRECTORY, None, "EnumerateDeliveryCacheDirectory"),
+        ]);
+
         Self {
             entries: Vec::new(),
             next_read_index: 0,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -56,5 +70,29 @@ impl IDeliveryCacheStorageService {
         }
         self.next_read_index += count;
         (RESULT_SUCCESS, count as i32)
+    }
+}
+
+impl SessionRequestHandler for IDeliveryCacheStorageService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "IDeliveryCacheStorageService"
+    }
+}
+
+impl ServiceFramework for IDeliveryCacheStorageService {
+    fn get_service_name(&self) -> &str {
+        "IDeliveryCacheStorageService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

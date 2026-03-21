@@ -11,7 +11,7 @@ use crate::internal_network::network::{
 /// Socket base trait.
 ///
 /// Corresponds to upstream `Network::SocketBase`.
-pub trait SocketBase {
+pub trait SocketBase: Send + Sync {
     fn initialize(&mut self, domain: Domain, type_: Type, protocol: Protocol) -> Errno;
     fn close(&mut self) -> Errno;
 

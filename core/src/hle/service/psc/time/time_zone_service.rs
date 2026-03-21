@@ -5,7 +5,11 @@
 //!
 //! ITimeZoneService: provides timezone queries and conversions.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::common::{
     CalendarAdditionalInfo, CalendarTime, LocationName, RuleVersion, SteadyClockTimePoint,
 };
@@ -40,13 +44,36 @@ pub struct TimeZoneService {
     // In upstream, holds references to StandardSteadyClockCore and TimeZone.
     // Here we keep local state until clock core wiring is complete.
     time_zone: TimeZone,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl TimeZoneService {
+    fn build_handlers() -> BTreeMap<u32, FunctionInfo> {
+        build_handler_map(&[
+            (commands::GET_DEVICE_LOCATION_NAME, None, "GetDeviceLocationName"),
+            (commands::SET_DEVICE_LOCATION_NAME, None, "SetDeviceLocationName"),
+            (commands::GET_TOTAL_LOCATION_NAME_COUNT, None, "GetTotalLocationNameCount"),
+            (commands::LOAD_LOCATION_NAME_LIST, None, "LoadLocationNameList"),
+            (commands::LOAD_TIME_ZONE_RULE, None, "LoadTimeZoneRule"),
+            (commands::GET_TIME_ZONE_RULE_VERSION, None, "GetTimeZoneRuleVersion"),
+            (commands::GET_DEVICE_LOCATION_NAME_AND_UPDATED_TIME, None, "GetDeviceLocationNameAndUpdatedTime"),
+            (commands::SET_DEVICE_LOCATION_NAME_WITH_TIME_ZONE_RULE, None, "SetDeviceLocationNameWithTimeZoneRule"),
+            (commands::PARSE_TIME_ZONE_BINARY, None, "ParseTimeZoneBinary"),
+            (commands::GET_DEVICE_LOCATION_NAME_OPERATION_EVENT_READABLE_HANDLE, None, "GetDeviceLocationNameOperationEventReadableHandle"),
+            (commands::TO_CALENDAR_TIME, None, "ToCalendarTime"),
+            (commands::TO_CALENDAR_TIME_WITH_MY_RULE, None, "ToCalendarTimeWithMyRule"),
+            (commands::TO_POSIX_TIME, None, "ToPosixTime"),
+            (commands::TO_POSIX_TIME_WITH_MY_RULE, None, "ToPosixTimeWithMyRule"),
+        ])
+    }
+
     pub fn new(can_write_timezone_device_location: bool) -> Self {
         Self {
             can_write_timezone_device_location,
             time_zone: TimeZone::new(),
+            handlers: Self::build_handlers(),
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -58,6 +85,8 @@ impl TimeZoneService {
         Self {
             can_write_timezone_device_location,
             time_zone,
+            handlers: Self::build_handlers(),
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -194,5 +223,29 @@ impl TimeZoneService {
         log::debug!("PSC::Time::TimeZoneService::ToPosixTimeWithMyRule called");
         self.time_zone
             .to_posix_time_with_my_rule(out_times, calendar_time)
+    }
+}
+
+impl SessionRequestHandler for TimeZoneService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ITimeZoneService"
+    }
+}
+
+impl ServiceFramework for TimeZoneService {
+    fn get_service_name(&self) -> &str {
+        "ITimeZoneService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

@@ -6,10 +6,13 @@
 //!
 //! ISystemClock: provides system clock time queries and modifications.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::os::event::Event;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::common::SystemClockContext;
 use super::errors::{RESULT_CLOCK_UNINITIALIZED, RESULT_PERMISSION_DENIED};
 
@@ -37,10 +40,19 @@ pub struct SystemClock {
     /// Lazily created operation event.
     /// Upstream: `std::unique_ptr<OperationEvent> m_operation_event`.
     operation_event: Option<Arc<Event>>,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl SystemClock {
     pub fn new(can_write_clock: bool, can_write_uninitialized_clock: bool) -> Self {
+        let handlers = build_handler_map(&[
+            (commands::GET_CURRENT_TIME, None, "GetCurrentTime"),
+            (commands::SET_CURRENT_TIME, None, "SetCurrentTime"),
+            (commands::GET_SYSTEM_CLOCK_CONTEXT, None, "GetSystemClockContext"),
+            (commands::SET_SYSTEM_CLOCK_CONTEXT, None, "SetSystemClockContext"),
+            (commands::GET_OPERATION_EVENT_READABLE_HANDLE, None, "GetOperationEventReadableHandle"),
+        ]);
         Self {
             can_write_clock,
             can_write_uninitialized_clock,
@@ -48,6 +60,8 @@ impl SystemClock {
             context: SystemClockContext::default(),
             current_time: 0,
             operation_event: None,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -131,5 +145,29 @@ impl SystemClock {
             .operation_event
             .get_or_insert_with(|| Arc::new(Event::new()));
         Arc::clone(event)
+    }
+}
+
+impl SessionRequestHandler for SystemClock {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ISystemClock"
+    }
+}
+
+impl ServiceFramework for SystemClock {
+    fn get_service_name(&self) -> &str {
+        "ISystemClock"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

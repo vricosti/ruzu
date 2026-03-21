@@ -6,7 +6,11 @@
 //!
 //! IScreenShotService — "caps:ss".
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::caps_types::{
     AlbumFileId, AlbumReportOption, ApplicationAlbumEntry, ScreenShotAttribute,
 };
@@ -26,12 +30,27 @@ pub mod commands {
 ///
 /// Corresponds to `IScreenShotService` in upstream caps_ss.h / caps_ss.cpp.
 pub struct IScreenShotService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     // TODO: AlbumManager reference
 }
 
 impl IScreenShotService {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (201, None, "SaveScreenShot"),
+            (202, None, "SaveEditedScreenShot"),
+            (203, None, "SaveScreenShotEx0"),
+            (204, None, "SaveEditedScreenShotEx0"),
+            (206, None, "SaveEditedScreenShotEx1"),
+            (208, None, "SaveScreenShotOfMovieEx1"),
+            (1000, None, "Unknown1000"),
+        ]);
+
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// SaveScreenShotEx0 (cmd 203).
@@ -91,5 +110,29 @@ impl IScreenShotService {
         // TODO: manager.save_edited_screen_shot(...)
         let entry = ApplicationAlbumEntry::default();
         Ok(entry)
+    }
+}
+
+impl SessionRequestHandler for IScreenShotService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "caps:ss"
+    }
+}
+
+impl ServiceFramework for IScreenShotService {
+    fn get_service_name(&self) -> &str {
+        "caps:ss"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

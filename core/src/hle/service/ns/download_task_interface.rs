@@ -6,7 +6,11 @@
 //!
 //! IDownloadTaskInterface — download task management for NS.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IDownloadTaskInterface.
 ///
@@ -26,11 +30,28 @@ pub mod commands {
 /// IDownloadTaskInterface.
 ///
 /// Corresponds to `IDownloadTaskInterface` in upstream.
-pub struct IDownloadTaskInterface;
+pub struct IDownloadTaskInterface {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl IDownloadTaskInterface {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (commands::CLEAR_TASK_STATUS_LIST, None, "ClearTaskStatusList"),
+            (commands::REQUEST_DOWNLOAD_TASK_LIST, None, "RequestDownloadTaskList"),
+            (commands::REQUEST_ENSURE_DOWNLOAD_TASK, None, "RequestEnsureDownloadTask"),
+            (commands::LIST_DOWNLOAD_TASK_STATUS, None, "ListDownloadTaskStatus"),
+            (commands::REQUEST_DOWNLOAD_TASK_LIST_DATA, None, "RequestDownloadTaskListData"),
+            (commands::TRY_COMMIT_CURRENT_APPLICATION_DOWNLOAD_TASK, None, "TryCommitCurrentApplicationDownloadTask"),
+            (commands::ENABLE_AUTO_COMMIT, None, "EnableAutoCommit"),
+            (commands::DISABLE_AUTO_COMMIT, None, "DisableAutoCommit"),
+            (commands::TRIGGER_DYNAMIC_COMMIT_EVENT, None, "TriggerDynamicCommitEvent"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// EnableAutoCommit (cmd 707).
@@ -47,5 +68,29 @@ impl IDownloadTaskInterface {
     pub fn disable_auto_commit(&self) -> Result<(), ResultCode> {
         log::warn!("(STUBBED) DisableAutoCommit called");
         Ok(())
+    }
+}
+
+impl SessionRequestHandler for IDownloadTaskInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ns::IDownloadTaskInterface"
+    }
+}
+
+impl ServiceFramework for IDownloadTaskInterface {
+    fn get_service_name(&self) -> &str {
+        "ns::IDownloadTaskInterface"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

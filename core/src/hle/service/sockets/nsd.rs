@@ -6,7 +6,12 @@
 //!
 //! NSD service — Nintendo Socket Daemon ("nsd:u", "nsd:a").
 
-use crate::hle::result::{ErrorModule, ResultCode};
+use std::collections::BTreeMap;
+
+use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Result code for overflow.
 ///
@@ -71,11 +76,48 @@ pub mod commands {
 /// NSD service.
 ///
 /// Corresponds to `NSD` in upstream nsd.h / nsd.cpp.
-pub struct Nsd;
+pub struct Nsd {
+    name: String,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl Nsd {
-    pub fn new() -> Self {
-        Self
+    pub fn new(name: &str) -> Self {
+        let handlers = build_handler_map(&[
+            (5, None, "GetSettingUrl"),
+            (10, None, "GetSettingName"),
+            (11, Some(Nsd::get_environment_identifier_handler), "GetEnvironmentIdentifier"),
+            (12, None, "GetDeviceId"),
+            (13, None, "DeleteSettings"),
+            (14, None, "ImportSettings"),
+            (15, None, "SetChangeEnvironmentIdentifierDisabled"),
+            (20, Some(Nsd::resolve_handler), "Resolve"),
+            (21, Some(Nsd::resolve_ex_handler), "ResolveEx"),
+            (30, None, "GetNasServiceSetting"),
+            (31, None, "GetNasServiceSettingEx"),
+            (40, None, "GetNasRequestFqdn"),
+            (41, None, "GetNasRequestFqdnEx"),
+            (42, None, "GetNasApiFqdn"),
+            (43, None, "GetNasApiFqdnEx"),
+            (50, None, "GetCurrentSetting"),
+            (51, None, "WriteTestParameter"),
+            (52, None, "ReadTestParameter"),
+            (60, None, "ReadSaveDataFromFsForTest"),
+            (61, None, "WriteSaveDataToFsForTest"),
+            (62, None, "DeleteSaveDataOfFsForTest"),
+            (63, None, "IsChangeEnvironmentIdentifierDisabled"),
+            (64, None, "SetWithoutDomainExchangeFqdns"),
+            (100, Some(Nsd::get_application_server_environment_type_handler), "GetApplicationServerEnvironmentType"),
+            (101, None, "SetApplicationServerEnvironmentType"),
+            (102, None, "DeleteApplicationServerEnvironmentType"),
+        ]);
+
+        Self {
+            name: name.to_string(),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// Resolve — the real implementation makes various substitutions.
@@ -130,5 +172,83 @@ impl Nsd {
     /// Corresponds to `NSD::GetApplicationServerEnvironmentType` in upstream nsd.cpp.
     pub fn get_application_server_environment_type(&self) -> ServerEnvironmentType {
         ServerEnvironmentType::Lp
+    }
+
+    fn resolve_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Nsd) };
+        let fqdn_buf = ctx.read_buffer(0);
+        let fqdn_in = String::from_utf8_lossy(&fqdn_buf).trim_end_matches('\0').to_string();
+
+        match svc.resolve(&fqdn_in) {
+            Ok(fqdn_out) => {
+                ctx.write_buffer(&fqdn_out, 0);
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn resolve_ex_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Nsd) };
+        let fqdn_buf = ctx.read_buffer(0);
+        let fqdn_in = String::from_utf8_lossy(&fqdn_buf).trim_end_matches('\0').to_string();
+
+        match svc.resolve_ex(&fqdn_in) {
+            Ok(fqdn_out) => {
+                ctx.write_buffer(&fqdn_out, 0);
+                // Upstream: rb{ctx, 4}; push(ResultSuccess); push(ResultSuccess);
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(RESULT_SUCCESS);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn get_environment_identifier_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Nsd) };
+        let env_id = svc.get_environment_identifier();
+        ctx.write_buffer(&env_id.identifier, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_application_server_environment_type_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Nsd) };
+        let env_type = svc.get_application_server_environment_type();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(env_type as u32);
+    }
+}
+
+impl SessionRequestHandler for Nsd {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl ServiceFramework for Nsd {
+    fn get_service_name(&self) -> &str {
+        &self.name
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

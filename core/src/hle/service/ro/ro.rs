@@ -6,7 +6,10 @@
 //!
 //! RO service — read-only module loading ("ldr:ro" and "ro:1").
 
+use std::collections::BTreeMap;
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::ro_results;
 use super::ro_types::{ModuleId, NroHeader, NrrHeader, NrrKind};
 
@@ -486,33 +489,49 @@ impl RoContext {
     }
 }
 
-/// IPC command IDs for RoInterface.
-///
-/// Corresponds to the function table in upstream `RoInterface`.
-pub mod commands {
-    pub const MAP_MANUAL_LOAD_MODULE_MEMORY: u32 = 0;
-    pub const UNMAP_MANUAL_LOAD_MODULE_MEMORY: u32 = 1;
-    pub const REGISTER_MODULE_INFO: u32 = 2;
-    pub const UNREGISTER_MODULE_INFO: u32 = 3;
-    pub const REGISTER_PROCESS_HANDLE: u32 = 4;
-    pub const REGISTER_PROCESS_MODULE_INFO: u32 = 10;
-}
-
 /// RoInterface — service interface per session.
 ///
 /// Corresponds to `RoInterface` in upstream ro.cpp.
 pub struct RoInterface {
     pub context_id: u64,
     pub nrr_kind: NrrKind,
+    name: String,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl RoInterface {
-    pub fn new(nrr_kind: NrrKind) -> Self {
+    pub fn new(name: &str, nrr_kind: NrrKind) -> Self {
+        let handlers = build_handler_map(&[
+            (0, None, "MapManualLoadModuleMemory"),
+            (1, None, "UnmapManualLoadModuleMemory"),
+            (2, None, "RegisterModuleInfo"),
+            (3, None, "UnregisterModuleInfo"),
+            (4, None, "RegisterProcessHandle"),
+            (10, None, "RegisterProcessModuleInfo"),
+        ]);
+
         Self {
             context_id: INVALID_CONTEXT_ID,
             nrr_kind,
+            name: name.to_string(),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
+}
+
+impl SessionRequestHandler for RoInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str { &self.name }
+}
+
+impl ServiceFramework for RoInterface {
+    fn get_service_name(&self) -> &str { &self.name }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
 }
 
 /// LoopProcess — registers "ldr:ro" and "ro:1" services.

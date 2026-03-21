@@ -6,7 +6,11 @@
 //!
 //! IScreenShotApplicationService — "caps:su".
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::caps_types::{
     AlbumReportOption, ApplicationAlbumEntry, ApplicationData, ScreenShotAttribute,
     ShimLibraryVersion,
@@ -30,6 +34,8 @@ pub const BYTES_PER_PIXEL: usize = 4;
 ///
 /// Corresponds to `IScreenShotApplicationService` in upstream caps_su.h / caps_su.cpp.
 pub struct IScreenShotApplicationService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     /// Internal buffer for CaptureAndSaveScreenshot.
     image_data: Vec<u8>,
     // TODO: AlbumManager reference
@@ -37,7 +43,17 @@ pub struct IScreenShotApplicationService {
 
 impl IScreenShotApplicationService {
     pub fn new() -> Self {
+        let handlers = build_handler_map(&[
+            (32, None, "SetShimLibraryVersion"),
+            (201, None, "SaveScreenShot"),
+            (203, None, "SaveScreenShotEx0"),
+            (205, None, "SaveScreenShotEx1"),
+            (210, None, "SaveScreenShotEx2"),
+        ]);
+
         Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
             image_data: vec![0u8; SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * BYTES_PER_PIXEL],
         }
     }
@@ -128,5 +144,29 @@ impl IScreenShotApplicationService {
         }
 
         // TODO: Call manager.save_screen_shot with the converted data.
+    }
+}
+
+impl SessionRequestHandler for IScreenShotApplicationService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "caps:su"
+    }
+}
+
+impl ServiceFramework for IScreenShotApplicationService {
+    fn get_service_name(&self) -> &str {
+        "caps:su"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

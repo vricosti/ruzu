@@ -4,7 +4,11 @@
 //! Port of zuyu/src/core/hle/service/psc/time/static.h
 //! Port of zuyu/src/core/hle/service/psc/time/static.cpp
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::common::{
     get_span_between_time_points, ClockSnapshot, StaticServiceSetupInfo, SteadyClockTimePoint,
@@ -92,10 +96,33 @@ pub struct StaticService {
     /// Boot instant for CalculateMonotonicSystemClockBaseTimePoint.
     /// Matches upstream `m_system.CoreTiming().GetClockTicks()` converted to time.
     boot_instant: std::time::Instant,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl StaticService {
     pub fn new(setup_info: StaticServiceSetupInfo) -> Self {
+        let handlers = build_handler_map(&[
+            (commands::GET_STANDARD_USER_SYSTEM_CLOCK, None, "GetStandardUserSystemClock"),
+            (commands::GET_STANDARD_NETWORK_SYSTEM_CLOCK, None, "GetStandardNetworkSystemClock"),
+            (commands::GET_STANDARD_STEADY_CLOCK, None, "GetStandardSteadyClock"),
+            (commands::GET_TIME_ZONE_SERVICE, None, "GetTimeZoneService"),
+            (commands::GET_STANDARD_LOCAL_SYSTEM_CLOCK, None, "GetStandardLocalSystemClock"),
+            (commands::GET_EPHEMERAL_NETWORK_SYSTEM_CLOCK, None, "GetEphemeralNetworkSystemClock"),
+            (commands::GET_SHARED_MEMORY_NATIVE_HANDLE, None, "GetSharedMemoryNativeHandle"),
+            (commands::SET_STANDARD_STEADY_CLOCK_INTERNAL_OFFSET, None, "SetStandardSteadyClockInternalOffset"),
+            (commands::GET_STANDARD_STEADY_CLOCK_RTC_VALUE, None, "GetStandardSteadyClockRtcValue"),
+            (commands::IS_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, None, "IsStandardUserSystemClockAutomaticCorrectionEnabled"),
+            (commands::SET_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, None, "SetStandardUserSystemClockAutomaticCorrectionEnabled"),
+            (commands::GET_STANDARD_USER_SYSTEM_CLOCK_INITIAL_YEAR, None, "GetStandardUserSystemClockInitialYear"),
+            (commands::IS_STANDARD_NETWORK_SYSTEM_CLOCK_ACCURACY_SUFFICIENT, None, "IsStandardNetworkSystemClockAccuracySufficient"),
+            (commands::GET_STANDARD_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME, None, "GetStandardUserSystemClockAutomaticCorrectionUpdatedTime"),
+            (commands::CALCULATE_MONOTONIC_SYSTEM_CLOCK_BASE_TIME_POINT, None, "CalculateMonotonicSystemClockBaseTimePoint"),
+            (commands::GET_CLOCK_SNAPSHOT, None, "GetClockSnapshot"),
+            (commands::GET_CLOCK_SNAPSHOT_FROM_SYSTEM_CLOCK_CONTEXT, None, "GetClockSnapshotFromSystemClockContext"),
+            (commands::CALCULATE_STANDARD_USER_SYSTEM_CLOCK_DIFFERENCE_BY_USER, None, "CalculateStandardUserSystemClockDifferenceByUser"),
+            (commands::CALCULATE_SPAN_BETWEEN, None, "CalculateSpanBetween"),
+        ]);
         Self {
             setup_info,
             automatic_correction_enabled: false,
@@ -108,6 +135,8 @@ impl StaticService {
             steady_clock_time_point: SteadyClockTimePoint::default(),
             time_zone: TimeZone::new(),
             boot_instant: std::time::Instant::now(),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -500,5 +529,29 @@ impl StaticService {
         snapshot.unk_ce = 0;
 
         Ok(snapshot)
+    }
+}
+
+impl SessionRequestHandler for StaticService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "time:su"
+    }
+}
+
+impl ServiceFramework for StaticService {
+    fn get_service_name(&self) -> &str {
+        "time:su"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

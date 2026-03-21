@@ -4,7 +4,11 @@
 //! Port of zuyu/src/core/hle/service/bcat/delivery_cache_file_service.h
 //! Port of zuyu/src/core/hle/service/bcat/delivery_cache_file_service.cpp
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::bcat_result;
 use super::bcat_types::*;
 
@@ -21,13 +25,24 @@ pub struct IDeliveryCacheFileService {
     // TODO: root: VirtualDir, current_file: Option<VirtualFile>
     pub has_open_file: bool,
     pub file_size: u64,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IDeliveryCacheFileService {
     pub fn new() -> Self {
+        let handlers = build_handler_map(&[
+            (commands::OPEN, None, "Open"),
+            (commands::READ, None, "Read"),
+            (commands::GET_SIZE, None, "GetSize"),
+            (commands::GET_DIGEST, None, "GetDigest"),
+        ]);
+
         Self {
             has_open_file: false,
             file_size: 0,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -75,5 +90,29 @@ impl IDeliveryCacheFileService {
         }
         // TODO: compute MD5 digest of current_file
         (RESULT_SUCCESS, [0u8; 0x10])
+    }
+}
+
+impl SessionRequestHandler for IDeliveryCacheFileService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "IDeliveryCacheFileService"
+    }
+}
+
+impl ServiceFramework for IDeliveryCacheFileService {
+    fn get_service_name(&self) -> &str {
+        "IDeliveryCacheFileService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

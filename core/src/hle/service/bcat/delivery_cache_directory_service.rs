@@ -4,7 +4,11 @@
 //! Port of zuyu/src/core/hle/service/bcat/delivery_cache_directory_service.h
 //! Port of zuyu/src/core/hle/service/bcat/delivery_cache_directory_service.cpp
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::bcat_result;
 use super::bcat_types::*;
 
@@ -19,12 +23,22 @@ pub mod commands {
 pub struct IDeliveryCacheDirectoryService {
     // TODO: root: VirtualDir, current_dir: Option<VirtualDir>
     pub has_open_dir: bool,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IDeliveryCacheDirectoryService {
     pub fn new() -> Self {
+        let handlers = build_handler_map(&[
+            (commands::OPEN, None, "Open"),
+            (commands::READ, None, "Read"),
+            (commands::GET_COUNT, None, "GetCount"),
+        ]);
+
         Self {
             has_open_dir: false,
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -61,5 +75,29 @@ impl IDeliveryCacheDirectoryService {
         }
         // TODO: return current_dir file count
         (RESULT_SUCCESS, 0)
+    }
+}
+
+impl SessionRequestHandler for IDeliveryCacheDirectoryService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "IDeliveryCacheDirectoryService"
+    }
+}
+
+impl ServiceFramework for IDeliveryCacheDirectoryService {
+    fn get_service_name(&self) -> &str {
+        "IDeliveryCacheDirectoryService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

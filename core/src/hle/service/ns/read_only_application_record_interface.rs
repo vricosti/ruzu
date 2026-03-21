@@ -6,7 +6,11 @@
 //!
 //! IReadOnlyApplicationRecordInterface — read-only access to application records.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IReadOnlyApplicationRecordInterface.
 ///
@@ -20,11 +24,22 @@ pub mod commands {
 /// IReadOnlyApplicationRecordInterface.
 ///
 /// Corresponds to `IReadOnlyApplicationRecordInterface` in upstream.
-pub struct IReadOnlyApplicationRecordInterface;
+pub struct IReadOnlyApplicationRecordInterface {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
 
 impl IReadOnlyApplicationRecordInterface {
     pub fn new() -> Self {
-        Self
+        let handlers = build_handler_map(&[
+            (commands::HAS_APPLICATION_RECORD, None, "HasApplicationRecord"),
+            (commands::NOTIFY_APPLICATION_FAILURE, None, "NotifyApplicationFailure"),
+            (commands::IS_DATA_CORRUPTED_RESULT, None, "IsDataCorruptedResult"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
     }
 
     /// HasApplicationRecord (cmd 0).
@@ -47,5 +62,29 @@ impl IReadOnlyApplicationRecordInterface {
             result,
         );
         Ok(false)
+    }
+}
+
+impl SessionRequestHandler for IReadOnlyApplicationRecordInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ns::IReadOnlyApplicationRecordInterface"
+    }
+}
+
+impl ServiceFramework for IReadOnlyApplicationRecordInterface {
+    fn get_service_name(&self) -> &str {
+        "ns::IReadOnlyApplicationRecordInterface"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

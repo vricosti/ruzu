@@ -4,7 +4,12 @@
 //! Port of zuyu/src/core/hle/service/am/service/library_applet_self_accessor.h
 //! Port of zuyu/src/core/hle/service/am/service/library_applet_self_accessor.cpp
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::ResultCode;
 use crate::hle::service::am::am_types::{AppletId, AppletIdentityInfo, LibraryAppletMode};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Library applet info.
 #[repr(C)]
@@ -49,10 +54,77 @@ impl Default for ErrorContext {
 /// ILibraryAppletSelfAccessor service.
 pub struct ILibraryAppletSelfAccessor {
     // TODO: Applet, AppletDataBroker references
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ILibraryAppletSelfAccessor {
     pub fn new() -> Self {
-        Self {}
+        let handlers = build_handler_map(&[
+            (0, None, "PopInData"),
+            (1, None, "PushOutData"),
+            (2, None, "PopInteractiveInData"),
+            (3, None, "PushInteractiveOutData"),
+            (5, None, "GetPopInDataEvent"),
+            (6, None, "GetPopInteractiveInDataEvent"),
+            (10, None, "ExitProcessAndReturn"),
+            (11, None, "GetLibraryAppletInfo"),
+            (12, None, "GetMainAppletIdentityInfo"),
+            (13, None, "CanUseApplicationCore"),
+            (14, None, "GetCallerAppletIdentityInfo"),
+            (15, None, "GetMainAppletApplicationControlProperty"),
+            (16, None, "GetMainAppletStorageId"),
+            (17, None, "GetCallerAppletIdentityInfoStack"),
+            (18, None, "GetNextReturnDestinationAppletIdentityInfo"),
+            (19, None, "GetDesirableKeyboardLayout"),
+            (20, None, "PopExtraStorage"),
+            (25, None, "GetPopExtraStorageEvent"),
+            (30, None, "UnpopInData"),
+            (31, None, "UnpopExtraStorage"),
+            (40, None, "GetIndirectLayerProducerHandle"),
+            (50, None, "ReportVisibleError"),
+            (51, None, "ReportVisibleErrorWithErrorContext"),
+            (60, None, "GetMainAppletApplicationDesiredLanguage"),
+            (70, None, "GetCurrentApplicationId"),
+            (80, None, "RequestExitToSelf"),
+            (90, None, "CreateApplicationAndPushAndRequestToLaunch"),
+            (100, None, "CreateGameMovieTrimmer"),
+            (101, None, "ReserveResourceForMovieOperation"),
+            (102, None, "UnreserveResourceForMovieOperation"),
+            (110, None, "GetMainAppletAvailableUsers"),
+            (120, None, "GetLaunchStorageInfoForDebug"),
+            (130, None, "GetGpuErrorDetectedSystemEvent"),
+            (140, None, "SetApplicationMemoryReservation"),
+            (150, None, "ShouldSetGpuTimeSliceManually"),
+            (160, None, "Cmd160"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for ILibraryAppletSelfAccessor {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+
+    fn service_name(&self) -> &str {
+        "am::ILibraryAppletSelfAccessor"
+    }
+}
+
+impl ServiceFramework for ILibraryAppletSelfAccessor {
+    fn get_service_name(&self) -> &str {
+        "am::ILibraryAppletSelfAccessor"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }

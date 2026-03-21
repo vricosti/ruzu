@@ -6,7 +6,11 @@
 //!
 //! IBcatService: main BCAT service interface.
 
+use std::collections::BTreeMap;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::bcat_types::*;
 use super::backend::ProgressServiceBackend;
 
@@ -43,16 +47,49 @@ pub mod commands {
 /// IBcatService corresponds to `IBcatService` in upstream `bcat_service.h`.
 pub struct IBcatService {
     pub progress: [ProgressServiceBackend; 2], // Normal, Directory
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     // TODO: backend reference
 }
 
 impl IBcatService {
     pub fn new() -> Self {
+        let handlers = build_handler_map(&[
+            (commands::REQUEST_SYNC_DELIVERY_CACHE, None, "RequestSyncDeliveryCache"),
+            (commands::REQUEST_SYNC_DELIVERY_CACHE_WITH_DIRECTORY_NAME, None, "RequestSyncDeliveryCacheWithDirectoryName"),
+            (commands::CANCEL_SYNC_DELIVERY_CACHE_REQUEST, None, "CancelSyncDeliveryCacheRequest"),
+            (commands::REQUEST_SYNC_DELIVERY_CACHE_WITH_APPLICATION_ID, None, "RequestSyncDeliveryCacheWithApplicationId"),
+            (commands::REQUEST_SYNC_DELIVERY_CACHE_WITH_APPLICATION_ID_AND_DIRECTORY_NAME, None, "RequestSyncDeliveryCacheWithApplicationIdAndDirectoryName"),
+            (commands::GET_DELIVERY_CACHE_STORAGE_UPDATE_NOTIFIER, None, "GetDeliveryCacheStorageUpdateNotifier"),
+            (commands::REQUEST_SUSPEND_DELIVERY_TASK, None, "RequestSuspendDeliveryTask"),
+            (commands::REGISTER_SYSTEM_APPLICATION_DELIVERY_TASK, None, "RegisterSystemApplicationDeliveryTask"),
+            (commands::UNREGISTER_SYSTEM_APPLICATION_DELIVERY_TASK, None, "UnregisterSystemApplicationDeliveryTask"),
+            (commands::SET_SYSTEM_APPLICATION_DELIVERY_TASK_TIMER, None, "SetSystemApplicationDeliveryTaskTimer"),
+            (commands::SET_PASSPHRASE, None, "SetPassphrase"),
+            (commands::UNKNOWN_30101, None, "Unknown30101"),
+            (commands::UNKNOWN_30102, None, "Unknown30102"),
+            (commands::REGISTER_BACKGROUND_DELIVERY_TASK, None, "RegisterBackgroundDeliveryTask"),
+            (commands::UNREGISTER_BACKGROUND_DELIVERY_TASK, None, "UnregisterBackgroundDeliveryTask"),
+            (commands::BLOCK_DELIVERY_TASK, None, "BlockDeliveryTask"),
+            (commands::UNBLOCK_DELIVERY_TASK, None, "UnblockDeliveryTask"),
+            (commands::SET_DELIVERY_TASK_TIMER, None, "SetDeliveryTaskTimer"),
+            (commands::REGISTER_SYSTEM_APPLICATION_DELIVERY_TASKS, None, "RegisterSystemApplicationDeliveryTasks"),
+            (commands::ENUMERATE_BACKGROUND_DELIVERY_TASK, None, "EnumerateBackgroundDeliveryTask"),
+            (commands::UNKNOWN_90101, None, "Unknown90101"),
+            (commands::GET_DELIVERY_LIST, None, "GetDeliveryList"),
+            (commands::CLEAR_DELIVERY_CACHE_STORAGE, None, "ClearDeliveryCacheStorage"),
+            (commands::CLEAR_DELIVERY_TASK_SUBSCRIPTION_STATUS, None, "ClearDeliveryTaskSubscriptionStatus"),
+            (commands::GET_PUSH_NOTIFICATION_LOG, None, "GetPushNotificationLog"),
+            (commands::UNKNOWN_90301, None, "Unknown90301"),
+        ]);
+
         Self {
             progress: [
                 ProgressServiceBackend::new("Normal"),
                 ProgressServiceBackend::new("Directory"),
             ],
+            handlers,
+            handlers_tipc: BTreeMap::new(),
         }
     }
 
@@ -110,5 +147,29 @@ impl IBcatService {
 
     pub fn get_progress_backend_mut(&mut self, sync_type: SyncType) -> &mut ProgressServiceBackend {
         &mut self.progress[sync_type as usize]
+    }
+}
+
+impl SessionRequestHandler for IBcatService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "IBcatService"
+    }
+}
+
+impl ServiceFramework for IBcatService {
+    fn get_service_name(&self) -> &str {
+        "IBcatService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
