@@ -134,8 +134,9 @@ const _: () = assert!(core::mem::size_of::<StaticServiceSetupInfo>() == 0x6);
 /// can be tracked in the ContextWriter's list and removed if needed.
 pub struct OperationEvent {
     id: u64,
-    // TODO: Kernel::KEvent* m_event — will be wired once kernel event
-    // infrastructure is available.
+    /// Kernel event for signaling context changes.
+    /// Corresponds to `Kernel::KEvent* m_event` in upstream.
+    event: std::sync::Arc<crate::hle::service::os::event::Event>,
 }
 
 static NEXT_OPERATION_EVENT_ID: std::sync::atomic::AtomicU64 =
@@ -148,7 +149,10 @@ impl OperationEvent {
     pub fn new() -> Self {
         let id = NEXT_OPERATION_EVENT_ID
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self { id }
+        Self {
+            id,
+            event: std::sync::Arc::new(crate::hle::service::os::event::Event::new()),
+        }
     }
 
     /// Get this event's unique ID (for list tracking).
@@ -160,7 +164,7 @@ impl OperationEvent {
     ///
     /// Corresponds to `m_event->Signal()` in upstream.
     pub fn signal(&self) {
-        // TODO: m_event->Signal() once KEvent is wired
+        self.event.signal();
     }
 }
 

@@ -4,6 +4,8 @@
 //! Port of zuyu/src/core/hle/service/acc/profile_manager.h
 //! Port of zuyu/src/core/hle/service/acc/profile_manager.cpp
 
+use common::fs::path_util::{get_ruzu_path, RuzuPath};
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 pub const MAX_USERS: usize = 8;
@@ -300,15 +302,108 @@ impl ProfileManager {
         }
     }
 
-    pub fn write_user_save_file(&self) {
-        // Upstream: serializes profiles to NAND save data via VFS.
-        log::debug!("ProfileManager::write_user_save_file called");
+    /// Write user profiles to save file.
+    /// Port of upstream `ProfileManager::WriteUserSaveFile`.
+    pub fn write_user_save_file(&mut self) {
+        if !self.is_save_needed {
+            return;
+        }
+
+        let save_dir = get_ruzu_path(RuzuPath::NANDDir)
+            .join("system/save/8000000000000010/su/avators");
+        if let Err(e) = std::fs::create_dir_all(&save_dir) {
+            log::warn!("Failed to create profile save directory: {}", e);
+            return;
+        }
+
+        let save_path = save_dir.join("profiles.dat");
+
+        // Serialize profiles: for each user, write uuid(16) + uuid2(16) + timestamp(8) + username(32) + extra_data(128) = 200 bytes per user
+        let mut data = Vec::with_capacity(MAX_USERS * 200);
+        for i in 0..MAX_USERS {
+            let profile = &self.profiles[i];
+            data.extend_from_slice(&profile.user_uuid.to_le_bytes()); // uuid
+            data.extend_from_slice(&profile.user_uuid.to_le_bytes()); // uuid2 (same as uuid)
+            data.extend_from_slice(&profile.creation_time.to_le_bytes()); // timestamp
+            data.extend_from_slice(&profile.username); // username
+            // Write extra_data as raw bytes (UserData is #[repr(C)], 0x80 bytes)
+            let user_data_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    &profile.data as *const UserData as *const u8,
+                    std::mem::size_of::<UserData>(),
+                )
+            };
+            data.extend_from_slice(user_data_bytes);
+        }
+
+        match std::fs::write(&save_path, &data) {
+            Ok(()) => {
+                self.is_save_needed = false;
+                log::debug!("Wrote profile save data to {}", save_path.display());
+            }
+            Err(e) => {
+                log::warn!("Failed to write profile save data: {}", e);
+            }
+        }
     }
 
+    /// Parse user profiles from save file.
+    /// Port of upstream `ProfileManager::ParseUserSaveFile`.
     fn parse_user_save_file(&mut self) {
-        // Upstream: reads profiles from NAND save data via VFS.
-        // For now, create a default user
-        log::debug!("ProfileManager::parse_user_save_file called");
+        let save_path = get_ruzu_path(RuzuPath::NANDDir)
+            .join("system/save/8000000000000010/su/avators/profiles.dat");
+
+        let data = match std::fs::read(&save_path) {
+            Ok(d) => d,
+            Err(_) => {
+                log::warn!(
+                    "Failed to load profile data from save... \
+                     Generating new user 'yuzu' with random UUID."
+                );
+                return;
+            }
+        };
+
+        // Each user record is 200 bytes: uuid(16) + uuid2(16) + timestamp(8) + username(32) + extra_data(128)
+        let record_size = 200;
+        if data.len() < MAX_USERS * record_size {
+            log::warn!(
+                "profiles.dat is smaller than expected ({} < {})... \
+                 Generating new user 'yuzu' with random UUID.",
+                data.len(),
+                MAX_USERS * record_size,
+            );
+            return;
+        }
+
+        for i in 0..MAX_USERS {
+            let offset = i * record_size;
+            let uuid = u128::from_le_bytes(data[offset..offset + 16].try_into().unwrap());
+            if uuid == 0 {
+                continue;
+            }
+            let timestamp = u64::from_le_bytes(
+                data[offset + 32..offset + 40].try_into().unwrap(),
+            );
+            let mut username = [0u8; PROFILE_USERNAME_SIZE];
+            username.copy_from_slice(&data[offset + 40..offset + 40 + PROFILE_USERNAME_SIZE]);
+
+            self.add_user(&ProfileInfo {
+                user_uuid: uuid,
+                username,
+                creation_time: timestamp,
+                data: UserData::default(),
+                is_open: false,
+            });
+        }
+
+        // Sort valid profiles first (matching upstream stable_partition).
+        let count = self.user_count;
+        self.profiles[..count].sort_by(|a, b| {
+            let a_valid = a.user_uuid != 0;
+            let b_valid = b.user_uuid != 0;
+            b_valid.cmp(&a_valid)
+        });
     }
 
     fn add_to_profiles(&mut self, profile: &ProfileInfo) -> Option<usize> {
