@@ -24,7 +24,7 @@ const NVDRV_SERVICE_NAMES: &[&str] = &["nvdrv", "nvdrv:a", "nvdrv:s", "nvdrv:t"]
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
     let module = Module::new();
     let mut server_manager =
-        crate::hle::service::server_manager::ServerManager::new(service_manager.clone());
+        crate::hle::service::server_manager::ServerManager::new(crate::core::SystemRef::null());
     for name in NVDRV_SERVICE_NAMES {
         let svc_name = name.to_string();
         let module = Arc::clone(&module);

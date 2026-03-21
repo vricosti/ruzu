@@ -42,7 +42,7 @@ pub fn loop_process(
     dm_addr: usize,
     mm_addr: usize,
 ) {
-    let mut server_manager = ServerManager::new(service_manager.clone());
+    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
 
     // ARP — stub until real implementations
     register_stub(&mut server_manager, "arp:r");

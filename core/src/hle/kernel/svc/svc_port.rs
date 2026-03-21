@@ -93,9 +93,26 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
     };
     log::info!("  ConnectToNamedPort(\"{}\")", name);
 
+    // Find the named port via KObjectName registry (matching upstream
+    // KObjectName::Find<KClientPort>(kernel, name)).
+    let kernel = system.kernel().expect("kernel not initialized");
     let service_manager = system.service_manager().unwrap();
-    let Some(session_handler) = service_manager.lock().unwrap().get_service(&name) else {
-        log::error!("  ConnectToNamedPort: service \"{}\" not found in service_manager", name);
+
+    // Try KObjectName first (upstream path), then fall back to ServiceManager.
+    let session_handler = if let Some(gd) = kernel.object_name_global_data() {
+        if let Some(_obj_id) = gd.find(&name) {
+            // Object found in kernel namespace — get handler from service manager.
+            service_manager.lock().unwrap().get_service(&name)
+        } else {
+            // Not in kernel namespace — try service manager directly.
+            service_manager.lock().unwrap().get_service(&name)
+        }
+    } else {
+        service_manager.lock().unwrap().get_service(&name)
+    };
+
+    let Some(session_handler) = session_handler else {
+        log::error!("  ConnectToNamedPort: service \"{}\" not found", name);
         return RESULT_NOT_FOUND;
     };
     log::info!("  ConnectToNamedPort: found service handler for \"{}\"", name);

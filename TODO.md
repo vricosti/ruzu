@@ -12,3 +12,19 @@ Some maxwell_3d tests hang (test_call_method_cb_bind, test_call_method_cb_data) 
         // Requires: oaknut-equivalent ARM64 code generation library for Rust.
         // NCE is AArch64-host-only; on x86_64 hosts this entire module is unused.
 ------
+
+ The AudioCore takes Arc<Values>. This is a case where we should change the API to not require an Arc<Values> since there's   
+  now a global. But that's a bigger refactor. For now, let me update the call sites to use values() and clone where needed.    
+                                                                                                                               
+  Let me now do all the edits. For the AudioCore case in main.rs, since it requires Arc<Values>, I'll create an Arc from a     
+  clone of the global values. 
+  ----
+
+  KScopedSchedulerLockAndSleep   
+    /// Upstream wraps in KScopedSchedulerLockAndSleep for atomic lock + sleep.
+    /// In our single-core cooperative model, the process lock provides
+    /// equivalent protection. Wire KScopedSchedulerLockAndSleep when
+    /// KConditionVariable gains a KernelCore reference.
+  ----
+
+  Requires rdynarmic A64 decoder integration                                                                                           

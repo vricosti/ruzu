@@ -242,7 +242,7 @@ impl IAddOnContentManager {
 /// ```
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
     let mut server_manager =
-        crate::hle::service::server_manager::ServerManager::new(service_manager.clone());
+        crate::hle::service::server_manager::ServerManager::new(crate::core::SystemRef::null());
     let factory: SessionRequestHandlerFactory =
         Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IAddOnContentManager::new()) });
     server_manager.register_named_service("aoc:u", factory, 64);
