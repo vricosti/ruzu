@@ -374,11 +374,16 @@ impl System {
     /// Corresponds to C++ InitializeKernel(system) (core.cpp:264-272).
     /// Called at the start of load(), before ROM loading.
     fn initialize_kernel(&mut self) {
+        // Upstream: KernelCore holds System& from construction.
+        // Set it here since Rust can't pass &self during construction.
+        let system_ref = SystemRef::from_ref(self);
+
         let kernel = self.kernel.as_mut().expect("kernel must be created in initialize()");
 
         // Upstream: ReinitializeIfNecessary() checks if multicore/memory layout
         // changed and re-runs Initialize() if so. We just call initialize() directly.
         kernel.initialize();
+        kernel.set_system_ref(system_ref);
 
         // Initialize the kernel physical memory manager with a Secure pool.
         // Upstream traverses the memory layout tree; we reserve a region at
