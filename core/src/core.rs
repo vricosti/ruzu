@@ -616,6 +616,8 @@ impl System {
                 log::warn!("Cannot initialize ARM interfaces: Memory not available");
             }
 
+            // Dump the memory block layout for diagnostics.
+            process_arc.lock().unwrap().page_table.dump_memory_blocks();
             self.current_process_arc = Some(process_arc);
         }
 

@@ -272,6 +272,20 @@ impl KMemoryBlockManager {
         self.find_block(address).map(|block| block.get_memory_info())
     }
 
+    /// Dump all blocks in the tree for diagnostic purposes.
+    pub fn dump_blocks(&self) {
+        log::info!("KMemoryBlockManager: {} blocks:", self.memory_block_tree.len());
+        for (_addr, block) in self.memory_block_tree.iter() {
+            let info = block.get_memory_info();
+            log::info!(
+                "  0x{:08X}..0x{:08X} ({:8} KB) state={:?} perm={:?}",
+                info.m_address, info.m_address + info.m_size,
+                info.m_size / 1024,
+                info.m_state, info.m_permission
+            );
+        }
+    }
+
     /// Find free area in a region with alignment/guard constraints.
     ///
     /// Upstream: KMemoryBlockManager::FindFreeArea.
