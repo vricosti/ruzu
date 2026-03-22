@@ -583,7 +583,39 @@ impl System {
             let process_arc = Arc::new(StdMutex::new(process));
             process_arc.lock().unwrap().bind_self_reference(&process_arc);
 
-            let run_result = process_arc.lock().unwrap().run(priority, stack_size, 1, 1, is_64bit);
+            // Wire the global scheduler context so the process can update the
+            // priority queue when threads become runnable.
+            if let Some(ref kernel) = self.kernel {
+                if let Some(gsc) = kernel.global_scheduler_context() {
+                    process_arc.lock().unwrap().global_scheduler_context = Some(gsc.clone());
+                }
+            }
+
+            // Upstream: KThread::InitializeUserThread passes
+            // system.GetCpuManager().GetGuestThreadFunc() as the fiber entry.
+            // GetGuestThreadFunc() returns a closure calling GuestThreadFunction(),
+            // which dispatches to MultiCoreRunGuestThread or SingleCoreRunGuestThread.
+            // Upstream: KThread::InitializeUserThread passes
+            // system.GetCpuManager().GetGuestThreadFunc() as the fiber entry.
+            // We transmit the kernel pointer as usize because the crate is named
+            // `core` which shadows `std::core`, preventing `unsafe impl Send`
+            // for raw pointer wrappers.
+            let guest_thread_func: Option<Box<dyn FnOnce() + Send>> = {
+                let kp = self.kernel.as_ref().unwrap() as *const KernelCore as usize;
+                Some(Box::new(move || {
+                    // Safety: kernel_ptr is valid for the lifetime of the thread
+                    // (System owns KernelCore and joins all threads before drop).
+                    let kernel = unsafe { &*(kp as *const KernelCore) };
+                    let is_multicore = kernel.is_multicore();
+                    if is_multicore {
+                        crate::cpu_manager::CpuManager::multi_core_run_guest_thread(kernel);
+                    } else {
+                        crate::cpu_manager::CpuManager::single_core_run_guest_thread_entry(kernel);
+                    }
+                }))
+            };
+
+            let run_result = process_arc.lock().unwrap().run(priority, stack_size, 1, 1, is_64bit, guest_thread_func);
             match run_result {
                 Ok((main_thread, _handle, _thread_id, _object_id)) => {
                     log::info!(
@@ -592,7 +624,14 @@ impl System {
                     );
                     // Store the application thread so CPU cores can find it.
                     if let Some(ref mut kernel) = self.kernel {
-                        kernel.set_application_thread(main_thread);
+                        kernel.set_application_thread(main_thread.clone());
+                        // Register thread in the global scheduler context so
+                        // schedulers can find it by ID during fiber dispatch.
+                        // Upstream: KThread::InitializeUserThread calls
+                        // kernel.GlobalSchedulerContext().AddThread(thread).
+                        if let Some(gsc) = kernel.global_scheduler_context() {
+                            gsc.lock().unwrap().add_thread(main_thread);
+                        }
                     }
                 }
                 Err(e) => {
@@ -1266,6 +1305,7 @@ impl System {
                 1,
                 1,
                 is_64bit,
+                None, // init_func — test/bootstrap path, no fiber needed
             )
             .expect("process runtime bootstrap must succeed");
         let tls_base = main_thread.lock().unwrap().get_tls_address().get();

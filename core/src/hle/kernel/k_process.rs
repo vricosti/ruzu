@@ -1729,6 +1729,7 @@ impl KProcess {
         main_thread_id: u64,
         main_object_id: u64,
         is_64bit: bool,
+        init_func: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<(Arc<Mutex<KThread>>, Handle, u64, u64), u32> {
         let state = self.state;
         if state != ProcessState::Created && state != ProcessState::CreatedAttached {
@@ -1807,7 +1808,7 @@ impl KProcess {
                 main_thread_id,
                 main_object_id,
                 is_64bit,
-                None, // init_func — will be set when CpuManager provides fiber closures
+                init_func, // Upstream: system.GetCpuManager().GetGuestThreadFunc()
             );
             if result != RESULT_SUCCESS.get_inner_value() {
                 return Err(result);
@@ -1855,6 +1856,17 @@ impl KProcess {
             // to avoid deadlock when called with process lock held).
             self.increment_running_thread_count();
             self.push_back_to_priority_queue(thread_id);
+
+            // Upstream: KScheduler::OnThreadStateChanged adds the thread to the
+            // priority queue and sets scheduler_update_needed. Since our
+            // global_scheduler_context may not be wired, directly set the
+            // scheduler's highest_priority_thread_id so Activate() →
+            // ScheduleImpl() can find the runnable thread.
+            if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
+                let mut sched = scheduler.lock().unwrap();
+                sched.state.highest_priority_thread_id = Some(thread_id);
+                sched.state.needs_scheduling.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         Ok((main_thread, thread_handle, stack_base, stack_top))
