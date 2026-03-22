@@ -507,23 +507,16 @@ impl System {
         // Wire the Memory bridge to the process page table BEFORE loading.
         // Upstream: Memory is passed to KPageTableBase::InitializeForProcess
         // which is called during KProcess::Initialize, before LoadModule.
-        // We must set it here so that operate() can populate page table
-        // entries during allocate_code_memory/load_module.
+        // We must set it here so that initialize_for_process can pass it
+        // to the page table, and operate(Map) can call map_memory_region.
         if let Some(ref memory) = self.memory {
             process.page_table.set_memory(memory.clone());
         }
 
         let (result_status, load_parameters) = loader.load(&mut process, &mut loader_system);
 
-        // Set the current page table on Memory so reads/writes resolve
-        // through the process's PageTable → DeviceMemory.
-        // Upstream: KProcess::Initialize calls m_memory.SetCurrentPageTable(*this).
-        if let Some(ref memory) = self.memory {
-            if let Some(impl_pt) = process.page_table.get_base_mut().get_impl_mut() {
-                let pt_ptr = impl_pt as *mut common::page_table::PageTable;
-                memory.lock().unwrap().set_current_page_table(pt_ptr);
-            }
-        }
+        // Note: set_current_page_table is called inside initialize_for_user
+        // (matching upstream k_process.cpp:423), so no need to call it here.
 
         if result_status != crate::loader::loader::ResultStatus::Success {
             log::error!(
