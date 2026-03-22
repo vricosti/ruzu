@@ -126,6 +126,10 @@ pub struct System {
     /// Upstream: `FileSystemController& GetFileSystemController()`.
     filesystem_controller: Arc<StdMutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
 
+    /// Content provider union for NCA/content lookups.
+    /// Upstream: `std::unique_ptr<FileSys::ContentProviderUnion> content_provider`.
+    content_provider: Option<Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>>,
+
     /// Telemetry session for collecting and submitting usage data.
     /// Upstream: `std::unique_ptr<Core::TelemetrySession> telemetry_session`.
     telemetry_session: Option<crate::telemetry_session::TelemetrySession>,
@@ -271,6 +275,7 @@ impl System {
             filesystem_controller: Arc::new(StdMutex::new(
                 crate::hle::service::filesystem::filesystem::FileSystemController::new(),
             )),
+            content_provider: None,
             device_memory: None,
             memory: None,
             suspend_guard: Mutex::new(()),
@@ -719,6 +724,36 @@ impl System {
     /// Get the GPU core mutably (type-erased).
     pub fn gpu_core_mut(&mut self) -> Option<&mut (dyn Any + Send)> {
         self.gpu_core.as_deref_mut()
+    }
+
+    /// Set the content provider.
+    /// Upstream: `system.SetContentProvider(make_unique<ContentProviderUnion>())`.
+    pub fn set_content_provider(&mut self, provider: Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>) {
+        self.content_provider = Some(provider);
+    }
+
+    /// Get the content provider.
+    /// Upstream: `system.GetContentProvider()`.
+    pub fn get_content_provider(&self) -> Option<&Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>> {
+        self.content_provider.as_ref()
+    }
+
+    /// Get the virtual filesystem.
+    /// Upstream: `system.GetFilesystem()`.
+    pub fn get_filesystem(&self) -> Option<&Arc<RealVfsFilesystem>> {
+        self.virtual_filesystem.as_ref()
+    }
+
+    /// Set the virtual filesystem.
+    /// Upstream: `system.SetFilesystem(make_shared<RealVfsFilesystem>())`.
+    pub fn set_filesystem(&mut self, vfs: Arc<RealVfsFilesystem>) {
+        self.virtual_filesystem = Some(vfs);
+    }
+
+    /// Clear the user channel.
+    /// Upstream: `system.GetUserChannel().clear()`.
+    pub fn clear_user_channel(&mut self) {
+        self.user_channel.clear();
     }
 
     /// Set the AudioCore subsystem.
