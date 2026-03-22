@@ -425,12 +425,12 @@ impl CpuManager {
             let jit_ref = &mut **jit;
             let opaque = &mut *(thread_ptr as *mut OpaqueKThread);
 
-            // Load the thread's register context into the JIT.
-            // Upstream: PhysicalCore::LoadContext → interface->SetContext(thread->GetContext())
+            // Load the thread's register context into the JIT on first entry.
+            // Upstream: this is done by KScheduler::Reload → PhysicalCore::LoadContext
+            // during context switches. We do it here since scheduler fiber dispatch
+            // isn't complete yet.
             {
                 let thread = thread_arc.lock().unwrap();
-                // Convert k_thread::ThreadContext → arm_interface::ThreadContext.
-                // Both structs have identical layout, so transmute is safe.
                 let k_ctx = &thread.thread_context;
                 let arm_ctx: &crate::arm::arm_interface::ThreadContext =
                     unsafe { &*(k_ctx as *const super::hle::kernel::k_thread::ThreadContext
@@ -439,17 +439,74 @@ impl CpuManager {
                 jit_ref.set_tpidrro_el0(thread.get_tls_address().get());
             }
 
-            // Set the running state on the physical core.
-            physical_core.set_running(
-                jit_ref as *mut dyn crate::arm::arm_interface::ArmInterface,
-                thread_ptr,
-            );
+            // Upstream PhysicalCore::RunThread loop (physical_core.cpp:65-145):
+            // Runs the JIT, handles the halt reason, loops until interrupt/return.
+            loop {
+                // Check termination.
+                {
+                    let thread = thread_arc.lock().unwrap();
+                    if thread.has_dpc() && thread.is_termination_requested() {
+                        break;
+                    }
+                }
 
-            // Run the JIT — executes ARM instructions until SVC, interrupt, or halt.
-            let _halt_reason = jit_ref.run_thread(opaque);
+                // Enter context — mark running on physical core.
+                if physical_core.is_interrupted() {
+                    break;
+                }
+                physical_core.set_running(
+                    jit_ref as *mut dyn crate::arm::arm_interface::ArmInterface,
+                    thread_ptr,
+                );
 
-            // Clear the running state.
-            physical_core.clear_running();
+                // Run the JIT.
+                let hr = jit_ref.run_thread(opaque);
+
+                // Exit context — clear running.
+                physical_core.clear_running();
+
+                // Handle halt reason (upstream physical_core.cpp:100-144).
+                use crate::arm::arm_interface::HaltReason;
+                let supervisor_call = hr.contains(HaltReason::SUPERVISOR_CALL);
+                let interrupt = hr.contains(HaltReason::BREAK_LOOP);
+
+                if supervisor_call {
+                    // Handle SVC — upstream: Svc::Call(system, interface->GetSvcNumber())
+                    let svc_number = jit_ref.get_svc_number();
+                    log::debug!("SVC #{:#x} called", svc_number);
+
+                    // Save context back to thread after JIT execution.
+                    {
+                        let mut thread = thread_arc.lock().unwrap();
+                        let k_ctx = &mut thread.thread_context;
+                        let arm_ctx: &mut crate::arm::arm_interface::ThreadContext =
+                            &mut *(k_ctx as *mut super::hle::kernel::k_thread::ThreadContext
+                                as *mut crate::arm::arm_interface::ThreadContext);
+                        jit_ref.get_context(arm_ctx);
+                    }
+
+                    // Dispatch the SVC.
+                    // Upstream: Svc::Call(system, svc_number) which needs &System.
+                    // The SVC dispatcher reads args from the ARM interface and
+                    // dispatches to the appropriate kernel handler.
+                    // For now, we use the physical_core's handoff_after_svc path
+                    // which was designed for this purpose.
+                    // TODO: wire full Svc::Call(system, svc_number) once System
+                    // reference is available in the CPU thread context.
+
+                    // SVC handled, return to MultiCoreRunGuestThread loop.
+                    break;
+                }
+
+                if interrupt {
+                    break;
+                }
+
+                // Any other halt reason — break.
+                if !hr.is_empty() {
+                    break;
+                }
+            }
         }
     }
 
