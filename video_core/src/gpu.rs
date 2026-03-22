@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::dma_pusher::CommandList;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::rasterizer_download_area::RasterizerDownloadArea;
+use crate::renderer_base::RendererBase;
 
 /// Device address type.
 pub type DAddr = u64;
@@ -106,8 +107,11 @@ pub struct Gpu {
     // Channel management
     new_channel_id: Mutex<i32>,
     bound_channel: Mutex<i32>,
+
+    /// The renderer backend (OpenGL, Vulkan, or Null).
+    /// Upstream: `std::unique_ptr<VideoCore::RendererBase> renderer` in GPU::Impl.
+    renderer: Mutex<Option<Box<dyn RendererBase>>>,
     // In the full port:
-    // renderer: Option<Box<dyn RendererBase>>,
     // rasterizer: *mut RasterizerInterface,
     // host1x: &Host1x,
     // gpu_thread: ThreadManager,
@@ -128,7 +132,26 @@ impl Gpu {
             sync_request_cv: Condvar::new(),
             new_channel_id: Mutex::new(1),
             bound_channel: Mutex::new(-1),
+            renderer: Mutex::new(None),
         }
+    }
+
+    /// Binds a renderer to the GPU.
+    ///
+    /// Upstream: `GPU::Impl::BindRenderer(unique_ptr<RendererBase> renderer_)`
+    /// Also extracts the rasterizer and binds it to host1x memory manager.
+    pub fn bind_renderer(&self, renderer: Box<dyn RendererBase>) {
+        // Upstream also does:
+        // rasterizer = renderer->ReadRasterizer();
+        // host1x.MemoryManager().BindInterface(rasterizer);
+        // host1x.GMMU().BindRasterizer(rasterizer);
+        log::info!("Gpu::bind_renderer: renderer bound (vendor: {})", renderer.get_device_vendor());
+        *self.renderer.lock().unwrap() = Some(renderer);
+    }
+
+    /// Returns a reference to the renderer, if bound.
+    pub fn renderer(&self) -> std::sync::MutexGuard<'_, Option<Box<dyn RendererBase>>> {
+        self.renderer.lock().unwrap()
     }
 
     /// Flush all current written commands into the host GPU for execution.
@@ -208,10 +231,17 @@ impl Gpu {
     }
 
     /// Start the GPU thread.
+    ///
+    /// Upstream: `GPU::Impl::Start()` calls `Settings::UpdateGPUAccuracy()`
+    /// then `gpu_thread.StartThread(*renderer, renderer->Context(), *scheduler)`.
+    /// Full GPU thread comes later; for now just log that we're ready.
     pub fn start(&self) {
-        // NOTE: Full implementation calls gpu_thread.StartThread(*renderer, renderer->Context(), *scheduler).
-        // Stubbed until renderer/gpu_thread integration is complete.
-        log::warn!("Gpu::start: gpu_thread and renderer not integrated, skipping");
+        let renderer_guard = self.renderer.lock().unwrap();
+        if renderer_guard.is_some() {
+            log::info!("Gpu::start: GPU started (renderer bound, GPU thread not yet implemented)");
+        } else {
+            log::warn!("Gpu::start: no renderer bound");
+        }
     }
 
     /// Notify shutdown.
@@ -268,18 +298,28 @@ impl Gpu {
     }
 
     /// Request framebuffer compositing.
-    pub fn request_composite(&self, _layers: Vec<FramebufferConfig>) {
-        // NOTE: Full implementation enqueues a sync operation that calls
-        // renderer->Composite(layers) after all pending fences are signaled.
-        // Stubbed until renderer and syncpoint integration is complete.
-        log::warn!("Gpu::request_composite: renderer not integrated, skipping composite");
+    ///
+    /// Upstream: `GPU::Impl::RequestComposite(layers, fences)` enqueues a sync
+    /// operation that waits for fences then calls `renderer->Composite(layers)`.
+    /// For now we skip fence gating and call composite directly within
+    /// the sync operation.
+    pub fn request_composite(&self, layers: Vec<FramebufferConfig>) {
+        let mut renderer_guard = self.renderer.lock().unwrap();
+        if let Some(ref mut renderer) = *renderer_guard {
+            renderer.composite(&layers);
+        } else {
+            log::warn!("Gpu::request_composite: no renderer bound, skipping composite");
+        }
     }
 
     /// Get the applet capture buffer.
     pub fn get_applet_capture_buffer(&self) -> Vec<u8> {
-        // NOTE: Full implementation calls renderer->GetAppletCaptureBuffer() via sync operation.
-        // Stubbed until renderer integration is complete.
-        Vec::new()
+        let renderer_guard = self.renderer.lock().unwrap();
+        if let Some(ref renderer) = *renderer_guard {
+            renderer.get_applet_capture_buffer()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Renderer frame end notification.

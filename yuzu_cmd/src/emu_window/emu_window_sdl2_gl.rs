@@ -90,6 +90,25 @@ impl SdlGlContext {
     }
 }
 
+// Safety: SDL GL contexts are designed to be used across threads (the GPU thread
+// acquires the context via MakeCurrent). The SDL API guarantees thread-safety for
+// GL context operations when properly managed (only one thread current at a time).
+unsafe impl Send for SdlGlContext {}
+
+impl ruzu_core::frontend::graphics_context::GraphicsContext for SdlGlContext {
+    fn swap_buffers(&mut self) {
+        SdlGlContext::swap_buffers(self);
+    }
+
+    fn make_current(&mut self) {
+        SdlGlContext::make_current(self);
+    }
+
+    fn done_current(&mut self) {
+        SdlGlContext::done_current(self);
+    }
+}
+
 impl Drop for SdlGlContext {
     /// Releases and destroys the SDL GL context.
     ///
@@ -330,6 +349,11 @@ impl EmuWindowSdl2Gl {
     /// Get the window drawable size in pixels.
     pub fn get_drawable_size(&self) -> (i32, i32) {
         self.base.get_drawable_size()
+    }
+
+    /// Returns the raw SDL window pointer.
+    pub fn raw_window(&self) -> *mut sdl::SDL_Window {
+        self.base.render_window
     }
 }
 

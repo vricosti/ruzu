@@ -12,7 +12,9 @@ use std::sync::Arc;
 use log::trace;
 
 use super::null_rasterizer::RasterizerNull;
+use crate::framebuffer_config::FramebufferConfig;
 use crate::rasterizer_interface::RasterizerInterface;
+use crate::renderer_base::{RendererBase, RendererBaseData};
 use crate::syncpoint::SyncpointManager;
 
 /// Tiled capture buffer size (matching zuyu's `VideoCore::Capture::TiledSize`).
@@ -26,7 +28,7 @@ const CAPTURE_TILED_SIZE: usize = 1280 * 720 * 4;
 /// Owns a [`RasterizerNull`] for draw call handling.
 pub struct RendererNull {
     rasterizer: RasterizerNull,
-    frame_count: u64,
+    base_data: RendererBaseData,
 }
 
 impl RendererNull {
@@ -34,7 +36,7 @@ impl RendererNull {
     pub fn new(syncpoints: Arc<SyncpointManager>) -> Self {
         Self {
             rasterizer: RasterizerNull::new(syncpoints),
-            frame_count: 0,
+            base_data: RendererBaseData::new(),
         }
     }
 
@@ -42,12 +44,12 @@ impl RendererNull {
     ///
     /// Matches zuyu's `RendererNull::Composite()`: increments frame counter
     /// but produces no display output.
-    pub fn composite(&mut self, framebuffer_count: usize) {
-        if framebuffer_count == 0 {
+    pub fn composite_impl(&mut self, layers: &[FramebufferConfig]) {
+        if layers.is_empty() {
             return;
         }
-        self.frame_count += 1;
-        trace!("RendererNull::composite frame={}", self.frame_count);
+        self.base_data.current_frame += 1;
+        trace!("RendererNull::composite frame={}", self.base_data.current_frame);
     }
 
     /// Get a zeroed applet capture buffer.
@@ -78,8 +80,41 @@ impl RendererNull {
     }
 
     /// Get the current frame count.
-    pub fn frame_count(&self) -> u64 {
-        self.frame_count
+    pub fn frame_count(&self) -> i32 {
+        self.base_data.current_frame
+    }
+}
+
+impl RendererBase for RendererNull {
+    fn composite(&mut self, layers: &[FramebufferConfig]) {
+        self.composite_impl(layers);
+    }
+
+    fn get_applet_capture_buffer(&self) -> Vec<u8> {
+        RendererNull::get_applet_capture_buffer(self)
+    }
+
+    fn read_rasterizer(&self) -> *mut dyn RasterizerInterface {
+        let trait_ref: &dyn RasterizerInterface = &self.rasterizer;
+        trait_ref as *const dyn RasterizerInterface as *mut dyn RasterizerInterface
+    }
+
+    fn get_device_vendor(&self) -> String {
+        self.device_vendor().to_string()
+    }
+
+    fn current_fps(&self) -> f32 {
+        self.base_data.current_fps
+    }
+
+    fn current_frame(&self) -> i32 {
+        self.base_data.current_frame
+    }
+
+    fn refresh_base_settings(&mut self) {}
+
+    fn is_screenshot_pending(&self) -> bool {
+        self.base_data.is_screenshot_pending()
     }
 }
 
@@ -87,20 +122,34 @@ impl RendererNull {
 mod tests {
     use super::*;
 
+    fn dummy_fb() -> FramebufferConfig {
+        FramebufferConfig {
+            address: 0,
+            offset: 0,
+            width: 1280,
+            height: 720,
+            stride: 1280,
+            pixel_format: crate::framebuffer_config::AndroidPixelFormat(0),
+            transform_flags: crate::framebuffer_config::BufferTransformFlags(0),
+            crop_rect: crate::framebuffer_config::RectI { left: 0, top: 0, right: 1280, bottom: 720 },
+            blending: crate::framebuffer_config::BlendMode::Opaque,
+        }
+    }
+
     #[test]
     fn test_renderer_null_composite() {
         let sp = Arc::new(SyncpointManager::new());
         let mut renderer = RendererNull::new(sp);
 
         // Empty framebuffer list should be a no-op
-        renderer.composite(0);
+        renderer.composite_impl(&[]);
         assert_eq!(renderer.frame_count(), 0);
 
         // Non-empty should increment
-        renderer.composite(1);
+        renderer.composite_impl(&[dummy_fb()]);
         assert_eq!(renderer.frame_count(), 1);
 
-        renderer.composite(2);
+        renderer.composite_impl(&[dummy_fb(), dummy_fb()]);
         assert_eq!(renderer.frame_count(), 2);
     }
 
