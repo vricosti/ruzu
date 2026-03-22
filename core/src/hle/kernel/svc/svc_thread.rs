@@ -178,7 +178,8 @@ pub fn sleep_thread(system: &System, ns: i64) {
         return;
     };
     let current_process = system.current_process_arc();
-    let mut scheduler = system.scheduler_arc().lock().unwrap();
+    let sched_arc = system.scheduler_arc();
+    let mut scheduler = sched_arc.lock().unwrap();
     if ns == YieldType::WithoutCoreMigration as i64 {
         scheduler.yield_without_core_migration(current_process, current_thread_id);
     } else if ns == YieldType::WithCoreMigration as i64 {

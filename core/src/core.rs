@@ -1177,12 +1177,20 @@ impl System {
             .expect("current_process_arc not set; call set_current_process_arc() first")
     }
 
-    /// Get the scheduler Arc. Panics if not set.
-    /// Upstream: `kernel.Scheduler(core_id)`.
-    pub fn scheduler_arc(&self) -> &Arc<StdMutex<KScheduler>> {
+    /// Get the scheduler Arc for the current core.
+    /// Upstream: `kernel.CurrentScheduler()`.
+    pub fn scheduler_arc(&self) -> Arc<StdMutex<KScheduler>> {
+        // Try per-core scheduler from kernel first (proper path).
+        if let Some(ref kernel) = self.kernel {
+            if let Some(sched) = kernel.current_scheduler() {
+                return sched.clone();
+            }
+        }
+        // Fallback to the System-level field (legacy path).
         self.scheduler_arc
             .as_ref()
-            .expect("scheduler_arc not set; call set_scheduler_arc() first")
+            .expect("scheduler_arc not set and no kernel scheduler available")
+            .clone()
     }
 
     /// Get the shared process memory. Panics if not set.

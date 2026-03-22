@@ -136,7 +136,7 @@ pub fn cancel_synchronization(system: &System, handle: Handle) -> ResultCode {
 /// clear interrupt flag, unpin.
 pub fn synchronize_preemption_state(system: &System) {
     // Lock the scheduler.
-    let scheduler = system.scheduler_arc().lock().unwrap();
+    let binding = system.scheduler_arc(); let scheduler = binding.lock().unwrap();
 
     // Get the current core ID and current thread.
     let core_id = match system.kernel() {
