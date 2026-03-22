@@ -1008,6 +1008,15 @@ impl KScheduler {
         let cur_thread = self.current_thread.as_ref().and_then(Weak::upgrade);
         let highest = self.state.highest_priority_thread_id;
 
+        log::info!(
+            "schedule_impl_fiber: core={} cur_thread={} highest={:?} has_gsc={} has_switch_fiber={}",
+            self.core_id,
+            cur_thread.as_ref().map(|t| t.lock().unwrap().get_thread_id()).unwrap_or(u64::MAX),
+            highest,
+            self.global_scheduler_context.is_some(),
+            self.switch_fiber.is_some(),
+        );
+
         let target = if self.state.interrupt_task_runnable {
             self.idle_thread.as_ref().and_then(Weak::upgrade)
         } else {
@@ -1017,12 +1026,23 @@ impl KScheduler {
             })
         };
 
+        log::info!(
+            "schedule_impl_fiber: target={}",
+            target.as_ref().map(|t| t.lock().unwrap().get_thread_id()).unwrap_or(u64::MAX),
+        );
+
         // If same as current, nothing to do.
         if let (Some(ref cur), Some(ref tgt)) = (&cur_thread, &target) {
             if Arc::ptr_eq(cur, tgt) {
+                log::info!("schedule_impl_fiber: target == current, returning");
                 std::sync::atomic::fence(Ordering::SeqCst);
                 return;
             }
+        }
+
+        if target.is_none() {
+            log::info!("schedule_impl_fiber: no target thread, returning");
+            return;
         }
 
         // Store switch state for the fiber.
@@ -1031,12 +1051,25 @@ impl KScheduler {
         self.switch_from_schedule = true;
 
         // Upstream: Common::Fiber::YieldTo(cur_thread->m_host_context, *m_switch_fiber)
-        // In our model, we don't yield to a fiber — the cooperative dispatch loop
-        // handles context switching. The fiber path would be:
-        if let (Some(ref cur), Some(ref switch_fiber)) = (&cur_thread, &self.switch_fiber) {
-            if let Some(ref host_ctx) = cur.lock().unwrap().host_context {
-                Fiber::yield_to(Arc::downgrade(host_ctx), switch_fiber);
+        if let Some(ref cur) = cur_thread {
+            let cur_lock = cur.lock().unwrap();
+            let has_ctx = cur_lock.host_context.is_some();
+            log::info!("schedule_impl_fiber: cur thread {} has host_context={}", cur_lock.get_thread_id(), has_ctx);
+            if let Some(ref host_ctx) = cur_lock.host_context {
+                if let Some(ref switch_fiber) = self.switch_fiber {
+                    let host_weak = Arc::downgrade(host_ctx);
+                    drop(cur_lock); // release thread lock before yield
+                    log::info!("schedule_impl_fiber: yielding to switch_fiber NOW");
+                    Fiber::yield_to(host_weak, switch_fiber);
+                    log::info!("schedule_impl_fiber: returned from switch_fiber");
+                } else {
+                    log::warn!("schedule_impl_fiber: no switch_fiber");
+                }
+            } else {
+                log::warn!("schedule_impl_fiber: current thread has no host_context");
             }
+        } else {
+            log::warn!("schedule_impl_fiber: no current thread");
         }
     }
 
