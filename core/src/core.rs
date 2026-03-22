@@ -558,6 +558,38 @@ impl System {
             );
         }
 
+        // Upstream line 366: applet_manager.CreateAndInsertByFrontendAppletParameters(process, params)
+        // This creates the applet and calls process->Run(), which creates the
+        // application's main thread with the proper entry point/stack/priority
+        // and adds it to the scheduler.
+        // Upstream line 366: applet_manager.CreateAndInsertByFrontendAppletParameters(process, params)
+        // Start the application process's main thread.
+        if let Some(process) = self.current_process.take() {
+            let lp = self.load_parameters.as_ref()
+                .expect("loader must provide process launch parameters");
+            let is_64bit = process.is_64bit();
+            let priority = lp.main_thread_priority;
+            let stack_size = lp.main_thread_stack_size as usize;
+
+            // Wrap in Arc<Mutex<>> — run() needs self_reference for thread creation.
+            let process_arc = Arc::new(StdMutex::new(process));
+            process_arc.lock().unwrap().bind_self_reference(&process_arc);
+
+            let run_result = process_arc.lock().unwrap().run(priority, stack_size, 1, 1, is_64bit);
+            match run_result {
+                Ok((main_thread, _handle, _thread_id, _object_id)) => {
+                    log::info!(
+                        "Application process main thread created (thread_id={})",
+                        main_thread.lock().unwrap().get_thread_id()
+                    );
+                }
+                Err(e) => {
+                    log::error!("Failed to run application process: 0x{:X}", e);
+                }
+            }
+            self.current_process_arc = Some(process_arc);
+        }
+
         self.status = SystemResultStatus::Success;
 
         log::info!("Successfully loaded ROM: {}", filepath);
