@@ -353,6 +353,31 @@ impl CpuManager {
             }
         }
 
+        // Load the thread's register context into the JIT ONCE before entering
+        // the execution loop. Upstream: this is done by KScheduler::Reload →
+        // PhysicalCore::LoadContext during context switches.
+        if let Some(thread_arc) = super::hle::kernel::kernel::get_current_thread_pointer() {
+            let thread = thread_arc.lock().unwrap();
+            if let Some(parent_weak) = thread.parent.as_ref() {
+                if let Some(parent_arc) = parent_weak.upgrade() {
+                    let core_index = kernel.current_physical_core_index();
+                    let mut process = parent_arc.lock().unwrap();
+                    if let Some(jit) = process.get_arm_interface_mut(core_index) {
+                        let k_ctx = &thread.thread_context;
+                        let arm_ctx: &crate::arm::arm_interface::ThreadContext =
+                            unsafe { &*(k_ctx as *const super::hle::kernel::k_thread::ThreadContext
+                                as *const crate::arm::arm_interface::ThreadContext) };
+                        jit.set_context(arm_ctx);
+                        jit.set_tpidrro_el0(thread.get_tls_address().get());
+                        log::info!(
+                            "Loaded thread context into JIT: PC=0x{:X} SP=0x{:X} core={}",
+                            k_ctx.pc, k_ctx.sp, core_index
+                        );
+                    }
+                }
+            }
+        }
+
         loop {
             let physical_core = kernel.current_physical_core();
             while !physical_core.is_interrupted() {
@@ -425,21 +450,10 @@ impl CpuManager {
             let jit_ref = &mut **jit;
             let opaque = &mut *(thread_ptr as *mut OpaqueKThread);
 
-            // Load the thread's register context into the JIT on first entry.
-            // Upstream: this is done by KScheduler::Reload → PhysicalCore::LoadContext
-            // during context switches. We do it here since scheduler fiber dispatch
-            // isn't complete yet.
-            {
-                let thread = thread_arc.lock().unwrap();
-                let k_ctx = &thread.thread_context;
-                let arm_ctx: &crate::arm::arm_interface::ThreadContext =
-                    unsafe { &*(k_ctx as *const super::hle::kernel::k_thread::ThreadContext
-                        as *const crate::arm::arm_interface::ThreadContext) };
-                jit_ref.set_context(arm_ctx);
-                jit_ref.set_tpidrro_el0(thread.get_tls_address().get());
-            }
-
             // Upstream PhysicalCore::RunThread loop (physical_core.cpp:65-145):
+            // NOTE: upstream does NOT call SetContext here — context is loaded
+            // once by the scheduler's Reload during context switches. The JIT
+            // maintains its own register state across run_thread() calls.
             // Runs the JIT, handles the halt reason, loops until interrupt/return.
             loop {
                 // Check termination.
