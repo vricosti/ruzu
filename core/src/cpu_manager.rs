@@ -492,6 +492,7 @@ impl CpuManager {
                     // 2. Call32/Call64: dispatch SVC, modifies args in-place
                     // 3. LoadSvcArguments: write modified args back to JIT
                     let svc_number = jit_ref.get_svc_number();
+                    log::debug!("SVC #{:#x} dispatching", svc_number);
 
                     let system_ref = kernel.system();
                     if !system_ref.is_null() {
