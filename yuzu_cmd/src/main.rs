@@ -319,15 +319,72 @@ fn main() {
     // (core.cpp:277-283). In Rust, video_core/audio_core crates can't be created
     // from core due to circular dependencies, so we provide a factory callback.
     // -----------------------------------------------------------------------
-    system.set_subsystem_factory(Box::new(|system| {
+
+    // Capture the raw SDL window pointer for creating GL contexts inside the factory.
+    // The window pointer is valid for the lifetime of emu_window (which outlives System).
+    // Store as usize to avoid Send issues with raw pointers.
+    let sdl_window_ptr_usize: usize = match &emu_window {
+        EmuWindow::Gl(w) => w.raw_window() as usize,
+        EmuWindow::Vk(w) => w.raw_window() as usize,
+        EmuWindow::Null(w) => w.raw_window() as usize,
+    };
+    let renderer_backend_str = renderer_backend.to_string();
+
+    system.set_subsystem_factory(Box::new(move |system| {
         use std::sync::Arc;
 
         // Host1x (upstream core.cpp:277): host1x_core = make_unique<Host1x>(system)
         let host1x = video_core::host1x::host1x::Host1x::new();
         system.set_host1x_core(Box::new(host1x));
 
+        // SyncpointManager for renderer use (matches crate::syncpoint::SyncpointManager).
+        let syncpoints = Arc::new(video_core::syncpoint::SyncpointManager::new());
+
         // GPU (upstream core.cpp:278): gpu_core = VideoCore::CreateGPU(emu_window, system)
-        let gpu = video_core::gpu::Gpu::new(false, true);
+        //
+        // Upstream flow:
+        //   auto context = emu_window.CreateSharedContext();
+        //   auto scope = context->Acquire();
+        //   auto renderer = CreateRenderer(system, emu_window, *gpu, context);
+        //   gpu->BindRenderer(renderer);
+        let renderer: Box<dyn video_core::renderer_base::RendererBase> = match renderer_backend_str.as_str() {
+            "opengl" => {
+                // Create a shared GL context for the renderer/GPU thread.
+                // Safety: sdl_window_ptr_usize was cast from a valid *mut SDL_Window
+                // that is alive for the duration of this closure.
+                let window_ptr = sdl_window_ptr_usize as *mut sdl2::sys::SDL_Window;
+                let context = Box::new(
+                    emu_window::emu_window_sdl2_gl::SdlGlContext::new(window_ptr),
+                );
+                let renderer = video_core::renderer_opengl::RendererOpenGL::new(
+                    |s| {
+                        let cs = std::ffi::CString::new(s).unwrap();
+                        unsafe {
+                            sdl2::sys::SDL_GL_GetProcAddress(cs.as_ptr())
+                                as *const std::os::raw::c_void
+                        }
+                    },
+                    syncpoints.clone(),
+                    context,
+                )
+                .unwrap_or_else(|e| {
+                    log::error!("Failed to create OpenGL renderer: {}", e);
+                    std::process::exit(1);
+                });
+                Box::new(renderer)
+            }
+            "vulkan" => {
+                log::warn!("Vulkan renderer not yet implemented, falling back to null");
+                Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
+                    syncpoints.clone(),
+                ))
+            }
+            _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
+                syncpoints.clone(),
+            )),
+        };
+
+        let gpu = video_core::video_core::create_gpu(false, true, renderer);
         system.set_gpu_core(Box::new(gpu));
 
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)

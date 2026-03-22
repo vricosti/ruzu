@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 common.workspace = true
+ruzu_core = { package = "core", path = "../core" }
 shader_recompiler.workspace = true
 gl.workspace = true
 log.workspace = true

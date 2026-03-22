@@ -1274,6 +1274,7 @@ dependencies = [
  "bitflags 2.11.0",
  "bytemuck",
  "common",
+ "core",
  "gl",
  "log",
  "parking_lot",

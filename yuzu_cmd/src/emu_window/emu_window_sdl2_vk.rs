@@ -131,6 +131,11 @@ impl EmuWindowSdl2Vk {
     pub fn wait_event(&mut self) {
         self.base.wait_event();
     }
+
+    /// Returns the raw SDL window pointer.
+    pub fn raw_window(&self) -> *mut sdl::SDL_Window {
+        self.base.render_window
+    }
 }
 
 impl Drop for EmuWindowSdl2Vk {
