@@ -990,28 +990,48 @@ impl KProcess {
     }
 
     pub fn create_thread_local_region(&mut self) -> Option<KProcessAddress> {
+        // Check existing partially-used TLS pages first.
         for page in &mut self.thread_local_pages {
             if let Some(region) = page.reserve() {
                 return Some(region);
             }
         }
 
-        if self.next_thread_local_page_address == 0 {
-            return None;
-        }
-
-        let page_address = self.next_thread_local_page_address;
-        self.next_thread_local_page_address += THREAD_LOCAL_PAGE_SIZE as u64;
-
-        // Map TLS page in the page table's block manager first — this creates
-        // the DeviceMemory mapping via operate(Map).
+        // Allocate a new TLS page using the find-free MapPages path.
+        // Matches upstream KThreadLocalPage::Initialize which calls:
+        //   m_owner->GetPageTable().MapPages(&m_virt_addr, 1, PageSize, phys_addr,
+        //                                    KMemoryState::ThreadLocal, KMemoryPermission::UserReadWrite)
+        // The 2-arg MapPages overload (out_addr, num_pages, state, perm) delegates to
+        // the find-free variant using GetRegionAddress(ThreadLocal) / GetRegionSize(ThreadLocal).
+        //
+        // For is_pa_valid=false, the find-free MapPages calls AllocateAndMapPagesImpl which
+        // allocates physical pages and maps them. We pass is_pa_valid=true with a computed
+        // physical address (DramBase + virt) matching our existing convention.
+        use super::svc_types::MemoryState as SvcMemoryState;
         let tls_num_pages = THREAD_LOCAL_PAGE_SIZE / PAGE_SIZE;
-        self.page_table.map_pages_at_address(
-            KProcessAddress::new(page_address),
+        let region_start = self.page_table.get_base().get_region_address(SvcMemoryState::ThreadLocal);
+        let region_size = self.page_table.get_base().get_region_size(SvcMemoryState::ThreadLocal);
+        let region_num_pages = region_size / PAGE_SIZE;
+
+        let (result, page_addr) = self.page_table.map_pages_find_free(
             tls_num_pages,
+            PAGE_SIZE,  // alignment = PageSize
+            0,          // phys_addr = 0 (will be computed by map_pages_find_free)
+            false,      // is_pa_valid = false (upstream: allocate physical memory)
+            KProcessAddress::new(region_start as u64),
+            region_num_pages,
             KMemoryState::THREAD_LOCAL,
             KMemoryPermission::USER_READ_WRITE,
         );
+        if result != RESULT_SUCCESS.get_inner_value() {
+            log::error!(
+                "create_thread_local_region: MapPages find-free failed ({:#x}), region=[{:#x}..{:#x}]",
+                result, region_start, region_start + region_size
+            );
+            return None;
+        }
+
+        let page_address = page_addr.get();
 
         // Zero the TLS page in DeviceMemory.
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
@@ -1260,15 +1280,10 @@ impl KProcess {
             return map_result;
         }
 
-        // Set up TLS page allocation base right after the code region.
-        // Upstream allocates TLS pages dynamically via MapPages in
-        // KThreadLocalPage::Initialize. We use a fixed base after the code
-        // region, matching the previous initialize_thread_local_region_allocation
-        // call that was in the loader.
-        {
-            let tls_base = ((code_address + code_size as u64) + 0xFFF) & !0xFFF;
-            self.initialize_thread_local_region_base(tls_base);
-        }
+        // TLS pages are allocated dynamically via the find-free MapPages path
+        // in create_thread_local_region, matching upstream KThreadLocalPage::Initialize
+        // which calls MapPages(&m_virt_addr, 1, PageSize, phys_addr, ThreadLocal, UserReadWrite).
+        // No fixed TLS base needed — the page table's find_free_area picks the address.
 
         // Initialize capabilities (upstream line 434-435).
         let mut caps = std::mem::take(&mut self.capabilities);
