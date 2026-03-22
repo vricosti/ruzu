@@ -101,6 +101,13 @@ pub struct KernelCore {
     /// Upstream: `std::array<std::unique_ptr<Kernel::PhysicalCore>, NUM_CPU_CORES> cores`.
     cores: Vec<PhysicalCore>,
 
+    /// Per-core main threads.
+    /// Upstream: created in `InitializePhysicalCores()` via `KThread::InitializeMainThread`.
+    main_threads: Vec<Arc<Mutex<KThread>>>,
+    /// Per-core idle threads.
+    /// Upstream: created in `InitializePhysicalCores()` via `KThread::InitializeIdleThread`.
+    idle_threads: Vec<Arc<Mutex<KThread>>>,
+
     // -- Slab resource counts --
     slab_resource_counts: KSlabResourceCounts,
 
@@ -150,6 +157,9 @@ impl KernelCore {
 
             schedulers: Vec::new(),
             cores: Vec::new(),
+
+            main_threads: Vec::new(),
+            idle_threads: Vec::new(),
 
             slab_resource_counts: KSlabResourceCounts::create_default(),
 
@@ -231,6 +241,8 @@ impl KernelCore {
 
         // Upstream: schedulers[core_id].reset() per core.
         self.schedulers.clear();
+        self.main_threads.clear();
+        self.idle_threads.clear();
 
         if let Some(ref container) = self.global_object_list_container {
             container.finalize();
@@ -479,23 +491,71 @@ impl KernelCore {
     /// Upstream: `Impl::InitializePhysicalCores()` (kernel.cpp:192-211).
     /// Creates KScheduler + PhysicalCore for each core, then initializes
     /// each scheduler with main/idle threads.
+    /// Initialize physical cores and per-core schedulers.
+    ///
+    /// Upstream: `Impl::InitializePhysicalCores()` (kernel.cpp:192-211).
+    /// For each core, creates a KScheduler and PhysicalCore, then creates
+    /// main and idle threads (ownerless, `ThreadType::Main`) and initializes
+    /// the scheduler with them so that `get_scheduler_current_thread()` returns
+    /// the main thread with a valid host fiber context.
     fn initialize_physical_cores(&mut self) {
         self.schedulers.clear();
         self.cores.clear();
+        self.main_threads.clear();
+        self.idle_threads.clear();
+
         for i in 0..hardware_properties::NUM_CPU_CORES as usize {
             let core_id = i as i32;
 
+            // Create scheduler and physical core.
             let scheduler = Arc::new(Mutex::new(KScheduler::new(core_id)));
-            self.schedulers.push(scheduler);
+            self.schedulers.push(scheduler.clone());
             self.cores.push(PhysicalCore::new(i, self.is_multicore));
 
-            // Upstream creates main_thread and idle_thread per core here via
-            // KThread::Create + InitializeMainThread / InitializeIdleThread,
-            // then calls schedulers[i]->Initialize(main_thread, idle_thread, core).
-            // Those threads require a fully wired KProcess and kernel, so we
-            // defer scheduler initialization to when threads are available.
-            // The caller must call scheduler.lock().unwrap().initialize(main_id, idle_id, core)
-            // once per-core threads are created.
+            // Create main thread.
+            // Upstream: auto* main_thread = KThread::Create(kernel);
+            //           main_thread->SetCurrentCore(core);
+            //           KThread::InitializeMainThread(system, main_thread, core);
+            //           KThread::Register(kernel, main_thread);
+            let main_thread = Arc::new(Mutex::new(KThread::new()));
+            {
+                let thread_id = self.create_new_thread_id();
+                let object_id = self.create_new_object_id() as u64;
+                let mut t = main_thread.lock().unwrap();
+                t.set_current_core(core_id);
+                t.initialize_kernel_main_thread(core_id, thread_id, object_id, None);
+                t.bind_self_reference(&main_thread);
+            }
+            // Upstream: KThread::Register(kernel, main_thread) → adds to object list container.
+            self.register_kernel_object(main_thread.lock().unwrap().get_object_id());
+
+            // Create idle thread.
+            // Upstream: auto* idle_thread = KThread::Create(kernel);
+            //           idle_thread->SetCurrentCore(core);
+            //           KThread::InitializeIdleThread(system, idle_thread, core);
+            //           KThread::Register(kernel, idle_thread);
+            let idle_thread = Arc::new(Mutex::new(KThread::new()));
+            {
+                let thread_id = self.create_new_thread_id();
+                let object_id = self.create_new_object_id() as u64;
+                let mut t = idle_thread.lock().unwrap();
+                t.set_current_core(core_id);
+                t.initialize_kernel_idle_thread(core_id, thread_id, object_id, None);
+                t.bind_self_reference(&idle_thread);
+            }
+            self.register_kernel_object(idle_thread.lock().unwrap().get_object_id());
+
+            // Initialize the scheduler with the main and idle threads.
+            // Upstream: schedulers[i]->Initialize(main_thread, idle_thread, core);
+            // This sets m_current_thread = main_thread so get_scheduler_current_thread()
+            // returns a valid thread.
+            scheduler
+                .lock()
+                .unwrap()
+                .initialize_with_threads(&main_thread, &idle_thread, core_id);
+
+            self.main_threads.push(main_thread);
+            self.idle_threads.push(idle_thread);
         }
     }
 }
