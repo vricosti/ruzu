@@ -1784,36 +1784,34 @@ impl KProcess {
             .create_thread_local_region()
             .ok_or_else(|| RESULT_INVALID_STATE.get_inner_value())?;
 
-        // Allocate stack.
-        // Upstream: m_page_table.MapPages(&stack_bottom, stack_size/PageSize,
-        //                                 KMemoryState::Stack, KMemoryPermission::UserReadWrite)
-        // stack_top = stack_bottom + stack_size
-        //
-        // Upstream uses the page table's find-free MapPages which searches the
-        // stack region for a free range. The stack region in a 32-bit address
-        // space overlaps with the code region, and the page table tracks which
-        // pages are free vs mapped.
-        //
-        // Place the stack after the TLS page, with guard pages matching upstream.
-        // Upstream MapPages find-free uses GetNumGuardPages() which returns
-        // 1 for kernel processes, 4 for user processes.
-        let tls_page = tls_address.get() & !(PAGE_SIZE as u64 - 1);
-        let num_guard_pages = self.page_table.get_num_guard_pages() as u64;
-        let stack_base = tls_page + THREAD_LOCAL_PAGE_SIZE as u64
-            + num_guard_pages * PAGE_SIZE as u64;
-        let stack_top = stack_base + stack_size as u64;
-        self.main_thread_stack_size = stack_size;
-
-        // Track the stack in the page table's memory block manager.
+        // Allocate stack using find-free MapPages, matching upstream exactly.
+        // Upstream KProcess::Run (k_process.cpp:938-940):
+        //   R_TRY(m_page_table.MapPages(&stack_bottom, stack_size / PageSize,
+        //                               KMemoryState::Stack, KMemoryPermission::UserReadWrite));
+        //   stack_top = stack_bottom + stack_size;
+        use super::svc_types::MemoryState as SvcMemoryState;
         let stack_num_pages = stack_size / PAGE_SIZE;
-        let map_result = self.page_table.map_pages_at_address(
-            KProcessAddress::new(stack_base),
+        let stack_region_start = self.page_table.get_base().get_region_address(SvcMemoryState::Stack);
+        let stack_region_size = self.page_table.get_base().get_region_size(SvcMemoryState::Stack);
+        let stack_region_num_pages = stack_region_size / PAGE_SIZE;
+
+        let (map_result, stack_bottom) = self.page_table.map_pages_find_free(
             stack_num_pages,
+            PAGE_SIZE,
+            0,
+            false,
+            KProcessAddress::new(stack_region_start as u64),
+            stack_region_num_pages,
             KMemoryState::STACK,
             KMemoryPermission::USER_READ_WRITE,
         );
+        let stack_base = stack_bottom.get();
+        let stack_top = stack_base + stack_size as u64;
+        self.main_thread_stack_size = stack_size;
+
         if map_result != RESULT_SUCCESS.get_inner_value() {
-            log::warn!("run: stack MapPages failed ({:#x}), continuing with ad-hoc allocation", map_result);
+            log::error!("run: stack MapPages find-free failed ({:#x})", map_result);
+            return Err(map_result);
         }
 
         // Zero the stack in DeviceMemory (if Memory is wired).
