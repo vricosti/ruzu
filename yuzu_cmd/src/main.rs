@@ -295,14 +295,23 @@ fn main() {
     };
 
     // -----------------------------------------------------------------------
-    // Step 4 (upstream): system.SetContentProvider, SetFilesystem, CreateFactories.
-    // These are not yet ported; log a note. The upstream calls are:
+    // Step 4 (upstream lines 367-370):
     //   system.SetContentProvider(make_unique<FileSys::ContentProviderUnion>());
     //   system.SetFilesystem(make_shared<FileSys::RealVfsFilesystem>());
     //   system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
     //   system.GetUserChannel().clear();
     // -----------------------------------------------------------------------
-    log::info!("Content provider / filesystem factories not yet wired — skipping");
+    {
+        use ruzu_core::file_sys::registered_cache::ContentProviderUnion;
+        system.set_content_provider(std::sync::Arc::new(std::sync::Mutex::new(ContentProviderUnion::new())));
+        // VFS is already created in system.initialize(); ensure it's set.
+        if system.get_filesystem().is_none() {
+            system.set_filesystem(ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem::new());
+        }
+        system.get_filesystem_controller().lock().unwrap().create_factories();
+        // Note: get_filesystem_controller() returns Arc clone, lock it.
+        system.clear_user_channel();
+    }
 
     // -----------------------------------------------------------------------
     // Step 5 (upstream): system.Load(*emu_window, filepath, load_parameters).
