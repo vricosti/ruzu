@@ -568,6 +568,13 @@ impl KernelCore {
 
             // Create scheduler and physical core.
             let scheduler = Arc::new(Mutex::new(KScheduler::new(core_id)));
+            // Wire the global scheduler context so the scheduler can find threads.
+            if let Some(ref gsc) = self.global_scheduler_context {
+                scheduler.lock().unwrap().global_scheduler_context = Some(gsc.clone());
+            }
+            // Initialize the switch fiber for this scheduler.
+            // Upstream: done implicitly during ScheduleImplFiber's first yield.
+            KScheduler::init_switch_fiber(&scheduler);
             self.schedulers.push(scheduler.clone());
             self.cores.push(PhysicalCore::new(i, self.is_multicore));
 

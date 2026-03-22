@@ -375,7 +375,8 @@ impl KScheduler {
 
     /// Matches upstream `KScheduler::Schedule()`.
     fn schedule(&mut self) {
-        self.schedule_impl_cooperative();
+        // Upstream: ScheduleImpl() which yields to the switch fiber.
+        self.schedule_impl_fiber();
     }
 
     /// Clear previous thread across all schedulers.

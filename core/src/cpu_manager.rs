@@ -205,49 +205,20 @@ impl CpuManager {
     /// Guest thread activation function.
     ///
     /// Upstream: `CpuManager::GuestActivate()` (cpu_manager.cpp:168-175).
-    /// Called as the entry point for new guest fibers.
+    /// Called as the entry point for main thread fibers (InitializeMainThread).
     ///
-    /// Upstream calls scheduler->Activate() which fiber-switches into
-    /// ScheduleImplFiber → SwitchThread → Reload → YieldTo the next thread's
-    /// fiber whose entry is GuestThreadFunction → MultiCoreRunGuestThread.
-    /// Because the fiber switch never returns, upstream has no code after
-    /// Activate().
-    ///
-    /// Since fiber-based scheduling isn't fully wired yet, we enter the guest
-    /// dispatch loop directly after Activate(). This is the function that the
-    /// fiber would eventually run, so the end result is identical: the current
-    /// core's host thread executes guest code in a loop.
+    /// Upstream calls scheduler->Activate() which fiber-switches to the
+    /// scheduled thread's fiber whose entry is GuestThreadFunction.
+    /// The fiber switch never returns.
     pub fn guest_activate(kernel: &KernelCore) {
         if let Some(scheduler_arc) = kernel.current_scheduler() {
             scheduler_arc.lock().unwrap().activate();
         }
-
         // Upstream: scheduler.Activate() fiber-switches and never returns.
-        // Since fiber-based scheduling isn't complete, enter the guest
-        // dispatch loop directly — this is what the fiber would eventually run.
-        let is_multicore = kernel.is_multicore();
-        if is_multicore {
-            Self::multi_core_run_guest_thread(kernel);
-        } else {
-            // Single-core needs CoreTiming for time advancement and preemption.
-            if let Some(core_timing) = kernel.core_timing() {
-                let core_timing = core_timing.clone();
-                let current_core = AtomicUsize::new(0);
-                let mut idle_count: usize = 0;
-                Self::single_core_run_guest_thread(
-                    kernel,
-                    &core_timing,
-                    &current_core,
-                    &mut idle_count,
-                );
-            } else {
-                log::error!("GuestActivate: single-core mode but no CoreTiming available");
-                // Fall back to multicore loop which doesn't need CoreTiming.
-                Self::multi_core_run_guest_thread(kernel);
-            }
-        }
-        // The guest thread functions loop forever, so this is effectively unreachable.
-        unreachable!("GuestActivate: guest thread function returned unexpectedly");
+        // If it returns, this core has no user thread — run idle loop.
+        // This happens for cores 1-3 when only core 0 has the application thread.
+        log::info!("GuestActivate: no user thread on this core, entering idle loop");
+        Self::multi_core_run_idle_thread(kernel);
     }
 
     /// Guest thread function — dispatches to multicore or single-core variant.
@@ -317,75 +288,21 @@ impl CpuManager {
     /// Upstream: `CpuManager::MultiCoreRunGuestThread()` (cpu_manager.cpp:73-88).
     /// Runs on the guest fiber. Calls PhysicalCore::RunThread in a loop,
     /// handling interrupts between runs.
-    fn multi_core_run_guest_thread(kernel: &KernelCore) {
+    pub fn multi_core_run_guest_thread(kernel: &KernelCore) {
         // Upstream: auto* thread = Kernel::GetCurrentThreadPointer(kernel);
         // kernel.CurrentScheduler()->OnThreadStart();
-        //
-        // In upstream, by this point the scheduler has fiber-switched to the
-        // application's user thread. The user thread starts with disable_count=1,
-        // and OnThreadStart() decrements it to 0 (EnableDispatch).
-        //
-        // Upstream: by this point the scheduler has fiber-switched to the
-        // application's user thread. The user thread starts with disable_count=1,
-        // and OnThreadStart() calls EnableDispatch (1→0).
-        //
-        // Since we skip the fiber switch:
-        // 1. Set the application thread as current on core 0
-        // 2. Restore disable_count to 1 (Activate's RescheduleCurrentCore decremented it to 0)
-        //    so OnThreadStart's EnableDispatch works correctly
-        if kernel.current_physical_core_index() == 0 {
-            if let Some(app_thread) = kernel.get_application_thread() {
-                super::hle::kernel::kernel::set_current_emu_thread(Some(&app_thread));
-            }
-        }
-
-        // Upstream: the thread OnThreadStart runs on always has disable_count=1.
-        // Activate() → RescheduleCurrentCore() decremented it to 0. Restore it.
         if let Some(thread_arc) = super::hle::kernel::kernel::get_current_thread_pointer() {
-            let mut t = thread_arc.lock().unwrap();
-            if t.get_disable_dispatch_count() == 0 {
-                t.disable_dispatch();
-            }
-            drop(t);
-
             if let Some(scheduler_arc) = kernel.current_scheduler() {
                 scheduler_arc.lock().unwrap().on_thread_start(&thread_arc);
-            }
-        }
-
-        // Load the thread's register context into the JIT ONCE before entering
-        // the execution loop. Upstream: this is done by KScheduler::Reload →
-        // PhysicalCore::LoadContext during context switches.
-        if let Some(thread_arc) = super::hle::kernel::kernel::get_current_thread_pointer() {
-            let thread = thread_arc.lock().unwrap();
-            if let Some(parent_weak) = thread.parent.as_ref() {
-                if let Some(parent_arc) = parent_weak.upgrade() {
-                    let core_index = kernel.current_physical_core_index();
-                    let mut process = parent_arc.lock().unwrap();
-                    if let Some(jit) = process.get_arm_interface_mut(core_index) {
-                        let k_ctx = &thread.thread_context;
-                        let arm_ctx: &crate::arm::arm_interface::ThreadContext =
-                            unsafe { &*(k_ctx as *const super::hle::kernel::k_thread::ThreadContext
-                                as *const crate::arm::arm_interface::ThreadContext) };
-                        jit.set_context(arm_ctx);
-                        jit.set_tpidrro_el0(thread.get_tls_address().get());
-                        log::info!(
-                            "Loaded thread context into JIT: PC=0x{:X} SP=0x{:X} core={}",
-                            k_ctx.pc, k_ctx.sp, core_index
-                        );
-                    }
-                }
             }
         }
 
         loop {
             let physical_core = kernel.current_physical_core();
             while !physical_core.is_interrupted() {
-                // Upstream: physical_core->RunThread(thread) gets the JIT from
-                // thread->GetOwnerProcess()->GetArmInterface(core_index).
-                // Here we replicate that lookup.
                 Self::run_guest_thread_once(kernel, physical_core);
-                // Re-fetch in case we changed cores during scheduling.
+                // Upstream: physical_core = &kernel.CurrentPhysicalCore();
+                // Re-fetch physical core in case we changed cores during scheduling.
                 break;
             }
 
@@ -567,6 +484,24 @@ impl CpuManager {
     // =========================================================================
     // SingleCore guest/idle thread loops
     // =========================================================================
+
+    /// Public entry point for single-core guest thread, called from the
+    /// guest thread fiber closure created in `core.rs`.
+    ///
+    /// Upstream: `CpuManager::GuestThreadFunction()` → `SingleCoreRunGuestThread()`.
+    /// In upstream, CpuManager is a class with member fields (core_timing,
+    /// current_core, idle_count). Here we access core_timing via kernel and
+    /// use local state for current_core/idle_count.
+    pub fn single_core_run_guest_thread_entry(kernel: &KernelCore) {
+        if let Some(core_timing) = kernel.core_timing() {
+            let core_timing = core_timing.clone();
+            let current_core = AtomicUsize::new(0);
+            let mut idle_count: usize = 0;
+            Self::single_core_run_guest_thread(kernel, &core_timing, &current_core, &mut idle_count);
+        } else {
+            log::error!("SingleCoreRunGuestThread: no CoreTiming available");
+        }
+    }
 
     /// Single-core guest thread loop.
     ///
