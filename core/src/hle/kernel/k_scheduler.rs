@@ -296,10 +296,27 @@ impl KScheduler {
 
     /// Reload a thread's context (restore guest state).
     /// Matches upstream `KScheduler::Reload(KThread*)`.
+    /// Upstream: `m_kernel.PhysicalCore(m_core_id).LoadContext(thread)`.
     pub fn reload(&self, thread: &Arc<Mutex<KThread>>) {
-        // Upstream: m_kernel.PhysicalCore(m_core_id).LoadContext(thread)
-        if let Some(core) = self.physical_cores.get(self.core_id as usize) {
-            core.load_context(&thread.lock().unwrap());
+        // Inline PhysicalCore::LoadContext since the scheduler doesn't hold
+        // a reference to the kernel's physical cores.
+        let thread_guard = thread.lock().unwrap();
+        let parent = match thread_guard.parent.as_ref().and_then(|w| w.upgrade()) {
+            Some(p) => p,
+            None => return,
+        };
+        let mut process = parent.lock().unwrap();
+        if let Some(jit) = process.get_arm_interface_mut(self.core_id as usize) {
+            let k_ctx = &thread_guard.thread_context;
+            let arm_ctx: &crate::arm::arm_interface::ThreadContext =
+                unsafe { &*(k_ctx as *const super::k_thread::ThreadContext
+                    as *const crate::arm::arm_interface::ThreadContext) };
+            jit.set_context(arm_ctx);
+            jit.set_tpidrro_el0(thread_guard.get_tls_address().get());
+            log::info!(
+                "KScheduler::Reload: core={} r15/PC=0x{:X} r13/SP=0x{:X}",
+                self.core_id, k_ctx.r[15], k_ctx.r[13],
+            );
         }
     }
 

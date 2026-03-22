@@ -300,14 +300,26 @@ impl CpuManager {
 
         // Upstream: auto* thread = Kernel::GetCurrentThreadPointer(kernel);
         // kernel.CurrentScheduler()->OnThreadStart();
+        // Upstream: kernel.CurrentScheduler()->OnThreadStart();
+        // OnThreadStart just calls thread.EnableDispatch().
+        // We can't lock the scheduler here because it's still locked by
+        // guest_activate → scheduler.activate() → schedule_impl_fiber
+        // (the lock is on the suspended kernel main thread's stack).
+        // Call EnableDispatch directly matching what OnThreadStart does.
         if let Some(thread_arc) = super::hle::kernel::kernel::get_current_thread_pointer() {
-            if let Some(scheduler_arc) = kernel.current_scheduler() {
-                scheduler_arc.lock().unwrap().on_thread_start(&thread_arc);
+            let mut t = thread_arc.lock().unwrap();
+            if t.get_disable_dispatch_count() > 0 {
+                t.enable_dispatch();
             }
         }
 
+        log::info!("multi_core_run_guest_thread: entering main loop");
         loop {
             let physical_core = kernel.current_physical_core();
+            let interrupted = physical_core.is_interrupted();
+            if interrupted {
+                log::info!("multi_core_run_guest_thread: core is interrupted, handling");
+            }
             while !physical_core.is_interrupted() {
                 Self::run_guest_thread_once(kernel, physical_core);
                 // Upstream: physical_core = &kernel.CurrentPhysicalCore();
