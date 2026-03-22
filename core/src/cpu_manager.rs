@@ -207,8 +207,13 @@ impl CpuManager {
     /// Guest thread activation function.
     ///
     /// Upstream: `CpuManager::GuestActivate()` (cpu_manager.cpp:168-175).
-    /// Called as the entry point for new guest fibers. Gets the current
-    /// scheduler and calls Activate(), which never returns.
+    /// Called as the entry point for new guest fibers.
+    /// Upstream: `GuestActivate()` (cpu_manager.cpp:168-175).
+    ///
+    /// Calls scheduler->Activate() which calls RescheduleCurrentCore() which
+    /// fiber-switches to the next runnable thread. That thread's fiber entry
+    /// is GuestThreadFunction → MultiCoreRunGuestThread which runs the JIT loop.
+    /// This function never returns.
     pub fn guest_activate(kernel: &KernelCore) {
         if let Some(scheduler_arc) = kernel.current_scheduler() {
             scheduler_arc.lock().unwrap().activate();
