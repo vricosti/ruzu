@@ -107,16 +107,19 @@ impl DynarmicCallbacks32 {
     }
 
     /// Matches upstream `DynarmicCallbacks32::CheckMemoryAccess`.
-    fn check_memory_access(&self, addr: u64, size: u64) -> bool {
-        if let Some(ref cm) = self.core_memory {
-            if !cm.lock().unwrap().is_valid_virtual_address_range(addr, size) {
-                log::error!(
-                    "DynarmicCallbacks32::CheckMemoryAccess: unmapped access at {:#x} size={}",
-                    addr, size
-                );
-                return false;
-            }
-        }
+    ///
+    /// Upstream behavior: `m_check_memory_access` is only true when
+    /// `debugger_enabled || !cpuopt_ignore_memory_aborts`. The default is
+    /// `cpuopt_ignore_memory_aborts = true`, so `m_check_memory_access = false`,
+    /// meaning this function returns true immediately without checking.
+    ///
+    /// Memory access validation is a debugger feature, not used in normal play.
+    /// The JIT uses page table fastmem for actual memory protection.
+    fn check_memory_access(&self, _addr: u64, _size: u64) -> bool {
+        // Upstream default: m_check_memory_access = false → return true.
+        // When debugger support is added, this should check
+        // is_valid_virtual_address_range and call halt_execution(EXCEPTION_RAISED)
+        // on failure, matching upstream lines 150-174.
         true
     }
 }
@@ -338,7 +341,9 @@ impl JitCallbacks for DynarmicCallbacks32 {
             _ => {
                 // All other exceptions: log and continue (no halt).
                 // Upstream only halts here if debugger is enabled (not implemented).
-                log::error!(
+                // Use trace level to avoid log spam — UndefinedInstruction (0) is
+                // common during normal execution.
+                log::trace!(
                     "ExceptionRaised(exception={}, pc={:#08x})",
                     exception, pc
                 );

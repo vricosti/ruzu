@@ -102,20 +102,14 @@ impl DynarmicCallbacks64 {
 
     /// Matches upstream `DynarmicCallbacks64::CheckMemoryAccess`.
     ///
-    /// Returns true if the access is valid. When core_memory is wired,
-    /// checks `IsValidVirtualAddressRange`; logs and returns false if unmapped.
-    /// Debug watchpoint support is not yet implemented (upstream checks
-    /// `MatchingWatchpoint` here, but we don't have debugger wired).
-    fn check_memory_access(&self, addr: u64, size: u64) -> bool {
-        if let Some(ref cm) = self.core_memory {
-            if !cm.lock().unwrap().is_valid_virtual_address_range(addr, size) {
-                log::error!(
-                    "DynarmicCallbacks64::CheckMemoryAccess: unmapped access at {:#x} size={}",
-                    addr, size
-                );
-                return false;
-            }
-        }
+    /// Upstream behavior: `m_check_memory_access` is only true when
+    /// `debugger_enabled || !cpuopt_ignore_memory_aborts`. The default is
+    /// `cpuopt_ignore_memory_aborts = true`, so `m_check_memory_access = false`,
+    /// meaning this function returns true immediately without checking.
+    ///
+    /// Memory access validation is a debugger feature, not used in normal play.
+    /// The JIT uses page table fastmem for actual memory protection.
+    fn check_memory_access(&self, _addr: u64, _size: u64) -> bool {
         true
     }
 }
