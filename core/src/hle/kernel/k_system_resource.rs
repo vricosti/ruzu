@@ -137,6 +137,12 @@ impl KSecureSystemResource {
         self.dynamic_page_manager.get_used() * PAGE_SIZE
     }
 
+    /// Matches upstream member function `KSecureSystemResource::CalculateRequiredSecureMemorySize() const`
+    /// which calls the static version with own m_resource_size and m_resource_pool.
+    pub fn calculate_required_secure_memory_size_self(&self) -> usize {
+        Self::calculate_required_secure_memory_size(self.resource_size, self.resource_pool)
+    }
+
     pub fn get_dynamic_page_manager(&self) -> &KDynamicPageManager {
         &self.dynamic_page_manager
     }

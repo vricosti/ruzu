@@ -19,6 +19,7 @@ use crate::hle::kernel::svc::svc_condition_variable;
 use crate::hle::kernel::svc::svc_debug_string;
 use crate::hle::kernel::svc::svc_event;
 use crate::hle::kernel::svc::svc_exception;
+use crate::hle::kernel::svc::svc_info;
 use crate::hle::kernel::svc::svc_ipc;
 use crate::hle::kernel::svc::svc_lock;
 use crate::hle::kernel::svc::svc_physical_memory;
@@ -965,56 +966,25 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         Some(SvcId::GetInfo) => {
             // IN: info_type=arg32[1], handle=arg32[2], info_subtype=gather64[0,3]
             // OUT: ret=arg32[0], out=scatter64[1,2]
-            let info_type = get_arg32(args, 1);
-            let _handle = get_arg32(args, 2);
+            let info_type_raw = get_arg32(args, 1);
+            let handle = get_arg32(args, 2);
             let info_subtype = gather64(args, 0, 3);
-            let process = system.current_process_arc().lock().unwrap();
-            let heap_base = process.page_table.get_heap_region_start().get();
-            let heap_size = process.page_table.get_heap_region_size() as u64;
-            let code_base = process.page_table.get_code_region_start().get();
-            let code_size = process.page_table.get_code_region_size() as u64;
-            let stack_base = process.page_table.get_stack_region_start().get();
-            let stack_size = process.page_table.get_stack_region_size() as u64;
-            let value: u64 = match info_type {
-                0 => process.get_core_mask(),    // CoreMask
-                1 => process.get_priority_mask(), // PriorityMask
-                2 => 0x4000_0000,       // AliasRegionAddress
-                3 => 0x4000_0000,       // AliasRegionSize
-                4 => heap_base,          // HeapRegionAddress
-                5 => heap_size,          // HeapRegionSize
-                6 => 0x1000_0000,        // TotalMemorySize
-                7 => code_size + stack_size, // UsedMemorySize
-                8 => 0,                  // DebuggerAttached
-                9 => 0,                  // ResourceLimit (handle, special case)
-                10 => 0,                 // IdleTickCount
-                11 => process.get_random_entropy(info_subtype as usize), // RandomEntropy
-                12 => code_base,         // AslrRegionAddress
-                13 => 0x8000_0000,       // AslrRegionSize (2 GiB for 32-bit)
-                14 => stack_base,        // StackRegionAddress
-                15 => stack_size,        // StackRegionSize
-                16 => 0,                 // SystemResourceSizeTotal
-                17 => 0,                 // SystemResourceSizeUsed
-                18 => system.runtime_program_id(), // ProgramId
-                19 => 0,                 // InitialProcessIdRange
-                20 => 0,                 // UserExceptionContextAddress
-                21 => 0x1000_0000,       // TotalNonSystemMemorySize
-                22 => code_size + stack_size, // UsedNonSystemMemorySize
-                23 => if process.is_application() { 1 } else { 0 }, // IsApplication
-                24 => 64,                // FreeThreadCount
-                25 => 0,                 // ThreadTickCount
-                _ => {
-                    log::warn!("  GetInfo: unknown type={}, sub_id={}", info_type, info_subtype);
-                    0
-                }
-            };
-            log::debug!("  GetInfo(type={}, sub_id={}) -> {:#x}", info_type, info_subtype, value);
-            set_arg32(args, 0, STUB_SUCCESS);
+            let info_type = crate::hle::kernel::svc::svc_types::InfoType::from_u32(info_type_raw);
+            let mut value: u64 = 0;
+            let result = svc_info::get_info(system, &mut value, info_type, handle, info_subtype);
+            set_arg32(args, 0, result.get_inner_value());
             scatter64(args, 1, 2, value);
         }
         Some(SvcId::GetSystemInfo) => {
-            // Same layout as GetInfo
-            set_arg32(args, 0, STUB_SUCCESS);
-            scatter64(args, 1, 2, 0);
+            let mut value: u64 = 0;
+            let result = svc_info::get_system_info(
+                &mut value,
+                crate::hle::kernel::svc::svc_types::SystemInfoType::from_u32(get_arg32(args, 1)),
+                get_arg32(args, 2),
+                gather64(args, 0, 3),
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            scatter64(args, 1, 2, value);
         }
 
         // =====================================================================
@@ -1383,49 +1353,13 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetInfo) => {
-            let info_type = get_arg64(args, 1) as u32;
-            let _handle = get_arg64(args, 2) as u32;
+            let info_type_raw = get_arg64(args, 1) as u32;
+            let handle = get_arg64(args, 2) as u32;
             let info_subtype = get_arg64(args, 3);
-            let process = system.current_process_arc().lock().unwrap();
-            let heap_base = process.page_table.get_heap_region_start().get();
-            let heap_size = process.page_table.get_heap_region_size() as u64;
-            let code_base = process.page_table.get_code_region_start().get();
-            let code_size = process.page_table.get_code_region_size() as u64;
-            let stack_base = process.page_table.get_stack_region_start().get();
-            let stack_size = process.page_table.get_stack_region_size() as u64;
-            let value: u64 = match info_type {
-                0 => process.get_core_mask(),
-                1 => process.get_priority_mask(),
-                2 => 0x4000_0000,
-                3 => 0x4000_0000,
-                4 => heap_base,
-                5 => heap_size,
-                6 => 0x1000_0000,
-                7 => code_size + stack_size,
-                8 => 0,
-                9 => 0,
-                10 => 0,
-                11 => process.get_random_entropy(info_subtype as usize),
-                12 => code_base,
-                13 => if code_base < 0x1_0000_0000 { 0x8000_0000 } else { 0x100_0000_0000 },
-                14 => stack_base,
-                15 => stack_size,
-                16 => 0,
-                17 => 0,
-                18 => system.runtime_program_id(),
-                19 => 0,
-                20 => 0,
-                21 => 0x1000_0000,
-                22 => code_size + stack_size,
-                23 => if process.is_application() { 1 } else { 0 },
-                24 => 64,
-                25 => 0,
-                _ => {
-                    log::warn!("  GetInfo: unknown type={}, sub_id={}", info_type, info_subtype);
-                    0
-                }
-            };
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let info_type = crate::hle::kernel::svc::svc_types::InfoType::from_u32(info_type_raw);
+            let mut value: u64 = 0;
+            let result = svc_info::get_info(system, &mut value, info_type, handle, info_subtype);
+            set_arg64(args, 0, result.get_inner_value() as u64);
             set_arg64(args, 1, value);
         }
         Some(SvcId::MapPhysicalMemory) => {

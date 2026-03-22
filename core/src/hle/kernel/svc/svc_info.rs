@@ -104,25 +104,16 @@ pub fn get_info(
                     *result = process.page_table.get_stack_region_size() as u64;
                 }
                 InfoType::TotalMemorySize => {
-                    // Upstream: process->GetTotalUserPhysicalMemorySize()
-                    // Approximate: code + heap + stack sizes
-                    *result = process.page_table.get_code_region_size() as u64
-                        + process.page_table.get_current_heap_size() as u64
-                        + process.page_table.get_stack_region_size() as u64;
+                    *result = process.get_total_user_physical_memory_size() as u64;
                 }
                 InfoType::UsedMemorySize => {
-                    // Upstream: process->GetUsedUserPhysicalMemorySize()
-                    *result = process.page_table.get_code_region_size() as u64
-                        + process.page_table.get_current_heap_size() as u64
-                        + process.page_table.get_stack_region_size() as u64;
+                    *result = process.get_used_user_physical_memory_size() as u64;
                 }
                 InfoType::SystemResourceSizeTotal => {
-                    // Upstream: process->GetTotalSystemResourceSize()
-                    *result = 0;
+                    *result = process.get_total_system_resource_size() as u64;
                 }
                 InfoType::SystemResourceSizeUsed => {
-                    // Upstream: process->GetUsedSystemResourceSize()
-                    *result = 0;
+                    *result = process.get_used_system_resource_size() as u64;
                 }
                 InfoType::ProgramId => {
                     *result = process.get_program_id();
@@ -131,16 +122,10 @@ pub fn get_info(
                     *result = process.get_process_local_region_address().get();
                 }
                 InfoType::TotalNonSystemMemorySize => {
-                    // Upstream: process->GetTotalNonSystemUserPhysicalMemorySize()
-                    *result = process.page_table.get_code_region_size() as u64
-                        + process.page_table.get_current_heap_size() as u64
-                        + process.page_table.get_stack_region_size() as u64;
+                    *result = process.get_total_non_system_user_physical_memory_size() as u64;
                 }
                 InfoType::UsedNonSystemMemorySize => {
-                    // Upstream: process->GetUsedNonSystemUserPhysicalMemorySize()
-                    *result = process.page_table.get_code_region_size() as u64
-                        + process.page_table.get_current_heap_size() as u64
-                        + process.page_table.get_stack_region_size() as u64;
+                    *result = process.get_used_non_system_user_physical_memory_size() as u64;
                 }
                 InfoType::IsApplication => {
                     *result = if process.is_application() { 1 } else { 0 };

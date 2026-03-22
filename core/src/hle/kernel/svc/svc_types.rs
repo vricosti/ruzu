@@ -182,6 +182,47 @@ pub enum InfoType {
     MesosphereCurrentProcess = 65001,
 }
 
+impl InfoType {
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            0 => Self::CoreMask,
+            1 => Self::PriorityMask,
+            2 => Self::AliasRegionAddress,
+            3 => Self::AliasRegionSize,
+            4 => Self::HeapRegionAddress,
+            5 => Self::HeapRegionSize,
+            6 => Self::TotalMemorySize,
+            7 => Self::UsedMemorySize,
+            8 => Self::DebuggerAttached,
+            9 => Self::ResourceLimit,
+            10 => Self::IdleTickCount,
+            11 => Self::RandomEntropy,
+            12 => Self::AslrRegionAddress,
+            13 => Self::AslrRegionSize,
+            14 => Self::StackRegionAddress,
+            15 => Self::StackRegionSize,
+            16 => Self::SystemResourceSizeTotal,
+            17 => Self::SystemResourceSizeUsed,
+            18 => Self::ProgramId,
+            19 => Self::InitialProcessIdRange,
+            20 => Self::UserExceptionContextAddress,
+            21 => Self::TotalNonSystemMemorySize,
+            22 => Self::UsedNonSystemMemorySize,
+            23 => Self::IsApplication,
+            24 => Self::FreeThreadCount,
+            25 => Self::ThreadTickCount,
+            26 => Self::IsSvcPermitted,
+            27 => Self::IoRegionHint,
+            65000 => Self::MesosphereMeta,
+            65001 => Self::MesosphereCurrentProcess,
+            _ => {
+                log::warn!("Unknown InfoType: {}", v);
+                Self::CoreMask // fallback — will be caught by the match
+            }
+        }
+    }
+}
+
 /// Break reason flags.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +352,20 @@ pub enum SystemInfoType {
     TotalPhysicalMemorySize = 0,
     UsedPhysicalMemorySize = 1,
     InitialProcessIdRange = 2,
+}
+
+impl SystemInfoType {
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            0 => Self::TotalPhysicalMemorySize,
+            1 => Self::UsedPhysicalMemorySize,
+            2 => Self::InitialProcessIdRange,
+            _ => {
+                log::warn!("Unknown SystemInfoType: {}", v);
+                Self::TotalPhysicalMemorySize
+            }
+        }
+    }
 }
 
 /// Process info type for GetProcessInfo.
