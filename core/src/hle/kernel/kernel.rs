@@ -141,6 +141,11 @@ pub struct KernelCore {
     /// without needing a System reference.
     core_timing: Option<Arc<Mutex<CoreTiming>>>,
 
+    /// Reference to the owning System.
+    /// Upstream: `Core::System& system` stored in KernelCore::Impl.
+    /// Used by SVC dispatch (`Svc::Call(system, svc_number)`) and other
+    /// kernel operations that need access to System-level state.
+    system_ref: crate::core::SystemRef,
 }
 
 // KProcess initial ID constants (matching upstream).
@@ -183,6 +188,7 @@ impl KernelCore {
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
             single_core_thread_id: AtomicU32::new(0),
             core_timing: None,
+            system_ref: crate::core::SystemRef::null(),
         }
     }
 
@@ -232,6 +238,18 @@ impl KernelCore {
     /// Upstream: accessed via `system.CoreTiming()`.
     pub fn core_timing(&self) -> Option<&Arc<Mutex<CoreTiming>>> {
         self.core_timing.as_ref()
+    }
+
+    /// Set the System reference.
+    /// Upstream: `KernelCore(System& system)` stores it at construction.
+    pub fn set_system_ref(&mut self, system_ref: crate::core::SystemRef) {
+        self.system_ref = system_ref;
+    }
+
+    /// Get the System reference.
+    /// Upstream: `KernelCore::System()`.
+    pub fn system(&self) -> crate::core::SystemRef {
+        self.system_ref
     }
 
     /// Set the application's main thread.
