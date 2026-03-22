@@ -425,6 +425,20 @@ impl CpuManager {
             let jit_ref = &mut **jit;
             let opaque = &mut *(thread_ptr as *mut OpaqueKThread);
 
+            // Load the thread's register context into the JIT.
+            // Upstream: PhysicalCore::LoadContext → interface->SetContext(thread->GetContext())
+            {
+                let thread = thread_arc.lock().unwrap();
+                // Convert k_thread::ThreadContext → arm_interface::ThreadContext.
+                // Both structs have identical layout, so transmute is safe.
+                let k_ctx = &thread.thread_context;
+                let arm_ctx: &crate::arm::arm_interface::ThreadContext =
+                    unsafe { &*(k_ctx as *const super::hle::kernel::k_thread::ThreadContext
+                        as *const crate::arm::arm_interface::ThreadContext) };
+                jit_ref.set_context(arm_ctx);
+                jit_ref.set_tpidrro_el0(thread.get_tls_address().get());
+            }
+
             // Set the running state on the physical core.
             physical_core.set_running(
                 jit_ref as *mut dyn crate::arm::arm_interface::ArmInterface,
