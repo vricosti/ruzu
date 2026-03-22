@@ -944,13 +944,6 @@ impl KPageTableBase {
             OperationType::Map => {
                 debug_assert!(virt_addr != 0);
 
-                if self.m_memory.is_none() || self.m_impl.is_none() {
-                    log::warn!(
-                        "KPageTableBase::operate Map: m_memory={} m_impl={} — mapping at 0x{:X} size=0x{:X} won't be visible to JIT",
-                        self.m_memory.is_some(), self.m_impl.is_some(), virt_addr, size
-                    );
-                }
-
                 if let (Some(memory), Some(impl_pt)) = (&self.m_memory, &mut self.m_impl) {
                     memory.lock().unwrap().map_memory_region(
                         impl_pt,
