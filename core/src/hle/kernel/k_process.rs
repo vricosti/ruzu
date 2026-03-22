@@ -1832,13 +1832,10 @@ impl KProcess {
                 _ => unreachable!("validated process state above"),
             });
 
-            if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
-                let core_id = self.get_ideal_core_id();
-                scheduler
-                    .lock()
-                    .unwrap()
-                    .initialize(main_thread_id, 0, core_id);
-            }
+            // Don't re-initialize the scheduler — it was already initialized
+            // with the kernel main thread in initialize_physical_cores.
+            // Just mark the user thread as needing scheduling.
+            // (highest_priority_thread_id is set below after thread.run())
 
             thread_handle
         };

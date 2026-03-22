@@ -217,13 +217,24 @@ impl KScheduler {
     /// In Rust we can't capture `self` in the constructor before the Arc exists,
     /// so this is a separate initialization step.
     pub fn init_switch_fiber(scheduler: &Arc<Mutex<KScheduler>>) {
-        let weak_scheduler = Arc::downgrade(scheduler);
+        // The switch fiber runs on the same OS thread as the code that yields
+        // to it. Only one fiber runs at a time, so there's no data race.
+        // We use a raw pointer because the scheduler's Mutex is already held
+        // by the caller when it yields to this fiber (YieldTo suspends the
+        // caller's fiber with the MutexGuard still on its stack).
+        // This matches upstream where ScheduleImplFiber accesses `this`
+        // directly without re-locking.
+        let sched_ptr = {
+            let mut guard = scheduler.lock().unwrap();
+            &mut *guard as *mut KScheduler as usize
+        };
         let fiber = Fiber::new(Box::new(move || {
             loop {
-                let sched = weak_scheduler
-                    .upgrade()
-                    .expect("KScheduler dropped while switch_fiber is running");
-                sched.lock().unwrap().schedule_impl_fiber_loop();
+                // Safety: only one fiber runs at a time on this OS thread,
+                // and the scheduler outlives the switch fiber. We use usize
+                // to bypass Send requirement (same pattern as CpuManager threads).
+                let sched = unsafe { &mut *(sched_ptr as *mut KScheduler) };
+                sched.schedule_impl_fiber_loop();
             }
         }));
         scheduler.lock().unwrap().switch_fiber = Some(fiber);
@@ -1073,13 +1084,22 @@ impl KScheduler {
         }
     }
 
-    /// Matches upstream `KScheduler::ScheduleImplFiber()`.
+    /// Matches upstream `KScheduler::ScheduleImplFiber()` (k_scheduler.cpp:420-494).
     /// This runs inside the switch fiber and handles the actual context switch:
     /// unloads old thread, spins to acquire new thread's context_guard,
     /// calls SwitchThread, reloads new thread, then yields back.
     fn schedule_impl_fiber_loop(&mut self) {
+        log::info!("schedule_impl_fiber_loop: ENTERED switch fiber");
+
         let cur_thread = self.switch_cur_thread.as_ref().and_then(Weak::upgrade);
         let mut highest_priority_thread = self.switch_highest_priority_thread.as_ref().and_then(Weak::upgrade);
+
+        log::info!(
+            "schedule_impl_fiber_loop: cur={} hpt={} from_schedule={}",
+            cur_thread.as_ref().map(|t| t.lock().unwrap().get_thread_id()).unwrap_or(u64::MAX),
+            highest_priority_thread.as_ref().map(|t| t.lock().unwrap().get_thread_id()).unwrap_or(u64::MAX),
+            self.switch_from_schedule,
+        );
 
         // If we're not coming from scheduling (i.e., we came from SC preemption),
         // skip the unload and jump straight to retry.
@@ -1157,13 +1177,19 @@ impl KScheduler {
 
         // Reload the guest thread context.
         if let Some(ref hpt) = highest_priority_thread {
+            let hpt_id = hpt.lock().unwrap().get_thread_id();
+            log::info!("schedule_impl_fiber_loop: Reload + YieldTo thread {}", hpt_id);
             self.reload(hpt);
 
             // Yield back from switch_fiber to the newly scheduled thread's host_context.
             // Upstream: Common::Fiber::YieldTo(m_switch_fiber, *highest_priority_thread->m_host_context)
             if let Some(ref switch_fiber) = self.switch_fiber {
-                if let Some(ref host_ctx) = hpt.lock().unwrap().host_context {
-                    Fiber::yield_to(Arc::downgrade(switch_fiber), host_ctx);
+                let host_ctx = hpt.lock().unwrap().host_context.clone();
+                if let Some(ref ctx) = host_ctx {
+                    log::info!("schedule_impl_fiber_loop: yielding from switch_fiber to thread {} fiber", hpt_id);
+                    Fiber::yield_to(Arc::downgrade(switch_fiber), ctx);
+                } else {
+                    log::warn!("schedule_impl_fiber_loop: thread {} has no host_context", hpt_id);
                 }
             }
         }
@@ -1174,8 +1200,14 @@ impl KScheduler {
     fn switch_thread_impl(&mut self, next_thread_id: u64) {
         let cur_thread_id = self.current_thread_id;
 
+        log::info!(
+            "switch_thread_impl: cur={:?} next={} has_gsc={}",
+            cur_thread_id, next_thread_id, self.global_scheduler_context.is_some()
+        );
+
         // If same thread, nothing to do.
         if Some(next_thread_id) == cur_thread_id {
+            log::info!("switch_thread_impl: same thread, skipping");
             return;
         }
 
@@ -1217,6 +1249,8 @@ impl KScheduler {
                         next_guard.set_current_core(self.core_id);
                     }
                 }
+                // Upstream: SetCurrentThread(m_kernel, next_thread);
+                super::kernel::set_current_emu_thread(Some(&next));
                 self.current_thread = Some(Arc::downgrade(&next));
             }
         }
