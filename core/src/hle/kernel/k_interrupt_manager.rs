@@ -17,7 +17,7 @@ use super::kernel::KernelCore;
 /// 2. If the current thread has a non-zero user disable count and is not already
 ///    pinned, pin it and set the interrupt flag in the thread's TLS.
 /// 3. Request rescheduling on the current scheduler.
-pub fn handle_interrupt(kernel: &mut KernelCore, core_id: i32) {
+pub fn handle_interrupt(kernel: &KernelCore, core_id: i32) {
     // Acknowledge the interrupt.
     // Upstream: kernel.PhysicalCore(core_id).ClearInterrupt();
     if let Some(physical_core) = kernel.physical_core(core_id as usize) {

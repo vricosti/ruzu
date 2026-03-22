@@ -361,7 +361,17 @@ impl ServerManager {
 
     /// Runs a server manager to completion.
     /// Port of upstream `ServerManager::RunServer(unique_ptr<ServerManager>)`.
-    pub fn run_server(mut server_manager: ServerManager) {
-        server_manager.loop_process();
+    /// Run the server in a background thread, matching upstream's
+    /// `kernel.RunOnHostCoreProcess("name", fn).detach()` /
+    /// `kernel.RunOnGuestCoreProcess("name", fn)` pattern.
+    /// Upstream runs each service in its own kernel thread.
+    pub fn run_server(server_manager: ServerManager) {
+        std::thread::Builder::new()
+            .name("ServiceServer".to_string())
+            .spawn(move || {
+                let mut sm = server_manager;
+                sm.loop_process();
+            })
+            .expect("Failed to spawn service server thread");
     }
 }
