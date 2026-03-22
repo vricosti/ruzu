@@ -108,6 +108,10 @@ pub struct KernelCore {
     /// Upstream: created in `InitializePhysicalCores()` via `KThread::InitializeIdleThread`.
     idle_threads: Vec<Arc<Mutex<KThread>>>,
 
+    /// The application's main thread (created by KProcess::run).
+    /// Used to set as the current thread when entering guest dispatch.
+    application_thread: Option<Arc<Mutex<KThread>>>,
+
     // -- Slab resource counts --
     slab_resource_counts: KSlabResourceCounts,
 
@@ -129,6 +133,13 @@ pub struct KernelCore {
     // -- Memory management --
     /// Physical memory manager. Upstream: `Impl::memory_manager`.
     memory_manager: KMemoryManager,
+
+    // -- Core timing --
+    /// Reference to the system's CoreTiming.
+    /// Upstream: accessed via `system.CoreTiming()` through `System& system` reference.
+    /// Stored here so fiber closures (guest_activate, idle thread) can access it
+    /// without needing a System reference.
+    core_timing: Option<Arc<Mutex<CoreTiming>>>,
 
 }
 
@@ -160,6 +171,7 @@ impl KernelCore {
 
             main_threads: Vec::new(),
             idle_threads: Vec::new(),
+            application_thread: None,
 
             slab_resource_counts: KSlabResourceCounts::create_default(),
 
@@ -170,6 +182,7 @@ impl KernelCore {
             memory_manager: KMemoryManager::new(),
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
             single_core_thread_id: AtomicU32::new(0),
+            core_timing: None,
         }
     }
 
@@ -206,6 +219,29 @@ impl KernelCore {
         if let Some(ref timer) = self.hardware_timer {
             KHardwareTimer::wire_callback(timer, core_timing);
         }
+    }
+
+    /// Store a reference to CoreTiming so that fiber closures (guest_activate,
+    /// idle thread) can access it without needing a System reference.
+    /// Must be called after System creates CoreTiming and before CPU threads start.
+    pub fn set_core_timing(&mut self, core_timing: Arc<Mutex<CoreTiming>>) {
+        self.core_timing = Some(core_timing);
+    }
+
+    /// Get the CoreTiming reference.
+    /// Upstream: accessed via `system.CoreTiming()`.
+    pub fn core_timing(&self) -> Option<&Arc<Mutex<CoreTiming>>> {
+        self.core_timing.as_ref()
+    }
+
+    /// Set the application's main thread.
+    pub fn set_application_thread(&mut self, thread: Arc<Mutex<KThread>>) {
+        self.application_thread = Some(thread);
+    }
+
+    /// Get the application's main thread.
+    pub fn get_application_thread(&self) -> Option<Arc<Mutex<KThread>>> {
+        self.application_thread.clone()
     }
 
     /// Shutdown the kernel.
