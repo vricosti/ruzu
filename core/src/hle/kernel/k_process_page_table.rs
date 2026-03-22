@@ -213,6 +213,10 @@ impl KProcessPageTable {
         self.base.query_info(addr)
     }
 
+    pub fn dump_memory_blocks(&self) {
+        self.base.m_memory_block_manager.dump_blocks();
+    }
+
     pub fn contains(&self, addr: KProcessAddress, size: usize) -> bool {
         self.base.contains_range(addr.get() as usize, size)
     }
