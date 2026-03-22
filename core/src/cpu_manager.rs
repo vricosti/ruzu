@@ -471,21 +471,14 @@ impl CpuManager {
                 let interrupt = hr.contains(HaltReason::BREAK_LOOP);
 
                 if supervisor_call {
-                    // Handle SVC — upstream: Svc::Call(system, interface->GetSvcNumber())
+                    // Upstream: Svc::Call(system, interface->GetSvcNumber())
+                    // (svc.cpp:4425-4441)
+                    //
+                    // 1. SaveSvcArguments: read R0-R7 from JIT
+                    // 2. Call32/Call64: dispatch SVC, modifies args in-place
+                    // 3. LoadSvcArguments: write modified args back to JIT
                     let svc_number = jit_ref.get_svc_number();
 
-                    // Save context back to thread after JIT execution.
-                    {
-                        let mut thread = thread_arc.lock().unwrap();
-                        let k_ctx = &mut thread.thread_context;
-                        let arm_ctx: &mut crate::arm::arm_interface::ThreadContext =
-                            &mut *(k_ctx as *mut super::hle::kernel::k_thread::ThreadContext
-                                as *mut crate::arm::arm_interface::ThreadContext);
-                        jit_ref.get_context(arm_ctx);
-                    }
-
-                    // Dispatch the SVC.
-                    // Upstream: Svc::Call(system, interface->GetSvcNumber())
                     let system_ref = kernel.system();
                     if !system_ref.is_null() {
                         let system = system_ref.get();
@@ -496,29 +489,18 @@ impl CpuManager {
                                 .map(|p| p.lock().unwrap().is_64bit())
                                 .unwrap_or(false)
                         };
-                        // Get SVC args from JIT registers.
+
+                        // Upstream: kernel.CurrentPhysicalCore().SaveSvcArguments(process, args)
                         let mut svc_args = [0u64; 8];
-                        {
-                            let thread = thread_arc.lock().unwrap();
-                            for i in 0..8 {
-                                svc_args[i] = thread.thread_context.r[i];
-                            }
-                        }
+                        jit_ref.get_svc_arguments(&mut svc_args);
+
+                        // Dispatch the SVC.
                         crate::hle::kernel::svc_dispatch::call(
                             system, svc_number, is_64bit, &mut svc_args,
                         );
-                        // Write SVC return values back to thread context + JIT.
-                        {
-                            let mut thread = thread_arc.lock().unwrap();
-                            for i in 0..8 {
-                                thread.thread_context.r[i] = svc_args[i];
-                            }
-                            let k_ctx = &thread.thread_context;
-                            let arm_ctx: &crate::arm::arm_interface::ThreadContext =
-                                &*(k_ctx as *const super::hle::kernel::k_thread::ThreadContext
-                                    as *const crate::arm::arm_interface::ThreadContext);
-                            jit_ref.set_context(arm_ctx);
-                        }
+
+                        // Upstream: kernel.CurrentPhysicalCore().LoadSvcArguments(process, args)
+                        jit_ref.set_svc_arguments(&svc_args);
                     } else {
                         log::warn!("SVC #{:#x}: no System reference available", svc_number);
                     }
