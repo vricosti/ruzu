@@ -583,11 +583,16 @@ impl System {
             let process_arc = Arc::new(StdMutex::new(process));
             process_arc.lock().unwrap().bind_self_reference(&process_arc);
 
-            // Wire the global scheduler context so the process can update the
-            // priority queue when threads become runnable.
+            // Wire the global scheduler context and per-core scheduler so the
+            // process can update priority queues when threads become runnable.
             if let Some(ref kernel) = self.kernel {
                 if let Some(gsc) = kernel.global_scheduler_context() {
                     process_arc.lock().unwrap().global_scheduler_context = Some(gsc.clone());
+                }
+                // Attach core-0's scheduler to the process.
+                // Upstream: the process's ideal core determines which scheduler it uses.
+                if let Some(scheduler) = kernel.scheduler(0) {
+                    process_arc.lock().unwrap().attach_scheduler(scheduler);
                 }
             }
 
@@ -615,7 +620,15 @@ impl System {
                 }))
             };
 
-            let run_result = process_arc.lock().unwrap().run(priority, stack_size, 1, 1, is_64bit, guest_thread_func);
+            // Use kernel's ID allocators to avoid collisions with per-core threads.
+            let (app_thread_id, app_object_id) = if let Some(ref kernel) = self.kernel {
+                (kernel.create_new_thread_id(), kernel.create_new_object_id() as u64)
+            } else {
+                (1, 1)
+            };
+            let run_result = process_arc.lock().unwrap().run(
+                priority, stack_size, app_thread_id, app_object_id, is_64bit, guest_thread_func,
+            );
             match run_result {
                 Ok((main_thread, _handle, _thread_id, _object_id)) => {
                     log::info!(
