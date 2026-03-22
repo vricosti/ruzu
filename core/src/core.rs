@@ -1204,22 +1204,14 @@ impl System {
     /// Get the current thread's ID via the scheduler.
     /// Matches upstream `GetCurrentThread(kernel).GetId()`.
     pub fn current_thread_id(&self) -> Option<u64> {
-        self.scheduler_arc
-            .as_ref()?
-            .lock()
-            .unwrap()
-            .get_scheduler_current_thread_id()
+        crate::hle::kernel::kernel::get_current_thread_pointer()
+            .map(|t| t.lock().unwrap().get_thread_id())
     }
 
-    /// Get the current thread Arc via scheduler + process.
+    /// Get the current thread Arc.
     /// Matches upstream `GetCurrentThread(kernel)`.
     pub fn current_thread(&self) -> Option<Arc<StdMutex<KThread>>> {
-        let current_thread_id = self.current_thread_id()?;
-        self.current_process_arc
-            .as_ref()?
-            .lock()
-            .unwrap()
-            .get_thread_by_thread_id(current_thread_id)
+        crate::hle::kernel::kernel::get_current_thread_pointer()
     }
 
     /// Get the Memory bridge for guest memory access.

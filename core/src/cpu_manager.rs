@@ -313,18 +313,12 @@ impl CpuManager {
             }
         }
 
-        log::info!("multi_core_run_guest_thread: entering main loop");
         loop {
-            let physical_core = kernel.current_physical_core();
-            let interrupted = physical_core.is_interrupted();
-            if interrupted {
-                log::info!("multi_core_run_guest_thread: core is interrupted, handling");
-            }
+            let mut physical_core = kernel.current_physical_core();
             while !physical_core.is_interrupted() {
                 Self::run_guest_thread_once(kernel, physical_core);
                 // Upstream: physical_core = &kernel.CurrentPhysicalCore();
-                // Re-fetch physical core in case we changed cores during scheduling.
-                break;
+                physical_core = kernel.current_physical_core();
             }
 
             Self::handle_interrupt(kernel);
