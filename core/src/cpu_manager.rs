@@ -385,16 +385,22 @@ impl CpuManager {
 
         let thread_arc = match super::hle::kernel::kernel::get_current_thread_pointer() {
             Some(t) => t,
-            None => return,
+            None => {
+                log::warn!("run_guest_thread_once: no current thread");
+                return;
+            }
         };
 
         let thread = thread_arc.lock().unwrap();
+        let tid = thread.get_thread_id();
+        let has_parent = thread.parent.is_some();
 
         // Get the owner process to access the ARM JIT interface.
         let parent_weak = match thread.parent.as_ref() {
             Some(p) => p.clone(),
             None => {
                 // Kernel threads (main/idle) have no owner process — nothing to run.
+                log::trace!("run_guest_thread_once: thread {} (has_parent={}) — idle", tid, has_parent);
                 drop(thread);
                 physical_core.idle();
                 return;
@@ -404,7 +410,10 @@ impl CpuManager {
 
         let parent_arc = match parent_weak.upgrade() {
             Some(p) => p,
-            None => return,
+            None => {
+                log::warn!("run_guest_thread_once: thread {} parent Weak cannot upgrade", tid);
+                return;
+            }
         };
 
         let core_index = physical_core.core_index();
@@ -415,6 +424,7 @@ impl CpuManager {
         let jit = match process.get_arm_interface_mut(core_index) {
             Some(j) => j as *mut _ as *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
             None => {
+                log::warn!("run_guest_thread_once: thread {} no ARM interface for core {}", tid, core_index);
                 drop(process);
                 physical_core.idle();
                 return;
