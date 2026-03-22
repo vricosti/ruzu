@@ -395,17 +395,12 @@ impl System {
                 .initialize_pool(Pool::SECURE, secure_pool_base, SECURE_POOL_SIZE);
         }
 
-        // Upstream: cpu_manager.Initialize()
-        // Spawns per-core host threads that wait on the GPU barrier before
-        // yielding to guest fibers.
-        self.cpu_manager.initialize();
-
-        // Upstream spawns threads inside Initialize(). In Rust we split the
-        // spawn because we need a pointer to the kernel which lives in System.
+        // Upstream: cpu_manager.Initialize() — creates barrier and spawns per-core
+        // host threads that wait on the GPU barrier before yielding to guest fibers.
         // Safety: kernel outlives the threads (shutdown joins them first).
         let kernel_ptr = self.kernel.as_ref().unwrap() as *const KernelCore;
         unsafe {
-            self.cpu_manager.spawn_threads(kernel_ptr);
+            self.cpu_manager.initialize(kernel_ptr);
         }
 
         log::info!("System: kernel initialized");
