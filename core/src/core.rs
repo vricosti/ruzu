@@ -395,6 +395,9 @@ impl System {
                 .initialize_pool(Pool::SECURE, secure_pool_base, SECURE_POOL_SIZE);
         }
 
+        // Provide CoreTiming to the kernel so guest thread functions can access it.
+        self.kernel.as_mut().unwrap().set_core_timing(self.core_timing.clone());
+
         // Upstream: cpu_manager.Initialize() — creates barrier and spawns per-core
         // host threads that wait on the GPU barrier before yielding to guest fibers.
         // Safety: kernel outlives the threads (shutdown joins them first).
@@ -582,6 +585,10 @@ impl System {
                         "Application process main thread created (thread_id={})",
                         main_thread.lock().unwrap().get_thread_id()
                     );
+                    // Store the application thread so CPU cores can find it.
+                    if let Some(ref mut kernel) = self.kernel {
+                        kernel.set_application_thread(main_thread);
+                    }
                 }
                 Err(e) => {
                     log::error!("Failed to run application process: 0x{:X}", e);

@@ -208,17 +208,48 @@ impl CpuManager {
     ///
     /// Upstream: `CpuManager::GuestActivate()` (cpu_manager.cpp:168-175).
     /// Called as the entry point for new guest fibers.
-    /// Upstream: `GuestActivate()` (cpu_manager.cpp:168-175).
     ///
-    /// Calls scheduler->Activate() which calls RescheduleCurrentCore() which
-    /// fiber-switches to the next runnable thread. That thread's fiber entry
-    /// is GuestThreadFunction → MultiCoreRunGuestThread which runs the JIT loop.
-    /// This function never returns.
+    /// Upstream calls scheduler->Activate() which fiber-switches into
+    /// ScheduleImplFiber → SwitchThread → Reload → YieldTo the next thread's
+    /// fiber whose entry is GuestThreadFunction → MultiCoreRunGuestThread.
+    /// Because the fiber switch never returns, upstream has no code after
+    /// Activate().
+    ///
+    /// Since fiber-based scheduling isn't fully wired yet, we enter the guest
+    /// dispatch loop directly after Activate(). This is the function that the
+    /// fiber would eventually run, so the end result is identical: the current
+    /// core's host thread executes guest code in a loop.
     pub fn guest_activate(kernel: &KernelCore) {
         if let Some(scheduler_arc) = kernel.current_scheduler() {
             scheduler_arc.lock().unwrap().activate();
         }
-        unreachable!("GuestActivate must not return");
+
+        // Upstream: scheduler.Activate() fiber-switches and never returns.
+        // Since fiber-based scheduling isn't complete, enter the guest
+        // dispatch loop directly — this is what the fiber would eventually run.
+        let is_multicore = kernel.is_multicore();
+        if is_multicore {
+            Self::multi_core_run_guest_thread(kernel);
+        } else {
+            // Single-core needs CoreTiming for time advancement and preemption.
+            if let Some(core_timing) = kernel.core_timing() {
+                let core_timing = core_timing.clone();
+                let current_core = AtomicUsize::new(0);
+                let mut idle_count: usize = 0;
+                Self::single_core_run_guest_thread(
+                    kernel,
+                    &core_timing,
+                    &current_core,
+                    &mut idle_count,
+                );
+            } else {
+                log::error!("GuestActivate: single-core mode but no CoreTiming available");
+                // Fall back to multicore loop which doesn't need CoreTiming.
+                Self::multi_core_run_guest_thread(kernel);
+            }
+        }
+        // The guest thread functions loop forever, so this is effectively unreachable.
+        unreachable!("GuestActivate: guest thread function returned unexpectedly");
     }
 
     /// Guest thread function — dispatches to multicore or single-core variant.
@@ -289,9 +320,37 @@ impl CpuManager {
     /// Runs on the guest fiber. Calls PhysicalCore::RunThread in a loop,
     /// handling interrupts between runs.
     fn multi_core_run_guest_thread(kernel: &KernelCore) {
-        // Upstream: kernel.CurrentScheduler()->OnThreadStart();
-        if let Some(scheduler_arc) = kernel.current_scheduler() {
-            if let Some(thread_arc) = kernel.get_current_emu_thread() {
+        // Upstream: auto* thread = Kernel::GetCurrentThreadPointer(kernel);
+        // kernel.CurrentScheduler()->OnThreadStart();
+        //
+        // In upstream, by this point the scheduler has fiber-switched to the
+        // application's user thread. The user thread starts with disable_count=1,
+        // and OnThreadStart() decrements it to 0 (EnableDispatch).
+        //
+        // Upstream: by this point the scheduler has fiber-switched to the
+        // application's user thread. The user thread starts with disable_count=1,
+        // and OnThreadStart() calls EnableDispatch (1→0).
+        //
+        // Since we skip the fiber switch:
+        // 1. Set the application thread as current on core 0
+        // 2. Restore disable_count to 1 (Activate's RescheduleCurrentCore decremented it to 0)
+        //    so OnThreadStart's EnableDispatch works correctly
+        if kernel.current_physical_core_index() == 0 {
+            if let Some(app_thread) = kernel.get_application_thread() {
+                super::hle::kernel::kernel::set_current_emu_thread(Some(&app_thread));
+            }
+        }
+
+        // Upstream: the thread OnThreadStart runs on always has disable_count=1.
+        // Activate() → RescheduleCurrentCore() decremented it to 0. Restore it.
+        if let Some(thread_arc) = super::hle::kernel::kernel::get_current_thread_pointer() {
+            let mut t = thread_arc.lock().unwrap();
+            if t.get_disable_dispatch_count() == 0 {
+                t.disable_dispatch();
+            }
+            drop(t);
+
+            if let Some(scheduler_arc) = kernel.current_scheduler() {
                 scheduler_arc.lock().unwrap().on_thread_start(&thread_arc);
             }
         }
