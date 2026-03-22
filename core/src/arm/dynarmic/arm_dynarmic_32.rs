@@ -74,6 +74,10 @@ struct DynarmicCallbacks32 {
     /// Set after jit creation via `set_halt_reason_ptr()`.
     /// Safety: valid for the lifetime of the A32Jit that owns this callback.
     jit_halt_reason_ptr: Option<*const u32>,
+    /// Raw pointer to jit_state.reg[15] (PC) for diagnostic logging.
+    /// No performance impact — only read when logging unmapped accesses.
+    /// Set after jit creation via `set_pc_ptr()`.
+    jit_pc_ptr: Option<*const u32>,
 }
 
 // Safety: jit_halt_reason_ptr points to an AtomicU32 inside the heap-allocated
@@ -94,7 +98,7 @@ impl DynarmicCallbacks32 {
             std::sync::Arc::as_ptr(&memory),
             memory.read().unwrap().base,
             if core_memory.is_some() { "wired" } else { "fallback" });
-        Self { memory, core_memory, svc_swi, uses_wall_clock, core_timing, last_exception_address, jit_halt_reason_ptr: None }
+        Self { memory, core_memory, svc_swi, uses_wall_clock, core_timing, last_exception_address, jit_halt_reason_ptr: None, jit_pc_ptr: None }
     }
 
     /// Halt the jit by atomically OR-ing a halt reason into the jit's halt_reason field.
@@ -375,6 +379,10 @@ impl JitCallbacks for DynarmicCallbacks32 {
 
     fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
         self.jit_halt_reason_ptr = Some(ptr);
+    }
+
+    fn set_pc_ptr(&mut self, ptr: *const u32) {
+        self.jit_pc_ptr = Some(ptr);
     }
 }
 
