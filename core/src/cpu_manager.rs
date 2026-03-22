@@ -93,9 +93,11 @@ impl CpuManager {
     /// Called when the GPU is ready. Synchronizes with the GPU barrier.
     /// Upstream: `CpuManager::OnGpuReady()` (cpu_manager.h:47-49).
     pub fn on_gpu_ready(&self) {
+        log::info!("CpuManager::on_gpu_ready — releasing GPU barrier");
         if let Some(ref barrier) = self.gpu_barrier {
             barrier.sync();
         }
+        log::info!("CpuManager::on_gpu_ready — barrier released");
     }
 
     /// Initializes the CPU manager, creating threads for each core.
@@ -197,7 +199,7 @@ impl CpuManager {
     ///
     /// Upstream: `CpuManager::HandleInterrupt()` (cpu_manager.cpp:62-67).
     /// Delegates to KInterruptManager::HandleInterrupt.
-    pub fn handle_interrupt(kernel: &mut KernelCore) {
+    pub fn handle_interrupt(kernel: &KernelCore) {
         let core_index = kernel.current_physical_core_index();
         k_interrupt_manager::handle_interrupt(kernel, core_index as i32);
     }
@@ -218,7 +220,7 @@ impl CpuManager {
     ///
     /// Upstream: `CpuManager::GuestThreadFunction()` (cpu_manager.cpp:42-48).
     pub fn guest_thread_function(
-        kernel: &mut KernelCore,
+        kernel: &KernelCore,
         core_timing: &Arc<Mutex<CoreTiming>>,
         current_core: &AtomicUsize,
         idle_count: &mut usize,
@@ -235,7 +237,7 @@ impl CpuManager {
     ///
     /// Upstream: `CpuManager::IdleThreadFunction()` (cpu_manager.cpp:50-56).
     pub fn idle_thread_function(
-        kernel: &mut KernelCore,
+        kernel: &KernelCore,
         core_timing: &Arc<Mutex<CoreTiming>>,
         current_core: &AtomicUsize,
         idle_count: &mut usize,
@@ -281,7 +283,7 @@ impl CpuManager {
     /// Upstream: `CpuManager::MultiCoreRunGuestThread()` (cpu_manager.cpp:73-88).
     /// Runs on the guest fiber. Calls PhysicalCore::RunThread in a loop,
     /// handling interrupts between runs.
-    fn multi_core_run_guest_thread(kernel: &mut KernelCore) {
+    fn multi_core_run_guest_thread(kernel: &KernelCore) {
         // Upstream: kernel.CurrentScheduler()->OnThreadStart();
         if let Some(scheduler_arc) = kernel.current_scheduler() {
             if let Some(thread_arc) = kernel.get_current_emu_thread() {
@@ -295,26 +297,105 @@ impl CpuManager {
             //     physical_core->RunThread(thread);
             //     physical_core = &kernel.CurrentPhysicalCore();
             // }
-            //
-            // PhysicalCore::RunThread takes (jit, thread) arguments — the JIT
-            // instance and opaque thread pointer are managed by the fiber context.
-            // In the full fiber-based execution model, the JIT is owned by the
-            // PhysicalCore and the thread comes from the scheduler.
-            // For now, check interrupt and idle until the JIT is wired through
-            // the fiber path.
             let physical_core = kernel.current_physical_core();
-            if !physical_core.is_interrupted() {
-                physical_core.idle();
+            while !physical_core.is_interrupted() {
+                // Upstream: physical_core->RunThread(thread) gets the JIT from
+                // thread->GetOwnerProcess()->GetArmInterface(core_index).
+                // Here we replicate that lookup.
+                Self::run_guest_thread_once(kernel, physical_core);
+                // Re-fetch in case we changed cores during scheduling.
+                break;
             }
 
             Self::handle_interrupt(kernel);
         }
     }
 
+    /// Execute one iteration of guest code via the JIT on the given physical core.
+    ///
+    /// Upstream: `PhysicalCore::RunThread(KThread*)` (physical_core.cpp:22-146).
+    /// Gets the ARM interface from thread->GetOwnerProcess()->GetArmInterface(core_index),
+    /// then runs the JIT until an interrupt, SVC, or halt.
+    fn run_guest_thread_once(kernel: &KernelCore, physical_core: &super::hle::kernel::physical_core::PhysicalCore) {
+        use crate::arm::arm_interface::KThread as OpaqueKThread;
+
+        let thread_arc = match super::hle::kernel::kernel::get_current_thread_pointer() {
+            Some(t) => t,
+            None => return,
+        };
+
+        let thread = thread_arc.lock().unwrap();
+
+        // Get the owner process to access the ARM JIT interface.
+        let parent_weak = match thread.parent.as_ref() {
+            Some(p) => p.clone(),
+            None => {
+                // Kernel threads (main/idle) have no owner process — nothing to run.
+                drop(thread);
+                physical_core.idle();
+                return;
+            }
+        };
+        drop(thread);
+
+        let parent_arc = match parent_weak.upgrade() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let core_index = physical_core.core_index();
+
+        // Get the ARM interface from the process for this core.
+        // Upstream: auto* interface = process->GetArmInterface(m_core_index);
+        let mut process = parent_arc.lock().unwrap();
+        let jit = match process.get_arm_interface_mut(core_index) {
+            Some(j) => j as *mut _ as *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
+            None => {
+                drop(process);
+                physical_core.idle();
+                return;
+            }
+        };
+        drop(process);
+
+        // Safety: The JIT is owned by the process which lives as long as the thread.
+        // We hold the raw pointer only for the duration of this call.
+        // The thread_arc Mutex<KThread> is cast to OpaqueKThread for the JIT interface.
+        let thread_ptr = {
+            let mut t = thread_arc.lock().unwrap();
+            &mut *t as *mut super::hle::kernel::k_thread::KThread
+        };
+
+        unsafe {
+            let jit_ref = &mut **jit;
+            let opaque = &mut *(thread_ptr as *mut OpaqueKThread);
+
+            // Set the running state on the physical core.
+            physical_core.set_running(
+                jit_ref as *mut dyn crate::arm::arm_interface::ArmInterface,
+                thread_ptr,
+            );
+
+            // Run the JIT.
+            let _halt_reason = jit_ref.run_thread(opaque);
+
+            // Clear the running state.
+            physical_core.clear_running();
+        }
+    }
+
+    /// Public entry point for the multicore idle thread loop, called from
+    /// fiber closures created in `KernelCore::initialize_physical_cores`.
+    ///
+    /// Upstream: `CpuManager::IdleThreadFunction()` → `MultiCoreRunIdleThread()`.
+    pub fn multi_core_run_idle_thread_entry(kernel: &KernelCore) {
+        Self::multi_core_run_idle_thread(kernel);
+    }
+
     /// Multicore idle thread loop.
     ///
     /// Upstream: `CpuManager::MultiCoreRunIdleThread()` (cpu_manager.cpp:90-106).
-    fn multi_core_run_idle_thread(kernel: &mut KernelCore) {
+    fn multi_core_run_idle_thread(kernel: &KernelCore) {
         if let Some(scheduler_arc) = kernel.current_scheduler() {
             if let Some(thread_arc) = kernel.get_current_emu_thread() {
                 scheduler_arc.lock().unwrap().on_thread_start(&thread_arc);
@@ -341,7 +422,7 @@ impl CpuManager {
     /// In the full fiber model, PhysicalCore::RunThread drives JIT execution
     /// for the current guest thread (obtained from the scheduler).
     fn single_core_run_guest_thread(
-        kernel: &mut KernelCore,
+        kernel: &KernelCore,
         core_timing: &Arc<Mutex<CoreTiming>>,
         current_core: &AtomicUsize,
         idle_count: &mut usize,
@@ -355,10 +436,9 @@ impl CpuManager {
 
         loop {
             // Upstream: physical_core->RunThread(thread)
-            // See multi_core_run_guest_thread comment about JIT wiring.
             let physical_core = kernel.current_physical_core();
             if !physical_core.is_interrupted() {
-                physical_core.idle();
+                Self::run_guest_thread_once(kernel, physical_core);
             }
 
             // Upstream: kernel.SetIsPhantomModeForSingleCore(true);
@@ -375,7 +455,7 @@ impl CpuManager {
     ///
     /// Upstream: `CpuManager::SingleCoreRunIdleThread()` (cpu_manager.cpp:133-143).
     fn single_core_run_idle_thread(
-        kernel: &mut KernelCore,
+        kernel: &KernelCore,
         core_timing: &Arc<Mutex<CoreTiming>>,
         current_core: &AtomicUsize,
         idle_count: &mut usize,
@@ -520,7 +600,9 @@ impl CpuManager {
 
         // Running.
         // Upstream: if (!gpu_barrier->Sync(token)) { return; }
+        log::info!("CpuManager: {} waiting on GPU barrier", name);
         gpu_barrier.sync();
+        log::info!("CpuManager: {} GPU barrier released", name);
         if stop_requested.load(Ordering::Relaxed) {
             return;
         }
