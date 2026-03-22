@@ -10,6 +10,7 @@
 //! KMemoryManager, KMemoryLayout, KHardwareTimer, KHandleTable,
 //! KResourceLimit, KWorkerTaskManager, and many other subsystems.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -26,12 +27,42 @@ use super::physical_core::PhysicalCore;
 use crate::core_timing::CoreTiming;
 use crate::hardware_properties;
 
-/// Thread-local host thread ID.
-/// Upstream: `static inline thread_local u8 host_thread_id = UINT8_MAX` in KernelCore::Impl.
-/// Core threads get IDs 0..NUM_CPU_CORES-1. Other host threads get IDs >= NUM_CPU_CORES.
-/// UINT8_MAX (255) means "not yet registered".
+// Thread-local host thread ID.
+// Upstream: `static inline thread_local u8 host_thread_id = UINT8_MAX` in KernelCore::Impl.
+// Core threads get IDs 0..NUM_CPU_CORES-1. Other host threads get IDs >= NUM_CPU_CORES.
+// UINT8_MAX (255) means "not yet registered".
 std::thread_local! {
     static HOST_THREAD_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+// Thread-local current thread pointer.
+// Upstream: `static inline thread_local KThread* current_thread{nullptr}` in KernelCore::Impl.
+// Each physical core host thread (and any other host thread) stores its own current KThread.
+std::thread_local! {
+    static CURRENT_THREAD: RefCell<Option<Weak<Mutex<KThread>>>> = RefCell::new(None);
+}
+
+/// Get the current emulation thread for the calling host thread.
+/// Upstream: `KernelCore::Impl::GetCurrentEmuThread()`.
+pub fn get_current_emu_thread() -> Option<Arc<Mutex<KThread>>> {
+    CURRENT_THREAD.with(|cell| {
+        cell.borrow().as_ref().and_then(Weak::upgrade)
+    })
+}
+
+/// Set the current emulation thread for the calling host thread.
+/// Upstream: `KernelCore::Impl::SetCurrentEmuThread(KThread*)`.
+pub fn set_current_emu_thread(thread: Option<&Arc<Mutex<KThread>>>) {
+    CURRENT_THREAD.with(|cell| {
+        *cell.borrow_mut() = thread.map(Arc::downgrade);
+    });
+}
+
+/// Get the current thread pointer for the calling host thread.
+/// Upstream: `GetCurrentThreadPointer(kernel)`.
+/// Returns None if no thread is set.
+pub fn get_current_thread_pointer() -> Option<Arc<Mutex<KThread>>> {
+    get_current_emu_thread()
 }
 
 /// Constants from the upstream KernelCore::Impl.
@@ -92,10 +123,6 @@ pub struct KernelCore {
     /// Physical memory manager. Upstream: `Impl::memory_manager`.
     memory_manager: KMemoryManager,
 
-    // -- Current thread tracking --
-    // Upstream: thread_local KThread* current_thread in Impl.
-    // In cooperative model, only one guest thread runs at a time.
-    current_emu_thread: Option<Weak<Mutex<KThread>>>,
 }
 
 // KProcess initial ID constants (matching upstream).
@@ -133,7 +160,6 @@ impl KernelCore {
             memory_manager: KMemoryManager::new(),
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
             single_core_thread_id: AtomicU32::new(0),
-            current_emu_thread: None,
         }
     }
 
@@ -341,16 +367,18 @@ impl KernelCore {
         self.object_name_global_data.as_ref()
     }
 
-    /// Get the current emulation thread.
+    /// Get the current emulation thread for the calling host thread.
     /// Matches upstream `KernelCore::GetCurrentEmuThread()`.
+    /// Delegates to the thread-local `get_current_emu_thread()` free function.
     pub fn get_current_emu_thread(&self) -> Option<Arc<Mutex<KThread>>> {
-        self.current_emu_thread.as_ref()?.upgrade()
+        get_current_emu_thread()
     }
 
-    /// Set the current emulation thread.
+    /// Set the current emulation thread for the calling host thread.
     /// Matches upstream `KernelCore::SetCurrentEmuThread(KThread*)`.
-    pub fn set_current_emu_thread(&mut self, thread: Option<&Arc<Mutex<KThread>>>) {
-        self.current_emu_thread = thread.map(Arc::downgrade);
+    /// Delegates to the thread-local `set_current_emu_thread()` free function.
+    pub fn set_current_emu_thread(&self, thread: Option<&Arc<Mutex<KThread>>>) {
+        set_current_emu_thread(thread);
     }
 
     /// Register a kernel object for leak tracking.

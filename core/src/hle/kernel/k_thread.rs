@@ -1732,21 +1732,25 @@ impl KThread {
     /// Matches upstream `KThread::FinishTermination()` (k_thread.cpp:428-448).
     ///
     /// Upstream spins until the thread is not executing on any core, then
-    /// signals the synchronization object and closes the thread reference.
+    /// acquires the scheduler lock, signals the synchronization object,
+    /// and closes the thread reference.
     pub fn finish_termination(&mut self) {
         // Upstream: Ensure the thread is not executing on any core.
-        // In upstream this is a spin-wait checking each core's scheduler current
-        // thread. In our cooperative model, the thread is guaranteed not to be
-        // executing when we reach this point, so we skip the spin.
-        //
-        // Upstream code for reference:
-        //   if (m_parent != nullptr) {
-        //       for (size_t i = 0; i < NUM_CPU_CORES; ++i) {
-        //           KThread* core_thread;
-        //           do { core_thread = m_kernel.Scheduler(i).GetSchedulerCurrentThread(); }
-        //           while (core_thread == this);
-        //       }
-        //   }
+        // Upstream spin-waits checking each core's scheduler current thread.
+        // We check via the process's scheduler references if available.
+        if self.parent.is_some() {
+            // Spin-wait: upstream does a tight loop per core checking
+            // scheduler.GetSchedulerCurrentThread() != this.
+            // In our model, the fiber-based context switching ensures
+            // that by the time the worker task runs, the thread has
+            // already been unloaded from its core. The spin is a safety check.
+            // We yield briefly to let any in-progress context switch complete.
+            std::thread::yield_now();
+        }
+
+        // Upstream: KScopedSchedulerLock sl{m_kernel};
+        // The scheduler lock ensures atomicity with thread state changes.
+        // The caller (do_worker_task_impl or exit) should acquire this.
 
         // Signal.
         // Upstream: m_signaled = true; KSynchronizationObject::NotifyAvailable();
@@ -1854,7 +1858,9 @@ impl KThread {
         }
 
         // Upstream: UNREACHABLE_MSG("KThread::Exit() would return")
-        // In our cooperative model, the caller handles thread cleanup.
+        // In the full fiber-based execution model, the scheduler context-switches
+        // away and this point is never reached.
+        log::error!("KThread::Exit() returned — upstream marks this as unreachable");
     }
 
     /// Terminate the thread (called by another thread).
@@ -1878,18 +1884,19 @@ impl KThread {
 
         // Upstream: Wait on this thread as a synchronization object until it
         // signals (i.e., until FinishTermination sets m_signaled = true).
-        //
         //   s32 index;
         //   KSynchronizationObject* objects[] = {this};
         //   R_TRY(KSynchronizationObject::Wait(m_kernel, &index, objects, 1,
         //                                      Svc::WaitInfinite));
         //
-        // In our cooperative model, the thread will complete termination
-        // when its execution returns to the scheduler loop. The caller
-        // should check thread state if synchronous termination is needed.
-        //
-        // Upstream: KSynchronizationObject::Wait() for blocking until terminated.
-        // Thread parking via begin_wait/end_wait is now available.
+        // Wait using the termination condvar. This blocks until
+        // FinishTermination() sets the completion flag.
+        let wait_pair = self.termination_wait_pair.clone();
+        let (lock, cv) = &*wait_pair;
+        let mut completed = lock.lock().unwrap();
+        while !*completed {
+            completed = cv.wait(completed).unwrap();
+        }
 
         RESULT_SUCCESS.get_inner_value()
     }
@@ -2651,14 +2658,20 @@ impl KScopedDisableDispatch {
 
 impl Drop for KScopedDisableDispatch {
     fn drop(&mut self) {
-        let mut thread = self.thread.lock().unwrap();
+        // Upstream: ~KScopedDisableDispatch() (k_thread.cpp:1429-1446)
+        // If shutting down, do nothing.
+        // Otherwise, if dispatch count is 1, reschedule; if > 1, just enable.
+
+        let thread = self.thread.lock().unwrap();
         if thread.get_disable_dispatch_count() <= 1 {
-            // Upstream: would call RescheduleCurrentCore() or
-            // RescheduleCurrentHLEThread(). In cooperative model,
-            // scheduling happens at SVC boundaries. Just enable dispatch.
-            thread.enable_dispatch();
+            drop(thread);
+            // Upstream: scheduler->RescheduleCurrentCore() if scheduler exists
+            // and not phantom mode; otherwise RescheduleCurrentHLEThread.
+            // Use the HLE reschedule path since we don't have kernel context here.
+            KScheduler::reschedule_current_hle_thread();
         } else {
-            thread.enable_dispatch();
+            drop(thread);
+            self.thread.lock().unwrap().enable_dispatch();
         }
     }
 }

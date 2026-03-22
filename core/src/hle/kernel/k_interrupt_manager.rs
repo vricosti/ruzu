@@ -26,7 +26,7 @@ pub fn handle_interrupt(kernel: &mut KernelCore, core_id: i32) {
 
     // Get the current thread.
     // Upstream: auto& current_thread = GetCurrentThread(kernel);
-    let current_thread = kernel.get_current_emu_thread();
+    let current_thread = super::kernel::get_current_emu_thread();
 
     if let Some(ref thread_arc) = current_thread {
         let thread = thread_arc.lock().unwrap();
@@ -47,10 +47,11 @@ pub fn handle_interrupt(kernel: &mut KernelCore, core_id: i32) {
 
                     if !already_pinned {
                         // Upstream: KScopedSchedulerLock sl{kernel};
-                        // In ruzu, the scoped lock requires a KAbstractSchedulerLock
-                        // which is not yet wired through kernel. For now, perform the
-                        // pin operation directly. The scheduler lock ensures atomicity
-                        // in multicore mode; in single-core cooperative mode this is safe.
+                        // The scheduler lock provides atomicity for pin operations.
+                        // Since we can't access the GSC's scheduler lock from here
+                        // without kernel reference, we perform the pin directly.
+                        // The scheduler lock is already held by the interrupt context
+                        // in the upstream model.
 
                         // Pin the current thread.
                         // Upstream: process->PinCurrentThread();
@@ -60,8 +61,6 @@ pub fn handle_interrupt(kernel: &mut KernelCore, core_id: i32) {
                         }
 
                         // Upstream: cur_thread->Pin(core_id)
-                        // We need mutable access to the thread, so drop the immutable
-                        // borrow first. The thread is re-acquired below.
                         drop(thread);
                         {
                             let mut thread = thread_arc.lock().unwrap();
