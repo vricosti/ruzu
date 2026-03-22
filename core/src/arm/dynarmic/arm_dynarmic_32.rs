@@ -68,7 +68,18 @@ struct DynarmicCallbacks32 {
     core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
     /// Last exception address reported by dynarmic.
     last_exception_address: Arc<AtomicU64>,
+    /// Raw pointer to the jit's halt_reason field (AtomicU32).
+    /// Used by exception_raised() to halt execution exactly as upstream does
+    /// via `m_parent.m_jit->HaltExecution(hr)`.
+    /// Set after jit creation via `set_halt_reason_ptr()`.
+    /// Safety: valid for the lifetime of the A32Jit that owns this callback.
+    jit_halt_reason_ptr: Option<*const u32>,
 }
+
+// Safety: jit_halt_reason_ptr points to an AtomicU32 inside the heap-allocated
+// JitInner, which is stable for the jit's lifetime. The pointer is only used
+// for atomic operations (fetch_or) which are thread-safe.
+unsafe impl Send for DynarmicCallbacks32 {}
 
 impl DynarmicCallbacks32 {
     fn new(
@@ -83,7 +94,16 @@ impl DynarmicCallbacks32 {
             std::sync::Arc::as_ptr(&memory),
             memory.read().unwrap().base,
             if core_memory.is_some() { "wired" } else { "fallback" });
-        Self { memory, core_memory, svc_swi, uses_wall_clock, core_timing, last_exception_address }
+        Self { memory, core_memory, svc_swi, uses_wall_clock, core_timing, last_exception_address, jit_halt_reason_ptr: None }
+    }
+
+    /// Halt the jit by atomically OR-ing a halt reason into the jit's halt_reason field.
+    /// This is the Rust equivalent of upstream's `m_parent.m_jit->HaltExecution(hr)`.
+    fn halt_execution(&self, reason: rdynarmic::halt_reason::HaltReason) {
+        if let Some(ptr) = self.jit_halt_reason_ptr {
+            let atomic = unsafe { &*(ptr as *const std::sync::atomic::AtomicU32) };
+            atomic.fetch_or(reason.bits(), Ordering::Release);
+        }
     }
 
     /// Matches upstream `DynarmicCallbacks32::CheckMemoryAccess`.
@@ -296,37 +316,32 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn exception_raised(&mut self, pc: u64, exception: u64) {
-        // ARM32 exception type 3 = NoExecuteFault (from upstream dynarmic Exception enum).
-        // Other values are unexpected for A32.
-        self.last_exception_address
-            .store(pc, Ordering::Relaxed);
-        log::error!(
-            "DynarmicCallbacks32::exception_raised(pc={:#x}, exception={:#x})",
-            pc, exception
-        );
-        let start = pc.saturating_sub(0x40);
-        log::error!("DynarmicCallbacks32 exception window around pc={:#x}", pc);
-        if let Some(ref cm) = self.core_memory {
-            let m = cm.lock().unwrap();
-            for addr in (start..=pc.saturating_add(0x20)).step_by(4) {
-                if !m.is_valid_virtual_address(addr) {
-                    log::error!("  [{:#010x}] <unmapped>", addr);
-                    continue;
-                }
-                let insn = m.read_32(addr);
-                let marker = if addr == pc { " <EXC>" } else { "" };
-                log::error!("  [{:#010x}] {:#010x}{}", addr, insn, marker);
+        // Port of upstream ExceptionRaised (arm_dynarmic_32.cpp:92-109).
+        //
+        // A32 Exception enum values:
+        //   0=UndefinedInstruction, 1=UnpredictableInstruction, 2=DecodeError,
+        //   3=SendEvent, 4=SendEventLocal, 5=WaitForInterrupt, 6=WaitForEvent,
+        //   7=Yield, 8=Breakpoint, 9=PreloadData, 10=PreloadDataWithIntentToWrite,
+        //   11=PreloadInstruction, 12=NoExecuteFault
+        //
+        // Upstream behavior:
+        //   NoExecuteFault (12): log critical + ReturnException(pc, PrefetchAbort) → halts
+        //   default (all others): if debugger, ReturnException(pc, InstructionBreakpoint)
+        //                         else just log critical (NO halt — execution continues)
+        match exception {
+            12 => {
+                // NoExecuteFault — halt execution.
+                self.last_exception_address.store(pc, Ordering::Relaxed);
+                log::error!("Cannot execute instruction at unmapped address {:#08x}", pc);
+                self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
-        } else {
-            let mem = self.memory.read().unwrap();
-            for addr in (start..=pc.saturating_add(0x10)).step_by(4) {
-                if !mem.is_valid_range(addr, 4) {
-                    log::error!("  [{:#010x}] <unmapped>", addr);
-                    continue;
-                }
-                let insn = mem.read_32(addr);
-                let marker = if addr == pc { " <EXC>" } else { "" };
-                log::error!("  [{:#010x}] {:#010x}{}", addr, insn, marker);
+            _ => {
+                // All other exceptions: log and continue (no halt).
+                // Upstream only halts here if debugger is enabled (not implemented).
+                log::error!(
+                    "ExceptionRaised(exception={}, pc={:#08x})",
+                    exception, pc
+                );
             }
         }
     }
@@ -351,6 +366,10 @@ impl JitCallbacks for DynarmicCallbacks32 {
         }
         let ct = self.core_timing.lock().unwrap();
         std::cmp::max(ct.get_downcount(), 0) as u64
+    }
+
+    fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
+        self.jit_halt_reason_ptr = Some(ptr);
     }
 }
 
@@ -431,6 +450,9 @@ impl ArmDynarmic32 {
             },
         };
 
+        // A32Jit::new() internally calls callbacks.set_halt_reason_ptr() with a
+        // pointer to jit_state.halt_reason, so exception_raised() can halt execution
+        // exactly as upstream's m_parent.m_jit->HaltExecution(hr).
         let jit = match rdynarmic::A32Jit::new(config) {
             Ok(jit) => {
                 log::info!("ArmDynarmic32: JIT created successfully for core {}", core_index);
