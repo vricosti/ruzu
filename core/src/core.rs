@@ -209,6 +209,12 @@ pub struct System {
     execute_program_callback: Option<ExecuteProgramCallback>,
     /// Callback to exit the application.
     exit_callback: Option<ExitCallback>,
+    /// Factory callback for creating video/audio subsystems.
+    /// Called by setup_for_application_process() to create Host1x, GPU, AudioCore.
+    /// Upstream creates these directly in SetupForApplicationProcess (core.cpp:277-283)
+    /// but Rust can't due to circular crate dependencies (video_core/audio_core depend on core).
+    /// The frontend registers this callback before calling load().
+    subsystem_factory: Option<Box<dyn FnOnce(&mut System) + Send>>,
 
     // ── Loader / VFS ──
     /// The application loader used to load the game.
@@ -296,6 +302,7 @@ impl System {
             user_channel: VecDeque::new(),
             execute_program_callback: None,
             exit_callback: None,
+            subsystem_factory: None,
             app_loader: None,
             virtual_filesystem: None,
             current_process: None,
@@ -407,17 +414,16 @@ impl System {
         // Upstream: telemetry_session = std::make_unique<Core::TelemetrySession>();
         self.telemetry_session = Some(crate::telemetry_session::TelemetrySession::new());
 
-        // 2. Host1x core — created by the frontend via set_host1x_core() after load()
-        //    returns, because video_core does not depend on core.
-        //    Upstream: host1x_core = make_unique<Tegra::Host1x::Host1x>(system);
-
-        // 3. GPU — created by the frontend via set_gpu_core() after load() returns.
-        //    Upstream: gpu_core = VideoCore::CreateGPU(emu_window, system);
-        //    Needs EmuWindow which is frontend-owned.
-
-        // 4. AudioCore — created by the frontend via set_audio_core() after load()
-        //    returns, because audio_core crate depends on core (circular dep).
-        //    Upstream: audio_core = make_unique<AudioCore::AudioCore>(system).
+        // 2-4. Host1x, GPU, AudioCore
+        // Upstream creates these directly (core.cpp:277-283):
+        //   host1x_core = make_unique<Host1x>(system);
+        //   gpu_core = VideoCore::CreateGPU(emu_window, system);
+        //   audio_core = make_unique<AudioCore>(system);
+        // In Rust, video_core/audio_core crates depend on core (circular dep),
+        // so the frontend provides a factory callback that creates them.
+        if let Some(factory) = self.subsystem_factory.take() {
+            factory(self);
+        }
 
         // 5. Create the ServiceManager.
         // Upstream: service_manager = std::make_shared<SM::ServiceManager>(kernel);
@@ -736,6 +742,13 @@ impl System {
     /// Upstream: `system.GetContentProvider()`.
     pub fn get_content_provider(&self) -> Option<&Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>> {
         self.content_provider.as_ref()
+    }
+
+    /// Register the subsystem factory callback.
+    /// The frontend calls this before load() to provide Host1x/GPU/AudioCore creation.
+    /// setup_for_application_process() will call this during loading.
+    pub fn set_subsystem_factory(&mut self, factory: Box<dyn FnOnce(&mut System) + Send>) {
+        self.subsystem_factory = Some(factory);
     }
 
     /// Get the virtual filesystem.
