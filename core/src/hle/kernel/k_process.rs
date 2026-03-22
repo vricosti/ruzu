@@ -734,6 +734,129 @@ impl KProcess {
         self.is_default_application_system_resource
     }
 
+    // -- Memory size methods matching upstream k_process.cpp:849-907 --
+
+    /// Matches upstream `KProcess::GetRequiredSecureMemorySizeNonDefault` (k_process.h:358-365).
+    fn get_required_secure_memory_size_non_default(&self) -> usize {
+        if !self.is_default_application_system_resource {
+            if let Some(ref sys_res) = self.system_resource {
+                let sr = sys_res.lock().unwrap();
+                if sr.base().is_secure_resource() {
+                    return sr.calculate_required_secure_memory_size_self();
+                }
+            }
+        }
+        0
+    }
+
+    /// Matches upstream `KProcess::GetRequiredSecureMemorySize` (k_process.h:367-374).
+    fn get_required_secure_memory_size(&self) -> usize {
+        if let Some(ref sys_res) = self.system_resource {
+            let sr = sys_res.lock().unwrap();
+            if sr.base().is_secure_resource() {
+                return sr.calculate_required_secure_memory_size_self();
+            }
+        }
+        0
+    }
+
+    /// Matches upstream `KProcess::GetUsedUserPhysicalMemorySize` (k_process.cpp:849-855).
+    pub fn get_used_user_physical_memory_size(&self) -> usize {
+        let norm_size = self.page_table.get_base().get_normal_memory_size();
+        let other_size = self.code_size + self.main_thread_stack_size;
+        let sec_size = self.get_required_secure_memory_size_non_default();
+        norm_size + other_size + sec_size
+    }
+
+    /// Matches upstream `KProcess::GetTotalUserPhysicalMemorySize` (k_process.cpp:857-877).
+    pub fn get_total_user_physical_memory_size(&self) -> usize {
+        // Get the amount of free and used size.
+        let free_size = if let Some(ref rl) = self.resource_limit {
+            rl.lock().unwrap().get_free_value(LimitableResource::PhysicalMemoryMax) as usize
+        } else {
+            0
+        };
+        let max_size = self.max_process_memory;
+
+        // Determine used size.
+        // NOTE: This does *not* check IsDefaultApplicationSystemResource(), unlike
+        // GetUsedUserPhysicalMemorySize().
+        let norm_size = self.page_table.get_base().get_normal_memory_size();
+        let other_size = self.code_size + self.main_thread_stack_size;
+        let sec_size = self.get_required_secure_memory_size();
+        let used_size = norm_size + other_size + sec_size;
+
+        // NOTE: These function calls will recalculate, introducing a race...it is unclear why
+        // Nintendo does it this way.
+        if used_size + free_size > max_size {
+            max_size
+        } else {
+            free_size + self.get_used_user_physical_memory_size()
+        }
+    }
+
+    /// Matches upstream `KProcess::GetUsedNonSystemUserPhysicalMemorySize` (k_process.cpp:880-884).
+    pub fn get_used_non_system_user_physical_memory_size(&self) -> usize {
+        let norm_size = self.page_table.get_base().get_normal_memory_size();
+        let other_size = self.code_size + self.main_thread_stack_size;
+        norm_size + other_size
+    }
+
+    /// Matches upstream `KProcess::GetTotalNonSystemUserPhysicalMemorySize` (k_process.cpp:887-907).
+    pub fn get_total_non_system_user_physical_memory_size(&self) -> usize {
+        // Get the amount of free and used size.
+        let free_size = if let Some(ref rl) = self.resource_limit {
+            rl.lock().unwrap().get_free_value(LimitableResource::PhysicalMemoryMax) as usize
+        } else {
+            0
+        };
+        let max_size = self.max_process_memory;
+
+        // Determine used size.
+        // NOTE: This does *not* check IsDefaultApplicationSystemResource(), unlike
+        // GetUsedUserPhysicalMemorySize().
+        let norm_size = self.page_table.get_base().get_normal_memory_size();
+        let other_size = self.code_size + self.main_thread_stack_size;
+        let sec_size = self.get_required_secure_memory_size();
+        let used_size = norm_size + other_size + sec_size;
+
+        // NOTE: These function calls will recalculate, introducing a race...it is unclear why
+        // Nintendo does it this way.
+        if used_size + free_size > max_size {
+            max_size - self.get_required_secure_memory_size_non_default()
+        } else {
+            free_size + self.get_used_non_system_user_physical_memory_size()
+        }
+    }
+
+    /// Matches upstream `KProcess::GetTotalSystemResourceSize` (k_process.h:376-383).
+    pub fn get_total_system_resource_size(&self) -> usize {
+        if self.is_default_application_system_resource {
+            return 0;
+        }
+        if let Some(ref sys_res) = self.system_resource {
+            let sr = sys_res.lock().unwrap();
+            if sr.base().is_secure_resource() {
+                return sr.get_size();
+            }
+        }
+        0
+    }
+
+    /// Matches upstream `KProcess::GetUsedSystemResourceSize` (k_process.h:385-392).
+    pub fn get_used_system_resource_size(&self) -> usize {
+        if self.is_default_application_system_resource {
+            return 0;
+        }
+        if let Some(ref sys_res) = self.system_resource {
+            let sr = sys_res.lock().unwrap();
+            if sr.base().is_secure_resource() {
+                return sr.get_used_size();
+            }
+        }
+        0
+    }
+
     pub fn is_suspended(&self) -> bool {
         self.is_suspended
     }
