@@ -1219,6 +1219,14 @@ impl KProcess {
             }
         }
 
+        // Initialize the Common::PageTable implementation.
+        // Upstream does this inside InitializeForProcess; here we do it after
+        // so that operate(Map) can write page table entries that Memory uses
+        // for virtual address resolution.
+        // Without this, m_impl is None and map_memory_region() is skipped,
+        // leaving all pages "unmapped" from Memory's perspective.
+        self.page_table.get_base_mut().initialize_impl();
+
         // Set the current page table on Memory so that write_block/read_block
         // can resolve addresses during code loading.
         // Upstream: m_memory.SetCurrentPageTable(*this) (k_process.cpp:423).
