@@ -173,12 +173,12 @@ impl IAm {
 ///
 /// Corresponds to `LoopProcess` in upstream `nfc.cpp`.
 /// Services registered: nfc:am, nfc:mf:u, nfc:user, nfc:sys
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
 
     log::debug!("NFC::LoopProcess - registering nfc:am, nfc:mf:u, nfc:user, nfc:sys");
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
     crate::hle::service::services::register_stub_services(
         &mut server_manager,
         &["nfc:am", "nfc:mf:u", "nfc:user", "nfc:sys"],

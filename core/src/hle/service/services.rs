@@ -131,114 +131,114 @@ impl Services {
         // kernel.RunOnHostCoreProcess("bsdsocket",  [&] { Sockets::LoopProcess(system); }).detach();
         // kernel.RunOnHostCoreProcess("vi",         [&, token] { VI::LoopProcess(system, token); }).detach();
 
-        Self::loop_process_audio(service_manager);
-        Self::loop_process_filesystem(service_manager, filesystem_controller);
-        Self::loop_process_jit(service_manager);
-        Self::loop_process_ldn(service_manager);
-        Self::loop_process_loader(service_manager);
+        Self::loop_process_audio(service_manager, system);
+        Self::loop_process_filesystem(service_manager, system, filesystem_controller);
+        Self::loop_process_jit(service_manager, system);
+        Self::loop_process_ldn(service_manager, system);
+        Self::loop_process_loader(service_manager, system);
         Self::loop_process_nvservices(service_manager, system);
-        Self::loop_process_bsdsocket(service_manager);
+        Self::loop_process_bsdsocket(service_manager, system);
         Self::loop_process_vi(service_manager, system);
 
         // ── Guest core processes (upstream: blocking) ──
         // kernel.RunOnGuestCoreProcess("sm", ...) is called FIRST.
         // SM::LoopProcess registers the "sm:" port via ManageNamedPort.
-        crate::hle::service::sm::sm::loop_process(service_manager, crate::core::SystemRef::null());
+        crate::hle::service::sm::sm::loop_process(service_manager, system);
 
         // kernel.RunOnGuestCoreProcess("account",    [&] { Account::LoopProcess(system); });
-        Self::loop_process_account(service_manager);
+        Self::loop_process_account(service_manager, system);
         // kernel.RunOnGuestCoreProcess("am",         [&] { AM::LoopProcess(system); });
-        crate::hle::service::am::am::loop_process(service_manager);
+        crate::hle::service::am::am::loop_process(service_manager, system);
         // kernel.RunOnGuestCoreProcess("aoc",        [&] { AOC::LoopProcess(system); });
-        crate::hle::service::aoc::addon_content_manager::loop_process(service_manager);
+        crate::hle::service::aoc::addon_content_manager::loop_process(service_manager, system);
         // kernel.RunOnGuestCoreProcess("apm",        [&] { APM::LoopProcess(system); });
-        crate::hle::service::apm::apm::loop_process(service_manager);
+        crate::hle::service::apm::apm::loop_process(service_manager, system);
         // kernel.RunOnGuestCoreProcess("bcat",       [&] { BCAT::LoopProcess(system); });
-        Self::loop_process_bcat(service_manager);
+        Self::loop_process_bcat(service_manager, system);
         // kernel.RunOnGuestCoreProcess("bpc",        [&] { BPC::LoopProcess(system); });
-        Self::loop_process_bpc(service_manager);
+        Self::loop_process_bpc(service_manager, system);
         // kernel.RunOnGuestCoreProcess("btdrv",      [&] { BtDrv::LoopProcess(system); });
-        Self::loop_process_btdrv(service_manager);
+        Self::loop_process_btdrv(service_manager, system);
         // kernel.RunOnGuestCoreProcess("btm",        [&] { BTM::LoopProcess(system); });
-        Self::loop_process_btm(service_manager);
+        Self::loop_process_btm(service_manager, system);
         // kernel.RunOnGuestCoreProcess("capsrv",     [&] { Capture::LoopProcess(system); });
-        Self::loop_process_capsrv(service_manager);
+        Self::loop_process_capsrv(service_manager, system);
         // kernel.RunOnGuestCoreProcess("erpt",       [&] { ERPT::LoopProcess(system); });
-        Self::loop_process_erpt(service_manager);
+        Self::loop_process_erpt(service_manager, system);
         // kernel.RunOnGuestCoreProcess("es",         [&] { ES::LoopProcess(system); });
-        Self::loop_process_es(service_manager);
+        Self::loop_process_es(service_manager, system);
         // kernel.RunOnGuestCoreProcess("eupld",      [&] { EUPLD::LoopProcess(system); });
-        Self::loop_process_eupld(service_manager);
+        Self::loop_process_eupld(service_manager, system);
         // kernel.RunOnGuestCoreProcess("fatal",      [&] { Fatal::LoopProcess(system); });
-        Self::loop_process_fatal(service_manager);
+        Self::loop_process_fatal(service_manager, system);
         // kernel.RunOnGuestCoreProcess("fgm",        [&] { FGM::LoopProcess(system); });
-        Self::loop_process_fgm(service_manager);
+        Self::loop_process_fgm(service_manager, system);
         // kernel.RunOnGuestCoreProcess("friends",    [&] { Friend::LoopProcess(system); });
-        Self::loop_process_friends(service_manager);
+        Self::loop_process_friends(service_manager, system);
         // kernel.RunOnGuestCoreProcess("settings",   [&] { Set::LoopProcess(system); });
-        Self::loop_process_settings(service_manager);
+        Self::loop_process_settings(service_manager, system);
         // kernel.RunOnGuestCoreProcess("psc",        [&] { PSC::LoopProcess(system); });
-        Self::loop_process_psc(service_manager);
+        Self::loop_process_psc(service_manager, system);
         // kernel.RunOnGuestCoreProcess("glue",       [&] { Glue::LoopProcess(system); });
-        crate::hle::service::glue::glue::loop_process(service_manager, dm_addr, mm_addr);
+        crate::hle::service::glue::glue::loop_process(service_manager, system, dm_addr, mm_addr);
         // kernel.RunOnGuestCoreProcess("grc",        [&] { GRC::LoopProcess(system); });
-        Self::loop_process_grc(service_manager);
+        Self::loop_process_grc(service_manager, system);
         // kernel.RunOnGuestCoreProcess("hid",        [&] { HID::LoopProcess(system); });
-        Self::loop_process_hid(service_manager);
+        Self::loop_process_hid(service_manager, system);
         // kernel.RunOnGuestCoreProcess("lbl",        [&] { LBL::LoopProcess(system); });
-        Self::loop_process_lbl(service_manager);
+        Self::loop_process_lbl(service_manager, system);
         // kernel.RunOnGuestCoreProcess("LogManager.Prod", [&] { LM::LoopProcess(system); });
-        Self::loop_process_lm(service_manager);
+        Self::loop_process_lm(service_manager, system);
         // kernel.RunOnGuestCoreProcess("mig",        [&] { Migration::LoopProcess(system); });
-        Self::loop_process_mig(service_manager);
+        Self::loop_process_mig(service_manager, system);
         // kernel.RunOnGuestCoreProcess("mii",        [&] { Mii::LoopProcess(system); });
-        Self::loop_process_mii(service_manager);
+        Self::loop_process_mii(service_manager, system);
         // kernel.RunOnGuestCoreProcess("mm",         [&] { MM::LoopProcess(system); });
-        Self::loop_process_mm(service_manager);
+        Self::loop_process_mm(service_manager, system);
         // kernel.RunOnGuestCoreProcess("mnpp",       [&] { MNPP::LoopProcess(system); });
-        Self::loop_process_mnpp(service_manager);
+        Self::loop_process_mnpp(service_manager, system);
         // kernel.RunOnGuestCoreProcess("nvnflinger", [&] { Nvnflinger::LoopProcess(system); });
-        Self::loop_process_nvnflinger(service_manager);
+        Self::loop_process_nvnflinger(service_manager, system);
         // kernel.RunOnGuestCoreProcess("NCM",        [&] { NCM::LoopProcess(system); });
-        Self::loop_process_ncm(service_manager);
+        Self::loop_process_ncm(service_manager, system);
         // kernel.RunOnGuestCoreProcess("nfc",        [&] { NFC::LoopProcess(system); });
-        Self::loop_process_nfc(service_manager);
+        Self::loop_process_nfc(service_manager, system);
         // kernel.RunOnGuestCoreProcess("nfp",        [&] { NFP::LoopProcess(system); });
-        Self::loop_process_nfp(service_manager);
+        Self::loop_process_nfp(service_manager, system);
         // kernel.RunOnGuestCoreProcess("ngc",        [&] { NGC::LoopProcess(system); });
-        Self::loop_process_ngc(service_manager);
+        Self::loop_process_ngc(service_manager, system);
         // kernel.RunOnGuestCoreProcess("nifm",       [&] { NIFM::LoopProcess(system); });
-        Self::loop_process_nifm(service_manager);
+        Self::loop_process_nifm(service_manager, system);
         // kernel.RunOnGuestCoreProcess("nim",        [&] { NIM::LoopProcess(system); });
-        Self::loop_process_nim(service_manager);
+        Self::loop_process_nim(service_manager, system);
         // kernel.RunOnGuestCoreProcess("npns",       [&] { NPNS::LoopProcess(system); });
-        Self::loop_process_npns(service_manager);
+        Self::loop_process_npns(service_manager, system);
         // kernel.RunOnGuestCoreProcess("ns",         [&] { NS::LoopProcess(system); });
-        Self::loop_process_ns(service_manager);
+        Self::loop_process_ns(service_manager, system);
         // kernel.RunOnGuestCoreProcess("olsc",       [&] { OLSC::LoopProcess(system); });
-        Self::loop_process_olsc(service_manager);
+        Self::loop_process_olsc(service_manager, system);
         // kernel.RunOnGuestCoreProcess("omm",        [&] { OMM::LoopProcess(system); });
-        Self::loop_process_omm(service_manager);
+        Self::loop_process_omm(service_manager, system);
         // kernel.RunOnGuestCoreProcess("pcie",       [&] { PCIe::LoopProcess(system); });
-        Self::loop_process_pcie(service_manager);
+        Self::loop_process_pcie(service_manager, system);
         // kernel.RunOnGuestCoreProcess("pctl",       [&] { PCTL::LoopProcess(system); });
-        crate::hle::service::pctl::pctl::loop_process(service_manager);
+        crate::hle::service::pctl::pctl::loop_process(service_manager, system);
         // kernel.RunOnGuestCoreProcess("pcv",        [&] { PCV::LoopProcess(system); });
-        Self::loop_process_pcv(service_manager);
+        Self::loop_process_pcv(service_manager, system);
         // kernel.RunOnGuestCoreProcess("prepo",      [&] { PlayReport::LoopProcess(system); });
-        Self::loop_process_prepo(service_manager);
+        Self::loop_process_prepo(service_manager, system);
         // kernel.RunOnGuestCoreProcess("ProcessManager", [&] { PM::LoopProcess(system); });
-        Self::loop_process_pm(service_manager);
+        Self::loop_process_pm(service_manager, system);
         // kernel.RunOnGuestCoreProcess("ptm",        [&] { PTM::LoopProcess(system); });
-        Self::loop_process_ptm(service_manager);
+        Self::loop_process_ptm(service_manager, system);
         // kernel.RunOnGuestCoreProcess("ro",         [&] { RO::LoopProcess(system); });
-        Self::loop_process_ro(service_manager);
+        Self::loop_process_ro(service_manager, system);
         // kernel.RunOnGuestCoreProcess("spl",        [&] { SPL::LoopProcess(system); });
-        Self::loop_process_spl(service_manager);
+        Self::loop_process_spl(service_manager, system);
         // kernel.RunOnGuestCoreProcess("ssl",        [&] { SSL::LoopProcess(system); });
-        Self::loop_process_ssl(service_manager);
+        Self::loop_process_ssl(service_manager, system);
         // kernel.RunOnGuestCoreProcess("usb",        [&] { USB::LoopProcess(system); });
-        Self::loop_process_usb(service_manager);
+        Self::loop_process_usb(service_manager, system);
 
         log::info!("Services: all service processes launched");
         Self {}
@@ -251,31 +251,32 @@ impl Services {
     // Services that have real Rust implementations call their own `loop_process`.
     // Services that are still stubs use `register_stub_services` below.
 
-    fn loop_process_audio(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::audio::audio::loop_process();
+    fn loop_process_audio(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::audio::audio::loop_process(system);
     }
 
     fn loop_process_filesystem(
         sm: &Arc<Mutex<ServiceManager>>,
+        system: crate::core::SystemRef,
         fsc: Arc<Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
     ) {
-        crate::hle::service::filesystem::filesystem::loop_process(sm, fsc);
+        crate::hle::service::filesystem::filesystem::loop_process(sm, system, fsc);
     }
 
-    fn loop_process_jit(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_jit(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["jit:u"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_ldn(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_ldn(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["ldn:m", "ldn:s", "ldn:u"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_loader(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_loader(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["ldr:pm", "ldr:shel", "ldr:dmnt"]);
         ServerManager::run_server(server_manager);
     }
@@ -284,70 +285,70 @@ impl Services {
         crate::hle::service::nvdrv::loop_process(system);
     }
 
-    fn loop_process_bsdsocket(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::sockets::sockets::loop_process();
+    fn loop_process_bsdsocket(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::sockets::sockets::loop_process(system);
     }
 
     fn loop_process_vi(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
         crate::hle::service::vi::vi::loop_process(system);
     }
 
-    fn loop_process_account(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::acc::acc::loop_process();
+    fn loop_process_account(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::acc::acc::loop_process(system);
     }
 
-    fn loop_process_bcat(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::bcat::bcat::loop_process();
+    fn loop_process_bcat(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::bcat::bcat::loop_process(system);
     }
 
-    fn loop_process_bpc(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::bpc::bpc::loop_process();
+    fn loop_process_bpc(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::bpc::bpc::loop_process(system);
     }
 
-    fn loop_process_btdrv(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::btdrv::btdrv::loop_process();
+    fn loop_process_btdrv(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::btdrv::btdrv::loop_process(system);
     }
 
-    fn loop_process_btm(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::btm::btm::loop_process();
+    fn loop_process_btm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::btm::btm::loop_process(system);
     }
 
-    fn loop_process_capsrv(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::caps::caps::loop_process();
+    fn loop_process_capsrv(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::caps::caps::loop_process(system);
     }
 
-    fn loop_process_erpt(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::erpt::erpt::loop_process();
+    fn loop_process_erpt(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::erpt::erpt::loop_process(system);
     }
 
-    fn loop_process_es(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::es::es::loop_process();
+    fn loop_process_es(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::es::es::loop_process(system);
     }
 
-    fn loop_process_eupld(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::eupld::eupld::loop_process();
+    fn loop_process_eupld(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::eupld::eupld::loop_process(system);
     }
 
-    fn loop_process_fatal(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_fatal(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["fatal:u"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_fgm(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::fgm::fgm::loop_process();
+    fn loop_process_fgm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::fgm::fgm::loop_process(system);
     }
 
-    fn loop_process_friends(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::friend::friend_interface::loop_process();
+    fn loop_process_friends(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::friend::friend_interface::loop_process(system);
     }
 
-    fn loop_process_settings(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::set::settings::loop_process();
+    fn loop_process_settings(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::set::settings::loop_process(system);
     }
 
-    fn loop_process_psc(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_psc(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         // psc:c, psc:m as stubs
         register_stub_services(&mut server_manager, &["psc:c", "psc:m"]);
         // time:m — real PSC::Time::ServiceManager
@@ -363,21 +364,21 @@ impl Services {
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_grc(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::grc::grc::loop_process();
+    fn loop_process_grc(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::grc::grc::loop_process(system);
     }
 
-    fn loop_process_hid(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::hid::hid::loop_process();
+    fn loop_process_hid(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::hid::hid::loop_process(system);
     }
 
-    fn loop_process_lbl(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::lbl::lbl::loop_process();
+    fn loop_process_lbl(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::lbl::lbl::loop_process(system);
     }
 
-    fn loop_process_lm(sm: &Arc<Mutex<ServiceManager>>) {
+    fn loop_process_lm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
         // LM has a real implementation.
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+        let mut server_manager = ServerManager::new(system);
         let factory: SessionRequestHandlerFactory = Box::new(|| {
             Arc::new(crate::hle::service::lm::lm::LM::new())
         });
@@ -385,122 +386,122 @@ impl Services {
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_mig(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_mig(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["mig:usr"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_mii(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_mii(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["mii:u", "mii:e"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_mm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_mm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["mm:u"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_mnpp(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_mnpp(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["mnpp:app"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_nvnflinger(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_nvnflinger(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["dispdrv"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_ncm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_ncm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["lr", "ncm"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_nfc(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::nfc::nfc::loop_process();
+    fn loop_process_nfc(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::nfc::nfc::loop_process(system);
     }
 
-    fn loop_process_nfp(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::nfp::nfp::loop_process();
+    fn loop_process_nfp(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::nfp::nfp::loop_process(system);
     }
 
-    fn loop_process_ngc(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_ngc(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["ngc:u"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_nifm(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::nifm::nifm::loop_process();
+    fn loop_process_nifm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::nifm::nifm::loop_process(system);
     }
 
-    fn loop_process_nim(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_nim(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["nim:shp"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_npns(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_npns(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["npns:s", "npns:u"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_ns(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::ns::ns::loop_process();
+    fn loop_process_ns(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::ns::ns::loop_process(system);
     }
 
-    fn loop_process_olsc(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::olsc::olsc::loop_process();
+    fn loop_process_olsc(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::olsc::olsc::loop_process(system);
     }
 
-    fn loop_process_omm(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_omm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["omm"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_pcie(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::pcie::pcie::loop_process();
+    fn loop_process_pcie(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::pcie::pcie::loop_process(system);
     }
 
-    fn loop_process_pcv(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::pcv::pcv::loop_process();
+    fn loop_process_pcv(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::pcv::pcv::loop_process(system);
     }
 
-    fn loop_process_prepo(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::prepo::prepo::loop_process();
+    fn loop_process_prepo(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::prepo::prepo::loop_process(system);
     }
 
-    fn loop_process_pm(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::pm::pm::loop_process();
+    fn loop_process_pm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::pm::pm::loop_process(system);
     }
 
-    fn loop_process_ptm(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::ptm::ptm::loop_process();
+    fn loop_process_ptm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::ptm::ptm::loop_process(system);
     }
 
-    fn loop_process_ro(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::ro::ro::loop_process();
+    fn loop_process_ro(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::ro::ro::loop_process(system);
     }
 
-    fn loop_process_spl(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::spl::spl::loop_process();
+    fn loop_process_spl(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::spl::spl::loop_process(system);
     }
 
-    fn loop_process_ssl(sm: &Arc<Mutex<ServiceManager>>) {
-        let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    fn loop_process_ssl(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        let mut server_manager = ServerManager::new(system);
         register_stub_services(&mut server_manager, &["ssl"]);
         ServerManager::run_server(server_manager);
     }
 
-    fn loop_process_usb(_sm: &Arc<Mutex<ServiceManager>>) {
-        crate::hle::service::usb::usb::loop_process();
+    fn loop_process_usb(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+        crate::hle::service::usb::usb::loop_process(system);
     }
 }
 

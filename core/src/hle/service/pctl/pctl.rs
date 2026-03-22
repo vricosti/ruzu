@@ -25,8 +25,8 @@ use crate::hle::service::sm::sm::ServiceManager;
 ///     ServerManager::RunServer(std::move(server_manager));
 /// }
 /// ```
-pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+    let mut server_manager = ServerManager::new(system);
 
     register_named_service(
         &mut server_manager,

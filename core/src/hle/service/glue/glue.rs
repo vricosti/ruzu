@@ -39,10 +39,11 @@ use crate::hle::service::sm::sm::ServiceManager;
 /// KMemoryManager, needed by time services for shared memory allocation.
 pub fn loop_process(
     service_manager: &Arc<Mutex<ServiceManager>>,
+    system: crate::core::SystemRef,
     dm_addr: usize,
     mm_addr: usize,
 ) {
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     // ARP — stub until real implementations
     register_stub(&mut server_manager, "arp:r");

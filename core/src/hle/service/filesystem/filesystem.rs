@@ -528,17 +528,19 @@ impl VfsDirectoryServiceWrapper {
 /// Registers "fsp-ldr", "fsp:pr", "fsp-srv".
 pub fn loop_process(
     service_manager: &Arc<Mutex<ServiceManager>>,
+    system: crate::core::SystemRef,
     fsc: Arc<Mutex<FileSystemController>>,
 ) {
-    register_services(service_manager, fsc);
+    register_services(service_manager, system, fsc);
 }
 
 pub fn register_services(
     service_manager: &Arc<Mutex<ServiceManager>>,
+    system: crate::core::SystemRef,
     fsc: Arc<Mutex<FileSystemController>>,
 ) {
     let mut server_manager =
-        crate::hle::service::server_manager::ServerManager::new(crate::core::SystemRef::null());
+        crate::hle::service::server_manager::ServerManager::new(system);
 
     server_manager.register_named_service(
         "fsp-ldr",

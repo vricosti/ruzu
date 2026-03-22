@@ -36,10 +36,10 @@ impl Module {
 ///     ServerManager::RunServer(std::move(server_manager));
 /// }
 /// ```
-pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
+pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
     let module = Arc::new(Module::new());
     let controller = Arc::new(Mutex::new(super::apm_controller::Controller::new()));
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     let factory: SessionRequestHandlerFactory = {
         let module = module.clone();

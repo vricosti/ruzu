@@ -19,12 +19,12 @@ use super::system_settings_server::ISystemSettingsServer;
 /// Registers "set", "set:cal", "set:fd", "set:sys" services.
 ///
 /// Corresponds to `Set::LoopProcess` in upstream settings.cpp.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use std::sync::Arc;
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     // "set" -> ISettingsServer
     server_manager.register_named_service(

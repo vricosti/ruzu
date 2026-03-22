@@ -441,18 +441,19 @@ impl System {
         // Upstream: service_manager = std::make_shared<SM::ServiceManager>(kernel);
         let service_manager = Arc::new(StdMutex::new(ServiceManager::new()));
 
+        // Store service_manager on System BEFORE launching services,
+        // so that ServerManager::register_named_service can find it via
+        // system.service_manager() during registration.
+        self.service_manager = Some(service_manager.clone());
+
         // 6. Launch all system services.
         // Upstream: services = std::make_unique<Services>(service_manager, system, stop_token);
-        // This calls each service module's LoopProcess which registers named
-        // services on the ServiceManager via per-process ServerManagers.
         let dm_ptr = self.device_memory.as_ref().unwrap().as_ref() as *const DeviceMemory;
         let mm_ptr = self.kernel.as_mut().unwrap().memory_manager_mut() as *mut _;
         let system_ref = SystemRef::from_ref(self);
         let _services = crate::hle::service::services::Services::new(
             &service_manager, system_ref, dm_ptr, mm_ptr, self.filesystem_controller.clone(),
         );
-
-        self.service_manager = Some(service_manager);
 
         // Upstream: is_powered_on = true, exit_locked = false, exit_requested = false
         self.is_powered_on.store(true, Ordering::Relaxed);

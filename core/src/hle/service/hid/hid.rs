@@ -19,7 +19,7 @@ use crate::hle::service::server_manager::ServerManager;
 /// - "irs"      -> IRS
 /// - "irs:sys"  -> IRS_SYS
 /// - "xcd:sys"  -> XCD_SYS
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     let firmware_settings = Arc::new(HidFirmwareSettings::new());
     let hid_core = Arc::new(parking_lot::Mutex::new(HIDCore::new()));
     let resource_manager = Arc::new(parking_lot::Mutex::new(
@@ -28,7 +28,7 @@ pub fn loop_process() {
 
     resource_manager.lock().initialize();
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     // "hid" -> IHidServer
     {

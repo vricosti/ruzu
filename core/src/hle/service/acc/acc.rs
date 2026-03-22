@@ -429,7 +429,7 @@ pub fn new_iprofile_editor(
 ///
 /// Corresponds to `LoopProcess` in upstream `acc.cpp`.
 /// Services registered: acc:u0, acc:u1, acc:su, acc:aa
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use std::sync::Arc;
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
@@ -441,7 +441,7 @@ pub fn loop_process() {
         super::profile_manager::ProfileManager::new(),
     ));
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     // acc:aa -> ACC_AA
     {
@@ -450,7 +450,7 @@ pub fn loop_process() {
         server_manager.register_named_service(
             "acc:aa",
             Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::acc_aa::AccAA::new(m.clone(), pm.clone(), crate::core::SystemRef::null()))
+                Arc::new(super::acc_aa::AccAA::new(m.clone(), pm.clone(), system))
             }),
             64,
         );
@@ -463,7 +463,7 @@ pub fn loop_process() {
         server_manager.register_named_service(
             "acc:su",
             Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::acc_su::AccSU::new(m.clone(), pm.clone(), crate::core::SystemRef::null()))
+                Arc::new(super::acc_su::AccSU::new(m.clone(), pm.clone(), system))
             }),
             64,
         );
@@ -476,7 +476,7 @@ pub fn loop_process() {
         server_manager.register_named_service(
             "acc:u0",
             Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::acc_u0::AccU0::new(m.clone(), pm.clone(), crate::core::SystemRef::null()))
+                Arc::new(super::acc_u0::AccU0::new(m.clone(), pm.clone(), system))
             }),
             64,
         );
@@ -489,7 +489,7 @@ pub fn loop_process() {
         server_manager.register_named_service(
             "acc:u1",
             Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::acc_u1::AccU1::new(m.clone(), pm.clone(), crate::core::SystemRef::null()))
+                Arc::new(super::acc_u1::AccU1::new(m.clone(), pm.clone(), system))
             }),
             64,
         );

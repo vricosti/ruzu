@@ -52,11 +52,11 @@ impl ServiceFramework for GRC {
 /// ```cpp
 /// server_manager->RegisterNamedService("grc:c", std::make_shared<GRC>(system));
 /// ```
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     server_manager.register_named_service(
         "grc:c",

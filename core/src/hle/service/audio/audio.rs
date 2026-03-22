@@ -17,8 +17,8 @@ use crate::hle::service::server_manager::ServerManager;
 /// server_manager->RegisterNamedService("audren:u", std::make_shared<IAudioRendererManager>(system));
 /// server_manager->RegisterNamedService("hwopus", std::make_shared<IHardwareOpusDecoderManager>(system));
 /// ```
-pub fn loop_process() {
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+pub fn loop_process(system: crate::core::SystemRef) {
+    let mut server_manager = ServerManager::new(system);
 
     // audctl — IAudioController does not yet implement SessionRequestHandler, use stub
     crate::hle::service::services::register_stub_services(&mut server_manager, &["audctl"]);

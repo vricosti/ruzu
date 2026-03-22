@@ -361,11 +361,11 @@ impl IAddOnContentManager {
 ///     ServerManager::RunServer(std::move(server_manager));
 /// }
 /// ```
-pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
+pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
     let mut server_manager =
-        crate::hle::service::server_manager::ServerManager::new(crate::core::SystemRef::null());
+        crate::hle::service::server_manager::ServerManager::new(system);
     let factory: SessionRequestHandlerFactory =
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IAddOnContentManager::new(crate::core::SystemRef::null())) });
+        Box::new(move || -> SessionRequestHandlerPtr { Arc::new(IAddOnContentManager::new(system)) });
     server_manager.register_named_service("aoc:u", factory, 64);
     crate::hle::service::server_manager::ServerManager::run_server(server_manager);
 }
