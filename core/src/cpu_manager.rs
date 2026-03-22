@@ -289,6 +289,15 @@ impl CpuManager {
     /// Runs on the guest fiber. Calls PhysicalCore::RunThread in a loop,
     /// handling interrupts between runs.
     pub fn multi_core_run_guest_thread(kernel: &KernelCore) {
+        log::info!("multi_core_run_guest_thread: ENTERED on core {}", kernel.current_physical_core_index());
+
+        let cur_thread = super::hle::kernel::kernel::get_current_thread_pointer();
+        log::info!(
+            "multi_core_run_guest_thread: current_thread={}, has_parent={}",
+            cur_thread.as_ref().map(|t| t.lock().unwrap().get_thread_id()).unwrap_or(u64::MAX),
+            cur_thread.as_ref().map(|t| t.lock().unwrap().parent.is_some()).unwrap_or(false),
+        );
+
         // Upstream: auto* thread = Kernel::GetCurrentThreadPointer(kernel);
         // kernel.CurrentScheduler()->OnThreadStart();
         if let Some(thread_arc) = super::hle::kernel::kernel::get_current_thread_pointer() {
