@@ -314,9 +314,35 @@ fn main() {
     }
 
     // -----------------------------------------------------------------------
-    // Step 5 (upstream): system.Load(*emu_window, filepath, load_parameters).
+    // Step 5: Register subsystem factory.
+    // Upstream creates Host1x, GPU, AudioCore inside SetupForApplicationProcess()
+    // (core.cpp:277-283). In Rust, video_core/audio_core crates can't be created
+    // from core due to circular dependencies, so we provide a factory callback.
+    // -----------------------------------------------------------------------
+    system.set_subsystem_factory(Box::new(|system| {
+        use std::sync::Arc;
+
+        // Host1x (upstream core.cpp:277): host1x_core = make_unique<Host1x>(system)
+        let host1x = video_core::host1x::host1x::Host1x::new();
+        system.set_host1x_core(Box::new(host1x));
+
+        // GPU (upstream core.cpp:278): gpu_core = VideoCore::CreateGPU(emu_window, system)
+        let gpu = video_core::gpu::Gpu::new(false, true);
+        system.set_gpu_core(Box::new(gpu));
+
+        // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
+        let shared_system: audio_core::SharedSystem =
+            Arc::new(parking_lot::Mutex::new(ruzu_core::core::System::new()));
+        let ac = audio_core::AudioCore::new(shared_system);
+        system.set_audio_core(Box::new(ac));
+    }));
+
+    // -----------------------------------------------------------------------
+    // Step 6 (upstream): system.Load(*emu_window, filepath, load_parameters).
     // Upstream passes the window reference to Load; our Rust Load doesn't
     // accept one yet, so we call with the current signature.
+    // The factory callback above will be called during load() ->
+    // setup_for_application_process() to create Host1x/GPU/AudioCore.
     // -----------------------------------------------------------------------
     let load_result = system.load(&filepath);
     if load_result != ruzu_core::core::SystemResultStatus::Success {
@@ -329,42 +355,11 @@ fn main() {
     }
 
     // Multiplayer callbacks are wired here when Network::RoomMember is ported.
-    // For now, log if multiplayer was requested.
     if let Some(ref mp) = args.multiplayer {
         log::warn!(
             "Multiplayer '{}' requested but Network::RoomMember not yet ported; ignoring",
             mp
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Create video/audio subsystems that upstream creates in
-    // SetupForApplicationProcess(). These live in the frontend because
-    // video_core and audio_core crates cannot be dependencies of core
-    // (circular dependency). Upstream order:
-    // 1. TelemetrySession — created inside core's setup_for_application_process()
-    // 2. Host1x
-    // 3. GPU
-    // 4. AudioCore
-    // -----------------------------------------------------------------------
-    {
-        use std::sync::Arc;
-
-        // Host1x (upstream core.cpp:277): host1x_core = make_unique<Host1x>(system)
-        let host1x = video_core::host1x::host1x::Host1x::new();
-        system.set_host1x_core(Box::new(host1x));
-
-        // GPU (upstream core.cpp:278): gpu_core = VideoCore::CreateGPU(emu_window, system)
-        let gpu = video_core::gpu::Gpu::new(false, true);
-        system.set_gpu_core(Box::new(gpu));
-
-        // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
-        // Upstream shares the same System; for now pass a separate one to avoid
-        // borrow issues. This should eventually share the real system.
-        let shared_system: audio_core::SharedSystem =
-            Arc::new(parking_lot::Mutex::new(ruzu_core::core::System::new()));
-        let ac = audio_core::AudioCore::new(shared_system);
-        system.set_audio_core(Box::new(ac));
     }
 
     // -----------------------------------------------------------------------
