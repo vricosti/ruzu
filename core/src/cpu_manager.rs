@@ -101,8 +101,12 @@ impl CpuManager {
     /// Initializes the CPU manager, creating threads for each core.
     ///
     /// Upstream: `CpuManager::Initialize()` (cpu_manager.cpp:23-31).
-    /// Spawns N host threads that each call RunThread(core).
-    pub fn initialize(&mut self) {
+    /// Creates GPU barrier and spawns N host threads that each call RunThread(core).
+    ///
+    /// # Safety
+    /// `kernel_ptr` must point to a valid KernelCore that outlives all spawned
+    /// threads (guaranteed by System::shutdown joining them first).
+    pub unsafe fn initialize(&mut self, kernel_ptr: *const KernelCore) {
         self.num_cores = if self.is_multicore {
             hardware_properties::NUM_CPU_CORES as usize
         } else {
@@ -119,23 +123,8 @@ impl CpuManager {
             self.is_multicore
         );
 
-        // Thread spawning is deferred to spawn_threads() because the kernel
-        // must be fully initialized first. System calls spawn_threads() after
-        // initialize(), passing a raw pointer to the KernelCore.
-    }
-
-    /// Spawn per-core host threads that run `RunThread(core)`.
-    ///
-    /// Upstream: this is done inline in `CpuManager::Initialize()` (cpu_manager.cpp:27-30).
-    /// In Rust, thread spawning is split out because the kernel reference is
-    /// not available at initialize() time — System owns both CpuManager and
-    /// KernelCore, so we pass a raw pointer. The pointer remains valid because
-    /// threads are joined in `shutdown()` before the kernel is destroyed.
-    ///
-    /// # Safety
-    /// `kernel_ptr` must point to a valid KernelCore that outlives all spawned
-    /// threads (guaranteed by System::shutdown joining them first).
-    pub unsafe fn spawn_threads(&mut self, kernel_ptr: *const KernelCore) {
+        // Upstream: for (core = 0; core < num_cores; core++)
+        //   core_data[core].host_thread = jthread([this, core](token) { RunThread(token, core); });
         for core in 0..self.num_cores {
             let barrier = self.gpu_barrier.clone().expect("gpu_barrier must be set before spawn_threads");
             let stop = self.stop_requested.clone();
