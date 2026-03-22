@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 struct CoreData {
     /// Host fiber context for this core's thread.
     /// Upstream: `std::shared_ptr<Common::Fiber> host_context`
-    host_context: Option<Arc<Fiber>>,
+    /// Wrapped in Arc<Mutex<>> because the spawned thread sets it and
+    /// ShutdownThread reads it from the guest fiber context.
+    host_context: Arc<Mutex<Option<Arc<Fiber>>>>,
     /// The host thread running this core.
     /// Upstream: `std::jthread host_thread`
     host_thread: Option<std::thread::JoinHandle<()>>,
@@ -27,7 +29,7 @@ struct CoreData {
 impl Default for CoreData {
     fn default() -> Self {
         Self {
-            host_context: None,
+            host_context: Arc::new(Mutex::new(None)),
             host_thread: None,
         }
     }
@@ -117,14 +119,47 @@ impl CpuManager {
             self.is_multicore
         );
 
-        // Upstream spawns threads here:
-        //   core_data[core].host_thread =
-        //       std::jthread([this, core](stop_token token) { RunThread(token, core); });
-        //
-        // Thread spawning requires passing a System reference to the thread.
-        // In ruzu, threads are spawned by the caller (System::load or run_main_loop)
-        // which can pass the necessary references. CpuManager provides RunThread
-        // as a callable method.
+        // Thread spawning is deferred to spawn_threads() because the kernel
+        // must be fully initialized first. System calls spawn_threads() after
+        // initialize(), passing a raw pointer to the KernelCore.
+    }
+
+    /// Spawn per-core host threads that run `RunThread(core)`.
+    ///
+    /// Upstream: this is done inline in `CpuManager::Initialize()` (cpu_manager.cpp:27-30).
+    /// In Rust, thread spawning is split out because the kernel reference is
+    /// not available at initialize() time — System owns both CpuManager and
+    /// KernelCore, so we pass a raw pointer. The pointer remains valid because
+    /// threads are joined in `shutdown()` before the kernel is destroyed.
+    ///
+    /// # Safety
+    /// `kernel_ptr` must point to a valid KernelCore that outlives all spawned
+    /// threads (guaranteed by System::shutdown joining them first).
+    pub unsafe fn spawn_threads(&mut self, kernel_ptr: *const KernelCore) {
+        for core in 0..self.num_cores {
+            let barrier = self.gpu_barrier.clone().expect("gpu_barrier must be set before spawn_threads");
+            let stop = self.stop_requested.clone();
+            let is_mc = self.is_multicore;
+            let is_ag = self.is_async_gpu;
+            let host_ctx_slot = self.core_data[core].host_context.clone();
+            // Safety: kernel_ptr is valid for the lifetime of the threads (joined before drop).
+            // We transmit as usize because the crate is named `core` which shadows
+            // `std::core`, preventing `unsafe impl Send` for raw pointer wrappers.
+            let kp = kernel_ptr as usize;
+
+            // Upstream: core_data[core].host_thread =
+            //   std::jthread([this, core](stop_token token) { RunThread(token, core); });
+            let handle = std::thread::Builder::new()
+                .name(if is_mc { format!("CPUCore_{}", core) } else { "CPUThread".to_string() })
+                .spawn(move || {
+                    // Safety: kernel_ptr is valid for the lifetime of this thread.
+                    let kernel = unsafe { &*(kp as *const KernelCore) };
+                    Self::run_thread_on_core(kernel, core, is_mc, is_ag, &barrier, &stop, &host_ctx_slot);
+                })
+                .expect("Failed to spawn CPU thread");
+
+            self.core_data[core].host_thread = Some(handle);
+        }
     }
 
     /// Shuts down all CPU threads.
@@ -160,8 +195,9 @@ impl CpuManager {
     }
 
     /// Get the host context for a core (for fiber switching).
-    pub fn core_host_context(&self, core: usize) -> Option<&Arc<Fiber>> {
-        self.core_data[core].host_context.as_ref()
+    /// Returns a clone of the Arc if set.
+    pub fn core_host_context(&self, core: usize) -> Option<Arc<Fiber>> {
+        self.core_data[core].host_context.lock().unwrap().clone()
     }
 
     // =========================================================================
@@ -443,21 +479,21 @@ impl CpuManager {
     // RunThread — the per-core host thread entry point
     // =========================================================================
 
-    /// Per-core host thread function.
+    /// Per-core host thread function (static, called from spawned threads).
     ///
     /// Upstream: `CpuManager::RunThread(stop_token, core)` (cpu_manager.cpp:186-222).
     ///
     /// Called on each spawned host thread. Registers with the kernel, creates
     /// a host fiber, waits for GPU, gets the scheduled thread, and yields to
     /// the guest fiber.
-    pub fn run_thread(
+    fn run_thread_on_core(
         kernel: &KernelCore,
         core: usize,
         is_multicore: bool,
         is_async_gpu: bool,
         gpu_barrier: &Arc<Barrier>,
-        core_host_context: &mut Option<Arc<Fiber>>,
         stop_requested: &AtomicBool,
+        host_context_slot: &Arc<Mutex<Option<Arc<Fiber>>>>,
     ) {
         // Initialization.
         // Upstream: system.RegisterCoreThread(core);
@@ -474,14 +510,29 @@ impl CpuManager {
 
         // Upstream: data.host_context = Common::Fiber::ThreadToFiber();
         let host_ctx = Fiber::thread_to_fiber();
-        *core_host_context = Some(host_ctx.clone());
+        *host_context_slot.lock().unwrap() = Some(host_ctx.clone());
+
+        // Upstream: SCOPE_EXIT { data.host_context->Exit(); }
+        // We use a guard struct to ensure Exit is called on all return paths.
+        struct FiberGuard<'a> {
+            fiber: &'a Arc<Fiber>,
+            name: &'a str,
+        }
+        impl<'a> Drop for FiberGuard<'a> {
+            fn drop(&mut self) {
+                self.fiber.exit();
+                log::info!("CpuManager: {} exiting", self.name);
+            }
+        }
+        let _guard = FiberGuard {
+            fiber: &host_ctx,
+            name: &name,
+        };
 
         // Running.
         // Upstream: if (!gpu_barrier->Sync(token)) { return; }
         gpu_barrier.sync();
         if stop_requested.load(Ordering::Relaxed) {
-            // Clean up the fiber before returning.
-            host_ctx.exit();
             return;
         }
 
@@ -491,24 +542,47 @@ impl CpuManager {
             // When GPU is fully wired, call gpu.obtain_context() here.
         }
 
-        // Upstream: auto& scheduler = *kernel.CurrentScheduler();
-        // auto* thread = scheduler.GetSchedulerCurrentThread();
-        // Kernel::SetCurrentThread(kernel, thread);
-        // Common::Fiber::YieldTo(data.host_context, *thread->GetHostContext());
+        // Upstream:
+        //   auto& scheduler = *kernel.CurrentScheduler();
+        //   auto* thread = scheduler.GetSchedulerCurrentThread();
+        //   Kernel::SetCurrentThread(kernel, thread);
+        //   Common::Fiber::YieldTo(data.host_context, *thread->GetHostContext());
         if let Some(scheduler_arc) = kernel.current_scheduler() {
             let scheduler = scheduler_arc.lock().unwrap();
-            let _thread_id = scheduler.get_scheduler_current_thread_id();
-            // To yield to the guest thread's fiber, we need the KThread object.
-            // This requires the kernel to look up the thread by ID and get its
-            // host_context. The full wiring depends on KScheduler creating
-            // per-core main/idle threads during InitializePhysicalCores.
-            drop(scheduler);
+            if let Some(thread_arc) = scheduler.get_scheduler_current_thread() {
+                // Upstream: Kernel::SetCurrentThread(kernel, thread);
+                super::hle::kernel::kernel::set_current_emu_thread(Some(&thread_arc));
+
+                // Get the guest thread's host context for fiber switching.
+                let thread = thread_arc.lock().unwrap();
+                if let Some(thread_host_ctx) = thread.get_host_context() {
+                    let thread_host_ctx = thread_host_ctx.clone();
+                    drop(thread);
+                    drop(scheduler);
+
+                    // Upstream: Common::Fiber::YieldTo(data.host_context, *thread->GetHostContext());
+                    Fiber::yield_to(Arc::downgrade(&host_ctx), &thread_host_ctx);
+                } else {
+                    drop(thread);
+                    drop(scheduler);
+                    log::warn!(
+                        "CpuManager: {} — scheduler current thread has no host context",
+                        name
+                    );
+                }
+            } else {
+                drop(scheduler);
+                log::warn!(
+                    "CpuManager: {} — no scheduler current thread available",
+                    name
+                );
+            }
+        } else {
+            log::warn!("CpuManager: {} — no current scheduler", name);
         }
 
-        // Clean up.
-        // Upstream: SCOPE_EXIT { data.host_context->Exit(); }
-        host_ctx.exit();
-        log::info!("CpuManager: {} exiting", name);
+        // After YieldTo returns, we've been yielded back (from ShutdownThread).
+        // The _guard drop will call host_ctx.exit() and log.
     }
 }
 

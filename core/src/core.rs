@@ -396,8 +396,17 @@ impl System {
         }
 
         // Upstream: cpu_manager.Initialize()
-        // Currently a no-op but preserves parity.
+        // Spawns per-core host threads that wait on the GPU barrier before
+        // yielding to guest fibers.
         self.cpu_manager.initialize();
+
+        // Upstream spawns threads inside Initialize(). In Rust we split the
+        // spawn because we need a pointer to the kernel which lives in System.
+        // Safety: kernel outlives the threads (shutdown joins them first).
+        let kernel_ptr = self.kernel.as_ref().unwrap() as *const KernelCore;
+        unsafe {
+            self.cpu_manager.spawn_threads(kernel_ptr);
+        }
 
         log::info!("System: kernel initialized");
     }
