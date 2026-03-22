@@ -93,11 +93,9 @@ impl CpuManager {
     /// Called when the GPU is ready. Synchronizes with the GPU barrier.
     /// Upstream: `CpuManager::OnGpuReady()` (cpu_manager.h:47-49).
     pub fn on_gpu_ready(&self) {
-        log::info!("CpuManager::on_gpu_ready — releasing GPU barrier");
         if let Some(ref barrier) = self.gpu_barrier {
             barrier.sync();
         }
-        log::info!("CpuManager::on_gpu_ready — barrier released");
     }
 
     /// Initializes the CPU manager, creating threads for each core.
@@ -356,11 +354,6 @@ impl CpuManager {
         }
 
         loop {
-            // Upstream: auto* physical_core = &kernel.CurrentPhysicalCore();
-            // while (!physical_core->IsInterrupted()) {
-            //     physical_core->RunThread(thread);
-            //     physical_core = &kernel.CurrentPhysicalCore();
-            // }
             let physical_core = kernel.current_physical_core();
             while !physical_core.is_interrupted() {
                 // Upstream: physical_core->RunThread(thread) gets the JIT from
@@ -385,22 +378,14 @@ impl CpuManager {
 
         let thread_arc = match super::hle::kernel::kernel::get_current_thread_pointer() {
             Some(t) => t,
-            None => {
-                log::warn!("run_guest_thread_once: no current thread");
-                return;
-            }
+            None => return,
         };
 
         let thread = thread_arc.lock().unwrap();
-        let tid = thread.get_thread_id();
-        let has_parent = thread.parent.is_some();
-
         // Get the owner process to access the ARM JIT interface.
         let parent_weak = match thread.parent.as_ref() {
             Some(p) => p.clone(),
             None => {
-                // Kernel threads (main/idle) have no owner process — nothing to run.
-                log::trace!("run_guest_thread_once: thread {} (has_parent={}) — idle", tid, has_parent);
                 drop(thread);
                 physical_core.idle();
                 return;
@@ -410,10 +395,7 @@ impl CpuManager {
 
         let parent_arc = match parent_weak.upgrade() {
             Some(p) => p,
-            None => {
-                log::warn!("run_guest_thread_once: thread {} parent Weak cannot upgrade", tid);
-                return;
-            }
+            None => return,
         };
 
         let core_index = physical_core.core_index();
@@ -424,7 +406,6 @@ impl CpuManager {
         let jit = match process.get_arm_interface_mut(core_index) {
             Some(j) => j as *mut _ as *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
             None => {
-                log::warn!("run_guest_thread_once: thread {} no ARM interface for core {}", tid, core_index);
                 drop(process);
                 physical_core.idle();
                 return;
@@ -450,7 +431,7 @@ impl CpuManager {
                 thread_ptr,
             );
 
-            // Run the JIT.
+            // Run the JIT — executes ARM instructions until SVC, interrupt, or halt.
             let _halt_reason = jit_ref.run_thread(opaque);
 
             // Clear the running state.
@@ -674,9 +655,7 @@ impl CpuManager {
 
         // Running.
         // Upstream: if (!gpu_barrier->Sync(token)) { return; }
-        log::info!("CpuManager: {} waiting on GPU barrier", name);
         gpu_barrier.sync();
-        log::info!("CpuManager: {} GPU barrier released", name);
         if stop_requested.load(Ordering::Relaxed) {
             return;
         }
