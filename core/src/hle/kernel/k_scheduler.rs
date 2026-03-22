@@ -159,6 +159,12 @@ impl KScheduler {
         self.current_thread_id
     }
 
+    /// Get the scheduler's current thread (Arc).
+    /// Upstream: `KScheduler::GetSchedulerCurrentThread()`.
+    pub fn get_scheduler_current_thread(&self) -> Option<Arc<Mutex<KThread>>> {
+        self.current_thread.as_ref().and_then(Weak::upgrade)
+    }
+
     /// Get the last context switch time.
     pub fn get_last_context_switch_time(&self) -> i64 {
         self.last_context_switch_time
