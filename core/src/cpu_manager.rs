@@ -465,8 +465,15 @@ impl CpuManager {
     ///
     /// Upstream: `CpuManager::MultiCoreRunIdleThread()` (cpu_manager.cpp:90-106).
     fn multi_core_run_idle_thread(kernel: &KernelCore) {
-        if let Some(scheduler_arc) = kernel.current_scheduler() {
-            if let Some(thread_arc) = kernel.get_current_emu_thread() {
+        // Upstream: kernel.CurrentScheduler()->OnThreadStart();
+        // OnThreadStart calls EnableDispatch — ensure dispatch_count is 1 first.
+        if let Some(thread_arc) = super::hle::kernel::kernel::get_current_thread_pointer() {
+            let mut t = thread_arc.lock().unwrap();
+            if t.get_disable_dispatch_count() == 0 {
+                t.disable_dispatch();
+            }
+            drop(t);
+            if let Some(scheduler_arc) = kernel.current_scheduler() {
                 scheduler_arc.lock().unwrap().on_thread_start(&thread_arc);
             }
         }
@@ -717,7 +724,9 @@ impl CpuManager {
                     drop(scheduler);
 
                     // Upstream: Common::Fiber::YieldTo(data.host_context, *thread->GetHostContext());
+                    log::info!("RunThread core {}: yielding from host fiber to main thread fiber", core);
                     Fiber::yield_to(Arc::downgrade(&host_ctx), &thread_host_ctx);
+                    log::info!("RunThread core {}: returned from main thread fiber", core);
                 } else {
                     drop(thread);
                     drop(scheduler);
