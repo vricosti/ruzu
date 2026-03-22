@@ -299,27 +299,10 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
         // ====================================================================
         // Process setup
         // ====================================================================
-        // Determine the code base address from address space type, matching upstream
-        // LoadFromMetadata's address space switch.
-        let code_base: u64 = match metadata.get_address_space_type() {
-            crate::file_sys::program_metadata::ProgramAddressSpaceType::Is32Bit |
-            crate::file_sys::program_metadata::ProgramAddressSpaceType::Is32BitNoMap => 0x0020_0000,
-            crate::file_sys::program_metadata::ProgramAddressSpaceType::Is36Bit => 0x0800_0000,
-            crate::file_sys::program_metadata::ProgramAddressSpaceType::Is39Bit => 0x8000_0000,
-        };
-
-        // Pre-allocate code memory BEFORE LoadFromMetadata, because
-        // LoadFromMetadata -> initialize_for_user -> initialize -> create_thread_local_region
-        // needs the page table's block manager to be initialized.
-        // allocate_code_memory configures the address space and initializes
-        // ProcessMemoryData to cover the full code + TLS region.
-        process.allocate_code_memory(code_base, code_size as usize);
-
-        // Configure TLS page allocation base before LoadFromMetadata, which calls
-        // Initialize -> create_thread_local_region for the PLR.
-        process.initialize_thread_local_region_allocation(code_base + code_size);
-
         // Upstream: process.LoadFromMetadata(metadata, code_size, aslr_space_start, is_hbl)
+        // This single call handles everything: InitializeForProcess (creates page table,
+        // block manager, address space layout), maps code region, sets permissions,
+        // initializes capabilities, assigns process ID, creates PLR.
         let process_setup_result = process.load_from_metadata(
             &metadata,
             code_size,

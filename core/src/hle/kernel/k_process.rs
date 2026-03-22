@@ -1219,12 +1219,11 @@ impl KProcess {
             }
         }
 
-        // Initialize the Common::PageTable implementation.
-        // Upstream does this inside InitializeForProcess; here we do it after
-        // so that operate(Map) can write page table entries that Memory uses
-        // for virtual address resolution.
-        // Without this, m_impl is None and map_memory_region() is skipped,
-        // leaving all pages "unmapped" from Memory's perspective.
+        // Create the Common::PageTable implementation.
+        // Upstream creates this inside InitializeForProcess. We create it here
+        // (after InitializeForProcess sets m_address_space_width) so that
+        // operate(Map) can populate page table entries for Memory to use.
+        // Matches upstream: m_impl = make_unique<PageTable>(); m_impl->Resize(width, PageBits)
         self.page_table.get_base_mut().initialize_impl();
 
         // Set the current page table on Memory so that write_block/read_block
@@ -1259,6 +1258,16 @@ impl KProcess {
         if map_result != RESULT_SUCCESS.get_inner_value() {
             self.page_table.finalize();
             return map_result;
+        }
+
+        // Set up TLS page allocation base right after the code region.
+        // Upstream allocates TLS pages dynamically via MapPages in
+        // KThreadLocalPage::Initialize. We use a fixed base after the code
+        // region, matching the previous initialize_thread_local_region_allocation
+        // call that was in the loader.
+        {
+            let tls_base = ((code_address + code_size as u64) + 0xFFF) & !0xFFF;
+            self.initialize_thread_local_region_base(tls_base);
         }
 
         // Initialize capabilities (upstream line 434-435).
