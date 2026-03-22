@@ -594,6 +594,23 @@ impl System {
                     log::error!("Failed to run application process: 0x{:X}", e);
                 }
             }
+            // Initialize ARM JIT interfaces on the process.
+            // Upstream: KProcess::InitializeInterfaces creates the exclusive monitor
+            // and one ARM JIT per core. This must happen before CPU threads try to
+            // run guest code via process.get_arm_interface_mut(core).
+            if let Some(core_memory) = self.memory_shared() {
+                let shared_memory = process_arc.lock().unwrap().get_shared_memory();
+                let core_timing = self.core_timing.clone();
+                process_arc.lock().unwrap().initialize_interfaces(
+                    core_memory,
+                    shared_memory,
+                    core_timing,
+                );
+                log::info!("ARM JIT interfaces initialized for application process");
+            } else {
+                log::warn!("Cannot initialize ARM interfaces: Memory not available");
+            }
+
             self.current_process_arc = Some(process_arc);
         }
 
