@@ -309,19 +309,29 @@ impl PhysicalCore {
     /// Load context from thread to current core.
     /// Port of upstream `PhysicalCore::LoadContext(const KThread* thread)`.
     pub fn load_context(&self, thread: &KThread) {
-        // Upstream: gets process from thread, gets arm_interface from process,
+        // Upstream: PhysicalCore::LoadContext (physical_core.cpp:148-167)
+        // Gets process from thread, gets arm_interface from process,
         // calls interface->SetContext(thread->GetContext()),
-        // interface->SetTpidrroEl0(thread->GetTlsAddress()),
-        // interface->SetWatchpointArray(&process->GetWatchpoints()).
-        //
-        // KProcess::arm_interfaces exists but we don't have a process reference
-        // on the thread here. The caller (KScheduler) should pass the process.
-        log::trace!(
-            "PhysicalCore::load_context: core={} pc=0x{:X} sp=0x{:X}",
-            self.m_core_index,
-            thread.thread_context.pc,
-            thread.thread_context.sp,
-        );
+        //       interface->SetTpidrroEl0(thread->GetTlsAddress()).
+        let parent = match thread.parent.as_ref().and_then(|w| w.upgrade()) {
+            Some(p) => p,
+            None => return, // Kernel threads don't run on emulated CPU cores.
+        };
+
+        let mut process = parent.lock().unwrap();
+        if let Some(jit) = process.get_arm_interface_mut(self.m_core_index) {
+            let k_ctx = &thread.thread_context;
+            // Safety: both ThreadContext types have identical layout.
+            let arm_ctx: &crate::arm::arm_interface::ThreadContext =
+                unsafe { &*(k_ctx as *const super::k_thread::ThreadContext
+                    as *const crate::arm::arm_interface::ThreadContext) };
+            jit.set_context(arm_ctx);
+            jit.set_tpidrro_el0(thread.get_tls_address().get());
+            log::info!(
+                "PhysicalCore::load_context: core={} r15/PC=0x{:X} r13/SP=0x{:X} ctx.pc=0x{:X} ctx.sp=0x{:X}",
+                self.m_core_index, k_ctx.r[15], k_ctx.r[13], k_ctx.pc, k_ctx.sp,
+            );
+        }
     }
 
     /// Save context from current core to thread.
