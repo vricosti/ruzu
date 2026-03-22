@@ -116,8 +116,8 @@ impl KScheduler {
         }
     }
 
-    /// Initialize the scheduler with main and idle threads.
-    /// Matches upstream `KScheduler::Initialize(main_thread, idle_thread, core_id)`.
+    /// Initialize the scheduler with main and idle threads (ID-only variant).
+    /// Used by tests that don't need full thread references.
     pub fn initialize(
         &mut self,
         main_thread_id: u64,
@@ -127,9 +127,30 @@ impl KScheduler {
         self.core_id = core_id;
         self.idle_thread_id = Some(idle_thread_id);
         self.current_thread_id = Some(main_thread_id);
-        // Upstream also: sets idle_thread_stack, interrupt_task_manager,
-        // inserts main_thread into PQ, sets scheduler update needed.
-        // PQ insertion is done by the caller (KProcess::create_main_thread).
+    }
+
+    /// Initialize the scheduler with main and idle thread references.
+    /// Matches upstream `KScheduler::Initialize(main_thread, idle_thread, core_id)`
+    /// (k_scheduler.cpp:147-168).
+    ///
+    /// Sets `m_current_thread = main_thread` so that `get_scheduler_current_thread()`
+    /// returns a valid thread with a host context for fiber switching.
+    pub fn initialize_with_threads(
+        &mut self,
+        main_thread: &Arc<Mutex<KThread>>,
+        idle_thread: &Arc<Mutex<KThread>>,
+        core_id: i32,
+    ) {
+        self.core_id = core_id;
+
+        let main_thread_id = main_thread.lock().unwrap().get_thread_id();
+        let idle_thread_id = idle_thread.lock().unwrap().get_thread_id();
+
+        self.idle_thread_id = Some(idle_thread_id);
+        self.idle_thread = Some(Arc::downgrade(idle_thread));
+
+        self.current_thread_id = Some(main_thread_id);
+        self.current_thread = Some(Arc::downgrade(main_thread));
     }
 
     /// Activate the scheduler.

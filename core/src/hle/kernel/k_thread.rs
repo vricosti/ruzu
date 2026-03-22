@@ -1467,6 +1467,80 @@ impl KThread {
         }
     }
 
+    /// Initialize as a kernel main thread (no process owner).
+    ///
+    /// Upstream: `KThread::InitializeMainThread(system, thread, virt_core)` (k_thread.cpp:279-282).
+    /// Calls `InitializeThread(thread, {}, {}, {}, IdleThreadPriority, virt_core, {},
+    ///         ThreadType::Main, system.GetCpuManager().GetGuestActivateFunc())`.
+    ///
+    /// The main thread is used by the scheduler as the initial current_thread for each core.
+    /// Its host fiber context is set to the guest activate function from CpuManager.
+    pub fn initialize_kernel_main_thread(
+        &mut self,
+        virt_core: i32,
+        thread_id: u64,
+        object_id: u64,
+        init_func: Option<Box<dyn FnOnce() + Send>>,
+    ) {
+        let phys_core = crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[virt_core as usize];
+
+        self.object_id = object_id;
+        self.thread_type = ThreadType::Main;
+        self.thread_id = thread_id;
+        self.priority = IDLE_THREAD_PRIORITY;
+        self.base_priority = IDLE_THREAD_PRIORITY;
+        self.virtual_ideal_core_id = virt_core;
+        self.physical_ideal_core_id = phys_core;
+        self.virtual_affinity_mask = 1u64 << virt_core;
+        self.physical_affinity_mask
+            .set_affinity_mask(1u64 << phys_core);
+        self.tls_address = KProcessAddress::default();
+        self.parent = None;
+        self.scheduler = None;
+        self.stack_top = KProcessAddress::default();
+        self.argument = 0;
+        self.core_id = phys_core;
+        self.current_core_id = phys_core;
+        self.thread_state
+            .store(ThreadState::RUNNABLE.bits(), Ordering::Relaxed);
+        self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
+        self.suspend_request_flags = 0;
+        self.wait_result = RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value();
+        self.schedule_count = -1;
+        self.initialized = true;
+        self.stack_parameters = StackParameters::default();
+        self.stack_parameters.disable_count = 1;
+        self.stack_parameters.is_in_exception_handler = true;
+
+        // No owner → use 64-bit thread context (upstream: m_parent == nullptr → 64-bit path).
+        self.reset_thread_context64(0, 0, 0);
+
+        // Initialize emulation parameters — create host fiber context.
+        // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
+        if let Some(func) = init_func {
+            self.host_context = Some(common::fiber::Fiber::new(func));
+        }
+    }
+
+    /// Initialize as a kernel idle thread (no process owner).
+    ///
+    /// Upstream: `KThread::InitializeIdleThread(system, thread, virt_core)` (k_thread.cpp:284-287).
+    /// Calls `InitializeThread(thread, {}, {}, {}, IdleThreadPriority, virt_core, {},
+    ///         ThreadType::Main, system.GetCpuManager().GetIdleThreadStartFunc())`.
+    ///
+    /// Note: upstream idle threads also use `ThreadType::Main`, not a separate type.
+    pub fn initialize_kernel_idle_thread(
+        &mut self,
+        virt_core: i32,
+        thread_id: u64,
+        object_id: u64,
+        init_func: Option<Box<dyn FnOnce() + Send>>,
+    ) {
+        // Upstream idle thread initialization is identical to main thread initialization,
+        // differing only in the init_func (IdleThreadStartFunc vs GuestActivateFunc).
+        self.initialize_kernel_main_thread(virt_core, thread_id, object_id, init_func);
+    }
+
     pub fn initialize_user_thread(
         &mut self,
         entry_point: u64,
