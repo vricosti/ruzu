@@ -136,8 +136,7 @@ impl KScheduler {
     /// Matches upstream `KScheduler::Activate()`.
     pub fn activate(&mut self) {
         self.is_active = true;
-        // Upstream: calls RescheduleCurrentCore().
-        // In cooperative model, scheduling happens at SVC boundaries.
+        self.reschedule_current_core();
     }
 
     /// Get the idle thread count.
@@ -174,7 +173,7 @@ impl KScheduler {
 
     /// Request schedule on interrupt.
     /// Matches upstream: sets needs_scheduling, calls ScheduleOnInterrupt
-    /// if dispatch is allowed. In cooperative model, just set the flag.
+    /// if dispatch is allowed.
     pub fn request_schedule_on_interrupt(&mut self) {
         self.state.needs_scheduling.store(true, Ordering::Relaxed);
     }
@@ -215,7 +214,8 @@ impl KScheduler {
         //   Common::Fiber::YieldTo(thread->GetHostContext(), *m_switch_fiber);
         //   GetCurrentThread(m_kernel).EnableDispatch();
 
-        if let Some(ref cur_thread) = self.current_thread.as_ref().and_then(Weak::upgrade) {
+        let cur_thread = super::kernel::get_current_thread_pointer();
+        if let Some(ref cur_thread) = cur_thread {
             cur_thread.lock().unwrap().disable_dispatch();
 
             // Unload the current thread
@@ -240,19 +240,29 @@ impl KScheduler {
 
     /// Unload a thread's context (save guest state).
     /// Matches upstream `KScheduler::Unload(KThread*)`.
-    /// In cooperative model: context save is handled by the dispatch loop
-    /// via PhysicalCore::SaveContext.
-    pub fn unload(&self, _thread: &Arc<Mutex<KThread>>) {
+    pub fn unload(&self, thread: &Arc<Mutex<KThread>>) {
         // Upstream: m_kernel.PhysicalCore(m_core_id).SaveContext(thread)
-        // Then unlock context_guard if not terminated.
-        // In cooperative model: save happens in physical_core dispatch.
+        if let Some(core) = self.physical_cores.get(self.core_id as usize) {
+            core.save_context(&mut thread.lock().unwrap());
+        }
+
+        // Check if the thread is terminated by checking the DPC flags.
+        let thread_guard = thread.lock().unwrap();
+        let dpc_flags = thread_guard.get_dpc();
+        drop(thread_guard);
+        if (dpc_flags & super::k_thread::DpcFlag::TERMINATED.bits() as u8) == 0 {
+            // Upstream: thread->m_context_guard.unlock()
+            // In our model, context_guard is managed by the fiber loop.
+        }
     }
 
     /// Reload a thread's context (restore guest state).
     /// Matches upstream `KScheduler::Reload(KThread*)`.
-    pub fn reload(&self, _thread: &Arc<Mutex<KThread>>) {
+    pub fn reload(&self, thread: &Arc<Mutex<KThread>>) {
         // Upstream: m_kernel.PhysicalCore(m_core_id).LoadContext(thread)
-        // In cooperative model: load happens in physical_core dispatch.
+        if let Some(core) = self.physical_cores.get(self.core_id as usize) {
+            core.load_context(&thread.lock().unwrap());
+        }
     }
 
     /// Reschedule other cores by sending IPI.
@@ -277,32 +287,60 @@ impl KScheduler {
     }
 
     /// Static version of RescheduleCores (when no scheduler instance available).
+    /// Upstream: `KScheduler::RescheduleCores(kernel, core_mask)` sends IPIs.
+    /// Without kernel reference, logs and returns (IPIs require physical core access).
     pub fn reschedule_cores(core_mask: u64) {
-        // Static version cannot access physical cores.
-        // This is called from EnableScheduling when no scheduler is available.
-        // In practice, the instance method reschedule_cores_impl is preferred.
         if core_mask != 0 {
             log::trace!("KScheduler::reschedule_cores: core_mask={:#x} (no physical core access)", core_mask);
+        }
+    }
+
+    /// Matches upstream `KScheduler::RescheduleCurrentHLEThread(kernel)`.
+    /// Called when no scheduler is available (non-core threads, phantom mode).
+    pub fn reschedule_current_hle_thread() {
+        if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
+            let mut t = cur_thread.lock().unwrap();
+            debug_assert!(t.get_disable_dispatch_count() == 1);
+
+            // Upstream: GetCurrentThread(kernel).DummyThreadBeginWait();
+            // Ensure dummy threads that are waiting block.
+            if t.is_dummy_thread() {
+                t.dummy_thread_begin_wait();
+            }
+
+            debug_assert!(t.get_state() != ThreadState::WAITING);
+            t.enable_dispatch();
         }
     }
 
     /// Reschedule the current core.
     /// Matches upstream `KScheduler::RescheduleCurrentCore()`.
     pub fn reschedule_current_core(&mut self) {
-        if let Some(ref cur_thread) = self.current_thread.as_ref().and_then(Weak::upgrade) {
-            cur_thread.lock().unwrap().enable_dispatch();
+        // Upstream: ASSERT(!m_kernel.IsPhantomModeForSingleCore());
+        // Upstream: ASSERT(GetCurrentThread(m_kernel).GetDisableDispatchCount() == 1);
 
-            if self.state.needs_scheduling.load(Ordering::SeqCst) {
-                self.reschedule_current_core_impl();
-            }
+        // Upstream: GetCurrentThread(m_kernel).EnableDispatch();
+        if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
+            cur_thread.lock().unwrap().enable_dispatch();
+        }
+
+        if self.state.needs_scheduling.load(Ordering::SeqCst) {
+            self.reschedule_current_core_impl();
         }
     }
 
     fn reschedule_current_core_impl(&mut self) {
+        // Upstream: if (m_state.needs_scheduling.load()) [[likely]] {
+        //     GetCurrentThread(m_kernel).DisableDispatch();
+        //     Schedule();
+        //     GetCurrentThread(m_kernel).EnableDispatch();
+        // }
         if self.state.needs_scheduling.load(Ordering::SeqCst) {
-            if let Some(ref cur_thread) = self.current_thread.as_ref().and_then(Weak::upgrade) {
+            if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
                 cur_thread.lock().unwrap().disable_dispatch();
-                self.schedule();
+            }
+            self.schedule();
+            if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
                 cur_thread.lock().unwrap().enable_dispatch();
             }
         }
@@ -330,8 +368,9 @@ impl KScheduler {
     /// Matches upstream `KScheduler::DisableScheduling(kernel)`.
     /// Increments the current thread's disable_dispatch_count.
     pub fn disable_scheduling(current_thread: &Arc<Mutex<KThread>>) {
-        debug_assert!(current_thread.lock().unwrap().get_disable_dispatch_count() >= 0);
-        current_thread.lock().unwrap().disable_dispatch();
+        let mut t = current_thread.lock().unwrap();
+        debug_assert!(t.get_disable_dispatch_count() >= 0);
+        t.disable_dispatch();
     }
 
     /// Matches upstream `KScheduler::EnableScheduling(kernel, cores_needing_scheduling)`.
@@ -345,10 +384,10 @@ impl KScheduler {
         debug_assert!(current_thread.lock().unwrap().get_disable_dispatch_count() >= 1);
 
         if scheduler.is_none() || is_phantom_mode {
-            // HACK: No scheduler or phantom mode — reschedule via HLE path.
+            // Upstream: KScheduler::RescheduleCores(kernel, cores_needing_scheduling);
+            //           KScheduler::RescheduleCurrentHLEThread(kernel);
             Self::reschedule_cores(cores_needing_scheduling);
-            // RescheduleCurrentHLEThread equivalent:
-            current_thread.lock().unwrap().enable_dispatch();
+            Self::reschedule_current_hle_thread();
             return;
         }
 
@@ -367,12 +406,31 @@ impl KScheduler {
 
     /// Matches upstream `KScheduler::UpdateHighestPriorityThreads(kernel)`.
     /// Called by KAbstractSchedulerLock::Unlock.
+    ///
+    /// Upstream checks IsSchedulerUpdateNeeded and if set, calls
+    /// UpdateHighestPriorityThreadsImpl. Returns bitmask of cores needing rescheduling.
+    ///
+    /// Note: The static version without kernel context returns 0.
+    /// The full implementation requires GlobalSchedulerContext access and is
+    /// invoked through the scheduler callbacks wired by the kernel.
     pub fn update_highest_priority_threads() -> u64 {
-        // In cooperative model, the dispatch loop's select_next_thread_from_pq
-        // handles thread selection at SVC boundaries. This static method
-        // would need GlobalSchedulerContext access (not available here).
-        // Returns 0 = no cores need IPI-based rescheduling.
+        // Without kernel context, return 0. When wired through SchedulerCallbacks,
+        // the kernel provides the actual implementation via
+        // update_highest_priority_threads_with_context().
         0
+    }
+
+    /// Full implementation of UpdateHighestPriorityThreads with GSC access.
+    /// Called from wired scheduler callbacks that have kernel context.
+    pub fn update_highest_priority_threads_with_context(
+        gsc: &mut super::global_scheduler_context::GlobalSchedulerContext,
+        schedulers: &mut [KScheduler],
+    ) -> u64 {
+        if gsc.m_scheduler_update_needed.load(std::sync::atomic::Ordering::Relaxed) {
+            Self::update_highest_priority_threads_impl(schedulers, gsc)
+        } else {
+            0
+        }
     }
 
     /// Matches upstream `KScheduler::UpdateHighestPriorityThreadsImpl(kernel)`.

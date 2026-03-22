@@ -252,7 +252,7 @@ impl GpuContext {
         let mut framebuffer = framebuffers.into_iter().next();
 
         // Take draw calls from Maxwell3D and render.
-        let draw_calls = proc.take_draw_calls();
+        let draw_calls: = proc.take_draw_calls();
         if !draw_calls.is_empty() {
             let mode = *self.render_mode.lock();
             match mode {

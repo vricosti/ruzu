@@ -124,13 +124,25 @@ impl KHardwareTimer {
         // Store weak ref for later resolution in do_task.
         self.thread_refs.insert(thread_id, Arc::downgrade(thread));
 
-        // Upstream: KScopedDisableDispatch + KScopedSpinLock
-        // Upstream: KScopedDisableDispatch + KScopedSpinLock.
-        // In cooperative model: process lock provides exclusion.
+        // Upstream: KScopedDisableDispatch dd{m_kernel} + KScopedSpinLock lk{GetLock()}.
+        // KScopedDisableDispatch increments the current thread's dispatch disable count
+        // to prevent rescheduling while modifying timer state.
+        // We disable dispatch on the current thread if available.
+        let current = super::kernel::get_current_thread_pointer();
+        if let Some(ref t) = current {
+            t.lock().unwrap().disable_dispatch();
+        }
+
+        // Spin lock exclusion handled by caller holding &mut self.
         if self.base.register_absolute_task_impl(thread_id, task_time) {
             if task_time <= self.m_wakeup_time {
                 self.enable_interrupt(task_time);
             }
+        }
+
+        // Re-enable dispatch.
+        if let Some(ref t) = current {
+            t.lock().unwrap().enable_dispatch();
         }
     }
 
@@ -142,13 +154,20 @@ impl KHardwareTimer {
         let task_time = thread_guard.get_timer_task_time();
         drop(thread_guard);
 
-        // Upstream: KScopedDisableDispatch + KScopedSpinLock
-        // Upstream: KScopedDisableDispatch + KScopedSpinLock.
-        // In cooperative model: process lock provides exclusion.
+        // Upstream: KScopedDisableDispatch dd{m_kernel} + KScopedSpinLock lk{m_lock}.
+        let current = super::kernel::get_current_thread_pointer();
+        if let Some(ref t) = current {
+            t.lock().unwrap().disable_dispatch();
+        }
+
         if task_time > 0 {
             self.base.cancel_task(thread_id, task_time);
         }
         self.thread_refs.remove(&thread_id);
+
+        if let Some(ref t) = current {
+            t.lock().unwrap().enable_dispatch();
+        }
     }
 
     /// Matches upstream: `KHardwareTimer::EnableInterrupt()`
@@ -187,13 +206,13 @@ impl KHardwareTimer {
     /// Called by the CoreTiming callback.
     /// Matches upstream: `KHardwareTimer::DoTask()`
     fn do_task(&mut self) {
-        // Upstream: KScopedSchedulerLock slk{m_kernel} + KScopedSpinLock lk(GetLock())
-        // In our cooperative model, the CoreTiming callback fires during
-        // CoreTiming::Advance() on the host thread. No concurrent guest
-        // execution occurs, so the scheduler lock is not needed for
-        // thread safety. It IS needed for the scheduler update side-effects
-        // (UpdateHighestPriorityThreads on unlock) — but in cooperative mode,
-        // scheduling decisions happen at SVC boundaries instead.
+        // Upstream: KScopedSchedulerLock slk{m_kernel} + KScopedSpinLock lk(GetLock()).
+        // The scheduler lock ensures atomicity with thread state changes and
+        // triggers UpdateHighestPriorityThreads on unlock (enabling rescheduling
+        // after timer-woken threads change priority queues).
+        // The scheduler lock is acquired by the caller (CoreTiming callback context)
+        // via the KScopedSchedulerLock. Since do_task is called from within
+        // Arc<Mutex<KHardwareTimer>>, the Mutex provides the spin lock equivalent.
 
         if !self.get_interrupt_enabled() {
             return;
