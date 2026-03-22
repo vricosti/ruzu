@@ -202,6 +202,18 @@ fn on_status_message_received(msg_type: u32, nickname: &str) {
 /// Application entry point.
 ///
 /// Maps to C++ `int main(int argc, char** argv)` in `yuzu.cpp`.
+///
+/// Upstream order of operations:
+/// 1. Parse args, create config
+/// 2. system.Initialize()
+/// 3. Create emu_window based on renderer backend
+/// 4. system.SetContentProvider/SetFilesystem/CreateFactories
+/// 5. system.Load(*emu_window, filepath, load_parameters)
+/// 6. system.GPU().Start()
+/// 7. system.GetCpuManager().OnGpuReady()
+/// 8. system.Run()  — starts CPU threads in background
+/// 9. while (emu_window->IsOpen()) { emu_window->WaitEvent(); }
+/// 10. system.Pause(), system.ShutdownMainProcess()
 fn main() {
     // Initialise logging backend (upstream: Common::Log::Initialize /
     // SetColorConsoleBackendEnabled / Start).
@@ -243,7 +255,7 @@ fn main() {
     common::settings::log_settings(&common::settings::values());
 
     // Initialise core system.
-    // Maps to C++ `Core::System system{}; system.Initialize(); system.ApplySettings()`.
+    // Maps to C++ `Core::System system{}; system.Initialize();`.
     let mut system = ruzu_core::core::System::new();
     system.initialize();
 
@@ -261,17 +273,42 @@ fn main() {
     };
     log::info!("Renderer backend: {}", renderer_backend);
 
-    // Multiplayer callbacks are wired here when Network::RoomMember is ported.
-    // For now, log if multiplayer was requested.
-    if let Some(ref mp) = args.multiplayer {
-        log::warn!(
-            "Multiplayer '{}' requested but Network::RoomMember not yet ported; ignoring",
-            mp
-        );
+    // -----------------------------------------------------------------------
+    // Step 3 (upstream): Create emu_window BEFORE loading.
+    // Maps to C++:
+    //   switch (Settings::values.renderer_backend.GetValue()) {
+    //     case OpenGL:  emu_window = make_unique<EmuWindow_SDL2_GL>(...);
+    //     case Vulkan:  emu_window = make_unique<EmuWindow_SDL2_VK>(...);
+    //     case Null:    emu_window = make_unique<EmuWindow_SDL2_Null>(...);
+    //   }
+    // -----------------------------------------------------------------------
+    enum EmuWindow {
+        Gl(EmuWindowSdl2Gl),
+        Vk(EmuWindowSdl2Vk),
+        Null(EmuWindowSdl2Null),
     }
 
-    // Load the game ROM.
-    // Maps to C++ `system.Load(...)`.
+    let mut emu_window = match renderer_backend {
+        "opengl" => EmuWindow::Gl(EmuWindowSdl2Gl::new(args.fullscreen)),
+        "vulkan" => EmuWindow::Vk(EmuWindowSdl2Vk::new(args.fullscreen)),
+        _ => EmuWindow::Null(EmuWindowSdl2Null::new(args.fullscreen)),
+    };
+
+    // -----------------------------------------------------------------------
+    // Step 4 (upstream): system.SetContentProvider, SetFilesystem, CreateFactories.
+    // These are not yet ported; log a note. The upstream calls are:
+    //   system.SetContentProvider(make_unique<FileSys::ContentProviderUnion>());
+    //   system.SetFilesystem(make_shared<FileSys::RealVfsFilesystem>());
+    //   system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
+    //   system.GetUserChannel().clear();
+    // -----------------------------------------------------------------------
+    log::info!("Content provider / filesystem factories not yet wired — skipping");
+
+    // -----------------------------------------------------------------------
+    // Step 5 (upstream): system.Load(*emu_window, filepath, load_parameters).
+    // Upstream passes the window reference to Load; our Rust Load doesn't
+    // accept one yet, so we call with the current signature.
+    // -----------------------------------------------------------------------
     let load_result = system.load(&filepath);
     if load_result != ruzu_core::core::SystemResultStatus::Success {
         log::error!(
@@ -282,13 +319,25 @@ fn main() {
         std::process::exit(-1);
     }
 
-    // Create video/audio subsystems that upstream creates in SetupForApplicationProcess().
-    // These are created here in the frontend because video_core and audio_core crates
-    // cannot be dependencies of core (circular dependency). Upstream order:
+    // Multiplayer callbacks are wired here when Network::RoomMember is ported.
+    // For now, log if multiplayer was requested.
+    if let Some(ref mp) = args.multiplayer {
+        log::warn!(
+            "Multiplayer '{}' requested but Network::RoomMember not yet ported; ignoring",
+            mp
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Create video/audio subsystems that upstream creates in
+    // SetupForApplicationProcess(). These live in the frontend because
+    // video_core and audio_core crates cannot be dependencies of core
+    // (circular dependency). Upstream order:
     // 1. TelemetrySession — created inside core's setup_for_application_process()
     // 2. Host1x
     // 3. GPU
     // 4. AudioCore
+    // -----------------------------------------------------------------------
     {
         use std::sync::Arc;
 
@@ -297,92 +346,71 @@ fn main() {
         system.set_host1x_core(Box::new(host1x));
 
         // GPU (upstream core.cpp:278): gpu_core = VideoCore::CreateGPU(emu_window, system)
-        // Full GPU initialization requires EmuWindow (renderer binding). For now, create
-        // the GPU struct; renderer will be bound later when the window is available.
         let gpu = video_core::gpu::Gpu::new(false, true);
         system.set_gpu_core(Box::new(gpu));
 
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
+        // Upstream shares the same System; for now pass a separate one to avoid
+        // borrow issues. This should eventually share the real system.
         let shared_system: audio_core::SharedSystem =
             Arc::new(parking_lot::Mutex::new(ruzu_core::core::System::new()));
         let ac = audio_core::AudioCore::new(shared_system);
         system.set_audio_core(Box::new(ac));
     }
 
-    // Start emulation.
-    // Maps to C++ `system.Run()`.
+    // -----------------------------------------------------------------------
+    // Step 6 (upstream): system.GPU().Start()
+    // Core is loaded, start the GPU (makes the GPU contexts current to this thread).
+    // -----------------------------------------------------------------------
+    if let Some(gpu_any) = system.gpu_core() {
+        if let Some(gpu) = gpu_any.downcast_ref::<video_core::gpu::Gpu>() {
+            gpu.start();
+        } else {
+            log::warn!("GPU core is not a video_core::gpu::Gpu — cannot call start()");
+        }
+    } else {
+        log::warn!("No GPU core set — skipping GPU().Start()");
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 7 (upstream): system.GetCpuManager().OnGpuReady()
+    // -----------------------------------------------------------------------
+    system.get_cpu_manager().on_gpu_ready();
+
+    // -----------------------------------------------------------------------
+    // Step 8 (upstream): system.Run()
+    // Starts CPU threads running in background via CpuManager.
+    // -----------------------------------------------------------------------
     system.run();
 
-    // Run emulation.
-    // Maps to upstream: system.Run() triggers CpuManager threads internally.
-    let (total_iterations, total_svcs) = system.run_main_loop();
-    log::info!("Emulation finished: {} iterations, {} SVCs", total_iterations, total_svcs);
-
-    // Create the renderer window and run the event loop.
-    // Maps to C++: switch on renderer_backend, then emu_window->IsOpen() / WaitEvent loop.
-    match renderer_backend {
-        "opengl" => {
-            let mut emu_window = EmuWindowSdl2Gl::new(args.fullscreen);
-
-            // Initialize the RendererOpenGL for frame presentation.
-            // In the full implementation, this is done inside GPU::BindRenderer().
-            let syncpoints = std::sync::Arc::new(
-                video_core::syncpoint::SyncpointManager::new(),
-            );
-            let renderer = video_core::renderer_opengl::RendererOpenGL::new(
-                |s| {
-                    let cs = std::ffi::CString::new(s).unwrap();
-                    unsafe {
-                        sdl2::sys::SDL_GL_GetProcAddress(cs.as_ptr()) as *const _
-                    }
-                },
-                syncpoints,
-            );
-            let mut renderer = match renderer {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("Failed to initialize OpenGL renderer: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
-            // Generate a test framebuffer: 1280x720 gradient pattern.
-            let fb_width = 1280u32;
-            let fb_height = 720u32;
-            let mut test_fb = vec![0u8; (fb_width * fb_height * 4) as usize];
-            for y in 0..fb_height {
-                for x in 0..fb_width {
-                    let idx = ((y * fb_width + x) * 4) as usize;
-                    test_fb[idx] = (x * 255 / fb_width) as u8;      // R
-                    test_fb[idx + 1] = (y * 255 / fb_height) as u8;  // G
-                    test_fb[idx + 2] = 128;                           // B
-                    test_fb[idx + 3] = 255;                           // A
-                }
-            }
-
-            log::info!("Entering OpenGL render loop");
-            while emu_window.is_open() {
-                emu_window.poll_events();
-
-                let (vp_w, vp_h) = emu_window.get_drawable_size();
-                renderer.composite(&test_fb, fb_width, fb_height, vp_w as u32, vp_h as u32);
-                emu_window.swap_buffers();
-
-                // Limit to ~60 FPS to avoid burning CPU.
-                std::thread::sleep(std::time::Duration::from_millis(16));
+    // -----------------------------------------------------------------------
+    // Step 9 (upstream): while (emu_window->IsOpen()) { emu_window->WaitEvent(); }
+    // Main thread stays in the window event loop.
+    // -----------------------------------------------------------------------
+    log::info!("Entering main event loop");
+    match &mut emu_window {
+        EmuWindow::Gl(w) => {
+            while w.is_open() {
+                w.wait_event();
             }
         }
-        "vulkan" => {
-            let mut emu_window = EmuWindowSdl2Vk::new(args.fullscreen);
-            while emu_window.is_open() {
-                emu_window.wait_event();
+        EmuWindow::Vk(w) => {
+            while w.is_open() {
+                w.wait_event();
             }
         }
-        _ => {
-            let mut emu_window = EmuWindowSdl2Null::new(args.fullscreen);
-            while emu_window.is_open() {
-                emu_window.wait_event();
+        EmuWindow::Null(w) => {
+            while w.is_open() {
+                w.wait_event();
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Step 10 (upstream): system.Pause(); system.ShutdownMainProcess();
+    // Cleanup after window closes.
+    // -----------------------------------------------------------------------
+    log::info!("Window closed, shutting down");
+    system.pause();
+    system.shutdown_main_process();
 }
