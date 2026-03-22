@@ -267,14 +267,14 @@ impl Interface {
 /// LoopProcess -- registers fatal:p and fatal:u services.
 ///
 /// Corresponds to `LoopProcess` in upstream fatal.cpp.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
     log::debug!("Fatal::LoopProcess called");
 
     let module = std::sync::Arc::new(Module::new());
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     let m1 = module.clone();
     server_manager.register_named_service(

@@ -99,11 +99,11 @@ impl IPmMainService {
 /// Registers "usb:ds", "usb:hs", "usb:pd", "usb:pd:c", "usb:pm" services.
 ///
 /// Corresponds to `LoopProcess` in upstream `usb.cpp`.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     let stub_names = &["usb:ds", "usb:hs", "usb:pd", "usb:pd:c", "usb:pm"];
     for &name in stub_names {

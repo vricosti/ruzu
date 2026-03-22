@@ -418,14 +418,14 @@ impl ServiceFramework for PlayReport {
 /// Registers "prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u" services.
 ///
 /// Corresponds to `LoopProcess` in upstream prepo.cpp.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
     log::debug!("PlayReport::LoopProcess called");
 
     let reporter = Arc::new(crate::reporter::Reporter::new());
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     for &name in &["prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u"] {
         let r = reporter.clone();

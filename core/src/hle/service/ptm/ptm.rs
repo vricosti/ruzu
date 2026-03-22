@@ -9,11 +9,11 @@
 /// LoopProcess — registers "psm" and "ts" services.
 ///
 /// Corresponds to `Service::PTM::LoopProcess` in upstream ptm.cpp.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     let stub_names = &["psm", "ts"];
     for &name in stub_names {

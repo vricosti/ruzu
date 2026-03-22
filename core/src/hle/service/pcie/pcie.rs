@@ -42,11 +42,11 @@ impl PCIe {
 /// Registers "pcie" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `pcie.cpp`.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     let stub_names = &["pcie"];
     for &name in stub_names {

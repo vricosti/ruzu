@@ -270,11 +270,11 @@ impl NetworkInterface {
 /// Registers "nifm:u", "nifm:a", "nifm:s" services.
 ///
 /// Corresponds to `LoopProcess` in upstream `nifm.cpp`.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     let stub_names = &["nifm:u", "nifm:a", "nifm:s"];
     for &name in stub_names {

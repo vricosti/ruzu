@@ -135,9 +135,9 @@ impl ErrorReportSession {
 ///
 /// Neither ErrorReportContext nor ErrorReportSession implement SessionRequestHandler yet,
 /// so we use stub services.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     let mut server_manager = crate::hle::service::server_manager::ServerManager::new(
-        crate::core::SystemRef::null(),
+        system,
     );
     crate::hle::service::services::register_stub_services(
         &mut server_manager,

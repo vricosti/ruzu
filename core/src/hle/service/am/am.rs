@@ -20,8 +20,8 @@ use super::window_system::WindowSystem;
 /// Matches upstream `void AM::LoopProcess(Core::System& system)`.
 /// In the C++ version, this creates a WindowSystem, ButtonPoller,
 /// EventObserver, and registers the two named services.
-pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>) {
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+    let mut server_manager = ServerManager::new(system);
 
     // Create a shared WindowSystem, matching upstream which creates it on the stack
     // and passes references to both appletOE and appletAE.

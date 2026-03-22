@@ -166,11 +166,11 @@ pub struct Linger {
 /// LoopProcess -- registers "bsd:u", "bsd:s", "bsdcfg", "nsd:u", "nsd:a", "sfdnsres" services.
 ///
 /// Corresponds to `Service::Sockets::LoopProcess` in upstream sockets.cpp.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     let stub_names = &["bsd:u", "bsd:s", "bsdcfg", "nsd:u", "nsd:a", "sfdnsres"];
     for &name in stub_names {

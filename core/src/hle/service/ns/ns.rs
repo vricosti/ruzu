@@ -21,14 +21,14 @@ pub const NS_SERVICE_GETTER_NAMES: &[&str] =
 /// LoopProcess — registers all NS services.
 ///
 /// Corresponds to `Service::NS::LoopProcess` in upstream ns.cpp.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use std::sync::Arc;
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
     log::debug!("NS::LoopProcess called");
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     // ns:am2, ns:ec, ns:rid, ns:rt, ns:web, ns:ro -> IServiceGetterInterface
     for &name in NS_SERVICE_GETTER_NAMES {

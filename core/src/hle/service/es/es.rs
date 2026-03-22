@@ -591,12 +591,12 @@ impl ServiceFramework for ETicket {
 /// Registers "es" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `es.cpp`.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use std::sync::Arc;
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     server_manager.register_named_service(
         "es",

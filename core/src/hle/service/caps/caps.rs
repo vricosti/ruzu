@@ -9,7 +9,7 @@
 /// LoopProcess — registers "caps:a", "caps:c", "caps:u", "caps:ss", "caps:sc", "caps:su".
 ///
 /// Corresponds to `Service::Capture::LoopProcess` in upstream caps.cpp.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use std::sync::{Arc, Mutex};
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
@@ -17,7 +17,7 @@ pub fn loop_process() {
 
     log::debug!("Capture::LoopProcess called");
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
     let album_manager = Arc::new(Mutex::new(AlbumManager::new()));
 
     // caps:a -> IAlbumAccessorService

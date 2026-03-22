@@ -140,12 +140,12 @@ impl IBluetoothDriver {
 /// Registers "btdrv" and "bt" services.
 ///
 /// Corresponds to `LoopProcess` in upstream btdrv.cpp.
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
 
     log::debug!("BtDrv::LoopProcess called");
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
     crate::hle::service::services::register_stub_services(
         &mut server_manager,
         &["btdrv", "bt"],

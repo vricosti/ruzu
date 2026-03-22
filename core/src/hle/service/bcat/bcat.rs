@@ -12,14 +12,14 @@
 /// Services registered:
 ///   bcat:a, bcat:m, bcat:u, bcat:s
 ///   news:a (permissions=0xffffffff), news:p (0x1), news:c (0x2), news:v (0x4), news:m (0xd)
-pub fn loop_process() {
+pub fn loop_process(system: crate::core::SystemRef) {
     use std::sync::Arc;
     use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 
     log::debug!("BCAT::LoopProcess - registering bcat and news services");
 
-    let mut server_manager = ServerManager::new(crate::core::SystemRef::null());
+    let mut server_manager = ServerManager::new(system);
 
     // bcat:a, bcat:m, bcat:u, bcat:s -> IServiceCreator
     for &name in &["bcat:a", "bcat:m", "bcat:u", "bcat:s"] {
