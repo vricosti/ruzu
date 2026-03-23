@@ -187,13 +187,13 @@
 ## 2026-03-23 — yuzu_cmd/src/main.rs vs /Users/vricosti/Dev/emulators/zuyu/src/yuzu_cmd/yuzu.cpp
 
 ### Intentional differences
-- None.
+- Rust still uses `clap` and a temporary `--renderer` CLI override because the upstream `getopt_long`/settings path is not fully ported. This is frontend plumbing outside the exit/shutdown ownership slice.
 
 ### Unintentional differences (to fix)
-- None in this shutdown slice. `main.rs` now follows the upstream `system.Pause(); system.ShutdownMainProcess();` path again.
+- Disk shader cache loading and debugger attach/detach still do not match the surrounding upstream `yuzu.cpp` flow.
 
 ### Missing items
-- None for this shutdown path.
+- Remaining `yuzu.cpp` parity outside the shutdown/exit path, including the unported debugger and disk-cache branches.
 
 ### Binary layout verification
 - PASS: frontend runtime/orchestration only; no raw-serialized structs are defined here.

@@ -446,6 +446,14 @@ fn main() {
     system.get_cpu_manager().on_gpu_ready();
 
     // -----------------------------------------------------------------------
+    // Upstream: system.RegisterExitCallback([&] { exit(0); })
+    // The SDL frontend exits immediately when the core requests application exit.
+    // -----------------------------------------------------------------------
+    system.register_exit_callback(Box::new(|| {
+        std::process::exit(0);
+    }));
+
+    // -----------------------------------------------------------------------
     // Step 8 (upstream): system.Run()
     // Starts CPU threads running in background via CpuManager.
     // -----------------------------------------------------------------------
