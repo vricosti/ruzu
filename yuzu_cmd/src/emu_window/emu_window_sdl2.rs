@@ -148,7 +148,9 @@ impl EmuWindowSdl2 {
         }
 
         self.dispatch_event(&event);
-        self.update_title_bar();
+        if self.is_open {
+            self.update_title_bar();
+        }
     }
 
     /// Polls and dispatches all pending SDL events without blocking.
@@ -162,7 +164,9 @@ impl EmuWindowSdl2 {
             self.dispatch_event(&event);
             had_events = true;
         }
-        self.update_title_bar();
+        if self.is_open {
+            self.update_title_bar();
+        }
         had_events
     }
 

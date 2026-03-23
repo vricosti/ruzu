@@ -106,6 +106,7 @@
 - Temporary SDL startup diagnostics were added around `SDL_Init` to log available video drivers and post-init driver/display information while investigating the macOS Cocoa startup failure. This is debug-only instrumentation in the Rust counterpart file and does not change ownership.
 - Rust still uses a simplified fixed title string in `update_title_bar` instead of the upstream perf-stats title formatting because the surrounding frontend/perf wiring is not yet ported.
 - `input_subsystem->Initialize()` and the destructor shutdown path remain stubbed/unported in Rust because the corresponding input subsystem ownership is not yet present in this frontend file.
+- Rust now skips the title-bar refresh once a close request has marked the window not open. This is a defensive divergence to avoid SDL/X11 calls on a window that the window manager may already have started destroying.
 
 ### Unintentional differences (to fix)
 - The macOS startup failure currently reproduces before SDL video initialization completes even though SDL reports the `cocoa` driver as available. Upstream does not hit this failure on the same frontend path, so additional platform-specific parity work is still required.
@@ -115,6 +116,7 @@
 ### Missing items
 - Port the remaining upstream helper and lifecycle methods listed above into `emu_window_sdl2.rs`.
 - Revisit whether the temporary SDL diagnostics should be kept behind debug logging only or removed once the macOS display-init issue is resolved.
+- Revisit whether the post-close title-bar guard can be removed once the remaining SDL/X11 close-path behavior is fully matched to upstream.
 
 ### Binary layout verification
 - PASS: frontend window runtime state only; no raw-serialized structs are defined here.
