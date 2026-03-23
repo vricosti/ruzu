@@ -320,22 +320,11 @@ impl AppLoaderNso {
         // BSS: add after arguments, matching upstream ordering.
         let bss_size = nso_header.segments[2].alignment_or_bss_size;
         code_set.data_segment_mut().size += bss_size;
-        let mut image_size = page_align_size(program_image.len() as u32 + bss_size);
+        let image_size = page_align_size(program_image.len() as u32 + bss_size);
         program_image.resize(image_size as usize, 0);
 
         for segment in &mut code_set.segments {
             segment.size = page_align_size(segment.size);
-        }
-
-        // After page-aligning segment sizes, the data segment (with BSS) may extend
-        // beyond the initial image_size. Ensure image covers all segments.
-        // Upstream on ARM64 hosts relies on NCE patching to refresh image_size via
-        // `image_size = program_image.size()` after RelocateAndCopy; on x86_64 hosts
-        // (no NCE) this expansion is needed explicitly.
-        let segments_end = (code_set.data_segment().addr as u32) + code_set.data_segment().size;
-        if segments_end > image_size {
-            image_size = page_align_size(segments_end);
-            program_image.resize(image_size as usize, 0);
         }
 
         // Upstream: applies PatchManager patches and NCE patching here.
