@@ -13,6 +13,7 @@ use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestH
 use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 
+use super::event_observer::EventObserver;
 use super::window_system::WindowSystem;
 
 /// Launches AM services.
@@ -26,6 +27,16 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     // Create a shared WindowSystem, matching upstream which creates it on the stack
     // and passes references to both appletOE and appletAE.
     let window_system = Arc::new(Mutex::new(WindowSystem::new()));
+    let window_system_ptr = {
+        let mut guard = window_system.lock().unwrap();
+        &mut *guard as *mut WindowSystem
+    };
+    let event_observer = EventObserver::new(window_system_ptr as *const WindowSystem);
+    {
+        let mut guard = window_system.lock().unwrap();
+        guard.set_event_observer(&event_observer as *const EventObserver as *mut EventObserver);
+    }
+    system.get().get_applet_manager().set_window_system(Some(window_system.clone()));
 
     let ws = window_system.clone();
     let factory_oe: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
@@ -40,4 +51,5 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     server_manager.register_named_service("appletAE", factory_ae, 64);
 
     ServerManager::run_server(server_manager);
+    drop(event_observer);
 }

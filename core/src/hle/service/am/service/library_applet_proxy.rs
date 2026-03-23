@@ -125,7 +125,7 @@ impl ILibraryAppletProxy {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::self_controller::ISelfController::new(proxy.applet.clone())),
+            Arc::new(super::self_controller::ISelfController::new(proxy.applet.clone(), None)),
         );
     }
 

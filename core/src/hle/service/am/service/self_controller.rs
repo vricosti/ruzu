@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -51,12 +52,30 @@ pub struct ISelfController {
     /// Reference to the applet.
     /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
+    /// Matches upstream `Kernel::KProcess* m_process`.
+    process: Option<Arc<Mutex<KProcess>>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl ISelfController {
-    pub fn new(applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
+    pub fn new(
+        applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
+        process: Option<Arc<Mutex<KProcess>>>,
+    ) -> Self {
+        {
+            let mut applet_guard = applet.lock().unwrap();
+            let applet_id = applet_guard.applet_id;
+            let mode = applet_guard.library_applet_mode;
+            let process_for_display = process
+                .clone()
+                .or_else(|| applet_guard.process.get_process());
+            if let Some(process_for_display) = process_for_display {
+                applet_guard
+                    .display_layer_manager
+                    .initialize(process_for_display, applet_id, mode);
+            }
+        }
         let handlers = build_handler_map(&[
             (0, Some(Self::exit_handler), "Exit"),
             (1, Some(Self::lock_exit_handler), "LockExit"),
@@ -84,6 +103,7 @@ impl ISelfController {
         ]);
         Self {
             applet,
+            process,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -339,13 +359,30 @@ impl ISelfController {
     /// applets to proceed past initialization. This is sufficient for games that do not
     /// depend on actual display layer management.
     fn create_managed_display_layer_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) CreateManagedDisplayLayer: returning dummy layer_id=1; DisplayLayerManager not yet implemented");
-        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u64(1); // dummy layer_id until DisplayLayerManager is ported
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let result = service
+            .applet
+            .lock()
+            .unwrap()
+            .display_layer_manager
+            .create_managed_display_layer();
+
+        match result {
+            Ok(layer_id) => {
+                log::info!("CreateManagedDisplayLayer: layer_id={}", layer_id);
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u64(layer_id);
+            }
+            Err(err) => {
+                log::error!("CreateManagedDisplayLayer failed: {:?}", err);
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(err);
+            }
+        }
     }
 
     /// SetIdleTimeDetectionExtension (cmd 62).
@@ -416,6 +453,12 @@ impl ISelfController {
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);
+    }
+}
+
+impl Drop for ISelfController {
+    fn drop(&mut self) {
+        self.applet.lock().unwrap().display_layer_manager.finalize();
     }
 }
 
