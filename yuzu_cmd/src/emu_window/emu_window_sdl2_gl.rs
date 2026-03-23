@@ -151,12 +151,25 @@ impl EmuWindowSdl2Gl {
         let mut base = EmuWindowSdl2::new();
 
         // Maps to SDL_GL_SetAttribute calls in upstream constructor.
+        // macOS only supports up to OpenGL 4.1 core profile (no compatibility profile).
+        #[cfg(target_os = "macos")]
+        let (gl_major, gl_minor, gl_profile) = (
+            4,
+            1,
+            sdl::SDL_GLprofile::SDL_GL_CONTEXT_PROFILE_CORE as i32,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let (gl_major, gl_minor, gl_profile) = (
+            4,
+            6,
+            sdl::SDL_GLprofile::SDL_GL_CONTEXT_PROFILE_COMPATIBILITY as i32,
+        );
         unsafe {
-            sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-            sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_CONTEXT_MINOR_VERSION, 6);
+            sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_CONTEXT_MAJOR_VERSION, gl_major);
+            sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_CONTEXT_MINOR_VERSION, gl_minor);
             sdl::SDL_GL_SetAttribute(
                 sdl::SDL_GLattr::SDL_GL_CONTEXT_PROFILE_MASK,
-                sdl::SDL_GLprofile::SDL_GL_CONTEXT_PROFILE_COMPATIBILITY as i32,
+                gl_profile,
             );
             sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_DOUBLEBUFFER, 1);
             sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_RED_SIZE, 8);
@@ -288,9 +301,30 @@ impl EmuWindowSdl2Gl {
         // GLAD_GL_ARB_texture_compression_rgtc via glad extension flags.
         // The `gl` crate does not provide per-extension availability flags;
         // we check via glGetStringi instead.
+        //
+        // Note: GL_ARB_texture_compression_rgtc was promoted to core in OpenGL 3.0.
+        // On macOS core profile contexts (GL 4.1 core), the functionality is always
+        // present but the extension string may not appear — so we also accept it
+        // when the GL version is 3.0 or higher.
         let mut unsupported: Vec<&str> = Vec::new();
         let mut has_s3tc = false;
         let mut has_rgtc = false;
+
+        // Check GL version for core-promoted extensions.
+        let gl_version = {
+            let mut major: gl::types::GLint = 0;
+            let mut minor: gl::types::GLint = 0;
+            unsafe {
+                gl::GetIntegerv(gl::MAJOR_VERSION, &mut major);
+                gl::GetIntegerv(gl::MINOR_VERSION, &mut minor);
+            }
+            (major, minor)
+        };
+
+        // RGTC is core since GL 3.0.
+        if gl_version.0 > 3 || (gl_version.0 == 3 && gl_version.1 >= 0) {
+            has_rgtc = true;
+        }
 
         let num_extensions = {
             let mut n: gl::types::GLint = 0;

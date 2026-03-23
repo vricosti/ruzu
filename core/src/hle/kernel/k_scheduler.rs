@@ -203,6 +203,60 @@ impl KScheduler {
     /// if dispatch is allowed.
     pub fn request_schedule_on_interrupt(&mut self) {
         self.state.needs_scheduling.store(true, Ordering::Relaxed);
+        // Full upstream path: if (CanSchedule()) { ScheduleOnInterrupt(); }
+        // We defer the actual fiber switch to the caller (cpu_manager) via
+        // schedule_raw_if_needed(), so that the switch never happens while
+        // the scheduler Mutex is held (holding a Mutex across a fiber yield
+        // causes deadlock when the next fiber tries to lock the same Mutex).
+    }
+
+    /// Activate the scheduler and schedule without holding the Mutex.
+    ///
+    /// Matches upstream `KScheduler::Activate()` (k_scheduler.cpp:138-141):
+    ///   m_is_active = true;
+    ///   RescheduleCurrentCore();
+    ///
+    /// Called via raw pointer from `CpuManager::guest_activate` so that the
+    /// fiber switch inside `schedule_impl_fiber` never occurs while the
+    /// per-core scheduler Mutex is held.
+    ///
+    /// # Safety
+    /// Must be called on the core OS thread.  The caller must have already
+    /// dropped the Mutex guard before invoking this function.  The scheduler
+    /// object must remain alive for the duration of the call (guaranteed by
+    /// the Arc kept in KernelCore).
+    pub unsafe fn activate_and_schedule_raw(sched: *mut KScheduler) {
+        (*sched).is_active = true;
+        // Upstream: RescheduleCurrentCore() → EnableDispatch + Schedule if needed.
+        if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
+            cur_thread.lock().unwrap().enable_dispatch();
+        }
+        if (*sched).state.needs_scheduling.load(Ordering::SeqCst) {
+            (*sched).reschedule_current_core_impl();
+        }
+    }
+
+    /// Perform a scheduling fiber switch without holding the Mutex.
+    ///
+    /// Matches the scheduling half of upstream `KScheduler::ScheduleOnInterrupt()`:
+    ///   DisableDispatch(); Schedule(); EnableDispatch();
+    ///
+    /// Called via raw pointer from `CpuManager` after `handle_interrupt()` so that
+    /// the fiber switch inside `schedule_impl_fiber` never occurs while the
+    /// per-core scheduler Mutex is held.
+    ///
+    /// # Safety
+    /// Same requirements as `activate_and_schedule_raw`.
+    pub unsafe fn schedule_raw_if_needed(sched: *mut KScheduler) {
+        if (*sched).state.needs_scheduling.load(Ordering::SeqCst) {
+            if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
+                cur_thread.lock().unwrap().disable_dispatch();
+            }
+            (*sched).schedule_impl_fiber();
+            if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
+                cur_thread.lock().unwrap().enable_dispatch();
+            }
+        }
     }
 
     /// Initialize the switch fiber for this scheduler.

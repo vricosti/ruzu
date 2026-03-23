@@ -26,7 +26,10 @@ pub enum ButtonPressDuration {
 /// lifecycle events. Mirrors upstream window_system.h fields.
 pub struct WindowSystem {
     /// Event observer — upstream: EventObserver* m_event_observer
-    event_observer: Option<*mut EventObserver>,
+    /// Owned here so its lifetime is tied to WindowSystem, not to the
+    /// loop_process stack frame (which returns as soon as the service
+    /// thread is spawned).
+    event_observer: Option<Box<EventObserver>>,
 
     /// Lock protecting mutable state.
     lock: Mutex<WindowSystemInner>,
@@ -53,11 +56,6 @@ struct WindowSystemInner {
     should_exit: bool,
 }
 
-// SAFETY: The raw pointer to EventObserver is only used by the thread that
-// owns the WindowSystem. The EventObserver outlives the WindowSystem per
-// upstream lifetime contract.
-unsafe impl Send for WindowSystem {}
-unsafe impl Sync for WindowSystem {}
 
 impl WindowSystem {
     pub fn new() -> Self {
@@ -75,7 +73,8 @@ impl WindowSystem {
     }
 
     /// Upstream: void SetEventObserver(EventObserver* event_observer)
-    pub fn set_event_observer(&mut self, observer: *mut EventObserver) {
+    /// Takes ownership of the EventObserver so it outlives loop_process.
+    pub fn set_event_observer(&mut self, observer: Box<EventObserver>) {
         self.event_observer = Some(observer);
     }
 
@@ -131,8 +130,8 @@ impl WindowSystem {
         }
 
         // Upstream: m_event_observer->TrackAppletProcess(*applet)
-        if let Some(observer) = self.event_observer {
-            unsafe { &*observer }.track_applet_process(&applet);
+        if let Some(ref observer) = self.event_observer {
+            observer.track_applet_process(&applet);
         }
 
         inner.applets.insert(aruid, applet);
@@ -259,8 +258,8 @@ impl WindowSystem {
     // --- Private helpers ---
 
     fn request_update(&self) {
-        if let Some(observer) = self.event_observer {
-            unsafe { &*observer }.request_update();
+        if let Some(ref observer) = self.event_observer {
+            observer.request_update();
         }
     }
 
@@ -335,8 +334,8 @@ impl WindowSystem {
             a.is_completed = true;
 
             // Request update to ensure quiescence.
-            if let Some(observer) = self.event_observer {
-                unsafe { &*observer }.request_update();
+            if let Some(ref observer) = self.event_observer {
+                observer.request_update();
             }
 
             // Unlink.
