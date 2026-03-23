@@ -687,7 +687,9 @@ impl System {
     pub fn run(&mut self) {
         let _lk = self.suspend_guard.lock();
 
-        // In C++: kernel.SuspendEmulation(false);
+        if let Some(ref kernel) = self.kernel {
+            kernel.suspend_emulation(false);
+        }
         self.core_timing.lock().unwrap().sync_pause(false);
         self.is_paused.store(false, Ordering::Relaxed);
 
@@ -700,7 +702,9 @@ impl System {
         let _lk = self.suspend_guard.lock();
 
         self.core_timing.lock().unwrap().sync_pause(true);
-        // In C++: kernel.SuspendEmulation(true);
+        if let Some(ref kernel) = self.kernel {
+            kernel.suspend_emulation(true);
+        }
         self.is_paused.store(true, Ordering::Relaxed);
 
         log::info!("System: paused");
@@ -732,20 +736,13 @@ impl System {
         self.exit_locked = false;
         self.exit_requested = false;
 
-        // In C++: gpu_core->NotifyShutdown();
-        // stop_event.request_stop();
-
         self.core_timing.lock().unwrap().sync_pause(false);
-
-        // In C++:
-        // Network::CancelPendingSocketOperations();
-        // kernel.SuspendEmulation(true);
-        // kernel.CloseServices();
-        // kernel.ShutdownCores();
-        // services.reset();
-        // service_manager.reset();
-        // fs_controller.Reset();
-        // cheat_engine.reset();
+        if let Some(ref kernel) = self.kernel {
+            kernel.suspend_emulation(true);
+            kernel.close_services();
+            kernel.shutdown_cores();
+        }
+        self.service_manager = None;
 
         // Upstream: telemetry_session.reset();
         self.telemetry_session = None;
@@ -763,12 +760,11 @@ impl System {
 
         self.perf_stats = None;
         self.cpu_manager.shutdown();
-
-        // In C++:
-        // debugger.reset();
-        // kernel.Shutdown();
-        // stop_event = {};
-        // Network::RestartSocketOperations();
+        self.current_process_arc = None;
+        self.current_process = None;
+        if let Some(ref mut kernel) = self.kernel {
+            kernel.shutdown();
+        }
 
         log::info!("System: shutdown complete");
     }

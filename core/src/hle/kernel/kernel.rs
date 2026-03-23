@@ -23,6 +23,8 @@ use super::init::init_slab_setup::KSlabResourceCounts;
 use super::k_auto_object_container::KAutoObjectWithListContainer;
 use super::k_hardware_timer::KHardwareTimer;
 use super::k_object_name::KObjectNameGlobalData;
+use super::k_thread::SuspendType;
+use super::k_worker_task_manager::KWorkerTaskManager;
 use super::physical_core::PhysicalCore;
 use crate::core_timing::CoreTiming;
 use crate::hardware_properties;
@@ -317,6 +319,49 @@ impl KernelCore {
         // Server managers are not yet tracked in KernelCore; no-op until wired.
     }
 
+    /// Suspend or resume emulation threads for the current application process.
+    ///
+    /// Upstream: `KernelCore::SuspendEmulation(bool)`.
+    /// This port currently tracks only the frontend-loaded application process.
+    pub fn suspend_emulation(&self, suspended: bool) {
+        let should_suspend = self.exception_exited || suspended;
+        let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() else {
+            return;
+        };
+
+        let threads: Vec<Arc<Mutex<KThread>>> = {
+            let process_guard = process.lock().unwrap();
+            process_guard.thread_objects.values().cloned().collect()
+        };
+
+        for thread in threads {
+            let mut thread_guard = thread.lock().unwrap();
+            if should_suspend {
+                thread_guard.request_suspend(SuspendType::System);
+            } else {
+                thread_guard.resume(SuspendType::System);
+            }
+        }
+
+        if should_suspend {
+            self.interrupt_all_cores();
+        }
+    }
+
+    /// Begin kernel-side shutdown for the current application process.
+    ///
+    /// Upstream: `KernelCore::ShutdownCores()`.
+    /// The current Rust port uses process termination plus per-core interrupts
+    /// to drive CpuManager guest fibers into their shutdown yield path.
+    pub fn shutdown_cores(&self) {
+        if let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() {
+            let _ = process.lock().unwrap().terminate();
+            KWorkerTaskManager::wait_for_global_idle();
+        }
+
+        self.interrupt_all_cores();
+    }
+
     /// Get the global scheduler context (Arc reference).
     pub fn global_scheduler_context(&self) -> Option<&Arc<Mutex<GlobalSchedulerContext>>> {
         self.global_scheduler_context.as_ref()
@@ -337,6 +382,14 @@ impl KernelCore {
     /// Upstream: `KernelCore::Scheduler(id)` (kernel.cpp:924).
     pub fn scheduler(&self, id: usize) -> Option<&Arc<Mutex<KScheduler>>> {
         self.schedulers.get(id)
+    }
+
+    fn interrupt_all_cores(&self) {
+        for core_id in 0..self.cores.len() {
+            if let Some(core) = self.physical_core(core_id) {
+                core.interrupt();
+            }
+        }
     }
 
     /// Get the scheduler for the calling host thread's core.

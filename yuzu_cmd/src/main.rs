@@ -23,14 +23,6 @@
 //! | `-v` / `--version`   | handled by clap          |
 
 use clap::Parser;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use sdl2::sys as sdl;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use signal_hook::consts::signal::{SIGINT, SIGTERM};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use signal_hook::iterator::Signals;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::thread;
 
 pub mod emu_window;
 pub mod sdl_config;
@@ -40,33 +32,6 @@ use emu_window::{
     emu_window_sdl2_vk::EmuWindowSdl2Vk,
 };
 use sdl_config::SdlConfig;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn install_signal_quit_handler() {
-    let mut signals = match Signals::new([SIGINT, SIGTERM]) {
-        Ok(signals) => signals,
-        Err(err) => {
-            log::warn!("Failed to install signal handlers: {}", err);
-            return;
-        }
-    };
-
-    thread::spawn(move || {
-        for signal in signals.forever() {
-            log::warn!("Received signal {}, requesting SDL shutdown", signal);
-            let mut event: sdl::SDL_Event = unsafe { std::mem::zeroed() };
-            event.type_ = sdl::SDL_EventType::SDL_QUIT as u32;
-            let push_result = unsafe { sdl::SDL_PushEvent(&mut event) };
-            if push_result < 0 {
-                log::error!("SDL_PushEvent(SDL_QUIT) failed; forcing process exit");
-                std::process::exit(0);
-            }
-        }
-    });
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn install_signal_quit_handler() {}
 
 // ---------------------------------------------------------------------------
 // CLI argument definitions
@@ -486,11 +451,6 @@ fn main() {
     // -----------------------------------------------------------------------
     system.run();
 
-    // Rust port adaptation: install SIGINT/SIGTERM handlers that wake the SDL
-    // event loop. Upstream shutdown is graceful, but the current Rust core
-    // shutdown path is not yet complete and can hang after window close.
-    install_signal_quit_handler();
-
     // -----------------------------------------------------------------------
     // Step 9 (upstream): while (emu_window->IsOpen()) { emu_window->WaitEvent(); }
     // Main thread stays in the window event loop.
@@ -515,11 +475,10 @@ fn main() {
     }
 
     // -----------------------------------------------------------------------
-    // Rust port adaptation:
-    // Exit immediately once the SDL window closes or a termination signal
-    // requests SDL_QUIT. The current Rust shutdown path can block waiting on
-    // CPU threads because upstream core shutdown ownership is still incomplete.
+    // Step 10 (upstream): system.Pause(); system.ShutdownMainProcess();
+    // Cleanup after window closes.
     // -----------------------------------------------------------------------
-    log::info!("Window closed, exiting frontend process");
-    std::process::exit(0);
+    log::info!("Window closed, shutting down");
+    system.pause();
+    system.shutdown_main_process();
 }
