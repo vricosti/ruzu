@@ -16,6 +16,8 @@ use crate::hle::service::nvnflinger::parcel::OutputParcel;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::container::Container;
+use super::manager_display_service::IManagerDisplayService;
+use super::system_display_service::ISystemDisplayService;
 use super::vi_results;
 use super::vi_types::*;
 
@@ -74,20 +76,20 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 101: GetSystemDisplayService
-    fn get_system_display_service(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_system_display_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
         log::warn!("IApplicationDisplayService::GetSystemDisplayService (STUBBED)");
-        let sub: Arc<dyn SessionRequestHandler> = Arc::new(
-            super::vi::ViStubService::new("ISystemDisplayService"),
-        );
+        let sub: Arc<dyn SessionRequestHandler> =
+            Arc::new(ISystemDisplayService::new(Arc::clone(&svc.container)));
         super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
     }
 
     /// cmd 102: GetManagerDisplayService
-    fn get_manager_display_service(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_manager_display_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
         log::warn!("IApplicationDisplayService::GetManagerDisplayService (STUBBED)");
-        let sub: Arc<dyn SessionRequestHandler> = Arc::new(
-            super::vi::ViStubService::new("IManagerDisplayService"),
-        );
+        let sub: Arc<dyn SessionRequestHandler> =
+            Arc::new(IManagerDisplayService::new(Arc::clone(&svc.container)));
         super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
     }
 

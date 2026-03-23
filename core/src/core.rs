@@ -17,6 +17,8 @@ use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_thread::KThread;
 use crate::hle::kernel::kernel::KernelCore;
+use crate::hle::service::am::applet_manager::{AppletManager, FrontendAppletParameters, LaunchType};
+use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::sm::sm::ServiceManager;
 use crate::memory::memory::Memory;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
@@ -121,6 +123,9 @@ pub struct System {
 
     /// Shared HLE service registry.
     service_manager: Option<Arc<std::sync::Mutex<ServiceManager>>>,
+
+    /// Applet manager used to register frontend-launched applets with AM.
+    applet_manager: AppletManager,
 
     /// Filesystem controller (process registrations, factory management).
     /// Upstream: `FileSystemController& GetFileSystemController()`.
@@ -278,6 +283,7 @@ impl System {
             gpu_core: None,
             audio_core: None,
             service_manager: None,
+            applet_manager: AppletManager::new(),
             filesystem_controller: Arc::new(StdMutex::new(
                 crate::hle::service::filesystem::filesystem::FileSystemController::new(),
             )),
@@ -620,6 +626,17 @@ impl System {
             } else {
                 (1, 1)
             };
+            self.applet_manager.create_and_insert_by_frontend_applet_parameters(
+                process_arc.clone(),
+                FrontendAppletParameters {
+                    program_id: process_arc.lock().unwrap().get_program_id(),
+                    applet_id: AppletId::Application,
+                    applet_type: AppletType::Application,
+                    launch_type: Some(LaunchType::FrontendInitiated),
+                    program_index: 0,
+                    previous_program_index: -1,
+                },
+            );
             let run_result = process_arc.lock().unwrap().run(
                 priority, stack_size, app_thread_id, app_object_id, is_64bit, guest_thread_func,
             );
@@ -1099,6 +1116,10 @@ impl System {
     /// Get the shared HLE service registry.
     pub fn service_manager(&self) -> Option<Arc<std::sync::Mutex<ServiceManager>>> {
         self.service_manager.clone()
+    }
+
+    pub fn get_applet_manager(&self) -> &AppletManager {
+        &self.applet_manager
     }
 
     /// Get the filesystem controller.

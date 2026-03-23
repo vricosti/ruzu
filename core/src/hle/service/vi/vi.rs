@@ -6,136 +6,26 @@
 //! VI service registration: creates a shared Container and registers
 //! vi:u, vi:s, vi:m root services.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::service::hle_ipc::SessionRequestHandler;
 
 use super::application_root_service::IApplicationRootService;
 use super::container::Container;
+use super::manager_root_service::IManagerRootService;
+use super::system_root_service::ISystemRootService;
 
 pub const VI_SERVICE_NAMES: &[&str] = &["vi:u", "vi:s", "vi:m"];
 
-// -- ViStubService (generic stub for sub-services like IHOSBinderDriver, etc.) --
+static SHARED_CONTAINER: LazyLock<Mutex<Option<Weak<Container>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
-pub struct ViStubService {
-    name: String,
-    handlers: BTreeMap<u32, FunctionInfo>,
-    handlers_tipc: BTreeMap<u32, FunctionInfo>,
-}
-
-impl ViStubService {
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            handlers: BTreeMap::new(),
-            handlers_tipc: BTreeMap::new(),
-        }
-    }
-}
-
-impl SessionRequestHandler for ViStubService {
-    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
-        ServiceFramework::handle_sync_request_impl(self, ctx)
-    }
-    fn service_name(&self) -> &str {
-        ServiceFramework::get_service_name(self)
-    }
-}
-
-impl ServiceFramework for ViStubService {
-    fn get_service_name(&self) -> &str { &self.name }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
-}
-
-// -- Stub root service for vi:s and vi:m (same pattern as IApplicationRootService
-//    but with different command IDs) --
-
-struct ViSystemRootService {
-    container: Arc<Container>,
-    handlers: BTreeMap<u32, FunctionInfo>,
-    handlers_tipc: BTreeMap<u32, FunctionInfo>,
-}
-
-impl ViSystemRootService {
-    fn new(container: Arc<Container>) -> Self {
-        Self {
-            container,
-            handlers: build_handler_map(&[
-                (1, Some(Self::get_display_service), "GetDisplayService"),
-                (3, None, "GetDisplayServiceWithProxyNameExchange"),
-            ]),
-            handlers_tipc: BTreeMap::new(),
-        }
-    }
-
-    fn get_display_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let root = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        log::debug!("ISystemRootService::GetDisplayService called");
-        let display_service = super::application_display_service::IApplicationDisplayService::new(
-            Arc::clone(&root.container),
-        );
-        let sub: Arc<dyn SessionRequestHandler> = Arc::new(display_service);
-        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
-    }
-}
-
-impl SessionRequestHandler for ViSystemRootService {
-    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
-        ServiceFramework::handle_sync_request_impl(self, ctx)
-    }
-    fn service_name(&self) -> &str { ServiceFramework::get_service_name(self) }
-}
-
-impl ServiceFramework for ViSystemRootService {
-    fn get_service_name(&self) -> &str { "vi:s" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
-}
-
-struct ViManagerRootService {
-    container: Arc<Container>,
-    handlers: BTreeMap<u32, FunctionInfo>,
-    handlers_tipc: BTreeMap<u32, FunctionInfo>,
-}
-
-impl ViManagerRootService {
-    fn new(container: Arc<Container>) -> Self {
-        Self {
-            container,
-            handlers: build_handler_map(&[
-                (2, Some(Self::get_display_service), "GetDisplayService"),
-                (3, None, "GetDisplayServiceWithProxyNameExchange"),
-            ]),
-            handlers_tipc: BTreeMap::new(),
-        }
-    }
-
-    fn get_display_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let root = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        log::debug!("IManagerRootService::GetDisplayService called");
-        let display_service = super::application_display_service::IApplicationDisplayService::new(
-            Arc::clone(&root.container),
-        );
-        let sub: Arc<dyn SessionRequestHandler> = Arc::new(display_service);
-        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
-    }
-}
-
-impl SessionRequestHandler for ViManagerRootService {
-    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
-        ServiceFramework::handle_sync_request_impl(self, ctx)
-    }
-    fn service_name(&self) -> &str { ServiceFramework::get_service_name(self) }
-}
-
-impl ServiceFramework for ViManagerRootService {
-    fn get_service_name(&self) -> &str { "vi:m" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+pub fn get_shared_container() -> Option<Arc<Container>> {
+    SHARED_CONTAINER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(Weak::upgrade)
 }
 
 // -- Registration --
@@ -146,6 +36,7 @@ impl ServiceFramework for ViManagerRootService {
 /// Creates a shared Container, then registers vi:u, vi:s, vi:m.
 pub fn loop_process(system: crate::core::SystemRef) {
     let container = Arc::new(Container::new(system));
+    *SHARED_CONTAINER.lock().unwrap() = Some(Arc::downgrade(&container));
 
     let mut server_manager =
         crate::hle::service::server_manager::ServerManager::new(system);
@@ -165,7 +56,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
     server_manager.register_named_service(
         "vi:s",
         Box::new(move || -> Arc<dyn SessionRequestHandler> {
-            Arc::new(ViSystemRootService::new(Arc::clone(&container_s)))
+            Arc::new(ISystemRootService::new(Arc::clone(&container_s)))
         }),
         64,
     );
@@ -175,7 +66,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
     server_manager.register_named_service(
         "vi:m",
         Box::new(move || -> Arc<dyn SessionRequestHandler> {
-            Arc::new(ViManagerRootService::new(Arc::clone(&container_m)))
+            Arc::new(IManagerRootService::new(Arc::clone(&container_m)))
         }),
         64,
     );

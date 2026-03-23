@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::applet::Applet;
 use crate::hle::service::am::window_system::WindowSystem;
@@ -31,6 +32,8 @@ pub struct IApplicationProxy {
     /// Reference to the window system.
     /// Matches upstream `WindowSystem& m_window_system`.
     window_system: Arc<Mutex<WindowSystem>>,
+    /// Matches upstream `Kernel::KProcess* m_process`.
+    process: Option<Arc<Mutex<KProcess>>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -38,7 +41,11 @@ pub struct IApplicationProxy {
 impl IApplicationProxy {
     /// Create with an applet and window system reference.
     /// Matches upstream: `IApplicationProxy(Core::System&, std::shared_ptr<Applet>, Kernel::KProcess*, WindowSystem&)`
-    pub fn new(applet: Arc<Mutex<Applet>>, window_system: Arc<Mutex<WindowSystem>>) -> Self {
+    pub fn new(
+        applet: Arc<Mutex<Applet>>,
+        process: Option<Arc<Mutex<KProcess>>>,
+        window_system: Arc<Mutex<WindowSystem>>,
+    ) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::get_common_state_getter_handler), "GetCommonStateGetter"),
             (1, Some(Self::get_self_controller_handler), "GetSelfController"),
@@ -65,6 +72,7 @@ impl IApplicationProxy {
         Self {
             applet,
             window_system,
+            process,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -111,7 +119,7 @@ impl IApplicationProxy {
     fn get_self_controller_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
         Self::push_interface_response(ctx, Arc::new(
-            super::self_controller::ISelfController::new(proxy.applet.clone())
+            super::self_controller::ISelfController::new(proxy.applet.clone(), proxy.process.clone())
         ));
     }
 

@@ -7,9 +7,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::am::am_types::FocusState;
-use crate::hle::service::am::applet::Applet;
+use crate::hle::kernel::k_process::KProcess;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::am::window_system::WindowSystem;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -38,11 +37,13 @@ impl IApplicationProxyService {
     ///
     /// Upstream calls GetAppletFromProcessId(pid) via WindowSystem::GetByAppletResourceUserId
     /// to find the existing applet for the calling process, then wraps it in an
-    /// IApplicationProxy. The current implementation creates a fresh Applet instead
-    /// of looking up an existing one, which is sufficient for the initial application
-    /// launch path but diverges from upstream for multi-process scenarios.
-    pub fn open_application_proxy(&self) {
-        log::debug!("IApplicationProxyService::OpenApplicationProxy called");
+    /// IApplicationProxy.
+    pub fn open_application_proxy(&self, pid: u64) -> Option<Arc<Mutex<crate::hle::service::am::applet::Applet>>> {
+        log::debug!("IApplicationProxyService::OpenApplicationProxy called, pid={:#x}", pid);
+        self.window_system
+            .lock()
+            .unwrap()
+            .get_by_applet_resource_user_id(pid)
     }
 
     fn open_application_proxy_handler(
@@ -52,33 +53,32 @@ impl IApplicationProxyService {
         let service = unsafe {
             &*(this as *const dyn ServiceFramework as *const IApplicationProxyService)
         };
-        service.open_application_proxy();
-        let applet = Arc::new(Mutex::new(Applet::new(true)));
-        {
-            let mut applet_guard = applet.lock().unwrap();
-            if ctx.get_pid() != 0 {
-                applet_guard.aruid.pid = ctx.get_pid();
-            }
-            if let Some(thread) = ctx.get_thread() {
-                if let Some(process) = thread.lock().unwrap().parent.as_ref().and_then(|p| p.upgrade()) {
-                    let process = process.lock().unwrap();
-                    if applet_guard.aruid.pid == 0 {
-                        applet_guard.aruid.pid = process.get_process_id();
-                    }
-                    applet_guard.program_id = process.get_program_id();
-                }
-            }
-            applet_guard.is_process_running = true;
-            applet_guard.lifecycle_manager.set_focus_state(FocusState::InFocus);
-            applet_guard.update_suspension_state_locked(true);
-            log::info!(
-                "OpenApplicationProxy: seeded applet aruid={:#x} program_id={:#x}",
-                applet_guard.aruid.pid,
-                applet_guard.program_id
-            );
-        }
+        let pid = if ctx.get_pid() != 0 {
+            ctx.get_pid()
+        } else {
+            ctx.get_thread()
+                .and_then(|thread| thread.lock().unwrap().parent.as_ref().and_then(|p| p.upgrade()))
+                .map(|process| process.lock().unwrap().get_process_id())
+                .unwrap_or(0)
+        };
+        let Some(applet) = service.open_application_proxy(pid) else {
+            // Upstream: UNIMPLEMENTED(); R_THROW(ResultUnknown);
+            log::error!("OpenApplicationProxy: no tracked applet for pid={:#x}", pid);
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        log::debug!(
+            "OpenApplicationProxy: found applet for pid={:#x}",
+            pid
+        );
+        let process = ctx
+            .get_thread()
+            .and_then(|thread| thread.lock().unwrap().parent.as_ref().and_then(|p| p.upgrade()))
+            .map(|process| process as Arc<Mutex<KProcess>>);
         let proxy = Arc::new(super::application_proxy::IApplicationProxy::new(
             applet,
+            process,
             service.window_system.clone(),
         ));
         let is_domain = ctx
