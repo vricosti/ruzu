@@ -1226,6 +1226,14 @@ impl KPageTableBase {
             return (op_result, 0);
         }
 
+        // Zero the newly mapped heap pages.
+        // Upstream: the kernel allocates zeroed physical pages from KPageHeap.
+        // In our emulator, DeviceMemory is pre-allocated and may contain stale data,
+        // so we must explicitly zero the heap region after mapping.
+        if let Some(memory) = &self.m_memory {
+            memory.lock().unwrap().zero_block(cur_address as u64, allocation_size);
+        }
+
         // Update block manager: new region is Normal/UserReadWrite.
         self.m_memory_block_manager.update(
             cur_address,
