@@ -40,6 +40,62 @@ pub struct MiiEditAppletInputCommon {
 }
 const _: () = assert!(std::mem::size_of::<MiiEditAppletInputCommon>() == 0x8);
 
+/// Port of MiiEditAppletInputV3 — size is 0x100 - sizeof(MiiEditAppletInputCommon) = 0xF8.
+///
+/// `valid_uuids` and `used_uuid` use `[u8; 16]` (not `u128`) to match the
+/// 1-byte alignment of C++ `Common::UUID` (`std::array<u8, 0x10>`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MiiEditAppletInputV3 {
+    pub special_mii_key_code: u32,
+    pub valid_uuids: [[u8; 16]; 8],
+    pub used_uuid: [u8; 16],
+    pub _padding: [u8; 0x64],
+}
+const _: () = assert!(
+    std::mem::size_of::<MiiEditAppletInputV3>() == 0x100 - std::mem::size_of::<MiiEditAppletInputCommon>()
+);
+
+impl Default for MiiEditAppletInputV3 {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Port of MiiEditAppletInputV4 — size is 0x100 - sizeof(MiiEditAppletInputCommon) = 0xF8.
+///
+/// `char_info` mirrors `Mii::CharInfo` (0x58 bytes) as a raw byte array to
+/// avoid a cross-crate dependency on the Mii service.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MiiEditAppletInputV4 {
+    pub special_mii_key_code: u32,
+    pub char_info: [u8; 0x58], // Mii::CharInfo
+    pub _padding1: [u8; 0x28],
+    pub used_uuid: [u8; 16],
+    pub _padding2: [u8; 0x64],
+}
+const _: () = assert!(
+    std::mem::size_of::<MiiEditAppletInputV4>() == 0x100 - std::mem::size_of::<MiiEditAppletInputCommon>()
+);
+
+impl Default for MiiEditAppletInputV4 {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Local aggregate matching upstream's `MiiEditV3` anonymous struct in
+/// `PushInShowMiiEditData`. Version3 uses `MiiEditAppletInputV3`.
+/// `static_assert(sizeof(MiiEditV3) == 0x100)` in upstream.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MiiEditV3 {
+    pub common: MiiEditAppletInputCommon,
+    pub input: MiiEditAppletInputV3,
+}
+const _: () = assert!(std::mem::size_of::<MiiEditV3>() == 0x100);
+
 /// Port of MiiEditAppletOutput (nn::mii::AppletOutput)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

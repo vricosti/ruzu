@@ -39,7 +39,7 @@ rdynarmic = { path = "../rdynarmic" }
 clap = { version = "4", features = ["derive"] }
 
 # Window / Graphics
-sdl2 = { version = "0.37", features = ["raw-window-handle", "bundled", "static-link"] }
+sdl2 = { version = "0.37", features = ["raw-window-handle"] }
 ash = "0.37"
 vulkano = "0.34"
 raw-window-handle = "0.6"
@@ -76,3 +76,4 @@ parking_lot = "0.12"
 serde_json = "1"
 tempfile = "3"
 openssl = "0.10"
+corosensei = "0.3.3"

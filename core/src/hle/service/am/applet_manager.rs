@@ -4,16 +4,300 @@
 //! Port of zuyu/src/core/hle/service/am/applet_manager.h
 //! Port of zuyu/src/core/hle/service/am/applet_manager.cpp
 
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
 
 use super::am_types::*;
 use super::applet::Applet;
+use super::applet_data_broker::AppletDataBroker;
 use super::window_system::WindowSystem;
+use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::service::os::process::Process;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// ---------------------------------------------------------------------------
+// Upstream anonymous-namespace constant and struct
+// ---------------------------------------------------------------------------
+
+/// Upstream: `constexpr u32 LaunchParameterAccountPreselectedUserMagic = 0xC79497CA`
+const LAUNCH_PARAMETER_ACCOUNT_PRESELECTED_USER_MAGIC: u32 = 0xC79497CA;
+
+/// Upstream: `struct LaunchParameterAccountPreselectedUser`
+/// Size must be 0x88 bytes (verified by static_assert in upstream).
+///
+/// Note: `current_user` uses `[u8; 16]` rather than `u128` because Rust's
+/// `u128` has 16-byte alignment, which would insert hidden padding and make
+/// the struct 0x90 bytes. C++ `Common::UUID` is a plain `std::array<u8, 0x10>`
+/// with 1-byte alignment, so `[u8; 16]` matches the layout exactly.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct LaunchParameterAccountPreselectedUser {
+    magic: u32,
+    is_account_selected: u32,
+    current_user: [u8; 16],    // Common::UUID — 16 bytes, alignment 1
+    _padding: [u8; 0x70],
+}
+const _: () = assert!(std::mem::size_of::<LaunchParameterAccountPreselectedUser>() == 0x88);
+
+// ---------------------------------------------------------------------------
+// Push-in helpers (upstream anonymous-namespace free functions)
+// ---------------------------------------------------------------------------
+
+/// Upstream: `AppletStorageChannel& InitializeFakeCallerApplet(system, applet)`
+///
+/// Creates a caller-applet broker on `applet` and returns a reference to its
+/// in-data channel so callers can push launch arguments.
+fn initialize_fake_caller_applet(applet: &mut Applet) -> &super::applet_data_broker::AppletStorageChannel {
+    applet.caller_applet_broker = Some(Arc::new(AppletDataBroker::new()));
+    applet.caller_applet_broker.as_ref().unwrap().get_in_data()
+}
+
+/// Upstream: `void PushInShowQlaunch(system, channel)`
+fn push_in_show_qlaunch(system_tick: u64, channel: &super::applet_data_broker::AppletStorageChannel) {
+    let arguments = CommonArguments {
+        arguments_version: CommonArgumentVersion::Version3,
+        size: CommonArgumentSize::Version3 as u32,
+        library_version: 0,
+        theme_color: ThemeColor::BasicBlack,
+        play_startup_sound: true,
+        _pad: [0u8; 3],
+        system_tick,
+    };
+    let mut buf = vec![0u8; std::mem::size_of::<CommonArguments>()];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &arguments as *const _ as *const u8,
+            buf.as_mut_ptr(),
+            buf.len(),
+        );
+    }
+    channel.push(buf);
+}
+
+/// Upstream: `void PushInShowAlbum(system, channel)`
+fn push_in_show_album(system_tick: u64, channel: &super::applet_data_broker::AppletStorageChannel) {
+    let arguments = CommonArguments {
+        arguments_version: CommonArgumentVersion::Version3,
+        size: CommonArgumentSize::Version3 as u32,
+        library_version: 1,
+        theme_color: ThemeColor::BasicBlack,
+        play_startup_sound: true,
+        _pad: [0u8; 3],
+        system_tick,
+    };
+    let mut arg_buf = vec![0u8; std::mem::size_of::<CommonArguments>()];
+    let settings_buf = vec![2u8];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &arguments as *const _ as *const u8,
+            arg_buf.as_mut_ptr(),
+            arg_buf.len(),
+        );
+    }
+    channel.push(arg_buf);
+    channel.push(settings_buf);
+}
+
+/// Upstream: `void PushInShowController(system, channel)`
+fn push_in_show_controller(
+    system_tick: u64,
+    channel: &super::applet_data_broker::AppletStorageChannel,
+) {
+    use crate::hle::service::am::frontend::applet_controller::{
+        ControllerAppletVersion, ControllerSupportArgNew, ControllerSupportArgHeader,
+        ControllerSupportArgPrivate,
+    };
+
+    let common_args = CommonArguments {
+        arguments_version: CommonArgumentVersion::Version3,
+        size: CommonArgumentSize::Version3 as u32,
+        library_version: ControllerAppletVersion::Version8 as u32,
+        theme_color: ThemeColor::BasicBlack,
+        play_startup_sound: true,
+        _pad: [0u8; 3],
+        system_tick,
+    };
+
+    let user_args = ControllerSupportArgNew {
+        header: ControllerSupportArgHeader {
+            player_count_min: 1,
+            player_count_max: 4,
+            enable_take_over_connection: true,
+            enable_left_justify: false,
+            enable_permit_joy_dual: true,
+            enable_single_mode: false,
+            enable_identification_color: false,
+        },
+        ..Default::default()
+    };
+
+    let private_args = ControllerSupportArgPrivate {
+        arg_private_size: std::mem::size_of::<ControllerSupportArgPrivate>() as u32,
+        arg_size: std::mem::size_of::<ControllerSupportArgNew>() as u32,
+        is_home_menu: true,
+        flag_1: true,
+        mode: 0, // ControllerSupportMode::ShowControllerSupport
+        caller: 0, // ControllerSupportCaller::Application
+        style_set: 0, // NpadStyleSet::None
+        joy_hold_type: 0,
+    };
+
+    let mut common_buf = vec![0u8; std::mem::size_of::<CommonArguments>()];
+    let mut private_buf = vec![0u8; std::mem::size_of::<ControllerSupportArgPrivate>()];
+    let mut user_buf = vec![0u8; std::mem::size_of::<ControllerSupportArgNew>()];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &common_args as *const _ as *const u8,
+            common_buf.as_mut_ptr(),
+            common_buf.len(),
+        );
+        std::ptr::copy_nonoverlapping(
+            &private_args as *const _ as *const u8,
+            private_buf.as_mut_ptr(),
+            private_buf.len(),
+        );
+        std::ptr::copy_nonoverlapping(
+            &user_args as *const _ as *const u8,
+            user_buf.as_mut_ptr(),
+            user_buf.len(),
+        );
+    }
+    channel.push(common_buf);
+    channel.push(private_buf);
+    channel.push(user_buf);
+}
+
+/// Upstream: `void PushInShowCabinetData(system, channel)`
+fn push_in_show_cabinet_data(
+    system_tick: u64,
+    channel: &super::applet_data_broker::AppletStorageChannel,
+) {
+    use crate::hle::service::am::frontend::applet_cabinet::{
+        CabinetAppletVersion, StartParamForAmiiboSettings,
+    };
+
+    let arguments = CommonArguments {
+        arguments_version: CommonArgumentVersion::Version3,
+        size: CommonArgumentSize::Version3 as u32,
+        library_version: CabinetAppletVersion::Version1 as u32,
+        theme_color: ThemeColor::BasicBlack,
+        play_startup_sound: true,
+        _pad: [0u8; 3],
+        system_tick,
+    };
+
+    // Upstream: amiibo_settings.applet_mode = system.GetFrontendAppletHolder().GetCabinetMode()
+    // We use the default (StartNicknameAndOwnerSettings = 0) since we have no frontend holder.
+    let amiibo_settings = StartParamForAmiiboSettings::default();
+
+    let mut arg_buf = vec![0u8; std::mem::size_of::<CommonArguments>()];
+    let mut settings_buf = vec![0u8; std::mem::size_of::<StartParamForAmiiboSettings>()];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &arguments as *const _ as *const u8,
+            arg_buf.as_mut_ptr(),
+            arg_buf.len(),
+        );
+        std::ptr::copy_nonoverlapping(
+            &amiibo_settings as *const _ as *const u8,
+            settings_buf.as_mut_ptr(),
+            settings_buf.len(),
+        );
+    }
+    channel.push(arg_buf);
+    channel.push(settings_buf);
+}
+
+/// Upstream: `void PushInShowMiiEditData(system, channel)`
+fn push_in_show_mii_edit_data(channel: &super::applet_data_broker::AppletStorageChannel) {
+    use crate::hle::service::am::frontend::applet_mii_edit_types::{
+        MiiEditAppletInputCommon, MiiEditAppletMode, MiiEditAppletVersion, MiiEditV3,
+    };
+
+    let mii_arguments = MiiEditV3 {
+        common: MiiEditAppletInputCommon {
+            version: MiiEditAppletVersion::Version3 as i32,
+            applet_mode: MiiEditAppletMode::ShowMiiEdit as u32,
+        },
+        input: Default::default(),
+    };
+
+    let mut buf = vec![0u8; std::mem::size_of::<MiiEditV3>()];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &mii_arguments as *const _ as *const u8,
+            buf.as_mut_ptr(),
+            buf.len(),
+        );
+    }
+    channel.push(buf);
+}
+
+/// Upstream: `void PushInShowSoftwareKeyboard(system, channel)`
+fn push_in_show_software_keyboard(
+    system_tick: u64,
+    channel: &super::applet_data_broker::AppletStorageChannel,
+) {
+    use crate::hle::service::am::frontend::applet_software_keyboard_types::{
+        SwkbdConfigCommon, SwkbdConfigNew, SwkbdTextDrawType, SwkbdType,
+    };
+
+    let arguments = CommonArguments {
+        arguments_version: CommonArgumentVersion::Version3,
+        size: CommonArgumentSize::Version3 as u32,
+        library_version: 0x8000D, // SwkbdAppletVersion::Version524301
+        theme_color: ThemeColor::BasicBlack,
+        play_startup_sound: true,
+        _pad: [0u8; 3],
+        system_tick,
+    };
+
+    let swkbd_config = SwkbdConfigCommon {
+        swkbd_type: SwkbdType::Qwerty as u32,
+        max_text_length: 500,
+        text_draw_type: SwkbdTextDrawType::Box as u32,
+        enable_return_button: true,
+        use_blur_background: true,
+        ..Default::default()
+    };
+    let swkbd_config_new = SwkbdConfigNew::default();
+
+    // Upstream: argument_data, then swkbd_data (config_common concatenated with config_new),
+    // then work_buffer (empty — initial_string_length = 0).
+    let mut arg_buf = vec![0u8; std::mem::size_of::<CommonArguments>()];
+    let mut swkbd_buf = vec![
+        0u8;
+        std::mem::size_of::<SwkbdConfigCommon>() + std::mem::size_of::<SwkbdConfigNew>()
+    ];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &arguments as *const _ as *const u8,
+            arg_buf.as_mut_ptr(),
+            arg_buf.len(),
+        );
+        std::ptr::copy_nonoverlapping(
+            &swkbd_config as *const _ as *const u8,
+            swkbd_buf.as_mut_ptr(),
+            std::mem::size_of::<SwkbdConfigCommon>(),
+        );
+        std::ptr::copy_nonoverlapping(
+            &swkbd_config_new as *const _ as *const u8,
+            swkbd_buf.as_mut_ptr().add(std::mem::size_of::<SwkbdConfigCommon>()),
+            std::mem::size_of::<SwkbdConfigNew>(),
+        );
+    }
+    channel.push(arg_buf);
+    channel.push(swkbd_buf);
+    // work_buffer: initial_string_length = 0, so empty — not pushed.
+}
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LaunchType {
+    #[default]
     FrontendInitiated,
     ApplicationInitiated,
 }
@@ -23,86 +307,99 @@ pub struct FrontendAppletParameters {
     pub program_id: ProgramId,
     pub applet_id: AppletId,
     pub applet_type: AppletType,
-    pub launch_type: Option<LaunchType>,
+    pub launch_type: LaunchType,
     pub program_index: i32,
     pub previous_program_index: i32,
 }
 
+/// Parameters needed to call `KProcess::run()`, stored alongside the pending
+/// process so `set_window_system` can call it after applet tracking — matching
+/// upstream `applet->process->Run()` at the end of `SetWindowSystem`.
+pub struct PendingRunParameters {
+    pub priority: i32,
+    pub stack_size: usize,
+    pub main_thread_id: u64,
+    pub main_object_id: u64,
+    pub is_64bit: bool,
+    pub init_func: Option<Box<dyn FnOnce() + Send>>,
+}
+
+// ---------------------------------------------------------------------------
+// AppletManager
+// ---------------------------------------------------------------------------
+
 /// Port of AppletManager
 ///
-/// Manages the lifecycle of applets. In the Rust port this stores an
-/// `Arc<Mutex<WindowSystem>>` rather than an upstream raw pointer so the
-/// shared AM service state can be accessed safely across threads.
+/// Upstream: `class AppletManager` in `applet_manager.h`.
+///
+/// Manages the lifecycle of applets. Stores a `SystemRef` matching upstream's
+/// `m_system: Core::System&`, and an `Arc<Mutex<WindowSystem>>` instead of
+/// upstream's raw `WindowSystem*` for safe cross-thread access.
 pub struct AppletManager {
-    /// Lock protecting mutable state — upstream: std::mutex m_lock
+    /// Upstream: `Core::System& m_system`
+    system: SystemRef,
+    /// Lock protecting mutable state — upstream: `std::mutex m_lock`
     lock: Mutex<AppletManagerInner>,
+    /// Condition variable — upstream: `std::condition_variable m_cv`
+    cv: Condvar,
 }
 
 struct AppletManagerInner {
-    /// WindowSystem owner — upstream: WindowSystem* m_window_system
+    /// Upstream: `WindowSystem* m_window_system`
     window_system: Option<Arc<Mutex<WindowSystem>>>,
-    pending_parameters: Option<FrontendAppletParameters>,
+    /// Upstream: `std::unique_ptr<Process> m_pending_process`
     pending_process: Option<Arc<Mutex<KProcess>>>,
+    /// Upstream: `FrontendAppletParameters m_pending_parameters`
+    pending_parameters: Option<FrontendAppletParameters>,
+    /// Rust-specific: run parameters needed to call KProcess::run() from set_window_system.
+    pending_run_params: Option<PendingRunParameters>,
 }
 
 impl AppletManager {
     pub fn new() -> Self {
         Self {
+            system: SystemRef::null(),
             lock: Mutex::new(AppletManagerInner {
                 window_system: None,
-                pending_parameters: None,
                 pending_process: None,
+                pending_parameters: None,
+                pending_run_params: None,
             }),
+            cv: Condvar::new(),
         }
     }
 
-    /// Upstream: void SetWindowSystem(WindowSystem* window_system)
+    /// Stores the system reference. Must be called once after `System` is
+    /// placed in its final memory location (e.g. at end of `initialize()`).
+    ///
+    /// Matches upstream: `AppletManager` constructor receives `Core::System& system`.
+    pub fn set_system(&mut self, system: SystemRef) {
+        self.system = system;
+    }
+
+    /// Upstream: `void SetWindowSystem(WindowSystem* window_system)`
     pub fn set_window_system(&self, window_system: Option<Arc<Mutex<WindowSystem>>>) {
         let mut inner = self.lock.lock().unwrap();
+
         inner.window_system = window_system;
-        Self::flush_pending_locked(&mut inner);
-    }
-
-    /// Upstream: void CreateAndInsertByFrontendAppletParameters(std::unique_ptr<Process>, params)
-    pub fn create_and_insert_by_frontend_applet_parameters(
-        &self,
-        process: Arc<Mutex<KProcess>>,
-        params: FrontendAppletParameters,
-    ) {
-        let mut inner = self.lock.lock().unwrap();
-        inner.pending_process = Some(process);
-        inner.pending_parameters = Some(params);
-        Self::flush_pending_locked(&mut inner);
-    }
-
-    /// Upstream: void RequestExit()
-    pub fn request_exit(&self) {
-        let inner = self.lock.lock().unwrap();
-        if let Some(ws) = inner.window_system.clone() {
-            ws.lock().unwrap().on_exit_requested();
+        if inner.window_system.is_none() {
+            return;
         }
-    }
 
-    /// Upstream: void OperationModeChanged()
-    pub fn operation_mode_changed(&self) {
-        let inner = self.lock.lock().unwrap();
-        if let Some(ws) = inner.window_system.clone() {
-            ws.lock().unwrap().on_operation_mode_changed();
-        }
-    }
+        // Block until CreateAndInsertByFrontendAppletParameters has been called.
+        // Upstream: `m_cv.wait(lk, [&] { return m_pending_process != nullptr; })`
+        inner = self
+            .cv
+            .wait_while(inner, |inner| inner.pending_process.is_none())
+            .unwrap();
 
-    fn flush_pending_locked(inner: &mut AppletManagerInner) {
-        let Some(window_system) = inner.window_system.clone() else {
-            return;
-        };
-        let Some(process) = inner.pending_process.take() else {
-            return;
-        };
-        let Some(params) = inner.pending_parameters.take() else {
-            inner.pending_process = Some(process);
-            return;
-        };
+        let window_system = inner.window_system.clone().unwrap();
+        let process = inner.pending_process.take().unwrap();
+        let params = inner.pending_parameters.take().unwrap();
+        let run_params = inner.pending_run_params.take();
+        drop(inner);
 
+        // Build the applet. Upstream: `auto applet = std::make_shared<Applet>(m_system, process, ...)`
         let mut applet = Applet::new(params.applet_id == AppletId::Application);
         applet.process = Process::with_process(process.clone());
         applet.aruid.pid = process.lock().unwrap().get_process_id();
@@ -110,25 +407,160 @@ impl AppletManager {
         applet.applet_id = params.applet_id;
         applet.applet_type = params.applet_type;
         applet.previous_program_index = params.previous_program_index;
+
+        // Upstream: push UserChannel data from previous application when
+        // launched by another application.
+        // `if (params.launch_type == LaunchType::ApplicationInitiated)`
+        if params.launch_type == LaunchType::ApplicationInitiated {
+            if !self.system.is_null() {
+                let user_channel: VecDeque<Vec<u8>> =
+                    self.system.get().get_user_channel_snapshot();
+                applet.user_channel_launch_parameter = user_channel;
+            }
+        }
+
+        // Upstream: push LaunchParameterAccountPreselectedUser
+        {
+            let mut lp = LaunchParameterAccountPreselectedUser {
+                magic: LAUNCH_PARAMETER_ACCOUNT_PRESELECTED_USER_MAGIC,
+                is_account_selected: 1,
+                current_user: [0u8; 16],
+                _padding: [0u8; 0x70],
+            };
+
+            let profile_manager =
+                crate::hle::service::acc::profile_manager::ProfileManager::new();
+            let current_user_idx = *common::settings::values().current_user.get_value() as usize;
+            if let Some(uuid) = profile_manager.get_user(current_user_idx) {
+                lp.current_user = uuid.to_le_bytes();
+            }
+
+            let mut buf = vec![0u8; std::mem::size_of::<LaunchParameterAccountPreselectedUser>()];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &lp as *const _ as *const u8,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
+            }
+            applet.preselected_user_launch_parameter.push_back(buf);
+        }
+
+        // Upstream: push applet-specific input data depending on applet_id.
+        let system_tick = if !self.system.is_null() {
+            self.system.get().get_core_timing_ticks()
+        } else {
+            0
+        };
+        // Upstream lines 302-329 of applet_manager.cpp: switch on applet_id.
+        match applet.applet_id {
+            AppletId::QLaunch => {
+                let channel = initialize_fake_caller_applet(&mut applet);
+                push_in_show_qlaunch(system_tick, channel);
+            }
+            AppletId::Cabinet => {
+                let channel = initialize_fake_caller_applet(&mut applet);
+                push_in_show_cabinet_data(system_tick, channel);
+            }
+            AppletId::MiiEdit => {
+                let channel = initialize_fake_caller_applet(&mut applet);
+                push_in_show_mii_edit_data(channel);
+            }
+            AppletId::PhotoViewer => {
+                let channel = initialize_fake_caller_applet(&mut applet);
+                push_in_show_album(system_tick, channel);
+            }
+            AppletId::SoftwareKeyboard => {
+                let channel = initialize_fake_caller_applet(&mut applet);
+                push_in_show_software_keyboard(system_tick, channel);
+            }
+            AppletId::Controller => {
+                let channel = initialize_fake_caller_applet(&mut applet);
+                push_in_show_controller(system_tick, channel);
+            }
+            _ => {}
+        }
+
+        // Upstream: `applet->lifecycle_manager.SetFocusState(FocusState::InFocus)`
         applet.is_process_running = true;
         applet.lifecycle_manager.set_focus_state(FocusState::InFocus);
-        applet.update_suspension_state_locked(true);
 
         let applet = Arc::new(Mutex::new(applet));
-        let mut ws = window_system.lock().unwrap();
+        let ws = window_system.lock().unwrap();
+
         if params.applet_id == AppletId::QLaunch {
             {
-                let mut applet_guard = applet.lock().unwrap();
-                applet_guard.lifecycle_manager.set_focus_handling_mode(false);
-                applet_guard
-                    .lifecycle_manager
-                    .set_out_of_focus_suspending_enabled(false);
+                let mut ag = applet.lock().unwrap();
+                ag.lifecycle_manager.set_focus_handling_mode(false);
+                ag.lifecycle_manager.set_out_of_focus_suspending_enabled(false);
             }
             ws.track_applet(applet, false);
             ws.request_home_menu_to_get_foreground();
         } else {
             ws.track_applet(applet, true);
             ws.request_application_to_get_foreground();
+        }
+        drop(ws);
+
+        // Upstream: `applet->process->Run()` — start the application main thread.
+        // In Rust we need the run parameters computed earlier in core.rs and
+        // stored in AppletManagerInner alongside the pending process.
+        if let Some(rp) = run_params {
+            let run_result = process.lock().unwrap().run(
+                rp.priority,
+                rp.stack_size,
+                rp.main_thread_id,
+                rp.main_object_id,
+                rp.is_64bit,
+                rp.init_func,
+            );
+            match run_result {
+                Ok((main_thread, _handle, _thread_id, _object_id)) => {
+                    log::info!(
+                        "Application process main thread created (thread_id={})",
+                        main_thread.lock().unwrap().get_thread_id()
+                    );
+                    // Register thread with kernel and global scheduler context.
+                    // Upstream: done implicitly via KProcess::Run() in SetWindowSystem.
+                    if !self.system.is_null() {
+                        self.system.get().register_application_thread(main_thread);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to run application process: 0x{:X}", e);
+                }
+            }
+        }
+    }
+
+    /// Upstream: `void CreateAndInsertByFrontendAppletParameters(std::unique_ptr<Process>, params)`
+    pub fn create_and_insert_by_frontend_applet_parameters(
+        &self,
+        process: Arc<Mutex<KProcess>>,
+        params: FrontendAppletParameters,
+        run_params: PendingRunParameters,
+    ) {
+        let mut inner = self.lock.lock().unwrap();
+        inner.pending_process = Some(process);
+        inner.pending_parameters = Some(params);
+        inner.pending_run_params = Some(run_params);
+        drop(inner);
+        self.cv.notify_all();
+    }
+
+    /// Upstream: `void RequestExit()`
+    pub fn request_exit(&self) {
+        let inner = self.lock.lock().unwrap();
+        if let Some(ws) = inner.window_system.clone() {
+            ws.lock().unwrap().on_exit_requested();
+        }
+    }
+
+    /// Upstream: `void OperationModeChanged()`
+    pub fn operation_mode_changed(&self) {
+        let inner = self.lock.lock().unwrap();
+        if let Some(ws) = inner.window_system.clone() {
+            ws.lock().unwrap().on_operation_mode_changed();
         }
     }
 }

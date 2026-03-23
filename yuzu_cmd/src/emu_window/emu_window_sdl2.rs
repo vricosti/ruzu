@@ -57,6 +57,18 @@ impl EmuWindowSdl2 {
     pub fn new() -> Self {
         // Maps to: input_subsystem->Initialize(); (stubbed — InputSubsystem not yet ported)
         // Maps to: SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER)
+        unsafe {
+            let num_drivers = sdl::SDL_GetNumVideoDrivers();
+            let mut drivers = Vec::new();
+            for i in 0..num_drivers {
+                let name = sdl::SDL_GetVideoDriver(i);
+                if !name.is_null() {
+                    drivers.push(CStr::from_ptr(name).to_string_lossy().into_owned());
+                }
+            }
+            log::info!("SDL video drivers available: {:?}", drivers);
+        }
+
         let ret = unsafe {
             sdl::SDL_Init(
                 sdl::SDL_INIT_VIDEO | sdl::SDL_INIT_JOYSTICK | sdl::SDL_INIT_GAMECONTROLLER,
@@ -68,6 +80,29 @@ impl EmuWindowSdl2 {
             log::error!("Failed to initialize SDL2: {}, Exiting...", err);
             std::process::exit(1);
         }
+
+        unsafe {
+            let current_driver = sdl::SDL_GetCurrentVideoDriver();
+            let current_driver = if current_driver.is_null() {
+                "<null>".to_string()
+            } else {
+                CStr::from_ptr(current_driver).to_string_lossy().into_owned()
+            };
+            let display_count = sdl::SDL_GetNumVideoDisplays();
+            log::info!(
+                "SDL initialized with video driver {:?}, display_count={}",
+                current_driver,
+                display_count
+            );
+            if display_count <= 0 {
+                let err = CStr::from_ptr(sdl::SDL_GetError()).to_string_lossy();
+                log::error!(
+                    "SDL reports no displays after initialization. SDL_GetError={}",
+                    err
+                );
+            }
+        }
+
         // Maps to: SDL_SetMainReady()
         unsafe { sdl::SDL_SetMainReady() };
 

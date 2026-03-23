@@ -202,6 +202,31 @@ impl CpuManager {
         k_interrupt_manager::handle_interrupt(kernel, core_index as i32);
     }
 
+    /// Perform a scheduling fiber switch without holding the per-core scheduler Mutex.
+    ///
+    /// Upstream: after `HandleInterrupt`, `RequestScheduleOnInterrupt` directly
+    /// calls `ScheduleOnInterrupt` → `Schedule` → `ScheduleImpl` (fiber yield)
+    /// without holding any lock.  In Rust, holding the scheduler Mutex across a
+    /// fiber yield causes deadlock (the next fiber cannot re-lock the same Mutex).
+    /// This helper acquires the Mutex briefly to get a raw pointer, releases it,
+    /// then calls `KScheduler::schedule_raw_if_needed` via the raw pointer so the
+    /// actual fiber switch occurs without the Mutex held.
+    ///
+    /// Called after every `handle_interrupt()` in the guest and idle thread loops.
+    fn reschedule_current_core_raw(kernel: &KernelCore) {
+        if let Some(scheduler_arc) = kernel.current_scheduler() {
+            let sched_ptr = {
+                let guard = scheduler_arc.lock().unwrap();
+                &*guard as *const super::hle::kernel::k_scheduler::KScheduler
+                    as *mut super::hle::kernel::k_scheduler::KScheduler
+            }; // Mutex guard dropped here
+            // Safety: core OS thread; scheduler Arc keeps pointer valid; cooperative fibers.
+            unsafe {
+                super::hle::kernel::k_scheduler::KScheduler::schedule_raw_if_needed(sched_ptr);
+            }
+        }
+    }
+
     /// Guest thread activation function.
     ///
     /// Upstream: `CpuManager::GuestActivate()` (cpu_manager.cpp:168-175).
@@ -212,7 +237,22 @@ impl CpuManager {
     /// The fiber switch never returns.
     pub fn guest_activate(kernel: &KernelCore) {
         if let Some(scheduler_arc) = kernel.current_scheduler() {
-            scheduler_arc.lock().unwrap().activate();
+            // Acquire the lock briefly to get a raw pointer, then release it
+            // BEFORE calling activate_and_schedule_raw.  This prevents holding
+            // the per-core scheduler Mutex across any fiber yield inside
+            // schedule_impl_fiber (which would deadlock the next fiber that
+            // tries to lock the same Mutex).
+            let sched_ptr = {
+                let guard = scheduler_arc.lock().unwrap();
+                &*guard as *const super::hle::kernel::k_scheduler::KScheduler
+                    as *mut super::hle::kernel::k_scheduler::KScheduler
+            }; // Mutex guard dropped here
+            // Safety: we're on the core OS thread; the scheduler Arc keeps the
+            // pointer valid; fibers are cooperative so no other fiber on this
+            // thread runs concurrently.
+            unsafe {
+                super::hle::kernel::k_scheduler::KScheduler::activate_and_schedule_raw(sched_ptr);
+            }
         }
         // Upstream: scheduler.Activate() fiber-switches and never returns.
         // If it returns, this core has no user thread — run idle loop.
@@ -322,6 +362,9 @@ impl CpuManager {
             }
 
             Self::handle_interrupt(kernel);
+            // Upstream: RequestScheduleOnInterrupt → ScheduleOnInterrupt → fiber yield.
+            // Done outside any Mutex lock to avoid deadlock (see reschedule_current_core_raw).
+            Self::reschedule_current_core_raw(kernel);
         }
     }
 
@@ -460,10 +503,22 @@ impl CpuManager {
                     break;
                 }
 
-                // Any other halt reason — break.
+                // Any other non-empty halt reason — break.
                 if !hr.is_empty() {
                     break;
                 }
+
+                // hr.is_empty() → quantum expired naturally (get_ticks_remaining() hit 0).
+                // Upstream multicore: the JIT runs until a hardware timer fires Interrupt(),
+                // which sets BreakLoop. Since ruzu has no hardware preemption timer yet,
+                // we advance CoreTiming here (fires pending kernel timer events) and reset
+                // the quantum so the JIT can continue executing the next slice.
+                if let Some(ct) = kernel.core_timing() {
+                    let mut ct_lock = ct.lock().unwrap();
+                    let _ = ct_lock.advance();
+                    ct_lock.reset_ticks();
+                }
+                // Continue the inner JIT loop — quantum is fresh, let interrupt check decide.
             }
         }
     }
@@ -500,6 +555,10 @@ impl CpuManager {
             }
 
             Self::handle_interrupt(kernel);
+            // Upstream: RequestScheduleOnInterrupt → ScheduleOnInterrupt → Schedule →
+            // ScheduleImpl (fiber yield).  We do the fiber switch here, outside of any
+            // Mutex lock, to avoid the scheduler Mutex being held across the yield.
+            Self::reschedule_current_core_raw(kernel);
         }
     }
 

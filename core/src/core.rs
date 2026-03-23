@@ -417,6 +417,12 @@ impl System {
             self.cpu_manager.initialize(kernel_ptr);
         }
 
+        // Wire up the system reference in AppletManager so it can access kernel,
+        // core_timing, and user_channel during SetWindowSystem.
+        // Upstream: AppletManager constructor takes Core::System& m_system.
+        let system_ref = SystemRef::from_ref(self);
+        self.applet_manager.set_system(system_ref);
+
         log::info!("System: kernel initialized");
     }
 
@@ -566,12 +572,8 @@ impl System {
             );
         }
 
-        // Upstream line 366: applet_manager.CreateAndInsertByFrontendAppletParameters(process, params)
-        // This creates the applet and calls process->Run(), which creates the
-        // application's main thread with the proper entry point/stack/priority
-        // and adds it to the scheduler.
-        // Upstream line 366: applet_manager.CreateAndInsertByFrontendAppletParameters(process, params)
-        // Start the application process's main thread.
+        // Upstream: applet_manager.CreateAndInsertByFrontendAppletParameters(process, params)
+        // followed by applet->process->Run() at the end of SetWindowSystem.
         if let Some(process) = self.current_process.take() {
             let lp = self.load_parameters.as_ref()
                 .expect("loader must provide process launch parameters");
@@ -590,16 +592,32 @@ impl System {
                     process_arc.lock().unwrap().global_scheduler_context = Some(gsc.clone());
                 }
                 // Attach core-0's scheduler to the process.
-                // Upstream: the process's ideal core determines which scheduler it uses.
                 if let Some(scheduler) = kernel.scheduler(0) {
                     process_arc.lock().unwrap().attach_scheduler(scheduler);
                 }
             }
 
-            // Upstream: KThread::InitializeUserThread passes
-            // system.GetCpuManager().GetGuestThreadFunc() as the fiber entry.
-            // GetGuestThreadFunc() returns a closure calling GuestThreadFunction(),
-            // which dispatches to MultiCoreRunGuestThread or SingleCoreRunGuestThread.
+            // Initialize ARM JIT interfaces before process.run() so that when
+            // the guest thread starts it can immediately call get_arm_interface_mut().
+            // Must happen before create_and_insert_by_frontend_applet_parameters so
+            // it is done before set_window_system calls process.run().
+            if let Some(core_memory) = self.memory_shared() {
+                let shared_memory = process_arc.lock().unwrap().get_shared_memory();
+                let core_timing = self.core_timing.clone();
+                process_arc.lock().unwrap().initialize_interfaces(
+                    core_memory,
+                    shared_memory,
+                    core_timing,
+                );
+                log::info!("ARM JIT interfaces initialized for application process");
+            } else {
+                log::warn!("Cannot initialize ARM interfaces: Memory not available");
+            }
+
+            // Dump the memory block layout for diagnostics.
+            process_arc.lock().unwrap().page_table.dump_memory_blocks();
+
+            // Build the guest-thread entry closure.
             // Upstream: KThread::InitializeUserThread passes
             // system.GetCpuManager().GetGuestThreadFunc() as the fiber entry.
             // We transmit the kernel pointer as usize because the crate is named
@@ -626,61 +644,35 @@ impl System {
             } else {
                 (1, 1)
             };
+
+            // Extract program_id in a separate binding so the MutexGuard<KProcess>
+            // is dropped before calling create_and_insert_by_frontend_applet_parameters.
+            let app_program_id = process_arc.lock().unwrap().get_program_id();
+
+            // Upstream: CreateAndInsertByFrontendAppletParameters stores process +
+            // params and notifies the CV. SetWindowSystem (running on the
+            // am:SetWindowSystem thread) will wake, build the applet, track it,
+            // and then call process->Run() with the run params we pass here.
             self.applet_manager.create_and_insert_by_frontend_applet_parameters(
                 process_arc.clone(),
                 FrontendAppletParameters {
-                    program_id: process_arc.lock().unwrap().get_program_id(),
+                    program_id: app_program_id,
                     applet_id: AppletId::Application,
                     applet_type: AppletType::Application,
-                    launch_type: Some(LaunchType::FrontendInitiated),
+                    launch_type: LaunchType::FrontendInitiated,
                     program_index: 0,
                     previous_program_index: -1,
                 },
+                crate::hle::service::am::applet_manager::PendingRunParameters {
+                    priority,
+                    stack_size,
+                    main_thread_id: app_thread_id,
+                    main_object_id: app_object_id,
+                    is_64bit,
+                    init_func: guest_thread_func,
+                },
             );
-            let run_result = process_arc.lock().unwrap().run(
-                priority, stack_size, app_thread_id, app_object_id, is_64bit, guest_thread_func,
-            );
-            match run_result {
-                Ok((main_thread, _handle, _thread_id, _object_id)) => {
-                    log::info!(
-                        "Application process main thread created (thread_id={})",
-                        main_thread.lock().unwrap().get_thread_id()
-                    );
-                    // Store the application thread so CPU cores can find it.
-                    if let Some(ref mut kernel) = self.kernel {
-                        kernel.set_application_thread(main_thread.clone());
-                        // Register thread in the global scheduler context so
-                        // schedulers can find it by ID during fiber dispatch.
-                        // Upstream: KThread::InitializeUserThread calls
-                        // kernel.GlobalSchedulerContext().AddThread(thread).
-                        if let Some(gsc) = kernel.global_scheduler_context() {
-                            gsc.lock().unwrap().add_thread(main_thread);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to run application process: 0x{:X}", e);
-                }
-            }
-            // Initialize ARM JIT interfaces on the process.
-            // Upstream: KProcess::InitializeInterfaces creates the exclusive monitor
-            // and one ARM JIT per core. This must happen before CPU threads try to
-            // run guest code via process.get_arm_interface_mut(core).
-            if let Some(core_memory) = self.memory_shared() {
-                let shared_memory = process_arc.lock().unwrap().get_shared_memory();
-                let core_timing = self.core_timing.clone();
-                process_arc.lock().unwrap().initialize_interfaces(
-                    core_memory,
-                    shared_memory,
-                    core_timing,
-                );
-                log::info!("ARM JIT interfaces initialized for application process");
-            } else {
-                log::warn!("Cannot initialize ARM interfaces: Memory not available");
-            }
 
-            // Dump the memory block layout for diagnostics.
-            process_arc.lock().unwrap().page_table.dump_memory_blocks();
             self.current_process_arc = Some(process_arc);
         }
 
@@ -1061,6 +1053,52 @@ impl System {
     /// Used to transfer data between programs.
     pub fn get_user_channel(&mut self) -> &mut VecDeque<Vec<u8>> {
         &mut self.user_channel
+    }
+
+    /// Returns a snapshot (clone) of the user channel for reading from a
+    /// shared reference (e.g. from AppletManager::set_window_system).
+    /// Upstream: `m_system.GetUserChannel()` used in SetWindowSystem for swap.
+    pub fn get_user_channel_snapshot(&self) -> std::collections::VecDeque<Vec<u8>> {
+        self.user_channel.clone()
+    }
+
+    /// Returns the current CoreTiming tick count.
+    /// Upstream: `system.CoreTiming().GetClockTicks()`.
+    pub fn get_core_timing_ticks(&self) -> u64 {
+        self.core_timing.lock().unwrap().get_clock_ticks()
+    }
+
+    /// Registers the application main thread with the kernel and global scheduler.
+    ///
+    /// Called from AppletManager::set_window_system after process::Run() returns,
+    /// matching the upstream flow where SetWindowSystem calls applet->process->Run()
+    /// and the created thread is immediately visible to the scheduler.
+    ///
+    /// # Safety
+    /// Must only be called during process setup, before CPU threads are released
+    /// past the GPU barrier. This ensures exclusive access to kernel state.
+    pub fn register_application_thread(
+        &self,
+        main_thread: Arc<StdMutex<crate::hle::kernel::k_thread::KThread>>,
+    ) {
+        let thread_id = main_thread.lock().unwrap().get_thread_id();
+        log::info!("register_application_thread: called, thread_id={}", thread_id);
+        // Upstream: KProcess::Run() owns all scheduler registration for the
+        // application thread (AddThread, PushBack, highest_priority_thread_id).
+        // By the time we reach here the thread is already in the GSC thread list
+        // and the priority queue (done in k_process::run() before thread.run()).
+        // All that remains is:
+        //   1. Record the application thread in the kernel for later use.
+        //   2. Interrupt core 0 to wake it from PhysicalCore::idle() so that
+        //      reschedule_current_core_raw can fiber-switch to the app thread.
+        let sys_ptr = self as *const Self as *mut Self;
+        if let Some(ref mut kernel) = unsafe { (*sys_ptr).kernel.as_mut() } {
+            kernel.set_application_thread(main_thread);
+            if let Some(core0) = kernel.physical_core(0) {
+                log::info!("register_application_thread: interrupting core 0 to wake idle loop");
+                core0.interrupt();
+            }
+        }
     }
 
     /// Registers a callback from the frontend for System to re-launch the application.

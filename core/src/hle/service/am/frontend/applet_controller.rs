@@ -75,6 +75,48 @@ pub struct ControllerSupportArgHeader {
 }
 const _: () = assert!(std::mem::size_of::<ControllerSupportArgHeader>() == 0x7);
 
+/// Port of ControllerSupportArgOld (LibraryAppletVersion 0x3, 0x4, 0x5) — 0x21C bytes.
+///
+/// `identification_colors`: 4 entries × 4 bytes each.
+/// `explain_text`: 4 entries × 0x81 bytes each.
+/// No padding between fields (all fields have alignment ≤ 1).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ControllerSupportArgOld {
+    pub header: ControllerSupportArgHeader,
+    pub identification_colors: [IdentificationColor; 4],
+    pub enable_explain_text: bool,
+    pub explain_text: [ExplainText; 4],
+}
+const _: () = assert!(std::mem::size_of::<ControllerSupportArgOld>() == 0x21C);
+
+impl Default for ControllerSupportArgOld {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Port of ControllerSupportArgNew (LibraryAppletVersion 0x7, 0x8) — 0x430 bytes.
+///
+/// `identification_colors`: 8 entries × 4 bytes each.
+/// `explain_text`: 8 entries × 0x81 bytes each.
+/// No padding between fields (all fields have alignment ≤ 1).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ControllerSupportArgNew {
+    pub header: ControllerSupportArgHeader,
+    pub identification_colors: [IdentificationColor; 8],
+    pub enable_explain_text: bool,
+    pub explain_text: [ExplainText; 8],
+}
+const _: () = assert!(std::mem::size_of::<ControllerSupportArgNew>() == 0x430);
+
+impl Default for ControllerSupportArgNew {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 /// Port of ControllerSupportResultInfo
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]

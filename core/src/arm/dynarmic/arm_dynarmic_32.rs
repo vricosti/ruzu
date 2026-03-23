@@ -320,6 +320,9 @@ impl JitCallbacks for DynarmicCallbacks32 {
 
     fn call_supervisor(&mut self, svc_num: u32) {
         self.svc_swi.store(svc_num, Ordering::Relaxed);
+        // Upstream DynarmicCallbacks32::CallSVC stores the SVC number and halts
+        // JIT execution with SupervisorCall so the host can dispatch the SVC.
+        self.halt_execution(rdynarmic::halt_reason::HaltReason::SVC);
     }
 
     fn exception_raised(&mut self, pc: u64, exception: u64) {

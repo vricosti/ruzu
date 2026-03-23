@@ -325,7 +325,7 @@ impl CoreTiming {
     /// Adds ticks to the CPU tick counter and decrements downcount.
     pub fn add_ticks(&mut self, ticks_to_add: u64) {
         self.cpu_ticks += ticks_to_add;
-        self.downcount -= self.cpu_ticks as i64;
+        self.downcount -= ticks_to_add as i64;
     }
 
     /// Resets the tick downcount to the max slice length.

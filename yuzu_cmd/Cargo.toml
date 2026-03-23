@@ -20,7 +20,6 @@ video_core = { workspace = true }
 input_common = { workspace = true }
 frontend_common = { workspace = true }
 parking_lot.workspace = true
-sdl2 = { workspace = true }
 gl = { workspace = true }
 ash = { workspace = true }
 raw-window-handle = { workspace = true }
@@ -28,3 +27,9 @@ clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 rdynarmic = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sdl2 = { version = "0.37", features = ["raw-window-handle", "bundled", "static-link"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sdl2 = { version = "0.37", features = ["raw-window-handle", "use-pkgconfig"] }

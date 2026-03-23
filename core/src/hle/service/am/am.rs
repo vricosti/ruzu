@@ -31,12 +31,27 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         let mut guard = window_system.lock().unwrap();
         &mut *guard as *mut WindowSystem
     };
-    let event_observer = EventObserver::new(window_system_ptr as *const WindowSystem);
+    let event_observer = Box::new(EventObserver::new(window_system_ptr as *const WindowSystem));
     {
         let mut guard = window_system.lock().unwrap();
-        guard.set_event_observer(&event_observer as *const EventObserver as *mut EventObserver);
+        guard.set_event_observer(event_observer);
     }
-    system.get().get_applet_manager().set_window_system(Some(window_system.clone()));
+    // Spawn set_window_system on a dedicated background thread so it can block on
+    // the condition variable while this thread proceeds to run_server.
+    // Matches upstream: AM::LoopProcess calls SetWindowSystem inside LoopProcess, which
+    // runs on a guest kernel thread via RunOnGuestCoreProcess, allowing the setup thread
+    // to call CreateAndInsertByFrontendAppletParameters concurrently.
+    let ws_for_thread = window_system.clone();
+    let system_for_thread = system;
+    std::thread::Builder::new()
+        .name("am:SetWindowSystem".to_string())
+        .spawn(move || {
+            system_for_thread
+                .get()
+                .get_applet_manager()
+                .set_window_system(Some(ws_for_thread));
+        })
+        .expect("failed to spawn am:SetWindowSystem thread");
 
     let ws = window_system.clone();
     let factory_oe: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
@@ -51,5 +66,4 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     server_manager.register_named_service("appletAE", factory_ae, 64);
 
     ServerManager::run_server(server_manager);
-    drop(event_observer);
 }

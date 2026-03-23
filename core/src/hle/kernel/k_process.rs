@@ -1994,6 +1994,17 @@ impl KProcess {
         };
 
         {
+            // Upstream: KThread::InitializeUserThread() calls
+            // GlobalSchedulerContext().AddThread(thread) before InitializeThread
+            // returns. In Rust, we do the equivalent here — add the thread to the
+            // GSC thread list before marking it runnable, so that
+            // push_back_to_priority_queue (which uses the GSC list to resolve
+            // thread IDs) and schedule_impl_fiber (which calls
+            // gsc.get_thread_by_thread_id) can find the thread immediately.
+            if let Some(gsc) = &self.global_scheduler_context {
+                gsc.lock().unwrap().add_thread(main_thread.clone());
+            }
+
             let mut thread = main_thread.lock().unwrap();
             let run_result = thread.run();
             if run_result != RESULT_SUCCESS.get_inner_value() {

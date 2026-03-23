@@ -79,14 +79,26 @@ const INVALID_SOCKET: i32 = -1;
 #[cfg(unix)]
 fn to_sockaddr_in(addr: &SockAddrIn) -> libc::sockaddr_in {
     let ip = addr.ip;
-    libc::sockaddr_in {
+    #[cfg(target_os = "linux")]
+    let sa = libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: addr.portno.to_be(),
         sin_addr: libc::in_addr {
             s_addr: u32::from_ne_bytes(ip).to_be(),
         },
         sin_zero: [0; 8],
-    }
+    };
+    #[cfg(target_os = "macos")]
+    let sa = libc::sockaddr_in {
+        sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: addr.portno.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(ip).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    sa
 }
 
 /// Convert libc::sockaddr_in to our SockAddrIn.
@@ -103,7 +115,10 @@ fn from_sockaddr_in(addr: &libc::sockaddr_in) -> SockAddrIn {
 /// Get the last socket error as an Errno.
 #[cfg(unix)]
 fn get_last_error() -> Errno {
+    #[cfg(target_os = "linux")]
     let err = unsafe { *libc::__errno_location() };
+    #[cfg(target_os = "macos")]
+    let err = unsafe { *libc::__error() };
     match err {
         libc::EWOULDBLOCK | libc::EAGAIN => Errno::Again,
         libc::ECONNREFUSED => Errno::Connrefused,
