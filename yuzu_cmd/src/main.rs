@@ -23,7 +23,14 @@
 //! | `-v` / `--version`   | handled by clap          |
 
 use clap::Parser;
-
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use sdl2::sys as sdl;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use signal_hook::iterator::Signals;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::thread;
 
 pub mod emu_window;
 pub mod sdl_config;
@@ -33,6 +40,33 @@ use emu_window::{
     emu_window_sdl2_vk::EmuWindowSdl2Vk,
 };
 use sdl_config::SdlConfig;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn install_signal_quit_handler() {
+    let mut signals = match Signals::new([SIGINT, SIGTERM]) {
+        Ok(signals) => signals,
+        Err(err) => {
+            log::warn!("Failed to install signal handlers: {}", err);
+            return;
+        }
+    };
+
+    thread::spawn(move || {
+        for signal in signals.forever() {
+            log::warn!("Received signal {}, requesting SDL shutdown", signal);
+            let mut event: sdl::SDL_Event = unsafe { std::mem::zeroed() };
+            event.type_ = sdl::SDL_EventType::SDL_QUIT as u32;
+            let push_result = unsafe { sdl::SDL_PushEvent(&mut event) };
+            if push_result < 0 {
+                log::error!("SDL_PushEvent(SDL_QUIT) failed; forcing process exit");
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn install_signal_quit_handler() {}
 
 // ---------------------------------------------------------------------------
 // CLI argument definitions
@@ -89,7 +123,12 @@ struct Args {
     /// Renderer backend: opengl, vulkan, or null.
     ///
     /// Not in upstream CLI — added for convenience while Settings is not fully ported.
-    #[arg(short = 'r', long = "renderer", value_name = "BACKEND", default_value = "opengl")]
+    #[arg(
+        short = 'r',
+        long = "renderer",
+        value_name = "BACKEND",
+        default_value = "opengl"
+    )]
     renderer: String,
 
     /// Positional game path (alternative to --game).
@@ -303,12 +342,18 @@ fn main() {
     // -----------------------------------------------------------------------
     {
         use ruzu_core::file_sys::registered_cache::ContentProviderUnion;
-        system.set_content_provider(std::sync::Arc::new(std::sync::Mutex::new(ContentProviderUnion::new())));
+        system.set_content_provider(std::sync::Arc::new(std::sync::Mutex::new(
+            ContentProviderUnion::new(),
+        )));
         // VFS is already created in system.initialize(); ensure it's set.
         if system.get_filesystem().is_none() {
             system.set_filesystem(ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem::new());
         }
-        system.get_filesystem_controller().lock().unwrap().create_factories();
+        system
+            .get_filesystem_controller()
+            .lock()
+            .unwrap()
+            .create_factories();
         // Note: get_filesystem_controller() returns Arc clone, lock it.
         system.clear_user_channel();
     }
@@ -347,42 +392,43 @@ fn main() {
         //   auto scope = context->Acquire();
         //   auto renderer = CreateRenderer(system, emu_window, *gpu, context);
         //   gpu->BindRenderer(renderer);
-        let renderer: Box<dyn video_core::renderer_base::RendererBase> = match renderer_backend_str.as_str() {
-            "opengl" => {
-                // Create a shared GL context for the renderer/GPU thread.
-                // Safety: sdl_window_ptr_usize was cast from a valid *mut SDL_Window
-                // that is alive for the duration of this closure.
-                let window_ptr = sdl_window_ptr_usize as *mut sdl2::sys::SDL_Window;
-                let context = Box::new(
-                    emu_window::emu_window_sdl2_gl::SdlGlContext::new(window_ptr),
-                );
-                let renderer = video_core::renderer_opengl::RendererOpenGL::new(
-                    |s| {
-                        let cs = std::ffi::CString::new(s).unwrap();
-                        unsafe {
-                            sdl2::sys::SDL_GL_GetProcAddress(cs.as_ptr())
-                                as *const std::os::raw::c_void
-                        }
-                    },
+        let renderer: Box<dyn video_core::renderer_base::RendererBase> =
+            match renderer_backend_str.as_str() {
+                "opengl" => {
+                    // Create a shared GL context for the renderer/GPU thread.
+                    // Safety: sdl_window_ptr_usize was cast from a valid *mut SDL_Window
+                    // that is alive for the duration of this closure.
+                    let window_ptr = sdl_window_ptr_usize as *mut sdl2::sys::SDL_Window;
+                    let context = Box::new(emu_window::emu_window_sdl2_gl::SdlGlContext::new(
+                        window_ptr,
+                    ));
+                    let renderer = video_core::renderer_opengl::RendererOpenGL::new(
+                        |s| {
+                            let cs = std::ffi::CString::new(s).unwrap();
+                            unsafe {
+                                sdl2::sys::SDL_GL_GetProcAddress(cs.as_ptr())
+                                    as *const std::os::raw::c_void
+                            }
+                        },
+                        syncpoints.clone(),
+                        context,
+                    )
+                    .unwrap_or_else(|e| {
+                        log::error!("Failed to create OpenGL renderer: {}", e);
+                        std::process::exit(1);
+                    });
+                    Box::new(renderer)
+                }
+                "vulkan" => {
+                    log::warn!("Vulkan renderer not yet implemented, falling back to null");
+                    Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
+                        syncpoints.clone(),
+                    ))
+                }
+                _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
                     syncpoints.clone(),
-                    context,
-                )
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to create OpenGL renderer: {}", e);
-                    std::process::exit(1);
-                });
-                Box::new(renderer)
-            }
-            "vulkan" => {
-                log::warn!("Vulkan renderer not yet implemented, falling back to null");
-                Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
-                    syncpoints.clone(),
-                ))
-            }
-            _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
-                syncpoints.clone(),
-            )),
-        };
+                )),
+            };
 
         let gpu = video_core::video_core::create_gpu(false, true, renderer);
         system.set_gpu_core(Box::new(gpu));
@@ -403,11 +449,7 @@ fn main() {
     // -----------------------------------------------------------------------
     let load_result = system.load(&filepath);
     if load_result != ruzu_core::core::SystemResultStatus::Success {
-        log::error!(
-            "Failed to load ROM '{}': {:?}",
-            filepath,
-            load_result,
-        );
+        log::error!("Failed to load ROM '{}': {:?}", filepath, load_result,);
         std::process::exit(-1);
     }
 
@@ -444,6 +486,11 @@ fn main() {
     // -----------------------------------------------------------------------
     system.run();
 
+    // Rust port adaptation: install SIGINT/SIGTERM handlers that wake the SDL
+    // event loop. Upstream shutdown is graceful, but the current Rust core
+    // shutdown path is not yet complete and can hang after window close.
+    install_signal_quit_handler();
+
     // -----------------------------------------------------------------------
     // Step 9 (upstream): while (emu_window->IsOpen()) { emu_window->WaitEvent(); }
     // Main thread stays in the window event loop.
@@ -468,10 +515,11 @@ fn main() {
     }
 
     // -----------------------------------------------------------------------
-    // Step 10 (upstream): system.Pause(); system.ShutdownMainProcess();
-    // Cleanup after window closes.
+    // Rust port adaptation:
+    // Exit immediately once the SDL window closes or a termination signal
+    // requests SDL_QUIT. The current Rust shutdown path can block waiting on
+    // CPU threads because upstream core shutdown ownership is still incomplete.
     // -----------------------------------------------------------------------
-    log::info!("Window closed, shutting down");
-    system.pause();
-    system.shutdown_main_process();
+    log::info!("Window closed, exiting frontend process");
+    std::process::exit(0);
 }

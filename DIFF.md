@@ -181,3 +181,18 @@
 
 ### Binary layout verification
 - PASS: runtime/JIT callback state only; no raw-serialized structs are defined here.
+
+## 2026-03-23 — yuzu_cmd/src/main.rs vs /Users/vricosti/Dev/emulators/zuyu/src/yuzu_cmd/yuzu.cpp
+
+### Intentional differences
+- Rust now installs `SIGINT`/`SIGTERM` handlers that post `SDL_QUIT` into the SDL event queue. Upstream `yuzu-cmd` relies on its fuller shutdown path and does not need this extra signal bridge.
+- After the SDL window closes, Rust exits the frontend process immediately instead of calling the upstream-equivalent `system.Pause(); system.ShutdownMainProcess();`. This is a temporary workaround so window-close and external termination do not hang while the Rust core shutdown path remains incomplete.
+
+### Unintentional differences (to fix)
+- Rust still does not match upstream shutdown ownership. The proper long-term fix is to make `System::shutdown_main_process()` and the underlying CPU/core teardown complete and non-blocking so the frontend can use the same graceful close path as upstream.
+
+### Missing items
+- Restore the upstream graceful shutdown sequence in `yuzu_cmd/src/main.rs` once Rust `core` shutdown parity is sufficient.
+
+### Binary layout verification
+- PASS: frontend runtime/orchestration only; no raw-serialized structs are defined here.
