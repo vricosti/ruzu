@@ -185,14 +185,57 @@
 ## 2026-03-23 — yuzu_cmd/src/main.rs vs /Users/vricosti/Dev/emulators/zuyu/src/yuzu_cmd/yuzu.cpp
 
 ### Intentional differences
-- Rust now installs `SIGINT`/`SIGTERM` handlers that post `SDL_QUIT` into the SDL event queue. Upstream `yuzu-cmd` relies on its fuller shutdown path and does not need this extra signal bridge.
-- After the SDL window closes, Rust exits the frontend process immediately instead of calling the upstream-equivalent `system.Pause(); system.ShutdownMainProcess();`. This is a temporary workaround so window-close and external termination do not hang while the Rust core shutdown path remains incomplete.
+- None.
 
 ### Unintentional differences (to fix)
-- Rust still does not match upstream shutdown ownership. The proper long-term fix is to make `System::shutdown_main_process()` and the underlying CPU/core teardown complete and non-blocking so the frontend can use the same graceful close path as upstream.
+- None in this shutdown slice. `main.rs` now follows the upstream `system.Pause(); system.ShutdownMainProcess();` path again.
 
 ### Missing items
-- Restore the upstream graceful shutdown sequence in `yuzu_cmd/src/main.rs` once Rust `core` shutdown parity is sufficient.
+- None for this shutdown path.
 
 ### Binary layout verification
 - PASS: frontend runtime/orchestration only; no raw-serialized structs are defined here.
+
+## 2026-03-23 — core/src/cpu_manager.rs vs /Users/vricosti/Dev/emulators/zuyu/src/core/cpu_manager.cpp
+
+### Intentional differences
+- Rust still does not create upstream-style per-core shutdown threads in `KernelCore`; instead, the CPU loops detect `System::is_shutting_down()` and explicitly yield the current guest fiber back to the host fiber via `CpuManager::shutdown_thread(...)`. This preserves the same shutdown destination while using the current Rust fiber ownership.
+
+### Unintentional differences (to fix)
+- The shutdown trigger still originates from `System::is_shutting_down()` polling inside the CPU loops rather than from upstream kernel-owned shutdown-thread scheduling.
+
+### Missing items
+- Port upstream kernel-owned shutdown-thread creation/scheduling so `CpuManager` no longer needs to poll `System::is_shutting_down()`.
+
+### Binary layout verification
+- PASS: runtime/thread orchestration only; no raw-serialized structs are defined here.
+
+## 2026-03-23 — core/src/hle/kernel/kernel.rs vs /Users/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp
+
+### Intentional differences
+- Rust now exposes `suspend_emulation()` and `shutdown_cores()` in the upstream ownership location (`kernel.rs`), but these currently operate only on `System::current_process_arc` rather than the upstream full kernel process list. This matches the current Rust runtime, which only tracks the frontend-loaded application process.
+
+### Unintentional differences (to fix)
+- `SuspendEmulation` does not yet implement the upstream wait-until-no-process-thread-is-running loop.
+- `ShutdownCores` does not yet create or run upstream-style per-core shutdown threads under a scheduler lock.
+- `CloseServices` remains a no-op because server-manager tracking is not fully wired into `KernelCore`.
+
+### Missing items
+- Port the remaining upstream process-list ownership and shutdown-thread scheduling into `kernel.rs`.
+
+### Binary layout verification
+- PASS: runtime/kernel orchestration only; no raw-serialized structs are defined here.
+
+## 2026-03-23 — core/src/core.rs vs /Users/vricosti/Dev/emulators/zuyu/src/core/core.cpp
+
+### Intentional differences
+- Rust now calls `kernel.suspend_emulation(...)`, `kernel.close_services()`, and `kernel.shutdown_cores()` from `System::run()`, `System::pause()`, and `System::shutdown_main_process()` in the upstream ownership order. The remaining divergence is inherited from the still-incomplete kernel implementation documented above.
+
+### Unintentional differences (to fix)
+- `shutdown_main_process()` still omits several upstream subsystems (`gpu_core->NotifyShutdown()`, socket cancellation/restart, cheat engine, debugger) because those shutdown hooks are not yet fully wired in the Rust port.
+
+### Missing items
+- Complete the remaining upstream teardown calls once the corresponding subsystems exist with matching ownership.
+
+### Binary layout verification
+- PASS: orchestration/runtime state only; no raw-serialized structs are defined in this slice.

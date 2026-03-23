@@ -319,6 +319,26 @@ impl CpuManager {
         unreachable!("ShutdownThread must not return");
     }
 
+    fn shutdown_if_requested(kernel: &KernelCore) {
+        let system_ref = kernel.system();
+        if system_ref.is_null() || !system_ref.get().is_shutting_down() {
+            return;
+        }
+
+        let system = system_ref.get();
+        let core = if system.cpu_manager.is_multicore() {
+            kernel.current_physical_core_index()
+        } else {
+            0
+        };
+        let host_context = system
+            .cpu_manager
+            .core_host_context(core)
+            .expect("core host context must exist during shutdown");
+
+        Self::shutdown_thread(kernel, &host_context, system.cpu_manager.is_multicore());
+    }
+
     // =========================================================================
     // MultiCore guest/idle thread loops
     // =========================================================================
@@ -354,6 +374,7 @@ impl CpuManager {
         }
 
         loop {
+            Self::shutdown_if_requested(kernel);
             let mut physical_core = kernel.current_physical_core();
             while !physical_core.is_interrupted() {
                 Self::run_guest_thread_once(kernel, physical_core);
@@ -362,6 +383,7 @@ impl CpuManager {
             }
 
             Self::handle_interrupt(kernel);
+            Self::shutdown_if_requested(kernel);
             // Upstream: RequestScheduleOnInterrupt → ScheduleOnInterrupt → fiber yield.
             // Done outside any Mutex lock to avoid deadlock (see reschedule_current_core_raw).
             Self::reschedule_current_core_raw(kernel);
@@ -549,12 +571,14 @@ impl CpuManager {
         }
 
         loop {
+            Self::shutdown_if_requested(kernel);
             let physical_core = kernel.current_physical_core();
             if !physical_core.is_interrupted() {
                 physical_core.idle();
             }
 
             Self::handle_interrupt(kernel);
+            Self::shutdown_if_requested(kernel);
             // Upstream: RequestScheduleOnInterrupt → ScheduleOnInterrupt → Schedule →
             // ScheduleImpl (fiber yield).  We do the fiber switch here, outside of any
             // Mutex lock, to avoid the scheduler Mutex being held across the yield.
@@ -603,6 +627,7 @@ impl CpuManager {
         }
 
         loop {
+            Self::shutdown_if_requested(kernel);
             // Upstream: physical_core->RunThread(thread)
             let physical_core = kernel.current_physical_core();
             if !physical_core.is_interrupted() {
@@ -616,6 +641,7 @@ impl CpuManager {
 
             Self::preempt_single_core_inner(kernel, core_timing, current_core, idle_count, true);
             Self::handle_interrupt(kernel);
+            Self::shutdown_if_requested(kernel);
         }
     }
 
@@ -635,10 +661,12 @@ impl CpuManager {
         }
 
         loop {
+            Self::shutdown_if_requested(kernel);
             Self::preempt_single_core_inner(kernel, core_timing, current_core, idle_count, false);
             core_timing.lock().unwrap().add_ticks(1000);
             *idle_count += 1;
             Self::handle_interrupt(kernel);
+            Self::shutdown_if_requested(kernel);
         }
     }
 

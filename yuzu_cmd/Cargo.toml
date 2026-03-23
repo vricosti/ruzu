@@ -30,8 +30,6 @@ rdynarmic = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sdl2 = { version = "0.37", features = ["raw-window-handle", "bundled", "static-link"] }
-signal-hook = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sdl2 = { version = "0.37", features = ["raw-window-handle", "use-pkgconfig"] }
-signal-hook = "0.3"
