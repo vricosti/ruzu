@@ -66,11 +66,22 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     // Read command buffer from TLS and parse (done inside populate).
     context.populate_from_incoming_command_buffer(&[]);
 
+    let (is_domain, session_handler_name) = {
+        let manager = request_manager.lock().unwrap();
+        let handler_name = manager
+            .session_handler()
+            .map(|handler| handler.service_name().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        (manager.is_domain(), handler_name)
+    };
+
     log::info!(
-        "  SendSyncRequest: handle={:#x} tls={:#x} cmd_type={:?} is_domain={} parsed_cmd={}",
-        session_handle, tls_address,
+        "  SendSyncRequest: handle={:#x} tls={:#x} service={} cmd_type={:?} is_domain={} parsed_cmd={}",
+        session_handle,
+        tls_address,
+        session_handler_name,
         context.get_command_type(),
-        request_manager.lock().unwrap().is_domain(),
+        is_domain,
         context.get_command(),
     );
 

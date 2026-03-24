@@ -177,6 +177,7 @@ impl PhysicalCore {
         scheduler: &Arc<Mutex<KScheduler>>,
         process: &Arc<Mutex<KProcess>>,
         svc_num: u32,
+        svc_count: u32,
         is_64bit: bool,
         svc_args: &mut SvcArgs,
         system: &System,
@@ -185,6 +186,30 @@ impl PhysicalCore {
         jit.set_svc_arguments(svc_args);
         log::trace!("dispatch_supervisor_call: before handoff (svc=0x{:x})", svc_num);
         self.handoff_after_svc(jit, thread_context, scheduler, process);
+        if let Some(threshold) = std::env::var("RUZU_LOG_AFTER_SVC")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            if svc_count >= threshold {
+                jit.get_context(thread_context);
+                let insn = process
+                    .lock()
+                    .unwrap()
+                    .process_memory
+                    .read()
+                    .unwrap()
+                    .read_32(thread_context.pc);
+                log::info!(
+                    "PhysicalCore::dispatch_supervisor_call after handoff: core={} svc_count={} svc=0x{:x} pc=0x{:08X} sp=0x{:08X} insn=0x{:08X}",
+                    self.m_core_index,
+                    svc_count,
+                    svc_num,
+                    thread_context.pc,
+                    thread_context.sp,
+                    insn,
+                );
+            }
+        }
         log::trace!("dispatch_supervisor_call: after handoff (svc=0x{:x})", svc_num);
     }
 
@@ -209,6 +234,10 @@ impl PhysicalCore {
         let mut step_after_svc = std::env::var("RUZU_STEP_AFTER_SVC")
             .ok()
             .and_then(|value| value.parse::<u32>().ok());
+        let log_step_interval = std::env::var("RUZU_LOG_STEP_INTERVAL")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0);
 
         #[cfg(feature = "debug-logs")]
         let mut ring_buf = physical_core_log::InstructionRingBuffer::new();
@@ -223,6 +252,26 @@ impl PhysicalCore {
 
             if use_step {
                 jit.get_context(thread_context);
+                if let Some(interval) = log_step_interval {
+                    if iteration % interval == 0 {
+                        let insn = process
+                            .lock()
+                            .unwrap()
+                            .process_memory
+                            .read()
+                            .unwrap()
+                            .read_32(thread_context.pc);
+                        log::info!(
+                            "PhysicalCore::run_loop step trace: core={} svc_count={} iteration={} pc=0x{:08X} sp=0x{:08X} insn=0x{:08X}",
+                            self.m_core_index,
+                            svc_count,
+                            iteration,
+                            thread_context.pc,
+                            thread_context.sp,
+                            insn,
+                        );
+                    }
+                }
                 #[cfg(feature = "debug-logs")]
                 {
                     let insn = process.lock().unwrap().process_memory.read().unwrap().read_32(thread_context.pc);
@@ -268,6 +317,7 @@ impl PhysicalCore {
                         scheduler,
                         process,
                         svc_num,
+                        svc_count,
                         is_64bit,
                         &mut svc_args,
                         system,

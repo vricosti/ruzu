@@ -823,8 +823,45 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 0, STUB_SUCCESS);
         }
         Some(SvcId::SendSyncRequest) => {
-            let result = svc_ipc::send_sync_request(system, get_arg32(args, 0));
+            let session_handle = get_arg32(args, 0);
+            let log_handle = std::env::var("RUZU_LOG_SVC_SYNC_HANDLE")
+                .ok()
+                .and_then(|value| {
+                    let trimmed = value.trim_start_matches("0x").trim_start_matches("0X");
+                    u32::from_str_radix(trimmed, 16)
+                        .ok()
+                        .or_else(|| value.parse::<u32>().ok())
+                });
+            if log_handle.is_some_and(|target| target == session_handle) {
+                log::info!(
+                    "svc::SendSyncRequest pre handle={:#x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
+                    session_handle,
+                    get_arg32(args, 0),
+                    get_arg32(args, 1),
+                    get_arg32(args, 2),
+                    get_arg32(args, 3),
+                    get_arg32(args, 4),
+                    get_arg32(args, 5),
+                    get_arg32(args, 6),
+                    get_arg32(args, 7),
+                );
+            }
+            let result = svc_ipc::send_sync_request(system, session_handle);
             set_arg32(args, 0, result.get_inner_value());
+            if log_handle.is_some_and(|target| target == session_handle) {
+                log::info!(
+                    "svc::SendSyncRequest post handle={:#x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
+                    session_handle,
+                    get_arg32(args, 0),
+                    get_arg32(args, 1),
+                    get_arg32(args, 2),
+                    get_arg32(args, 3),
+                    get_arg32(args, 4),
+                    get_arg32(args, 5),
+                    get_arg32(args, 6),
+                    get_arg32(args, 7),
+                );
+            }
         }
         Some(SvcId::SendSyncRequestWithUserBuffer) => {
             set_arg32(args, 0, STUB_SUCCESS);

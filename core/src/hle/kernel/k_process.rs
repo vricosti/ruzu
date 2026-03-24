@@ -1680,7 +1680,7 @@ impl KProcess {
             // Release resource limit hint.
             // Upstream: m_memory_release_hint = GetUsedNonSystemUserPhysicalMemorySize();
             //           m_resource_limit->Release(PhysicalMemoryMax, 0, m_memory_release_hint);
-            self.memory_release_hint = self.code_size + self.main_thread_stack_size;
+            self.memory_release_hint = self.get_used_non_system_user_physical_memory_size();
             if let Some(ref rl) = self.resource_limit {
                 rl.lock().unwrap().release_with_hint(
                     LimitableResource::PhysicalMemoryMax,
@@ -1886,6 +1886,7 @@ impl KProcess {
         is_64bit: bool,
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<(Arc<Mutex<KThread>>, Handle, u64, u64), u32> {
+        use super::k_scoped_resource_reservation::KScopedResourceReservation;
         let state = self.state;
         if state != ProcessState::Created && state != ProcessState::CreatedAttached {
             return Err(RESULT_INVALID_STATE.get_inner_value());
@@ -1894,6 +1895,24 @@ impl KProcess {
         let handle_result = self.ensure_handle_table_initialized();
         if handle_result != RESULT_SUCCESS.get_inner_value() {
             return Err(handle_result);
+        }
+
+        let mut thread_reservation = KScopedResourceReservation::new(
+            self.resource_limit.clone(),
+            LimitableResource::ThreadCountMax,
+            1,
+        );
+        if !thread_reservation.succeeded() {
+            return Err(svc_results::RESULT_LIMIT_REACHED.get_inner_value());
+        }
+
+        let mut stack_memory_reservation = KScopedResourceReservation::new(
+            self.resource_limit.clone(),
+            LimitableResource::PhysicalMemoryMax,
+            stack_size as i64,
+        );
+        if !stack_memory_reservation.succeeded() {
+            return Err(svc_results::RESULT_LIMIT_REACHED.get_inner_value());
         }
 
         let self_weak = self
@@ -2030,6 +2049,9 @@ impl KProcess {
             }
         }
 
+        thread_reservation.commit();
+        stack_memory_reservation.commit();
+
         Ok((main_thread, thread_handle, stack_base, stack_top))
     }
 
@@ -2065,9 +2087,8 @@ impl KProcess {
         }
 
         // Get the used memory size (for resource limit release).
-        let used_memory_size = self.code_size + self.main_thread_stack_size;
         // Upstream: used_memory_size = self.get_used_non_system_user_physical_memory_size();
-        // Requires full page table accounting to compute actual usage.
+        let used_memory_size = self.get_used_non_system_user_physical_memory_size();
 
         // Finalize the page table.
         self.page_table.finalize();

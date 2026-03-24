@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/arm/dynarmic/arm_dynarmic_32.h and arm_dynarmic_32.cpp
 //! ARM32 dynarmic backend.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::arm::arm_interface::{
@@ -39,6 +39,60 @@ fn translate_halt_reason(hr: rdynarmic::halt_reason::HaltReason) -> HaltReason {
     }
 
     result
+}
+
+fn optimization_flags_from_mask(mask: u32) -> OptimizationFlag {
+    let mut flags = OptimizationFlag::NO_OPTIMIZATIONS;
+
+    if mask & OptimizationFlag::BLOCK_LINKING.bits() != 0 {
+        flags |= OptimizationFlag::BLOCK_LINKING;
+    }
+    if mask & OptimizationFlag::RETURN_STACK_BUFFER.bits() != 0 {
+        flags |= OptimizationFlag::RETURN_STACK_BUFFER;
+    }
+    if mask & OptimizationFlag::FAST_DISPATCH.bits() != 0 {
+        flags |= OptimizationFlag::FAST_DISPATCH;
+    }
+    if mask & OptimizationFlag::GET_SET_ELIMINATION.bits() != 0 {
+        flags |= OptimizationFlag::GET_SET_ELIMINATION;
+    }
+    if mask & OptimizationFlag::CONST_PROP.bits() != 0 {
+        flags |= OptimizationFlag::CONST_PROP;
+    }
+    if mask & OptimizationFlag::MISC_IR_OPT.bits() != 0 {
+        flags |= OptimizationFlag::MISC_IR_OPT;
+    }
+    if mask & OptimizationFlag::UNSAFE_UNFUSE_FMA.bits() != 0 {
+        flags |= OptimizationFlag::UNSAFE_UNFUSE_FMA;
+    }
+    if mask & OptimizationFlag::UNSAFE_REDUCED_ERROR_FP.bits() != 0 {
+        flags |= OptimizationFlag::UNSAFE_REDUCED_ERROR_FP;
+    }
+    if mask & OptimizationFlag::UNSAFE_INACCURATE_NAN.bits() != 0 {
+        flags |= OptimizationFlag::UNSAFE_INACCURATE_NAN;
+    }
+    if mask & OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE.bits() != 0 {
+        flags |= OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE;
+    }
+    if mask & OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR.bits() != 0 {
+        flags |= OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
+    }
+
+    flags
+}
+
+fn parse_trace_hex_env(name: &str) -> Option<u32> {
+    let value = std::env::var(name).ok()?;
+    let trimmed = value.trim();
+    let trimmed = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    u32::from_str_radix(trimmed, 16).ok()
+}
+
+fn parse_trace_u32_env(name: &str) -> Option<u32> {
+    std::env::var(name).ok()?.trim().parse().ok()
 }
 
 /// JIT callbacks for ARM32.
@@ -78,6 +132,15 @@ struct DynarmicCallbacks32 {
     /// No performance impact — only read when logging unmapped accesses.
     /// Set after jit creation via `set_pc_ptr()`.
     jit_pc_ptr: Option<*const u32>,
+    /// Raw pointer to jit_state.upper_location_descriptor for A32 mode diagnostics.
+    /// Used to reconstruct Thumb/E/IT state when logging unmapped accesses.
+    jit_upper_location_descriptor_ptr: Option<*const u32>,
+    /// Ensures the optional diagnostic code dump only happens once.
+    dumped_unmapped_window: AtomicBool,
+    /// Shared exclusive monitor backing Dynarmic's global monitor state.
+    exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
+    /// CPU core index associated with this callback/JIT instance.
+    core_index: usize,
 }
 
 // Safety: jit_halt_reason_ptr points to an AtomicU32 inside the heap-allocated
@@ -93,12 +156,27 @@ impl DynarmicCallbacks32 {
         uses_wall_clock: bool,
         core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
         last_exception_address: Arc<AtomicU64>,
+        exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
+        core_index: usize,
     ) -> Self {
         log::info!("DynarmicCallbacks32: Arc memory ptr = {:?}, base = {:#x}, core_memory={}",
             std::sync::Arc::as_ptr(&memory),
             memory.read().unwrap().base,
             if core_memory.is_some() { "wired" } else { "fallback" });
-        Self { memory, core_memory, svc_swi, uses_wall_clock, core_timing, last_exception_address, jit_halt_reason_ptr: None, jit_pc_ptr: None }
+        Self {
+            memory,
+            core_memory,
+            svc_swi,
+            uses_wall_clock,
+            core_timing,
+            last_exception_address,
+            jit_halt_reason_ptr: None,
+            jit_pc_ptr: None,
+            jit_upper_location_descriptor_ptr: None,
+            dumped_unmapped_window: AtomicBool::new(false),
+            exclusive_monitor,
+            core_index,
+        }
     }
 
     /// Halt the jit by atomically OR-ing a halt reason into the jit's halt_reason field.
@@ -126,9 +204,184 @@ impl DynarmicCallbacks32 {
         // on failure, matching upstream lines 150-174.
         true
     }
+
+    fn log_guest_pc_on_unmapped_access(&self, access_kind: &str, vaddr: u64) {
+        let enabled = std::env::var("RUZU_LOG_UNMAPPED_ACCESS_PC")
+            .ok()
+            .is_some_and(|value| value != "0");
+        if !enabled {
+            return;
+        }
+
+        let Some(pc_ptr) = self.jit_pc_ptr else {
+            log::error!(
+                "DynarmicCallbacks32 {} @ {:#010x}: jit_pc_ptr unavailable",
+                access_kind,
+                vaddr
+            );
+            return;
+        };
+
+        let pc = unsafe { *pc_ptr as u64 };
+        let insn = if let Some(ref cm) = self.core_memory {
+            let memory = cm.lock().unwrap();
+            if memory.is_valid_virtual_address_range(pc, 4) {
+                Some(memory.read_32(pc))
+            } else {
+                None
+            }
+        } else {
+            let memory = self.memory.read().unwrap();
+            if memory.is_valid_range(pc, 4) {
+                Some(memory.read_32(pc))
+            } else {
+                None
+            }
+        };
+
+        match insn {
+            Some(insn) => log::error!(
+                "DynarmicCallbacks32 {} @ {:#010x}: guest pc=0x{:08x} insn=0x{:08x}",
+                access_kind,
+                vaddr,
+                pc,
+                insn
+            ),
+            None => log::error!(
+                "DynarmicCallbacks32 {} @ {:#010x}: guest pc=0x{:08x} insn=<unmapped>",
+                access_kind,
+                vaddr,
+                pc
+            ),
+        }
+
+        let log_regs = std::env::var("RUZU_LOG_UNMAPPED_ACCESS_REGS")
+            .ok()
+            .is_some_and(|value| value != "0");
+        if log_regs {
+            self.log_guest_registers_on_unmapped_access(access_kind, vaddr);
+        }
+
+        self.dump_guest_code_window_on_unmapped_access();
+    }
+
+    fn log_guest_registers_on_unmapped_access(&self, access_kind: &str, vaddr: u64) {
+        let Some(pc_ptr) = self.jit_pc_ptr else {
+            return;
+        };
+
+        // rdynarmic exposes jit_state.reg[15] as the PC pointer. The full
+        // GPR bank is contiguous, so walk back to reg[0] for diagnostics.
+        let regs_ptr = unsafe { pc_ptr.sub(15) };
+        let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
+        let upper_location_descriptor = self
+            .jit_upper_location_descriptor_ptr
+            .map(|ptr| unsafe { *ptr })
+            .unwrap_or_default();
+        let thumb = (upper_location_descriptor & 1) != 0;
+        let it_state = ((upper_location_descriptor >> 8) & 0x3)
+            | (((upper_location_descriptor >> 10) & 0x3f) << 2);
+        log::error!(
+            "DynarmicCallbacks32 {} @ {:#010x}: r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
+            access_kind,
+            vaddr,
+            regs[0],
+            regs[1],
+            regs[2],
+            regs[3],
+            regs[4],
+            regs[5],
+            regs[6],
+            regs[7],
+        );
+        log::error!(
+            "DynarmicCallbacks32 {} @ {:#010x}: r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x} pc={:#010x} upper={:#010x} thumb={} it={:#04x}",
+            access_kind,
+            vaddr,
+            regs[8],
+            regs[9],
+            regs[10],
+            regs[11],
+            regs[12],
+            regs[13],
+            regs[14],
+            regs[15],
+            upper_location_descriptor,
+            thumb,
+            it_state,
+        );
+    }
+
+    fn dump_guest_code_window_on_unmapped_access(&self) {
+        let Ok(path) = std::env::var("RUZU_DUMP_UNMAPPED_CODE_PATH") else {
+            return;
+        };
+        if path.is_empty() {
+            return;
+        }
+        if self
+            .dumped_unmapped_window
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let Some(pc_ptr) = self.jit_pc_ptr else {
+            return;
+        };
+        let pc = unsafe { *pc_ptr as u64 };
+        let window_size = 0x100usize;
+        let window_start = pc.saturating_sub(0x40) & !1;
+        let mut bytes = vec![0u8; window_size];
+
+        if let Some(ref cm) = self.core_memory {
+            let memory = cm.lock().unwrap();
+            if !memory.is_valid_virtual_address_range(window_start, window_size as u64) {
+                return;
+            }
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = memory.read_8(window_start + index as u64);
+            }
+        } else {
+            let memory = self.memory.read().unwrap();
+            if !memory.is_valid_range(window_start, window_size) {
+                return;
+            }
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = memory.read_8(window_start + index as u64);
+            }
+        }
+
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => {
+                log::error!(
+                    "DynarmicCallbacks32 dumped guest code window: pc=0x{:08x} start=0x{:08x} size=0x{:x} path={}",
+                    pc,
+                    window_start,
+                    window_size,
+                    path
+                );
+            }
+            Err(err) => {
+                log::error!(
+                    "DynarmicCallbacks32 failed to write guest code window: pc=0x{:08x} start=0x{:08x} size=0x{:x} path={} err={}",
+                    pc,
+                    window_start,
+                    window_size,
+                    path,
+                    err
+                );
+            }
+        }
+    }
 }
 
 impl JitCallbacks for DynarmicCallbacks32 {
+    fn set_upper_location_descriptor_ptr(&mut self, ptr: *const u32) {
+        self.jit_upper_location_descriptor_ptr = Some(ptr);
+    }
+
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
         // Upstream: returns std::nullopt if IsValidVirtualAddressRange fails.
         if let Some(ref cm) = self.core_memory {
@@ -150,6 +403,14 @@ impl JitCallbacks for DynarmicCallbacks32 {
 
     fn memory_read_8(&self, vaddr: u64) -> u8 {
         self.check_memory_access(vaddr, 1);
+        if !self
+            .core_memory
+            .as_ref()
+            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 1))
+            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 1))
+        {
+            self.log_guest_pc_on_unmapped_access("memory_read_8", vaddr);
+        }
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().read_8(vaddr)
         } else {
@@ -159,6 +420,14 @@ impl JitCallbacks for DynarmicCallbacks32 {
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
         self.check_memory_access(vaddr, 2);
+        if !self
+            .core_memory
+            .as_ref()
+            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 2))
+            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 2))
+        {
+            self.log_guest_pc_on_unmapped_access("memory_read_16", vaddr);
+        }
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().read_16(vaddr)
         } else {
@@ -168,11 +437,21 @@ impl JitCallbacks for DynarmicCallbacks32 {
 
     fn memory_read_32(&self, vaddr: u64) -> u32 {
         self.check_memory_access(vaddr, 4);
-        if let Some(ref cm) = self.core_memory {
+        if !self
+            .core_memory
+            .as_ref()
+            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 4))
+            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 4))
+        {
+            self.log_guest_pc_on_unmapped_access("memory_read_32", vaddr);
+        }
+        let value = if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().read_32(vaddr)
         } else {
             self.memory.read().unwrap().read_32(vaddr)
-        }
+        };
+
+        value
     }
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
@@ -197,6 +476,14 @@ impl JitCallbacks for DynarmicCallbacks32 {
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
         if !self.check_memory_access(vaddr, 1) { return; }
+        if !self
+            .core_memory
+            .as_ref()
+            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 1))
+            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 1))
+        {
+            self.log_guest_pc_on_unmapped_access("memory_write_8", vaddr);
+        }
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().write_8(vaddr, value);
         } else {
@@ -206,6 +493,14 @@ impl JitCallbacks for DynarmicCallbacks32 {
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
         if !self.check_memory_access(vaddr, 2) { return; }
+        if !self
+            .core_memory
+            .as_ref()
+            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 2))
+            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 2))
+        {
+            self.log_guest_pc_on_unmapped_access("memory_write_16", vaddr);
+        }
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().write_16(vaddr, value);
         } else {
@@ -215,6 +510,14 @@ impl JitCallbacks for DynarmicCallbacks32 {
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
         if !self.check_memory_access(vaddr, 4) { return; }
+        if !self
+            .core_memory
+            .as_ref()
+            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 4))
+            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 4))
+        {
+            self.log_guest_pc_on_unmapped_access("memory_write_32", vaddr);
+        }
         if let Some(ref cm) = self.core_memory {
             cm.lock().unwrap().write_32(vaddr, value);
         } else {
@@ -285,6 +588,14 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
+        if !self
+            .core_memory
+            .as_ref()
+            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 4))
+            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 4))
+        {
+            self.log_guest_pc_on_unmapped_access("exclusive_write_32", vaddr);
+        }
         self.check_memory_access(vaddr, 4)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock().unwrap().write_exclusive_32(vaddr, value, expected)
@@ -315,7 +626,9 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_clear(&mut self) {
-        // No-op until exclusive monitor is wired
+        if !self.exclusive_monitor.is_null() {
+            unsafe { (*self.exclusive_monitor).get_monitor().clear_processor(self.core_index) };
+        }
     }
 
     fn call_supervisor(&mut self, svc_num: u32) {
@@ -450,13 +763,40 @@ impl ArmDynarmic32 {
             uses_wall_clock,
             core_timing,
             last_exception_address.clone(),
+            exclusive_monitor,
+            core_index,
         );
+
+        let optimizations = if let Some(mask) = std::env::var("RUZU_A32_OPTIMIZATION_MASK")
+            .ok()
+            .and_then(|value| {
+                let trimmed = value.trim();
+                let digits = trimmed
+                    .strip_prefix("0x")
+                    .or_else(|| trimmed.strip_prefix("0X"))
+                    .unwrap_or(trimmed);
+                u32::from_str_radix(digits, 16)
+                    .ok()
+                    .or_else(|| trimmed.parse::<u32>().ok())
+            })
+        {
+            optimization_flags_from_mask(mask)
+        } else if std::env::var("RUZU_A32_NO_OPTIMIZATIONS")
+            .ok()
+            .is_some_and(|value| value != "0")
+        {
+            OptimizationFlag::NO_OPTIMIZATIONS
+        } else {
+            // Temporary workaround: keep all verified-safe A32 optimizations enabled except
+            // block linking, which currently miscompiles the MK8D vi:m -> GetDisplayService path.
+            optimization_flags_from_mask(0x3E)
+        };
 
         let config = JitConfig {
             callbacks: Box::new(callbacks),
             enable_cycle_counting: !uses_wall_clock,
             code_cache_size: 512 * 1024 * 1024,
-            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+            optimizations,
             unsafe_optimizations: false,
             global_monitor: if exclusive_monitor.is_null() {
                 None
@@ -554,6 +894,94 @@ impl ArmInterface for ArmDynarmic32 {
         };
 
         jit.clear_exclusive_state();
+
+        let trace_start = parse_trace_hex_env("RUZU_A32_TRACE_RANGE_START");
+        let trace_end = parse_trace_hex_env("RUZU_A32_TRACE_RANGE_END");
+        let trace_limit = parse_trace_u32_env("RUZU_A32_TRACE_LIMIT").unwrap_or(0);
+        let trace_search_limit =
+            parse_trace_u32_env("RUZU_A32_TRACE_SEARCH_LIMIT").unwrap_or(0);
+        if let (Some(start), Some(end)) = (trace_start, trace_end) {
+            let current_pc = jit.get_register(15);
+            if trace_limit > 0 && (current_pc >= start && current_pc < end || trace_search_limit > 0) {
+                let mut last_hr = rdynarmic::halt_reason::HaltReason::empty();
+                let mut entered_range = current_pc >= start && current_pc < end;
+                let mut logged_steps = 0u32;
+                let total_limit = if entered_range {
+                    trace_limit
+                } else {
+                    trace_search_limit.saturating_add(trace_limit)
+                };
+                for step in 0..total_limit {
+                    let pc = jit.get_register(15);
+                    if !entered_range {
+                        log::info!(
+                            "[A32TRACE] search_step={} pc=0x{:08x} cpsr=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
+                            step,
+                            pc,
+                            jit.get_cpsr(),
+                            jit.get_register(0),
+                            jit.get_register(1),
+                            jit.get_register(2),
+                            jit.get_register(3),
+                            jit.get_register(13),
+                            jit.get_register(14),
+                        );
+                        if pc >= start && pc < end {
+                            entered_range = true;
+                            log::info!(
+                                "[A32TRACE] entered range at search_step={} pc=0x{:08x}",
+                                step,
+                                pc
+                            );
+                        } else {
+                            last_hr = jit.step();
+                            if !last_hr.is_empty() {
+                                log::info!("[A32TRACE] halt while searching: {:?}", last_hr);
+                                break;
+                            }
+                            if step + 1 >= trace_search_limit {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    if pc < start || pc >= end || logged_steps >= trace_limit {
+                        break;
+                    }
+                    let cpsr = jit.get_cpsr();
+                    log::info!(
+                        "[A32TRACE] step={} search_step={} pc=0x{:08x} cpsr=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} r4=0x{:08x} r5=0x{:08x} r6=0x{:08x} r7=0x{:08x} r8=0x{:08x} r9=0x{:08x} r10=0x{:08x} r11=0x{:08x} r12=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
+                        logged_steps,
+                        step,
+                        pc,
+                        cpsr,
+                        jit.get_register(0),
+                        jit.get_register(1),
+                        jit.get_register(2),
+                        jit.get_register(3),
+                        jit.get_register(4),
+                        jit.get_register(5),
+                        jit.get_register(6),
+                        jit.get_register(7),
+                        jit.get_register(8),
+                        jit.get_register(9),
+                        jit.get_register(10),
+                        jit.get_register(11),
+                        jit.get_register(12),
+                        jit.get_register(13),
+                        jit.get_register(14),
+                    );
+                    logged_steps += 1;
+                    last_hr = jit.step();
+                    if !last_hr.is_empty() {
+                        log::info!("[A32TRACE] halt={:?}", last_hr);
+                        break;
+                    }
+                }
+                return translate_halt_reason(last_hr);
+            }
+        }
+
         let rdynarmic_hr = jit.run();
         translate_halt_reason(rdynarmic_hr)
     }
@@ -601,9 +1029,10 @@ impl ArmInterface for ArmDynarmic32 {
 
         // Upstream maps A32 GPRs to ThreadContext:
         // GPR[0..15] -> ctx.r[0..15], rest zeroed
-        for i in 0..15 {
+        for i in 0..16 {
             ctx.r[i] = jit.get_register(i) as u64;
         }
+        ctx.fp = jit.get_register(11) as u64;
         // r[15] is PC in A32
         ctx.pc = jit.get_register(15) as u64;
         ctx.sp = jit.get_register(13) as u64;

@@ -16,8 +16,10 @@
 
 use std::sync::Arc;
 
+use super::binder::IBinder;
 use super::buffer_queue_core::BufferQueueCore;
 use super::graphic_buffer_producer::{QueueBufferInput, QueueBufferOutput};
+use super::parcel::{InputParcel, OutputParcel};
 use super::pixel_format::PixelFormat;
 use super::status::Status;
 use super::ui::fence::Fence;
@@ -243,5 +245,186 @@ impl BufferQueueProducer {
         self.core.signal_dequeue_condition();
 
         Status::NoError
+    }
+}
+
+impl IBinder for BufferQueueProducer {
+    fn transact(&self, code: u32, parcel_data: &[u8], parcel_reply: &mut [u8], _flags: u32) {
+        #[repr(u32)]
+        enum TransactionId {
+            RequestBuffer = 1,
+            SetBufferCount = 2,
+            DequeueBuffer = 3,
+            DetachBuffer = 4,
+            DetachNextBuffer = 5,
+            AttachBuffer = 6,
+            QueueBuffer = 7,
+            CancelBuffer = 8,
+            Query = 9,
+            Connect = 10,
+            Disconnect = 11,
+            AllocateBuffers = 13,
+            SetPreallocatedBuffer = 14,
+            GetBufferHistory = 17,
+        }
+
+        let mut status = Status::NoError;
+        let mut parcel_in = InputParcel::new(parcel_data);
+        let mut parcel_out = OutputParcel::new();
+
+        match code {
+            x if x == TransactionId::Connect as u32 => {
+                let enable_listener = parcel_in.read::<u8>() != 0;
+                let api = match parcel_in.read::<i32>() {
+                    0 => NativeWindowApi::NoConnectedApi,
+                    1 => NativeWindowApi::Egl,
+                    2 => NativeWindowApi::Cpu,
+                    3 => NativeWindowApi::Media,
+                    4 => NativeWindowApi::Camera,
+                    _ => NativeWindowApi::NoConnectedApi,
+                };
+                let producer_controlled_by_app = parcel_in.read::<u8>() != 0;
+
+                if enable_listener {
+                    log::warn!("BufferQueueProducer::transact Connect listener is unimplemented");
+                }
+
+                let (new_status, output) = self.connect(None, api, producer_controlled_by_app);
+                status = new_status;
+                parcel_out.write(&output);
+            }
+            x if x == TransactionId::SetPreallocatedBuffer as u32 => {
+                let slot = parcel_in.read::<i32>();
+                let buffer = parcel_in.read_object::<NvGraphicBuffer>().map(Arc::new);
+                status = self.set_preallocated_buffer(slot, buffer);
+            }
+            x if x == TransactionId::DequeueBuffer as u32 => {
+                let is_async = parcel_in.read::<u8>() != 0;
+                let width = parcel_in.read::<u32>();
+                let height = parcel_in.read::<u32>();
+                let pixel_format = parcel_in.read::<PixelFormat>();
+                let usage = parcel_in.read::<u32>();
+
+                let (new_status, slot, fence) =
+                    self.dequeue_buffer(is_async, width, height, pixel_format, usage);
+                status = new_status;
+                parcel_out.write(&slot);
+                parcel_out.write_flattened_object(Some(&fence));
+            }
+            x if x == TransactionId::RequestBuffer as u32 => {
+                let slot = parcel_in.read::<i32>();
+                let (new_status, buf) = self.request_buffer(slot);
+                status = new_status;
+                parcel_out.write_flattened_object(buf.as_ref().map(|g| &g.buffer));
+            }
+            x if x == TransactionId::QueueBuffer as u32 => {
+                let slot = parcel_in.read::<i32>();
+                let input = parcel_in.read_flattened::<QueueBufferInput>();
+                let (new_status, output) = self.queue_buffer(slot, &input);
+                status = new_status;
+                parcel_out.write(&output);
+            }
+            x if x == TransactionId::Query as u32 => {
+                let what_raw = parcel_in.read::<i32>();
+                match what_raw {
+                    0 => {
+                        let (new_status, value) = self.query(NativeWindow::Width);
+                        status = new_status;
+                        parcel_out.write(&value);
+                    }
+                    1 => {
+                        let (new_status, value) = self.query(NativeWindow::Height);
+                        status = new_status;
+                        parcel_out.write(&value);
+                    }
+                    2 => {
+                        let (new_status, value) = self.query(NativeWindow::Format);
+                        status = new_status;
+                        parcel_out.write(&value);
+                    }
+                    3 => {
+                        let (new_status, value) = self.query(NativeWindow::MinUndequeedBuffers);
+                        status = new_status;
+                        parcel_out.write(&value);
+                    }
+                    9 => {
+                        let (new_status, value) = self.query(NativeWindow::ConsumerRunningBehind);
+                        status = new_status;
+                        parcel_out.write(&value);
+                    }
+                    10 => {
+                        let (new_status, value) = self.query(NativeWindow::ConsumerUsageBits);
+                        status = new_status;
+                        parcel_out.write(&value);
+                    }
+                    11 => {
+                        let (new_status, value) = self.query(NativeWindow::StickyTransform);
+                        status = new_status;
+                        parcel_out.write(&value);
+                    }
+                    _ => {
+                        log::error!("BufferQueueProducer::transact Query unknown what={}", what_raw);
+                        status = Status::BadValue;
+                    }
+                }
+            }
+            x if x == TransactionId::CancelBuffer as u32 => {
+                let slot = parcel_in.read::<i32>();
+                let fence = parcel_in.read_flattened::<Fence>();
+                self.cancel_buffer(slot, &fence);
+            }
+            x if x == TransactionId::Disconnect as u32 => {
+                let api = match parcel_in.read::<i32>() {
+                    0 => NativeWindowApi::NoConnectedApi,
+                    1 => NativeWindowApi::Egl,
+                    2 => NativeWindowApi::Cpu,
+                    3 => NativeWindowApi::Media,
+                    4 => NativeWindowApi::Camera,
+                    _ => {
+                        log::error!("BufferQueueProducer::transact Disconnect unknown api");
+                        NativeWindowApi::NoConnectedApi
+                    }
+                };
+                status = self.disconnect(api);
+            }
+            x if x == TransactionId::DetachBuffer as u32 => {
+                let slot = parcel_in.read::<i32>();
+                status = Status::BadValue;
+                log::warn!("BufferQueueProducer::transact DetachBuffer(slot={}) unimplemented", slot);
+            }
+            x if x == TransactionId::SetBufferCount as u32 => {
+                let buffer_count = parcel_in.read::<i32>();
+                status = self.set_buffer_count(buffer_count);
+            }
+            x if x == TransactionId::GetBufferHistory as u32 => {
+                log::warn!("BufferQueueProducer::transact GetBufferHistory (STUBBED)");
+            }
+            x if x == TransactionId::DetachNextBuffer as u32 => {
+                status = Status::BadValue;
+                log::warn!("BufferQueueProducer::transact DetachNextBuffer unimplemented");
+            }
+            x if x == TransactionId::AttachBuffer as u32 => {
+                status = Status::BadValue;
+                log::warn!("BufferQueueProducer::transact AttachBuffer unimplemented");
+            }
+            x if x == TransactionId::AllocateBuffers as u32 => {
+                status = Status::BadValue;
+                log::warn!("BufferQueueProducer::transact AllocateBuffers unimplemented");
+            }
+            _ => {
+                status = Status::BadValue;
+                log::error!("BufferQueueProducer::transact unknown code={}", code);
+            }
+        }
+
+        parcel_out.write(&status);
+        let serialized = parcel_out.serialize();
+        let copy_len = std::cmp::min(parcel_reply.len(), serialized.len());
+        parcel_reply[..copy_len].copy_from_slice(&serialized[..copy_len]);
+    }
+
+    fn get_native_handle(&self, type_id: u32) -> Option<u32> {
+        log::warn!("BufferQueueProducer::get_native_handle type_id={} (STUBBED)", type_id);
+        None
     }
 }

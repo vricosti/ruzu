@@ -248,7 +248,7 @@ pub const SVC_ARGUMENT_HANDLE_COUNT_MAX: usize = 0x40;
 
 // ---------------------------------------------------------------------------
 // ThreadContext placeholder
-// Upstream is Svc::ThreadContext with 31 GPRs, FP/SIMD regs, etc.
+// Upstream is Svc::ThreadContext with 29 GPRs, FP/SIMD regs, etc.
 // ---------------------------------------------------------------------------
 
 /// Placeholder for Svc::ThreadContext.
@@ -256,12 +256,13 @@ pub const SVC_ARGUMENT_HANDLE_COUNT_MAX: usize = 0x40;
 #[derive(Clone, Default)]
 #[repr(C)]
 pub struct ThreadContext {
-    pub r: [u64; 31],
+    pub r: [u64; 29],
     pub fp: u64,
     pub lr: u64,
     pub sp: u64,
     pub pc: u64,
     pub pstate: u32,
+    pub padding: u32,
     pub v: [u128; 32],
     pub fpcr: u32,
     pub fpsr: u32,

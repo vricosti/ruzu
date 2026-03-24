@@ -10,10 +10,12 @@
 
 use std::sync::Arc;
 
+use super::binder::IBinder;
 use super::buffer_item::BufferItem;
 use super::buffer_queue_core::BufferQueueCore;
 use super::buffer_queue_defs::NUM_BUFFER_SLOTS;
 use super::buffer_slot::BufferState;
+use super::parcel::{InputParcel, OutputParcel};
 use super::status::Status;
 use super::ui::fence::Fence;
 
@@ -244,5 +246,88 @@ impl BufferQueueConsumer {
 
         log::debug!("BufferQueueConsumer: returning mask {}", mask);
         *out_slot_mask = mask;
+    }
+}
+
+impl IBinder for BufferQueueConsumer {
+    fn transact(&self, code: u32, parcel_data: &[u8], parcel_reply: &mut [u8], _flags: u32) {
+        #[repr(u32)]
+        enum TransactionId {
+            AcquireBuffer = 1,
+            DetachBuffer = 2,
+            AttachBuffer = 3,
+            ReleaseBuffer = 4,
+            ConsumerConnect = 5,
+            ConsumerDisconnect = 6,
+            GetReleasedBuffers = 7,
+            SetDefaultBufferSize = 8,
+            SetDefaultMaxBufferCount = 9,
+            DisableAsyncBuffer = 10,
+            SetMaxAcquiredBufferCount = 11,
+            SetConsumerName = 12,
+            SetDefaultBufferFormat = 13,
+            SetConsumerUsageBits = 14,
+            SetTransformHint = 15,
+            GetSidebandStream = 16,
+            Unknown18 = 18,
+            Unknown20 = 20,
+        }
+
+        let mut status = Status::NoError;
+        let mut parcel_in = InputParcel::new(parcel_data);
+        let mut parcel_out = OutputParcel::new();
+
+        match code {
+            x if x == TransactionId::AcquireBuffer as u32 => {
+                let mut item = BufferItem::default();
+                let present_when = parcel_in.read::<i64>();
+                status = self.acquire_buffer(&mut item, present_when);
+                log::warn!("BufferQueueConsumer::transact AcquireBuffer flattening is unimplemented");
+            }
+            x if x == TransactionId::ReleaseBuffer as u32 => {
+                let slot = parcel_in.read::<i32>();
+                let frame_number = parcel_in.read::<u64>();
+                let release_fence = parcel_in.read_flattened::<Fence>();
+                status = self.release_buffer(slot, frame_number, &release_fence);
+            }
+            x if x == TransactionId::GetReleasedBuffers as u32 => {
+                let mut slot_mask = 0u64;
+                self.get_released_buffers(&mut slot_mask);
+                parcel_out.write(&slot_mask);
+            }
+            x if x == TransactionId::DetachBuffer as u32
+                || x == TransactionId::AttachBuffer as u32
+                || x == TransactionId::ConsumerConnect as u32
+                || x == TransactionId::ConsumerDisconnect as u32
+                || x == TransactionId::SetDefaultBufferSize as u32
+                || x == TransactionId::SetDefaultMaxBufferCount as u32
+                || x == TransactionId::DisableAsyncBuffer as u32
+                || x == TransactionId::SetMaxAcquiredBufferCount as u32
+                || x == TransactionId::SetConsumerName as u32
+                || x == TransactionId::SetDefaultBufferFormat as u32
+                || x == TransactionId::SetConsumerUsageBits as u32
+                || x == TransactionId::SetTransformHint as u32
+                || x == TransactionId::GetSidebandStream as u32
+                || x == TransactionId::Unknown18 as u32
+                || x == TransactionId::Unknown20 as u32 =>
+            {
+                status = Status::BadValue;
+                log::warn!("BufferQueueConsumer::transact unimplemented code={}", code);
+            }
+            _ => {
+                status = Status::BadValue;
+                log::error!("BufferQueueConsumer::transact unknown code={}", code);
+            }
+        }
+
+        parcel_out.write(&status);
+        let serialized = parcel_out.serialize();
+        let copy_len = std::cmp::min(parcel_reply.len(), serialized.len());
+        parcel_reply[..copy_len].copy_from_slice(&serialized[..copy_len]);
+    }
+
+    fn get_native_handle(&self, type_id: u32) -> Option<u32> {
+        log::warn!("BufferQueueConsumer::get_native_handle type_id={} (STUBBED)", type_id);
+        None
     }
 }

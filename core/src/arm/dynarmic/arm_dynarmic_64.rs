@@ -77,7 +77,15 @@ struct DynarmicCallbacks64 {
     core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
     /// Last exception address reported by dynarmic.
     last_exception_address: Arc<AtomicU64>,
+    /// Shared exclusive monitor backing Dynarmic's global monitor state.
+    exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
+    /// CPU core index associated with this callback/JIT instance.
+    core_index: usize,
 }
+
+// Safety: exclusive_monitor points to process-owned state that outlives the callback/JIT.
+// Each callback is still used by only one JIT/core.
+unsafe impl Send for DynarmicCallbacks64 {}
 
 impl DynarmicCallbacks64 {
     fn new(
@@ -87,6 +95,8 @@ impl DynarmicCallbacks64 {
         uses_wall_clock: bool,
         core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
         last_exception_address: Arc<AtomicU64>,
+        exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
+        core_index: usize,
     ) -> Self {
         Self {
             memory,
@@ -97,6 +107,8 @@ impl DynarmicCallbacks64 {
             uses_wall_clock,
             core_timing,
             last_exception_address,
+            exclusive_monitor,
+            core_index,
         }
     }
 
@@ -277,7 +289,9 @@ impl JitCallbacks for DynarmicCallbacks64 {
     }
 
     fn exclusive_clear(&mut self) {
-        // No-op until exclusive monitor is wired
+        if !self.exclusive_monitor.is_null() {
+            unsafe { (*self.exclusive_monitor).get_monitor().clear_processor(self.core_index) };
+        }
     }
 
     fn instruction_cache_operation(&mut self, op: u64, vaddr: u64) {
@@ -425,6 +439,7 @@ impl ArmDynarmic64 {
         let callbacks = DynarmicCallbacks64::new(
             shared_memory, core_memory, svc.clone(),
             uses_wall_clock, core_timing, last_exception_address.clone(),
+            exclusive_monitor, core_index,
         );
 
         // Configure JIT

@@ -29,16 +29,18 @@ pub struct KProcess {
 }
 
 /// Opaque type representing Kernel::Svc::ThreadContext
-/// Matches upstream: 31 GPRs, fp, lr, sp, pc, pstate, 32 vector regs, fpcr, fpsr, tpidr
+/// Matches upstream: 29 GPRs (x0-x28 / r0-r28), fp, lr, sp, pc, pstate, padding,
+/// 32 vector regs, fpcr, fpsr, tpidr
 #[derive(Clone, Default)]
 #[repr(C)]
 pub struct ThreadContext {
-    pub r: [u64; 31],
+    pub r: [u64; 29],
     pub fp: u64,
     pub lr: u64,
     pub sp: u64,
     pub pc: u64,
     pub pstate: u32,
+    pub padding: u32,
     pub v: [u128; 32],
     pub fpcr: u32,
     pub fpsr: u32,

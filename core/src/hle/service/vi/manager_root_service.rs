@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::container::Container;
@@ -40,7 +41,13 @@ impl IManagerRootService {
         let root = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         log::debug!("IManagerRootService::GetDisplayService called");
 
-        let policy = Policy::User;
+        let mut rp = RequestParser::new(ctx);
+        let Some(policy) = Policy::from_raw(rp.pop_u32()) else {
+            log::error!("IManagerRootService::GetDisplayService: invalid policy");
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(super::vi_results::RESULT_PERMISSION_DENIED);
+            return;
+        };
 
         match service_creator::get_application_display_service(Permission::Manager, policy) {
             Ok(()) => {

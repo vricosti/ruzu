@@ -19,7 +19,7 @@ use super::k_memory_block::*;
 use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_memory_layout::KERNEL_ASLR_ALIGNMENT;
 use super::k_memory_manager;
-use super::k_resource_limit::KResourceLimit;
+use super::k_resource_limit::{KResourceLimit, LimitableResource};
 use super::svc_types::{ADDRESS_SPACE_MASK, CreateProcessFlag, MemoryState as SvcMemoryState};
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::result::ResultCode;
@@ -1103,6 +1103,8 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::SetHeapSize`.
     /// Faithfully implements heap grow/shrink with Operate calls.
     pub fn set_heap_size(&mut self, size: usize) -> (u32, usize) {
+        use super::k_scoped_resource_reservation::KScopedResourceReservation;
+
         // Validate preconditions.
         if self.m_is_kernel {
             return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
@@ -1155,6 +1157,13 @@ impl KPageTableBase {
                 return (op_result, 0);
             }
 
+            if let Some(ref resource_limit) = self.m_resource_limit {
+                resource_limit
+                    .lock()
+                    .unwrap()
+                    .release(LimitableResource::PhysicalMemoryMax, free_size as i64);
+            }
+
             // Update block manager: freed region becomes Free.
             self.m_memory_block_manager.update(
                 free_start,
@@ -1180,6 +1189,15 @@ impl KPageTableBase {
         // === Grow heap ===
         let cur_address = self.m_current_heap_end;
         let allocation_size = size - current_heap_size;
+
+        let mut memory_reservation = KScopedResourceReservation::new(
+            self.m_resource_limit.clone(),
+            LimitableResource::PhysicalMemoryMax,
+            allocation_size as i64,
+        );
+        if !memory_reservation.succeeded() {
+            return (svc_results::RESULT_LIMIT_REACHED.get_inner_value(), 0);
+        }
 
         // Upstream: reserve resource limit, allocate physical pages.
         // In our emulator, physical memory is pre-allocated in DeviceMemory.
@@ -1233,6 +1251,8 @@ impl KPageTableBase {
         if let Some(memory) = &self.m_memory {
             memory.lock().unwrap().zero_block(cur_address as u64, allocation_size);
         }
+
+        memory_reservation.commit();
 
         // Update block manager: new region is Normal/UserReadWrite.
         self.m_memory_block_manager.update(
@@ -2308,7 +2328,10 @@ impl KPageTableBase {
     pub fn get_code_data_size(&self) -> usize { self.get_size_by_state(KMemoryState::CODE_DATA) }
     pub fn get_alias_code_size(&self) -> usize { self.get_size_by_state(KMemoryState::ALIAS_CODE) }
     pub fn get_alias_code_data_size(&self) -> usize { self.get_size_by_state(KMemoryState::ALIAS_CODE_DATA) }
-    pub fn get_normal_memory_size(&self) -> usize { self.get_size_by_state(KMemoryState::NORMAL) }
+    pub fn get_normal_memory_size(&self) -> usize {
+        self.m_current_heap_end.saturating_sub(self.m_heap_region_start)
+            + self.m_mapped_physical_memory_size
+    }
 
     // -- GetContiguousMemoryRangeWithState --
 
