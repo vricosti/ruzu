@@ -455,6 +455,7 @@ impl ArmDynarmic64 {
             } else {
                 Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
             },
+            fastmem_pointer: None, // TODO: wire for A64
         };
 
         // Create the JIT

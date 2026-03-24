@@ -58,6 +58,16 @@ impl Memory {
         }
     }
 
+    /// Get the fastmem arena base pointer (for JIT direct memory access).
+    /// Returns null if DeviceMemory buffer is not available.
+    pub fn fastmem_pointer(&self) -> *mut u8 {
+        if self.buffer.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { (*self.buffer).virtual_base_pointer() }
+        }
+    }
+
     /// Set the current page table (called when switching processes).
     /// Set the current page table and wire up the fastmem arena.
     /// Matches upstream `Memory::Impl::SetCurrentPageTable`.
