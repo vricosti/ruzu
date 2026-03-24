@@ -785,9 +785,8 @@ impl ArmDynarmic32 {
         {
             OptimizationFlag::NO_OPTIMIZATIONS
         } else {
-            // Temporary workaround: keep all verified-safe A32 optimizations enabled except
-            // block linking, which currently miscompiles the MK8D vi:m -> GetDisplayService path.
-            optimization_flags_from_mask(0x3E)
+            // All safe optimizations enabled, matching upstream default.
+            optimization_flags_from_mask(0x3F)
         };
 
         let config = JitConfig {
