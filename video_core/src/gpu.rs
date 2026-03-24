@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::dma_pusher::CommandList;
+use crate::control::channel_state::CommandList;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::rasterizer_download_area::RasterizerDownloadArea;
 use crate::renderer_base::RendererBase;
@@ -111,10 +111,13 @@ pub struct Gpu {
     /// The renderer backend (OpenGL, Vulkan, or Null).
     /// Upstream: `std::unique_ptr<VideoCore::RendererBase> renderer` in GPU::Impl.
     renderer: Mutex<Option<Box<dyn RendererBase>>>,
+
+    /// GPU command thread manager.
+    /// Upstream: `VideoCommon::GPUThread::ThreadManager gpu_thread` in GPU::Impl.
+    gpu_thread: Mutex<crate::gpu_thread::ThreadManager>,
     // In the full port:
     // rasterizer: *mut RasterizerInterface,
     // host1x: &Host1x,
-    // gpu_thread: ThreadManager,
     // scheduler: Box<Scheduler>,
     // channels: HashMap<i32, Arc<ChannelState>>,
 }
@@ -133,6 +136,7 @@ impl Gpu {
             new_channel_id: Mutex::new(1),
             bound_channel: Mutex::new(-1),
             renderer: Mutex::new(None),
+            gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(is_async)),
         }
     }
 
@@ -238,7 +242,18 @@ impl Gpu {
     pub fn start(&self) {
         let renderer_guard = self.renderer.lock().unwrap();
         if renderer_guard.is_some() {
-            log::info!("Gpu::start: GPU started (renderer bound, GPU thread not yet implemented)");
+            log::info!("Gpu::start: GPU started (renderer bound, starting GPU thread)");
+            drop(renderer_guard);
+            // Upstream: gpu_thread.StartThread(*renderer, renderer->Context(), *scheduler)
+            // We pass raw pointers to self (the Gpu) since the thread needs to call tick_work().
+            // Safety: The Gpu outlives the ThreadManager (dropped in Gpu::drop order).
+            let gpu_ptr = self as *const Gpu;
+            // TODO: pass real Scheduler pointer when scheduler is wired into Gpu.
+            // For now pass null — the GPU thread will skip SubmitList commands.
+            let scheduler_ptr = std::ptr::null::<crate::control::scheduler::Scheduler>();
+            unsafe {
+                self.gpu_thread.lock().unwrap().start_thread(gpu_ptr, scheduler_ptr);
+            }
         } else {
             log::warn!("Gpu::start: no renderer bound");
         }
@@ -250,10 +265,9 @@ impl Gpu {
     }
 
     /// Push GPU command entries to be processed.
-    pub fn push_gpu_entries(&self, _channel: i32, _entries: CommandList) {
-        // NOTE: Full implementation calls gpu_thread.SubmitList(channel, entries).
-        // Stubbed until gpu_thread integration is complete.
-        log::warn!("Gpu::push_gpu_entries: gpu_thread not integrated, dropping entries");
+    /// Matches upstream `GPU::Impl::PushGPUEntries(s32, CommandList&&)`.
+    pub fn push_gpu_entries(&self, channel: i32, entries: CommandList) {
+        self.gpu_thread.lock().unwrap().submit_list(channel, entries);
     }
 
     /// Notify rasterizer about a CPU read.
@@ -270,31 +284,30 @@ impl Gpu {
     }
 
     /// Flush a region.
-    pub fn flush_region(&self, _addr: DAddr, _size: u64) {
-        // NOTE: Full implementation calls gpu_thread.FlushRegion(addr, size).
-        // Stubbed until gpu_thread integration is complete.
-        log::warn!("Gpu::flush_region: gpu_thread not integrated, skipping flush");
+    /// Matches upstream `GPU::Impl::FlushRegion(DAddr, u64)`.
+    pub fn flush_region(&self, addr: DAddr, size: u64) {
+        self.gpu_thread.lock().unwrap().flush_region(addr, size);
     }
 
     /// Invalidate a region.
-    pub fn invalidate_region(&self, _addr: DAddr, _size: u64) {
-        // NOTE: Full implementation calls gpu_thread.InvalidateRegion(addr, size).
-        // Stubbed until gpu_thread integration is complete.
-        log::warn!("Gpu::invalidate_region: gpu_thread not integrated, skipping invalidation");
+    /// Matches upstream `GPU::Impl::InvalidateRegion(DAddr, u64)`.
+    pub fn invalidate_region(&self, addr: DAddr, size: u64) {
+        self.gpu_thread.lock().unwrap().invalidate_region(addr, size);
     }
 
     /// Notify rasterizer of a CPU write.
+    /// Matches upstream `GPU::Impl::OnCPUWrite(DAddr, u64)`.
     pub fn on_cpu_write(&self, _addr: DAddr, _size: u64) -> bool {
-        // NOTE: Full implementation calls rasterizer->OnCPUWrite(addr, size).
-        // Stubbed until rasterizer integration is complete; return false (no cache hit).
+        // Upstream: calls rasterizer->OnCPUWrite(addr, size).
+        // Returns true if GPU caches were affected.
+        // Requires rasterizer integration.
         false
     }
 
     /// Flush and invalidate a region.
-    pub fn flush_and_invalidate_region(&self, _addr: DAddr, _size: u64) {
-        // NOTE: Full implementation calls gpu_thread.FlushAndInvalidateRegion(addr, size).
-        // Stubbed until gpu_thread integration is complete.
-        log::warn!("Gpu::flush_and_invalidate_region: gpu_thread not integrated, skipping");
+    /// Matches upstream `GPU::Impl::FlushAndInvalidateRegion(DAddr, u64)`.
+    pub fn flush_and_invalidate_region(&self, addr: DAddr, size: u64) {
+        self.gpu_thread.lock().unwrap().flush_and_invalidate_region(addr, size);
     }
 
     /// Request framebuffer compositing.
