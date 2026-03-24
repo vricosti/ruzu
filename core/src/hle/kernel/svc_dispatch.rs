@@ -467,8 +467,6 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let mem_info_ptr = get_arg32(args, 0) as u64;
             let query_addr = get_arg32(args, 2) as u64;
             let (base, size, state, perm) = query_memory_info(system, query_addr);
-            log::info!("  QueryMemory(info_ptr={:#x}, addr={:#x}) -> base={:#x} size={:#x} state={} perm={}",
-                mem_info_ptr, query_addr, base, size, state, perm);
             // Write MemoryInfo structure to guest memory.
             // Upstream: current_memory.WriteBlock(out_memory_info, &svc_mem_info, sizeof(...))
             {
