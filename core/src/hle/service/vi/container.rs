@@ -8,12 +8,14 @@
 //! infrastructure. It is the central coordinator for the VI service.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::SessionRequestHandler;
 use crate::hle::service::nvnflinger::hos_binder_driver::IHosBinderDriver;
 use crate::hle::service::nvnflinger::hos_binder_driver_server::HosBinderDriverServer;
 use crate::hle::service::nvnflinger::surface_flinger::SurfaceFlinger;
+use crate::hle::service::sm::sm::ServiceManager;
 
 use super::conductor::Conductor;
 use super::display_list::DisplayList;
@@ -30,11 +32,12 @@ use super::vi_types::DisplayName;
 /// 4. Registers all displays with SurfaceFlinger
 /// 5. Creates the Conductor (vsync manager)
 pub struct Container {
-    system: crate::core::SystemRef,
     inner: Mutex<ContainerInner>,
-    /// Binder server — shared with SurfaceFlinger and IHOSBinderDriver.
+    /// Shared `dispdrv` session handler obtained from the global ServiceManager.
+    binder_driver: Arc<dyn SessionRequestHandler>,
+    /// Binder server — shared with the global `dispdrv` binder driver.
     server: Arc<HosBinderDriverServer>,
-    /// Surface compositor.
+    /// Surface compositor shared with the global `dispdrv` binder driver.
     surface_flinger: Arc<SurfaceFlinger>,
 }
 
@@ -66,9 +69,22 @@ impl Container {
             display_ids.push(d.get_id());
         });
 
-        // Create binder server and surface flinger (matches upstream Container constructor)
-        let server = HosBinderDriverServer::new();
-        let surface_flinger = SurfaceFlinger::new(Arc::clone(&server));
+        let service_manager = system
+            .get()
+            .service_manager()
+            .expect("Container::new: missing ServiceManager");
+        let binder_driver = ServiceManager::get_service_blocking(
+            &service_manager,
+            "dispdrv",
+            Duration::from_secs(5),
+        )
+        .expect("Container::new: timed out waiting for dispdrv");
+        let binder_driver_impl = binder_driver
+            .as_any()
+            .downcast_ref::<IHosBinderDriver>()
+            .expect("Container::new: dispdrv is not IHosBinderDriver");
+        let server = Arc::clone(binder_driver_impl.get_server());
+        let surface_flinger = binder_driver_impl.get_surface_flinger();
 
         // Register all displays with the surface flinger
         for &id in &display_ids {
@@ -78,13 +94,13 @@ impl Container {
         let conductor = Conductor::new(&display_ids);
 
         Self {
-            system,
             inner: Mutex::new(ContainerInner {
                 displays,
                 layers: LayerList::default(),
                 conductor: Some(conductor),
                 is_shut_down: false,
             }),
+            binder_driver,
             server,
             surface_flinger,
         }
@@ -100,10 +116,7 @@ impl Container {
     /// Get the binder driver service.
     /// Upstream: Container owns IHOSBinderDriver and returns it via GetBinderDriver().
     pub fn get_binder_driver(&self) -> Arc<dyn SessionRequestHandler> {
-        Arc::new(IHosBinderDriver::new(
-            Arc::clone(&self.server),
-            Arc::clone(&self.surface_flinger),
-        ))
+        Arc::clone(&self.binder_driver)
     }
 
     pub fn on_terminate(&self) {
@@ -134,46 +147,59 @@ impl Container {
 
     pub fn destroy_managed_layer(&self, layer_id: u64) -> Result<(), ResultCode> {
         let mut inner = self.inner.lock().unwrap();
-        let _ = Self::close_layer_locked(&mut inner, layer_id);
-        Self::destroy_layer_locked(&mut inner, layer_id)
+        let _ = Self::close_layer_locked(&self.surface_flinger, &mut inner, layer_id);
+        Self::destroy_layer_locked(&self.surface_flinger, &mut inner, layer_id)
     }
 
     pub fn open_layer(&self, layer_id: u64, aruid: u64) -> Result<i32, ResultCode> {
         let mut inner = self.inner.lock().unwrap();
-        Self::open_layer_locked(&mut inner, layer_id, aruid)
+        Self::open_layer_locked(&self.surface_flinger, &mut inner, layer_id, aruid)
     }
 
     pub fn close_layer(&self, layer_id: u64) -> Result<(), ResultCode> {
         let mut inner = self.inner.lock().unwrap();
-        Self::close_layer_locked(&mut inner, layer_id)
+        Self::close_layer_locked(&self.surface_flinger, &mut inner, layer_id)
     }
 
     pub fn create_stray_layer(&self, display_id: u64) -> Result<(i32, u64), ResultCode> {
         let mut inner = self.inner.lock().unwrap();
         let layer_id = Self::create_layer_locked(&self.surface_flinger, &mut inner, display_id, 0)?;
-        let producer_binder_id = Self::open_layer_locked(&mut inner, layer_id, 0)?;
+        let producer_binder_id =
+            Self::open_layer_locked(&self.surface_flinger, &mut inner, layer_id, 0)?;
         Ok((producer_binder_id, layer_id))
     }
 
     pub fn destroy_stray_layer(&self, layer_id: u64) -> Result<(), ResultCode> {
         let mut inner = self.inner.lock().unwrap();
-        Self::close_layer_locked(&mut inner, layer_id)?;
-        Self::destroy_layer_locked(&mut inner, layer_id)
+        Self::close_layer_locked(&self.surface_flinger, &mut inner, layer_id)?;
+        Self::destroy_layer_locked(&self.surface_flinger, &mut inner, layer_id)
     }
 
-    pub fn set_layer_visibility(&self, layer_id: u64, _visible: bool) -> Result<(), ResultCode> {
+    pub fn set_layer_visibility(&self, layer_id: u64, visible: bool) -> Result<(), ResultCode> {
         let inner = self.inner.lock().unwrap();
-        if inner.layers.get_layer_by_id(layer_id).is_none() {
-            return Err(vi_results::RESULT_NOT_FOUND);
-        }
+        let layer = inner
+            .layers
+            .get_layer_by_id(layer_id)
+            .ok_or(vi_results::RESULT_NOT_FOUND)?;
+        self.surface_flinger
+            .set_layer_visibility(layer.get_consumer_binder_id(), visible);
         Ok(())
     }
 
-    pub fn set_layer_blending(&self, layer_id: u64, _enabled: bool) -> Result<(), ResultCode> {
+    pub fn set_layer_blending(&self, layer_id: u64, enabled: bool) -> Result<(), ResultCode> {
         let inner = self.inner.lock().unwrap();
-        if inner.layers.get_layer_by_id(layer_id).is_none() {
-            return Err(vi_results::RESULT_NOT_FOUND);
-        }
+        let layer = inner
+            .layers
+            .get_layer_by_id(layer_id)
+            .ok_or(vi_results::RESULT_NOT_FOUND)?;
+        self.surface_flinger.set_layer_blending(
+            layer.get_consumer_binder_id(),
+            if enabled {
+                crate::hle::service::nvnflinger::hwc_layer::LayerBlending::Coverage
+            } else {
+                crate::hle::service::nvnflinger::hwc_layer::LayerBlending::None
+            },
+        );
         Ok(())
     }
 
@@ -209,24 +235,35 @@ impl Container {
             .create_layer(owner_aruid, display_id, consumer_binder_id, producer_binder_id)
             .ok_or(vi_results::RESULT_NOT_FOUND)?;
 
+        surface_flinger.create_layer(consumer_binder_id);
+
         Ok(layer.get_id())
     }
 
     fn destroy_layer_locked(
+        surface_flinger: &Arc<SurfaceFlinger>,
         inner: &mut ContainerInner,
         layer_id: u64,
     ) -> Result<(), ResultCode> {
-        if inner.layers.get_layer_by_id(layer_id).is_none() {
-            return Err(vi_results::RESULT_NOT_FOUND);
-        }
+        let layer = inner
+            .layers
+            .get_layer_by_id(layer_id)
+            .ok_or(vi_results::RESULT_NOT_FOUND)?;
+        let consumer_binder_id = layer.get_consumer_binder_id();
+        let producer_binder_id = layer.get_producer_binder_id();
+
+        surface_flinger.destroy_layer(consumer_binder_id);
+        surface_flinger.destroy_buffer_queue(consumer_binder_id, producer_binder_id);
+
         inner.layers.destroy_layer(layer_id);
         Ok(())
     }
 
     fn open_layer_locked(
+        surface_flinger: &Arc<SurfaceFlinger>,
         inner: &mut ContainerInner,
         layer_id: u64,
-        _aruid: u64,
+        aruid: u64,
     ) -> Result<i32, ResultCode> {
         if inner.is_shut_down {
             return Err(vi_results::RESULT_OPERATION_FAILED);
@@ -241,12 +278,20 @@ impl Container {
             return Err(vi_results::RESULT_OPERATION_FAILED);
         }
 
+        if layer.get_owner_aruid() != aruid {
+            return Err(vi_results::RESULT_PERMISSION_DENIED);
+        }
+
         let producer_binder_id = layer.get_producer_binder_id();
+        let consumer_binder_id = layer.get_consumer_binder_id();
+        let display_id = layer.get_display_id();
         layer.open();
+        surface_flinger.add_layer_to_display_stack(display_id, consumer_binder_id);
         Ok(producer_binder_id)
     }
 
     fn close_layer_locked(
+        surface_flinger: &Arc<SurfaceFlinger>,
         inner: &mut ContainerInner,
         layer_id: u64,
     ) -> Result<(), ResultCode> {
@@ -259,6 +304,9 @@ impl Container {
             return Err(vi_results::RESULT_OPERATION_FAILED);
         }
 
+        let consumer_binder_id = layer.get_consumer_binder_id();
+        let display_id = layer.get_display_id();
+        surface_flinger.remove_layer_from_display_stack(display_id, consumer_binder_id);
         layer.close();
         Ok(())
     }

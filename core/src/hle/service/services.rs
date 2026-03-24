@@ -138,6 +138,11 @@ impl Services {
         Self::loop_process_loader(service_manager, system);
         Self::loop_process_nvservices(service_manager, system);
         Self::loop_process_bsdsocket(service_manager, system);
+        // Upstream detaches host/guest service processes, so VI can block waiting for
+        // "dispdrv" while nvnflinger registers it on another service thread. Our current
+        // sequential fallback has no detached service threads yet, so we must register the
+        // shared dispdrv owner before entering VI.
+        Self::loop_process_nvnflinger(service_manager, system);
         Self::loop_process_vi(service_manager, system);
 
         // ── Guest core processes (upstream: blocking) ──
@@ -198,7 +203,8 @@ impl Services {
         // kernel.RunOnGuestCoreProcess("mnpp",       [&] { MNPP::LoopProcess(system); });
         Self::loop_process_mnpp(service_manager, system);
         // kernel.RunOnGuestCoreProcess("nvnflinger", [&] { Nvnflinger::LoopProcess(system); });
-        Self::loop_process_nvnflinger(service_manager, system);
+        // Already launched above in the sequential fallback to preserve the upstream
+        // VI -> dispdrv dependency without detached service threads.
         // kernel.RunOnGuestCoreProcess("NCM",        [&] { NCM::LoopProcess(system); });
         Self::loop_process_ncm(service_manager, system);
         // kernel.RunOnGuestCoreProcess("nfc",        [&] { NFC::LoopProcess(system); });
@@ -411,9 +417,7 @@ impl Services {
     }
 
     fn loop_process_nvnflinger(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
-        let mut server_manager = ServerManager::new(system);
-        register_stub_services(&mut server_manager, &["dispdrv"]);
-        ServerManager::run_server(server_manager);
+        crate::hle::service::nvnflinger::nvnflinger::loop_process(system);
     }
 
     fn loop_process_ncm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {

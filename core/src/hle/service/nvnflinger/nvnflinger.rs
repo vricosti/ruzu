@@ -10,6 +10,9 @@
 
 use std::sync::Arc;
 
+use crate::hle::service::hle_ipc::SessionRequestHandler;
+use crate::hle::service::server_manager::ServerManager;
+
 use super::hos_binder_driver::IHosBinderDriver;
 use super::hos_binder_driver_server::HosBinderDriverServer;
 use super::surface_flinger::SurfaceFlinger;
@@ -61,4 +64,18 @@ impl Default for Nvnflinger {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Matches upstream `Service::Nvnflinger::LoopProcess(Core::System& system)`.
+pub fn loop_process(system: crate::core::SystemRef) {
+    let nvnflinger = Arc::new(Nvnflinger::new());
+
+    let mut server_manager = ServerManager::new(system);
+    let binder_driver = Arc::clone(nvnflinger.get_binder_driver());
+    server_manager.register_named_service(
+        "dispdrv",
+        Box::new(move || -> Arc<dyn SessionRequestHandler> { binder_driver.clone() }),
+        64,
+    );
+    ServerManager::run_server(server_manager);
 }

@@ -28,7 +28,7 @@ impl HosBinderDriverServer {
         Arc::new(Self {
             inner: Mutex::new(HosBinderDriverServerInner {
                 binders: HashMap::new(),
-                next_id: 0,
+                next_id: 1,
             }),
         })
     }
@@ -79,8 +79,37 @@ impl Default for HosBinderDriverServer {
         Self {
             inner: Mutex::new(HosBinderDriverServerInner {
                 binders: HashMap::new(),
-                next_id: 0,
+                next_id: 1,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::HosBinderDriverServer;
+    use crate::hle::service::nvnflinger::binder::IBinder;
+
+    struct DummyBinder;
+
+    impl IBinder for DummyBinder {
+        fn transact(&self, _code: u32, _parcel_data: &[u8], _parcel_reply: &mut [u8], _flags: u32) {}
+
+        fn get_native_handle(&self, _type_id: u32) -> Option<u32> {
+            None
+        }
+    }
+
+    #[test]
+    fn register_binder_starts_ids_at_one() {
+        let server = HosBinderDriverServer::new();
+
+        let first = server.register_binder(Arc::new(DummyBinder));
+        let second = server.register_binder(Arc::new(DummyBinder));
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
     }
 }

@@ -284,6 +284,7 @@ pub fn get_backtrace(thread: &KThread) -> Vec<BacktraceEntry> {
         sp: ctx.sp,
         pc: ctx.pc,
         pstate: ctx.pstate,
+        padding: ctx.padding,
         v: ctx.v,
         fpcr: ctx.fpcr,
         fpsr: ctx.fpsr,

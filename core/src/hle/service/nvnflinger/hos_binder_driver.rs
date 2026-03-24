@@ -149,6 +149,9 @@ impl SessionRequestHandler for IHosBinderDriver {
     fn service_name(&self) -> &str {
         ServiceFramework::get_service_name(self)
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ServiceFramework for IHosBinderDriver {

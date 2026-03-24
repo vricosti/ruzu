@@ -1254,7 +1254,7 @@ impl HLERequestContext {
 
         // Write the command buffer back to guest TLS memory.
         // Matches upstream: memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), write_size * sizeof(u32))
-        let write_words = ipc::COMMAND_BUFFER_LENGTH;
+        let write_words = (self.write_size as usize).min(ipc::COMMAND_BUFFER_LENGTH);
         if let Some(ref memory) = self.memory {
             // Write via Memory bridge (upstream path).
             let m = memory.lock().unwrap();
@@ -1345,5 +1345,37 @@ mod tests {
         ctx.populate_from_incoming_command_buffer(&[]);
 
         assert_eq!(ctx.get_pid(), 0x51);
+    }
+
+    #[test]
+    fn write_to_outgoing_command_buffer_only_writes_write_size_words() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+        let tls_address = 0x3000;
+        {
+            let mut mem = shared_memory.write().unwrap();
+            mem.allocate(tls_address, 0x1000);
+            mem.write_32(tls_address + 16, 0xdead_beef);
+        }
+
+        let mut ctx = HLERequestContext::new_with_thread(thread, shared_memory.clone(), tls_address);
+        ctx.write_size = 4;
+        ctx.cmd_buf[0] = 0x1111_1111;
+        ctx.cmd_buf[1] = 0x2222_2222;
+        ctx.cmd_buf[2] = 0x3333_3333;
+        ctx.cmd_buf[3] = 0x4444_4444;
+        ctx.cmd_buf[4] = 0;
+
+        assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
+
+        let mem = shared_memory.read().unwrap();
+        assert_eq!(mem.read_32(tls_address), 0x1111_1111);
+        assert_eq!(mem.read_32(tls_address + 4), 0x2222_2222);
+        assert_eq!(mem.read_32(tls_address + 8), 0x3333_3333);
+        assert_eq!(mem.read_32(tls_address + 12), 0x4444_4444);
+        assert_eq!(mem.read_32(tls_address + 16), 0xdead_beef);
     }
 }

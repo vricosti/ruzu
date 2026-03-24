@@ -29,6 +29,16 @@ pub enum Policy {
     Compositor = 1,
 }
 
+impl Policy {
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::User),
+            1 => Some(Self::Compositor),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum ConvertedScaleMode {
@@ -116,5 +126,18 @@ impl NativeWindow {
             dispdrv: *b"dispdrv\0",
             _padding1: [0; 2],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Policy;
+
+    #[test]
+    fn policy_from_raw_matches_upstream_values() {
+        assert_eq!(Policy::from_raw(0), Some(Policy::User));
+        assert_eq!(Policy::from_raw(1), Some(Policy::Compositor));
+        assert_eq!(Policy::from_raw(2), None);
+        assert_eq!(Policy::from_raw(u32::MAX), None);
     }
 }
