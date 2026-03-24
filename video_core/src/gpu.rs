@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::control::channel_state::CommandList;
+use crate::dma_pusher::CommandList;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::rasterizer_download_area::RasterizerDownloadArea;
 use crate::renderer_base::RendererBase;
@@ -112,14 +112,22 @@ pub struct Gpu {
     /// Upstream: `std::unique_ptr<VideoCore::RendererBase> renderer` in GPU::Impl.
     renderer: Mutex<Option<Box<dyn RendererBase>>>,
 
+    /// Rasterizer extracted from renderer.
+    /// Upstream: `VideoCore::RasterizerInterface* rasterizer` in GPU::Impl.
+    rasterizer: std::sync::atomic::AtomicPtr<()>,
+
+    /// GPU channel scheduler.
+    /// Upstream: `std::unique_ptr<Tegra::Control::Scheduler> scheduler` in GPU::Impl.
+    /// Initialized after Gpu is constructed (needs self-referential pointer).
+    scheduler: Mutex<Option<Box<crate::control::scheduler::Scheduler>>>,
+
     /// GPU command thread manager.
     /// Upstream: `VideoCommon::GPUThread::ThreadManager gpu_thread` in GPU::Impl.
     gpu_thread: Mutex<crate::gpu_thread::ThreadManager>,
-    // In the full port:
-    // rasterizer: *mut RasterizerInterface,
-    // host1x: &Host1x,
-    // scheduler: Box<Scheduler>,
-    // channels: HashMap<i32, Arc<ChannelState>>,
+
+    /// Registered GPU channels.
+    /// Upstream: `std::unordered_map<s32, std::shared_ptr<ChannelState>> channels`.
+    channels: Mutex<HashMap<i32, Arc<parking_lot::Mutex<crate::control::channel_state::ChannelState>>>>,
 }
 
 impl Gpu {
@@ -136,8 +144,24 @@ impl Gpu {
             new_channel_id: Mutex::new(1),
             bound_channel: Mutex::new(-1),
             renderer: Mutex::new(None),
+            rasterizer: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            scheduler: Mutex::new(None),
             gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(is_async)),
+            channels: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Initialize the scheduler. Must be called after Gpu is placed at its
+    /// final address (the scheduler stores a raw pointer back to the Gpu).
+    ///
+    /// Upstream creates the scheduler in the GPU::Impl constructor:
+    ///   `scheduler{std::make_unique<Control::Scheduler>(gpu)}`
+    /// We defer it because Rust cannot take `&self` in the constructor.
+    pub fn init_scheduler(&self) {
+        let scheduler = unsafe {
+            crate::control::scheduler::Scheduler::new(self as *const Gpu)
+        };
+        *self.scheduler.lock().unwrap() = Some(Box::new(scheduler));
     }
 
     /// Binds a renderer to the GPU.
@@ -145,12 +169,50 @@ impl Gpu {
     /// Upstream: `GPU::Impl::BindRenderer(unique_ptr<RendererBase> renderer_)`
     /// Also extracts the rasterizer and binds it to host1x memory manager.
     pub fn bind_renderer(&self, renderer: Box<dyn RendererBase>) {
+        // Extract rasterizer from renderer.
+        // Upstream: rasterizer = renderer->ReadRasterizer();
+        let rasterizer_ptr = renderer.read_rasterizer();
+        self.rasterizer.store(rasterizer_ptr as *mut (), Ordering::Release);
         // Upstream also does:
-        // rasterizer = renderer->ReadRasterizer();
         // host1x.MemoryManager().BindInterface(rasterizer);
         // host1x.GMMU().BindRasterizer(rasterizer);
         log::info!("Gpu::bind_renderer: renderer bound (vendor: {})", renderer.get_device_vendor());
         *self.renderer.lock().unwrap() = Some(renderer);
+    }
+
+    /// Bind a GPU channel by its bind ID.
+    ///
+    /// Matches upstream `GPU::Impl::BindChannel(s32 channel_id)`.
+    /// Sets the active channel for command processing.
+    pub fn bind_channel(&self, channel_id: i32) {
+        *self.bound_channel.lock().unwrap() = channel_id;
+    }
+
+    /// Create a new GPU channel and register it with the scheduler.
+    ///
+    /// Matches upstream `GPU::Impl::CreateChannel(s32 channel_id)`.
+    pub fn create_channel(&self, channel_id: i32) -> Arc<parking_lot::Mutex<crate::control::channel_state::ChannelState>> {
+        let channel_state = Arc::new(parking_lot::Mutex::new(
+            crate::control::channel_state::ChannelState::new(channel_id),
+        ));
+        self.channels.lock().unwrap().insert(channel_id, channel_state.clone());
+
+        // Register with scheduler.
+        if let Some(ref mut scheduler) = *self.scheduler.lock().unwrap() {
+            scheduler.declare_channel(channel_state.clone());
+        }
+
+        channel_state
+    }
+
+    /// Allocate a new channel ID.
+    ///
+    /// Matches upstream `GPU::Impl::AllocateChannel()`.
+    pub fn allocate_channel(&self) -> i32 {
+        let mut id = self.new_channel_id.lock().unwrap();
+        let channel_id = *id;
+        *id += 1;
+        channel_id
     }
 
     /// Returns a reference to the renderer, if bound.
@@ -251,21 +313,34 @@ impl Gpu {
     ///
     /// Upstream: `GPU::Impl::Start()` calls `Settings::UpdateGPUAccuracy()`
     /// then `gpu_thread.StartThread(*renderer, renderer->Context(), *scheduler)`.
-    /// Full GPU thread comes later; for now just log that we're ready.
     pub fn start(&self) {
-        let renderer_guard = self.renderer.lock().unwrap();
-        if renderer_guard.is_some() {
+        // Initialize scheduler if not already done.
+        if self.scheduler.lock().unwrap().is_none() {
+            self.init_scheduler();
+        }
+
+        let mut renderer_guard = self.renderer.lock().unwrap();
+        if let Some(ref mut renderer) = *renderer_guard {
             log::info!("Gpu::start: GPU started (renderer bound, starting GPU thread)");
-            drop(renderer_guard);
             // Upstream: gpu_thread.StartThread(*renderer, renderer->Context(), *scheduler)
-            // We pass raw pointers to self (the Gpu) since the thread needs to call tick_work().
-            // Safety: The Gpu outlives the ThreadManager (dropped in Gpu::drop order).
             let gpu_ptr = self as *const Gpu;
-            // TODO: pass real Scheduler pointer when scheduler is wired into Gpu.
-            // For now pass null — the GPU thread will skip SubmitList commands.
-            let scheduler_ptr = std::ptr::null::<crate::control::scheduler::Scheduler>();
+            let renderer_ptr = renderer.as_mut() as *mut dyn RendererBase;
+            let context_ptr = renderer.context_ptr();
+            let scheduler_guard = self.scheduler.lock().unwrap();
+            let scheduler_ptr = scheduler_guard
+                .as_ref()
+                .map(|s| s.as_ref() as *const crate::control::scheduler::Scheduler)
+                .unwrap_or(std::ptr::null());
+            drop(scheduler_guard);
+            drop(renderer_guard);
+            // Safety: Gpu, renderer, and scheduler outlive the ThreadManager.
             unsafe {
-                self.gpu_thread.lock().unwrap().start_thread(gpu_ptr, scheduler_ptr);
+                self.gpu_thread.lock().unwrap().start_thread(
+                    gpu_ptr,
+                    renderer_ptr,
+                    context_ptr,
+                    scheduler_ptr,
+                );
             }
         } else {
             log::warn!("Gpu::start: no renderer bound");

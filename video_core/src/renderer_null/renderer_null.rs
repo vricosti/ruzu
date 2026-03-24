@@ -26,9 +26,14 @@ const CAPTURE_TILED_SIZE: usize = 1280 * 720 * 4;
 ///
 /// Extends the renderer base concept with no-op frame composition.
 /// Owns a [`RasterizerNull`] for draw call handling.
+/// Null graphics context (no-op).
+struct NullContext;
+impl ruzu_core::frontend::graphics_context::GraphicsContext for NullContext {}
+
 pub struct RendererNull {
     rasterizer: RasterizerNull,
     base_data: RendererBaseData,
+    null_context: NullContext,
 }
 
 impl RendererNull {
@@ -37,6 +42,7 @@ impl RendererNull {
         Self {
             rasterizer: RasterizerNull::new(syncpoints),
             base_data: RendererBaseData::new(),
+            null_context: NullContext,
         }
     }
 
@@ -86,6 +92,10 @@ impl RendererNull {
 }
 
 impl RendererBase for RendererNull {
+    fn context_ptr(&mut self) -> *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext {
+        &mut self.null_context as *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext
+    }
+
     fn composite(&mut self, layers: &[FramebufferConfig]) {
         self.composite_impl(layers);
     }

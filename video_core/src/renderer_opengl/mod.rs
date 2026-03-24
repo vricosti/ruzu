@@ -378,6 +378,10 @@ impl RendererOpenGL {
 }
 
 impl RendererBase for RendererOpenGL {
+    fn context_ptr(&mut self) -> *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext {
+        &mut *self.context as *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext
+    }
+
     fn composite(&mut self, layers: &[FramebufferConfig]) {
         self.composite_impl(layers);
     }

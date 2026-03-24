@@ -12,10 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use crate::control::scheduler::Scheduler;
-// Upstream uses Tegra::CommandList from dma_pusher.h.
-// The Scheduler in ruzu currently takes control::channel_state::CommandList (Vec<Vec<u32>>).
-// Use that type here for compatibility until the types are unified.
-use crate::control::channel_state::CommandList;
+use crate::dma_pusher::CommandList;
 
 /// Device address type.
 pub type DAddr = u64;
@@ -147,7 +144,16 @@ pub struct ThreadManager {
     state: Arc<SynchState>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Rasterizer fat pointer as [usize; 2] for direct calls
+    /// (InvalidateRegion, FlushAndInvalidateRegion).
+    /// Matches upstream `VideoCore::RasterizerInterface* rasterizer`.
+    /// [0, 0] means null. Set during start_thread from renderer.ReadRasterizer().
+    rasterizer_raw: [usize; 2],
 }
+
+// Safety: ThreadManager is accessed under Gpu's Mutex lock.
+// The rasterizer pointer is valid for the lifetime of the renderer.
+unsafe impl Send for ThreadManager {}
 
 impl ThreadManager {
     /// Creates a new thread manager.
@@ -158,6 +164,16 @@ impl ThreadManager {
             state: Arc::new(SynchState::new()),
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
+            rasterizer_raw: [0, 0],
+        }
+    }
+
+    /// Get the rasterizer pointer, or None if not set.
+    fn rasterizer(&self) -> Option<*mut dyn crate::rasterizer_interface::RasterizerInterface> {
+        if self.rasterizer_raw[0] == 0 {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute(self.rasterizer_raw) })
         }
     }
 
@@ -167,21 +183,55 @@ impl ThreadManager {
     /// The thread runs `run_thread` which pops commands and dispatches them.
     ///
     /// # Safety
-    /// `gpu_ptr` must remain valid for the lifetime of the thread (i.e., until Drop).
-    pub unsafe fn start_thread(&mut self, gpu_ptr: *const crate::gpu::Gpu, scheduler_ptr: *const Scheduler) {
+    /// `gpu_ptr`, `context_ptr`, `renderer_ptr`, and `scheduler_ptr` must remain
+    /// valid for the lifetime of the thread.
+    pub unsafe fn start_thread(
+        &mut self,
+        gpu_ptr: *const crate::gpu::Gpu,
+        renderer_ptr: *mut dyn crate::renderer_base::RendererBase,
+        context_ptr: *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext,
+        scheduler_ptr: *const Scheduler,
+    ) {
+        // Extract rasterizer from renderer, matching upstream:
+        //   rasterizer = renderer.ReadRasterizer();
+        let rasterizer_fat = unsafe { &*renderer_ptr }.read_rasterizer();
+        self.rasterizer_raw = unsafe { std::mem::transmute(rasterizer_fat) };
+
         let state = self.state.clone();
         let stop = self.stop.clone();
-        let gpu = gpu_ptr as usize; // Send-safe via usize
+        let gpu = gpu_ptr as usize;
         let sched = scheduler_ptr as usize;
+        // Copy rasterizer fat pointer for the thread.
+        let rasterizer_vtable = self.rasterizer_raw;
+        let ctx_raw: [usize; 2] = if context_ptr.is_null() {
+            [0, 0]
+        } else {
+            unsafe { std::mem::transmute(context_ptr) }
+        };
 
         let handle = std::thread::Builder::new()
             .name("GPU".to_string())
             .spawn(move || {
                 log::info!("GPU thread started");
-                // Safety: gpu_ptr and scheduler_ptr are valid for the thread's lifetime.
                 let gpu_ref = unsafe { &*(gpu as *const crate::gpu::Gpu) };
                 let scheduler_ref = unsafe { &*(sched as *const Scheduler) };
-                run_thread(&state, &stop, gpu_ref, scheduler_ref);
+
+                // Upstream: auto current_context = context.Acquire();
+                let has_context = ctx_raw[0] != 0;
+                if has_context {
+                    let context: *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext =
+                        unsafe { std::mem::transmute(ctx_raw) };
+                    unsafe { &mut *context }.make_current();
+                }
+
+                run_thread(&state, &stop, gpu_ref, scheduler_ref, rasterizer_vtable);
+
+                // Release context on exit.
+                if has_context {
+                    let context: *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext =
+                        unsafe { std::mem::transmute(ctx_raw) };
+                    unsafe { &mut *context }.done_current();
+                }
                 log::info!("GPU thread exiting");
             })
             .expect("Failed to spawn GPU thread");
@@ -210,21 +260,30 @@ impl ThreadManager {
         }
         // In async mode with extreme GPU accuracy, upstream does:
         //   gpu.RequestFlush(addr, size) → TickGPU() → WaitForSyncOperation()
-        // For now, skip flush in async mode (matches upstream behavior for non-extreme).
+        // In non-extreme async mode, upstream skips flush entirely.
     }
 
     /// Notify rasterizer that a region should be invalidated.
     /// Matches upstream `ThreadManager::InvalidateRegion(DAddr, u64)`.
-    pub fn invalidate_region(&self, _addr: DAddr, _size: u64) {
-        // Upstream: rasterizer->OnCacheInvalidation(addr, size)
-        // Requires rasterizer integration.
+    ///
+    /// Upstream calls directly on the rasterizer (NOT queued to the GPU thread).
+    pub fn invalidate_region(&self, addr: DAddr, size: u64) {
+        if let Some(rasterizer) = self.rasterizer() {
+            // Safety: rasterizer pointer is valid for the lifetime of the renderer.
+            unsafe { &mut *rasterizer }.on_cache_invalidation(addr, size);
+        }
     }
 
     /// Notify rasterizer that a region should be flushed and invalidated.
     /// Matches upstream `ThreadManager::FlushAndInvalidateRegion(DAddr, u64)`.
-    pub fn flush_and_invalidate_region(&self, _addr: DAddr, _size: u64) {
-        // Upstream: rasterizer->OnCacheInvalidation(addr, size)
-        // Skip flush in async mode.
+    ///
+    /// Upstream calls directly on the rasterizer (NOT queued).
+    /// Flush is skipped in async mode (only invalidation runs).
+    pub fn flush_and_invalidate_region(&self, addr: DAddr, size: u64) {
+        if let Some(rasterizer) = self.rasterizer() {
+            // Safety: rasterizer pointer is valid for the lifetime of the renderer.
+            unsafe { &mut *rasterizer }.on_cache_invalidation(addr, size);
+        }
     }
 
     /// Tick the GPU to process pending requests.
@@ -291,6 +350,7 @@ fn run_thread(
     stop: &AtomicBool,
     gpu: &crate::gpu::Gpu,
     scheduler: &Scheduler,
+    rasterizer_raw: [usize; 2],
 ) {
     while !stop.load(Ordering::Relaxed) {
         let Some(next) = state.pop_wait(stop) else {
@@ -306,12 +366,19 @@ fn run_thread(
             }
             CommandData::FlushRegion(flush) => {
                 // Upstream: rasterizer->FlushRegion(flush.addr, flush.size)
-                // Requires rasterizer integration.
-                let _ = (flush.addr, flush.size);
+                if rasterizer_raw[0] != 0 {
+                    let rasterizer: *mut dyn crate::rasterizer_interface::RasterizerInterface =
+                        unsafe { std::mem::transmute(rasterizer_raw) };
+                    unsafe { &mut *rasterizer }.flush_region(flush.addr, flush.size);
+                }
             }
             CommandData::InvalidateRegion(inv) => {
                 // Upstream: rasterizer->OnCacheInvalidation(inv.addr, inv.size)
-                let _ = (inv.addr, inv.size);
+                if rasterizer_raw[0] != 0 {
+                    let rasterizer: *mut dyn crate::rasterizer_interface::RasterizerInterface =
+                        unsafe { std::mem::transmute(rasterizer_raw) };
+                    unsafe { &mut *rasterizer }.on_cache_invalidation(inv.addr, inv.size);
+                }
             }
             CommandData::FlushAndInvalidateRegion(_) => {
                 // Upstream: ASSERT(false) — should not reach here
