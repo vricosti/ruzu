@@ -600,3 +600,100 @@
 
 ### Binary layout verification
 - PASS: translation file only; no raw-serialized structs are defined here.
+## 2026-03-24 — ../rdynarmic/src/backend/x64/block_of_code.rs vs upstream dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
+
+### Intentional differences
+- Rust tests construct `RunCodeCallbacks` inline: mechanical adaptation of upstream C++ test scaffolding.
+
+### Unintentional differences (to fix)
+- None after this change.
+
+### Missing items
+- No new runtime items in this pass.
+
+### Binary layout verification
+- PASS: test-only callback initialization; no serialized layout affected.
+
+## 2026-03-24 — ../rdynarmic/src/backend/x64/a64_emit_x64.rs vs upstream dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+
+### Intentional differences
+- Rust unit tests use a local `make_test_callbacks()` helper rather than upstream's C++ fixture style.
+
+### Unintentional differences (to fix)
+- None after this change.
+
+### Missing items
+- No new runtime items in this pass.
+
+### Binary layout verification
+- PASS: test-only callback initialization; no serialized layout affected.
+
+## 2026-03-24 — ../rdynarmic/src/tests_a32_fuzz.rs vs upstream dynarmic tests
+
+### Intentional differences
+- Rust keeps the fuzz harness in a native test module instead of upstream's exact C++ test harness layout.
+
+### Unintentional differences (to fix)
+- The `JitConfig` initializer lagged behind the new `fastmem_pointer` field and no longer matched the runtime config shape.
+
+### Missing items
+- No new runtime items in this pass.
+
+### Binary layout verification
+- PASS: test-only config initialization; no serialized layout affected.
+## 2026-03-24 — ../rdynarmic/src/backend/x64/a32_emit_x64.rs vs upstream dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+
+### Intentional differences
+- Rust keeps the same A32 translation/emission ownership as upstream; this pass removes temporary local instrumentation, mirrors upstream's local `gpr_order` construction by starting from the generic GPR list and removing `R13` only when `fastmem_pointer` is active, and temporarily logs the full IR block if `emit_block` panics so the remaining regalloc mismatch can be diagnosed.
+
+### Unintentional differences (to fix)
+- None after this change.
+
+### Missing items
+- A remaining regalloc mismatch still exists when `BLOCK_LINKING` is re-enabled; the temporary panic logging is there to isolate the exact failing block before removing it again.
+
+### Binary layout verification
+- PASS: logging removal only; no layout impact.
+
+## 2026-03-24 — core/src/hle/kernel/svc_dispatch.rs vs core/hle/kernel/svc.cpp
+
+### Intentional differences
+- Rust SVC dispatch remains centralized in one file as part of the existing port shape; this pass only removes temporary high-volume tracing.
+
+### Unintentional differences (to fix)
+- None after this change.
+
+### Missing items
+- No new SVC parity items addressed in this pass.
+
+### Binary layout verification
+- PASS: logging removal only; no layout impact.
+
+## 2026-03-24 — ../rdynarmic/src/backend/x64/emit_data_processing.rs vs upstream dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+
+### Intentional differences
+- Rust keeps the shared data-processing emitters in one Rust module instead of several C++ methods on `EmitX64`, but method ownership remains aligned by opcode responsibility.
+- Rust unit tests use native `#[test]` helpers and dummy callbacks instead of upstream's C++ fixture style.
+
+### Unintentional differences (to fix)
+- `UnsignedDiv32`, `UnsignedDiv64`, `SignedDiv32`, and `SignedDiv64` previously forced the dividend into `RAX` too early instead of matching upstream's `ScratchGpr(RAX/RDX)` then arbitrary-reg dividend/divisor flow. This caused the A32 `0x3f` MK8D regalloc panic under block-linking pressure. Fixed in this pass.
+
+### Missing items
+- No new division-emission parity gaps identified in this pass.
+
+### Binary layout verification
+- PASS: emitter-only control-flow change; no serialized layout affected.
+
+## 2026-03-24 — ../rdynarmic/src/backend/x64/a32_emit_x64.rs vs upstream dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+
+### Intentional differences
+- Rust keeps the upstream-local `gpr_order` construction and removes `R13` only when `fastmem_pointer` is active, matching the upstream ownership of A32 fastmem register reservation.
+
+### Unintentional differences (to fix)
+- Temporary panic logging used to isolate the remaining A32 regalloc mismatch has been removed after the `UnsignedDiv32` parity fix; no known divergence remains from that diagnostic pass.
+
+### Missing items
+- No new `a32_emit_x64` ownership gaps identified in this pass.
+
+### Binary layout verification
+- PASS: logging cleanup only; no layout impact.
