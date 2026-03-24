@@ -135,6 +135,37 @@ Examples of common false confidence:
 
 For this port, "probably equivalent" is not good enough.
 
+### 6. Method names, signatures, and lifecycle must match upstream
+
+When porting a C++ method:
+
+- **Name**: use the upstream method name converted to `snake_case`. Do not rename at the semantic level. `EmitA32SetCpsr` becomes `emit_a32_set_cpsr`, not `write_status_register`.
+- **Arguments**: preserve the same arguments in the same order. If upstream takes `(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst)`, the Rust port takes the equivalent `(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst)`. Do not add, remove, or reorder parameters without documenting why.
+- **Return type**: match upstream. If upstream returns `void`, the port returns nothing. If upstream returns `bool`, the port returns `bool`.
+- **Lifecycle**: if upstream constructs an object in the constructor and destroys it in the destructor, the port does the same (`new` / `Drop`). If upstream initializes in `Initialize()` and finalizes in `Finalize()`, the port does not merge them into the constructor.
+- **Call order**: if upstream calls A before B, the port calls A before B. Effect ordering bugs (like writing LR before reading Rm in `BLX_reg`) are real bugs.
+
+### 7. Zero assumptions — always verify against upstream
+
+Never assume what an upstream function does based on its name. Always read the upstream implementation before writing the port.
+
+Examples of bugs caused by assumptions:
+
+- Assuming `SetCpsrNZCVRaw` means "store raw x64 format" when upstream means "convert from raw ARM format"
+- Assuming `ALUWritePC` always does interworking when upstream checks T flag first
+- Assuming `get_nzcv_from_op` returns ARM-format flags when it returns x64-format
+- Assuming `image_size` covers all segments when page-alignment changes sizes after calculation
+- Assuming a function name ending in `_raw` means "no conversion" when upstream defines it as the opposite
+
+When in doubt:
+
+1. Read the upstream `.cpp` implementation line by line
+2. Read the upstream `.h` declaration for the contract
+3. Check the upstream callers to understand expected input/output formats
+4. Write a test that compares the result against the upstream oracle (a32_diff)
+
+Do not write "matches upstream" in a comment unless you have actually verified it against the upstream source code in the current session.
+
 ## Non-Negotiable Rules
 
 ### Rule A: Preserve file structure whenever technically possible
