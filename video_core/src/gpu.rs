@@ -192,6 +192,19 @@ impl Gpu {
     }
 
     /// Obtains current flush request fence id.
+    /// Queue a synchronization operation to be executed by TickWork().
+    /// Returns a fence number that can be passed to wait_for_sync_operation.
+    ///
+    /// Matches upstream `GPU::Impl::RequestSyncOperation(Func&& action)`.
+    pub fn request_sync_operation(&self, action: Box<dyn FnOnce() + Send>) -> u64 {
+        let mut requests = self.sync_requests.lock().unwrap();
+        let mut last = self.last_sync_fence.lock().unwrap();
+        *last += 1;
+        let fence = *last;
+        requests.push_back(action);
+        fence
+    }
+
     pub fn current_sync_request_fence(&self) -> u64 {
         self.current_sync_fence.load(Ordering::Relaxed)
     }
@@ -314,25 +327,47 @@ impl Gpu {
     ///
     /// Upstream: `GPU::Impl::RequestComposite(layers, fences)` enqueues a sync
     /// operation that waits for fences then calls `renderer->Composite(layers)`.
-    /// For now we skip fence gating and call composite directly within
-    /// the sync operation.
+    /// Request a composite (frame presentation).
+    ///
+    /// Matches upstream `GPU::Impl::RequestComposite(layers, fences)`:
+    /// queues the composite as a sync operation, signals the GPU thread
+    /// via TickGPU, then waits for execution.
+    ///
+    /// Simplified: upstream also handles NvFence gating for multi-fence
+    /// swap chains. We skip fence gating and composite directly.
     pub fn request_composite(&self, layers: Vec<FramebufferConfig>) {
-        let mut renderer_guard = self.renderer.lock().unwrap();
-        if let Some(ref mut renderer) = *renderer_guard {
-            renderer.composite(&layers);
-        } else {
-            log::warn!("Gpu::request_composite: no renderer bound, skipping composite");
-        }
+        // Capture a raw pointer to self for the callback via usize (Send-safe).
+        // Safety: the Gpu outlives the sync request (we wait for it below).
+        let gpu_addr = self as *const Gpu as usize;
+        let wait_fence = self.request_sync_operation(Box::new(move || {
+            let gpu = unsafe { &*(gpu_addr as *const Gpu) };
+            let mut renderer_guard = gpu.renderer.lock().unwrap();
+            if let Some(ref mut renderer) = *renderer_guard {
+                renderer.composite(&layers);
+            }
+        }));
+        self.gpu_thread.lock().unwrap().tick_gpu();
+        self.wait_for_sync_operation(wait_fence);
     }
 
     /// Get the applet capture buffer.
+    ///
+    /// Matches upstream: queues via sync request + TickGPU + wait.
     pub fn get_applet_capture_buffer(&self) -> Vec<u8> {
-        let renderer_guard = self.renderer.lock().unwrap();
-        if let Some(ref renderer) = *renderer_guard {
-            renderer.get_applet_capture_buffer()
-        } else {
-            Vec::new()
-        }
+        use std::sync::{Arc, Mutex};
+        let result = Arc::new(Mutex::new(Vec::new()));
+        let result_clone = result.clone();
+        let gpu_addr = self as *const Gpu as usize;
+        let wait_fence = self.request_sync_operation(Box::new(move || {
+            let gpu = unsafe { &*(gpu_addr as *const Gpu) };
+            let renderer_guard = gpu.renderer.lock().unwrap();
+            if let Some(ref renderer) = *renderer_guard {
+                *result_clone.lock().unwrap() = renderer.get_applet_capture_buffer();
+            }
+        }));
+        self.gpu_thread.lock().unwrap().tick_gpu();
+        self.wait_for_sync_operation(wait_fence);
+        Arc::try_unwrap(result).unwrap().into_inner().unwrap()
     }
 
     /// Renderer frame end notification.
