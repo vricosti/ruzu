@@ -43,6 +43,11 @@ impl Default for RendererSettings {
 ///
 /// Renderers (OpenGL, Vulkan, Null) implement this trait.
 pub trait RendererBase: Send {
+    /// Get a mutable pointer to the graphics context owned by this renderer.
+    /// Matches upstream `RendererBase::Context()`.
+    /// The returned pointer is valid for the lifetime of the renderer.
+    fn context_ptr(&mut self) -> *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext;
+
     /// Finalize rendering the guest frame and draw into the presentation texture.
     fn composite(&mut self, layers: &[FramebufferConfig]);
 
