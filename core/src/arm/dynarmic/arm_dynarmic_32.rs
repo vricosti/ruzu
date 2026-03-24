@@ -11,7 +11,7 @@ use crate::arm::arm_interface::{
     ArmInterface, ArmInterfaceBase, Architecture, DebugWatchpoint, HaltReason, KProcess,
     KThread, ThreadContext,
 };
-use crate::hle::kernel::k_process::SharedProcessMemory;
+use crate::hle::kernel::k_process::{KProcess as RealKProcess, SharedProcessMemory};
 use crate::memory::memory::Memory;
 
 use rdynarmic::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
@@ -134,7 +134,6 @@ struct DynarmicCallbacks32 {
     jit_pc_ptr: Option<*const u32>,
     /// Raw pointer to jit_state.upper_location_descriptor for A32 mode diagnostics.
     /// Used to reconstruct Thumb/E/IT state when logging unmapped accesses.
-    jit_upper_location_descriptor_ptr: Option<*const u32>,
     /// Ensures the optional diagnostic code dump only happens once.
     dumped_unmapped_window: AtomicBool,
     /// Shared exclusive monitor backing Dynarmic's global monitor state.
@@ -172,7 +171,6 @@ impl DynarmicCallbacks32 {
             last_exception_address,
             jit_halt_reason_ptr: None,
             jit_pc_ptr: None,
-            jit_upper_location_descriptor_ptr: None,
             dumped_unmapped_window: AtomicBool::new(false),
             exclusive_monitor,
             core_index,
@@ -274,10 +272,7 @@ impl DynarmicCallbacks32 {
         // GPR bank is contiguous, so walk back to reg[0] for diagnostics.
         let regs_ptr = unsafe { pc_ptr.sub(15) };
         let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
-        let upper_location_descriptor = self
-            .jit_upper_location_descriptor_ptr
-            .map(|ptr| unsafe { *ptr })
-            .unwrap_or_default();
+        let upper_location_descriptor = 0u32;
         let thumb = (upper_location_descriptor & 1) != 0;
         let it_state = ((upper_location_descriptor >> 8) & 0x3)
             | (((upper_location_descriptor >> 10) & 0x3f) << 2);
@@ -378,10 +373,6 @@ impl DynarmicCallbacks32 {
 }
 
 impl JitCallbacks for DynarmicCallbacks32 {
-    fn set_upper_location_descriptor_ptr(&mut self, ptr: *const u32) {
-        self.jit_upper_location_descriptor_ptr = Some(ptr);
-    }
-
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
         // Upstream: returns std::nullopt if IsValidVirtualAddressRange fails.
         if let Some(ref cm) = self.core_memory {
@@ -747,13 +738,20 @@ impl ArmDynarmic32 {
     pub fn new(
         _system: &dyn std::any::Any,
         uses_wall_clock: bool,
-        _process: &KProcess,
+        process: &KProcess,
         exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
         core_index: usize,
         shared_memory: SharedProcessMemory,
         core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
     ) -> Self {
+        // Get fastmem pointer from core_memory before moving it into callbacks.
+        // Matches upstream: process->GetPageTable().GetBasePageTable().GetImpl().fastmem_arena
+        let fastmem_pointer: Option<*mut u8> = core_memory
+            .as_ref()
+            .map(|cm| cm.lock().unwrap().fastmem_pointer())
+            .filter(|p| !p.is_null());
+
         let svc_swi = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
         let callbacks = DynarmicCallbacks32::new(
@@ -801,9 +799,9 @@ impl ArmDynarmic32 {
             global_monitor: if exclusive_monitor.is_null() {
                 None
             } else {
-                // Pass the inner rdynarmic::ExclusiveMonitor to the JIT.
                 Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
             },
+            fastmem_pointer,
         };
 
         // A32Jit::new() internally calls callbacks.set_halt_reason_ptr() with a
