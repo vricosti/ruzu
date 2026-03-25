@@ -89,6 +89,9 @@ pub struct SessionRequestManager {
     is_initialized_for_sm: bool,
     session_handler: Option<SessionRequestHandlerPtr>,
     domain_handlers: Vec<Option<SessionRequestHandlerPtr>>,
+    /// Reference to the owning ServerManager.
+    /// Matches upstream: `Service::ServerManager& server_manager`.
+    server_manager: Option<Arc<Mutex<super::server_manager::ServerManager>>>,
 }
 
 #[derive(Clone)]
@@ -107,7 +110,26 @@ impl SessionRequestManager {
             is_initialized_for_sm: false,
             session_handler: None,
             domain_handlers: Vec::new(),
+            server_manager: None,
         }
+    }
+
+    /// Create with a ServerManager reference, matching upstream constructor:
+    /// `SessionRequestManager(KernelCore& kernel, ServerManager& server_manager)`.
+    pub fn new_with_server_manager(server_manager: Arc<Mutex<super::server_manager::ServerManager>>) -> Self {
+        Self {
+            convert_to_domain: false,
+            is_domain: false,
+            is_initialized_for_sm: false,
+            session_handler: None,
+            domain_handlers: Vec::new(),
+            server_manager: Some(server_manager),
+        }
+    }
+
+    /// Get the ServerManager reference. Matches upstream `GetServerManager()`.
+    pub fn get_server_manager(&self) -> Option<&Arc<Mutex<super::server_manager::ServerManager>>> {
+        self.server_manager.as_ref()
     }
 
     pub fn is_domain(&self) -> bool {
@@ -336,6 +358,10 @@ pub struct HLERequestContext {
     manager: Option<Arc<Mutex<SessionRequestManager>>>,
     service_manager: Option<Arc<Mutex<ServiceManager>>>,
     is_deferred: bool,
+
+    /// Temporary: holds the server session from the last create_session_with_manager call,
+    /// so that push_ipc_interface can register it with the ServerManager.
+    pub(crate) last_created_server_session: Option<Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>>,
 }
 
 impl HLERequestContext {
@@ -376,6 +402,7 @@ impl HLERequestContext {
             manager: None,
             service_manager: None,
             is_deferred: false,
+            last_created_server_session: None,
         };
         ctx.cmd_buf[0] = 0;
         ctx
@@ -413,6 +440,7 @@ impl HLERequestContext {
             manager: None,
             service_manager: None,
             is_deferred: false,
+            last_created_server_session: None,
         }
     }
 
@@ -581,7 +609,7 @@ impl HLERequestContext {
     /// 3. ServerManager::RegisterSession(server_session, manager)
     /// 4. handle_table.Add(client_session)
     pub fn create_session_for_service(
-        &self,
+        &mut self,
         handler: SessionRequestHandlerPtr,
     ) -> Option<Handle> {
         let manager = Arc::new(std::sync::Mutex::new(SessionRequestManager::new()));
@@ -599,7 +627,7 @@ impl HLERequestContext {
     ///     &session->GetServerSession(), session_manager);
     /// ```
     pub fn create_session_with_manager(
-        &self,
+        &mut self,
         manager: Arc<std::sync::Mutex<SessionRequestManager>>,
     ) -> Option<Handle> {
         log::info!("HLERequestContext::create_session_with_manager: begin");
@@ -636,16 +664,16 @@ impl HLERequestContext {
         let client_session = session.lock().unwrap().get_client_session().clone();
 
         // Register the server session with its manager.
-        // In upstream, this is done by the ServerManager that owns the service
-        // port. Since we don't yet have per-port ServerManagers wired to the
-        // session lifecycle, we set the manager directly on the server session
-        // and initialize the client session with it.
+        // Matches upstream: ServerManager.RegisterSession(&serverSession, manager).
         log::info!("HLERequestContext::create_session_with_manager: registering session");
         server_session.lock().unwrap().set_manager(manager.clone());
         client_session
             .lock()
             .unwrap()
             .initialize_with_manager(object_id, manager.clone());
+
+        // Store server session for push_ipc_interface to register with ServerManager.
+        self.last_created_server_session = Some(server_session.clone());
 
         // Register the owning session and the client endpoint in the process object tables.
         log::info!("HLERequestContext::create_session_with_manager: registering process objects");
