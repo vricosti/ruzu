@@ -1,40 +1,117 @@
- The bug is in the application-thread scheduling handoff, not in the A32 JIT.
+# MK8D Crash Analysis
 
-  What happens:
+## Current status
 
-  - Core 0 starts, calls GuestActivate(), finds no user thread yet, and drops into idle.
-  - Later, KProcess::run() creates the application main thread and sets scheduler.state.highest_priority_thread_id =
-    Some(thread_id) in core/src/hle/kernel/k_process.rs:2017.
-  - But at that point the thread is not yet in GlobalSchedulerContext’s thread list. That happens later in core/src/core.rs:1091
-    via register_application_thread().
+The game **calls `svcBreak` (fatal abort)** during initialization.
+It is NOT a JIT bug, NOT an infinite loop, NOT a scheduler issue.
 
-  Why this is bad:
+## Root cause
 
-  - KScheduler::schedule_impl_fiber() resolves highest_priority_thread_id back to an Arc<KThread> through
-    gsc.get_thread_by_thread_id(id) in core/src/hle/kernel/k_scheduler.rs:1099 and will get None if the thread has not been added
-    to the GSC list yet.
-  - So the scheduler can be told “thread X is highest priority” before it can actually look thread X up.
-  - That means the reschedule can fail and the core stays idle, which matches the symptom: no [A32JIT] lookup_block logs at all.
+IPC response divergences between ruzu and upstream zuyu cause the game
+to receive incorrect data from HLE services. The game detects the error
+and aborts via `svcBreak(0, 0, 0)` after calling
+`SetTerminateResult(0x801f2)` (vi module error code).
 
-  The concrete race:
+## Evidence
 
-  1. KProcess::run() sets highest_priority_thread_id and needs_scheduling.
-  2. The thread is still absent from GlobalSchedulerContext::m_thread_list.
-  3. Scheduler tries to pick the target thread by ID and gets None.
-  4. Core 0 remains idle unless another wakeup happens after registration.
+### SVC trace comparison
 
-  Why I’m confident:
+Reference traces generated with `RUZU_SVC_TRACE=1`:
+- **Upstream zuyu**: runs 60s successfully, 234K+ SVCs, reaches Vulkan pipeline caching
+- **Ruzu**: aborts at 176 SVCs with `svcBreak`
 
-  - Your log reaches System: running but never shows any A32 JIT lookup/compile logs.
-  - That means guest dispatch never actually reached the A32 dispatcher.
-  - The scheduler/GSC mismatch above is enough to cause exactly that.
+### Abort sequence (step-traced)
 
-  Fix:
+```
+step 45124: SVC #0x1d (SignalProcessWideKey)
+step 55232: SVC #0x21 (SendSyncRequest) handle=0x281fc → IApplicationFunctions cmd=22 (SetTerminateResult)
+step 55444: SVC #0x1d (SignalProcessWideKey)
+step 63138: SVC #0x26 (Break) → svcBreak(0, 0, 0) — GAME ABORTS
+```
 
-  - Add the new thread to GlobalSchedulerContext before publishing it as schedulable.
-  - In practice, do the GSC registration inside KProcess::run() before:
-      - push_back_to_priority_queue(thread_id)
-      - highest_priority_thread_id = Some(thread_id)
-      - any interrupt/reschedule request
+The game calls `SetTerminateResult(0x801f2)` to record the error, then aborts.
+After the abort, the game's crash handler corrupts SP/LR (SP=0xfffffff0, LR=0x0),
+which was initially mistaken for a JIT bug.
 
-  So the bug is: the thread becomes “selected” before it becomes “resolvable.”
+### IPC response divergences found
+
+Comparing TLS response dumps between upstream and ruzu:
+
+1. **Extra IPC calls in ruzu** — ruzu makes additional `sm:RegisterClient` and
+   `sm:GetService("lm")` calls that upstream doesn't, causing all subsequent
+   session handles to be shifted by one.
+
+2. **Handle numbering diverges**:
+   - Upstream: `0x201fc`, `0x281fd`, `0x301fb`, ...
+   - Ruzu:     `0x181fd`, `0x201fd`, `0x281fc`, ...
+
+3. **Domain response data differs** — at least one domain IPC response returns
+   `0x0007d402` in upstream but `0x0` in ruzu. This appears to be in a
+   service call response that returns a non-trivial value.
+
+4. **NVDrv response value differs** — upstream returns `2` where ruzu returns
+   `1` in what appears to be an nvdrv file descriptor or session count.
+
+## Service call sequence before abort
+
+```
+ 1. ConnectToNamedPort("sm:") → handle 0x101fe
+ 2. sm: QueryPointerBufferSize → 0x8000
+ 3. sm: RegisterClient
+ 4. sm: GetService("lm") → logger service
+ 5. sm: GetService("apm") → performance service
+ 6. sm: GetService("appletOE") → applet service
+ 7. appletOE: ConvertToDomain → domain mode
+ 8. appletOE: domain[1] cmd=0 → OpenApplicationProxy → IApplicationProxy (domain obj 2)
+ 9. IApplicationProxy: GetApplicationFunctions (obj 3), GetLibraryAppletCreator (obj 4),
+    GetCommonStateGetter (obj 5), GetSelfController (obj 6), GetWindowController (obj 7),
+    GetAudioController (obj 8), GetDisplayController (obj 9), GetDebugFunctions (obj 10)
+10. ICommonStateGetter: cmd 0, 1, 9
+11. IWindowController: cmd 1, 10
+12. ISelfController: cmd 13
+13. sm: GetService("pctl:a") → parental control
+14. pctl:a: ConvertToDomain, cmd 0
+15. sm: GetService("fsp-srv") → filesystem
+16. fsp-srv: ConvertToDomain, cmd 1 (SetCurrentProcess), cmd 200 (OpenDataStorageByCurrentProcess),
+    IStorage cmd 0 (Read), cmd 203, cmd 1005, cmd 200 again, more reads
+17. sm: GetService("nvdrv") → nvidia driver
+18. nvdrv: QueryPointerBufferSize, Initialize, SetAruid, CloneCurrentObjectEx,
+    Open device, Ioctl1(fd=1, 0xC183001B)
+19. sm: GetService("vi:m"), GetService("vi:s"), GetService("vi:u")
+20. vi:m: QueryPointerBufferSize, GetDisplayService → IApplicationDisplayService (handle 0x981ef)
+21. *** ABORT: SetTerminateResult(0x801f2) + svcBreak(0,0,0) ***
+```
+
+## How to reproduce the trace
+
+```bash
+# Ruzu trace:
+RUZU_SVC_TRACE=1 RUST_LOG=off cargo run --release --bin yuzu-cmd -- \
+  -g "Mario Kart 8 Deluxe.nsp" 2>traces/ruzu_trace.txt
+
+# Upstream trace (requires rebuilding zuyu with ZUYU_SVC_TRACE support):
+ZUYU_SVC_TRACE=1 zuyu-cmd -g "Mario Kart 8 Deluxe.nsp" 2>traces/zuyu_trace.txt
+
+# Compare:
+diff <(grep "TLS_RSP" traces/zuyu_trace.txt | head -N) \
+     <(grep "TLS_RSP" traces/ruzu_trace.txt)
+```
+
+## Next steps (in priority order)
+
+1. **Fix extra IPC calls** — find why ruzu makes extra sm:RegisterClient/GetService("lm")
+   calls that upstream doesn't. This shifts all handle numbers.
+
+2. **Fix domain response data** — the `0x0007d402` vs `0x0` divergence in a domain
+   response. Check which service returns this and why ruzu returns zero.
+
+3. **Fix nvdrv ioctl response** — the fd/count `2` vs `1` difference.
+
+4. After fixing these, re-run the trace comparison and iterate.
+
+## Performance (resolved)
+
+JIT performance issues are fixed:
+- **rdynarmic mprotect fix**: skip `mprotect` on block cache hits (500x speedup)
+- **Block linking enabled**: `optimization_flags_from_mask(0x3F)` matching upstream default
+- MK8D init: **8.5 minutes → <1 second**
