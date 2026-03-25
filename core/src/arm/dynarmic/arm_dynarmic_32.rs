@@ -684,6 +684,12 @@ impl JitCallbacks for DynarmicCallbacks32 {
         std::cmp::max(ct.get_downcount(), 0) as u64
     }
 
+    /// Matches upstream `DynarmicCallbacks32::GetCNTPCT`.
+    /// Returns the current system counter value from CoreTiming.
+    fn get_cntpct(&self) -> u64 {
+        self.core_timing.lock().unwrap().get_clock_ticks()
+    }
+
     fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
         self.jit_halt_reason_ptr = Some(ptr);
     }
