@@ -806,6 +806,9 @@ impl ArmDynarmic32 {
         // A32Jit::new() internally calls callbacks.set_halt_reason_ptr() with a
         // pointer to jit_state.halt_reason, so exception_raised() can halt execution
         // exactly as upstream's m_parent.m_jit->HaltExecution(hr).
+        log::warn!("ArmDynarmic32: fastmem_pointer={:?} cycle_counting={} optimizations={:#x}",
+            fastmem_pointer.map(|p| p as usize), !uses_wall_clock, optimizations.bits());
+
         let jit = match rdynarmic::A32Jit::new(config) {
             Ok(jit) => {
                 log::info!("ArmDynarmic32: JIT created successfully for core {}", core_index);
