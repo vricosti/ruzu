@@ -1436,10 +1436,70 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
 /// 4. Exits the SVC profile
 /// 5. Loads SVC arguments back to the physical core
 pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
-    if is_64bit {
-        call64(system, imm, args);
+    // Structured SVC trace — enabled by RUZU_SVC_TRACE=1
+    let trace_enabled = {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static INIT: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
+        match INIT.load(Ordering::Relaxed) {
+            2 => true,
+            1 => false,
+            _ => {
+                let on = std::env::var("RUZU_SVC_TRACE").is_ok();
+                INIT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                on
+            }
+        }
+    };
+
+    if trace_enabled {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SVC_SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SVC_SEQ.fetch_add(1, Ordering::Relaxed);
+        let svc_name = SvcId::from_u32(imm).map_or("???".to_string(), |s| format!("{:?}", s));
+
+        // Log SVC entry
+        eprintln!("SVC[{:04}] #{:#04x} ({}) IN  args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            seq, imm, svc_name,
+            args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+
+        // For SendSyncRequest, dump TLS before
+        if imm == 0x21 {
+            if let Some(memory) = system.get_svc_memory() {
+                let m = memory.lock().unwrap();
+                if let Some(thread) = system.current_thread() {
+                    let tls = thread.lock().unwrap().get_tls_address().get();
+                    let mut words = [0u32; 16];
+                    for i in 0..16 { words[i] = m.read_32(tls + i as u64 * 4); }
+                    eprintln!("  TLS_REQ [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
+                        tls, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+                        words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
+                }
+            }
+        }
+
+        if is_64bit { call64(system, imm, args); } else { call32(system, imm, args); }
+
+        // Log SVC exit
+        eprintln!("SVC[{:04}] #{:#04x} ({}) OUT args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            seq, imm, svc_name,
+            args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+
+        // For SendSyncRequest, dump TLS after (response)
+        if imm == 0x21 {
+            if let Some(memory) = system.get_svc_memory() {
+                let m = memory.lock().unwrap();
+                if let Some(thread) = system.current_thread() {
+                    let tls = thread.lock().unwrap().get_tls_address().get();
+                    let mut words = [0u32; 16];
+                    for i in 0..16 { words[i] = m.read_32(tls + i as u64 * 4); }
+                    eprintln!("  TLS_RSP [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
+                        tls, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+                        words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
+                }
+            }
+        }
     } else {
-        call32(system, imm, args);
+        if is_64bit { call64(system, imm, args); } else { call32(system, imm, args); }
     }
 
     // Upstream reaches the equivalent behavior when the scheduler lock is
