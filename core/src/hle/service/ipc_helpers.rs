@@ -226,8 +226,9 @@ impl<'a> ResponseBuilder<'a> {
     ///
     /// Matches upstream `ResponseBuilder::PushIpcInterface<T>(shared_ptr<T>)`.
     ///
-    /// In non-domain mode: creates a new KSession, registers it with the parent
-    /// session's SessionRequestManager, and adds the client session as a move handle.
+    /// In non-domain mode: creates a new KSession with a SessionRequestManager linked
+    /// to the parent's ServerManager, registers it, and adds the client session as a
+    /// move handle.
     ///
     /// In domain mode: adds the service object as a domain object.
     pub fn push_ipc_interface(&mut self, iface: std::sync::Arc<dyn super::hle_ipc::SessionRequestHandler>) {
@@ -238,13 +239,42 @@ impl<'a> ResponseBuilder<'a> {
         if is_domain {
             self.context.add_domain_object(iface);
         } else {
-            // Non-domain: create a new session matching upstream PushIpcInterface.
+            // Non-domain: create a new session matching upstream PushIpcInterface exactly.
+            //
             // Upstream:
             //   auto next_manager = make_shared<SessionRequestManager>(kernel, manager->GetServerManager());
             //   next_manager->SetSessionHandler(iface);
             //   manager->GetServerManager().RegisterSession(&session->GetServerSession(), next_manager);
             //   context->AddMoveObject(&session->GetClientSession());
-            let handle = self.context.create_session_for_service(iface).unwrap_or(0);
+
+            // Get the parent manager's ServerManager reference.
+            let parent_server_manager = self.context.get_manager()
+                .and_then(|m| m.lock().unwrap().get_server_manager().cloned());
+
+            // Create child manager linked to same ServerManager.
+            let child_manager = if let Some(ref sm) = parent_server_manager {
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    super::hle_ipc::SessionRequestManager::new_with_server_manager(sm.clone())
+                ))
+            } else {
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    super::hle_ipc::SessionRequestManager::new()
+                ))
+            };
+            child_manager.lock().unwrap().set_session_handler(iface);
+
+            // Create session and get handle.
+            let handle = self.context.create_session_with_manager(child_manager.clone()).unwrap_or(0);
+
+            // Register with ServerManager (matching upstream line 164).
+            if let Some(sm) = parent_server_manager {
+                // Get server session from the context's last created session.
+                // The session was just created by create_session_with_manager.
+                if let Some(server_session) = self.context.last_created_server_session.take() {
+                    let _ = sm.lock().unwrap().register_session(server_session, child_manager);
+                }
+            }
+
             self.push_move_objects(handle);
         }
     }
