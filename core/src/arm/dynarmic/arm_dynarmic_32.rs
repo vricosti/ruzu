@@ -800,7 +800,7 @@ impl ArmDynarmic32 {
             } else {
                 Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
             },
-            fastmem_pointer,
+            fastmem_pointer: if std::env::var("RUZU_NO_FASTMEM").is_ok() { None } else { fastmem_pointer },
         };
 
         // A32Jit::new() internally calls callbacks.set_halt_reason_ptr() with a

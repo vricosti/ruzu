@@ -982,7 +982,9 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 }
             }
 
+            eprintln!("!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) — GAME ABORTED !!!", reason, info1, info2);
             svc_exception::break_execution(system, reason, info1, info2);
+            std::process::exit(1);
         }
         Some(SvcId::OutputDebugString) => {
             // IN: str=arg32[0], len=arg32[1]; OUT: ret=arg32[0]
@@ -1379,7 +1381,9 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             let reason = get_arg64(args, 0) as u32;
             let info1 = get_arg64(args, 1);
             let info2 = get_arg64(args, 2);
+            eprintln!("!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) — GAME ABORTED !!!", reason, info1, info2);
             svc_exception::break_execution(system, reason, info1, info2);
+            std::process::exit(1);
         }
         Some(SvcId::OutputDebugString) => {
             let str_ptr = get_arg64(args, 0);
