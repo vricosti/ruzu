@@ -222,6 +222,33 @@ impl<'a> ResponseBuilder<'a> {
         self.context.outgoing_move_objects.push(KAutoObjectRef::Handle(handle));
     }
 
+    /// Push an IPC interface (service object) as a move handle or domain object.
+    ///
+    /// Matches upstream `ResponseBuilder::PushIpcInterface<T>(shared_ptr<T>)`.
+    ///
+    /// In non-domain mode: creates a new KSession, registers it with the parent
+    /// session's SessionRequestManager, and adds the client session as a move handle.
+    ///
+    /// In domain mode: adds the service object as a domain object.
+    pub fn push_ipc_interface(&mut self, iface: std::sync::Arc<dyn super::hle_ipc::SessionRequestHandler>) {
+        let is_domain = self.context
+            .get_manager()
+            .map_or(false, |m| m.lock().unwrap().is_domain());
+
+        if is_domain {
+            self.context.add_domain_object(iface);
+        } else {
+            // Non-domain: create a new session matching upstream PushIpcInterface.
+            // Upstream:
+            //   auto next_manager = make_shared<SessionRequestManager>(kernel, manager->GetServerManager());
+            //   next_manager->SetSessionHandler(iface);
+            //   manager->GetServerManager().RegisterSession(&session->GetServerSession(), next_manager);
+            //   context->AddMoveObject(&session->GetClientSession());
+            let handle = self.context.create_session_for_service(iface).unwrap_or(0);
+            self.push_move_objects(handle);
+        }
+    }
+
     /// Push a u32 value.
     pub fn push_u32(&mut self, value: u32) {
         if self.index < ipc::COMMAND_BUFFER_LENGTH {

@@ -506,10 +506,12 @@ impl LM {
 
     fn open_logger_handler(_this: &dyn crate::hle::service::service::ServiceFramework, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) {
         log::debug!("LM::OpenLogger called");
-        // Upstream: IPC::ResponseBuilder rb{ctx, 2, 0, 1}; rb.PushIpcInterface<ILogger>(system);
+        // Upstream: IPC::ResponseBuilder rb{ctx, 2, 0, 1}; rb.Push(ResultSuccess); rb.PushIpcInterface<ILogger>(system);
         let logger: std::sync::Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
             std::sync::Arc::new(ILogger::new());
-        crate::hle::service::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, logger);
+        let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(crate::hle::result::RESULT_SUCCESS);
+        rb.push_ipc_interface(logger);
     }
 }
 
