@@ -349,14 +349,43 @@ fn parse_log(entry: &LogPacketHeaderEntry, log_data: &[u8], destination: LogDest
 pub struct ILogger {
     entries: HashMap<LogPacketHeaderEntry, Vec<u8>>,
     destination: LogDestination,
+    handlers: std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo>,
+    handlers_tipc: std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo>,
 }
 
 impl ILogger {
     pub fn new() -> Self {
+        let handlers = crate::hle::service::service::build_handler_map(&[
+            (0, Some(ILogger::log_handler), "Log"),
+            (1, Some(ILogger::set_destination_handler), "SetDestination"),
+        ]);
         Self {
             entries: HashMap::new(),
             destination: LogDestination::ALL,
+            handlers,
+            handlers_tipc: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn log_handler(_this: &dyn crate::hle::service::service::ServiceFramework, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) {
+        // Upstream: always returns success. Log data is read from the buffer.
+        let data = ctx.read_buffer(0);
+        // Parse and output the log message (stateless — no need to mutate ILogger).
+        // For now, just read the buffer and return success like upstream.
+        if data.len() >= std::mem::size_of::<LogPacketHeader>() {
+            // Minimal log parsing — could use a static/thread-local ILogger if needed.
+            log::trace!("ILogger::Log: {} bytes", data.len());
+        }
+        let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(crate::hle::result::RESULT_SUCCESS);
+    }
+
+    fn set_destination_handler(_this: &dyn crate::hle::service::service::ServiceFramework, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) {
+        let mut rp = crate::hle::service::ipc_helpers::RequestParser::new(ctx);
+        let destination = rp.pop_u32();
+        log::debug!("ILogger::SetDestination: {:#x}", destination);
+        let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(crate::hle::result::RESULT_SUCCESS);
     }
 
     /// Log (cmd 0) - processes log packets.
@@ -427,6 +456,35 @@ impl ILogger {
     }
 }
 
+impl crate::hle::service::hle_ipc::SessionRequestHandler for ILogger {
+    fn handle_sync_request(&self, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) -> crate::hle::result::ResultCode {
+        use crate::hle::service::service::ServiceFramework;
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ILogger"
+    }
+}
+
+impl crate::hle::service::service::ServiceFramework for ILogger {
+    fn get_service_name(&self) -> &str {
+        "ILogger"
+    }
+
+    fn get_max_sessions(&self) -> u32 {
+        1
+    }
+
+    fn handlers(&self) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// LM service ("lm").
 ///
 /// Corresponds to `LM` in upstream lm.cpp.
@@ -446,11 +504,12 @@ impl LM {
         }
     }
 
-    fn open_logger_handler(this: &dyn crate::hle::service::service::ServiceFramework, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) {
+    fn open_logger_handler(_this: &dyn crate::hle::service::service::ServiceFramework, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) {
         log::debug!("LM::OpenLogger called");
-        // Upstream creates an ILogger domain object. For bring-up, just return success.
-        let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(crate::hle::result::RESULT_SUCCESS);
+        // Upstream: IPC::ResponseBuilder rb{ctx, 2, 0, 1}; rb.PushIpcInterface<ILogger>(system);
+        let logger: std::sync::Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
+            std::sync::Arc::new(ILogger::new());
+        crate::hle::service::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, logger);
     }
 }
 
