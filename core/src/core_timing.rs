@@ -105,8 +105,8 @@ pub struct CoreTiming {
     event_queue: BinaryHeap<TimingEvent>,
     event_fifo_id: u64,
 
-    event: Event,
-    pause_event: Event,
+    event: Arc<Event>,
+    pause_event: Arc<Event>,
     basic_lock: Mutex<()>,
     advance_lock: Mutex<()>,
     timer_thread: Option<std::thread::JoinHandle<()>>,
@@ -136,8 +136,8 @@ impl CoreTiming {
             global_timer: 0,
             event_queue: BinaryHeap::new(),
             event_fifo_id: 0,
-            event: Event::new(),
-            pause_event: Event::new(),
+            event: Arc::new(Event::new()),
+            pause_event: Arc::new(Event::new()),
             basic_lock: Mutex::new(()),
             advance_lock: Mutex::new(()),
             timer_thread: None,
@@ -168,16 +168,116 @@ impl CoreTiming {
         self.shutting_down.store(false, Ordering::SeqCst);
         self.cpu_ticks = 0;
 
-        if self.is_multicore {
-            // For multicore, we need to spawn the timer thread.
-            // Since CoreTiming uses internal synchronization, we extract the shared state
-            // and run the thread loop. For now in Rust, we note that the C++ code
-            // spawns a thread that calls ThreadLoop(). We implement this with a
-            // simplified approach.
-            // NOTE: Full multicore timer thread would require Arc-wrapping CoreTiming.
-            // For the initial port, multicore timer thread is a placeholder.
-            log::info!("CoreTiming: multicore timer thread not yet spawned (requires Arc<Self>)");
+        // Note: In multicore mode, the timer thread must be started separately
+        // via start_timer_thread() after CoreTiming is wrapped in Arc<Mutex<>>.
+        // Upstream spawns it here because C++ has shared_ptr.
+    }
+
+    /// Start the timer thread for multicore mode.
+    /// Must be called after CoreTiming is wrapped in Arc<Mutex<>> and events are scheduled.
+    /// Matches upstream `CoreTiming::Initialize()` which spawns ThreadLoop.
+    pub fn start_timer_thread(ct: Arc<std::sync::Mutex<CoreTiming>>) {
+        let is_multicore = ct.lock().unwrap().is_multicore;
+        if !is_multicore {
+            return;
         }
+
+        // Extract shared state before moving into thread closure.
+        // Matches upstream ThreadLoop accessing CoreTiming fields directly.
+        let shutting_down = ct.lock().unwrap().shutting_down.clone();
+        let paused = ct.lock().unwrap().paused.clone();
+        let paused_set = ct.lock().unwrap().paused_set.clone();
+        let wait_set = ct.lock().unwrap().wait_set.clone();
+        let event = ct.lock().unwrap().event.clone();
+        let pause_event = ct.lock().unwrap().pause_event.clone();
+        let ct_clone = ct.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("CoreTiming".to_string())
+            .spawn(move || {
+                // Upstream: ThreadEntry calls on_thread_init() then ThreadLoop().
+                {
+                    let ct = ct_clone.lock().unwrap();
+                    if let Some(ref init_fn) = ct.on_thread_init {
+                        init_fn();
+                    }
+                }
+
+                // ThreadLoop — matches upstream CoreTiming::ThreadLoop().
+                // Note: upstream accesses CoreTiming fields directly (no outer mutex).
+                // We must minimize lock holding to avoid deadlocking with CPU threads
+                // that call get_clock_ticks() under the same mutex.
+                ct_clone.lock().unwrap().has_started.store(true, Ordering::SeqCst);
+                while !shutting_down.load(Ordering::SeqCst) {
+                    while !paused.load(Ordering::SeqCst) {
+                        paused_set.store(false, Ordering::SeqCst);
+
+                        // Pop due events under lock, fire callbacks outside lock.
+                        let due_events = ct_clone.lock().unwrap().collect_due_events();
+                        for (evt_type, evt_time, reschedule_time) in &due_events {
+                            let et = evt_type.lock();
+                            let ns_late = {
+                                let ct = ct_clone.lock().unwrap();
+                                ct.get_global_time_ns().as_nanos() as i64 - evt_time
+                            };
+                            let callback_result = (et.callback)(
+                                *evt_time,
+                                std::time::Duration::from_nanos(ns_late.max(0) as u64),
+                            );
+
+                            if *reschedule_time != 0 {
+                                let mut ct = ct_clone.lock().unwrap();
+                                let next_time = match callback_result {
+                                    Some(dur) => dur.as_nanos() as i64,
+                                    None => *reschedule_time,
+                                };
+                                let fire_time = if *evt_time < ct.pause_end_time {
+                                    ct.pause_end_time + next_time
+                                } else {
+                                    evt_time + next_time
+                                };
+                                let fifo_id = ct.event_fifo_id;
+                                ct.event_fifo_id += 1;
+                                ct.event_queue.push(TimingEvent {
+                                    time: fire_time,
+                                    fifo_order: fifo_id,
+                                    event_type: Arc::downgrade(evt_type),
+                                    reschedule_time: next_time,
+                                });
+                            }
+                        }
+
+                        if due_events.is_empty() {
+                            // Check if there's a future event to wait for.
+                            let next_time = {
+                                let ct = ct_clone.lock().unwrap();
+                                ct.event_queue.peek().map(|e| e.time)
+                            };
+                            if let Some(next_ns) = next_time {
+                                let now_ns = ct_clone.lock().unwrap()
+                                    .get_global_time_ns().as_nanos() as i64;
+                                let wait_time = next_ns - now_ns;
+                                if wait_time > 0 {
+                                    event.wait_for(std::time::Duration::from_nanos(
+                                        wait_time as u64,
+                                    ));
+                                }
+                            } else {
+                                wait_set.store(true, Ordering::SeqCst);
+                                event.wait();
+                            }
+                            wait_set.store(false, Ordering::SeqCst);
+                        }
+                    }
+
+                    paused_set.store(true, Ordering::SeqCst);
+                    pause_event.wait();
+                }
+            })
+            .expect("Failed to spawn CoreTiming timer thread");
+
+        ct.lock().unwrap().timer_thread = Some(handle);
+        log::info!("CoreTiming: timer thread started");
     }
 
     /// Clear all pending events. This should ONLY be done on exit.
@@ -336,6 +436,29 @@ impl CoreTiming {
     /// Adds idle ticks.
     pub fn idle(&mut self) {
         self.cpu_ticks += 1000;
+    }
+
+    /// Collect all due events from the queue without firing callbacks.
+    /// Returns Vec of (event_type_arc, fire_time, reschedule_time).
+    /// Used by the timer thread to fire callbacks outside the CoreTiming lock.
+    pub fn collect_due_events(
+        &mut self,
+    ) -> Vec<(Arc<parking_lot::Mutex<EventType>>, i64, i64)> {
+        self.global_timer = self.get_global_time_ns().as_nanos() as i64;
+        let mut result = Vec::new();
+        loop {
+            let _basic = self.basic_lock.lock();
+            match self.event_queue.peek() {
+                Some(evt) if evt.time <= self.global_timer => {
+                    let evt = self.event_queue.pop().unwrap();
+                    if let Some(arc) = evt.event_type.upgrade() {
+                        result.push((arc, evt.time, evt.reschedule_time));
+                    }
+                }
+                _ => break,
+            }
+        }
+        result
     }
 
     /// Returns the current downcount.

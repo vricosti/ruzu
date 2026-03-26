@@ -255,6 +255,10 @@ pub struct KernelCore {
     /// Used by SVC dispatch (`Svc::Call(system, svc_number)`) and other
     /// kernel operations that need access to System-level state.
     system_ref: crate::core::SystemRef,
+
+    /// Preemption timer event (10ms interval).
+    /// Upstream: `std::shared_ptr<Core::Timing::EventType> preemption_event`.
+    preemption_event: Option<Arc<parking_lot::Mutex<crate::core_timing::EventType>>>,
 }
 
 // KProcess initial ID constants (matching upstream).
@@ -298,6 +302,7 @@ impl KernelCore {
             single_core_thread_id: AtomicU32::new(0),
             core_timing: None,
             system_ref: crate::core::SystemRef::null(),
+            preemption_event: None,
         }
     }
 
@@ -334,6 +339,41 @@ impl KernelCore {
         if let Some(ref gsc) = self.global_scheduler_context {
             gsc.lock().unwrap().m_scheduler_lock.set_callbacks(&SCHEDULER_CALLBACKS);
         }
+
+        // Initialize preemption event.
+        // Upstream: InitializePreemption schedules a looping CoreTiming event every 10ms
+        // that calls PreemptThreads + Interrupt on each core, forcing the JIT out of
+        // tight loops so the scheduler can reschedule threads.
+        // Upstream: InitializePreemption creates a looping CoreTiming event.
+        // The callback takes KScopedSchedulerLock then calls PreemptThreads.
+        // Additionally, we interrupt all cores to force the JIT to exit
+        // linked block loops and check is_interrupted in the outer loop.
+        self.preemption_event = Some(crate::core_timing::create_event(
+            "PreemptionCallback".to_string(),
+            Box::new(move |_time, _ns| {
+                let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
+                if kernel_ptr.is_null() {
+                    return None;
+                }
+                let kernel = unsafe { &*kernel_ptr };
+
+                // PreemptThreads (rotate priority queue).
+                if let Some(gsc_arc) = kernel.global_scheduler_context() {
+                    let mut gsc = gsc_arc.lock().unwrap();
+                    gsc.preempt_threads();
+                }
+
+                // Interrupt all cores — sets is_interrupted=true and calls
+                // HaltExecution on the JIT to break out of linked block loops.
+                for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
+                    if let Some(core) = kernel.physical_core(core_id) {
+                        core.interrupt();
+                    }
+                }
+
+                None
+            }),
+        ));
     }
 
     /// Wire the hardware timer to CoreTiming.
@@ -355,6 +395,19 @@ impl KernelCore {
     /// Upstream: accessed via `system.CoreTiming()`.
     pub fn core_timing(&self) -> Option<&Arc<Mutex<CoreTiming>>> {
         self.core_timing.as_ref()
+    }
+
+    /// Schedule the preemption timer event (10ms interval).
+    /// Matches upstream `InitializePreemption(kernel)` in kernel.cpp.
+    /// Must be called after set_core_timing().
+    pub fn schedule_preemption_event(&self, core_timing: &Arc<std::sync::Mutex<CoreTiming>>) {
+        if let Some(ref event) = self.preemption_event {
+            let interval = std::time::Duration::from_millis(10);
+            core_timing.lock().unwrap().schedule_looping_event(
+                interval, interval, event, false,
+            );
+            log::info!("KernelCore: preemption event scheduled (10ms interval)");
+        }
     }
 
     /// Set the System reference.

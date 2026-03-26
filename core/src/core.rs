@@ -409,6 +409,11 @@ impl System {
         // Provide CoreTiming to the kernel so guest thread functions can access it.
         self.kernel.as_mut().unwrap().set_core_timing(self.core_timing.clone());
 
+        // Schedule preemption event (10ms interval) and start timer thread.
+        // Upstream: InitializePreemption in kernel.cpp schedules a looping event.
+        self.kernel.as_ref().unwrap().schedule_preemption_event(&self.core_timing);
+        CoreTiming::start_timer_thread(self.core_timing.clone());
+
         // Upstream: cpu_manager.Initialize() — creates barrier and spawns per-core
         // host threads that wait on the GPU barrier before yielding to guest fibers.
         // Safety: kernel outlives the threads (shutdown joins them first).
