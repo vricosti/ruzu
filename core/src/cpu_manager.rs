@@ -484,7 +484,7 @@ impl CpuManager {
                 // To enable: change `cfg!(feature = "step_tracer")` to `true` below,
                 // or use: cargo build --features step_tracer
                 #[allow(unreachable_code)]
-                if cfg!(feature = "step_tracer") {
+                if cfg!(feature = "step_tracer") { // old step tracer (pre-dispatch, DO NOT USE)
                     use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
                     static SVC_N: AtomicU32 = AtomicU32::new(0);
                     static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -503,9 +503,25 @@ impl CpuManager {
                                 }
                             }
                             if ACTIVE.load(Ordering::Relaxed) {
+                                // Write binary register trace: each step = 17 u32s (R0-R15 + CPSR)
+                                let mut trace_file = std::fs::File::create("/tmp/ruzu_reg_trace.bin")
+                                    .expect("cannot create trace file");
+                                use std::io::Write;
                                 for step in 0..500_000u32 {
                                     let op = unsafe { &mut *(thread_ptr as *mut crate::arm::arm_interface::KThread) };
                                     let h = jit_ref.step_thread(op);
+                                    // Dump all registers
+                                    {
+                                        let mut c = crate::arm::arm_interface::ThreadContext::default();
+                                        jit_ref.get_context(&mut c);
+                                        let mut regs = [0u32; 17];
+                                        for i in 0..16 { regs[i] = c.r[i] as u32; }
+                                        regs[16] = c.pstate;
+                                        let bytes: &[u8] = unsafe {
+                                            std::slice::from_raw_parts(regs.as_ptr() as *const u8, 68)
+                                        };
+                                        let _ = trace_file.write_all(bytes);
+                                    }
                                     if step % 10_000 == 0 {
                                         let mut c = crate::arm::arm_interface::ThreadContext::default();
                                         jit_ref.get_context(&mut c);
@@ -619,6 +635,70 @@ impl CpuManager {
                         jit_ref.set_svc_arguments(&svc_args);
                     } else {
                         log::warn!("SVC #{:#x}: no System reference available", svc_number);
+                    }
+
+                    // Step tracer — activated AFTER SVC dispatch so registers are correct.
+                    // Enable with RUZU_STEP_AFTER_SVC=N env var.
+                    if cfg!(feature = "step_tracer") {
+                        use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+                        static SVC_N2: AtomicU32 = AtomicU32::new(0);
+                        static ACTIVE2: AtomicBool = AtomicBool::new(false);
+                        static DONE2: AtomicBool = AtomicBool::new(false);
+                        if !DONE2.load(Ordering::Relaxed) {
+                            let threshold: Option<u32> = {
+                                use std::sync::OnceLock;
+                                static V2: OnceLock<Option<u32>> = OnceLock::new();
+                                *V2.get_or_init(|| std::env::var("RUZU_STEP_AFTER_SVC").ok().and_then(|s| s.trim().parse().ok()))
+                            };
+                            if let Some(t) = threshold {
+                                let n = SVC_N2.fetch_add(1, Ordering::Relaxed);
+                                if n == t {
+                                    ACTIVE2.store(true, Ordering::Relaxed);
+                                    eprintln!("=== STEP TRACE activated after SVC#{} (post-dispatch) ===", t);
+                                }
+                                if ACTIVE2.load(Ordering::Relaxed) {
+                                    let mut trace_file = std::fs::File::create("/tmp/ruzu_reg_trace.bin")
+                                        .expect("cannot create trace file");
+                                    use std::io::Write;
+                                    for step in 0..500_000u32 {
+                                        let op = unsafe { &mut *(thread_ptr as *mut crate::arm::arm_interface::KThread) };
+                                        let h = jit_ref.step_thread(op);
+                                        let mut c = crate::arm::arm_interface::ThreadContext::default();
+                                        jit_ref.get_context(&mut c);
+                                        let mut regs = [0u32; 17];
+                                        for i in 0..16 { regs[i] = c.r[i] as u32; }
+                                        regs[16] = c.pstate;
+                                        let bytes: &[u8] = unsafe {
+                                            std::slice::from_raw_parts(regs.as_ptr() as *const u8, 68)
+                                        };
+                                        let _ = trace_file.write_all(bytes);
+                                        if step % 10_000 == 0 {
+                                            eprintln!("STEP {:6} PC={:#010x} SP={:#010x} R0={:#010x}",
+                                                step, c.pc, c.sp, c.r[0]);
+                                        }
+                                        if h.contains(crate::arm::arm_interface::HaltReason::SUPERVISOR_CALL) {
+                                            let svc = jit_ref.get_svc_number();
+                                            if svc == 0x26 {
+                                                eprintln!("=== svcBreak at step {} ===", step);
+                                                DONE2.store(true, Ordering::Relaxed);
+                                                ACTIVE2.store(false, Ordering::Relaxed);
+                                                std::process::exit(1);
+                                            }
+                                            let sr = kernel.system();
+                                            if !sr.is_null() {
+                                                let sys = sr.get();
+                                                let mut a = [0u64; 8];
+                                                jit_ref.get_svc_arguments(&mut a);
+                                                crate::hle::kernel::svc_dispatch::call(sys, svc, false, &mut a);
+                                                jit_ref.set_svc_arguments(&a);
+                                            }
+                                        }
+                                    }
+                                    DONE2.store(true, Ordering::Relaxed);
+                                    ACTIVE2.store(false, Ordering::Relaxed);
+                                }
+                            }
+                        }
                     }
 
                     // SVC handled, return to MultiCoreRunGuestThread loop.
