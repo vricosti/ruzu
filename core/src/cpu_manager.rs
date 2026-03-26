@@ -476,6 +476,105 @@ impl CpuManager {
                 // Exit context — clear running.
                 physical_core.clear_running();
 
+                // Step-trace after SVC N (RUZU_STEP_AFTER_SVC=N).
+                // Steps all instructions from that point, dispatching SVCs inline,
+                // logging every SVC with full args + TLS, and exiting on svcBreak.
+                {
+                    use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+                    static SVC_N: AtomicU32 = AtomicU32::new(0);
+                    static ACTIVE: AtomicBool = AtomicBool::new(false);
+                    static DONE: AtomicBool = AtomicBool::new(false);
+                    if !DONE.load(Ordering::Relaxed) {
+                        let threshold: Option<u32> = {
+                            use std::sync::OnceLock;
+                            static V: OnceLock<Option<u32>> = OnceLock::new();
+                            *V.get_or_init(|| std::env::var("RUZU_STEP_AFTER_SVC").ok().and_then(|s| s.trim().parse().ok()))
+                        };
+                        if let Some(t) = threshold {
+                            if hr.contains(crate::arm::arm_interface::HaltReason::SUPERVISOR_CALL) {
+                                if SVC_N.fetch_add(1, Ordering::Relaxed) == t {
+                                    ACTIVE.store(true, Ordering::Relaxed);
+                                    eprintln!("=== STEP TRACE activated after SVC#{} ===", t);
+                                }
+                            }
+                            if ACTIVE.load(Ordering::Relaxed) {
+                                for step in 0..500_000u32 {
+                                    let op = unsafe { &mut *(thread_ptr as *mut crate::arm::arm_interface::KThread) };
+                                    let h = jit_ref.step_thread(op);
+                                    if step % 10_000 == 0 {
+                                        let mut c = crate::arm::arm_interface::ThreadContext::default();
+                                        jit_ref.get_context(&mut c);
+                                        eprintln!("STEP {:6} PC={:#010x} SP={:#010x} LR={:#010x} R0={:#010x}",
+                                            step, c.pc, c.sp, c.lr, c.r[0]);
+                                    }
+                                    if h.contains(crate::arm::arm_interface::HaltReason::SUPERVISOR_CALL) {
+                                        let svc = jit_ref.get_svc_number();
+                                        let mut args = [0u64; 8];
+                                        jit_ref.get_svc_arguments(&mut args);
+                                        let mut c = crate::arm::arm_interface::ThreadContext::default();
+                                        jit_ref.get_context(&mut c);
+                                        eprintln!("SVC_IN  imm=0x{:02x} step={} core=0 tid=0 args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}]",
+                                            svc, step, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+                                        // For SendSyncRequest, dump TLS before
+                                        if svc == 0x21 {
+                                            let sr = kernel.system();
+                                            if !sr.is_null() {
+                                                let sys = sr.get();
+                                                if let Some(memory) = sys.get_svc_memory() {
+                                                    let m = memory.lock().unwrap();
+                                                    let tls = c.r[1] as u64; // R1 often has TLS in args but let's use actual TLS
+                                                    if let Some(thread) = sys.current_thread() {
+                                                        let tls_addr = thread.lock().unwrap().get_tls_address().get();
+                                                        let mut w = [0u32; 16];
+                                                        for i in 0..16 { w[i] = m.read_32(tls_addr + i as u64 * 4); }
+                                                        eprintln!("  TLS_REQ [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
+                                                            tls_addr, w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11],w[12],w[13],w[14],w[15]);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Dispatch
+                                        let sr = kernel.system();
+                                        if !sr.is_null() {
+                                            let sys = sr.get();
+                                            crate::hle::kernel::svc_dispatch::call(sys, svc, false, &mut args);
+                                            jit_ref.set_svc_arguments(&args);
+                                        }
+                                        eprintln!("SVC_OUT imm=0x{:02x} args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}]",
+                                            svc, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+                                        // For SendSyncRequest, dump TLS after
+                                        if svc == 0x21 {
+                                            let sr2 = kernel.system();
+                                            if !sr2.is_null() {
+                                                let sys2 = sr2.get();
+                                                if let Some(memory) = sys2.get_svc_memory() {
+                                                    let m = memory.lock().unwrap();
+                                                    if let Some(thread) = sys2.current_thread() {
+                                                        let tls_addr = thread.lock().unwrap().get_tls_address().get();
+                                                        let mut w = [0u32; 16];
+                                                        for i in 0..16 { w[i] = m.read_32(tls_addr + i as u64 * 4); }
+                                                        eprintln!("  TLS_RSP [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
+                                                            tls_addr, w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11],w[12],w[13],w[14],w[15]);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if svc == 0x26 {
+                                            eprintln!("=== svcBreak — exiting ===");
+                                            DONE.store(true, Ordering::Relaxed);
+                                            ACTIVE.store(false, Ordering::Relaxed);
+                                            std::process::exit(1);
+                                        }
+                                    }
+                                }
+                                eprintln!("=== step limit reached (500K) ===");
+                                DONE.store(true, Ordering::Relaxed);
+                                ACTIVE.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+
                 // Handle halt reason (upstream physical_core.cpp:100-144).
                 use crate::arm::arm_interface::HaltReason;
                 let supervisor_call = hr.contains(HaltReason::SUPERVISOR_CALL);
