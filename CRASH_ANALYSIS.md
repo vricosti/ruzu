@@ -1,6 +1,34 @@
-# MK8D Analysis — NO CRASH, JIT PERFORMANCE REMAINING
+# MK8D Analysis — RTLD FIXED, BLOCKED ON HLE SERVICES
 
 ## Status (2026-03-26)
+
+**Major progress.** Game now passes rtld relocation processing and reaches HLE
+service initialization (ConnectToNamedPort, SendSyncRequest). 82 SVCs in 30s
+(was 58, stuck on rtld bytecode interpreter). Next blocker is HLE service
+responses.
+
+### Session fixes (2026-03-26 afternoon)
+
+| Fix | Impact |
+|-----|--------|
+| GetNZFromOp: test+lahf instead of xor+lahf | **Fixed N/Z flags for all logic ops** |
+| carry_in for logic imm rotate=0 | **Fixed C flag preservation** |
+| corosensei fibers (replace ucontext) | ~50-250x faster context switch |
+| CoreTiming timer thread + preemption event | 10ms periodic JIT interrupt |
+| Scheduler update_highest_priority_threads callback | Thread distribution to cores |
+| Two-pass GSE (FlagsPass + RegisterPass) | Upstream-parity IR optimization |
+| replace_uses_with as Identity | Upstream-parity IR semantics |
+
+### Root cause of rtld infinite loop (FIXED)
+
+The rtld's relocation bytecode interpreter at 0x200440 looped on all-zero BSS
+data because the relocation encoder never ran. The encoder's conditional branch
+took the wrong path due to incorrect N/Z flags from `GetNZFromOp`, which used
+`xor al, al; lahf` (always Z=1) instead of `test value, value; lahf`.
+
+355/355 rdynarmic tests pass. 5000/5000 fuzz comparisons with upstream oracle pass.
+
+## Previous status
 
 **No crash.** Game runs correctly. Performance bottleneck identified and root
 cause found: rdynarmic generates +49% more IR than upstream (17.4 vs 11.7
