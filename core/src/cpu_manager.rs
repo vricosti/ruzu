@@ -477,9 +477,14 @@ impl CpuManager {
                 physical_core.clear_running();
 
                 // Step-trace after SVC N (RUZU_STEP_AFTER_SVC=N).
-                // Steps all instructions from that point, dispatching SVCs inline,
-                // logging every SVC with full args + TLS, and exiting on svcBreak.
-                {
+                // Enabled at compile time via cfg. Steps all instructions from that
+                // point, dispatching SVCs inline with full args + TLS logging, and
+                // exiting on svcBreak. Disabled by default to avoid overhead.
+                //
+                // To enable: change `cfg!(feature = "step_tracer")` to `true` below,
+                // or use: cargo build --features step_tracer
+                #[allow(unreachable_code)]
+                if cfg!(feature = "step_tracer") {
                     use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
                     static SVC_N: AtomicU32 = AtomicU32::new(0);
                     static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -573,7 +578,7 @@ impl CpuManager {
                             }
                         }
                     }
-                }
+                } // cfg!(feature = "step_tracer")
 
                 // Handle halt reason (upstream physical_core.cpp:100-144).
                 use crate::arm::arm_interface::HaltReason;
