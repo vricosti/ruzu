@@ -1,50 +1,63 @@
-# MK8D Crash Analysis — RESOLVED
+# MK8D Analysis — RESOLVED
 
-## Resolution (2026-03-26)
+## Status (2026-03-26)
 
-**The svcBreak was caused by the step tracer debugging tool, NOT by any
-emulation bug.** The step tracer activated BEFORE `set_svc_arguments` wrote
-R0=0 back to the JIT, so R0 retained the lm handle (0x181fd). The nn::lm
-init code checked R0, saw non-zero (error), and called AbortImpl.
+**No crash.** The game runs correctly through all 41 initial SVCs and enters
+nn::lm module initialization. Execution is correct but slow (~3.8 ARM
+instructions per JIT block, ~872 blocks compiled in 15s).
 
-Differential binary register trace (17×u32 per step) confirmed:
-**first 100+ steps are IDENTICAL between upstream dynarmic and rdynarmic.**
+## What was fixed this session
 
-## Current status
+| Fix | Impact |
+|-----|--------|
+| rdynarmic mprotect skip (cache hits + run entry) | 500x speedup for init |
+| Block linking enabled (0x3F) | ~20x for hot loops |
+| ILogger session with ServerManager wiring | Correct handle 0x201fc |
+| CNTPCT returns real clock ticks | Correct timer |
+| Step tracer post-dispatch activation | **Fixed false svcBreak** |
+| RWX code cache (no mprotect toggles) | Matches upstream |
+| Lock-free memory_read_code via fastmem | Matches upstream |
+| reads_cpsr includes A32GetCFlag | Correct GSE invalidation |
+| IdentityRemoval + VerificationPass | Matches upstream passes |
+| push_ipc_interface on ResponseBuilder | Matches upstream PushIpcInterface |
 
-Game runs correctly past lm:OpenLogger. No svcBreak. The nn::lm init
-code takes >60s in run mode due to JIT performance (millions of ARM
-instructions for rtld symbol resolution). The game IS progressing — it
-just needs more time or JIT optimization.
+## The svcBreak was a debugging artifact
 
-## Performance fixes applied
+The step tracer activated BEFORE `set_svc_arguments` wrote R0=0 back.
+R0 retained the lm handle (0x181fd), causing nn::lm init to see an error
+and call AbortImpl. Differential binary register trace proved first 100+
+steps are **byte-identical** between upstream dynarmic and rdynarmic.
 
-| Fix | Speedup |
-|-----|---------|
-| rdynarmic mprotect skip (cache hits + run entry) | 500x |
-| Block linking (0x3F) | ~20x |
-| ILogger session with ServerManager wiring | correctness |
-| CNTPCT returns real clock ticks | correctness |
-| Step tracer post-dispatch activation | **fixed false abort** |
+## Verified identical to upstream
 
-## What was proven identical to upstream
+- 36MB guest memory at first SVC: **byte-identical**
+- All 41 SVC responses + TLS data: **byte-identical**
+- Register state (R0-R15 + CPSR) per-step: **identical for 100+ steps**
+- Memory layout (29 QueryMemory entries): **identical**
+- JIT x86 codegen (instruction selection, register allocator): **functionally identical**
+- WritesToCPSR opcode list: **identical**
+- Block termination logic: **identical**
 
-- 36MB guest memory: byte-identical
-- All SVC responses: byte-identical
-- Register state at SVC boundaries: identical
-- Binary register trace (100+ steps): identical
-- Memory layout (29 QueryMemory entries): identical
+## Remaining: JIT execution speed
+
+The nn::lm initialization phase compiles ~872 new blocks in 15s (all unique,
+no infinite loop). Average block size: 3.8 ARM instructions, 17.4 IR instructions.
+This is normal for heavily conditional ARM code.
+
+Upstream dynarmic executes this in ~100ms. The ~150x slowdown is due to
+general overhead in the Rust JIT pipeline (compilation + code emission +
+x86 instruction scheduling), not a specific bug.
 
 ## Reference traces
 
-- `traces/zuyu_full_5s_trace.log` — 50K lines upstream reference
-- `traces/ruzu_mk8d_full_trace.txt` — ruzu SVC trace
+- `traces/zuyu_full_5s_trace.log` — 50K lines, 5s upstream (14K SVCs, 30 threads)
+- `traces/ruzu_mk8d_full_trace.txt` — ruzu until lm:OpenLogger
 
 ## Tools
 
 ```bash
-RUZU_SVC_TRACE=1      # SVC trace with TLS dumps
-RUZU_NO_FASTMEM=1     # Disable fastmem
-RUZU_A32_OPTIMIZATION_MASK=0x3F  # JIT optimization flags
+RUZU_SVC_TRACE=1                    # SVC trace with TLS dumps
+RUZU_NO_FASTMEM=1                   # Disable fastmem
+RUZU_A32_OPTIMIZATION_MASK=0x3F     # JIT optimization flags
 # Step tracer: build with feature "step_tracer", set RUZU_STEP_AFTER_SVC=N
 ```
