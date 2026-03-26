@@ -128,6 +128,10 @@ struct DynarmicCallbacks32 {
     /// Set after jit creation via `set_halt_reason_ptr()`.
     /// Safety: valid for the lifetime of the A32Jit that owns this callback.
     jit_halt_reason_ptr: Option<*const u32>,
+    /// Cached fastmem pointer for lock-free memory reads during code translation.
+    /// Matches upstream's direct `m_memory` reference (no synchronization).
+    /// Safety: valid for the lifetime of the DeviceMemory backing.
+    fastmem_ptr: *const u8,
     /// Raw pointer to jit_state.reg[15] (PC) for diagnostic logging.
     /// No performance impact — only read when logging unmapped accesses.
     /// Set after jit creation via `set_pc_ptr()`.
@@ -158,10 +162,14 @@ impl DynarmicCallbacks32 {
         exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
         core_index: usize,
     ) -> Self {
-        log::info!("DynarmicCallbacks32: Arc memory ptr = {:?}, base = {:#x}, core_memory={}",
-            std::sync::Arc::as_ptr(&memory),
-            memory.read().unwrap().base,
-            if core_memory.is_some() { "wired" } else { "fallback" });
+        // Cache fastmem pointer for lock-free code reads during JIT compilation.
+        // Matches upstream's direct m_memory reference.
+        let fastmem_ptr = core_memory
+            .as_ref()
+            .map(|cm| cm.lock().unwrap().fastmem_pointer())
+            .unwrap_or(std::ptr::null_mut()) as *const u8;
+        log::info!("DynarmicCallbacks32: core_memory={} fastmem_ptr={:?}",
+            if core_memory.is_some() { "wired" } else { "fallback" }, fastmem_ptr);
         Self {
             memory,
             core_memory,
@@ -169,6 +177,7 @@ impl DynarmicCallbacks32 {
             uses_wall_clock,
             core_timing,
             last_exception_address,
+            fastmem_ptr,
             jit_halt_reason_ptr: None,
             jit_pc_ptr: None,
             dumped_unmapped_window: AtomicBool::new(false),
@@ -374,7 +383,15 @@ impl DynarmicCallbacks32 {
 
 impl JitCallbacks for DynarmicCallbacks32 {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
-        // Upstream: returns std::nullopt if IsValidVirtualAddressRange fails.
+        // Lock-free fast path using cached fastmem pointer, matching upstream's
+        // direct m_memory.Read32(vaddr) without any synchronization.
+        if !self.fastmem_ptr.is_null() {
+            let value = unsafe {
+                (self.fastmem_ptr.add(vaddr as usize) as *const u32).read_unaligned()
+            };
+            return Some(value);
+        }
+        // Fallback (tests without fastmem): lock and read
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
             if m.is_valid_virtual_address_range(vaddr, 4) {
