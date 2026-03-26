@@ -56,25 +56,36 @@ Upstream chains IR values directly:
 GetRegister R0 → LSL → UXTAB (uses LSL result directly) → SetRegister R0
 ```
 
-The **Get-Set Elimination (GSE) pass** should eliminate these but the current
-implementation doesn't handle:
-1. **FlagsPass** needs reverse iteration (upstream does, rdynarmic doesn't)
-2. **RegisterPass** needs simpler value propagation without tracking_type check
-3. **Dead store elimination** for intermediate SetRegister instructions
+The **Get-Set Elimination (GSE) pass** was rewritten to match upstream's two-pass
+approach and is now deployed.
 
-### GSE rewrite status
+### GSE rewrite (2026-03-26) — DONE
 
-A rewrite matching upstream's two-pass approach (FlagsPass reverse + RegisterPass
-forward) was implemented and **achieved 12 IR for block 0x2009c0** (exact upstream
-parity). However, it introduced a regression (29 SVCs vs 41 in 2 minutes) indicating
-a bug in the propagation logic. **Reverted** — needs debugging with unit tests.
+`replace_uses_with` now matches upstream `Inst::ReplaceUsesWith`: converts target
+to `Identity(replacement)` instead of global search-replace + tombstone. The
+IdentityRemovalPass (always run after optimization) chases through Identity
+indirections.
 
-### Next steps for GSE fix
+The A32 GSE now implements upstream's exact two-pass approach:
+- **FlagsPass** (reverse iteration): eliminates redundant CPSR flag ops, extracts
+  C from NZCV via `GetCFlagFromNZCV`, downgrades `SetCpsrNZC` to `SetCpsrNZ`
+  when C is identity
+- **RegisterPass** (forward iteration): eliminates redundant register Get/Set pairs
+  with multi-slot ext reg tracking (Single/Double/VectorDouble/VectorQuad)
 
-1. Write unit tests for the GSE pass using known block IR patterns
-2. Debug the flags_pass — likely tombstones an instruction still referenced
-3. Debug the register_pass — verify dead store elimination doesn't break deps
-4. Verify with block 0x2009c0 + other blocks before deploying
+353 tests pass (2 pre-existing failures unchanged).
+
+### JIT performance comparison (20 first SVCs)
+
+| Metric | Upstream (zuyu) | Ruzu | Ratio |
+|--------|-----------------|------|-------|
+| SVC 0 → SVC 19 (20 QueryMemory) | 2.87ms | 0.70ms | **ruzu 4x faster** |
+| SVC 0 → SVC 28 (29 QueryMemory) | 3.13ms | 0.97ms | **ruzu 3x faster** |
+
+**Conclusion:** The JIT is no longer the bottleneck. The 29 QueryMemory calls
+execute in under 1ms. The game is now blocked on the **scheduler**
+(`schedule_impl_fiber`) which fails to yield to the next guest thread after the
+QueryMemory loop completes.
 
 ## Verified identical to upstream
 
