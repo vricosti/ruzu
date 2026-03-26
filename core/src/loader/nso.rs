@@ -276,6 +276,9 @@ impl AppLoaderNso {
             if nso_header.is_segment_compressed(i) {
                 data = decompress_segment(&data, nso_header.segments[i].size);
             }
+            log::info!("NSO segment[{}]: location={:#x} size={:#x} compressed={:#x} data.len={:#x}",
+                i, nso_header.segments[i].location, nso_header.segments[i].size,
+                nso_header.segments_compressed_size[i], data.len());
             let needed_size =
                 module_start + nso_header.segments[i].location as usize + data.len();
             if program_image.len() < needed_size {
@@ -288,6 +291,8 @@ impl AppLoaderNso {
             code_set.segments[i].offset = module_start + nso_header.segments[i].location as usize;
             code_set.segments[i].size = nso_header.segments[i].size;
         }
+        log::info!("NSO bss_size={:#x} program_image.len={:#x}",
+            nso_header.segments[2].alignment_or_bss_size, program_image.len());
 
         // Upstream: arguments are added BEFORE BSS, matching upstream ordering.
         // Upstream condition: `should_pass_arguments && !Settings::values.program_args.GetValue().empty()`
