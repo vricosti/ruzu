@@ -1,57 +1,94 @@
-# MK8D Analysis — RESOLVED
+# MK8D Analysis — NO CRASH, JIT PERFORMANCE REMAINING
 
 ## Status (2026-03-26)
 
-**No crash.** The game runs correctly through all 41 initial SVCs and enters
-nn::lm module initialization. Execution is correct but slow (~3.8 ARM
-instructions per JIT block, ~872 blocks compiled in 15s).
+**No crash.** Game runs correctly. Performance bottleneck identified and root
+cause found: rdynarmic generates +49% more IR than upstream (17.4 vs 11.7
+avg IR per block) due to redundant register reads/writes that the GSE pass
+doesn't eliminate.
 
-## What was fixed this session
+## Session fixes
 
 | Fix | Impact |
 |-----|--------|
 | rdynarmic mprotect skip (cache hits + run entry) | 500x speedup for init |
 | Block linking enabled (0x3F) | ~20x for hot loops |
-| ILogger session with ServerManager wiring | Correct handle 0x201fc |
+| ILogger session with ServerManager wiring | Correct handle |
 | CNTPCT returns real clock ticks | Correct timer |
 | Step tracer post-dispatch activation | **Fixed false svcBreak** |
-| RWX code cache (no mprotect toggles) | Matches upstream |
-| Lock-free memory_read_code via fastmem | Matches upstream |
-| reads_cpsr includes A32GetCFlag | Correct GSE invalidation |
+| RWX code cache (zero mprotect) | Matches upstream |
+| Lock-free memory_read_code via cached fastmem | Matches upstream |
+| reads_cpsr includes A32GetCFlag/A32GetCpsr | Correct GSE invalidation |
 | IdentityRemoval + VerificationPass | Matches upstream passes |
 | push_ipc_interface on ResponseBuilder | Matches upstream PushIpcInterface |
+| Data processing reads only needed operands | -1 IR (MOV operand1) |
 
-## The svcBreak was a debugging artifact
+## Root cause: svcBreak was debugging artifact
 
 The step tracer activated BEFORE `set_svc_arguments` wrote R0=0 back.
-R0 retained the lm handle (0x181fd), causing nn::lm init to see an error
-and call AbortImpl. Differential binary register trace proved first 100+
-steps are **byte-identical** between upstream dynarmic and rdynarmic.
+Differential register trace proved 100+ steps **byte-identical** to upstream.
+
+## Performance bottleneck identified
+
+### IR bloat: +49% more IR instructions per block
+
+| Metric | Upstream | rdynarmic | Ratio |
+|--------|----------|-----------|-------|
+| Avg ARM insts/block | 4.4 | 3.8 | similar |
+| **Avg IR insts/block** | **11.7** | **17.4** | **+49%** |
+| Blocks compiled in 15s | 217,400 | 872 | 250x slower |
+
+### Specific example: block 0x2009c0 (4 ARM instructions)
+
+| | Upstream | rdynarmic (before) | rdynarmic (GSE rewrite) |
+|---|---|---|---|
+| IR instructions | **12** | **20** (+67%) | **12** (matched!) |
+
+### Cause: redundant Set+Get pairs between ARM instructions
+
+rdynarmic translates each ARM instruction independently:
+```
+GetRegister R0 → LSL → SetRegister R0 → GetRegister R0 → UXTAB → SetRegister R0 → ...
+```
+
+Upstream chains IR values directly:
+```
+GetRegister R0 → LSL → UXTAB (uses LSL result directly) → SetRegister R0
+```
+
+The **Get-Set Elimination (GSE) pass** should eliminate these but the current
+implementation doesn't handle:
+1. **FlagsPass** needs reverse iteration (upstream does, rdynarmic doesn't)
+2. **RegisterPass** needs simpler value propagation without tracking_type check
+3. **Dead store elimination** for intermediate SetRegister instructions
+
+### GSE rewrite status
+
+A rewrite matching upstream's two-pass approach (FlagsPass reverse + RegisterPass
+forward) was implemented and **achieved 12 IR for block 0x2009c0** (exact upstream
+parity). However, it introduced a regression (29 SVCs vs 41 in 2 minutes) indicating
+a bug in the propagation logic. **Reverted** — needs debugging with unit tests.
+
+### Next steps for GSE fix
+
+1. Write unit tests for the GSE pass using known block IR patterns
+2. Debug the flags_pass — likely tombstones an instruction still referenced
+3. Debug the register_pass — verify dead store elimination doesn't break deps
+4. Verify with block 0x2009c0 + other blocks before deploying
 
 ## Verified identical to upstream
 
-- 36MB guest memory at first SVC: **byte-identical**
-- All 41 SVC responses + TLS data: **byte-identical**
-- Register state (R0-R15 + CPSR) per-step: **identical for 100+ steps**
-- Memory layout (29 QueryMemory entries): **identical**
-- JIT x86 codegen (instruction selection, register allocator): **functionally identical**
-- WritesToCPSR opcode list: **identical**
-- Block termination logic: **identical**
-
-## Remaining: JIT execution speed
-
-The nn::lm initialization phase compiles ~872 new blocks in 15s (all unique,
-no infinite loop). Average block size: 3.8 ARM instructions, 17.4 IR instructions.
-This is normal for heavily conditional ARM code.
-
-Upstream dynarmic executes this in ~100ms. The ~150x slowdown is due to
-general overhead in the Rust JIT pipeline (compilation + code emission +
-x86 instruction scheduling), not a specific bug.
+- 36MB guest memory at first SVC: byte-identical
+- 100+ step register trace: byte-identical
+- All SVC responses + TLS: byte-identical
+- Memory layout (29 QueryMemory entries): identical
+- Block sizes: similar (4.4 vs 3.8 ARM insts)
+- x86 codegen (instruction selection, regalloc): functionally identical
 
 ## Reference traces
 
 - `traces/zuyu_full_5s_trace.log` — 50K lines, 5s upstream (14K SVCs, 30 threads)
-- `traces/ruzu_mk8d_full_trace.txt` — ruzu until lm:OpenLogger
+- `traces/ruzu_mk8d_full_trace.txt` — ruzu SVC trace
 
 ## Tools
 
