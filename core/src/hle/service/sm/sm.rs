@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn test_loop_process() {
         let sm = Arc::new(Mutex::new(ServiceManager::new()));
-        loop_process(&sm);
+        loop_process(&sm, crate::core::SystemRef::null());
         // After loop_process, "sm:" is registered on the SM (for connect_to_named_port
         // compatibility) and also as a managed named port on the ServerManager.
         assert!(sm.lock().unwrap().get_service_port("sm:").is_ok());

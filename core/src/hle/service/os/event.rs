@@ -8,17 +8,31 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
+use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::kernel::k_scheduler::KScheduler;
+
+/// Bridge from a service-layer Event to a kernel KReadableEvent.
+///
+/// Upstream `Event` holds a `KEvent*` and `Signal()` calls `m_event->Signal()`
+/// which in turn calls `KReadableEvent::Signal()`. This bridge replicates that
+/// chain: when the service Event is signaled, we also signal the kernel readable
+/// event to wake any threads blocked in WaitSynchronization.
+struct KernelEventBridge {
+    readable_event: Arc<Mutex<KReadableEvent>>,
+    process: Arc<Mutex<KProcess>>,
+    scheduler: Arc<Mutex<KScheduler>>,
+}
+
 /// Event — wraps a kernel event for service use.
 ///
 /// Upstream stores a `KEvent*` and calls `m_event->Signal()` / `m_event->Clear()`.
-/// Since HLE services don't always have a full KEvent wired, we use a
-/// Condvar-based signaling mechanism that provides the same behavioral contract:
-/// - Signal: wakes all waiters
-/// - Clear: resets the signaled state
-/// - Wait: blocks until signaled (not exposed here, done via kernel wait)
+/// The optional `kernel_bridge` allows signaling a kernel KReadableEvent,
+/// which wakes threads blocked in WaitSynchronization on the event handle.
 pub struct Event {
     signaled: Arc<Mutex<bool>>,
     cv: Arc<Condvar>,
+    kernel_bridge: Option<KernelEventBridge>,
 }
 
 impl Event {
@@ -26,15 +40,49 @@ impl Event {
         Self {
             signaled: Arc::new(Mutex::new(false)),
             cv: Arc::new(Condvar::new()),
+            kernel_bridge: None,
+        }
+    }
+
+    /// Create an Event bridged to a kernel KReadableEvent.
+    ///
+    /// When `signal()` is called, the kernel readable event is also signaled,
+    /// waking any threads blocked in WaitSynchronization on this event's handle.
+    pub fn new_with_kernel_event(
+        readable_event: Arc<Mutex<KReadableEvent>>,
+        process: Arc<Mutex<KProcess>>,
+        scheduler: Arc<Mutex<KScheduler>>,
+    ) -> Self {
+        Self {
+            signaled: Arc::new(Mutex::new(false)),
+            cv: Arc::new(Condvar::new()),
+            kernel_bridge: Some(KernelEventBridge {
+                readable_event,
+                process,
+                scheduler,
+            }),
         }
     }
 
     /// Signal the event. Wakes all waiters.
     /// Port of upstream `Event::Signal()` → `m_event->Signal()`.
     pub fn signal(&self) {
-        let mut signaled = self.signaled.lock().unwrap();
-        *signaled = true;
-        self.cv.notify_all();
+        {
+            let mut signaled = self.signaled.lock().unwrap();
+            *signaled = true;
+            self.cv.notify_all();
+        }
+        // Drop signaled lock before acquiring kernel locks to avoid deadlock.
+
+        // Bridge to kernel: signal the KReadableEvent to wake WaitSynchronization.
+        if let Some(ref bridge) = self.kernel_bridge {
+            let mut process = bridge.process.lock().unwrap();
+            bridge
+                .readable_event
+                .lock()
+                .unwrap()
+                .signal(&mut process, &bridge.scheduler);
+        }
     }
 
     /// Clear the event (reset signaled state).
@@ -58,7 +106,7 @@ impl Event {
     /// Wait for the event with a timeout. Returns true if signaled, false if timed out.
     pub fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
         let guard = self.signaled.lock().unwrap();
-        let (guard, result) = self.cv.wait_timeout_while(guard, timeout, |s| !*s).unwrap();
+        let (guard, _result) = self.cv.wait_timeout_while(guard, timeout, |s| !*s).unwrap();
         *guard
     }
 }

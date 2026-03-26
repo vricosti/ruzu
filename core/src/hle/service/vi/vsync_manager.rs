@@ -4,45 +4,43 @@
 //! Port of zuyu/src/core/hle/service/vi/vsync_manager.h
 //! Port of zuyu/src/core/hle/service/vi/vsync_manager.cpp
 
-use std::collections::BTreeSet;
+use std::sync::Arc;
 
-/// VsyncManager tracks a set of vsync event handles and signals them on vsync.
+use crate::hle::service::os::event::Event;
+
+/// VsyncManager tracks a set of vsync events and signals them on vsync.
 ///
-/// In upstream C++, the Event pointers are raw pointers to Service::Event objects.
-/// Here we use u64 handles as identifiers for the events, since the actual
-/// event signaling depends on the kernel event infrastructure.
+/// Upstream stores `std::set<Event*>` and calls `event->Signal()` on each.
+/// We store `Arc<Event>` and call `event.signal()`.
 pub struct VsyncManager {
-    /// Set of registered vsync event handles.
-    vsync_events: BTreeSet<u64>,
+    vsync_events: Vec<Arc<Event>>,
 }
 
 impl VsyncManager {
     pub fn new() -> Self {
         Self {
-            vsync_events: BTreeSet::new(),
+            vsync_events: Vec::new(),
         }
     }
 
     /// Signal all registered vsync events.
-    ///
-    /// In upstream, this calls event->Signal() on each event.
-    /// The actual signaling depends on the kernel event infrastructure.
+    /// Port of upstream `VsyncManager::SignalVsync`.
     pub fn signal_vsync(&self) {
-        for _event_handle in &self.vsync_events {
-            // In a full port, this would signal the kernel event:
-            // event.signal();
-            log::trace!("VsyncManager: signal_vsync event={}", _event_handle);
+        for event in &self.vsync_events {
+            event.signal();
         }
     }
 
-    /// Register a vsync event handle.
-    pub fn link_vsync_event(&mut self, event_handle: u64) {
-        self.vsync_events.insert(event_handle);
+    /// Register a vsync event.
+    /// Port of upstream `VsyncManager::LinkVsyncEvent`.
+    pub fn link_vsync_event(&mut self, event: Arc<Event>) {
+        self.vsync_events.push(event);
     }
 
-    /// Unregister a vsync event handle.
-    pub fn unlink_vsync_event(&mut self, event_handle: u64) {
-        self.vsync_events.remove(&event_handle);
+    /// Unregister a vsync event.
+    /// Port of upstream `VsyncManager::UnlinkVsyncEvent`.
+    pub fn unlink_vsync_event(&mut self, event: &Arc<Event>) {
+        self.vsync_events.retain(|e| !Arc::ptr_eq(e, event));
     }
 }
 
