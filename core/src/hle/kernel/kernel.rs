@@ -37,6 +37,113 @@ std::thread_local! {
     static HOST_THREAD_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
 }
 
+// Global kernel pointer for scheduler callbacks.
+// Set during kernel initialization, cleared on shutdown.
+// The callbacks (fn pointers) need access to GSC + schedulers but can't capture state.
+static KERNEL_PTR: std::sync::atomic::AtomicPtr<KernelCore> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Real scheduler callbacks that access the kernel via KERNEL_PTR.
+/// Wired to the scheduler lock during kernel initialization.
+static SCHEDULER_CALLBACKS: super::k_scheduler_lock::SchedulerCallbacks =
+    super::k_scheduler_lock::SchedulerCallbacks {
+        disable_scheduling: real_disable_scheduling,
+        enable_scheduling: real_enable_scheduling,
+        update_highest_priority_threads: real_update_highest_priority_threads,
+    };
+
+fn real_disable_scheduling() {
+    if let Some(thread) = get_current_thread_pointer() {
+        let mut t = thread.lock().unwrap();
+        debug_assert!(t.get_disable_dispatch_count() >= 0);
+        t.disable_dispatch();
+    }
+}
+
+fn real_enable_scheduling(cores_needing_scheduling: u64) {
+    if let Some(thread) = get_current_thread_pointer() {
+        let mut t = thread.lock().unwrap();
+        debug_assert!(t.get_disable_dispatch_count() >= 1);
+        if t.get_disable_dispatch_count() > 1 {
+            t.enable_dispatch();
+        } else {
+            t.enable_dispatch();
+            // Upstream: RescheduleCurrentCore if cores_needing_scheduling has our core.
+            // For now, trigger schedule on all cores that need it.
+            if cores_needing_scheduling != 0 {
+                drop(t); // release thread lock before touching schedulers
+                let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
+                if !kernel_ptr.is_null() {
+                    let kernel = unsafe { &*kernel_ptr };
+                    for core_id in 0..hardware_properties::NUM_CPU_CORES {
+                        if cores_needing_scheduling & (1u64 << core_id) != 0 {
+                            if let Some(sched) = kernel.scheduler(core_id as usize) {
+                                let s = sched.lock().unwrap();
+                                s.state.needs_scheduling.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn real_update_highest_priority_threads() -> u64 {
+    let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
+    if kernel_ptr.is_null() {
+        return 0;
+    }
+    let kernel = unsafe { &*kernel_ptr };
+
+    let gsc_arc = match kernel.global_scheduler_context() {
+        Some(gsc) => gsc.clone(),
+        None => return 0,
+    };
+    let mut gsc = gsc_arc.lock().unwrap();
+
+    if !gsc.m_scheduler_update_needed.load(Ordering::Relaxed) {
+        return 0;
+    }
+
+    // Collect mutable references to schedulers.
+    let sched_arcs: Vec<_> = (0..hardware_properties::NUM_CPU_CORES as usize)
+        .filter_map(|i| kernel.scheduler(i).cloned())
+        .collect();
+    let mut sched_guards: Vec<_> = sched_arcs.iter().map(|s| s.lock().unwrap()).collect();
+
+    // Build a contiguous Vec<KScheduler> is not feasible since they're behind Mutex.
+    // Instead, call update_highest_priority_thread on each scheduler individually.
+    gsc.m_scheduler_update_needed.store(false, Ordering::Relaxed);
+
+    let mut cores_needing_scheduling = 0u64;
+    let mut idle_cores = 0u64;
+    let mut top_threads: [Option<u64>; hardware_properties::NUM_CPU_CORES as usize] =
+        [None; hardware_properties::NUM_CPU_CORES as usize];
+
+    for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
+        let top_thread_id = gsc.m_priority_queue.get_scheduled_front(core_id as i32);
+        if top_thread_id.is_none() {
+            idle_cores |= 1u64 << core_id;
+        }
+        top_threads[core_id] = top_thread_id;
+        if core_id < sched_guards.len() {
+            cores_needing_scheduling |=
+                sched_guards[core_id].update_highest_priority_thread(top_threads[core_id]);
+        }
+    }
+
+    // TODO: Idle core migration — move suggested threads to idle cores.
+    // Full implementation is in KScheduler::update_highest_priority_threads_impl.
+    // For now, the basic per-core scheduling above is sufficient to unblock
+    // threads that are in the priority queue.
+    let _ = idle_cores;
+
+    gsc.wakeup_waiting_dummy_threads();
+
+    cores_needing_scheduling
+}
+
 // Thread-local current thread pointer.
 // Upstream: `static inline thread_local KThread* current_thread{nullptr}` in KernelCore::Impl.
 // Each physical core host thread (and any other host thread) stores its own current KThread.
@@ -219,6 +326,14 @@ impl KernelCore {
 
         // Initialize global data.
         self.object_name_global_data = Some(KObjectNameGlobalData::new());
+
+        // Wire up scheduler lock callbacks.
+        // The callbacks need kernel access but are plain fn pointers.
+        // Store a raw pointer to self in a static for the callbacks to use.
+        KERNEL_PTR.store(self as *mut KernelCore, Ordering::Release);
+        if let Some(ref gsc) = self.global_scheduler_context {
+            gsc.lock().unwrap().m_scheduler_lock.set_callbacks(&SCHEDULER_CALLBACKS);
+        }
     }
 
     /// Wire the hardware timer to CoreTiming.

@@ -1,90 +1,42 @@
 //! Port of zuyu/src/common/fiber.h and zuyu/src/common/fiber.cpp
 //! Status: COMPLET
-//! Derniere synchro: 2026-03-19
+//! Derniere synchro: 2026-03-26
 //!
-//! Fiber/coroutine implementation using platform-specific context switching.
-//! On Linux, this uses libc's ucontext API (makecontext/swapcontext).
-//! On macOS, this uses `corosensei` as a same-thread stack-switching backend,
-//! since macOS ARM64 does not provide getcontext/makecontext/swapcontext.
-//! The C++ version uses boost::context::detail::fcontext; we use ucontext as a portable
-//! alternative that is available on all Linux systems.
+//! Fiber/coroutine implementation using `corosensei` for fast context switching.
+//! The C++ version uses boost::context::detail::fcontext; corosensei uses the same
+//! approach (pure-assembly register save/restore, no sigprocmask syscall).
+//!
+//! Previous Linux implementation used libc's ucontext API which incurs a syscall
+//! per context switch (~200-1000ns). corosensei switches in ~4ns on x86-64.
 
-use parking_lot::Mutex;
-use std::sync::{Arc, Weak};
-
-#[cfg(target_os = "linux")]
-use crate::virtual_buffer::VirtualBuffer;
-#[cfg(target_os = "macos")]
 use corosensei::{stack::DefaultStack, Coroutine, CoroutineResult, Yielder};
-#[cfg(target_os = "macos")]
+use parking_lot::Mutex;
 use std::ptr::NonNull;
+use std::sync::{Arc, Weak};
 
 const DEFAULT_STACK_SIZE: usize = 512 * 1024;
 
-/// Opaque fiber context. On Linux we use ucontext_t.
-#[cfg(target_os = "linux")]
-type FiberContext = libc::ucontext_t;
-
-#[cfg(target_os = "macos")]
-type MacCoroutine = Coroutine<(), Arc<Fiber>, (), DefaultStack>;
-
-#[cfg(target_os = "macos")]
-type MacYielder = Yielder<(), Arc<Fiber>>;
+type FiberCoroutine = Coroutine<(), Arc<Fiber>, (), DefaultStack>;
+type FiberYielder = Yielder<(), Arc<Fiber>>;
 
 // ─── FiberImpl ────────────────────────────────────────────────────────────────
 
 struct FiberImpl {
-    #[cfg(target_os = "linux")]
-    stack: VirtualBuffer<u8>,
-    #[cfg(target_os = "linux")]
-    rewind_stack: VirtualBuffer<u8>,
-
     guard: Mutex<()>,
     previous_fiber: Option<Arc<Fiber>>,
     is_thread_fiber: bool,
     released: bool,
 
-    #[cfg(target_os = "linux")]
     entry_point: Option<Box<dyn FnOnce() + Send>>,
-    #[cfg(target_os = "macos")]
-    entry_point: Option<Box<dyn FnOnce() + Send>>,
-    #[cfg(target_os = "linux")]
-    rewind_point: Option<Box<dyn FnOnce() + Send>>,
-    #[cfg(target_os = "macos")]
     rewind_point: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(target_os = "linux")]
-    context: FiberContext,
-    #[cfg(target_os = "linux")]
-    rewind_context: Option<FiberContext>,
-    #[cfg(target_os = "macos")]
-    context: Option<MacCoroutine>,
-    #[cfg(target_os = "macos")]
-    rewind_context: Option<MacCoroutine>,
-    #[cfg(target_os = "macos")]
-    current_yielder: Option<NonNull<MacYielder>>,
-    #[cfg(target_os = "macos")]
+    context: Option<FiberCoroutine>,
+    rewind_context: Option<FiberCoroutine>,
+    current_yielder: Option<NonNull<FiberYielder>>,
     self_ref: Weak<Fiber>,
 }
 
 impl FiberImpl {
-    #[cfg(target_os = "linux")]
     fn new_empty() -> Self {
-        Self {
-            stack: VirtualBuffer::with_count(DEFAULT_STACK_SIZE),
-            rewind_stack: VirtualBuffer::with_count(DEFAULT_STACK_SIZE),
-            guard: Mutex::new(()),
-            entry_point: None,
-            rewind_point: None,
-            previous_fiber: None,
-            is_thread_fiber: false,
-            released: false,
-            context: unsafe { std::mem::zeroed() },
-            rewind_context: None,
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn new_empty_macos() -> Self {
         Self {
             guard: Mutex::new(()),
             entry_point: None,
@@ -119,27 +71,17 @@ pub struct Fiber {
 unsafe impl Send for Fiber {}
 unsafe impl Sync for Fiber {}
 
-// ─── Linux helpers ────────────────────────────────────────────────────────────
-
-/// Helper to reconstruct a Fiber pointer from two i32 halves passed via makecontext.
-#[cfg(target_os = "linux")]
-unsafe fn fiber_from_halves(low: i32, high: i32) -> &'static Fiber {
-    let ptr = ((high as u64) << 32) | (low as u64 & 0xFFFFFFFF);
-    &*(ptr as *const Fiber)
-}
+// ─── Coroutine entry points ──────────────────────────────────────────────────
 
 /// Corresponds to upstream Fiber::FiberStartFunc + Fiber::Start
-#[cfg(target_os = "linux")]
-extern "C" fn fiber_start_func(fiber_ptr: i32, fiber_ptr_high: i32) {
-    let fiber = unsafe { fiber_from_halves(fiber_ptr, fiber_ptr_high) };
+fn coroutine_start(fiber: &Fiber, yielder: &FiberYielder) {
     let imp = unsafe { &mut *fiber.imp.get() };
+    imp.current_yielder = Some(NonNull::from(yielder));
 
     // Upstream Start(): unlock previous fiber's guard and reset
     assert!(imp.previous_fiber.is_some());
     if let Some(prev) = imp.previous_fiber.take() {
         let prev_imp = unsafe { &mut *prev.imp.get() };
-        // Safety: the previous fiber locked its guard before the context switch;
-        // we unlock it here from a different context, matching upstream behavior.
         unsafe { prev_imp.guard.force_unlock() };
     }
 
@@ -152,44 +94,7 @@ extern "C" fn fiber_start_func(fiber_ptr: i32, fiber_ptr_high: i32) {
 }
 
 /// Corresponds to upstream Fiber::RewindStartFunc + Fiber::OnRewind
-#[cfg(target_os = "linux")]
-extern "C" fn rewind_start_func(fiber_ptr: i32, fiber_ptr_high: i32) {
-    let fiber = unsafe { fiber_from_halves(fiber_ptr, fiber_ptr_high) };
-    let imp = unsafe { &mut *fiber.imp.get() };
-
-    // OnRewind: swap context <- rewind_context, clear rewind_context, swap stacks
-    assert!(imp.rewind_context.is_some());
-    imp.context = imp.rewind_context.take().unwrap();
-    std::mem::swap(&mut imp.stack, &mut imp.rewind_stack);
-
-    // Execute the rewind function
-    if let Some(rewind) = imp.rewind_point.take() {
-        rewind();
-    }
-
-    unreachable!("Fiber rewind point returned!");
-}
-
-#[cfg(target_os = "macos")]
-fn corosensei_start(fiber: &Fiber, yielder: &MacYielder) {
-    let imp = unsafe { &mut *fiber.imp.get() };
-    imp.current_yielder = Some(NonNull::from(yielder));
-
-    assert!(imp.previous_fiber.is_some());
-    if let Some(prev) = imp.previous_fiber.take() {
-        let prev_imp = unsafe { &mut *prev.imp.get() };
-        unsafe { prev_imp.guard.force_unlock() };
-    }
-
-    if let Some(entry) = imp.entry_point.take() {
-        entry();
-    }
-
-    unreachable!("Fiber entry point returned!");
-}
-
-#[cfg(target_os = "macos")]
-fn corosensei_on_rewind(fiber: &Fiber, yielder: &MacYielder) {
+fn coroutine_on_rewind(fiber: &Fiber, yielder: &FiberYielder) {
     let imp = unsafe { &mut *fiber.imp.get() };
     imp.current_yielder = Some(NonNull::from(yielder));
 
@@ -200,23 +105,25 @@ fn corosensei_on_rewind(fiber: &Fiber, yielder: &MacYielder) {
     unreachable!("Fiber rewind point returned!");
 }
 
-#[cfg(target_os = "macos")]
-fn build_context(fiber: *const Fiber, rewind: bool) -> MacCoroutine {
+/// Build a corosensei coroutine for a fiber.
+fn build_context(fiber: *const Fiber, rewind: bool) -> FiberCoroutine {
     Coroutine::with_stack(
         DefaultStack::new(DEFAULT_STACK_SIZE).expect("failed to allocate fiber stack"),
         move |yielder, ()| {
             let fiber = unsafe { &*fiber };
             if rewind {
-                corosensei_on_rewind(fiber, yielder);
+                coroutine_on_rewind(fiber, yielder);
             } else {
-                corosensei_start(fiber, yielder);
+                coroutine_start(fiber, yielder);
             }
         },
     )
 }
 
-#[cfg(target_os = "macos")]
-fn mac_dispatch_from_thread(mut target: Arc<Fiber>) {
+/// Dispatch loop for thread fibers. The thread fiber acts as a trampoline:
+/// it resumes the target coroutine, which may suspend back with a new target.
+/// The loop continues until the target is a thread fiber (return to thread).
+fn dispatch_from_thread(mut target: Arc<Fiber>) {
     loop {
         let next = {
             let target_imp = unsafe { &mut *target.imp.get() };
@@ -240,128 +147,68 @@ fn mac_dispatch_from_thread(mut target: Arc<Fiber>) {
     }
 }
 
-// ─── Fiber impl ───────────────────────────────────────────────────────────────
+// ─── Fiber impl ──────────────────────────────────────────────────────────────
 
 impl Fiber {
     /// Create a new fiber with the given entry point function.
+    /// Matches upstream `Fiber::Fiber(std::function<void()>&& entry_point_func)`.
     pub fn new(entry_point_func: Box<dyn FnOnce() + Send>) -> Arc<Self> {
-        // ── Linux ──────────────────────────────────────────────────────────────
-        #[cfg(target_os = "linux")]
-        {
-            let mut imp = FiberImpl::new_empty();
-            imp.entry_point = Some(entry_point_func);
+        let mut imp = FiberImpl::new_empty();
+        imp.entry_point = Some(entry_point_func);
+        let fiber = Arc::new(Self {
+            imp: std::cell::UnsafeCell::new(imp),
+        });
 
-            let fiber = Arc::new(Self {
-                imp: std::cell::UnsafeCell::new(imp),
-            });
-
-            let fiber_imp = unsafe { &mut *fiber.imp.get() };
-            unsafe {
-                libc::getcontext(&mut fiber_imp.context);
-                fiber_imp.context.uc_stack.ss_sp =
-                    fiber_imp.stack.data_mut() as *mut libc::c_void;
-                fiber_imp.context.uc_stack.ss_size = DEFAULT_STACK_SIZE;
-                fiber_imp.context.uc_link = std::ptr::null_mut();
-
-                let ptr = &*fiber as *const Fiber as u64;
-                let low = ptr as i32;
-                let high = (ptr >> 32) as i32;
-
-                libc::makecontext(
-                    &mut fiber_imp.context,
-                    std::mem::transmute::<extern "C" fn(i32, i32), extern "C" fn()>(
-                        fiber_start_func,
-                    ),
-                    2,
-                    low,
-                    high,
-                );
-            }
-
-            fiber
-        }
-
-        // ── macOS ──────────────────────────────────────────────────────────────
-        #[cfg(target_os = "macos")]
-        {
-            let mut imp = FiberImpl::new_empty_macos();
-            imp.entry_point = Some(entry_point_func);
-            let fiber = Arc::new(Self {
-                imp: std::cell::UnsafeCell::new(imp),
-            });
-
-            let fiber_imp = unsafe { &mut *fiber.imp.get() };
-            fiber_imp.self_ref = Arc::downgrade(&fiber);
-            fiber_imp.context = Some(build_context(&*fiber as *const Fiber, false));
-            fiber
-        }
+        let fiber_imp = unsafe { &mut *fiber.imp.get() };
+        fiber_imp.self_ref = Arc::downgrade(&fiber);
+        fiber_imp.context = Some(build_context(&*fiber as *const Fiber, false));
+        fiber
     }
 
     /// Convert the current thread to a fiber (creates a fiber that represents the current thread).
+    /// Matches upstream `Fiber::ThreadToFiber()`.
     pub fn thread_to_fiber() -> Arc<Self> {
-        // ── Linux ──────────────────────────────────────────────────────────────
-        #[cfg(target_os = "linux")]
-        {
-            let mut imp = FiberImpl::new_empty();
-            imp.is_thread_fiber = true;
+        let imp = FiberImpl {
+            is_thread_fiber: true,
+            ..FiberImpl::new_empty()
+        };
 
-            let fiber = Arc::new(Self {
-                imp: std::cell::UnsafeCell::new(imp),
-            });
+        let fiber = Arc::new(Self {
+            imp: std::cell::UnsafeCell::new(imp),
+        });
 
-            let fiber_imp = unsafe { &mut *fiber.imp.get() };
-            let guard = fiber_imp.guard.lock();
-            std::mem::forget(guard);
+        // Lock the guard to indicate this fiber is "running" (matching upstream behavior)
+        let fiber_imp = unsafe { &mut *fiber.imp.get() };
+        fiber_imp.self_ref = Arc::downgrade(&fiber);
+        let guard = fiber_imp.guard.lock();
+        std::mem::forget(guard);
 
-            unsafe {
-                libc::getcontext(&mut fiber_imp.context);
-            }
-
-            fiber
-        }
-
-        // ── macOS ──────────────────────────────────────────────────────────────
-        #[cfg(target_os = "macos")]
-        {
-            let imp = FiberImpl {
-                is_thread_fiber: true,
-                ..FiberImpl::new_empty_macos()
-            };
-
-            let fiber = Arc::new(Self {
-                imp: std::cell::UnsafeCell::new(imp),
-            });
-
-            // Lock the guard to indicate this fiber is "running" (matching Linux behavior)
-            let fiber_imp = unsafe { &mut *fiber.imp.get() };
-            fiber_imp.self_ref = Arc::downgrade(&fiber);
-            let guard = fiber_imp.guard.lock();
-            std::mem::forget(guard);
-
-            fiber
-        }
+        fiber
     }
 
     /// Yields control from Fiber 'from' to Fiber 'to'.
     /// Fiber 'from' must be the currently running fiber.
+    /// Matches upstream `Fiber::YieldTo(weak_ptr<Fiber>, Fiber&)`.
     pub fn yield_to(weak_from: Weak<Fiber>, to: &Arc<Fiber>) {
         let to_imp = unsafe { &mut *to.imp.get() };
 
-        // ── Linux ──────────────────────────────────────────────────────────────
-        #[cfg(target_os = "linux")]
-        {
-            // Lock the target fiber
-            let guard = to_imp.guard.lock();
-            std::mem::forget(guard);
+        // Lock the target fiber
+        let guard = to_imp.guard.lock();
+        std::mem::forget(guard);
+        to_imp.previous_fiber = weak_from.upgrade();
 
-            // Set previous fiber
-            to_imp.previous_fiber = weak_from.upgrade();
+        if let Some(from_fiber) = weak_from.upgrade() {
+            let from_imp = unsafe { &mut *from_fiber.imp.get() };
 
-            if let Some(from_fiber) = weak_from.upgrade() {
-                let from_imp = unsafe { &mut *from_fiber.imp.get() };
-                unsafe {
-                    libc::swapcontext(&mut from_imp.context, &to_imp.context);
-                }
+            if from_imp.is_thread_fiber {
+                // Thread fiber: act as dispatcher trampoline
+                dispatch_from_thread(Arc::clone(to));
+            } else {
+                // Non-thread fiber: suspend back to dispatcher with the target
+                let yielder = from_imp
+                    .current_yielder
+                    .expect("Running fiber missing yielder");
+                unsafe { yielder.as_ref() }.suspend(Arc::clone(to));
 
                 // After returning here (another fiber yielded back to us),
                 // release previous fiber — matches upstream YieldTo post-jump logic
@@ -372,111 +219,46 @@ impl Fiber {
                 }
             }
         }
-
-        // ── macOS ──────────────────────────────────────────────────────────────
-        #[cfg(target_os = "macos")]
-        {
-            let guard = to_imp.guard.lock();
-            std::mem::forget(guard);
-            to_imp.previous_fiber = weak_from.upgrade();
-
-            if let Some(from_fiber) = weak_from.upgrade() {
-                let from_imp = unsafe { &mut *from_fiber.imp.get() };
-
-                if from_imp.is_thread_fiber {
-                    mac_dispatch_from_thread(Arc::clone(to));
-                } else {
-                    let yielder = from_imp
-                        .current_yielder
-                        .expect("Running macOS fiber missing yielder");
-                    unsafe { yielder.as_ref() }.suspend(Arc::clone(to));
-
-                    let from_imp2 = unsafe { &mut *from_fiber.imp.get() };
-                    if let Some(prev) = from_imp2.previous_fiber.take() {
-                        let prev_imp = unsafe { &mut *prev.imp.get() };
-                        unsafe { prev_imp.guard.force_unlock() };
-                    }
-                }
-            }
-        }
     }
 
     /// Set a rewind function for this fiber.
+    /// Matches upstream `Fiber::SetRewindPoint`.
     pub fn set_rewind_point(&self, rewind_func: Box<dyn FnOnce() + Send>) {
         let imp = unsafe { &mut *self.imp.get() };
-        #[cfg(target_os = "macos")]
-        {
-            let rewind_slot = std::sync::Mutex::new(Some(rewind_func));
-            imp.rewind_point = Some(Arc::new(move || {
-                let rewind = rewind_slot
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("Rewind point called more than once");
-                rewind();
-            }));
-        }
-        #[cfg(target_os = "linux")]
-        {
-            imp.rewind_point = Some(rewind_func);
-        }
+        let rewind_slot = std::sync::Mutex::new(Some(rewind_func));
+        imp.rewind_point = Some(Arc::new(move || {
+            let rewind = rewind_slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("Rewind point called more than once");
+            rewind();
+        }));
     }
 
-    /// Rewind this fiber — sets up rewind context and jumps to rewind_start_func,
-    /// which calls OnRewind logic (swap contexts/stacks, run rewind_point).
+    /// Rewind this fiber — sets up rewind context and jumps to rewind entry,
+    /// which calls OnRewind logic (run rewind_point).
+    /// Matches upstream `Fiber::Rewind`.
     pub fn rewind(&self) {
         let imp = unsafe { &mut *self.imp.get() };
         assert!(imp.rewind_point.is_some(), "No rewind point set");
+        assert!(imp.rewind_context.is_none(), "Already has rewind context");
 
-        // ── Linux ──────────────────────────────────────────────────────────────
-        #[cfg(target_os = "linux")]
-        unsafe {
-            assert!(imp.rewind_context.is_none(), "Already has rewind context");
+        imp.rewind_context = Some(build_context(self as *const Fiber, true));
+        let target = imp
+            .self_ref
+            .upgrade()
+            .expect("Fiber lost self-reference during rewind");
 
-            let mut rewind_ctx: FiberContext = std::mem::zeroed();
-            libc::getcontext(&mut rewind_ctx);
-            rewind_ctx.uc_stack.ss_sp = imp.rewind_stack.data_mut() as *mut libc::c_void;
-            rewind_ctx.uc_stack.ss_size = DEFAULT_STACK_SIZE;
-            rewind_ctx.uc_link = std::ptr::null_mut();
-
-            let ptr = self as *const Fiber as u64;
-            let low = ptr as i32;
-            let high = (ptr >> 32) as i32;
-
-            libc::makecontext(
-                &mut rewind_ctx,
-                std::mem::transmute::<extern "C" fn(i32, i32), extern "C" fn()>(
-                    rewind_start_func,
-                ),
-                2,
-                low,
-                high,
-            );
-
-            imp.rewind_context = Some(rewind_ctx);
-            let rewind_ctx_ptr = imp.rewind_context.as_mut().unwrap() as *mut FiberContext;
-            libc::swapcontext(&mut imp.context, rewind_ctx_ptr);
-        }
-
-        // ── macOS ──────────────────────────────────────────────────────────────
-        #[cfg(target_os = "macos")]
-        {
-            assert!(imp.rewind_context.is_none(), "Already has rewind context");
-            imp.rewind_context = Some(build_context(self as *const Fiber, true));
-            let target = imp
-                .self_ref
-                .upgrade()
-                .expect("Fiber lost self-reference during rewind");
-
-            let yielder = imp
-                .current_yielder
-                .expect("Running macOS fiber missing yielder during rewind");
-            unsafe { yielder.as_ref() }.suspend(target);
-            unreachable!("Rewind should not return on macOS");
-        }
+        let yielder = imp
+            .current_yielder
+            .expect("Running fiber missing yielder during rewind");
+        unsafe { yielder.as_ref() }.suspend(target);
+        unreachable!("Rewind should not return");
     }
 
     /// Only call from main thread's fiber.
+    /// Matches upstream `Fiber::Exit`.
     pub fn exit(&self) {
         let imp = unsafe { &mut *self.imp.get() };
         assert!(imp.is_thread_fiber, "Exiting non main thread fiber");
@@ -487,10 +269,7 @@ impl Fiber {
         unsafe {
             imp.guard.force_unlock();
         }
-        #[cfg(target_os = "macos")]
-        {
-            imp.current_yielder = None;
-        }
+        imp.current_yielder = None;
         imp.released = true;
     }
 }
