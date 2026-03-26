@@ -15,6 +15,7 @@ use crate::hle::service::hle_ipc::SessionRequestHandler;
 use crate::hle::service::nvnflinger::hos_binder_driver::IHosBinderDriver;
 use crate::hle::service::nvnflinger::hos_binder_driver_server::HosBinderDriverServer;
 use crate::hle::service::nvnflinger::surface_flinger::SurfaceFlinger;
+use crate::hle::service::os::event::Event;
 use crate::hle::service::sm::sm::ServiceManager;
 
 use super::conductor::Conductor;
@@ -39,12 +40,16 @@ pub struct Container {
     server: Arc<HosBinderDriverServer>,
     /// Surface compositor shared with the global `dispdrv` binder driver.
     surface_flinger: Arc<SurfaceFlinger>,
+    /// Conductor drives vsync timing. Arc<Mutex<>> because the CoreTiming
+    /// callback needs a weak reference to it.
+    conductor: Arc<Mutex<Conductor>>,
+    /// System reference for accessing process/scheduler from service handlers.
+    system: crate::core::SystemRef,
 }
 
 struct ContainerInner {
     displays: DisplayList,
     layers: LayerList,
-    conductor: Option<Conductor>,
     is_shut_down: bool,
 }
 
@@ -91,18 +96,20 @@ impl Container {
             surface_flinger.add_display(id);
         }
 
-        let conductor = Conductor::new(&display_ids);
+        let conductor = Arc::new(Mutex::new(Conductor::new(system, &display_ids)));
+        Conductor::start(&conductor);
 
         Self {
             inner: Mutex::new(ContainerInner {
                 displays,
                 layers: LayerList::default(),
-                conductor: Some(conductor),
                 is_shut_down: false,
             }),
             binder_driver,
             server,
             surface_flinger,
+            conductor,
+            system,
         }
     }
 
@@ -117,6 +124,11 @@ impl Container {
     /// Upstream: Container owns IHOSBinderDriver and returns it via GetBinderDriver().
     pub fn get_binder_driver(&self) -> Arc<dyn SessionRequestHandler> {
         Arc::clone(&self.binder_driver)
+    }
+
+    /// Get the system reference.
+    pub fn system(&self) -> crate::core::SystemRef {
+        self.system
     }
 
     pub fn on_terminate(&self) {
@@ -203,18 +215,22 @@ impl Container {
         Ok(())
     }
 
-    pub fn link_vsync_event(&self, display_id: u64, event_handle: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ref mut conductor) = inner.conductor {
-            conductor.link_vsync_event(display_id, event_handle);
-        }
+    /// Link a vsync event for a display.
+    /// Port of upstream `Container::LinkVsyncEvent`.
+    pub fn link_vsync_event(&self, display_id: u64, event: Arc<Event>) {
+        self.conductor
+            .lock()
+            .unwrap()
+            .link_vsync_event(display_id, event);
     }
 
-    pub fn unlink_vsync_event(&self, display_id: u64, event_handle: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ref mut conductor) = inner.conductor {
-            conductor.unlink_vsync_event(display_id, event_handle);
-        }
+    /// Unlink a vsync event for a display.
+    /// Port of upstream `Container::UnlinkVsyncEvent`.
+    pub fn unlink_vsync_event(&self, display_id: u64, event: &Arc<Event>) {
+        self.conductor
+            .lock()
+            .unwrap()
+            .unlink_vsync_event(display_id, event);
     }
 
     fn create_layer_locked(

@@ -2497,7 +2497,7 @@ mod tests {
             process
                 .lock()
                 .unwrap()
-                .run(0, 0x100000, 1, 1, false)
+                .run(0, 0x100000, 1, 1, false, None)
                 .expect("process runtime bootstrap should succeed");
 
         assert_ne!(main_thread_handle, 0);
