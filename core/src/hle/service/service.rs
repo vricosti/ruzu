@@ -162,6 +162,7 @@ pub trait ServiceFramework: SessionRequestHandler {
             }
             ipc::CommandType::ControlWithContext | ipc::CommandType::Control => {
                 // Matches upstream: system.ServiceManager().InvokeControlRequest(ctx)
+                log::debug!("Control cmd={} on service '{}'", ctx.get_command(), self.get_service_name());
                 if let Some(sm) = ctx.get_service_manager().cloned().or_else(|| self.service_manager()) {
                     let controller = sm.lock().unwrap().controller_interface();
                     controller.invoke_request(ctx);
