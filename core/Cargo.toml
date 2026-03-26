@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 debug-logs = []
+step_tracer = []
 
 [dependencies]
 common = { path = "../common" }

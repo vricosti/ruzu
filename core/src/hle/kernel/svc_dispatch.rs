@@ -982,6 +982,21 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 }
             }
 
+            // Dump nearby memory strings for symbol resolution debugging
+            if let Some(memory) = system.get_svc_memory() {
+                let m = memory.lock().unwrap();
+                // Try reading strings at known addresses from the step trace
+                for addr in [0x20bc7fau64, 0x20bc827, 0x2244ec7] {
+                    let mut buf = vec![0u8; 128];
+                    for i in 0..128u64 { buf[i as usize] = m.read_8(addr + i); }
+                    if let Some(end) = buf.iter().position(|&b| b == 0) { buf.truncate(end); }
+                    if let Ok(s) = String::from_utf8(buf.clone()) {
+                        if !s.is_empty() && s.len() < 120 {
+                            eprintln!("  [{addr:#x}] = \"{s}\"");
+                        }
+                    }
+                }
+            }
             eprintln!("!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) — GAME ABORTED !!!", reason, info1, info2);
             svc_exception::break_execution(system, reason, info1, info2);
             std::process::exit(1);
