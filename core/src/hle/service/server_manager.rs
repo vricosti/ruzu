@@ -7,21 +7,26 @@
 //! - ServerManager: manages server ports and sessions for HLE services
 //! - Session: wrapper pairing a KServerSession with a SessionRequestManager
 //!
-//! Upstream uses MultiWait/MultiWaitHolder for the event loop. We use
-//! Event-based signaling with a polling loop matching the same behavioral
-//! contract.
+//! Upstream uses MultiWait/MultiWaitHolder for the event loop.
+//! We use Event-based signaling with a polling loop matching the same
+//! behavioral contract.
+//!
+//! IPC dispatch in ruzu currently flows through svc_ipc::send_sync_request()
+//! → hle_ipc::complete_sync_request() synchronously. The ServerManager event
+//! loop handles session lifecycle, port management, and deferred requests.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
+use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::k_server_session::KServerSession;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
-    SessionRequestHandlerFactory, SessionRequestHandlerPtr, SessionRequestManager,
+    self, HLERequestContext, SessionRequestHandlerFactory, SessionRequestHandlerPtr,
+    SessionRequestManager,
 };
-use crate::core::SystemRef;
-use crate::hle::kernel::k_port::KPort;
 use crate::hle::service::os::event::Event;
 use crate::hle::service::os::multi_wait::MultiWait;
 use crate::hle::service::os::multi_wait_holder::MultiWaitHolder;
@@ -39,9 +44,13 @@ enum UserDataTag {
 /// Session wrapper pairing a KServerSession with its SessionRequestManager.
 ///
 /// Matches upstream `Service::Session` (server_manager.cpp).
+/// Upstream also stores an HLERequestContext for in-flight requests.
 struct Session {
     server_session: Arc<Mutex<KServerSession>>,
     manager: Arc<Mutex<SessionRequestManager>>,
+    /// Stored context for in-flight requests.
+    /// Upstream: `HLERequestContext context` stored per-session.
+    context: Option<HLERequestContext>,
 }
 
 /// Manages server ports and sessions for HLE services.
@@ -51,8 +60,10 @@ struct Session {
 /// We implement the same pattern with our MultiWait/MultiWaitHolder.
 pub struct ServerManager {
     /// Reference to the System, matching upstream `Core::System& m_system`.
-    /// All subsystem access (ServiceManager, Kernel, etc.) goes through this.
     system: SystemRef,
+
+    /// Service name for thread identification.
+    name: String,
 
     /// Locally managed named ports (not registered with SM).
     managed_ports: HashMap<String, SessionRequestHandlerFactory>,
@@ -78,7 +89,7 @@ pub struct ServerManager {
 
     /// Deferred sessions awaiting retry.
     /// Upstream: `std::list<Session*> m_deferred_sessions`.
-    deferred_sessions: Vec<usize>, // indices into sessions
+    deferred_sessions: Vec<usize>,
 
     /// Wakeup holder in the multi-wait.
     /// Upstream: `std::optional<MultiWaitHolder> m_wakeup_holder`.
@@ -88,8 +99,7 @@ pub struct ServerManager {
     /// Upstream: `std::optional<MultiWaitHolder> m_deferral_holder`.
     deferral_holder: Option<Box<MultiWaitHolder>>,
 
-    /// Stop flag.
-    /// Upstream: `std::stop_source m_stop_source`.
+    /// Stop flag. Upstream: `std::stop_source m_stop_source`.
     stop_requested: AtomicBool,
 
     /// Whether the server has been stopped.
@@ -99,17 +109,15 @@ pub struct ServerManager {
 impl ServerManager {
     /// Creates a new ServerManager.
     /// Port of upstream `ServerManager::ServerManager(Core::System& system)`.
-    /// Creates a new ServerManager.
-    /// Matches upstream `ServerManager::ServerManager(Core::System& system)`.
     pub fn new(system: SystemRef) -> Self {
         let wakeup_event = Arc::new(Event::new());
 
-        // Create the wakeup holder for the event loop.
         let mut wakeup_holder = Box::new(MultiWaitHolder::from_event(wakeup_event.clone()));
         wakeup_holder.set_user_data(usize::MAX); // sentinel, not a real tag
 
         Self {
             system,
+            name: String::new(),
             managed_ports: HashMap::new(),
             sessions: Vec::new(),
             wakeup_event,
@@ -125,7 +133,6 @@ impl ServerManager {
     }
 
     /// Get the service manager from System.
-    /// Upstream: `m_system.ServiceManager()`.
     fn service_manager(&self) -> Option<Arc<Mutex<ServiceManager>>> {
         if self.system.is_null() {
             return None;
@@ -140,10 +147,14 @@ impl ServerManager {
         server_session: Arc<Mutex<KServerSession>>,
         manager: Arc<Mutex<SessionRequestManager>>,
     ) -> ResultCode {
+        log::debug!("ServerManager({}): register_session", self.name);
         self.sessions.push(Session {
             server_session,
             manager,
+            context: None,
         });
+        // Signal wakeup so the event loop picks up the new session.
+        self.wakeup_event.signal();
         RESULT_SUCCESS
     }
 
@@ -155,9 +166,13 @@ impl ServerManager {
         handler_factory: SessionRequestHandlerFactory,
         max_sessions: u32,
     ) -> ResultCode {
+        if self.name.is_empty() {
+            self.name = service_name.to_string();
+        }
+
         let sm = match self.service_manager() {
             Some(sm) => sm,
-            None => return RESULT_SUCCESS, // No service manager available
+            None => return RESULT_SUCCESS,
         };
         let result = sm.lock().unwrap().register_service(
             service_name.to_string(),
@@ -167,7 +182,8 @@ impl ServerManager {
 
         if result.is_error() {
             log::warn!(
-                "ServerManager: failed to register '{}' with SM: {:#x}",
+                "ServerManager({}): failed to register '{}': {:#x}",
+                self.name,
                 service_name,
                 result.get_inner_value()
             );
@@ -190,22 +206,15 @@ impl ServerManager {
 
     /// Manages a named port (standalone, not registered with SM).
     /// Port of upstream `ServerManager::ManageNamedPort`.
-    ///
-    /// Upstream: creates a KPort, initializes it, registers it with the kernel,
-    /// calls KObjectName::NewFromName to register the client port by name,
-    /// then starts tracking the server port in the event loop.
     pub fn manage_named_port(
         &mut self,
         port_name: &str,
         handler_factory: SessionRequestHandlerFactory,
         max_sessions: u32,
     ) -> ResultCode {
-        // Create and initialize a KPort (matching upstream).
         let mut port = KPort::new();
         port.initialize(max_sessions as i32, false, 0);
 
-        // Register the object name with the kernel (matching upstream
-        // KObjectName::NewFromName(kernel, &port->GetClientPort(), name)).
         if !self.system.is_null() {
             if let Some(kernel) = self.system.get().kernel() {
                 if let Some(gd) = kernel.object_name_global_data() {
@@ -214,7 +223,6 @@ impl ServerManager {
             }
         }
 
-        // Store the handler factory for the event loop.
         self.managed_ports
             .insert(port_name.to_string(), handler_factory);
 
@@ -223,18 +231,13 @@ impl ServerManager {
 
     /// Manages deferral events.
     /// Port of upstream `ServerManager::ManageDeferral(KEvent**)`.
-    /// Creates a deferral event, registers a MultiWaitHolder for it,
-    /// and links it to the deferred list.
     pub fn manage_deferral(&mut self) -> (ResultCode, Option<Arc<Event>>) {
-        // Create the deferral event.
         let event = Arc::new(Event::new());
         self.deferral_event = Some(event.clone());
 
-        // Create a MultiWaitHolder for the deferral event.
         let mut holder = Box::new(MultiWaitHolder::from_event(event.clone()));
         holder.set_user_data(UserDataTag::DeferEvent as usize);
 
-        // Link to the deferred list (will be picked up by next LinkDeferred call).
         self.link_to_deferred_list_holder(&mut holder);
         self.deferral_holder = Some(holder);
 
@@ -245,35 +248,45 @@ impl ServerManager {
     /// Port of upstream `ServerManager::LinkToDeferredList`.
     fn link_to_deferred_list_holder(&self, holder: &mut MultiWaitHolder) {
         holder.link_to_multi_wait();
-        // Signal the wakeup event so the event loop picks up the new item.
         self.wakeup_event.signal();
     }
 
     /// Move all items from the deferred list to the main multi-wait.
     /// Port of upstream `ServerManager::LinkDeferred`.
     fn link_deferred(&mut self) {
-        // In upstream, this moves holders between two MultiWait lists.
-        // Our simplified model doesn't need this since we check all holders.
+        // In upstream, this atomically moves holders from m_deferred_list to
+        // m_multi_wait under the deferred_list_mutex. Our polling model checks
+        // all sessions directly, so this is a no-op. The structural slot is
+        // preserved for future kernel-level wait integration.
     }
 
     /// Main loop for processing server events.
     /// Port of upstream `ServerManager::LoopProcess`.
     pub fn loop_process(&mut self) -> ResultCode {
+        log::info!("ServerManager({}): entering event loop", self.name);
         while !self.stop_requested.load(Ordering::Relaxed) {
             self.wait_and_process_impl();
         }
         self.stopped.store(true, Ordering::Release);
+        log::info!("ServerManager({}): event loop exited", self.name);
         RESULT_SUCCESS
     }
 
     /// Wait for a signaled event and process it.
     /// Port of upstream `ServerManager::WaitAndProcessImpl`.
     fn wait_and_process_impl(&mut self) -> bool {
+        // Link any deferred items into the main wait list.
+        self.link_deferred();
+
+        // Check if stop was requested.
+        if self.stop_requested.load(Ordering::Relaxed) {
+            return false;
+        }
+
         // Check if any session has a pending request.
-        for (i, session) in self.sessions.iter().enumerate() {
-            let ss = session.server_session.lock().unwrap();
-            if ss.is_signaled() {
-                drop(ss);
+        for i in 0..self.sessions.len() {
+            let is_signaled = self.sessions[i].server_session.lock().unwrap().is_signaled();
+            if is_signaled {
                 self.on_session_event(i);
                 return true;
             }
@@ -291,10 +304,11 @@ impl ServerManager {
         // Check wakeup event.
         if self.wakeup_event.is_signaled() {
             self.wakeup_event.clear();
-            return true; // Just loop again to pick up new items.
+            return true;
         }
 
         // No events signaled — brief sleep to avoid busy-wait.
+        // Upstream blocks on svcWaitSynchronization; we poll.
         std::thread::sleep(std::time::Duration::from_micros(100));
         false
     }
@@ -303,27 +317,32 @@ impl ServerManager {
     /// Port of upstream `ServerManager::OnSessionEvent`.
     fn on_session_event(&mut self, session_index: usize) {
         let session = &self.sessions[session_index];
-        let mut ss = session.server_session.lock().unwrap();
+        let result = session.server_session.lock().unwrap().receive_request();
 
-        // Receive the request.
-        let result = ss.receive_request();
         if result != 0 {
-            // Session closed — remove it.
-            drop(ss);
+            // Session closed or no pending requests — remove it.
+            log::debug!(
+                "ServerManager({}): session {} closed (result={}), removing",
+                self.name,
+                session_index,
+                result
+            );
             self.sessions.remove(session_index);
             return;
         }
-        drop(ss);
 
-        // Complete the sync request (with deferral handling).
         self.complete_sync_request(session_index);
     }
 
     /// Handle a deferral event — retry deferred sessions.
     /// Port of upstream `ServerManager::OnDeferralEvent`.
     fn on_deferral_event(&mut self) {
-        // Retry all deferred sessions.
         let deferred = std::mem::take(&mut self.deferred_sessions);
+        log::debug!(
+            "ServerManager({}): retrying {} deferred sessions",
+            self.name,
+            deferred.len()
+        );
         for session_index in deferred {
             if session_index < self.sessions.len() {
                 self.complete_sync_request(session_index);
@@ -333,21 +352,106 @@ impl ServerManager {
 
     /// Complete a sync request, handling deferral.
     /// Port of upstream `ServerManager::CompleteSyncRequest`.
+    ///
+    /// Upstream flow:
+    /// 1. `session->GetContext()->SetIsDeferred(false)`
+    /// 2. `session->GetManager()->CompleteSyncRequest(server_session, context)`
+    /// 3. If deferred: add to deferred_sessions, return
+    /// 4. Else: `server_session->SendReplyHLE()`, re-link session
+    ///
+    /// In ruzu, IPC dispatch happens synchronously in svc_ipc::send_sync_request()
+    /// which calls hle_ipc::complete_sync_request() directly. This path handles
+    /// sessions that flow through the ServerManager's event loop (e.g., from
+    /// port accept or deferred retry).
     fn complete_sync_request(&mut self, session_index: usize) {
-        // In upstream, this calls session->GetManager()->CompleteSyncRequest().
-        // If the request was deferred, it's added to the deferred list.
-        // For now, we don't have the full CompleteSyncRequest pipeline, so
-        // we just mark as processed.
-        let _ = session_index;
+        if session_index >= self.sessions.len() {
+            return;
+        }
+
+        let manager = self.sessions[session_index].manager.clone();
+
+        // Create a context for the dispatch. The ServerManager thread doesn't
+        // have a guest thread context, so we use a minimal context with the
+        // process memory from the system.
+        let mut context = if !self.system.is_null() {
+            let process_arc = self.system.get().current_process_arc();
+            let shared_memory = process_arc.lock().unwrap().get_shared_memory();
+            let thread = self.system.get().current_thread();
+
+            let ctx = if let Some(thread) = thread {
+                let tls = thread.lock().unwrap().get_tls_address().get();
+                HLERequestContext::new_with_thread(thread, shared_memory, tls)
+            } else {
+                // No guest thread — create context with just shared memory.
+                HLERequestContext::new_with_thread(
+                    Arc::new(std::sync::Mutex::new(
+                        crate::hle::kernel::k_thread::KThread::new(),
+                    )),
+                    shared_memory,
+                    0,
+                )
+            };
+            ctx
+        } else {
+            // Null system — can't dispatch without memory access.
+            log::warn!(
+                "ServerManager({}): complete_sync_request with null system",
+                self.name
+            );
+            return;
+        };
+
+        if let Some(memory) = self.system.get().get_svc_memory() {
+            context.set_memory(memory);
+        }
+        context.set_session_request_manager(manager.clone());
+        if let Some(sm) = self.service_manager() {
+            context.set_service_manager(sm);
+        }
+        context.set_is_deferred_value(false);
+        context.populate_from_incoming_command_buffer(&[]);
+
+        let result = hle_ipc::complete_sync_request(&manager, &mut context);
+
+        // Check if the request was deferred.
+        if context.get_is_deferred() {
+            log::debug!(
+                "ServerManager({}): session {} deferred",
+                self.name,
+                session_index
+            );
+            self.deferred_sessions.push(session_index);
+            return;
+        }
+
+        // Write response back.
+        context.write_to_outgoing_command_buffer();
+
+        // Check for session close.
+        if result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED {
+            log::debug!(
+                "ServerManager({}): session {} closed after dispatch",
+                self.name,
+                session_index
+            );
+            self.sessions.remove(session_index);
+            return;
+        }
+
+        log::trace!(
+            "ServerManager({}): session {} completed (result={:#x})",
+            self.name,
+            session_index,
+            result.get_inner_value()
+        );
     }
 
     /// Starts additional host threads for processing.
     /// Port of upstream `ServerManager::StartAdditionalHostThreads`.
     pub fn start_additional_host_threads(&mut self, name: &str, num_threads: usize) {
-        // Upstream spawns std::jthread instances that call LoopProcessImpl.
-        // In our model, the HLE services run on the main thread.
         log::debug!(
-            "ServerManager::start_additional_host_threads: {} x {}",
+            "ServerManager({}): start_additional_host_threads({}, {})",
+            self.name,
             name,
             num_threads
         );
@@ -356,21 +460,29 @@ impl ServerManager {
     /// Request the server to stop.
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
-        self.wakeup_event.signal(); // Wake the loop so it exits.
+        self.wakeup_event.signal();
     }
 
     /// Runs a server manager to completion.
     /// Port of upstream `ServerManager::RunServer(unique_ptr<ServerManager>)`.
-    /// Run the server in a background thread, matching upstream's
-    /// `kernel.RunOnHostCoreProcess("name", fn).detach()` /
-    /// `kernel.RunOnGuestCoreProcess("name", fn)` pattern.
-    /// Upstream runs each service in its own kernel thread.
+    ///
+    /// Spawns a background host thread running the event loop.
+    /// Upstream: `m_system.RunServer()` → `kernel.RunOnGuestCoreProcess()`.
+    /// We use a host thread (matching RunOnHostCoreProcess pattern) since
+    /// HLE services don't need to run on emulated ARM cores.
     pub fn run_server(server_manager: ServerManager) {
+        let thread_name = if server_manager.name.is_empty() {
+            "ServiceServer".to_string()
+        } else {
+            format!("HLE:{}", server_manager.name)
+        };
         std::thread::Builder::new()
-            .name("ServiceServer".to_string())
+            .name(thread_name.clone())
             .spawn(move || {
                 let mut sm = server_manager;
+                log::info!("ServerManager thread '{}' started", thread_name);
                 sm.loop_process();
+                log::info!("ServerManager thread '{}' exited", thread_name);
             })
             .expect("Failed to spawn service server thread");
     }
