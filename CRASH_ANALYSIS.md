@@ -1,11 +1,28 @@
-# MK8D Analysis — RTLD FIXED, BLOCKED ON HLE SERVICES
+# MK8D Analysis — RTLD FIXED, GAME CODE EXECUTING
 
 ## Status (2026-03-26)
 
-**Major progress.** Game now passes rtld relocation processing and reaches HLE
-service initialization (ConnectToNamedPort, SendSyncRequest). 82 SVCs in 30s
-(was 58, stuck on rtld bytecode interpreter). Next blocker is HLE service
-responses.
+**Major progress.** Game passes rtld, connects to services (sm:, lm:), and enters
+the main game binary. 82 SVCs + 206 JIT blocks compiled (5 in game binary at
+0x1d0xxxx-0x1dfxxxx). Code loops in the game binary after service init —
+likely waiting for a condition (timer, thread, or unimplemented SVC).
+
+### Current execution sequence
+
+1. rtld: relocations processed correctly (was broken by N/Z flag bug)
+2. QueryMemory x29 — address space enumeration
+3. GetInfo x2, GetThreadPriority, SignalProcessWideKey
+4. ConnectToNamedPort("sm:") → handle 0x101fe
+5. sm: QueryPointerBufferSize, Initialize, GetService("lm") → handle 0x181fd
+6. lm: QueryPointerBufferSize, OpenLogger → ILogger handle 0x201fc
+7. **Game binary enters**: 5 blocks at 0x1d3165c, 0x2010870, 0x1d0ad08, 0x1d376b8, 0x1df7e50
+8. **Loops** — no new blocks compiled, no new SVCs
+
+### Next investigation
+
+The 5 game binary blocks need disassembly to identify what the code waits for.
+Likely candidates: SleepThread, WaitSynchronization, CNTPCT timer loop, or
+waiting for another thread (scheduler issue).
 
 ### Session fixes (2026-03-26 afternoon)
 
