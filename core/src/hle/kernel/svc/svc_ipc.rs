@@ -117,36 +117,6 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     // Calling it again for Session/Domain is safe — it just re-writes the same data.
     context.write_to_outgoing_command_buffer();
 
-    // Debug: dump TLS after response
-    {
-        if let Some(memory) = system.get_svc_memory() {
-            let m = memory.lock().unwrap();
-            log::info!(
-                "  TLS[0..15]: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                m.read_32(tls_address), m.read_32(tls_address + 4),
-                m.read_32(tls_address + 8), m.read_32(tls_address + 12),
-                m.read_32(tls_address + 16), m.read_32(tls_address + 20),
-                m.read_32(tls_address + 24), m.read_32(tls_address + 28),
-                m.read_32(tls_address + 32), m.read_32(tls_address + 36),
-                m.read_32(tls_address + 40), m.read_32(tls_address + 44),
-                m.read_32(tls_address + 48), m.read_32(tls_address + 52),
-                m.read_32(tls_address + 56), m.read_32(tls_address + 60),
-            );
-        } else {
-            let mem = debug_memory.read().unwrap();
-            log::info!(
-                "  TLS[0..15]: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                mem.read_32(tls_address), mem.read_32(tls_address + 4),
-                mem.read_32(tls_address + 8), mem.read_32(tls_address + 12),
-                mem.read_32(tls_address + 16), mem.read_32(tls_address + 20),
-                mem.read_32(tls_address + 24), mem.read_32(tls_address + 28),
-                mem.read_32(tls_address + 32), mem.read_32(tls_address + 36),
-                mem.read_32(tls_address + 40), mem.read_32(tls_address + 44),
-                mem.read_32(tls_address + 48), mem.read_32(tls_address + 52),
-                mem.read_32(tls_address + 56), mem.read_32(tls_address + 60),
-            );
-        }
-    }
 
     // Upstream: SendSyncRequest always returns ResultSuccess to the guest.
     // RESULT_SESSION_CLOSED is an internal signal consumed by the kernel
