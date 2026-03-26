@@ -2,84 +2,79 @@
 
 ## Current status (2026-03-26)
 
-Game calls `svcBreak(0, 0, 0)` during `nn::lm` module initialization,
-63K ARM instructions after receiving the ILogger handle from `lm:OpenLogger`.
+Game calls `svcBreak(0, 0, 0)` at ARM step 63408, during `nn::lm` module
+initialization, after receiving a valid ILogger handle from `lm:OpenLogger`.
 
-## Root cause: nn::lm runtime assertion failure
+## Root cause: Unknown — likely rdynarmic JIT codegen bug
 
-The abort is a deliberate `nn::diag::detail::AbortImpl` call, NOT a symbol
-lookup failure or memory corruption. The nn SDK's logger initialization code
-performs a runtime check that fails.
+Every observable state is **byte-identical** between upstream zuyu and ruzu.
+The game starts from the same memory, receives the same SVC responses, and
+has the same register values at every SVC boundary. Yet it aborts in ruzu
+but succeeds in upstream.
 
-### Symbol resolution trace (step-traced)
+### What has been proven IDENTICAL
 
-rtld resolves these symbols in order before the abort:
+| What | Method | Result |
+|------|--------|--------|
+| Guest memory (36MB) | Binary dump at first SVC | **Byte-identical** |
+| QueryMemory walk (29 entries) | SVC trace comparison | **Identical** |
+| All 41 SVC responses (R0-R7) | Register dump at each SVC | **Identical** |
+| TLS data for 5 IPC calls | TLS dump comparison | **Byte-identical** |
+| Memory at `[0x22de3dc]` (flag byte) | Memory probe at each SVC | **0x00 in both** |
+| EXPH heap magic at `[0x22de3a8]` | Memory probe | **0x45585048 in both** |
+| NSO module segments | Loader comparison | **Identical sizes/offsets** |
+| Module load addresses | Log comparison | **8 modules at same addresses** |
+| Thread priority | SVC comparison | **0x2c in both** |
+| TPIDR (TLS pointer) | Code review | **Set correctly** |
 
-| # | Symbol | Purpose |
-|---|--------|---------|
-| 1 | `nn::sf::impl::detail::ServiceObjectImplBase2::ReleaseImpl` | ILogger interface release |
-| 2 | `nn::lmem::FreeToExpHeap` | Heap free |
-| 3 | `nn::lmem::detail::FreeToExpHeap` | Heap free (detail) |
-| 4 | `nn::diag::detail::AbortImpl` | **Abort handler** |
-| 5 | `nn::diag::detail::VAbortImpl` | Abort variant |
-| 6-11 | `InvokeAbortObserver`, `DefaultAbortObserver`, etc. | Abort chain |
-| 12 | `nn::svc::aarch32::Break` | svcBreak wrapper |
-
-Symbols 1-3 are resolved normally. Symbol 4+ are the **abort handler chain**
-— the game already decided to abort and is setting up the crash path.
-
-### ARM instruction trace before svcBreak
+### Abort sequence (step-traced)
 
 ```
-step 63374: PC=0x201b90  — rtld lookup returned (R0 has result)
-step 63375: R0=0x00000000 — lookup returned NULL → NOT FOUND
-step 63376: back to rtld dispatcher
-...
-step 63389: R0=0x01d504d0 — resolves to svcBreak wrapper address
-step 63396: R0=0x00000001 — some flag/check
-step 63406: LR=0x01ce5a00 — abort handler address set
-step 63407: PC=0x01d504d0 — jump to svcBreak wrapper
-step 63408: SVC #0x26 — svcBreak fires
+Step     0: SVC#40 returns (lm:OpenLogger) — PC=0x1d3c7c0, R0=0x181fd
+Step 10694: Enter nn::lm init at PC=0x1d09fcc — R0=0x22de3a8 (heap), R1=0x22de438
+Step 10699: LDRB R0,[R4,#0x34] → R0=0x00 (correct, same as upstream)
+Step 10703: BL init_function — enters SDK init via PLT
+Step 15585: Game reads TLS addr (0x2395200), thread handle (0x81ff), lm handle (0x181fd)
+Step 44933: SVC 0x1d (SignalProcessWideKey)
+Step 55702: SVC 0x1d (SignalProcessWideKey)
+Step 63408: SVC 0x26 (svcBreak) — ABORT
 ```
 
-## What's been verified IDENTICAL to upstream
+### Symbol resolution trace before abort
 
-- QueryMemory walk: 29 entries, all matching
-- All 41 SVC responses: args + TLS data byte-identical
-- ILogger handle: 0x201fc in both
-- NSO loader: segments, BSS, page alignment correct
-- Module addresses: all 8 modules at same addresses
-- JIT codegen: x86 code manually verified for rtld hash loop
-- Fastmem: data matches shared_memory
-- Block manager: memory regions identical
-- System NCAs/fonts: tested with yuzu's data, no change
-- CNTPCT: now returns real time (was returning 0, fixed)
+Normal symbols resolved: `ServiceObjectImplBase2::ReleaseImpl`, `FreeToExpHeap` (×2).
+Then the abort handler chain: `AbortImpl` → `VAbortImpl` → `InvokeAbortObserver` →
+`DefaultAbortObserver` → `GetAbortObserverManager` → `Abort` → `svc::aarch32::Break`.
+
+### What upstream does differently after lm:OpenLogger
+
+```
+Upstream: OpenLogger → Close(lm) → CloseHandle → GetService("apm") → ...continues
+Ruzu:     OpenLogger → [63K ARM instructions] → SignalProcessWideKey ×2 → svcBreak
+```
 
 ## Performance fixes (resolved)
 
 - **rdynarmic mprotect fix**: skip on cache hits + run() entry (500x speedup)
-- **Block linking enabled**: 0x3F matching upstream
-- **ILogger fix**: returns ILogger via move handle matching upstream
-- **CNTPCT fix**: A32 get_cntpct now returns CoreTiming clock ticks
+- **Block linking**: 0x3F matching upstream default
+- **ILogger**: returns ILogger via move handle with ServerManager wiring
+- **CNTPCT**: A32 returns CoreTiming clock ticks
 - MK8D init: **8.5 minutes → <1 second**
 
-## Hypotheses for remaining bug
+## Reference traces
 
-1. **nn::lm initialization runtime check**: The game's lm module initialization
-   performs some check after receiving the ILogger handle. This check fails in
-   ruzu but passes in upstream. Since there are NO IPC calls between OpenLogger
-   and the abort, the check is purely in-process — reading some memory value
-   or checking some process-local state.
+- `traces/zuyu_full_5s_trace.log` — 50,731 lines, 5s of upstream MK8D
+  - 14,209 SVCs, 2,717 IPC calls, 14,112 scheduler switches, 30 threads
+- `traces/ruzu_mk8d_full_trace.txt` — 107 lines, ruzu until svcBreak
+  - 42 SVCs, first 40 identical to upstream
 
-2. **Heap initialization**: The symbols `FreeToExpHeap` suggest the game's
-   heap allocator is being set up. If `SetHeapSize` (SVC 0x01) wasn't called,
-   or the heap region isn't properly configured, heap allocation fails and
-   the nn SDK aborts.
+## Next step: A32 differential oracle
 
-3. **Missing SVC**: The game might call an SVC between OpenLogger and the
-   abort that we don't handle correctly. The SVC trace shows no calls, but
-   in run mode SVCs inside the JIT might not trigger properly (though step
-   mode confirmed only SignalProcessWideKey × 2 then Break).
+The `a32_oracle` at `zuyu/build/a32_oracle` can execute ARM instructions
+step-by-step using upstream dynarmic's C++ interpreter. Wire it into ruzu's
+step tracer to compare register state after each of the 63K instructions
+between lm:OpenLogger and svcBreak. The first divergence will identify
+the miscompiled ARM instruction.
 
 ## Investigation tools
 
@@ -87,25 +82,7 @@ step 63408: SVC #0x26 — svcBreak fires
 # SVC trace:
 RUZU_SVC_TRACE=1 RUST_LOG=off ./target/release/yuzu-cmd -g <rom> 2>trace.txt
 
-# Step trace after SVC N:
-RUZU_STEP_AFTER_SVC=40
-
-# Disable fastmem:
-RUZU_NO_FASTMEM=1
-
-# Override JIT optimizations:
-RUZU_A32_OPTIMIZATION_MASK=0x3F
-RUZU_A32_NO_OPTIMIZATIONS=1
+# Disable fastmem:       RUZU_NO_FASTMEM=1
+# Override optimizations: RUZU_A32_OPTIMIZATION_MASK=0x3F
+# svcBreak exits cleanly via process::exit(1)
 ```
-
-## Next steps
-
-1. Trace the exact ARM function that performs the failing check (between steps
-   ~1246 and ~1297 where resolution switches from FreeToExpHeap to AbortImpl).
-   Add step logging for this range.
-
-2. Check if `SetHeapSize` (SVC 0x01) is called BEFORE the lm initialization.
-   In the current trace it appears MUCH later — maybe it needs to happen first.
-
-3. Compare the game's heap state between upstream and ruzu at the point of
-   the abort.
