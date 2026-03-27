@@ -45,10 +45,44 @@ because some pre-condition is not met. This could be:
 2. A check on process state that returns unexpected values
 3. A memory layout check that fails (heap, TLS, or address space)
 
+### Detailed trace analysis (63K steps)
+
+The step tracer binary dump reveals the EXACT flow:
+
+1. 8 NSO modules loaded correctly (rtld, main, subsdk0-4, sdk)
+2. rtld processes ALL relocations successfully (~58K steps)
+3. rtld calls 10 init_array functions via lazy PLT resolution
+4. Init functions 1-9 succeed (mutex lock/unlock, TLS access all work)
+5. **Init function #10** (`0x01CE5A70`) is called with `[[noreturn]]` semantics
+6. The code AFTER the call site is `BL AbortImpl` — a guard for if the function returns
+7. **In ruzu, init #10 returns normally** → hits the abort guard → svcBreak
+
+**Why init #10 returns in ruzu but not upstream:**
+- Init #10 calls several SDK functions including mutex lock/unlock
+- All mutex operations succeed (TLS thread tag = 0x000081FF, LDREX/STREX work)
+- The function makes SignalProcessWideKey SVC (condvar signal) during execution
+- In upstream, this function would call WaitSynchronization or SleepThread to block
+- **In ruzu, the function completes all work and returns instead of blocking**
+
+**Root cause hypothesis:**
+The init function is likely `nn::os::detail::UserExceptionHandler::Initialize()` or
+a similar [[noreturn]] init that sets up an event loop. The event loop should block
+on a kernel wait (WaitSynchronization) but either:
+1. The wait condition is immediately satisfied (event already signaled)
+2. A missing SVC causes the wait to return immediately
+3. The WaitSynchronization timeout handling differs from upstream
+
+**Verified NOT the cause:**
+- TST instruction: works correctly (confirmed with unit test)
+- Mutex lock/unlock: works correctly (TLS properly initialized)
+- Module loading: all 8 modules loaded at correct addresses with correct sizes
+- Relocations: all resolved successfully by guest rtld
+- QueryMemory: same addresses as upstream
+
 **Next steps:**
-- Disassemble subsdk4 at offset `0x5C29xx` (function calling abort)
-- Dump guest memory at key addresses to compare with upstream
-- Check what assertion the SDK checks before calling abort
+- Identify which SVC the [[noreturn]] init function should block on
+- Compare that SVC's behavior between ruzu and upstream
+- Check if WaitSynchronization with timeout=-1 blocks correctly
 
 ### Session fixes (2026-03-27)
 | Fix | Impact |
