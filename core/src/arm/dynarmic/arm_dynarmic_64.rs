@@ -14,7 +14,7 @@ use crate::arm::arm_interface::{
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
 
-use rdynarmic::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
+use rdynarmic::jit_config::{UserCallbacks, JitConfig, OptimizationFlag};
 
 /// Translate rdynarmic's HaltReason to core's HaltReason.
 ///
@@ -126,7 +126,7 @@ impl DynarmicCallbacks64 {
     }
 }
 
-impl JitCallbacks for DynarmicCallbacks64 {
+impl UserCallbacks for DynarmicCallbacks64 {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
         // Upstream: returns std::nullopt if IsValidVirtualAddressRange fails.
         if let Some(ref cm) = self.core_memory {

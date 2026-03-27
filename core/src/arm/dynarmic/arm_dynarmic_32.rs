@@ -14,7 +14,7 @@ use crate::arm::arm_interface::{
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
 
-use rdynarmic::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
+use rdynarmic::jit_config::{UserCallbacks, JitConfig, OptimizationFlag};
 
 /// Translate rdynarmic's HaltReason to core's HaltReason.
 ///
@@ -372,7 +372,7 @@ impl DynarmicCallbacks32 {
     }
 }
 
-impl JitCallbacks for DynarmicCallbacks32 {
+impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
         // Lock-free fast path using cached fastmem pointer, matching upstream's
         // direct m_memory.Read32(vaddr) without any synchronization.
