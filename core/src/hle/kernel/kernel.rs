@@ -358,9 +358,12 @@ impl KernelCore {
                 let kernel = unsafe { &*kernel_ptr };
 
                 // PreemptThreads (rotate priority queue).
+                // Drop the GSC lock before interrupting cores to avoid
+                // deadlock with CPU threads that hold core locks then need GSC.
                 if let Some(gsc_arc) = kernel.global_scheduler_context() {
                     let mut gsc = gsc_arc.lock().unwrap();
                     gsc.preempt_threads();
+                    drop(gsc);
                 }
 
                 // Interrupt all cores — sets is_interrupted=true and calls

@@ -118,6 +118,7 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     context.write_to_outgoing_command_buffer();
 
 
+
     // Upstream: SendSyncRequest always returns ResultSuccess to the guest.
     // RESULT_SESSION_CLOSED is an internal signal consumed by the kernel
     // (KServerSession closes the session), not exposed to user code.
