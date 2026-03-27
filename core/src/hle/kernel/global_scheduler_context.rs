@@ -120,6 +120,11 @@ impl GlobalSchedulerContext {
 
     pub fn push_back_to_priority_queue(&mut self, thread_id: u64) {
         let accessor = self.make_accessor();
+        let found = accessor.find_thread(thread_id).is_some();
+        log::debug!(
+            "GSC::push_back_to_priority_queue: thread_id={} found_in_list={} list_size={}",
+            thread_id, found, accessor.threads.len()
+        );
         let mut pq = std::mem::take(&mut self.m_priority_queue);
         pq.push_back(thread_id, &accessor);
         self.m_priority_queue = pq;

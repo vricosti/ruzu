@@ -402,9 +402,10 @@ impl KernelCore {
             (id, id)
         };
 
-        // Give the process a scheduler reference (needed for thread init).
-        if let Some(scheduler) = self.current_scheduler() {
-            process.lock().unwrap().scheduler = Some(Arc::downgrade(&scheduler));
+        // Give the process a scheduler reference for the target core.
+        // Upstream: service threads run on core 3, so use core 3's scheduler.
+        if let Some(scheduler) = self.scheduler(SERVICE_THREAD_CORE as usize) {
+            process.lock().unwrap().scheduler = Some(Arc::downgrade(scheduler));
         }
 
         {
@@ -421,22 +422,39 @@ impl KernelCore {
 
         // Register with GlobalSchedulerContext so the scheduler can find it.
         if let Some(gsc) = self.global_scheduler_context() {
-            gsc.lock().unwrap().add_thread(Arc::clone(&thread));
+            let mut gsc = gsc.lock().unwrap();
+            gsc.add_thread(Arc::clone(&thread));
+
+            // Make the thread runnable.
+            thread.lock().unwrap().run();
+
+            // Push into priority queue — matches upstream KScheduler::OnThreadStateChanged
+            // which calls GetPriorityQueue(kernel).PushBack(thread) when state becomes Runnable.
+            gsc.push_back_to_priority_queue(thread_id);
         }
 
-        // Make the thread runnable.
-        {
-            let mut t = thread.lock().unwrap();
-            t.run();
+        // Request reschedule so the scheduler picks up the new thread.
+        // Upstream: SetSchedulerUpdateNeeded + KScopedSchedulerLock release triggers reschedule.
+        // Request reschedule on ALL cores (upstream does this via SetSchedulerUpdateNeeded
+        // which marks a global flag checked by all cores).
+        for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+            if let Some(scheduler) = self.scheduler(core_id) {
+                scheduler.lock().unwrap().request_schedule();
+            }
         }
 
         // Register the thread in the process.
         process.lock().unwrap().register_thread_object(Arc::clone(&thread));
 
-        log::info!(
-            "KernelCore::run_on_guest_core_process: '{}' thread_id={} core={} priority={}",
-            name, thread_id, SERVICE_THREAD_CORE, SERVICE_THREAD_PRIORITY
-        );
+        // Verify the thread is in the priority queue.
+        if let Some(gsc) = self.global_scheduler_context() {
+            let gsc = gsc.lock().unwrap();
+            let front = gsc.m_priority_queue.get_scheduled_front(SERVICE_THREAD_CORE);
+            log::info!(
+                "KernelCore::run_on_guest_core_process: '{}' thread_id={} core={} priority={} pq_front={:?}",
+                name, thread_id, SERVICE_THREAD_CORE, SERVICE_THREAD_PRIORITY, front
+            );
+        }
     }
 
     /// Run a service function on a host thread with a dummy KThread for tracking.
