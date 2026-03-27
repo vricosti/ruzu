@@ -343,6 +343,18 @@ impl AppLoaderNso {
 
         // Upstream: applies cheats if PatchManager is present. Not yet wired.
 
+        // Dump raw module binary for offline disassembly.
+        if let Ok(dump_dir) = std::env::var("RUZU_DUMP_MODULES") {
+            let _ = std::fs::create_dir_all(&dump_dir);
+            let module_name = nso_file.get_name();
+            let path = format!("{}/0x{:08X}_{}.bin", dump_dir, load_base, module_name);
+            if let Err(e) = std::fs::write(&path, &program_image) {
+                log::error!("Failed to dump module: {}", e);
+            } else {
+                log::info!("NSO: dumped {} bytes to {}", program_image.len(), path);
+            }
+        }
+
         // Load codeset into process.
         code_set.memory = program_image;
         process.load_module(code_set, load_base);
