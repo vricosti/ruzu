@@ -1,11 +1,33 @@
-# MK8D Analysis — RTLD FIXED, GAME CODE EXECUTING
+# MK8D Analysis — GAME HITS BKPT (ABORT) AFTER SDK INIT
 
-## Status (2026-03-26)
+## Status (2026-03-27)
 
-**Major progress.** Game passes rtld, connects to services (sm:, lm:), and enters
-the main game binary. 82 SVCs + 206 JIT blocks compiled (5 in game binary at
-0x1d0xxxx-0x1dfxxxx). Code loops in the game binary after service init —
-likely waiting for a condition (timer, thread, or unimplemented SVC).
+**Game aborts.** After rtld + 40 SVCs (sm: connect, lm: OpenLogger), the game
+enters SDK init code, progresses through ~22 preemption intervals (~220ms),
+then executes **BKPT #0x5C** (Thumb 0xBE5C) at PC=0x01DFD6AC. This is
+`__builtin_trap()` — an assertion failure in the SDK. The game loops on the
+BKPT forever because the JIT doesn't raise a debug exception for it.
+
+### Key addresses
+- **0x01DFD6AC**: BKPT #0x5C (Thumb) — the abort point
+- **0x01DF7E3C**: last valid code before abort (preempt #21, lr=0x01DF7858)
+- CPSR=0xA0000020 (Thumb mode, N+C flags set)
+- R0=4, R4=0x86814000 (kernel-space address — bad pointer?)
+
+### Root cause: unknown assertion failure
+The game's SDK init hits an assertion. Possible causes:
+1. Missing/wrong IPC response (OpenLogger returned wrong format?)
+2. Missing service that should have been initialized by another thread
+3. Memory mapping issue (R4=0x86814000 is above ASLR range)
+4. TLS corruption
+
+### Session fixes (2026-03-27)
+| Fix | Impact |
+|-----|--------|
+| CoreTiming timer thread deadlock | **Preemption now works** (150 callbacks/5s) |
+| Vsync pipeline (Conductor+CoreTiming+KernelEventBridge) | 60Hz vsync events ready |
+| ServerManager complete_sync_request | Real IPC dispatch wired |
+| All 7 SVCs verified vs upstream | No mismatches found |
 
 ### Current execution sequence
 
