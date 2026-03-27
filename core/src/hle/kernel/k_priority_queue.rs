@@ -293,9 +293,14 @@ impl KPriorityQueueImpl {
         debug_assert!(is_valid_priority(priority));
         if priority > LOWEST_PRIORITY { return; }
 
-        if self.queues[priority as usize].push_back(core, member_id, accessor) {
+        let was_empty = self.queues[priority as usize].push_back(core, member_id, accessor);
+        if was_empty {
             self.available_priorities[core as usize].set_bit(priority);
         }
+        log::debug!(
+            "KPriorityQueueImpl::push_back: p={} core={} thread={} was_empty={}",
+            priority, core, member_id, was_empty,
+        );
     }
 
     pub fn push_front(&mut self, priority: i32, core: i32, member_id: u64, accessor: &impl ThreadAccessor) {
@@ -495,9 +500,19 @@ impl KPriorityQueue {
     pub fn push_back(&mut self, member_id: u64, accessor: &impl ThreadAccessor) {
         let Some((priority, active_core, affinity, is_dummy)) = accessor.with_thread(member_id, |m| {
             (m.get_priority(), m.get_active_core(), m.get_affinity_mask_value(), m.is_dummy_thread())
-        }) else { return; };
+        }) else {
+            log::warn!("KPriorityQueue::push_back: thread {} not found in accessor", member_id);
+            return;
+        };
 
-        if is_dummy { return; }
+        if is_dummy {
+            log::debug!("KPriorityQueue::push_back: thread {} is dummy, skipping", member_id);
+            return;
+        }
+        log::debug!(
+            "KPriorityQueue::push_back: thread {} priority={} active_core={} affinity={:#X}",
+            member_id, priority, active_core, affinity
+        );
         self.push_back_impl(priority, member_id, active_core, affinity, accessor);
     }
 
