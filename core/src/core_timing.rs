@@ -249,9 +249,9 @@ impl CoreTiming {
 
                         if due_events.is_empty() {
                             // Check if there's a future event to wait for.
-                            let next_time = {
+                            let (next_time, queue_len) = {
                                 let ct = ct_clone.lock().unwrap();
-                                ct.event_queue.peek().map(|e| e.time)
+                                (ct.event_queue.peek().map(|e| e.time), ct.event_queue.len())
                             };
                             if let Some(next_ns) = next_time {
                                 let now_ns = ct_clone.lock().unwrap()

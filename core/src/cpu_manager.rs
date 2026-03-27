@@ -476,6 +476,7 @@ impl CpuManager {
                 // Exit context — clear running.
                 physical_core.clear_running();
 
+
                 // Step-trace after SVC N (RUZU_STEP_AFTER_SVC=N).
                 // Enabled at compile time via cfg. Steps all instructions from that
                 // point, dispatching SVCs inline with full args + TLS logging, and
@@ -715,14 +716,15 @@ impl CpuManager {
                 }
 
                 // hr.is_empty() → quantum expired naturally (get_ticks_remaining() hit 0).
-                // Upstream multicore: the JIT runs until a hardware timer fires Interrupt(),
-                // which sets BreakLoop. Since ruzu has no hardware preemption timer yet,
-                // we advance CoreTiming here (fires pending kernel timer events) and reset
-                // the quantum so the JIT can continue executing the next slice.
-                if let Some(ct) = kernel.core_timing() {
-                    let mut ct_lock = ct.lock().unwrap();
-                    let _ = ct_lock.advance();
-                    ct_lock.reset_ticks();
+                // In multicore mode, the CoreTiming timer thread handles event
+                // processing and the preemption interrupt breaks the JIT out of
+                // tight loops. In single-core mode, we advance CoreTiming here.
+                if !kernel.is_multicore() {
+                    if let Some(ct) = kernel.core_timing() {
+                        let mut ct_lock = ct.lock().unwrap();
+                        let _ = ct_lock.advance();
+                        ct_lock.reset_ticks();
+                    }
                 }
                 // Continue the inner JIT loop — quantum is fresh, let interrupt check decide.
             }
