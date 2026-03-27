@@ -647,38 +647,31 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn exception_raised(&mut self, pc: u64, exception: u64) {
+        use rdynarmic::frontend::a32::types::Exception;
+
         // Port of upstream ExceptionRaised (arm_dynarmic_32.cpp:92-109).
         //
-        // A32 Exception enum values:
-        //   0=UndefinedInstruction, 1=UnpredictableInstruction, 2=DecodeError,
-        //   3=SendEvent, 4=SendEventLocal, 5=WaitForInterrupt, 6=WaitForEvent,
-        //   7=Yield, 8=Breakpoint, 9=PreloadData, 10=PreloadDataWithIntentToWrite,
-        //   11=PreloadInstruction, 12=NoExecuteFault
-        //
         // Upstream behavior:
-        //   NoExecuteFault (12): log critical + ReturnException(pc, PrefetchAbort) → halts
-        //   default (all others): if debugger, ReturnException(pc, InstructionBreakpoint)
-        //                         else just log critical (NO halt — execution continues)
+        //   NoExecuteFault: log critical + ReturnException(pc, PrefetchAbort) → halts
+        //   Breakpoint:     if debugger, ReturnException(pc, InstructionBreakpoint)
+        //                   else just log critical (no halt — execution continues)
+        //   Hints (SEV/WFI/WFE/Yield): benign, no-op
+        //   Others:         log warning
         match exception {
-            12 => {
-                // NoExecuteFault — halt execution.
+            x if x == Exception::NoExecuteFault.as_u32() as u64 => {
                 self.last_exception_address.store(pc, Ordering::Relaxed);
                 log::error!("Cannot execute instruction at unmapped address {:#08x}", pc);
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
-            2 | 8 => {
-                // Breakpoint (8) or DecodeError (2, legacy BKPT encoding).
+            x if x == Exception::Breakpoint.as_u32() as u64 => {
                 // Game called __builtin_trap() / abort().
-                // Log once with register dump, then halt.
+                // Upstream sends to debugger which suspends the thread. Without
+                // debugger, halt execution to avoid infinite loop on the BKPT.
                 use std::sync::atomic::{AtomicBool, Ordering as AtOrd};
                 static LOGGED: AtomicBool = AtomicBool::new(false);
                 if !LOGGED.swap(true, AtOrd::Relaxed) {
-                    log::error!(
-                        "===== BKPT/abort at pc={:#08x} (exception={}) =====",
-                        pc, exception
-                    );
+                    log::error!("===== BKPT at pc={:#08x} =====", pc);
                     log::error!("Game hit __builtin_trap(). Dumping state:");
-                    // Dump registers via jit_pc_ptr (reg[15] = PC, walk back for all GPRs)
                     if let Some(pc_ptr) = self.jit_pc_ptr {
                         let regs_ptr = unsafe { pc_ptr.sub(15) };
                         let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
@@ -686,9 +679,8 @@ impl JitCallbacks for DynarmicCallbacks32 {
                             log::error!("  R{:2}: 0x{:08X}", i, regs[i]);
                         }
                     }
-                    // Dump nearby code via fastmem
                     if !self.fastmem_ptr.is_null() {
-                        let pc_val = pc & !1; // clear thumb bit
+                        let pc_val = pc & !1;
                         log::error!("  Nearby Thumb code:");
                         for off in (-16i64..32).step_by(2) {
                             let addr = (pc_val as i64 + off) as u64;
@@ -703,17 +695,15 @@ impl JitCallbacks for DynarmicCallbacks32 {
                 self.last_exception_address.store(pc, Ordering::Relaxed);
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
+            x if x == Exception::SendEvent.as_u32() as u64
+              || x == Exception::SendEventLocal.as_u32() as u64
+              || x == Exception::WaitForInterrupt.as_u32() as u64
+              || x == Exception::WaitForEvent.as_u32() as u64
+              || x == Exception::Yield.as_u32() as u64 => {
+                // Hint instructions — benign, no-op.
+            }
             _ => {
-                // All other exceptions: log and continue (no halt).
-                // Upstream only halts here if debugger is enabled (not implemented).
-                // Hint instructions (Yield, WFI, WFE, SEV, SEVL) map to exceptions
-                // 3-7 and are benign — don't log.
-                if exception < 3 || exception > 7 {
-                    log::warn!(
-                        "ExceptionRaised(exception={}, pc={:#08x})",
-                        exception, pc
-                    );
-                }
+                log::warn!("ExceptionRaised(exception={}, pc={:#08x})", exception, pc);
             }
         }
     }
