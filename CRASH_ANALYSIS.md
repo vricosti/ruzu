@@ -14,12 +14,41 @@ BKPT forever because the JIT doesn't raise a debug exception for it.
 - CPSR=0xA0000020 (Thumb mode, N+C flags set)
 - R0=4, R4=0x86814000 (kernel-space address — bad pointer?)
 
-### Root cause: unknown assertion failure
-The game's SDK init hits an assertion. Possible causes:
-1. Missing/wrong IPC response (OpenLogger returned wrong format?)
-2. Missing service that should have been initialized by another thread
-3. Memory mapping issue (R4=0x86814000 is above ASLR range)
-4. TLS corruption
+### Root cause: SDK assertion failure in subsdk4 (nnSdk)
+
+**Full call chain (traced via step_tracer binary dump):**
+
+1. rtld at 0x200000 completes ALL relocations successfully (~63K instructions)
+2. Game code enters SDK init via lazy PLT trampoline
+3. Code in subsdk4 at `0x01CE59xx` calls `nn::diag::detail::AbortImpl`
+4. AbortImpl calls `nn::svc::aarch32::Break(0, 0, 0)` at `0x01D504D0` in sdk module
+5. svcBreak(reason=0) = **PANIC**
+
+**What the rtld does (confirmed working):**
+- Resolves relocations by walking .dynamic sections
+- The resolve function at `0x200FF4` returns 1 (success)
+- The check at `0x200E50` (`CMP R0, #1`) passes (Z=1, returns normally)
+- The lazy PLT trampoline at `0x002016E4` correctly jumps to the resolved function
+
+**Upstream comparison:**
+After the same 40 SVCs, upstream continues with:
+- `lm: Log` (ILogger message)
+- `sm: GetService("apm")` → handle 0x301fb
+- `sm: GetService("appletOE")`
+- Many more IPCs (apm config, etc.)
+
+Ruzu never makes these calls — the SDK aborts before reaching them.
+
+**Likely cause:** The SDK initialization code in subsdk4 hits an assertion
+because some pre-condition is not met. This could be:
+1. A global variable initialized by another thread (missing multi-threading)
+2. A check on process state that returns unexpected values
+3. A memory layout check that fails (heap, TLS, or address space)
+
+**Next steps:**
+- Disassemble subsdk4 at offset `0x5C29xx` (function calling abort)
+- Dump guest memory at key addresses to compare with upstream
+- Check what assertion the SDK checks before calling abort
 
 ### Session fixes (2026-03-27)
 | Fix | Impact |
