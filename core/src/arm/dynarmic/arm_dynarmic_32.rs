@@ -105,13 +105,21 @@ fn parse_trace_u32_env(name: &str) -> Option<u32> {
 /// Also holds a reference to CoreTiming for tick management, matching upstream's
 /// `m_parent.m_system.CoreTiming()` access pattern.
 struct DynarmicCallbacks32 {
+    /// Upstream: `ArmDynarmic32& m_parent`.
+    /// Raw pointer set post-construction via `set_parent_ptr()`.
+    /// Used for LogBacktrace and IsInThumbMode.
+    /// Safety: valid for the lifetime of the parent ArmDynarmic32.
+    parent: *const ArmDynarmic32,
+    /// Upstream: `Core::Memory::Memory& m_memory`.
+    /// None in tests where Memory is not wired.
+    core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+    /// Upstream: `Kernel::KProcess* m_process`.
+    /// Raw pointer to the owning process, used for LogBacktrace.
+    /// Safety: valid for the lifetime of the KProcess that owns this JIT.
+    process: *const crate::hle::kernel::k_process::KProcess,
     /// Shared guest memory reference (ProcessMemoryData).
     /// Used as fallback when core_memory is None (tests).
     memory: SharedProcessMemory,
-    /// Core::Memory::Memory bridge (reads/writes via PageTable → DeviceMemory).
-    /// Matches upstream `Core::Memory::Memory& m_memory`.
-    /// None in tests where Memory is not wired.
-    core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
     /// SVC/SWI number from last supervisor call, shared with parent ArmDynarmic32.
     svc_swi: Arc<AtomicU32>,
     /// Whether wall clock is used (if true, ticking is disabled).
@@ -133,11 +141,8 @@ struct DynarmicCallbacks32 {
     /// Safety: valid for the lifetime of the DeviceMemory backing.
     fastmem_ptr: *const u8,
     /// Raw pointer to jit_state.reg[15] (PC) for diagnostic logging.
-    /// No performance impact — only read when logging unmapped accesses.
     /// Set after jit creation via `set_pc_ptr()`.
     jit_pc_ptr: Option<*const u32>,
-    /// Raw pointer to jit_state.upper_location_descriptor for A32 mode diagnostics.
-    /// Used to reconstruct Thumb/E/IT state when logging unmapped accesses.
     /// Ensures the optional diagnostic code dump only happens once.
     dumped_unmapped_window: AtomicBool,
     /// Shared exclusive monitor backing Dynarmic's global monitor state.
@@ -155,6 +160,7 @@ impl DynarmicCallbacks32 {
     fn new(
         memory: SharedProcessMemory,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+        process: *const crate::hle::kernel::k_process::KProcess,
         svc_swi: Arc<AtomicU32>,
         uses_wall_clock: bool,
         core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
@@ -171,8 +177,10 @@ impl DynarmicCallbacks32 {
         log::info!("DynarmicCallbacks32: core_memory={} fastmem_ptr={:?}",
             if core_memory.is_some() { "wired" } else { "fallback" }, fastmem_ptr);
         Self {
-            memory,
+            parent: std::ptr::null(),
             core_memory,
+            process,
+            memory,
             svc_swi,
             uses_wall_clock,
             core_timing,
@@ -184,6 +192,13 @@ impl DynarmicCallbacks32 {
             exclusive_monitor,
             core_index,
         }
+    }
+
+    /// Set the parent pointer post-construction.
+    /// Matches upstream's `m_parent` reference set during DynarmicCallbacks32 construction.
+    /// In Rust, the parent doesn't exist yet when callbacks are created, so we set it after.
+    fn set_parent_ptr(&mut self, parent: *const ArmDynarmic32) {
+        self.parent = parent;
     }
 
     /// Halt the jit by atomically OR-ing a halt reason into the jit's halt_reason field.
@@ -663,34 +678,39 @@ impl JitCallbacks for DynarmicCallbacks32 {
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
             _ => {
-                // Upstream: if debugger enabled, halt with InstructionBreakpoint.
-                // Without debugger: log backtrace + critical, execution continues.
-                //
-                // We log once with register dump (matches upstream LogBacktrace),
-                // then let execution continue (matching upstream non-debugger path).
-                use std::sync::atomic::{AtomicBool, Ordering as AtOrd};
-                static LOGGED: AtomicBool = AtomicBool::new(false);
-                if !LOGGED.swap(true, AtOrd::Relaxed) {
-                    let is_thumb = self.jit_pc_ptr
-                        .map(|p| unsafe { (*p.add(1) & 1) != 0 })
-                        .unwrap_or(false);
-                    log::error!(
-                        "ExceptionRaised(exception={}, pc={:#08x}, code={:#08x}, thumb={})",
-                        exception, pc,
-                        if !self.fastmem_ptr.is_null() {
-                            unsafe { (self.fastmem_ptr.add((pc & !1) as usize) as *const u32).read_unaligned() }
-                        } else { 0 },
-                        is_thumb,
-                    );
-                    // LogBacktrace: dump registers
+                // Upstream: if debugger enabled, ReturnException(pc, InstructionBreakpoint).
+                // Without debugger: m_parent.LogBacktrace(m_process) + LOG_CRITICAL.
+                // Execution continues (no halt).
+                if !self.parent.is_null() && !self.process.is_null() {
+                    let parent = unsafe { &*self.parent };
+                    let process = unsafe {
+                        &*(self.process as *const crate::arm::arm_interface::KProcess)
+                    };
+                    let mut ctx = ThreadContext::default();
+                    // Build ThreadContext from JIT state for LogBacktrace.
                     if let Some(pc_ptr) = self.jit_pc_ptr {
                         let regs_ptr = unsafe { pc_ptr.sub(15) };
                         let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
                         for i in 0..16 {
-                            log::error!("  R{:2}: 0x{:08X}", i, regs[i]);
+                            ctx.r[i] = regs[i] as u64;
                         }
+                        ctx.pc = pc;
+                        ctx.sp = regs[13] as u64;
                     }
+                    parent.base.log_backtrace(process, &ctx);
                 }
+
+                let is_thumb = self.jit_pc_ptr
+                    .map(|p| unsafe { (*p.add(1) & 1) != 0 })
+                    .unwrap_or(false);
+                log::error!(
+                    "ExceptionRaised(exception={}, pc={:#08x}, code={:#08x}, thumb={})",
+                    exception, pc,
+                    if !self.fastmem_ptr.is_null() {
+                        unsafe { (self.fastmem_ptr.add((pc & !1) as usize) as *const u32).read_unaligned() }
+                    } else { 0 },
+                    is_thumb,
+                );
                 // Upstream: execution continues (no halt without debugger).
             }
         }
@@ -797,6 +817,7 @@ impl ArmDynarmic32 {
         let callbacks = DynarmicCallbacks32::new(
             shared_memory,
             core_memory,
+            process as *const _ as *const crate::hle::kernel::k_process::KProcess,
             svc_swi.clone(),
             uses_wall_clock,
             core_timing,
