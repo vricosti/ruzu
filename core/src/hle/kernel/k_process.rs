@@ -682,7 +682,7 @@ impl KProcess {
                 ))
             } else {
                 use crate::arm::dynarmic::arm_dynarmic_32::ArmDynarmic32;
-                Box::new(ArmDynarmic32::new(
+                let mut arm = Box::new(ArmDynarmic32::new(
                     &dummy_system as &dyn std::any::Any,
                     true, // uses_wall_clock
                     dummy_process,
@@ -691,7 +691,12 @@ impl KProcess {
                     shared_memory.clone(),
                     core_timing.clone(),
                     Some(memory.clone()),
-                ))
+                ));
+                // Set the parent pointer now that ArmDynarmic32 is at its final
+                // stable location inside the Box. Callbacks access parent fields
+                // (svc_swi, core_timing, etc.) through this pointer during run_thread().
+                arm.set_parent_ptr();
+                arm as Box<dyn crate::arm::arm_interface::ArmInterface>
             };
             self.arm_interfaces[i] = Some(jit);
         }

@@ -4,14 +4,14 @@
 //! Port of zuyu/src/core/arm/dynarmic/arm_dynarmic_32.h and arm_dynarmic_32.cpp
 //! ARM32 dynarmic backend.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::arm::arm_interface::{
     ArmInterface, ArmInterfaceBase, Architecture, DebugWatchpoint, HaltReason, KProcess,
     KThread, ThreadContext,
 };
-use crate::hle::kernel::k_process::{KProcess as RealKProcess, SharedProcessMemory};
+use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
 
 use rdynarmic::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
@@ -99,17 +99,21 @@ fn parse_trace_u32_env(name: &str) -> Option<u32> {
 ///
 /// Corresponds to upstream `DynarmicCallbacks32`.
 ///
-/// Holds a shared reference to guest process memory, matching upstream's
-/// `Core::Memory::Memory& m_memory` obtained from `process->GetMemory()`.
+/// Upstream fields: `m_parent`, `m_memory`, `m_process`, `m_debugger_enabled`,
+/// `m_check_memory_access`. All other state (svc_swi, core_timing, exclusive_monitor,
+/// core_index, etc.) is accessed through `m_parent`.
 ///
-/// Also holds a reference to CoreTiming for tick management, matching upstream's
-/// `m_parent.m_system.CoreTiming()` access pattern.
+/// In Rust, `parent` is a raw pointer set post-construction via `set_parent_ptr()`,
+/// matching upstream's reference-based `m_parent`. The pointer is null during JIT
+/// construction but is set immediately after. All callback methods are only called
+/// by the JIT during `run_thread()`, at which point parent is guaranteed to be set.
 struct DynarmicCallbacks32 {
     /// Upstream: `ArmDynarmic32& m_parent`.
-    /// Raw pointer set post-construction via `set_parent_ptr()`.
-    /// Used for LogBacktrace and IsInThumbMode.
-    /// Safety: valid for the lifetime of the parent ArmDynarmic32.
-    parent: *const ArmDynarmic32,
+    /// Shared atomic pointer set post-construction by the parent ArmDynarmic32.
+    /// Uses AtomicPtr so the parent can set it after JIT creation without needing
+    /// mutable access to the callbacks (which are consumed by the JIT).
+    /// Safety: once set, valid for the lifetime of the parent ArmDynarmic32.
+    parent: Arc<AtomicPtr<ArmDynarmic32>>,
     /// Upstream: `Core::Memory::Memory& m_memory`.
     /// None in tests where Memory is not wired.
     core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
@@ -119,41 +123,22 @@ struct DynarmicCallbacks32 {
     process: *const crate::hle::kernel::k_process::KProcess,
     /// Shared guest memory reference (ProcessMemoryData).
     /// Used as fallback when core_memory is None (tests).
+    /// Not in upstream, but needed for Rust fallback path.
     memory: SharedProcessMemory,
-    /// SVC/SWI number from last supervisor call, shared with parent ArmDynarmic32.
-    svc_swi: Arc<AtomicU32>,
-    /// Whether wall clock is used (if true, ticking is disabled).
-    /// Matches upstream `m_parent.m_uses_wall_clock`.
-    uses_wall_clock: bool,
-    /// Core timing reference for tick management.
-    /// Matches upstream `m_parent.m_system.CoreTiming()`.
-    core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
-    /// Last exception address reported by dynarmic.
-    last_exception_address: Arc<AtomicU64>,
-    /// Raw pointer to the jit's halt_reason field (AtomicU32).
-    /// Used by exception_raised() to halt execution exactly as upstream does
-    /// via `m_parent.m_jit->HaltExecution(hr)`.
-    /// Set after jit creation via `set_halt_reason_ptr()`.
-    /// Safety: valid for the lifetime of the A32Jit that owns this callback.
-    jit_halt_reason_ptr: Option<*const u32>,
     /// Cached fastmem pointer for lock-free memory reads during code translation.
     /// Matches upstream's direct `m_memory` reference (no synchronization).
     /// Safety: valid for the lifetime of the DeviceMemory backing.
     fastmem_ptr: *const u8,
     /// Raw pointer to jit_state.reg[15] (PC) for diagnostic logging.
     /// Set after jit creation via `set_pc_ptr()`.
+    /// Not in upstream, but needed since we don't have debugger.
     jit_pc_ptr: Option<*const u32>,
     /// Ensures the optional diagnostic code dump only happens once.
     dumped_unmapped_window: AtomicBool,
-    /// Shared exclusive monitor backing Dynarmic's global monitor state.
-    exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
-    /// CPU core index associated with this callback/JIT instance.
-    core_index: usize,
 }
 
-// Safety: jit_halt_reason_ptr points to an AtomicU32 inside the heap-allocated
-// JitInner, which is stable for the jit's lifetime. The pointer is only used
-// for atomic operations (fetch_or) which are thread-safe.
+// Safety: The raw pointers (parent, process, fastmem_ptr, jit_pc_ptr) all point to
+// objects that are stable for the JIT's lifetime. The JIT is single-threaded per core.
 unsafe impl Send for DynarmicCallbacks32 {}
 
 impl DynarmicCallbacks32 {
@@ -161,12 +146,7 @@ impl DynarmicCallbacks32 {
         memory: SharedProcessMemory,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
         process: *const crate::hle::kernel::k_process::KProcess,
-        svc_swi: Arc<AtomicU32>,
-        uses_wall_clock: bool,
-        core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
-        last_exception_address: Arc<AtomicU64>,
-        exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
-        core_index: usize,
+        parent_ptr: Arc<AtomicPtr<ArmDynarmic32>>,
     ) -> Self {
         // Cache fastmem pointer for lock-free code reads during JIT compilation.
         // Matches upstream's direct m_memory reference.
@@ -177,36 +157,32 @@ impl DynarmicCallbacks32 {
         log::info!("DynarmicCallbacks32: core_memory={} fastmem_ptr={:?}",
             if core_memory.is_some() { "wired" } else { "fallback" }, fastmem_ptr);
         Self {
-            parent: std::ptr::null(),
+            parent: parent_ptr,
             core_memory,
             process,
             memory,
-            svc_swi,
-            uses_wall_clock,
-            core_timing,
-            last_exception_address,
             fastmem_ptr,
-            jit_halt_reason_ptr: None,
             jit_pc_ptr: None,
             dumped_unmapped_window: AtomicBool::new(false),
-            exclusive_monitor,
-            core_index,
         }
     }
 
-    /// Set the parent pointer post-construction.
-    /// Matches upstream's `m_parent` reference set during DynarmicCallbacks32 construction.
-    /// In Rust, the parent doesn't exist yet when callbacks are created, so we set it after.
-    fn set_parent_ptr(&mut self, parent: *const ArmDynarmic32) {
-        self.parent = parent;
+    /// Get a reference to the parent ArmDynarmic32.
+    /// All callback methods are only called by the JIT during run_thread(),
+    /// at which point parent is guaranteed to be set by ArmDynarmic32::new().
+    ///
+    /// Corresponds to upstream's `m_parent` reference.
+    fn parent(&self) -> &ArmDynarmic32 {
+        let ptr = self.parent.load(Ordering::Acquire);
+        debug_assert!(!ptr.is_null(), "DynarmicCallbacks32::parent() called before parent pointer was set");
+        unsafe { &*ptr }
     }
 
-    /// Halt the jit by atomically OR-ing a halt reason into the jit's halt_reason field.
+    /// Halt the jit execution with the given reason.
     /// This is the Rust equivalent of upstream's `m_parent.m_jit->HaltExecution(hr)`.
     fn halt_execution(&self, reason: rdynarmic::halt_reason::HaltReason) {
-        if let Some(ptr) = self.jit_halt_reason_ptr {
-            let atomic = unsafe { &*(ptr as *const std::sync::atomic::AtomicU32) };
-            atomic.fetch_or(reason.bits(), Ordering::Release);
+        if let Some(jit) = self.parent().jit.as_ref() {
+            jit.halt_execution(reason);
         }
     }
 
@@ -220,7 +196,7 @@ impl DynarmicCallbacks32 {
     /// Memory access validation is a debugger feature, not used in normal play.
     /// The JIT uses page table fastmem for actual memory protection.
     fn check_memory_access(&self, _addr: u64, _size: u64) -> bool {
-        // Upstream default: m_check_memory_access = false → return true.
+        // Upstream default: m_check_memory_access = false -> return true.
         // When debugger support is added, this should check
         // is_valid_virtual_address_range and call halt_execution(EXCEPTION_RAISED)
         // on failure, matching upstream lines 150-174.
@@ -292,7 +268,7 @@ impl DynarmicCallbacks32 {
             return;
         };
 
-        // rdynarmic exposes jit_state.reg[15] as the PC pointer. The full
+        // rdynarmic exposes jit_state.reg[15] (PC) as the PC pointer. The full
         // GPR bank is contiguous, so walk back to reg[0] for diagnostics.
         let regs_ptr = unsafe { pc_ptr.sub(15) };
         let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
@@ -649,15 +625,17 @@ impl JitCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_clear(&mut self) {
-        if !self.exclusive_monitor.is_null() {
-            unsafe { (*self.exclusive_monitor).get_monitor().clear_processor(self.core_index) };
+        // Upstream: m_parent.m_exclusive_monitor.ClearProcessor(m_parent.m_core_index)
+        let parent = self.parent();
+        if !parent.exclusive_monitor.is_null() {
+            unsafe { (*parent.exclusive_monitor).get_monitor().clear_processor(parent.core_index) };
         }
     }
 
     fn call_supervisor(&mut self, svc_num: u32) {
-        self.svc_swi.store(svc_num, Ordering::Relaxed);
-        // Upstream DynarmicCallbacks32::CallSVC stores the SVC number and halts
-        // JIT execution with SupervisorCall so the host can dispatch the SVC.
+        // Upstream: m_parent.m_svc_swi = swi;
+        //           m_parent.m_jit->HaltExecution(SupervisorCall);
+        self.parent().svc_swi.store(svc_num, Ordering::Relaxed);
         self.halt_execution(rdynarmic::halt_reason::HaltReason::SVC);
     }
 
@@ -667,22 +645,24 @@ impl JitCallbacks for DynarmicCallbacks32 {
         // Port of upstream ExceptionRaised (arm_dynarmic_32.cpp:92-109).
         //
         // Upstream behavior:
-        //   NoExecuteFault: ReturnException(pc, PrefetchAbort) → halts
-        //   default:        if debugger → ReturnException(pc, InstructionBreakpoint)
-        //                   else → LogBacktrace + LOG_CRITICAL (NO halt, continues)
+        //   NoExecuteFault: ReturnException(pc, PrefetchAbort) -> halts
+        //   default:        if debugger -> ReturnException(pc, InstructionBreakpoint)
+        //                   else -> LogBacktrace + LOG_CRITICAL (NO halt, continues)
         //   Hints (SEV/WFI/WFE/Yield): handled by IR as no-ops, never reach here
         match exception {
             x if x == Exception::NoExecuteFault.as_u32() as u64 => {
                 log::error!("Cannot execute instruction at unmapped address {:#08x}", pc);
-                self.last_exception_address.store(pc, Ordering::Relaxed);
+                // Upstream: ReturnException(pc, PrefetchAbort)
+                // Store the exception address so the parent can retrieve it.
+                self.parent().last_exception_address.store(pc, Ordering::Relaxed);
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
             _ => {
                 // Upstream: if debugger enabled, ReturnException(pc, InstructionBreakpoint).
                 // Without debugger: m_parent.LogBacktrace(m_process) + LOG_CRITICAL.
                 // Execution continues (no halt).
-                if !self.parent.is_null() && !self.process.is_null() {
-                    let parent = unsafe { &*self.parent };
+                if !self.parent.load(Ordering::Acquire).is_null() && !self.process.is_null() {
+                    let parent = self.parent();
                     let process = unsafe {
                         &*(self.process as *const crate::arm::arm_interface::KProcess)
                     };
@@ -719,33 +699,31 @@ impl JitCallbacks for DynarmicCallbacks32 {
     /// Matches upstream `DynarmicCallbacks32::AddTicks`:
     /// Divides ticks by NUM_CPU_CORES (4), passes to CoreTiming::AddTicks.
     fn add_ticks(&mut self, ticks: u64) {
-        if self.uses_wall_clock {
+        // Upstream: ASSERT_MSG(!m_parent.m_uses_wall_clock, ...)
+        if self.parent().base.uses_wall_clock {
             return;
         }
         // Divide by number of CPU cores, minimum 1 tick.
         // Matches upstream: amortized_ticks = max(ticks / NUM_CPU_CORES, 1)
         let amortized_ticks = std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
-        self.core_timing.lock().unwrap().add_ticks(amortized_ticks);
+        self.parent().core_timing.lock().unwrap().add_ticks(amortized_ticks);
     }
 
     /// Matches upstream `DynarmicCallbacks32::GetTicksRemaining`:
     /// Returns max(CoreTiming::GetDowncount(), 0).
     fn get_ticks_remaining(&self) -> u64 {
-        if self.uses_wall_clock {
+        // Upstream: ASSERT_MSG(!m_parent.m_uses_wall_clock, ...)
+        if self.parent().base.uses_wall_clock {
             return u64::MAX;
         }
-        let ct = self.core_timing.lock().unwrap();
+        let ct = self.parent().core_timing.lock().unwrap();
         std::cmp::max(ct.get_downcount(), 0) as u64
     }
 
     /// Matches upstream `DynarmicCallbacks32::GetCNTPCT`.
     /// Returns the current system counter value from CoreTiming.
     fn get_cntpct(&self) -> u64 {
-        self.core_timing.lock().unwrap().get_clock_ticks()
-    }
-
-    fn set_halt_reason_ptr(&mut self, ptr: *const u32) {
-        self.jit_halt_reason_ptr = Some(ptr);
+        self.parent().core_timing.lock().unwrap().get_clock_ticks()
     }
 
     fn set_pc_ptr(&mut self, ptr: *const u32) {
@@ -768,12 +746,23 @@ pub struct ArmDynarmic32 {
     /// Passed to JitConfig::global_monitor for cross-core LDXR/STXR synchronization.
     exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
 
-    /// Core index for this CPU
+    /// Core index for this CPU.
+    /// Upstream: `m_core_index`.
     core_index: usize,
 
-    /// SVC callback number, shared with DynarmicCallbacks32.
-    /// Upstream: m_svc_swi written by callback via m_parent reference.
+    /// SVC callback number.
+    /// Upstream: `m_svc_swi` written by callback via `m_parent` reference.
     svc_swi: Arc<AtomicU32>,
+
+    /// Core timing reference for tick management.
+    /// Upstream: accessed via `m_system.CoreTiming()`.
+    /// Stored here so callbacks can access it via `parent().core_timing`.
+    core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+
+    /// Shared atomic pointer used by callbacks to reach back to this ArmDynarmic32.
+    /// The callbacks store a clone of this Arc. After JIT creation, the parent sets
+    /// this to point to itself, allowing callbacks to access parent fields.
+    parent_ptr: Arc<AtomicPtr<ArmDynarmic32>>,
 
     /// Watchpoint that caused a halt
     halted_watchpoint: Option<DebugWatchpoint>,
@@ -814,16 +803,12 @@ impl ArmDynarmic32 {
 
         let svc_swi = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
+        let parent_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let callbacks = DynarmicCallbacks32::new(
             shared_memory,
             core_memory,
             process as *const _ as *const crate::hle::kernel::k_process::KProcess,
-            svc_swi.clone(),
-            uses_wall_clock,
-            core_timing,
-            last_exception_address.clone(),
-            exclusive_monitor,
-            core_index,
+            parent_ptr.clone(),
         );
 
         let optimizations = if let Some(mask) = std::env::var("RUZU_A32_OPTIMIZATION_MASK")
@@ -864,9 +849,6 @@ impl ArmDynarmic32 {
             fastmem_pointer: if std::env::var("RUZU_NO_FASTMEM").is_ok() { None } else { fastmem_pointer },
         };
 
-        // A32Jit::new() internally calls callbacks.set_halt_reason_ptr() with a
-        // pointer to jit_state.halt_reason, so exception_raised() can halt execution
-        // exactly as upstream's m_parent.m_jit->HaltExecution(hr).
         log::warn!("ArmDynarmic32: fastmem_pointer={:?} cycle_counting={} optimizations={:#x}",
             fastmem_pointer.map(|p| p as usize), !uses_wall_clock, optimizations.bits());
 
@@ -881,17 +863,41 @@ impl ArmDynarmic32 {
             }
         };
 
-        Self {
+        let result = Self {
             base: ArmInterfaceBase::new(uses_wall_clock),
             exclusive_monitor,
             core_index,
             svc_swi,
+            core_timing,
+            parent_ptr,
             halted_watchpoint: None,
             breakpoint_context: ThreadContext::default(),
             jit,
             cp15_uro: 0,
             last_exception_address,
-        }
+        };
+
+        // NOTE: The parent pointer is NOT set here because `result` will be moved
+        // by the caller (e.g. into a Box). The caller MUST call `set_parent_ptr()`
+        // after placing the ArmDynarmic32 at its final stable location.
+        // Until then, callbacks that access parent() will panic on the debug_assert.
+        // This is safe because callbacks are only invoked during run_thread().
+
+        result
+    }
+
+    /// Set the parent pointer so callbacks can access this ArmDynarmic32.
+    ///
+    /// MUST be called after the ArmDynarmic32 is placed at its final stable memory
+    /// location (e.g. after Box allocation). The pointer must remain valid for the
+    /// lifetime of the JIT. Callbacks will panic if parent() is called before this.
+    ///
+    /// Matches upstream where `m_parent` is a reference set during construction.
+    /// In Rust, we defer because the callbacks are consumed by the JIT before the
+    /// parent struct reaches its final location.
+    pub fn set_parent_ptr(&mut self) {
+        let ptr: *mut ArmDynarmic32 = self;
+        self.parent_ptr.store(ptr, Ordering::Release);
     }
 
     /// Check if CPU is in Thumb mode.
