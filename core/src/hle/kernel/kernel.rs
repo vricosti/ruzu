@@ -379,6 +379,83 @@ impl KernelCore {
         ));
     }
 
+    /// Run a service function on a guest core as a KThread with fiber context.
+    ///
+    /// Port of upstream `KernelCore::RunOnGuestCoreProcess` (kernel.cpp:1105-1139).
+    /// Creates a new KProcess and KThread, initializes the thread as a service
+    /// thread (HighPriority, core 3, priority 16), and makes it schedulable.
+    /// The scheduler will pick it up and run the fiber on guest core 3.
+    pub fn run_on_guest_core_process(&self, name: &str, func: Box<dyn FnOnce() + Send>) {
+        const SERVICE_THREAD_PRIORITY: i32 = 16;
+        const SERVICE_THREAD_CORE: i32 = 3;
+
+        // Create a service process for tracking.
+        let process = Arc::new(Mutex::new(super::k_process::KProcess::new()));
+        // Minimal init — service processes don't need page tables or user memory.
+
+        // Create the service thread.
+        let thread = Arc::new(Mutex::new(super::k_thread::KThread::new()));
+        let (thread_id, object_id) = {
+            static NEXT_SERVICE_THREAD_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0x8000_0000);
+            let id = NEXT_SERVICE_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+            (id, id)
+        };
+
+        // Give the process a scheduler reference (needed for thread init).
+        if let Some(scheduler) = self.current_scheduler() {
+            process.lock().unwrap().scheduler = Some(Arc::downgrade(&scheduler));
+        }
+
+        {
+            let mut t = thread.lock().unwrap();
+            t.initialize_service_thread(
+                func,
+                SERVICE_THREAD_PRIORITY,
+                SERVICE_THREAD_CORE,
+                &process,
+                thread_id,
+                object_id,
+            );
+        }
+
+        // Register with GlobalSchedulerContext so the scheduler can find it.
+        if let Some(gsc) = self.global_scheduler_context() {
+            gsc.lock().unwrap().add_thread(Arc::clone(&thread));
+        }
+
+        // Make the thread runnable.
+        {
+            let mut t = thread.lock().unwrap();
+            t.run();
+        }
+
+        // Register the thread in the process.
+        process.lock().unwrap().register_thread_object(Arc::clone(&thread));
+
+        log::info!(
+            "KernelCore::run_on_guest_core_process: '{}' thread_id={} core={} priority={}",
+            name, thread_id, SERVICE_THREAD_CORE, SERVICE_THREAD_PRIORITY
+        );
+    }
+
+    /// Run a service function on a host thread with a dummy KThread for tracking.
+    ///
+    /// Port of upstream `KernelCore::RunOnHostCoreProcess` (kernel.cpp:1077-1094).
+    /// Spawns an OS thread that runs the function. Used for CPU-intensive services
+    /// (audio, filesystem, etc.) that benefit from running on host hardware.
+    pub fn run_on_host_core_process(&self, name: &str, func: Box<dyn FnOnce() + Send>) {
+        let thread_name = format!("HLE:{}", name);
+        std::thread::Builder::new()
+            .name(thread_name.clone())
+            .spawn(move || {
+                log::info!("Host service thread '{}' started", thread_name);
+                func();
+                log::info!("Host service thread '{}' exited", thread_name);
+            })
+            .expect("Failed to spawn host service thread");
+    }
+
     /// Wire the hardware timer to CoreTiming.
     /// Must be called after initialize() when System has CoreTiming available.
     pub fn wire_hardware_timer(&self, core_timing: Arc<std::sync::Mutex<CoreTiming>>) {
