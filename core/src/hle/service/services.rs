@@ -122,15 +122,7 @@ impl Services {
         }
 
         // ── Host core processes (upstream: .detach()) ──
-        // kernel.RunOnHostCoreProcess("audio",      [&] { Audio::LoopProcess(system); }).detach();
-        // kernel.RunOnHostCoreProcess("FS",         [&] { FileSystem::LoopProcess(system); }).detach();
-        // kernel.RunOnHostCoreProcess("jit",        [&] { JIT::LoopProcess(system); }).detach();
-        // kernel.RunOnHostCoreProcess("ldn",        [&] { LDN::LoopProcess(system); }).detach();
-        // kernel.RunOnHostCoreProcess("Loader",     [&] { LDR::LoopProcess(system); }).detach();
-        // kernel.RunOnHostCoreProcess("nvservices", [&] { Nvidia::LoopProcess(system); }).detach();
-        // kernel.RunOnHostCoreProcess("bsdsocket",  [&] { Sockets::LoopProcess(system); }).detach();
-        // kernel.RunOnHostCoreProcess("vi",         [&, token] { VI::LoopProcess(system, token); }).detach();
-
+        // These run on host OS threads, matching upstream RunOnHostCoreProcess.
         Self::loop_process_audio(service_manager, system);
         Self::loop_process_filesystem(service_manager, system, filesystem_controller);
         Self::loop_process_jit(service_manager, system);
@@ -138,113 +130,126 @@ impl Services {
         Self::loop_process_loader(service_manager, system);
         Self::loop_process_nvservices(service_manager, system);
         Self::loop_process_bsdsocket(service_manager, system);
-        // Upstream detaches host/guest service processes, so VI can block waiting for
-        // "dispdrv" while nvnflinger registers it on another service thread. Our current
-        // sequential fallback has no detached service threads yet, so we must register the
-        // shared dispdrv owner before entering VI.
         Self::loop_process_nvnflinger(service_manager, system);
         Self::loop_process_vi(service_manager, system);
 
-        // ── Guest core processes (upstream: blocking) ──
-        // kernel.RunOnGuestCoreProcess("sm", ...) is called FIRST.
-        // SM::LoopProcess registers the "sm:" port via ManageNamedPort.
-        crate::hle::service::sm::sm::loop_process(service_manager, system);
+        // ── Guest core processes (upstream: RunOnGuestCoreProcess) ──
+        // Each service gets a KThread fiber on guest core 3, priority 16.
+        // The scheduler runs these alongside the game thread.
+        //
+        // Helper: launch a service on a guest core KThread if kernel is available,
+        // otherwise fall back to direct call (tests).
+        let kernel_ref = if !system.is_null() { system.get().kernel().map(|k| k as *const _ as usize) } else { None };
 
-        // kernel.RunOnGuestCoreProcess("account",    [&] { Account::LoopProcess(system); });
-        Self::loop_process_account(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("am",         [&] { AM::LoopProcess(system); });
-        crate::hle::service::am::am::loop_process(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("aoc",        [&] { AOC::LoopProcess(system); });
-        crate::hle::service::aoc::addon_content_manager::loop_process(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("apm",        [&] { APM::LoopProcess(system); });
-        crate::hle::service::apm::apm::loop_process(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("bcat",       [&] { BCAT::LoopProcess(system); });
-        Self::loop_process_bcat(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("bpc",        [&] { BPC::LoopProcess(system); });
-        Self::loop_process_bpc(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("btdrv",      [&] { BtDrv::LoopProcess(system); });
-        Self::loop_process_btdrv(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("btm",        [&] { BTM::LoopProcess(system); });
-        Self::loop_process_btm(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("capsrv",     [&] { Capture::LoopProcess(system); });
-        Self::loop_process_capsrv(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("erpt",       [&] { ERPT::LoopProcess(system); });
-        Self::loop_process_erpt(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("es",         [&] { ES::LoopProcess(system); });
-        Self::loop_process_es(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("eupld",      [&] { EUPLD::LoopProcess(system); });
-        Self::loop_process_eupld(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("fatal",      [&] { Fatal::LoopProcess(system); });
-        Self::loop_process_fatal(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("fgm",        [&] { FGM::LoopProcess(system); });
-        Self::loop_process_fgm(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("friends",    [&] { Friend::LoopProcess(system); });
-        Self::loop_process_friends(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("settings",   [&] { Set::LoopProcess(system); });
-        Self::loop_process_settings(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("psc",        [&] { PSC::LoopProcess(system); });
-        Self::loop_process_psc(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("glue",       [&] { Glue::LoopProcess(system); });
-        crate::hle::service::glue::glue::loop_process(service_manager, system, dm_addr, mm_addr);
-        // kernel.RunOnGuestCoreProcess("grc",        [&] { GRC::LoopProcess(system); });
-        Self::loop_process_grc(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("hid",        [&] { HID::LoopProcess(system); });
-        Self::loop_process_hid(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("lbl",        [&] { LBL::LoopProcess(system); });
-        Self::loop_process_lbl(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("LogManager.Prod", [&] { LM::LoopProcess(system); });
-        Self::loop_process_lm(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("mig",        [&] { Migration::LoopProcess(system); });
-        Self::loop_process_mig(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("mii",        [&] { Mii::LoopProcess(system); });
-        Self::loop_process_mii(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("mm",         [&] { MM::LoopProcess(system); });
-        Self::loop_process_mm(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("mnpp",       [&] { MNPP::LoopProcess(system); });
-        Self::loop_process_mnpp(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("nvnflinger", [&] { Nvnflinger::LoopProcess(system); });
-        // Already launched above in the sequential fallback to preserve the upstream
-        // VI -> dispdrv dependency without detached service threads.
-        // kernel.RunOnGuestCoreProcess("NCM",        [&] { NCM::LoopProcess(system); });
-        Self::loop_process_ncm(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("nfc",        [&] { NFC::LoopProcess(system); });
-        Self::loop_process_nfc(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("nfp",        [&] { NFP::LoopProcess(system); });
-        Self::loop_process_nfp(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("ngc",        [&] { NGC::LoopProcess(system); });
-        Self::loop_process_ngc(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("nifm",       [&] { NIFM::LoopProcess(system); });
-        Self::loop_process_nifm(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("nim",        [&] { NIM::LoopProcess(system); });
-        Self::loop_process_nim(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("npns",       [&] { NPNS::LoopProcess(system); });
-        Self::loop_process_npns(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("ns",         [&] { NS::LoopProcess(system); });
-        Self::loop_process_ns(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("olsc",       [&] { OLSC::LoopProcess(system); });
-        Self::loop_process_olsc(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("omm",        [&] { OMM::LoopProcess(system); });
-        Self::loop_process_omm(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("pcie",       [&] { PCIe::LoopProcess(system); });
-        Self::loop_process_pcie(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("pctl",       [&] { PCTL::LoopProcess(system); });
-        crate::hle::service::pctl::pctl::loop_process(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("pcv",        [&] { PCV::LoopProcess(system); });
-        Self::loop_process_pcv(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("prepo",      [&] { PlayReport::LoopProcess(system); });
-        Self::loop_process_prepo(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("ProcessManager", [&] { PM::LoopProcess(system); });
-        Self::loop_process_pm(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("ptm",        [&] { PTM::LoopProcess(system); });
-        Self::loop_process_ptm(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("ro",         [&] { RO::LoopProcess(system); });
-        Self::loop_process_ro(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("spl",        [&] { SPL::LoopProcess(system); });
-        Self::loop_process_spl(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("ssl",        [&] { SSL::LoopProcess(system); });
-        Self::loop_process_ssl(service_manager, system);
-        // kernel.RunOnGuestCoreProcess("usb",        [&] { USB::LoopProcess(system); });
-        Self::loop_process_usb(service_manager, system);
+        macro_rules! guest_service {
+            ($name:expr, $body:expr) => {
+                if let Some(kptr) = kernel_ref {
+                    let kernel = unsafe { &*(kptr as *const crate::hle::kernel::kernel::KernelCore) };
+                    kernel.run_on_guest_core_process($name, Box::new($body));
+                } else {
+                    ($body)();
+                }
+            };
+        }
+
+        // SM must be first (other services depend on it).
+        let sm = service_manager.clone();
+        guest_service!("sm", move || {
+            crate::hle::service::sm::sm::loop_process(&sm, system);
+        });
+
+        let sm = service_manager.clone();
+        guest_service!("account", move || { Self::loop_process_account(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("am", move || { crate::hle::service::am::am::loop_process(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("aoc", move || { crate::hle::service::aoc::addon_content_manager::loop_process(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("apm", move || { crate::hle::service::apm::apm::loop_process(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("bcat", move || { Self::loop_process_bcat(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("bpc", move || { Self::loop_process_bpc(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("btdrv", move || { Self::loop_process_btdrv(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("btm", move || { Self::loop_process_btm(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("capsrv", move || { Self::loop_process_capsrv(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("erpt", move || { Self::loop_process_erpt(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("es", move || { Self::loop_process_es(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("eupld", move || { Self::loop_process_eupld(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("fatal", move || { Self::loop_process_fatal(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("fgm", move || { Self::loop_process_fgm(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("friends", move || { Self::loop_process_friends(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("settings", move || { Self::loop_process_settings(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("psc", move || { Self::loop_process_psc(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("glue", move || { crate::hle::service::glue::glue::loop_process(&sm, system, dm_addr, mm_addr); });
+        let sm = service_manager.clone();
+        guest_service!("grc", move || { Self::loop_process_grc(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("hid", move || { Self::loop_process_hid(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("lbl", move || { Self::loop_process_lbl(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("LogManager.Prod", move || { Self::loop_process_lm(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("mig", move || { Self::loop_process_mig(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("mii", move || { Self::loop_process_mii(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("mm", move || { Self::loop_process_mm(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("mnpp", move || { Self::loop_process_mnpp(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("NCM", move || { Self::loop_process_ncm(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("nfc", move || { Self::loop_process_nfc(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("nfp", move || { Self::loop_process_nfp(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("ngc", move || { Self::loop_process_ngc(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("nifm", move || { Self::loop_process_nifm(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("nim", move || { Self::loop_process_nim(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("npns", move || { Self::loop_process_npns(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("ns", move || { Self::loop_process_ns(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("olsc", move || { Self::loop_process_olsc(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("omm", move || { Self::loop_process_omm(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("pcie", move || { Self::loop_process_pcie(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("pctl", move || { crate::hle::service::pctl::pctl::loop_process(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("pcv", move || { Self::loop_process_pcv(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("prepo", move || { Self::loop_process_prepo(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("ProcessManager", move || { Self::loop_process_pm(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("ptm", move || { Self::loop_process_ptm(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("ro", move || { Self::loop_process_ro(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("spl", move || { Self::loop_process_spl(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("ssl", move || { Self::loop_process_ssl(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("usb", move || { Self::loop_process_usb(&sm, system); });
 
         log::info!("Services: all service processes launched");
         Self {}

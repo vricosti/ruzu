@@ -1675,6 +1675,63 @@ impl KThread {
         RESULT_SUCCESS.get_inner_value()
     }
 
+    /// Initialize as a service thread.
+    ///
+    /// Port of upstream `KThread::InitializeServiceThread` (k_thread.cpp:304-321).
+    /// Creates a HighPriority thread with a host fiber context that runs the
+    /// given function. The fiber wraps the function with OnThreadStart/ExitThread
+    /// matching upstream's lambda in InitializeServiceThread.
+    ///
+    /// Used by `KernelCore::run_on_guest_core_process()` to create service threads
+    /// that the scheduler runs on guest cores.
+    pub fn initialize_service_thread(
+        &mut self,
+        func: Box<dyn FnOnce() + Send>,
+        priority: i32,
+        core: i32,
+        owner: &Arc<Mutex<KProcess>>,
+        thread_id: u64,
+        object_id: u64,
+    ) {
+        let owner_weak = Arc::downgrade(owner);
+        let scheduler = owner.lock().unwrap().scheduler.clone();
+
+        self.object_id = object_id;
+        self.thread_type = ThreadType::HighPriority;
+        self.thread_id = thread_id;
+        self.priority = priority;
+        self.base_priority = priority;
+        self.virtual_ideal_core_id = core;
+        self.physical_ideal_core_id = core;
+        self.virtual_affinity_mask = 1u64 << core;
+        self.physical_affinity_mask
+            .set_affinity_mask(1u64 << core);
+        self.thread_state
+            .store(ThreadState::INITIALIZED.bits(), Ordering::Relaxed);
+        self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
+        self.suspend_request_flags = 0;
+        self.parent = Some(owner_weak);
+        self.scheduler = scheduler;
+        self.core_id = core;
+        self.current_core_id = core;
+        self.wait_result = RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value();
+        self.schedule_count = -1;
+        self.initialized = true;
+        self.stack_parameters.disable_count = 1;
+        self.stack_parameters.is_in_exception_handler = true;
+
+        // Create host fiber context from the service function.
+        // Upstream wraps with: OnThreadStart() → func() → ExitThread()
+        // OnThreadStart calls thread.EnableDispatch().
+        // ExitThread is handled by the scheduler when the fiber returns.
+        self.host_context = Some(common::fiber::Fiber::new(func));
+
+        log::info!(
+            "KThread::initialize_service_thread: thread_id={} priority={} core={}",
+            thread_id, priority, core
+        );
+    }
+
     pub fn clone_fpu_status_from(&mut self, current: &KThread) {
         self.thread_context.fpcr = current.thread_context.fpcr;
         self.thread_context.fpsr = current.thread_context.fpsr;
