@@ -133,8 +133,6 @@ struct DynarmicCallbacks32 {
     /// Set after jit creation via `set_pc_ptr()`.
     /// Not in upstream, but needed since we don't have debugger.
     jit_pc_ptr: Option<*const u32>,
-    /// Ensures the optional diagnostic code dump only happens once.
-    dumped_unmapped_window: AtomicBool,
 }
 
 // Safety: The raw pointers (parent, process, fastmem_ptr, jit_pc_ptr) all point to
@@ -163,7 +161,6 @@ impl DynarmicCallbacks32 {
             memory,
             fastmem_ptr,
             jit_pc_ptr: None,
-            dumped_unmapped_window: AtomicBool::new(false),
         }
     }
 
@@ -195,181 +192,19 @@ impl DynarmicCallbacks32 {
     ///
     /// Memory access validation is a debugger feature, not used in normal play.
     /// The JIT uses page table fastmem for actual memory protection.
+    /// Access `m_memory` — returns a lock guard on the Memory bridge.
+    /// Matches upstream's `m_memory` reference (Core::Memory::Memory&).
+    /// Panics if core_memory is not wired (only happens in tests).
+    fn mem(&self) -> std::sync::MutexGuard<'_, Memory> {
+        self.core_memory.as_ref().expect("core_memory not wired").lock().unwrap()
+    }
+
+    /// Matches upstream `DynarmicCallbacks32::CheckMemoryAccess`.
+    /// Default: no check (m_check_memory_access = false).
     fn check_memory_access(&self, _addr: u64, _size: u64) -> bool {
-        // Upstream default: m_check_memory_access = false -> return true.
-        // When debugger support is added, this should check
-        // is_valid_virtual_address_range and call halt_execution(EXCEPTION_RAISED)
-        // on failure, matching upstream lines 150-174.
         true
     }
 
-    fn log_guest_pc_on_unmapped_access(&self, access_kind: &str, vaddr: u64) {
-        let enabled = std::env::var("RUZU_LOG_UNMAPPED_ACCESS_PC")
-            .ok()
-            .is_some_and(|value| value != "0");
-        if !enabled {
-            return;
-        }
-
-        let Some(pc_ptr) = self.jit_pc_ptr else {
-            log::error!(
-                "DynarmicCallbacks32 {} @ {:#010x}: jit_pc_ptr unavailable",
-                access_kind,
-                vaddr
-            );
-            return;
-        };
-
-        let pc = unsafe { *pc_ptr as u64 };
-        let insn = if let Some(ref cm) = self.core_memory {
-            let memory = cm.lock().unwrap();
-            if memory.is_valid_virtual_address_range(pc, 4) {
-                Some(memory.read_32(pc))
-            } else {
-                None
-            }
-        } else {
-            let memory = self.memory.read().unwrap();
-            if memory.is_valid_range(pc, 4) {
-                Some(memory.read_32(pc))
-            } else {
-                None
-            }
-        };
-
-        match insn {
-            Some(insn) => log::error!(
-                "DynarmicCallbacks32 {} @ {:#010x}: guest pc=0x{:08x} insn=0x{:08x}",
-                access_kind,
-                vaddr,
-                pc,
-                insn
-            ),
-            None => log::error!(
-                "DynarmicCallbacks32 {} @ {:#010x}: guest pc=0x{:08x} insn=<unmapped>",
-                access_kind,
-                vaddr,
-                pc
-            ),
-        }
-
-        let log_regs = std::env::var("RUZU_LOG_UNMAPPED_ACCESS_REGS")
-            .ok()
-            .is_some_and(|value| value != "0");
-        if log_regs {
-            self.log_guest_registers_on_unmapped_access(access_kind, vaddr);
-        }
-
-        self.dump_guest_code_window_on_unmapped_access();
-    }
-
-    fn log_guest_registers_on_unmapped_access(&self, access_kind: &str, vaddr: u64) {
-        let Some(pc_ptr) = self.jit_pc_ptr else {
-            return;
-        };
-
-        // rdynarmic exposes jit_state.reg[15] (PC) as the PC pointer. The full
-        // GPR bank is contiguous, so walk back to reg[0] for diagnostics.
-        let regs_ptr = unsafe { pc_ptr.sub(15) };
-        let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
-        let upper_location_descriptor = 0u32;
-        let thumb = (upper_location_descriptor & 1) != 0;
-        let it_state = ((upper_location_descriptor >> 8) & 0x3)
-            | (((upper_location_descriptor >> 10) & 0x3f) << 2);
-        log::error!(
-            "DynarmicCallbacks32 {} @ {:#010x}: r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
-            access_kind,
-            vaddr,
-            regs[0],
-            regs[1],
-            regs[2],
-            regs[3],
-            regs[4],
-            regs[5],
-            regs[6],
-            regs[7],
-        );
-        log::error!(
-            "DynarmicCallbacks32 {} @ {:#010x}: r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x} pc={:#010x} upper={:#010x} thumb={} it={:#04x}",
-            access_kind,
-            vaddr,
-            regs[8],
-            regs[9],
-            regs[10],
-            regs[11],
-            regs[12],
-            regs[13],
-            regs[14],
-            regs[15],
-            upper_location_descriptor,
-            thumb,
-            it_state,
-        );
-    }
-
-    fn dump_guest_code_window_on_unmapped_access(&self) {
-        let Ok(path) = std::env::var("RUZU_DUMP_UNMAPPED_CODE_PATH") else {
-            return;
-        };
-        if path.is_empty() {
-            return;
-        }
-        if self
-            .dumped_unmapped_window
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
-
-        let Some(pc_ptr) = self.jit_pc_ptr else {
-            return;
-        };
-        let pc = unsafe { *pc_ptr as u64 };
-        let window_size = 0x100usize;
-        let window_start = pc.saturating_sub(0x40) & !1;
-        let mut bytes = vec![0u8; window_size];
-
-        if let Some(ref cm) = self.core_memory {
-            let memory = cm.lock().unwrap();
-            if !memory.is_valid_virtual_address_range(window_start, window_size as u64) {
-                return;
-            }
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                *byte = memory.read_8(window_start + index as u64);
-            }
-        } else {
-            let memory = self.memory.read().unwrap();
-            if !memory.is_valid_range(window_start, window_size) {
-                return;
-            }
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                *byte = memory.read_8(window_start + index as u64);
-            }
-        }
-
-        match std::fs::write(&path, &bytes) {
-            Ok(()) => {
-                log::error!(
-                    "DynarmicCallbacks32 dumped guest code window: pc=0x{:08x} start=0x{:08x} size=0x{:x} path={}",
-                    pc,
-                    window_start,
-                    window_size,
-                    path
-                );
-            }
-            Err(err) => {
-                log::error!(
-                    "DynarmicCallbacks32 failed to write guest code window: pc=0x{:08x} start=0x{:08x} size=0x{:x} path={} err={}",
-                    pc,
-                    window_start,
-                    window_size,
-                    path,
-                    err
-                );
-            }
-        }
-    }
 }
 
 impl UserCallbacks for DynarmicCallbacks32 {
@@ -402,147 +237,51 @@ impl UserCallbacks for DynarmicCallbacks32 {
 
     fn memory_read_8(&self, vaddr: u64) -> u8 {
         self.check_memory_access(vaddr, 1);
-        if !self
-            .core_memory
-            .as_ref()
-            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 1))
-            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 1))
-        {
-            self.log_guest_pc_on_unmapped_access("memory_read_8", vaddr);
-        }
-        if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().read_8(vaddr)
-        } else {
-            self.memory.read().unwrap().read_8(vaddr)
-        }
+        self.mem().read_8(vaddr)
     }
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
         self.check_memory_access(vaddr, 2);
-        if !self
-            .core_memory
-            .as_ref()
-            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 2))
-            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 2))
-        {
-            self.log_guest_pc_on_unmapped_access("memory_read_16", vaddr);
-        }
-        if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().read_16(vaddr)
-        } else {
-            self.memory.read().unwrap().read_16(vaddr)
-        }
+        self.mem().read_16(vaddr)
     }
 
     fn memory_read_32(&self, vaddr: u64) -> u32 {
         self.check_memory_access(vaddr, 4);
-        if !self
-            .core_memory
-            .as_ref()
-            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 4))
-            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 4))
-        {
-            self.log_guest_pc_on_unmapped_access("memory_read_32", vaddr);
-        }
-        let value = if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().read_32(vaddr)
-        } else {
-            self.memory.read().unwrap().read_32(vaddr)
-        };
-
-        value
+        self.mem().read_32(vaddr)
     }
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
         self.check_memory_access(vaddr, 8);
-        if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().read_64(vaddr)
-        } else {
-            self.memory.read().unwrap().read_64(vaddr)
-        }
+        self.mem().read_64(vaddr)
     }
 
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
         self.check_memory_access(vaddr, 16);
-        if let Some(ref cm) = self.core_memory {
-            let m = cm.lock().unwrap();
-            (m.read_64(vaddr), m.read_64(vaddr + 8))
-        } else {
-            let mem = self.memory.read().unwrap();
-            (mem.read_64(vaddr), mem.read_64(vaddr + 8))
-        }
+        let m = self.mem();
+        (m.read_64(vaddr), m.read_64(vaddr + 8))
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
-        if !self.check_memory_access(vaddr, 1) { return; }
-        if !self
-            .core_memory
-            .as_ref()
-            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 1))
-            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 1))
-        {
-            self.log_guest_pc_on_unmapped_access("memory_write_8", vaddr);
-        }
-        if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().write_8(vaddr, value);
-        } else {
-            self.memory.write().unwrap().write_8(vaddr, value);
-        }
+        if self.check_memory_access(vaddr, 1) { self.mem().write_8(vaddr, value); }
     }
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
-        if !self.check_memory_access(vaddr, 2) { return; }
-        if !self
-            .core_memory
-            .as_ref()
-            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 2))
-            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 2))
-        {
-            self.log_guest_pc_on_unmapped_access("memory_write_16", vaddr);
-        }
-        if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().write_16(vaddr, value);
-        } else {
-            self.memory.write().unwrap().write_16(vaddr, value);
-        }
+        if self.check_memory_access(vaddr, 2) { self.mem().write_16(vaddr, value); }
     }
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
-        if !self.check_memory_access(vaddr, 4) { return; }
-        if !self
-            .core_memory
-            .as_ref()
-            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 4))
-            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 4))
-        {
-            self.log_guest_pc_on_unmapped_access("memory_write_32", vaddr);
-        }
-        if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().write_32(vaddr, value);
-        } else {
-            self.memory.write().unwrap().write_32(vaddr, value);
-        }
+        if self.check_memory_access(vaddr, 4) { self.mem().write_32(vaddr, value); }
     }
 
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
-        if !self.check_memory_access(vaddr, 8) { return; }
-        if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().write_64(vaddr, value);
-        } else {
-            self.memory.write().unwrap().write_64(vaddr, value);
-        }
+        if self.check_memory_access(vaddr, 8) { self.mem().write_64(vaddr, value); }
     }
 
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
-        if !self.check_memory_access(vaddr, 16) { return; }
-        if let Some(ref cm) = self.core_memory {
-            let m = cm.lock().unwrap();
+        if self.check_memory_access(vaddr, 16) {
+            let m = self.mem();
             m.write_64(vaddr, value_lo);
             m.write_64(vaddr + 8, value_hi);
-        } else {
-            let mut mem = self.memory.write().unwrap();
-            mem.write_64(vaddr, value_lo);
-            mem.write_64(vaddr + 8, value_hi);
         }
     }
 
@@ -567,61 +306,23 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
-        self.check_memory_access(vaddr, 1)
-            && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_8(vaddr, value, expected)
-            } else {
-                self.memory_write_8(vaddr, value);
-                true
-            }
+        self.check_memory_access(vaddr, 1) && self.mem().write_exclusive_8(vaddr, value, expected)
     }
 
     fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
-        self.check_memory_access(vaddr, 2)
-            && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_16(vaddr, value, expected)
-            } else {
-                self.memory_write_16(vaddr, value);
-                true
-            }
+        self.check_memory_access(vaddr, 2) && self.mem().write_exclusive_16(vaddr, value, expected)
     }
 
     fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
-        if !self
-            .core_memory
-            .as_ref()
-            .map(|cm| cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 4))
-            .unwrap_or_else(|| self.memory.read().unwrap().is_valid_range(vaddr, 4))
-        {
-            self.log_guest_pc_on_unmapped_access("exclusive_write_32", vaddr);
-        }
-        self.check_memory_access(vaddr, 4)
-            && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_32(vaddr, value, expected)
-            } else {
-                self.memory_write_32(vaddr, value);
-                true
-            }
+        self.check_memory_access(vaddr, 4) && self.mem().write_exclusive_32(vaddr, value, expected)
     }
 
     fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
-        self.check_memory_access(vaddr, 8)
-            && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_64(vaddr, value, expected)
-            } else {
-                self.memory_write_64(vaddr, value);
-                true
-            }
+        self.check_memory_access(vaddr, 8) && self.mem().write_exclusive_64(vaddr, value, expected)
     }
 
     fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64, expected_lo: u64, expected_hi: u64) -> bool {
-        self.check_memory_access(vaddr, 16)
-            && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
-            } else {
-                self.memory_write_128(vaddr, value_lo, value_hi);
-                true
-            }
+        self.check_memory_access(vaddr, 16) && self.mem().write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
     }
 
     fn exclusive_clear(&mut self) {
