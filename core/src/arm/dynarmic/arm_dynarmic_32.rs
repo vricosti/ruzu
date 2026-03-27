@@ -652,26 +652,37 @@ impl JitCallbacks for DynarmicCallbacks32 {
         // Port of upstream ExceptionRaised (arm_dynarmic_32.cpp:92-109).
         //
         // Upstream behavior:
-        //   NoExecuteFault: log critical + ReturnException(pc, PrefetchAbort) → halts
-        //   Breakpoint:     if debugger, ReturnException(pc, InstructionBreakpoint)
-        //                   else just log critical (no halt — execution continues)
-        //   Hints (SEV/WFI/WFE/Yield): benign, no-op
-        //   Others:         log warning
+        //   NoExecuteFault: ReturnException(pc, PrefetchAbort) → halts
+        //   default:        if debugger → ReturnException(pc, InstructionBreakpoint)
+        //                   else → LogBacktrace + LOG_CRITICAL (NO halt, continues)
+        //   Hints (SEV/WFI/WFE/Yield): handled by IR as no-ops, never reach here
         match exception {
             x if x == Exception::NoExecuteFault.as_u32() as u64 => {
-                self.last_exception_address.store(pc, Ordering::Relaxed);
                 log::error!("Cannot execute instruction at unmapped address {:#08x}", pc);
+                self.last_exception_address.store(pc, Ordering::Relaxed);
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
-            x if x == Exception::Breakpoint.as_u32() as u64 => {
-                // Game called __builtin_trap() / abort().
-                // Upstream sends to debugger which suspends the thread. Without
-                // debugger, halt execution to avoid infinite loop on the BKPT.
+            _ => {
+                // Upstream: if debugger enabled, halt with InstructionBreakpoint.
+                // Without debugger: log backtrace + critical, execution continues.
+                //
+                // We log once with register dump (matches upstream LogBacktrace),
+                // then let execution continue (matching upstream non-debugger path).
                 use std::sync::atomic::{AtomicBool, Ordering as AtOrd};
                 static LOGGED: AtomicBool = AtomicBool::new(false);
                 if !LOGGED.swap(true, AtOrd::Relaxed) {
-                    log::error!("===== BKPT at pc={:#08x} =====", pc);
-                    log::error!("Game hit __builtin_trap(). Dumping state:");
+                    let is_thumb = self.jit_pc_ptr
+                        .map(|p| unsafe { (*p.add(1) & 1) != 0 })
+                        .unwrap_or(false);
+                    log::error!(
+                        "ExceptionRaised(exception={}, pc={:#08x}, code={:#08x}, thumb={})",
+                        exception, pc,
+                        if !self.fastmem_ptr.is_null() {
+                            unsafe { (self.fastmem_ptr.add((pc & !1) as usize) as *const u32).read_unaligned() }
+                        } else { 0 },
+                        is_thumb,
+                    );
+                    // LogBacktrace: dump registers
                     if let Some(pc_ptr) = self.jit_pc_ptr {
                         let regs_ptr = unsafe { pc_ptr.sub(15) };
                         let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
@@ -679,31 +690,8 @@ impl JitCallbacks for DynarmicCallbacks32 {
                             log::error!("  R{:2}: 0x{:08X}", i, regs[i]);
                         }
                     }
-                    if !self.fastmem_ptr.is_null() {
-                        let pc_val = pc & !1;
-                        log::error!("  Nearby Thumb code:");
-                        for off in (-16i64..32).step_by(2) {
-                            let addr = (pc_val as i64 + off) as u64;
-                            let hw = unsafe {
-                                (self.fastmem_ptr.add(addr as usize) as *const u16).read_unaligned()
-                            };
-                            let marker = if addr == pc_val { " <-- PC" } else { "" };
-                            log::error!("    0x{:08X}: 0x{:04X}{}", addr, hw, marker);
-                        }
-                    }
                 }
-                self.last_exception_address.store(pc, Ordering::Relaxed);
-                self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
-            }
-            x if x == Exception::SendEvent.as_u32() as u64
-              || x == Exception::SendEventLocal.as_u32() as u64
-              || x == Exception::WaitForInterrupt.as_u32() as u64
-              || x == Exception::WaitForEvent.as_u32() as u64
-              || x == Exception::Yield.as_u32() as u64 => {
-                // Hint instructions — benign, no-op.
-            }
-            _ => {
-                log::warn!("ExceptionRaised(exception={}, pc={:#08x})", exception, pc);
+                // Upstream: execution continues (no halt without debugger).
             }
         }
     }
