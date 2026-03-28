@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_thread_queue::KThreadQueue;
 use crate::hle::kernel::k_thread::{
     ConditionVariableThreadKey, KThread, ThreadWaitReasonForDebugging,
@@ -27,6 +28,23 @@ use crate::hle::kernel::svc::svc_results::{
     RESULT_TERMINATION_REQUESTED,
 };
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+
+fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> Option<Instant> {
+    if timeout_tick <= 0 {
+        return None;
+    }
+
+    let relative_ns = match current_tick {
+        Some(now_tick) => timeout_tick.saturating_sub(now_tick).max(0) as u64,
+        None => u64::try_from(timeout_tick).unwrap_or(u64::MAX),
+    };
+
+    Some(
+        Instant::now()
+            .checked_add(Duration::from_nanos(relative_ns))
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
+    )
+}
 
 /// Condition variable for thread synchronization.
 ///
@@ -215,16 +233,12 @@ impl KConditionVariable {
 
             // If there are remaining waiters, transfer the lock info to the next owner.
             let next_owner_thread: Option<Arc<Mutex<KThread>>> =
-                if let Some((next_owner_id, _priority)) = next_owner_result {
-                    if has_waiters {
-                        if let Some(lock_info) =
-                            owner_thread.lock().unwrap().take_transfer_lock_info()
+                if let Some((next_owner_id, _priority, transfer_lock_info)) = next_owner_result {
+                    if let Some(lock_info) = transfer_lock_info {
+                        if let Some(next_thread) =
+                            process_guard.get_thread_by_thread_id(next_owner_id)
                         {
-                            if let Some(next_thread) =
-                                process_guard.get_thread_by_thread_id(next_owner_id)
-                            {
-                                next_thread.lock().unwrap().add_held_lock(lock_info);
-                            }
+                            next_thread.lock().unwrap().add_held_lock(lock_info);
                         }
                     }
                     if let Some(next_thread) =
@@ -280,6 +294,46 @@ impl KConditionVariable {
         }
 
         result
+    }
+
+    fn wait_for_current_thread(process: &Arc<Mutex<KProcess>>, current_thread: &Arc<Mutex<KThread>>) {
+        let scheduler = process
+            .lock()
+            .unwrap()
+            .scheduler
+            .as_ref()
+            .and_then(|scheduler| scheduler.upgrade());
+
+        if let Some(scheduler) = scheduler {
+            scheduler.lock().unwrap().request_schedule();
+
+            let sched_ptr = {
+                let mut scheduler_guard = scheduler.lock().unwrap();
+                &mut *scheduler_guard as *mut KScheduler
+            };
+
+            if super::kernel::get_current_thread_pointer().is_some() {
+                unsafe {
+                    KScheduler::schedule_raw_if_needed(sched_ptr);
+                }
+            } else {
+                loop {
+                    let state = current_thread.lock().unwrap().get_state();
+                    if state != super::k_thread::ThreadState::WAITING {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        } else {
+            loop {
+                let state = current_thread.lock().unwrap().get_state();
+                if state != super::k_thread::ThreadState::WAITING {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
     }
 
     /// Wait for the lock at the given address.
@@ -347,8 +401,11 @@ impl KConditionVariable {
 
         // Upstream calls owner_thread->Close() here to release the handle
         // reference. In Rust, Arc reference counting handles this automatically.
+        drop(process_guard);
 
-        RESULT_SUCCESS
+        Self::wait_for_current_thread(process, current_thread);
+
+        ResultCode::new(current_thread.lock().unwrap().get_wait_result())
     }
 
     // -- Condition variable --
@@ -462,26 +519,19 @@ impl KConditionVariable {
                 &mut has_waiters,
             );
 
-            // Transfer lock info if there are remaining waiters.
-            if has_waiters {
-                if let Some(lock_info) = current_thread.lock().unwrap().take_transfer_lock_info() {
-                    if let Some((next_id, _)) = next_owner_result {
-                        if let Some(next_thread) = process_guard.get_thread_by_thread_id(next_id) {
-                            next_thread.lock().unwrap().add_held_lock(lock_info);
-                        }
-                    }
-                }
-            }
-
             // Update for the next owner thread.
             // Matches upstream: next_value = next_owner_thread->GetAddressKeyValue();
             let mut next_value = 0u32;
-            if let Some((next_owner_thread_id, _priority)) = next_owner_result {
+            if let Some((next_owner_thread_id, _priority, transfer_lock_info)) = next_owner_result {
                 let Some(next_owner_thread) =
                     process_guard.get_thread_by_thread_id(next_owner_thread_id)
                 else {
                     return RESULT_INVALID_STATE;
                 };
+
+                if let Some(lock_info) = transfer_lock_info {
+                    next_owner_thread.lock().unwrap().add_held_lock(lock_info);
+                }
 
                 next_owner_thread.lock().unwrap().set_waiting_lock_info(None);
 
@@ -492,10 +542,15 @@ impl KConditionVariable {
 
                 // Wake up the next owner.
                 // Matches upstream: next_owner_thread->EndWait(ResultSuccess);
-                next_owner_thread
-                    .lock()
-                    .unwrap()
-                    .end_wait(RESULT_SUCCESS.get_inner_value());
+                let (no_id, no_pri, no_core, no_aff, no_dummy) = {
+                    let mut guard = next_owner_thread.lock().unwrap();
+                    guard.end_wait(RESULT_SUCCESS.get_inner_value());
+                    super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(&guard)
+                };
+                // Thread transitioned WAITING → RUNNABLE — push to PQ.
+                process_guard.push_back_to_priority_queue_with_props(
+                    no_id, no_pri, no_core, no_aff, no_dummy,
+                );
             }
 
             // Write to the cv key.
@@ -666,7 +721,6 @@ impl KConditionVariable {
     ) {
         let mut current_thread = current_thread.lock().unwrap();
         current_thread.set_user_address_key(KProcessAddress::new(addr), value);
-        current_thread.set_address_arbiter(addr);
         current_thread.set_waiting_lock_owner_thread_id(Some(owner_thread_id));
         current_thread.begin_wait_with_queue(
             ThreadQueueImplForKConditionVariableWaitForAddress::queue(),
@@ -694,13 +748,8 @@ impl KConditionVariable {
         );
         current_thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
         if timeout > 0 {
-            current_thread.set_wait_result(RESULT_SUCCESS.get_inner_value());
-            let timeout_ns = u64::try_from(timeout).unwrap_or(u64::MAX);
-            current_thread.sleep_deadline = Some(
-                Instant::now()
-                    .checked_add(Duration::from_nanos(timeout_ns))
-                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
-            );
+            current_thread.sleep_deadline =
+                deadline_from_timeout_tick(timeout, super::kernel::get_current_hardware_tick());
         }
     }
 }
@@ -827,7 +876,48 @@ mod tests {
             waiter.lock().unwrap().get_wait_reason_for_debugging(),
             ThreadWaitReasonForDebugging::ConditionVar
         );
+        assert!(
+            !waiter.lock().unwrap().is_waiting_for_address_arbiter(),
+            "WaitForAddress should not set address-arbiter tree state on this path"
+        );
         assert_eq!(owner.lock().unwrap().waiter_thread_ids(), vec![2]);
+    }
+
+    #[test]
+    fn wait_for_address_returns_after_signal_result() {
+        let (process, owner, waiter, owner_handle, address) = setup_threads();
+        process
+            .lock()
+            .unwrap()
+            .process_memory
+            .write()
+            .unwrap()
+            .write_32(address, owner_handle | HANDLE_WAIT_MASK);
+
+        let process_for_signal = Arc::clone(&process);
+        let owner_for_signal = Arc::clone(&owner);
+        let signal_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            let result = KConditionVariable::signal_to_address(
+                &process_for_signal,
+                &owner_for_signal,
+                address,
+            );
+            assert_eq!(result, RESULT_SUCCESS);
+        });
+
+        let result = KConditionVariable::wait_for_address(
+            &process,
+            &waiter,
+            owner_handle,
+            address,
+            0x1234,
+        );
+
+        signal_thread.join().unwrap();
+
+        assert_eq!(result, RESULT_SUCCESS);
+        assert_eq!(waiter.lock().unwrap().get_state(), ThreadState::RUNNABLE);
     }
 
     #[test]
@@ -885,10 +975,7 @@ mod tests {
     fn wait_with_timeout_keeps_condvar_queue_until_timer_cancels_it() {
         let (process, _owner, waiter, _owner_handle, address) = setup_threads();
         let key = 0x1c00;
-        let result = process
-            .lock()
-            .unwrap()
-            .wait_condition_variable(&waiter, address, key, 0x1234, 1);
+        let result = KProcess::wait_condition_variable(&process, &waiter, address, key, 0x1234, 1);
 
         assert_eq!(result, RESULT_SUCCESS.get_inner_value());
         assert!(waiter.lock().unwrap().has_wait_queue());
@@ -993,5 +1080,38 @@ mod tests {
             process.lock().unwrap().cond_var.waiting_thread_ids(),
             vec![3, 2]
         );
+    }
+
+    #[test]
+    fn deadline_from_timeout_tick_uses_absolute_tick_when_available() {
+        let start = Instant::now();
+        let deadline = super::deadline_from_timeout_tick(250, Some(200)).unwrap();
+        let remaining = deadline.saturating_duration_since(start);
+
+        assert!(remaining <= Duration::from_micros(100));
+        assert!(remaining <= Duration::from_nanos(50_000));
+    }
+
+    #[test]
+    fn wait_locked_returns_only_after_signal() {
+        let (process, owner, _waiter, _owner_handle, address) = setup_threads();
+        let key = 0x1c00;
+
+        let process_for_signal = Arc::clone(&process);
+        let signal_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            process_for_signal
+                .lock()
+                .unwrap()
+                .signal_condition_variable(key, 1);
+        });
+
+        let result =
+            KProcess::wait_condition_variable(&process, &owner, address, key, 0x1111, -1);
+
+        signal_thread.join().unwrap();
+
+        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+        assert_eq!(owner.lock().unwrap().get_state(), ThreadState::RUNNABLE);
     }
 }

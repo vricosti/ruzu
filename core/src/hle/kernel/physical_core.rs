@@ -161,13 +161,11 @@ impl PhysicalCore {
             return;
         };
 
-        let next_thread_id = next_thread.lock().unwrap().get_thread_id();
-        if next_thread_id == current_thread_id {
-            return;
-        }
-
         self.restore_thread_to_jit(jit, thread_context, &next_thread);
-        runtime.m_current_thread = next_thread;
+        let next_thread_id = next_thread.lock().unwrap().get_thread_id();
+        if next_thread_id != current_thread_id {
+            runtime.m_current_thread = next_thread;
+        }
     }
 
     pub fn dispatch_supervisor_call(
@@ -387,12 +385,22 @@ impl PhysicalCore {
     /// Save context from current core to thread.
     /// Port of upstream `PhysicalCore::SaveContext(KThread* thread)`.
     pub fn save_context(&self, thread: &mut KThread) {
-        // Upstream: gets process from thread, gets arm_interface,
+        // Upstream: PhysicalCore::SaveContext (physical_core.cpp:170-182)
+        // Gets process from thread, gets arm_interface from process,
         // calls interface->GetContext(thread->GetContext()).
-        log::trace!(
-            "PhysicalCore::save_context: core={}",
-            self.m_core_index,
-        );
+        let parent = match thread.parent.as_ref().and_then(|w| w.upgrade()) {
+            Some(p) => p,
+            None => return, // Kernel threads don't run on emulated CPU cores.
+        };
+
+        let process = parent.lock().unwrap();
+        if let Some(jit) = process.get_arm_interface(self.m_core_index) {
+            let k_ctx = &mut thread.thread_context;
+            let arm_ctx: &mut crate::arm::arm_interface::ThreadContext =
+                unsafe { &mut *(k_ctx as *mut super::k_thread::ThreadContext
+                    as *mut crate::arm::arm_interface::ThreadContext) };
+            jit.get_context(arm_ctx);
+        }
     }
 
     /// Log backtrace of current processor state.
@@ -491,6 +499,9 @@ impl PhysicalCore {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     use crate::arm::arm_interface::{Architecture, DebugWatchpoint, KThread as OpaqueKThread};
     use crate::core::System;
@@ -668,5 +679,78 @@ mod tests {
             scheduler.lock().unwrap().get_scheduler_current_thread_id(),
             Some(2)
         );
+    }
+
+    #[test]
+    fn handoff_after_svc_restores_same_thread_context_after_wait() {
+        let mut system = System::new_for_test();
+
+        let mut process = KProcess::new();
+        process.capabilities.core_mask = 0xF;
+        process.capabilities.priority_mask = u64::MAX;
+        process.flags = 0;
+        process.allocate_code_memory(0x200000, 0x20000);
+        process.initialize_handle_table();
+        process.initialize_thread_local_region_base(0x240000);
+
+        let process = Arc::new(Mutex::new(process));
+        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.initialize_main_thread(0x200000, 0x250000, 0, 0x23f000, &process, 1, 1, false);
+            thread.set_priority(44);
+            thread.set_base_priority(44);
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(current_thread.clone());
+        process.lock().unwrap().push_back_to_priority_queue(1);
+        scheduler.lock().unwrap().initialize(1, 0, 0);
+
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+        system.set_current_process_arc(process.clone());
+        system.set_scheduler_arc(scheduler.clone());
+        system.set_shared_process_memory(shared_memory);
+        system.set_runtime_program_id(1);
+        system.set_runtime_64bit(false);
+
+        let physical_core = PhysicalCore::new(0, false);
+        let mut thread_context = ThreadContext::default();
+        let mut jit = TestArmInterface::new(VecDeque::new());
+        physical_core.initialize_guest_runtime(current_thread.clone(), &mut jit, &mut thread_context);
+
+        jit.context.r[0] = 0xAA;
+        jit.context.pc = 0x200100;
+
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.remove_from_priority_queue(1);
+        }
+        current_thread.lock().unwrap().begin_wait();
+
+        let woke_thread = Arc::new(AtomicBool::new(false));
+        let woke_thread_flag = woke_thread.clone();
+        let current_thread_for_waker = current_thread.clone();
+        let process_for_waker = process.clone();
+        let wake_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            {
+                let mut thread = current_thread_for_waker.lock().unwrap();
+                thread.thread_context.r[0] = 0x55;
+                thread.thread_context.pc = 0x200200;
+                thread.end_wait(0);
+            }
+            process_for_waker.lock().unwrap().push_back_to_priority_queue(1);
+            woke_thread_flag.store(true, Ordering::SeqCst);
+        });
+
+        physical_core.handoff_after_svc(&mut jit, &mut thread_context, &scheduler, &process);
+        wake_handle.join().unwrap();
+
+        assert!(woke_thread.load(Ordering::SeqCst));
+        assert_eq!(jit.context.r[0], 0x55);
+        assert_eq!(jit.context.pc, 0x200200);
     }
 }

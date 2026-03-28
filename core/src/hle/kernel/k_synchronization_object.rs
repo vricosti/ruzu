@@ -931,7 +931,7 @@ pub fn process_waiter_snapshot(
 }
 
 pub fn wait(
-    process: &mut KProcess,
+    process: &Arc<Mutex<KProcess>>,
     current_thread: &Arc<Mutex<KThread>>,
     scheduler: &Arc<Mutex<KScheduler>>,
     out_index: &mut i32,
@@ -953,33 +953,69 @@ pub fn wait(
     let mut wait_set = SynchronizationWaitSet::new();
     wait_set.begin(object_ids);
 
-    if !all_objects_known(process, &wait_set) {
-        return RESULT_INVALID_HANDLE;
+    {
+        let mut process_guard = process.lock().unwrap();
+
+        if !all_objects_known(&process_guard, &wait_set) {
+            return RESULT_INVALID_HANDLE;
+        }
+
+        if let Some(index) = first_signaled_index(&process_guard, &wait_set) {
+            *out_index = index as i32;
+            return crate::hle::result::RESULT_SUCCESS;
+        }
+
+        *out_index = -1;
+        if timeout_ns == 0 {
+            return RESULT_TIMED_OUT;
+        }
+
+        let current_thread_id = current_thread.lock().unwrap().thread_id;
+        wait_set.bind_thread(current_thread_id);
+        link_wait_set(&mut process_guard, &wait_set);
+
+        // Thread leaving RUNNABLE → remove from PQ.
+        process_guard.remove_from_priority_queue(current_thread_id);
+
+        current_thread
+            .lock()
+            .unwrap()
+            .begin_wait_synchronization(wait_set, timeout_ns);
     }
 
-    if let Some(index) = first_signaled_index(process, &wait_set) {
-        *out_index = index as i32;
-        return crate::hle::result::RESULT_SUCCESS;
-    }
-
-    *out_index = -1;
-    if timeout_ns == 0 {
-        return RESULT_TIMED_OUT;
-    }
-
-    let current_thread_id = current_thread.lock().unwrap().thread_id;
-    wait_set.bind_thread(current_thread_id);
-    link_wait_set(process, &wait_set);
-
-    // Thread leaving RUNNABLE → remove from PQ.
-    process.remove_from_priority_queue(current_thread_id);
-
-    current_thread
-        .lock()
-        .unwrap()
-        .begin_wait_synchronization(wait_set, timeout_ns);
     scheduler.lock().unwrap().request_schedule();
-    crate::hle::result::RESULT_SUCCESS
+
+    let sched_ptr = {
+        let mut scheduler_guard = scheduler.lock().unwrap();
+        &mut *scheduler_guard as *mut KScheduler
+    };
+
+    if super::kernel::get_current_thread_pointer().is_some() {
+        loop {
+            unsafe {
+                KScheduler::schedule_raw_if_needed(sched_ptr);
+            }
+
+            let state = current_thread.lock().unwrap().get_state();
+            if state != super::k_thread::ThreadState::WAITING {
+                break;
+            }
+
+            std::thread::yield_now();
+        }
+    } else {
+        loop {
+            let state = current_thread.lock().unwrap().get_state();
+            if state != super::k_thread::ThreadState::WAITING {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    let thread = current_thread.lock().unwrap();
+    *out_index = thread.get_synced_index();
+    ResultCode::new(thread.get_wait_result())
 }
 
 fn is_known_object(process: &KProcess, object_id: u64) -> bool {
@@ -1381,8 +1417,8 @@ mod tests {
 
     #[test]
     fn wait_returns_signaled_index() {
-        let mut process = KProcess::new();
-        process.process_id = 100;
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        process.lock().unwrap().process_id = 100;
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
 
         let current_thread = Arc::new(Mutex::new(KThread::new()));
@@ -1395,11 +1431,11 @@ mod tests {
         let readable = Arc::new(Mutex::new(KReadableEvent::new()));
         readable.lock().unwrap().initialize(7, 2);
         readable.lock().unwrap().is_signaled = true;
-        process.register_readable_event_object(2, readable);
+        process.lock().unwrap().register_readable_event_object(2, readable);
 
         let mut out_index = -1;
         let result = wait(
-            &mut process,
+            &process,
             &current_thread,
             &scheduler,
             &mut out_index,
@@ -1421,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_links_and_blocks_thread() {
+    fn wait_blocks_and_returns_after_signal_without_holding_process_lock() {
         let process = Arc::new(Mutex::new(KProcess::new()));
         {
             let mut guard = process.lock().unwrap();
@@ -1448,39 +1484,119 @@ mod tests {
             .unwrap()
             .register_thread_object(current_thread.clone());
 
-        let mut process_guard = process.lock().unwrap();
+        let process_for_signal = process.clone();
+        let scheduler_for_signal = scheduler.clone();
+        let signaler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let event = {
+                process_for_signal
+                    .lock()
+                    .unwrap()
+                    .get_readable_event_by_object_id(2)
+                    .unwrap()
+            };
+            let mut process_guard = process_for_signal.lock().unwrap();
+            let _ = event
+                .lock()
+                .unwrap()
+                .signal(&mut process_guard, &scheduler_for_signal);
+        });
+
         let mut out_index = -1;
         let result = wait(
-            &mut process_guard,
+            &process,
             &current_thread,
             &scheduler,
             &mut out_index,
             vec![2],
             -1,
         );
-        drop(process_guard);
+        signaler.join().unwrap();
 
         assert_eq!(result, RESULT_SUCCESS);
-        assert_eq!(out_index, -1);
+        assert_eq!(out_index, 0);
         assert_eq!(
             current_thread.lock().unwrap().get_state(),
-            crate::hle::kernel::k_thread::ThreadState::WAITING
+            crate::hle::kernel::k_thread::ThreadState::RUNNABLE
         );
+        assert_eq!(current_thread.lock().unwrap().get_synced_index(), 0);
+    }
+
+    #[test]
+    fn wait_blocks_on_guest_thread_path_until_signal() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
         {
-            let process_guard = process.lock().unwrap();
-            let event = process_guard.get_readable_event_by_object_id(2).unwrap();
-            let event_guard = event.lock().unwrap();
-            assert_eq!(
-                event_guard.sync_object.waiter_snapshot(&process_guard),
-                vec![1]
+            let mut guard = process.lock().unwrap();
+            guard.process_id = 100;
+            let readable = Arc::new(Mutex::new(KReadableEvent::new()));
+            readable.lock().unwrap().initialize(7, 2);
+            guard.register_readable_event_object(2, readable);
+        }
+
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.thread_id = 1;
+            thread.object_id = 1;
+            thread.parent = Some(Arc::downgrade(&process));
+            thread.scheduler = Some(Arc::downgrade(&scheduler));
+            thread.thread_state.store(
+                crate::hle::kernel::k_thread::ThreadState::RUNNABLE.bits(),
+                Ordering::Relaxed,
             );
         }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(current_thread.clone());
+
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+
+        let process_for_signal = Arc::clone(&process);
+        let scheduler_for_signal = Arc::clone(&scheduler);
+        let signaler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let event = {
+                process_for_signal
+                    .lock()
+                    .unwrap()
+                    .get_readable_event_by_object_id(2)
+                    .unwrap()
+            };
+            let mut process_guard = process_for_signal.lock().unwrap();
+            let _ = event
+                .lock()
+                .unwrap()
+                .signal(&mut process_guard, &scheduler_for_signal);
+        });
+
+        let mut out_index = -1;
+        let result = wait(
+            &process,
+            &current_thread,
+            &scheduler,
+            &mut out_index,
+            vec![2],
+            -1,
+        );
+
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+        signaler.join().unwrap();
+
+        assert_eq!(result, RESULT_SUCCESS);
+        assert_eq!(out_index, 0);
+        assert_eq!(
+            current_thread.lock().unwrap().get_state(),
+            crate::hle::kernel::k_thread::ThreadState::RUNNABLE
+        );
+        assert_eq!(current_thread.lock().unwrap().get_synced_index(), 0);
     }
 
     #[test]
     fn wait_timeout_zero_returns_timed_out() {
-        let mut process = KProcess::new();
-        process.process_id = 100;
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        process.lock().unwrap().process_id = 100;
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
         {
@@ -1491,11 +1607,11 @@ mod tests {
 
         let readable = Arc::new(Mutex::new(KReadableEvent::new()));
         readable.lock().unwrap().initialize(7, 2);
-        process.register_readable_event_object(2, readable);
+        process.lock().unwrap().register_readable_event_object(2, readable);
 
         let mut out_index = 123;
         let result = wait(
-            &mut process,
+            &process,
             &current_thread,
             &scheduler,
             &mut out_index,

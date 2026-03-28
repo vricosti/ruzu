@@ -14,7 +14,16 @@ use parking_lot::Mutex;
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 
-const DEFAULT_STACK_SIZE: usize = 512 * 1024;
+/// Upstream uses 512 KiB (`default_stack_size = 512 * 1024` in fiber.cpp)
+/// backed by VirtualBuffer (lazily committed pages — only touched pages use
+/// physical memory). corosensei uses mmap+MAP_NORESERVE with a guard page,
+/// so the OS similarly only commits pages on demand.
+///
+/// 4 MiB is needed because Rust debug builds place large temporaries on the
+/// stack (e.g. `[NpadControllerData; 10]` at ~150 KiB during HID init, plus
+/// deep call chains through service initialization). Release builds inline
+/// and elide copies, requiring much less.
+const DEFAULT_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 type FiberCoroutine = Coroutine<(), Arc<Fiber>, (), DefaultStack>;
 type FiberYielder = Yielder<(), Arc<Fiber>>;
@@ -80,7 +89,8 @@ fn coroutine_start(fiber: &Fiber, yielder: &FiberYielder) {
 
     // Upstream Start(): unlock previous fiber's guard and reset
     assert!(imp.previous_fiber.is_some());
-    if let Some(prev) = imp.previous_fiber.take() {
+    let switch_fiber = imp.previous_fiber.take();
+    if let Some(ref prev) = switch_fiber {
         let prev_imp = unsafe { &mut *prev.imp.get() };
         unsafe { prev_imp.guard.force_unlock() };
     }
@@ -90,7 +100,19 @@ fn coroutine_start(fiber: &Fiber, yielder: &FiberYielder) {
         entry();
     }
 
-    unreachable!("Fiber entry point returned!");
+    // Entry point returned (e.g., service thread finished setup).
+    // Upstream: ExitThread() → StartTermination → KScopedSchedulerLock destructor
+    // yields back to the switch fiber. We yield back to the switch fiber directly.
+    // This fiber will not be resumed — the scheduler removes terminated threads from PQ.
+    if let Some(prev) = switch_fiber {
+        log::info!("coroutine_start: entry returned, yielding back to switch fiber");
+        yielder.suspend(prev);
+    }
+
+    // If we get here after being resumed again, just park forever.
+    loop {
+        std::thread::park();
+    }
 }
 
 /// Corresponds to upstream Fiber::RewindStartFunc + Fiber::OnRewind

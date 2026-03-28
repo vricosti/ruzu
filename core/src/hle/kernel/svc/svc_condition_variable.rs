@@ -55,11 +55,14 @@ pub fn wait_process_wide_key_atomic(
 
     // Upstream: Common::AlignDown(cv_key, sizeof(u32)) — aligns down to 4-byte boundary.
     let aligned_cv_key = cv_key & !3u64;
-    let result = system
-        .current_process_arc()
-        .lock()
-        .unwrap()
-        .wait_condition_variable(&current_thread, address, aligned_cv_key, tag, timeout);
+    let result = crate::hle::kernel::k_process::KProcess::wait_condition_variable(
+        &system.current_process_arc(),
+        &current_thread,
+        address,
+        aligned_cv_key,
+        tag,
+        timeout,
+    );
 
     ResultCode::new(result)
 }

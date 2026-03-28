@@ -17,6 +17,7 @@ use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_thread::KThread;
 use crate::hle::kernel::kernel::KernelCore;
+use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::am::applet_manager::{AppletManager, FrontendAppletParameters, LaunchType};
 use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::sm::sm::ServiceManager;
@@ -1145,6 +1146,18 @@ impl System {
     /// Get a reference to the kernel core.
     pub fn kernel(&self) -> Option<&KernelCore> {
         self.kernel.as_ref()
+    }
+
+    /// Runs a service server until shutdown.
+    ///
+    /// Port of upstream `System::RunServer`.
+    pub fn run_server(&self, server_manager: ServerManager) {
+        let Some(kernel) = self.kernel() else {
+            log::warn!("System::run_server called before kernel initialization");
+            return;
+        };
+
+        kernel.run_server(server_manager);
     }
 
     /// Get a mutable reference to the kernel core.

@@ -499,6 +499,23 @@ fn assign_bits(value: u32, field: u32, position: usize, bits: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_thread::KThread;
+    use crate::hle::service::hle_ipc::{SessionRequestHandler, SessionRequestManager};
+    use crate::hle::result::ResultCode;
+    use std::sync::{Arc, Mutex};
+
+    struct TestHandler;
+
+    impl SessionRequestHandler for TestHandler {
+        fn handle_sync_request(&self, _context: &mut HLERequestContext) -> ResultCode {
+            RESULT_SUCCESS
+        }
+
+        fn service_name(&self) -> &str {
+            "TestHandler"
+        }
+    }
 
     #[test]
     fn test_result_session_closed() {
@@ -523,5 +540,49 @@ mod tests {
         }
         // The command buffer should have been written to.
         // Basic smoke test that it doesn't panic.
+    }
+
+    #[test]
+    fn push_ipc_interface_writes_move_handle_into_response() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        assert_eq!(
+            process.lock().unwrap().ensure_handle_table_initialized(),
+            RESULT_SUCCESS.get_inner_value()
+        );
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+        let tls_address = 0x4000;
+        {
+            let mut mem = shared_memory.write().unwrap();
+            mem.allocate(tls_address, 0x1000);
+        }
+
+        let mut ctx = HLERequestContext::new_with_thread(thread, shared_memory.clone(), tls_address);
+        let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        ctx.set_session_request_manager(manager);
+
+        let handle;
+        {
+            let mut rb = ResponseBuilder::new(&mut ctx, 2, 0, 1);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_ipc_interface(Arc::new(TestHandler));
+        }
+
+        assert_eq!(ctx.outgoing_move_objects.len(), 1);
+        handle = match &ctx.outgoing_move_objects[0] {
+            crate::hle::service::hle_ipc::KAutoObjectRef::Handle(handle) => *handle,
+            _ => panic!("expected handle-backed move object"),
+        };
+        assert_ne!(handle, 0);
+
+        assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
+
+        let mem = shared_memory.read().unwrap();
+        let handle_word = mem.read_32(tls_address + 12);
+        assert_eq!(handle_word, handle);
+        assert!(process.lock().unwrap().handle_table.get_object(handle).is_some());
     }
 }

@@ -351,12 +351,15 @@ impl CpuManager {
     pub fn multi_core_run_guest_thread(kernel: &KernelCore) {
         log::info!("multi_core_run_guest_thread: ENTERED on core {}", kernel.current_physical_core_index());
 
+
+
         let cur_thread = super::hle::kernel::kernel::get_current_thread_pointer();
         log::info!(
             "multi_core_run_guest_thread: current_thread={}, has_parent={}",
             cur_thread.as_ref().map(|t| t.lock().unwrap().get_thread_id()).unwrap_or(u64::MAX),
             cur_thread.as_ref().map(|t| t.lock().unwrap().parent.is_some()).unwrap_or(false),
         );
+
 
         // Upstream: auto* thread = Kernel::GetCurrentThreadPointer(kernel);
         // kernel.CurrentScheduler()->OnThreadStart();
@@ -376,6 +379,11 @@ impl CpuManager {
         loop {
             Self::shutdown_if_requested(kernel);
             let mut physical_core = kernel.current_physical_core();
+            // Clear any stale interrupt before entering the JIT loop.
+            // The preemption timer may have fired while we were in the scheduler.
+            if physical_core.is_interrupted() {
+                Self::handle_interrupt(kernel);
+            }
             while !physical_core.is_interrupted() {
                 Self::run_guest_thread_once(kernel, physical_core);
                 // Upstream: physical_core = &kernel.CurrentPhysicalCore();

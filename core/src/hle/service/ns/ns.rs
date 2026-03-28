@@ -80,26 +80,28 @@ pub fn loop_process(system: crate::core::SystemRef) {
         );
     }
 
-    // pl:u -> IPlatformServiceManager
-    {
-        let pl_u: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
-            Arc::new(super::platform_service_manager::IPlatformServiceManager::new());
-        let pl_u_clone = Arc::clone(&pl_u);
-        server_manager.register_named_service(
-            "pl:u",
-            Box::new(move || pl_u_clone.clone()),
-            64,
-        );
-    }
-
     // pl:s -> IPlatformServiceManager
     {
-        let pl_s: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
-            Arc::new(super::platform_service_manager::IPlatformServiceManager::new());
+        let pl_s: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> = Arc::new(
+            super::platform_service_manager::IPlatformServiceManager::new(system, "pl:s"),
+        );
         let pl_s_clone = Arc::clone(&pl_s);
         server_manager.register_named_service(
             "pl:s",
             Box::new(move || pl_s_clone.clone()),
+            64,
+        );
+    }
+
+    // pl:u -> IPlatformServiceManager
+    {
+        let pl_u: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> = Arc::new(
+            super::platform_service_manager::IPlatformServiceManager::new(system, "pl:u"),
+        );
+        let pl_u_clone = Arc::clone(&pl_u);
+        server_manager.register_named_service(
+            "pl:u",
+            Box::new(move || pl_u_clone.clone()),
             64,
         );
     }
