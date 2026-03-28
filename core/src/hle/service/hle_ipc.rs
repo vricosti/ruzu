@@ -1179,9 +1179,9 @@ impl HLERequestContext {
         // Buffer descriptors C.
         let mut c_index = buffer_c_offset;
         self.buffer_c_descriptors.clear();
-        let c_flags_raw = header.buf_c_descriptor_flags();
-        if c_flags_raw as u32 > ipc::BufferDescriptorCFlag::InlineDescriptor as u32 {
-            if c_flags_raw == ipc::BufferDescriptorCFlag::OneDescriptor {
+        let c_flags_raw = bit_field_extract(header.raw_high, 10, 4);
+        if c_flags_raw > ipc::BufferDescriptorCFlag::InlineDescriptor as u32 {
+            if c_flags_raw == ipc::BufferDescriptorCFlag::OneDescriptor as u32 {
                 if c_index + 1 < ipc::COMMAND_BUFFER_LENGTH {
                     self.buffer_c_descriptors.push(ipc::BufferDescriptorC {
                         address_bits_0_31: self.cmd_buf[c_index],
@@ -1189,9 +1189,9 @@ impl HLERequestContext {
                     });
                 }
             } else {
-                // Number of C descriptors = flags - 2
-                let raw_flags = bit_field_extract(header.raw_high, 10, 4);
-                let num_c = raw_flags.wrapping_sub(2) as usize;
+                // Number of C descriptors = flags - 2, matching upstream
+                // `static_cast<u32>(buf_c_descriptor_flags.Value()) - 2`.
+                let num_c = c_flags_raw.wrapping_sub(2) as usize;
                 if num_c < 14 {
                     for _ in 0..num_c {
                         if c_index + 1 < ipc::COMMAND_BUFFER_LENGTH {
@@ -1405,5 +1405,35 @@ mod tests {
         assert_eq!(mem.read_32(tls_address + 8), 0x3333_3333);
         assert_eq!(mem.read_32(tls_address + 12), 0x4444_4444);
         assert_eq!(mem.read_32(tls_address + 16), 0xdead_beef);
+    }
+
+    #[test]
+    fn parse_command_buffer_keeps_multi_descriptor_c_receive_list() {
+        let mut ctx = HLERequestContext::new();
+        let mut cmd_buf = [0u32; ipc::COMMAND_BUFFER_LENGTH];
+
+        let mut raw_high = 0u32;
+        raw_high |= 4; // data_size
+        raw_high |= 5 << 10; // 3 C descriptors encoded as flags raw value 5
+
+        cmd_buf[0] = ipc::CommandType::Request as u32;
+        cmd_buf[1] = raw_high;
+        cmd_buf[4] = 0x4943_4653; // SFCI
+        cmd_buf[6] = 0x1111_2222;
+        cmd_buf[7] = (0x30u32 << 16) | 0x0003;
+        cmd_buf[8] = 0x3333_4444;
+        cmd_buf[9] = (0x40u32 << 16) | 0x0005;
+        cmd_buf[10] = 0x5555_6666;
+        cmd_buf[11] = (0x50u32 << 16) | 0x0007;
+
+        ctx.populate_from_incoming_command_buffer(&cmd_buf);
+
+        assert_eq!(ctx.buffer_descriptor_c().len(), 3);
+        assert_eq!(ctx.buffer_descriptor_c()[0].address(), 0x0003_1111_2222);
+        assert_eq!(ctx.buffer_descriptor_c()[0].size(), 0x30);
+        assert_eq!(ctx.buffer_descriptor_c()[1].address(), 0x0005_3333_4444);
+        assert_eq!(ctx.buffer_descriptor_c()[1].size(), 0x40);
+        assert_eq!(ctx.buffer_descriptor_c()[2].address(), 0x0007_5555_6666);
+        assert_eq!(ctx.buffer_descriptor_c()[2].size(), 0x50);
     }
 }

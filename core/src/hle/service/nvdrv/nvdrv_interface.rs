@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use super::core::container::SessionId;
 use super::nvdata::*;
 use super::nvdrv::Module;
+use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::svc_common::PseudoHandle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -58,7 +60,6 @@ impl NvdrvInterface {
 
     /// Port of NVDRV::Open
     pub fn open(&mut self, device_name: &str) -> (DeviceFD, NvResult) {
-        log::debug!("Open called");
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
             return (0, NvResult::NotInitialized);
@@ -140,14 +141,14 @@ impl NvdrvInterface {
     }
 
     /// Port of NVDRV::Initialize
-    pub fn initialize(&mut self) -> NvResult {
+    pub fn initialize(&mut self, process: &Arc<Mutex<KProcess>>) -> NvResult {
         log::warn!("(STUBBED) Initialize called");
         if self.is_initialized {
             return NvResult::Success;
         }
 
         let container = self.nvdrv.get_container();
-        self.session_id = container.open_session();
+        self.session_id = container.open_session(process);
         self.is_initialized = true;
         NvResult::Success
     }
@@ -322,9 +323,50 @@ impl NvdrvService {
     fn initialize_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
         let mut rp = RequestParser::new(ctx);
+        let process_handle = ctx.get_copy_handle(0);
+        let _transfer_memory_handle = ctx.get_copy_handle(1);
         let _transfer_memory_size = rp.pop_u32();
-        let nv_result = service.interface.lock().unwrap().initialize();
+        let nv_result = match Self::resolve_process_from_handle(ctx, process_handle) {
+            Some(process) => service.interface.lock().unwrap().initialize(&process),
+            None => {
+                log::error!(
+                    "NVDRV::Initialize could not resolve process handle {:#x}",
+                    process_handle
+                );
+                NvResult::BadParameter
+            }
+        };
         Self::push_nv_result(ctx, nv_result);
+    }
+
+    fn resolve_process_from_handle(
+        ctx: &HLERequestContext,
+        process_handle: u32,
+    ) -> Option<Arc<Mutex<KProcess>>> {
+        let thread = ctx.get_thread()?;
+        let parent = {
+            let thread_guard = thread.lock().unwrap();
+            thread_guard.parent.as_ref()?.upgrade()?
+        };
+
+        if process_handle == PseudoHandle::CurrentProcess as u32 || process_handle == 0 {
+            return Some(parent);
+        }
+
+        let is_valid = {
+            let parent_guard = parent.lock().unwrap();
+            parent_guard.handle_table.get_object(process_handle).is_some()
+        };
+
+        if !is_valid {
+            log::error!(
+                "NVDRV::Initialize handle {:#x} is not valid in the current process handle table",
+                process_handle
+            );
+            return None;
+        }
+
+        Some(parent)
     }
 
     fn query_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
