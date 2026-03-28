@@ -184,10 +184,14 @@ impl ArmInterfaceBase {
         log::error!("");
         // Upstream: calls debug::get_backtrace_from_context(process, ctx) and logs each.
         // Transmute the opaque KProcess to the real type to access memory/page table.
-        let real_process = unsafe {
-            &*(_process as *const KProcess
-                as *const crate::hle::kernel::k_process::KProcess)
-        };
+        // Use a raw pointer cast to avoid alignment issues between the opaque and real types.
+        let real_ptr = _process as *const KProcess
+            as *const crate::hle::kernel::k_process::KProcess;
+        if (real_ptr as usize) % std::mem::align_of::<crate::hle::kernel::k_process::KProcess>() != 0 {
+            log::error!("log_backtrace: KProcess pointer {real_ptr:?} is misaligned, skipping");
+            return;
+        }
+        let real_process = unsafe { &*real_ptr };
         let entries = crate::arm::debug::get_backtrace_from_context(real_process, ctx);
         for entry in &entries {
             log::error!(

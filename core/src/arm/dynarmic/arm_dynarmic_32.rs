@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/arm/dynarmic/arm_dynarmic_32.h and arm_dynarmic_32.cpp
 //! ARM32 dynarmic backend.
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::arm::arm_interface::{
@@ -359,40 +359,25 @@ impl UserCallbacks for DynarmicCallbacks32 {
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
             _ => {
-                // Upstream: if debugger enabled, ReturnException(pc, InstructionBreakpoint).
-                // Without debugger: m_parent.LogBacktrace(m_process) + LOG_CRITICAL.
-                // Execution continues (no halt).
-                if !self.parent.load(Ordering::Acquire).is_null() && !self.process.is_null() {
-                    let parent = self.parent();
-                    let process = unsafe {
-                        &*(self.process as *const crate::arm::arm_interface::KProcess)
-                    };
-                    let mut ctx = ThreadContext::default();
-                    // Build ThreadContext from JIT state for LogBacktrace.
-                    if let Some(pc_ptr) = self.jit_pc_ptr {
-                        let regs_ptr = unsafe { pc_ptr.sub(15) };
-                        let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
-                        for i in 0..16 {
-                            ctx.r[i] = regs[i] as u64;
-                        }
-                        ctx.pc = pc;
-                        ctx.sp = regs[13] as u64;
-                    }
-                    parent.base.log_backtrace(process, &ctx);
-                }
+                let mut ctx = ThreadContext::default();
+                self.parent().get_context(&mut ctx);
 
-                let is_thumb = self.jit_pc_ptr
-                    .map(|p| unsafe { (*p.add(1) & 1) != 0 })
-                    .unwrap_or(false);
+                let process = unsafe { &*(self.process as *const KProcess) };
+                self.parent().base.log_backtrace(process, &ctx);
+
+                let code = if self.check_memory_access(pc, 4) {
+                    self.mem().read_32(pc)
+                } else {
+                    0
+                };
+
                 log::error!(
-                    "ExceptionRaised(exception={}, pc={:#08x}, code={:#08x}, thumb={})",
-                    exception, pc,
-                    if !self.fastmem_ptr.is_null() {
-                        unsafe { (self.fastmem_ptr.add((pc & !1) as usize) as *const u32).read_unaligned() }
-                    } else { 0 },
-                    is_thumb,
+                    "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X}, thumb = {})",
+                    exception,
+                    pc as u32,
+                    code,
+                    self.parent().is_in_thumb_mode()
                 );
-                // Upstream: execution continues (no halt without debugger).
             }
         }
     }

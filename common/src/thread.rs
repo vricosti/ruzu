@@ -97,6 +97,10 @@ impl Event {
         }
     }
 
+    pub fn is_set_peek(&self) -> bool {
+        self.is_set.load(Ordering::Relaxed)
+    }
+
     pub fn set(&self) {
         let _lk = self.mutex.lock().unwrap();
         if !self.is_set.load(Ordering::Relaxed) {

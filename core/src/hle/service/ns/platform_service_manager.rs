@@ -2,8 +2,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of zuyu/src/core/hle/service/ns/platform_service_manager.cpp/.h
-//!
-//! Platform font management service (pl:s, pl:u).
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use crate::core::SystemRef;
+use crate::file_sys::system_archive::data::{
+    font_chinese_simplified, font_chinese_traditional, font_extended_chinese_simplified,
+    font_korean, font_nintendo_extended, font_standard,
+};
+use crate::hle::kernel::k_shared_memory::{KSharedMemory, MemoryPermission};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
@@ -33,20 +45,42 @@ pub enum LoadState {
     Loaded = 1,
 }
 
-pub const SHARED_FONTS: &[(FontArchives, &str)] = &[
-    (FontArchives::Standard, "nintendo_udsg-r_std_003.bfttf"),
-    (FontArchives::ChineseSimple, "nintendo_udsg-r_org_zh-cn_003.bfttf"),
-    (FontArchives::ChineseSimple, "nintendo_udsg-r_ext_zh-cn_003.bfttf"),
-    (FontArchives::ChineseTraditional, "nintendo_udjxh-db_zh-tw_003.bfttf"),
-    (FontArchives::Korean, "nintendo_udsg-r_ko_003.bfttf"),
-    (FontArchives::Extension, "nintendo_ext_003.bfttf"),
-    (FontArchives::Extension, "nintendo_ext2_003.bfttf"),
-];
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FontRegion {
+    pub offset: u32,
+    pub size: u32,
+}
 
-/// Constants for shared font decryption
-pub const EXPECTED_RESULT: u32 = 0x7f9a0218;
-pub const EXPECTED_MAGIC: u32 = 0x36f81a1e;
 pub const SHARED_FONT_MEM_SIZE: u64 = 0x1100000;
+const EMPTY_REGION: FontRegion = FontRegion { offset: 0, size: 0 };
+const MAX_ELEMENT_COUNT: usize = 6;
+
+const SHARED_FONTS: [(FontArchives, &[u8]); 6] = [
+    (
+        FontArchives::Standard,
+        &font_standard::FONT_STANDARD,
+    ),
+    (
+        FontArchives::ChineseSimple,
+        &font_chinese_simplified::FONT_CHINESE_SIMPLIFIED,
+    ),
+    (
+        FontArchives::ChineseSimple,
+        &font_extended_chinese_simplified::FONT_EXTENDED_CHINESE_SIMPLIFIED,
+    ),
+    (
+        FontArchives::ChineseTraditional,
+        &font_chinese_traditional::FONT_CHINESE_TRADITIONAL,
+    ),
+    (
+        FontArchives::Korean,
+        &font_korean::FONT_KOREAN,
+    ),
+    (
+        FontArchives::Extension,
+        &font_nintendo_extended::FONT_NINTENDO_EXTENDED,
+    ),
+];
 
 pub const IPLATFORM_SERVICE_MANAGER_COMMANDS: &[(u32, bool, &str)] = &[
     (0, true, "RequestLoad"),
@@ -67,193 +101,221 @@ pub const IPLATFORM_SERVICE_MANAGER_COMMANDS: &[(u32, bool, &str)] = &[
     (1001, false, "GetNgWordDataSizeForPlatformRegionChina"),
 ];
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FontRegion {
-    pub offset: u32,
-    pub size: u32,
+fn align_up_8(value: usize) -> usize {
+    (value + 7) & !7
 }
 
-pub const EMPTY_REGION: FontRegion = FontRegion { offset: 0, size: 0 };
+fn build_shared_font_blob() -> (Vec<u8>, Vec<FontRegion>) {
+    let mut blob = vec![0u8; SHARED_FONT_MEM_SIZE as usize];
+    let mut regions = Vec::with_capacity(SHARED_FONTS.len());
+    let mut offset = 0usize;
 
-// ---------------------------------------------------------------------------
-// IPlatformServiceManager — real service implementation (pl:s, pl:u)
-// ---------------------------------------------------------------------------
+    for (_, font_bytes) in SHARED_FONTS {
+        let size = font_bytes.len();
+        if offset + size > blob.len() {
+            break;
+        }
+        blob[offset..offset + size].copy_from_slice(font_bytes);
+        regions.push(FontRegion {
+            offset: offset as u32,
+            size: size as u32,
+        });
+        offset = align_up_8(offset + size);
+    }
 
-use std::collections::BTreeMap;
+    (blob, regions)
+}
 
-use crate::file_sys::romfs;
-use crate::file_sys::system_archive::system_archive;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-
-/// IPlatformServiceManager — handles shared font loading.
-///
-/// The constructor synthesizes all font archives, matching upstream
-/// `IPlatformServiceManager::IPlatformServiceManager` in platform_service_manager.cpp.
 pub struct IPlatformServiceManager {
-    font_regions: Vec<FontRegion>,
-    font_data: Vec<Vec<u8>>,
+    system: SystemRef,
+    service_name: &'static str,
+    shared_font_bytes: Vec<u8>,
+    shared_font_regions: Vec<FontRegion>,
+    shared_memory_handle: Mutex<Option<u32>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IPlatformServiceManager {
-    pub fn new() -> Self {
-        let mut font_regions = Vec::new();
-        let mut font_data = Vec::new();
-        let mut current_offset: u32 = 0;
-
-        // Iterate SHARED_FONTS and synthesize each archive, matching upstream constructor.
-        // Upstream: for each font in SHARED_FONTS:
-        //   1. Try NCA from NAND
-        //   2. Fall back to SynthesizeSystemArchive(font.first)
-        //   3. ExtractRomFS and load font file
-        for &(archive, font_file_name) in SHARED_FONTS {
-            let title_id = archive as u64;
-
-            // Synthesize the system archive (matches upstream fallback path)
-            let romfs_file = system_archive::synthesize_system_archive(title_id);
-
-            let mut font_bytes = Vec::new();
-
-            if let Some(romfs_file) = romfs_file {
-                // Extract the RomFS to get the font file
-                let extracted = romfs::extract_romfs(Some(romfs_file));
-                if let Some(dir) = extracted {
-                    // Look for the font file in the extracted directory
-                    if let Some(file) = dir.get_file(font_file_name) {
-                        font_bytes = file.read_all_bytes();
-                    } else {
-                        log::warn!(
-                            "IPlatformServiceManager: font file '{}' not found in archive {:#018X}",
-                            font_file_name, title_id
-                        );
-                    }
-                } else {
-                    log::warn!(
-                        "IPlatformServiceManager: failed to extract RomFS for {:#018X}",
-                        title_id
-                    );
-                }
-            } else {
-                log::warn!(
-                    "IPlatformServiceManager: failed to synthesize archive {:#018X}",
-                    title_id
-                );
-            }
-
-            let size = font_bytes.len() as u32;
-            font_regions.push(FontRegion {
-                offset: current_offset,
-                size,
-            });
-            current_offset += (size + 0xFFF) & !0xFFF; // Align to 4K
-            font_data.push(font_bytes);
-        }
-
-        log::info!(
-            "IPlatformServiceManager: loaded {} fonts, total size {}",
-            font_data.len(),
-            current_offset
-        );
-
+    pub fn new(system: SystemRef, service_name: &'static str) -> Self {
+        let (shared_font_bytes, shared_font_regions) = build_shared_font_blob();
         Self {
-            font_regions,
-            font_data,
+            system,
+            service_name,
+            shared_font_bytes,
+            shared_font_regions,
+            shared_memory_handle: Mutex::new(None),
             handlers: build_handler_map(&[
                 (0, Some(Self::request_load), "RequestLoad"),
                 (1, Some(Self::get_load_state), "GetLoadState"),
                 (2, Some(Self::get_size), "GetSize"),
-                (3, Some(Self::get_shared_memory_address_offset), "GetSharedMemoryAddressOffset"),
-                (4, Some(Self::get_shared_memory_native_handle), "GetSharedMemoryNativeHandle"),
-                (5, Some(Self::get_shared_font_in_order_of_priority), "GetSharedFontInOrderOfPriority"),
-                (6, Some(Self::get_shared_font_in_order_of_priority), "GetSharedFontInOrderOfPriorityForSystem"),
+                (
+                    3,
+                    Some(Self::get_shared_memory_address_offset),
+                    "GetSharedMemoryAddressOffset",
+                ),
+                (
+                    4,
+                    Some(Self::get_shared_memory_native_handle),
+                    "GetSharedMemoryNativeHandle",
+                ),
+                (
+                    5,
+                    Some(Self::get_shared_font_in_order_of_priority),
+                    "GetSharedFontInOrderOfPriority",
+                ),
+                (
+                    6,
+                    Some(Self::get_shared_font_in_order_of_priority),
+                    "GetSharedFontInOrderOfPriorityForSystem",
+                ),
             ]),
             handlers_tipc: BTreeMap::new(),
         }
     }
 
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    fn get_shared_font_region(&self, index: usize) -> FontRegion {
+        self.shared_font_regions
+            .get(index)
+            .copied()
+            .unwrap_or(EMPTY_REGION)
+    }
+
+    fn create_shared_memory_handle(&self, ctx: &HLERequestContext) -> Option<u32> {
+        let thread = ctx.get_thread()?;
+        let parent = thread.lock().unwrap().parent.as_ref()?.upgrade()?;
+
+        let system_ptr = self.system.get() as *const crate::core::System as *mut crate::core::System;
+        let device_memory_ptr = unsafe { (*system_ptr).device_memory() as *const _ };
+        let kernel = unsafe { (*system_ptr).kernel_mut()? };
+
+        let mut shmem = KSharedMemory::new();
+        if shmem
+            .initialize(
+                unsafe { &*device_memory_ptr },
+                kernel.memory_manager_mut(),
+                MemoryPermission::Read,
+                MemoryPermission::Read,
+                SHARED_FONT_MEM_SIZE as usize,
+            )
+            .is_error()
+        {
+            return None;
+        }
+
+        let dst = shmem.get_pointer_mut(0);
+        if dst.is_null() {
+            return None;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.shared_font_bytes.as_ptr(),
+                dst,
+                self.shared_font_bytes.len(),
+            );
+        }
+
+        let object_id = kernel.create_new_object_id() as u64;
+        let shmem = Arc::new(shmem);
+
+        let handle = {
+            let mut process = parent.lock().unwrap();
+            process.register_shared_memory_object(object_id, shmem);
+            process.handle_table.add(object_id).ok()?
+        };
+
+        Some(handle)
+    }
+
     fn request_load(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IPlatformServiceManager::RequestLoad called");
+        let mut rp = RequestParser::new(ctx);
+        let _ = rp.pop_u32();
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     fn get_load_state(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IPlatformServiceManager::GetLoadState called");
+        let mut rp = RequestParser::new(ctx);
+        let _ = rp.pop_u32();
+
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(LoadState::Loaded as u32);
     }
 
     fn get_size(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        let mut rp = crate::hle::service::ipc_helpers::RequestParser::new(ctx);
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
         let font_id = rp.pop_u32() as usize;
-        let size = svc.font_regions.get(font_id).map_or(0, |r| r.size);
-        log::debug!("IPlatformServiceManager::GetSize(font_id={}) -> {}", font_id, size);
+
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(size);
+        rb.push_u32(service.get_shared_font_region(font_id).size);
     }
 
     fn get_shared_memory_address_offset(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        let mut rp = crate::hle::service::ipc_helpers::RequestParser::new(ctx);
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
         let font_id = rp.pop_u32() as usize;
-        let offset = svc.font_regions.get(font_id).map_or(0, |r| r.offset);
-        log::debug!("IPlatformServiceManager::GetSharedMemoryAddressOffset(font_id={}) -> {}", font_id, offset);
+
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(offset);
+        rb.push_u32(service.get_shared_font_region(font_id).offset);
     }
 
-    fn get_shared_memory_native_handle(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IPlatformServiceManager::GetSharedMemoryNativeHandle called");
-        // Return a copy handle for the shared memory
-        if let Some(handle) = ctx.create_readable_event_handle(false) {
+    fn get_shared_memory_native_handle(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+
+        if let Some(handle) = *service.shared_memory_handle.lock().unwrap() {
             let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
             rb.push_result(RESULT_SUCCESS);
             rb.push_copy_objects(handle);
-        } else {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(0);
+            return;
         }
+
+        let handle = service.create_shared_memory_handle(ctx);
+        let mut cached = service.shared_memory_handle.lock().unwrap();
+        *cached = handle;
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle.unwrap_or(0));
     }
 
-    fn get_shared_font_in_order_of_priority(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        log::debug!("IPlatformServiceManager::GetSharedFontInOrderOfPriority called");
+    fn get_shared_font_in_order_of_priority(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let _language_code = rp.pop_u64();
 
-        // Write font type, offset, and size arrays to output buffers
-        let num_fonts = SHARED_FONTS.len();
+        let max_size = service.shared_font_regions.len().min(MAX_ELEMENT_COUNT);
 
-        // Buffer 0: font types (u32 each)
-        let mut types_buf = vec![0u8; num_fonts * 4];
-        for i in 0..num_fonts {
-            let font_type = i as u32;
-            types_buf[i * 4..i * 4 + 4].copy_from_slice(&font_type.to_le_bytes());
+        let mut font_codes = vec![0u8; max_size * 4];
+        let mut font_offsets = vec![0u8; max_size * 4];
+        let mut font_sizes = vec![0u8; max_size * 4];
+
+        for i in 0..max_size {
+            let region = service.get_shared_font_region(i);
+            font_codes[i * 4..(i + 1) * 4].copy_from_slice(&(i as u32).to_le_bytes());
+            font_offsets[i * 4..(i + 1) * 4].copy_from_slice(&region.offset.to_le_bytes());
+            font_sizes[i * 4..(i + 1) * 4].copy_from_slice(&region.size.to_le_bytes());
         }
-        ctx.write_buffer(&types_buf, 0);
 
-        // Buffer 1: offsets (u32 each)
-        let mut offsets_buf = vec![0u8; num_fonts * 4];
-        for i in 0..num_fonts {
-            let offset = svc.font_regions.get(i).map_or(0u32, |r| r.offset);
-            offsets_buf[i * 4..i * 4 + 4].copy_from_slice(&offset.to_le_bytes());
-        }
-        ctx.write_buffer(&offsets_buf, 1);
-
-        // Buffer 2: sizes (u32 each)
-        // Note: may not have buffer 2 available in all cases
+        ctx.write_buffer(&font_codes, 0);
+        ctx.write_buffer(&font_offsets, 1);
+        ctx.write_buffer(&font_sizes, 2);
 
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(1); // loaded = true
-        rb.push_u32(num_fonts as u32);
+        rb.push_u32(1);
+        rb.push_u32(max_size as u32);
     }
 }
 
@@ -261,13 +323,42 @@ impl SessionRequestHandler for IPlatformServiceManager {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
+
     fn service_name(&self) -> &str {
         ServiceFramework::get_service_name(self)
     }
 }
 
 impl ServiceFramework for IPlatformServiceManager {
-    fn get_service_name(&self) -> &str { "pl:u" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        self.service_name
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_font_blob_builds_six_regions() {
+        let (_blob, regions) = build_shared_font_blob();
+        assert_eq!(regions.len(), MAX_ELEMENT_COUNT);
+        assert!(regions.iter().all(|region| region.size > 0));
+    }
+
+    #[test]
+    fn shared_font_blob_offsets_are_monotonic() {
+        let (_blob, regions) = build_shared_font_blob();
+        for pair in regions.windows(2) {
+            assert!(pair[0].offset < pair[1].offset);
+        }
+    }
 }

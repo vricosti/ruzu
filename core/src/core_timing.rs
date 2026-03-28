@@ -208,6 +208,9 @@ impl CoreTiming {
                 // We must minimize lock holding to avoid deadlocking with CPU threads
                 // that call get_clock_ticks() under the same mutex.
                 ct_clone.lock().unwrap().has_started.store(true, Ordering::SeqCst);
+                // Ensure the timer thread starts unpaused.
+                // sync_pause(false) from System::run() may not have been called yet.
+                paused.store(false, Ordering::SeqCst);
                 while !shutting_down.load(Ordering::SeqCst) {
                     while !paused.load(Ordering::SeqCst) {
                         paused_set.store(false, Ordering::SeqCst);
@@ -258,7 +261,10 @@ impl CoreTiming {
                                     .get_global_time_ns().as_nanos() as i64;
                                 let wait_time = next_ns - now_ns;
                                 if wait_time > 0 {
-                                    event.wait_for(std::time::Duration::from_nanos(
+                                        // Sleep directly instead of using event.wait_for(),
+                                    // which can return immediately if the event flag is
+                                    // spuriously set by other CoreTiming operations.
+                                    std::thread::sleep(std::time::Duration::from_nanos(
                                         wait_time as u64,
                                     ));
                                 }

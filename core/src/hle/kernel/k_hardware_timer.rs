@@ -30,6 +30,8 @@ pub struct KHardwareTimer {
     /// Upstream doesn't need this because KTimerTask IS the KThread (inheritance).
     /// We use composition instead, so we track weak refs here.
     thread_refs: HashMap<u64, Weak<Mutex<KThread>>>,
+    /// GSC reference for PQ updates when timer wakes threads.
+    gsc: Option<Weak<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>>,
 }
 
 impl KHardwareTimer {
@@ -40,7 +42,12 @@ impl KHardwareTimer {
             m_event_type: None,
             core_timing: None,
             thread_refs: HashMap::new(),
+            gsc: None,
         }
+    }
+
+    pub fn set_gsc(&mut self, gsc: Weak<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>) {
+        self.gsc = Some(gsc);
     }
 
     /// Create the CoreTiming callback.
@@ -228,14 +235,30 @@ impl KHardwareTimer {
         // borrow issues (the callback borrows thread_refs while base is &mut).
         let thread_refs = self.thread_refs.clone();
 
+        let mut woken_props: Vec<(u64, i32, i32, u64, bool)> = Vec::new();
         let next_time = self.base.do_interrupt_task_impl(cur_tick, |task_id| {
             // task->OnTimer() — resolve thread and call on_timer
             if let Some(weak) = thread_refs.get(&task_id) {
                 if let Some(thread) = weak.upgrade() {
-                    thread.lock().unwrap().on_timer();
+                    let mut guard = thread.lock().unwrap();
+                    guard.on_timer();
+                    // Thread transitioned WAITING → RUNNABLE — collect props for PQ push.
+                    woken_props.push(
+                        super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(&guard),
+                    );
                 }
             }
         });
+
+        // Push woken threads to PQ.
+        if !woken_props.is_empty() {
+            if let Some(gsc) = self.gsc.as_ref().and_then(Weak::upgrade) {
+                let mut gsc = gsc.lock().unwrap();
+                for (id, pri, core, aff, dummy) in woken_props {
+                    gsc.push_back_to_priority_queue(id, pri, core, aff, dummy, None);
+                }
+            }
+        }
 
         // Clean up expired thread refs (tasks with time reset to 0 have been removed)
         self.thread_refs

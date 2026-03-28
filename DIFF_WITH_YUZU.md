@@ -219,7 +219,57 @@ The following upstream code is Linux-only in ruzu. The Windows code paths are no
 - PASS: no raw serialized structs are owned in this file.
 
 
-## Misc
+---
+
+## 2026-03-27 — core/src/hle/kernel/k_priority_queue.rs, k_scheduler.rs, global_scheduler_context.rs — scheduler architecture divergence
+
+### Intentional differences
+
+**QueueEntry storage**: Upstream uses intrusive linked lists with `QueueEntry` nodes embedded directly in `KThread` (via `m_per_core_priority_queue_entry[4]`), accessed through raw `KThread*` pointers. Ruzu stores entries in a `HashMap<u64, [QueueEntry; 4]>` inside `KPriorityQueue` itself. This eliminates the `ThreadAccessor` / `KPriorityQueueMember` traits and allows PQ operations without locking any `KThread` mutex.
+
+**Property cache**: Upstream reads thread properties (`priority`, `active_core`, `affinity_mask`, `is_dummy`) directly from `KThread*` pointers during PQ operations and scheduler migration. Ruzu caches these properties in `ThreadProps` inside the PQ, updated on push/remove/change operations. The migration loop reads from this cache instead of locking threads.
+
+**Lock ordering (thread-process-GSC)**: Upstream uses a single `KAbstractSchedulerLock` (recursive spinlock) to serialize all scheduler operations -- there is no per-thread mutex. Ruzu wraps threads in `Arc<Mutex<KThread>>`, creating a lock ordering constraint: thread then process then GSC. The reverse direction (GSC then thread) is avoided to prevent deadlock. This is the root cause of the next difference.
+
+**PQ updates via direct GSC reference on KThread**: Upstream's `KThread::SetState()` acquires `KScopedSchedulerLock` and calls `KScheduler::OnThreadStateChanged(kernel, this, old_state)` which immediately updates the PQ. Ruzu's `set_state()` calls `notify_state_transition()` which accesses the GSC directly via a `Weak<Mutex<GlobalSchedulerContext>>` stored on KThread (matching upstream's access via `KernelCore&`). The PQ push/remove happens inside `notify_state_transition` without going through the process lock. Some legacy call sites still do manual PQ push/remove (condvar, sync objects, hardware timer) — these should be audited for double-push risk.
+
+**`IncrementScheduledCount` via `Arc<AtomicI64>`**: Upstream calls `thread->GetOwnerProcess()->IncrementScheduledCount()` by navigating from thread to process via a raw pointer. This is impossible in ruzu from within the GSC lock (would require thread then process locking, creating a deadlock). Instead, `KProcess::schedule_count` is an `Arc<AtomicI64>` shared between the process, the KThread, and the PQ's `ThreadProps` cache. `pq.increment_scheduled_count(thread_id)` does a lock-free `fetch_add(1, Relaxed)` on the shared atomic.
+
+**Migration `core_id` update deferred**: Upstream calls `thread->SetActiveCore(new_core)` during migration inside `UpdateHighestPriorityThreadsImpl` under the scheduler lock. Ruzu cannot lock threads while holding the GSC lock (deadlock risk). Instead, `change_core` updates the PQ's cached `active_core`, and the actual `KThread::core_id` update is collected in a `Vec<(thread_id, new_core)>` and applied after releasing the GSC lock.
+
+### Unintentional differences (to fix)
+
+- Some call sites (condvar, sync objects, hardware timer) still do manual `push_back_to_priority_queue` / `remove_from_priority_queue` after state transitions that also go through `set_state()` → `notify_state_transition()`. These may cause benign double-push/double-remove but should be audited and removed where redundant.
+
+### Missing items
+
+- `IncrementScheduledCount` in `yield_with_core_migration` and `yield_to_any_thread` -- these currently delegate to `yield_without_core_migration` which has a single call. Upstream has 2 calls in each. Will be added when these yield variants are fully implemented.
+
+### Binary layout verification
+
+- N/A: scheduler state is not serialized.
+
+---
+
+## 2026-03-27 — common/src/fiber.rs — fiber entry point return handling
+
+### Intentional differences
+
+**Service thread fiber lifecycle**: Upstream wraps service thread entry points with `OnThreadStart()` → `func()` → `ExitThread()`. ExitThread calls `KThread::Exit()` which transitions to TERMINATED under `KScopedSchedulerLock`, ensuring the scheduler removes the thread and switches to the next. In ruzu, `coroutine_start` yields back to the switch fiber (via `yielder.suspend()`) when the entry function returns, instead of hitting `unreachable!()`. The service thread wrapper in `run_on_guest_core_process` transitions the thread to TERMINATED before the fiber function returns, so the PQ is updated before the switch fiber re-enters its scheduling loop.
+
+**Switch fiber re-entry**: Upstream's switch fiber loop (`ScheduleImplFiber`) relies on `KScopedSchedulerLock` destructor calling `UpdateHighestPriorityThreads` before each scheduling decision. Ruzu's `schedule_impl_fiber_loop` explicitly calls `UpdateHighestPriorityThreads` via the scheduler lock's callback on each re-entry, to handle the case where a service thread's TERMINATED transition removed it from PQ but `highest_priority_thread_id` was stale.
+
+### Unintentional differences (to fix)
+
+- None currently.
+
+### Binary layout verification
+
+- N/A: fiber state is not serialized.
+
+---
+
+## Misc
 //Translate outgoing copy objects handles.
 //Upstream: handle_table.Add() for proper KAutoObject translation.
 //For now, skip past — handles were written by push_move_objects/push_copy_objects.

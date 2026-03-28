@@ -603,6 +603,8 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let handle = get_arg32(args, 1);
             let mut out_priority = 0;
             let result = svc_thread::get_thread_priority(system, &mut out_priority, handle);
+            log::info!("  GetThreadPriority(handle={:#x}) -> result={:#x}, priority={}",
+                handle, result.get_inner_value(), out_priority);
             set_arg32(args, 0, result.get_inner_value());
             set_arg32(args, 1, out_priority as u32);
         }

@@ -23,7 +23,7 @@ use super::k_memory_block::{
 };
 use super::k_process_page_table::KProcessPageTable;
 use super::k_readable_event::KReadableEvent;
-use super::k_priority_queue::{KPriorityQueueMember, ThreadAccessor};
+// KPriorityQueueMember/ThreadAccessor removed: PQ now self-contained.
 use super::k_scheduler::KScheduler;
 use super::k_session::KSession;
 use super::k_memory_manager;
@@ -404,7 +404,7 @@ pub struct KProcess {
     /// Memory pool for this process.
     /// Upstream: `KMemoryManager::Pool m_memory_pool`.
     pub memory_pool: k_memory_manager::Pool,
-    pub schedule_count: i64,
+    pub schedule_count: std::sync::Arc<std::sync::atomic::AtomicI64>,
     pub capabilities: KCapabilities,
     pub program_id: u64,
     pub process_id: u64,
@@ -536,7 +536,7 @@ impl KProcess {
             num_running_threads: AtomicU16::new(0),
             flags: 0,
             memory_pool: k_memory_manager::Pool::Application,
-            schedule_count: 0,
+            schedule_count: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             capabilities: KCapabilities::new(),
             program_id: 0,
             process_id: 0,
@@ -938,15 +938,22 @@ impl KProcess {
     }
 
     pub fn get_scheduled_count(&self) -> i64 {
-        self.schedule_count
+        self.schedule_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn increment_scheduled_count(&mut self) {
-        self.schedule_count += 1;
+    /// Upstream: IncrementScheduledCount(thread) — increments the owning process counter.
+    /// Invalidates threads' cached yield-schedule-count so next yield does real work.
+    pub fn increment_scheduled_count(&self) {
+        self.schedule_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn attach_scheduler(&mut self, scheduler: &Arc<Mutex<KScheduler>>) {
         self.scheduler = Some(Arc::downgrade(scheduler));
+        // Also wire the GSC from the scheduler so PQ operations work.
+        let sched = scheduler.lock().unwrap();
+        if let Some(ref gsc) = sched.global_scheduler_context {
+            self.global_scheduler_context = Some(Arc::clone(gsc));
+        }
     }
 
     pub fn bind_self_reference(&mut self, process: &Arc<Mutex<KProcess>>) {
@@ -954,22 +961,22 @@ impl KProcess {
     }
 
     pub fn wait_condition_variable(
-        &mut self,
+        process: &Arc<Mutex<KProcess>>,
         current_thread: &Arc<Mutex<KThread>>,
         address: u64,
         cv_key: u64,
         tag: u32,
         timeout: i64,
     ) -> u32 {
-        // Mirror the signal/reprioritize ownership pattern: take the condition
-        // variable owner out temporarily so it can operate on the process state
-        // without a second mutable borrow of `self`.
-        let mut cond_var = std::mem::take(&mut self.cond_var);
-        let result = cond_var
-            .wait_locked(self, current_thread, address, cv_key, tag, timeout)
-            .get_inner_value();
-        self.cond_var = cond_var;
-        result
+        let mut cond_var = {
+            let mut process_guard = process.lock().unwrap();
+            std::mem::take(&mut process_guard.cond_var)
+        };
+
+        let result = cond_var.wait(process, current_thread, address, cv_key, tag, timeout);
+
+        process.lock().unwrap().cond_var = cond_var;
+        result.get_inner_value()
     }
 
     pub fn signal_condition_variable(&mut self, cv_key: u64, count: i32) {
@@ -1006,21 +1013,97 @@ impl KProcess {
     // Delegate to GlobalSchedulerContext which owns the PQ.
     // Matches upstream: GetPriorityQueue(kernel).PushBack/Remove/etc.
 
+    /// Push a thread to the priority queue.
+    /// Thread properties must be extracted while the thread lock is held,
+    /// then passed here after releasing the thread lock.
+    pub fn push_back_to_priority_queue_with_props(
+        &self,
+        thread_id: u64,
+        priority: i32,
+        active_core: i32,
+        affinity: u64,
+        is_dummy: bool,
+    ) {
+        if let Some(ref gsc) = self.global_scheduler_context {
+            gsc.lock().unwrap().push_back_to_priority_queue(
+                thread_id, priority, active_core, affinity, is_dummy,
+                Some(std::sync::Arc::clone(&self.schedule_count)),
+            );
+        }
+        // Upstream: IncrementScheduledCount(thread) in OnThreadStateChanged
+        self.increment_scheduled_count();
+    }
+
+    /// Remove a thread from the priority queue.
+    pub fn remove_from_priority_queue_with_props(
+        &self,
+        thread_id: u64,
+        priority: i32,
+        active_core: i32,
+        affinity: u64,
+        is_dummy: bool,
+    ) {
+        if let Some(ref gsc) = self.global_scheduler_context {
+            gsc.lock().unwrap().remove_from_priority_queue(
+                thread_id, priority, active_core, affinity, is_dummy,
+            );
+        }
+        // Upstream: IncrementScheduledCount(thread) in OnThreadStateChanged
+        self.increment_scheduled_count();
+    }
+
+    /// Convenience: push a thread to PQ by thread_id.
+    /// Looks up the thread from the process's thread table, extracts props.
     pub fn push_back_to_priority_queue(&self, thread_id: u64) {
-        if let Some(ref gsc) = self.global_scheduler_context {
-            gsc.lock().unwrap().push_back_to_priority_queue(thread_id);
+        if let Some(thread) = self.get_thread_by_thread_id(thread_id) {
+            let guard = thread.lock().unwrap();
+            let (id, pri, core, aff, dummy) =
+                super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(&guard);
+            drop(guard);
+            self.push_back_to_priority_queue_with_props(id, pri, core, aff, dummy);
         }
     }
 
+    /// Convenience: remove a thread from PQ by thread_id.
     pub fn remove_from_priority_queue(&self, thread_id: u64) {
-        if let Some(ref gsc) = self.global_scheduler_context {
-            gsc.lock().unwrap().remove_from_priority_queue(thread_id);
+        if let Some(thread) = self.get_thread_by_thread_id(thread_id) {
+            let guard = thread.lock().unwrap();
+            let (id, pri, core, aff, dummy) =
+                super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(&guard);
+            drop(guard);
+            self.remove_from_priority_queue_with_props(id, pri, core, aff, dummy);
         }
     }
 
-    pub fn change_priority_in_queue(&self, thread_id: u64, old_priority: i32, is_running: bool) {
+    /// Push a thread to PQ, extracting props from a thread reference.
+    pub fn push_back_to_priority_queue_from_thread(&self, thread: &super::k_thread::KThread) {
+        let (id, pri, core, aff, dummy) =
+            super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(thread);
+        self.push_back_to_priority_queue_with_props(id, pri, core, aff, dummy);
+    }
+
+    /// Remove a thread from PQ, extracting props from a thread reference.
+    pub fn remove_from_priority_queue_from_thread(&self, thread: &super::k_thread::KThread) {
+        let (id, pri, core, aff, dummy) =
+            super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(thread);
+        self.remove_from_priority_queue_with_props(id, pri, core, aff, dummy);
+    }
+
+    pub fn change_priority_in_queue(
+        &self,
+        thread_id: u64,
+        old_priority: i32,
+        new_priority: i32,
+        active_core: i32,
+        affinity: u64,
+        is_running: bool,
+        is_dummy: bool,
+    ) {
         if let Some(ref gsc) = self.global_scheduler_context {
-            gsc.lock().unwrap().change_priority_in_queue(thread_id, old_priority, is_running);
+            gsc.lock().unwrap().on_thread_priority_changed(
+                thread_id, old_priority, new_priority, active_core, affinity,
+                is_running, is_dummy, thread_id,
+            );
         }
     }
 
@@ -1542,7 +1625,7 @@ impl KProcess {
         self.exception_thread_id = None;
         self.is_suspended = false;
         self.memory_release_hint = 0;
-        self.schedule_count = 0;
+        self.schedule_count = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
         self.is_handle_table_initialized = false;
 
         // Open a reference to our resource limit.
@@ -1981,6 +2064,8 @@ impl KProcess {
                 ideal_core_id,
                 self_weak,
                 scheduler_weak,
+                self.global_scheduler_context.as_ref().map(|g| Arc::downgrade(g)),
+                Some(Arc::clone(&self.schedule_count)),
                 tls_address,
                 main_thread_id,
                 main_object_id,
@@ -2034,24 +2119,16 @@ impl KProcess {
             if run_result != RESULT_SUCCESS.get_inner_value() {
                 return Err(run_result);
             }
-            let thread_id = thread.get_thread_id();
             drop(thread);
 
             // Increment running thread count (thread.run() no longer does this
             // to avoid deadlock when called with process lock held).
             self.increment_running_thread_count();
-            self.push_back_to_priority_queue(thread_id);
 
-            // Upstream: KScheduler::OnThreadStateChanged adds the thread to the
-            // priority queue and sets scheduler_update_needed. Since our
-            // global_scheduler_context may not be wired, directly set the
-            // scheduler's highest_priority_thread_id so Activate() →
-            // ScheduleImpl() can find the runnable thread.
-            if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
-                let mut sched = scheduler.lock().unwrap();
-                sched.state.highest_priority_thread_id = Some(thread_id);
-                sched.state.needs_scheduling.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            // thread.run() → set_state(RUNNABLE) → notify_state_transition now
+            // pushes to PQ via the GSC reference and notifies the scheduler
+            // automatically, matching upstream's KThread::Run() + KScopedSchedulerLock
+            // destructor path.
         }
 
         thread_reservation.commit();
@@ -2438,31 +2515,9 @@ impl Default for KProcess {
     }
 }
 
-/// ThreadAccessor impl for KProcess — allows the KPriorityQueue to
-/// read/write thread queue entries through the process's thread table.
-///
-/// Upstream doesn't need this because KPriorityQueue uses raw Member*
-/// pointers (which ARE the KThread objects). We need indirection because
-/// our threads are behind Arc<Mutex<>>.
-impl ThreadAccessor for KProcess {
-    fn with_thread<F, R>(&self, thread_id: u64, f: F) -> Option<R>
-    where
-        F: FnOnce(&dyn KPriorityQueueMember) -> R,
-    {
-        let thread = self.get_thread_by_thread_id(thread_id)?;
-        let guard = thread.lock().unwrap();
-        Some(f(&*guard))
-    }
-
-    fn with_thread_mut<F, R>(&self, thread_id: u64, f: F) -> Option<R>
-    where
-        F: FnOnce(&mut dyn KPriorityQueueMember) -> R,
-    {
-        let thread = self.get_thread_by_thread_id(thread_id)?;
-        let mut guard = thread.lock().unwrap();
-        Some(f(&mut *guard))
-    }
-}
+// ThreadAccessor impl removed: QueueEntry and thread properties are now
+// stored inside KPriorityQueue. PQ operations no longer need to lock
+// individual KThread objects.
 
 #[cfg(test)]
 mod tests {

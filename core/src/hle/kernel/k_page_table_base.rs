@@ -850,7 +850,7 @@ impl KPageTableBase {
             return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
         }
 
-        log::debug!(
+        log::info!(
             "KPageTableBase::InitializeForProcess: width={}, code=[{:#x}..{:#x}], \
              alias_code=[{:#x}..{:#x}], heap=[{:#x}..{:#x}], alias=[{:#x}..{:#x}], \
              stack=[{:#x}..{:#x}], kmap=[{:#x}..{:#x}]",

@@ -1,6 +1,6 @@
 //! Port of zuyu/src/core/hle/kernel/global_scheduler_context.h/.cpp
 //! Status: EN COURS
-//! Derniere synchro: 2026-03-16
+//! Derniere synchro: 2026-03-27
 //!
 //! GlobalSchedulerContext: the global scheduler context that manages the
 //! priority queue of threads and the scheduler lock.
@@ -10,49 +10,15 @@ use std::sync::{Arc, Mutex};
 
 use crate::hardware_properties;
 
-use super::k_priority_queue::{KPriorityQueue, KPriorityQueueMember, ThreadAccessor};
+use super::k_priority_queue::KPriorityQueue;
 use super::k_scheduler_lock::KAbstractSchedulerLock;
-use super::k_thread::KThread;
+use super::k_thread::{KThread, ThreadState, ThreadType};
 
 /// Priority at or above which core migration is allowed.
 pub const HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY: i32 = 2;
 
 /// Preemption priorities for each core (indices 0-3).
 pub const PREEMPTION_PRIORITIES: [u32; hardware_properties::NUM_CPU_CORES as usize] = [59, 59, 59, 63];
-
-/// ThreadAccessor backed by a snapshot of Arc<Mutex<KThread>> references.
-/// Used for PQ operations that need to resolve thread IDs to thread data.
-pub struct ThreadListAccessor {
-    threads: Vec<Arc<Mutex<KThread>>>,
-}
-
-impl ThreadListAccessor {
-    fn find_thread(&self, thread_id: u64) -> Option<&Arc<Mutex<KThread>>> {
-        self.threads.iter().find(|t| {
-            t.lock().unwrap().get_thread_id() == thread_id
-        })
-    }
-}
-
-impl ThreadAccessor for ThreadListAccessor {
-    fn with_thread<F, R>(&self, thread_id: u64, f: F) -> Option<R>
-    where
-        F: FnOnce(&dyn KPriorityQueueMember) -> R,
-    {
-        let thread = self.find_thread(thread_id)?;
-        let guard = thread.lock().unwrap();
-        Some(f(&*guard))
-    }
-
-    fn with_thread_mut<F, R>(&self, thread_id: u64, f: F) -> Option<R>
-    where
-        F: FnOnce(&mut dyn KPriorityQueueMember) -> R,
-    {
-        let thread = self.find_thread(thread_id)?;
-        let mut guard = thread.lock().unwrap();
-        Some(f(&mut *guard))
-    }
-}
 
 /// The global scheduler context.
 ///
@@ -107,72 +73,167 @@ impl GlobalSchedulerContext {
             .cloned()
     }
 
-    // -- Priority queue operations --
-    // These snapshot the thread list, then operate on the PQ with that snapshot
-    // as the ThreadAccessor. The PQ is extracted via std::mem::take to avoid
-    // double-borrow issues (same pattern as KProcess::push_back_to_priority_queue).
+    // -- Centralized PQ state change handler --
+    // Matches upstream KScheduler::OnThreadStateChanged (k_scheduler.cpp:522).
+    //
+    // This is the single authority for keeping the PQ in sync with thread state.
+    // All thread state transitions that cross Runnable must call this.
+    //
+    // Thread properties are passed directly (extracted by the caller while
+    // holding the thread lock), so this function never locks any KThread.
 
-    pub fn make_accessor(&self) -> ThreadListAccessor {
-        ThreadListAccessor {
-            threads: self.m_thread_list.lock().unwrap().clone(),
+    /// Called when a thread's state changes. Updates the PQ accordingly.
+    /// Matches upstream `KScheduler::OnThreadStateChanged`.
+    ///
+    /// `old_state` and `new_state` are the base states (masked with ThreadState::MASK).
+    pub fn on_thread_state_changed(
+        &mut self,
+        thread_id: u64,
+        old_state: ThreadState,
+        new_state: ThreadState,
+        priority: i32,
+        active_core: i32,
+        affinity: u64,
+        is_dummy: bool,
+        process_schedule_count: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    ) {
+        if old_state == new_state {
+            return;
+        }
+
+        if old_state == ThreadState::RUNNABLE {
+            // Was runnable, now not — remove from PQ.
+            self.m_priority_queue.remove(thread_id, priority, active_core, affinity, is_dummy);
+            self.m_priority_queue.increment_scheduled_count(thread_id);
+            self.m_scheduler_update_needed
+                .store(true, std::sync::atomic::Ordering::Release);
+
+            if is_dummy {
+                self.unregister_dummy_thread_for_wakeup(thread_id);
+            }
+        } else if new_state == ThreadState::RUNNABLE {
+            // Was not runnable, now is — add to PQ.
+            self.m_priority_queue.push_back(
+                thread_id, priority, active_core, affinity, is_dummy,
+                process_schedule_count,
+            );
+            self.m_priority_queue.increment_scheduled_count(thread_id);
+            self.m_scheduler_update_needed
+                .store(true, std::sync::atomic::Ordering::Release);
+
+            if is_dummy {
+                self.register_dummy_thread_for_wakeup(thread_id);
+            }
         }
     }
 
-    pub fn push_back_to_priority_queue(&mut self, thread_id: u64) {
-        let accessor = self.make_accessor();
-        let found = accessor.find_thread(thread_id).is_some();
-        log::debug!(
-            "GSC::push_back_to_priority_queue: thread_id={} found_in_list={} list_size={}",
-            thread_id, found, accessor.threads.len()
+    /// Called when a thread's priority changes while it is Runnable.
+    /// Matches upstream `KScheduler::OnThreadPriorityChanged`.
+    pub fn on_thread_priority_changed(
+        &mut self,
+        _thread_id: u64,
+        old_priority: i32,
+        new_priority: i32,
+        active_core: i32,
+        affinity: u64,
+        is_running: bool,
+        is_dummy: bool,
+        _member_id: u64,
+    ) {
+        self.m_priority_queue.change_priority(
+            old_priority, is_running, _member_id,
+            new_priority, active_core, affinity, is_dummy,
         );
-        let mut pq = std::mem::take(&mut self.m_priority_queue);
-        pq.push_back(thread_id, &accessor);
-        self.m_priority_queue = pq;
+        self.m_scheduler_update_needed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub fn remove_from_priority_queue(&mut self, thread_id: u64) {
-        let accessor = self.make_accessor();
-        let mut pq = std::mem::take(&mut self.m_priority_queue);
-        pq.remove(thread_id, &accessor);
-        self.m_priority_queue = pq;
+    /// Called when a thread's affinity mask changes while it is Runnable.
+    /// Matches upstream `KScheduler::OnThreadAffinityMaskChanged`.
+    pub fn on_thread_affinity_changed(
+        &mut self,
+        thread_id: u64,
+        prev_core: i32,
+        prev_affinity: u64,
+        new_core: i32,
+        new_affinity: u64,
+        priority: i32,
+        is_dummy: bool,
+    ) {
+        self.m_priority_queue.change_affinity_mask(
+            prev_core, prev_affinity, thread_id,
+            new_core, new_affinity, priority, is_dummy,
+        );
+        self.m_scheduler_update_needed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub fn change_priority_in_queue(&mut self, thread_id: u64, old_priority: i32, is_running: bool) {
-        let accessor = self.make_accessor();
-        let mut pq = std::mem::take(&mut self.m_priority_queue);
-        pq.change_priority(old_priority, is_running, thread_id, &accessor);
-        self.m_priority_queue = pq;
+    // -- Legacy PQ operations (for callers that pass properties directly) --
+
+    pub fn push_back_to_priority_queue(
+        &mut self,
+        thread_id: u64,
+        priority: i32,
+        active_core: i32,
+        affinity: u64,
+        is_dummy: bool,
+        process_schedule_count: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    ) {
+        self.m_priority_queue.push_back(
+            thread_id, priority, active_core, affinity, is_dummy, process_schedule_count,
+        );
+        self.m_scheduler_update_needed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn remove_from_priority_queue(
+        &mut self,
+        thread_id: u64,
+        priority: i32,
+        active_core: i32,
+        affinity: u64,
+        is_dummy: bool,
+    ) {
+        self.m_priority_queue.remove(thread_id, priority, active_core, affinity, is_dummy);
+        self.m_scheduler_update_needed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn get_scheduled_front(&self, core: i32) -> Option<u64> {
         self.m_priority_queue.get_scheduled_front(core)
     }
 
-    pub fn move_to_scheduled_back(&mut self, thread_id: u64) -> Option<u64> {
-        let accessor = self.make_accessor();
-        let mut pq = std::mem::take(&mut self.m_priority_queue);
-        let result = pq.move_to_scheduled_back(thread_id, &accessor);
-        self.m_priority_queue = pq;
+    pub fn move_to_scheduled_back(
+        &mut self,
+        thread_id: u64,
+        priority: i32,
+        active_core: i32,
+        is_dummy: bool,
+    ) -> Option<u64> {
+        let result = self.m_priority_queue.move_to_scheduled_back(thread_id, priority, active_core, is_dummy);
+        self.m_scheduler_update_needed
+            .store(true, std::sync::atomic::Ordering::Release);
         result
     }
 
     pub fn get_scheduled_next(&self, core: i32, thread_id: u64, priority: i32) -> Option<u64> {
-        let accessor = self.make_accessor();
-        self.m_priority_queue.get_scheduled_next(core, thread_id, priority, &accessor)
+        self.m_priority_queue.get_scheduled_next(core, thread_id, priority)
     }
 
     // -- PreemptThreads --
 
     pub fn preempt_threads(&mut self) {
-        let accessor = self.make_accessor();
         for core_id in 0..hardware_properties::NUM_CPU_CORES {
             let priority = PREEMPTION_PRIORITIES[core_id as usize] as i32;
-            let mut pq = std::mem::take(&mut self.m_priority_queue);
-            let top_thread_id = pq.get_scheduled_front_at_priority(core_id as i32, priority);
+            let top_thread_id = self.m_priority_queue.get_scheduled_front_at_priority(core_id as i32, priority);
             if let Some(top_id) = top_thread_id {
-                let _ = pq.move_to_scheduled_back(top_id, &accessor);
+                // Look up cached properties for this thread
+                let (t_priority, t_core, t_dummy) = self.m_priority_queue
+                    .get_thread_props(top_id)
+                    .map(|p| (p.priority, p.active_core, p.is_dummy))
+                    .unwrap_or((priority, core_id as i32, false));
+                let _ = self.m_priority_queue.move_to_scheduled_back(top_id, t_priority, t_core, t_dummy);
             }
-            self.m_priority_queue = pq;
         }
     }
 
@@ -210,6 +271,18 @@ impl GlobalSchedulerContext {
         }
 
         self.m_woken_dummy_threads.lock().unwrap().clear();
+    }
+
+    /// Helper: extract PQ-relevant properties from a locked KThread.
+    /// Used by callers that need to pass properties to on_thread_state_changed.
+    pub fn extract_thread_props(thread: &KThread) -> (u64, i32, i32, u64, bool) {
+        (
+            thread.get_thread_id(),
+            thread.priority,
+            thread.core_id,
+            thread.physical_affinity_mask.get_affinity_mask(),
+            thread.thread_type == ThreadType::Dummy,
+        )
     }
 }
 

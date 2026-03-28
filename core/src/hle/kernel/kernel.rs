@@ -15,8 +15,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::k_memory_manager::KMemoryManager;
+use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
 use super::k_thread::KThread;
+use super::super::service::server_manager::ServerManager;
 
 use super::global_scheduler_context::GlobalSchedulerContext;
 use super::init::init_slab_setup::KSlabResourceCounts;
@@ -90,6 +92,8 @@ fn real_enable_scheduling(cores_needing_scheduling: u64) {
 }
 
 fn real_update_highest_priority_threads() -> u64 {
+    use super::k_scheduler::KScheduler;
+
     let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
     if kernel_ptr.is_null() {
         return 0;
@@ -100,46 +104,43 @@ fn real_update_highest_priority_threads() -> u64 {
         Some(gsc) => gsc.clone(),
         None => return 0,
     };
-    let mut gsc = gsc_arc.lock().unwrap();
 
-    if !gsc.m_scheduler_update_needed.load(Ordering::Relaxed) {
-        return 0;
-    }
-
-    // Collect mutable references to schedulers.
+    // Collect scheduler arcs before locking GSC (lock order: GSC before schedulers).
     let sched_arcs: Vec<_> = (0..hardware_properties::NUM_CPU_CORES as usize)
         .filter_map(|i| kernel.scheduler(i).cloned())
         .collect();
-    let mut sched_guards: Vec<_> = sched_arcs.iter().map(|s| s.lock().unwrap()).collect();
 
-    // Build a contiguous Vec<KScheduler> is not feasible since they're behind Mutex.
-    // Instead, call update_highest_priority_thread on each scheduler individually.
-    gsc.m_scheduler_update_needed.store(false, Ordering::Relaxed);
+    let migrations;
+    let cores_needing_scheduling;
+    {
+        let mut gsc = gsc_arc.lock().unwrap();
 
-    let mut cores_needing_scheduling = 0u64;
-    let mut idle_cores = 0u64;
-    let mut top_threads: [Option<u64>; hardware_properties::NUM_CPU_CORES as usize] =
-        [None; hardware_properties::NUM_CPU_CORES as usize];
-
-    for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
-        let top_thread_id = gsc.m_priority_queue.get_scheduled_front(core_id as i32);
-        if top_thread_id.is_none() {
-            idle_cores |= 1u64 << core_id;
+        if !gsc.m_scheduler_update_needed.load(Ordering::Relaxed) {
+            return 0;
         }
-        top_threads[core_id] = top_thread_id;
-        if core_id < sched_guards.len() {
-            cores_needing_scheduling |=
-                sched_guards[core_id].update_highest_priority_thread(top_threads[core_id]);
-        }
+
+        let mut sched_guards: Vec<_> = sched_arcs.iter().map(|s| s.lock().unwrap()).collect();
+
+        // Delegate to full implementation with idle core migration.
+        let result = KScheduler::update_highest_priority_threads_impl(
+            &mut sched_guards, &mut gsc,
+        );
+        cores_needing_scheduling = result.0;
+        migrations = result.1;
+        // GSC lock released here.
     }
 
-    // TODO: Idle core migration — move suggested threads to idle cores.
-    // Full implementation is in KScheduler::update_highest_priority_threads_impl.
-    // For now, the basic per-core scheduling above is sufficient to unblock
-    // threads that are in the priority queue.
-    let _ = idle_cores;
-
-    gsc.wakeup_waiting_dummy_threads();
+    // Apply deferred migration core_id updates (outside GSC lock to avoid deadlock).
+    // Upstream: SetActiveCore is called inside UpdateHighestPriorityThreadsImpl under
+    // the scheduler lock. We defer it because our lock ordering is thread→GSC.
+    if !migrations.is_empty() {
+        let gsc = gsc_arc.lock().unwrap();
+        for (thread_id, new_core) in migrations {
+            if let Some(thread) = gsc.get_thread_by_thread_id(thread_id) {
+                thread.lock().unwrap().core_id = new_core;
+            }
+        }
+    }
 
     cores_needing_scheduling
 }
@@ -172,6 +173,20 @@ pub fn set_current_emu_thread(thread: Option<&Arc<Mutex<KThread>>>) {
 /// Returns None if no thread is set.
 pub fn get_current_thread_pointer() -> Option<Arc<Mutex<KThread>>> {
     get_current_emu_thread()
+}
+
+/// Get the current hardware timer tick for the active kernel instance.
+/// Returns `None` when no kernel or hardware timer is initialized.
+pub fn get_current_hardware_tick() -> Option<i64> {
+    let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
+    if kernel_ptr.is_null() {
+        return None;
+    }
+
+    let kernel = unsafe { &*kernel_ptr };
+    kernel
+        .hardware_timer()
+        .map(|timer| timer.lock().unwrap().get_tick())
 }
 
 /// Constants from the upstream KernelCore::Impl.
@@ -259,6 +274,14 @@ pub struct KernelCore {
     /// Preemption timer event (10ms interval).
     /// Upstream: `std::shared_ptr<Core::Timing::EventType> preemption_event`.
     preemption_event: Option<Arc<parking_lot::Mutex<crate::core_timing::EventType>>>,
+
+    /// Active service server managers.
+    /// Upstream: `Impl::server_managers`.
+    server_managers: Mutex<Vec<Arc<Mutex<ServerManager>>>>,
+
+    /// Guest service processes created by `RunOnGuestCoreProcess`.
+    /// Upstream keeps them alive after `KProcess::Register(*this, process)`.
+    service_processes: Mutex<Vec<Arc<Mutex<KProcess>>>>,
 }
 
 // KProcess initial ID constants (matching upstream).
@@ -303,6 +326,8 @@ impl KernelCore {
             core_timing: None,
             system_ref: crate::core::SystemRef::null(),
             preemption_event: None,
+            server_managers: Mutex::new(Vec::new()),
+            service_processes: Mutex::new(Vec::new()),
         }
     }
 
@@ -358,16 +383,13 @@ impl KernelCore {
                 let kernel = unsafe { &*kernel_ptr };
 
                 // PreemptThreads (rotate priority queue).
-                // Drop the GSC lock before interrupting cores to avoid
-                // deadlock with CPU threads that hold core locks then need GSC.
                 if let Some(gsc_arc) = kernel.global_scheduler_context() {
                     let mut gsc = gsc_arc.lock().unwrap();
                     gsc.preempt_threads();
                     drop(gsc);
                 }
 
-                // Interrupt all cores — sets is_interrupted=true and calls
-                // HaltExecution on the JIT to break out of linked block loops.
+                // Interrupt all cores.
                 for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
                     if let Some(core) = kernel.physical_core(core_id) {
                         core.interrupt();
@@ -392,6 +414,10 @@ impl KernelCore {
         // Create a service process for tracking.
         let process = Arc::new(Mutex::new(super::k_process::KProcess::new()));
         // Minimal init — service processes don't need page tables or user memory.
+        self.service_processes
+            .lock()
+            .unwrap()
+            .push(Arc::clone(&process));
 
         // Create the service thread.
         let thread = Arc::new(Mutex::new(super::k_thread::KThread::new()));
@@ -407,10 +433,16 @@ impl KernelCore {
         if let Some(scheduler) = self.scheduler(SERVICE_THREAD_CORE as usize) {
             process.lock().unwrap().scheduler = Some(Arc::downgrade(scheduler));
         }
+        // Wire GSC so the thread's notify_state_transition can update PQ directly.
+        if let Some(gsc) = self.global_scheduler_context() {
+            process.lock().unwrap().global_scheduler_context = Some(gsc.clone());
+        }
 
         {
             let mut t = thread.lock().unwrap();
             t.initialize_service_thread(
+                self.system_ref,
+                &thread,
                 func,
                 SERVICE_THREAD_PRIORITY,
                 SERVICE_THREAD_CORE,
@@ -420,18 +452,15 @@ impl KernelCore {
             );
         }
 
-        // Register with GlobalSchedulerContext so the scheduler can find it.
-        if let Some(gsc) = self.global_scheduler_context() {
-            let mut gsc = gsc.lock().unwrap();
-            gsc.add_thread(Arc::clone(&thread));
+        // Upstream registers the thread before making it runnable.
+        process.lock().unwrap().register_thread_object(Arc::clone(&thread));
+        self.register_kernel_object(thread.lock().unwrap().get_object_id());
 
-            // Make the thread runnable.
-            thread.lock().unwrap().run();
-
-            // Push into priority queue — matches upstream KScheduler::OnThreadStateChanged
-            // which calls GetPriorityQueue(kernel).PushBack(thread) when state becomes Runnable.
-            gsc.push_back_to_priority_queue(thread_id);
-        }
+        // Make the thread runnable. t.run() → set_state(RUNNABLE) →
+        // notify_state_transition pushes to PQ via the GSC reference
+        // (wired during initialize_service_thread from the process).
+        // Must be called OUTSIDE GSC lock scope to avoid deadlock.
+        thread.lock().unwrap().run();
 
         // Request reschedule so the scheduler picks up the new thread.
         // Upstream: SetSchedulerUpdateNeeded + KScopedSchedulerLock release triggers reschedule.
@@ -442,10 +471,6 @@ impl KernelCore {
                 scheduler.lock().unwrap().request_schedule();
             }
         }
-
-        // Register the thread in the process.
-        process.lock().unwrap().register_thread_object(Arc::clone(&thread));
-
         // Verify the thread is in the priority queue.
         if let Some(gsc) = self.global_scheduler_context() {
             let gsc = gsc.lock().unwrap();
@@ -565,6 +590,7 @@ impl KernelCore {
         self.schedulers.clear();
         self.main_threads.clear();
         self.idle_threads.clear();
+        self.service_processes.lock().unwrap().clear();
 
         if let Some(ref container) = self.global_object_list_container {
             container.finalize();
@@ -582,7 +608,35 @@ impl KernelCore {
     /// Close all active services.
     /// Upstream iterates server_managers and closes each.
     pub fn close_services(&self) {
-        // Server managers are not yet tracked in KernelCore; no-op until wired.
+        let server_managers = {
+            let mut managers = self.server_managers.lock().unwrap();
+            std::mem::take(&mut *managers)
+        };
+
+        for manager in server_managers {
+            manager.lock().unwrap().request_stop();
+        }
+
+    }
+
+    /// Port of upstream `KernelCore::RunServer`.
+    pub fn run_server(&self, server_manager: ServerManager) {
+        let manager = Arc::new(Mutex::new(server_manager));
+
+        {
+            let mut managers = self.server_managers.lock().unwrap();
+            if self.is_shutting_down.load(Ordering::Relaxed) {
+                return;
+            }
+            managers.push(Arc::clone(&manager));
+        }
+
+        manager.lock().unwrap().loop_process();
+    }
+
+    #[cfg(test)]
+    fn track_server_manager_for_test(&self, server_manager: Arc<Mutex<ServerManager>>) {
+        self.server_managers.lock().unwrap().push(server_manager);
     }
 
     /// Suspend or resume emulation threads for the current application process.
@@ -978,6 +1032,42 @@ impl KernelCore {
             self.main_threads.push(main_thread);
             self.idle_threads.push(idle_thread);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::SystemRef;
+
+    #[test]
+    fn close_services_requests_stop_on_tracked_server_managers() {
+        let kernel = KernelCore::new();
+        let manager = Arc::new(Mutex::new(ServerManager::new(SystemRef::null())));
+
+        kernel.track_server_manager_for_test(Arc::clone(&manager));
+        kernel.close_services();
+
+        assert!(manager.lock().unwrap().stop_requested_for_test());
+    }
+
+    #[test]
+    fn run_on_guest_core_process_retains_service_process_owner() {
+        let mut kernel = KernelCore::new();
+        kernel.initialize();
+
+        kernel.run_on_guest_core_process("svc-test", Box::new(|| {}));
+
+        assert_eq!(kernel.service_processes.lock().unwrap().len(), 1);
+
+        let service_process = kernel.service_processes.lock().unwrap()[0].clone();
+        let thread = {
+            let process = service_process.lock().unwrap();
+            process.thread_objects.values().next().cloned()
+        }
+        .expect("service process should keep its thread object");
+
+        assert!(thread.lock().unwrap().parent.as_ref().and_then(Weak::upgrade).is_some());
     }
 }
 

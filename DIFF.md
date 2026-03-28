@@ -159,6 +159,69 @@
 - Re-audit whether the retained suspended pre-rewind coroutine on macOS can be safely dropped/reset earlier without violating upstream lifecycle semantics.
 - Full `cargo test -p common` green run once the unrelated `elf` test crash is resolved.
 
+## 2026-03-28 — core/src/hle/kernel/kernel.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_hardware_timer.cpp
+
+### Intentional differences
+- Rust adds `get_current_hardware_tick()` as a narrow helper over the existing global `KERNEL_PTR` so lower kernel owners can query the current hardware tick without pushing timeout conversion logic back into SVC files. This is mechanical plumbing to preserve upstream timeout ownership in `KThread` and `KConditionVariable`.
+
+### Unintentional differences (to fix)
+- `KernelCore` still exposes global-pointer based access patterns that do not line up one-for-one with upstream method ownership. The helper only narrows an existing divergence; it does not remove it.
+
+### Missing items
+- Full parity audit of the remaining `KernelCore` global access helpers versus upstream call sites.
+
+### Binary layout verification
+- PASS: helper-only change; no raw-serialized structs affected.
+
+## 2026-03-28 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.h
+
+### Intentional differences
+- Positive timeout ticks are translated to host `Instant` deadlines through a small local helper because the current Rust scheduler models wakeups with `Instant` rather than upstream `KHardwareTimer` tasks at every call site. This preserves upstream ownership of timeout consumption in `k_thread.rs`.
+- When no kernel/hardware timer is initialized (unit tests / bootstrap-only paths), the helper falls back to treating the positive timeout as a relative duration. This is a Rust test-environment adaptation until every focused test path has a wired kernel timer.
+
+### Unintentional differences (to fix)
+- `wait_park_mutex` / `wait_park_cv` remain in the struct even though `BeginWait` now matches upstream and no longer parks the host thread. They are leftover Rust-only state.
+- `BeginWait`/`EndWait`/`CancelWait` still rely on the current Rust scheduler and queue plumbing, which remains only behaviorally close to upstream rather than line-for-line equivalent.
+
+### Missing items
+- Remove obsolete host-thread parking fields once no remaining callers/tests depend on them.
+- Full parity audit of all wait/cancel paths that still use Rust-specific queue helpers.
+
+### Binary layout verification
+- PASS: `KThread` is not serialized by raw memory copy here; this change only affects runtime wait semantics.
+
+## 2026-03-28 — core/src/hle/kernel/k_condition_variable.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.h
+
+### Intentional differences
+- Positive timeout ticks are translated to host `Instant` deadlines through a local helper because the Rust scheduler currently wakes sleepers from `Instant` deadlines instead of driving every condition-variable wait through upstream `KHardwareTimer` ownership.
+- When no kernel/hardware timer is initialized, the helper falls back to relative-duration behavior for test-only paths.
+
+### Unintentional differences (to fix)
+- `wait_locked` and `begin_wait_condition_variable` still model timeout wakeup through `sleep_deadline` polling rather than upstream timer-task registration on the wait queue.
+- The Rust implementation still carries lock-transfer and process-lookup adaptations that do not yet map one-for-one to upstream raw pointer ownership.
+
+### Missing items
+- Full upstream-equivalent timer-task ownership for condition-variable waits.
+- Re-audit of every cancel/end-wait path after the `BeginWait` ownership fix in `k_thread.rs`.
+
+### Binary layout verification
+- PASS: no raw-serialized structs changed.
+
+## 2026-03-28 — core/src/hle/kernel/svc/svc_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_thread.cpp
+
+### Intentional differences
+- Rust factors the positive-sleep timeout conversion into `sleep_timeout_tick_from_ns(current_tick, ns)` instead of spelling it inline in `sleep_thread()`: this is a mechanical extraction within the same owner file to make the upstream absolute-tick formula directly testable.
+
+### Unintentional differences (to fix)
+- `sleep_thread()` still falls back to `i64::MAX` when the kernel or hardware timer is unavailable. Upstream always has a live `KernelCore`/`KHardwareTimer` on this path.
+- The non-positive yield paths still rely on the current Rust scheduler helpers and are not yet a full line-by-line parity port of upstream `KScheduler::Yield*`.
+
+### Missing items
+- Full line-by-line parity audit for the remaining SVC thread commands in this file, especially the scheduler/yield helpers and resource-limit reservation paths.
+
+### Binary layout verification
+- PASS: service handler file only; no raw-serialized structs changed.
+
 ### Binary layout verification
 - PASS: `fiber.rs` defines runtime control-flow state only and no raw-serialized structs.
 
@@ -697,3 +760,250 @@
 
 ### Binary layout verification
 - PASS: logging cleanup only; no layout impact.
+
+## 2026-03-28 — core/src/hle/service/ns/platform_service_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ns/platform_service_manager.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ns/platform_service_manager.cpp
+
+### Intentional differences
+- Rust keeps the upstream file ownership in `platform_service_manager.rs`, but loads baked font byte arrays from `file_sys::system_archive::data` instead of traversing NAND NCAs / synthesized RomFS files at runtime. This preserves the service-local ownership while diverging from the literal upstream content-loading path.
+- Rust lazily creates and registers a process-visible `KSharedMemory` handle on first `GetSharedMemoryNativeHandle` call, instead of copying into `kernel.GetFontSharedMem()` and returning that kernel-owned object. This is a temporary Rust adaptation to the current kernel/shared-memory ownership shape.
+
+### Unintentional differences (to fix)
+- Upstream defines `SHARED_FONTS` with 7 source files, including `nintendo_ext2_003.bfttf`. Rust currently builds only 6 regions and has no counterpart for the second extension font source.
+- Upstream stores decrypted shared-font blobs with an 8-byte header and returns regions as `offset + 8` / `size - 8`. Rust currently copies prebuilt font bytes directly into shared memory and returns offsets/sizes for that direct layout, so the backing blob layout is not byte-for-byte upstream-identical.
+
+### Missing items
+- No Rust counterpart yet for the upstream helper functions `DecryptSharedFontToTTF`, `EncryptSharedFont`, `DecryptSharedFont`, and `GetU32Swapped`; the current port bypasses those helpers because it does not reconstruct the upstream encrypted BFTTF layout.
+- No parity test yet proving that `GetSharedMemoryNativeHandle` maps a guest-visible region whose bytes and reported offsets/sizes match upstream expectations.
+
+### Binary layout verification
+- FAIL: `FontRegion` itself matches the simple upstream `{u32 offset; u32 size;}` shape, but the shared-font backing blob layout does not yet match the upstream encrypted-header layout byte-for-byte.
+
+## 2026-03-28 — core/src/hle/service/ns/ns.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ns/ns.cpp
+
+### Intentional differences
+- Rust uses `ServerManager::new(system)` plus closure-based registration because `register_named_service` expects factories, whereas upstream directly passes `std::shared_ptr` instances.
+
+### Unintentional differences (to fix)
+- `pdm:qry` is still registered as `GenericStubService`, while upstream registers `IQueryService`.
+
+### Missing items
+- `IServiceGetterInterface` instances are still constructed without the `(system, service_name)` ownership shape used upstream.
+
+### Binary layout verification
+- PASS: service registration file only; no serialized structs are defined here.
+
+## 2026-03-28 — core/src/arm/dynarmic/arm_dynarmic_32.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- Rust still routes the callback through the existing `ArmDynarmic32` owner struct instead of storing upstream's exact `m_debugger_enabled` boolean in `DynarmicCallbacks32`; debugger-disabled behavior is currently hard-wired because debugger parity is still incomplete.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the default `ExceptionRaised` path was halting execution on `BKPT`/other non-`NoExecuteFault` exceptions. Upstream only halts when the debugger is enabled; otherwise it logs the backtrace and critical message, then returns to execution.
+
+### Missing items
+- The exact upstream debugger-enabled path still is not wired: Rust does not yet save `breakpoint_context` and return `InstructionBreakpoint` conditionally based on a real debugger-enabled flag.
+
+### Binary layout verification
+- PASS: control-flow change only; no serialized layout affected.
+
+## 2026-03-28 — core/src/core.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/core.h and /home/vricosti/Dev/emulators/zuyu/src/core/core.cpp
+
+### Intentional differences
+- Rust still flattens upstream `System::Impl` into one `System` struct. The `run_server()` method added in this pass restores the same ownership chain (`ServerManager -> System -> KernelCore`) even though the Pimpl boundary is not represented literally.
+
+### Unintentional differences (to fix)
+- None newly identified in the `System::RunServer` slice after this pass.
+
+### Missing items
+- No broader `System::Impl` parity audit was completed in this pass beyond the `RunServer` ownership path.
+
+### Binary layout verification
+- PASS: ownership/control-flow change only; no serialized layout affected.
+
+## 2026-03-28 — core/src/hle/kernel/kernel.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp
+
+### Intentional differences
+- Rust tracks active service servers as `Mutex<Vec<Arc<Mutex<ServerManager>>>>` instead of upstream's `std::vector<std::unique_ptr<Service::ServerManager>>`. This preserves kernel ownership while adapting to Rust shared ownership for shutdown signaling.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KernelCore` previously had no counterpart for upstream `RunServer()` ownership. `ServerManager::run_server()` spawned an unrelated host thread directly instead of transferring ownership into the kernel.
+- Fixed in this pass: `KernelCore::run_server()` incorrectly called `run_on_guest_core_process()` again, creating a second guest thread and letting the original service thread return immediately. Upstream pushes the manager into `server_managers` and calls `manager->LoopProcess()` inline on the current guest service thread.
+- `close_services()` previously did nothing, while upstream destroys tracked server managers during kernel shutdown. Rust now requests stop on all tracked managers, but still does not wait for them to finish as strictly as upstream destruction does.
+
+### Missing items
+- Rust still lacks the exact upstream shutdown semantics where destroying each `ServerManager` waits for `LoopProcess()` to stop before the owner is released.
+
+### Binary layout verification
+- PASS: kernel ownership/control-flow change only; no serialized layout affected.
+
+## 2026-03-28 — core/src/hle/service/server_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp
+
+### Intentional differences
+- Rust keeps session/port tracking in Rust collections and helper wrappers instead of upstream intrusive lists / `MultiWaitHolder` inheritance. This is an existing structural adaptation, not introduced by this pass.
+- Rust still lacks a full counterpart to upstream `MultiWait::WaitAny(m_system.Kernel())`, so this pass adds a guest-kernel readable wakeup event to block the current service thread instead of leaving it permanently runnable. This preserves the upstream ownership slice in `server_manager.rs` while remaining a temporary adaptation.
+- Rust also has to trigger a scheduler fiber yield immediately after entering this wait, because unlike the upstream `WaitAny()` path there is no surrounding SVC/interrupt exit to reschedule automatically.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ServerManager::run_server()` no longer owns its own host-thread spawn. It now follows the upstream ownership chain through `System::run_server()` and `KernelCore::run_server()`.
+- Fixed in this pass: the old no-event path kept guest service threads runnable via `rotate_scheduled_queue + schedule_raw_if_needed`, which does not match upstream `WaitSignaled()` behavior and produced permanent runnable churn on MK8D service cores. Rust now sleeps the guest service thread on a kernel-readable wakeup event and signals that event from the same `register_session` / deferred-link / stop paths that wake the service-layer event loop.
+- `wait_and_process_impl()` still scans sessions/events in Rust order instead of delegating selection to upstream `WaitSignaled()` with `m_multi_wait.WaitAny(m_system.Kernel())`.
+- `OnPortEvent` / `Process` / `WaitSignaled` ownership is still not ported line-for-line; the event loop remains an approximation around the same responsibilities.
+
+### Missing items
+- No Rust counterpart yet for the full upstream `WaitSignaled()` / `Process(MultiWaitHolder*)` split with `UserDataTag`-driven dispatch.
+- No Rust counterpart yet for upstream `Port` as a real `KServerPort` waitable inside `m_multi_wait`; server-session and port wait integration is still partial.
+- `StartAdditionalHostThreads()` remains a stub and does not mirror upstream behavior.
+
+### Binary layout verification
+- PASS: service manager control-flow change only; no serialized layout affected.
+## 2026-03-28 — core/src/hle/kernel/k_thread.rs vs zuyu/src/core/hle/kernel/k_thread.h / k_thread.cpp
+
+### Intentional differences
+- `LockWithPriorityInheritanceInfo` stores waiter ordering in a `BTreeSet` and owner identity as `thread_id`: Rust ownership replaces upstream intrusive containers and raw pointers while keeping the same per-thread ownership boundary.
+
+### Unintentional differences (to fix)
+- `RestorePriority` is still simplified: upstream walks the full owner chain and reorders waiters around both held locks and condvar trees, while Rust still uses `restore_priority_simplified()`.
+
+### Missing items
+- Full upstream-equivalent `RestorePriority(KernelCore&, KThread*)`.
+- Full intrusive-tree parity for lock waiter ordering updates during priority changes.
+
+### Binary layout verification
+- PASS: this change did not modify raw serialized/thread-context payload layout.
+
+## 2026-03-28 — core/src/hle/kernel/k_condition_variable.rs vs zuyu/src/core/hle/kernel/k_condition_variable.cpp
+
+### Intentional differences
+- `ThreadTree` is represented with `BTreeSet` + `HashMap` instead of the upstream intrusive red-black tree; ordering still follows `(cv_key, priority, thread_id)`.
+- `UpdateLockAtomic` still uses process-memory serialization instead of the upstream exclusive-monitor CAS loop. This remains an existing documented deviation.
+
+### Unintentional differences (to fix)
+- `Signal`/`Wait` behavior still needs end-to-end confirmation against MK8D's `SignalProcessWideKey -> Break(0,0,0)` path; the current parity fixes were necessary but not sufficient.
+
+### Missing items
+- Real exclusive-monitor-based `UpdateLockAtomic`.
+- End-to-end validation that condvar wake/owner transfer semantics fully match upstream on the MK8D bootstrap path.
+
+### Binary layout verification
+- PASS: no raw byte layout or IPC payload struct changed in this slice.
+
+## 2026-03-28 — core/src/hle/kernel/kernel.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp
+
+### Intentional differences
+- Rust still creates the guest-core service `KProcess` with the existing lightweight `KProcess::new()` path instead of a full counterpart to upstream `process->Initialize(CreateProcessParameter{}, GetSystemResourceLimit(), false)`. This preserves file ownership in `kernel.rs` but the service-process initialization slice is still incomplete.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KernelCore::run_on_guest_core_process()` wrapped the service closure and forced `ThreadState::TERMINATED` directly after `func()` returned. Upstream does not own exit semantics in `kernel.cpp`; `KThread::InitializeServiceThread()` owns the `OnThreadStart() -> func() -> ExitThread()` lambda in `k_thread.cpp`.
+- Fixed in this pass: `KernelCore::run_on_guest_core_process()` made the service thread runnable before `register_thread_object()`. Upstream orders this as `InitializeServiceThread -> KThread::Register -> Run`, so Rust could previously dispatch a service thread before self-reference/process registration existed.
+- Fixed in this pass: `KernelCore::run_on_guest_core_process()` created the guest service `KProcess` in a local `Arc` but did not retain kernel ownership after setup. Upstream calls `KProcess::Register(*this, process)`, so the Rust `Weak<KProcess>` stored by service threads could otherwise dangle as soon as the setup function returned.
+- Rust still does not reserve `ThreadCountMax` before service-thread initialization the way upstream `KScopedResourceReservation thread_reservation(process, LimitableResource::ThreadCountMax)` does.
+
+### Missing items
+- Full counterpart to upstream service-process initialization and `KScopedResourceReservation` commit flow in `RunOnGuestCoreProcess`.
+- Rust still does not maintain a real upstream-like registered process table; `service_processes` is a targeted ownership retention vector, not a full `KProcess::Register` parity implementation.
+
+### Binary layout verification
+- PASS: ordering/ownership change only; no serialized layout affected.
+
+## 2026-03-28 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp
+
+### Intentional differences
+- Rust passes `&Arc<Mutex<KThread>>` into `initialize_service_thread()` so the method can own the upstream `GlobalSchedulerContext::AddThread(thread)` step from the matching Rust file. This preserves method ownership in `k_thread.rs` while adapting pointer semantics to `Arc<Mutex<_>>`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the upstream `GlobalSchedulerContext().AddThread(thread)` step lived in `kernel.rs` instead of `k_thread.rs`, so service-thread global-scheduler registration was owned by the wrong file.
+- `InitializeServiceThread` still does not mirror upstream line-for-line around `InitializeThread(...)` because the Rust service-thread path is layered over the existing host-fiber constructor rather than a unified `InitializeThread` helper.
+
+### Missing items
+- Full line-for-line parity for the shared `InitializeThread(...)` helper path used by `InitializeUserThread`, `InitializeHighPriorityThread`, and `InitializeServiceThread` upstream.
+
+### Binary layout verification
+- PASS: service-thread ownership/control-flow change only; no raw layout changed.
+## 2026-03-28 — `core/src/hle/kernel/k_synchronization_object.rs` vs `src/core/hle/kernel/k_synchronization_object.cpp`
+
+### Intentional differences
+- Rust keeps `SynchronizationWaitSet` / process object-ID indirection instead of upstream raw `KSynchronizationObject**`: mechanical adaptation to the current object registry layout.
+
+### Unintentional differences (to fix)
+- Prior to this pass, `Wait(...)` returned `RESULT_SUCCESS` immediately after `BeginWait` instead of resuming only after the wait completed. Fixed.
+- Prior to this pass, the Rust callers kept the `KProcess` mutex locked across the whole blocked wait path, preventing wake/signal paths from reacquiring process state. Fixed by moving process locking inside the preparation slice only.
+
+### Missing items
+- Full upstream `KScopedSchedulerLockAndSleep` structure is still not ported literally; the Rust path still uses existing scheduler/timer helpers.
+
+### Binary layout verification
+- PASS: no raw byte layout affected in this pass.
+
+## 2026-03-28 — `core/src/hle/kernel/k_scheduler.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp`
+
+### Intentional differences
+- Rust still stores scheduler thread references as `Arc<Mutex<KThread>>` / `Weak<Mutex<KThread>>` and uses host `Fiber` wrappers instead of upstream raw `KThread*` and `Common::Fiber` references. This is the existing ownership adaptation for the Rust scheduler port.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `schedule_impl_fiber()` returned early when `highest_priority_thread_id == None`. Upstream `KScheduler::ScheduleImpl()` still arms the switch fiber in that case and lets `ScheduleImplFiber()` fall back to `m_idle_thread`; the Rust early return skipped the idle-thread handoff entirely.
+
+### Missing items
+- Full line-for-line parity for `ScheduleImpl()` / `ScheduleImplFiber()` is still incomplete, especially around interrupt-task handling and the exact `DisableDispatch`/`EnableDispatch` sequencing.
+
+### Binary layout verification
+- PASS: control-flow only; no serialized or raw struct layout changed.
+
+## 2026-03-28 — `core/src/hle/kernel/svc/svc_synchronization.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_synchronization.cpp`
+
+### Intentional differences
+- Rust still resolves handles through the existing process object-ID registries instead of upstream `GetMultipleObjects<KSynchronizationObject>()`. This is the current ownership adaptation of the process object tables.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `WaitSynchronization` forwarded positive `timeout_ns` values directly to `k_synchronization_object::wait()`. Upstream converts positive nanosecond timeouts to absolute hardware ticks as `current_tick + timeout_ns + 2` before calling `KSynchronizationObject::Wait(...)`.
+
+### Missing items
+- Full upstream-equivalent `GetMultipleObjects<KSynchronizationObject>()` handle resolution path instead of rebuilding object IDs in Rust.
+
+### Binary layout verification
+- PASS: timeout conversion/control-flow only; no raw layout changed.
+
+## 2026-03-28 — `core/src/hle/kernel/k_condition_variable.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.cpp`
+
+### Intentional differences
+- Rust still uses `Arc<Mutex<KProcess>>` / `Arc<Mutex<KThread>>` and a `BTreeSet`-backed tree instead of upstream raw pointers and intrusive RB-tree nodes. This is the existing ownership adaptation for the kernel thread/process registry.
+- `UpdateLockAtomic` still uses serialized process-memory access instead of the upstream exclusive-monitor CAS loop. This remains documented debt until the exclusive monitor is wired into this owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `WaitForAddress(...)` returned `RESULT_SUCCESS` immediately after `BeginWait(...)`. Upstream returns only after the wait completes and then propagates `cur_thread->GetWaitResult()`.
+- Fixed in this pass: positive-timeout `Wait(...)` pre-seeded `wait_result = ResultSuccess` before the wait completed. Upstream does not set the wait result speculatively before `BeginWait(...)`.
+
+### Missing items
+- Full literal counterpart to upstream `KScopedSchedulerLockAndSleep` / `wait_queue.SetHardwareTimer(timer)` ownership inside this file. The Rust port still relies on the existing scheduler/timer helpers layered around the owner methods.
+- Exclusive-monitor-backed `UpdateLockAtomic`.
+
+### Binary layout verification
+- PASS: no serialized layout or raw payload struct changed in this slice.
+
+## 2026-03-28 — `core/src/hle/kernel/k_process.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp`
+
+### Intentional differences
+- Rust `KProcess::wait_condition_variable(...)` still wraps the owner `KConditionVariable` through `std::mem::take(&mut self.cond_var)` to satisfy Rust borrowing rules while keeping condition-variable ownership in `k_condition_variable.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KProcess::wait_condition_variable(...)` returned the immediate setup result from `KConditionVariable::wait_locked(...)` instead of scheduling away and returning only after the current thread's wait completed, unlike the upstream `KConditionVariable::Wait(...)` call chain.
+
+### Missing items
+- Full upstream-equivalent scheduler-lock RAII around the `KConditionVariable::Wait(...)` call chain remains incomplete; the Rust wrapper still uses the existing scheduler request + wait loop adaptation.
+
+### Binary layout verification
+- PASS: control-flow only; no raw or serialized layout changed.
+
+## 2026-03-28 — `core/src/hle/kernel/k_synchronization_object.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_synchronization_object.cpp`
+
+### Intentional differences
+- Rust still represents waited objects through process object IDs and `SynchronizationWaitSet` instead of upstream raw `KSynchronizationObject**`. This remains the current ownership adaptation for the Rust handle/object registry.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: on the guest-thread path, `wait(...)` called `KScheduler::schedule_raw_if_needed(...)` once and then returned immediately even if the current thread was still `WAITING`. Upstream `KSynchronizationObject::Wait(...)` only returns after the waiting thread is resumed and `thread->GetWaitResult()` is finalized.
+
+### Missing items
+- Full literal `KScopedSchedulerLockAndSleep` parity is still not present; the Rust path still uses the existing scheduler/timer plumbing instead of the upstream RAII helper object.
+- The older stack-local `KSynchronizationObject::wait(_kernel, out_index, objects, timeout)` stub higher in this file is still dead compatibility code and should eventually be removed once no callers remain.
+
+### Binary layout verification
+- PASS: wait-control-flow change only; no raw payload or serialized layout changed.

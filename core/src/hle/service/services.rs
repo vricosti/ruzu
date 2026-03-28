@@ -114,6 +114,8 @@ impl Services {
     ) -> Self {
         let dm_addr = device_memory as usize;
         let mm_addr = memory_manager as usize;
+        let kernel_ref =
+            if !system.is_null() { system.get().kernel().map(|k| k as *const _ as usize) } else { None };
 
         // Upstream: system.GetFileSystemController().CreateFactories(*system.GetFilesystem(), false);
         {
@@ -123,15 +125,34 @@ impl Services {
 
         // ── Host core processes (upstream: .detach()) ──
         // These run on host OS threads, matching upstream RunOnHostCoreProcess.
-        Self::loop_process_audio(service_manager, system);
-        Self::loop_process_filesystem(service_manager, system, filesystem_controller);
-        Self::loop_process_jit(service_manager, system);
-        Self::loop_process_ldn(service_manager, system);
-        Self::loop_process_loader(service_manager, system);
-        Self::loop_process_nvservices(service_manager, system);
-        Self::loop_process_bsdsocket(service_manager, system);
-        Self::loop_process_nvnflinger(service_manager, system);
-        Self::loop_process_vi(service_manager, system);
+        macro_rules! host_service {
+            ($name:expr, $body:expr) => {
+                if let Some(kptr) = kernel_ref {
+                    let kernel = unsafe { &*(kptr as *const crate::hle::kernel::kernel::KernelCore) };
+                    kernel.run_on_host_core_process($name, Box::new($body));
+                } else {
+                    ($body)();
+                }
+            };
+        }
+
+        let sm = service_manager.clone();
+        host_service!("audio", move || { Self::loop_process_audio(&sm, system); });
+        let sm = service_manager.clone();
+        let fsc = filesystem_controller.clone();
+        host_service!("FS", move || { Self::loop_process_filesystem(&sm, system, fsc); });
+        let sm = service_manager.clone();
+        host_service!("jit", move || { Self::loop_process_jit(&sm, system); });
+        let sm = service_manager.clone();
+        host_service!("ldn", move || { Self::loop_process_ldn(&sm, system); });
+        let sm = service_manager.clone();
+        host_service!("Loader", move || { Self::loop_process_loader(&sm, system); });
+        let sm = service_manager.clone();
+        host_service!("nvservices", move || { Self::loop_process_nvservices(&sm, system); });
+        let sm = service_manager.clone();
+        host_service!("bsdsocket", move || { Self::loop_process_bsdsocket(&sm, system); });
+        let sm = service_manager.clone();
+        host_service!("vi", move || { Self::loop_process_vi(&sm, system); });
 
         // ── Guest core processes (upstream: RunOnGuestCoreProcess) ──
         // Each service gets a KThread fiber on guest core 3, priority 16.
@@ -139,8 +160,6 @@ impl Services {
         //
         // Helper: launch a service on a guest core KThread if kernel is available,
         // otherwise fall back to direct call (tests).
-        let kernel_ref = if !system.is_null() { system.get().kernel().map(|k| k as *const _ as usize) } else { None };
-
         macro_rules! guest_service {
             ($name:expr, $body:expr) => {
                 if let Some(kptr) = kernel_ref {
@@ -210,6 +229,8 @@ impl Services {
         guest_service!("mm", move || { Self::loop_process_mm(&sm, system); });
         let sm = service_manager.clone();
         guest_service!("mnpp", move || { Self::loop_process_mnpp(&sm, system); });
+        let sm = service_manager.clone();
+        guest_service!("nvnflinger", move || { Self::loop_process_nvnflinger(&sm, system); });
         let sm = service_manager.clone();
         guest_service!("NCM", move || { Self::loop_process_ncm(&sm, system); });
         let sm = service_manager.clone();

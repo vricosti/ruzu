@@ -11,6 +11,15 @@ use crate::hle::kernel::svc_common::{Handle, ARGUMENT_HANDLE_COUNT_MAX};
 use crate::hle::kernel::k_synchronization_object;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
+fn synchronization_timeout_tick_from_ns(current_tick: i64, timeout_ns: i64) -> i64 {
+    debug_assert!(timeout_ns > 0);
+
+    let timeout = current_tick
+        .saturating_add(timeout_ns)
+        .saturating_add(2);
+    if timeout <= 0 { i64::MAX } else { timeout }
+}
+
 /// Closes a handle.
 pub fn close_handle(system: &System, handle: Handle) -> ResultCode {
     log::trace!("svc::CloseHandle closing handle 0x{:08X}", handle);
@@ -26,7 +35,8 @@ pub fn close_handle(system: &System, handle: Handle) -> ResultCode {
 pub fn reset_signal(system: &System, handle: Handle) -> ResultCode {
     log::debug!("svc::ResetSignal called handle 0x{:08X}", handle);
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -59,7 +69,8 @@ pub fn wait_synchronization(
         return RESULT_OUT_OF_RANGE;
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
 
     // Read handle array from guest memory.
     // Upstream: R_UNLESS(GetCurrentMemory(kernel).ReadBlock(user_handles, handles.data(),
@@ -101,14 +112,25 @@ pub fn wait_synchronization(
         };
         object_ids.push(object_id);
     }
+    let timeout = if timeout_ns > 0 {
+        let current_tick = system
+            .kernel()
+            .and_then(|kernel| kernel.hardware_timer())
+            .map(|timer| timer.lock().unwrap().get_tick())
+            .unwrap_or(i64::MAX);
+        synchronization_timeout_tick_from_ns(current_tick, timeout_ns)
+    } else {
+        timeout_ns
+    };
     let scheduler = system.scheduler_arc().clone();
+    drop(process);
     k_synchronization_object::wait(
-        &mut process,
+        &process_arc,
         &current_thread,
         &scheduler,
         out_index,
         object_ids,
-        timeout_ns,
+        timeout,
     )
 }
 
@@ -277,6 +299,11 @@ mod tests {
     }
 
     #[test]
+    fn synchronization_timeout_tick_from_ns_uses_absolute_tick() {
+        assert_eq!(synchronization_timeout_tick_from_ns(100, 25), 127);
+    }
+
+    #[test]
     fn wait_synchronization_blocks_then_wakes_on_signal() {
         let system = test_system();
         let mut write_handle = 0;
@@ -292,12 +319,20 @@ mod tests {
             mem.write_32(0x200100, read_handle);
         }
 
+        let system_ref = crate::core::SystemRef::from_ref(&system);
+        let waiter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert_eq!(svc_event::signal_event(system_ref.get(), write_handle), RESULT_SUCCESS);
+        });
+
         let mut out_index = -1;
         assert_eq!(
             wait_synchronization(&system, &mut out_index, 0x200100, 1, -1),
             RESULT_SUCCESS
         );
-        assert_eq!(out_index, -1);
+        assert_eq!(out_index, 0);
+
+        waiter.join().unwrap();
 
         let current_thread = {
             system.current_process_arc()
@@ -306,9 +341,6 @@ mod tests {
                 .get_thread_by_thread_id(1)
                 .unwrap()
         };
-        assert_eq!(current_thread.lock().unwrap().get_state(), crate::hle::kernel::k_thread::ThreadState::WAITING);
-
-        assert_eq!(svc_event::signal_event(&system, write_handle), RESULT_SUCCESS);
 
         let thread = current_thread.lock().unwrap();
         assert_eq!(thread.get_state(), crate::hle::kernel::k_thread::ThreadState::RUNNABLE);
@@ -386,12 +418,21 @@ mod tests {
             .get_thread_by_object_id(object_id)
             .unwrap();
 
+        let target_thread_for_exit = target_thread.clone();
+        let exiter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            target_thread_for_exit.lock().unwrap().exit();
+            KWorkerTaskManager::wait_for_global_idle();
+        });
+
         let mut out_index = -1;
         assert_eq!(
             wait_synchronization(&system, &mut out_index, 0x200100, 1, -1),
             RESULT_SUCCESS
         );
-        assert_eq!(out_index, -1);
+        assert_eq!(out_index, 0);
+
+        exiter.join().unwrap();
 
         let current_thread = {
             system.current_process_arc()
@@ -400,13 +441,6 @@ mod tests {
                 .get_thread_by_thread_id(1)
                 .unwrap()
         };
-        assert_eq!(
-            current_thread.lock().unwrap().get_state(),
-            crate::hle::kernel::k_thread::ThreadState::WAITING
-        );
-
-        target_thread.lock().unwrap().exit();
-        KWorkerTaskManager::wait_for_global_idle();
 
         let thread = current_thread.lock().unwrap();
         assert_eq!(

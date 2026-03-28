@@ -17,6 +17,20 @@ fn is_valid_virtual_core_id(core_id: i32) -> bool {
     (0..4).contains(&core_id)
 }
 
+fn sleep_timeout_tick_from_ns(current_tick: i64, ns: i64) -> i64 {
+    debug_assert!(ns > 0);
+
+    let offset_tick = ns;
+    if offset_tick > 0 {
+        let timeout = current_tick
+            .saturating_add(offset_tick)
+            .saturating_add(2);
+        if timeout <= 0 { i64::MAX } else { timeout }
+    } else {
+        i64::MAX
+    }
+}
+
 fn resolve_thread_handle(system: &System, handle: Handle) -> Option<Arc<Mutex<KThread>>> {
     if handle == PseudoHandle::CurrentThread as Handle {
         return system.current_thread();
@@ -130,15 +144,9 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
         return RESULT_INVALID_HANDLE;
     };
 
-    let thread_id = thread.lock().unwrap().get_thread_id();
     let result = thread.lock().unwrap().run();
-    if result == RESULT_SUCCESS.get_inner_value() {
-        system.current_process_arc()
-            .lock()
-            .unwrap()
-            .push_back_to_priority_queue(thread_id);
-        system.scheduler_arc().lock().unwrap().request_schedule();
-    }
+    // thread.run() → set_state(RUNNABLE) → notify_state_transition pushes
+    // to PQ via GSC and notifies the scheduler automatically.
     ResultCode::new(result)
 }
 
@@ -163,13 +171,19 @@ pub fn sleep_thread(system: &System, ns: i64) {
             return;
         };
 
-        let result = thread.lock().unwrap().sleep(ns);
+        let current_tick = system
+            .kernel()
+            .and_then(|kernel| kernel.hardware_timer())
+            .map(|timer| timer.lock().unwrap().get_tick())
+            .unwrap_or(i64::MAX);
+        let result = thread.lock().unwrap().sleep(sleep_timeout_tick_from_ns(current_tick, ns));
         if result != RESULT_SUCCESS.get_inner_value() {
             log::warn!("svc::SleepThread(sleep) failed: {:#x}", result);
             return;
         }
 
-        system.scheduler_arc().lock().unwrap().request_schedule();
+        // thread.sleep() → set_state(WAITING) → notify_state_transition removes
+        // from PQ via GSC and notifies the scheduler automatically.
         return;
     }
 
@@ -372,6 +386,11 @@ mod tests {
         let result = start_thread(&system, handle);
         assert_eq!(result, RESULT_SUCCESS);
         assert_eq!(thread.lock().unwrap().get_state(), crate::hle::kernel::k_thread::ThreadState::RUNNABLE);
+    }
+
+    #[test]
+    fn sleep_thread_uses_upstream_absolute_timeout_tick() {
+        assert_eq!(sleep_timeout_tick_from_ns(1234, 10), 1246);
     }
 
     #[test]
