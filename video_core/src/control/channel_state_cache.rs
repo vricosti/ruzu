@@ -354,7 +354,7 @@ mod tests {
     fn test_create_and_erase_channel() {
         use std::sync::Arc;
         use parking_lot::Mutex;
-        use super::super::channel_state::MemoryManager;
+        use crate::memory_manager::MemoryManager;
 
         let mut caches: ChannelSetupCaches<ChannelInfo> = ChannelSetupCaches::new();
 
@@ -375,7 +375,7 @@ mod tests {
     fn test_bind_to_channel() {
         use std::sync::Arc;
         use parking_lot::Mutex;
-        use super::super::channel_state::MemoryManager;
+        use crate::memory_manager::MemoryManager;
 
         let mut caches: ChannelSetupCaches<ChannelInfo> = ChannelSetupCaches::new();
 

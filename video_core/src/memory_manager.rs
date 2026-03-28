@@ -368,6 +368,181 @@ impl Default for GpuMemoryManager {
     }
 }
 
+/// Port owner for `Tegra::MemoryManager`.
+///
+/// The current Rust tree still uses `GpuMemoryManager` directly in a few owner files.
+/// This wrapper lets `channel_state` and nvdrv keep the upstream type ownership in
+/// `video_core/memory_manager.rs` instead of inventing a local placeholder.
+pub struct MemoryManager {
+    id: usize,
+    gpu_memory_manager: GpuMemoryManager,
+    address_space_bits: u64,
+    split_address: u64,
+    big_page_bits: u64,
+    page_bits: u64,
+}
+
+impl MemoryManager {
+    /// Temporary Rust constructor used by the current bridge path.
+    ///
+    /// Upstream constructs `Tegra::MemoryManager` with `Core::System` and address-space
+    /// geometry. The current Rust port has not yet threaded those owners through every callsite,
+    /// so the inner GPU page-table backend still starts from the local default constructor.
+    pub fn new(id: usize) -> Self {
+        Self::new_with_geometry(id, 40, 1u64 << 34, 16, 12)
+    }
+
+    /// Rust-side constructor matching the upstream geometry owner more closely.
+    pub fn new_with_geometry(
+        id: usize,
+        address_space_bits: u64,
+        split_address: u64,
+        big_page_bits: u64,
+        page_bits: u64,
+    ) -> Self {
+        Self {
+            id,
+            gpu_memory_manager: GpuMemoryManager::new(),
+            address_space_bits,
+            split_address,
+            big_page_bits,
+            page_bits,
+        }
+    }
+
+    /// Upstream: `MemoryManager::GetID()`.
+    pub fn get_id(&self) -> usize {
+        self.id
+    }
+
+    pub fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
+        self.gpu_memory_manager.gpu_to_cpu_address(gpu_addr)
+    }
+
+    pub fn is_continuous_range(&self, gpu_addr: u64, size: u64) -> bool {
+        self.gpu_memory_manager.is_continuous_range(gpu_addr, size)
+    }
+
+    pub fn is_fully_mapped_range(&self, gpu_addr: u64, size: u64) -> bool {
+        self.gpu_memory_manager.is_fully_mapped_range(gpu_addr, size)
+    }
+
+    pub fn is_granular_range(&self, gpu_addr: u64, size: u64) -> bool {
+        self.gpu_memory_manager.is_granular_range(gpu_addr, size)
+    }
+
+    pub fn read_block(
+        &self,
+        gpu_src: u64,
+        output: &mut [u8],
+        read_cpu: &dyn Fn(u64, &mut [u8]),
+    ) {
+        self.gpu_memory_manager.read_block(gpu_src, output, read_cpu);
+    }
+
+    pub fn read_block_unsafe(
+        &self,
+        gpu_src: u64,
+        output: &mut [u8],
+        read_cpu: &dyn Fn(u64, &mut [u8]),
+    ) {
+        self.gpu_memory_manager
+            .read_block_unsafe(gpu_src, output, read_cpu);
+    }
+
+    pub fn write_block(
+        &self,
+        gpu_dest: u64,
+        input: &[u8],
+        write_cpu: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        self.gpu_memory_manager
+            .write_block(gpu_dest, input, write_cpu);
+    }
+
+    pub fn write_block_unsafe(
+        &self,
+        gpu_dest: u64,
+        input: &[u8],
+        write_cpu: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        self.gpu_memory_manager
+            .write_block_unsafe(gpu_dest, input, write_cpu);
+    }
+
+    pub fn flush_region(&self, gpu_addr: u64, size: u64) {
+        self.gpu_memory_manager.flush_region(gpu_addr, size);
+    }
+
+    pub fn invalidate_region(&self, gpu_addr: u64, size: u64) {
+        self.gpu_memory_manager.invalidate_region(gpu_addr, size);
+    }
+
+    pub fn is_within_gpu_address_range(&self, gpu_addr: u64) -> bool {
+        self.gpu_memory_manager.is_within_gpu_address_range(gpu_addr)
+    }
+
+    pub fn max_continuous_range(&self, gpu_addr: u64, size: u64) -> u64 {
+        self.gpu_memory_manager.max_continuous_range(gpu_addr, size)
+    }
+
+    pub fn get_memory_layout_size(&self, gpu_addr: u64) -> u64 {
+        self.gpu_memory_manager.get_memory_layout_size(gpu_addr)
+    }
+
+    /// Upstream: `MemoryManager::Map(gpu_addr, dev_addr, size, kind, is_big_pages)`.
+    ///
+    /// The current Rust backend still ignores `kind` and `is_big_pages`, but keeps
+    /// the owner-local behavior and callsite ordering in the upstream file.
+    pub fn map(
+        &mut self,
+        gpu_addr: u64,
+        device_addr: u64,
+        size: u64,
+        _kind: u32,
+        _is_big_pages: bool,
+    ) -> u64 {
+        self.gpu_memory_manager.map(gpu_addr, device_addr, size);
+        gpu_addr
+    }
+
+    /// Upstream: `MemoryManager::MapSparse(gpu_addr, size, is_big_pages)`.
+    ///
+    /// The current simplified backend has no reserved-page representation, so sparse
+    /// ranges are modeled as unmapped ranges until a later `Map(...)` fills them.
+    pub fn map_sparse(&mut self, gpu_addr: u64, size: u64, _is_big_pages: bool) -> u64 {
+        self.gpu_memory_manager.unmap(gpu_addr, size);
+        gpu_addr
+    }
+
+    /// Upstream: `MemoryManager::Unmap(gpu_addr, size)`.
+    pub fn unmap(&mut self, gpu_addr: u64, size: u64) {
+        self.gpu_memory_manager.unmap(gpu_addr, size);
+    }
+
+    pub fn address_space_bits(&self) -> u64 {
+        self.address_space_bits
+    }
+
+    pub fn split_address(&self) -> u64 {
+        self.split_address
+    }
+
+    pub fn big_page_bits(&self) -> u64 {
+        self.big_page_bits
+    }
+
+    pub fn page_bits(&self) -> u64 {
+        self.page_bits
+    }
+}
+
+impl Default for MemoryManager {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +652,26 @@ mod tests {
         // Second chunk: first 4 bytes of page 2.
         assert_eq!(written[1].0, 0xB000_0000);
         assert_eq!(written[1].1, vec![5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn test_memory_manager_wrapper_tracks_geometry_and_mapping_surface() {
+        let mut mm = MemoryManager::new_with_geometry(5, 37, 1u64 << 34, 17, 12);
+
+        assert_eq!(mm.get_id(), 5);
+        assert_eq!(mm.address_space_bits(), 37);
+        assert_eq!(mm.split_address(), 1u64 << 34);
+        assert_eq!(mm.big_page_bits(), 17);
+        assert_eq!(mm.page_bits(), 12);
+
+        assert_eq!(mm.map_sparse(0x4000, 0x2000, false), 0x4000);
+        assert_eq!(mm.gpu_to_cpu_address(0x4000), None);
+
+        assert_eq!(mm.map(0x4000, 0x9000_0000, 0x2000, 0, false), 0x4000);
+        assert_eq!(mm.gpu_to_cpu_address(0x4000), Some(0x9000_0000));
+        assert_eq!(mm.gpu_to_cpu_address(0x4ABC), Some(0x9000_0ABC));
+
+        mm.unmap(0x4000, 0x2000);
+        assert_eq!(mm.gpu_to_cpu_address(0x4000), None);
     }
 }
