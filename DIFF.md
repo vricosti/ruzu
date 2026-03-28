@@ -1007,3 +1007,127 @@
 
 ### Binary layout verification
 - PASS: wait-control-flow change only; no raw payload or serialized layout changed.
+
+## 2026-03-28 — `/home/vricosti/Dev/emulators/rdynarmic/src/frontend/a32/translate/thumb16.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A32/translate/impl/thumb16.cpp`
+
+### Intentional differences
+- Rust keeps the Thumb16 translators in a single `thumb16.rs` owner file instead of the upstream monolithic `thumb16.cpp`, but the owner boundary still matches the upstream Thumb16 translation unit.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `thumb16_blx_reg()` wrote `LR` before `BXWritePC(target)`. Upstream orders these as `PushRSB`, `UpdateUpperLocationDescriptor`, `BXWritePC(GetRegister(m))`, then `SetRegister(LR, return_addr)`. The old Rust order was observably wrong when `m == LR`, because the branch target consumed the newly written return address instead of the original `LR`.
+
+### Missing items
+- No new missing item identified in this slice beyond the broader Thumb16 translation parity still tracked elsewhere.
+
+### Binary layout verification
+- PASS: IR/control-flow only; no raw payload or serialized layout changed.
+
+## 2026-03-28 — `/home/vricosti/Dev/emulators/rdynarmic/src/frontend/a32/translate/synchronization.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A32/translate/impl/synchronization.cpp`
+
+### Intentional differences
+- Rust keeps the ARM synchronization translators in one `synchronization.rs` owner file instead of the upstream `synchronization.cpp`, but the owner boundary still matches the upstream translation unit.
+- Rust uses a local `unpredictable_instruction(...)` helper inside this file instead of the upstream shared `TranslatorVisitor::UnpredictableInstruction()` method. The helper now mirrors the upstream sequence for this owner slice: `UpdateUpperLocationDescriptor`, advance `PC`, `ExceptionRaised`, then `CheckHalt(ReturnToDispatch)`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `LDREX*` and `STREX*` used `AccType::Ordered` in the Rust port. Upstream uses `IR::AccType::ATOMIC` for the ARM exclusive load/store family.
+- Fixed in this pass: `LDREX*`, `STREX*`, `SWP`, and `SWPB` were missing upstream `UnpredictableInstruction()` guards on `PC` and overlapping register combinations. In particular, `STREX/STREXB/STREXH` with `Rd == PC` were incorrectly accepted and lowered into `set_register(R15, ...)`, which emitted `A32BXWritePC` mid-block instead of raising an unpredictable-instruction exception like upstream.
+- Fixed in this pass: the earlier local unpredictable path only emitted `ExceptionRaised` and returned `true`. Upstream stops translation for that instruction and sets a halt-check terminal after updating `PC`.
+
+### Missing items
+- Full line-for-line parity for the acquire/release instructions (`LDA*`, `STL*`, `STLEX*`) present in upstream `synchronization.cpp` is still missing from the Rust owner file.
+- This slice still needs a backend-level regression once the remaining `A32ExceptionRaised`/regalloc panic is fixed; current regression coverage stops at frontend/IR generation.
+
+### Binary layout verification
+- PASS: IR/control-flow only; no raw payload or serialized layout changed.
+
+## 2026-03-28 — `core/src/hle/service/hle_ipc.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp`
+
+### Intentional differences
+- Rust still keeps the IPC command buffer parsing inside `HLERequestContext` methods instead of the upstream C++ class split between header/implementation. Ownership remains in the matching owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: C receive-list descriptor parsing used `CommandHeader::buf_c_descriptor_flags()` too early, which collapses raw flag values `3..15` to `Disabled`. Upstream consumes the raw 4-bit field and interprets values greater than `InlineDescriptor` as multi-descriptor C receive-lists. The Rust path now reads the raw field directly and preserves the upstream `flags - 2` descriptor count rule.
+
+### Missing items
+- No new missing item identified in this slice beyond the remaining broader HIPC parity still tracked elsewhere.
+
+### Binary layout verification
+- PASS: command-buffer layout unchanged; fixed only the interpretation of the raw header bits.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/core/container.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/core/container.cpp`
+
+### Intentional differences
+- Rust still omits upstream Host1x SMMU registration, ASID ownership, and heap preallocation because those owners are not fully wired in this port yet. Session ownership remains in the matching owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `open_session()` always created a fresh session instead of matching the upstream reuse-by-process behavior for active sessions.
+- Fixed in this pass: session state did not retain the owning process, which prevented downstream `nvmap` from recovering `GetSession(...)->process` like upstream.
+
+### Missing items
+- Upstream `RegisterProcess`, `UnregisterProcess`, and heap preallocation remain unported in this owner file.
+
+### Binary layout verification
+- PASS: no raw serialized payload affected; session owner fields are internal Rust state only.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/nvdrv_interface.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv_interface.cpp`
+
+### Intentional differences
+- Rust still resolves handles through the current process handle table and `Arc<Mutex<KProcess>>` instead of upstream raw `KProcess*` object accessors. This is the existing object-ownership adaptation.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Initialize` ignored the copied process handle and opened an anonymous session. Upstream resolves the process object from copy handle 0 and opens the nvdrv session against that process.
+
+### Missing items
+- `MapSharedMem`, `SetAruidForTest`, and `InitializeDevtools` are still unimplemented, matching the already documented gaps in this service owner.
+
+### Binary layout verification
+- PASS: IPC payload shape unchanged; fixed only handle/process resolution behavior.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvmap.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp`
+
+### Intentional differences
+- Rust still omits the full Host1x-backed SMMU/GMMU integration present upstream. The owner file remains responsible for nvmap device ioctl behavior.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IocAlloc` stopped after `Handle::alloc(...)` and never mirrored the upstream `process->GetPageTable().LockForMapDeviceAddressSpace(...)` step.
+- Fixed in this pass: `NvMapDevice` had no access to the owning `Container`, so it could not recover the active session's process owner like upstream `container.GetSession(...)->process`.
+
+### Missing items
+- Full upstream success path still expects Host1x-backed handle pinning and address-space mapping in `NvCore::NvMap`.
+
+### Binary layout verification
+- PASS: `IocAllocParams` layout unchanged; fixed only post-allocation lifecycle behavior.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`
+
+### Intentional differences
+- Rust still does not instantiate the upstream GPU memory manager / GMMU object. The owner file keeps a lighter internal mapping model until Host1x memory-manager parity is completed.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `AllocAsEx` did not initialize the upstream small-page and big-page allocators, leaving subsequent address-space allocations without the required VA allocator state.
+- Fixed in this pass: `AllocateSpace(flags without Fixed)` never assigned `params.offset`, while upstream allocates GPU VA and returns it to the guest.
+- Fixed in this pass: `MapBufferEx(flags without Fixed)` returned success without allocating or recording any GPU VA mapping, while upstream allocates space and writes the resulting `offset` back to the request struct.
+- Fixed in this pass: `FreeSpace` did not free the corresponding small/big-page allocator range.
+
+### Missing items
+- Full upstream `gmmu->Map`, sparse mapping, and `nvmap.PinHandle(...)` device-address translation are still incomplete in this owner file.
+- The per-allocation `mappings` list from upstream `Allocation` is still not modeled literally in Rust.
+
+### Binary layout verification
+- PASS: ioctl struct layouts unchanged; added allocator-backed state and return-value behavior only.
+
+## 2026-03-28 — `core/src/hle/kernel/k_page_table_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.cpp`
+
+### Intentional differences
+- Rust still does not model upstream allocator RAII helpers such as `KMemoryBlockManagerUpdateAllocator`; it uses the existing `update_lock(...)` API in the matching owner file instead.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `LockForMapDeviceAddressSpace` incorrectly delegated to the generic `lock_memory_and_open(...)` helper. Upstream performs its own state/attribute check for the device-share path and then updates blocks via `KMemoryBlock::ShareToDevice`.
+- Fixed in this pass: `UnlockForDeviceAddressSpace` similarly used the generic unlock helper instead of the upstream device-share-specific contiguous-state check plus `KMemoryBlock::UnshareToDevice`.
+- The old Rust path incorrectly rejected a valid `NORMAL` region used by `nvmap::IocAlloc`, returning `RESULT_INVALID_CURRENT_MEMORY` where upstream asserts success.
+
+### Missing items
+- `LockForUnmapDeviceAddressSpace` / `UnlockForDeviceAddressSpacePartialMap` are still not ported literally alongside this slice.
+
+### Binary layout verification
+- PASS: no raw struct layout affected; fixed kernel memory-state transition behavior only.

@@ -2503,36 +2503,83 @@ impl KPageTableBase {
         &mut self, addr: usize, size: usize,
         perm: KMemoryPermission, is_aligned: bool,
     ) -> u32 {
-        let mut paddr = 0u64;
         let state_flag = if is_aligned {
             KMemoryState::FLAG_CAN_ALIGNED_DEVICE_MAP
         } else {
             KMemoryState::FLAG_CAN_DEVICE_MAP
         };
-        self.lock_memory_and_open(
-            &mut paddr, addr, size,
-            state_flag, state_flag,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF),
-            KMemoryAttribute::from_bits_truncate(
-                KMemoryAttribute::IPC_LOCKED.bits() | KMemoryAttribute::LOCKED.bits(),
-            ),
-            KMemoryPermission::NONE,
+        let num_pages = size / PAGE_SIZE;
+        if !self.contains_range(addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let attr_mask = KMemoryAttribute::from_bits_truncate(
+            KMemoryAttribute::IPC_LOCKED.bits() | KMemoryAttribute::LOCKED.bits(),
+        );
+        let (result, out_old_state, _, _, _) = self.check_memory_state_range(
+            addr,
+            size,
+            state_flag,
+            state_flag,
+            perm,
+            perm,
+            attr_mask,
+            KMemoryAttribute::NONE,
             KMemoryAttribute::DEVICE_SHARED,
-        )
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let old_state = out_old_state.unwrap_or(KMemoryState::FREE);
+        let _was_io =
+            Self::k_state_to_svc(old_state & KMemoryState::from_bits_truncate(KMemoryState::MASK.bits()))
+                == SvcMemoryState::Io;
+
+        self.m_memory_block_manager.update_lock(
+            addr,
+            num_pages,
+            KMemoryPermission::NONE,
+            |block, new_perm, is_first, is_last| {
+                block.share_to_device(new_perm, is_first, is_last);
+            },
+        );
+        0
     }
 
     /// Matches upstream `KPageTableBase::UnlockForDeviceAddressSpace`.
     pub fn unlock_for_device_address_space(&mut self, addr: usize, size: usize) -> u32 {
-        self.unlock_memory(
-            addr, size,
-            KMemoryState::FLAG_CAN_DEVICE_MAP, KMemoryState::FLAG_CAN_DEVICE_MAP,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF),
-            KMemoryAttribute::DEVICE_SHARED,
+        let num_pages = size / PAGE_SIZE;
+        if !self.contains_range(addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let attr_mask = KMemoryAttribute::from_bits_truncate(
+            KMemoryAttribute::DEVICE_SHARED.bits() | KMemoryAttribute::LOCKED.bits(),
+        );
+        let (result, _) = self.check_memory_state_contiguous(
+            addr,
+            size,
+            KMemoryState::FLAG_CAN_DEVICE_MAP,
+            KMemoryState::FLAG_CAN_DEVICE_MAP,
             KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            attr_mask,
             KMemoryAttribute::DEVICE_SHARED,
-        )
+        );
+        if result != 0 {
+            return result;
+        }
+
+        self.m_memory_block_manager.update_lock(
+            addr,
+            num_pages,
+            KMemoryPermission::NONE,
+            |block, new_perm, is_first, is_last| {
+                block.unshare_to_device(new_perm, is_first, is_last);
+            },
+        );
+        0
     }
 
     // -- IO Region Mapping --

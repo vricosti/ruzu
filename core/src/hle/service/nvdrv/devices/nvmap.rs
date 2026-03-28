@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::hle::service::nvdrv::core::container::SessionId;
+use crate::hle::kernel::k_memory_block::KMemoryPermission;
+use crate::hle::service::nvdrv::core::container::{Container, SessionId};
 use crate::hle::service::nvdrv::core::nvmap as nvmap_core;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
@@ -83,6 +84,7 @@ const _: () = assert!(std::mem::size_of::<IocGetIdParams>() == 8);
 /// The nvmap device file.
 pub struct NvMapDevice {
     file: *const nvmap_core::NvMap,
+    container: *const Container,
     sessions: Mutex<HashMap<DeviceFD, SessionId>>,
 }
 
@@ -91,15 +93,20 @@ unsafe impl Send for NvMapDevice {}
 unsafe impl Sync for NvMapDevice {}
 
 impl NvMapDevice {
-    pub fn new(file: &nvmap_core::NvMap) -> Self {
+    pub fn new(file: &nvmap_core::NvMap, container: &Container) -> Self {
         Self {
             file: file as *const _,
+            container: container as *const _,
             sessions: Mutex::new(HashMap::new()),
         }
     }
 
     fn file(&self) -> &nvmap_core::NvMap {
         unsafe { &*self.file }
+    }
+
+    fn container(&self) -> &Container {
+        unsafe { &*self.container }
     }
 
     pub fn ioc_create(&self, params: &mut IocCreateParams) -> NvResult {
@@ -162,8 +169,43 @@ impl NvMapDevice {
         let session_id = sessions.get(&fd).copied().unwrap_or_default();
         drop(sessions);
 
-        let result = handle.alloc(params.flags, params.align, params.kind, params.address, session_id);
-        result
+        let result =
+            handle.alloc(params.flags, params.align, params.kind, params.address, session_id);
+        if result != NvResult::Success {
+            log::error!("Object failed to allocate, handle={:08X}", params.handle);
+            return result;
+        }
+
+        let Some(process) = self.container().get_session_process(session_id) else {
+            log::error!("Active session missing process for fd={}", fd);
+            return NvResult::InvalidState;
+        };
+
+        let handle_size = {
+            let inner = handle.lock_inner();
+            inner.size as usize
+        };
+        let lock_result = process
+            .lock()
+            .unwrap()
+            .page_table
+            .get_base_mut()
+            .lock_for_map_device_address_space(
+                params.address as usize,
+                handle_size,
+                KMemoryPermission::NONE,
+                true,
+            );
+        if lock_result != 0 {
+            log::error!(
+                "LockForMapDeviceAddressSpace failed: handle={:08X} result=0x{:X}",
+                params.handle,
+                lock_result
+            );
+            return NvResult::BadValue;
+        }
+
+        NvResult::Success
     }
 
     pub fn ioc_get_id(&self, params: &mut IocGetIdParams) -> NvResult {

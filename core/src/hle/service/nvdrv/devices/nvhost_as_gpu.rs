@@ -8,6 +8,8 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use common::address_space::FlatAllocator;
+
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
@@ -139,6 +141,8 @@ struct VM {
     va_range_start: u64,
     va_range_split: u64,
     va_range_end: u64,
+    small_page_allocator: Option<FlatAllocator>,
+    big_page_allocator: Option<FlatAllocator>,
     initialised: bool,
 }
 
@@ -151,6 +155,8 @@ impl Default for VM {
             va_range_start: (DEFAULT_BIG_PAGE_SIZE as u64) << 10,
             va_range_split: 1u64 << 34,
             va_range_end: 1u64 << 37,
+            small_page_allocator: None,
+            big_page_allocator: None,
             initialised: false,
         }
     }
@@ -211,7 +217,14 @@ impl NvHostAsGpu {
             vm.va_range_end = params.va_range_end;
         }
 
-        // Stubbed: Full implementation requires FlatAllocator and GPU memory manager.
+        let start_pages = (vm.va_range_start >> VM::PAGE_SIZE_BITS) as u32;
+        let end_pages = (vm.va_range_split >> VM::PAGE_SIZE_BITS) as u32;
+        vm.small_page_allocator = Some(FlatAllocator::new(start_pages, end_pages));
+
+        let start_big_pages = (vm.va_range_split >> vm.big_page_size_bits) as u32;
+        let end_big_pages = ((vm.va_range_end - vm.va_range_split) >> vm.big_page_size_bits) as u32;
+        vm.big_page_allocator = Some(FlatAllocator::new(start_big_pages, end_big_pages));
+
         vm.initialised = true;
 
         NvResult::Success
@@ -225,7 +238,7 @@ impl NvHostAsGpu {
             params.flags
         );
 
-        let vm = self.vm.lock().unwrap();
+        let mut vm = self.vm.lock().unwrap();
         if !vm.initialised {
             return NvResult::BadValue;
         }
@@ -241,16 +254,41 @@ impl NvHostAsGpu {
             return NvResult::NotImplemented;
         }
 
-        // Stubbed: Full implementation requires FlatAllocator.
+        let page_size_bits = if params.page_size == VM::YUZU_PAGESIZE {
+            VM::PAGE_SIZE_BITS
+        } else {
+            vm.big_page_size_bits
+        };
+
+        let allocator = if params.page_size == VM::YUZU_PAGESIZE {
+            vm.small_page_allocator.as_mut()
+        } else {
+            vm.big_page_allocator.as_mut()
+        };
+        let Some(allocator) = allocator else {
+            return NvResult::InvalidState;
+        };
+
+        if flags.contains(MappingFlags::FIXED) {
+            allocator.allocate_fixed((params.offset >> page_size_bits) as u32, params.pages);
+        } else {
+            let Some(offset_pages) = allocator.allocate(params.pages) else {
+                return NvResult::InsufficientMemory;
+            };
+            params.offset = (offset_pages as u64) << page_size_bits;
+        }
+
         let size = (params.pages as u64) * (params.page_size as u64);
         let mut alloc_map = self.allocation_map.lock().unwrap();
-        alloc_map.insert(params.offset, Allocation {
-            size,
-            page_size: params.page_size,
-            sparse: flags.contains(MappingFlags::SPARSE),
-            big_pages: params.page_size != VM::YUZU_PAGESIZE,
-        });
-
+        alloc_map.insert(
+            params.offset,
+            Allocation {
+                size,
+                page_size: params.page_size,
+                sparse: flags.contains(MappingFlags::SPARSE),
+                big_pages: params.page_size != VM::YUZU_PAGESIZE,
+            },
+        );
         NvResult::Success
     }
 
@@ -262,11 +300,10 @@ impl NvHostAsGpu {
             params.page_size
         );
 
-        let vm = self.vm.lock().unwrap();
+        let mut vm = self.vm.lock().unwrap();
         if !vm.initialised {
             return NvResult::BadValue;
         }
-        drop(vm);
 
         let mut alloc_map = self.allocation_map.lock().unwrap();
         if let Some(alloc) = alloc_map.get(&params.offset) {
@@ -274,6 +311,22 @@ impl NvHostAsGpu {
                 || alloc.size != (params.pages as u64) * (params.page_size as u64)
             {
                 return NvResult::BadValue;
+            }
+            let page_size_bits = if alloc.big_pages {
+                vm.big_page_size_bits
+            } else {
+                VM::PAGE_SIZE_BITS
+            };
+            let allocator = if alloc.big_pages {
+                vm.big_page_allocator.as_mut()
+            } else {
+                vm.small_page_allocator.as_mut()
+            };
+            if let Some(allocator) = allocator {
+                allocator.free(
+                    (params.offset >> page_size_bits) as u32,
+                    (alloc.size >> page_size_bits) as u32,
+                );
             }
             alloc_map.remove(&params.offset);
             NvResult::Success
@@ -296,13 +349,99 @@ impl NvHostAsGpu {
             params.offset
         );
 
-        let vm = self.vm.lock().unwrap();
+        let mut vm = self.vm.lock().unwrap();
         if !vm.initialised {
             return NvResult::BadValue;
         }
-        drop(vm);
 
-        // Stubbed: Full implementation requires NvMap pin and GPU memory manager.
+        let flags = MappingFlags::from_bits_truncate(params.flags);
+        let size = if params.mapping_size != 0 {
+            params.mapping_size
+        } else {
+            params.page_size.max(VM::YUZU_PAGESIZE) as u64
+        };
+
+        if flags.contains(MappingFlags::REMAP) {
+            let mapping_map = self.mapping_map.lock().unwrap();
+            let Some(mapping) = mapping_map.get(&(params.offset as u64)) else {
+                return NvResult::BadValue;
+            };
+            if mapping.size < size {
+                return NvResult::BadValue;
+            }
+            return NvResult::Success;
+        }
+
+        let big_page = if params.page_size == vm.big_page_size {
+            true
+        } else if params.page_size == 0 || params.page_size == VM::YUZU_PAGESIZE {
+            false
+        } else {
+            return NvResult::BadValue;
+        };
+
+        if flags.contains(MappingFlags::FIXED) {
+            let alloc_map = self.allocation_map.lock().unwrap();
+            let Some((alloc_start, alloc)) = alloc_map.range(..=(params.offset as u64)).next_back() else {
+                return NvResult::BadValue;
+            };
+            if (params.offset as u64) < *alloc_start
+                || ((params.offset as u64) - *alloc_start) + size > alloc.size
+            {
+                return NvResult::BadValue;
+            }
+            let use_big_pages = alloc.big_pages && big_page;
+            drop(alloc_map);
+            self.mapping_map.lock().unwrap().insert(
+                params.offset as u64,
+                Mapping {
+                    handle: params.handle,
+                    ptr: 0,
+                    offset: params.offset as u64,
+                    size,
+                    fixed: true,
+                    big_page: use_big_pages,
+                    sparse_alloc: false,
+                },
+            );
+            return NvResult::Success;
+        }
+
+        let page_size = if big_page {
+            vm.big_page_size
+        } else {
+            VM::YUZU_PAGESIZE
+        };
+        let page_size_bits = if big_page {
+            vm.big_page_size_bits
+        } else {
+            VM::PAGE_SIZE_BITS
+        };
+        let allocator = if big_page {
+            vm.big_page_allocator.as_mut()
+        } else {
+            vm.small_page_allocator.as_mut()
+        };
+        let Some(allocator) = allocator else {
+            return NvResult::InvalidState;
+        };
+        let aligned_size = (size + page_size as u64 - 1) & !((page_size as u64) - 1);
+        let Some(offset_pages) = allocator.allocate((aligned_size >> page_size_bits) as u32) else {
+            return NvResult::InsufficientMemory;
+        };
+        params.offset = ((offset_pages as u64) << page_size_bits) as i64;
+        self.mapping_map.lock().unwrap().insert(
+            params.offset as u64,
+            Mapping {
+                handle: params.handle,
+                ptr: 0,
+                offset: params.offset as u64,
+                size,
+                fixed: false,
+                big_page,
+                sparse_alloc: false,
+            },
+        );
         NvResult::Success
     }
 
@@ -490,5 +629,42 @@ impl NvDevice for NvHostAsGpu {
     fn query_event(&self, event_id: u32) -> Option<u32> {
         log::error!("Unknown AS GPU Event {}", event_id);
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IoctlAllocAsEx, IoctlAllocSpace, IoctlMapBufferEx, NvHostAsGpu};
+    use crate::hle::service::nvdrv::nvdata::NvResult;
+
+    #[test]
+    fn allocate_space_returns_non_zero_offset_for_dynamic_allocations() {
+        let gpu_as = NvHostAsGpu::new();
+        let mut alloc_as = IoctlAllocAsEx::default();
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
+
+        let mut params = IoctlAllocSpace {
+            pages: 1,
+            page_size: 0x1000,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.allocate_space(&mut params), NvResult::Success);
+        assert_ne!(params.offset, 0);
+    }
+
+    #[test]
+    fn map_buffer_ex_returns_non_zero_offset_for_dynamic_mappings() {
+        let gpu_as = NvHostAsGpu::new();
+        let mut alloc_as = IoctlAllocAsEx::default();
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
+
+        let mut params = IoctlMapBufferEx {
+            mapping_size: 0x1000,
+            page_size: 0x1000,
+            handle: 4,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.map_buffer_ex(&mut params), NvResult::Success);
+        assert_ne!(params.offset, 0);
     }
 }

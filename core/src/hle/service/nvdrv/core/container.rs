@@ -6,11 +6,12 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/core/container.cpp
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Mutex, Weak};
 
 use super::heap_mapper::HeapMapper;
 use super::nvmap::NvMap;
 use super::syncpoint_manager::SyncpointManager;
+use crate::hle::kernel::k_process::KProcess;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionId {
@@ -19,8 +20,11 @@ pub struct SessionId {
 
 pub struct Session {
     pub id: SessionId,
-    /// In the C++ code, this holds a pointer to the KProcess.
-    /// We omit this since we don't have kernel integration yet.
+    /// Matches upstream `Kernel::KProcess* process`.
+    pub process: Option<Weak<Mutex<KProcess>>>,
+    /// Process identity used for session reuse. This mirrors the upstream
+    /// pointer-identity comparison in a Rust-friendly form.
+    pub process_identity: usize,
     pub has_preallocated_area: bool,
     pub mapper: Option<HeapMapper>,
     pub is_active: bool,
@@ -28,9 +32,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(id: SessionId) -> Self {
+    pub fn new(id: SessionId, process: &std::sync::Arc<Mutex<KProcess>>) -> Self {
+        let process_identity = std::sync::Arc::as_ptr(process) as usize;
         Self {
             id,
+            process: Some(std::sync::Arc::downgrade(process)),
+            process_identity,
             has_preallocated_area: false,
             mapper: None,
             is_active: false,
@@ -83,34 +90,40 @@ impl Container {
     /// Opens a session. If the same process already has an active session,
     /// increments its ref count and returns the existing session ID.
     ///
-    /// In the C++ code, this takes a KProcess* and checks process identity.
-    /// Since we don't have kernel integration yet, each call creates a new session.
-    /// The heap preallocation optimization is also omitted (requires page table queries).
-    pub fn open_session(&self) -> SessionId {
+    /// Matches upstream `Container::OpenSession(KProcess* process)` for the
+    /// session reuse and ownership checks. ASID/SMMU registration and heap
+    /// preallocation remain unimplemented here.
+    pub fn open_session(&self, process: &std::sync::Arc<Mutex<KProcess>>) -> SessionId {
         let mut inner = self.inner.lock().unwrap();
+        let process_identity = std::sync::Arc::as_ptr(process) as usize;
 
-        // In the C++ code, we'd check for an existing active session for the same process.
-        // Without KProcess*, we always create a new session.
+        for session in &mut inner.sessions {
+            if !session.is_active {
+                continue;
+            }
+            if session.process_identity == process_identity {
+                session.ref_count += 1;
+                return session.id;
+            }
+        }
 
         let new_id;
         if let Some(recycled_id) = inner.id_pool.pop_front() {
             new_id = recycled_id;
             if new_id < inner.sessions.len() {
-                inner.sessions[new_id] = Session::new(SessionId { id: new_id });
+                inner.sessions[new_id] = Session::new(SessionId { id: new_id }, process);
             }
         } else {
             new_id = inner.new_ids;
             inner.new_ids += 1;
-            inner.sessions.push(Session::new(SessionId { id: new_id }));
+            inner
+                .sessions
+                .push(Session::new(SessionId { id: new_id }, process));
         }
 
         let session = &mut inner.sessions[new_id];
         session.is_active = true;
         session.ref_count = 1;
-
-        // NOTE: In the C++ code, if the process is an application, it performs heap preallocation
-        // by scanning the process page table for the largest contiguous heap region and
-        // preallocating SMMU space. This is omitted here as it requires kernel page table access.
 
         SessionId { id: new_id }
     }
@@ -134,6 +147,8 @@ impl Container {
 
             // Session is being fully closed
             session.is_active = false;
+            session.process = None;
+            session.process_identity = 0;
             session.has_preallocated_area = false;
             session.mapper = None;
 
@@ -162,6 +177,21 @@ impl Container {
         }
     }
 
+    /// Returns the process owner for an active session.
+    ///
+    /// This is the Rust counterpart of upstream `GetSession(session_id)->process`.
+    pub fn get_session_process(
+        &self,
+        session_id: SessionId,
+    ) -> Option<std::sync::Arc<Mutex<KProcess>>> {
+        let inner = self.inner.lock().unwrap();
+        let session = inner.sessions.get(session_id.id)?;
+        if !session.is_active {
+            return None;
+        }
+        session.process.as_ref()?.upgrade()
+    }
+
     pub fn get_nv_map_file(&self) -> &NvMap {
         &self.file
     }
@@ -172,5 +202,29 @@ impl Container {
 
     pub fn host1x_device_file(&self) -> &Host1xDeviceFileData {
         &self.device_file_data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::Container;
+    use crate::hle::kernel::k_process::KProcess;
+
+    #[test]
+    fn open_session_reuses_active_session_for_same_process() {
+        let container = Container::new();
+        let process = Arc::new(Mutex::new(KProcess::new()));
+
+        let first = container.open_session(&process);
+        let second = container.open_session(&process);
+
+        assert_eq!(first, second);
+
+        container.close_session(first);
+        let third = container.open_session(&process);
+
+        assert_eq!(third, first);
     }
 }

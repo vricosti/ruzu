@@ -104,7 +104,10 @@ impl Module {
             "/dev/nvhost-as-gpu" => Arc::new(NvHostAsGpu::new()),
             "/dev/nvhost-gpu" => Arc::new(NvHostGpu::new()),
             "/dev/nvhost-ctrl-gpu" => Arc::new(NvHostCtrlGpu::new()),
-            "/dev/nvmap" => Arc::new(NvMapDevice::new(self.container.get_nv_map_file())),
+            "/dev/nvmap" => Arc::new(NvMapDevice::new(
+                self.container.get_nv_map_file(),
+                &self.container,
+            )),
             "/dev/nvdisp_disp0" => Arc::new(NvDispDisp0::new()),
             "/dev/nvhost-ctrl" => {
                 Arc::new(NvHostCtrl::new(self.container.get_syncpoint_manager()))
