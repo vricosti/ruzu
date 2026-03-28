@@ -5,11 +5,18 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
+use crate::gpu_core::{GpuChannelHandle, GpuMemoryManagerHandle};
+use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::service::nvdrv::core::container::Container;
 use crate::hle::service::nvdrv::core::container::SessionId;
+use crate::hle::service::nvdrv::core::syncpoint_manager::SyncpointManager;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
+use crate::hle::service::nvdrv::nvdrv::EventInterface;
 use crate::hle::service::nvdrv::nvdata::*;
 
 #[repr(u32)]
@@ -135,24 +142,64 @@ pub struct IoctlGetWaitbase {
 
 /// nvhost_gpu device.
 pub struct NvHostGpu {
+    sm_exception_breakpoint_int_report_event: Arc<Mutex<KReadableEvent>>,
+    sm_exception_breakpoint_pause_report_event: Arc<Mutex<KReadableEvent>>,
+    error_notifier_event: Arc<Mutex<KReadableEvent>>,
+    syncpoint_manager: *const SyncpointManager,
+    container: *const Container,
+    channel_syncpoint: AtomicU32,
+    channel_initialized: AtomicBool,
     nvmap_fd: Mutex<i32>,
     user_data: Mutex<u64>,
     zcull_params: Mutex<IoctlZCullBind>,
     channel_priority: Mutex<u32>,
     channel_timeslice: Mutex<u32>,
+    channel_state: Arc<dyn GpuChannelHandle>,
+    bound_address_space: AtomicBool,
     sessions: Mutex<HashMap<DeviceFD, SessionId>>,
 }
 
+unsafe impl Send for NvHostGpu {}
+unsafe impl Sync for NvHostGpu {}
+
 impl NvHostGpu {
-    pub fn new() -> Self {
+    pub fn new(
+        system: SystemRef,
+        events_interface: Arc<EventInterface>,
+        container: &Container,
+    ) -> Self {
+        let channel_state = system
+            .get()
+            .gpu_core()
+            .expect("GPU core must be initialized before nvhost_gpu open")
+            .allocate_channel_handle();
         Self {
+            sm_exception_breakpoint_int_report_event: events_interface
+                .create_event("GpuChannelSMExceptionBreakpointInt"),
+            sm_exception_breakpoint_pause_report_event: events_interface
+                .create_event("GpuChannelSMExceptionBreakpointPause"),
+            error_notifier_event: events_interface.create_event("GpuChannelErrorNotifier"),
+            syncpoint_manager: container.get_syncpoint_manager() as *const _,
+            container: container as *const _,
+            channel_syncpoint: AtomicU32::new(0),
+            channel_initialized: AtomicBool::new(false),
             nvmap_fd: Mutex::new(0),
             user_data: Mutex::new(0),
             zcull_params: Mutex::new(IoctlZCullBind::default()),
             channel_priority: Mutex::new(0),
             channel_timeslice: Mutex::new(0),
+            channel_state,
+            bound_address_space: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn syncpoint_manager(&self) -> &SyncpointManager {
+        unsafe { &*self.syncpoint_manager }
+    }
+
+    fn container(&self) -> &Container {
+        unsafe { &*self.container }
     }
 
     pub fn set_nvmap_fd(&self, params: &mut IoctlSetNvmapFD) -> NvResult {
@@ -195,14 +242,32 @@ impl NvHostGpu {
         NvResult::Success
     }
 
-    pub fn alloc_gpfifo_ex2(&self, params: &mut IoctlAllocGpfifoEx2, _fd: DeviceFD) -> NvResult {
+    pub fn alloc_gpfifo_ex2(&self, params: &mut IoctlAllocGpfifoEx2, fd: DeviceFD) -> NvResult {
         log::warn!(
             "nvhost_gpu::AllocGPFIFOEx2 (STUBBED) called, num_entries={:X}, flags={:X}",
             params.num_entries,
             params.flags
         );
-        // Stubbed: Full implementation requires GPU channel state and syncpoint manager.
-        params.fence_out = NvFence::default();
+
+        if self.channel_initialized.swap(true, Ordering::AcqRel) {
+            log::error!("nvhost_gpu::AllocGPFIFOEx2 called on already initialized channel");
+            return NvResult::AlreadyAllocated;
+        }
+
+        let channel_syncpoint = self.syncpoint_manager().allocate_syncpoint(false);
+        self.channel_syncpoint
+            .store(channel_syncpoint, Ordering::Release);
+        let program_id = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&fd)
+            .copied()
+            .and_then(|session_id| self.container().get_session_process(session_id))
+            .map(|process| process.lock().unwrap().get_program_id())
+            .unwrap_or(0);
+        self.channel_state.init_channel(program_id);
+        params.fence_out = self.syncpoint_manager().get_syncpoint_fence(channel_syncpoint);
         NvResult::Success
     }
 
@@ -219,7 +284,7 @@ impl NvHostGpu {
     pub fn submit_gpfifo_base1(
         &self,
         params: &mut IoctlSubmitGpfifo,
-        _commands: &[u8],
+        commands: &[u8],
     ) -> NvResult {
         log::trace!(
             "nvhost_gpu::SubmitGPFIFOBase1 called, gpfifo={:X}, num_entries={:X}, flags={:X}",
@@ -227,7 +292,34 @@ impl NvHostGpu {
             params.num_entries,
             params.flags
         );
-        // Stubbed: Full implementation requires GPU push buffer submission.
+
+        let available_entries = commands.len() / std::mem::size_of::<u64>();
+        if params.num_entries as usize > available_entries {
+            log::error!(
+                "nvhost_gpu::SubmitGPFIFOBase1 invalid size num_entries={} available_entries={}",
+                params.num_entries,
+                available_entries
+            );
+            return NvResult::InvalidSize;
+        }
+
+        let channel_syncpoint = self.channel_syncpoint.load(Ordering::Acquire);
+        if channel_syncpoint == 0 {
+            log::error!("nvhost_gpu::SubmitGPFIFOBase1 called before AllocGPFIFOEx2");
+            return NvResult::InvalidState;
+        }
+
+        params.fence.id = channel_syncpoint as i32;
+        let increment = (if params.fence_increment() { 2 } else { 0 })
+            + if params.increment_value() {
+                params.fence.value
+            } else {
+                0
+            };
+        params.fence.value = self
+            .syncpoint_manager()
+            .increment_syncpoint_max_ext(channel_syncpoint, increment);
+        self.syncpoint_manager().signal_syncpoint(channel_syncpoint);
         params.flags = 0;
         NvResult::Success
     }
@@ -247,6 +339,25 @@ impl NvHostGpu {
         log::info!("nvhost_gpu::ChannelSetTimeslice called, timeslice=0x{:X}", params.timeslice);
         *self.channel_timeslice.lock().unwrap() = params.timeslice;
         NvResult::Success
+    }
+
+    pub fn bind_address_space(&self, memory_manager: Arc<dyn GpuMemoryManagerHandle>) {
+        self.channel_state.bind_memory_manager(memory_manager);
+        self.bound_address_space.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_bound_address_space(&self) -> bool {
+        self.bound_address_space.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for NvHostGpu {
+    fn drop(&mut self) {
+        let channel_syncpoint = self.channel_syncpoint.load(Ordering::Acquire);
+        if channel_syncpoint != 0 {
+            self.syncpoint_manager().free_syncpoint(channel_syncpoint);
+        }
     }
 }
 
@@ -414,13 +525,129 @@ impl NvDevice for NvHostGpu {
         sessions.remove(&fd);
     }
 
-    fn query_event(&self, event_id: u32) -> Option<u32> {
+    fn query_event(&self, event_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
         match event_id {
-            1 | 2 | 3 => Some(event_id),
+            1 => Some(Arc::clone(&self.sm_exception_breakpoint_int_report_event)),
+            2 => Some(Arc::clone(&self.sm_exception_breakpoint_pause_report_event)),
+            3 => Some(Arc::clone(&self.error_notifier_event)),
             _ => {
                 log::error!("Unknown Ctrl GPU Event {}", event_id);
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{IoctlAllocGpfifoEx2, IoctlSubmitGpfifo, NvHostGpu};
+    use crate::gpu_core::{GpuChannelHandle, GpuCoreInterface, GpuMemoryManagerHandle};
+    use crate::hle::service::nvdrv::nvdrv::EventInterface;
+    use crate::hle::service::nvdrv::core::container::Container;
+    use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
+    use crate::hle::service::nvdrv::nvdata::{NvFence, NvResult};
+
+    #[derive(Default)]
+    struct FakeGpuCore;
+
+    struct FakeGpuMemoryManagerHandle;
+    struct FakeGpuChannelHandle;
+
+    impl GpuChannelHandle for FakeGpuChannelHandle {
+        fn bind_memory_manager(&self, _memory_manager: Arc<dyn GpuMemoryManagerHandle>) {}
+
+        fn init_channel(&self, _program_id: u64) {}
+    }
+
+    impl GpuMemoryManagerHandle for FakeGpuMemoryManagerHandle {
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+
+        fn map(&self, _gpu_addr: u64, _device_addr: u64, _size: u64, _kind: u32, _is_big_pages: bool) {}
+
+        fn map_sparse(&self, _gpu_addr: u64, _size: u64, _is_big_pages: bool) {}
+
+        fn unmap(&self, _gpu_addr: u64, _size: u64) {}
+    }
+
+    impl GpuCoreInterface for FakeGpuCore {
+        fn as_any(&self) -> &(dyn std::any::Any + Send) {
+            self
+        }
+
+        fn allocate_channel_handle(&self) -> Arc<dyn GpuChannelHandle> {
+            Arc::new(FakeGpuChannelHandle)
+        }
+
+        fn allocate_memory_manager_handle(
+            &self,
+            _address_space_bits: u64,
+            _split_address: u64,
+            _big_page_bits: u64,
+            _page_bits: u64,
+        ) -> Arc<dyn GpuMemoryManagerHandle> {
+            Arc::new(FakeGpuMemoryManagerHandle)
+        }
+    }
+
+    #[test]
+    fn alloc_gpfifo_ex2_allocates_syncpoint_fence() {
+        let mut system = crate::core::System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore));
+        let container = Container::new();
+        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(&system)));
+        let gpu = NvHostGpu::new(crate::core::SystemRef::from_ref(&system), events, &container);
+        let mut params = IoctlAllocGpfifoEx2::default();
+
+        let result = gpu.alloc_gpfifo_ex2(&mut params, 1);
+
+        assert_eq!(result, NvResult::Success);
+        assert_ne!(params.fence_out.id, 0);
+    }
+
+    #[test]
+    fn submit_gpfifo_base1_returns_signalled_fence_and_clears_flags() {
+        let mut system = crate::core::System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore));
+        let container = Container::new();
+        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(&system)));
+        let gpu = NvHostGpu::new(crate::core::SystemRef::from_ref(&system), events, &container);
+        let mut alloc = IoctlAllocGpfifoEx2::default();
+        assert_eq!(gpu.alloc_gpfifo_ex2(&mut alloc, 1), NvResult::Success);
+
+        let mut params = IoctlSubmitGpfifo {
+            num_entries: 1,
+            flags: (1 << 1) | (1 << 8),
+            fence: NvFence { id: 0, value: 3 },
+            ..Default::default()
+        };
+        let commands = [0u8; 8];
+
+        let result = gpu.submit_gpfifo_base1(&mut params, &commands);
+
+        assert_eq!(result, NvResult::Success);
+        assert_eq!(params.flags, 0);
+        assert_eq!(params.fence.id, alloc.fence_out.id);
+        assert_eq!(params.fence.value, 5);
+        assert!(container
+            .get_syncpoint_manager()
+            .is_fence_signalled(&params.fence));
+    }
+
+    #[test]
+    fn query_event_returns_three_known_events() {
+        let mut system = crate::core::System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore));
+        let container = Container::new();
+        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(&system)));
+        let gpu = NvHostGpu::new(crate::core::SystemRef::from_ref(&system), events, &container);
+
+        assert!(gpu.query_event(1).is_some());
+        assert!(gpu.query_event(2).is_some());
+        assert!(gpu.query_event(3).is_some());
+        assert!(gpu.query_event(4).is_none());
     }
 }

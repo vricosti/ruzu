@@ -1131,3 +1131,348 @@
 
 ### Binary layout verification
 - PASS: no raw struct layout affected; fixed kernel memory-state transition behavior only.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/core/syncpoint_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/core/syncpoint_manager.cpp`
+
+### Intentional differences
+- Rust still does not own the upstream `Host1x` object inside this file, so `update_min()` cannot sample hardware syncpoint values yet.
+- Rust adds a local `signal_syncpoint(id)` helper in this owner file. This is a temporary adaptation for immediately-completing nvdrv stubs until the upstream Host1x-backed completion path exists.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Rust port had no owner-local way to bring `counter_min` up to `counter_max` after synchronous stubbed GPU work, so fences returned by the partial `nvhost_gpu` path never became signalled.
+
+### Missing items
+- Full upstream `Host1x` wiring for `UpdateMin()` remains missing.
+- Upstream fence expiry still depends on real Host1x progress rather than the temporary synchronous helper used here.
+
+### Binary layout verification
+- PASS: internal manager state only; no serialized payload layout changed.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvhost_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp`
+
+### Intentional differences
+- Rust still does not own upstream GPU channel state, puller command submission, or event-backed notifier objects in this owner file because the `video_core` ownership boundary is not yet ported literally.
+- Rust uses the owner-local `SyncpointManager::signal_syncpoint()` adaptation to complete fences immediately for the stubbed submission path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `AllocGPFIFOEx2` returned a default fence instead of allocating/returning the per-channel syncpoint fence owned by this device upstream.
+- Fixed in this pass: `SubmitGPFIFOBase1` did not propagate fence increment semantics into the returned fence state. The Rust port now updates the channel syncpoint max value and returns the matching fence from the owner file.
+- Fixed in this pass: `nvhost_gpu` was constructed without the container-owned syncpoint manager it needs for upstream per-channel fence ownership.
+
+### Missing items
+- `InitChannel`, `PushGPUEntries`, wait/increment command-list generation, and event notifier behaviour from upstream `nvhost_gpu.cpp` remain unported.
+- The Rust owner file still does not bind real `video_core::ChannelState` / Host1x submission state.
+
+### Binary layout verification
+- PASS: ioctl struct layouts unchanged; fixed fence/syncpoint ownership and lifecycle only.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/nvdrv.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv.cpp`
+
+### Intentional differences
+- Rust still constructs devices directly in the `match` inside `Module::open()` instead of mirroring the upstream builder map verbatim. Device ownership nevertheless remains in the matching owner file.
+- Rust still uses the lightweight `EventInterface` placeholder rather than upstream `KEvent*` service-context objects.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `/dev/nvhost-gpu` was not receiving the shared `Container` owner needed for syncpoint parity.
+- Fixed in this pass: `/dev/nvhost-as-gpu` was not receiving the shared `Container` owner needed to recover `NvMap` and session-owned state like upstream `nvhost_as_gpu(system, *this, container)`.
+
+### Missing items
+- Full upstream builder ownership, service-context events, and device constructors that depend on `video_core` owners remain incomplete.
+
+### Binary layout verification
+- PASS: no raw payload layout affected; fixed only owner wiring during device creation.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`
+
+### Intentional differences
+- Rust still does not construct the upstream `Tegra::MemoryManager` / GMMU owner in this file, so the owner-local model remains bookkeeping-only for VA state.
+- `BindChannel` remains documented-stubbed in this owner file because directly assigning `channel_state->memory_manager = gmmu` would introduce a `core -> video_core` dependency cycle in the current Rust tree.
+- `Remap` is still stubbed in Rust; the upstream `gmmu->Map(...)` semantics are not yet representable without the missing memory-manager owner.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Rust owner file did not keep upstream `Container` / `NvMap` ownership, so `MapBufferEx` could not look up or pin nvmap handles locally.
+- Fixed in this pass: `MapBufferEx` created mappings with `ptr = 0` instead of the pinned device address returned by `NvMap::PinHandle(...)`.
+- Fixed in this pass: `MapBufferEx` defaulted the mapping size from `page_size`, while upstream falls back to the nvmap handle's original size.
+- Fixed in this pass: fixed mappings were not recorded against their parent allocation, so `FreeSpace` could not mirror upstream per-allocation mapping cleanup and unpin behaviour.
+- Fixed in this pass: `UnmapBuffer` removed bookkeeping state only; it now also mirrors the owner-local unpin/free behaviour for mapped handles.
+
+### Missing items
+- Full upstream `gmmu->Map`, sparse remap handling, and allocation-backed `Mapping` ownership via shared objects remain incomplete.
+- `GetVARegionsImpl` still synthesizes the two regions from stored VM bounds rather than the upstream allocator getters.
+- The current Rust `Allocation::mappings` uses offset bookkeeping rather than the upstream `std::list<std::shared_ptr<Mapping>>`.
+
+### Binary layout verification
+- PASS: ioctl struct layouts unchanged; fixed only owner-local mapping bookkeeping and pin/unpin lifecycle.
+
+## 2026-03-28 — `core/src/arm/debug.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/debug.cpp`
+
+### Intentional differences
+- Rust still has partial symbolication and module discovery in this owner file; `find_modules()` remains a placeholder because page-table based module walking is not fully wired yet.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `get_backtrace_from_context()` did not match upstream guard conditions before dereferencing frame records.
+- Fixed in this pass: the Rust port skipped the upstream `pc` entry insertion and walked the frame chain by reading `fp` blindly, without checking zero, alignment, or `IsValidVirtualAddressRange`.
+- The old Rust behavior could segfault the host while logging an invited exception, masking the real guest fault path.
+
+### Missing items
+- Full upstream module enumeration and symbolication remain incomplete in this file.
+
+### Binary layout verification
+- PASS: no serialized layout changed; fixed only backtrace walking guards and entry ordering.
+
+## 2026-03-28 — `core/src/arm/debug.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/debug.cpp`
+
+### Intentional differences
+- Rust still has partial symbolication and module discovery in this owner file; `find_modules()` remains a placeholder because page-table based module walking is not fully wired yet.
+- `symbolicate_backtrace()` now takes the real Rust `KProcess` directly instead of round-tripping through the local opaque forward declaration. This is a Rust-only safety adaptation that preserves owner/file boundaries.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the AArch32 backtrace path read `ctx.r[11]` instead of the upstream-owned `ctx.fp` field.
+- Fixed in this pass: frame-record validation used `ProcessMemoryData::is_valid_range()`, which treated sparse address-space holes as valid and was looser than upstream `Memory::IsValidVirtualAddressRange`.
+- The Rust backtrace path still does not share the exact upstream memory-validity implementation because the Rust memory subsystem is split across `ProcessMemoryData` and `KProcessPageTable`.
+
+### Missing items
+- Full upstream module enumeration and symbolication remain incomplete in this file.
+- Re-audit `find_modules()` / `get_module_end()` once page-table based module walking is fully ported.
+
+### Binary layout verification
+- PASS: no serialized layout changed; fixed only frame-pointer source selection, mapping validation, and local symbolication plumbing.
+
+## 2026-03-28 — `core/src/arm/dynarmic/arm_dynarmic_32.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp`
+
+### Intentional differences
+- Rust still stores the last exception address on the parent and halts with `EXCEPTION_RAISED` on `NoExecuteFault`, because the full upstream `ReturnException(...)` path is not yet ported in this owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Rust `ExceptionRaised` path added an extra `check_memory_access(pc, 4)` guard before reading the faulting instruction, unlike upstream which calls `m_memory.Read32(pc)` directly.
+- The extra guard could recursively re-enter the same exception path while logging, producing an infinite backtrace loop at a stable `pc` and hiding the real exception log line.
+
+### Missing items
+- Full upstream debugger-enabled `ReturnException(pc, InstructionBreakpoint)` behavior is still not implemented in this owner file.
+- Re-audit the remaining `ExceptionRaised` / `CallSVC` ordering against upstream once the current MK8D bring-up bug is fully resolved.
+
+### Binary layout verification
+- PASS: no serialized layout changed; fixed only exception logging control flow in the owner callback.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`
+
+### Intentional differences
+- Rust still does not construct the upstream `Tegra::MemoryManager` / `GPU().InitAddressSpace(*gmmu)` owner in `AllocAsEx`, because the current Rust tree does not yet carry that `video_core` integration in this owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GetVARegions` synthesized the returned ranges from `vm.va_range_*` instead of the upstream allocator-owned `GetVAStart()` / `GetVALimit()` values.
+- That divergence made the owner file less traceable to upstream and risked drifting if allocator state stopped matching the initial VM ranges.
+
+### Missing items
+- Full upstream `gmmu` construction and `BindChannel` ownership transfer into `channel_state->memory_manager` remain incomplete.
+- `GetVARegions3` and the rest of the address-space lifecycle still need re-audit once the missing `gmmu` owner is ported.
+
+### Binary layout verification
+- PASS: `VaRegion` / ioctl struct layouts unchanged; fixed only region source selection and ownership parity.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`
+
+### Intentional differences
+- Rust still does not construct the upstream `Tegra::MemoryManager` / `GPU().InitAddressSpace(*gmmu)` owner in `AllocAsEx`, so `Remap` preserves the upstream allocation validation and `NvMap::PinHandle(...)` lifecycle without yet calling the missing `gmmu->Map(...)` / `MapSparse(...)` backend.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Remap` was a stub that returned `Success` without performing the upstream allocation-range validation, sparse-allocation check, or `NvMap::PinHandle(...)` ownership step.
+- The stub made this owner file structurally correct but behaviorally too weak, allowing invalid remaps and skipping persistent nvmap pinning that upstream performs for sparse remap entries.
+
+### Missing items
+- Full upstream `gmmu->Map(...)` and `gmmu->MapSparse(...)` calls in `Remap` remain unported in this owner file.
+- `BindChannel` still does not transfer the upstream `gmmu` owner into `nvhost_gpu::channel_state->memory_manager`.
+
+### Binary layout verification
+- PASS: `IoctlRemapEntry` layout unchanged; fixed only owner-local remap validation and nvmap pinning behavior.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp`
+
+### Intentional differences
+- Rust still uses the local `core::syncpoint_manager::SyncpointManager` owner rather than the upstream Host1x syncpoint manager, so `IocCtrlEventWait` cannot yet register or deregister real host actions in this owner file.
+- Because the upstream host-action handle owner is missing, the Rust port preserves the slot allocation, `fails`, and `SyncpointEventValue` encoding semantics locally but still returns `Timeout` without wiring the asynchronous signal callback.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IocCtrlEventWait` had drifted from upstream `fails` handling for the non-allocation path and did not clear the reused slot state after a non-allocation wait request.
+- Fixed in this pass: freeing an NV event did not reset all owner-local fields (`fails`, `assigned_value`) even though upstream resets the slot back to an available state.
+
+### Missing items
+- Full upstream `wait_handle` ownership and Host1x callback registration/deregistration remain unported in this file.
+- Re-audit `IocCtrlClearEventWait` once the upstream host-action path exists in Rust.
+
+### Binary layout verification
+- PASS: `SyncpointEventValue`, `IocCtrlEventWaitParams`, and related ioctl structs remain unchanged; only event-slot lifecycle logic changed.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`
+
+### Intentional differences
+- Rust still does not own a real upstream `gmmu` / `Tegra::MemoryManager` in this file, so `Remap` and `MapBufferEx(REMAP)` preserve the upstream validation and address calculations but still stop short of a real `gmmu->Map(...)` call.
+- `BindChannel` still cannot write through to upstream `nvhost_gpu::channel_state->memory_manager` because that owner lives across the current `core` / `video_core` boundary; Rust stores the bound address-space token in the matching owner file instead.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `MapBufferEx(REMAP)` rejected `mapping_size == 0` and negative signed offsets even though upstream only checks the mapped-region size and uses signed address addition.
+- Fixed in this pass: `MapBufferEx(REMAP)` did not mirror the upstream signed `offset + buffer_offset` / `ptr + buffer_offset` address calculation.
+- Fixed in this pass: `Remap(handle == 0)` had no explicit sparse-path behavior in the owner file; Rust now preserves the upstream branch structure and logging even though the final `MapSparse(...)` backend call is still missing.
+
+### Missing items
+- Full upstream `gmmu->Map(...)`, `gmmu->MapSparse(...)`, and `GPU().InitAddressSpace(*gmmu)` ownership are still missing.
+- `BindChannel` still needs a real memory-manager transfer once the upstream `channel_state` owner is reachable without violating crate ownership.
+
+### Binary layout verification
+- PASS: `IoctlMapBufferEx`, `IoctlRemapEntry`, and `IoctlBindChannel` layouts remain unchanged; only control flow and owner-local state updates changed.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvhost_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp`
+
+### Intentional differences
+- Rust still does not expose the upstream `channel_state` / `memory_manager` owner in this file, so the temporary `bound_address_space_token` field stands in for the missing direct `memory_manager` assignment.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the owner file had no place to receive the `BindChannel` result from `nvhost_as_gpu`, so the address-space binding state was silently discarded.
+
+### Missing items
+- Replace `bound_address_space_token` with the real upstream `channel_state->memory_manager` ownership when the `video_core` owner can be ported without violating crate boundaries.
+
+### Binary layout verification
+- PASS: no ioctl payload layout changed; fixed only owner-local channel binding state.
+
+## 2026-03-28 — `core/src/hle/service/nvdrv/nvdrv.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv.cpp`
+
+### Intentional differences
+- Rust still uses explicit per-device construction in `Module::open()` rather than the exact upstream factory structure.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Module` did not retain a typed `nvhost_gpu` owner path, so `nvhost_as_gpu::BindChannel` could not recover the target device like upstream `module.GetDevice<nvhost_gpu>(fd)`.
+
+### Missing items
+- Full upstream device-factory structure and service-context lifetime still need re-audit once the remaining nvdrv owners are ported.
+
+### Binary layout verification
+- PASS: no serialized layout changed; fixed only module-side owner lookup for `BindChannel`.
+
+## 2026-03-29 — `core/src/gpu_core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`
+
+### Intentional differences
+- Rust adds this bridge-only owner file because the split `core` / `video_core` crate graph cannot name `Tegra::GPU`, `Tegra::MemoryManager`, or `ChannelState` directly across crates the way the monolithic upstream tree can.
+- The traits preserve upstream ownership boundaries (`GPU::AllocateChannel()`, `std::make_shared<Tegra::MemoryManager>(...)`, `channel_state->memory_manager = gmmu`) without introducing a reverse `core -> video_core` dependency.
+
+### Unintentional differences (to fix)
+- None in this bridge file for the current slice; it exists specifically to preserve upstream ownership under the Rust crate split.
+
+### Missing items
+- The bridge now exposes `Map(...)`, `MapSparse(...)`, and `Unmap(...)` because `nvhost_as_gpu.cpp` owns those calls upstream too.
+- It still does not expose the full upstream address-space initialization path (`system.GPU().InitAddressSpace(*gmmu)` behavior remains owner-local to `video_core::gpu`).
+
+### Binary layout verification
+- PASS: no serialized layout; this file only carries opaque trait ownership.
+
+## 2026-03-29 — `core/src/core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core.h` and `/home/vricosti/Dev/emulators/zuyu/src/core/core.cpp`
+
+### Intentional differences
+- `System::gpu_core` now stores `Box<dyn GpuCoreInterface>` instead of `Box<dyn Any + Send>` so Rust owners can reach the upstream-equivalent GPU channel / memory-manager lifecycle without violating crate boundaries.
+- The type-erased frontend handoff remains because Rust still constructs `video_core::gpu::Gpu` outside `core`, unlike upstream `System::Impl`.
+
+### Unintentional differences (to fix)
+- None fixed in this pass beyond narrowing the type-erased owner to a GPU-specific interface.
+
+### Missing items
+- `System` still does not construct the concrete GPU in the exact upstream place; the frontend bootstrap path remains a documented Rust split-crate difference.
+
+### Binary layout verification
+- PASS: no serialized layout changed; only subsystem owner typing changed.
+
+## 2026-03-29 — `video_core/src/gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp`
+
+### Intentional differences
+- Rust adds opaque bridge implementations (`GpuChannelHandle`, `GpuMemoryManagerHandle`) in this owner file because upstream can hand around `shared_ptr<ChannelState>` and `shared_ptr<MemoryManager>` directly, while Rust must hide those concrete types from `core`.
+- The bridge still constructs the memory-manager object through `GpuCoreInterface` because `core` and `video_core` remain split crates, unlike the monolithic upstream tree.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `BindChannel` no longer receives a synthetic `usize` token. The owner file now transfers an opaque memory-manager object so `channel_state.memory_manager` points at the same GPU-owned object allocated by `nvhost_as_gpu`, matching upstream ownership much more closely.
+- Fixed in this pass: `VideoGpuMemoryManagerHandle` now wraps `video_core::memory_manager::MemoryManager` instead of the temporary local placeholder that had been declared in `control/channel_state.rs`.
+
+### Missing items
+- The concrete `Tegra::MemoryManager` behavior (`Map`, `MapSparse`, `Unmap`, rasterizer binding, address translation with system memory backing) is still only partially ported behind `VideoGpuMemoryManagerHandle`.
+- `GPU::InitAddressSpace(*gmmu)` still has no direct Rust counterpart in this owner file.
+
+### Binary layout verification
+- PASS: no ioctl or serialized layout changed; fixed only GPU-side owner transfer semantics.
+
+## 2026-03-29 — `video_core/src/memory_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.cpp`
+
+### Intentional differences
+- Rust still retains the older simplified `GpuMemoryManager` backend internally because the full upstream `Core::System`, `MaxwellDeviceMemoryManager`, rasterizer invalidation, and page-table helpers are not fully wired into this crate yet.
+- A thin `MemoryManager` wrapper was added in this file to restore the upstream owner and type name without moving the backend into an unrelated module.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the concrete memory-manager owner no longer lived as a placeholder type inside `control/channel_state.rs`; it now resides in the matching upstream owner file.
+- Fixed in this pass: owner-local `Map(...)`, `MapSparse(...)`, and `Unmap(...)` entrypoints now exist in this file instead of being silently dropped in `nvhost_as_gpu`.
+
+### Missing items
+- Constructor parity is incomplete: upstream takes `Core::System&`, optional `MaxwellDeviceMemoryManager&`, address-space bits, split address, big-page bits, and page bits. Rust currently exposes only `MemoryManager::new(id)`.
+- `BindRasterizer`, `Map`, `MapSparse`, `Unmap`, `GetPageKind`, `GetSubmappedRange`, dirty tracking, invalidation accumulator behavior, and host memory pointer fast paths remain unported.
+- `MemoryManager` still delegates to the simplified `GpuMemoryManager` instead of the upstream multi-level page table plus host1x device memory manager.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout introduced in this pass; owner relocation only.
+
+## 2026-03-29 — `video_core/src/control/channel_state.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state.cpp`
+
+### Intentional differences
+- Engine ownership is still placeholder-only in Rust because `Maxwell3D`, `Fermi2D`, `KeplerCompute`, `MaxwellDMA`, and `KeplerMemory` are not fully constructed here yet.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ChannelState` no longer owns a fake local `MemoryManager` type. Its `memory_manager` field now points at the real owner type from `video_core::memory_manager`, matching upstream ownership boundaries.
+
+### Missing items
+- `Init` still does not instantiate the upstream engines with `system` and `*memory_manager`.
+- `BindRasterizer` still does not forward to the full engine set or the real memory-manager rasterizer binding path.
+
+### Binary layout verification
+- PASS: no serialized layout changes; only type ownership changed.
+
+## 2026-03-29 — `core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`
+
+### Intentional differences
+- Rust still lacks the full upstream `Tegra::MemoryManager` backend, so the new `gmmu` field stores an opaque bridge handle instead of a concrete `shared_ptr<Tegra::MemoryManager>`.
+- `AllocAsEx` now allocates the upstream-equivalent owner object, and the bridge now forwards `MapBufferEx` / `Remap` / sparse allocation teardown into `gmmu->Map(...)` / `MapSparse(...)` / `Unmap(...)`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `BindChannel` no longer forwards a fake address-space token. It now transfers the `gmmu` owner allocated in `AllocAsEx`, matching the upstream ownership path `gpu_channel_device->channel_state->memory_manager = gmmu`.
+- Fixed in this pass: the Rust constructor now carries `SystemRef`, matching the upstream owner set (`system`, `module`, `container`) instead of synthesizing the GPU memory-manager transfer indirectly.
+- Fixed in this pass: `AllocateSpace`, `FreeMappingLocked`, `FreeSpace`, `Remap`, `MapBufferEx`, and `UnmapBuffer` no longer stop at allocator bookkeeping; they now call the `gmmu` bridge in the same owner file where upstream performs `gmmu->Map(...)`, `MapSparse(...)`, and `Unmap(...)`.
+
+### Missing items
+- The `gmmu` handle still wraps a simplified `video_core::memory_manager::MemoryManager` backend, so page kinds, big-page semantics, sparse-vs-reserved distinction, rasterizer invalidation, and host1x device-memory parity remain incomplete.
+
+### Binary layout verification
+- PASS: `IoctlAllocAsEx`, `IoctlMapBufferEx`, `IoctlRemapEntry`, and `IoctlBindChannel` layouts unchanged; fixed only owner lifecycle and transfer semantics.
+
+## 2026-03-29 — `core/src/hle/service/nvdrv/devices/nvhost_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp`
+
+### Intentional differences
+- Rust still allocates `channel_syncpoint` lazily in `AllocGPFIFOEx2` instead of the upstream constructor; this owner ordering divergence remains to be fixed.
+- Event destruction still uses the local no-op `EventInterface::free_event(...)` placeholder because the full upstream service-context close path is not present yet.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `bind_address_space()` no longer stores or propagates a synthetic token. The owner now receives and forwards an opaque GPU memory-manager object, so `channel_state.memory_manager` is set from the actual `nvhost_as_gpu` owner object rather than a fabricated identifier.
+
+### Missing items
+- Re-audit constructor/destructor ordering against upstream (`AllocateSyncpoint`, `FreeEvent`, `FreeSyncpoint`) once the current nvdrv runtime bug is fully resolved.
+- Full upstream `SubmitGPFIFOImpl` / pushbuffer submission remains unported in this file.
+
+### Binary layout verification
+- PASS: no ioctl payload layout changed; fixed only memory-manager ownership transfer.
+
+## 2026-03-29 — `core/src/hle/service/nvdrv/nvdrv.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv.cpp`
+
+### Intentional differences
+- Rust still uses explicit per-device construction in `Module::open()` rather than the exact upstream factory structure.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `/dev/nvhost-as-gpu` now receives the same upstream owner set (`system`, `module`, `container`) instead of constructing the device without `system`.
+
+### Missing items
+- Full upstream device-factory structure and service-context lifetime still need re-audit once the remaining nvdrv owners are ported.
+
+### Binary layout verification
+- PASS: no serialized layout changed; fixed only constructor ownership parity.

@@ -6,13 +6,30 @@
 //! GPU controller: manages channels, engines, rendering, and host synchronization.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::dma_pusher::CommandList;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::rasterizer_download_area::RasterizerDownloadArea;
 use crate::renderer_base::RendererBase;
+use ruzu_core::gpu_core::{GpuChannelHandle, GpuCoreInterface, GpuMemoryManagerHandle};
+
+struct VideoGpuChannelHandle {
+    gpu: *const Gpu,
+    channel_state: Arc<parking_lot::Mutex<crate::control::channel_state::ChannelState>>,
+}
+
+struct VideoGpuMemoryManagerHandle {
+    memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+}
+
+unsafe impl Send for VideoGpuChannelHandle {}
+unsafe impl Sync for VideoGpuChannelHandle {}
+unsafe impl Send for VideoGpuMemoryManagerHandle {}
+unsafe impl Sync for VideoGpuMemoryManagerHandle {}
+
+static NEXT_MEMORY_MANAGER_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Device address type.
 pub type DAddr = u64;
@@ -449,5 +466,84 @@ impl Gpu {
     pub fn renderer_frame_end_notify(&self) {
         // NOTE: Full implementation calls system.GetPerfStats().EndGameFrame().
         // Stubbed until perf stats integration is complete.
+    }
+}
+
+impl GpuChannelHandle for VideoGpuChannelHandle {
+    fn bind_memory_manager(&self, memory_manager: Arc<dyn GpuMemoryManagerHandle>) {
+        let memory_manager = memory_manager
+            .as_any()
+            .downcast_ref::<VideoGpuMemoryManagerHandle>()
+            .expect("GPU memory manager handle must come from video_core::gpu::Gpu");
+        let mut channel_state = self.channel_state.lock();
+        channel_state.memory_manager = Some(Arc::clone(&memory_manager.memory_manager));
+    }
+
+    fn init_channel(&self, program_id: u64) {
+        let mut channel_state = self.channel_state.lock();
+        if channel_state.initialized {
+            return;
+        }
+
+        let gpu = unsafe { &*self.gpu };
+        channel_state.init(gpu, program_id);
+    }
+}
+
+impl GpuMemoryManagerHandle for VideoGpuMemoryManagerHandle {
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+
+    fn map(&self, gpu_addr: u64, device_addr: u64, size: u64, kind: u32, is_big_pages: bool) {
+        self.memory_manager
+            .lock()
+            .map(gpu_addr, device_addr, size, kind, is_big_pages);
+    }
+
+    fn map_sparse(&self, gpu_addr: u64, size: u64, is_big_pages: bool) {
+        self.memory_manager
+            .lock()
+            .map_sparse(gpu_addr, size, is_big_pages);
+    }
+
+    fn unmap(&self, gpu_addr: u64, size: u64) {
+        self.memory_manager.lock().unmap(gpu_addr, size);
+    }
+}
+
+impl GpuCoreInterface for Gpu {
+    fn as_any(&self) -> &(dyn std::any::Any + Send) {
+        self
+    }
+
+    fn allocate_channel_handle(&self) -> Arc<dyn GpuChannelHandle> {
+        let channel_id = self.allocate_channel();
+        let channel_state = self.create_channel(channel_id);
+        Arc::new(VideoGpuChannelHandle {
+            gpu: self as *const Gpu,
+            channel_state,
+        })
+    }
+
+    fn allocate_memory_manager_handle(
+        &self,
+        address_space_bits: u64,
+        split_address: u64,
+        big_page_bits: u64,
+        page_bits: u64,
+    ) -> Arc<dyn GpuMemoryManagerHandle> {
+        let id = NEXT_MEMORY_MANAGER_ID.fetch_add(1, Ordering::AcqRel);
+        Arc::new(VideoGpuMemoryManagerHandle {
+            memory_manager: Arc::new(parking_lot::Mutex::new(
+                crate::memory_manager::MemoryManager::new_with_geometry(
+                    id,
+                    address_space_bits,
+                    split_address,
+                    big_page_bits,
+                    page_bits,
+                ),
+            )),
+        })
     }
 }
