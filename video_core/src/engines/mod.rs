@@ -91,8 +91,9 @@ pub trait Engine: Send {
 }
 
 /// Number of registers per engine.
-/// CB_BIND registers reach 0x2424, so 0x4000 covers the full space.
-pub const ENGINE_REG_COUNT: usize = 0x4000;
+/// Upstream: `Regs::NUM_REGS = 0xE00`. Register array indexed by word (u32) offset.
+/// GPU methods are word indices: method M writes reg_array[M].
+pub const ENGINE_REG_COUNT: usize = 0xE00;
 
 /// Rendered framebuffer output from an engine.
 pub struct Framebuffer {

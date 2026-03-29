@@ -96,6 +96,13 @@ impl Conductor {
     /// Process a vsync tick: signal vsync events for each display.
     /// Port of upstream `Conductor::ProcessVsync`.
     fn process_vsync(&mut self) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static VSYNC_COUNT: AtomicU32 = AtomicU32::new(0);
+        let c = VSYNC_COUNT.fetch_add(1, Ordering::Relaxed);
+        let total_events: usize = self.vsync_managers.values().map(|m| m.event_count()).sum();
+        if c < 5 || c % 300 == 0 {
+            log::info!("Conductor::process_vsync #{} managers={} total_events={}", c, self.vsync_managers.len(), total_events);
+        }
         for (_display_id, manager) in self.vsync_managers.iter() {
             manager.signal_vsync();
         }

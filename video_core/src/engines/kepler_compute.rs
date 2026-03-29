@@ -157,6 +157,21 @@ impl KeplerCompute {
         }
     }
 
+    /// Corresponds to upstream `KeplerCompute::CallMethod`.
+    pub fn call_method(&mut self, method: u32, argument: u32, _is_last_call: bool) {
+        let idx = method as usize;
+        if idx < ENGINE_REG_COUNT {
+            self.regs[idx] = argument;
+        }
+    }
+
+    /// Corresponds to upstream `KeplerCompute::CallMultiMethod`.
+    pub fn call_multi_method(&mut self, method: u32, args: &[u32], _amount: u32, _methods_pending: u32) {
+        for &arg in args {
+            self.call_method(method, arg, false);
+        }
+    }
+
     /// Corresponds to `KeplerCompute::BindRasterizer`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
         self.rasterizer = Some(unsafe {

@@ -84,6 +84,8 @@ impl SynchronizationWaiters {
             self.head = Some(handle);
         }
         self.tail = Some(handle);
+        log::debug!("SynchronizationWaiters::link thread_id={} wait_index={} head={:?} tail={:?}",
+            handle.thread_id, handle.wait_index, self.head, self.tail);
     }
 
     pub fn unlink(&mut self, process: &mut KProcess, thread_id: u64, wait_index: usize) {
@@ -167,6 +169,8 @@ impl SynchronizationObjectState {
     }
 
     pub fn link_waiter(&mut self, process: &mut KProcess, node: SynchronizationWaitNode) {
+        log::debug!("KSynchronizationObject::link_waiter obj_id={} thread_id={}",
+            node.object_id, node.handle.thread_id);
         self.waiters.link(process, node.handle);
     }
 

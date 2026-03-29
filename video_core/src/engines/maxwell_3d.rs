@@ -18,7 +18,13 @@ use crate::rasterizer_interface::RasterizerInterface;
 // ── Register offset constants (method addresses) ────────────────────────────
 
 /// Render target array base. 8 targets, 0x10 words (0x40 bytes) each.
-const RT_BASE: u32 = 0x0800;
+/// Convert upstream byte offset (from ASSERT_REG_POSITION) to word index.
+/// Matches upstream `MAXWELL3D_REG_INDEX(field) = offsetof(Regs, field) / sizeof(u32)`.
+macro_rules! reg_index {
+    ($byte_offset:expr) => { $byte_offset / 4 };
+    ($base:expr, +$field:expr) => { $base / 4 + $field };
+}
+const RT_BASE: u32 = reg_index!(0x0800);
 /// Words per render target.
 const RT_STRIDE: u32 = 0x10;
 
@@ -30,51 +36,51 @@ const RT_OFF_HEIGHT: u32 = 0x03;
 const RT_OFF_FORMAT: u32 = 0x04;
 
 /// Clear color RGBA: 4 consecutive f32-as-u32 registers.
-const CLEAR_COLOR_BASE: u32 = 0x0D80;
+const CLEAR_COLOR_BASE: u32 = reg_index!(0x0D80);
 /// Clear depth value (f32 as u32 bits).
 #[allow(dead_code)]
-const CLEAR_DEPTH: u32 = 0x0D90;
+const CLEAR_DEPTH: u32 = reg_index!(0x0D90);
 /// Clear stencil value.
 #[allow(dead_code)]
-const CLEAR_STENCIL: u32 = 0x0DA0;
+const CLEAR_STENCIL: u32 = reg_index!(0x0DA0);
 /// Clear surface trigger register.
-const CLEAR_SURFACE: u32 = 0x19D0;
+const CLEAR_SURFACE: u32 = reg_index!(0x19D0);
 
 // ── Viewport registers ──────────────────────────────────────────────────────
 
 /// Viewport transform base. 16 viewports, 8 words each.
 /// Words: scale_x, scale_y, scale_z, translate_x, translate_y, translate_z, swizzle, snap.
-const VP_TRANSFORM_BASE: u32 = 0x0A00;
+const VP_TRANSFORM_BASE: u32 = reg_index!(0x0A00);
 const VP_TRANSFORM_STRIDE: u32 = 8;
 
 // ── Scissor registers ───────────────────────────────────────────────────────
 
 /// Scissor base. 16 scissors, 4 words each.
 /// Words: enable, min_x|max_x(packed), min_y|max_y(packed), pad.
-const SCISSOR_BASE: u32 = 0x0E00;
+const SCISSOR_BASE: u32 = reg_index!(0x0E00);
 const SCISSOR_STRIDE: u32 = 4;
 
 // ── Vertex buffer registers ─────────────────────────────────────────────────
 
 /// Vertex buffer first vertex.
-const VB_FIRST: u32 = 0x0D74;
+const VB_FIRST: u32 = reg_index!(0x0D74); // upstream byte 0x0D74
 /// Vertex buffer vertex count.
-const VB_COUNT: u32 = 0x0D75;
+const VB_COUNT: u32 = reg_index!(0x0D78); // upstream byte 0x0D78
 
 /// Vertex stream array base. 32 streams, 4 words each.
 /// Words: stride|enable, addr_high, addr_low, frequency.
-const VERTEX_STREAM_BASE: u32 = 0x1C00;
+const VERTEX_STREAM_BASE: u32 = reg_index!(0x1C00);
 const VERTEX_STREAM_STRIDE: u32 = 4;
 
 /// Vertex stream limit array base. 32 streams, 2 words each.
 #[allow(dead_code)]
-const VERTEX_STREAM_LIMIT_BASE: u32 = 0x1F00;
+const VERTEX_STREAM_LIMIT_BASE: u32 = reg_index!(0x1F00);
 
 // ── Index buffer registers ──────────────────────────────────────────────────
 
 /// Index buffer base (7 words).
 /// Words: addr_high, addr_low, limit_high, limit_low, format, first, count.
-const IB_BASE: u32 = 0x17C8;
+const IB_BASE: u32 = reg_index!(0x17C8);
 const IB_OFF_ADDR_HIGH: u32 = 0;
 const IB_OFF_ADDR_LOW: u32 = 1;
 #[allow(dead_code)]
@@ -88,129 +94,129 @@ const IB_OFF_COUNT: u32 = 6;
 // ── Draw registers ──────────────────────────────────────────────────────────
 
 /// Draw end trigger (previously DRAW_REG).
-const DRAW_END: u32 = 0x1614;
+const DRAW_END: u32 = reg_index!(0x1614); // upstream byte 0x1614
 /// Draw begin: sets topology and instance mode.
-const DRAW_BEGIN: u32 = 0x1615;
+const DRAW_BEGIN: u32 = reg_index!(0x1618); // upstream byte 0x1618
 
 /// Signed base vertex offset for indexed draws (i32).
-const GLOBAL_BASE_VERTEX_INDEX: u32 = 0x1434;
+const GLOBAL_BASE_VERTEX_INDEX: u32 = reg_index!(0x1434);
 /// Base instance offset for instanced draws.
-const GLOBAL_BASE_INSTANCE_INDEX: u32 = 0x1438;
+const GLOBAL_BASE_INSTANCE_INDEX: u32 = reg_index!(0x1438);
 /// Each write pushes 4 LE bytes of inline index data.
-const DRAW_INLINE_INDEX: u32 = 0x15E8;
+const DRAW_INLINE_INDEX: u32 = reg_index!(0x15E8);
 
 // ── Report semaphore registers ────────────────────────────────────────────────
 
 /// Report semaphore block: 4 words (addr_high, addr_low, payload, query).
 /// Writing to REPORT_SEMAPHORE_BASE + 3 triggers the operation.
-const REPORT_SEMAPHORE_BASE: u32 = 0x6C0;
+const REPORT_SEMAPHORE_BASE: u32 = reg_index!(0x06C0);
 /// Trigger register for report semaphore (writing here fires the operation).
 const REPORT_SEMAPHORE_TRIGGER: u32 = REPORT_SEMAPHORE_BASE + 3;
 
 // ── Depth/Stencil registers ─────────────────────────────────────────────────
 
-const DEPTH_MODE: u32 = 0x0D7C;
-const DEPTH_TEST_ENABLE: u32 = 0x12CC;
-const DEPTH_WRITE_ENABLE: u32 = 0x12E8;
-const DEPTH_TEST_FUNC: u32 = 0x130C;
+const DEPTH_MODE: u32 = reg_index!(0x0D7C);
+const DEPTH_TEST_ENABLE: u32 = reg_index!(0x12CC);
+const DEPTH_WRITE_ENABLE: u32 = reg_index!(0x12E8);
+const DEPTH_TEST_FUNC: u32 = reg_index!(0x130C);
 
-const STENCIL_ENABLE: u32 = 0x1380;
-const STENCIL_FRONT_OP_BASE: u32 = 0x1384;
-const STENCIL_FRONT_REF: u32 = 0x1394;
-const STENCIL_FRONT_FUNC_MASK: u32 = 0x1398;
-const STENCIL_FRONT_MASK: u32 = 0x139C;
+const STENCIL_ENABLE: u32 = reg_index!(0x1380);
+const STENCIL_FRONT_OP_BASE: u32 = reg_index!(0x1384);
+const STENCIL_FRONT_REF: u32 = reg_index!(0x1394);
+const STENCIL_FRONT_FUNC_MASK: u32 = reg_index!(0x1398);
+const STENCIL_FRONT_MASK: u32 = reg_index!(0x139C);
 
-const STENCIL_TWO_SIDE_ENABLE: u32 = 0x1594;
-const STENCIL_BACK_OP_BASE: u32 = 0x1598;
-const STENCIL_BACK_REF: u32 = 0x0F54;
-const STENCIL_BACK_MASK: u32 = 0x0F58;
-const STENCIL_BACK_FUNC_MASK: u32 = 0x0F5C;
+const STENCIL_TWO_SIDE_ENABLE: u32 = reg_index!(0x1594);
+const STENCIL_BACK_OP_BASE: u32 = reg_index!(0x1598);
+const STENCIL_BACK_REF: u32 = reg_index!(0x0F54);
+const STENCIL_BACK_MASK: u32 = reg_index!(0x0F58);
+const STENCIL_BACK_FUNC_MASK: u32 = reg_index!(0x0F5C);
 
 // ── Blend registers ─────────────────────────────────────────────────────────
 
 /// 4 consecutive f32 registers: R, G, B, A blend constant color.
-const BLEND_COLOR_BASE: u32 = 0x131C;
+const BLEND_COLOR_BASE: u32 = reg_index!(0x131C);
 
 /// Global blend struct base.
 /// +0 separate_alpha, +1 color_op, +2 color_src, +3 color_dst,
 /// +4 alpha_op, +5 alpha_src, +6 (color_key), +7 alpha_dst,
 /// +8 single_rop_ctrl, +9..+16 enable[0..7]
-const BLEND_BASE: u32 = 0x133C;
+const BLEND_BASE: u32 = reg_index!(0x133C);
 
 /// Whether per-target blend overrides are active.
-const BLEND_PER_TARGET_ENABLED: u32 = 0x12E4;
+const BLEND_PER_TARGET_ENABLED: u32 = reg_index!(0x12E4);
 
 /// Per-target blend base. 8 entries, stride 8.
 /// +0 sep_alpha, +1 color_op, +2 color_src, +3 color_dst,
 /// +4 alpha_op, +5 alpha_src, +6 alpha_dst
-const BLEND_PER_TARGET_BASE: u32 = 0x1E00;
+const BLEND_PER_TARGET_BASE: u32 = reg_index!(0x1E00);
 const BLEND_PER_TARGET_STRIDE: u32 = 8;
 
 // ── Rasterizer registers ────────────────────────────────────────────────────
 
-const POLYGON_MODE_FRONT: u32 = 0x0DAC;
-const POLYGON_MODE_BACK: u32 = 0x0DB0;
-const LINE_WIDTH_SMOOTH: u32 = 0x13B0;
-const LINE_WIDTH_ALIASED: u32 = 0x13B4;
-const SLOPE_SCALE_DEPTH_BIAS: u32 = 0x156C;
-const DEPTH_BIAS: u32 = 0x15BC;
-const DEPTH_BIAS_CLAMP: u32 = 0x187C;
-const CULL_TEST_ENABLE: u32 = 0x1918;
-const FRONT_FACE: u32 = 0x191C;
-const CULL_FACE: u32 = 0x1920;
+const POLYGON_MODE_FRONT: u32 = reg_index!(0x0DAC);
+const POLYGON_MODE_BACK: u32 = reg_index!(0x0DB0);
+const LINE_WIDTH_SMOOTH: u32 = reg_index!(0x13B0);
+const LINE_WIDTH_ALIASED: u32 = reg_index!(0x13B4);
+const SLOPE_SCALE_DEPTH_BIAS: u32 = reg_index!(0x156C);
+const DEPTH_BIAS: u32 = reg_index!(0x15BC);
+const DEPTH_BIAS_CLAMP: u32 = reg_index!(0x187C);
+const CULL_TEST_ENABLE: u32 = reg_index!(0x1918);
+const FRONT_FACE: u32 = reg_index!(0x191C);
+const CULL_FACE: u32 = reg_index!(0x1920);
 
 // ── Shader program registers ────────────────────────────────────────────────
 
 /// Program region base: addr_high at +0, addr_low at +1.
-const PROGRAM_REGION_BASE: u32 = 0x1608;
+const PROGRAM_REGION_BASE: u32 = reg_index!(0x1608);
 
 // ── Vertex attribute registers ────────────────────────────────────────────
 
 /// Vertex attribute array base. 32 entries, 1 word each.
 /// Per entry: bits[4:0]=buffer, bit[6]=constant, bits[20:7]=offset,
 ///            bits[26:21]=size, bits[29:27]=type, bit[31]=bgra.
-const VERTEX_ATTRIB_BASE: u32 = 0x1160;
+const VERTEX_ATTRIB_BASE: u32 = reg_index!(0x1160);
 const NUM_VERTEX_ATTRIBS: u32 = 32;
 
 // ── Shader pipeline registers ─────────────────────────────────────────────
 
 /// Shader pipeline base. 6 stages, 0x10 words each.
 /// Per stage: +0 packed(enable|type), +1 offset, +3 register_count, +4 binding_group.
-const PIPELINE_BASE: u32 = 0x2000;
+const PIPELINE_BASE: u32 = reg_index!(0x2000);
 const PIPELINE_STRIDE: u32 = 0x10;
 const NUM_SHADER_PROGRAMS: usize = 6;
 
 // ── Color write mask registers ────────────────────────────────────────────
 
 /// If nonzero, all RTs share color_mask[0].
-const COLOR_MASK_COMMON: u32 = 0x0F90;
+const COLOR_MASK_COMMON: u32 = reg_index!(0x0F90);
 /// Per-RT color write mask array. 8 entries, 1 word each.
 /// Per RT: R=bit[0], G=bit[4], B=bit[8], A=bit[12].
-const COLOR_MASK_BASE: u32 = 0x1A00;
+const COLOR_MASK_BASE: u32 = reg_index!(0x1A00);
 
 // ── Render target control register ────────────────────────────────────────
 
 /// RT control: count in bits[3:0], target map in bits[6:4],[9:7],... (3 bits each).
-const RT_CONTROL: u32 = 0x121C;
+const RT_CONTROL: u32 = reg_index!(0x121C);
 
 // ── Constant buffer registers ───────────────────────────────────────────────
 
 /// CB config: +0 size, +1 addr_high, +2 addr_low, +3 offset.
-const CB_CONFIG_BASE: u32 = 0x2380;
+const CB_CONFIG_BASE: u32 = reg_index!(0x2380);
 
 /// CB data: 16 words of inline push (0x2384..0x2393).
-const CB_DATA_BASE: u32 = 0x2384;
-const CB_DATA_END: u32 = 0x2394; // exclusive
+const CB_DATA_BASE: u32 = reg_index!(0x2384);
+const CB_DATA_END: u32 = reg_index!(0x2394); // exclusive
 
 /// CB bind base. 5 stages, stride 8, trigger at +4.
-const CB_BIND_BASE: u32 = 0x2400;
+const CB_BIND_BASE: u32 = reg_index!(0x2400);
 const CB_BIND_STRIDE: u32 = 8;
 /// CB bind trigger registers (one per shader stage).
-const CB_BIND_TRIGGER_0: u32 = 0x2404;
-const CB_BIND_TRIGGER_1: u32 = 0x240C;
-const CB_BIND_TRIGGER_2: u32 = 0x2414;
-const CB_BIND_TRIGGER_3: u32 = 0x241C;
-const CB_BIND_TRIGGER_4: u32 = 0x2424;
+const CB_BIND_TRIGGER_0: u32 = reg_index!(0x2404);
+const CB_BIND_TRIGGER_1: u32 = reg_index!(0x240C);
+const CB_BIND_TRIGGER_2: u32 = reg_index!(0x2414);
+const CB_BIND_TRIGGER_3: u32 = reg_index!(0x241C);
+const CB_BIND_TRIGGER_4: u32 = reg_index!(0x2424);
 
 /// Number of shader stages (vertex, tess ctrl, tess eval, geometry, fragment).
 const NUM_SHADER_STAGES: usize = 5;
@@ -220,120 +226,123 @@ const MAX_CB_SLOTS: usize = 18;
 // ── Texture/Sampler pool registers ──────────────────────────────────────────
 
 /// Texture sampler pool base: +0 addr_high, +1 addr_low, +2 limit.
-const TEX_SAMPLER_POOL_BASE: u32 = 0x155C;
+const TEX_SAMPLER_POOL_BASE: u32 = reg_index!(0x155C);
 
 /// Texture header pool base: +0 addr_high, +1 addr_low, +2 limit.
-const TEX_HEADER_POOL_BASE: u32 = 0x1574;
+const TEX_HEADER_POOL_BASE: u32 = reg_index!(0x1574);
 
 /// Sampler binding mode register.
 /// 0 = Independently (tic_id and tsc_id are separate in texture handle)
 /// 1 = ViaHeaderBinding (tic_id == tsc_id, linked)
-const SAMPLER_BINDING: u32 = 0x1234;
+const SAMPLER_BINDING: u32 = reg_index!(0x1234);
 
 // ── MME (Macro Method Executor) registers ──────────────────────────────────
 
 /// Pointer into macro code upload buffer (auto-increments on instruction write).
-const LOAD_MME_INSTRUCTION_PTR: u32 = 0x0114;
+/// Upstream byte offset 0x0114, word index 0x45.
+const LOAD_MME_INSTRUCTION_PTR: u32 = reg_index!(0x0114);
 /// Code word to upload at the current pointer.
-const LOAD_MME_INSTRUCTION: u32 = 0x0115;
+/// Upstream byte offset 0x0118, word index 0x46.
+const LOAD_MME_INSTRUCTION: u32 = reg_index!(0x0118);
 /// Pointer into 128-slot position table (auto-increments on bind).
-const LOAD_MME_START_ADDR_PTR: u32 = 0x0116;
+/// Upstream byte offset 0x011C, word index 0x47.
+const LOAD_MME_START_ADDR_PTR: u32 = reg_index!(0x011C);
 /// Start offset for the current macro slot.
-const LOAD_MME_START_ADDR: u32 = 0x0117;
-/// First macro method register. In the real GPU, methods 0xE00..0xFFF invoke
-/// macros. Ruzu's register array uses byte-offset-based indices (matching
-/// yuzu's ASSERT_REG_POSITION values), so macro methods map to 0xE00*4=0x3800.
-const MACRO_METHODS_START: u32 = 0x3800;
+/// Upstream byte offset 0x0120, word index 0x48.
+const LOAD_MME_START_ADDR: u32 = reg_index!(0x0120);
+/// First macro method register. Methods 0xE00..0xFFF invoke macros.
+/// Now uses word indices matching upstream (ENGINE_REG_COUNT = 0xE00).
+const MACRO_METHODS_START: u32 = reg_index!(0x3800);
 /// Exclusive end of macro method range (0x1000 * 4).
-const MACRO_METHODS_END: u32 = 0x4000;
+const MACRO_METHODS_END: u32 = reg_index!(0x4000);
 
 // ── Additional register offsets (upstream ASSERT_REG_POSITION values) ──────
 
 /// Wait-for-idle register. Writing triggers a rasterizer idle wait.
-const WAIT_FOR_IDLE: u32 = 0x0110;
+const WAIT_FOR_IDLE: u32 = reg_index!(0x0110);
 /// Shadow RAM control register.
-const SHADOW_RAM_CONTROL: u32 = 0x0124;
+const SHADOW_RAM_CONTROL: u32 = reg_index!(0x0124);
 /// Launch DMA register (triggers inline upload execution).
-const LAUNCH_DMA: u32 = 0x01B0;
+const LAUNCH_DMA: u32 = reg_index!(0x01B0);
 /// Inline data register (data words for DMA upload).
-const INLINE_DATA: u32 = 0x01B4;
+const INLINE_DATA: u32 = reg_index!(0x01B4);
 /// Sync info register (triggers sync point signaling).
-const SYNC_INFO: u32 = 0x02C8;
+const SYNC_INFO: u32 = reg_index!(0x02C8);
 /// Fragment barrier register.
-const FRAGMENT_BARRIER: u32 = 0x0DE0;
+const FRAGMENT_BARRIER: u32 = reg_index!(0x0DE0);
 /// Draw texture trigger (writing src_y0 triggers the draw).
-const DRAW_TEXTURE_SRC_Y0: u32 = 0x1088;
+const DRAW_TEXTURE_SRC_Y0: u32 = reg_index!(0x1088);
 /// Vertex array instance first (triggers instanced array draw).
-const VERTEX_ARRAY_INSTANCE_FIRST: u32 = 0x1214;
+const VERTEX_ARRAY_INSTANCE_FIRST: u32 = reg_index!(0x1214);
 /// Vertex array instance subsequent (triggers subsequent instance draw).
-const VERTEX_ARRAY_INSTANCE_SUBSEQUENT: u32 = 0x1218;
+const VERTEX_ARRAY_INSTANCE_SUBSEQUENT: u32 = reg_index!(0x1218);
 /// Inline index 4x8 (index0 triggers 4-byte inline index push).
-const INLINE_INDEX_4X8_INDEX0: u32 = 0x1300;
+const INLINE_INDEX_4X8_INDEX0: u32 = reg_index!(0x1300);
 /// Invalidate texture data cache register.
-const INVALIDATE_TEXTURE_DATA_CACHE: u32 = 0x0F74;
+const INVALIDATE_TEXTURE_DATA_CACHE: u32 = reg_index!(0x0F74);
 /// Tiled cache barrier register.
-const TILED_CACHE_BARRIER: u32 = 0x0F7C;
+const TILED_CACHE_BARRIER: u32 = reg_index!(0x0F7C);
 /// Clear report value register (triggers counter reset).
-const CLEAR_REPORT_VALUE: u32 = 0x1530;
+const CLEAR_REPORT_VALUE: u32 = reg_index!(0x1530);
 /// Render enable block base: +0 addr_high, +1 addr_low, +2 mode.
-const RENDER_ENABLE_BASE: u32 = 0x1550;
+const RENDER_ENABLE_BASE: u32 = reg_index!(0x1550);
 /// Render enable mode register (triggers query condition evaluation).
-const RENDER_ENABLE_MODE: u32 = 0x1554;
+const RENDER_ENABLE_MODE: u32 = reg_index!(0x1554);
 /// Render enable override register.
-const RENDER_ENABLE_OVERRIDE: u32 = 0x1944;
+const RENDER_ENABLE_OVERRIDE: u32 = reg_index!(0x1944);
 /// Inline index 2x16 even (triggers 2-short inline index push).
-const INLINE_INDEX_2X16_EVEN: u32 = 0x15EC;
+const INLINE_INDEX_2X16_EVEN: u32 = reg_index!(0x15EC);
 /// Topology override register.
-const TOPOLOGY_OVERRIDE: u32 = 0x1970;
+const TOPOLOGY_OVERRIDE: u32 = reg_index!(0x1970);
 /// Index buffer 32-bit first register.
-const INDEX_BUFFER32_FIRST: u32 = 0x17E4;
+const INDEX_BUFFER32_FIRST: u32 = reg_index!(0x17E4);
 /// Index buffer 16-bit first register.
-const INDEX_BUFFER16_FIRST: u32 = 0x17E8;
+const INDEX_BUFFER16_FIRST: u32 = reg_index!(0x17E8);
 /// Index buffer 8-bit first register.
-const INDEX_BUFFER8_FIRST: u32 = 0x17EC;
+const INDEX_BUFFER8_FIRST: u32 = reg_index!(0x17EC);
 /// Index buffer 32-bit subsequent register.
-const INDEX_BUFFER32_SUBSEQUENT: u32 = 0x17F0;
+const INDEX_BUFFER32_SUBSEQUENT: u32 = reg_index!(0x17F0);
 /// Index buffer 16-bit subsequent register.
-const INDEX_BUFFER16_SUBSEQUENT: u32 = 0x17F4;
+const INDEX_BUFFER16_SUBSEQUENT: u32 = reg_index!(0x17F4);
 /// Index buffer 8-bit subsequent register.
-const INDEX_BUFFER8_SUBSEQUENT: u32 = 0x17F8;
+const INDEX_BUFFER8_SUBSEQUENT: u32 = reg_index!(0x17F8);
 /// Report semaphore query trigger (writing here fires the semaphore query).
 const REPORT_SEMAPHORE_QUERY: u32 = 0x1B00 + 3;
 /// Falcon register array base (firmware call). falcon[4] = 0x2300 + 4 = 0x2304.
-const FALCON4: u32 = 0x2304;
+const FALCON4: u32 = reg_index!(0x2304);
 /// Shadow scratch memory base (0x3400). Used by firmware stubs.
-const SHADOW_SCRATCH_BASE: u32 = 0x3400;
+const SHADOW_SCRATCH_BASE: u32 = reg_index!(0x3400);
 
 /// Macro registers start offset (method index space, not byte offset).
 /// Methods >= 0xE00 are macro triggers.
-const MACRO_REGISTERS_START: u32 = 0xE00;
+const MACRO_REGISTERS_START: u32 = reg_index!(0x3800);
 
 // ── Common render target formats ────────────────────────────────────────────
 
-const RT_FORMAT_A8B8G8R8_UNORM: u32 = 0xD5;
-const RT_FORMAT_A8B8G8R8_SRGB: u32 = 0xD6;
+const RT_FORMAT_A8B8G8R8_UNORM: u32 = reg_index!(0x0354);
+const RT_FORMAT_A8B8G8R8_SRGB: u32 = reg_index!(0x0358);
 #[allow(dead_code)]
-const RT_FORMAT_A8R8G8B8_UNORM: u32 = 0xCF;
+const RT_FORMAT_A8R8G8B8_UNORM: u32 = reg_index!(0x00CC);
 #[allow(dead_code)]
-const RT_FORMAT_R16G16B16A16_FLOAT: u32 = 0xCA;
+const RT_FORMAT_R16G16B16A16_FLOAT: u32 = reg_index!(0x00C8);
 #[allow(dead_code)]
-const RT_FORMAT_R32_FLOAT: u32 = 0xE5;
+const RT_FORMAT_R32_FLOAT: u32 = reg_index!(0x00E4);
 #[allow(dead_code)]
-const RT_FORMAT_R16G16_FLOAT: u32 = 0xDE;
+const RT_FORMAT_R16G16_FLOAT: u32 = reg_index!(0x00DC);
 #[allow(dead_code)]
-const RT_FORMAT_R32G32_FLOAT: u32 = 0xCB;
+const RT_FORMAT_R32G32_FLOAT: u32 = reg_index!(0x00C8);
 #[allow(dead_code)]
-const RT_FORMAT_R16_FLOAT: u32 = 0xF2;
+const RT_FORMAT_R16_FLOAT: u32 = reg_index!(0x00F0);
 #[allow(dead_code)]
-const RT_FORMAT_R8_UNORM: u32 = 0xF3;
+const RT_FORMAT_R8_UNORM: u32 = reg_index!(0x00F0);
 #[allow(dead_code)]
-const RT_FORMAT_R16G16_UNORM: u32 = 0xDA;
+const RT_FORMAT_R16G16_UNORM: u32 = reg_index!(0x00D8);
 #[allow(dead_code)]
-const RT_FORMAT_B5G6R5_UNORM: u32 = 0xE8;
+const RT_FORMAT_B5G6R5_UNORM: u32 = reg_index!(0x00E8);
 #[allow(dead_code)]
-const RT_FORMAT_A2B10G10R10_UNORM: u32 = 0xD1;
+const RT_FORMAT_A2B10G10R10_UNORM: u32 = reg_index!(0x00D0);
 #[allow(dead_code)]
-const RT_FORMAT_R11G11B10_FLOAT: u32 = 0xE0;
+const RT_FORMAT_R11G11B10_FLOAT: u32 = reg_index!(0x00E0);
 
 // ── Draw state types ────────────────────────────────────────────────────────
 
@@ -2663,8 +2672,12 @@ impl Maxwell3D {
                 self.macro_interpreter.clear_code(ptr);
             }
             LOAD_MME_INSTRUCTION => {
+                // Upstream: macro_engine->AddCode(regs.load_mme.instruction_ptr, argument)
+                // AddCode appends to a vector keyed by instruction_ptr.
+                // We use a flat array, so write at current ptr and auto-increment.
                 let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
                 self.macro_interpreter.upload_code(ptr, argument);
+                self.regs[LOAD_MME_INSTRUCTION_PTR as usize] = ptr + 1;
             }
             LOAD_MME_START_ADDR => {
                 self.process_macro_bind(argument);

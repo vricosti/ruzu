@@ -106,12 +106,13 @@ pub fn wait_synchronization(
     };
 
     let mut object_ids = Vec::with_capacity(num_handles as usize);
-    for handle in handles {
-        let Some(object_id) = process.handle_table.get_object(handle) else {
+    for handle in &handles {
+        let Some(object_id) = process.handle_table.get_object(*handle) else {
             return RESULT_INVALID_HANDLE;
         };
         object_ids.push(object_id);
     }
+    log::trace!("  WaitSynchronization handles={:?} object_ids={:?} timeout_ns={}", handles, object_ids, timeout_ns);
     let timeout = if timeout_ns > 0 {
         let current_tick = system
             .kernel()

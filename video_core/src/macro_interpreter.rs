@@ -305,6 +305,8 @@ impl MacroInterpreter {
 
     /// Clear macro code starting from the given offset. Matches upstream
     /// `MacroEngine::ClearCode` — resets code storage from the pointer onward.
+    pub fn code_size(&self) -> usize { self.code.len() }
+
     pub fn clear_code(&mut self, offset: u32) {
         let idx = offset as usize;
         if idx < self.code.len() {
@@ -356,7 +358,17 @@ impl MacroInterpreter {
         self.pc = start;
 
         // Execute until exit.
-        while self.step(false, processor) {}
+        let mut steps = 0u32;
+        while self.step(false, processor) {
+            steps += 1;
+            if steps > 1_000_000 {
+                log::warn!("Macro slot {}: exceeded 1M steps, breaking (PC={})", slot, self.pc);
+                break;
+            }
+        }
+        if steps > 100 {
+            log::info!("Macro slot {} executed {} steps", slot, steps);
+        }
 
         // Verify all parameters were consumed.
         if self.next_param_index != self.params.len() {
