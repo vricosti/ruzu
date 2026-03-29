@@ -77,27 +77,10 @@ pub fn query_process_memory(
     let process = process_arc.lock().unwrap();
 
     // Query the page table for memory info at the given address.
-    let mem_info = match process.page_table.query_info(address as usize) {
-        Some(info) => info,
-        None => {
-            // If no block found, return a free block covering the rest of the address space.
-            // This matches upstream behavior: the block manager always has a terminal block.
-            *out_page_info = PageInfo::default();
-            // Write a "free" MemoryInfo to user memory.
-            let svc_mem_info = MemoryInfo {
-                base_address: address,
-                size: 0,
-                state: MemoryState::Free as u32,
-                attribute: 0,
-                permission: MemoryPermission::None as u32,
-                ipc_count: 0,
-                device_count: 0,
-                padding: 0,
-            };
-            write_memory_info(system, out_memory_info, &svc_mem_info);
-            return RESULT_SUCCESS;
-        }
-    };
+    let mem_info = process
+        .page_table
+        .query_info(address as usize)
+        .expect("KPageTableBase::query_info must synthesize the terminal inaccessible block");
 
     // Convert KMemoryInfo to SVC MemoryInfo.
     let svc_mem_info = MemoryInfo {

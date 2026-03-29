@@ -43,6 +43,30 @@ pub struct NvdrvInterface {
 }
 
 impl NvdrvInterface {
+    fn should_trace_ioctl_payload(command: Ioctl) -> bool {
+        matches!(
+            command.raw,
+            0xC0B0_4705
+                | 0xC018_4706
+                | 0x8004_4701
+                | 0x8028_4702
+                | 0x4028_4109
+                | 0xC040_4108
+                | 0xC018_4102
+                | 0xC028_4106
+                | 0xC008_0101
+                | 0xC020_0104
+        )
+    }
+
+    fn format_prefix_hex(bytes: &[u8], limit: usize) -> String {
+        bytes.iter()
+            .take(limit)
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     pub fn new(nvdrv: Arc<Module>) -> Self {
         Self {
             nvdrv,
@@ -76,18 +100,48 @@ impl NvdrvInterface {
         } else {
             NvResult::FileOperationFailed
         };
+        log::info!(
+            "NVDRV::Open device_name={} -> fd={} nv_result={:?}",
+            device_name,
+            fd,
+            result
+        );
         (fd, result)
     }
 
     /// Port of NVDRV::Ioctl1
     pub fn ioctl1(&mut self, fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
-        log::debug!("Ioctl1 called fd={}, ioctl=0x{:08X}", fd, command.raw);
+        log::info!("Ioctl1 called fd={}, ioctl=0x{:08X}", fd, command.raw);
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
             return NvResult::NotInitialized;
         }
 
+        if Self::should_trace_ioctl_payload(command) {
+            log::info!(
+                "Ioctl1 input fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
+                fd,
+                command.raw,
+                input.len(),
+                Self::format_prefix_hex(input, 0x40)
+            );
+        }
         let nv_result = self.nvdrv.ioctl1(fd, command, input, output);
+        log::info!(
+            "Ioctl1 result fd={}, ioctl=0x{:08X}, nv_result={:?}",
+            fd,
+            command.raw,
+            nv_result
+        );
+        if Self::should_trace_ioctl_payload(command) {
+            log::info!(
+                "Ioctl1 output fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
+                fd,
+                command.raw,
+                output.len(),
+                Self::format_prefix_hex(output, 0x40)
+            );
+        }
         nv_result
     }
 
@@ -100,13 +154,39 @@ impl NvdrvInterface {
         inline_input: &[u8],
         output: &mut [u8],
     ) -> NvResult {
-        log::debug!("Ioctl2 called fd={}, ioctl=0x{:08X}", fd, command.raw);
+        log::info!("Ioctl2 called fd={}, ioctl=0x{:08X}", fd, command.raw);
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
             return NvResult::NotInitialized;
         }
 
+        if Self::should_trace_ioctl_payload(command) {
+            log::info!(
+                "Ioctl2 input fd={} ioctl=0x{:08X} len0=0x{:X} len1=0x{:X} bytes0=[{}] bytes1=[{}]",
+                fd,
+                command.raw,
+                input.len(),
+                inline_input.len(),
+                Self::format_prefix_hex(input, 0x40),
+                Self::format_prefix_hex(inline_input, 0x40)
+            );
+        }
         let nv_result = self.nvdrv.ioctl2(fd, command, input, inline_input, output);
+        log::info!(
+            "Ioctl2 result fd={}, ioctl=0x{:08X}, nv_result={:?}",
+            fd,
+            command.raw,
+            nv_result
+        );
+        if Self::should_trace_ioctl_payload(command) {
+            log::info!(
+                "Ioctl2 output fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
+                fd,
+                command.raw,
+                output.len(),
+                Self::format_prefix_hex(output, 0x40)
+            );
+        }
         nv_result
     }
 
@@ -119,13 +199,39 @@ impl NvdrvInterface {
         output: &mut [u8],
         inline_output: &mut [u8],
     ) -> NvResult {
-        log::debug!("Ioctl3 called fd={}, ioctl=0x{:08X}", fd, command.raw);
+        log::info!("Ioctl3 called fd={}, ioctl=0x{:08X}", fd, command.raw);
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
             return NvResult::NotInitialized;
         }
 
+        if Self::should_trace_ioctl_payload(command) {
+            log::info!(
+                "Ioctl3 input fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
+                fd,
+                command.raw,
+                input.len(),
+                Self::format_prefix_hex(input, 0x40)
+            );
+        }
         let nv_result = self.nvdrv.ioctl3(fd, command, input, output, inline_output);
+        log::info!(
+            "Ioctl3 result fd={}, ioctl=0x{:08X}, nv_result={:?}",
+            fd,
+            command.raw,
+            nv_result
+        );
+        if Self::should_trace_ioctl_payload(command) {
+            log::info!(
+                "Ioctl3 output fd={} ioctl=0x{:08X} len0=0x{:X} len1=0x{:X} bytes0=[{}] bytes1=[{}]",
+                fd,
+                command.raw,
+                output.len(),
+                inline_output.len(),
+                Self::format_prefix_hex(output, 0x40),
+                Self::format_prefix_hex(inline_output, 0x40)
+            );
+        }
         nv_result
     }
 
@@ -154,13 +260,28 @@ impl NvdrvInterface {
     }
 
     /// Port of NVDRV::QueryEvent
-    pub fn query_event(&self, fd: DeviceFD, event_id: u32) -> (NvResult, Option<u32>) {
+    pub fn query_event(
+        &self,
+        fd: DeviceFD,
+        event_id: u32,
+    ) -> (
+        NvResult,
+        Option<Arc<Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>>,
+    ) {
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
             return (NvResult::NotInitialized, None);
         }
 
-        self.nvdrv.query_event(fd, event_id)
+        let result = self.nvdrv.query_event(fd, event_id);
+        log::info!(
+            "NVDRV::QueryEvent fd={} event_id={} -> nv_result={:?} has_event={}",
+            fd,
+            event_id,
+            result.0,
+            result.1.is_some()
+        );
+        result
     }
 
     /// Port of NVDRV::SetAruid
@@ -261,14 +382,113 @@ impl NvdrvService {
         let fd = rp.pop_i32();
         let command = rp.pop_raw::<Ioctl>();
         let input = ctx.read_buffer(0);
-        let mut output = vec![0; ctx.get_write_buffer_size(0)];
+        let write_size = ctx.get_write_buffer_size(0);
+        let mut output = vec![0; write_size];
+        log::info!(
+            "NVDRV::ioctl1_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X}",
+            fd,
+            command.raw,
+            input.len(),
+            write_size
+        );
         let nv_result = service
             .interface
             .lock()
             .unwrap()
             .ioctl1(fd, command, &input, &mut output);
+        log::info!(
+            "NVDRV::ioctl1_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
+            fd,
+            command.raw,
+            nv_result
+        );
+        if command.raw == 0x4028_4109 {
+            let in_preview_len = input.len().min(40);
+            let out_preview_len = output.len().min(40);
+            log::debug!(
+                "NVDRV::Ioctl1 0x40284109 fd={} input_prefix={:02X?} output_prefix={:02X?} nv_result={:?}",
+                fd,
+                &input[..in_preview_len],
+                &output[..out_preview_len],
+                nv_result,
+            );
+        }
+        if command.raw == 0xC018_4102 {
+            let preview_len = output.len().min(24);
+            log::debug!(
+                "NVDRV::Ioctl1 0xC0184102 fd={} write_size=0x{:X} is_out={} nv_result={:?} output_prefix={:02X?}",
+                fd,
+                write_size,
+                command.is_out(),
+                nv_result,
+                &output[..preview_len]
+            );
+        }
+        if command.raw == 0xC040_4108 {
+            let preview_len = output.len().min(48);
+            let b_desc = ctx
+                .buffer_descriptor_b()
+                .get(0)
+                .map(|d| (d.address(), d.size()));
+            let c_desc = ctx
+                .buffer_descriptor_c()
+                .get(0)
+                .map(|d| (d.address(), d.size()));
+            log::debug!(
+                "NVDRV::Ioctl1 0xC0404108 fd={} write_size=0x{:X} is_out={} can_write={} b_desc={:?} c_desc={:?} nv_result={:?} output_prefix={:02X?}",
+                fd,
+                write_size,
+                command.is_out(),
+                ctx.can_write_buffer(0),
+                b_desc,
+                c_desc,
+                nv_result,
+                &output[..preview_len]
+            );
+        }
+        if command.raw == 0xC020_0104 {
+            let preview_len = output.len().min(32);
+            let b_desc = ctx
+                .buffer_descriptor_b()
+                .get(0)
+                .map(|d| (d.address(), d.size()));
+            let c_desc = ctx
+                .buffer_descriptor_c()
+                .get(0)
+                .map(|d| (d.address(), d.size()));
+            log::debug!(
+                "NVDRV::Ioctl1 0xC0200104 fd={} write_size=0x{:X} is_out={} can_write={} b_desc={:?} c_desc={:?} nv_result={:?} output_prefix={:02X?}",
+                fd,
+                write_size,
+                command.is_out(),
+                ctx.can_write_buffer(0),
+                b_desc,
+                c_desc,
+                nv_result,
+                &output[..preview_len]
+            );
+        }
+        if command.raw == 0xC028_4106 {
+            let in_preview_len = input.len().min(40);
+            let out_preview_len = output.len().min(40);
+            log::debug!(
+                "NVDRV::Ioctl1 0xC0284106 fd={} write_size=0x{:X} is_out={} nv_result={:?} input_prefix={:02X?} output_prefix={:02X?}",
+                fd,
+                write_size,
+                command.is_out(),
+                nv_result,
+                &input[..in_preview_len],
+                &output[..out_preview_len]
+            );
+        }
         if command.is_out() {
-            ctx.write_buffer(&output, 0);
+            let written = ctx.write_buffer(&output, 0);
+            if command.raw == 0xC020_0104 {
+                log::debug!(
+                    "NVDRV::Ioctl1 0xC0200104 wrote {} bytes to guest buffer",
+                    written
+                );
+            }
         }
         Self::push_nv_result(ctx, nv_result);
     }
@@ -281,11 +501,25 @@ impl NvdrvService {
         let input = ctx.read_buffer(0);
         let inline_input = ctx.read_buffer(1);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
+        log::info!(
+            "NVDRV::ioctl2_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} inline_in_len=0x{:X} out_len=0x{:X}",
+            fd,
+            command.raw,
+            input.len(),
+            inline_input.len(),
+            output.len()
+        );
         let nv_result = service
             .interface
             .lock()
             .unwrap()
             .ioctl2(fd, command, &input, &inline_input, &mut output);
+        log::info!(
+            "NVDRV::ioctl2_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
+            fd,
+            command.raw,
+            nv_result
+        );
         if command.is_out() {
             ctx.write_buffer(&output, 0);
         }
@@ -300,11 +534,25 @@ impl NvdrvService {
         let input = ctx.read_buffer(0);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
         let mut inline_output = vec![0; ctx.get_write_buffer_size(1)];
+        log::info!(
+            "NVDRV::ioctl3_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X} inline_out_len=0x{:X}",
+            fd,
+            command.raw,
+            input.len(),
+            output.len(),
+            inline_output.len()
+        );
         let nv_result = service
             .interface
             .lock()
             .unwrap()
             .ioctl3(fd, command, &input, &mut output, &mut inline_output);
+        log::info!(
+            "NVDRV::ioctl3_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
+            fd,
+            command.raw,
+            nv_result
+        );
         if command.is_out() {
             ctx.write_buffer(&output, 0);
             ctx.write_buffer(&inline_output, 1);
@@ -375,11 +623,7 @@ impl NvdrvService {
         let fd = rp.pop_i32();
         let event_id = rp.pop_u32();
         let (nv_result, maybe_event) = service.interface.lock().unwrap().query_event(fd, event_id);
-        let copy_handle = if nv_result == NvResult::Success && maybe_event.is_some() {
-            ctx.create_readable_event_handle(false)
-        } else {
-            None
-        };
+        let copy_handle = maybe_event.and_then(|event| ctx.copy_handle_for_readable_event(event));
 
         if let Some(handle) = copy_handle {
             let mut rb = ResponseBuilder::new(ctx, 3, 1, 0);

@@ -729,6 +729,25 @@ impl HLERequestContext {
         self.create_readable_event(signaled).map(|(handle, _)| handle)
     }
 
+    /// Installs an existing readable event object into the current process handle table.
+    pub fn copy_handle_for_readable_event(
+        &self,
+        readable_event: Arc<Mutex<KReadableEvent>>,
+    ) -> Option<Handle> {
+        let thread = self.thread.as_ref()?;
+        let thread_guard = thread.lock().unwrap();
+        let parent = thread_guard.parent.as_ref()?.upgrade()?;
+        let mut process = parent.lock().unwrap();
+
+        if process.ensure_handle_table_initialized() != RESULT_SUCCESS.get_inner_value() {
+            return None;
+        }
+
+        let object_id = readable_event.lock().unwrap().object_id;
+        process.register_readable_event_object(object_id, readable_event);
+        process.handle_table.add(object_id).ok()
+    }
+
     pub fn get_is_deferred(&self) -> bool {
         self.is_deferred
     }
@@ -902,6 +921,20 @@ impl HLERequestContext {
         let size = data.len().min(buffer_size);
         let address = self.buffer_b_descriptors[buffer_index].address();
         self.write_guest_memory(address, &data[..size]);
+        if (size == 32 && (data[0] == 0x04 || data[0] == 0x08))
+            || (size == 24 && data.len() >= 24 && data[4] == 0x00 && data[5] == 0x00)
+            || (size == 48 && data.len() >= 48 && data[24] == 0x00 && data[28] == 0x00)
+            || (size == 64 && data.len() >= 64 && data[8] == 0x30 && data[12] == 0x00)
+        {
+            let verify = self.read_guest_memory(address, size.min(64));
+            log::debug!(
+                "WriteBufferB probe addr=0x{:X} size=0x{:X} data_prefix={:02X?} verify_prefix={:02X?}",
+                address,
+                size,
+                &data[..size.min(64)],
+                &verify[..verify.len().min(64)]
+            );
+        }
         size
     }
 
@@ -916,6 +949,20 @@ impl HLERequestContext {
         let size = data.len().min(buffer_size);
         let address = self.buffer_c_descriptors[buffer_index].address();
         self.write_guest_memory(address, &data[..size]);
+        if (size == 32 && (data[0] == 0x04 || data[0] == 0x08))
+            || (size == 24 && data.len() >= 24 && data[4] == 0x00 && data[5] == 0x00)
+            || (size == 48 && data.len() >= 48 && data[24] == 0x00 && data[28] == 0x00)
+            || (size == 64 && data.len() >= 64 && data[8] == 0x30 && data[12] == 0x00)
+        {
+            let verify = self.read_guest_memory(address, size.min(64));
+            log::debug!(
+                "WriteBufferC probe addr=0x{:X} size=0x{:X} data_prefix={:02X?} verify_prefix={:02X?}",
+                address,
+                size,
+                &data[..size.min(64)],
+                &verify[..verify.len().min(64)]
+            );
+        }
         size
     }
 

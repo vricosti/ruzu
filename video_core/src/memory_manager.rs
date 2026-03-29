@@ -14,17 +14,39 @@ const L1_BITS: u32 = 14;
 const L0_BITS: u32 = 14;
 const L1_SIZE: usize = 1 << L1_BITS; // 16384 entries per L1 table
 
-/// Sentinel for unmapped pages.
-const INVALID_ENTRY: u64 = u64::MAX;
-
 /// Total GPU address space: 40 bits = 1 TiB.
 pub const GPU_VA_BITS: u32 = L0_BITS + L1_BITS + PAGE_BITS;
 pub const GPU_VA_SIZE: u64 = 1 << GPU_VA_BITS;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum EntryType {
+    #[default]
+    Free,
+    Reserved,
+    Mapped,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PageEntry {
+    entry_type: EntryType,
+    cpu_page_addr: u64,
+    kind_raw: u32,
+}
+
+impl Default for PageEntry {
+    fn default() -> Self {
+        Self {
+            entry_type: EntryType::Free,
+            cpu_page_addr: 0,
+            kind_raw: 0xFF,
+        }
+    }
+}
+
 /// GPU virtual memory manager with a 2-level page table.
 pub struct GpuMemoryManager {
     /// L0 table: each entry is an optional L1 page table.
-    page_table: Vec<Option<Box<[u64; L1_SIZE]>>>,
+    page_table: Vec<Option<Box<[PageEntry; L1_SIZE]>>>,
     /// Next free GPU VA for bump allocation.
     next_alloc: u64,
 }
@@ -44,12 +66,19 @@ impl GpuMemoryManager {
     }
 
     /// Map a contiguous range of GPU VA to CPU addresses.
-    pub fn map(&mut self, gpu_va: u64, cpu_addr: u64, size: u64) {
+    pub fn map(&mut self, gpu_va: u64, cpu_addr: u64, size: u64, kind_raw: u32) {
         let mut offset = 0u64;
         while offset < size {
             let va = gpu_va + offset;
             let ca = cpu_addr + offset;
-            self.set_entry(va, ca);
+            self.set_entry(
+                va,
+                PageEntry {
+                    entry_type: EntryType::Mapped,
+                    cpu_page_addr: ca & !(PAGE_SIZE - 1),
+                    kind_raw,
+                },
+            );
             offset += PAGE_SIZE;
         }
         log::trace!(
@@ -65,10 +94,28 @@ impl GpuMemoryManager {
         let mut offset = 0u64;
         while offset < size {
             let va = gpu_va + offset;
-            self.set_entry(va, INVALID_ENTRY);
+            self.set_entry(va, PageEntry::default());
             offset += PAGE_SIZE;
         }
         log::trace!("gpu_mm: unmap GPU 0x{:X}..0x{:X}", gpu_va, gpu_va + size);
+    }
+
+    /// Reserve a contiguous GPU VA range without backing it by CPU pages.
+    pub fn map_sparse(&mut self, gpu_va: u64, size: u64, kind_raw: u32) {
+        let mut offset = 0u64;
+        while offset < size {
+            let va = gpu_va + offset;
+            self.set_entry(
+                va,
+                PageEntry {
+                    entry_type: EntryType::Reserved,
+                    cpu_page_addr: 0,
+                    kind_raw,
+                },
+            );
+            offset += PAGE_SIZE;
+        }
+        log::trace!("gpu_mm: reserve GPU 0x{:X}..0x{:X}", gpu_va, gpu_va + size);
     }
 
     /// Translate a GPU VA to a CPU/guest physical address.
@@ -76,16 +123,12 @@ impl GpuMemoryManager {
     pub fn translate(&self, gpu_va: u64) -> Option<u64> {
         let page_offset = gpu_va & (PAGE_SIZE - 1);
         let entry = self.get_entry(gpu_va);
-        if entry == INVALID_ENTRY {
-            None
-        } else {
-            Some(entry + page_offset)
-        }
+        (entry.entry_type == EntryType::Mapped).then_some(entry.cpu_page_addr + page_offset)
     }
 
     /// Map at a specific GPU VA (alias for `map`).
     pub fn alloc_fixed(&mut self, gpu_va: u64, cpu_addr: u64, size: u64) {
-        self.map(gpu_va, cpu_addr, size);
+        self.map(gpu_va, cpu_addr, size, 0xFF);
     }
 
     /// Allocate GPU VA from the bump allocator and map to a CPU address.
@@ -94,7 +137,7 @@ impl GpuMemoryManager {
         let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let gpu_va = self.next_alloc;
         self.next_alloc += aligned_size;
-        self.map(gpu_va, cpu_addr, aligned_size);
+        self.map(gpu_va, cpu_addr, aligned_size, 0xFF);
         gpu_va
     }
 
@@ -176,7 +219,7 @@ impl GpuMemoryManager {
     pub fn is_fully_mapped_range(&self, gpu_addr: u64, size: u64) -> bool {
         let mut offset = 0u64;
         while offset < size {
-            if self.translate(gpu_addr + offset).is_none() {
+            if self.get_entry(gpu_addr + offset).entry_type != EntryType::Mapped {
                 return false;
             }
             offset += PAGE_SIZE;
@@ -241,41 +284,108 @@ impl GpuMemoryManager {
     /// Upstream: `MemoryManager::MaxContinuousRange(gpu_addr, size)`
     /// Walks pages forward from `gpu_addr` until an unmapped page is found or `size` is reached.
     pub fn max_continuous_range(&self, gpu_addr: u64, size: u64) -> u64 {
+        let mut old_page_addr = None;
+        let mut range_so_far = 0u64;
         let mut remaining = size;
         let mut current = gpu_addr;
+
         while remaining > 0 {
-            if self.translate(current).is_none() {
-                break;
+            let cpu_addr = match self.translate(current) {
+                Some(addr) => addr,
+                None => break,
+            };
+            if let Some(expected) = old_page_addr {
+                if expected != cpu_addr {
+                    break;
+                }
             }
+
             let page_offset = current & (PAGE_SIZE - 1);
             let chunk = std::cmp::min(remaining, PAGE_SIZE - page_offset);
+            range_so_far += chunk;
+            old_page_addr = Some(cpu_addr + chunk);
             current += chunk;
             remaining -= chunk;
         }
-        size - remaining
+
+        range_so_far
     }
 
     /// Return the total mapped size starting from a GPU address.
     ///
     /// Upstream: `MemoryManager::GetMemoryLayoutSize(gpu_addr)`
     /// Returns the continuous mapped range size from `gpu_addr`.
-    pub fn get_memory_layout_size(&self, gpu_addr: u64) -> u64 {
-        // Walk pages until we hit an unmapped page or end of address space.
+    pub fn get_memory_layout_size(&self, gpu_addr: u64, max_size: u64) -> u64 {
+        let first = self.get_entry(gpu_addr);
+        if first.entry_type == EntryType::Free {
+            return 0;
+        }
+
         let mut total = 0u64;
         let mut current = gpu_addr;
         loop {
-            if current >= GPU_VA_SIZE {
+            if current >= GPU_VA_SIZE || total >= max_size {
                 break;
             }
-            if self.translate(current).is_none() {
+            if self.get_entry(current).entry_type == EntryType::Free {
                 break;
             }
             let page_offset = current & (PAGE_SIZE - 1);
-            let chunk = PAGE_SIZE - page_offset;
+            let chunk = std::cmp::min(PAGE_SIZE - page_offset, max_size - total);
             total += chunk;
             current += chunk;
         }
         total
+    }
+
+    /// Return all continuous mapped GPU subranges beneath a virtual range.
+    ///
+    /// Upstream: `MemoryManager::GetSubmappedRange(gpu_addr, size)`.
+    pub fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
+        let mut result = Vec::new();
+        let mut last_segment: Option<(u64, u64)> = None;
+        let mut old_page_addr = None;
+        let mut remaining = size;
+        let mut current = gpu_addr;
+
+        while remaining > 0 {
+            let page_offset = current & (PAGE_SIZE - 1);
+            let chunk = std::cmp::min(remaining, PAGE_SIZE - page_offset);
+            let cpu_addr = self.translate(current);
+
+            match cpu_addr {
+                Some(dev_addr_base) => {
+                    if let Some(expected) = old_page_addr {
+                        if expected != dev_addr_base {
+                            if let Some(segment) = last_segment.take() {
+                                result.push(segment);
+                            }
+                        }
+                    }
+                    old_page_addr = Some(dev_addr_base + chunk);
+                    if let Some(segment) = &mut last_segment {
+                        segment.1 += chunk;
+                    } else {
+                        last_segment = Some((current, chunk));
+                    }
+                }
+                None => {
+                    old_page_addr = None;
+                    if let Some(segment) = last_segment.take() {
+                        result.push(segment);
+                    }
+                }
+            }
+
+            current += chunk;
+            remaining -= chunk;
+        }
+
+        if let Some(segment) = last_segment {
+            result.push(segment);
+        }
+
+        result
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
@@ -288,33 +398,27 @@ impl GpuMemoryManager {
         ((gpu_va >> PAGE_BITS) & ((1 << L1_BITS) - 1)) as usize
     }
 
-    fn set_entry(&mut self, gpu_va: u64, cpu_page_addr: u64) {
+    fn set_entry(&mut self, gpu_va: u64, entry: PageEntry) {
         let l0 = Self::l0_index(gpu_va);
         let l1 = Self::l1_index(gpu_va);
 
         if self.page_table[l0].is_none() {
-            if cpu_page_addr == INVALID_ENTRY {
+            if entry.entry_type == EntryType::Free {
                 return; // No L1 table and we're unmapping — nothing to do.
             }
-            self.page_table[l0] = Some(Box::new([INVALID_ENTRY; L1_SIZE]));
+            self.page_table[l0] = Some(Box::new([PageEntry::default(); L1_SIZE]));
         }
 
-        // Store the entry: either INVALID_ENTRY for unmapped, or aligned CPU address.
-        let entry = if cpu_page_addr == INVALID_ENTRY {
-            INVALID_ENTRY
-        } else {
-            cpu_page_addr & !(PAGE_SIZE - 1)
-        };
         self.page_table[l0].as_mut().unwrap()[l1] = entry;
     }
 
-    fn get_entry(&self, gpu_va: u64) -> u64 {
+    fn get_entry(&self, gpu_va: u64) -> PageEntry {
         let l0 = Self::l0_index(gpu_va);
         let l1 = Self::l1_index(gpu_va);
 
         match &self.page_table[l0] {
             Some(table) => table[l1],
-            None => INVALID_ENTRY,
+            None => PageEntry::default(),
         }
     }
 
@@ -380,6 +484,7 @@ pub struct MemoryManager {
     split_address: u64,
     big_page_bits: u64,
     page_bits: u64,
+    rasterizer_bound: bool,
 }
 
 impl MemoryManager {
@@ -407,6 +512,7 @@ impl MemoryManager {
             split_address,
             big_page_bits,
             page_bits,
+            rasterizer_bound: false,
         }
     }
 
@@ -487,7 +593,20 @@ impl MemoryManager {
     }
 
     pub fn get_memory_layout_size(&self, gpu_addr: u64) -> u64 {
-        self.gpu_memory_manager.get_memory_layout_size(gpu_addr)
+        self.gpu_memory_manager
+            .get_memory_layout_size(gpu_addr, u64::MAX)
+    }
+
+    pub fn get_memory_layout_size_bounded(&self, gpu_addr: u64, max_size: u64) -> u64 {
+        self.gpu_memory_manager.get_memory_layout_size(gpu_addr, max_size)
+    }
+
+    pub fn get_page_kind_raw(&self, gpu_addr: u64) -> u32 {
+        self.gpu_memory_manager.get_entry(gpu_addr).kind_raw
+    }
+
+    pub fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
+        self.gpu_memory_manager.get_submapped_range(gpu_addr, size)
     }
 
     /// Upstream: `MemoryManager::Map(gpu_addr, dev_addr, size, kind, is_big_pages)`.
@@ -499,19 +618,16 @@ impl MemoryManager {
         gpu_addr: u64,
         device_addr: u64,
         size: u64,
-        _kind: u32,
+        kind: u32,
         _is_big_pages: bool,
     ) -> u64 {
-        self.gpu_memory_manager.map(gpu_addr, device_addr, size);
+        self.gpu_memory_manager.map(gpu_addr, device_addr, size, kind);
         gpu_addr
     }
 
     /// Upstream: `MemoryManager::MapSparse(gpu_addr, size, is_big_pages)`.
-    ///
-    /// The current simplified backend has no reserved-page representation, so sparse
-    /// ranges are modeled as unmapped ranges until a later `Map(...)` fills them.
     pub fn map_sparse(&mut self, gpu_addr: u64, size: u64, _is_big_pages: bool) -> u64 {
-        self.gpu_memory_manager.unmap(gpu_addr, size);
+        self.gpu_memory_manager.map_sparse(gpu_addr, size, 0xFF);
         gpu_addr
     }
 
@@ -535,6 +651,19 @@ impl MemoryManager {
     pub fn page_bits(&self) -> u64 {
         self.page_bits
     }
+
+    /// Upstream: `MemoryManager::BindRasterizer(rasterizer)`.
+    ///
+    /// The current Rust backend does not yet thread the concrete rasterizer
+    /// interface through this owner, but it preserves the lifecycle edge and
+    /// records whether `GPU::InitAddressSpace()` has bound one.
+    pub fn bind_rasterizer(&mut self) {
+        self.rasterizer_bound = true;
+    }
+
+    pub fn has_bound_rasterizer(&self) -> bool {
+        self.rasterizer_bound
+    }
 }
 
 impl Default for MemoryManager {
@@ -550,7 +679,7 @@ mod tests {
     #[test]
     fn test_map_and_translate() {
         let mut mm = GpuMemoryManager::new();
-        mm.map(0x1000, 0xDEAD_0000, 0x2000);
+        mm.map(0x1000, 0xDEAD_0000, 0x2000, 0xFF);
 
         assert_eq!(mm.translate(0x1000), Some(0xDEAD_0000));
         assert_eq!(mm.translate(0x1500), Some(0xDEAD_0500));
@@ -568,7 +697,7 @@ mod tests {
     #[test]
     fn test_unmap() {
         let mut mm = GpuMemoryManager::new();
-        mm.map(0x1000, 0xBEEF_0000, 0x1000);
+        mm.map(0x1000, 0xBEEF_0000, 0x1000, 0xFF);
         assert_eq!(mm.translate(0x1000), Some(0xBEEF_0000));
 
         mm.unmap(0x1000, 0x1000);
@@ -592,7 +721,7 @@ mod tests {
     #[test]
     fn test_page_boundary_offset() {
         let mut mm = GpuMemoryManager::new();
-        mm.map(0x5000, 0xCAFE_0000, 0x1000);
+        mm.map(0x5000, 0xCAFE_0000, 0x1000, 0xFF);
 
         // Address within the page should add the offset.
         assert_eq!(mm.translate(0x5ABC), Some(0xCAFE_0ABC));
@@ -601,7 +730,7 @@ mod tests {
     #[test]
     fn test_read_via_callback() {
         let mut mm = GpuMemoryManager::new();
-        mm.map(0x1000, 0x8000_0000, 0x1000);
+        mm.map(0x1000, 0x8000_0000, 0x1000, 0xFF);
 
         let mut buf = [0u8; 4];
         mm.read(0x1000, &mut buf, &|addr, dst| {
@@ -618,7 +747,7 @@ mod tests {
     #[test]
     fn test_write_via_callback() {
         let mut mm = GpuMemoryManager::new();
-        mm.map(0x1000, 0x8000_0000, 0x1000);
+        mm.map(0x1000, 0x8000_0000, 0x1000, 0xFF);
 
         let mut written: Vec<(u64, Vec<u8>)> = Vec::new();
         let data = [0xDE, 0xAD, 0xBE, 0xEF];
@@ -635,8 +764,8 @@ mod tests {
     fn test_write_cross_page() {
         let mut mm = GpuMemoryManager::new();
         // Map two consecutive pages to different CPU addresses.
-        mm.map(0x1000, 0xA000_0000, 0x1000);
-        mm.map(0x2000, 0xB000_0000, 0x1000);
+        mm.map(0x1000, 0xA000_0000, 0x1000, 0xFF);
+        mm.map(0x2000, 0xB000_0000, 0x1000, 0xFF);
 
         let mut written: Vec<(u64, Vec<u8>)> = Vec::new();
         // Write 8 bytes starting at 0x1FFC (4 bytes in page 1, 4 bytes in page 2).
@@ -666,12 +795,38 @@ mod tests {
 
         assert_eq!(mm.map_sparse(0x4000, 0x2000, false), 0x4000);
         assert_eq!(mm.gpu_to_cpu_address(0x4000), None);
+        assert_eq!(mm.get_memory_layout_size(0x4000), 0x2000);
+        assert_eq!(mm.get_memory_layout_size_bounded(0x4000, 0x1000), 0x1000);
+        assert_eq!(mm.get_page_kind_raw(0x4000), 0xFF);
 
         assert_eq!(mm.map(0x4000, 0x9000_0000, 0x2000, 0, false), 0x4000);
         assert_eq!(mm.gpu_to_cpu_address(0x4000), Some(0x9000_0000));
         assert_eq!(mm.gpu_to_cpu_address(0x4ABC), Some(0x9000_0ABC));
+        assert_eq!(mm.get_page_kind_raw(0x4000), 0);
 
         mm.unmap(0x4000, 0x2000);
         assert_eq!(mm.gpu_to_cpu_address(0x4000), None);
+    }
+
+    #[test]
+    fn test_max_continuous_range_stops_on_cpu_discontinuity() {
+        let mut mm = GpuMemoryManager::new();
+        mm.map(0x1000, 0x8000_0000, 0x1000, 0xFF);
+        mm.map(0x2000, 0x9000_0000, 0x1000, 0xFF);
+
+        assert_eq!(mm.max_continuous_range(0x1000, 0x2000), 0x1000);
+    }
+
+    #[test]
+    fn test_get_submapped_range_splits_discontinuous_and_unmapped_pages() {
+        let mut mm = GpuMemoryManager::new();
+        mm.map(0x1000, 0x8000_0000, 0x1000, 0xFF);
+        mm.map(0x2000, 0x8000_1000, 0x1000, 0xFF);
+        mm.map(0x4000, 0x9000_0000, 0x1000, 0xFF);
+
+        assert_eq!(
+            mm.get_submapped_range(0x1000, 0x4000),
+            vec![(0x1000, 0x2000), (0x4000, 0x1000)]
+        );
     }
 }

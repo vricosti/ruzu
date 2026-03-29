@@ -57,6 +57,12 @@ impl Scheduler {
     ///
     /// Corresponds to `Scheduler::Push(s32 channel, CommandList&& entries)`.
     pub fn push(&self, channel: i32, entries: CommandList) {
+        log::info!(
+            "Scheduler::push channel={} command_lists={} prefetch={}",
+            channel,
+            entries.command_lists.len(),
+            entries.prefetch_command_list.len()
+        );
         let _lock = self.scheduling_guard.lock();
 
         let channel_state = self

@@ -11,6 +11,7 @@ use std::sync::{Mutex, Weak};
 use super::heap_mapper::HeapMapper;
 use super::nvmap::NvMap;
 use super::syncpoint_manager::SyncpointManager;
+use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -75,9 +76,13 @@ pub struct Container {
 
 impl Container {
     pub fn new() -> Self {
+        Self::new_with_system(SystemRef::null())
+    }
+
+    pub fn new_with_system(system: SystemRef) -> Self {
         Self {
             file: NvMap::new(),
-            manager: SyncpointManager::new(),
+            manager: SyncpointManager::new_with_system(system),
             device_file_data: Host1xDeviceFileData::default(),
             inner: Mutex::new(ContainerInner {
                 sessions: Vec::new(),

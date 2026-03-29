@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
+use crate::core::SystemRef;
 use crate::hle::service::nvdrv::nvdata::NvFence;
 
 #[repr(u32)]
@@ -60,6 +61,7 @@ impl Default for SyncpointInfo {
 /// Refer to Chapter 14 of the Tegra X1 TRM for an exhaustive overview of them.
 /// https://http.download.nvidia.com/tegra-public-appnotes/host1x.html
 pub struct SyncpointManager {
+    system: SystemRef,
     /// Uses Mutex for interior mutability since `reserved` and `interface_managed` need mutation.
     /// The AtomicU32 fields (counter_min, counter_max) can be accessed without the lock.
     syncpoints: Mutex<Vec<SyncpointInfo>>,
@@ -67,6 +69,10 @@ pub struct SyncpointManager {
 
 impl SyncpointManager {
     pub fn new() -> Self {
+        Self::new_with_system(SystemRef::null())
+    }
+
+    pub fn new_with_system(system: SystemRef) -> Self {
         let mut syncpoints: Vec<SyncpointInfo> =
             (0..SYNCPOINT_COUNT).map(|_| SyncpointInfo::default()).collect();
 
@@ -88,6 +94,7 @@ impl SyncpointManager {
         }
 
         Self {
+            system,
             syncpoints: Mutex::new(syncpoints),
         }
     }
@@ -182,11 +189,14 @@ impl SyncpointManager {
             return 0;
         }
 
-        // Upstream reads the hardware syncpoint value via:
-        //   syncpoint.counter_min = host1x.GetSyncpointManager().GetHostSyncpointValue(id);
-        // This synchronises the software counter_min with the GPU's current syncpoint
-        // value. Until Host1x integration is available, return the current software value.
-        syncpoint.counter_min.load(Ordering::Relaxed)
+        let host_value = self
+            .system
+            .get()
+            .host1x_core()
+            .map(|host1x| host1x.get_host_syncpoint_value(id))
+            .unwrap_or_else(|| syncpoint.counter_min.load(Ordering::Relaxed));
+        syncpoint.counter_min.store(host_value, Ordering::Relaxed);
+        host_value
     }
 
     /// Returns a fence that will be signalled once this syncpoint hits its maximum value.
@@ -202,6 +212,49 @@ impl SyncpointManager {
         NvFence {
             id: id as i32,
             value: syncpoint.counter_max.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Marks all queued work for a syncpoint as completed.
+    ///
+    /// Upstream updates `counter_min` from host1x hardware in `UpdateMin()`. The Rust port still
+    /// lacks that bridge on this path, so synchronous nvdrv stubs use this helper to keep
+    /// min/max coherent after they complete work immediately.
+    pub fn signal_syncpoint(&self, id: u32) -> u32 {
+        let syncpoints = self.syncpoints.lock().unwrap();
+        let syncpoint = &syncpoints[id as usize];
+
+        if !syncpoint.reserved {
+            debug_assert!(false, "Syncpoint {} is not reserved", id);
+            return 0;
+        }
+
+        let max = syncpoint.counter_max.load(Ordering::Relaxed);
+        syncpoint.counter_min.store(max, Ordering::Relaxed);
+        max
+    }
+
+    pub fn register_host_action(
+        &self,
+        id: u32,
+        expected_value: u32,
+        action: Box<dyn FnOnce() + Send>,
+    ) -> Option<u64> {
+        self.system
+            .get()
+            .host1x_core()
+            .and_then(|host1x| host1x.register_host_action(id, expected_value, action))
+    }
+
+    pub fn deregister_host_action(&self, id: u32, handle: u64) {
+        if let Some(host1x) = self.system.get().host1x_core() {
+            host1x.deregister_host_action(id, handle);
+        }
+    }
+
+    pub fn wait_host(&self, id: u32, expected_value: u32) {
+        if let Some(host1x) = self.system.get().host1x_core() {
+            host1x.wait_host(id, expected_value);
         }
     }
 

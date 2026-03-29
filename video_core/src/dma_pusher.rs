@@ -7,8 +7,11 @@
 //! See https://envytools.readthedocs.io/en/latest/hw/fifo/dma-pusher.html
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::engines::engine_interface::EngineInterface;
+use crate::engines::puller::{MethodCall, Puller};
+use parking_lot::Mutex;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -204,11 +207,23 @@ pub struct DmaPusher {
     dma_increment_once: bool,
     ib_enable: bool,
     command_headers: Vec<CommandHeader>,
+    gpu: *const crate::gpu::Gpu,
+    memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
+    puller: Puller,
 }
+
+// Safety: `gpu` points back to the owning `Gpu`, which outlives the `DmaPusher`
+// through `ChannelState`. `memory_manager` is already synchronized by `Arc<Mutex<_>>`.
+unsafe impl Send for DmaPusher {}
 
 impl DmaPusher {
     /// Creates a new DmaPusher.
-    pub fn new() -> Self {
+    pub fn new(
+        gpu: *const crate::gpu::Gpu,
+        memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
+        channel_state: *mut crate::control::channel_state::ChannelState,
+    ) -> Self {
+        let puller_memory_manager = Arc::clone(&memory_manager);
         Self {
             dma_pushbuffer: VecDeque::new(),
             dma_pushbuffer_subindex: 0,
@@ -216,7 +231,17 @@ impl DmaPusher {
             dma_increment_once: false,
             ib_enable: true,
             command_headers: Vec::new(),
+            gpu,
+            memory_manager,
+            puller: Puller::new(gpu, puller_memory_manager, channel_state),
         }
+    }
+
+    pub fn bind_rasterizer(
+        &mut self,
+        rasterizer: &dyn crate::rasterizer_interface::RasterizerInterface,
+    ) {
+        self.puller.bind_rasterizer(rasterizer);
     }
 
     /// Push a command list into the DMA pushbuffer queue.
@@ -230,11 +255,16 @@ impl DmaPusher {
     /// processing and method dispatch are fully implemented; engine dispatch goes
     /// through the `subchannel` engine interface.
     pub fn dispatch_calls(&mut self) {
+        log::info!(
+            "DmaPusher::dispatch_calls queued_lists={}",
+            self.dma_pushbuffer.len()
+        );
         self.dma_pushbuffer_subindex = 0;
         self.dma_state.is_last_call = true;
 
         // In the full port, this loops while system.is_powered_on().
         while self.step() {}
+        log::info!("DmaPusher::dispatch_calls complete");
 
         // Full implementation calls gpu.flush_commands() and gpu.on_command_list_end().
         // These are no-ops until GPU integration is complete.
@@ -273,10 +303,16 @@ impl DmaPusher {
         if !command_list.prefetch_command_list.is_empty() {
             // Prefetched command list from nvdrv (synchronization etc.).
             let commands: Vec<CommandHeader> = command_list.prefetch_command_list.clone();
-            self.process_commands_standalone(&commands);
+            self.process_commands(&commands);
             self.dma_pushbuffer.pop_front();
         } else {
             let command_list_header = command_list.command_lists[self.dma_pushbuffer_subindex];
+            log::info!(
+                "DmaPusher::step command_list addr=0x{:X} size={} non_main={}",
+                command_list_header.addr(),
+                command_list_header.size(),
+                command_list_header.is_non_main()
+            );
             self.dma_pushbuffer_subindex += 1;
             self.dma_state.dma_get = command_list_header.addr();
 
@@ -289,13 +325,21 @@ impl DmaPusher {
                 return true;
             }
 
-            // Reading command headers from GPU memory requires the MemoryManager.
-            // Until that integration is complete, we log and skip.
-            log::trace!(
-                "DmaPusher: skipping GPU-resident command list at 0x{:X} ({} words)",
-                command_list_header.addr(),
-                command_list_header.size()
-            );
+            let command_count = command_list_header.size() as usize;
+            let byte_len = command_count * std::mem::size_of::<CommandHeader>();
+            let mut raw = vec![0u8; byte_len];
+            let gpu = unsafe { &*self.gpu };
+            let mm = self.memory_manager.lock();
+            mm.read_block_unsafe(command_list_header.addr(), &mut raw, &|cpu_addr, dst| {
+                let _ = gpu.read_guest_memory(cpu_addr, dst);
+            });
+            drop(mm);
+
+            self.command_headers.clear();
+            self.command_headers.extend(raw.chunks_exact(4).map(|chunk| CommandHeader {
+                raw: u32::from_le_bytes(chunk.try_into().unwrap()),
+            }));
+            self.process_commands(&self.command_headers.clone());
         }
         true
     }
@@ -335,14 +379,85 @@ impl DmaPusher {
                 return true;
             }
 
-            // GPU-resident command list reading requires MemoryManager.
-            log::trace!(
-                "DmaPusher: skipping GPU-resident command list at 0x{:X} ({} words)",
-                command_list_header.addr(),
-                command_list_header.size()
-            );
+            let command_count = command_list_header.size() as usize;
+            let byte_len = command_count * std::mem::size_of::<CommandHeader>();
+            let mut raw = vec![0u8; byte_len];
+            let gpu = unsafe { &*self.gpu };
+            let mm = self.memory_manager.lock();
+            mm.read_block_unsafe(command_list_header.addr(), &mut raw, &|cpu_addr, dst| {
+                let _ = gpu.read_guest_memory(cpu_addr, dst);
+            });
+            drop(mm);
+
+            self.command_headers.clear();
+            self.command_headers.extend(raw.chunks_exact(4).map(|chunk| CommandHeader {
+                raw: u32::from_le_bytes(chunk.try_into().unwrap()),
+            }));
+            let commands = self.command_headers.clone();
+            self.process_commands_with_engine(&commands, engine);
         }
         true
+    }
+
+    fn process_commands(&mut self, commands: &[CommandHeader]) {
+        let mut index = 0;
+        while index < commands.len() {
+            let command_header = commands[index];
+
+            if self.dma_state.method_count > 0 {
+                self.dma_state.dma_word_offset = (index as u64) * 4;
+                if self.dma_state.non_incrementing {
+                    let max_write =
+                        std::cmp::min(index + self.dma_state.method_count as usize, commands.len()) - index;
+                    self.dispatch_multi_method(&commands[index..index + max_write]);
+                    self.dma_state.method_count -= max_write as u32;
+                    self.dma_state.is_last_call = true;
+                    index += max_write;
+                    continue;
+                } else {
+                    self.dma_state.is_last_call = self.dma_state.method_count <= 1;
+                    self.dispatch_method(command_header.argument());
+                }
+
+                if !self.dma_state.non_incrementing {
+                    self.dma_state.method += 1;
+                }
+
+                if self.dma_increment_once {
+                    self.dma_state.non_incrementing = true;
+                }
+
+                self.dma_state.method_count -= 1;
+            } else {
+                match command_header.mode() {
+                    Some(SubmissionMode::Increasing) => {
+                        self.set_state(&command_header);
+                        self.dma_state.non_incrementing = false;
+                        self.dma_increment_once = false;
+                    }
+                    Some(SubmissionMode::NonIncreasing) => {
+                        self.set_state(&command_header);
+                        self.dma_state.non_incrementing = true;
+                        self.dma_increment_once = false;
+                    }
+                    Some(SubmissionMode::Inline) => {
+                        self.dma_state.method = command_header.method();
+                        self.dma_state.subchannel = command_header.subchannel();
+                        self.dma_state.dma_word_offset = (-(self.dma_state.dma_get as i64)) as u64;
+                        self.dispatch_method(command_header.arg_count());
+                        self.dma_state.non_incrementing = true;
+                        self.dma_increment_once = false;
+                    }
+                    Some(SubmissionMode::IncreaseOnce) => {
+                        self.set_state(&command_header);
+                        self.dma_state.non_incrementing = false;
+                        self.dma_increment_once = true;
+                    }
+                    _ => {}
+                }
+            }
+            index += 1;
+        }
     }
 
     /// Process a span of command headers, dispatching to an engine.
@@ -364,17 +479,14 @@ impl DmaPusher {
                         index + self.dma_state.method_count as usize,
                         commands.len(),
                     ) - index;
-                    self.dispatch_multi_method(
-                        &commands[index..index + max_write],
-                        engine,
-                    );
+                    self.dispatch_multi_method(&commands[index..index + max_write]);
                     self.dma_state.method_count -= max_write as u32;
                     self.dma_state.is_last_call = true;
                     index += max_write;
                     continue;
                 } else {
                     self.dma_state.is_last_call = self.dma_state.method_count <= 1;
-                    self.dispatch_method(command_header.argument(), engine);
+                    self.dispatch_method(command_header.argument());
                 }
 
                 if !self.dma_state.non_incrementing {
@@ -404,93 +516,7 @@ impl DmaPusher {
                         self.dma_state.subchannel = command_header.subchannel();
                         self.dma_state.dma_word_offset =
                             (-(self.dma_state.dma_get as i64)) as u64;
-                        self.dispatch_method(command_header.arg_count(), engine);
-                        self.dma_state.non_incrementing = true;
-                        self.dma_increment_once = false;
-                    }
-                    Some(SubmissionMode::IncreaseOnce) => {
-                        self.set_state(&command_header);
-                        self.dma_state.non_incrementing = false;
-                        self.dma_increment_once = true;
-                    }
-                    _ => {}
-                }
-            }
-            index += 1;
-        }
-    }
-
-    /// Process a span of command headers without engine dispatch (standalone).
-    /// Used when no engine is available (prefetched commands during non-engine dispatch).
-    fn process_commands_standalone(&mut self, commands: &[CommandHeader]) {
-        let mut index = 0;
-        while index < commands.len() {
-            let command_header = commands[index];
-
-            if self.dma_state.method_count > 0 {
-                self.dma_state.dma_word_offset = (index as u64) * 4;
-                if self.dma_state.non_incrementing {
-                    let max_write = std::cmp::min(
-                        index + self.dma_state.method_count as usize,
-                        commands.len(),
-                    ) - index;
-                    // Without engine, log the multi-method dispatch.
-                    if self.dma_state.method >= NON_PULLER_METHODS {
-                        log::trace!(
-                            "DmaPusher: standalone multi-method 0x{:X} x{}",
-                            self.dma_state.method,
-                            max_write
-                        );
-                    }
-                    self.dma_state.method_count -= max_write as u32;
-                    self.dma_state.is_last_call = true;
-                    index += max_write;
-                    continue;
-                } else {
-                    self.dma_state.is_last_call = self.dma_state.method_count <= 1;
-                    // Without engine, log the method dispatch.
-                    if self.dma_state.method >= NON_PULLER_METHODS {
-                        log::trace!(
-                            "DmaPusher: standalone method 0x{:X} arg=0x{:X}",
-                            self.dma_state.method,
-                            command_header.argument()
-                        );
-                    }
-                }
-
-                if !self.dma_state.non_incrementing {
-                    self.dma_state.method += 1;
-                }
-
-                if self.dma_increment_once {
-                    self.dma_state.non_incrementing = true;
-                }
-
-                self.dma_state.method_count -= 1;
-            } else {
-                match command_header.mode() {
-                    Some(SubmissionMode::Increasing) => {
-                        self.set_state(&command_header);
-                        self.dma_state.non_incrementing = false;
-                        self.dma_increment_once = false;
-                    }
-                    Some(SubmissionMode::NonIncreasing) => {
-                        self.set_state(&command_header);
-                        self.dma_state.non_incrementing = true;
-                        self.dma_increment_once = false;
-                    }
-                    Some(SubmissionMode::Inline) => {
-                        self.dma_state.method = command_header.method();
-                        self.dma_state.subchannel = command_header.subchannel();
-                        self.dma_state.dma_word_offset =
-                            (-(self.dma_state.dma_get as i64)) as u64;
-                        if self.dma_state.method >= NON_PULLER_METHODS {
-                            log::trace!(
-                                "DmaPusher: standalone inline method 0x{:X} arg=0x{:X}",
-                                self.dma_state.method,
-                                command_header.arg_count()
-                            );
-                        }
+                        self.dispatch_method(command_header.arg_count());
                         self.dma_state.non_incrementing = true;
                         self.dma_increment_once = false;
                     }
@@ -514,61 +540,22 @@ impl DmaPusher {
 
     /// Dispatch a single method call to an engine. Matches upstream
     /// `DmaPusher::CallMethod`.
-    fn dispatch_method(&self, argument: u32, engine: &mut dyn EngineInterface) {
-        if self.dma_state.method < NON_PULLER_METHODS {
-            // Puller methods (subchannel binding, semaphores, etc.).
-            // In the full port, this goes to puller.CallPullerMethod().
-            log::trace!(
-                "DmaPusher: puller method 0x{:X} arg=0x{:X}",
-                self.dma_state.method,
-                argument
-            );
-            return;
-        }
-
-        // Non-puller methods go to the subchannel engine.
-        // Check the execution mask to decide whether to defer or execute immediately.
-        let method = self.dma_state.method as usize;
-        if method < engine.execution_mask().len() && !engine.execution_mask()[method] {
-            // Non-executable method: defer to method sink.
-            engine.push_method_sink(self.dma_state.method, argument);
-            return;
-        }
-
-        // Executable method: flush sink first, then dispatch.
-        engine.consume_sink();
-        engine.set_current_dma_segment(
-            self.dma_state.dma_get.wrapping_add(self.dma_state.dma_word_offset),
-        );
-        engine.call_method(self.dma_state.method, argument, self.dma_state.is_last_call);
+    fn dispatch_method(&mut self, argument: u32) {
+        self.puller.call_method(&MethodCall::new(
+            self.dma_state.method,
+            argument,
+            self.dma_state.subchannel,
+            self.dma_state.method_count,
+        ));
     }
 
     /// Dispatch a multi-method call to an engine. Matches upstream
     /// `DmaPusher::CallMultiMethod`.
-    fn dispatch_multi_method(
-        &self,
-        commands: &[CommandHeader],
-        engine: &mut dyn EngineInterface,
-    ) {
-        if self.dma_state.method < NON_PULLER_METHODS {
-            // Puller multi-method.
-            log::trace!(
-                "DmaPusher: puller multi-method 0x{:X} x{}",
-                self.dma_state.method,
-                commands.len()
-            );
-            return;
-        }
-
-        // Extract argument words from command headers.
+    fn dispatch_multi_method(&mut self, commands: &[CommandHeader]) {
         let args: Vec<u32> = commands.iter().map(|c| c.argument()).collect();
-
-        engine.consume_sink();
-        engine.set_current_dma_segment(
-            self.dma_state.dma_get.wrapping_add(self.dma_state.dma_word_offset),
-        );
-        engine.call_multi_method(
+        self.puller.call_multi_method(
             self.dma_state.method,
+            self.dma_state.subchannel,
             &args,
             args.len() as u32,
             self.dma_state.method_count,

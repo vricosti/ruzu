@@ -13,9 +13,9 @@ use log::trace;
 
 use super::null_rasterizer::RasterizerNull;
 use crate::framebuffer_config::FramebufferConfig;
+use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer_interface::RasterizerInterface;
 use crate::renderer_base::{RendererBase, RendererBaseData};
-use crate::syncpoint::SyncpointManager;
 
 /// Tiled capture buffer size (matching zuyu's `VideoCore::Capture::TiledSize`).
 ///

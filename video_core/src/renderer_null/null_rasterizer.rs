@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use log::trace;
 
+use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
-use crate::syncpoint::SyncpointManager;
 
 // ── AccelerateDMA ──────────────────────────────────────────────────────────
 
@@ -154,10 +154,10 @@ impl RasterizerInterface for RasterizerNull {
     /// Increment the syncpoint value.
     ///
     /// Matches zuyu's `RasterizerNull::SignalSyncPoint()` which increments
-    /// both guest and host syncpoints. Our SyncpointManager uses a single
-    /// counter per syncpoint, so one increment suffices.
+    /// both guest and host syncpoints through Host1x.
     fn signal_sync_point(&mut self, id: u32) {
-        self.syncpoints.increment(id);
+        self.syncpoints.increment_guest(id);
+        self.syncpoints.increment_host(id);
     }
 
     fn signal_reference(&mut self) {}
@@ -263,6 +263,8 @@ mod tests {
         let sp = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerNull::new(sp.clone());
         rast.signal_sync_point(1);
+        assert_eq!(sp.get_guest_syncpoint_value(1), 1);
+        assert_eq!(sp.get_host_syncpoint_value(1), 1);
     }
 
     #[test]

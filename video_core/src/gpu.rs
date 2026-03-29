@@ -13,7 +13,9 @@ use crate::dma_pusher::CommandList;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::rasterizer_download_area::RasterizerDownloadArea;
 use crate::renderer_base::RendererBase;
-use ruzu_core::gpu_core::{GpuChannelHandle, GpuCoreInterface, GpuMemoryManagerHandle};
+use ruzu_core::gpu_core::{
+    GpuChannelHandle, GpuCommandList, GpuCoreInterface, GpuMemoryManagerHandle,
+};
 
 struct VideoGpuChannelHandle {
     gpu: *const Gpu,
@@ -131,7 +133,10 @@ pub struct Gpu {
 
     /// Rasterizer extracted from renderer.
     /// Upstream: `VideoCore::RasterizerInterface* rasterizer` in GPU::Impl.
-    rasterizer: std::sync::atomic::AtomicPtr<()>,
+    ///
+    /// Rust trait objects are fat pointers, so preserve both the data and
+    /// vtable words instead of truncating to a thin pointer.
+    rasterizer: Mutex<Option<[usize; 2]>>,
 
     /// GPU channel scheduler.
     /// Upstream: `std::unique_ptr<Tegra::Control::Scheduler> scheduler` in GPU::Impl.
@@ -145,6 +150,11 @@ pub struct Gpu {
     /// Registered GPU channels.
     /// Upstream: `std::unordered_map<s32, std::shared_ptr<ChannelState>> channels`.
     channels: Mutex<HashMap<i32, Arc<parking_lot::Mutex<crate::control::channel_state::ChannelState>>>>,
+
+    /// Owner-local bridge for GPU VA command fetches that still need core guest memory access.
+    /// This is a temporary Rust adaptation until `video_core::MemoryManager` owns the same
+    /// backing memory integration as upstream.
+    guest_memory_reader: Mutex<Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>>>,
 }
 
 impl Gpu {
@@ -161,10 +171,11 @@ impl Gpu {
             new_channel_id: Mutex::new(1),
             bound_channel: Mutex::new(-1),
             renderer: Mutex::new(None),
-            rasterizer: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            rasterizer: Mutex::new(None),
             scheduler: Mutex::new(None),
             gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(is_async)),
             channels: Mutex::new(HashMap::new()),
+            guest_memory_reader: Mutex::new(None),
         }
     }
 
@@ -189,7 +200,7 @@ impl Gpu {
         // Extract rasterizer from renderer.
         // Upstream: rasterizer = renderer->ReadRasterizer();
         let rasterizer_ptr = renderer.read_rasterizer();
-        self.rasterizer.store(rasterizer_ptr as *mut (), Ordering::Release);
+        *self.rasterizer.lock().unwrap() = Some(unsafe { std::mem::transmute(rasterizer_ptr) });
         // Upstream also does:
         // host1x.MemoryManager().BindInterface(rasterizer);
         // host1x.GMMU().BindRasterizer(rasterizer);
@@ -203,6 +214,26 @@ impl Gpu {
     /// Sets the active channel for command processing.
     pub fn bind_channel(&self, channel_id: i32) {
         *self.bound_channel.lock().unwrap() = channel_id;
+    }
+
+    fn rasterizer_ptr(&self) -> Option<*mut dyn crate::rasterizer_interface::RasterizerInterface> {
+        (*self.rasterizer.lock().unwrap())
+            .map(|raw| unsafe { std::mem::transmute(raw) })
+    }
+
+    pub fn set_guest_memory_reader(
+        &self,
+        reader: Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>,
+    ) {
+        *self.guest_memory_reader.lock().unwrap() = Some(reader);
+    }
+
+    pub fn read_guest_memory(&self, addr: u64, output: &mut [u8]) -> bool {
+        let Some(reader) = self.guest_memory_reader.lock().unwrap().clone() else {
+            return false;
+        };
+        reader(addr, output);
+        true
     }
 
     /// Create a new GPU channel and register it with the scheduler.
@@ -487,6 +518,15 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
 
         let gpu = unsafe { &*self.gpu };
         channel_state.init(gpu, program_id);
+        if let Some(rasterizer) = gpu.rasterizer_ptr() {
+            let rasterizer = unsafe { &mut *rasterizer };
+            channel_state.bind_rasterizer(rasterizer);
+            rasterizer.initialize_channel(channel_state.bind_id);
+        }
+    }
+
+    fn bind_id(&self) -> i32 {
+        self.channel_state.lock().bind_id
     }
 }
 
@@ -545,5 +585,143 @@ impl GpuCoreInterface for Gpu {
                 ),
             )),
         })
+    }
+
+    fn init_address_space(&self, memory_manager: Arc<dyn GpuMemoryManagerHandle>) {
+        let handle = memory_manager
+            .as_any()
+            .downcast_ref::<VideoGpuMemoryManagerHandle>()
+            .expect("GPU memory manager handle must originate from video_core::Gpu");
+        if self.rasterizer_ptr().is_none() {
+            return;
+        }
+        handle.memory_manager.lock().bind_rasterizer();
+    }
+
+    fn push_gpu_entries(&self, channel_id: i32, entries: GpuCommandList) {
+        let command_list = CommandList {
+            command_lists: entries
+                .command_lists
+                .into_iter()
+                .map(|header| crate::dma_pusher::CommandListHeader { raw: header.raw })
+                .collect(),
+            prefetch_command_list: entries
+                .prefetch_command_list
+                .into_iter()
+                .map(|header| crate::dma_pusher::CommandHeader { raw: header.raw })
+                .collect(),
+        };
+        Gpu::push_gpu_entries(self, channel_id, command_list);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory_manager::MemoryManager;
+    use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    struct FakeRasterizer {
+        initialized_channels: Arc<StdMutex<Vec<i32>>>,
+    }
+
+    impl RasterizerInterface for FakeRasterizer {
+        fn draw(&mut self, _is_indexed: bool, _instance_count: u32) {}
+        fn draw_texture(&mut self) {}
+        fn clear(&mut self, _layer_count: u32) {}
+        fn dispatch_compute(&mut self) {}
+        fn reset_counter(&mut self, _query_type: u32) {}
+        fn query(
+            &mut self,
+            _gpu_addr: u64,
+            _query_type: u32,
+            _has_timeout: bool,
+            _payload: u32,
+            _subreport: u32,
+            _gpu_write: &dyn Fn(u64, &[u8]),
+        ) {
+        }
+        fn bind_graphics_uniform_buffer(
+            &mut self,
+            _stage: usize,
+            _index: u32,
+            _gpu_addr: u64,
+            _size: u32,
+        ) {
+        }
+        fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
+        fn signal_fence(&mut self, _func: Box<dyn FnOnce()>) {}
+        fn sync_operation(&mut self, _func: Box<dyn FnOnce()>) {}
+        fn signal_sync_point(&mut self, _value: u32) {}
+        fn signal_reference(&mut self) {}
+        fn release_fences(&mut self, _force: bool) {}
+        fn flush_all(&mut self) {}
+        fn flush_region(&mut self, _addr: u64, _size: u64) {}
+        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+            false
+        }
+        fn get_flush_area(&self, addr: u64, _size: u64) -> RasterizerDownloadArea {
+            RasterizerDownloadArea {
+                start_address: addr,
+                end_address: addr,
+                preemptive: true,
+            }
+        }
+        fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
+        fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
+            false
+        }
+        fn invalidate_gpu_cache(&mut self) {}
+        fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
+        fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
+        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn wait_for_idle(&mut self) {}
+        fn fragment_barrier(&mut self) {}
+        fn tiled_cache_barrier(&mut self) {}
+        fn flush_commands(&mut self) {}
+        fn tick_frame(&mut self) {}
+        fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
+        fn initialize_channel(&mut self, channel_id: i32) {
+            self.initialized_channels.lock().unwrap().push(channel_id);
+        }
+    }
+
+    #[test]
+    fn init_channel_binds_rasterizer_and_initializes_channel() {
+        let gpu = Gpu::new(false, false);
+        let channel_state = gpu.create_channel(7);
+        channel_state.lock().memory_manager = Some(Arc::new(parking_lot::Mutex::new(
+            MemoryManager::new_with_geometry(1, 32, 0x1_0000_0000, 16, 12),
+        )));
+
+        let initialized_channels = Arc::new(StdMutex::new(Vec::new()));
+        let rasterizer = Box::new(FakeRasterizer {
+            initialized_channels: initialized_channels.clone(),
+        });
+        let rasterizer_ptr: *mut FakeRasterizer = Box::into_raw(rasterizer);
+        *gpu.rasterizer.lock().unwrap() =
+            Some(unsafe { std::mem::transmute(rasterizer_ptr as *mut dyn RasterizerInterface) });
+
+        let handle = VideoGpuChannelHandle {
+            gpu: &gpu as *const Gpu,
+            channel_state: channel_state.clone(),
+        };
+        handle.init_channel(0x1234);
+
+        assert!(channel_state.lock().initialized);
+        assert!(channel_state
+            .lock()
+            .memory_manager
+            .as_ref()
+            .unwrap()
+            .lock()
+            .has_bound_rasterizer());
+        assert_eq!(*initialized_channels.lock().unwrap(), vec![7]);
+
+        unsafe {
+            drop(Box::from_raw(rasterizer_ptr));
+        }
     }
 }

@@ -345,10 +345,8 @@ fn main() {
 
         // Host1x (upstream core.cpp:277): host1x_core = make_unique<Host1x>(system)
         let host1x = video_core::host1x::host1x::Host1x::new();
+        let syncpoints = host1x.syncpoint_manager().clone();
         system.set_host1x_core(Box::new(host1x));
-
-        // SyncpointManager for renderer use (matches crate::syncpoint::SyncpointManager).
-        let syncpoints = Arc::new(video_core::syncpoint::SyncpointManager::new());
 
         // GPU (upstream core.cpp:278): gpu_core = VideoCore::CreateGPU(emu_window, system)
         //
@@ -386,16 +384,19 @@ fn main() {
                 }
                 "vulkan" => {
                     log::warn!("Vulkan renderer not yet implemented, falling back to null");
-                    Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
-                        syncpoints.clone(),
-                    ))
+                    Box::new(video_core::renderer_null::renderer_null::RendererNull::new(syncpoints.clone()))
                 }
-                _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
-                    syncpoints.clone(),
-                )),
+                _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(syncpoints.clone())),
             };
 
         let gpu = video_core::video_core::create_gpu(false, true, renderer);
+        let system_ref = ruzu_core::core::SystemRef::from_ref(&system);
+        gpu.set_guest_memory_reader(Arc::new(move |addr, output: &mut [u8]| {
+            if let Some(process) = system_ref.get().current_process() {
+                let bytes = process.read_memory_vec(addr, output.len());
+                output.copy_from_slice(&bytes);
+            }
+        }));
         system.set_gpu_core(Box::new(gpu));
 
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
@@ -431,7 +432,7 @@ fn main() {
     // Core is loaded, start the GPU (makes the GPU contexts current to this thread).
     // -----------------------------------------------------------------------
     if let Some(gpu_any) = system.gpu_core() {
-        if let Some(gpu) = gpu_any.downcast_ref::<video_core::gpu::Gpu>() {
+        if let Some(gpu) = gpu_any.as_any().downcast_ref::<video_core::gpu::Gpu>() {
             gpu.start();
         } else {
             log::warn!("GPU core is not a video_core::gpu::Gpu — cannot call start()");

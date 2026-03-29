@@ -7,6 +7,7 @@
 //! parameters; actual DMA copy is not yet implemented.
 
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
+use crate::rasterizer_interface::RasterizerInterface;
 
 // ── Register constants (method = byte_offset / 4) ──────────────────────────
 
@@ -26,6 +27,7 @@ pub struct MaxwellDMA {
     regs: Box<[u32; ENGINE_REG_COUNT]>,
     /// Set when a DMA launch trigger is detected; consumed by tests / future logic.
     pub pending_launch: bool,
+    rasterizer: Option<[usize; 2]>,
 }
 
 impl MaxwellDMA {
@@ -33,7 +35,15 @@ impl MaxwellDMA {
         Self {
             regs: Box::new([0u32; ENGINE_REG_COUNT]),
             pending_launch: false,
+            rasterizer: None,
         }
+    }
+
+    /// Corresponds to `MaxwellDMA::BindRasterizer`.
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
+        self.rasterizer = Some(unsafe {
+            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
+        });
     }
 
     // ── Typed accessors ────────────────────────────────────────────────
@@ -201,6 +211,16 @@ mod tests {
         let mut eng = MaxwellDMA::new();
         eng.write_reg(0x200, 42); // Random register
         assert!(!eng.pending_launch);
+    }
+
+    #[test]
+    fn test_bind_rasterizer_stores_reference() {
+        let syncpoints = std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        let mut eng = MaxwellDMA::new();
+        assert!(eng.rasterizer.is_none());
+        eng.bind_rasterizer(&rasterizer);
+        assert!(eng.rasterizer.is_some());
     }
 
     #[test]
