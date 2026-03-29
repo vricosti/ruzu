@@ -155,6 +155,7 @@ pub struct Gpu {
     /// This is a temporary Rust adaptation until `video_core::MemoryManager` owns the same
     /// backing memory integration as upstream.
     guest_memory_reader: Mutex<Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>>>,
+    guest_memory_writer: Mutex<Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>>,
 }
 
 impl Gpu {
@@ -176,6 +177,7 @@ impl Gpu {
             gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(is_async)),
             channels: Mutex::new(HashMap::new()),
             guest_memory_reader: Mutex::new(None),
+            guest_memory_writer: Mutex::new(None),
         }
     }
 
@@ -234,6 +236,22 @@ impl Gpu {
         };
         reader(addr, output);
         true
+    }
+
+    /// Set the guest memory writer callback.
+    pub fn set_guest_memory_writer(
+        &self,
+        writer: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
+    ) {
+        *self.guest_memory_writer.lock().unwrap() = Some(writer);
+    }
+
+    /// Write guest memory at the given CPU/device address.
+    pub fn write_guest_memory(&self, addr: u64, data: &[u8]) {
+        let Some(writer) = self.guest_memory_writer.lock().unwrap().clone() else {
+            return;
+        };
+        writer(addr, data);
     }
 
     /// Create a new GPU channel and register it with the scheduler.
@@ -518,6 +536,8 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
 
         let gpu = unsafe { &*self.gpu };
         channel_state.init(gpu, program_id);
+        log::info!("VideoGpuChannelHandle::init_channel: program_id={:#x} maxwell_3d={}",
+            program_id, channel_state.maxwell_3d.is_some());
         if let Some(rasterizer) = gpu.rasterizer_ptr() {
             let rasterizer = unsafe { &mut *rasterizer };
             channel_state.bind_rasterizer(rasterizer);

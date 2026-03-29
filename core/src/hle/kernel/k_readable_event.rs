@@ -95,12 +95,24 @@ impl KReadableEvent {
         if !self.is_signaled {
             return;
         }
+        let waiters = self.sync_object.waiter_snapshot(process);
         let outcome = crate::hle::kernel::k_synchronization_object::process_waiter_snapshot(
             process,
             self.object_id,
-            &self.sync_object.waiter_snapshot(process),
+            &waiters,
             RESULT_SUCCESS.get_inner_value(),
         );
+
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NOTIFY_COUNT: AtomicU32 = AtomicU32::new(0);
+        let c = NOTIFY_COUNT.fetch_add(1, Ordering::Relaxed);
+        if c < 5 || c % 300 == 0 {
+            log::info!(
+                "KReadableEvent::notify_available #{}: object_id={} waiters={} woke_any={} unlink={}",
+                c, self.object_id, waiters.len(), outcome.woke_any, outcome.unlink_thread_ids.len()
+            );
+        }
+
         for thread_id in outcome.unlink_thread_ids {
             self.unlink_waiter(process, thread_id);
         }

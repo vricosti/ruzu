@@ -392,9 +392,54 @@ fn main() {
         let gpu = video_core::video_core::create_gpu(false, true, renderer);
         let system_ref = ruzu_core::core::SystemRef::from_ref(&system);
         gpu.set_guest_memory_reader(Arc::new(move |addr, output: &mut [u8]| {
-            if let Some(process) = system_ref.get().current_process() {
-                let bytes = process.read_memory_vec(addr, output.len());
-                output.copy_from_slice(&bytes);
+            // Upstream: reads through Memory which resolves via the process page table.
+            // The Memory page table maps guest virtual addresses to DeviceMemory host
+            // pointers. This works for addresses that have been mapped by the kernel
+            // (code, heap, stack, TLS, etc.).
+            let sys = system_ref.get();
+            if let Some(memory) = sys.memory_shared() {
+                let m = memory.lock().unwrap();
+                if !m.read_block(addr, output) {
+                    // Fallback: direct DeviceMemory access for addresses not
+                    // in the process page table (e.g., nvmap device addresses).
+                    let dm = sys.device_memory();
+                    let base = ruzu_core::device_memory::dram_memory_map::BASE;
+                    if addr >= base {
+                        let offset = (addr - base) as usize;
+                        let backing = dm.buffer.backing_base_pointer();
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                backing.add(offset),
+                                output.as_mut_ptr(),
+                                output.len(),
+                            );
+                        }
+                    }
+                }
+            }
+        }));
+        let system_ref2 = ruzu_core::core::SystemRef::from_ref(&system);
+        gpu.set_guest_memory_writer(Arc::new(move |addr, data: &[u8]| {
+            let sys = system_ref2.get();
+            // Write through Memory first, fallback to DeviceMemory.
+            if let Some(memory) = sys.memory_shared() {
+                let m = memory.lock().unwrap();
+                if m.write_block(addr, data) {
+                    return;
+                }
+            }
+            let dm = sys.device_memory();
+            let base = ruzu_core::device_memory::dram_memory_map::BASE;
+            if addr >= base {
+                let offset = (addr - base) as usize;
+                let backing = dm.buffer.backing_base_pointer();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        backing.add(offset) as *mut u8,
+                        data.len(),
+                    );
+                }
             }
         }));
         system.set_gpu_core(Box::new(gpu));

@@ -80,6 +80,13 @@ impl IHosBinderDriver {
 
         if let Some(binder) = svc.server.try_get_binder(id) {
             binder.transact(transaction_id, &parcel_data, &mut parcel_reply, flags);
+            log::info!(
+                "TransactParcel response: id={} txn={} reply_len={} first_bytes=[{:02x?}]",
+                id, transaction_id, parcel_reply.len(),
+                &parcel_reply[..parcel_reply.len().min(32)]
+            );
+        } else {
+            log::warn!("TransactParcel: binder id={} not found", id);
         }
         // Upstream: R_SUCCEED_IF(binder == nullptr) — silently succeeds if not found
 
@@ -122,9 +129,12 @@ impl IHosBinderDriver {
             id, type_id
         );
 
-        // Upstream returns a copy handle to a KReadableEvent from the binder.
-        // For now, create a readable event and return it.
-        if let Some(handle) = ctx.create_readable_event_handle(false) {
+        // Upstream returns a copy handle to a KReadableEvent from the binder's
+        // buffer queue (buffer-available event). When a buffer is available for
+        // dequeue, this event is signaled.
+        // For now, create a pre-signaled event so the game doesn't block.
+        // TODO: wire to actual buffer queue buffer-available signaling.
+        if let Some(handle) = ctx.create_readable_event_handle(true) {
             let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
             rb.push_result(RESULT_SUCCESS);
             rb.push_copy_objects(handle);

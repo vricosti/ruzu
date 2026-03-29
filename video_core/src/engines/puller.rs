@@ -323,6 +323,16 @@ impl Puller {
         u32::from_le_bytes(bytes)
     }
 
+    fn write_gpu_u32(&self, gpu_va: u64, value: u32) {
+        let bytes = value.to_le_bytes();
+        let gpu = unsafe { &*self.gpu };
+        self.memory_manager
+            .lock()
+            .write_block_unsafe(gpu_va, &bytes, &mut |cpu_addr, data| {
+                gpu.write_guest_memory(cpu_addr, data);
+            });
+    }
+
     /// Determine whether a method should be dispatched to an engine (true)
     /// or handled by the puller itself (false).
     ///
@@ -335,12 +345,6 @@ impl Puller {
     ///
     /// Corresponds to `Puller::CallMethod`.
     pub fn call_method(&mut self, method_call: &MethodCall) {
-        log::trace!(
-            "Processing method {:08X} on subchannel {}",
-            method_call.method,
-            method_call.subchannel
-        );
-
         assert!((method_call.subchannel as usize) < NUM_SUBCHANNELS);
 
         if Self::execute_method_on_engine(method_call.method) {
@@ -466,6 +470,13 @@ impl Puller {
             EngineID::MaxwellB => {
                 if let Some(engine) = channel_state.maxwell_3d.as_mut() {
                     engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                } else {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static DROP_COUNT: AtomicU32 = AtomicU32::new(0);
+                    let c = DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if c < 5 {
+                        log::warn!("Puller: MaxwellB method {:#x} DROPPED (maxwell_3d is None)", method_call.method);
+                    }
                 }
             }
             EngineID::KeplerInlineToMemoryB => {
@@ -473,8 +484,20 @@ impl Puller {
                     engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
                 }
             }
-            EngineID::FermiTwodA | EngineID::KeplerComputeB | EngineID::MaxwellDmaCopyA => {
-                log::warn!("Puller::call_engine_method: engine {:?} dispatch not yet wired", engine);
+            EngineID::FermiTwodA => {
+                if let Some(engine) = channel_state.fermi_2d.as_mut() {
+                    engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                }
+            }
+            EngineID::KeplerComputeB => {
+                if let Some(engine) = channel_state.kepler_compute.as_mut() {
+                    engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                }
+            }
+            EngineID::MaxwellDmaCopyA => {
+                if let Some(engine) = channel_state.maxwell_dma.as_mut() {
+                    engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                }
             }
         }
     }
@@ -482,9 +505,6 @@ impl Puller {
     /// Dispatch a multi-method call to the bound engine.
     ///
     /// Corresponds to `Puller::CallEngineMultiMethod`.
-    /// Stubbed — requires access to channel_state engines to look up the bound engine for
-    /// the subchannel and call engine->CallMultiMethod(method, base_start, amount, methods_pending).
-    /// Upstream: Puller::CallEngineMultiMethod() in video_core/engines/puller.cpp
     pub fn call_engine_multi_method(
         &mut self,
         method: u32,
@@ -513,14 +533,24 @@ impl Puller {
                     engine.call_multi_method(method, base_start, amount, methods_pending);
                 }
             }
-            EngineID::FermiTwodA | EngineID::KeplerComputeB | EngineID::MaxwellDmaCopyA => {
-                log::warn!(
-                    "Puller::call_engine_multi_method: engine {:?} dispatch not yet wired",
-                    engine
-                );
+            EngineID::FermiTwodA => {
+                if let Some(engine) = channel_state.fermi_2d.as_mut() {
+                    engine.call_multi_method(method, base_start, amount, methods_pending);
+                }
+            }
+            EngineID::KeplerComputeB => {
+                if let Some(engine) = channel_state.kepler_compute.as_mut() {
+                    engine.call_multi_method(method, base_start, amount, methods_pending);
+                }
+            }
+            EngineID::MaxwellDmaCopyA => {
+                if let Some(engine) = channel_state.maxwell_dma.as_mut() {
+                    engine.call_multi_method(method, base_start, amount, methods_pending);
+                }
             }
         }
     }
+
 
     // ── Private helpers ─────────────────────────────────────────────────
 
@@ -611,15 +641,21 @@ impl Puller {
     ///
     /// Corresponds to `Puller::ProcessSemaphoreAcquire`.
     fn process_semaphore_acquire(&mut self) {
+        let addr = self.regs.semaphore_address();
         let value = self.regs.semaphore_acquire();
-        while self.read_gpu_u32(self.regs.semaphore_address()) != value {
+        let mut word = self.read_gpu_u32(addr);
+        while word != value {
             self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(false));
+            word = self.read_gpu_u32(addr);
+            // TODO(kemathe73) figure out how to do the acquire_timeout
         }
     }
 
     /// Process a semaphore release.
     ///
     /// Corresponds to `Puller::ProcessSemaphoreRelease`.
+    /// Upstream calls `rasterizer->Query(address, Payload, IsAFence, payload, 0)`
+    /// which writes the payload value to GPU memory at the semaphore address.
     fn process_semaphore_release(&mut self) {
         let sequence_address = self.regs.semaphore_address();
         let payload = self.regs.semaphore_release();
@@ -628,6 +664,11 @@ impl Puller {
             sequence_address,
             payload
         );
+        // Upstream: rasterizer->Query(sequence_address, QueryType::Payload,
+        //           QueryPropertiesFlags::IsAFence, payload, 0);
+        // With the null rasterizer, write the payload directly to GPU memory
+        // so SemaphoreAcquire can find it.
+        self.write_gpu_u32(sequence_address, payload);
     }
 }
 

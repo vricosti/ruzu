@@ -23,6 +23,11 @@ impl VsyncManager {
         }
     }
 
+    /// Number of registered events.
+    pub fn event_count(&self) -> usize {
+        self.vsync_events.len()
+    }
+
     /// Signal all registered vsync events.
     /// Port of upstream `VsyncManager::SignalVsync`.
     pub fn signal_vsync(&self) {

@@ -331,7 +331,9 @@ impl DmaPusher {
             let gpu = unsafe { &*self.gpu };
             let mm = self.memory_manager.lock();
             mm.read_block_unsafe(command_list_header.addr(), &mut raw, &|cpu_addr, dst| {
-                let _ = gpu.read_guest_memory(cpu_addr, dst);
+                if !gpu.read_guest_memory(cpu_addr, dst) {
+                    log::warn!("DmaPusher: read_guest_memory FAILED cpu_addr={:#x} len={}", cpu_addr, dst.len());
+                }
             });
             drop(mm);
 
@@ -339,6 +341,14 @@ impl DmaPusher {
             self.command_headers.extend(raw.chunks_exact(4).map(|chunk| CommandHeader {
                 raw: u32::from_le_bytes(chunk.try_into().unwrap()),
             }));
+            let non_zero = self.command_headers.iter().filter(|h| h.raw != 0).count();
+            if non_zero > 0 {
+                log::info!(
+                    "DmaPusher::step {} commands ({} non-zero) first={:#010x}",
+                    self.command_headers.len(), non_zero,
+                    self.command_headers.first().map_or(0, |h| h.raw),
+                );
+            }
             self.process_commands(&self.command_headers.clone());
         }
         true
@@ -385,7 +395,9 @@ impl DmaPusher {
             let gpu = unsafe { &*self.gpu };
             let mm = self.memory_manager.lock();
             mm.read_block_unsafe(command_list_header.addr(), &mut raw, &|cpu_addr, dst| {
-                let _ = gpu.read_guest_memory(cpu_addr, dst);
+                if !gpu.read_guest_memory(cpu_addr, dst) {
+                    log::warn!("DmaPusher: read_guest_memory FAILED cpu_addr={:#x} len={}", cpu_addr, dst.len());
+                }
             });
             drop(mm);
 
