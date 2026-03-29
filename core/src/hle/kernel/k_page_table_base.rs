@@ -850,7 +850,7 @@ impl KPageTableBase {
             return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
         }
 
-        log::info!(
+        log::debug!(
             "KPageTableBase::InitializeForProcess: width={}, code=[{:#x}..{:#x}], \
              alias_code=[{:#x}..{:#x}], heap=[{:#x}..{:#x}], alias=[{:#x}..{:#x}], \
              stack=[{:#x}..{:#x}], kmap=[{:#x}..{:#x}]",
@@ -1276,8 +1276,25 @@ impl KPageTableBase {
     // -- QueryInfo --
 
     /// Query memory info at an address.
-    /// Matches upstream `KPageTableBase::QueryInfoImpl`.
+    /// Matches upstream `KPageTableBase::QueryInfo`.
     pub fn query_info(&self, addr: usize) -> Option<KMemoryInfo> {
+        if !self.contains(addr) {
+            return Some(KMemoryInfo {
+                m_address: self.m_address_space_end,
+                m_size: 0usize.wrapping_sub(self.m_address_space_end),
+                m_state: KMemoryState::INACCESSIBLE,
+                m_device_disable_merge_left_count: 0,
+                m_device_disable_merge_right_count: 0,
+                m_ipc_lock_count: 0,
+                m_device_use_count: 0,
+                m_ipc_disable_merge_count: 0,
+                m_permission: KMemoryPermission::NONE,
+                m_attribute: KMemoryAttribute::NONE,
+                m_original_permission: KMemoryPermission::NONE,
+                m_disable_merge_attribute: KMemoryBlockDisableMergeAttribute::NONE,
+            });
+        }
+
         self.m_memory_block_manager.query_info(addr)
     }
 
@@ -1370,6 +1387,11 @@ impl KPageTableBase {
         if mask_attr.contains(KMemoryAttribute::UNCACHED) {
             state_test_mask = KMemoryState::from_bits_truncate(
                 state_test_mask.bits() | KMemoryState::FLAG_CAN_CHANGE_ATTRIBUTE.bits(),
+            );
+        }
+        if mask_attr.contains(KMemoryAttribute::PERMISSION_LOCKED) {
+            state_test_mask = KMemoryState::from_bits_truncate(
+                state_test_mask.bits() | KMemoryState::FLAG_CAN_PERMISSION_LOCK.bits(),
             );
         }
 
@@ -2839,5 +2861,66 @@ impl KPageTableBase {
 impl Default for KPageTableBase {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::svc::svc_results;
+
+    #[test]
+    fn query_info_out_of_range_returns_inaccessible_terminal_block() {
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x0020_0000;
+        page_table.m_address_space_end = 0x4000_0000;
+
+        let info = page_table.query_info(0x4004_0000).unwrap();
+
+        assert_eq!(info.m_address, 0x4000_0000);
+        assert_eq!(info.m_size, 0usize.wrapping_sub(0x4000_0000));
+        assert_eq!(info.m_state, KMemoryState::INACCESSIBLE);
+        assert_eq!(info.m_permission, KMemoryPermission::NONE);
+        assert_eq!(info.m_attribute, KMemoryAttribute::NONE);
+        assert_eq!(info.m_ipc_lock_count, 0);
+        assert_eq!(info.m_device_use_count, 0);
+    }
+
+    #[test]
+    fn set_memory_attribute_permission_locked_requires_permission_lock_capability() {
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_4000;
+        page_table
+            .m_memory_block_manager
+            .initialize(page_table.m_address_space_start, page_table.m_address_space_end);
+
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            1,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let result = page_table.set_memory_attribute(
+            page_table.m_address_space_start,
+            PAGE_SIZE,
+            KMemoryAttribute::PERMISSION_LOCKED.bits().into(),
+            KMemoryAttribute::PERMISSION_LOCKED.bits().into(),
+        );
+
+        assert_eq!(
+            result,
+            svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value()
+        );
+
+        let info = page_table
+            .m_memory_block_manager
+            .query_info(page_table.m_address_space_start)
+            .unwrap();
+        assert_eq!(info.m_attribute, KMemoryAttribute::NONE);
     }
 }

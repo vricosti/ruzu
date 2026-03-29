@@ -119,6 +119,7 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
 
     if (session_handler_name == "sm:" && context.get_command() == 1)
         || (session_handler_name == "lm" && context.get_command() == 0)
+        || (session_handler_name == "nvdrv" && context.get_command() == 1)
     {
         if let Some(memory) = system.get_svc_memory() {
             let m = memory.lock().unwrap();

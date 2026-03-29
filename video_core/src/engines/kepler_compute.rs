@@ -9,6 +9,7 @@
 //! `take_dispatch_calls()`.
 
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
+use crate::rasterizer_interface::RasterizerInterface;
 
 // ── Register offset constants (method addresses) ────────────────────────────
 
@@ -143,6 +144,7 @@ pub struct KeplerCompute {
     dispatch_calls: Vec<DispatchCall>,
     /// QMD GPU VA set on LAUNCH write, consumed by execute_pending.
     pending_launch: Option<u64>,
+    rasterizer: Option<[usize; 2]>,
 }
 
 impl KeplerCompute {
@@ -151,7 +153,15 @@ impl KeplerCompute {
             regs: Box::new([0u32; ENGINE_REG_COUNT]),
             dispatch_calls: Vec::new(),
             pending_launch: None,
+            rasterizer: None,
         }
+    }
+
+    /// Corresponds to `KeplerCompute::BindRasterizer`.
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
+        self.rasterizer = Some(unsafe {
+            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
+        });
     }
 
     // ── Register accessors ──────────────────────────────────────────────
@@ -513,6 +523,16 @@ mod tests {
         // Second take should be empty.
         let second = engine.take_dispatch_calls();
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn test_bind_rasterizer_stores_reference() {
+        let syncpoints = std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        let mut engine = KeplerCompute::new();
+        assert!(engine.rasterizer.is_none());
+        engine.bind_rasterizer(&rasterizer);
+        assert!(engine.rasterizer.is_some());
     }
 
     #[test]

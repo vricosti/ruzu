@@ -66,7 +66,10 @@ impl NvDevice for NvDispDisp0 {
     fn on_open(&self, _session_id: SessionId, _fd: DeviceFD) {}
     fn on_close(&self, _fd: DeviceFD) {}
 
-    fn query_event(&self, event_id: u32) -> Option<u32> {
+    fn query_event(
+        &self,
+        event_id: u32,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>> {
         log::error!("Unknown DISP Event {}", event_id);
         None
     }

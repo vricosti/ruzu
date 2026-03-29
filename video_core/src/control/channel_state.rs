@@ -9,56 +9,14 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::dma_pusher::{CommandList, DmaPusher};
+use crate::dma_pusher::DmaPusher;
+use crate::engines::fermi_2d::Fermi2D;
+use crate::engines::kepler_compute::KeplerCompute;
+use crate::engines::kepler_memory::KeplerMemory;
+use crate::engines::maxwell_3d::Maxwell3D;
+use crate::engines::maxwell_dma::MaxwellDMA;
+use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerInterface;
-
-// ---------------------------------------------------------------------------
-// Forward-declared / opaque placeholders for engine types not yet ported.
-// These mirror the C++ forward declarations in channel_state.h.
-// As the corresponding crates/modules are ported, replace with real imports.
-// ---------------------------------------------------------------------------
-
-/// Placeholder for `Tegra::Engines::Maxwell3D`.
-pub struct Maxwell3D {
-    _private: (),
-}
-
-/// Placeholder for `Tegra::Engines::Fermi2D`.
-pub struct Fermi2D {
-    _private: (),
-}
-
-/// Placeholder for `Tegra::Engines::KeplerCompute`.
-pub struct KeplerCompute {
-    _private: (),
-}
-
-/// Placeholder for `Tegra::Engines::MaxwellDMA`.
-pub struct MaxwellDMA {
-    _private: (),
-}
-
-/// Placeholder for `Tegra::Engines::KeplerMemory`.
-pub struct KeplerMemory {
-    _private: (),
-}
-
-/// Placeholder for `Tegra::MemoryManager`.
-pub struct MemoryManager {
-    id: usize,
-}
-
-impl MemoryManager {
-    /// Placeholder constructor.
-    pub fn new(id: usize) -> Self {
-        Self { id }
-    }
-
-    /// Return the unique address-space ID.  Upstream: `MemoryManager::GetID()`.
-    pub fn get_id(&self) -> usize {
-        self.id
-    }
-}
 
 // ---------------------------------------------------------------------------
 // ChannelState
@@ -124,15 +82,18 @@ impl ChannelState {
         );
         self.program_id = program_id;
 
-        // Upstream creates all engines here:
-        //   maxwell_3d = std::make_unique<Maxwell3D>(system, *memory_manager)
-        //   fermi_2d = std::make_unique<Fermi2D>()
-        //   kepler_compute = std::make_unique<KeplerCompute>(system, *memory_manager)
-        //   maxwell_dma = std::make_unique<MaxwellDMA>(system, *memory_manager)
-        //   kepler_memory = std::make_unique<KeplerMemory>(system, *memory_manager)
+        // Upstream creates DmaPusher first, then the engine set.
+        self.dma_pusher = Some(Box::new(crate::dma_pusher::DmaPusher::new(
+            _gpu as *const crate::gpu::Gpu,
+            Arc::clone(self.memory_manager.as_ref().unwrap()),
+            self as *mut ChannelState,
+        )));
 
-        // Create the DMA pusher for this channel.
-        self.dma_pusher = Some(Box::new(crate::dma_pusher::DmaPusher::new()));
+        self.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        self.fermi_2d = Some(Box::new(Fermi2D::new()));
+        self.kepler_compute = Some(Box::new(KeplerCompute::new()));
+        self.maxwell_dma = Some(Box::new(MaxwellDMA::new()));
+        self.kepler_memory = Some(Box::new(KeplerMemory::new()));
 
         self.initialized = true;
         log::debug!(
@@ -146,22 +107,34 @@ impl ChannelState {
     ///
     /// Corresponds to `ChannelState::BindRasterizer(RasterizerInterface*)`.
     ///
-    /// In the full implementation, this forwards the rasterizer reference to:
-    /// dma_pusher, memory_manager, maxwell_3d, fermi_2d, kepler_memory,
-    /// kepler_compute, maxwell_dma.
-    pub fn bind_rasterizer(&mut self, _rasterizer: &dyn RasterizerInterface) {
+    /// In the current port, this forwards the rasterizer reference through the
+    /// same owner list as upstream.
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
         log::debug!(
             "ChannelState::bind_rasterizer bind_id={}",
             self.bind_id
         );
-        // Forward to DMA pusher if available.
-        // Upstream: dma_pusher->BindRasterizer(rasterizer)
-        // The real DmaPusher will forward to its Puller.
-        // DmaPusher::bind_rasterizer is not yet integrated — requires Puller port.
-        if let Some(ref mut _dma) = self.dma_pusher {
-            // dma.bind_rasterizer(rasterizer);
+        if let Some(ref mut dma) = self.dma_pusher {
+            dma.bind_rasterizer(rasterizer);
         }
-        // Forward to engines when they are instantiated
+        if let Some(ref mut mm) = self.memory_manager {
+            mm.lock().bind_rasterizer();
+        }
+        if let Some(ref mut maxwell_3d) = self.maxwell_3d {
+            maxwell_3d.bind_rasterizer(rasterizer);
+        }
+        if let Some(ref mut fermi_2d) = self.fermi_2d {
+            fermi_2d.bind_rasterizer(rasterizer);
+        }
+        if let Some(ref mut kepler_memory) = self.kepler_memory {
+            kepler_memory.bind_rasterizer();
+        }
+        if let Some(ref mut kepler_compute) = self.kepler_compute {
+            kepler_compute.bind_rasterizer(rasterizer);
+        }
+        if let Some(ref mut maxwell_dma) = self.maxwell_dma {
+            maxwell_dma.bind_rasterizer(rasterizer);
+        }
     }
 }
 

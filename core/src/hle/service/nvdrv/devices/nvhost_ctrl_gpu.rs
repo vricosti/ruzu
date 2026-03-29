@@ -4,9 +4,13 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.h
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.cpp
 
+use std::sync::{Arc, Mutex};
+
+use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
+use crate::hle::service::nvdrv::nvdrv::EventInterface;
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
 
 #[repr(C)]
@@ -145,12 +149,16 @@ const _: () = assert!(std::mem::size_of::<IoctlGetGpuTime>() == 0x10);
 
 /// nvhost_ctrl_gpu device.
 pub struct NvHostCtrlGpu {
-    // Stubbed: events would be managed through EventInterface.
+    error_notifier_event: Arc<Mutex<KReadableEvent>>,
+    unknown_event: Arc<Mutex<KReadableEvent>>,
 }
 
 impl NvHostCtrlGpu {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(events_interface: Arc<EventInterface>) -> Self {
+        Self {
+            error_notifier_event: events_interface.create_event("CtrlGpuErrorNotifier"),
+            unknown_event: events_interface.create_event("CtrlGpuUnknownEvent"),
+        }
     }
 
     fn fill_gpu_characteristics(gc: &mut IoctlGpuCharacteristics) {
@@ -393,12 +401,10 @@ impl NvDevice for NvHostCtrlGpu {
     fn on_open(&self, _session_id: SessionId, _fd: DeviceFD) {}
     fn on_close(&self, _fd: DeviceFD) {}
 
-    fn query_event(&self, event_id: u32) -> Option<u32> {
+    fn query_event(&self, event_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
         match event_id {
-            1 | 2 => {
-                // Stubbed: would return error_notifier_event or unknown_event
-                Some(event_id)
-            }
+            1 => Some(Arc::clone(&self.error_notifier_event)),
+            2 => Some(Arc::clone(&self.unknown_event)),
             _ => {
                 log::error!("Unknown Ctrl GPU Event {}", event_id);
                 None

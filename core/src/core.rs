@@ -142,15 +142,15 @@ pub struct System {
 
     /// Host1x subsystem (syncpoint manager, device memory, GMMU, CDMA devices).
     /// Upstream: `std::unique_ptr<Tegra::Host1x::Host1x> host1x_core`.
-    /// Type-erased because video_core crate does not depend on core.
-    /// The frontend creates the concrete Host1x and sets it via set_host1x_core().
-    host1x_core: Option<Box<dyn Any + Send>>,
+    /// Stored behind an opaque bridge so `core` keeps upstream ownership
+    /// without naming `video_core` concrete types.
+    host1x_core: Option<Box<dyn crate::host1x_core::Host1xCoreInterface>>,
 
     /// GPU core (channels, engines, rendering, host synchronization).
     /// Upstream: `std::unique_ptr<Tegra::GPU> gpu_core`.
     /// Type-erased because video_core crate does not depend on core.
     /// The frontend creates the concrete GPU and sets it via set_gpu_core().
-    gpu_core: Option<Box<dyn Any + Send>>,
+    gpu_core: Option<Box<dyn crate::gpu_core::GpuCoreInterface>>,
 
     /// AudioCore subsystem (audio sinks, ADSP, audio manager).
     /// Upstream: `std::unique_ptr<AudioCore::AudioCore> audio_core`.
@@ -821,38 +821,41 @@ impl System {
     /// Set the Host1x core subsystem.
     /// Called by the frontend after System::load() since video_core does not
     /// depend on core. Upstream: created in SetupForApplicationProcess() (core.cpp:277).
-    pub fn set_host1x_core(&mut self, host1x: Box<dyn Any + Send>) {
+    pub fn set_host1x_core(
+        &mut self,
+        host1x: Box<dyn crate::host1x_core::Host1xCoreInterface>,
+    ) {
         self.host1x_core = Some(host1x);
     }
 
-    /// Get the Host1x core (type-erased).
-    /// Callers must downcast to the concrete Host1x type.
+    /// Get the Host1x core.
     /// Upstream: `System::Host1x()` returns `Tegra::Host1x::Host1x&`.
-    pub fn host1x_core(&self) -> Option<&(dyn Any + Send)> {
+    pub fn host1x_core(&self) -> Option<&dyn crate::host1x_core::Host1xCoreInterface> {
         self.host1x_core.as_deref()
     }
 
-    /// Get the Host1x core mutably (type-erased).
-    pub fn host1x_core_mut(&mut self) -> Option<&mut (dyn Any + Send)> {
+    pub fn host1x_core_mut(
+        &mut self,
+    ) -> Option<&mut dyn crate::host1x_core::Host1xCoreInterface> {
         self.host1x_core.as_deref_mut()
     }
 
     /// Set the GPU core subsystem.
     /// Called by the frontend after System::load() since video_core does not
     /// depend on core. Upstream: created in SetupForApplicationProcess() (core.cpp:278).
-    pub fn set_gpu_core(&mut self, gpu: Box<dyn Any + Send>) {
+    pub fn set_gpu_core(&mut self, gpu: Box<dyn crate::gpu_core::GpuCoreInterface>) {
         self.gpu_core = Some(gpu);
     }
 
     /// Get the GPU core (type-erased).
     /// Callers must downcast to the concrete GPU type.
     /// Upstream: `System::GPU()` returns `Tegra::GPU&`.
-    pub fn gpu_core(&self) -> Option<&(dyn Any + Send)> {
+    pub fn gpu_core(&self) -> Option<&dyn crate::gpu_core::GpuCoreInterface> {
         self.gpu_core.as_deref()
     }
 
     /// Get the GPU core mutably (type-erased).
-    pub fn gpu_core_mut(&mut self) -> Option<&mut (dyn Any + Send)> {
+    pub fn gpu_core_mut(&mut self) -> Option<&mut dyn crate::gpu_core::GpuCoreInterface> {
         self.gpu_core.as_deref_mut()
     }
 

@@ -15,9 +15,9 @@ use std::sync::Arc;
 use super::gl_device::Device;
 use crate::engines::maxwell_3d::DrawCall;
 use crate::engines::Framebuffer;
+use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer::SoftwareRasterizer;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
-use crate::syncpoint::SyncpointManager;
 
 /// OpenGL rasterizer matching zuyu's `RasterizerOpenGL`.
 ///
@@ -125,12 +125,16 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn signal_sync_point(&mut self, id: u32) {
-        self.syncpoints.increment(id);
+        log::info!("RasterizerOpenGL::signal_sync_point id={}", id);
+        self.syncpoints.increment_guest(id);
+        self.syncpoints.increment_host(id);
     }
 
     fn signal_reference(&mut self) {}
 
-    fn release_fences(&mut self, _force: bool) {}
+    fn release_fences(&mut self, force: bool) {
+        log::info!("RasterizerOpenGL::release_fences force={}", force);
+    }
 
     fn flush_all(&mut self) {
         unsafe { gl::Flush(); }

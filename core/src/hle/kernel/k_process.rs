@@ -662,9 +662,8 @@ impl KProcess {
             as *mut DynarmicExclusiveMonitor;
 
         let dummy_system: u32 = 0;
-        let dummy_process = unsafe {
-            &*(&dummy_system as *const u32
-                as *const crate::arm::arm_interface::KProcess)
+        let process = unsafe {
+            &*(self as *const KProcess as *const crate::arm::arm_interface::KProcess)
         };
 
         for i in 0..hardware_properties::NUM_CPU_CORES as usize {
@@ -673,7 +672,7 @@ impl KProcess {
                 Box::new(ArmDynarmic64::new(
                     &dummy_system as &dyn std::any::Any,
                     true, // uses_wall_clock
-                    dummy_process,
+                    process,
                     em_ptr,
                     i,
                     shared_memory.clone(),
@@ -685,7 +684,7 @@ impl KProcess {
                 let mut arm = Box::new(ArmDynarmic32::new(
                     &dummy_system as &dyn std::any::Any,
                     true, // uses_wall_clock
-                    dummy_process,
+                    process,
                     em_ptr,
                     i,
                     shared_memory.clone(),

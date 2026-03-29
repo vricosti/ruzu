@@ -7,6 +7,24 @@
 use std::any::Any;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct GpuCommandListHeader {
+    pub raw: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct GpuCommandHeader {
+    pub raw: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GpuCommandList {
+    pub command_lists: Vec<GpuCommandListHeader>,
+    pub prefetch_command_list: Vec<GpuCommandHeader>,
+}
+
 /// Opaque GPU memory-manager state handle.
 pub trait GpuMemoryManagerHandle: Any + Send + Sync {
     fn as_any(&self) -> &(dyn Any + Send + Sync);
@@ -32,6 +50,9 @@ pub trait GpuChannelHandle: Send + Sync {
 
     /// Mirrors the upstream `system.GPU().InitChannel(*channel_state, program_id)`.
     fn init_channel(&self, program_id: u64);
+
+    /// Mirrors the upstream `channel_state->bind_id`.
+    fn bind_id(&self) -> i32;
 }
 
 /// Opaque GPU implementation owned by [`crate::core::System`].
@@ -50,4 +71,10 @@ pub trait GpuCoreInterface: Any + Send {
         big_page_bits: u64,
         page_bits: u64,
     ) -> Arc<dyn GpuMemoryManagerHandle>;
+
+    /// Mirrors the upstream `GPU::InitAddressSpace(Tegra::MemoryManager&)`.
+    fn init_address_space(&self, memory_manager: Arc<dyn GpuMemoryManagerHandle>);
+
+    /// Mirrors the upstream `GPU::PushGPUEntries(s32, CommandList&&)`.
+    fn push_gpu_entries(&self, channel_id: i32, entries: GpuCommandList);
 }

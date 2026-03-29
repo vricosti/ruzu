@@ -175,27 +175,52 @@ impl NvMapDevice {
             log::error!("Object failed to allocate, handle={:08X}", params.handle);
             return result;
         }
+        log::debug!(
+            "nvmap::IocAlloc result handle={} align=0x{:X} kind=0x{:X} address=0x{:X}",
+            params.handle,
+            params.align,
+            params.kind,
+            params.address
+        );
 
         let Some(process) = self.container().get_session_process(session_id) else {
             log::error!("Active session missing process for fd={}", fd);
             return NvResult::InvalidState;
         };
 
+        let before_info = {
+            let process_guard = process.lock().unwrap();
+            process_guard.page_table.get_base().query_info(params.address as usize)
+        };
+        if params.handle == 8 {
+            log::debug!("nvmap::IocAlloc before lock handle=8 info={:?}", before_info);
+        }
+
         let handle_size = {
             let inner = handle.lock_inner();
             inner.size as usize
         };
-        let lock_result = process
-            .lock()
-            .unwrap()
-            .page_table
-            .get_base_mut()
-            .lock_for_map_device_address_space(
-                params.address as usize,
-                handle_size,
-                KMemoryPermission::NONE,
-                true,
+        let (lock_result, after_info) = {
+            let mut process_guard = process.lock().unwrap();
+            let lock_result = process_guard
+                .page_table
+                .get_base_mut()
+                .lock_for_map_device_address_space(
+                    params.address as usize,
+                    handle_size,
+                    KMemoryPermission::NONE,
+                    true,
+                );
+            let after_info = process_guard.page_table.get_base().query_info(params.address as usize);
+            (lock_result, after_info)
+        };
+        if params.handle == 8 {
+            log::debug!(
+                "nvmap::IocAlloc after lock handle=8 result=0x{:X} info={:?}",
+                lock_result,
+                after_info
             );
+        }
         if lock_result != 0 {
             log::error!(
                 "LockForMapDeviceAddressSpace failed: handle={:08X} result=0x{:X}",

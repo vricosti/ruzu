@@ -13,6 +13,7 @@ use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::{ClassId, Engine, Framebuffer, PendingWrite, ENGINE_REG_COUNT};
 use crate::descriptor_table::{TicTable, TscTable};
 use crate::macro_interpreter::{MacroInterpreter, MacroProcessor};
+use crate::rasterizer_interface::RasterizerInterface;
 
 // ── Register offset constants (method addresses) ────────────────────────────
 
@@ -1628,6 +1629,8 @@ pub struct Maxwell3D {
     inline_index_data: Vec<u8>,
     /// Pending semaphore writes to be returned by execute_pending.
     pending_semaphore_writes: Vec<PendingWrite>,
+    /// Bound rasterizer backend.
+    rasterizer: Option<[usize; 2]>,
     /// MME macro interpreter for programmable macro execution.
     macro_interpreter: MacroInterpreter,
     /// Method of the macro currently being fed parameters (0 = none).
@@ -1673,6 +1676,7 @@ impl Maxwell3D {
             instance_count: 0,
             inline_index_data: Vec::new(),
             pending_semaphore_writes: Vec::new(),
+            rasterizer: None,
             macro_interpreter: MacroInterpreter::new(),
             executing_macro: 0,
             macro_params: Vec::new(),
@@ -1687,6 +1691,23 @@ impl Maxwell3D {
     /// Whether conditional rendering allows execution.
     pub fn should_execute(&self) -> bool {
         self.execute_on
+    }
+
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
+        self.rasterizer = Some(unsafe {
+            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
+        });
+    }
+
+    fn with_rasterizer_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut dyn RasterizerInterface) -> R,
+    ) -> Option<R> {
+        let raw = self.rasterizer?;
+        let rasterizer = unsafe {
+            &mut *std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
+        };
+        Some(f(rasterizer))
     }
 
     // ── Render target accessors ──────────────────────────────────────────
@@ -2632,9 +2653,7 @@ impl Maxwell3D {
     ) {
         match method {
             WAIT_FOR_IDLE => {
-                // Upstream calls rasterizer->WaitForIdle(). We log since rasterizer
-                // may not be bound yet.
-                log::trace!("Maxwell3D: wait_for_idle");
+                let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.wait_for_idle());
             }
             SHADOW_RAM_CONTROL => {
                 self.shadow_state[SHADOW_RAM_CONTROL as usize] = nonshadow_argument;
@@ -2683,13 +2702,16 @@ impl Maxwell3D {
                 log::trace!("Maxwell3D: inline_data 0x{:X}", argument);
             }
             FRAGMENT_BARRIER => {
-                log::trace!("Maxwell3D: fragment_barrier");
+                let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.fragment_barrier());
             }
             INVALIDATE_TEXTURE_DATA_CACHE => {
-                log::trace!("Maxwell3D: invalidate_texture_data_cache");
+                let _ = self.with_rasterizer_mut(|rasterizer| {
+                    rasterizer.invalidate_gpu_cache();
+                    rasterizer.wait_for_idle();
+                });
             }
             TILED_CACHE_BARRIER => {
-                log::trace!("Maxwell3D: tiled_cache_barrier");
+                let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.tiled_cache_barrier());
             }
             _ => {
                 // Delegate to draw manager equivalent.
@@ -2857,6 +2879,9 @@ impl Maxwell3D {
                 address,
                 size
             );
+            let _ = self.with_rasterizer_mut(|rasterizer| {
+                rasterizer.bind_graphics_uniform_buffer(stage_index, slot as u32, address, size)
+            });
         } else {
             self.cb_bindings[stage_index][slot] = ConstBufferBinding::default();
             log::trace!(
@@ -2864,6 +2889,9 @@ impl Maxwell3D {
                 stage_index,
                 slot
             );
+            let _ = self.with_rasterizer_mut(|rasterizer| {
+                rasterizer.disable_graphics_uniform_buffer(stage_index, slot as u32)
+            });
         }
     }
 
@@ -2966,14 +2994,21 @@ impl Maxwell3D {
     fn process_counter_reset(&mut self) {
         let clear_report = self.regs[CLEAR_REPORT_VALUE as usize];
         log::debug!("Maxwell3D: counter_reset report=0x{:X}", clear_report);
-        // In the full implementation, this calls rasterizer->ResetCounter(query_type).
+        let query_type = match clear_report {
+            1 => 2,
+            2 => 6,
+            3 => 1,
+            4 => 7,
+            _ => 0,
+        };
+        let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.reset_counter(query_type));
     }
 
     /// Handle sync point. Matches upstream `ProcessSyncPoint`.
     fn process_sync_point(&mut self) {
         let sync_point = self.regs[SYNC_INFO as usize] & 0xFFFF;
         log::debug!("Maxwell3D: sync_point {}", sync_point);
-        // In the full implementation, this calls rasterizer->SignalSyncPoint(sync_point).
+        let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.signal_sync_point(sync_point));
     }
 
     // ── Macro processing (matching upstream ProcessMacro / CallMacroMethod) ─
@@ -3312,6 +3347,95 @@ impl Engine for Maxwell3D {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default, Clone)]
+    struct RasterizerCalls {
+        wait_for_idle: u32,
+        signal_sync_point: Vec<u32>,
+        reset_counter: Vec<u32>,
+        bound_uniforms: Vec<(usize, u32, u64, u32)>,
+        disabled_uniforms: Vec<(usize, u32)>,
+    }
+
+    struct TestRasterizer {
+        calls: Arc<Mutex<RasterizerCalls>>,
+    }
+
+    impl TestRasterizer {
+        fn new(calls: Arc<Mutex<RasterizerCalls>>) -> Self {
+            Self { calls }
+        }
+    }
+
+    impl RasterizerInterface for TestRasterizer {
+        fn draw(&mut self, _is_indexed: bool, _instance_count: u32) {}
+        fn draw_texture(&mut self) {}
+        fn clear(&mut self, _layer_count: u32) {}
+        fn dispatch_compute(&mut self) {}
+        fn reset_counter(&mut self, query_type: u32) {
+            self.calls.lock().unwrap().reset_counter.push(query_type);
+        }
+        fn query(
+            &mut self,
+            _gpu_addr: u64,
+            _query_type: u32,
+            _has_timeout: bool,
+            _payload: u32,
+            _subreport: u32,
+            _gpu_write: &dyn Fn(u64, &[u8]),
+        ) {
+        }
+        fn bind_graphics_uniform_buffer(
+            &mut self,
+            stage: usize,
+            index: u32,
+            gpu_addr: u64,
+            size: u32,
+        ) {
+            self.calls
+                .lock()
+                .unwrap()
+                .bound_uniforms
+                .push((stage, index, gpu_addr, size));
+        }
+        fn disable_graphics_uniform_buffer(&mut self, stage: usize, index: u32) {
+            self.calls
+                .lock()
+                .unwrap()
+                .disabled_uniforms
+                .push((stage, index));
+        }
+        fn signal_fence(&mut self, _func: Box<dyn FnOnce()>) {}
+        fn sync_operation(&mut self, _func: Box<dyn FnOnce()>) {}
+        fn signal_sync_point(&mut self, value: u32) {
+            self.calls.lock().unwrap().signal_sync_point.push(value);
+        }
+        fn signal_reference(&mut self) {}
+        fn release_fences(&mut self, _force: bool) {}
+        fn flush_all(&mut self) {}
+        fn flush_region(&mut self, _addr: u64, _size: u64) {}
+        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool { false }
+        fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
+            RasterizerDownloadArea { start_address: addr, end_address: addr + size, preemptive: false }
+        }
+        fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
+        fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool { false }
+        fn invalidate_gpu_cache(&mut self) {}
+        fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
+        fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
+        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn wait_for_idle(&mut self) {
+            self.calls.lock().unwrap().wait_for_idle += 1;
+        }
+        fn fragment_barrier(&mut self) {}
+        fn tiled_cache_barrier(&mut self) {}
+        fn flush_commands(&mut self) {}
+        fn tick_frame(&mut self) {}
+        fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
+    }
 
     // ── Existing tests ───────────────────────────────────────────────────
 
@@ -5594,9 +5718,42 @@ mod tests {
     #[test]
     fn test_call_method_sync_point() {
         let mut engine = Maxwell3D::new();
-        // Writing sync_info should not panic.
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
         engine.call_method(SYNC_INFO, 42, true);
         assert_eq!(engine.regs[SYNC_INFO as usize], 42);
+        assert_eq!(calls.lock().unwrap().signal_sync_point, vec![42]);
+    }
+
+    #[test]
+    fn test_wait_for_idle_calls_rasterizer() {
+        let mut engine = Maxwell3D::new();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
+        engine.call_method(WAIT_FOR_IDLE, 0, true);
+        assert_eq!(calls.lock().unwrap().wait_for_idle, 1);
+    }
+
+    #[test]
+    fn test_cb_bind_forwards_to_rasterizer() {
+        let mut engine = Maxwell3D::new();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
+
+        engine.call_method(CB_CONFIG_BASE, 0x800, true);
+        engine.call_method(CB_CONFIG_BASE + 1, 0x1, true);
+        engine.call_method(CB_CONFIG_BASE + 2, 0x2000, true);
+        let bind_base = (CB_BIND_BASE + 0 * CB_BIND_STRIDE) as usize;
+        engine.regs[bind_base + 4] = 0x21;
+        engine.call_method(CB_BIND_TRIGGER_0, 0x21, true);
+
+        assert_eq!(
+            calls.lock().unwrap().bound_uniforms,
+            vec![(0, 2, 0x1_0000_2000, 0x800)]
+        );
     }
 
     #[test]

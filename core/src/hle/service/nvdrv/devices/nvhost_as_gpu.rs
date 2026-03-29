@@ -316,6 +316,11 @@ impl NvHostAsGpu {
                 vm.big_page_size_bits as u64,
                 VM::PAGE_SIZE_BITS as u64,
             );
+        self.system
+            .get()
+            .gpu_core()
+            .expect("GPU core must remain initialized during nvhost_as_gpu::AllocAsEx")
+            .init_address_space(gmmu.clone());
         *self.gmmu.lock().unwrap() = Some(gmmu);
         vm.initialised = true;
 
@@ -937,6 +942,10 @@ mod tests {
         fn bind_memory_manager(&self, _memory_manager: Arc<dyn GpuMemoryManagerHandle>) {}
 
         fn init_channel(&self, _program_id: u64) {}
+
+        fn bind_id(&self) -> i32 {
+            1
+        }
     }
 
     impl GpuMemoryManagerHandle for FakeGpuMemoryManagerHandle {
@@ -985,6 +994,12 @@ mod tests {
                 ops: Arc::clone(&self.ops),
             })
         }
+
+        fn init_address_space(&self, _memory_manager: Arc<dyn GpuMemoryManagerHandle>) {
+            self.ops.lock().unwrap().push("init_address_space".to_string());
+        }
+
+        fn push_gpu_entries(&self, _channel_id: i32, _entries: crate::gpu_core::GpuCommandList) {}
     }
 
     #[test]
@@ -1003,6 +1018,25 @@ mod tests {
         };
         assert_eq!(gpu_as.allocate_space(&mut params), NvResult::Success);
         assert_ne!(params.offset, 0);
+    }
+
+    #[test]
+    fn alloc_as_ex_initializes_gpu_address_space_after_allocating_memory_manager() {
+        let system = System::new_for_test();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new();
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+
+        let mut alloc_as = IoctlAllocAsEx::default();
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
+
+        let gpu_core = system.gpu_core().unwrap();
+        let fake_gpu = gpu_core
+            .as_any()
+            .downcast_ref::<FakeGpuCore>()
+            .expect("test system should expose FakeGpuCore");
+        let ops = fake_gpu.ops.lock().unwrap();
+        assert!(ops.iter().any(|op| op == "init_address_space"));
     }
 
     #[test]

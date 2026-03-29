@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use log::error;
+use ruzu_core::host1x_core::Host1xCoreInterface;
 
 use crate::host1x::ffmpeg::ffmpeg::Frame;
 use crate::host1x::syncpoint_manager::SyncpointManager;
@@ -252,5 +253,37 @@ impl Host1x {
 impl Default for Host1x {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Host1xCoreInterface for Host1x {
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+
+    fn get_host_syncpoint_value(&self, id: u32) -> u32 {
+        self.syncpoint_manager.get_host_syncpoint_value(id)
+    }
+
+    fn wait_host(&self, id: u32, expected_value: u32) {
+        self.syncpoint_manager.wait_host(id, expected_value);
+    }
+
+    fn register_host_action(
+        &self,
+        id: u32,
+        expected_value: u32,
+        action: Box<dyn FnOnce() + Send>,
+    ) -> Option<u64> {
+        self.syncpoint_manager
+            .register_host_action(id, expected_value, action)
+            .map(|handle| handle.raw())
+    }
+
+    fn deregister_host_action(&self, id: u32, handle: u64) {
+        self.syncpoint_manager.deregister_host_action(
+            id,
+            &crate::host1x::syncpoint_manager::ActionHandle::from_raw(handle),
+        );
     }
 }

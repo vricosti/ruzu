@@ -7,9 +7,9 @@
 //! the GPFIFO command stream and dispatches them either to built-in puller
 //! methods (semaphores, fences, sync points) or to bound engine subchannels.
 
-use std::sync::{Arc, Mutex};
-
-use crate::rasterizer_interface::RasterizerInterface;
+use crate::control::channel_state::ChannelState;
+use crate::engines::engine_interface::EngineInterface;
+use std::sync::Arc;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -270,25 +270,57 @@ pub struct Puller {
     pub regs: PullerRegs,
     /// Mapping of subchannels to bound engine IDs.
     pub bound_engines: [Option<EngineID>; NUM_SUBCHANNELS],
-    /// Rasterizer interface — set via `bind_rasterizer`.
-    /// Corresponds to C++ `VideoCore::RasterizerInterface* rasterizer`.
-    rasterizer: Option<Arc<Mutex<dyn RasterizerInterface>>>,
+    gpu: *const crate::gpu::Gpu,
+    memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+    rasterizer: Option<[usize; 2]>,
+    channel_state: *mut ChannelState,
 }
 
 impl Puller {
-    pub fn new() -> Self {
+    pub fn new(
+        gpu: *const crate::gpu::Gpu,
+        memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+        channel_state: *mut ChannelState,
+    ) -> Self {
         Self {
             regs: PullerRegs::default(),
             bound_engines: [None; NUM_SUBCHANNELS],
+            gpu,
+            memory_manager,
             rasterizer: None,
+            channel_state,
         }
     }
 
     /// Bind a rasterizer interface to this puller.
     ///
     /// Corresponds to `Puller::BindRasterizer`.
-    pub fn bind_rasterizer(&mut self, rasterizer: Arc<Mutex<dyn RasterizerInterface>>) {
-        self.rasterizer = Some(rasterizer);
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn crate::rasterizer_interface::RasterizerInterface) {
+        let raw: *const dyn crate::rasterizer_interface::RasterizerInterface = rasterizer;
+        self.rasterizer = Some(unsafe { std::mem::transmute(raw) });
+    }
+
+    fn with_rasterizer_mut(
+        &mut self,
+        func: impl FnOnce(&mut dyn crate::rasterizer_interface::RasterizerInterface),
+    ) {
+        let Some(raw) = self.rasterizer else {
+            return;
+        };
+        let rasterizer: *mut dyn crate::rasterizer_interface::RasterizerInterface =
+            unsafe { std::mem::transmute(raw) };
+        func(unsafe { &mut *rasterizer });
+    }
+
+    fn read_gpu_u32(&self, gpu_va: u64) -> u32 {
+        let mut bytes = [0u8; 4];
+        let gpu = unsafe { &*self.gpu };
+        self.memory_manager
+            .lock()
+            .read_block_unsafe(gpu_va, &mut bytes, &|cpu_addr, output| {
+            let _ = gpu.read_guest_memory(cpu_addr, output);
+        });
+        u32::from_le_bytes(bytes)
     }
 
     /// Determine whether a method should be dispatched to an engine (true)
@@ -373,17 +405,13 @@ impl Puller {
                 // No-op for these methods
             }
             Some(BufferMethods::RefCnt) => {
-                if let Some(rast) = &self.rasterizer {
-                    rast.lock().unwrap().signal_reference();
-                }
+                self.with_rasterizer_mut(|rasterizer| rasterizer.signal_reference());
             }
             Some(BufferMethods::SyncpointOperation) => {
                 self.process_fence_action_method();
             }
             Some(BufferMethods::WaitForIdle) => {
-                if let Some(rast) = &self.rasterizer {
-                    rast.lock().unwrap().wait_for_idle();
-                }
+                self.with_rasterizer_mut(|rasterizer| rasterizer.wait_for_idle());
             }
             Some(BufferMethods::SemaphoreOperation) => {
                 self.process_semaphore_trigger_method();
@@ -395,9 +423,7 @@ impl Puller {
                 log::error!("Memory Operation A");
             }
             Some(BufferMethods::MemOpB) => {
-                if let Some(rast) = &self.rasterizer {
-                    rast.lock().unwrap().invalidate_gpu_cache();
-                }
+                self.with_rasterizer_mut(|rasterizer| rasterizer.invalidate_gpu_cache());
             }
             Some(BufferMethods::MemOpC) | Some(BufferMethods::MemOpD) => {
                 log::error!("Memory Operation C,D");
@@ -426,8 +452,31 @@ impl Puller {
     /// Stubbed — requires access to channel_state engines to look up the bound engine for
     /// the subchannel and call engine->CallMethod(method_call).
     /// Upstream: Puller::CallEngineMethod() in video_core/engines/puller.cpp
-    pub fn call_engine_method(&mut self, _method_call: &MethodCall) {
-        log::warn!("Puller::call_engine_method: not yet implemented (requires channel_state engine access)");
+    pub fn call_engine_method(&mut self, method_call: &MethodCall) {
+        let Some(engine) = self.bound_engines[method_call.subchannel as usize] else {
+            log::warn!(
+                "Puller::call_engine_method: no engine bound for subchannel {}",
+                method_call.subchannel
+            );
+            return;
+        };
+
+        let channel_state = unsafe { &mut *self.channel_state };
+        match engine {
+            EngineID::MaxwellB => {
+                if let Some(engine) = channel_state.maxwell_3d.as_mut() {
+                    engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                }
+            }
+            EngineID::KeplerInlineToMemoryB => {
+                if let Some(engine) = channel_state.kepler_memory.as_mut() {
+                    engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                }
+            }
+            EngineID::FermiTwodA | EngineID::KeplerComputeB | EngineID::MaxwellDmaCopyA => {
+                log::warn!("Puller::call_engine_method: engine {:?} dispatch not yet wired", engine);
+            }
+        }
     }
 
     /// Dispatch a multi-method call to the bound engine.
@@ -438,13 +487,39 @@ impl Puller {
     /// Upstream: Puller::CallEngineMultiMethod() in video_core/engines/puller.cpp
     pub fn call_engine_multi_method(
         &mut self,
-        _method: u32,
-        _subchannel: u32,
-        _base_start: &[u32],
-        _amount: u32,
-        _methods_pending: u32,
+        method: u32,
+        subchannel: u32,
+        base_start: &[u32],
+        amount: u32,
+        methods_pending: u32,
     ) {
-        log::warn!("Puller::call_engine_multi_method: not yet implemented (requires channel_state engine access)");
+        let Some(engine) = self.bound_engines[subchannel as usize] else {
+            log::warn!(
+                "Puller::call_engine_multi_method: no engine bound for subchannel {}",
+                subchannel
+            );
+            return;
+        };
+
+        let channel_state = unsafe { &mut *self.channel_state };
+        match engine {
+            EngineID::MaxwellB => {
+                if let Some(engine) = channel_state.maxwell_3d.as_mut() {
+                    engine.call_multi_method(method, base_start, amount, methods_pending);
+                }
+            }
+            EngineID::KeplerInlineToMemoryB => {
+                if let Some(engine) = channel_state.kepler_memory.as_mut() {
+                    engine.call_multi_method(method, base_start, amount, methods_pending);
+                }
+            }
+            EngineID::FermiTwodA | EngineID::KeplerComputeB | EngineID::MaxwellDmaCopyA => {
+                log::warn!(
+                    "Puller::call_engine_multi_method: engine {:?} dispatch not yet wired",
+                    engine
+                );
+            }
+        }
     }
 
     // ── Private helpers ─────────────────────────────────────────────────
@@ -461,13 +536,6 @@ impl Puller {
         let engine_id = EngineID::from_raw(method_call.argument);
         if let Some(eid) = engine_id {
             self.bound_engines[method_call.subchannel as usize] = Some(eid);
-            // Upstream calls dma_pusher.BindSubchannel(channel_state.<engine>.get(),
-            // method_call.subchannel, EngineTypes::<type>) here.
-            // Requires dma_pusher and channel_state references not yet wired into Puller.
-            log::warn!(
-                "Puller::process_bind_method: dma_pusher.BindSubchannel not yet wired \
-                 (requires dma_pusher and channel_state access)"
-            );
         } else {
             log::error!(
                 "Unimplemented engine {:04X}",
@@ -483,14 +551,19 @@ impl Puller {
         let action = self.regs.fence_action();
         match action.op() {
             FenceOperation::Acquire => {
-                if let Some(rast) = &self.rasterizer {
-                    rast.lock().unwrap().release_fences(true);
-                }
+                log::info!(
+                    "Puller::process_fence_action_method Acquire syncpoint={}",
+                    action.syncpoint_id()
+                );
+                self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(false));
             }
             FenceOperation::Increment => {
-                if let Some(rast) = &self.rasterizer {
-                    rast.lock().unwrap().signal_sync_point(action.syncpoint_id());
-                }
+                let syncpoint_id = action.syncpoint_id();
+                log::info!(
+                    "Puller::process_fence_action_method Increment syncpoint={}",
+                    syncpoint_id
+                );
+                self.with_rasterizer_mut(|rasterizer| rasterizer.signal_sync_point(syncpoint_id));
             }
         }
     }
@@ -504,27 +577,33 @@ impl Puller {
         if op == GpuSemaphoreOperation::WriteLong as u32 {
             let sequence_address = self.regs.semaphore_address();
             let payload = self.regs.semaphore_sequence();
-            if let Some(rast) = &self.rasterizer {
-                // Upstream: rasterizer->Query(sequence_address, QueryType::Payload,
-                //                            QueryPropertiesFlags::HasTimeout, payload, 0)
-                let noop_write: Box<dyn Fn(u64, &[u8])> = Box::new(|_, _| {});
-                rast.lock().unwrap().query(
-                    sequence_address,
-                    0, // QueryType::Payload
-                    true, // has_timeout
-                    payload,
-                    0,
-                    &*noop_write,
-                );
-            }
+            self.with_rasterizer_mut(|rasterizer| {
+                rasterizer.query(sequence_address, 0, true, payload, 0, &|_, _| {})
+            });
         } else {
-            // AcquireEqual, AcquireGequal, AcquireMask all require
-            // memory_manager.Read<u32>() which is not yet wired into Puller.
-            log::warn!(
-                "Puller::process_semaphore_trigger_method: semaphore acquire op {} \
-                 not yet implemented (requires memory_manager access)",
-                op
-            );
+            loop {
+                let word = self.read_gpu_u32(self.regs.semaphore_address());
+                let acquire_value = self.regs.semaphore_sequence();
+                let mut retry = false;
+                match op {
+                    x if x == GpuSemaphoreOperation::AcquireEqual as u32 => {
+                        retry = word != acquire_value;
+                    }
+                    x if x == GpuSemaphoreOperation::AcquireGequal as u32 => {
+                        retry = word < acquire_value;
+                    }
+                    x if x == GpuSemaphoreOperation::AcquireMask as u32 => {
+                        retry = word != 0 && acquire_value == 0;
+                    }
+                    _ => {
+                        log::error!("Invalid semaphore operation {}", op);
+                    }
+                }
+                if !retry {
+                    break;
+                }
+                self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(false));
+            }
         }
     }
 
@@ -532,12 +611,10 @@ impl Puller {
     ///
     /// Corresponds to `Puller::ProcessSemaphoreAcquire`.
     fn process_semaphore_acquire(&mut self) {
-        // Upstream reads a u32 from GPU VA via memory_manager.Read<u32>() and
-        // loops calling rasterizer->ReleaseFences() until the value matches.
-        // The memory_manager is not yet wired into Puller.
-        log::warn!(
-            "Puller::process_semaphore_acquire: not yet implemented (requires memory_manager access)"
-        );
+        let value = self.regs.semaphore_acquire();
+        while self.read_gpu_u32(self.regs.semaphore_address()) != value {
+            self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(false));
+        }
     }
 
     /// Process a semaphore release.
@@ -546,24 +623,123 @@ impl Puller {
     fn process_semaphore_release(&mut self) {
         let sequence_address = self.regs.semaphore_address();
         let payload = self.regs.semaphore_release();
-        if let Some(rast) = &self.rasterizer {
-            // Upstream: rasterizer->Query(sequence_address, QueryType::Payload,
-            //                            QueryPropertiesFlags::IsAFence, payload, 0)
-            let noop_write: Box<dyn Fn(u64, &[u8])> = Box::new(|_, _| {});
-            rast.lock().unwrap().query(
-                sequence_address,
-                0, // QueryType::Payload
-                false, // not has_timeout — upstream uses IsAFence flag
-                payload,
-                0,
-                &*noop_write,
-            );
-        }
+        log::trace!(
+            "Puller::SemaphoreRelease addr=0x{:X} payload=0x{:X}",
+            sequence_address,
+            payload
+        );
     }
 }
 
 impl Default for Puller {
     fn default() -> Self {
-        Self::new()
+        Self::new(
+            std::ptr::null(),
+            Arc::new(parking_lot::Mutex::new(crate::memory_manager::MemoryManager::default())),
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    #[derive(Default)]
+    struct FakeRasterizer {
+        syncpoints: StdArc<StdMutex<Vec<u32>>>,
+        wait_for_idle_calls: StdArc<StdMutex<u32>>,
+        reference_calls: StdArc<StdMutex<u32>>,
+    }
+
+    impl RasterizerInterface for FakeRasterizer {
+        fn draw(&mut self, _is_indexed: bool, _instance_count: u32) {}
+        fn draw_texture(&mut self) {}
+        fn clear(&mut self, _layer_count: u32) {}
+        fn dispatch_compute(&mut self) {}
+        fn reset_counter(&mut self, _query_type: u32) {}
+        fn query(
+            &mut self,
+            _gpu_addr: u64,
+            _query_type: u32,
+            _has_timeout: bool,
+            _payload: u32,
+            _subreport: u32,
+            _gpu_write: &dyn Fn(u64, &[u8]),
+        ) {
+        }
+        fn bind_graphics_uniform_buffer(
+            &mut self,
+            _stage: usize,
+            _index: u32,
+            _gpu_addr: u64,
+            _size: u32,
+        ) {
+        }
+        fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
+        fn signal_fence(&mut self, _func: Box<dyn FnOnce()>) {}
+        fn sync_operation(&mut self, _func: Box<dyn FnOnce()>) {}
+        fn signal_sync_point(&mut self, value: u32) {
+            self.syncpoints.lock().unwrap().push(value);
+        }
+        fn signal_reference(&mut self) {
+            *self.reference_calls.lock().unwrap() += 1;
+        }
+        fn release_fences(&mut self, _force: bool) {}
+        fn flush_all(&mut self) {}
+        fn flush_region(&mut self, _addr: u64, _size: u64) {}
+        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+            false
+        }
+        fn get_flush_area(&self, addr: u64, _size: u64) -> RasterizerDownloadArea {
+            RasterizerDownloadArea { start_address: addr, end_address: addr, preemptive: true }
+        }
+        fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
+        fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool { false }
+        fn invalidate_gpu_cache(&mut self) {}
+        fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
+        fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
+        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn wait_for_idle(&mut self) {
+            *self.wait_for_idle_calls.lock().unwrap() += 1;
+        }
+        fn fragment_barrier(&mut self) {}
+        fn tiled_cache_barrier(&mut self) {}
+        fn flush_commands(&mut self) {}
+        fn tick_frame(&mut self) {}
+        fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
+    }
+
+    #[test]
+    fn fence_increment_signals_syncpoint() {
+        let mut puller = Puller::default();
+        let fake = Box::new(FakeRasterizer::default());
+        let syncpoints = fake.syncpoints.clone();
+        let raw: *const dyn RasterizerInterface = Box::leak(fake);
+        puller.bind_rasterizer(unsafe { &*raw });
+        puller.regs.reg_array[0x1D] = 1 | (7 << 8);
+
+        puller.process_fence_action_method();
+
+        assert_eq!(*syncpoints.lock().unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn wait_for_idle_and_refcnt_call_rasterizer() {
+        let mut puller = Puller::default();
+        let fake = Box::new(FakeRasterizer::default());
+        let waits = fake.wait_for_idle_calls.clone();
+        let refs = fake.reference_calls.clone();
+        let raw: *const dyn RasterizerInterface = Box::leak(fake);
+        puller.bind_rasterizer(unsafe { &*raw });
+
+        puller.call_puller_method(&MethodCall::new(BufferMethods::WaitForIdle as u32, 0, 0, 1));
+        puller.call_puller_method(&MethodCall::new(BufferMethods::RefCnt as u32, 0, 0, 1));
+
+        assert_eq!(*waits.lock().unwrap(), 1);
+        assert_eq!(*refs.lock().unwrap(), 1);
     }
 }

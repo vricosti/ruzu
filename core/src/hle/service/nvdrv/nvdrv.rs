@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
+use crate::hle::kernel::k_readable_event::KReadableEvent;
 use super::core::container::{Container, SessionId};
 use super::devices::nvdevice::NvDevice;
 use super::devices::nvdisp_disp0::NvDispDisp0;
@@ -28,36 +30,30 @@ use super::nvdata::*;
 /// Since we don't have a full kernel event system, this is a lightweight placeholder
 /// that tracks event allocations.
 pub struct EventInterface {
-    guard: Mutex<()>,
-    next_event_id: Mutex<u32>,
+    system: SystemRef,
 }
 
 impl EventInterface {
-    pub fn new() -> Self {
-        Self {
-            guard: Mutex::new(()),
-            next_event_id: Mutex::new(0),
-        }
+    pub fn new(system: SystemRef) -> Self {
+        Self { system }
     }
 
-    /// Creates a new event with the given name.
-    /// In the C++ code: module.service_context.CreateEvent(name)
-    /// Returns an opaque event identifier.
-    pub fn create_event(&self, name: &str) -> u32 {
-        let _lock = self.guard.lock().unwrap();
-        let mut next_id = self.next_event_id.lock().unwrap();
-        let id = *next_id;
-        *next_id += 1;
-        log::debug!("EventInterface::create_event('{}') -> {}", name, id);
-        id
+    pub fn system(&self) -> SystemRef {
+        self.system
+    }
+
+    /// Creates a persistent readable event owned by nvdrv.
+    pub fn create_event(&self, name: &str) -> Arc<Mutex<KReadableEvent>> {
+        let object_id = self.system.get().kernel().unwrap().create_new_object_id() as u64;
+        let readable_event = Arc::new(Mutex::new(KReadableEvent::new()));
+        readable_event.lock().unwrap().initialize(0, object_id);
+        log::debug!("EventInterface::create_event('{}') -> object_id={}", name, object_id);
+        readable_event
     }
 
     /// Frees a previously created event.
     /// In the C++ code: module.service_context.CloseEvent(event)
-    pub fn free_event(&self, _event_id: u32) {
-        let _lock = self.guard.lock().unwrap();
-        // In the C++ code, this calls service_context.CloseEvent(event)
-        // Since we don't have kernel events yet, this is a no-op.
+    pub fn free_event(&self, _event: Arc<Mutex<KReadableEvent>>) {
     }
 }
 
@@ -67,17 +63,19 @@ pub struct Module {
     container: Container,
     next_fd: Mutex<DeviceFD>,
     open_files: Mutex<HashMap<DeviceFD, Arc<dyn NvDevice + Send + Sync>>>,
-    events_interface: EventInterface,
+    gpu_files: Mutex<HashMap<DeviceFD, Arc<NvHostGpu>>>,
+    events_interface: Arc<EventInterface>,
 }
 
 impl Module {
     pub fn new(system: crate::core::SystemRef) -> Arc<Self> {
         Arc::new(Self {
             system,
-            container: Container::new(),
+            container: Container::new_with_system(system),
             next_fd: Mutex::new(1),
             open_files: Mutex::new(HashMap::new()),
-            events_interface: EventInterface::new(),
+            gpu_files: Mutex::new(HashMap::new()),
+            events_interface: Arc::new(EventInterface::new(system)),
         })
     }
 
@@ -101,16 +99,27 @@ impl Module {
         drop(next_fd);
 
         let device: Arc<dyn NvDevice + Send + Sync> = match device_name {
-            "/dev/nvhost-as-gpu" => Arc::new(NvHostAsGpu::new()),
-            "/dev/nvhost-gpu" => Arc::new(NvHostGpu::new()),
-            "/dev/nvhost-ctrl-gpu" => Arc::new(NvHostCtrlGpu::new()),
+            "/dev/nvhost-as-gpu" => Arc::new(NvHostAsGpu::new(self.system, self, &self.container)),
+            "/dev/nvhost-gpu" => {
+                let gpu = Arc::new(NvHostGpu::new(
+                    self.system,
+                    Arc::clone(&self.events_interface),
+                    &self.container,
+                ));
+                self.gpu_files.lock().unwrap().insert(fd, Arc::clone(&gpu));
+                gpu
+            }
+            "/dev/nvhost-ctrl-gpu" => Arc::new(NvHostCtrlGpu::new(Arc::clone(&self.events_interface))),
             "/dev/nvmap" => Arc::new(NvMapDevice::new(
                 self.container.get_nv_map_file(),
                 &self.container,
             )),
             "/dev/nvdisp_disp0" => Arc::new(NvDispDisp0::new()),
             "/dev/nvhost-ctrl" => {
-                Arc::new(NvHostCtrl::new(self.container.get_syncpoint_manager()))
+                Arc::new(NvHostCtrl::new(
+                    Arc::clone(&self.events_interface),
+                    self.container.get_syncpoint_manager(),
+                ))
             }
             "/dev/nvhost-nvdec" => Arc::new(NvHostNvDec::new()),
             "/dev/nvhost-nvjpg" => Arc::new(NvHostNvJpg::new()),
@@ -204,6 +213,7 @@ impl Module {
         }
         let mut files = self.open_files.lock().unwrap();
         if let Some(device) = files.remove(&fd) {
+            self.gpu_files.lock().unwrap().remove(&fd);
             device.on_close(fd);
             NvResult::Success
         } else {
@@ -215,8 +225,11 @@ impl Module {
     /// Queries an event for a given device fd and event_id.
     ///
     /// Port of Module::QueryEvent from nvdrv.cpp.
-    /// Returns (NvResult, Option<event_token>) where event_token is an opaque identifier.
-    pub fn query_event(&self, fd: DeviceFD, event_id: u32) -> (NvResult, Option<u32>) {
+    pub fn query_event(
+        &self,
+        fd: DeviceFD,
+        event_id: u32,
+    ) -> (NvResult, Option<Arc<Mutex<KReadableEvent>>>) {
         if fd < 0 {
             log::error!("Invalid DeviceFD={}!", fd);
             return (NvResult::InvalidState, None);
@@ -242,7 +255,11 @@ impl Module {
         &self.container
     }
 
-    pub fn get_events_interface(&self) -> &EventInterface {
+    pub fn get_events_interface(&self) -> &Arc<EventInterface> {
         &self.events_interface
+    }
+
+    pub fn get_gpu_device(&self, fd: DeviceFD) -> Option<Arc<NvHostGpu>> {
+        self.gpu_files.lock().unwrap().get(&fd).cloned()
     }
 }

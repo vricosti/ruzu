@@ -3,6 +3,9 @@
 
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvdevice.h
 
+use std::sync::{Arc, Mutex};
+
+use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
 
@@ -44,8 +47,11 @@ pub trait NvDevice {
     /// Called once a device is closed.
     fn on_close(&self, fd: DeviceFD);
 
-    /// Queries an event by id. Returns None if no event exists for the given id.
-    fn query_event(&self, _event_id: u32) -> Option<u32> {
+    /// Queries the readable end of a persistent nvdrv event by id.
+    ///
+    /// Upstream returns `Kernel::KEvent*` here and the interface layer copies its readable end
+    /// into the caller handle table. The Rust port returns the persistent readable event directly.
+    fn query_event(&self, _event_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
         None
     }
 }

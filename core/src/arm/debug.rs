@@ -6,6 +6,7 @@
 
 use crate::arm::arm_interface::ThreadContext;
 use crate::arm::symbols;
+use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
 use crate::hardware_properties;
 use std::collections::BTreeMap;
 
@@ -40,6 +41,61 @@ pub struct BacktraceEntry {
 /// Segment base addresses for 32-bit and 64-bit modes.
 /// Upstream: `constexpr std::array<u64, 2> SegmentBases{0x60000000ULL, 0x7100000000ULL};`
 const SEGMENT_BASES: [u64; 2] = [0x6000_0000, 0x71_0000_0000];
+
+fn can_walk_frame_record<F>(fp: u64, record_size: u64, is_valid_range: F) -> bool
+where
+    F: FnOnce(u64, u64) -> bool,
+{
+    fp != 0 && (fp % 4 == 0) && is_valid_range(fp, record_size)
+}
+
+fn is_mapped_process_range(
+    process: &crate::hle::kernel::k_process::KProcess,
+    base: u64,
+    size: u64,
+) -> bool {
+    if size == 0 {
+        return false;
+    }
+
+    let start = match usize::try_from(base) {
+        Ok(start) => start,
+        Err(_) => return false,
+    };
+
+    let info = match process.page_table.query_info(start) {
+        Some(info) => info,
+        None => return false,
+    };
+
+    range_fits_memory_info(base, size, &info)
+}
+
+fn range_fits_memory_info(
+    base: u64,
+    size: u64,
+    info: &crate::hle::kernel::k_memory_block::KMemoryInfo,
+) -> bool {
+    let start = match usize::try_from(base) {
+        Ok(start) => start,
+        Err(_) => return false,
+    };
+    let end = match start.checked_add(size as usize) {
+        Some(end) => end,
+        None => return false,
+    };
+
+    if start < info.get_address() || end > info.get_end_address() {
+        return false;
+    }
+
+    if (info.get_state() & KMemoryState::MASK).bits() == 0 {
+        return false;
+    }
+
+    let permission = info.get_permission();
+    permission != KMemoryPermission::NONE && !permission.contains(KMemoryPermission::NOT_MAPPED)
+}
 
 /// Helper: transmute opaque KProcess to real KProcess.
 /// SAFETY: The caller must ensure the pointer actually points to a real KProcess.
@@ -227,16 +283,22 @@ pub fn get_backtrace_from_context(
     let mem = memory.read().unwrap();
 
     let mut entries = Vec::new();
-    let mut fp = if is_64bit { ctx.fp } else { ctx.r[11] };
+    let pc = ctx.pc;
+    let mut fp = ctx.fp;
     let mut lr = ctx.lr;
+
+    entries.push(BacktraceEntry {
+        module: String::new(),
+        address: pc,
+        original_address: pc,
+        offset: 0,
+        name: String::new(),
+    });
 
     // Walk frame pointer chain.
     // AArch64: fp+0 = prev fp, fp+8 = return address
     // AArch32: fp+0 = prev fp, fp+4 = return address
     for _ in 0..256 {
-        if lr == 0 {
-            break;
-        }
         entries.push(BacktraceEntry {
             module: String::new(),
             address: lr,
@@ -244,32 +306,84 @@ pub fn get_backtrace_from_context(
             offset: 0,
             name: String::new(),
         });
-        if fp == 0 {
-            break;
-        }
+
         if is_64bit {
+            if !can_walk_frame_record(fp, 16, |base, size| is_mapped_process_range(process, base, size))
+            {
+                break;
+            }
             let new_fp = mem.read_64(fp);
             lr = mem.read_64(fp + 8);
-            if new_fp == fp || new_fp == 0 {
-                break;
-            }
             fp = new_fp;
         } else {
-            let new_fp = mem.read_32(fp) as u64;
-            lr = mem.read_32(fp + 4) as u64;
-            if new_fp == fp || new_fp == 0 {
+            if !can_walk_frame_record(fp, 8, |base, size| is_mapped_process_range(process, base, size))
+            {
                 break;
             }
+            let new_fp = mem.read_32(fp) as u64;
+            lr = mem.read_32(fp + 4) as u64;
             fp = new_fp;
         }
     }
 
     // Symbolicate.
-    let opaque_process = unsafe {
-        &*(process as *const crate::hle::kernel::k_process::KProcess as *const KProcess)
-    };
-    symbolicate_backtrace(opaque_process, &mut entries, is_64bit);
+    symbolicate_backtrace(process, &mut entries, is_64bit);
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{can_walk_frame_record, range_fits_memory_info};
+    use crate::hle::kernel::k_memory_block::{
+        KMemoryAttribute, KMemoryBlockDisableMergeAttribute, KMemoryInfo, KMemoryPermission,
+        KMemoryState,
+    };
+
+    #[test]
+    fn can_walk_frame_record_rejects_zero_and_misaligned_pointers() {
+        assert!(!can_walk_frame_record(0, 8, |_, _| true));
+        assert!(!can_walk_frame_record(3, 8, |_, _| true));
+        assert!(can_walk_frame_record(4, 8, |_, _| true));
+    }
+
+    #[test]
+    fn can_walk_frame_record_requires_valid_range() {
+        assert!(!can_walk_frame_record(0x1000, 8, |_, _| false));
+        assert!(can_walk_frame_record(0x1000, 8, |base, size| base == 0x1000 && size == 8));
+    }
+
+    fn mapped_info(address: usize, size: usize, permission: KMemoryPermission) -> KMemoryInfo {
+        KMemoryInfo {
+            m_address: address,
+            m_size: size,
+            m_state: KMemoryState::NORMAL,
+            m_device_disable_merge_left_count: 0,
+            m_device_disable_merge_right_count: 0,
+            m_ipc_lock_count: 0,
+            m_device_use_count: 0,
+            m_ipc_disable_merge_count: 0,
+            m_permission: permission,
+            m_attribute: KMemoryAttribute::NONE,
+            m_original_permission: permission,
+            m_disable_merge_attribute: KMemoryBlockDisableMergeAttribute::NONE,
+        }
+    }
+
+    #[test]
+    fn range_fits_memory_info_requires_backed_readable_region() {
+        let info = mapped_info(0x2000, 0x1000, KMemoryPermission::USER_READ_WRITE);
+
+        assert!(range_fits_memory_info(0x2000, 8, &info));
+        assert!(!range_fits_memory_info(0x1FFC, 8, &info));
+        assert!(!range_fits_memory_info(0x3000, 8, &info));
+    }
+
+    #[test]
+    fn range_fits_memory_info_rejects_unmapped_permissions() {
+        let info = mapped_info(0x2000, 0x1000, KMemoryPermission::NOT_MAPPED);
+
+        assert!(!range_fits_memory_info(0x2000, 8, &info));
+    }
 }
 
 /// Get a backtrace from a thread.
@@ -301,11 +415,11 @@ pub fn get_backtrace(thread: &KThread) -> Vec<BacktraceEntry> {
 /// Symbolicate a backtrace by resolving module names and symbol names.
 /// Corresponds to upstream anonymous `SymbolicateBacktrace` (debug.cpp).
 fn symbolicate_backtrace(
-    process: &KProcess,
+    process: &crate::hle::kernel::k_process::KProcess,
     out: &mut Vec<BacktraceEntry>,
     is_64: bool,
 ) {
-    let modules = find_modules(process);
+    let modules = find_modules_for_process(process);
     let segment_base = SEGMENT_BASES[is_64 as usize];
 
     for entry in out.iter_mut() {
@@ -326,4 +440,15 @@ fn symbolicate_backtrace(
 
         // Symbol lookup would go here via symbols::get_symbol_name.
     }
+}
+
+fn find_modules_for_process(
+    process: &crate::hle::kernel::k_process::KProcess,
+) -> Modules {
+    let memory = process.get_shared_memory();
+    let mem = memory.read().unwrap();
+    let _is_64bit = process.is_64bit();
+
+    drop(mem);
+    Modules::new()
 }

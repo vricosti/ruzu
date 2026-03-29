@@ -7,6 +7,7 @@
 //! trigger writes and logs parameters; actual pixel copy is not yet implemented.
 
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
+use crate::rasterizer_interface::RasterizerInterface;
 
 // ── Register constants (method = byte_offset / 4) ──────────────────────────
 
@@ -33,6 +34,7 @@ pub struct Fermi2D {
     regs: Box<[u32; ENGINE_REG_COUNT]>,
     /// Set when a blit trigger is detected; consumed by tests / future logic.
     pub pending_blit: bool,
+    rasterizer: Option<[usize; 2]>,
 }
 
 impl Fermi2D {
@@ -40,7 +42,15 @@ impl Fermi2D {
         Self {
             regs: Box::new([0u32; ENGINE_REG_COUNT]),
             pending_blit: false,
+            rasterizer: None,
         }
+    }
+
+    /// Corresponds to `Fermi2D::BindRasterizer`.
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
+        self.rasterizer = Some(unsafe {
+            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
+        });
     }
 
     // ── Typed accessors ────────────────────────────────────────────────
@@ -250,6 +260,16 @@ mod tests {
         let mut eng = Fermi2D::new();
         eng.write_reg(0x100, 42); // Random register
         assert!(!eng.pending_blit);
+    }
+
+    #[test]
+    fn test_bind_rasterizer_stores_reference() {
+        let syncpoints = std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
+        let mut eng = Fermi2D::new();
+        assert!(eng.rasterizer.is_none());
+        eng.bind_rasterizer(&rasterizer);
+        assert!(eng.rasterizer.is_some());
     }
 
     #[test]

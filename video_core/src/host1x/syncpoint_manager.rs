@@ -24,6 +24,16 @@ pub struct RegisteredAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActionHandle(u64);
 
+impl ActionHandle {
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// Internal storage for actions keyed by a monotonic ID.
 struct ActionEntry {
     id: u64,
