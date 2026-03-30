@@ -85,10 +85,26 @@ pub fn create_thread(
     let object_id = system.kernel().unwrap().create_new_object_id() as u64;
     let thread_id = system.kernel().unwrap().create_new_thread_id();
 
+    // Create the guest thread fiber entry — matches upstream
+    // `system.GetCpuManager().GetGuestThreadFunc()`.
+    let guest_thread_func: Option<Box<dyn FnOnce() + Send>> = {
+        let kernel = system.kernel().expect("kernel must exist");
+        let kp = kernel as *const crate::hle::kernel::kernel::KernelCore as usize;
+        let is_multicore = kernel.is_multicore();
+        Some(Box::new(move || {
+            let kernel = unsafe { &*(kp as *const crate::hle::kernel::kernel::KernelCore) };
+            if is_multicore {
+                crate::cpu_manager::CpuManager::multi_core_run_guest_thread(kernel);
+            } else {
+                crate::cpu_manager::CpuManager::single_core_run_guest_thread_entry(kernel);
+            }
+        }))
+    };
+
     let thread = Arc::new(Mutex::new(KThread::new()));
     {
         let mut new_thread = thread.lock().unwrap();
-        let result = new_thread.initialize_user_thread(
+        let result = new_thread.initialize_user_thread_with_init_func(
             entry_point,
             arg,
             stack_bottom,
@@ -98,6 +114,7 @@ pub fn create_thread(
             thread_id,
             object_id,
             system.runtime_is_64bit(),
+            guest_thread_func,
         );
         if result != RESULT_SUCCESS.get_inner_value() {
             return ResultCode::new(result);
@@ -118,6 +135,13 @@ pub fn create_thread(
     if handle_table_result != RESULT_SUCCESS.get_inner_value() {
         let _ = process.delete_thread_local_region(thread_tls_address);
         return ResultCode::new(handle_table_result);
+    }
+
+    // Register the thread with the GlobalSchedulerContext so the scheduler can
+    // find it by thread_id during fiber dispatch.
+    // Upstream: KThread::Register(kernel, thread) adds to kernel object list.
+    if let Some(ref gsc) = process.global_scheduler_context {
+        gsc.lock().unwrap().add_thread(Arc::clone(&thread));
     }
 
     process.register_thread_object(thread);

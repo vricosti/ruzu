@@ -13,13 +13,15 @@ fn hash_value_unsigned(val: u64) -> usize {
 
     let mut i = length * size_t_bits;
     while i > 0 {
-        seed ^= (val >> i) as usize;
-        seed = seed.wrapping_add(seed << 6).wrapping_add(seed >> 2);
+        seed ^= ((val >> i) as usize)
+            .wrapping_add(seed << 6)
+            .wrapping_add(seed >> 2);
         i -= size_t_bits;
     }
 
-    seed ^= val as usize;
-    seed = seed.wrapping_add(seed << 6).wrapping_add(seed >> 2);
+    seed ^= (val as usize)
+        .wrapping_add(seed << 6)
+        .wrapping_add(seed >> 2);
 
     seed
 }
@@ -27,7 +29,7 @@ fn hash_value_unsigned(val: u64) -> usize {
 /// Combines a hash seed with a new value.
 /// On 64-bit platforms, uses a MurmurHash-inspired mixing function.
 /// On 32-bit platforms, uses the boost hash_combine formula.
-fn hash_combine_impl(mut h: usize, k: usize) -> usize {
+fn hash_combine_impl(h: usize, k: usize) -> usize {
     #[cfg(target_pointer_width = "64")]
     {
         let m: u64 = (0xc6a4a793u64 << 32) + 0x5bd1e995;
@@ -95,6 +97,22 @@ pub fn hash_u32_slice(v: &[u32]) -> usize {
 mod tests {
     use super::*;
 
+    fn upstream_hash_value_unsigned_u32(val: u32) -> usize {
+        let mut seed: usize = 0;
+        seed ^= (val as usize)
+            .wrapping_add(seed << 6)
+            .wrapping_add(seed >> 2);
+        seed
+    }
+
+    fn upstream_hash_range_u32(v: &[u32]) -> usize {
+        let mut seed: usize = 0;
+        for &word in v {
+            seed = hash_combine_impl(seed, upstream_hash_value_unsigned_u32(word));
+        }
+        seed
+    }
+
     #[test]
     fn test_hash_combine_deterministic() {
         let mut seed1: usize = 0;
@@ -134,5 +152,21 @@ mod tests {
     fn test_hash_empty() {
         let h = hash_range(std::iter::empty::<u64>());
         assert_eq!(h, 0);
+    }
+
+    #[test]
+    fn test_hash_u32_slice_matches_upstream_reference() {
+        let code = [
+            0x0011_0071,
+            0x0740_0451,
+            0x0000_0301,
+            0x0000_0041,
+            0x0000_2041,
+            0x0000_1841,
+            0x0231_0021,
+            0x0000_0841,
+        ];
+
+        assert_eq!(hash_u32_slice(&code), upstream_hash_range_u32(&code));
     }
 }

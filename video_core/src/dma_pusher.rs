@@ -8,9 +8,11 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::engines::engine_interface::EngineInterface;
-use crate::engines::puller::{MethodCall, Puller};
+use crate::engines::engine_interface::EngineTypes;
+use crate::engines::puller::{EngineID, MethodCall, Puller};
 use parking_lot::Mutex;
 
 /// GPU virtual address type.
@@ -179,6 +181,7 @@ const MAX_SUBCHANNELS: usize = 8;
 const MACRO_REGISTERS_START: u32 = 0xE00;
 #[allow(dead_code)]
 const COMPUTE_INLINE: u32 = 0x6D;
+static DISPATCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Internal DMA state tracking.
 #[derive(Debug, Default)]
@@ -207,6 +210,8 @@ pub struct DmaPusher {
     dma_increment_once: bool,
     ib_enable: bool,
     command_headers: Vec<CommandHeader>,
+    subchannels: [Option<[usize; 2]>; MAX_SUBCHANNELS],
+    subchannel_type: [EngineTypes; MAX_SUBCHANNELS],
     gpu: *const crate::gpu::Gpu,
     memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
     puller: Puller,
@@ -231,10 +236,23 @@ impl DmaPusher {
             dma_increment_once: false,
             ib_enable: true,
             command_headers: Vec::new(),
+            subchannels: [None; MAX_SUBCHANNELS],
+            subchannel_type: [EngineTypes::Maxwell3D; MAX_SUBCHANNELS],
             gpu,
             memory_manager,
-            puller: Puller::new(gpu, puller_memory_manager, channel_state),
+            puller: Puller::new(gpu, puller_memory_manager, std::ptr::null_mut(), channel_state),
         }
+    }
+
+    /// Install the stable boxed self pointer into the embedded puller.
+    ///
+    /// This must be called only after the `DmaPusher` has reached its final
+    /// owning address. Doing it inside `new()` would capture a pre-move
+    /// address and make `Puller::ProcessBindMethod()` write subchannel
+    /// bindings into stale storage.
+    pub fn install_self_reference(&mut self) {
+        let self_ptr: *mut DmaPusher = self;
+        self.puller.set_dma_pusher(self_ptr);
     }
 
     pub fn bind_rasterizer(
@@ -242,6 +260,18 @@ impl DmaPusher {
         rasterizer: &dyn crate::rasterizer_interface::RasterizerInterface,
     ) {
         self.puller.bind_rasterizer(rasterizer);
+    }
+
+    pub fn bind_subchannel(
+        &mut self,
+        engine: &mut dyn EngineInterface,
+        subchannel_id: u32,
+        engine_type: EngineTypes,
+    ) {
+        self.subchannels[subchannel_id as usize] = Some(unsafe {
+            std::mem::transmute::<*mut dyn EngineInterface, [usize; 2]>(engine)
+        });
+        self.subchannel_type[subchannel_id as usize] = engine_type;
     }
 
     /// Push a command list into the DMA pushbuffer queue.
@@ -266,8 +296,9 @@ impl DmaPusher {
         while self.step() {}
         log::info!("DmaPusher::dispatch_calls complete");
 
-        // Full implementation calls gpu.flush_commands() and gpu.on_command_list_end().
-        // These are no-ops until GPU integration is complete.
+        let gpu = unsafe { &*self.gpu };
+        gpu.flush_commands();
+        gpu.on_command_list_end();
     }
 
     /// Dispatch all pending command lists with an engine to receive method calls.
@@ -277,6 +308,46 @@ impl DmaPusher {
         self.dma_state.is_last_call = true;
 
         while self.step_with_engine(engine) {}
+    }
+
+    fn set_current_engine_dirty(&mut self, dirty: bool) {
+        let Some(engine_id) = self.puller.bound_engines[self.dma_state.subchannel as usize] else {
+            return;
+        };
+        match engine_id {
+            EngineID::MaxwellB => {
+                if let Some(raw) = self.subchannels[self.dma_state.subchannel as usize] {
+                    let engine: *mut dyn EngineInterface = unsafe { std::mem::transmute(raw) };
+                    unsafe { &mut *engine }.set_current_dirty(dirty);
+                }
+            }
+            EngineID::KeplerComputeB
+            | EngineID::KeplerInlineToMemoryB
+            | EngineID::FermiTwodA
+            | EngineID::MaxwellDmaCopyA => {
+                if let Some(raw) = self.subchannels[self.dma_state.subchannel as usize] {
+                    let engine: *mut dyn EngineInterface = unsafe { std::mem::transmute(raw) };
+                    unsafe { &mut *engine }.set_current_dirty(dirty);
+                }
+            }
+        }
+    }
+
+    fn update_current_dirty_for_fetch(&mut self, command_gpu_addr: GPUVAddr, word_count: u32) {
+        let needs_dirty_check = self.dma_state.method >= MACRO_REGISTERS_START
+            || (self.puller.bound_engines[self.dma_state.subchannel as usize]
+                == Some(EngineID::KeplerComputeB)
+                && self.dma_state.method == COMPUTE_INLINE);
+        if !needs_dirty_check {
+            return;
+        }
+
+        let dirty = self
+            .memory_manager
+            .lock()
+            .is_memory_dirty(command_gpu_addr, word_count as u64 * std::mem::size_of::<u32>() as u64);
+
+        self.set_current_engine_dirty(dirty);
     }
 
     /// Process the next step of command submission. Matches upstream `DmaPusher::Step`.
@@ -324,6 +395,11 @@ impl DmaPusher {
             if command_list_header.size() == 0 {
                 return true;
             }
+
+            self.update_current_dirty_for_fetch(
+                command_list_header.addr(),
+                command_list_header.size(),
+            );
 
             let command_count = command_list_header.size() as usize;
             let byte_len = command_count * std::mem::size_of::<CommandHeader>();
@@ -389,6 +465,11 @@ impl DmaPusher {
                 return true;
             }
 
+            self.update_current_dirty_for_fetch(
+                command_list_header.addr(),
+                command_list_header.size(),
+            );
+
             let command_count = command_list_header.size() as usize;
             let byte_len = command_count * std::mem::size_of::<CommandHeader>();
             let mut raw = vec![0u8; byte_len];
@@ -413,7 +494,13 @@ impl DmaPusher {
 
     fn process_commands(&mut self, commands: &[CommandHeader]) {
         let mut index = 0;
+        let mut total_dispatches = 0u64;
         while index < commands.len() {
+            total_dispatches += 1;
+            if total_dispatches % 100_000 == 0 {
+                log::warn!("DmaPusher::process_commands heartbeat: {} dispatches, index={}/{}",
+                    total_dispatches, index, commands.len());
+            }
             let command_header = commands[index];
 
             if self.dma_state.method_count > 0 {
@@ -553,24 +640,124 @@ impl DmaPusher {
     /// Dispatch a single method call to an engine. Matches upstream
     /// `DmaPusher::CallMethod`.
     fn dispatch_method(&mut self, argument: u32) {
-        self.puller.call_method(&MethodCall::new(
-            self.dma_state.method,
-            argument,
-            self.dma_state.subchannel,
-            self.dma_state.method_count,
-        ));
+        if self.dma_state.method < NON_PULLER_METHODS {
+            let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if trace_idx < 48 {
+                log::info!(
+                    "DmaPusher::dispatch_method puller method=0x{:X} arg=0x{:X} subch={} pending={}",
+                    self.dma_state.method,
+                    argument,
+                    self.dma_state.subchannel,
+                    self.dma_state.method_count
+                );
+            }
+            self.puller.call_method(&MethodCall::new(
+                self.dma_state.method,
+                argument,
+                self.dma_state.subchannel,
+                self.dma_state.method_count,
+            ));
+            return;
+        }
+
+        let Some(raw) = self.subchannels[self.dma_state.subchannel as usize] else {
+            let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if trace_idx < 48 {
+                log::warn!(
+                    "DmaPusher::dispatch_method no subchannel binding method=0x{:X} arg=0x{:X} subch={}",
+                    self.dma_state.method,
+                    argument,
+                    self.dma_state.subchannel
+                );
+            }
+            return;
+        };
+        let subchannel: *mut dyn EngineInterface = unsafe { std::mem::transmute(raw) };
+        let subchannel = unsafe { &mut *subchannel };
+        if !subchannel.execution_mask()[self.dma_state.method as usize] {
+            let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if trace_idx < 48 {
+                log::info!(
+                    "DmaPusher::dispatch_method sink method=0x{:X} arg=0x{:X} subch={}",
+                    self.dma_state.method,
+                    argument,
+                    self.dma_state.subchannel
+                );
+            }
+            subchannel.push_method_sink(self.dma_state.method, argument);
+            return;
+        }
+        let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace_idx < 48 {
+            log::info!(
+                "DmaPusher::dispatch_method execute method=0x{:X} arg=0x{:X} subch={} dma_seg=0x{:X}",
+                self.dma_state.method,
+                argument,
+                self.dma_state.subchannel,
+                self.dma_state.dma_get.wrapping_add(self.dma_state.dma_word_offset)
+            );
+        }
+        subchannel.consume_sink();
+        subchannel.set_current_dma_segment(self.dma_state.dma_get.wrapping_add(self.dma_state.dma_word_offset));
+        subchannel.call_method(self.dma_state.method, argument, self.dma_state.is_last_call);
     }
 
     /// Dispatch a multi-method call to an engine. Matches upstream
     /// `DmaPusher::CallMultiMethod`.
     fn dispatch_multi_method(&mut self, commands: &[CommandHeader]) {
         let args: Vec<u32> = commands.iter().map(|c| c.argument()).collect();
-        self.puller.call_multi_method(
+        if self.dma_state.method >= 0x45 && self.dma_state.method <= 0x48 {
+            let preview: Vec<String> = args.iter().take(6).map(|v| format!("{:08X}", v)).collect();
+            log::info!(
+                "DmaPusher::dispatch_multi_method method=0x{:X} subch={} count={} pending={} args[0..]={:?}",
+                self.dma_state.method,
+                self.dma_state.subchannel,
+                args.len(),
+                self.dma_state.method_count,
+                preview
+            );
+        }
+        if self.dma_state.method < NON_PULLER_METHODS {
+            self.puller.call_multi_method(
+                self.dma_state.method,
+                self.dma_state.subchannel,
+                &args,
+                args.len() as u32,
+                self.dma_state.method_count,
+            );
+            return;
+        }
+        let Some(raw) = self.subchannels[self.dma_state.subchannel as usize] else {
+            return;
+        };
+        let subchannel: *mut dyn EngineInterface = unsafe { std::mem::transmute(raw) };
+        let subchannel = unsafe { &mut *subchannel };
+        subchannel.consume_sink();
+        subchannel.set_current_dma_segment(self.dma_state.dma_get.wrapping_add(self.dma_state.dma_word_offset));
+        subchannel.call_multi_method(
             self.dma_state.method,
-            self.dma_state.subchannel,
             &args,
             args.len() as u32,
             self.dma_state.method_count,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::channel_state::ChannelState;
+
+    #[test]
+    fn install_self_reference_uses_stable_boxed_address() {
+        let mut channel_state = Box::new(ChannelState::new(7));
+        let memory_manager = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+        let channel_ptr: *mut ChannelState = &mut *channel_state;
+        let mut dma = Box::new(DmaPusher::new(std::ptr::null(), memory_manager, channel_ptr));
+        let dma_ptr: *mut DmaPusher = &mut *dma;
+
+        dma.install_self_reference();
+
+        assert_eq!(dma.puller.dma_pusher_ptr_for_test(), dma_ptr);
     }
 }

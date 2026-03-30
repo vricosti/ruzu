@@ -8,6 +8,7 @@
 //! recorded as a `DispatchCall`. The backend later consumes these via
 //! `take_dispatch_calls()`.
 
+use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 use crate::rasterizer_interface::RasterizerInterface;
 
@@ -141,6 +142,7 @@ pub struct DispatchCall {
 
 pub struct KeplerCompute {
     regs: Box<[u32; ENGINE_REG_COUNT]>,
+    interface_state: EngineInterfaceState,
     dispatch_calls: Vec<DispatchCall>,
     /// QMD GPU VA set on LAUNCH write, consumed by execute_pending.
     pending_launch: Option<u64>,
@@ -151,6 +153,13 @@ impl KeplerCompute {
     pub fn new() -> Self {
         Self {
             regs: Box::new([0u32; ENGINE_REG_COUNT]),
+            interface_state: {
+                let mut state = EngineInterfaceState::new();
+                state.execution_mask[0x6C] = true;
+                state.execution_mask[0x6D] = true;
+                state.execution_mask[LAUNCH as usize] = true;
+                state
+            },
             dispatch_calls: Vec::new(),
             pending_launch: None,
             rasterizer: None,
@@ -231,6 +240,52 @@ impl KeplerCompute {
 impl Default for KeplerCompute {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl EngineInterface for KeplerCompute {
+    fn call_method(&mut self, method: u32, method_argument: u32, is_last_call: bool) {
+        KeplerCompute::call_method(self, method, method_argument, is_last_call);
+    }
+
+    fn call_multi_method(
+        &mut self,
+        method: u32,
+        base_start: &[u32],
+        amount: u32,
+        methods_pending: u32,
+    ) {
+        KeplerCompute::call_multi_method(self, method, base_start, amount, methods_pending);
+    }
+
+    fn consume_sink_impl(&mut self) {
+        let sink = std::mem::take(&mut self.interface_state.method_sink);
+        for (method, value) in sink {
+            let idx = method as usize;
+            if idx < ENGINE_REG_COUNT {
+                self.regs[idx] = value;
+            }
+        }
+    }
+
+    fn execution_mask(&self) -> &[bool] {
+        &self.interface_state.execution_mask
+    }
+
+    fn push_method_sink(&mut self, method: u32, value: u32) {
+        self.interface_state.method_sink.push((method, value));
+    }
+
+    fn set_current_dma_segment(&mut self, segment: u64) {
+        self.interface_state.current_dma_segment = segment;
+    }
+
+    fn current_dirty(&self) -> bool {
+        self.interface_state.current_dirty
+    }
+
+    fn set_current_dirty(&mut self, dirty: bool) {
+        self.interface_state.current_dirty = dirty;
     }
 }
 

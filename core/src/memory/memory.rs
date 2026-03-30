@@ -9,8 +9,11 @@ use common::host_memory::HostMemory;
 #[cfg(target_os = "linux")]
 use common::heap_tracker::HeapTracker;
 use common::page_table::{PageInfo, PageTable, PageType};
+use std::sync::{Arc, Mutex};
 
 use crate::device_memory::{dram_memory_map, DeviceMemory};
+use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
+use crate::core::SystemRef;
 
 /// Page size constants matching upstream YUZU_PAGEBITS / YUZU_PAGESIZE.
 const PAGE_BITS: usize = 12;
@@ -26,6 +29,8 @@ pub use common::host_memory::MemoryPermission;
 /// Manages the mapping between guest virtual addresses, physical addresses
 /// (in DeviceMemory), and host pointers (in the PageTable used by dynarmic).
 pub struct Memory {
+    /// Upstream owner: `Core::System& system`.
+    system: SystemRef,
     /// Pointer to the device memory backing store.
     device_memory: *const DeviceMemory,
     /// Pointer to the HostMemory buffer (used for fastmem arena base).
@@ -36,6 +41,8 @@ pub struct Memory {
     heap_tracker: Option<Box<HeapTracker>>,
     /// Current page table (set by SetCurrentPageTable when switching processes).
     current_page_table: *mut PageTable,
+    /// Upstream owner: `std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers`.
+    gpu_dirty_managers: Vec<Arc<Mutex<GpuDirtyMemoryManager>>>,
 }
 
 // SAFETY: Memory is used behind Arc<Mutex<>> and all raw pointers are
@@ -48,14 +55,25 @@ impl Memory {
     ///
     /// # Safety
     /// The caller must ensure that `device_memory` and `buffer` outlive this Memory.
-    pub unsafe fn new(device_memory: *const DeviceMemory, buffer: *const HostMemory) -> Self {
+    pub unsafe fn new(
+        system: SystemRef,
+        device_memory: *const DeviceMemory,
+        buffer: *const HostMemory,
+    ) -> Self {
         Self {
+            system,
             device_memory,
             buffer,
             #[cfg(target_os = "linux")]
             heap_tracker: None,
             current_page_table: std::ptr::null_mut(),
+            gpu_dirty_managers: Vec::new(),
         }
+    }
+
+    /// Upstream: `Memory::SetGPUDirtyManagers(std::span<Core::GPUDirtyMemoryManager>)`.
+    pub fn set_gpu_dirty_managers(&mut self, managers: Vec<Arc<Mutex<GpuDirtyMemoryManager>>>) {
+        self.gpu_dirty_managers = managers;
     }
 
     /// Get the fastmem arena base pointer (for JIT direct memory access).
@@ -335,6 +353,45 @@ impl Memory {
         self.get_pointer_from_debug_memory(vaddr)
     }
 
+    fn current_physical_address(&self, vaddr: u64) -> Option<u64> {
+        if self.current_page_table.is_null() {
+            return None;
+        }
+        let pt = unsafe { &*self.current_page_table };
+        let page_idx = (vaddr >> PAGE_BITS) as usize;
+        if page_idx >= pt.backing_addr.size() {
+            return None;
+        }
+        let backing = pt.backing_addr[page_idx];
+        if backing == 0 {
+            return None;
+        }
+        Some(backing + vaddr)
+    }
+
+    fn handle_rasterizer_write(&self, vaddr: u64, size: usize) {
+        let Some(device_addr) = self.current_physical_address(vaddr) else {
+            return;
+        };
+
+        let do_collection = self
+            .system
+            .is_null()
+            || self
+                .system
+                .get()
+                .gpu_core()
+                .map(|gpu| gpu.on_cpu_write(device_addr, size as u64))
+                .unwrap_or(false);
+        if !do_collection {
+            return;
+        }
+
+        if let Some(manager) = self.gpu_dirty_managers.first() {
+            manager.lock().unwrap().collect(device_addr, size);
+        }
+    }
+
     /// Get a host pointer for a guest virtual address.
     /// Matches upstream `Memory::GetPointer`.
     pub fn get_pointer(&self, vaddr: u64) -> *mut u8 {
@@ -415,11 +472,13 @@ impl Memory {
 
     /// Write a u8. Matches upstream `Memory::Write8`.
     pub fn write_8(&self, vaddr: u64, data: u8) {
+        self.handle_rasterizer_write(vaddr, std::mem::size_of::<u8>());
         unsafe { self.write_raw::<u8>(vaddr, data) }
     }
 
     /// Write a u16 (LE). Matches upstream `Memory::Write16`.
     pub fn write_16(&self, vaddr: u64, data: u16) {
+        self.handle_rasterizer_write(vaddr, std::mem::size_of::<u16>());
         if (vaddr & 1) == 0 {
             unsafe { self.write_raw::<u16>(vaddr, data) }
         } else {
@@ -430,6 +489,7 @@ impl Memory {
 
     /// Write a u32 (LE). Matches upstream `Memory::Write32`.
     pub fn write_32(&self, vaddr: u64, data: u32) {
+        self.handle_rasterizer_write(vaddr, std::mem::size_of::<u32>());
         if (vaddr & 3) == 0 {
             unsafe { self.write_raw::<u32>(vaddr, data) }
         } else {
@@ -440,6 +500,7 @@ impl Memory {
 
     /// Write a u64 (LE). Matches upstream `Memory::Write64`.
     pub fn write_64(&self, vaddr: u64, data: u64) {
+        self.handle_rasterizer_write(vaddr, std::mem::size_of::<u64>());
         if (vaddr & 7) == 0 {
             unsafe { self.write_raw::<u64>(vaddr, data) }
         } else {
@@ -528,6 +589,7 @@ impl Memory {
                 log::error!("Unmapped WriteBlock @ {:#018x}", vaddr);
                 user_accessible = false;
             } else {
+                self.handle_rasterizer_write(vaddr, copy_amount);
                 unsafe {
                     std::ptr::copy_nonoverlapping(src[offset..].as_ptr(), ptr, copy_amount);
                 }
@@ -561,6 +623,7 @@ impl Memory {
                 log::error!("Unmapped ZeroBlock @ {:#018x}", vaddr);
                 user_accessible = false;
             } else {
+                self.handle_rasterizer_write(vaddr, copy_amount);
                 unsafe {
                     std::ptr::write_bytes(ptr, 0, copy_amount);
                 }

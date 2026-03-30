@@ -1464,7 +1464,8 @@ impl KProcess {
             let memory_clone = base.m_memory.clone();
             if let (Some(memory), Some(impl_pt)) = (memory_clone, base.get_impl_mut()) {
                 let pt_ptr = impl_pt as *mut common::page_table::PageTable;
-                memory.lock().unwrap().set_current_page_table(pt_ptr);
+                let mut memory = memory.lock().unwrap();
+                memory.set_current_page_table(pt_ptr);
             }
         }
 

@@ -10,6 +10,7 @@
 use crate::core_timing::CoreTiming;
 use crate::cpu_manager::CpuManager;
 use crate::device_memory::DeviceMemory;
+use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
 use crate::file_sys::fs_filesystem::OpenMode;
 use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use crate::hardware_properties;
@@ -163,6 +164,8 @@ pub struct System {
     /// Core::Memory::Memory bridge (maps virtual→physical→host).
     /// Upstream: `std::unique_ptr<Core::Memory::Memory> m_memory`.
     memory: Option<Arc<StdMutex<Memory>>>,
+    /// Upstream owner: `std::array<GPUDirtyMemoryManager, NUM_CPU_CORES>`.
+    gpu_dirty_memory_managers: Vec<Arc<StdMutex<GpuDirtyMemoryManager>>>,
 
     // ── State flags ──
     /// Guard for suspend/resume operations.
@@ -291,6 +294,7 @@ impl System {
             content_provider: None,
             device_memory: None,
             memory: None,
+            gpu_dirty_memory_managers: Vec::new(),
             suspend_guard: Mutex::new(()),
             is_paused: AtomicBool::new(false),
             is_shutting_down: AtomicBool::new(false),
@@ -339,7 +343,11 @@ impl System {
         // Upstream: m_memory = make_unique<Core::Memory::Memory>(system)
         let dm_ptr = self.device_memory.as_ref().unwrap().as_ref() as *const DeviceMemory;
         let buffer_ptr = unsafe { &(*dm_ptr).buffer as *const common::host_memory::HostMemory };
-        let memory = unsafe { Memory::new(dm_ptr, buffer_ptr) };
+        let mut memory = unsafe { Memory::new(SystemRef::from_ref(self), dm_ptr, buffer_ptr) };
+        self.gpu_dirty_memory_managers = (0..hardware_properties::NUM_CPU_CORES as usize)
+            .map(|_| Arc::new(StdMutex::new(GpuDirtyMemoryManager::new())))
+            .collect();
+        memory.set_gpu_dirty_managers(self.gpu_dirty_memory_managers.clone());
         self.memory = Some(Arc::new(StdMutex::new(memory)));
 
         // Read configuration from settings.
@@ -940,6 +948,18 @@ impl System {
     /// Upstream: `System::Memory()`.
     pub fn memory_shared(&self) -> Option<Arc<StdMutex<Memory>>> {
         self.memory.clone()
+    }
+
+    /// Upstream: `System::GetGPUDirtyMemoryManager()`.
+    pub fn gpu_dirty_memory_managers(&self) -> Vec<Arc<StdMutex<GpuDirtyMemoryManager>>> {
+        self.gpu_dirty_memory_managers.clone()
+    }
+
+    /// Upstream: `System::GatherGPUDirtyMemory(std::function<void(PAddr, size_t)>&)`.
+    pub fn gather_gpu_dirty_memory(&self, callback: &mut dyn FnMut(u64, usize)) {
+        for manager in &self.gpu_dirty_memory_managers {
+            manager.lock().unwrap().gather(callback);
+        }
     }
 
     /// Gets a reference to the CPU manager.

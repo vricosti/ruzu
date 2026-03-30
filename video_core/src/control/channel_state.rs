@@ -88,8 +88,24 @@ impl ChannelState {
             Arc::clone(self.memory_manager.as_ref().unwrap()),
             self as *mut ChannelState,
         )));
+        self.dma_pusher
+            .as_mut()
+            .expect("DmaPusher must exist immediately after construction")
+            .install_self_reference();
 
-        self.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        let mut maxwell_3d = Box::new(Maxwell3D::new());
+        maxwell_3d.set_memory_manager(Arc::clone(self.memory_manager.as_ref().unwrap()));
+        let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
+        maxwell_3d.set_guest_memory_reader(Arc::new(move |addr, output| unsafe {
+            let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
+            let _ = gpu.read_guest_memory(addr, output);
+        }));
+        let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
+        maxwell_3d.set_guest_memory_writer(Arc::new(move |addr, data| unsafe {
+            let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
+            gpu.write_guest_memory(addr, data);
+        }));
+        self.maxwell_3d = Some(maxwell_3d);
         self.fermi_2d = Some(Box::new(Fermi2D::new()));
         self.kepler_compute = Some(Box::new(KeplerCompute::new()));
         self.maxwell_dma = Some(Box::new(MaxwellDMA::new()));
@@ -118,7 +134,7 @@ impl ChannelState {
             dma.bind_rasterizer(rasterizer);
         }
         if let Some(ref mut mm) = self.memory_manager {
-            mm.lock().bind_rasterizer();
+            mm.lock().bind_rasterizer(rasterizer);
         }
         if let Some(ref mut maxwell_3d) = self.maxwell_3d {
             maxwell_3d.bind_rasterizer(rasterizer);

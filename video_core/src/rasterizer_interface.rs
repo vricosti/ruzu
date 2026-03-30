@@ -7,6 +7,10 @@
 //! Abstract interface for GPU rasterizer backends. Each renderer
 //! (Null, OpenGL, Vulkan) provides its own implementation.
 
+use std::sync::Arc;
+
+use crate::query_cache::types::QueryPropertiesFlags;
+
 /// Shader loading callback stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadCallbackStage {
@@ -61,10 +65,10 @@ pub trait RasterizerInterface {
         &mut self,
         gpu_addr: u64,
         query_type: u32,
-        has_timeout: bool,
+        flags: QueryPropertiesFlags,
         payload: u32,
         subreport: u32,
-        gpu_write: &dyn Fn(u64, &[u8]),
+        gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     );
 
     // ── Uniform buffers ─────────────────────────────────────────────────
@@ -84,10 +88,10 @@ pub trait RasterizerInterface {
     // ── Synchronization ─────────────────────────────────────────────────
 
     /// Signal a GPU-based semaphore as a fence.
-    fn signal_fence(&mut self, func: Box<dyn FnOnce()>);
+    fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>);
 
     /// Send an operation to be done after a certain amount of flushes.
-    fn sync_operation(&mut self, func: Box<dyn FnOnce()>);
+    fn sync_operation(&mut self, func: Box<dyn FnOnce() + Send>);
 
     /// Signal a GPU-based syncpoint as a fence.
     fn signal_sync_point(&mut self, value: u32);

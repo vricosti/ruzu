@@ -9,7 +9,10 @@
 
 use crate::control::channel_state::ChannelState;
 use crate::engines::engine_interface::EngineInterface;
+use crate::engines::engine_interface::EngineTypes;
+use crate::query_cache::types::QueryPropertiesFlags;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -179,7 +182,9 @@ pub enum GpuSemaphoreOperation {
 // ── Puller register file ────────────────────────────────────────────────────
 
 /// Number of registers in the puller register file.
-const PULLER_NUM_REGS: usize = 0x40;
+///
+/// Upstream: `Puller::Regs::NUM_REGS = 0x800`.
+const PULLER_NUM_REGS: usize = 0x800;
 
 /// Puller register file.
 ///
@@ -261,6 +266,7 @@ impl PullerRegs {
 
 /// Number of subchannels.
 const NUM_SUBCHANNELS: usize = 8;
+static PULLER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// The GPU command puller.
 ///
@@ -272,6 +278,7 @@ pub struct Puller {
     pub bound_engines: [Option<EngineID>; NUM_SUBCHANNELS],
     gpu: *const crate::gpu::Gpu,
     memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+    dma_pusher: *mut crate::dma_pusher::DmaPusher,
     rasterizer: Option<[usize; 2]>,
     channel_state: *mut ChannelState,
 }
@@ -280,6 +287,7 @@ impl Puller {
     pub fn new(
         gpu: *const crate::gpu::Gpu,
         memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+        dma_pusher: *mut crate::dma_pusher::DmaPusher,
         channel_state: *mut ChannelState,
     ) -> Self {
         Self {
@@ -287,6 +295,7 @@ impl Puller {
             bound_engines: [None; NUM_SUBCHANNELS],
             gpu,
             memory_manager,
+            dma_pusher,
             rasterizer: None,
             channel_state,
         }
@@ -298,6 +307,19 @@ impl Puller {
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn crate::rasterizer_interface::RasterizerInterface) {
         let raw: *const dyn crate::rasterizer_interface::RasterizerInterface = rasterizer;
         self.rasterizer = Some(unsafe { std::mem::transmute(raw) });
+    }
+
+    pub fn channel_state_ptr(&self) -> *mut ChannelState {
+        self.channel_state
+    }
+
+    pub fn set_dma_pusher(&mut self, dma_pusher: *mut crate::dma_pusher::DmaPusher) {
+        self.dma_pusher = dma_pusher;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dma_pusher_ptr_for_test(&self) -> *mut crate::dma_pusher::DmaPusher {
+        self.dma_pusher
     }
 
     fn with_rasterizer_mut(
@@ -325,10 +347,14 @@ impl Puller {
 
     fn write_gpu_u32(&self, gpu_va: u64, value: u32) {
         let bytes = value.to_le_bytes();
+        self.write_gpu_bytes(gpu_va, &bytes);
+    }
+
+    fn write_gpu_bytes(&self, gpu_va: u64, data: &[u8]) {
         let gpu = unsafe { &*self.gpu };
         self.memory_manager
             .lock()
-            .write_block_unsafe(gpu_va, &bytes, &mut |cpu_addr, data| {
+            .write_block_unsafe(gpu_va, data, &mut |cpu_addr, data| {
                 gpu.write_guest_memory(cpu_addr, data);
             });
     }
@@ -391,6 +417,16 @@ impl Puller {
     ///
     /// Corresponds to `Puller::CallPullerMethod`.
     pub fn call_puller_method(&mut self, method_call: &MethodCall) {
+        let trace_idx = PULLER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace_idx < 48 {
+            log::info!(
+                "Puller::call_puller_method method=0x{:X} arg=0x{:X} subch={} pending={}",
+                method_call.method,
+                method_call.argument,
+                method_call.subchannel,
+                method_call.method_count
+            );
+        }
         let method_idx = method_call.method as usize;
         if method_idx < PULLER_NUM_REGS {
             self.regs.reg_array[method_idx] = method_call.argument;
@@ -466,6 +502,16 @@ impl Puller {
         };
 
         let channel_state = unsafe { &mut *self.channel_state };
+        let trace_idx = PULLER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace_idx < 48 {
+            log::info!(
+                "Puller::call_engine_method engine={:?} method=0x{:X} arg=0x{:X} subch={}",
+                engine,
+                method_call.method,
+                method_call.argument,
+                method_call.subchannel
+            );
+        }
         match engine {
             EngineID::MaxwellB => {
                 if let Some(engine) = channel_state.maxwell_3d.as_mut() {
@@ -566,6 +612,62 @@ impl Puller {
         let engine_id = EngineID::from_raw(method_call.argument);
         if let Some(eid) = engine_id {
             self.bound_engines[method_call.subchannel as usize] = Some(eid);
+            log::info!(
+                "Puller::process_bind_method subch={} engine={:?}",
+                method_call.subchannel,
+                eid
+            );
+            let channel_state = unsafe { &mut *self.channel_state };
+            let dma_pusher = unsafe { self.dma_pusher.as_mut() };
+            if let Some(dma_pusher) = dma_pusher {
+                match eid {
+                    EngineID::FermiTwodA => {
+                        if let Some(engine) = channel_state.fermi_2d.as_mut() {
+                            dma_pusher.bind_subchannel(
+                                engine.as_mut(),
+                                method_call.subchannel,
+                                EngineTypes::Fermi2D,
+                            );
+                        }
+                    }
+                    EngineID::MaxwellB => {
+                        if let Some(engine) = channel_state.maxwell_3d.as_mut() {
+                            dma_pusher.bind_subchannel(
+                                engine.as_mut(),
+                                method_call.subchannel,
+                                EngineTypes::Maxwell3D,
+                            );
+                        }
+                    }
+                    EngineID::KeplerComputeB => {
+                        if let Some(engine) = channel_state.kepler_compute.as_mut() {
+                            dma_pusher.bind_subchannel(
+                                engine.as_mut(),
+                                method_call.subchannel,
+                                EngineTypes::KeplerCompute,
+                            );
+                        }
+                    }
+                    EngineID::KeplerInlineToMemoryB => {
+                        if let Some(engine) = channel_state.kepler_memory.as_mut() {
+                            dma_pusher.bind_subchannel(
+                                engine.as_mut(),
+                                method_call.subchannel,
+                                EngineTypes::KeplerMemory,
+                            );
+                        }
+                    }
+                    EngineID::MaxwellDmaCopyA => {
+                        if let Some(engine) = channel_state.maxwell_dma.as_mut() {
+                            dma_pusher.bind_subchannel(
+                                engine.as_mut(),
+                                method_call.subchannel,
+                                EngineTypes::MaxwellDMA,
+                            );
+                        }
+                    }
+                }
+            }
         } else {
             log::error!(
                 "Unimplemented engine {:04X}",
@@ -607,8 +709,24 @@ impl Puller {
         if op == GpuSemaphoreOperation::WriteLong as u32 {
             let sequence_address = self.regs.semaphore_address();
             let payload = self.regs.semaphore_sequence();
+            let gpu = self.gpu as usize;
+            let memory_manager = Arc::clone(&self.memory_manager);
             self.with_rasterizer_mut(|rasterizer| {
-                rasterizer.query(sequence_address, 0, true, payload, 0, &|_, _| {})
+                rasterizer.query(
+                    sequence_address,
+                    0,
+                    QueryPropertiesFlags::HAS_TIMEOUT,
+                    payload,
+                    0,
+                    Arc::new(move |gpu_addr, bytes| {
+                        let gpu = unsafe { &*(gpu as *const crate::gpu::Gpu) };
+                        memory_manager
+                            .lock()
+                            .write_block_unsafe(gpu_addr, bytes, &mut |cpu_addr, data| {
+                                gpu.write_guest_memory(cpu_addr, data);
+                            });
+                    }),
+                )
             });
         } else {
             loop {
@@ -664,11 +782,29 @@ impl Puller {
             sequence_address,
             payload
         );
-        // Upstream: rasterizer->Query(sequence_address, QueryType::Payload,
-        //           QueryPropertiesFlags::IsAFence, payload, 0);
-        // With the null rasterizer, write the payload directly to GPU memory
-        // so SemaphoreAcquire can find it.
-        self.write_gpu_u32(sequence_address, payload);
+        if self.rasterizer.is_none() {
+            self.write_gpu_u32(sequence_address, payload);
+            return;
+        }
+        let gpu = self.gpu as usize;
+        let memory_manager = Arc::clone(&self.memory_manager);
+        self.with_rasterizer_mut(|rasterizer| {
+            rasterizer.query(
+                sequence_address,
+                0,
+                QueryPropertiesFlags::IS_A_FENCE,
+                payload,
+                0,
+                Arc::new(move |gpu_addr, bytes| {
+                    let gpu = unsafe { &*(gpu as *const crate::gpu::Gpu) };
+                    memory_manager
+                        .lock()
+                        .write_block_unsafe(gpu_addr, bytes, &mut |cpu_addr, data| {
+                            gpu.write_guest_memory(cpu_addr, data);
+                        });
+                }),
+            )
+        });
     }
 }
 
@@ -677,6 +813,7 @@ impl Default for Puller {
         Self::new(
             std::ptr::null(),
             Arc::new(parking_lot::Mutex::new(crate::memory_manager::MemoryManager::default())),
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
     }
@@ -705,10 +842,10 @@ mod tests {
             &mut self,
             _gpu_addr: u64,
             _query_type: u32,
-            _has_timeout: bool,
+            _flags: QueryPropertiesFlags,
             _payload: u32,
             _subreport: u32,
-            _gpu_write: &dyn Fn(u64, &[u8]),
+            _gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
         ) {
         }
         fn bind_graphics_uniform_buffer(
@@ -720,8 +857,8 @@ mod tests {
         ) {
         }
         fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
-        fn signal_fence(&mut self, _func: Box<dyn FnOnce()>) {}
-        fn sync_operation(&mut self, _func: Box<dyn FnOnce()>) {}
+        fn signal_fence(&mut self, _func: Box<dyn FnOnce() + Send>) {}
+        fn sync_operation(&mut self, _func: Box<dyn FnOnce() + Send>) {}
         fn signal_sync_point(&mut self, value: u32) {
             self.syncpoints.lock().unwrap().push(value);
         }

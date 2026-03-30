@@ -70,11 +70,12 @@ impl Scheduler {
             .get(&channel)
             .expect("Scheduler::push: channel not found");
 
-        let mut cs = channel_state.lock();
         // Safety: gpu pointer is valid for the lifetime of the Scheduler.
         let gpu = unsafe { &*self.gpu };
-        gpu.bind_channel(cs.bind_id);
+        let bind_id = channel_state.lock().bind_id;
+        gpu.bind_channel(bind_id);
 
+        let mut cs = channel_state.lock();
         let dma_pusher = cs
             .dma_pusher
             .as_mut()

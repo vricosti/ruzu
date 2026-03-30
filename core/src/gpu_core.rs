@@ -77,4 +77,7 @@ pub trait GpuCoreInterface: Any + Send {
 
     /// Mirrors the upstream `GPU::PushGPUEntries(s32, CommandList&&)`.
     fn push_gpu_entries(&self, channel_id: i32, entries: GpuCommandList);
+
+    /// Mirrors the upstream `GPU::OnCPUWrite(DAddr, u64)`.
+    fn on_cpu_write(&self, addr: u64, size: u64) -> bool;
 }

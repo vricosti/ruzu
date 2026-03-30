@@ -6,6 +6,7 @@
 //! Handles 2D blitting operations (surface copies, fills). Detects blit
 //! trigger writes and logs parameters; actual pixel copy is not yet implemented.
 
+use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 use crate::rasterizer_interface::RasterizerInterface;
 
@@ -32,6 +33,7 @@ const BLIT_TRIGGER: u32 = 0x237;
 
 pub struct Fermi2D {
     regs: Box<[u32; ENGINE_REG_COUNT]>,
+    interface_state: EngineInterfaceState,
     /// Set when a blit trigger is detected; consumed by tests / future logic.
     pub pending_blit: bool,
     rasterizer: Option<[usize; 2]>,
@@ -41,6 +43,11 @@ impl Fermi2D {
     pub fn new() -> Self {
         Self {
             regs: Box::new([0u32; ENGINE_REG_COUNT]),
+            interface_state: {
+                let mut state = EngineInterfaceState::new();
+                state.execution_mask[BLIT_TRIGGER as usize] = true;
+                state
+            },
             pending_blit: false,
             rasterizer: None,
         }
@@ -129,6 +136,52 @@ impl Fermi2D {
             self.src_format(),
         );
         self.pending_blit = true;
+    }
+}
+
+impl EngineInterface for Fermi2D {
+    fn call_method(&mut self, method: u32, method_argument: u32, is_last_call: bool) {
+        Fermi2D::call_method(self, method, method_argument, is_last_call);
+    }
+
+    fn call_multi_method(
+        &mut self,
+        method: u32,
+        base_start: &[u32],
+        amount: u32,
+        methods_pending: u32,
+    ) {
+        Fermi2D::call_multi_method(self, method, base_start, amount, methods_pending);
+    }
+
+    fn consume_sink_impl(&mut self) {
+        let sink = std::mem::take(&mut self.interface_state.method_sink);
+        for (method, value) in sink {
+            let idx = method as usize;
+            if idx < ENGINE_REG_COUNT {
+                self.regs[idx] = value;
+            }
+        }
+    }
+
+    fn execution_mask(&self) -> &[bool] {
+        &self.interface_state.execution_mask
+    }
+
+    fn push_method_sink(&mut self, method: u32, value: u32) {
+        self.interface_state.method_sink.push((method, value));
+    }
+
+    fn set_current_dma_segment(&mut self, segment: u64) {
+        self.interface_state.current_dma_segment = segment;
+    }
+
+    fn current_dirty(&self) -> bool {
+        self.interface_state.current_dirty
+    }
+
+    fn set_current_dirty(&mut self, dirty: bool) {
+        self.interface_state.current_dirty = dirty;
     }
 }
 

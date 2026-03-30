@@ -173,6 +173,39 @@
 ### Binary layout verification
 - PASS: helper-only change; no raw-serialized structs affected.
 
+## 2026-03-29 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust still models `RasterizerOpenGL` with the current lightweight `FenceManager<Fence>` and without the full upstream cache objects (`texture_cache`, `buffer_cache`, `query_cache`). `signal_reference()` now preserves the upstream ownership and ordering semantics within that reduced backend.
+
+### Unintentional differences (to fix)
+- `signal_sync_point()` is still implemented directly in `gl_rasterizer.rs` instead of delegating through `FenceManager::SignalSyncPoint(...)` because the generic Rust fence manager does not yet own the upstream `GPU`/`Host1x` references.
+- `query()` still writes `ticks=0` for timeout queries instead of the upstream timestamp path.
+- The rest of the OpenGL rasterizer remains substantially simplified relative to upstream cache and rendering behavior.
+
+### Missing items
+- Upstream-equivalent `FenceManager` ownership of syncpoint signaling.
+- Remaining cache-backed rendering/query behavior from `gl_rasterizer.cpp`.
+
+### Binary layout verification
+- PASS: runtime-only file; no raw-serialized structs are defined here.
+
+## 2026-03-29 — video_core/src/fence_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/fence_manager.h
+
+### Intentional differences
+- Rust keeps a generic `FenceManager<F>` without the upstream cache/renderer template parameters. The new `#[cfg(test)]` accessors are test-only inspection helpers and do not affect runtime ownership.
+
+### Unintentional differences (to fix)
+- `FenceManager` still does not own the upstream `GPU`/`Host1x` references, so `SignalSyncPoint(...)` is not yet hosted directly in this file.
+- Async flush/cache ownership remains simplified relative to upstream.
+
+### Missing items
+- Full upstream `SignalSyncPoint` ownership in `fence_manager.rs`.
+- Remaining cache-backed `ShouldFlush`/`CommitAsyncFlushes` behavior.
+
+### Binary layout verification
+- PASS: runtime-only generic manager; no raw-serialized structs are defined here.
+
 ## 2026-03-28 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.h
 
 ### Intentional differences
@@ -1727,6 +1760,338 @@
 ### Binary layout verification
 - PASS: no guest-visible binary layout in this owner file.
 
+## 2026-03-30 — video_core/src/renderer_opengl/gl_rasterizer.rs vs video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust uses an injected callback to reach the owning `GPU::InvalidateGPUCache()` because `RasterizerOpenGL` is stored separately from `Gpu` and does not hold a direct `GPU&` field yet.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `invalidate_gpu_cache()` no longer returns early as a stub; it now forwards to the owner callback, matching upstream `gpu.InvalidateGPUCache()` behaviorally.
+
+### Missing items
+- direct owner field parity (`GPU& gpu`) in the OpenGL rasterizer constructor
+
+### Binary layout verification
+- PASS: no guest-visible binary layout in this owner file.
+
+## 2026-03-30 — core/src/memory/memory.rs vs core/memory.cpp
+
+### Intentional differences
+- Rust stores `gpu_dirty_managers` as `Vec<Arc<Mutex<...>>>` instead of `std::span<...>` because the managers are owned by `System` and shared across owners without C++-style reference stability.
+
+### Unintentional differences (to fix)
+- CPU-write collection still uses a simplified core-index selection (`first()` manager) instead of the exact upstream per-host-thread slot selection and `sys_core` guard logic.
+- `HandleRasterizerDownload` / `InvalidateGPUMemory` are not yet ported literally in this owner file.
+
+### Missing items
+- exact upstream `HandleRasterizerDownload`
+- exact upstream `InvalidateGPUMemory`
+- exact per-core dirty area tracking state
+
+### Binary layout verification
+- PASS: no guest-visible binary layout; this slice restores owner-local lifecycle and dirty-memory collection wiring.
+
+## 2026-03-30 — core/src/core.rs vs core/core.cpp
+
+### Intentional differences
+- Rust stores `gpu_dirty_memory_managers` in `Vec<Arc<Mutex<_>>>` instead of a fixed native array to preserve cross-owner shared mutability safely.
+
+### Unintentional differences (to fix)
+- none in the `GetGPUDirtyMemoryManager` / `GatherGPUDirtyMemory` ownership slice after this change.
+
+### Missing items
+- none in this file's current dirty-memory slice
+
+### Binary layout verification
+- PASS: not layout-sensitive; ownership/method placement matched.
+
+## 2026-03-30 — video_core/src/gpu.rs vs video_core/gpu.cpp
+
+### Intentional differences
+- Rust stores the upstream `Core::System&` as `SystemRef` behind a mutex because `Gpu` is constructed before it is finally moved into `System`.
+
+### Unintentional differences (to fix)
+- `InvalidateGPUCache()` now matches the upstream owner and behavior slice by calling `system.GatherGPUDirtyMemory(...)` and forwarding ranges to `rasterizer.on_cache_invalidation(...)`.
+- `OnCPUWrite()` now delegates to `rasterizer->OnCPUWrite(...)` instead of remaining a stub.
+
+### Missing items
+- full upstream `RequestFlush` behavior
+- remaining direct host1x/system integrations still owned elsewhere
+
+### Binary layout verification
+- PASS: no guest-visible binary layout in this owner file.
+
+## 2026-03-30 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Upstream writes report query fallback results through `memory_manager` owned directly by `Maxwell3D`; Rust preserves the same owner and ordering but routes the final CPU write through the injected `guest_memory_writer` callback because `video_core` does not own the full `Core::System` object.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `process_query_get()` no longer passes a no-op writer callback to `rasterizer.query(...)` when a rasterizer is bound. This previously allowed report semaphore queries to "succeed" without writing their payload/timestamp back to guest-visible memory, diverging from upstream `Rasterizer*::QueryFallback(...)`.
+
+### Missing items
+- Full ownership split cleanup for the Rust-only `guest_memory_reader` / `guest_memory_writer` bridges.
+
+### Binary layout verification
+- PASS: this slice changes callback wiring/order only; no guest-visible struct layout changed.
+
+## 2026-03-30 — video_core/src/macro_engine/macro_hle.rs vs video_core/macro/macro_hle.cpp
+
+### Intentional differences
+- Upstream constructs `HLEMacro(Maxwell3D&)` once in the owner constructor. The Rust port now stores an optional raw `Maxwell3D` owner pointer and refreshes it from `MacroEngine` before execution because `Maxwell3D` contains `MacroEngine` by value and cannot hand out `&mut self` during struct construction without extra self-referential machinery.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `HLE_ClearConstBuffer<base_size>` now follows upstream behavior instead of warning-only stubs, including `RefreshParameters()`, `const_buffer` register setup, zero-fill through `ProcessCBMultiData`, and offset reset.
+- Fixed in this pass: `HLE_ClearMemory` now follows upstream behavior instead of warning-only stubs, including upload register setup, `launch_dma` trigger, and zeroed `inline_data` upload.
+- The other HLE macro implementations in this owner file are still stubs and must be ported as their hashes become relevant on the runtime path.
+
+### Missing items
+- owner-faithful implementations for `HLE_C713C83D8F63CCF3`, `HLE_D7333D26E0A93EDE`, `HLE_BindShader`, `HLE_SetRasterBoundingBox`, `HLE_TransformFeedbackSetup`, and the draw-indirect helpers
+
+### Binary layout verification
+- PASS: no guest-visible raw struct layout in this owner file; parity concern is owner/lifecycle and method behavior.
+
+## 2026-03-30 — video_core/src/macro_engine/macro_engine.rs vs video_core/macro/macro.cpp
+
+### Intentional differences
+- Rust still injects the backend compiler as a closure into `execute()` instead of storing a polymorphic upstream subclass instance directly.
+- `MacroEngine` now forwards a raw `Maxwell3D` owner pointer into `HleMacro` immediately before lookup/execution instead of receiving it in the constructor; this is the narrowest self-reference adaptation that preserves file ownership.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: HLE macro lookup no longer operates ownerless on the runtime path; it now receives the owning `Maxwell3D` before cached HLE execution.
+
+### Missing items
+- upstream-equivalent backend ownership instead of closure injection
+- dump/settings integration from upstream `Dump(...)`
+
+### Binary layout verification
+- PASS: `Opcode`/`MethodAddress` raw-bit layout unchanged by this slice.
+
+## 2026-03-30 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust exposes narrow `pub(crate)` helper methods `hle_clear_const_buffer()` and `hle_clear_memory()` in the matching owner file so `macro_hle.rs` can invoke the same owner-local behavior without breaking module boundaries. Upstream performs the body directly from the HLE macro classes through the owning `Maxwell3D&`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the HLE runtime path now refreshes `MacroEngine` with the current `Maxwell3D` owner before both `call_macro_method()` and `flush_macro()`, so HLE macros can mutate the real engine state instead of remaining ownerless.
+- Fixed in this pass: `HLE_ClearConstBuffer` and `HLE_ClearMemory` now execute through the real `Maxwell3D` owner in this file instead of stubbing out at the macro layer.
+- Fixed in this pass: `ProcessCBMultiData()` now performs the upstream `memory_manager.WriteBlockCached(...)` write instead of acting as a logging-only offset bump. This makes the HLE clear-const-buffer path functionally meaningful again.
+
+### Missing items
+- upstream-faithful owner helpers for the remaining HLE macro classes
+- cleanup of temporary macro trace logging once the runtime blocker is resolved
+
+### Binary layout verification
+- PASS: no struct layout changed; parity concern is owner routing and register/write ordering.
+
+## 2026-03-30 — video_core/src/memory_manager.rs vs video_core/memory_manager.cpp
+
+### Intentional differences
+- The outer Rust `MemoryManager` wrapper still exists to preserve crate/lifetime boundaries around `Arc<Mutex<_>>`; upstream exposes the concrete owner directly.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the outer wrapper now exposes `write_block_cached(...)`, matching the upstream API surface needed by `Maxwell3D::ProcessCBMultiData()`.
+
+### Missing items
+- remaining behavioral gaps in the backend noted earlier (`PTEKind`, fuller big-page semantics, and other incomplete owner slices)
+
+### Binary layout verification
+- PASS: no guest-visible struct layout changed in this wrapper slice.
+
+## 2026-03-30 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust still stores the register file as a flat `Box<[u32; ENGINE_REG_COUNT]>` instead of a typed `Regs` union. This slice only corrects the constant placement/routing for the `const_buffer.buffer` method range within that flat owner.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `CB_DATA_BASE`/`CB_DATA_END` were off by 3 header registers. Rust was incorrectly routing writes to `const_buffer.address_high`, `const_buffer.address_low`, and `const_buffer.offset` through `ProcessCBData/ProcessCBMultiData`, whereas upstream only treats `const_buffer.buffer[0..15]` as CB inline data.
+- `process_cb_multi_data()` still logs instead of performing the full upstream `memory_manager.WriteBlockCached(...)` side effect.
+- `maxwell_3d.rs` still keeps some behavior that upstream owns in auxiliary engine files or richer typed register structs.
+
+### Missing items
+- full typed-owner parity for `Regs::ConstantBuffer`
+- full `WriteBlockCached` side effect parity in `ProcessCBMultiData`
+
+### Binary layout verification
+- PASS: this slice corrects method index placement against upstream `Regs::ConstantBuffer`; no new binary payload layout was introduced.
+
+## 2026-03-30 — common/src/container_hash.rs vs common/container_hash.h
+
+### Intentional differences
+- Rust keeps only the unsigned/container hashing helpers actually used by the current port, rather than every C++ template overload. This slice only corrects the arithmetic in the shared unsigned-value path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `hash_value_unsigned()` previously performed `seed ^= value; seed += ...` as two separate steps, which does not match upstream `seed ^= value + (seed << 6) + (seed >> 2)`. That produced non-upstream `Common::HashValue` results for vectors/slices, including macro-code hashes.
+- The Rust file still does not expose every upstream overload shape, only the ones currently needed by the port.
+
+### Missing items
+- any additional upstream `HashValue` overloads if/when a later owner needs them
+
+### Binary layout verification
+- PASS: not a binary-layout slice; this is pure hash-function parity.
+
+## 2026-03-29 — video_core/src/rasterizer_interface.rs vs video_core/rasterizer_interface.h
+
+### Intentional differences
+- Rust carries an explicit guest-memory write callback in `RasterizerInterface::query(...)` because `GPUVAddr` writes are not yet owned directly by each backend as in upstream.
+
+### Unintentional differences (to fix)
+- none in this query-callback ownership slice
+
+### Missing items
+- full direct backend ownership of GPU memory writes without the Rust callback adaptation
+
+### Binary layout verification
+- PASS: interface-only file; no raw serialized layout
+
+## 2026-03-29 — video_core/src/renderer_null/null_rasterizer.rs vs video_core/renderer_null/null_rasterizer.cpp
+
+### Intentional differences
+- Rust uses the injected guest-memory callback instead of upstream direct `gpu_memory->Write<...>()`.
+
+### Unintentional differences (to fix)
+- null backend still writes a placeholder `ticks=0` instead of upstream `m_gpu.GetTicks()`.
+
+### Missing items
+- GPU tick ownership parity for timestamped query writes
+
+### Binary layout verification
+- PASS: no guest-visible struct layout; query write ordering covered by targeted tests
+
+## 2026-03-29 — video_core/src/renderer_opengl/gl_rasterizer.rs vs video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust still routes query fallback writes through an injected callback instead of upstream direct `gpu_memory` access.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Query(..., IsAFence, ...)` now defers the guest write behind `signal_fence(...)` instead of writing immediately and signaling an empty fence.
+- timestamped fallback queries still write `ticks=0` instead of upstream `gpu.GetTicks()`.
+
+### Missing items
+- full `QueryCache` / `QueryFallback` split
+- upstream GPU tick sourcing in query fallback writes
+
+### Binary layout verification
+- PASS: no raw struct layout; fence ordering covered by `query_fence_defers_guest_write_until_release`
+
+## 2026-03-29 — video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp
+
+### Intentional differences
+- Rust Vulkan query path is still a simplified fallback and uses the injected guest-memory callback rather than upstream `query_cache.CounterReport(...)`.
+
+### Unintentional differences (to fix)
+- owner signature updated in this pass to keep callback ownership compatible with deferred fence/query execution elsewhere.
+
+### Missing items
+- full `CounterReport` / `QueryCache` parity
+
+### Binary layout verification
+- PASS: no raw serialized layout in this owner file
+
+## 2026-03-29 — video_core/src/engines/puller.rs vs video_core/engines/puller.cpp
+
+### Intentional differences
+- Rust semaphore/query paths still bridge GPU memory writes through `MemoryManager::write_block_unsafe(...)` plus the `Gpu::write_guest_memory(...)` callback because direct backend ownership remains split across crates.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the guest write callback passed to `rasterizer.query(...)` is now owned (`Arc<dyn Fn...>`) so `SemaphoreRelease` can be deferred behind a fence like upstream.
+
+### Missing items
+- direct backend ownership of query/semaphore writes without the Rust callback bridge
+
+### Binary layout verification
+- PASS: not layout-sensitive; this slice changes callback lifetime/ordering only
+
+## 2026-03-29 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust still falls back to a no-op guest write callback when `Maxwell3D` emits report semaphore queries without a backend-owned memory writer.
+
+### Unintentional differences (to fix)
+- owner signature updated in this pass to keep query callbacks compatible with deferred execution semantics.
+
+### Missing items
+- direct backend ownership of report-semaphore writeback destination
+
+### Binary layout verification
+- PASS: query register ownership unchanged; this slice only updates callback lifetime semantics
+
+## 2026-03-29 — video_core/src/fence_manager.rs vs video_core/fence_manager.h
+
+### Intentional differences
+- Rust stores queued callbacks as `Box<dyn FnOnce() + Send>` and uses `Arc<Mutex<...>>` fence owners instead of the upstream template/`shared_ptr` shape, but the ownership still remains in the same owner file.
+
+### Unintentional differences (to fix)
+- `tick_frame()` and fence release ordering are now owner-local and match the upstream lifecycle for queued fences/operations in this slice.
+
+### Missing items
+- none in this generic fence lifecycle slice
+
+### Binary layout verification
+- PASS: no guest-visible binary layout in this owner file.
+
+## 2026-03-29 — video_core/src/renderer_opengl/gl_fence_manager.rs vs video_core/renderer_opengl/gl_fence_manager.cpp
+
+### Intentional differences
+- Rust implements `FenceBase` for `Arc<Mutex<GLInnerFence>>` instead of using upstream inheritance and `std::shared_ptr`.
+
+### Unintentional differences (to fix)
+- none in the `GLInnerFence` queue/is_signaled/wait slice after this change
+
+### Missing items
+- none in this owner-local backend slice
+
+### Binary layout verification
+- PASS: no guest-visible binary layout in this owner file.
+
+## 2026-03-29 — video_core/src/renderer_opengl/gl_rasterizer.rs vs video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Rust keeps `FenceManagerOpenGL` and the generic `FenceManager<Fence>` as explicit fields rather than upstream nested ownership, but both stay in the same owner file/module boundary.
+
+### Unintentional differences (to fix)
+- `signal_fence`, `sync_operation`, `signal_sync_point`, `signal_reference`, `release_fences`, `wait_for_idle`, `flush_commands`, and `tick_frame` now route through the fence manager with the same owner responsibilities as upstream.
+
+### Missing items
+- Full rasterizer behavior outside the fence/sync slice remains elsewhere in this owner file.
+
+### Binary layout verification
+- PASS: no guest-visible binary layout in this owner file.
+
+## 2026-03-29 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Upstream owns `Core::System&` and `MemoryManager&` directly in `Maxwell3D`; the Rust port still threads guest-memory reads through an injected callback and stores the `MemoryManager` behind `Arc<Mutex<_>>` to preserve crate boundaries.
+- Upstream reads `Regs::ReportSemaphore::Compare` directly into the C++ struct; Rust currently decodes the same 24-byte block manually in this owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RenderEnable::Override` now matches upstream enum semantics (`UseRenderEnable = 0`, `AlwaysRender = 1`, `NeverRender = 2`) instead of the previous shifted mapping.
+- Fixed in this pass: `ProcessQueryGet()` now uses the upstream register owner and query semantics, including `HasTimeout`/`IsAFence` flag derivation and `rasterizer->Query(...)` as the primary path.
+- Fixed in this pass: `REPORT_SEMAPHORE_QUERY` now matches `MAXWELL3D_REG_INDEX(report_semaphore.query)` instead of a stale raw byte offset that incorrectly routed the write through macro processing.
+- Fixed in this pass: the local high-register regression test now verifies the upstream word-indexed register owner instead of indexing the raw byte offset.
+
+### Missing items
+- fuller `Core::System` ownership parity in the constructor
+- direct `memory_manager.ReadBlock(...)` owner wiring instead of the current callback bridge
+
+### Binary layout verification
+- PASS: register indices now use upstream word-indexed placement for the corrected `report_semaphore.query` owner.
+
+## 2026-03-29 — `video_core/src/engines/puller.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/puller.{h,cpp}`
+
+### Intentional differences
+- Rust still stores `GPU`, `MemoryManager`, `DmaPusher`, and `ChannelState` through raw pointers / `Arc<Mutex<_>>` bridges instead of direct C++ references, to preserve crate boundaries without changing owner placement.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ProcessSemaphoreTriggerMethod()` now forwards the rasterizer query writeback into GPU memory, matching the upstream `rasterizer->Query(...)` side effect instead of discarding the write with a no-op callback.
+- Fixed in this pass: the puller register file now matches upstream `Regs::NUM_REGS = 0x800` instead of truncating to `0x40`.
+
+### Missing items
+- Upstream `Regs` still exposes the named acquire-state registers directly in the owner struct; the Rust port still accesses them through helper methods over the backing array.
+
+### Binary layout verification
+- PASS: no guest-visible binary layout; owner-local register file size and method side effects now match upstream more closely.
+
 ## 2026-03-29 — `video_core/src/engines/kepler_compute.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/kepler_compute.{h,cpp}`
 
 ### Intentional differences
@@ -1746,18 +2111,35 @@
 
 ### Intentional differences
 - Rust still stores the rasterizer edge as an erased fat-pointer payload instead of the upstream raw pointer field, because ownership crosses crate boundaries.
-- Rust still keeps several upload and query paths simplified in this owner file.
+- Rust still keeps several query and draw-manager-adjacent paths simplified in this owner file.
 
 ### Unintentional differences (to fix)
 - Fixed in this pass: `bind_rasterizer()` now exists in the owner file and `process_method_call()` forwards the upstream rasterizer-backed hooks for `WaitForIdle`, cache barriers, syncpoints, counter reset, and constant-buffer bind operations.
+- Fixed in this pass: `LAUNCH_DMA` and `INLINE_DATA` in `process_method_call()` / `call_multi_method()` now execute through the owner-local `upload_state`, matching the upstream `upload_state.ProcessExec(...)` and `upload_state.ProcessData(...)` dispatch points.
 
 ### Missing items
-- Upstream `upload_state.BindRasterizer(rasterizer)` is still missing because the `upload_state` owner path is not ported in Rust yet.
+- Upstream `upload_state` still owns `MemoryManager&` and `RasterizerInterface*` directly, while Rust still supplies them through temporary callbacks/context to preserve current crate boundaries.
 - `process_counter_reset()` still uses a temporary query-type mapping that should be aligned with the upstream enums.
 - Additional rasterizer-backed paths in this owner file remain simplified.
 
 ### Binary layout verification
 - PASS: no guest-visible binary layout in this owner file.
+
+## 2026-03-29 — `video_core/src/engines/engine_upload.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/engine_upload.{h,cpp}`
+
+### Intentional differences
+- Upstream `Upload::State` stores `MemoryManager&`, `Registers&`, and `RasterizerInterface*` directly as owner fields. Rust still uses an owner-local `FlushContext` callback bundle at flush time to avoid cross-crate lifetime/self-reference issues.
+- Upstream block-linear flush reads existing GPU memory through `GpuGuestMemoryScoped<... SafeReadCachedWrite>`. Rust still zero-fills unread portions because this owner file does not yet receive a direct guest-memory read callback for the block-linear path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the owner file now talks to the outer `video_core::memory_manager::MemoryManager` API with `read_block(...)` and `write_block(...)`, matching the upstream owner boundary instead of calling nonexistent internal-style `read(...)` / `write(...)` methods.
+
+### Missing items
+- Direct upstream-style ownership of `MemoryManager&` and `RasterizerInterface*`.
+- Upstream-equivalent safe cached read behavior for block-linear uploads.
+
+### Binary layout verification
+- PASS: `Registers` / `DestRegisters` remain owned in the matching file and preserve the upstream field order used by the upload logic.
 
 ## 2026-03-29 — `video_core/src/engines/maxwell_dma.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.{h,cpp}`
 
@@ -1782,11 +2164,13 @@
 ### Unintentional differences (to fix)
 - Fixed in this pass: `DmaPusher` now owns a real `Puller` and routes decoded methods through it instead of logging and returning on all puller methods `< 0x40`.
 - Fixed in this pass: `DispatchCalls()` now drives the same owner path that can bind subchannels and dispatch engine methods, rather than a standalone no-op method stream.
+- Fixed in this pass: `Step()` now mirrors the upstream `current_dirty = memory_manager.IsMemoryDirty(...)` pre-check for the macro-heavy `Maxwell3D` path before fetching command headers.
 
 ### Missing items
 - `DmaPusher` still lacks the full upstream subchannel object table and `BindSubchannel` owner API.
 - `DispatchCalls()` still does not implement the upstream `system.IsPoweredOn()` loop or rasterizer flush behavior exactly.
 - The upstream safe/unsafe guest-memory fetch split based on accuracy and macro/compute cases remains simplified.
+- The compute-side `current_dirty` equivalent is still absent because `kepler_compute.rs` does not yet expose the corresponding owner-local state/hooks.
 
 ### Binary layout verification
 - PASS: `CommandHeader` and `CommandListHeader` layout unchanged.
@@ -1824,6 +2208,36 @@
 ### Binary layout verification
 - PASS: no guest-visible layout in this owner file.
 
+## 2026-03-30 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+- Rust still keeps the simplified fallback query path and does not yet own the upstream OpenGL query cache / `GPU&` integration needed for `gpu.GetTicks()` and typed query-cache backends.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: fallback `Query()` now matches upstream `QueryFallback()` for non-payload query types by forcing the written payload to `1` instead of echoing the caller-supplied payload.
+- Fixed in this pass: `signal_fence()` now triggers `invalidate_gpu_cache()` after queueing/flushing the fence, matching the upstream `FenceManager::SignalFence()` lifecycle that ends with `rasterizer.InvalidateGPUCache()`.
+
+### Missing items
+- Real `gpu.GetTicks()` sourcing in the fallback path is still missing.
+- The typed `MaxwellToVideoCoreQuery()` / `query_cache.Query()` owner path is still not ported.
+
+### Binary layout verification
+- PASS: no guest-visible binary layout in this owner file.
+
+## 2026-03-30 — `video_core/src/renderer_null/null_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_null/null_rasterizer.cpp`
+
+### Intentional differences
+- Rust still injects the Host1x syncpoint owner directly instead of storing the upstream `GPU&`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Query()` now matches upstream `RasterizerNull::Query()` fallback behavior for non-payload query types by writing `1` instead of the raw payload.
+
+### Missing items
+- Real GPU tick sourcing is still missing in the timeout path because this owner still does not have upstream `GPU&`.
+
+### Binary layout verification
+- PASS: no guest-visible binary layout in this owner file.
+
 ## 2026-03-29 — `video_core/src/renderer_null/renderer_null.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_null/renderer_null.{h,cpp}`
 
 ### Intentional differences
@@ -1852,6 +2266,40 @@
 ### Binary layout verification
 - PASS: no guest-visible layout in this owner file.
 
+## 2026-03-29 — `video_core/src/memory_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.{h,cpp}`
+
+### Intentional differences
+- Rust still keeps guest-memory access behind callback-based read/write closures instead of owning upstream `Core::System` and `MaxwellDeviceMemoryManager` directly.
+- The invalidation accumulator and full safe/unsafe cache-type split are still simplified.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `BindRasterizer()` no longer records only a boolean. The owner file now stores the rasterizer edge and uses it for upstream-visible `ModifyGPUMemory`, `UnmapMemory`, `FlushRegion`, `InvalidateRegion`, and `MustFlushRegion` callbacks.
+- Fixed in this pass: the earlier bounded Rust `GetMemoryLayoutSize(gpu_addr, max_size)` change was unwound. The method now matches upstream again and ignores `max_size`.
+
+### Missing items
+- The full upstream `Core::System` / `MaxwellDeviceMemoryManager` ownership and pointer-continuity check for big pages are still adapted in Rust.
+- `FlushCaching()` and the invalidation accumulator still do not match the upstream implementation.
+- Safe vs unsafe read/write cache behavior remains simplified.
+
+### Binary layout verification
+- PASS: page-table entry packing and public wrapper layout remain unchanged; only owner-local rasterizer behavior changed.
+
+## 2026-03-29 — `video_core/src/gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.{h,cpp}`
+
+### Intentional differences
+- Rust still uses the `GpuCoreInterface` bridge because `core` and `video_core` are split crates, unlike upstream.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Gpu::bind_channel()` no longer only records `bound_channel`. It now also performs the upstream-visible rasterizer side effect `BindChannel(current_channel)`.
+- Fixed in this pass: `init_address_space()` now passes the actual rasterizer object into `MemoryManager::bind_rasterizer(...)` instead of toggling a placeholder boolean.
+
+### Missing items
+- The bridge layer (`GpuCoreInterface` / handles) is still a structural divergence from upstream and should be unwound if the crate boundary changes.
+- Additional upstream GPU lifecycle methods still remain simplified elsewhere in this file.
+
+### Binary layout verification
+- PASS: no guest-visible layout in this owner file.
+
 ## 2026-03-29 — `yuzu_cmd/src/main.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/yuzu_cmd/yuzu.cpp`
 
 ### Intentional differences
@@ -1865,3 +2313,281 @@
 
 ### Binary layout verification
 - PASS: frontend wiring only; no binary layout involved.
+## 2026-03-29 — video_core/src/dma_pusher.rs vs video_core/dma_pusher.cpp
+
+### Intentional differences
+- `EngineInterface*` / `RasterizerInterface*` are stored as Rust fat-pointer payloads (`[usize; 2]`) instead of raw C++ pointers: required to preserve trait-object vtable metadata.
+
+### Unintentional differences (to fix)
+- `system.IsPoweredOn()` loop guard is still not owned by `DmaPusher`: Rust still loops until `step()` returns false.
+- safe/unsafe GPU memory fetch split is still simplified compared to upstream.
+
+### Missing items
+- full `system` ownership in constructor and `gpu.FlushCommands()` / `gpu.OnCommandListEnd()` parity on all dispatch paths
+
+### Binary layout verification
+- PASS: `CommandListHeader` and `CommandHeader` remain raw-bit packed wrappers.
+
+## 2026-03-29 — video_core/src/engines/puller.rs vs video_core/engines/puller.cpp
+
+### Intentional differences
+- `DmaPusher&` is represented as a late-bound raw pointer set after `DmaPusher` construction to work around Rust self-referential construction.
+
+### Unintentional differences (to fix)
+- `bound_engines` still uses `Option<EngineID>` instead of a fully initialized fixed array value model.
+
+### Missing items
+- none in the `ProcessBindMethod -> BindSubchannel` ownership slice
+
+### Binary layout verification
+- PASS: puller register file remains word-indexed at upstream offsets.
+
+## 2026-03-29 — video_core/src/engines/kepler_compute.rs vs video_core/engines/kepler_compute.cpp
+
+### Intentional differences
+- Rust still keeps the higher-level recorded-dispatch representation (`DispatchCall` / `QueueMetaData`) alongside the upstream-like `EngineInterfaceState`.
+
+### Unintentional differences (to fix)
+- upload handling (`upload_state`, `uploads`, `indirect_compute`) is still incomplete relative to upstream.
+
+### Missing items
+- `ConsumeSinkImpl` exact upstream body for upload-related state
+- `GetIndirectComputeAddress`
+- `GetTICEntry`
+- `GetTSCEntry`
+
+### Binary layout verification
+- PASS: launch-related register indices kept at upstream word offsets.
+
+## 2026-03-29 — video_core/src/engines/kepler_memory.rs vs video_core/engines/kepler_memory.cpp
+
+### Intentional differences
+- Rust still uses the owner-local `engine_upload::State` abstraction instead of storing upstream references directly.
+
+### Unintentional differences (to fix)
+- none in the `EngineInterface` ownership slice
+
+### Missing items
+- full flush-context wiring for upload completion
+
+### Binary layout verification
+- PASS: exec/data register ownership and execution mask placement match upstream.
+
+## 2026-03-29 — video_core/src/engines/fermi_2d.rs vs video_core/engines/fermi_2d.cpp
+
+### Intentional differences
+- simplified software blit backend remains compared to upstream accelerated paths.
+
+### Unintentional differences (to fix)
+- `Fermi2D` backend behavior is still heavily simplified beyond the `EngineInterface` ownership slice.
+
+### Missing items
+- full blitter/rasterizer acceleration parity
+
+### Binary layout verification
+- PASS: trigger method remains executable through the upstream-owned `execution_mask`.
+
+## 2026-03-29 — video_core/src/engines/maxwell_dma.rs vs video_core/engines/maxwell_dma.cpp
+
+### Intentional differences
+- Rust keeps a simplified DMA execution backend while preserving the upstream `launch_dma` trigger ownership.
+
+### Unintentional differences (to fix)
+- full launch semantics, remap behavior, and acceleration paths remain simplified.
+
+### Missing items
+- full DMA launch behavior parity
+
+### Binary layout verification
+- PASS: `launch_dma` remains the executable register in the engine-local `execution_mask`.
+## 2026-03-29 — video_core/src/control/scheduler.rs vs video_core/control/scheduler.cpp
+
+### Intentional differences
+- `shared_ptr<ChannelState>` is represented as `Arc<Mutex<ChannelState>>`, so the Rust port must shorten lock scope where upstream reads fields lock-free.
+
+### Unintentional differences (to fix)
+- none in the `Push()` lock-order slice
+
+### Missing items
+- none in this file's current port slice
+
+### Binary layout verification
+- PASS: not layout-sensitive; ownership/order checked against upstream
+
+## 2026-03-29 — video_core/src/dma_pusher.rs vs video_core/dma_pusher.cpp
+
+### Intentional differences
+- Rust still stores engine trait objects through a fat-pointer representation because `std::array<EngineInterface*>` has no direct safe Rust equivalent.
+
+### Unintentional differences (to fix)
+- The first Rust port installed `Puller`'s back-pointer to `DmaPusher` before the final `Box` move, so `ProcessBindMethod()` wrote subchannel bindings into stale storage instead of the live `DmaPusher`.
+
+### Missing items
+- none in the stable self-reference ownership slice
+
+### Binary layout verification
+- PASS: `CommandHeader`/`CommandListHeader` bitfield extraction remains unchanged; this slice only fixes object lifetime/order.
+
+## 2026-03-29 — video_core/src/control/channel_state.rs vs video_core/control/channel_state.cpp
+
+### Intentional differences
+- Rust must perform one extra explicit step after `Box<DmaPusher>` construction to install the stable self-reference used by `Puller`.
+
+### Unintentional differences (to fix)
+- none in the `DmaPusher` construction ordering slice after this change
+
+### Missing items
+- none in this ownership-order slice
+
+### Binary layout verification
+- PASS: not layout-sensitive; parity concern is initialization order only.
+
+## 2026-03-29 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Upstream owns `Core::System&` and `MemoryManager&` directly in `Maxwell3D`; the Rust port currently threads guest-memory reads through an injected callback and stores the `MemoryManager` behind `Arc<Mutex<_>>` to preserve crate boundaries.
+- Upstream owns most draw-side helpers in `video_core/engines/draw_manager.cpp`; the Rust port still has `process_draw_method_call()` absorbed into `maxwell_3d.rs`. This slice only restores the missing upstream behaviors for `DrawIndexSmall`, `VertexArrayInstanced`, and `DrawTexture` inside the current owner.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Rust-only compatibility wrapper `Engine::write_reg()` now delegates to `EngineInterface::call_method(...)` instead of bypassing side effects through `process_method()`, so runtime command processing and tests observe the same lifecycle as upstream `CallMethod`.
+- `refresh_parameters_impl()` is now wired in the correct owner, but still uses a Rust callback bridge instead of the direct upstream `memory_manager.ReadBlock(...)` call path.
+- Full structural ownership parity with `draw_manager.rs` is still missing; `DrawManager::ProcessMethodCall()` remains split between files instead of being restored to the dedicated owner.
+
+### Missing items
+- fuller `Core::System` ownership parity in the constructor
+- full file-ownership parity for `DrawManager` logic
+
+### Binary layout verification
+- PASS: not layout-sensitive; this slice is lifecycle/ownership parity for macro parameter refresh.
+
+## 2026-03-29 — video_core/src/macro_engine/macro_engine.rs vs video_core/macro/macro.cpp
+
+### Intentional differences
+- Rust replaces the virtual `Compile` method with a closure parameter on `execute()` because `MacroEngine` is stored as a concrete owner and the backend is injected at call time.
+
+### Unintentional differences (to fix)
+- macro execution backend selection still depends on a Rust closure instead of a concrete upstream subclass instance held by the engine owner.
+- dump/settings integration from upstream `Dump(...)` and `Settings::values.*` is still absent.
+
+### Missing items
+- upstream-equivalent backend factory ownership (`MacroInterpreter`/JIT owner held directly)
+- macro dump/settings path wiring
+
+### Binary layout verification
+- PASS: `Opcode` and `MethodAddress` raw-bit layout remain represented in the same owner file.
+
+## 2026-03-29 — `video_core/src/dma_pusher.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/dma_pusher.{h,cpp}`
+
+### Intentional differences
+- Rust still uses callback-based guest-memory fetch and does not yet mirror the full upstream safe/unsafe read policy or `system.IsPoweredOn()` dependency exactly.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `dispatch_calls()` now finishes with the same owner-local lifecycle as upstream by calling `gpu.flush_commands()` and `gpu.on_command_list_end()` after draining the pushbuffer.
+
+### Missing items
+- Full upstream `system.IsPoweredOn()` loop condition and remaining safe/unsafe fetch parity.
+
+### Binary layout verification
+- PASS: no guest-visible binary layout in this owner file.
+
+## 2026-03-29 — `video_core/src/gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.{h,cpp}`
+
+### Intentional differences
+- Rust still routes ownership through mutexes and callback bridges where upstream stores direct references/pointers in `GPU::Impl`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `flush_commands()` now delegates to `rasterizer->FlushCommands()`.
+- Fixed in this pass: `on_command_list_end()` now delegates to `rasterizer->ReleaseFences(false)` like upstream, instead of returning early as a stub.
+
+### Missing items
+- Upstream `Settings::UpdateGPUAccuracy()` side effect in `OnCommandListEnd()`.
+- Full `host1x.MemoryManager().BindInterface(...)` and `host1x.GMMU().BindRasterizer(...)` parity remains elsewhere in this owner file.
+
+### Binary layout verification
+- PASS: no guest-visible binary layout in this owner file.
+## 2026-03-30 — `video_core/src/fence_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/fence_manager.h`
+
+### Intentional differences
+- Rust keeps the upstream CRTP fence manager as a generic struct with callback parameters instead of C++ template inheritance, while preserving owner placement and method boundaries in this file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `signal_fence()` no longer defers every callback unconditionally. It now matches upstream `delay_fence = Settings::IsGPULevelHigh()`, executing callbacks immediately outside GPU-high mode and only deferring them when GPU-high accuracy is enabled.
+
+### Missing items
+- Async fence-thread parity for the `can_async_check` path is still simplified compared to upstream OpenGL/Vulkan implementations.
+- Upstream `CommitAsyncFlushes`, `ShouldFlush`, and `PopAsyncFlushes` helpers are still collapsed into caller-side behavior instead of being fully ported into this owner.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-03-30 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+- Rust still stores the upstream `GPU` cache invalidation edge as an `invalidate_gpu_cache_callback` instead of calling back through the full `GPU` owner directly, because the current `RasterizerOpenGL` port remains split from the full upstream object graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `signal_reference()` no longer degrades to ordering-only fence release. It now queues a real no-op fence through `signal_fence()`, matching upstream `FenceManager::SignalReference() -> SignalFence(do_nothing)`.
+
+### Missing items
+- Large portions of OpenGL rendering state/cache logic remain unported in this owner file.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+## 2026-03-30 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust keeps the register file as flat `u32` arrays instead of the upstream typed `Regs` union. This preserves owner placement in the same file but not the upstream binary struct layout.
+
+### Unintentional differences (to fix)
+- `Maxwell3D::new()` previously skipped upstream `InitializeRegisterDefaults()`: fixed. The Rust constructor now applies the upstream boot-time defaults for blend, stencil, color masks, vertex-attribute constant bits, rasterization enables, and line widths before copying them into `shadow_state`.
+- Viewport and typed register-field defaults are still only partially represented through flat register writes, not through the full upstream typed `Regs` substructures.
+
+### Missing items
+- Full typed parity for the remaining `InitializeRegisterDefaults()` fields, especially the typed viewport/viewports defaults and any still-unmodeled boot values.
+
+### Binary layout verification
+- FAIL: the Rust engine still uses flat register arrays, not the upstream binary `Regs` layout.
+## 2026-03-30 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- OpenGL backend ownership stays in `gl_rasterizer.rs`, but Rust uses trait-object plumbing and test-only hooks that do not exist in the upstream C++ file.
+
+### Unintentional differences (to fix)
+- `RasterizerOpenGL::signal_reference()` had drifted to `signal_fence(do_nothing)`: fixed. It now matches upstream and calls `FenceManager::SignalOrdering()` instead of queueing a reference fence.
+
+### Missing items
+- `FenceManager::signal_ordering()` still lacks the full upstream cache-accumulation side effects because the current generic Rust fence manager does not directly own texture/buffer/query caches.
+
+### Binary layout verification
+- PASS: no raw shared binary layout in this file.
+## 2026-03-30 — video_core/src/fence_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/fence_manager.h
+
+### Intentional differences
+- Rust garde un `FenceManager<F>` générique et injecte les dépendances rasterizer/cache par callbacks d’appel plutôt que par ownership direct `rasterizer/gpu/texture_cache/buffer_cache/query_cache`. C’est une adaptation mécanique à la structure actuelle des owners Rust, tout en restaurant l’ordre upstream dans `signal_fence`, `signal_sync_point`, `signal_ordering` et `wait_pending_fences`.
+
+### Unintentional differences (to fix)
+- `HAS_ASYNC_CHECK` n’existe toujours pas comme axe structurel réel en Rust; le manager ne possède pas encore le vrai thread de release upstream.
+- Le manager ne possède pas encore directement les caches/rasterizer comme l’upstream `FenceManager<Traits>`, donc `ShouldWait`, `ShouldFlush`, `CommitAsyncFlushes`, `PopAsyncFlushes` et `AccumulateFlushes` restent délégués au callsite.
+
+### Missing items
+- Parité ownership complète du template upstream avec caches/rasterizer en membres directs.
+- Release thread upstream pour le mode async-check.
+
+### Binary layout verification
+- PASS: fichier runtime-only, sans struct sérialisée en raw bytes.
+
+## 2026-03-30 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- `RasterizerOpenGL` Rust reste encore très allégé et n’own pas les vrais `TextureCache`, `BufferCache`, `QueryCache` OpenGL upstream. Les callbacks passés à `FenceManager` sont donc actuellement `false`/no-op pour les chemins cache.
+
+### Unintentional differences (to fix)
+- `SignalFence`, `SignalSyncPoint`, `SignalReference` et `ReleaseFences` suivent maintenant l’ordre upstream via `FenceManager`, mais sans les vrais caches OpenGL derrière; la visibilité complète des flushes async n’est donc pas rétablie.
+- `FlushCommands`/`InvalidateGPUCache` restent appelés côté rasterizer après `FenceManager::signal_fence(...)` au lieu d’être owned directement par le manager comme upstream.
+
+### Missing items
+- Vrais owners `texture_cache`, `buffer_cache`, `query_cache` OpenGL dans `RasterizerOpenGL`.
+- Passage des vrais `ShouldWaitAsyncFlushes`/`HasUncommittedFlushes`/`CommitAsyncFlushes`/`PopAsyncFlushes`/`AccumulateFlushes` à `FenceManager`.
+
+### Binary layout verification
+- PASS: fichier runtime-only, sans layout binaire partagé.

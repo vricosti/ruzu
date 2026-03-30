@@ -208,6 +208,10 @@ impl RendererOpenGL {
         })
     }
 
+    pub fn rasterizer_mut(&mut self) -> &mut RasterizerOpenGL {
+        &mut self.rasterizer
+    }
+
     /// Composite framebuffers to the screen.
     ///
     /// Port of `RendererOpenGL::Composite()`.

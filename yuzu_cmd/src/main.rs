@@ -355,17 +355,19 @@ fn main() {
         //   auto scope = context->Acquire();
         //   auto renderer = CreateRenderer(system, emu_window, *gpu, context);
         //   gpu->BindRenderer(renderer);
+        let system_ref = ruzu_core::core::SystemRef::from_ref(&system);
+        let gpu = Box::new(video_core::gpu::Gpu::new(false, true));
+        gpu.set_system_ref(system_ref);
+        let gpu_ptr = gpu.as_ref() as *const video_core::gpu::Gpu as usize;
+
         let renderer: Box<dyn video_core::renderer_base::RendererBase> =
             match renderer_backend_str.as_str() {
                 "opengl" => {
-                    // Create a shared GL context for the renderer/GPU thread.
-                    // Safety: sdl_window_ptr_usize was cast from a valid *mut SDL_Window
-                    // that is alive for the duration of this closure.
                     let window_ptr = sdl_window_ptr_usize as *mut sdl2::sys::SDL_Window;
                     let context = Box::new(emu_window::emu_window_sdl2_gl::SdlGlContext::new(
                         window_ptr,
                     ));
-                    let renderer = video_core::renderer_opengl::RendererOpenGL::new(
+                    let mut renderer = video_core::renderer_opengl::RendererOpenGL::new(
                         |s| {
                             let cs = std::ffi::CString::new(s).unwrap();
                             unsafe {
@@ -380,6 +382,11 @@ fn main() {
                         log::error!("Failed to create OpenGL renderer: {}", e);
                         std::process::exit(1);
                     });
+                    renderer.rasterizer_mut().set_invalidate_gpu_cache_callback(Arc::new(
+                        move || unsafe {
+                            (&*(gpu_ptr as *const video_core::gpu::Gpu)).invalidate_gpu_cache();
+                        },
+                    ));
                     Box::new(renderer)
                 }
                 "vulkan" => {
@@ -388,9 +395,7 @@ fn main() {
                 }
                 _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(syncpoints.clone())),
             };
-
-        let gpu = video_core::video_core::create_gpu(false, true, renderer);
-        let system_ref = ruzu_core::core::SystemRef::from_ref(&system);
+        gpu.bind_renderer(renderer);
         gpu.set_guest_memory_reader(Arc::new(move |addr, output: &mut [u8]| {
             // Upstream: reads through Memory which resolves via the process page table.
             // The Memory page table maps guest virtual addresses to DeviceMemory host
@@ -442,7 +447,7 @@ fn main() {
                 }
             }
         }));
-        system.set_gpu_core(Box::new(gpu));
+        system.set_gpu_core(gpu);
 
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
         let shared_system: audio_core::SharedSystem =
