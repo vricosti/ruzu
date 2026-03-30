@@ -805,14 +805,14 @@ impl RasterizerInterface for RasterizerVulkan {
         gpu_addr: u64,
         _query_type: u32,
         flags: QueryPropertiesFlags,
+        gpu_ticks: u64,
         payload: u32,
         _subreport: u32,
         gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     ) {
         let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         if has_timeout {
-            let ticks: u64 = 0;
-            gpu_write(gpu_addr + 8, &ticks.to_le_bytes());
+            gpu_write(gpu_addr + 8, &gpu_ticks.to_le_bytes());
             gpu_write(gpu_addr, &(payload as u64).to_le_bytes());
         } else {
             gpu_write(gpu_addr, &payload.to_le_bytes());

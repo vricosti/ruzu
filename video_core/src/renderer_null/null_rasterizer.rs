@@ -112,19 +112,16 @@ impl RasterizerInterface for RasterizerNull {
     fn query(
         &mut self,
         gpu_addr: u64,
-        query_type: u32,
+        _query_type: u32,
         flags: QueryPropertiesFlags,
-        mut payload: u32,
+        gpu_ticks: u64,
+        payload: u32,
         _subreport: u32,
         gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     ) {
-        if query_type != 0 {
-            payload = 1;
-        }
         let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         if has_timeout {
-            let ticks: u64 = 0;
-            gpu_write(gpu_addr + 8, &ticks.to_le_bytes());
+            gpu_write(gpu_addr + 8, &gpu_ticks.to_le_bytes());
             gpu_write(gpu_addr, &(payload as u64).to_le_bytes());
         } else {
             gpu_write(gpu_addr, &payload.to_le_bytes());
@@ -296,6 +293,7 @@ mod tests {
             0x1000,
             0,
             QueryPropertiesFlags::empty(),
+            0,
             42,
             0,
             Arc::new(move |addr, data| {
@@ -320,6 +318,7 @@ mod tests {
             0x2000,
             0,
             QueryPropertiesFlags::HAS_TIMEOUT,
+            0x1234_5678_9ABC_DEF0,
             99,
             0,
             Arc::new(move |addr, data| {
@@ -330,13 +329,13 @@ mod tests {
         let w = written.lock().unwrap();
         assert_eq!(w.len(), 2);
         assert_eq!(w[0].0, 0x2008);
-        assert_eq!(w[0].1, 0u64.to_le_bytes().to_vec());
+        assert_eq!(w[0].1, 0x1234_5678_9ABC_DEF0u64.to_le_bytes().to_vec());
         assert_eq!(w[1].0, 0x2000);
         assert_eq!(w[1].1, 99u64.to_le_bytes().to_vec());
     }
 
     #[test]
-    fn test_query_non_payload_writes_one() {
+    fn test_query_non_payload_preserves_payload() {
         let sp = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerNull::new(sp);
 
@@ -346,6 +345,7 @@ mod tests {
             0x3000,
             2,
             QueryPropertiesFlags::empty(),
+            0,
             0xDEAD_BEEF,
             0,
             Arc::new(move |addr, data| {
@@ -356,7 +356,7 @@ mod tests {
         let w = written.lock().unwrap();
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].0, 0x3000);
-        assert_eq!(w[0].1, 1u32.to_le_bytes().to_vec());
+        assert_eq!(w[0].1, 0xDEAD_BEEFu32.to_le_bytes().to_vec());
     }
 
     #[test]

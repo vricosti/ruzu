@@ -55,8 +55,8 @@ pub fn create_thread(
     priority: i32,
     mut core_id: i32,
 ) -> ResultCode {
-    log::debug!(
-        "svc::CreateThread called entry=0x{:08X}, arg=0x{:08X}, stack=0x{:08X}, prio=0x{:08X}, core=0x{:08X}",
+    log::info!(
+        "svc::CreateThread called entry=0x{:08X}, arg=0x{:08X}, stack=0x{:08X}, prio={}, core={}",
         entry_point, arg, stack_bottom, priority, core_id
     );
 

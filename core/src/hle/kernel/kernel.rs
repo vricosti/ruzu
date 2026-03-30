@@ -150,14 +150,47 @@ fn real_update_highest_priority_threads() -> u64 {
 // Each physical core host thread (and any other host thread) stores its own current KThread.
 std::thread_local! {
     static CURRENT_THREAD: RefCell<Option<Weak<Mutex<KThread>>>> = RefCell::new(None);
+    static HOST_DUMMY_THREAD: RefCell<Option<Arc<Mutex<KThread>>>> = const { RefCell::new(None) };
+}
+
+fn get_or_create_host_dummy_thread(kernel: &KernelCore) -> Arc<Mutex<KThread>> {
+    HOST_DUMMY_THREAD.with(|cell| {
+        if let Some(thread) = cell.borrow().as_ref() {
+            return Arc::clone(thread);
+        }
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let thread_id = kernel.create_new_thread_id();
+            let object_id = kernel.create_new_object_id() as u64;
+            let mut guard = thread.lock().unwrap();
+            let rc = guard.initialize_dummy_thread(None, thread_id, object_id);
+            assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+            guard.bind_self_reference(&thread);
+        }
+
+        *cell.borrow_mut() = Some(Arc::clone(&thread));
+        thread
+    })
 }
 
 /// Get the current emulation thread for the calling host thread.
 /// Upstream: `KernelCore::Impl::GetCurrentEmuThread()`.
 pub fn get_current_emu_thread() -> Option<Arc<Mutex<KThread>>> {
-    CURRENT_THREAD.with(|cell| {
-        cell.borrow().as_ref().and_then(Weak::upgrade)
-    })
+    let current = CURRENT_THREAD.with(|cell| cell.borrow().as_ref().and_then(Weak::upgrade));
+    if current.is_some() {
+        return current;
+    }
+
+    let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
+    if kernel_ptr.is_null() {
+        return None;
+    }
+
+    let kernel = unsafe { &*kernel_ptr };
+    let dummy = get_or_create_host_dummy_thread(kernel);
+    set_current_emu_thread(Some(&dummy));
+    Some(dummy)
 }
 
 /// Set the current emulation thread for the calling host thread.
@@ -489,12 +522,37 @@ impl KernelCore {
     /// (audio, filesystem, etc.) that benefit from running on host hardware.
     pub fn run_on_host_core_process(&self, name: &str, func: Box<dyn FnOnce() + Send>) {
         let thread_name = format!("HLE:{}", name);
+        let kernel_ptr = self as *const KernelCore as usize;
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            let rc = process_guard.initialize(&[], 0, 0, 0, 0, 0, None, false);
+            assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+            process_guard.bind_self_reference(&process);
+        }
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let thread_id = self.create_new_thread_id();
+            let object_id = self.create_new_object_id() as u64;
+            let mut thread_guard = thread.lock().unwrap();
+            let rc = thread_guard.initialize_dummy_thread(Some(&process), thread_id, object_id);
+            assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+            thread_guard.bind_self_reference(&thread);
+        }
+        process.lock().unwrap().register_thread_object(Arc::clone(&thread));
+
         std::thread::Builder::new()
             .name(thread_name.clone())
-            .spawn(move || {
-                log::info!("Host service thread '{}' started", thread_name);
-                func();
-                log::info!("Host service thread '{}' exited", thread_name);
+            .spawn({
+                let thread = Arc::clone(&thread);
+                move || {
+                    let kernel = unsafe { &*(kernel_ptr as *const KernelCore) };
+                    kernel.register_host_thread_with_existing(Some(&thread));
+                    log::info!("Host service thread '{}' started", thread_name);
+                    func();
+                    log::info!("Host service thread '{}' exited", thread_name);
+                }
             })
             .expect("Failed to spawn host service thread");
     }
@@ -762,13 +820,29 @@ impl KernelCore {
 
     /// Register a host thread (non-core) by allocating the next host thread ID.
     /// Upstream: `KernelCore::RegisterHostThread(existing_thread)` (kernel.cpp:1036).
-    pub fn register_host_thread(&self) {
+    pub fn register_host_thread_with_existing(
+        &self,
+        existing_thread: Option<&Arc<Mutex<KThread>>>,
+    ) {
         HOST_THREAD_ID.with(|id| {
             if id.get() == u32::MAX {
                 let new_id = self.next_host_thread_id.fetch_add(1, Ordering::Relaxed);
                 id.set(new_id);
             }
         });
+
+        if let Some(thread) = existing_thread {
+            set_current_emu_thread(Some(thread));
+        } else {
+            let dummy = get_or_create_host_dummy_thread(self);
+            set_current_emu_thread(Some(&dummy));
+        }
+    }
+
+    /// Register a host thread (non-core) by allocating the next host thread ID.
+    /// Upstream: `KernelCore::RegisterHostThread(existing_thread)` (kernel.cpp:1036).
+    pub fn register_host_thread(&self) {
+        self.register_host_thread_with_existing(None);
     }
 
     /// Get the host thread ID for the calling thread.
@@ -1068,6 +1142,44 @@ mod tests {
         .expect("service process should keep its thread object");
 
         assert!(thread.lock().unwrap().parent.as_ref().and_then(Weak::upgrade).is_some());
+    }
+
+    #[test]
+    fn register_host_thread_sets_dummy_current_thread() {
+        let mut kernel = KernelCore::new();
+        kernel.initialize();
+
+        set_current_emu_thread(None);
+        kernel.register_host_thread();
+
+        let current = kernel
+            .get_current_emu_thread()
+            .expect("host thread should have a current dummy thread");
+        assert!(current.lock().unwrap().is_dummy_thread());
+    }
+
+    #[test]
+    fn register_host_thread_with_existing_keeps_existing_thread_as_current() {
+        let mut kernel = KernelCore::new();
+        kernel.initialize();
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let thread_id = kernel.create_new_thread_id();
+            let object_id = kernel.create_new_object_id() as u64;
+            let mut guard = thread.lock().unwrap();
+            let rc = guard.initialize_dummy_thread(None, thread_id, object_id);
+            assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+            guard.bind_self_reference(&thread);
+        }
+
+        set_current_emu_thread(None);
+        kernel.register_host_thread_with_existing(Some(&thread));
+
+        let current = kernel
+            .get_current_emu_thread()
+            .expect("existing thread should remain current");
+        assert!(Arc::ptr_eq(&current, &thread));
     }
 }
 

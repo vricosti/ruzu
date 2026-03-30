@@ -131,12 +131,17 @@ impl Process {
     /// Reset the process signal.
     pub fn reset_signal(&self) {
         if let Some(ref process) = self.process {
-            process.lock().unwrap().is_signaled = false;
+            process.lock().unwrap().reset();
         }
     }
 
     /// Get a clone of the KProcess reference.
     pub fn get_process(&self) -> Option<Arc<Mutex<KProcess>>> {
+        self.process.clone()
+    }
+
+    /// Upstream: `Kernel::KProcess* GetHandle() const`.
+    pub fn get_handle(&self) -> Option<Arc<Mutex<KProcess>>> {
         self.process.clone()
     }
 }

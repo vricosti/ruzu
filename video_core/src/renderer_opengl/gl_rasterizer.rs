@@ -121,20 +121,17 @@ impl RasterizerInterface for RasterizerOpenGL {
     fn query(
         &mut self,
         gpu_addr: u64,
-        query_type: u32,
+        _query_type: u32,
         flags: QueryPropertiesFlags,
-        mut payload: u32,
+        gpu_ticks: u64,
+        payload: u32,
         _subreport: u32,
         gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     ) {
-        if query_type != 0 {
-            payload = 1;
-        }
         let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         let func = Box::new(move || {
             if has_timeout {
-                let ticks: u64 = 0;
-                gpu_write(gpu_addr + 8, &ticks.to_le_bytes());
+                gpu_write(gpu_addr + 8, &gpu_ticks.to_le_bytes());
                 gpu_write(gpu_addr, &(payload as u64).to_le_bytes());
             } else {
                 gpu_write(gpu_addr, &payload.to_le_bytes());
@@ -312,6 +309,7 @@ mod tests {
             0x1000,
             0,
             QueryPropertiesFlags::IS_A_FENCE,
+            0,
             0x1234_5678,
             0,
             Arc::new(move |addr, data| {
@@ -381,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn query_non_payload_fallback_writes_one() {
+    fn query_non_payload_preserves_payload() {
         let syncpoints = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
         let writes = Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
@@ -391,6 +389,7 @@ mod tests {
             0x3000,
             3,
             QueryPropertiesFlags::empty(),
+            0,
             0xCAFE_BABE,
             0,
             Arc::new(move |addr, data| {
@@ -401,6 +400,6 @@ mod tests {
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, 0x3000);
-        assert_eq!(writes[0].1, 1u32.to_le_bytes().to_vec());
+        assert_eq!(writes[0].1, 0xCAFE_BABEu32.to_le_bytes().to_vec());
     }
 }

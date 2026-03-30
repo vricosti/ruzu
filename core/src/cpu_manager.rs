@@ -461,6 +461,92 @@ impl CpuManager {
             // maintains its own register state across run_thread() calls.
             // Runs the JIT, handles the halt reason, loops until interrupt/return.
             loop {
+                if cfg!(feature = "step_tracer") {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static THREAD_TRACE_DONE: AtomicBool = AtomicBool::new(false);
+                    if !THREAD_TRACE_DONE.load(Ordering::Relaxed) {
+                        let trace_thread_id = std::env::var("RUZU_TRACE_THREAD_ID")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok());
+                        let trace_pc = std::env::var("RUZU_TRACE_THREAD_PC")
+                            .ok()
+                            .and_then(|s| {
+                                let s = s.trim();
+                                let s = s
+                                    .strip_prefix("0x")
+                                    .or_else(|| s.strip_prefix("0X"))
+                                    .unwrap_or(s);
+                                u32::from_str_radix(s, 16).ok()
+                            });
+                        let trace_steps = std::env::var("RUZU_TRACE_THREAD_STEPS")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u32>().ok())
+                            .unwrap_or(200_000);
+
+                        if let (Some(expected_tid), Some(expected_pc)) = (trace_thread_id, trace_pc) {
+                            let should_trace = {
+                                let thread = thread_arc.lock().unwrap();
+                                if thread.get_thread_id() != expected_tid {
+                                    false
+                                } else {
+                                    let mut ctx = crate::arm::arm_interface::ThreadContext::default();
+                                    jit_ref.get_context(&mut ctx);
+                                    ctx.pc as u32 == expected_pc
+                                }
+                            };
+
+                            if should_trace {
+                                eprintln!(
+                                    "=== THREAD TRACE activated for tid={} at pc={:#010x} ===",
+                                    expected_tid, expected_pc
+                                );
+                                let mut trace_file = std::fs::File::create("/tmp/ruzu_thread_trace.bin")
+                                    .expect("cannot create thread trace file");
+                                use std::io::Write;
+                                for step in 0..trace_steps {
+                                    let op = &mut *(thread_ptr as *mut crate::arm::arm_interface::KThread);
+                                    let h = jit_ref.step_thread(op);
+                                    let mut c = crate::arm::arm_interface::ThreadContext::default();
+                                    jit_ref.get_context(&mut c);
+                                    let mut regs = [0u32; 17];
+                                    for i in 0..16 {
+                                        regs[i] = c.r[i] as u32;
+                                    }
+                                    regs[16] = c.pstate;
+                                    let bytes: &[u8] = std::slice::from_raw_parts(
+                                        regs.as_ptr() as *const u8,
+                                        68,
+                                    );
+                                    let _ = trace_file.write_all(bytes);
+                                    if step % 10_000 == 0 {
+                                        eprintln!(
+                                            "THREAD_STEP {:6} PC={:#010x} SP={:#010x} LR={:#010x} R0={:#010x}",
+                                            step, c.pc, c.sp, c.lr, c.r[0]
+                                        );
+                                    }
+                                    if h.contains(crate::arm::arm_interface::HaltReason::SUPERVISOR_CALL) {
+                                        let svc = jit_ref.get_svc_number();
+                                        let mut a = [0u64; 8];
+                                        jit_ref.get_svc_arguments(&mut a);
+                                        eprintln!(
+                                            "THREAD_SVC imm=0x{:02x} step={} args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}]",
+                                            svc, step, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]
+                                        );
+                                        let sr = kernel.system();
+                                        if !sr.is_null() {
+                                            let sys = sr.get();
+                                            crate::hle::kernel::svc_dispatch::call(sys, svc, false, &mut a);
+                                            jit_ref.set_svc_arguments(&a);
+                                        }
+                                    }
+                                }
+                                eprintln!("=== THREAD TRACE completed after {} steps ===", trace_steps);
+                                THREAD_TRACE_DONE.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+
                 // Check termination.
                 {
                     let thread = thread_arc.lock().unwrap();

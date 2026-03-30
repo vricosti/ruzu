@@ -5,10 +5,15 @@
 //! Port of zuyu/src/core/hle/service/am/event_observer.cpp
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 use super::applet::Applet;
+use super::process_holder::ProcessHolder;
 use super::window_system::WindowSystem;
+use crate::hle::kernel::k_process::ProcessState;
+use crate::hle::service::os::event::Event;
+use crate::hle::service::os::multi_wait::MultiWait;
+use crate::hle::service::os::multi_wait_holder::MultiWaitHolder;
 
 /// Tag for multi-wait user data.
 #[repr(u32)]
@@ -18,26 +23,23 @@ pub enum UserDataTag {
     AppletProcess = 1,
 }
 
-/// Port of EventObserver
-///
-/// Observes applet process lifecycle events and triggers WindowSystem updates.
-/// Upstream uses kernel multi-wait and a dedicated thread. Here we use a
-/// condvar-based wakeup mechanism and a background thread that calls
-/// WindowSystem::update() when signaled.
 pub struct EventObserver {
-    /// Shared state for the wakeup mechanism.
-    wakeup: Arc<WakeupState>,
-
-    /// Stop flag for the processing thread.
-    stop_requested: Arc<AtomicBool>,
-
-    /// Processing thread — upstream: std::thread m_thread
+    shared: Arc<SharedState>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-struct WakeupState {
-    mutex: Mutex<bool>,
-    condvar: Condvar,
+struct SharedState {
+    window_system: usize,
+    wakeup_event: Arc<Event>,
+    stop_requested: AtomicBool,
+    state: Mutex<ObserverState>,
+}
+
+struct ObserverState {
+    process_holder_list: Vec<Box<ProcessHolder>>,
+    wakeup_holder: Box<MultiWaitHolder>,
+    multi_wait: MultiWait,
+    deferred_wait_list: MultiWait,
 }
 
 impl EventObserver {
@@ -47,85 +49,190 @@ impl EventObserver {
     /// The WindowSystem pointer must remain valid for the lifetime of this
     /// EventObserver (matching upstream lifetime contract).
     pub fn new(window_system: *const WindowSystem) -> Self {
-        let wakeup = Arc::new(WakeupState {
-            mutex: Mutex::new(false),
-            condvar: Condvar::new(),
-        });
-        let stop_requested = Arc::new(AtomicBool::new(false));
+        let wakeup_event = Arc::new(Event::new());
+        let mut observer_state = ObserverState {
+            process_holder_list: Vec::new(),
+            wakeup_holder: Box::new(MultiWaitHolder::from_event(wakeup_event.clone())),
+            multi_wait: MultiWait::new(),
+            deferred_wait_list: MultiWait::new(),
+        };
+        observer_state
+            .wakeup_holder
+            .set_user_data(UserDataTag::WakeupEvent as usize);
+        observer_state
+            .wakeup_holder
+            .link_to_multi_wait(&mut observer_state.multi_wait as *mut MultiWait);
 
-        let wakeup_clone = wakeup.clone();
-        let stop_clone = stop_requested.clone();
-        let ws = window_system as usize; // transfer as usize for Send
+        let shared = Arc::new(SharedState {
+            window_system: window_system as usize,
+            wakeup_event,
+            stop_requested: AtomicBool::new(false),
+            state: Mutex::new(observer_state),
+        });
+
+        let shared_clone = shared.clone();
 
         let thread = std::thread::Builder::new()
             .name("am:EventObserver".into())
             .spawn(move || {
-                // SAFETY: The WindowSystem pointer is valid for the lifetime of EventObserver,
-                // matching upstream's raw pointer usage pattern.
-                let window_system = unsafe { &*(ws as *const WindowSystem) };
-                Self::thread_func(window_system, &wakeup_clone, &stop_clone);
+                Self::thread_func(shared_clone);
             })
             .expect("Failed to spawn EventObserver thread");
 
         Self {
-            wakeup,
-            stop_requested,
+            shared,
             thread: Some(thread),
         }
     }
 
     /// Upstream: void TrackAppletProcess(Applet& applet)
     ///
-    /// In upstream, this creates a ProcessHolder and links it to the multi-wait.
-    /// Here, since we use a simplified condvar wakeup, we just signal the
-    /// observer to start watching. The process state is checked during update().
-    pub fn track_applet_process(&self, _applet: &Arc<Mutex<Applet>>) {
-        // Signal wakeup so the observer thread performs an update cycle.
-        self.signal_wakeup();
+    pub fn track_applet_process(&self, applet: &Arc<Mutex<Applet>>) {
+        let process = {
+            let applet = applet.lock().unwrap();
+            if !applet.process.is_initialized() {
+                return;
+            }
+            let Some(process) = applet.process.get_handle() else {
+                return;
+            };
+            process
+        };
+
+        let mut holder = Box::new(ProcessHolder::new(applet.clone(), process));
+        holder
+            .get_multi_wait_holder_mut()
+            .set_user_data(UserDataTag::AppletProcess as usize);
+
+        let mut state = self.shared.state.lock().unwrap();
+        if state.process_holder_list.iter().any(|existing| {
+            Arc::ptr_eq(existing.get_process(), holder.get_process())
+        }) {
+            return;
+        }
+
+        holder
+            .get_multi_wait_holder_mut()
+            .link_to_multi_wait(&mut state.deferred_wait_list as *mut MultiWait);
+        state.process_holder_list.push(holder);
+        drop(state);
+        self.shared.wakeup_event.signal();
     }
 
     /// Upstream: void RequestUpdate()
     pub fn request_update(&self) {
-        self.signal_wakeup();
+        self.shared.wakeup_event.signal();
     }
 
-    fn signal_wakeup(&self) {
-        let mut signaled = self.wakeup.mutex.lock().unwrap();
-        *signaled = true;
-        self.wakeup.condvar.notify_one();
+    fn link_deferred(shared: &SharedState) {
+        let mut state = shared.state.lock().unwrap();
+        let mut deferred = std::mem::take(&mut state.deferred_wait_list);
+        state.multi_wait.move_all(&mut deferred);
+        state.deferred_wait_list = deferred;
     }
 
-    fn thread_func(
-        window_system: &WindowSystem,
-        wakeup: &WakeupState,
-        stop_requested: &AtomicBool,
-    ) {
+    fn wait_signaled(shared: &SharedState) -> Option<*mut MultiWaitHolder> {
         loop {
-            // Wait for a signal or stop request.
-            {
-                let mut signaled = wakeup.mutex.lock().unwrap();
-                while !*signaled && !stop_requested.load(Ordering::Acquire) {
-                    signaled = wakeup.condvar.wait(signaled).unwrap();
-                }
+            Self::link_deferred(shared);
 
-                if stop_requested.load(Ordering::Acquire) {
-                    break;
-                }
-
-                *signaled = false;
+            if shared.stop_requested.load(Ordering::Acquire) {
+                return None;
             }
 
-            // Perform recalculation — upstream: m_window_system.Update()
-            window_system.update();
+            let holders = {
+                let state = shared.state.lock().unwrap();
+                state.multi_wait.holders_snapshot()
+            };
+
+            for holder in holders {
+                let is_signaled = unsafe { (*holder).is_signaled() };
+                if !is_signaled {
+                    continue;
+                }
+
+                let tag = unsafe { (*holder).get_user_data() };
+                if tag != UserDataTag::WakeupEvent as usize {
+                    let mut state = shared.state.lock().unwrap();
+                    state.multi_wait.unlink_holder(holder);
+                }
+                return Some(holder);
+            }
+
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+
+    fn process(shared: &SharedState, holder: *mut MultiWaitHolder) {
+        let user_data = unsafe { (*holder).get_user_data() };
+        match user_data {
+            x if x == UserDataTag::WakeupEvent as usize => {
+                shared.wakeup_event.clear();
+                let window_system = unsafe { &*(shared.window_system as *const WindowSystem) };
+                window_system.update();
+            }
+            x if x == UserDataTag::AppletProcess as usize => {
+                let (applet, process_running, terminated) = {
+                    let mut state = shared.state.lock().unwrap();
+                    let Some(index) = state.process_holder_list.iter().position(|candidate| {
+                        std::ptr::eq(
+                            candidate.get_multi_wait_holder(),
+                            unsafe { &*holder },
+                        )
+                    }) else {
+                        return;
+                    };
+
+                    let process = state.process_holder_list[index].get_process().clone();
+                    let applet = state.process_holder_list[index].get_applet().clone();
+                    let (terminated, process_running) = {
+                        let process = process.lock().unwrap();
+                        let state = process.get_state();
+                        (
+                            process.is_terminated(),
+                            state == ProcessState::Running
+                                || state == ProcessState::RunningAttached
+                                || state == ProcessState::DebugBreak,
+                        )
+                    };
+
+                    if terminated {
+                        state.process_holder_list.remove(index);
+                    } else {
+                        let deferred_wait_list =
+                            &mut state.deferred_wait_list as *mut MultiWait;
+                        process.lock().unwrap().reset();
+                        state.process_holder_list[index]
+                            .get_multi_wait_holder_mut()
+                            .link_to_multi_wait(deferred_wait_list);
+                    }
+
+                    (applet, process_running, terminated)
+                };
+
+                {
+                    let mut applet = applet.lock().unwrap();
+                    applet.is_process_running = process_running;
+                    let _ = terminated;
+                }
+
+                let window_system = unsafe { &*(shared.window_system as *const WindowSystem) };
+                window_system.update();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn thread_func(shared: Arc<SharedState>) {
+        while let Some(holder) = Self::wait_signaled(&shared) {
+            Self::process(&shared, holder);
         }
     }
 }
 
 impl Drop for EventObserver {
     fn drop(&mut self) {
-        // Signal thread and wait for processing to finish.
-        self.stop_requested.store(true, Ordering::Release);
-        self.signal_wakeup();
+        self.shared.stop_requested.store(true, Ordering::Release);
+        self.shared.wakeup_event.signal();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }

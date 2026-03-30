@@ -282,7 +282,8 @@ impl ServerManager {
     /// Link a holder to the deferred list and signal the wakeup event.
     /// Port of upstream `ServerManager::LinkToDeferredList`.
     fn link_to_deferred_list_holder(&self, holder: &mut MultiWaitHolder) {
-        holder.link_to_multi_wait();
+        let mut deferred_list = self.deferred_list.lock().unwrap();
+        holder.link_to_multi_wait(&mut *deferred_list as *mut MultiWait);
         self.signal_guest_wakeup();
     }
 

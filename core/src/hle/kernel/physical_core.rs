@@ -129,6 +129,7 @@ impl PhysicalCore {
         jit: &mut dyn ArmInterface,
         thread_context: &mut ThreadContext,
     ) {
+        let _ = KScheduler::lock_thread_context_for_runtime(&main_thread);
         self.restore_thread_to_jit(jit, thread_context, &main_thread);
         *self.m_runtime.lock().unwrap() = Some(PhysicalCoreRuntime {
             m_current_thread: main_thread,
@@ -161,8 +162,16 @@ impl PhysicalCore {
             return;
         };
 
-        self.restore_thread_to_jit(jit, thread_context, &next_thread);
         let next_thread_id = next_thread.lock().unwrap().get_thread_id();
+        if next_thread_id != current_thread_id {
+            let current_thread_arc = Arc::clone(&runtime.m_current_thread);
+            KScheduler::unlock_thread_context_for_runtime(&current_thread_arc);
+            while !KScheduler::lock_thread_context_for_runtime(&next_thread) {
+                std::hint::spin_loop();
+            }
+        }
+
+        self.restore_thread_to_jit(jit, thread_context, &next_thread);
         if next_thread_id != current_thread_id {
             runtime.m_current_thread = next_thread;
         }

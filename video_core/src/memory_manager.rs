@@ -1646,6 +1646,7 @@ mod tests {
             _gpu_addr: u64,
             _query_type: u32,
             _flags: crate::query_cache::types::QueryPropertiesFlags,
+            _gpu_ticks: u64,
             _payload: u32,
             _subreport: u32,
             _gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,

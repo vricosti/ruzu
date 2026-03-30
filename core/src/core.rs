@@ -1155,15 +1155,17 @@ impl System {
     }
 
     /// Register a host thread as an emulated CPU Core.
-    /// Placeholder - full implementation requires the kernel module.
-    pub fn register_core_thread(&mut self, _id: usize) {
-        // In C++: impl->kernel.RegisterCoreThread(id);
+    pub fn register_core_thread(&mut self, id: usize) {
+        if let Some(kernel) = self.kernel.as_ref() {
+            kernel.register_core_thread(id);
+        }
     }
 
     /// Register a host thread as an auxiliary thread.
-    /// Placeholder - full implementation requires the kernel module.
     pub fn register_host_thread(&mut self) {
-        // In C++: impl->kernel.RegisterHostThread();
+        if let Some(kernel) = self.kernel.as_ref() {
+            kernel.register_host_thread();
+        }
     }
 
     /// Get a reference to the kernel core.

@@ -14,7 +14,7 @@ use super::multi_wait_holder::MultiWaitHolder;
 /// Upstream stores an intrusive list of MultiWaitHolder and calls
 /// svcWaitSynchronization on all their native handles.
 pub struct MultiWait {
-    holders: Vec<*mut MultiWaitHolder>,
+    pub(crate) holders: Vec<*mut MultiWaitHolder>,
 }
 
 // Safety: MultiWait holders are managed by the service layer on a single thread.
@@ -31,9 +31,8 @@ impl MultiWait {
     /// Link a holder to this MultiWait.
     pub fn link_holder(&mut self, holder: *mut MultiWaitHolder) {
         unsafe {
-            (*holder).link_to_multi_wait();
+            (*holder).link_to_multi_wait(self as *mut MultiWait);
         }
-        self.holders.push(holder);
     }
 
     /// Unlink a holder from this MultiWait.
@@ -41,7 +40,20 @@ impl MultiWait {
         unsafe {
             (*holder).unlink_from_multi_wait();
         }
-        self.holders.retain(|&h| h != holder);
+    }
+
+    /// Port of upstream `MultiWait::MoveAll`.
+    pub fn move_all(&mut self, other: &mut MultiWait) {
+        while let Some(holder) = other.holders.first().copied() {
+            unsafe {
+                (*holder).unlink_from_multi_wait();
+                (*holder).link_to_multi_wait(self as *mut MultiWait);
+            }
+        }
+    }
+
+    pub fn holders_snapshot(&self) -> Vec<*mut MultiWaitHolder> {
+        self.holders.clone()
     }
 
     /// WaitAny — block until any holder is signaled, return the signaled holder.
@@ -61,7 +73,8 @@ impl MultiWait {
         // Upstream: svcWaitSynchronization(handles, count, timeout).
         // We poll with a short sleep to avoid busy-waiting.
         loop {
-            for &holder in &self.holders {
+            let holders = self.holders_snapshot();
+            for &holder in &holders {
                 unsafe {
                     if (*holder).is_signaled() {
                         return Some(holder);

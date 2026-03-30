@@ -1699,6 +1699,58 @@ impl KThread {
         RESULT_SUCCESS.get_inner_value()
     }
 
+    /// Initialize as a dummy host thread.
+    ///
+    /// Port of upstream `KThread::InitializeDummyThread` (k_thread.cpp:269-276).
+    /// Used for non-guest host threads that still need a current `KThread`
+    /// owner in kernel code paths.
+    pub fn initialize_dummy_thread(
+        &mut self,
+        owner: Option<&Arc<Mutex<KProcess>>>,
+        thread_id: u64,
+        object_id: u64,
+    ) -> u32 {
+        let core = (NUM_CPU_CORES as i32) - 1;
+
+        self.object_id = object_id;
+        self.thread_type = ThreadType::Dummy;
+        self.thread_id = thread_id;
+        self.priority = DUMMY_THREAD_PRIORITY;
+        self.base_priority = DUMMY_THREAD_PRIORITY;
+        self.virtual_ideal_core_id = core;
+        self.physical_ideal_core_id = core;
+        self.virtual_affinity_mask = 1u64 << core;
+        self.physical_affinity_mask.set_affinity_mask(1u64 << core);
+        self.thread_state
+            .store(ThreadState::INITIALIZED.bits(), Ordering::Relaxed);
+        self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
+        self.suspend_request_flags = 0;
+        self.parent = owner.map(Arc::downgrade);
+        self.scheduler = owner.and_then(|process| process.lock().unwrap().scheduler.clone());
+        self.global_scheduler_context = owner.and_then(|process| {
+            process
+                .lock()
+                .unwrap()
+                .global_scheduler_context
+                .as_ref()
+                .map(Arc::downgrade)
+        });
+        self.process_schedule_count = owner.map(|process| {
+            Arc::clone(&process.lock().unwrap().schedule_count)
+        });
+        self.core_id = core;
+        self.current_core_id = core;
+        self.wait_result = RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value();
+        self.schedule_count = -1;
+        self.initialized = true;
+        self.stack_parameters = StackParameters::default();
+        self.stack_parameters.disable_count = 0;
+        self.stack_parameters.is_in_exception_handler = true;
+        self.reset_thread_context64(0, 0, 0);
+
+        RESULT_SUCCESS.get_inner_value()
+    }
+
     /// Initialize as a service thread.
     ///
     /// Port of upstream `KThread::InitializeServiceThread` (k_thread.cpp:304-321).

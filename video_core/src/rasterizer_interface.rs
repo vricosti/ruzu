@@ -66,6 +66,7 @@ pub trait RasterizerInterface {
         gpu_addr: u64,
         query_type: u32,
         flags: QueryPropertiesFlags,
+        gpu_ticks: u64,
         payload: u32,
         subreport: u32,
         gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,

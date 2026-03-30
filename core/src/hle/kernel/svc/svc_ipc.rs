@@ -5,6 +5,7 @@
 //! SVC handlers for IPC (Inter-Process Communication) operations.
 
 use crate::core::System;
+use crate::hle::ipc;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
@@ -24,7 +25,14 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         Some(thread) => thread,
         None => return RESULT_INVALID_HANDLE,
     };
-    let tls_address = current_thread.lock().unwrap().get_tls_address().get();
+    let (tls_address, thread_id, saved_tpidr) = {
+        let thread = current_thread.lock().unwrap();
+        (
+            thread.get_tls_address().get(),
+            thread.thread_id,
+            thread.thread_context.tpidr,
+        )
+    };
 
     let (client_session, shared_memory) = {
         let process = system.current_process_arc().lock().unwrap();
@@ -84,6 +92,119 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         is_domain,
         context.get_command(),
     );
+
+    if context.get_command_type() == ipc::CommandType::Invalid {
+        let runtime_tpidr = {
+            let core_id = system.cpu_manager.current_core();
+            let mut process = system.current_process_arc().lock().unwrap();
+            if let Some(jit) = process.get_arm_interface_mut(core_id) {
+                let mut ctx = crate::arm::arm_interface::ThreadContext::default();
+                jit.get_context(&mut ctx);
+                ctx.tpidr
+            } else {
+                0
+            }
+        };
+        if let Some(memory) = system.get_svc_memory() {
+            let m = memory.lock().unwrap();
+            log::error!(
+                "  SendSyncRequest INVALID CMD: thread_id={} handle={:#x} tls={:#x} saved_tpidr={:#x} runtime_tpidr={:#x} service={} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                thread_id,
+                session_handle,
+                tls_address,
+                saved_tpidr,
+                runtime_tpidr,
+                session_handler_name,
+                m.read_32(tls_address),
+                m.read_32(tls_address + 4),
+                m.read_32(tls_address + 8),
+                m.read_32(tls_address + 12),
+                m.read_32(tls_address + 16),
+                m.read_32(tls_address + 20),
+                m.read_32(tls_address + 24),
+                m.read_32(tls_address + 28),
+            );
+            if tls_address >= 0x200 {
+                let prev_tls = tls_address - 0x200;
+                log::error!(
+                    "  SendSyncRequest INVALID CMD neighbor-0x200: addr={:#x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                    prev_tls,
+                    m.read_32(prev_tls),
+                    m.read_32(prev_tls + 4),
+                    m.read_32(prev_tls + 8),
+                    m.read_32(prev_tls + 12),
+                    m.read_32(prev_tls + 16),
+                    m.read_32(prev_tls + 20),
+                    m.read_32(prev_tls + 24),
+                    m.read_32(prev_tls + 28),
+                );
+            }
+            if tls_address >= 0x400 {
+                let prev_prev_tls = tls_address - 0x400;
+                log::error!(
+                    "  SendSyncRequest INVALID CMD neighbor-0x400: addr={:#x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                    prev_prev_tls,
+                    m.read_32(prev_prev_tls),
+                    m.read_32(prev_prev_tls + 4),
+                    m.read_32(prev_prev_tls + 8),
+                    m.read_32(prev_prev_tls + 12),
+                    m.read_32(prev_prev_tls + 16),
+                    m.read_32(prev_prev_tls + 20),
+                    m.read_32(prev_prev_tls + 24),
+                    m.read_32(prev_prev_tls + 28),
+                );
+            }
+        } else {
+            let mem = debug_memory.read().unwrap();
+            log::error!(
+                "  SendSyncRequest INVALID CMD: thread_id={} handle={:#x} tls={:#x} saved_tpidr={:#x} runtime_tpidr={:#x} service={} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                thread_id,
+                session_handle,
+                tls_address,
+                saved_tpidr,
+                runtime_tpidr,
+                session_handler_name,
+                mem.read_32(tls_address),
+                mem.read_32(tls_address + 4),
+                mem.read_32(tls_address + 8),
+                mem.read_32(tls_address + 12),
+                mem.read_32(tls_address + 16),
+                mem.read_32(tls_address + 20),
+                mem.read_32(tls_address + 24),
+                mem.read_32(tls_address + 28),
+            );
+            if tls_address >= 0x200 {
+                let prev_tls = tls_address - 0x200;
+                log::error!(
+                    "  SendSyncRequest INVALID CMD neighbor-0x200: addr={:#x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                    prev_tls,
+                    mem.read_32(prev_tls),
+                    mem.read_32(prev_tls + 4),
+                    mem.read_32(prev_tls + 8),
+                    mem.read_32(prev_tls + 12),
+                    mem.read_32(prev_tls + 16),
+                    mem.read_32(prev_tls + 20),
+                    mem.read_32(prev_tls + 24),
+                    mem.read_32(prev_tls + 28),
+                );
+            }
+            if tls_address >= 0x400 {
+                let prev_prev_tls = tls_address - 0x400;
+                log::error!(
+                    "  SendSyncRequest INVALID CMD neighbor-0x400: addr={:#x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                    prev_prev_tls,
+                    mem.read_32(prev_prev_tls),
+                    mem.read_32(prev_prev_tls + 4),
+                    mem.read_32(prev_prev_tls + 8),
+                    mem.read_32(prev_prev_tls + 12),
+                    mem.read_32(prev_prev_tls + 16),
+                    mem.read_32(prev_prev_tls + 20),
+                    mem.read_32(prev_prev_tls + 24),
+                    mem.read_32(prev_prev_tls + 28),
+                );
+            }
+        }
+    }
 
     // Debug: if handle is 0, the game didn't receive the previous response correctly
     if session_handle == 0 {

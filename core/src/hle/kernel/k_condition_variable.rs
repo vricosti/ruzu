@@ -313,8 +313,17 @@ impl KConditionVariable {
             };
 
             if super::kernel::get_current_thread_pointer().is_some() {
-                unsafe {
-                    KScheduler::schedule_raw_if_needed(sched_ptr);
+                loop {
+                    unsafe {
+                        KScheduler::schedule_raw_if_needed(sched_ptr);
+                    }
+
+                    let state = current_thread.lock().unwrap().get_state();
+                    if state != super::k_thread::ThreadState::WAITING {
+                        break;
+                    }
+
+                    std::thread::yield_now();
                 }
             } else {
                 loop {
@@ -484,7 +493,15 @@ impl KConditionVariable {
         timeout: i64,
     ) -> ResultCode {
         let mut process_guard = process.lock().unwrap();
-        self.wait_locked(&mut process_guard, current_thread, addr, key, value, timeout)
+        let result = self.wait_locked(&mut process_guard, current_thread, addr, key, value, timeout);
+        drop(process_guard);
+
+        if result == RESULT_SUCCESS {
+            Self::wait_for_current_thread(process, current_thread);
+            ResultCode::new(current_thread.lock().unwrap().get_wait_result())
+        } else {
+            result
+        }
     }
 
     /// Internal wait implementation, called when the process lock is already held.
@@ -1096,6 +1113,7 @@ mod tests {
     fn wait_locked_returns_only_after_signal() {
         let (process, owner, _waiter, _owner_handle, address) = setup_threads();
         let key = 0x1c00;
+        let start = Instant::now();
 
         let process_for_signal = Arc::clone(&process);
         let signal_thread = std::thread::spawn(move || {
@@ -1113,5 +1131,34 @@ mod tests {
 
         assert_eq!(result, RESULT_SUCCESS.get_inner_value());
         assert_eq!(owner.lock().unwrap().get_state(), ThreadState::RUNNABLE);
+        assert!(start.elapsed() >= Duration::from_millis(8));
+    }
+
+    #[test]
+    fn wait_locked_guest_thread_path_loops_until_signal() {
+        let (process, owner, _waiter, _owner_handle, address) = setup_threads();
+        let key = 0x1c40;
+        let start = Instant::now();
+
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&owner));
+
+        let process_for_signal = Arc::clone(&process);
+        let signal_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            process_for_signal
+                .lock()
+                .unwrap()
+                .signal_condition_variable(key, 1);
+        });
+
+        let result =
+            KProcess::wait_condition_variable(&process, &owner, address, key, 0x2222, -1);
+
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+        signal_thread.join().unwrap();
+
+        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+        assert_eq!(owner.lock().unwrap().get_state(), ThreadState::RUNNABLE);
+        assert!(start.elapsed() >= Duration::from_millis(8));
     }
 }
