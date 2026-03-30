@@ -697,6 +697,7 @@ impl CpuManager {
                 let interrupt = hr.contains(HaltReason::BREAK_LOOP);
 
 
+
                 if supervisor_call {
                     // Upstream: Svc::Call(system, interface->GetSvcNumber())
                     // (svc.cpp:4425-4441)
