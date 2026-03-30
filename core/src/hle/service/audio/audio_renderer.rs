@@ -3,7 +3,9 @@
 //! IAudioRenderer service.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -30,6 +32,12 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 pub struct IAudioRenderer {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
+    /// The rendered event — signals the game that audio rendering is complete.
+    /// Upstream: `Kernel::KEvent* rendered_event` created in constructor via
+    /// `service_context.CreateEvent("IAudioRendererEvent")`.
+    /// Created lazily on first `QuerySystemEvent` call since we need the
+    /// HLERequestContext to create the kernel event.
+    rendered_event: Mutex<Option<Arc<Mutex<KReadableEvent>>>>,
 }
 
 impl IAudioRenderer {
@@ -53,67 +61,127 @@ impl IAudioRenderer {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            rendered_event: Mutex::new(None),
         }
     }
 
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
     fn get_sample_rate_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::GetSampleRate (STUBBED)");
+        log::debug!("IAudioRenderer::GetSampleRate");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(48000);
     }
 
     fn get_sample_count_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::GetSampleCount (STUBBED)");
+        log::debug!("IAudioRenderer::GetSampleCount");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(240);
     }
 
     fn get_mix_buffer_count_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::GetMixBufferCount (STUBBED)");
+        log::debug!("IAudioRenderer::GetMixBufferCount");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(0);
     }
 
     fn get_state_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::GetState (STUBBED)");
+        log::debug!("IAudioRenderer::GetState");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // Stopped state
+        rb.push_u32(0); // 0 = started (upstream: `!impl->GetSystem().IsActive()`)
     }
 
-    fn request_update_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::RequestUpdate (STUBBED)");
+    /// Port of upstream `IAudioRenderer::RequestUpdate` → delegates to RequestUpdateAuto.
+    /// Since we don't have a real audio renderer impl, we stub the response and signal
+    /// the rendered event so the game's WaitSynchronization returns.
+    fn request_update_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("IAudioRenderer::RequestUpdate");
+        Self::request_update_impl(this, ctx);
+    }
+
+    fn request_update_auto_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("IAudioRenderer::RequestUpdateAuto");
+        Self::request_update_impl(this, ctx);
+    }
+
+    /// Common implementation for RequestUpdate and RequestUpdateAuto.
+    /// Without a real audio renderer, we return an empty output buffer.
+    /// The rendered event was created as pre-signaled and stays signaled
+    /// (KReadableEvent does not auto-clear), so WaitSynchronization always
+    /// returns immediately. This prevents the game from blocking on audio.
+    fn request_update_impl(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         ctx.write_buffer(&[], 0);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     fn start_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::Start (STUBBED)");
+        log::debug!("IAudioRenderer::Start");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     fn stop_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::Stop (STUBBED)");
+        log::debug!("IAudioRenderer::Stop");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn query_system_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::QuerySystemEvent (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+    /// Port of upstream `IAudioRenderer::QuerySystemEvent`.
+    ///
+    /// Upstream returns `&rendered_event->GetReadableEvent()` as a copy handle.
+    /// We create the KReadableEvent lazily on first call and return its handle.
+    /// The event starts signaled so the first WaitSynchronization returns immediately.
+    fn query_system_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::info!("IAudioRenderer::QuerySystemEvent");
+        let svc = Self::as_self(this);
+
+        let mut event_guard = svc.rendered_event.lock().unwrap();
+
+        if let Some(ref readable) = *event_guard {
+            // Event already created — return an additional handle to it.
+            if let Some(handle) = ctx.copy_handle_for_readable_event(Arc::clone(readable)) {
+                log::info!("IAudioRenderer::QuerySystemEvent returning existing event handle={:#x}", handle);
+                let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_copy_objects(handle);
+            } else {
+                log::error!("IAudioRenderer::QuerySystemEvent failed to copy handle");
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+            }
+            return;
+        }
+
+        // Create the event (signaled=true so first WaitSynchronization returns immediately).
+        let Some((handle, readable_event)) = ctx.create_readable_event(true) else {
+            log::error!("IAudioRenderer::QuerySystemEvent failed to create KReadableEvent");
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+            return;
+        };
+
+        log::info!("IAudioRenderer::QuerySystemEvent created event handle={:#x}", handle);
+
+        *event_guard = Some(readable_event);
+        drop(event_guard);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
     }
 
     fn set_rendering_time_limit_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioRenderer::SetRenderingTimeLimit (STUBBED)");
+        log::debug!("IAudioRenderer::SetRenderingTimeLimit");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -122,24 +190,17 @@ impl IAudioRenderer {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioRenderer::GetRenderingTimeLimit (STUBBED)");
+        log::debug!("IAudioRenderer::GetRenderingTimeLimit");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(100); // 100% rendering time limit
-    }
-
-    fn request_update_auto_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::RequestUpdateAuto (STUBBED)");
-        ctx.write_buffer(&[], 0);
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
     }
 
     fn set_voice_drop_parameter_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioRenderer::SetVoiceDropParameter (STUBBED)");
+        log::debug!("IAudioRenderer::SetVoiceDropParameter");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -148,7 +209,7 @@ impl IAudioRenderer {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioRenderer::GetVoiceDropParameter (STUBBED)");
+        log::debug!("IAudioRenderer::GetVoiceDropParameter");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_f32(0.0);

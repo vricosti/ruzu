@@ -3,7 +3,9 @@
 //! IAudioDevice service.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -33,6 +35,10 @@ pub struct IAudioDevice {
     _device_num: u32,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
+    /// The audio device event — upstream creates this in the constructor via
+    /// `service_context.CreateEvent(...)` and signals it immediately.
+    /// Created lazily on first Query*Event call.
+    event: Mutex<Option<Arc<Mutex<KReadableEvent>>>>,
 }
 
 impl IAudioDevice {
@@ -59,7 +65,29 @@ impl IAudioDevice {
             _device_num: device_num,
             handlers,
             handlers_tipc: BTreeMap::new(),
+            event: Mutex::new(None),
         }
+    }
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    /// Ensure the shared event exists, creating it lazily. Returns a handle for the caller.
+    /// Upstream creates the event in the constructor and signals it immediately.
+    fn get_or_create_event(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) -> Option<u32> {
+        let svc = Self::as_self(this);
+        let mut event_guard = svc.event.lock().unwrap();
+
+        if let Some(ref readable) = *event_guard {
+            // Already created — return a copy handle.
+            return ctx.copy_handle_for_readable_event(Arc::clone(readable));
+        }
+
+        // Create the event (signaled=true, matching upstream constructor `event->Signal()`).
+        let (handle, readable_event) = ctx.create_readable_event(true)?;
+        *event_guard = Some(readable_event);
+        Some(handle)
     }
 
     /// Write the default audio device name to the output buffer.
@@ -72,7 +100,7 @@ impl IAudioDevice {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::ListAudioDeviceName (STUBBED)");
+        log::debug!("IAudioDevice::ListAudioDeviceName");
         Self::write_device_name(ctx);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -83,7 +111,7 @@ impl IAudioDevice {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::SetAudioDeviceOutputVolume (STUBBED)");
+        log::debug!("IAudioDevice::SetAudioDeviceOutputVolume");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -92,7 +120,7 @@ impl IAudioDevice {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::GetAudioDeviceOutputVolume (STUBBED)");
+        log::debug!("IAudioDevice::GetAudioDeviceOutputVolume");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_f32(1.0);
@@ -102,26 +130,36 @@ impl IAudioDevice {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::GetActiveAudioDeviceName (STUBBED)");
+        log::debug!("IAudioDevice::GetActiveAudioDeviceName");
         Self::write_device_name(ctx);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
+    /// Port of upstream `IAudioDevice::QueryAudioDeviceSystemEvent`.
+    /// Upstream: signals the event then returns `&event->GetReadableEvent()`.
     fn query_audio_device_system_event_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::QueryAudioDeviceSystemEvent (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        log::info!("IAudioDevice::QueryAudioDeviceSystemEvent");
+        if let Some(handle) = Self::get_or_create_event(this, ctx) {
+            log::info!("IAudioDevice::QueryAudioDeviceSystemEvent handle={:#x}", handle);
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        } else {
+            log::error!("IAudioDevice::QueryAudioDeviceSystemEvent failed to create event");
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+        }
     }
 
     fn get_active_channel_count_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::GetActiveChannelCount (STUBBED)");
+        log::debug!("IAudioDevice::GetActiveChannelCount");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(2); // stereo
@@ -131,7 +169,7 @@ impl IAudioDevice {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::ListAudioDeviceNameAuto (STUBBED)");
+        log::debug!("IAudioDevice::ListAudioDeviceNameAuto");
         Self::write_device_name(ctx);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -142,7 +180,7 @@ impl IAudioDevice {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::SetAudioDeviceOutputVolumeAuto (STUBBED)");
+        log::debug!("IAudioDevice::SetAudioDeviceOutputVolumeAuto");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -151,7 +189,7 @@ impl IAudioDevice {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::GetAudioDeviceOutputVolumeAuto (STUBBED)");
+        log::debug!("IAudioDevice::GetAudioDeviceOutputVolumeAuto");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_f32(1.0);
@@ -161,35 +199,53 @@ impl IAudioDevice {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::GetActiveAudioDeviceNameAuto (STUBBED)");
+        log::debug!("IAudioDevice::GetActiveAudioDeviceNameAuto");
         Self::write_device_name(ctx);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
+    /// Port of upstream `IAudioDevice::QueryAudioDeviceInputEvent`.
+    /// Upstream returns `&event->GetReadableEvent()`.
     fn query_audio_device_input_event_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::QueryAudioDeviceInputEvent (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        log::info!("IAudioDevice::QueryAudioDeviceInputEvent");
+        if let Some(handle) = Self::get_or_create_event(this, ctx) {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        } else {
+            log::error!("IAudioDevice::QueryAudioDeviceInputEvent failed to create event");
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+        }
     }
 
+    /// Port of upstream `IAudioDevice::QueryAudioDeviceOutputEvent`.
+    /// Upstream returns `&event->GetReadableEvent()`.
     fn query_audio_device_output_event_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::QueryAudioDeviceOutputEvent (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        log::info!("IAudioDevice::QueryAudioDeviceOutputEvent");
+        if let Some(handle) = Self::get_or_create_event(this, ctx) {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        } else {
+            log::error!("IAudioDevice::QueryAudioDeviceOutputEvent failed to create event");
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+        }
     }
 
     fn get_active_audio_output_device_name_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::GetActiveAudioOutputDeviceName (STUBBED)");
+        log::debug!("IAudioDevice::GetActiveAudioOutputDeviceName");
         Self::write_device_name(ctx);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -199,7 +255,7 @@ impl IAudioDevice {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioDevice::ListAudioOutputDeviceName (STUBBED)");
+        log::debug!("IAudioDevice::ListAudioOutputDeviceName");
         Self::write_device_name(ctx);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
