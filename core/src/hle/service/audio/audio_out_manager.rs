@@ -3,6 +3,7 @@
 //! IAudioOutManager service ("audout:u").
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -52,15 +53,19 @@ impl IAudioOutManager {
         rb.push_u32(1); // one audio out device
     }
 
+    /// Port of upstream `IAudioOutManager::OpenAudioOut`.
+    /// Creates an IAudioOut sub-session.
     fn open_audio_out_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioOutManager::OpenAudioOut (STUBBED)");
+        log::info!("IAudioOutManager::OpenAudioOut");
         Self::write_audio_out_name(ctx);
+        let audio_out = Arc::new(super::audio_out::IAudioOut::new());
         let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(48000); // sample rate
         rb.push_u32(2); // channel count
         rb.push_u32(2); // pcm format (Int16)
         rb.push_u32(0); // state (Stopped)
+        rb.push_ipc_interface(audio_out);
     }
 
     fn list_audio_outs_auto_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -71,15 +76,19 @@ impl IAudioOutManager {
         rb.push_u32(1); // one audio out device
     }
 
+    /// Port of upstream `IAudioOutManager::OpenAudioOutAuto`.
+    /// Creates an IAudioOut sub-session.
     fn open_audio_out_auto_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioOutManager::OpenAudioOutAuto (STUBBED)");
+        log::info!("IAudioOutManager::OpenAudioOutAuto");
         Self::write_audio_out_name(ctx);
+        let audio_out = Arc::new(super::audio_out::IAudioOut::new());
         let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(48000); // sample rate
         rb.push_u32(2); // channel count
         rb.push_u32(2); // pcm format (Int16)
         rb.push_u32(0); // state (Stopped)
+        rb.push_ipc_interface(audio_out);
     }
 }
 

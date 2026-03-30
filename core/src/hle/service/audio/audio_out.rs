@@ -3,7 +3,9 @@
 //! IAudioOut service.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -30,6 +32,9 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 pub struct IAudioOut {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
+    /// Buffer event — upstream creates in constructor, signals when buffers are released.
+    /// Created lazily on first RegisterBufferEvent call.
+    buffer_event: Mutex<Option<Arc<Mutex<KReadableEvent>>>>,
 }
 
 impl IAudioOut {
@@ -53,6 +58,7 @@ impl IAudioOut {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            buffer_event: Mutex::new(None),
         }
     }
 
@@ -81,10 +87,40 @@ impl IAudioOut {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn register_buffer_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioOut::RegisterBufferEvent (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    /// Port of upstream `IAudioOut::RegisterBufferEvent`.
+    /// Upstream returns `&buffer_event->GetReadableEvent()`.
+    fn register_buffer_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::info!("IAudioOut::RegisterBufferEvent");
+        let svc = Self::as_self(this);
+        let mut event_guard = svc.buffer_event.lock().unwrap();
+
+        if let Some(ref readable) = *event_guard {
+            if let Some(handle) = ctx.copy_handle_for_readable_event(Arc::clone(readable)) {
+                let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_copy_objects(handle);
+                return;
+            }
+        }
+
+        // Create pre-signaled event (so first wait returns immediately).
+        if let Some((handle, readable_event)) = ctx.create_readable_event(true) {
+            log::info!("IAudioOut::RegisterBufferEvent created event handle={:#x}", handle);
+            *event_guard = Some(readable_event);
+            drop(event_guard);
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(handle);
+        } else {
+            log::error!("IAudioOut::RegisterBufferEvent failed to create event");
+            drop(event_guard);
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+        }
     }
 
     fn get_released_audio_out_buffers_handler(
