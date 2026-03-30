@@ -15,8 +15,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use crate::hle::kernel::k_process::{KProcess, ProcessMemoryData};
-use crate::hle::kernel::kernel::KernelCore;
+use crate::hle::kernel::k_process::ProcessMemoryData;
 use crate::hle::result::ResultCode;
 
 /// Type alias matching KProcess::SharedProcessMemory.
@@ -96,60 +95,43 @@ struct AddressWaitEntry {
     cv: Arc<Condvar>,
 }
 
-/// Resolve the current process's memory from the kernel.
-/// Matches upstream: `GetCurrentMemory(kernel)` →
-/// `GetCurrentProcess(kernel).GetMemory()` →
-/// `kernel.GetCurrentEmuThread().GetOwnerProcess().GetMemory()`
-fn get_current_memory(kernel: &Arc<Mutex<KernelCore>>) -> Option<SharedProcessMemory> {
-    let kernel_guard = kernel.lock().unwrap();
-    let thread_arc = kernel_guard.get_current_emu_thread()?;
-    let thread_guard = thread_arc.lock().unwrap();
-    let process_arc = thread_guard.parent.as_ref()?.upgrade()?;
-    let process_guard = process_arc.lock().unwrap();
-    Some(process_guard.process_memory.clone())
-}
-
 /// Address arbiter for thread synchronization on userspace addresses.
 ///
 /// Port of upstream `KAddressArbiter` (k_address_arbiter.h).
-/// Upstream stores `Core::System& m_system` and `KernelCore& m_kernel`.
-/// We store `Arc<Mutex<KernelCore>>` to resolve the current process's memory
-/// dynamically via `get_current_memory()`, supporting multiple processes.
+/// Upstream stores `Core::System& m_system` and `KernelCore& m_kernel`, but the
+/// owner is `KProcess::m_address_arbiter`, so the effective memory owner is the
+/// process itself. In Rust we store the owning process memory directly.
 pub struct KAddressArbiter {
     /// Map from guest virtual address to wait state.
     wait_map: Mutex<BTreeMap<u64, AddressWaitEntry>>,
-    /// Kernel reference for resolving current process memory.
-    /// Upstream: `KernelCore& m_kernel` (from `m_system.Kernel()`).
-    kernel: Option<Arc<Mutex<KernelCore>>>,
+    /// Owning process memory.
+    memory: Option<SharedProcessMemory>,
 }
 
 impl KAddressArbiter {
     pub fn new() -> Self {
         Self {
             wait_map: Mutex::new(BTreeMap::new()),
-            kernel: None,
+            memory: None,
         }
     }
 
-    /// Create with a kernel reference.
-    /// Matches upstream `KAddressArbiter(Core::System& system)` which stores
-    /// `m_system{system}, m_kernel{system.Kernel()}`.
-    pub fn with_kernel(kernel: Arc<Mutex<KernelCore>>) -> Self {
+    /// Create with the owning process memory.
+    pub fn with_memory(memory: SharedProcessMemory) -> Self {
         Self {
             wait_map: Mutex::new(BTreeMap::new()),
-            kernel: Some(kernel),
+            memory: Some(memory),
         }
     }
 
-    /// Set the kernel reference (for deferred initialization).
-    pub fn set_kernel(&mut self, kernel: Arc<Mutex<KernelCore>>) {
-        self.kernel = Some(kernel);
+    /// Set the owning process memory (for deferred initialization).
+    pub fn set_memory(&mut self, memory: SharedProcessMemory) {
+        self.memory = Some(memory);
     }
 
-    /// Resolve the current process's guest memory.
-    /// Matches upstream `GetCurrentMemory(m_kernel)`.
+    /// Resolve the owning process's guest memory.
     fn current_memory(&self) -> Option<SharedProcessMemory> {
-        self.kernel.as_ref().and_then(get_current_memory)
+        self.memory.clone()
     }
 
     /// Dispatch a signal operation to the given address.
@@ -383,5 +365,35 @@ impl KAddressArbiter {
 impl Default for KAddressArbiter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn signal_and_wait_share_same_process_owned_arbiter() {
+        let memory = Arc::new(RwLock::new(ProcessMemoryData::new()));
+        memory.write().unwrap().write_32(0x1000, 1);
+
+        let arbiter = Arc::new(KAddressArbiter::with_memory(memory));
+        let waiter = Arc::clone(&arbiter);
+        let join = thread::spawn(move || {
+            waiter
+                .wait_for_address(0x1000, ArbitrationType::WaitIfEqual, 1, -1)
+                .get_inner_value()
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        let signal_result = arbiter
+            .signal_to_address(0x1000, SignalType::Signal, 0, 1)
+            .get_inner_value();
+        assert_eq!(signal_result, 0);
+
+        let wait_result = join.join().unwrap();
+        assert_eq!(wait_result, 0);
     }
 }

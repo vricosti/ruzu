@@ -710,12 +710,14 @@ impl Puller {
             let sequence_address = self.regs.semaphore_address();
             let payload = self.regs.semaphore_sequence();
             let gpu = self.gpu as usize;
+            let gpu_ticks = unsafe { &*(gpu as *const crate::gpu::Gpu) }.get_ticks();
             let memory_manager = Arc::clone(&self.memory_manager);
             self.with_rasterizer_mut(|rasterizer| {
                 rasterizer.query(
                     sequence_address,
                     0,
                     QueryPropertiesFlags::HAS_TIMEOUT,
+                    gpu_ticks,
                     payload,
                     0,
                     Arc::new(move |gpu_addr, bytes| {
@@ -787,12 +789,14 @@ impl Puller {
             return;
         }
         let gpu = self.gpu as usize;
+        let gpu_ticks = unsafe { &*(gpu as *const crate::gpu::Gpu) }.get_ticks();
         let memory_manager = Arc::clone(&self.memory_manager);
         self.with_rasterizer_mut(|rasterizer| {
             rasterizer.query(
                 sequence_address,
                 0,
                 QueryPropertiesFlags::IS_A_FENCE,
+                gpu_ticks,
                 payload,
                 0,
                 Arc::new(move |gpu_addr, bytes| {
@@ -843,6 +847,7 @@ mod tests {
             _gpu_addr: u64,
             _query_type: u32,
             _flags: QueryPropertiesFlags,
+            _gpu_ticks: u64,
             _payload: u32,
             _subreport: u32,
             _gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,

@@ -106,13 +106,32 @@ pub fn wait_synchronization(
     };
 
     let mut object_ids = Vec::with_capacity(num_handles as usize);
+    let mut object_kinds = Vec::with_capacity(num_handles as usize);
     for handle in &handles {
         let Some(object_id) = process.handle_table.get_object(*handle) else {
             return RESULT_INVALID_HANDLE;
         };
+        let kind = if process.get_readable_event_by_object_id(object_id).is_some() {
+            "readable_event"
+        } else if process.get_thread_by_object_id(object_id).is_some() {
+            "thread"
+        } else if process.process_id == object_id {
+            "process"
+        } else if process.get_event_by_object_id(object_id).is_some() {
+            "event"
+        } else {
+            "unknown"
+        };
         object_ids.push(object_id);
+        object_kinds.push(kind);
     }
-    log::trace!("  WaitSynchronization handles={:?} object_ids={:?} timeout_ns={}", handles, object_ids, timeout_ns);
+    log::trace!(
+        "  WaitSynchronization handles={:?} object_ids={:?} kinds={:?} timeout_ns={}",
+        handles,
+        object_ids,
+        object_kinds,
+        timeout_ns
+    );
     let timeout = if timeout_ns > 0 {
         let current_tick = system
             .kernel()
@@ -125,14 +144,20 @@ pub fn wait_synchronization(
     };
     let scheduler = system.scheduler_arc().clone();
     drop(process);
-    k_synchronization_object::wait(
+    let result = k_synchronization_object::wait(
         &process_arc,
         &current_thread,
         &scheduler,
         out_index,
         object_ids,
         timeout,
-    )
+    );
+    log::trace!(
+        "  WaitSynchronization result={:?} out_index={}",
+        result,
+        *out_index
+    );
+    result
 }
 
 /// Resumes a thread waiting on WaitSynchronization.

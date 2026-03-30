@@ -99,11 +99,12 @@ pub fn wait_for_address(
         timeout_ns
     };
 
-    // Upstream: GetCurrentProcess(kernel).WaitAddressArbiter(address, arb_type, value, timeout)
-    // which delegates to m_address_arbiter.WaitForAddress(address, arb_type, value, timeout)
-    // KProcess does not yet have an address_arbiter field. Using a temporary local instance.
-    let arbiter = crate::hle::kernel::k_address_arbiter::KAddressArbiter::new();
-    arbiter.wait_for_address(address, to_k_arb_type(arb_type), value, timeout)
+    let result = system
+        .current_process_arc()
+        .lock()
+        .unwrap()
+        .wait_address_arbiter(address, to_k_arb_type(arb_type), value, timeout);
+    ResultCode::new(result)
 }
 
 /// Signals to an address (via Address Arbiter).
@@ -130,9 +131,10 @@ pub fn signal_to_address(
         return RESULT_INVALID_ENUM_VALUE;
     }
 
-    // Upstream: GetCurrentProcess(kernel).SignalAddressArbiter(address, signal_type, value, count)
-    // which delegates to m_address_arbiter.SignalToAddress(address, signal_type, value, count)
-    // KProcess does not yet have an address_arbiter field. Using a temporary local instance.
-    let arbiter = crate::hle::kernel::k_address_arbiter::KAddressArbiter::new();
-    arbiter.signal_to_address(address, to_k_sig_type(signal_type), value, count)
+    let result = system
+        .current_process_arc()
+        .lock()
+        .unwrap()
+        .signal_address_arbiter(address, to_k_sig_type(signal_type), value, count);
+    ResultCode::new(result)
 }

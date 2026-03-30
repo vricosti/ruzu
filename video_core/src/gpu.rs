@@ -9,6 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use common::settings;
 use crate::dma_pusher::CommandList;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::rasterizer_download_area::RasterizerDownloadArea;
@@ -394,10 +395,17 @@ impl Gpu {
 
     /// Returns the GPU ticks.
     pub fn get_ticks(&self) -> u64 {
-        // NOTE: Full implementation calls system.CoreTiming().GetGPUTicks()
-        // and divides by 256 when use_fast_gpu_time is enabled.
-        // Stubbed until CoreTiming integration is complete.
-        0
+        let system = *self.system.lock().unwrap();
+        if system.is_null() {
+            return 0;
+        }
+
+        let mut gpu_tick = system.get().core_timing().lock().unwrap().get_gpu_ticks();
+        if *settings::values().use_fast_gpu_time.get_value() {
+            gpu_tick /= 256;
+        }
+
+        gpu_tick
     }
 
     /// Returns whether async GPU mode is enabled.
@@ -683,7 +691,7 @@ mod tests {
     use super::*;
     use crate::memory_manager::MemoryManager;
     use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
     struct FakeRasterizer {
         initialized_channels: Arc<StdMutex<Vec<i32>>>,
@@ -701,6 +709,7 @@ mod tests {
             _gpu_addr: u64,
             _query_type: u32,
             _flags: crate::query_cache::types::QueryPropertiesFlags,
+            _gpu_ticks: u64,
             _payload: u32,
             _subreport: u32,
             _gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
@@ -817,5 +826,36 @@ mod tests {
         unsafe {
             drop(Box::from_raw(rasterizer_ptr));
         }
+    }
+
+    #[test]
+    fn get_ticks_uses_core_timing_and_fast_gpu_time_setting() {
+        static SETTINGS_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        let _guard = SETTINGS_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+
+        let system = ruzu_core::core::System::new();
+        system.core_timing.lock().unwrap().add_ticks(512);
+        let base_gpu_ticks = system.core_timing.lock().unwrap().get_gpu_ticks();
+
+        let gpu = Gpu::new(false, false);
+        gpu.set_system_ref(ruzu_core::core::SystemRef::from_ref(&system));
+
+        let previous_fast_gpu_time = {
+            let values = settings::values();
+            *values.use_fast_gpu_time.get_value()
+        };
+
+        settings::values_mut().use_fast_gpu_time.set_value(false);
+        assert_eq!(gpu.get_ticks(), base_gpu_ticks);
+
+        settings::values_mut().use_fast_gpu_time.set_value(true);
+        assert_eq!(gpu.get_ticks(), base_gpu_ticks / 256);
+
+        settings::values_mut()
+            .use_fast_gpu_time
+            .set_value(previous_fast_gpu_time);
     }
 }

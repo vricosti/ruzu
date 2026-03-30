@@ -206,6 +206,22 @@
 ### Binary layout verification
 - PASS: runtime-only generic manager; no raw-serialized structs are defined here.
 
+## 2026-03-30 — core/src/hle/kernel/k_condition_variable.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.h
+
+### Intentional differences
+- Rust still wraps ownership through `Arc<Mutex<KProcess>>` and a local `wait_for_current_thread(...)` helper instead of upstream `KScopedSchedulerLockAndSleep`: this is a mechanical adaptation to preserve the same ownership in `k_condition_variable.rs` while integrating with the current Rust scheduler.
+
+### Unintentional differences (to fix)
+- `wait_for_current_thread(...)` still relies on the current Rust scheduler/request-schedule path rather than a line-for-line equivalent of upstream `KScopedSchedulerLockAndSleep` plus timer task ownership.
+- `KProcess::wait_condition_variable(...)` still extracts/reinserts `cond_var` with `std::mem::take` to satisfy Rust borrowing rules; ownership stays correct but the lifecycle is not yet structurally identical to upstream member-call syntax.
+
+### Missing items
+- Full parity audit of the timeout/hardware-timer wake path used by `WaitProcessWideKeyAtomic`.
+- Remaining line-by-line comparison of priority-update hooks and signal ordering against upstream `SignalImpl`/tree iteration.
+
+### Binary layout verification
+- PASS: runtime-only synchronization owner; no raw-serialized struct layout changed in this slice.
+
 ## 2026-03-28 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.h
 
 ### Intentional differences
@@ -2591,3 +2607,259 @@
 
 ### Binary layout verification
 - PASS: fichier runtime-only, sans layout binaire partagé.
+
+## 2026-03-30 — `core/src/hle/kernel/k_condition_variable.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.cpp`
+
+### Intentional differences
+- Rust garde une boucle de polling/yield dans `wait_for_current_thread()` au lieu d’un vrai `KScopedSchedulerLockAndSleep` kernel-side. C’est une adaptation mécanique à l’absence de blocage host-thread identique au C++, mais le point d’observation reste dans le bon owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the guest-thread branch of `wait_for_current_thread()` only called `KScheduler::schedule_raw_if_needed()` once, then returned even if the thread was still `WAITING`. Upstream does not return from `WaitForAddress` / `Wait` before the thread is actually resumed. The Rust path now loops until the thread leaves `WAITING`, matching the upstream wait lifecycle.
+
+### Missing items
+- Full upstream `KScopedSchedulerLockAndSleep` ownership and timer integration still remain unported in this owner.
+- `UpdateLockAtomic` still uses serialized process-memory read/modify/write instead of the upstream exclusive-monitor loop.
+
+### Binary layout verification
+- PASS: runtime-only file, no raw shared binary struct layout.
+## 2026-03-30 — core/src/hle/kernel/k_address_arbiter.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_address_arbiter.cpp
+
+### Intentional differences
+- `KAddressArbiter` stores the owning process memory directly instead of `Core::System&` / `KernelCore&`: this preserves the real upstream owner (`KProcess::m_address_arbiter`) without introducing a new global kernel `Arc` in Rust.
+- wait/signal internals still use `Condvar` + per-address waiter counts instead of upstream `KConditionVariable::ThreadTree` + scheduler lock objects: temporary behavioral simplification already present before this slice.
+
+### Unintentional differences (to fix)
+- `WaitIfLessThan` / `WaitIfEqual` still do not build the full upstream `ThreadQueueImplForKAddressArbiter` + `KScopedSchedulerLockAndSleep` path, so scheduling / cancellation parity is incomplete.
+- atomic guest-memory updates still use `RwLock` writes instead of the upstream exclusive monitor loop.
+
+### Missing items
+- full `ThreadTree` ownership matching upstream
+- proper timer-cancel / thread-cancel integration during address-arbiter waits
+- exact exclusive monitor semantics
+
+### Binary layout verification
+- PASS: no raw shared struct layout involved in this slice
+
+## 2026-03-30 — video_core/src/renderer_null/null_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_null/null_rasterizer.cpp
+
+### Intentional differences
+- Rust still stores `SyncpointManager` directly instead of the upstream `GPU& m_gpu`, because the current `RasterizerInterface` adaptation passes narrower owners than the C++ class graph.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `Query()` no longer overwrites non-payload queries with `1`; it now writes the provided payload, matching upstream.
+- `InitializeChannel` / `BindChannel` / `ReleaseChannel` are still no-op stubs, while upstream routes them through `ChannelSetupCaches<ChannelInfo>`.
+- timeout queries still write `ticks=0` because `Gpu::get_ticks()` remains a placeholder in the Rust owner.
+
+### Missing items
+- route channel lifecycle through the upstream-equivalent `ChannelSetupCaches<ChannelInfo>`
+- real GPU tick source for timeout query writes
+
+### Binary layout verification
+- PASS: runtime-only file, no raw shared struct layout.
+
+## 2026-03-30 — core/src/hle/kernel/kernel.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp
+
+### Intentional differences
+- Rust keeps `Arc<Mutex<KThread>>` in thread-local storage for `CURRENT_THREAD`/dummy-host-thread state instead of upstream raw `KThread*`. This preserves the same owner/lifecycle boundary while fitting Rust ownership.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `KernelCore::register_host_thread()` no longer only allocated a host-thread ID. It now also installs either the provided existing thread or a lazily created dummy host thread as the current emulation thread, matching upstream `RegisterHostThread(existing_thread)` and `GetHostDummyThread(...)`.
+- fixed in this pass: `run_on_host_core_process()` no longer spawned a bare host OS thread. It now creates a dummy `KThread`, associates it with a host process owner, and calls `register_host_thread_with_existing(...)` inside the spawned thread, matching upstream `RunHostThreadFunc(...)`.
+
+### Missing items
+- `RunOnHostCoreThread` still has no direct Rust counterpart file/method.
+- host-thread dummy thread registration still does not register the dummy thread in the global kernel object list the way upstream `KThread::Register(kernel, thread)` does for explicit host-core process threads.
+
+### Binary layout verification
+- PASS: lifecycle/owner file only; no raw shared struct layout changed.
+
+## 2026-03-30 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp
+
+### Intentional differences
+- Rust models dummy-thread ownership with `Option<&Arc<Mutex<KProcess>>>` instead of upstream raw `KProcess*`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `initialize_dummy_thread(...)` now exists in the owner file and sets dummy-thread priority/core/type/disable-count like upstream `KThread::InitializeDummyThread`.
+
+### Missing items
+- the broader `Initialize(...)` / `InitializeThread(...)` helper layering still remains structurally reduced versus upstream.
+
+### Binary layout verification
+- PASS: no guest-visible raw struct layout changed in this slice.
+
+## 2026-03-30 — core/src/core.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/core.cpp
+
+### Intentional differences
+- none in this pass
+
+### Unintentional differences (to fix)
+- fixed in this pass: `System::register_core_thread()` and `System::register_host_thread()` no longer remain stubs; they now delegate to `KernelCore` like upstream.
+
+### Missing items
+- none in this slice
+
+### Binary layout verification
+- PASS: owner/delegation file only; no raw shared struct layout changed.
+
+## 2026-03-30 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- `RasterizerOpenGL` Rust still uses a heavily reduced owner set and delegates actual rendering to the software rasterizer, unlike the full upstream cache/pipeline stack.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `query()` no longer overwrites non-payload queries with `1`; it now preserves the payload like upstream.
+- timeout queries still write `ticks=0` because the Rust GPU tick path is not yet wired to `CoreTiming`.
+
+### Missing items
+- real GPU tick source for timeout query writes
+- full OpenGL cache and pipeline ownership matching upstream
+
+### Binary layout verification
+- PASS: runtime-only file, no raw shared struct layout.
+
+## 2026-03-30 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.h
+
+### Intentional differences
+- the Rust owner wires `m_address_arbiter` with `SharedProcessMemory` directly at `KProcess::new()`, because the current Rust kernel still stores `KernelCore` by value instead of behind a shared owning pointer.
+
+### Unintentional differences (to fix)
+- `KProcess::WaitAddressArbiter` / `SignalAddressArbiter` now exist in the correct owner, but they still delegate to the simplified Rust `KAddressArbiter`, not the full upstream implementation.
+
+### Missing items
+- full upstream `KAddressArbiter` behavior behind these wrappers
+
+### Binary layout verification
+- PASS: owner-only method slice, no serialized layout change
+
+## 2026-03-30 — core/src/hle/kernel/svc/svc_address_arbiter.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_address_arbiter.cpp
+
+### Intentional differences
+- none
+
+### Unintentional differences (to fix)
+- fixed: `WaitForAddress` / `SignalToAddress` no longer instantiate a throwaway local `KAddressArbiter`; they now delegate to the upstream owner `KProcess::m_address_arbiter`.
+- timeout conversion and enum validation still need broader runtime validation against real games.
+
+### Missing items
+- none for owner placement in this file
+
+### Binary layout verification
+- PASS: no raw shared struct layout involved in this slice
+
+## 2026-03-30 — video_core/src/gpu.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.{h,cpp}
+
+### Intentional differences
+- Rust stores the upstream `Core::System&` as `SystemRef` behind a mutex because the crate split prevents the exact `GPU::Impl` object graph.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `Gpu::get_ticks()` no longer returns a stubbed zero. It now reads `system.CoreTiming().GetGPUTicks()` and applies `Settings::values.use_fast_gpu_time` scaling like upstream.
+
+### Missing items
+- `renderer_frame_end_notify()`, CPU-context ownership, and remaining renderer/host1x lifecycle details are still structurally reduced versus upstream `GPU::Impl`.
+- `BindRenderer()` still does not directly perform the full upstream `host1x.MemoryManager().BindInterface(...)` and `host1x.GMMU().BindRasterizer(...)` wiring in this owner file.
+
+### Binary layout verification
+- PASS: no guest-visible binary layout in this owner file.
+
+## 2026-03-30 — video_core/src/rasterizer_interface.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/rasterizer_interface.h
+
+### Intentional differences
+- Rust temporarily threads `gpu_ticks` through `RasterizerInterface::query(...)` because the current crate split does not let each rasterizer own an upstream-equivalent `GPU&`. This is a Rust-only adaptation to preserve the upstream query timestamp behavior.
+
+### Unintentional differences (to fix)
+- none in this pass
+
+### Missing items
+- restore direct owner access to `GPU::GetTicks()` from rasterizer owners once the crate graph can represent the upstream object graph without an extra parameter.
+
+### Binary layout verification
+- PASS: trait/interface file, no raw shared struct layout.
+
+## 2026-03-30 — video_core/src/control/channel_state.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state.cpp
+
+### Intentional differences
+- Rust still injects owner-local callbacks into `Maxwell3D` because it cannot hand the exact upstream `Core::System&` / `GPU&` graph through constructors.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `ChannelState::init()` now wires a `gpu_ticks_getter` bridge into `Maxwell3D`, so semaphore/query timestamp writes can use real GPU ticks instead of a stubbed zero.
+
+### Missing items
+- remaining constructor/lifecycle parity for other owner-local bridges in `ChannelState::Init(...)`.
+
+### Binary layout verification
+- PASS: owner-only lifecycle file, no raw shared struct layout.
+
+## 2026-03-30 — video_core/src/engines/maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp
+
+### Intentional differences
+- Rust uses an owner-local callback for `system.GPU().GetTicks()` because this engine still lacks the exact upstream `Core::System&` ownership chain.
+
+### Unintentional differences (to fix)
+- fixed in this pass: long query/semaphore report writes no longer force a zero timestamp when a rasterizer is present; they now source GPU ticks through the owner-local bridge.
+
+### Missing items
+- full upstream `Core::System&` ownership instead of callback bridges.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout changed in this slice.
+
+## 2026-03-30 — video_core/src/renderer_null/null_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_null/null_rasterizer.cpp
+
+### Intentional differences
+- Rust still stores `SyncpointManager` directly instead of the upstream `GPU& m_gpu`, because the current `RasterizerInterface` adaptation passes narrower owners than the C++ class graph.
+
+### Unintentional differences (to fix)
+- fixed in this pass: timeout `Query()` writes no longer force `ticks=0`; they now consume the propagated GPU tick value and write the same timestamp/payload layout as upstream.
+- `InitializeChannel` / `BindChannel` / `ReleaseChannel` are still no-op stubs, while upstream routes them through `ChannelSetupCaches<ChannelInfo>`.
+
+### Missing items
+- route channel lifecycle through the upstream-equivalent `ChannelSetupCaches<ChannelInfo>`
+
+### Binary layout verification
+- PASS: runtime-only file, no raw shared struct layout.
+
+## 2026-03-30 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- `RasterizerOpenGL` Rust still uses a heavily reduced owner set and delegates actual rendering to the software rasterizer, unlike the full upstream cache/pipeline stack.
+
+### Unintentional differences (to fix)
+- fixed in this pass: timeout `query()` writes no longer force `ticks=0`; they now preserve the payload and consume propagated GPU ticks like upstream.
+
+### Missing items
+- full OpenGL cache and pipeline ownership matching upstream
+
+### Binary layout verification
+- PASS: runtime-only file, no raw shared struct layout.
+
+## 2026-03-30 — core/src/hle/kernel/k_scheduler.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp
+
+### Intentional differences
+- The Rust port currently skips the upstream idle-core migration pass inside `UpdateHighestPriorityThreadsImpl`. This is a temporary containment for a Rust-only backend limitation: `common/src/fiber.rs` does not yet faithfully support the upstream cross-host-thread fiber exchange semantics, so migrating a runnable thread between core schedulers can resume its host fiber on the wrong host core and corrupt runtime thread-local state.
+- `set_scheduler_current_thread(...)` is a Rust-only helper to keep `current_thread_id`, `current_thread`, and thread-local `CurrentThread` bookkeeping coherent in the absence of the upstream raw `SetCurrentThread(m_kernel, next_thread)` global path.
+
+### Unintentional differences (to fix)
+- Full upstream idle-core migration remains unported until `common/src/fiber.rs` reaches behavioral parity for cross-thread fiber exchange.
+- The file still contains more logging and investigation scaffolding than upstream in some scheduling paths.
+
+### Missing items
+- Restore the upstream migration loop once `common/src/fiber.rs` can safely exchange runnable guest fibers across host core threads.
+- Re-audit remaining scheduler logging/debug scaffolding and remove it after the runtime bug is closed.
+
+### Binary layout verification
+- PASS: scheduler runtime logic only; no raw-serialized structs affected.
+
+## 2026-03-30 — core/src/hle/kernel/physical_core.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/physical_core.cpp
+
+### Intentional differences
+- Rust keeps `initialize_guest_runtime(...)` and `handoff_after_svc(...)` owner-local helpers because the current callback-based `run_loop(...)` does not mirror the upstream `RunThread(...)` monolith one-for-one. This preserves `PhysicalCore` ownership while adapting to the Rust run-loop structure.
+
+### Unintentional differences (to fix)
+- The current Rust file still contains additional post-SVC context-guard handoff logic not present in upstream `physical_core.cpp`. This was added while debugging cross-core resume bugs and should be re-audited once the scheduler/fiber migration issue is resolved.
+- The file still contains investigation logging gated by environment variables in the post-SVC path.
+
+### Missing items
+- Reconcile `handoff_after_svc(...)` with the upstream `Svc::Call(...)` return path once the scheduler/current-thread ownership is stable.
+
+### Binary layout verification
+- PASS: runtime control-flow file; no raw-serialized structs affected.

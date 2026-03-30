@@ -495,6 +495,7 @@ impl KProcess {
 
     /// Create a new process with default state.
     pub fn new() -> Self {
+        let process_memory = Arc::new(RwLock::new(ProcessMemoryData::new()));
         Self {
             page_table: KProcessPageTable::new(),
             used_kernel_memory_size: std::sync::atomic::AtomicUsize::new(0),
@@ -567,7 +568,7 @@ impl KProcess {
             running_thread_switch_counts: [0u64; NUM_CPU_CORES as usize],
             pinned_threads: [None; NUM_CPU_CORES as usize],
             watchpoints: [DebugWatchpoint::default(); NUM_WATCHPOINTS],
-            process_memory: Arc::new(RwLock::new(ProcessMemoryData::new())),
+            process_memory: process_memory.clone(),
             debug_page_refcounts: BTreeMap::new(),
             cpu_time: AtomicI64::new(0),
             num_process_switches: AtomicI64::new(0),
@@ -577,7 +578,7 @@ impl KProcess {
             num_ipc_messages: AtomicI64::new(0),
             num_ipc_replies: AtomicI64::new(0),
             num_ipc_receives: AtomicI64::new(0),
-            address_arbiter: super::k_address_arbiter::KAddressArbiter::new(),
+            address_arbiter: super::k_address_arbiter::KAddressArbiter::with_memory(process_memory),
         }
     }
 
@@ -985,6 +986,32 @@ impl KProcess {
         let mut cond_var = std::mem::take(&mut self.cond_var);
         let _ = cond_var.signal(self, cv_key, count);
         self.cond_var = cond_var;
+    }
+
+    /// Port of upstream `KProcess::SignalAddressArbiter`.
+    pub fn signal_address_arbiter(
+        &mut self,
+        address: u64,
+        signal_type: super::k_address_arbiter::SignalType,
+        value: i32,
+        count: i32,
+    ) -> u32 {
+        self.address_arbiter
+            .signal_to_address(address, signal_type, value, count)
+            .get_inner_value()
+    }
+
+    /// Port of upstream `KProcess::WaitAddressArbiter`.
+    pub fn wait_address_arbiter(
+        &mut self,
+        address: u64,
+        arb_type: super::k_address_arbiter::ArbitrationType,
+        value: i32,
+        timeout: i64,
+    ) -> u32 {
+        self.address_arbiter
+            .wait_for_address(address, arb_type, value, timeout)
+            .get_inner_value()
     }
 
     pub fn before_update_condition_variable_priority(&mut self, thread_id: u64) {

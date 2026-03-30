@@ -1736,6 +1736,8 @@ pub struct Maxwell3D {
     guest_memory_reader: Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>>,
     /// Owner-local bridge for guest memory writes needed by inline upload paths.
     guest_memory_writer: Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
+    /// Rust owner-local bridge for upstream `system.GPU().GetTicks()` query timestamp writes.
+    gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     /// Graphics TIC descriptor table (texture image descriptors).
     tic_table: TicTable,
     /// Graphics TSC descriptor table (texture sampler descriptors).
@@ -1781,6 +1783,7 @@ impl Maxwell3D {
             current_macro_dirty: false,
             guest_memory_reader: None,
             guest_memory_writer: None,
+            gpu_ticks_getter: None,
             tic_table: TicTable::new(),
             tsc_table: TscTable::new(),
         };
@@ -1879,6 +1882,10 @@ impl Maxwell3D {
         guest_memory_writer: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     ) {
         self.guest_memory_writer = Some(guest_memory_writer);
+    }
+
+    pub fn set_gpu_ticks_getter(&mut self, gpu_ticks_getter: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.gpu_ticks_getter = Some(gpu_ticks_getter);
     }
 
     fn read_gpu_block(&self, addr: u64, output: &mut [u8]) -> bool {
@@ -2581,6 +2588,7 @@ impl Maxwell3D {
                 self.draw_mode = DrawMode::General;
             }
             InstanceId::Subsequent => {
+                self.instance_count += 1;
                 self.draw_mode = DrawMode::Instance;
             }
             InstanceId::Unchanged => {}
@@ -2603,8 +2611,8 @@ impl Maxwell3D {
                 self.draw_calls.push(draw);
             }
             DrawMode::Instance => {
-                // Accumulate; actual DrawCall is emitted on flush.
-                self.instance_count += 1;
+                // Upstream DrawManager::DrawEnd does nothing for instance mode unless forced
+                // through DrawDeferred().
             }
             DrawMode::InlineIndex => {
                 let inline_data = std::mem::take(&mut self.inline_index_data);
@@ -2627,7 +2635,7 @@ impl Maxwell3D {
     /// Flush a deferred instanced draw batch. Called when a new First
     /// instance_id is seen or when take_draw_calls needs to finalize.
     fn flush_deferred_draw(&mut self) {
-        let count = self.instance_count;
+        let count = self.instance_count + 1;
         let draw = self.build_draw_call(count, Vec::new());
         log::debug!(
             "Maxwell3D: flush_deferred_draw {:?} instance_count={}",
@@ -3315,12 +3323,18 @@ impl Maxwell3D {
                     subreport,
                 );
 
+                let gpu_ticks = self
+                    .gpu_ticks_getter
+                    .as_ref()
+                    .map(|getter| getter())
+                    .unwrap_or(0);
                 let _ = self.with_rasterizer_mut(|rasterizer| {
                     queried = true;
                     rasterizer.query(
                         gpu_va,
                         query_type,
                         flags,
+                        gpu_ticks,
                         payload,
                         subreport,
                         Arc::clone(&gpu_write),
@@ -3806,6 +3820,7 @@ mod tests {
             gpu_addr: u64,
             _query_type: u32,
             flags: QueryPropertiesFlags,
+            gpu_ticks: u64,
             payload: u32,
             _subreport: u32,
             gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
@@ -3813,7 +3828,7 @@ mod tests {
             let bytes = if flags.contains(QueryPropertiesFlags::HAS_TIMEOUT) {
                 let mut buf = Vec::with_capacity(16);
                 buf.extend_from_slice(&(payload as u64).to_le_bytes());
-                buf.extend_from_slice(&0u64.to_le_bytes());
+                buf.extend_from_slice(&gpu_ticks.to_le_bytes());
                 buf
             } else {
                 payload.to_le_bytes().to_vec()
@@ -5494,7 +5509,7 @@ mod tests {
         engine.write_reg(DRAW_BEGIN, 4); // First (bits[27:26]=0)
         let draws = engine.take_draw_calls();
         assert_eq!(draws.len(), 1);
-        assert_eq!(draws[0].instance_count, 3);
+        assert_eq!(draws[0].instance_count, 4);
     }
 
     #[test]
@@ -5507,6 +5522,7 @@ mod tests {
             engine.write_reg(DRAW_BEGIN, subsequent);
             engine.write_reg(DRAW_END, 0);
         }
+        assert_eq!(engine.instance_count, 2);
 
         // Flush via First.
         engine.write_reg(DRAW_BEGIN, 4);

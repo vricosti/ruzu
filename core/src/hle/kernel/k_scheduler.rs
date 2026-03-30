@@ -123,6 +123,14 @@ impl KScheduler {
         }
     }
 
+    pub(crate) fn lock_thread_context_for_runtime(thread: &Arc<Mutex<KThread>>) -> bool {
+        Self::try_lock_thread_context(thread)
+    }
+
+    pub(crate) fn unlock_thread_context_for_runtime(thread: &Arc<Mutex<KThread>>) {
+        Self::unlock_thread_context(thread);
+    }
+
     fn exit_thread_if_termination_requested(
         &self,
         process: &Arc<Mutex<KProcess>>,
@@ -659,104 +667,23 @@ impl KScheduler {
             }
         }
 
-        // Idle core migration: try to move suggested threads to idle cores.
-        // Uses PQ's cached thread properties — no KThread locking needed.
-        let pq = &mut gsc.m_priority_queue;
-        while idle_cores != 0 {
-            let core_id = idle_cores.trailing_zeros() as i32;
-
-            let mut suggested = pq.get_suggested_front(core_id);
-            let mut migration_candidates: Vec<i32> = Vec::new();
-
-            while let Some(suggested_id) = suggested {
-                let suggested_core = pq.get_thread_props(suggested_id)
-                    .map(|p| p.active_core)
-                    .unwrap_or(-1);
-
-                let top_on_suggested =
-                    if suggested_core >= 0 { top_threads[suggested_core as usize] } else { None };
-
-                if top_on_suggested != Some(suggested_id) {
-                    // Check priority threshold for migration.
-                    let top_priority = top_on_suggested.and_then(|id| {
-                        pq.get_thread_props(id).map(|p| p.priority)
-                    });
-                    if let Some(p) = top_priority {
-                        if p < HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY {
-                            break; // Too high priority to migrate
-                        }
-                    }
-
-                    // Migrate the suggested thread to the idle core.
-                    // Upstream: suggested->SetActiveCore(core_id);
-                    //           priority_queue.ChangeCore(suggested_core, suggested);
-                    let s_priority = pq.get_thread_props(suggested_id)
-                        .map(|p| p.priority).unwrap_or(63);
-                    pq.change_core(suggested_core, suggested_id, core_id, s_priority, false, true);
-                    migrations.push((suggested_id, core_id));
-                    top_threads[core_id as usize] = Some(suggested_id);
-                    if (core_id as usize) < schedulers.len() {
-                        let (mask, prev_id) =
-                            schedulers[core_id as usize].update_highest_priority_thread(Some(suggested_id));
-                        cores_needing_scheduling |= mask;
-                        if let Some(pid) = prev_id {
-                            pq.increment_scheduled_count(pid);
-                        }
-                    }
-                    break;
-                }
-
-                migration_candidates.push(suggested_core);
-                let s_priority = pq.get_thread_props(suggested_id)
-                    .map(|p| p.priority).unwrap_or(63);
-                suggested = pq.get_suggested_next(core_id, suggested_id, s_priority);
-            }
-
-            // If we didn't migrate a thread directly, try migrating a top thread
-            // from a candidate core (if that core has another thread to run).
-            if suggested.is_none() && top_threads[core_id as usize].is_none() {
-                for &candidate_core in &migration_candidates {
-                    if candidate_core < 0 { continue; }
-                    let Some(candidate_top_id) = top_threads[candidate_core as usize] else { continue; };
-                    let c_priority = pq.get_thread_props(candidate_top_id)
-                        .map(|p| p.priority).unwrap_or(63);
-                    let next_on_candidate = pq.get_scheduled_next(
-                        candidate_core,
-                        candidate_top_id,
-                        c_priority,
-                    );
-                    if let Some(next_id) = next_on_candidate {
-                        // The candidate core has another thread — migrate its top.
-                        top_threads[candidate_core as usize] = Some(next_id);
-                        if (candidate_core as usize) < schedulers.len() {
-                            let (mask, prev_id) =
-                                schedulers[candidate_core as usize]
-                                    .update_highest_priority_thread(Some(next_id));
-                            cores_needing_scheduling |= mask;
-                            if let Some(pid) = prev_id {
-                                pq.increment_scheduled_count(pid);
-                            }
-                        }
-
-                        pq.change_core(candidate_core, candidate_top_id, core_id, c_priority, false, false);
-                        migrations.push((candidate_top_id, core_id));
-                        top_threads[core_id as usize] = Some(candidate_top_id);
-                        if (core_id as usize) < schedulers.len() {
-                            let (mask, prev_id) =
-                                schedulers[core_id as usize]
-                                    .update_highest_priority_thread(Some(candidate_top_id));
-                            cores_needing_scheduling |= mask;
-                            if let Some(pid) = prev_id {
-                                pq.increment_scheduled_count(pid);
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-
-            idle_cores &= !(1u64 << core_id);
-        }
+        // Upstream migrates runnable threads toward idle cores here.
+        //
+        // The current Rust `common::fiber` backend still does not provide
+        // trustworthy cross-host-thread fiber exchange parity with the upstream
+        // `boost::context` implementation. Allowing the migration step here can
+        // move a runnable guest thread to another core scheduler while its host
+        // fiber continues executing on the previous host core, which corrupts
+        // per-thread runtime state such as TLS-visible IPC buffers.
+        //
+        // Keep ownership and all non-migration scheduling logic in this file,
+        // but skip the actual migration pass until the backend can faithfully
+        // exchange fibers between host threads.
+        let _ = (
+            &mut idle_cores,
+            &mut migrations,
+            HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY,
+        );
 
         // Wake up waiting dummy threads.
         gsc.wakeup_waiting_dummy_threads();
@@ -907,6 +834,17 @@ impl KScheduler {
             self.yielded_thread_id = None;
         }
         self.state.needs_scheduling.store(false, Ordering::Relaxed);
+    }
+
+    pub fn set_scheduler_current_thread(&mut self, thread: &Arc<Mutex<KThread>>) {
+        let thread_id = thread.lock().unwrap().get_thread_id();
+        self.current_thread_id = Some(thread_id);
+        self.current_thread = Some(Arc::downgrade(thread));
+        if self.yielded_thread_id == Some(thread_id) {
+            self.yielded_thread_id = None;
+        }
+        self.state.needs_scheduling.store(false, Ordering::Relaxed);
+        super::kernel::set_current_emu_thread(Some(thread));
     }
 
     pub fn request_schedule(&self) {
@@ -1471,7 +1409,11 @@ impl KScheduler {
             .unwrap()
             .get_thread_by_thread_id(next_thread_id);
         if next_thread.is_some() {
-            self.set_scheduler_current_thread_id(next_thread_id);
+            if let Some(ref thread) = next_thread {
+                self.set_scheduler_current_thread(thread);
+            } else {
+                self.set_scheduler_current_thread_id(next_thread_id);
+            }
         }
         next_thread
     }

@@ -6,8 +6,19 @@
 //!
 //! MultiWaitHolder — holds a synchronization object for MultiWait.
 
+use std::ptr::NonNull;
+use std::sync::{Arc, Mutex};
+
+use crate::hle::kernel::k_process::KProcess;
+
 use super::event::Event;
-use std::sync::Arc;
+use super::multi_wait::MultiWait;
+
+enum WaitableHandle {
+    None,
+    Event(Arc<Event>),
+    Process(Arc<Mutex<KProcess>>),
+}
 
 /// MultiWaitHolder — holds a native synchronization object handle.
 ///
@@ -16,18 +27,22 @@ use std::sync::Arc;
 /// and a linked flag.
 pub struct MultiWaitHolder {
     user_data: usize,
-    /// The event this holder is waiting on (if any).
-    event: Option<Arc<Event>>,
-    /// Whether this holder is currently linked to a MultiWait.
-    is_linked: bool,
+    multi_wait: Option<NonNull<MultiWait>>,
+    native_handle: WaitableHandle,
 }
+
+// Matches the ownership model used throughout the service layer: the raw
+// `multi_wait` pointer is only linkage metadata, while the waited objects are
+// owned through `Arc` and synchronized independently.
+unsafe impl Send for MultiWaitHolder {}
+unsafe impl Sync for MultiWaitHolder {}
 
 impl MultiWaitHolder {
     pub fn new() -> Self {
         Self {
             user_data: 0,
-            event: None,
-            is_linked: false,
+            multi_wait: None,
+            native_handle: WaitableHandle::None,
         }
     }
 
@@ -35,8 +50,17 @@ impl MultiWaitHolder {
     pub fn from_event(event: Arc<Event>) -> Self {
         Self {
             user_data: 0,
-            event: Some(event),
-            is_linked: false,
+            multi_wait: None,
+            native_handle: WaitableHandle::Event(event),
+        }
+    }
+
+    /// Create a holder wrapping a process synchronization object.
+    pub fn from_process(process: Arc<Mutex<KProcess>>) -> Self {
+        Self {
+            user_data: 0,
+            multi_wait: None,
+            native_handle: WaitableHandle::Process(process),
         }
     }
 
@@ -52,26 +76,38 @@ impl MultiWaitHolder {
 
     /// Check if the held object is signaled.
     pub fn is_signaled(&self) -> bool {
-        if let Some(ref event) = self.event {
-            event.is_signaled()
-        } else {
-            false
+        match &self.native_handle {
+            WaitableHandle::None => false,
+            WaitableHandle::Event(event) => event.is_signaled(),
+            WaitableHandle::Process(process) => process.lock().unwrap().is_signaled(),
         }
     }
 
     /// Link this holder to a MultiWait.
-    pub fn link_to_multi_wait(&mut self) {
-        self.is_linked = true;
+    pub fn link_to_multi_wait(&mut self, multi_wait: *mut MultiWait) {
+        assert!(self.multi_wait.is_none(), "holder already linked");
+        self.multi_wait = NonNull::new(multi_wait);
+        unsafe {
+            (*multi_wait).holders.push(self as *mut MultiWaitHolder);
+        }
     }
 
     /// Unlink this holder from its MultiWait.
     pub fn unlink_from_multi_wait(&mut self) {
-        self.is_linked = false;
+        let Some(mut multi_wait) = self.multi_wait.take() else {
+            return;
+        };
+        unsafe {
+            multi_wait
+                .as_mut()
+                .holders
+                .retain(|&holder| !std::ptr::eq(holder, self as *mut MultiWaitHolder));
+        }
     }
 
     /// Check if currently linked.
     pub fn is_linked(&self) -> bool {
-        self.is_linked
+        self.multi_wait.is_some()
     }
 }
 

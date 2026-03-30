@@ -105,6 +105,11 @@ impl ChannelState {
             let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
             gpu.write_guest_memory(addr, data);
         }));
+        let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
+        maxwell_3d.set_gpu_ticks_getter(Arc::new(move || unsafe {
+            let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
+            gpu.get_ticks()
+        }));
         self.maxwell_3d = Some(maxwell_3d);
         self.fermi_2d = Some(Box::new(Fermi2D::new()));
         self.kepler_compute = Some(Box::new(KeplerCompute::new()));
