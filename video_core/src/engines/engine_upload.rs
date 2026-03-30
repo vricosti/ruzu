@@ -8,7 +8,7 @@
 //! an `upload::State` that accumulates data words and flushes them to
 //! GPU virtual memory when the transfer completes.
 
-use crate::memory_manager::GpuMemoryManager;
+use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerInterface;
 use crate::textures::decoders;
 
@@ -70,7 +70,7 @@ impl DestRegisters {
 /// is needed, avoiding lifetime issues from storing references.
 pub struct FlushContext<'a> {
     pub rasterizer: Option<&'a mut dyn RasterizerInterface>,
-    pub memory_manager: &'a GpuMemoryManager,
+    pub memory_manager: &'a MemoryManager,
     pub write_cpu_mem: &'a mut dyn FnMut(u64, &[u8]),
 }
 
@@ -248,7 +248,7 @@ impl State {
                         );
                     } else {
                         // No rasterizer — fall back to direct memory write.
-                        ctx.memory_manager.write(
+                        ctx.memory_manager.write_block(
                             dest_line,
                             &read_buffer[start..end],
                             ctx.write_cpu_mem,
@@ -293,7 +293,8 @@ impl State {
             // engine would provide a read callback. For now, zero-fill is safe because
             // swizzle_subrect overwrites the relevant parts.
             let read_cpu = |_addr: u64, _dst: &mut [u8]| {};
-            ctx.memory_manager.read(address, &mut self.tmp_buffer, &read_cpu);
+            ctx.memory_manager
+                .read_block(address, &mut self.tmp_buffer, &read_cpu);
 
             // Swizzle the upload data into the tiled buffer.
             decoders::swizzle_subrect(
@@ -313,7 +314,8 @@ impl State {
             );
 
             // Write the swizzled buffer back to GPU memory.
-            ctx.memory_manager.write(address, &self.tmp_buffer, ctx.write_cpu_mem);
+            ctx.memory_manager
+                .write_block(address, &self.tmp_buffer, ctx.write_cpu_mem);
         }
     }
 }

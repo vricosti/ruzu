@@ -13,6 +13,7 @@ use std::sync::Arc;
 use log::trace;
 
 use crate::host1x::syncpoint_manager::SyncpointManager;
+use crate::query_cache::types::QueryPropertiesFlags;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 
 // ── AccelerateDMA ──────────────────────────────────────────────────────────
@@ -111,12 +112,16 @@ impl RasterizerInterface for RasterizerNull {
     fn query(
         &mut self,
         gpu_addr: u64,
-        _query_type: u32,
-        has_timeout: bool,
-        payload: u32,
+        query_type: u32,
+        flags: QueryPropertiesFlags,
+        mut payload: u32,
         _subreport: u32,
-        gpu_write: &dyn Fn(u64, &[u8]),
+        gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     ) {
+        if query_type != 0 {
+            payload = 1;
+        }
+        let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         if has_timeout {
             let ticks: u64 = 0;
             gpu_write(gpu_addr + 8, &ticks.to_le_bytes());
@@ -142,12 +147,12 @@ impl RasterizerInterface for RasterizerNull {
     // ── Synchronization ─────────────────────────────────────────────────
 
     /// Execute fence callback immediately (null backend has no GPU latency).
-    fn signal_fence(&mut self, func: Box<dyn FnOnce()>) {
+    fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
         func();
     }
 
     /// Execute sync operation immediately.
-    fn sync_operation(&mut self, func: Box<dyn FnOnce()>) {
+    fn sync_operation(&mut self, func: Box<dyn FnOnce() + Send>) {
         func();
     }
 
@@ -285,10 +290,18 @@ mod tests {
         let sp = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerNull::new(sp);
 
-        let written = std::sync::Mutex::new(Vec::new());
-        rast.query(0x1000, 0, false, 42, 0, &|addr, data| {
-            written.lock().unwrap().push((addr, data.to_vec()));
-        });
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let written_cb = Arc::clone(&written);
+        rast.query(
+            0x1000,
+            0,
+            QueryPropertiesFlags::empty(),
+            42,
+            0,
+            Arc::new(move |addr, data| {
+                written_cb.lock().unwrap().push((addr, data.to_vec()));
+            }),
+        );
 
         let w = written.lock().unwrap();
         assert_eq!(w.len(), 1);
@@ -301,10 +314,18 @@ mod tests {
         let sp = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerNull::new(sp);
 
-        let written = std::sync::Mutex::new(Vec::new());
-        rast.query(0x2000, 0, true, 99, 0, &|addr, data| {
-            written.lock().unwrap().push((addr, data.to_vec()));
-        });
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let written_cb = Arc::clone(&written);
+        rast.query(
+            0x2000,
+            0,
+            QueryPropertiesFlags::HAS_TIMEOUT,
+            99,
+            0,
+            Arc::new(move |addr, data| {
+                written_cb.lock().unwrap().push((addr, data.to_vec()));
+            }),
+        );
 
         let w = written.lock().unwrap();
         assert_eq!(w.len(), 2);
@@ -312,6 +333,30 @@ mod tests {
         assert_eq!(w[0].1, 0u64.to_le_bytes().to_vec());
         assert_eq!(w[1].0, 0x2000);
         assert_eq!(w[1].1, 99u64.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn test_query_non_payload_writes_one() {
+        let sp = Arc::new(SyncpointManager::new());
+        let mut rast = RasterizerNull::new(sp);
+
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let written_cb = Arc::clone(&written);
+        rast.query(
+            0x3000,
+            2,
+            QueryPropertiesFlags::empty(),
+            0xDEAD_BEEF,
+            0,
+            Arc::new(move |addr, data| {
+                written_cb.lock().unwrap().push((addr, data.to_vec()));
+            }),
+        );
+
+        let w = written.lock().unwrap();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].0, 0x3000);
+        assert_eq!(w[0].1, 1u32.to_le_bytes().to_vec());
     }
 
     #[test]

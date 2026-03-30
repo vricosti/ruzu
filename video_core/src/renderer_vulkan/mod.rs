@@ -20,6 +20,8 @@
 //! - [`BufferCache`] — vertex/index/uniform buffer management
 //! - [`TextureCache`] — image/view/sampler/framebuffer management
 
+use crate::query_cache::types::QueryPropertiesFlags;
+
 pub mod blit_image;
 pub mod blit_screen;
 pub mod buffer_cache;
@@ -802,11 +804,12 @@ impl RasterizerInterface for RasterizerVulkan {
         &mut self,
         gpu_addr: u64,
         _query_type: u32,
-        has_timeout: bool,
+        flags: QueryPropertiesFlags,
         payload: u32,
         _subreport: u32,
-        gpu_write: &dyn Fn(u64, &[u8]),
+        gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     ) {
+        let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         if has_timeout {
             let ticks: u64 = 0;
             gpu_write(gpu_addr + 8, &ticks.to_le_bytes());
@@ -827,12 +830,12 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
 
-    fn signal_fence(&mut self, func: Box<dyn FnOnce()>) {
+    fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
         self.finish();
         func();
     }
 
-    fn sync_operation(&mut self, func: Box<dyn FnOnce()>) {
+    fn sync_operation(&mut self, func: Box<dyn FnOnce() + Send>) {
         func();
     }
 

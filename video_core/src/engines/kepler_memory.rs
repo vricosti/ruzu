@@ -9,7 +9,7 @@
 //!   https://github.com/envytools/envytools/blob/master/rnndb/graph/gk104_p2mf.xml
 //!   https://cgit.freedesktop.org/mesa/mesa/tree/src/gallium/drivers/nouveau/nvc0/nve4_p2mf.xml.h
 
-use super::engine_interface::EngineInterfaceState;
+use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
 
 // ── Register layout constants ───────────────────────────────────────────────
@@ -182,5 +182,45 @@ impl KeplerMemory {
 impl Default for KeplerMemory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl EngineInterface for KeplerMemory {
+    fn call_method(&mut self, method: u32, method_argument: u32, is_last_call: bool) {
+        KeplerMemory::call_method(self, method, method_argument, is_last_call);
+    }
+
+    fn call_multi_method(
+        &mut self,
+        method: u32,
+        base_start: &[u32],
+        amount: u32,
+        methods_pending: u32,
+    ) {
+        KeplerMemory::call_multi_method(self, method, base_start, amount, methods_pending);
+    }
+
+    fn consume_sink_impl(&mut self) {
+        KeplerMemory::consume_sink_impl(self);
+    }
+
+    fn execution_mask(&self) -> &[bool] {
+        &self.interface_state.execution_mask
+    }
+
+    fn push_method_sink(&mut self, method: u32, value: u32) {
+        self.interface_state.method_sink.push((method, value));
+    }
+
+    fn set_current_dma_segment(&mut self, segment: u64) {
+        self.interface_state.current_dma_segment = segment;
+    }
+
+    fn current_dirty(&self) -> bool {
+        self.interface_state.current_dirty
+    }
+
+    fn set_current_dirty(&mut self, dirty: bool) {
+        self.interface_state.current_dirty = dirty;
     }
 }

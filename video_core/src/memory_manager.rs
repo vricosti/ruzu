@@ -13,6 +13,7 @@ use common::range_map::RangeMap;
 use common::virtual_buffer::VirtualBuffer;
 
 use crate::pte_kind::PteKind;
+use crate::rasterizer_interface::RasterizerInterface;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -94,6 +95,7 @@ pub struct GpuMemoryManager {
 
     // Unique identifier for rasterizer callbacks
     unique_identifier: usize,
+    rasterizer: Option<[usize; 2]>,
 }
 
 impl GpuMemoryManager {
@@ -165,12 +167,31 @@ impl GpuMemoryManager {
             big_page_continuous,
             kind_map: RangeMap::new(PteKind::Invalid),
             unique_identifier,
+            rasterizer: None,
         }
     }
 
     /// Upstream: `MemoryManager::GetID()`.
     pub fn get_id(&self) -> usize {
         self.unique_identifier
+    }
+
+    fn with_rasterizer_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut dyn RasterizerInterface) -> R,
+    ) -> Option<R> {
+        let raw = self.rasterizer?;
+        let rasterizer = unsafe {
+            &mut *std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
+        };
+        Some(f(rasterizer))
+    }
+
+    /// Upstream: `MemoryManager::BindRasterizer(rasterizer)`.
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
+        self.rasterizer = Some(unsafe {
+            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
+        });
     }
 
     // ── Entry access (bitpacked) ────────────────────────────────────────
@@ -264,23 +285,28 @@ impl GpuMemoryManager {
         size: u64,
         kind: PteKind,
     ) -> u64 {
+        let page_size = self.page_size;
         if entry_type == EntryType::Mapped {
             self.page_table.reserve_range(gpu_addr, size as usize);
         }
         let mut offset = 0u64;
         while offset < size {
             let current_gpu_addr = gpu_addr + offset;
-            let _current_entry_type = self.get_entry_small(current_gpu_addr);
+            let current_entry_type = self.get_entry_small(current_gpu_addr);
             self.set_entry_small(current_gpu_addr, entry_type);
-            // Upstream calls rasterizer->ModifyGPUMemory here if entry changed.
-            // Skipped until rasterizer is wired.
+            if current_entry_type != entry_type {
+                let unique_identifier = self.unique_identifier;
+                let _ = self.with_rasterizer_mut(|rasterizer| {
+                    rasterizer.modify_gpu_memory(unique_identifier, current_gpu_addr, page_size)
+                });
+            }
             if entry_type == EntryType::Mapped {
                 let current_dev_addr = dev_addr + offset;
                 let index = self.page_entry_index_small(current_gpu_addr);
                 let sub_value = (current_dev_addr >> CPU_PAGE_BITS) as u32;
                 self.page_table[index] = sub_value;
             }
-            offset += self.page_size;
+            offset += page_size;
         }
         self.kind_map.map(gpu_addr, gpu_addr + size, kind);
         gpu_addr
@@ -299,13 +325,22 @@ impl GpuMemoryManager {
         size: u64,
         kind: PteKind,
     ) -> u64 {
+        let big_page_size = self.big_page_size;
         let mut offset = 0u64;
         while offset < size {
             let current_gpu_addr = gpu_addr + offset;
-            let _current_entry_type = self.get_entry_big(current_gpu_addr);
+            let current_entry_type = self.get_entry_big(current_gpu_addr);
             self.set_entry_big(current_gpu_addr, entry_type);
-            // Upstream calls rasterizer->ModifyGPUMemory here if entry changed.
-            // Skipped until rasterizer is wired.
+            if current_entry_type != entry_type {
+                let unique_identifier = self.unique_identifier;
+                let _ = self.with_rasterizer_mut(|rasterizer| {
+                    rasterizer.modify_gpu_memory(
+                        unique_identifier,
+                        current_gpu_addr,
+                        big_page_size,
+                    )
+                });
+            }
             if entry_type == EntryType::Mapped {
                 let current_dev_addr = dev_addr + offset;
                 let index = self.page_entry_index_big(current_gpu_addr);
@@ -317,7 +352,7 @@ impl GpuMemoryManager {
                 // which is the common case for GPU buffers.
                 self.set_big_page_continuous(index, true);
             }
-            offset += self.big_page_size;
+            offset += big_page_size;
         }
         self.kind_map.map(gpu_addr, gpu_addr + size, kind);
         gpu_addr
@@ -1148,21 +1183,117 @@ impl GpuMemoryManager {
 
     /// Upstream: `MemoryManager::GetMemoryLayoutSize(gpu_addr, max_size)`.
     pub fn get_memory_layout_size(&self, gpu_addr: u64, _max_size: u64) -> u64 {
-        // Upstream: kind_map.GetContinuousSizeFrom(gpu_addr)
         self.kind_map.get_continuous_size_from(gpu_addr) as u64
     }
 
-    // ── Cache/rasterizer stubs ──────────────────────────────────────────
+    fn get_submapped_device_ranges(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
+        let mut result = Vec::new();
+        let mut last_segment: Option<(u64, u64)> = None;
+        let mut old_page_addr: Option<u64> = None;
+
+        let split = |last_segment: &mut Option<(u64, u64)>, result: &mut Vec<(u64, u64)>| {
+            if let Some(seg) = last_segment.take() {
+                result.push(seg);
+            }
+        };
+
+        let mut remaining = size as usize;
+        let mut big_page_index = (gpu_addr >> self.big_page_bits) as usize;
+        let mut big_page_offset = (gpu_addr & self.big_page_mask) as usize;
+        let mut current_address = gpu_addr;
+
+        while remaining > 0 {
+            let copy_amount =
+                std::cmp::min(self.big_page_size as usize - big_page_offset, remaining);
+            match self.get_entry_big(current_address) {
+                EntryType::Mapped => {
+                    let dev_addr_base =
+                        (self.big_page_table_dev[big_page_index] as u64) << CPU_PAGE_BITS;
+                    let dev_addr = dev_addr_base + big_page_offset as u64;
+                    if let Some(expected) = old_page_addr {
+                        if expected != dev_addr {
+                            split(&mut last_segment, &mut result);
+                        }
+                    }
+                    old_page_addr = Some(dev_addr + copy_amount as u64);
+                    if let Some(seg) = &mut last_segment {
+                        seg.1 += copy_amount as u64;
+                    } else {
+                        last_segment = Some((dev_addr, copy_amount as u64));
+                    }
+                }
+                EntryType::Reserved => {
+                    split(&mut last_segment, &mut result);
+                    old_page_addr = None;
+                }
+                EntryType::Free => {
+                    let base =
+                        (big_page_index as u64) << self.big_page_bits | big_page_offset as u64;
+                    let mut sm_remaining = copy_amount;
+                    let mut sm_page_index = (base >> self.page_bits) as usize;
+                    let mut sm_page_offset = (base & self.page_mask) as usize;
+                    let mut sm_current = base;
+                    while sm_remaining > 0 {
+                        let sm_copy =
+                            std::cmp::min(self.page_size as usize - sm_page_offset, sm_remaining);
+                        match self.get_entry_small(sm_current) {
+                            EntryType::Mapped => {
+                                let dev_addr_base =
+                                    (self.page_table[sm_page_index] as u64) << CPU_PAGE_BITS;
+                                let dev_addr = dev_addr_base + sm_page_offset as u64;
+                                if let Some(expected) = old_page_addr {
+                                    if expected != dev_addr {
+                                        split(&mut last_segment, &mut result);
+                                    }
+                                }
+                                old_page_addr = Some(dev_addr + sm_copy as u64);
+                                if let Some(seg) = &mut last_segment {
+                                    seg.1 += sm_copy as u64;
+                                } else {
+                                    last_segment = Some((dev_addr, sm_copy as u64));
+                                }
+                            }
+                            _ => {
+                                split(&mut last_segment, &mut result);
+                                old_page_addr = None;
+                            }
+                        }
+                        sm_page_index += 1;
+                        sm_page_offset = 0;
+                        sm_remaining -= sm_copy;
+                        sm_current += sm_copy as u64;
+                    }
+                }
+            }
+            big_page_index += 1;
+            big_page_offset = 0;
+            remaining -= copy_amount;
+            current_address += copy_amount as u64;
+        }
+        split(&mut last_segment, &mut result);
+        result
+    }
+
+    // ── Cache/rasterizer operations ─────────────────────────────────────
 
     /// Upstream: `MemoryManager::FlushRegion(gpu_addr, size)`.
-    /// Requires rasterizer binding — no-op until bound.
-    pub fn flush_region(&self, _gpu_addr: u64, _size: u64) {
-        // Upstream: walks pages and calls rasterizer->FlushRegion per mapped page.
+    pub fn flush_region(&mut self, gpu_addr: u64, size: u64) {
+        let ranges = self.get_submapped_device_ranges(gpu_addr, size);
+        let _ = self.with_rasterizer_mut(|rasterizer| {
+            for (addr, map_size) in ranges {
+                rasterizer.flush_region(addr, map_size);
+            }
+        });
     }
 
     /// Upstream: `MemoryManager::InvalidateRegion(gpu_addr, size)`.
-    pub fn invalidate_region(&self, _gpu_addr: u64, _size: u64) {
-        // Upstream: walks pages and calls rasterizer->InvalidateRegion per mapped page.
+    pub fn invalidate_region(&mut self, gpu_addr: u64, size: u64) {
+        let ranges = self.get_submapped_device_ranges(gpu_addr, size);
+        let _ = self.with_rasterizer_mut(|rasterizer| {
+            for (addr, map_size) in ranges {
+                rasterizer.invalidate_region(addr, map_size);
+            }
+        });
     }
 
     /// Upstream: `MemoryManager::FlushCaching()`.
@@ -1178,9 +1309,14 @@ impl GpuMemoryManager {
     }
 
     /// Upstream: `MemoryManager::IsMemoryDirty(gpu_addr, size)`.
-    pub fn is_memory_dirty(&self, _gpu_addr: u64, _size: u64) -> bool {
-        // Requires rasterizer binding.
-        false
+    pub fn is_memory_dirty(&mut self, gpu_addr: u64, size: u64) -> bool {
+        let ranges = self.get_submapped_device_ranges(gpu_addr, size);
+        self.with_rasterizer_mut(|rasterizer| {
+            ranges
+                .into_iter()
+                .any(|(addr, map_size)| rasterizer.must_flush_region(addr, map_size))
+        })
+        .unwrap_or(false)
     }
 
     /// Read a value of type `T` from GPU virtual address space.
@@ -1288,7 +1424,6 @@ fn pte_kind_from_u32(raw: u32) -> PteKind {
 pub struct MemoryManager {
     id: usize,
     inner: GpuMemoryManager,
-    rasterizer_bound: bool,
 }
 
 impl MemoryManager {
@@ -1313,7 +1448,6 @@ impl MemoryManager {
                 big_page_bits,
                 page_bits,
             ),
-            rasterizer_bound: false,
         }
     }
 
@@ -1374,12 +1508,25 @@ impl MemoryManager {
         self.inner.write_block_unsafe(gpu_dest, input, write_cpu);
     }
 
-    pub fn flush_region(&self, gpu_addr: u64, size: u64) {
+    pub fn write_block_cached(
+        &self,
+        gpu_dest: u64,
+        input: &[u8],
+        write_cpu: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        self.inner.write_block_cached(gpu_dest, input, write_cpu);
+    }
+
+    pub fn flush_region(&mut self, gpu_addr: u64, size: u64) {
         self.inner.flush_region(gpu_addr, size);
     }
 
-    pub fn invalidate_region(&self, gpu_addr: u64, size: u64) {
+    pub fn invalidate_region(&mut self, gpu_addr: u64, size: u64) {
         self.inner.invalidate_region(gpu_addr, size);
+    }
+
+    pub fn is_memory_dirty(&mut self, gpu_addr: u64, size: u64) -> bool {
+        self.inner.is_memory_dirty(gpu_addr, size)
     }
 
     pub fn is_within_gpu_address_range(&self, gpu_addr: u64) -> bool {
@@ -1447,12 +1594,12 @@ impl MemoryManager {
     }
 
     /// Upstream: `MemoryManager::BindRasterizer(rasterizer)`.
-    pub fn bind_rasterizer(&mut self) {
-        self.rasterizer_bound = true;
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
+        self.inner.bind_rasterizer(rasterizer);
     }
 
     pub fn has_bound_rasterizer(&self) -> bool {
-        self.rasterizer_bound
+        self.inner.rasterizer.is_some()
     }
 }
 
@@ -1465,6 +1612,95 @@ impl Default for MemoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rasterizer_interface::RasterizerDownloadArea;
+    use std::sync::{Arc, Mutex};
+
+    struct TestRasterizer {
+        modify_calls: Arc<Mutex<Vec<(usize, u64, u64)>>>,
+        unmap_calls: Arc<Mutex<Vec<(u64, u64)>>>,
+        flush_calls: Arc<Mutex<Vec<(u64, u64)>>>,
+        invalidate_calls: Arc<Mutex<Vec<(u64, u64)>>>,
+        dirty_regions: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+
+    impl TestRasterizer {
+        fn new() -> Self {
+            Self {
+                modify_calls: Arc::new(Mutex::new(Vec::new())),
+                unmap_calls: Arc::new(Mutex::new(Vec::new())),
+                flush_calls: Arc::new(Mutex::new(Vec::new())),
+                invalidate_calls: Arc::new(Mutex::new(Vec::new())),
+                dirty_regions: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl RasterizerInterface for TestRasterizer {
+        fn draw(&mut self, _is_indexed: bool, _instance_count: u32) {}
+        fn draw_texture(&mut self) {}
+        fn clear(&mut self, _layer_count: u32) {}
+        fn dispatch_compute(&mut self) {}
+        fn reset_counter(&mut self, _query_type: u32) {}
+        fn query(
+            &mut self,
+            _gpu_addr: u64,
+            _query_type: u32,
+            _flags: crate::query_cache::types::QueryPropertiesFlags,
+            _payload: u32,
+            _subreport: u32,
+            _gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
+        ) {
+        }
+        fn bind_graphics_uniform_buffer(
+            &mut self,
+            _stage: usize,
+            _index: u32,
+            _gpu_addr: u64,
+            _size: u32,
+        ) {
+        }
+        fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
+        fn signal_fence(&mut self, _func: Box<dyn FnOnce() + Send>) {}
+        fn sync_operation(&mut self, _func: Box<dyn FnOnce() + Send>) {}
+        fn signal_sync_point(&mut self, _value: u32) {}
+        fn signal_reference(&mut self) {}
+        fn release_fences(&mut self, _force: bool) {}
+        fn flush_all(&mut self) {}
+        fn flush_region(&mut self, addr: u64, size: u64) {
+            self.flush_calls.lock().unwrap().push((addr, size));
+        }
+        fn must_flush_region(&self, addr: u64, size: u64) -> bool {
+            self.dirty_regions.lock().unwrap().contains(&(addr, size))
+        }
+        fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
+            RasterizerDownloadArea {
+                start_address: addr,
+                end_address: addr + size,
+                preemptive: false,
+            }
+        }
+        fn invalidate_region(&mut self, addr: u64, size: u64) {
+            self.invalidate_calls.lock().unwrap().push((addr, size));
+        }
+        fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
+        fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
+            false
+        }
+        fn invalidate_gpu_cache(&mut self) {}
+        fn unmap_memory(&mut self, addr: u64, size: u64) {
+            self.unmap_calls.lock().unwrap().push((addr, size));
+        }
+        fn modify_gpu_memory(&mut self, as_id: usize, addr: u64, size: u64) {
+            self.modify_calls.lock().unwrap().push((as_id, addr, size));
+        }
+        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn wait_for_idle(&mut self) {}
+        fn fragment_barrier(&mut self) {}
+        fn tiled_cache_barrier(&mut self) {}
+        fn flush_commands(&mut self) {}
+        fn tick_frame(&mut self) {}
+        fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
+    }
 
     #[test]
     fn test_map_and_translate_big_pages() {
@@ -1588,6 +1824,42 @@ mod tests {
 
         mm.unmap(0x10000, 0x10000);
         assert_eq!(mm.gpu_to_cpu_address(0x10000), None);
+    }
+
+    #[test]
+    fn test_bind_rasterizer_enables_modify_and_unmap_callbacks() {
+        let mut mm = MemoryManager::new_with_geometry(7, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let modify_calls = Arc::clone(&rasterizer.modify_calls);
+        let unmap_calls = Arc::clone(&rasterizer.unmap_calls);
+
+        mm.bind_rasterizer(&rasterizer);
+        mm.map(0x10000, 0x9000_0000, 0x1000, 0, false);
+        mm.unmap(0x10000, 0x1000);
+
+        assert!(mm.has_bound_rasterizer());
+        assert_eq!(modify_calls.lock().unwrap().len(), 2);
+        assert_eq!(*unmap_calls.lock().unwrap(), vec![(0x9000_0000, 0x1000)]);
+    }
+
+    #[test]
+    fn test_flush_invalidate_and_dirty_follow_device_ranges() {
+        let mut mm = MemoryManager::new_with_geometry(9, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let flush_calls = Arc::clone(&rasterizer.flush_calls);
+        let invalidate_calls = Arc::clone(&rasterizer.invalidate_calls);
+        let dirty_regions = Arc::clone(&rasterizer.dirty_regions);
+
+        mm.bind_rasterizer(&rasterizer);
+        mm.map(0x20000, 0x9100_0000, 0x2000, 0, false);
+        dirty_regions.lock().unwrap().push((0x9100_0000, 0x2000));
+
+        assert!(mm.inner.is_memory_dirty(0x20000, 0x2000));
+        mm.flush_region(0x20000, 0x2000);
+        mm.invalidate_region(0x20000, 0x2000);
+
+        assert_eq!(*flush_calls.lock().unwrap(), vec![(0x9100_0000, 0x2000)]);
+        assert_eq!(*invalidate_calls.lock().unwrap(), vec![(0x9100_0000, 0x2000)]);
     }
 
     #[test]

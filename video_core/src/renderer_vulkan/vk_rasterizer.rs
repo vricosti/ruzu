@@ -190,7 +190,14 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::Query`.
-    pub fn query(&mut self, _gpu_addr: u64, _query_type: u32, _flags: u32, _payload: u32, _subreport: u32) {
+    pub fn query(
+        &mut self,
+        _gpu_addr: u64,
+        _query_type: u32,
+        _flags: crate::query_cache::types::QueryPropertiesFlags,
+        _payload: u32,
+        _subreport: u32,
+    ) {
         // Delegates to query_cache.Query
     }
 
@@ -262,12 +269,12 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::SignalFence`.
-    pub fn signal_fence(&mut self, _func: Box<dyn FnOnce()>) {
+    pub fn signal_fence(&mut self, _func: Box<dyn FnOnce() + Send>) {
         // Delegates to fence_manager.SignalFence
     }
 
     /// Port of `RasterizerVulkan::SyncOperation`.
-    pub fn sync_operation(&mut self, _func: Box<dyn FnOnce()>) {
+    pub fn sync_operation(&mut self, _func: Box<dyn FnOnce() + Send>) {
         // Delegates to fence_manager.SyncOperation
     }
 

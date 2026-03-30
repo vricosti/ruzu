@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use crate::fence_manager::FenceBase;
+
 /// An OpenGL sync fence.
 ///
 /// Corresponds to `OpenGL::GLInnerFence`.
@@ -90,6 +92,15 @@ impl Drop for GLInnerFence {
 ///
 /// Corresponds to `OpenGL::Fence = std::shared_ptr<GLInnerFence>`.
 pub type Fence = Arc<std::sync::Mutex<GLInnerFence>>;
+
+impl FenceBase for Fence {
+    fn is_stubbed(&self) -> bool {
+        self.lock().unwrap().is_stubbed
+    }
+}
+
+unsafe impl Send for GLInnerFence {}
+unsafe impl Sync for GLInnerFence {}
 
 /// OpenGL fence manager.
 ///

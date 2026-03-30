@@ -9,11 +9,40 @@
 //! Register writes are stored in a flat array and side-effect methods (clear,
 //! draw begin/end) are triggered on specific register writes.
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+use super::engine_upload;
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::{ClassId, Engine, Framebuffer, PendingWrite, ENGINE_REG_COUNT};
 use crate::descriptor_table::{TicTable, TscTable};
-use crate::macro_interpreter::{MacroInterpreter, MacroProcessor};
+use crate::macro_engine::macro_engine::{get_macro_engine, MacroEngine};
+use crate::macro_engine::macro_interpreter::MacroInterpreterImpl;
+use crate::memory_manager::MemoryManager;
+use crate::query_cache::types::QueryPropertiesFlags;
 use crate::rasterizer_interface::RasterizerInterface;
+
+#[derive(Clone, Copy)]
+struct Maxwell3DPtr(*mut Maxwell3D);
+
+unsafe impl Send for Maxwell3DPtr {}
+
+impl Maxwell3DPtr {
+    unsafe fn call_method(self, address: u32, value: u32) {
+        (&mut *self.0).call_method(address, value, true);
+    }
+
+    unsafe fn read_reg(self, method: u32) -> u32 {
+        let gpu = &*self.0;
+        let idx = method as usize;
+        if idx < ENGINE_REG_COUNT {
+            gpu.regs[idx]
+        } else {
+            0
+        }
+    }
+}
 
 // ── Register offset constants (method addresses) ────────────────────────────
 
@@ -45,6 +74,7 @@ const CLEAR_DEPTH: u32 = reg_index!(0x0D90);
 const CLEAR_STENCIL: u32 = reg_index!(0x0DA0);
 /// Clear surface trigger register.
 const CLEAR_SURFACE: u32 = reg_index!(0x19D0);
+const RASTERIZE_ENABLE: u32 = reg_index!(0x037C);
 
 // ── Viewport registers ──────────────────────────────────────────────────────
 
@@ -119,6 +149,7 @@ const DEPTH_MODE: u32 = reg_index!(0x0D7C);
 const DEPTH_TEST_ENABLE: u32 = reg_index!(0x12CC);
 const DEPTH_WRITE_ENABLE: u32 = reg_index!(0x12E8);
 const DEPTH_TEST_FUNC: u32 = reg_index!(0x130C);
+const POINT_SIZE: u32 = reg_index!(0x1518);
 
 const STENCIL_ENABLE: u32 = reg_index!(0x1380);
 const STENCIL_FRONT_OP_BASE: u32 = reg_index!(0x1384);
@@ -164,6 +195,7 @@ const DEPTH_BIAS_CLAMP: u32 = reg_index!(0x187C);
 const CULL_TEST_ENABLE: u32 = reg_index!(0x1918);
 const FRONT_FACE: u32 = reg_index!(0x191C);
 const CULL_FACE: u32 = reg_index!(0x1920);
+const FRAMEBUFFER_SRGB: u32 = reg_index!(0x15B8);
 
 // ── Shader program registers ────────────────────────────────────────────────
 
@@ -190,6 +222,7 @@ const NUM_SHADER_PROGRAMS: usize = 6;
 
 /// If nonzero, all RTs share color_mask[0].
 const COLOR_MASK_COMMON: u32 = reg_index!(0x0F90);
+const COLOR_TARGET_MRT_ENABLE: u32 = reg_index!(0x0FAC);
 /// Per-RT color write mask array. 8 entries, 1 word each.
 /// Per RT: R=bit[0], G=bit[4], B=bit[8], A=bit[12].
 const COLOR_MASK_BASE: u32 = reg_index!(0x1A00);
@@ -204,9 +237,11 @@ const RT_CONTROL: u32 = reg_index!(0x121C);
 /// CB config: +0 size, +1 addr_high, +2 addr_low, +3 offset.
 const CB_CONFIG_BASE: u32 = reg_index!(0x2380);
 
-/// CB data: 16 words of inline push (0x2384..0x2393).
-const CB_DATA_BASE: u32 = reg_index!(0x2384);
-const CB_DATA_END: u32 = reg_index!(0x2394); // exclusive
+/// CB data: 16 words of inline push at `const_buffer.buffer`.
+/// Upstream `Regs::ConstantBuffer` has 4 header words
+/// `(size, address_high, address_low, offset)` before `buffer[16]`.
+const CB_DATA_BASE: u32 = reg_index!(0x2390);
+const CB_DATA_END: u32 = reg_index!(0x23D0); // exclusive
 
 /// CB bind base. 5 stages, stride 8, trigger at +4.
 const CB_BIND_BASE: u32 = reg_index!(0x2400);
@@ -266,6 +301,7 @@ const SHADOW_RAM_CONTROL: u32 = reg_index!(0x0124);
 const LAUNCH_DMA: u32 = reg_index!(0x01B0);
 /// Inline data register (data words for DMA upload).
 const INLINE_DATA: u32 = reg_index!(0x01B4);
+const UPLOAD_REGS_BASE: usize = reg_index!(0x0180) as usize;
 /// Sync info register (triggers sync point signaling).
 const SYNC_INFO: u32 = reg_index!(0x02C8);
 /// Fragment barrier register.
@@ -307,9 +343,12 @@ const INDEX_BUFFER16_SUBSEQUENT: u32 = reg_index!(0x17F4);
 /// Index buffer 8-bit subsequent register.
 const INDEX_BUFFER8_SUBSEQUENT: u32 = reg_index!(0x17F8);
 /// Report semaphore query trigger (writing here fires the semaphore query).
-const REPORT_SEMAPHORE_QUERY: u32 = 0x1B00 + 3;
-/// Falcon register array base (firmware call). falcon[4] = 0x2300 + 4 = 0x2304.
-const FALCON4: u32 = reg_index!(0x2304);
+// Matches upstream MAXWELL3D_REG_INDEX(report_semaphore.query).
+const REPORT_SEMAPHORE_QUERY: u32 = REPORT_SEMAPHORE_TRIGGER;
+/// Falcon register array element used by `ProcessFirmwareCall4`.
+/// Upstream owner is `MAXWELL3D_REG_INDEX(falcon[4])`, i.e. byte offset
+/// `0x2300 + 4 * sizeof(u32) = 0x2310`.
+const FALCON4: u32 = reg_index!(0x2310);
 /// Shadow scratch memory base (0x3400). Used by firmware stubs.
 const SHADOW_SCRATCH_BASE: u32 = reg_index!(0x3400);
 
@@ -487,6 +526,40 @@ enum DrawMode {
     General,
     Instance,
     InlineIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VertexArrayParams {
+    start: u32,
+    count: u32,
+    topology: PrimitiveTopology,
+}
+
+impl VertexArrayParams {
+    fn from_raw(raw: u32) -> Self {
+        Self {
+            start: raw & 0xFFFF,
+            count: (raw >> 16) & 0xFFF,
+            topology: PrimitiveTopology::from_raw((raw >> 28) & 0x7),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexBufferSmallParams {
+    first: u32,
+    count: u32,
+    topology: PrimitiveTopology,
+}
+
+impl IndexBufferSmallParams {
+    fn from_raw(raw: u32) -> Self {
+        Self {
+            first: raw & 0xFFFF,
+            count: (raw >> 16) & 0xFFF,
+            topology: PrimitiveTopology::from_raw((raw >> 28) & 0xF),
+        }
+    }
 }
 
 /// Sampler binding mode — how texture handles encode TIC/TSC indices.
@@ -1640,8 +1713,14 @@ pub struct Maxwell3D {
     pending_semaphore_writes: Vec<PendingWrite>,
     /// Bound rasterizer backend.
     rasterizer: Option<[usize; 2]>,
-    /// MME macro interpreter for programmable macro execution.
-    macro_interpreter: MacroInterpreter,
+    /// Start offsets of each macro in macro memory.
+    macro_positions: [u32; 0x80],
+    /// MME macro engine for uploaded programmable macro execution.
+    macro_engine: MacroEngine,
+    /// Upstream owner `Upload::State upload_state`.
+    upload_state: engine_upload::State,
+    /// Upstream owner `MemoryManager& memory_manager`.
+    memory_manager: Option<Arc<Mutex<MemoryManager>>>,
     /// Method of the macro currently being fed parameters (0 = none).
     executing_macro: u32,
     /// Accumulated parameters for the current macro call.
@@ -1652,6 +1731,11 @@ pub struct Maxwell3D {
     macro_segments: Vec<(u64, u32)>,
     /// Whether the current macro has dirty memory.
     current_macro_dirty: bool,
+    /// Rust adaptation for the upstream `Core::System& system` dependency used
+    /// here only to read guest memory through the active GPU owner.
+    guest_memory_reader: Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>>,
+    /// Owner-local bridge for guest memory writes needed by inline upload paths.
+    guest_memory_writer: Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
     /// Graphics TIC descriptor table (texture image descriptors).
     tic_table: TicTable,
     /// Graphics TSC descriptor table (texture sampler descriptors).
@@ -1666,7 +1750,7 @@ impl Maxwell3D {
             execution_mask[i] = Self::is_method_executable(i as u32);
         }
 
-        Self {
+        let mut engine = Self {
             regs: Box::new([0u32; ENGINE_REG_COUNT]),
             shadow_state: Box::new([0u32; ENGINE_REG_COUNT]),
             interface_state: EngineInterfaceState {
@@ -1686,15 +1770,86 @@ impl Maxwell3D {
             inline_index_data: Vec::new(),
             pending_semaphore_writes: Vec::new(),
             rasterizer: None,
-            macro_interpreter: MacroInterpreter::new(),
+            macro_positions: [0u32; 0x80],
+            macro_engine: get_macro_engine(),
+            upload_state: engine_upload::State::new(),
+            memory_manager: None,
             executing_macro: 0,
             macro_params: Vec::new(),
             macro_addresses: Vec::new(),
             macro_segments: Vec::new(),
             current_macro_dirty: false,
+            guest_memory_reader: None,
+            guest_memory_writer: None,
             tic_table: TicTable::new(),
             tsc_table: TscTable::new(),
+        };
+        engine.initialize_register_defaults();
+        engine
+    }
+
+    fn initialize_register_defaults(&mut self) {
+        for viewport in 0..16usize {
+            let base = VP_TRANSFORM_BASE as usize + viewport * VP_TRANSFORM_STRIDE as usize;
+            self.regs[base + 6] = 0x688;
         }
+
+        self.regs[BLEND_BASE as usize + 1] = 1;
+        self.regs[BLEND_BASE as usize + 2] = 0x02;
+        self.regs[BLEND_BASE as usize + 3] = 0x01;
+        self.regs[BLEND_BASE as usize + 4] = 1;
+        self.regs[BLEND_BASE as usize + 5] = 0x02;
+        self.regs[BLEND_BASE as usize + 7] = 0x01;
+
+        for rt in 0..8usize {
+            let base = BLEND_PER_TARGET_BASE as usize + rt * BLEND_PER_TARGET_STRIDE as usize;
+            self.regs[base + 1] = 1;
+            self.regs[base + 2] = 0x02;
+            self.regs[base + 3] = 0x01;
+            self.regs[base + 4] = 1;
+            self.regs[base + 5] = 0x02;
+            self.regs[base + 6] = 0x01;
+        }
+
+        let front_base = STENCIL_FRONT_OP_BASE as usize;
+        self.regs[front_base] = 1;
+        self.regs[front_base + 1] = 1;
+        self.regs[front_base + 2] = 1;
+        self.regs[front_base + 3] = 0x207;
+        self.regs[STENCIL_FRONT_FUNC_MASK as usize] = 0xFFFF_FFFF;
+        self.regs[STENCIL_FRONT_MASK as usize] = 0xFFFF_FFFF;
+        self.regs[STENCIL_TWO_SIDE_ENABLE as usize] = 1;
+
+        let back_base = STENCIL_BACK_OP_BASE as usize;
+        self.regs[back_base] = 1;
+        self.regs[back_base + 1] = 1;
+        self.regs[back_base + 2] = 1;
+        self.regs[back_base + 3] = 0x207;
+        self.regs[STENCIL_BACK_FUNC_MASK as usize] = 0xFFFF_FFFF;
+        self.regs[STENCIL_BACK_MASK as usize] = 0xFFFF_FFFF;
+
+        self.regs[DEPTH_TEST_FUNC as usize] = 0x207;
+        self.regs[FRONT_FACE as usize] = 0x0900;
+        self.regs[CULL_FACE as usize] = 0x0405;
+        self.regs[POINT_SIZE as usize] = f32::to_bits(1.0);
+
+        for rt in 0..8usize {
+            self.regs[COLOR_MASK_BASE as usize + rt] = 0x1111;
+        }
+
+        for attrib in 0..NUM_VERTEX_ATTRIBS as usize {
+            self.regs[VERTEX_ATTRIB_BASE as usize + attrib] |= 1 << 6;
+        }
+
+        self.regs[RASTERIZE_ENABLE as usize] = 1;
+        self.regs[COLOR_TARGET_MRT_ENABLE as usize] = 1;
+        self.regs[FRAMEBUFFER_SRGB as usize] = 1;
+        self.regs[LINE_WIDTH_ALIASED as usize] = f32::to_bits(1.0);
+        self.regs[LINE_WIDTH_SMOOTH as usize] = f32::to_bits(1.0);
+        self.regs[POLYGON_MODE_BACK as usize] = 0x1B02;
+        self.regs[POLYGON_MODE_FRONT as usize] = 0x1B02;
+
+        self.shadow_state.copy_from_slice(&self.regs[..]);
     }
 
     /// Whether conditional rendering allows execution.
@@ -1708,6 +1863,37 @@ impl Maxwell3D {
         });
     }
 
+    pub fn set_memory_manager(&mut self, memory_manager: Arc<Mutex<MemoryManager>>) {
+        self.memory_manager = Some(memory_manager);
+    }
+
+    pub fn set_guest_memory_reader(
+        &mut self,
+        guest_memory_reader: Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>,
+    ) {
+        self.guest_memory_reader = Some(guest_memory_reader);
+    }
+
+    pub fn set_guest_memory_writer(
+        &mut self,
+        guest_memory_writer: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
+    ) {
+        self.guest_memory_writer = Some(guest_memory_writer);
+    }
+
+    fn read_gpu_block(&self, addr: u64, output: &mut [u8]) -> bool {
+        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
+            return false;
+        };
+        let Some(guest_memory_reader) = self.guest_memory_reader.as_ref().cloned() else {
+            return false;
+        };
+        memory_manager
+            .lock()
+            .read_block(addr, output, &*guest_memory_reader);
+        true
+    }
+
     fn with_rasterizer_mut<R>(
         &mut self,
         f: impl FnOnce(&mut dyn RasterizerInterface) -> R,
@@ -1719,6 +1905,50 @@ impl Maxwell3D {
         Some(f(rasterizer))
     }
 
+    pub fn get_macro_address(&self, index: usize) -> u64 {
+        self.macro_addresses[index]
+    }
+
+    pub fn refresh_parameters(&mut self) {
+        if !self.current_macro_dirty {
+            return;
+        }
+        self.refresh_parameters_impl();
+    }
+
+    pub fn any_parameters_dirty(&self) -> bool {
+        self.current_macro_dirty
+    }
+
+    fn refresh_parameters_impl(&mut self) {
+        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
+            return;
+        };
+        let Some(guest_memory_reader) = self.guest_memory_reader.as_ref().cloned() else {
+            return;
+        };
+
+        let mut current_index = 0usize;
+        for &(segment_addr, word_count) in &self.macro_segments {
+            let word_count = word_count as usize;
+            if segment_addr == 0 {
+                current_index += word_count;
+                continue;
+            }
+
+            let byte_count = word_count * std::mem::size_of::<u32>();
+            let mut bytes = vec![0u8; byte_count];
+            memory_manager
+                .lock()
+                .read_block(segment_addr, &mut bytes, &*guest_memory_reader);
+            for (word_index, chunk) in bytes.chunks_exact(4).enumerate() {
+                self.macro_params[current_index + word_index] =
+                    u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
+            }
+            current_index += word_count;
+        }
+    }
+
     // ── Render target accessors ──────────────────────────────────────────
 
     /// GPU virtual address of render target `index` (0..7).
@@ -1727,6 +1957,78 @@ impl Maxwell3D {
         let high = self.regs[base + RT_OFF_ADDRESS_HIGH as usize] as u64;
         let low = self.regs[base + RT_OFF_ADDRESS_LOW as usize] as u64;
         (high << 32) | low
+    }
+
+    fn upload_registers(&self) -> engine_upload::Registers {
+        engine_upload::Registers {
+            line_length_in: self.regs[UPLOAD_REGS_BASE],
+            line_count: self.regs[UPLOAD_REGS_BASE + 1],
+            dest: engine_upload::DestRegisters {
+                address_high: self.regs[UPLOAD_REGS_BASE + 2],
+                address_low: self.regs[UPLOAD_REGS_BASE + 3],
+                pitch: self.regs[UPLOAD_REGS_BASE + 4],
+                block_dims: self.regs[UPLOAD_REGS_BASE + 5],
+                width: self.regs[UPLOAD_REGS_BASE + 6],
+                height: self.regs[UPLOAD_REGS_BASE + 7],
+                depth: self.regs[UPLOAD_REGS_BASE + 8],
+                layer: self.regs[UPLOAD_REGS_BASE + 9],
+                x: self.regs[UPLOAD_REGS_BASE + 10],
+                y: self.regs[UPLOAD_REGS_BASE + 11],
+            },
+        }
+    }
+
+    fn launch_dma_is_linear(&self) -> bool {
+        (self.regs[LAUNCH_DMA as usize] & 0x1) != 0
+    }
+
+    fn process_inline_upload_word(&mut self, data: u32, is_last_call: bool) {
+        self.upload_state.regs = self.upload_registers();
+        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
+            return;
+        };
+        let rasterizer_raw = self
+            .rasterizer
+            .map(|raw| unsafe { std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw) });
+        let writer = self.guest_memory_writer.as_ref().cloned();
+        let mut write_cpu = move |addr: u64, bytes: &[u8]| {
+            if let Some(writer) = writer.as_ref() {
+                writer(addr, bytes);
+            }
+        };
+        let memory_manager = memory_manager.lock();
+        let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
+        let mut ctx = engine_upload::FlushContext {
+            rasterizer: rasterizer.as_deref_mut(),
+            memory_manager: &*memory_manager,
+            write_cpu_mem: &mut write_cpu,
+        };
+        self.upload_state
+            .process_data_word_with_ctx(data, is_last_call, &mut ctx);
+    }
+
+    fn process_inline_upload_multi(&mut self, data: &[u32]) {
+        self.upload_state.regs = self.upload_registers();
+        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
+            return;
+        };
+        let rasterizer_raw = self
+            .rasterizer
+            .map(|raw| unsafe { std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw) });
+        let writer = self.guest_memory_writer.as_ref().cloned();
+        let mut write_cpu = move |addr: u64, bytes: &[u8]| {
+            if let Some(writer) = writer.as_ref() {
+                writer(addr, bytes);
+            }
+        };
+        let memory_manager = memory_manager.lock();
+        let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
+        let mut ctx = engine_upload::FlushContext {
+            rasterizer: rasterizer.as_deref_mut(),
+            memory_manager: &*memory_manager,
+            write_cpu_mem: &mut write_cpu,
+        };
+        self.upload_state.process_data_multi_with_ctx(data, &mut ctx);
     }
 
     /// Width of render target `index`.
@@ -2432,43 +2734,8 @@ impl Maxwell3D {
 
     /// Handle report semaphore trigger (write to REPORT_SEMAPHORE_BASE + 3).
     fn handle_report_semaphore(&mut self, value: u32) {
-        let operation = ReportOperation::from_raw(value);
-        match operation {
-            ReportOperation::Release | ReportOperation::ReportOnly => {
-                let gpu_va = self.report_semaphore_address();
-                let payload = self.report_semaphore_payload();
-                let short_query = (value >> 28) & 1 != 0;
-
-                let data = if short_query {
-                    payload.to_le_bytes().to_vec()
-                } else {
-                    let mut buf = Vec::with_capacity(16);
-                    buf.extend_from_slice(&(payload as u64).to_le_bytes());
-                    buf.extend_from_slice(&0u64.to_le_bytes());
-                    buf
-                };
-
-                log::debug!(
-                    "Maxwell3D: report_semaphore {:?} va=0x{:X} payload=0x{:X} short={} bytes={}",
-                    operation,
-                    gpu_va,
-                    payload,
-                    short_query,
-                    data.len(),
-                );
-
-                self.pending_semaphore_writes.push(PendingWrite {
-                    gpu_va,
-                    data,
-                });
-            }
-            ReportOperation::Acquire => {
-                log::debug!("Maxwell3D: report_semaphore Acquire (no-op)");
-            }
-            ReportOperation::Trap => {
-                log::debug!("Maxwell3D: report_semaphore Trap (no-op)");
-            }
-        }
+        let _ = value;
+        self.process_query_get();
     }
 
     /// Handle CB_DATA write: auto-increment CB offset by 4.
@@ -2669,15 +2936,11 @@ impl Maxwell3D {
             }
             LOAD_MME_INSTRUCTION_PTR => {
                 let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
-                self.macro_interpreter.clear_code(ptr);
+                self.macro_engine.clear_code(ptr);
             }
             LOAD_MME_INSTRUCTION => {
-                // Upstream: macro_engine->AddCode(regs.load_mme.instruction_ptr, argument)
-                // AddCode appends to a vector keyed by instruction_ptr.
-                // We use a flat array, so write at current ptr and auto-increment.
                 let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
-                self.macro_interpreter.upload_code(ptr, argument);
-                self.regs[LOAD_MME_INSTRUCTION_PTR as usize] = ptr + 1;
+                self.macro_engine.add_code(ptr, argument);
             }
             LOAD_MME_START_ADDR => {
                 self.process_macro_bind(argument);
@@ -2706,13 +2969,11 @@ impl Maxwell3D {
                 self.process_sync_point();
             }
             LAUNCH_DMA => {
-                // Upstream calls upload_state.ProcessExec().
-                log::trace!("Maxwell3D: launch_dma");
+                self.upload_state.regs = self.upload_registers();
+                self.upload_state.process_exec(self.launch_dma_is_linear());
             }
             INLINE_DATA => {
-                // Upstream calls upload_state.ProcessData(argument, is_last_call).
-                let _ = is_last_call;
-                log::trace!("Maxwell3D: inline_data 0x{:X}", argument);
+                self.process_inline_upload_word(argument, is_last_call);
             }
             FRAGMENT_BARRIER => {
                 let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.fragment_barrier());
@@ -2785,16 +3046,14 @@ impl Maxwell3D {
                 }
                 self.draw_mode = DrawMode::InlineIndex;
             }
-            VERTEX_ARRAY_INSTANCE_FIRST | VERTEX_ARRAY_INSTANCE_SUBSEQUENT => {
-                // Instanced array draws — log for now until full DrawManager port.
-                log::trace!(
-                    "Maxwell3D: vertex_array_instance method=0x{:X} arg=0x{:X}",
-                    method,
-                    argument
-                );
+            VERTEX_ARRAY_INSTANCE_FIRST => {
+                self.draw_array_instanced(argument, false);
+            }
+            VERTEX_ARRAY_INSTANCE_SUBSEQUENT => {
+                self.draw_array_instanced(argument, true);
             }
             DRAW_TEXTURE_SRC_Y0 => {
-                log::trace!("Maxwell3D: draw_texture (trigger at src_y0)");
+                self.draw_texture();
             }
             TOPOLOGY_OVERRIDE => {
                 // Value written to regs; topology override handled during draw.
@@ -2804,10 +3063,38 @@ impl Maxwell3D {
     }
 
     /// Handle small indexed draw (index_buffer{32,16,8}_{first,subsequent}).
-    fn draw_index_small(&mut self, _argument: u32) {
-        // In upstream, this triggers an immediate indexed draw with parameters
-        // decoded from the argument. For now, log the event.
-        log::trace!("Maxwell3D: draw_index_small");
+    fn draw_index_small(&mut self, argument: u32) {
+        let params = IndexBufferSmallParams::from_raw(argument);
+        let mut draw = self.build_draw_call(1, Vec::new());
+        draw.topology = params.topology;
+        draw.indexed = true;
+        draw.index_buffer_first = params.first;
+        draw.index_buffer_count = params.count;
+        self.draw_calls.push(draw);
+    }
+
+    /// Handle `vertex_array_instance_{first,subsequent}` immediate instanced draws.
+    fn draw_array_instanced(&mut self, argument: u32, subsequent: bool) {
+        let params = VertexArrayParams::from_raw(argument);
+        self.current_topology = params.topology;
+        self.draw_mode = DrawMode::Instance;
+        if !subsequent {
+            self.instance_count = 1;
+        }
+
+        let mut draw = self.build_draw_call(1, Vec::new());
+        draw.topology = params.topology;
+        draw.indexed = false;
+        draw.vertex_first = params.start;
+        draw.vertex_count = params.count;
+        draw.base_instance = self.instance_count.saturating_sub(1);
+        self.instance_count += 1;
+        self.draw_calls.push(draw);
+    }
+
+    /// Handle draw-texture trigger.
+    fn draw_texture(&mut self) {
+        let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.draw_texture());
     }
 
     // ── Upstream ProcessCBData / ProcessCBMultiData / ProcessCBBind ──────
@@ -2841,16 +3128,23 @@ impl Maxwell3D {
             return;
         }
 
-        // In the full implementation, this would write through the memory manager:
-        // memory_manager.WriteBlockCached(buffer_address + offset, data, data.len() * 4)
-        // For now, log the operation.
         let copy_size = data.len() as u32 * 4;
-        log::trace!(
-            "Maxwell3D: CB write {} bytes at buffer 0x{:X}+0x{:X}",
-            copy_size,
-            buffer_address,
-            offset
-        );
+        let address = buffer_address.wrapping_add(offset as u64);
+        if let Some(memory_manager) = self.memory_manager.as_ref().cloned() {
+            let writer = self.guest_memory_writer.as_ref().cloned();
+            let mut write_cpu = move |addr: u64, bytes: &[u8]| {
+                if let Some(writer) = writer.as_ref() {
+                    writer(addr, bytes);
+                }
+            };
+            let mut bytes = Vec::with_capacity(copy_size as usize);
+            for value in data {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            memory_manager
+                .lock()
+                .write_block_cached(address, &bytes, &mut write_cpu);
+        }
 
         // Increment the current buffer position.
         self.regs[cb_base + 3] = offset.wrapping_add(copy_size);
@@ -2908,21 +3202,68 @@ impl Maxwell3D {
         }
     }
 
-    // ── Upstream ProcessMacroBind / ProcessFirmwareCall4 ─────────────────
+    // ── Upstream ProcessMacroUpload / ProcessMacroBind / ProcessFirmwareCall4 ──
+
+    /// Upload a macro code word. Matches upstream `ProcessMacroUpload`.
+    fn process_macro_upload(&mut self, data: u32) {
+        let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
+        self.macro_engine.add_code(ptr, data);
+        self.regs[LOAD_MME_INSTRUCTION_PTR as usize] = ptr.wrapping_add(1);
+    }
 
     /// Bind a macro start address. Matches upstream `ProcessMacroBind`.
     fn process_macro_bind(&mut self, data: u32) {
         let ptr = self.regs[LOAD_MME_START_ADDR_PTR as usize];
-        self.macro_interpreter.set_position(ptr, data);
+        self.macro_positions[ptr as usize] = data;
         self.regs[LOAD_MME_START_ADDR_PTR as usize] = ptr + 1;
+        log::info!(
+            "Maxwell3D::process_macro_bind slot={} start=0x{:X}",
+            ptr,
+            data
+        );
     }
 
     /// Handle firmware call 4. Matches upstream `ProcessFirmwareCall4`.
     fn process_firmware_call4(&mut self) {
-        log::debug!("Maxwell3D: ProcessFirmwareCall4 (STUBBED)");
         // Firmware call 4 changes some registers depending on its parameters.
         // These registers don't affect emulation, so set shadow_scratch[0] = 1.
         self.regs[SHADOW_SCRATCH_BASE as usize] = 1;
+    }
+
+    pub(crate) fn hle_clear_const_buffer(&mut self, base_size: usize, parameters: &[u32]) {
+        self.refresh_parameters();
+        if parameters.len() < 3 {
+            return;
+        }
+        self.regs[CB_CONFIG_BASE as usize] = base_size as u32;
+        self.regs[CB_CONFIG_BASE as usize + 1] = parameters[0];
+        self.regs[CB_CONFIG_BASE as usize + 2] = parameters[1];
+        self.regs[CB_CONFIG_BASE as usize + 3] = 0;
+        let zeroes = vec![0u32; parameters[2] as usize];
+        self.process_cb_multi_data(&zeroes);
+    }
+
+    pub(crate) fn hle_clear_memory(&mut self, parameters: &[u32], zero_memory: &mut Vec<u32>) {
+        self.refresh_parameters();
+        if parameters.len() < 3 {
+            return;
+        }
+        let needed_memory = (parameters[2] / std::mem::size_of::<u32>() as u32) as usize;
+        if needed_memory > zero_memory.len() {
+            zero_memory.resize(needed_memory, 0);
+        }
+        self.regs[UPLOAD_REGS_BASE] = parameters[2];
+        self.regs[UPLOAD_REGS_BASE + 1] = 1;
+        self.regs[UPLOAD_REGS_BASE + 2] = parameters[0];
+        self.regs[UPLOAD_REGS_BASE + 3] = parameters[1];
+        <Self as EngineInterface>::call_method(self, LAUNCH_DMA, 0x1011, true);
+        <Self as EngineInterface>::call_multi_method(
+            self,
+            INLINE_DATA,
+            &zero_memory[..needed_memory],
+            needed_memory as u32,
+            needed_memory as u32,
+        );
     }
 
     // ── Upstream ProcessQueryGet / ProcessQueryCondition / etc ───────────
@@ -2936,28 +3277,70 @@ impl Maxwell3D {
                 let gpu_va = self.report_semaphore_address();
                 let payload = self.report_semaphore_payload();
                 let short_query = (query_word >> 28) & 1 != 0;
-
-                let data = if short_query {
-                    payload.to_le_bytes().to_vec()
-                } else {
-                    let mut buf = Vec::with_capacity(16);
-                    buf.extend_from_slice(&(payload as u64).to_le_bytes());
-                    buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp placeholder
-                    buf
+                let query_type = (query_word >> 24) & 0xF;
+                let subreport = (query_word >> 16) & 0x3F;
+                let mut flags = QueryPropertiesFlags::empty();
+                if !short_query {
+                    flags |= QueryPropertiesFlags::HAS_TIMEOUT;
+                }
+                if short_query && operation == ReportOperation::Release {
+                    flags |= QueryPropertiesFlags::IS_A_FENCE;
+                }
+                let mut queried = false;
+                let gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync> = {
+                    let memory_manager = self.memory_manager.as_ref().cloned();
+                    let guest_memory_writer = self.guest_memory_writer.as_ref().cloned();
+                    Arc::new(move |gpu_addr: u64, bytes: &[u8]| {
+                        let Some(memory_manager) = memory_manager.as_ref() else {
+                            return;
+                        };
+                        let Some(guest_memory_writer) = guest_memory_writer.as_ref() else {
+                            return;
+                        };
+                        memory_manager.lock().write_block_unsafe(
+                            gpu_addr,
+                            bytes,
+                            &mut |cpu_addr, data| guest_memory_writer(cpu_addr, data),
+                        );
+                    })
                 };
 
                 log::debug!(
-                    "Maxwell3D: query_get {:?} va=0x{:X} payload=0x{:X} short={}",
+                    "Maxwell3D: query_get {:?} va=0x{:X} payload=0x{:X} short={} type={} subreport={}",
                     operation,
                     gpu_va,
                     payload,
                     short_query,
+                    query_type,
+                    subreport,
                 );
 
-                self.pending_semaphore_writes.push(PendingWrite {
-                    gpu_va,
-                    data,
+                let _ = self.with_rasterizer_mut(|rasterizer| {
+                    queried = true;
+                    rasterizer.query(
+                        gpu_va,
+                        query_type,
+                        flags,
+                        payload,
+                        subreport,
+                        Arc::clone(&gpu_write),
+                    );
                 });
+
+                if !queried {
+                    let data = if short_query {
+                        payload.to_le_bytes().to_vec()
+                    } else {
+                        let mut buf = Vec::with_capacity(16);
+                        buf.extend_from_slice(&(payload as u64).to_le_bytes());
+                        buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp placeholder
+                        buf
+                    };
+                    self.pending_semaphore_writes.push(PendingWrite {
+                        gpu_va,
+                        data,
+                    });
+                }
             }
             ReportOperation::Acquire => {
                 log::debug!("Maxwell3D: query_get Acquire (unimplemented)");
@@ -2970,35 +3353,57 @@ impl Maxwell3D {
 
     /// Handle render enable / query condition. Matches upstream `ProcessQueryCondition`.
     fn process_query_condition(&mut self) {
-        // In the full implementation, this would check rasterizer->AccelerateConditionalRendering()
-        // and read GPU memory for conditional evaluation. For now, always enable.
         let override_val = self.regs[RENDER_ENABLE_OVERRIDE as usize];
         match override_val {
             0 => {
-                // AlwaysRender
-                self.execute_on = true;
-            }
-            1 => {
-                // NeverRender
-                self.execute_on = false;
-            }
-            _ => {
-                // UseRenderEnable — evaluate mode
                 let mode = self.regs[RENDER_ENABLE_MODE as usize];
                 match mode {
-                    0 => self.execute_on = true,  // True
-                    1 => self.execute_on = false,  // False
-                    2 | 3 | 4 => {
-                        // Conditional / IfEqual / IfNotEqual — requires GPU memory read.
-                        // Default to enabled until memory manager integration.
-                        log::trace!("Maxwell3D: render_enable conditional mode={} (defaulting to true)", mode);
-                        self.execute_on = true;
+                    0 => self.execute_on = false,
+                    1 => self.execute_on = true,
+                    2..=4 => {
+                        let condition_address = ((self.regs[RENDER_ENABLE_BASE as usize] as u64) << 32)
+                            | self.regs[(RENDER_ENABLE_BASE + 1) as usize] as u64;
+                        let mut compare_bytes = [0u8; 24];
+                        if !self.read_gpu_block(condition_address, &mut compare_bytes) {
+                            self.execute_on = true;
+                            return;
+                        }
+                        let read_word = |index: usize| -> u32 {
+                            let start = index * 4;
+                            u32::from_le_bytes(compare_bytes[start..start + 4].try_into().unwrap())
+                        };
+                        let initial_sequence = read_word(0);
+                        let initial_mode = read_word(1);
+                        let current_sequence = read_word(4);
+                        let current_mode = read_word(5);
+                        self.execute_on = match mode {
+                            2 => initial_sequence != 0 && initial_mode != 0,
+                            3 => {
+                                initial_sequence == current_sequence
+                                    && initial_mode == current_mode
+                            }
+                            4 => {
+                                initial_sequence != current_sequence
+                                    || initial_mode != current_mode
+                            }
+                            _ => unreachable!(),
+                        };
                     }
                     _ => {
                         log::warn!("Maxwell3D: unknown render_enable mode {}", mode);
                         self.execute_on = true;
                     }
                 }
+            }
+            1 => {
+                self.execute_on = true;
+            }
+            2 => {
+                self.execute_on = false;
+            }
+            _ => {
+                log::warn!("Maxwell3D: unknown render_enable override {}", override_val);
+                self.execute_on = true;
             }
         }
     }
@@ -3060,14 +3465,39 @@ impl Maxwell3D {
     fn call_macro_method(&mut self, method: u32) {
         self.executing_macro = 0;
 
-        let entry =
-            ((method - MACRO_REGISTERS_START) >> 1) % 128;
+        let entry = ((method - MACRO_REGISTERS_START) >> 1) % 128;
         let params = std::mem::take(&mut self.macro_params);
-
-        // Extract the interpreter to avoid borrow conflicts.
-        let mut interp = std::mem::take(&mut self.macro_interpreter);
-        interp.execute(entry, &params, self);
-        self.macro_interpreter = interp;
+        let macro_method = self.macro_positions[entry as usize];
+        if macro_method == 0x14F {
+            log::info!(
+                "Maxwell3D::call_macro_method trace entry={} macro_start=0x{:X} params={:08X?} addrs={:X?} segments={:X?} dirty={}",
+                entry,
+                macro_method,
+                params,
+                self.macro_addresses,
+                self.macro_segments,
+                self.current_macro_dirty
+            );
+        }
+        let self_raw = std::ptr::from_mut(self);
+        let self_ptr = Maxwell3DPtr(self_raw);
+        self.macro_engine.set_maxwell_3d(self_raw);
+        let compile = |code: &[u32]| -> Box<dyn crate::macro_engine::macro_engine::CachedMacro> {
+            let mut program = MacroInterpreterImpl::new(code.to_vec());
+            let writer_ptr = self_ptr;
+            program.set_method_writer(move |address, value, _is_last_call| unsafe {
+                writer_ptr.call_method(address, value);
+            });
+            let reader_ptr = self_ptr;
+            program.set_method_reader(move |method| unsafe { reader_ptr.read_reg(method) });
+            Box::new(program)
+        };
+        self.macro_engine.execute(
+            macro_method,
+            &params,
+            move || unsafe { (&mut *self_ptr.0).refresh_parameters() },
+            compile,
+        );
 
         // Upstream calls draw_manager->DrawDeferred() here.
         // Flush any deferred instanced draw.
@@ -3172,12 +3602,27 @@ impl Maxwell3D {
             return;
         }
         let method = self.executing_macro;
-        let slot = ((method - MACRO_METHODS_START) >> 1) as u32 % 128;
         let params = std::mem::take(&mut self.macro_params);
-
-        let mut interp = std::mem::take(&mut self.macro_interpreter);
-        interp.execute(slot, &params, self);
-        self.macro_interpreter = interp;
+        let entry = ((method - MACRO_METHODS_START) >> 1) % 128;
+        let macro_method = self.macro_positions[entry as usize];
+        let self_raw = std::ptr::from_mut(self);
+        let self_ptr = Maxwell3DPtr(self_raw);
+        self.macro_engine.set_maxwell_3d(self_raw);
+        self.macro_engine.execute(
+            macro_method,
+            &params,
+            move || unsafe { (&mut *self_ptr.0).refresh_parameters() },
+            |code| {
+                let mut program = MacroInterpreterImpl::new(code.to_vec());
+                let writer_ptr = self_ptr;
+                program.set_method_writer(move |address, value, _is_last_call| unsafe {
+                    writer_ptr.call_method(address, value);
+                });
+                let reader_ptr = self_ptr;
+                program.set_method_reader(move |method| unsafe { reader_ptr.read_reg(method) });
+                Box::new(program)
+            },
+        );
         self.executing_macro = 0;
     }
 }
@@ -3243,8 +3688,7 @@ impl EngineInterface for Maxwell3D {
             }
             INLINE_DATA => {
                 assert!(methods_pending == amount as u32);
-                // Upstream calls upload_state.ProcessData(base_start, amount).
-                log::trace!("Maxwell3D: inline_data multi {} words", amount);
+                self.process_inline_upload_multi(&base_start[..amount]);
             }
             _ => {
                 for i in 0..amount {
@@ -3295,50 +3739,13 @@ fn words_from_bytes(bytes: &[u8; 32]) -> [u32; 8] {
     words
 }
 
-impl MacroProcessor for Maxwell3D {
-    fn macro_read(&self, method: u32) -> u32 {
-        let idx = method as usize;
-        if idx < ENGINE_REG_COUNT {
-            self.regs[idx]
-        } else {
-            0
-        }
-    }
-
-    fn macro_write(&mut self, method: u32, value: u32) {
-        self.process_method(method, value);
-    }
-}
-
 impl Engine for Maxwell3D {
     fn class_id(&self) -> ClassId {
         ClassId::Threed
     }
 
     fn write_reg(&mut self, method: u32, value: u32) {
-        // Handle MME upload registers.
-        match method {
-            LOAD_MME_INSTRUCTION => {
-                let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
-                self.macro_interpreter.upload_code(ptr, value);
-                self.regs[LOAD_MME_INSTRUCTION_PTR as usize] = ptr + 1;
-                return;
-            }
-            LOAD_MME_START_ADDR => {
-                let ptr = self.regs[LOAD_MME_START_ADDR_PTR as usize];
-                self.macro_interpreter.set_position(ptr, value);
-                self.regs[LOAD_MME_START_ADDR_PTR as usize] = ptr + 1;
-                return;
-            }
-            MACRO_METHODS_START..MACRO_METHODS_END => {
-                self.handle_macro_method(method, value);
-                return;
-            }
-            _ => {}
-        }
-
-        // Standard method processing with side effects.
-        self.process_method(method, value);
+        <Self as EngineInterface>::call_method(self, method, value, true);
     }
 
     fn take_framebuffer(&mut self) -> Option<Framebuffer> {
@@ -3366,8 +3773,10 @@ mod tests {
     #[derive(Default, Clone)]
     struct RasterizerCalls {
         wait_for_idle: u32,
+        draw_texture: u32,
         signal_sync_point: Vec<u32>,
         reset_counter: Vec<u32>,
+        query_writes: Vec<(u64, Vec<u8>)>,
         bound_uniforms: Vec<(usize, u32, u64, u32)>,
         disabled_uniforms: Vec<(usize, u32)>,
     }
@@ -3384,7 +3793,9 @@ mod tests {
 
     impl RasterizerInterface for TestRasterizer {
         fn draw(&mut self, _is_indexed: bool, _instance_count: u32) {}
-        fn draw_texture(&mut self) {}
+        fn draw_texture(&mut self) {
+            self.calls.lock().unwrap().draw_texture += 1;
+        }
         fn clear(&mut self, _layer_count: u32) {}
         fn dispatch_compute(&mut self) {}
         fn reset_counter(&mut self, query_type: u32) {
@@ -3392,13 +3803,27 @@ mod tests {
         }
         fn query(
             &mut self,
-            _gpu_addr: u64,
+            gpu_addr: u64,
             _query_type: u32,
-            _has_timeout: bool,
-            _payload: u32,
+            flags: QueryPropertiesFlags,
+            payload: u32,
             _subreport: u32,
-            _gpu_write: &dyn Fn(u64, &[u8]),
+            gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
         ) {
+            let bytes = if flags.contains(QueryPropertiesFlags::HAS_TIMEOUT) {
+                let mut buf = Vec::with_capacity(16);
+                buf.extend_from_slice(&(payload as u64).to_le_bytes());
+                buf.extend_from_slice(&0u64.to_le_bytes());
+                buf
+            } else {
+                payload.to_le_bytes().to_vec()
+            };
+            gpu_write(gpu_addr, &bytes);
+            self.calls
+                .lock()
+                .unwrap()
+                .query_writes
+                .push((gpu_addr, bytes));
         }
         fn bind_graphics_uniform_buffer(
             &mut self,
@@ -3420,8 +3845,8 @@ mod tests {
                 .disabled_uniforms
                 .push((stage, index));
         }
-        fn signal_fence(&mut self, _func: Box<dyn FnOnce()>) {}
-        fn sync_operation(&mut self, _func: Box<dyn FnOnce()>) {}
+        fn signal_fence(&mut self, _func: Box<dyn FnOnce() + Send>) {}
+        fn sync_operation(&mut self, _func: Box<dyn FnOnce() + Send>) {}
         fn signal_sync_point(&mut self, value: u32) {
             self.calls.lock().unwrap().signal_sync_point.push(value);
         }
@@ -3461,10 +3886,11 @@ mod tests {
 
     #[test]
     fn test_write_reg_high_method() {
-        // Regression: methods above 0xFFF were silently dropped with old 0x1000 size.
+        // Regression: methods above 0xFFF byte offset were silently dropped.
+        // The register file stores upstream word indices, not raw byte offsets.
         let mut engine = Maxwell3D::new();
-        engine.write_reg(0x19D0, 0x1234);
-        assert_eq!(engine.regs[0x19D0], 0x1234);
+        engine.write_reg(CLEAR_SURFACE, 0x1234);
+        assert_eq!(engine.regs[CLEAR_SURFACE as usize], 0x1234);
     }
 
     #[test]
@@ -5286,6 +5712,45 @@ mod tests {
         assert!(writes2.is_empty());
     }
 
+    #[test]
+    fn test_report_semaphore_query_writes_through_rasterizer_callback() {
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let mut rasterizer = TestRasterizer::new(Arc::clone(&calls));
+        let memory_manager = Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::default(),
+        ));
+        memory_manager.lock().map(0x7000, 0x8000, 0x1000, 0, false);
+
+        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let writes_cb = Arc::clone(&writes);
+
+        let mut engine = Maxwell3D::new();
+        engine.bind_rasterizer(&rasterizer);
+        engine.set_memory_manager(Arc::clone(&memory_manager));
+        engine.set_guest_memory_writer(Arc::new(move |cpu_addr, data| {
+            writes_cb.lock().unwrap().push((cpu_addr, data.to_vec()));
+        }));
+
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x7000);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0x1122_3344);
+        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 1 << 28);
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.query_writes.len(), 1);
+        assert_eq!(calls.query_writes[0].0, 0x7000);
+        assert_eq!(calls.query_writes[0].1, 0x1122_3344u32.to_le_bytes().to_vec());
+        drop(calls);
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 0x8000);
+        assert_eq!(writes[0].1, 0x1122_3344u32.to_le_bytes().to_vec());
+        assert!(engine.pending_semaphore_writes.is_empty());
+
+        let _ = &mut rasterizer;
+    }
+
     // ── MME macro integration tests ─────────────────────────────────────
 
     /// Helper: encode an AddImmediate macro opcode.
@@ -5307,12 +5772,46 @@ mod tests {
         engine.write_reg(LOAD_MME_INSTRUCTION_PTR, 5);
         assert_eq!(engine.regs[LOAD_MME_INSTRUCTION_PTR as usize], 5);
 
-        // Upload two code words — pointer should auto-increment.
+        // Upload two code words. Upstream's ProcessMethodCall path keeps using the
+        // current instruction_ptr as the code key for each write.
         engine.write_reg(LOAD_MME_INSTRUCTION, 0xAAAA);
-        assert_eq!(engine.regs[LOAD_MME_INSTRUCTION_PTR as usize], 6);
+        assert_eq!(engine.regs[LOAD_MME_INSTRUCTION_PTR as usize], 5);
 
         engine.write_reg(LOAD_MME_INSTRUCTION, 0xBBBB);
-        assert_eq!(engine.regs[LOAD_MME_INSTRUCTION_PTR as usize], 7);
+        assert_eq!(engine.regs[LOAD_MME_INSTRUCTION_PTR as usize], 5);
+    }
+
+    #[test]
+    fn test_refresh_parameters_updates_dirty_macro_segments() {
+        let gpu = crate::gpu::Gpu::new(false, false);
+        gpu.set_guest_memory_reader(std::sync::Arc::new(|addr, output| {
+            let backing = [
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            ];
+            let start = (addr - 0x2000) as usize;
+            output.copy_from_slice(&backing[start..start + output.len()]);
+        }));
+
+        let memory_manager = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::default(),
+        ));
+        memory_manager.lock().map(0x1000, 0x2000, 8, 0, false);
+
+        let mut engine = Maxwell3D::new();
+        engine.set_memory_manager(std::sync::Arc::clone(&memory_manager));
+        let gpu_ptr = &gpu as *const crate::gpu::Gpu as usize;
+        engine.set_guest_memory_reader(std::sync::Arc::new(move |addr, output| unsafe {
+            let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
+            let _ = gpu.read_guest_memory(addr, output);
+        }));
+        engine.macro_params = vec![0, 0];
+        engine.macro_segments.push((0x1000, 2));
+        engine.current_macro_dirty = true;
+
+        engine.refresh_parameters();
+
+        assert_eq!(engine.macro_params, vec![0x4433_2211, 0x8877_6655]);
+        assert!(engine.any_parameters_dirty());
     }
 
     #[test]
@@ -5328,6 +5827,28 @@ mod tests {
 
         engine.write_reg(LOAD_MME_START_ADDR, 20);
         assert_eq!(engine.regs[LOAD_MME_START_ADDR_PTR as usize], 2);
+    }
+
+    #[test]
+    fn test_initialize_register_defaults_matches_upstream_boot_values() {
+        let engine = Maxwell3D::new();
+
+        assert_eq!(engine.regs[DEPTH_TEST_FUNC as usize], 0x207);
+        assert_eq!(engine.regs[STENCIL_TWO_SIDE_ENABLE as usize], 1);
+        assert_eq!(engine.regs[STENCIL_FRONT_FUNC_MASK as usize], 0xFFFF_FFFF);
+        assert_eq!(engine.regs[STENCIL_BACK_MASK as usize], 0xFFFF_FFFF);
+        assert_eq!(engine.regs[POINT_SIZE as usize], f32::to_bits(1.0));
+        assert_eq!(engine.regs[COLOR_MASK_BASE as usize], 0x1111);
+        assert_eq!(engine.regs[VERTEX_ATTRIB_BASE as usize] & (1 << 6), 1 << 6);
+        assert_eq!(engine.regs[RASTERIZE_ENABLE as usize], 1);
+        assert_eq!(engine.regs[COLOR_TARGET_MRT_ENABLE as usize], 1);
+        assert_eq!(engine.regs[FRAMEBUFFER_SRGB as usize], 1);
+        assert_eq!(engine.regs[LINE_WIDTH_ALIASED as usize], f32::to_bits(1.0));
+        assert_eq!(engine.regs[LINE_WIDTH_SMOOTH as usize], f32::to_bits(1.0));
+        assert_eq!(engine.regs[POLYGON_MODE_FRONT as usize], 0x1B02);
+        assert_eq!(engine.regs[POLYGON_MODE_BACK as usize], 0x1B02);
+        assert_eq!(engine.shadow_state[DEPTH_TEST_FUNC as usize], 0x207);
+        assert_eq!(engine.shadow_state[COLOR_MASK_BASE as usize], 0x1111);
     }
 
     #[test]
@@ -5612,6 +6133,76 @@ mod tests {
     }
 
     #[test]
+    fn test_cb_header_writes_do_not_trigger_cb_data_path() {
+        let mut engine = Maxwell3D::new();
+
+        engine.call_method(CB_CONFIG_BASE, 0x200, true);
+        engine.call_method(CB_CONFIG_BASE + 1, 0x1234, true);
+        engine.call_method(CB_CONFIG_BASE + 2, 0x5678, true);
+        engine.call_method(CB_CONFIG_BASE + 3, 0x40, true);
+
+        assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x200);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x1234);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 2) as usize], 0x5678);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 0x40);
+    }
+
+    #[test]
+    fn test_hle_clear_const_buffer_sets_cb_and_resets_offset() {
+        let mut engine = Maxwell3D::new();
+        engine.hle_clear_const_buffer(0x5F00, &[0x12, 0x3456, 4]);
+
+        assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x5F00);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x12);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 2) as usize], 0x3456);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 16);
+    }
+
+    #[test]
+    fn test_process_cb_multi_data_writes_through_memory_manager() {
+        let mut engine = Maxwell3D::new();
+        let memory_manager = Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new_with_geometry(1, 32, 0x1_0000_0000, 16, 12),
+        ));
+        memory_manager.lock().map(0x10000, 0x9000_0000, 0x1000, 0, false);
+        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let writes_clone = Arc::clone(&writes);
+        engine.set_memory_manager(Arc::clone(&memory_manager));
+        engine.set_guest_memory_writer(Arc::new(move |addr, bytes| {
+            writes_clone.lock().unwrap().push((addr, bytes.to_vec()));
+        }));
+
+        engine.call_method(CB_CONFIG_BASE, 0x100, true);
+        engine.call_method(CB_CONFIG_BASE + 1, 0, true);
+        engine.call_method(CB_CONFIG_BASE + 2, 0x10000, true);
+        engine.call_method(CB_CONFIG_BASE + 3, 0, true);
+        engine.call_multi_method(CB_DATA_BASE, &[0x11223344, 0x55667788], 2, 2);
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 0x9000_0000);
+        assert_eq!(
+            writes[0].1,
+            vec![0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
+        );
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 8);
+    }
+
+    #[test]
+    fn test_hle_clear_memory_sets_upload_regs_and_launches_dma() {
+        let mut engine = Maxwell3D::new();
+        let mut zero_memory = Vec::new();
+        engine.hle_clear_memory(&[0x44, 0x5566, 0x20], &mut zero_memory);
+
+        assert_eq!(engine.regs[UPLOAD_REGS_BASE], 0x20);
+        assert_eq!(engine.regs[UPLOAD_REGS_BASE + 1], 1);
+        assert_eq!(engine.regs[UPLOAD_REGS_BASE + 2], 0x44);
+        assert_eq!(engine.regs[UPLOAD_REGS_BASE + 3], 0x5566);
+        assert_eq!(engine.regs[LAUNCH_DMA as usize], 0x1011);
+        assert_eq!(zero_memory.len(), 8);
+    }
+
+    #[test]
     fn test_call_multi_method_default_iterates() {
         let mut engine = Maxwell3D::new();
         // Writing to a generic register (not CB_DATA) via call_multi_method
@@ -5626,6 +6217,7 @@ mod tests {
     #[test]
     fn test_call_method_firmware_call4() {
         let mut engine = Maxwell3D::new();
+        assert_eq!(FALCON4, reg_index!(0x2310));
         // Writing to falcon[4] should set shadow_scratch[0] to 1.
         engine.call_method(FALCON4, 0, true);
         assert_eq!(engine.regs[SHADOW_SCRATCH_BASE as usize], 1);
@@ -5692,8 +6284,8 @@ mod tests {
     #[test]
     fn test_call_method_query_condition_always_render() {
         let mut engine = Maxwell3D::new();
-        // Set render_enable_override to AlwaysRender (0).
-        engine.call_method(RENDER_ENABLE_OVERRIDE, 0, true);
+        // Set render_enable_override to AlwaysRender (1).
+        engine.call_method(RENDER_ENABLE_OVERRIDE, 1, true);
         // Trigger query condition evaluation.
         engine.call_method(RENDER_ENABLE_MODE, 0, true);
         assert!(engine.should_execute());
@@ -5702,10 +6294,44 @@ mod tests {
     #[test]
     fn test_call_method_query_condition_never_render() {
         let mut engine = Maxwell3D::new();
-        // Set render_enable_override to NeverRender (1).
-        engine.call_method(RENDER_ENABLE_OVERRIDE, 1, true);
+        // Set render_enable_override to NeverRender (2).
+        engine.call_method(RENDER_ENABLE_OVERRIDE, 2, true);
         engine.call_method(RENDER_ENABLE_MODE, 0, true);
         assert!(!engine.should_execute());
+    }
+
+    #[test]
+    fn test_call_method_query_condition_if_equal_reads_compare_block() {
+        let gpu = crate::gpu::Gpu::new(false, false);
+        gpu.set_guest_memory_reader(std::sync::Arc::new(|addr, output| {
+            let mut backing = [0u8; 24];
+            backing[0..4].copy_from_slice(&5u32.to_le_bytes());
+            backing[4..8].copy_from_slice(&7u32.to_le_bytes());
+            backing[16..20].copy_from_slice(&5u32.to_le_bytes());
+            backing[20..24].copy_from_slice(&7u32.to_le_bytes());
+            let start = (addr - 0x3000) as usize;
+            output.copy_from_slice(&backing[start..start + output.len()]);
+        }));
+
+        let memory_manager = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::default(),
+        ));
+        memory_manager.lock().map(0x2000, 0x3000, 24, 0, false);
+
+        let mut engine = Maxwell3D::new();
+        engine.set_memory_manager(std::sync::Arc::clone(&memory_manager));
+        let gpu_ptr = &gpu as *const crate::gpu::Gpu as usize;
+        engine.set_guest_memory_reader(std::sync::Arc::new(move |addr, output| unsafe {
+            let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
+            let _ = gpu.read_guest_memory(addr, output);
+        }));
+
+        engine.call_method(RENDER_ENABLE_BASE, 0, true);
+        engine.call_method(RENDER_ENABLE_BASE + 1, 0x2000, true);
+        engine.call_method(RENDER_ENABLE_OVERRIDE, 0, true);
+        engine.call_method(RENDER_ENABLE_MODE, 3, true);
+
+        assert!(engine.should_execute());
     }
 
     #[test]
@@ -5750,6 +6376,18 @@ mod tests {
     }
 
     #[test]
+    fn test_draw_texture_trigger_calls_rasterizer() {
+        let mut engine = Maxwell3D::new();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
+
+        engine.call_method(DRAW_TEXTURE_SRC_Y0, 0x1234, true);
+
+        assert_eq!(calls.lock().unwrap().draw_texture, 1);
+    }
+
+    #[test]
     fn test_cb_bind_forwards_to_rasterizer() {
         let mut engine = Maxwell3D::new();
         let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
@@ -5767,6 +6405,48 @@ mod tests {
             calls.lock().unwrap().bound_uniforms,
             vec![(0, 2, 0x1_0000_2000, 0x800)]
         );
+    }
+
+    #[test]
+    fn test_draw_index_small_matches_upstream_immediate_indexed_draw() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[(IB_BASE + IB_OFF_FORMAT) as usize] = 2;
+        engine.regs[GLOBAL_BASE_VERTEX_INDEX as usize] = 7;
+        engine.regs[GLOBAL_BASE_INSTANCE_INDEX as usize] = 3;
+
+        let argument = (4u32 << 28) | (100u32 << 16) | 12u32;
+        engine.call_method(INDEX_BUFFER32_FIRST, argument, true);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        let draw = &draws[0];
+        assert!(draw.indexed);
+        assert_eq!(draw.topology, PrimitiveTopology::Triangles);
+        assert_eq!(draw.index_buffer_first, 12);
+        assert_eq!(draw.index_buffer_count, 100);
+        assert_eq!(draw.base_vertex, 7);
+        assert_eq!(draw.base_instance, 3);
+        assert_eq!(draw.instance_count, 1);
+    }
+
+    #[test]
+    fn test_vertex_array_instance_methods_match_upstream_base_instance_progression() {
+        let mut engine = Maxwell3D::new();
+
+        let encoded = (4u32 << 28) | (20u32 << 16) | 10u32;
+        engine.call_method(VERTEX_ARRAY_INSTANCE_FIRST, encoded, true);
+        engine.call_method(VERTEX_ARRAY_INSTANCE_SUBSEQUENT, encoded, true);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].topology, PrimitiveTopology::Triangles);
+        assert_eq!(draws[0].vertex_first, 10);
+        assert_eq!(draws[0].vertex_count, 20);
+        assert_eq!(draws[0].indexed, false);
+        assert_eq!(draws[0].base_instance, 0);
+        assert_eq!(draws[0].instance_count, 1);
+        assert_eq!(draws[1].base_instance, 1);
+        assert_eq!(draws[1].instance_count, 1);
     }
 
     #[test]

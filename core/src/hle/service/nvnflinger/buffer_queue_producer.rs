@@ -83,40 +83,120 @@ impl BufferQueueProducer {
 
     pub fn dequeue_buffer(
         &self,
-        _async_flag: bool,
-        _width: u32,
-        _height: u32,
+        async_flag: bool,
+        width: u32,
+        height: u32,
         _format: PixelFormat,
         _usage: u32,
     ) -> (Status, i32, Fence) {
-        // Upstream dequeue_buffer calls WaitForFreeSlotThenRelock to find a free buffer slot,
-        // then configures the slot's GraphicBuffer via NvMap allocation and returns the slot
-        // index with an acquire fence. Requires:
-        //   - WaitForFreeSlotThenRelock (condition variable wait loop over mSlots)
-        //   - NvMap buffer allocation for GraphicBuffer backing
-        //   - Kernel event signaling for buffer availability
-        // Blocked on NvMap and kernel event infrastructure.
-        log::warn!("BufferQueueProducer::dequeue_buffer: slot management infrastructure not yet ported");
-        (Status::WouldBlock, -1, Fence::default())
+        let mut inner = self.core.mutex.lock().unwrap();
+
+        if inner.is_abandoned {
+            return (Status::NoInit, -1, Fence::default());
+        }
+
+        let max_buffer_count = inner.get_max_buffer_count_locked(async_flag);
+
+        // Find a free slot with a graphic buffer (preallocated).
+        // Upstream: WaitForFreeSlotThenRelock picks the oldest free buffer.
+        let mut found: i32 = -1;
+        for s in 0..(max_buffer_count as usize) {
+            if inner.slots[s].buffer_state == super::buffer_slot::BufferState::Free
+                && inner.slots[s].graphic_buffer.is_some()
+            {
+                if found == -1
+                    || inner.slots[s].frame_number < inner.slots[found as usize].frame_number
+                {
+                    found = s as i32;
+                }
+            }
+        }
+
+        if found == -1 {
+            // No free buffers — upstream would block via condition variable.
+            // Return WouldBlock so the caller can retry.
+            return (Status::WouldBlock, -1, Fence::default());
+        }
+
+        let s = found as usize;
+        inner.slots[s].buffer_state = super::buffer_slot::BufferState::Dequeued;
+
+        // Use default size if width/height are 0.
+        let _w = if width == 0 { inner.default_width } else { width };
+        let _h = if height == 0 { inner.default_height } else { height };
+
+        let fence = inner.slots[s].fence;
+        inner.slots[s].fence = Fence::no_fence();
+
+        log::debug!("BufferQueueProducer::dequeue_buffer -> slot={}", found);
+        (Status::NoError, found, fence)
     }
 
     pub fn queue_buffer(
         &self,
-        _slot: i32,
-        _input: &QueueBufferInput,
+        slot: i32,
+        input: &QueueBufferInput,
     ) -> (Status, QueueBufferOutput) {
-        // Upstream queue_buffer validates the slot, updates frame number, sets the buffer's
-        // acquire fence, notifies the consumer listener (onFrameAvailable/onFrameReplaced),
-        // and returns QueueBufferOutput with
-        // (
-        //   width, height, transformHint, numPendingBuffers from the consumer.
-        // Requires:
-        //   - Complete mSlots buffer state management
-        //   - ConsumerListener notification (IConsumerListener::onFrameAvailable)
-        //   - Fence synchronization
-        // Blocked on buffer queue and consumer listener infrastructure.
-        log::warn!("BufferQueueProducer::queue_buffer: buffer queue infrastructure not yet ported");
-        (Status::WouldBlock, QueueBufferOutput::new())
+        let mut inner = self.core.mutex.lock().unwrap();
+
+        if inner.is_abandoned {
+            return (Status::NoInit, QueueBufferOutput::new());
+        }
+
+        if slot < 0 || slot as usize >= super::buffer_queue_defs::NUM_BUFFER_SLOTS {
+            return (Status::BadValue, QueueBufferOutput::new());
+        }
+
+        let s = slot as usize;
+        if inner.slots[s].buffer_state != super::buffer_slot::BufferState::Dequeued {
+            log::error!(
+                "BufferQueueProducer::queue_buffer: slot {} not dequeued (state={:?})",
+                slot, inner.slots[s].buffer_state
+            );
+            return (Status::BadValue, QueueBufferOutput::new());
+        }
+
+        // Transition to Queued.
+        inner.slots[s].buffer_state = super::buffer_slot::BufferState::Queued;
+        inner.slots[s].fence = input.fence;
+        inner.frame_counter += 1;
+        inner.slots[s].frame_number = inner.frame_counter;
+
+        // Push to the FIFO queue for the consumer.
+        let gb = inner.slots[s].graphic_buffer.clone();
+        let frame_num = inner.frame_counter;
+        let item = super::buffer_item::BufferItem {
+            slot,
+            graphic_buffer: gb,
+            fence: input.fence,
+            crop: input.crop,
+            transform: input.transform,
+            scaling_mode: input.scaling_mode as u32,
+            timestamp: input.timestamp,
+            is_auto_timestamp: input.is_auto_timestamp != 0,
+            frame_number: frame_num,
+            swap_interval: input.swap_interval,
+            is_droppable: false,
+            acquire_called: false,
+            transform_to_display_inverse: false,
+        };
+        inner.queue.push(item);
+
+        let mut output = QueueBufferOutput::new();
+        output.inflate(
+            inner.default_width,
+            inner.default_height,
+            inner.transform_hint,
+            inner.queue.len() as u32,
+        );
+
+        // Upstream: notify consumer (onFrameAvailable).
+        // Signal that a buffer is available for the consumer to acquire.
+        drop(inner);
+        self.core.signal_dequeue_condition();
+
+        log::debug!("BufferQueueProducer::queue_buffer slot={} frame={}", slot, self.core.mutex.lock().unwrap().frame_counter);
+        (Status::NoError, output)
     }
 
     pub fn cancel_buffer(&self, slot: i32, fence: &Fence) {

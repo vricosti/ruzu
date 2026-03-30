@@ -10,10 +10,11 @@
 use std::collections::HashMap;
 
 use super::macro_engine::CachedMacro;
+use crate::engines::maxwell_3d::Maxwell3D;
 
 // ── Known HLE program hashes ─────────────────────────────────────────────────
 
-// These are the CityHash64 values of known upstream macro programs.
+// These are the Common::HashValue(code) values of known upstream macro programs.
 // Port of the hash constants from the `HLEMacro::HLEMacro` constructor.
 
 const HASH_DRAW_ARRAYS_INDIRECT: u64 = 0x0D61FC9FAAC9FCAD;
@@ -38,7 +39,22 @@ const HASH_DRAW_INDIRECT_BYTE_COUNT: u64 = 0xB5F74EDB717278EC;
 ///
 /// Port of `HLEMacroImpl` from `macro_hle.cpp`.
 /// In upstream, this holds a reference to Maxwell3D. That dependency
-/// will be wired when the engine integration is complete.
+/// is carried via a raw pointer and set by `MacroEngine` before lookup.
+
+#[derive(Clone, Copy)]
+struct Maxwell3DPtr(*mut Maxwell3D);
+
+unsafe impl Send for Maxwell3DPtr {}
+
+impl Maxwell3DPtr {
+    unsafe fn clear_const_buffer(self, base_size: usize, parameters: &[u32]) {
+        (&mut *self.0).hle_clear_const_buffer(base_size, parameters);
+    }
+
+    unsafe fn clear_memory(self, parameters: &[u32], zero_memory: &mut Vec<u32>) {
+        (&mut *self.0).hle_clear_memory(parameters, zero_memory);
+    }
+}
 
 /// HLE: DrawArraysIndirect (non-extended).
 ///
@@ -205,22 +221,19 @@ impl CachedMacro for HleSetRasterBoundingBox {
 /// Port of `HLE_ClearConstBuffer<base_size>`.
 struct HleClearConstBuffer {
     base_size: usize,
+    maxwell3d: Option<Maxwell3DPtr>,
 }
 
 impl CachedMacro for HleClearConstBuffer {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D register access to set const_buffer registers
-        // and call ProcessCBMultiData with a zero buffer of base_size entries.
-        // Upstream: HLE_ClearConstBuffer<base_size>::Execute() in video_core/macro/macro_hle.cpp:
-        //   regs.const_buffer.size = base_size
-        //   regs.const_buffer.address_high = params[0]
-        //   regs.const_buffer.address_low  = params[1]
-        //   regs.const_buffer.offset = 0
-        //   ProcessCBMultiData(zeroes.data(), params[2] * 4)
-        log::warn!(
-            "HLE_ClearConstBuffer(base_size=0x{:X}): not yet implemented (requires Maxwell3D integration)",
-            self.base_size
-        );
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!(
+                "HLE_ClearConstBuffer(base_size=0x{:X}): missing Maxwell3D owner",
+                self.base_size
+            );
+            return;
+        };
+        unsafe { maxwell3d.clear_const_buffer(self.base_size, parameters) };
     }
 }
 
@@ -228,20 +241,17 @@ impl CachedMacro for HleClearConstBuffer {
 ///
 /// Port of `HLE_ClearMemory`.
 struct HleClearMemory {
-    #[allow(dead_code)]
     zero_memory: Vec<u32>,
+    maxwell3d: Option<Maxwell3DPtr>,
 }
 
 impl CachedMacro for HleClearMemory {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D register access to set upload registers and call
-        // CallMethod(launch_dma) + CallMultiMethod(inline_data) with zeroed memory.
-        // Upstream: HLE_ClearMemory::Execute() in video_core/macro/macro_hle.cpp:
-        //   needed_memory = params[2] / sizeof(u32)
-        //   regs.upload.{line_length_in=params[2], line_count=1, dest.address_{high,low}}
-        //   CallMethod(MAXWELL3D_REG_INDEX(launch_dma), 0x1011, true)
-        //   CallMultiMethod(MAXWELL3D_REG_INDEX(inline_data), zero_memory, needed_memory, ...)
-        log::warn!("HLE_ClearMemory: not yet implemented (requires Maxwell3D integration)");
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_ClearMemory: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.clear_memory(parameters, &mut self.zero_memory) };
     }
 }
 
@@ -269,13 +279,14 @@ impl CachedMacro for HleTransformFeedbackSetup {
 // ── HLE Macro Registry ──────────────────────────────────────────────────────
 
 /// Builder function type for creating HLE macro instances.
-type HleBuilder = fn() -> Box<dyn CachedMacro>;
+type HleBuilder = fn(Option<Maxwell3DPtr>) -> Box<dyn CachedMacro>;
 
 /// Registry of known HLE macro programs, keyed by hash.
 ///
 /// Port of `Tegra::HLEMacro`.
 pub struct HleMacro {
     builders: HashMap<u64, HleBuilder>,
+    maxwell3d: Option<Maxwell3DPtr>,
 }
 
 impl HleMacro {
@@ -285,47 +296,61 @@ impl HleMacro {
     pub fn new() -> Self {
         let mut builders: HashMap<u64, HleBuilder> = HashMap::new();
 
-        builders.insert(HASH_DRAW_ARRAYS_INDIRECT, || {
+        builders.insert(HASH_DRAW_ARRAYS_INDIRECT, |_| {
             Box::new(HleDrawArraysIndirect { extended: false })
         });
-        builders.insert(HASH_DRAW_ARRAYS_INDIRECT_EXT, || {
+        builders.insert(HASH_DRAW_ARRAYS_INDIRECT_EXT, |_| {
             Box::new(HleDrawArraysIndirect { extended: true })
         });
-        builders.insert(HASH_DRAW_INDEXED_INDIRECT, || {
+        builders.insert(HASH_DRAW_INDEXED_INDIRECT, |_| {
             Box::new(HleDrawIndexedIndirect { extended: false })
         });
-        builders.insert(HASH_DRAW_INDEXED_INDIRECT_EXT, || {
+        builders.insert(HASH_DRAW_INDEXED_INDIRECT_EXT, |_| {
             Box::new(HleDrawIndexedIndirect { extended: true })
         });
-        builders.insert(HASH_MULTI_DRAW_INDEXED_INDIRECT_COUNT, || {
+        builders.insert(HASH_MULTI_DRAW_INDEXED_INDIRECT_COUNT, |_| {
             Box::new(HleMultiDrawIndexedIndirectCount)
         });
-        builders.insert(HASH_MULTI_LAYER_CLEAR, || Box::new(HleMultiLayerClear));
-        builders.insert(HASH_C713C83D8F63CCF3, || Box::new(HleC713C83d8f63Ccf3));
-        builders.insert(HASH_D7333D26E0A93EDE, || Box::new(HleD7333d26e0a93Ede));
-        builders.insert(HASH_BIND_SHADER, || Box::new(HleBindShader));
-        builders.insert(HASH_SET_RASTER_BOUNDING_BOX, || {
+        builders.insert(HASH_MULTI_LAYER_CLEAR, |_| Box::new(HleMultiLayerClear));
+        builders.insert(HASH_C713C83D8F63CCF3, |_| Box::new(HleC713C83d8f63Ccf3));
+        builders.insert(HASH_D7333D26E0A93EDE, |_| Box::new(HleD7333d26e0a93Ede));
+        builders.insert(HASH_BIND_SHADER, |_| Box::new(HleBindShader));
+        builders.insert(HASH_SET_RASTER_BOUNDING_BOX, |_| {
             Box::new(HleSetRasterBoundingBox)
         });
-        builders.insert(HASH_CLEAR_CONST_BUFFER_5F00, || {
-            Box::new(HleClearConstBuffer { base_size: 0x5F00 })
-        });
-        builders.insert(HASH_CLEAR_CONST_BUFFER_7000, || {
-            Box::new(HleClearConstBuffer { base_size: 0x7000 })
-        });
-        builders.insert(HASH_CLEAR_MEMORY, || {
-            Box::new(HleClearMemory {
-                zero_memory: Vec::new(),
+        builders.insert(HASH_CLEAR_CONST_BUFFER_5F00, |maxwell3d| {
+            Box::new(HleClearConstBuffer {
+                base_size: 0x5F00,
+                maxwell3d,
             })
         });
-        builders.insert(HASH_TRANSFORM_FEEDBACK_SETUP, || {
+        builders.insert(HASH_CLEAR_CONST_BUFFER_7000, |maxwell3d| {
+            Box::new(HleClearConstBuffer {
+                base_size: 0x7000,
+                maxwell3d,
+            })
+        });
+        builders.insert(HASH_CLEAR_MEMORY, |maxwell3d| {
+            Box::new(HleClearMemory {
+                zero_memory: Vec::new(),
+                maxwell3d,
+            })
+        });
+        builders.insert(HASH_TRANSFORM_FEEDBACK_SETUP, |_| {
             Box::new(HleTransformFeedbackSetup)
         });
-        builders.insert(HASH_DRAW_INDIRECT_BYTE_COUNT, || {
+        builders.insert(HASH_DRAW_INDIRECT_BYTE_COUNT, |_| {
             Box::new(HleDrawIndirectByteCount)
         });
 
-        Self { builders }
+        Self {
+            builders,
+            maxwell3d: None,
+        }
+    }
+
+    pub fn set_maxwell_3d(&mut self, maxwell3d: *mut Maxwell3D) {
+        self.maxwell3d = Some(Maxwell3DPtr(maxwell3d));
     }
 
     /// Look up and instantiate an HLE program by its hash.
@@ -334,7 +359,11 @@ impl HleMacro {
     ///
     /// Returns `None` if the hash is not recognized.
     pub fn get_hle_program(&self, hash: u64) -> Option<Box<dyn CachedMacro>> {
-        self.builders.get(&hash).map(|builder| builder())
+        let hit = self.builders.contains_key(&hash);
+        log::info!("HleMacro::get_hle_program hash=0x{:016X} hit={}", hash, hit);
+        self.builders
+            .get(&hash)
+            .map(|builder| builder(self.maxwell3d))
     }
 }
 

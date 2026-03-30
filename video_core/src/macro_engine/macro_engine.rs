@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 
 use super::macro_hle::HleMacro;
+use common::container_hash::hash_u32_slice;
+use crate::engines::maxwell_3d::Maxwell3D;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -308,14 +310,24 @@ impl MacroEngine {
         }
     }
 
+    pub fn set_maxwell_3d(&mut self, maxwell3d: *mut Maxwell3D) {
+        self.hle_macros.set_maxwell_3d(maxwell3d);
+    }
+
     /// Store uploaded macro code word.
     ///
     /// Port of `MacroEngine::AddCode`.
     pub fn add_code(&mut self, method: u32, data: u32) {
-        self.uploaded_macro_code
-            .entry(method)
-            .or_default()
-            .push(data);
+        let entry = self.uploaded_macro_code.entry(method).or_default();
+        entry.push(data);
+        if method >= 0x140 && method <= 0x180 {
+            log::info!(
+                "MacroEngine::add_code method=0x{:X} len={} data=0x{:08X}",
+                method,
+                entry.len(),
+                data
+            );
+        }
     }
 
     /// Clear the code associated with a method.
@@ -324,6 +336,9 @@ impl MacroEngine {
     pub fn clear_code(&mut self, method: u32) {
         self.macro_cache.remove(&method);
         self.uploaded_macro_code.remove(&method);
+        if method >= 0x140 && method <= 0x180 {
+            log::info!("MacroEngine::clear_code method=0x{:X}", method);
+        }
     }
 
     /// Compile (if not cached) and execute a macro.
@@ -332,9 +347,16 @@ impl MacroEngine {
     ///
     /// The `compile_fn` parameter provides the compilation strategy (interpreter
     /// or JIT), replacing the virtual `Compile` method from upstream.
-    pub fn execute<F>(&mut self, method: u32, parameters: &[u32], compile_fn: F)
+    pub fn execute<F, R>(
+        &mut self,
+        method: u32,
+        parameters: &[u32],
+        mut refresh_parameters: R,
+        compile_fn: F,
+    )
     where
         F: FnOnce(&[u32]) -> Box<dyn CachedMacro>,
+        R: FnMut(),
     {
         if let Some(cache_info) = self.macro_cache.get_mut(&method) {
             if cache_info.has_hle_program {
@@ -342,47 +364,52 @@ impl MacroEngine {
                     hle.execute(parameters, method);
                 }
             } else if let Some(ref mut lle) = cache_info.lle_program {
-                // maxwell3d.refresh_parameters();
+                refresh_parameters();
                 lle.execute(parameters, method);
             }
             return;
         }
 
-        // Macro not compiled — find uploaded code
-        let mut mid_method: Option<u32> = None;
-        let has_direct = self.uploaded_macro_code.contains_key(&method);
-
-        if !has_direct {
+        let mut mid_method = None;
+        let code_for_compile = if let Some(code) = self.uploaded_macro_code.get(&method) {
+            code.clone()
+        } else {
             for (&method_base, code) in &self.uploaded_macro_code {
                 if method >= method_base && (method - method_base) < code.len() as u32 {
                     mid_method = Some(method_base);
                     break;
                 }
             }
-            if mid_method.is_none() {
-                panic!("Macro 0x{:x} was not uploaded", method);
-            }
-        }
-
-        let (code_for_compile, hash) = if mid_method.is_none() {
-            let code = self.uploaded_macro_code[&method].clone();
-            let hash = hash_macro_code(&code);
-            (code, hash)
-        } else {
-            let base = mid_method.unwrap();
-            let rebased = (method - base) as usize;
-            let cached = self.uploaded_macro_code[&base].clone();
-            let mut code = vec![0u32; cached.len() - rebased];
-            code.copy_from_slice(&cached[rebased..]);
-            let hash = hash_macro_code(&code);
-            self.uploaded_macro_code.insert(method, code.clone());
-            (code, hash)
+            let method_base = mid_method.expect("Macro was not uploaded");
+            let macro_cached = self
+                .uploaded_macro_code
+                .get(&method_base)
+                .expect("mid_method base must exist");
+            let rebased_method = (method - method_base) as usize;
+            macro_cached[rebased_method..].to_vec()
         };
+        let hash = hash_macro_code(&code_for_compile);
+        if method == 0x14F {
+            log::info!(
+                "MacroEngine::execute method=0x{:X} code_len={} hash=0x{:016X} mid_method={:?}",
+                method,
+                code_for_compile.len(),
+                hash,
+                mid_method
+            );
+        }
 
         let lle_program = compile_fn(&code_for_compile);
 
         let hle_program = self.hle_macros.get_hle_program(hash);
         let has_hle = hle_program.is_some();
+        if method == 0x14F {
+            log::info!(
+                "MacroEngine::execute method=0x{:X} has_hle={}",
+                method,
+                has_hle
+            );
+        }
 
         let cache_info = CacheInfo {
             lle_program: Some(lle_program),
@@ -400,9 +427,11 @@ impl MacroEngine {
                 hle.execute(parameters, method);
             }
         } else if let Some(ref mut lle) = entry.lle_program {
+            refresh_parameters();
             lle.execute(parameters, method);
         }
     }
+
 }
 
 // ── Factory ──────────────────────────────────────────────────────────────────
@@ -419,12 +448,8 @@ pub fn get_macro_engine() -> MacroEngine {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Simple hash for macro code (placeholder for CityHash).
 fn hash_macro_code(code: &[u32]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    code.hash(&mut hasher);
-    hasher.finish()
+    hash_u32_slice(code) as u64
 }
 
 /// Dump macro code to filesystem (debug utility).
@@ -472,15 +497,50 @@ mod tests {
         let mut engine = MacroEngine::new();
         engine.add_code(0x100, 0xDEADBEEF);
         engine.add_code(0x100, 0xCAFEBABE);
-        assert_eq!(engine.uploaded_macro_code[&0x100].len(), 2);
+        assert_eq!(
+            engine.uploaded_macro_code.get(&0x100),
+            Some(&vec![0xDEADBEEF, 0xCAFEBABE])
+        );
     }
 
     #[test]
     fn macro_engine_clear_code() {
         let mut engine = MacroEngine::new();
         engine.add_code(0x100, 0xDEADBEEF);
+        engine.add_code(0x101, 0xCAFEBABE);
         engine.clear_code(0x100);
         assert!(!engine.uploaded_macro_code.contains_key(&0x100));
+        assert!(engine.uploaded_macro_code.contains_key(&0x101));
+    }
+
+    #[test]
+    fn macro_engine_execute_rebases_mid_method_inside_uploaded_blob() {
+        let mut engine = MacroEngine::new();
+        engine.add_code(0x100, 0x11111111);
+        engine.add_code(0x100, 0x22222222);
+        engine.add_code(0x100, 0x33333333);
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_compile = std::sync::Arc::clone(&captured);
+        engine.execute(0x101, &[0], || {}, move |code| {
+            *captured_compile.lock().unwrap() = code.to_vec();
+            struct NoopMacro;
+            impl CachedMacro for NoopMacro {
+                fn execute(&mut self, _parameters: &[u32], _method: u32) {}
+            }
+            Box::new(NoopMacro)
+        });
+
+        assert_eq!(
+            &*captured.lock().unwrap(),
+            &[0x22222222, 0x33333333]
+        );
+    }
+
+    #[test]
+    fn hash_macro_code_matches_upstream_hash_range_for_u32_vector() {
+        let code = [0x04744351, 0x00708215, 0x00004041, 0x20390021];
+        assert_eq!(hash_macro_code(&code), 0x7412B5E8633D2C9B);
     }
 
     #[test]
