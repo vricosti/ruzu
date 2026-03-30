@@ -124,6 +124,17 @@ impl GlobalSchedulerContext {
             if is_dummy {
                 self.register_dummy_thread_for_wakeup(thread_id);
             }
+
+            // Wake the target core from idle so it picks up the new thread.
+            // Upstream: KScheduler::RescheduleOtherCores triggers interrupts
+            // on cores whose highest priority changed.
+            if active_core >= 0 {
+                if let Some(kernel) = super::kernel::get_kernel_ref() {
+                    if let Some(core) = kernel.physical_core(active_core as usize) {
+                        core.interrupt();
+                    }
+                }
+            }
         }
     }
 

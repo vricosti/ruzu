@@ -45,6 +45,12 @@ std::thread_local! {
 static KERNEL_PTR: std::sync::atomic::AtomicPtr<KernelCore> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
+/// Public accessor for KERNEL_PTR — used by GSC to interrupt cores on thread state changes.
+pub fn get_kernel_ref() -> Option<&'static KernelCore> {
+    let ptr = KERNEL_PTR.load(Ordering::Acquire);
+    if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
+}
+
 /// Real scheduler callbacks that access the kernel via KERNEL_PTR.
 /// Wired to the scheduler lock during kernel initialization.
 static SCHEDULER_CALLBACKS: super::k_scheduler_lock::SchedulerCallbacks =
