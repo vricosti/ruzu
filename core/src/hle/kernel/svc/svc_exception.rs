@@ -71,7 +71,8 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
             // BreakReason::Panic
             log::error!(
                 "Userspace PANIC! info1=0x{:016X}, info2=0x{:016X}",
-                info1, info2
+                info1,
+                info2
             );
             handle_debug_buffer(info1, info2, &mut has_dumped_buffer);
         }
@@ -79,7 +80,8 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
             // BreakReason::Assert
             log::error!(
                 "Userspace Assertion failed! info1=0x{:016X}, info2=0x{:016X}",
-                info1, info2
+                info1,
+                info2
             );
             handle_debug_buffer(info1, info2, &mut has_dumped_buffer);
         }
@@ -87,7 +89,8 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
             // BreakReason::User
             log::warn!(
                 "Userspace Break! 0x{:016X} with size 0x{:016X}",
-                info1, info2
+                info1,
+                info2
             );
             handle_debug_buffer(info1, info2, &mut has_dumped_buffer);
         }
@@ -95,28 +98,32 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
             // BreakReason::PreLoadDll
             log::info!(
                 "Userspace Attempting to load an NRO at 0x{:016X} with size 0x{:016X}",
-                info1, info2
+                info1,
+                info2
             );
         }
         4 => {
             // BreakReason::PostLoadDll
             log::info!(
                 "Userspace Loaded an NRO at 0x{:016X} with size 0x{:016X}",
-                info1, info2
+                info1,
+                info2
             );
         }
         5 => {
             // BreakReason::PreUnloadDll
             log::info!(
                 "Userspace Attempting to unload an NRO at 0x{:016X} with size 0x{:016X}",
-                info1, info2
+                info1,
+                info2
             );
         }
         6 => {
             // BreakReason::PostUnloadDll
             log::info!(
                 "Userspace Unloaded an NRO at 0x{:016X} with size 0x{:016X}",
-                info1, info2
+                info1,
+                info2
             );
         }
         7 => {
@@ -126,7 +133,9 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
         _ => {
             log::warn!(
                 "Signalling debugger, Unknown break reason {:#X}, info1=0x{:016X}, info2=0x{:016X}",
-                reason, info1, info2
+                reason,
+                info1,
+                info2
             );
             handle_debug_buffer(info1, info2, &mut has_dumped_buffer);
         }
@@ -139,13 +148,16 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
     if !notification_only {
         log::error!(
             "Emulated program broke execution! reason=0x{:016X}, info1=0x{:016X}, info2=0x{:016X}",
-            reason as u64, info1, info2
+            reason as u64,
+            info1,
+            info2
         );
 
         handle_debug_buffer(info1, info2, &mut has_dumped_buffer);
 
-        // Upstream: system.CurrentPhysicalCore().LogBacktrace();
-        // Backtrace logging depends on PhysicalCore integration.
+        if let Some(kernel) = system.kernel() {
+            kernel.current_physical_core().log_backtrace();
+        }
     }
 
     // Upstream: Debugger notification.

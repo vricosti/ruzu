@@ -55,13 +55,19 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
 
     let ws = window_system.clone();
     let factory_oe: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-        Arc::new(super::service::application_proxy_service::IApplicationProxyService::new(ws.clone()))
+        Arc::new(
+            super::service::application_proxy_service::IApplicationProxyService::new(ws.clone()),
+        )
     });
     server_manager.register_named_service("appletOE", factory_oe, 64);
 
     let ws = window_system.clone();
     let factory_ae: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-        Arc::new(super::service::all_system_applet_proxies_service::IAllSystemAppletProxiesService::new(ws.clone()))
+        Arc::new(
+            super::service::all_system_applet_proxies_service::IAllSystemAppletProxiesService::new(
+                ws.clone(),
+            ),
+        )
     });
     server_manager.register_named_service("appletAE", factory_ae, 64);
 

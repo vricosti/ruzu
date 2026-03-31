@@ -39,18 +39,58 @@ impl IAudioIn {
             (0, Some(Self::get_audio_in_state_handler), "GetAudioInState"),
             (1, Some(Self::start_handler), "Start"),
             (2, Some(Self::stop_handler), "Stop"),
-            (3, Some(Self::append_audio_in_buffer_handler), "AppendAudioInBuffer"),
-            (4, Some(Self::register_buffer_event_handler), "RegisterBufferEvent"),
-            (5, Some(Self::get_released_audio_in_buffers_handler), "GetReleasedAudioInBuffers"),
-            (6, Some(Self::contains_audio_in_buffer_handler), "ContainsAudioInBuffer"),
-            (7, Some(Self::append_uac_in_buffer_handler), "AppendUacInBuffer"),
-            (8, Some(Self::append_audio_in_buffer_auto_handler), "AppendAudioInBufferAuto"),
-            (9, Some(Self::get_released_audio_in_buffers_auto_handler), "GetReleasedAudioInBuffersAuto"),
-            (10, Some(Self::append_uac_in_buffer_auto_handler), "AppendUacInBufferAuto"),
-            (11, Some(Self::get_audio_in_buffer_count_handler), "GetAudioInBufferCount"),
+            (
+                3,
+                Some(Self::append_audio_in_buffer_handler),
+                "AppendAudioInBuffer",
+            ),
+            (
+                4,
+                Some(Self::register_buffer_event_handler),
+                "RegisterBufferEvent",
+            ),
+            (
+                5,
+                Some(Self::get_released_audio_in_buffers_handler),
+                "GetReleasedAudioInBuffers",
+            ),
+            (
+                6,
+                Some(Self::contains_audio_in_buffer_handler),
+                "ContainsAudioInBuffer",
+            ),
+            (
+                7,
+                Some(Self::append_uac_in_buffer_handler),
+                "AppendUacInBuffer",
+            ),
+            (
+                8,
+                Some(Self::append_audio_in_buffer_auto_handler),
+                "AppendAudioInBufferAuto",
+            ),
+            (
+                9,
+                Some(Self::get_released_audio_in_buffers_auto_handler),
+                "GetReleasedAudioInBuffersAuto",
+            ),
+            (
+                10,
+                Some(Self::append_uac_in_buffer_auto_handler),
+                "AppendUacInBufferAuto",
+            ),
+            (
+                11,
+                Some(Self::get_audio_in_buffer_count_handler),
+                "GetAudioInBufferCount",
+            ),
             (12, Some(Self::set_device_gain_handler), "SetDeviceGain"),
             (13, Some(Self::get_device_gain_handler), "GetDeviceGain"),
-            (14, Some(Self::flush_audio_in_buffers_handler), "FlushAudioInBuffers"),
+            (
+                14,
+                Some(Self::flush_audio_in_buffers_handler),
+                "FlushAudioInBuffers",
+            ),
         ]);
         Self {
             handlers,
@@ -100,10 +140,7 @@ impl IAudioIn {
         rb.push_u32(0); // count
     }
 
-    fn contains_audio_in_buffer_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn contains_audio_in_buffer_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioIn::ContainsAudioInBuffer (STUBBED)");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);

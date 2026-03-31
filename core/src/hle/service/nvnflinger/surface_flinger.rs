@@ -11,8 +11,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use super::buffer_queue_core::BufferQueueCore;
+use super::buffer_item_consumer::BufferItemConsumer;
 use super::buffer_queue_consumer::BufferQueueConsumer;
+use super::buffer_queue_core::BufferQueueCore;
 use super::buffer_queue_producer::BufferQueueProducer;
 use super::display::{Display, Layer, LayerStack};
 use super::hos_binder_driver_server::HosBinderDriverServer;
@@ -26,6 +27,8 @@ pub struct SurfaceFlinger {
 
 struct SurfaceFlingerInner {
     displays: HashMap<u64, Display>,
+    layers: LayerStack,
+    consumers: HashMap<i32, Arc<BufferQueueConsumer>>,
 }
 
 impl SurfaceFlinger {
@@ -33,6 +36,8 @@ impl SurfaceFlinger {
         Arc::new(Self {
             inner: Mutex::new(SurfaceFlingerInner {
                 displays: HashMap::new(),
+                layers: LayerStack::new(),
+                consumers: HashMap::new(),
             }),
             server,
         })
@@ -52,47 +57,84 @@ impl SurfaceFlinger {
     /// Returns (consumer_binder_id, producer_binder_id).
     pub fn create_buffer_queue(&self) -> (i32, i32) {
         let core = BufferQueueCore::new();
-        let consumer_binder: Arc<dyn super::binder::IBinder> =
-            Arc::new(BufferQueueConsumer::new(Arc::clone(&core)));
+        let consumer = Arc::new(BufferQueueConsumer::new(Arc::clone(&core)));
+        let consumer_binder: Arc<dyn super::binder::IBinder> = consumer.clone();
         let producer_binder: Arc<dyn super::binder::IBinder> =
             Arc::new(BufferQueueProducer::new(Arc::clone(&core)));
 
         let consumer_id = self.server.register_binder(consumer_binder);
         let producer_id = self.server.register_binder(producer_binder);
+        self.inner
+            .lock()
+            .unwrap()
+            .consumers
+            .insert(consumer_id, consumer);
 
         log::info!(
             "SurfaceFlinger::create_buffer_queue consumer_id={}, producer_id={}",
-            consumer_id, producer_id
+            consumer_id,
+            producer_id
         );
 
         (consumer_id, producer_id)
     }
 
     pub fn destroy_buffer_queue(&self, _consumer_id: i32, _producer_id: i32) {
+        self.inner.lock().unwrap().consumers.remove(&_consumer_id);
         self.server.unregister_binder(_consumer_id);
         self.server.unregister_binder(_producer_id);
     }
 
-    pub fn create_layer(&self, _consumer_binder_id: i32) {
-        // In upstream, creates a Layer from the consumer's BufferItemConsumer
-        // and adds it to the display. Full implementation depends on
-        // BufferItemConsumer creation infrastructure.
-        log::debug!("SurfaceFlinger::create_layer consumer_id={}", _consumer_binder_id);
+    pub fn create_layer(&self, consumer_binder_id: i32) {
+        let consumer = {
+            self.inner
+                .lock()
+                .unwrap()
+                .consumers
+                .get(&consumer_binder_id)
+                .cloned()
+        };
+        let Some(consumer) = consumer else {
+            return;
+        };
+
+        let buffer_item_consumer = Arc::new(BufferItemConsumer::new(consumer));
+        let _ = buffer_item_consumer.connect(false);
+        self.inner
+            .lock()
+            .unwrap()
+            .layers
+            .layers
+            .push(Arc::new(Layer::new(
+                buffer_item_consumer,
+                consumer_binder_id,
+            )));
     }
 
     pub fn destroy_layer(&self, consumer_binder_id: i32) {
         let mut inner = self.inner.lock().unwrap();
+        inner
+            .layers
+            .layers
+            .retain(|l| l.consumer_id != consumer_binder_id);
         for (_, display) in inner.displays.iter_mut() {
-            display.stack.layers.retain(|l| l.consumer_id != consumer_binder_id);
+            display
+                .stack
+                .layers
+                .retain(|l| l.consumer_id != consumer_binder_id);
         }
     }
 
     pub fn add_layer_to_display_stack(&self, display_id: u64, consumer_binder_id: i32) {
-        log::debug!(
-            "SurfaceFlinger::add_layer_to_display_stack display={} consumer={}",
-            display_id,
-            consumer_binder_id
-        );
+        let mut inner = self.inner.lock().unwrap();
+        let layer = inner.layers.find_layer(consumer_binder_id);
+        let Some(display) = inner.displays.get_mut(&display_id) else {
+            return;
+        };
+        let Some(layer) = layer else {
+            return;
+        };
+        display.stack.layers.push(layer);
     }
 
     pub fn remove_layer_from_display_stack(&self, display_id: u64, consumer_binder_id: i32) {

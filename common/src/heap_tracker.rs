@@ -574,13 +574,8 @@ impl HeapTracker {
             }
 
             // Map the area.
-            self.buffer_mut().map(
-                vaddr as usize,
-                paddr as usize,
-                size,
-                perm,
-                false,
-            );
+            self.buffer_mut()
+                .map(vaddr as usize, paddr as usize, size, perm, false);
 
             // This map is now resident.
             state.resident_map_count += 1;

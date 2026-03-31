@@ -202,8 +202,13 @@ impl WindowAdaptPass {
         for i in 0..layer_count {
             let mut matrix = [0.0f32; 6];
             let mut verts = [ScreenRectVertex::default(); 4];
-            let texture =
-                layers[i].configure_draw(&mut matrix, &mut verts, &framebuffers[i], layout, invert_y);
+            let texture = layers[i].configure_draw(
+                &mut matrix,
+                &mut verts,
+                &framebuffers[i],
+                layout,
+                invert_y,
+            );
             textures.push(texture);
             matrices.push(matrix);
             vertices.push(verts);
@@ -222,13 +227,7 @@ impl WindowAdaptPass {
             gl::BindSampler(0, self.sampler);
 
             gl::Disable(gl::FRAMEBUFFER_SRGB);
-            gl::ViewportIndexedf(
-                0,
-                0.0,
-                0.0,
-                layout.width as f32,
-                layout.height as f32,
-            );
+            gl::ViewportIndexedf(0, 0.0, 0.0, layout.width as f32, layout.height as f32);
 
             // Clear screen to background color.
             // Upstream reads from Settings::values.bg_red/green/blue.
@@ -269,13 +268,7 @@ impl WindowAdaptPass {
                 gl::BindTextureUnit(0, textures[i]);
 
                 // Upload orthographic matrix (location 0, mat3x2).
-                gl::ProgramUniformMatrix3x2fv(
-                    self.program,
-                    0,
-                    1,
-                    gl::FALSE,
-                    matrices[i].as_ptr(),
-                );
+                gl::ProgramUniformMatrix3x2fv(self.program, 0, 1, gl::FALSE, matrices[i].as_ptr());
 
                 // Upload vertex data to VBO.
                 gl::NamedBufferSubData(

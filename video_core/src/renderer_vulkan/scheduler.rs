@@ -137,9 +137,7 @@ impl Scheduler {
     ) {
         if self.rp_state.inside_renderpass {
             // Already in a render pass — check if compatible
-            if self.rp_state.renderpass == renderpass
-                && self.rp_state.framebuffer == framebuffer
-            {
+            if self.rp_state.renderpass == renderpass && self.rp_state.framebuffer == framebuffer {
                 return;
             }
             // Different render pass — end current one first

@@ -54,8 +54,8 @@ pub type KScopedNotAlignedSpinLock<'a> = KScopedLock<'a, KNotAlignedSpinLock>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::k_spin_lock::KSpinLock;
+    use super::*;
 
     #[test]
     fn test_scoped_lock() {

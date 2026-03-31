@@ -118,10 +118,7 @@ pub fn remove_mod(_program_id: u64, _mod_name: &str) -> bool {
 /// * `callback` - Callback to report progress. Returns true to cancel.
 ///
 /// NOTE: Requires `Core::System` and VFS; stubbed.
-pub fn install_nsp(
-    _filename: &str,
-    _callback: &dyn Fn(usize, usize) -> bool,
-) -> InstallResult {
+pub fn install_nsp(_filename: &str, _callback: &dyn Fn(usize, usize) -> bool) -> InstallResult {
     // NOTE: Full implementation opens the NSP as a VFS partition, iterates its
     // NCA files and installs them into the system registered cache via
     // Core::System's content manager.
@@ -138,10 +135,7 @@ pub fn install_nsp(
 /// * `callback` - Callback to report progress. Returns true to cancel.
 ///
 /// NOTE: Requires VFS and RegisteredCache; stubbed.
-pub fn install_nca(
-    _filename: &str,
-    _callback: &dyn Fn(usize, usize) -> bool,
-) -> InstallResult {
+pub fn install_nca(_filename: &str, _callback: &dyn Fn(usize, usize) -> bool) -> InstallResult {
     log::warn!("install_nca: VFS and RegisteredCache not integrated, returning Failure");
     InstallResult::Failure
 }
@@ -197,12 +191,18 @@ mod tests {
     #[test]
     fn test_install_result_values() {
         assert_ne!(InstallResult::Success, InstallResult::Failure);
-        assert_ne!(InstallResult::Overwrite, InstallResult::BaseInstallAttempted);
+        assert_ne!(
+            InstallResult::Overwrite,
+            InstallResult::BaseInstallAttempted
+        );
     }
 
     #[test]
     fn test_game_verification_result_values() {
-        assert_ne!(GameVerificationResult::Success, GameVerificationResult::Failed);
+        assert_ne!(
+            GameVerificationResult::Success,
+            GameVerificationResult::Failed
+        );
         assert_ne!(
             GameVerificationResult::Failed,
             GameVerificationResult::NotImplemented

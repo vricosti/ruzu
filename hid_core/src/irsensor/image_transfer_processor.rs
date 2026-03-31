@@ -71,12 +71,9 @@ impl ImageTransferProcessor {
     pub fn set_config(&mut self, config: PackedImageTransferProcessorConfig) {
         self.current_config.camera_config.exposure_time = config.camera_config.exposure_time;
         self.current_config.camera_config.gain = config.camera_config.gain as u32;
-        self.current_config.camera_config.is_negative_used =
-            config.camera_config.is_negative_used;
+        self.current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
         self.current_config.camera_config.light_target = unsafe {
-            std::mem::transmute::<u32, CameraLightTarget>(
-                config.camera_config.light_target as u32,
-            )
+            std::mem::transmute::<u32, CameraLightTarget>(config.camera_config.light_target as u32)
         };
         self.current_config.origin_format = unsafe {
             std::mem::transmute::<u32, ImageTransferProcessorFormat>(config.format as u32)
@@ -90,22 +87,15 @@ impl ImageTransferProcessor {
     pub fn set_config_ex(&mut self, config: PackedImageTransferProcessorExConfig) {
         self.current_config.camera_config.exposure_time = config.camera_config.exposure_time;
         self.current_config.camera_config.gain = config.camera_config.gain as u32;
-        self.current_config.camera_config.is_negative_used =
-            config.camera_config.is_negative_used;
+        self.current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
         self.current_config.camera_config.light_target = unsafe {
-            std::mem::transmute::<u32, CameraLightTarget>(
-                config.camera_config.light_target as u32,
-            )
+            std::mem::transmute::<u32, CameraLightTarget>(config.camera_config.light_target as u32)
         };
         self.current_config.origin_format = unsafe {
-            std::mem::transmute::<u32, ImageTransferProcessorFormat>(
-                config.origin_format as u32,
-            )
+            std::mem::transmute::<u32, ImageTransferProcessorFormat>(config.origin_format as u32)
         };
         self.current_config.trimming_format = unsafe {
-            std::mem::transmute::<u32, ImageTransferProcessorFormat>(
-                config.trimming_format as u32,
-            )
+            std::mem::transmute::<u32, ImageTransferProcessorFormat>(config.trimming_format as u32)
         };
         self.current_config.trimming_start_x = config.trimming_start_x;
         self.current_config.trimming_start_y = config.trimming_start_y;

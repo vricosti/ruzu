@@ -7,11 +7,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::bcat_types::DeliveryCacheProgressImpl;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::bcat_types::DeliveryCacheProgressImpl;
 
 /// IPC command IDs for IDeliveryCacheProgressService
 pub mod commands {

@@ -223,15 +223,14 @@ impl AesCtrCounterExtendedStorage {
 
                     let mut upper_iv = NcaAesCtrUpperIv::default();
                     upper_iv.set_generation(cur_entry.generation as u32);
-                    upper_iv.value = (upper_iv.value & 0xFFFF_FFFF)
-                        | ((self.secure_value as u64) << 32);
+                    upper_iv.value =
+                        (upper_iv.value & 0xFFFF_FFFF) | ((self.secure_value as u64) << 32);
 
                     let mut iv = [0u8; IV_SIZE];
                     AesCtrStorage::make_iv(&mut iv, upper_iv.value, counter_offset);
 
                     // Decrypt the data in-place.
-                    let buf_slice =
-                        &mut buffer[cur_data_offset..cur_data_offset + cur_size];
+                    let buf_slice = &mut buffer[cur_data_offset..cur_data_offset + cur_size];
                     decryptor.decrypt(buf_slice, &self.key, &iv);
                 }
             }

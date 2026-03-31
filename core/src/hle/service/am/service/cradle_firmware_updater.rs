@@ -42,17 +42,24 @@ impl ICradleFirmwareUpdater {
         let handlers = build_handler_map(&[
             (0, Some(Self::start_update_handler), "StartUpdate"),
             (1, Some(Self::finish_update_handler), "FinishUpdate"),
-            (2, Some(Self::get_cradle_device_info_handler), "GetCradleDeviceInfo"),
-            (3, Some(Self::get_cradle_device_info_change_event_handler), "GetCradleDeviceInfoChangeEvent"),
+            (
+                2,
+                Some(Self::get_cradle_device_info_handler),
+                "GetCradleDeviceInfo",
+            ),
+            (
+                3,
+                Some(Self::get_cradle_device_info_change_event_handler),
+                "GetCradleDeviceInfoChangeEvent",
+            ),
             (4, None, "GetUpdateProgressInfo"),
             (5, None, "GetLastInternalResult"),
         ]);
         let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
             "ICradleFirmwareUpdater".to_string(),
         );
-        let cradle_device_info_event_handle = service_context.create_event(
-            "ICradleFirmwareUpdater:CradleDeviceInfoChangeEvent".to_string(),
-        );
+        let cradle_device_info_event_handle = service_context
+            .create_event("ICradleFirmwareUpdater:CradleDeviceInfoChangeEvent".to_string());
         Self {
             service_context,
             cradle_device_info_event_handle,
@@ -78,7 +85,8 @@ impl ICradleFirmwareUpdater {
     }
 
     fn start_update_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICradleFirmwareUpdater) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICradleFirmwareUpdater) };
         service.start_update();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -86,7 +94,8 @@ impl ICradleFirmwareUpdater {
     }
 
     fn finish_update_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICradleFirmwareUpdater) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICradleFirmwareUpdater) };
         service.finish_update();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -94,7 +103,8 @@ impl ICradleFirmwareUpdater {
     }
 
     fn get_cradle_device_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICradleFirmwareUpdater) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICradleFirmwareUpdater) };
         let info = service.get_cradle_device_info();
 
         let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);

@@ -21,10 +21,7 @@ pub fn emit_demote_to_helper_invocation(ctx: &mut SpirvEmitContext) {
         let impossible_label = ctx.builder.id();
 
         ctx.builder
-            .selection_merge(
-                impossible_label,
-                rspirv::spirv::SelectionControl::NONE,
-            )
+            .selection_merge(impossible_label, rspirv::spirv::SelectionControl::NONE)
             .unwrap();
         ctx.builder
             .branch_conditional(ctx.const_true, kill_label, impossible_label, vec![])

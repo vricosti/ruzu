@@ -226,11 +226,7 @@ impl GestureHandler {
         }
     }
 
-    fn set_tap_event(
-        &mut self,
-        gesture_type: &mut GestureType,
-        attributes: &mut GestureAttribute,
-    ) {
+    fn set_tap_event(&mut self, gesture_type: &mut GestureType, attributes: &mut GestureAttribute) {
         *gesture_type = GestureType::Tap;
         self.gesture = self.last_gesture.clone();
         self.force_update = true;
@@ -242,11 +238,7 @@ impl GestureHandler {
         }
     }
 
-    fn update_pan_event(
-        &mut self,
-        next_state: &mut GestureState,
-        gesture_type: &mut GestureType,
-    ) {
+    fn update_pan_event(&mut self, next_state: &mut GestureState, gesture_type: &mut GestureType) {
         next_state.delta_x = self.gesture.mid_point[0] - self.last_gesture_state.pos_x;
         next_state.delta_y = self.gesture.mid_point[1] - self.last_gesture_state.pos_y;
         next_state.vel_x = next_state.delta_x as f32 / self.time_difference;
@@ -258,8 +250,7 @@ impl GestureHandler {
             > PINCH_THRESHOLD
         {
             *gesture_type = GestureType::Pinch;
-            next_state.scale =
-                self.gesture.average_distance / self.last_gesture.average_distance;
+            next_state.scale = self.gesture.average_distance / self.last_gesture.average_distance;
         }
 
         let angle_between_two_lines = ((self.gesture.angle - self.last_gesture.angle)
@@ -269,8 +260,7 @@ impl GestureHandler {
         if angle_between_two_lines.abs() > ANGLE_THRESHOLD {
             *gesture_type = GestureType::Rotate;
             next_state.scale = 0.0;
-            next_state.rotation_angle =
-                angle_between_two_lines * 180.0 / std::f32::consts::PI;
+            next_state.rotation_angle = angle_between_two_lines * 180.0 / std::f32::consts::PI;
         }
     }
 

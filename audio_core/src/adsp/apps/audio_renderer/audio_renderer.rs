@@ -135,7 +135,8 @@ impl AudioRenderer {
             .system
             .lock()
             .core_timing()
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .get_global_time_ns()
             .as_nanos() as u64;
         self.mailbox.send(Direction::Dsp, Message::Render as u32);
@@ -307,8 +308,13 @@ impl AudioRenderer {
 
                     let mut buffers_reset = [false; MAX_RENDERER_SESSIONS];
                     let mut render_times_taken = [0u64; MAX_RENDERER_SESSIONS];
-                    let start_time =
-                        system.lock().core_timing().lock().unwrap().get_global_time_us().as_micros() as u64;
+                    let start_time = system
+                        .lock()
+                        .core_timing()
+                        .lock()
+                        .unwrap()
+                        .get_global_time_us()
+                        .as_micros() as u64;
                     let session0_applet_resource_user_id =
                         shared.lock().command_buffers[0].applet_resource_user_id;
 
@@ -375,8 +381,13 @@ impl AudioRenderer {
                         let buffer = &mut command_buffers[index];
                         processor.set_process_time_max(max_time);
                         render_times_taken[index] = processor.process(index as u32);
-                        let end_time =
-                            system.lock().core_timing().lock().unwrap().get_global_time_us().as_micros() as u64;
+                        let end_time = system
+                            .lock()
+                            .core_timing()
+                            .lock()
+                            .unwrap()
+                            .get_global_time_us()
+                            .as_micros() as u64;
                         buffer.remaining_command_count = processor.get_remaining_command_count();
                         buffer.render_time_taken_us = end_time.saturating_sub(start_time);
                     }

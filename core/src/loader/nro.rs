@@ -173,9 +173,7 @@ impl AppLoaderNro {
             let file_size = file.get_size();
             if file_size >= nro_header.file_size as usize + std::mem::size_of::<AssetHeader>() {
                 let offset = nro_header.file_size as usize;
-                if let Some(asset_header) =
-                    read_object::<AssetHeader>(file.as_ref(), offset)
-                {
+                if let Some(asset_header) = read_object::<AssetHeader>(file.as_ref(), offset) {
                     if asset_header.format_version != 0 {
                         log::warn!(
                             "NRO Asset Header has format {}, currently supported format is 0. \
@@ -242,11 +240,7 @@ impl AppLoaderNro {
     /// Internal NRO loading implementation.
     ///
     /// Maps to upstream static `LoadNroImpl`.
-    fn load_nro_impl(
-        _system: &mut System,
-        process: &mut KProcess,
-        data: &[u8],
-    ) -> bool {
+    fn load_nro_impl(_system: &mut System, process: &mut KProcess, data: &[u8]) -> bool {
         if data.len() < std::mem::size_of::<NroHeader>() {
             return false;
         }
@@ -327,8 +321,7 @@ impl AppLoaderNro {
             );
 
             if mod_header.magic == make_magic(b'M', b'O', b'D', b'0') {
-                bss_size =
-                    page_align_size(mod_header.bss_end_offset - mod_header.bss_start_offset);
+                bss_size = page_align_size(mod_header.bss_end_offset - mod_header.bss_start_offset);
             }
         }
 

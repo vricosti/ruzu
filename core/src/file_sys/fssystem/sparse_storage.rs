@@ -33,9 +33,7 @@ impl VfsFile for ZeroStorage {
         false
     }
 
-    fn get_containing_directory(
-        &self,
-    ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+    fn get_containing_directory(&self) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
         None
     }
 
@@ -164,9 +162,7 @@ impl VfsFile for SparseStorage {
         false
     }
 
-    fn get_containing_directory(
-        &self,
-    ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+    fn get_containing_directory(&self) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
         None
     }
 

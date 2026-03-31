@@ -68,7 +68,10 @@ pub struct SynchronizationWaitNodeHandle {
 
 impl SynchronizationWaiters {
     pub fn new() -> Self {
-        Self { head: None, tail: None }
+        Self {
+            head: None,
+            tail: None,
+        }
     }
 
     pub fn link(&mut self, process: &mut KProcess, handle: SynchronizationWaitNodeHandle) {
@@ -84,8 +87,13 @@ impl SynchronizationWaiters {
             self.head = Some(handle);
         }
         self.tail = Some(handle);
-        log::debug!("SynchronizationWaiters::link thread_id={} wait_index={} head={:?} tail={:?}",
-            handle.thread_id, handle.wait_index, self.head, self.tail);
+        log::debug!(
+            "SynchronizationWaiters::link thread_id={} wait_index={} head={:?} tail={:?}",
+            handle.thread_id,
+            handle.wait_index,
+            self.head,
+            self.tail
+        );
     }
 
     pub fn unlink(&mut self, process: &mut KProcess, thread_id: u64, wait_index: usize) {
@@ -169,8 +177,11 @@ impl SynchronizationObjectState {
     }
 
     pub fn link_waiter(&mut self, process: &mut KProcess, node: SynchronizationWaitNode) {
-        log::debug!("KSynchronizationObject::link_waiter obj_id={} thread_id={}",
-            node.object_id, node.handle.thread_id);
+        log::debug!(
+            "KSynchronizationObject::link_waiter obj_id={} thread_id={}",
+            node.object_id,
+            node.handle.thread_id
+        );
         self.waiters.link(process, node.handle);
     }
 
@@ -330,8 +341,14 @@ impl WaitableObject {
 
     fn link_waiter(&self, process: &mut KProcess, node: SynchronizationWaitNode) {
         match self {
-            Self::ReadableEvent(event) => event.lock().unwrap().sync_object.link_waiter(process, node),
-            Self::Thread(thread) => thread.lock().unwrap().sync_object.link_waiter(process, node),
+            Self::ReadableEvent(event) => {
+                event.lock().unwrap().sync_object.link_waiter(process, node)
+            }
+            Self::Thread(thread) => thread
+                .lock()
+                .unwrap()
+                .sync_object
+                .link_waiter(process, node),
             Self::Process => process.link_waiter(node.handle.thread_id),
         }
     }
@@ -360,13 +377,20 @@ impl WaitableObject {
 
     fn waiter_thread_ids(&self, process: &KProcess) -> Vec<u64> {
         match self {
-            Self::ReadableEvent(event) => event.lock().unwrap().sync_object.waiter_snapshot(process),
+            Self::ReadableEvent(event) => {
+                event.lock().unwrap().sync_object.waiter_snapshot(process)
+            }
             Self::Thread(thread) => thread.lock().unwrap().sync_object.waiter_snapshot(process),
             Self::Process => process.sync_object.waiter_snapshot(process),
         }
     }
 
-    fn unlink_all_waiters_for_thread(&self, process: &mut KProcess, thread_id: u64, object_id: u64) {
+    fn unlink_all_waiters_for_thread(
+        &self,
+        process: &mut KProcess,
+        thread_id: u64,
+        object_id: u64,
+    ) {
         match self {
             Self::ReadableEvent(event) => event
                 .lock()
@@ -395,7 +419,9 @@ fn with_wait_object<R>(
 ) -> Option<R> {
     let thread = process.get_thread_by_thread_id(handle.thread_id)?;
     let thread = thread.lock().unwrap();
-    let wait_object = thread.synchronization_wait.object_by_wait_index(handle.wait_index)?;
+    let wait_object = thread
+        .synchronization_wait
+        .object_by_wait_index(handle.wait_index)?;
     Some(f(wait_object))
 }
 
@@ -426,7 +452,11 @@ fn wait_object_links(
     bool,
 )> {
     with_wait_object(process, handle, |wait_object| {
-        (wait_object.prev_waiter, wait_object.next_waiter, wait_object.linked)
+        (
+            wait_object.prev_waiter,
+            wait_object.next_waiter,
+            wait_object.linked,
+        )
     })
 }
 
@@ -716,11 +746,7 @@ pub fn unlink_waiter(process: &mut KProcess, wait_node: &SynchronizationWaitNode
     }
 }
 
-pub fn unlink_all_waiters_for_thread(
-    process: &mut KProcess,
-    object_id: u64,
-    thread_id: u64,
-) {
+pub fn unlink_all_waiters_for_thread(process: &mut KProcess, object_id: u64, thread_id: u64) {
     if let Some(object) = resolve_waitable_object(process, object_id) {
         object.unlink_all_waiters_for_thread(process, thread_id, object_id);
     }
@@ -856,7 +882,10 @@ impl ThreadQueueImplForKSynchronizationObjectWait {
     }
 }
 
-pub fn first_signaled_index(process: &KProcess, wait_set: &SynchronizationWaitSet) -> Option<usize> {
+pub fn first_signaled_index(
+    process: &KProcess,
+    wait_set: &SynchronizationWaitSet,
+) -> Option<usize> {
     wait_set
         .objects()
         .iter()
@@ -1132,7 +1161,14 @@ mod tests {
                 },
             },
         );
-        assert_eq!(readable.lock().unwrap().sync_object.waiter_snapshot(&process), vec![99]);
+        assert_eq!(
+            readable
+                .lock()
+                .unwrap()
+                .sync_object
+                .waiter_snapshot(&process),
+            vec![99]
+        );
         unlink_waiter(
             &mut process,
             &SynchronizationWaitNode {
@@ -1145,16 +1181,8 @@ mod tests {
         );
         assert!(readable.lock().unwrap().sync_object.waiters_are_empty());
 
-        waiter
-            .lock()
-            .unwrap()
-            .synchronization_wait
-            .begin(vec![55]);
-        waiter
-            .lock()
-            .unwrap()
-            .synchronization_wait
-            .bind_thread(99);
+        waiter.lock().unwrap().synchronization_wait.begin(vec![55]);
+        waiter.lock().unwrap().synchronization_wait.bind_thread(99);
 
         link_waiter(
             &mut process,
@@ -1202,8 +1230,18 @@ mod tests {
         wait_set.bind_thread(99);
         link_wait_set(&mut process, &wait_set);
 
-        assert_eq!(readable.lock().unwrap().sync_object.waiter_snapshot(&process), vec![99]);
-        assert_eq!(thread.lock().unwrap().sync_object.waiter_snapshot(&process), vec![99]);
+        assert_eq!(
+            readable
+                .lock()
+                .unwrap()
+                .sync_object
+                .waiter_snapshot(&process),
+            vec![99]
+        );
+        assert_eq!(
+            thread.lock().unwrap().sync_object.waiter_snapshot(&process),
+            vec![99]
+        );
         assert_eq!(process.sync_object.waiter_snapshot(&process), vec![99]);
     }
 
@@ -1368,7 +1406,10 @@ mod tests {
             Some(1)
         );
         assert!(readable.lock().unwrap().sync_object.waiters_are_empty());
-        assert_eq!(thread.lock().unwrap().sync_object.waiter_snapshot(&process), vec![99]);
+        assert_eq!(
+            thread.lock().unwrap().sync_object.waiter_snapshot(&process),
+            vec![99]
+        );
         assert!(process.sync_object.waiters_are_empty());
     }
 
@@ -1435,7 +1476,10 @@ mod tests {
         let readable = Arc::new(Mutex::new(KReadableEvent::new()));
         readable.lock().unwrap().initialize(7, 2);
         readable.lock().unwrap().is_signaled = true;
-        process.lock().unwrap().register_readable_event_object(2, readable);
+        process
+            .lock()
+            .unwrap()
+            .register_readable_event_object(2, readable);
 
         let mut out_index = -1;
         let result = wait(
@@ -1611,7 +1655,10 @@ mod tests {
 
         let readable = Arc::new(Mutex::new(KReadableEvent::new()));
         readable.lock().unwrap().initialize(7, 2);
-        process.lock().unwrap().register_readable_event_object(2, readable);
+        process
+            .lock()
+            .unwrap()
+            .register_readable_event_object(2, readable);
 
         let mut out_index = 123;
         let result = wait(

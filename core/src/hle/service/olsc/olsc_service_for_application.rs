@@ -40,9 +40,7 @@ pub struct IOlscServiceForApplication {
 
 impl IOlscServiceForApplication {
     pub fn new() -> Self {
-        Self {
-            initialized: false,
-        }
+        Self { initialized: false }
     }
 
     /// Cmd 0: Initialize

@@ -86,10 +86,10 @@ pub mod wall_clock;
 pub mod fs;
 
 // Platform-specific
-#[cfg(target_arch = "x86_64")]
-pub mod x64;
 #[cfg(target_arch = "aarch64")]
 pub mod arm64;
+#[cfg(target_arch = "x86_64")]
+pub mod x64;
 
 pub use error::ResultCode;
 pub use types::*;

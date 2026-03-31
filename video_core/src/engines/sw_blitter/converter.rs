@@ -510,14 +510,17 @@ impl Converter for GenericConverter {
                 }
                 let word_idx = self.bound_words[comp];
                 if word_idx < words.len() {
-                    self.convert_from_component(comp, &mut words[word_idx], old_components[ir_index]);
+                    self.convert_from_component(
+                        comp,
+                        &mut words[word_idx],
+                        old_components[ir_index],
+                    );
                 }
             }
 
             // Write words back to output bytes.
-            let words_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
-            };
+            let words_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
             let end = (dst_start + self.total_bytes_per_pixel).min(output.len());
             let copy_len = end - dst_start;
             output[dst_start..end].copy_from_slice(&words_bytes[..copy_len]);
@@ -942,12 +945,8 @@ impl ConverterFactory {
             },
             // Unknown format — use NullConverter
             _ => {
-                log::warn!(
-                    "Unimplemented format converter for format 0x{:X}",
-                    format
-                );
-                self.cache
-                    .insert(format, Box::new(NullConverter));
+                log::warn!("Unimplemented format converter for format 0x{:X}", format);
+                self.cache.insert(format, Box::new(NullConverter));
                 return;
             }
         };
@@ -993,10 +992,26 @@ mod tests {
         // G (index 1) = component with swizzle G = 0x80/255
         // B (index 2) = component with swizzle B = 0x00/255
         // A (index 3) = component with swizzle A = 0xFF/255
-        assert!((output[0] - (0x40 as f32 / 255.0)).abs() < 0.01, "R mismatch: {}", output[0]);
-        assert!((output[1] - (0x80 as f32 / 255.0)).abs() < 0.01, "G mismatch: {}", output[1]);
-        assert!((output[2] - (0x00 as f32 / 255.0)).abs() < 0.01, "B mismatch: {}", output[2]);
-        assert!((output[3] - (0xFF as f32 / 255.0)).abs() < 0.01, "A mismatch: {}", output[3]);
+        assert!(
+            (output[0] - (0x40 as f32 / 255.0)).abs() < 0.01,
+            "R mismatch: {}",
+            output[0]
+        );
+        assert!(
+            (output[1] - (0x80 as f32 / 255.0)).abs() < 0.01,
+            "G mismatch: {}",
+            output[1]
+        );
+        assert!(
+            (output[2] - (0x00 as f32 / 255.0)).abs() < 0.01,
+            "B mismatch: {}",
+            output[2]
+        );
+        assert!(
+            (output[3] - (0xFF as f32 / 255.0)).abs() < 0.01,
+            "A mismatch: {}",
+            output[3]
+        );
     }
 
     #[test]
@@ -1018,7 +1033,12 @@ mod tests {
         let input = val.to_le_bytes();
         let mut ir = [0.0f32; 4];
         converter.convert_to(&input, &mut ir);
-        assert!((ir[0] - val).abs() < 1e-6, "R mismatch: {} vs {}", ir[0], val);
+        assert!(
+            (ir[0] - val).abs() < 1e-6,
+            "R mismatch: {} vs {}",
+            ir[0],
+            val
+        );
         assert_eq!(ir[1], 0.0);
         assert_eq!(ir[2], 0.0);
         assert_eq!(ir[3], 0.0);
@@ -1027,7 +1047,12 @@ mod tests {
         let mut output = [0u8; 4];
         converter.convert_from(&ir, &mut output);
         let result = f32::from_le_bytes(output);
-        assert!((result - val).abs() < 1e-6, "Roundtrip mismatch: {} vs {}", result, val);
+        assert!(
+            (result - val).abs() < 1e-6,
+            "Roundtrip mismatch: {} vs {}",
+            result,
+            val
+        );
     }
 
     #[test]

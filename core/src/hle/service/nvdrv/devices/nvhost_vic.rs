@@ -24,13 +24,7 @@ impl NvHostVic {
 }
 
 impl NvDevice for NvHostVic {
-    fn ioctl1(
-        &self,
-        fd: DeviceFD,
-        command: Ioctl,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> NvResult {
+    fn ioctl1(&self, fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
         nvhost_nvdec_common::ioctl1_common(&self.common, fd, command, input, output)
     }
 

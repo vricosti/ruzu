@@ -154,7 +154,8 @@ impl QueryCacheBase {
         log::trace!(
             "QueryCacheBase::invalidate_region: addr={:#x} size={} — \
              removing cache entries; streamer flag mutation requires backend (not yet ported)",
-            addr, size
+            addr,
+            size
         );
         self.iterate_cache(addr, size, true, |_location| false);
     }
@@ -178,7 +179,8 @@ impl QueryCacheBase {
         log::trace!(
             "QueryCacheBase::flush_region: addr={:#x} size={} — \
              streamer SemiFlushQueryDirty / rasterizer ReleaseFences not yet ported",
-            addr, size
+            addr,
+            size
         );
         self.iterate_cache(addr, size, false, |_location| false);
     }
@@ -229,7 +231,8 @@ impl QueryCacheBase {
                         log::trace!(
                             "QueryCacheBase::is_region_gpu_modified: addr={:#x} size={} — \
                              cached query present but IsQueryDirty requires backend",
-                            addr, size
+                            addr,
+                            size
                         );
                         return false;
                     }
@@ -301,9 +304,7 @@ impl QueryCacheBase {
     /// syncs all pending streamer writes via PresyncWrites / SyncWrites and
     /// issues a runtime Barrier pair.
     pub fn notify_wfi(&mut self) {
-        log::warn!(
-            "QueryCacheBase::notify_wfi: streamer / runtime Barriers not yet available"
-        );
+        log::warn!("QueryCacheBase::notify_wfi: streamer / runtime Barriers not yet available");
     }
 
     /// Attempt to use host-side conditional rendering.
@@ -388,9 +389,7 @@ impl QueryCacheBase {
     /// calls runtime PauseHostConditionalRendering; on resume calls
     /// ResumeHostConditionalRendering.
     pub fn notify_segment(&mut self, _resume: bool) {
-        log::warn!(
-            "QueryCacheBase::notify_segment: runtime / streamer not yet available"
-        );
+        log::warn!("QueryCacheBase::notify_segment: runtime / streamer not yet available");
     }
 
     /// Iterate over cached queries in the given address range.
@@ -460,9 +459,7 @@ impl QueryCacheBase {
     /// sets `IsInvalidated` flag via `ObtainQuery(location)`.
     /// Requires the streamer array to look up the `QueryBase`.
     pub fn invalidate_query_at(_location: QueryLocation) {
-        log::warn!(
-            "QueryCacheBase::invalidate_query_at: streamer array not yet available"
-        );
+        log::warn!("QueryCacheBase::invalidate_query_at: streamer array not yet available");
     }
 
     /// Check if a query is dirty (host-managed but not guest-synced).
@@ -493,9 +490,7 @@ impl QueryCacheBase {
     /// calls `rasterizer.ReleaseFences()`.
     /// Requires the rasterizer interface.
     pub fn request_guest_host_sync(&self) {
-        log::warn!(
-            "QueryCacheBase::request_guest_host_sync: rasterizer not yet available"
-        );
+        log::warn!("QueryCacheBase::request_guest_host_sync: rasterizer not yet available");
     }
 
     /// Unregister queries that have been processed.
@@ -506,9 +501,7 @@ impl QueryCacheBase {
     /// Requires the streamer array and `pending_unregister` vec (both live in
     /// `QueryCacheBaseImpl`).
     pub fn unregister_pending(&mut self) {
-        log::warn!(
-            "QueryCacheBase::unregister_pending: streamer / impl state not yet available"
-        );
+        log::warn!("QueryCacheBase::unregister_pending: streamer / impl state not yet available");
     }
 }
 

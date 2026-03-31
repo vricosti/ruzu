@@ -50,7 +50,10 @@ impl ConcatenatedVfsFile {
     /// Wrapper function to allow for more efficient handling of files.len() == 0, 1 cases.
     ///
     /// Maps to upstream `ConcatenatedVfsFile::MakeConcatenatedFile` (vector variant).
-    pub fn make_concatenated_file(name: String, mut files: Vec<VirtualFile>) -> Option<VirtualFile> {
+    pub fn make_concatenated_file(
+        name: String,
+        mut files: Vec<VirtualFile>,
+    ) -> Option<VirtualFile> {
         // Fold trivial cases.
         if files.is_empty() {
             return None;
@@ -240,8 +243,11 @@ mod tests {
 
     #[test]
     fn test_concatenated_single() {
-        let f: VirtualFile =
-            Arc::new(VectorVfsFile::new(vec![1, 2, 3], "single".to_string(), None));
+        let f: VirtualFile = Arc::new(VectorVfsFile::new(
+            vec![1, 2, 3],
+            "single".to_string(),
+            None,
+        ));
         let result =
             ConcatenatedVfsFile::make_concatenated_file("name".to_string(), vec![f]).unwrap();
         // Single file should be returned directly
@@ -250,17 +256,13 @@ mod tests {
 
     #[test]
     fn test_concatenated_multiple() {
-        let f1: VirtualFile =
-            Arc::new(VectorVfsFile::new(vec![1, 2, 3], "a".to_string(), None));
-        let f2: VirtualFile =
-            Arc::new(VectorVfsFile::new(vec![4, 5], "b".to_string(), None));
+        let f1: VirtualFile = Arc::new(VectorVfsFile::new(vec![1, 2, 3], "a".to_string(), None));
+        let f2: VirtualFile = Arc::new(VectorVfsFile::new(vec![4, 5], "b".to_string(), None));
         let f3: VirtualFile = Arc::new(VectorVfsFile::new(vec![6], "c".to_string(), None));
 
-        let concat = ConcatenatedVfsFile::make_concatenated_file(
-            "concat".to_string(),
-            vec![f1, f2, f3],
-        )
-        .unwrap();
+        let concat =
+            ConcatenatedVfsFile::make_concatenated_file("concat".to_string(), vec![f1, f2, f3])
+                .unwrap();
 
         assert_eq!(concat.get_name(), "concat");
         assert_eq!(concat.get_size(), 6);
@@ -273,16 +275,12 @@ mod tests {
 
     #[test]
     fn test_concatenated_read_across_boundary() {
-        let f1: VirtualFile =
-            Arc::new(VectorVfsFile::new(vec![1, 2, 3], "a".to_string(), None));
-        let f2: VirtualFile =
-            Arc::new(VectorVfsFile::new(vec![4, 5, 6], "b".to_string(), None));
+        let f1: VirtualFile = Arc::new(VectorVfsFile::new(vec![1, 2, 3], "a".to_string(), None));
+        let f2: VirtualFile = Arc::new(VectorVfsFile::new(vec![4, 5, 6], "b".to_string(), None));
 
-        let concat = ConcatenatedVfsFile::make_concatenated_file(
-            "concat".to_string(),
-            vec![f1, f2],
-        )
-        .unwrap();
+        let concat =
+            ConcatenatedVfsFile::make_concatenated_file("concat".to_string(), vec![f1, f2])
+                .unwrap();
 
         let mut buf = [0u8; 4];
         assert_eq!(concat.read(&mut buf, 4, 1), 4);
@@ -291,10 +289,8 @@ mod tests {
 
     #[test]
     fn test_concatenated_with_filler() {
-        let f1: VirtualFile =
-            Arc::new(VectorVfsFile::new(vec![1, 2], "a".to_string(), None));
-        let f2: VirtualFile =
-            Arc::new(VectorVfsFile::new(vec![3, 4], "b".to_string(), None));
+        let f1: VirtualFile = Arc::new(VectorVfsFile::new(vec![1, 2], "a".to_string(), None));
+        let f2: VirtualFile = Arc::new(VectorVfsFile::new(vec![3, 4], "b".to_string(), None));
 
         // f1 at offset 0 (size 2), gap at offset 2 (size 2), f2 at offset 4 (size 2)
         let concat = ConcatenatedVfsFile::make_concatenated_file_with_filler(

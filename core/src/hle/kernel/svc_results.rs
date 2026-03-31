@@ -53,8 +53,7 @@ pub const RESULT_INVALID_ENUM_VALUE: ResultCode =
     ResultCode::from_module_description(ErrorModule::Kernel, 120);
 pub const RESULT_NOT_FOUND: ResultCode =
     ResultCode::from_module_description(ErrorModule::Kernel, 121);
-pub const RESULT_BUSY: ResultCode =
-    ResultCode::from_module_description(ErrorModule::Kernel, 122);
+pub const RESULT_BUSY: ResultCode = ResultCode::from_module_description(ErrorModule::Kernel, 122);
 pub const RESULT_SESSION_CLOSED: ResultCode =
     ResultCode::from_module_description(ErrorModule::Kernel, 123);
 pub const RESULT_INVALID_STATE: ResultCode =
@@ -88,8 +87,14 @@ mod tests {
 
     #[test]
     fn test_kernel_result_codes_module() {
-        assert_eq!(RESULT_OUT_OF_SESSIONS.get_module_raw(), ErrorModule::Kernel as u32);
-        assert_eq!(RESULT_INVALID_HANDLE.get_module_raw(), ErrorModule::Kernel as u32);
+        assert_eq!(
+            RESULT_OUT_OF_SESSIONS.get_module_raw(),
+            ErrorModule::Kernel as u32
+        );
+        assert_eq!(
+            RESULT_INVALID_HANDLE.get_module_raw(),
+            ErrorModule::Kernel as u32
+        );
     }
 
     #[test]

@@ -63,7 +63,9 @@ impl TelemetryJsonImpl {
     fn top_section(&self) -> &HashMap<String, String> {
         static EMPTY: std::sync::LazyLock<HashMap<String, String>> =
             std::sync::LazyLock::new(HashMap::new);
-        self.sections.get(&(FieldType::None as u8)).unwrap_or(&EMPTY)
+        self.sections
+            .get(&(FieldType::None as u8))
+            .unwrap_or(&EMPTY)
     }
 
     fn serialize_section(&mut self, field_type: FieldType, name: &str) {
@@ -100,58 +102,47 @@ impl TelemetryJson {
     // -----------------------------------------------------------------------
 
     pub fn visit_bool(&mut self, field_type: FieldType, name: &str, value: bool) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_f64(&mut self, field_type: FieldType, name: &str, value: f64) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_f32(&mut self, field_type: FieldType, name: &str, value: f32) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_u8(&mut self, field_type: FieldType, name: &str, value: u8) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_u16(&mut self, field_type: FieldType, name: &str, value: u16) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_u32(&mut self, field_type: FieldType, name: &str, value: u32) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_u64(&mut self, field_type: FieldType, name: &str, value: u64) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_i8(&mut self, field_type: FieldType, name: &str, value: i8) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_i16(&mut self, field_type: FieldType, name: &str, value: i16) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_i32(&mut self, field_type: FieldType, name: &str, value: i32) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_i64(&mut self, field_type: FieldType, name: &str, value: i64) {
-        self.inner
-            .serialize(field_type, name, &value.to_string());
+        self.inner.serialize(field_type, name, &value.to_string());
     }
 
     pub fn visit_string(&mut self, field_type: FieldType, name: &str, value: &str) {
@@ -180,7 +171,9 @@ impl TelemetryJson {
 
         // NOTE: Would POST to /telemetry via a detached task. Stubbed.
         let _content = format!("{:?}", self.inner.top_section());
-        log::warn!("TelemetryJson::complete: HTTP client not implemented; telemetry data not submitted");
+        log::warn!(
+            "TelemetryJson::complete: HTTP client not implemented; telemetry data not submitted"
+        );
     }
 
     /// Submits a testcase.
@@ -195,7 +188,9 @@ impl TelemetryJson {
             .serialize_section(FieldType::UserConfig, "UserConfig");
 
         // NOTE: Would POST to /gamedb/testcase. Stubbed.
-        log::warn!("TelemetryJson::submit_testcase: HTTP client not implemented; testcase not submitted");
+        log::warn!(
+            "TelemetryJson::submit_testcase: HTTP client not implemented; testcase not submitted"
+        );
         false
     }
 }

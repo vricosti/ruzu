@@ -26,8 +26,12 @@ pub fn collect_shader_info_pass(program: &mut Program) {
         for inst in &block.instructions {
             match inst.opcode {
                 // Constant buffer access
-                Opcode::GetCbufU32 | Opcode::GetCbufF32 | Opcode::GetCbufU8
-                | Opcode::GetCbufS8 | Opcode::GetCbufU16 | Opcode::GetCbufS16 => {
+                Opcode::GetCbufU32
+                | Opcode::GetCbufF32
+                | Opcode::GetCbufU8
+                | Opcode::GetCbufS8
+                | Opcode::GetCbufU16
+                | Opcode::GetCbufS16 => {
                     if let Some(&Value::ImmU32(idx)) = inst.args.first() {
                         cbuf_set.insert(idx);
                     }
@@ -89,12 +93,19 @@ pub fn collect_shader_info_pass(program: &mut Program) {
 
     program.info.constant_buffer_descriptors = cbuf_set
         .into_iter()
-        .map(|index| CbufDescriptor { index, size: 0x10000 })
+        .map(|index| CbufDescriptor {
+            index,
+            size: 0x10000,
+        })
         .collect();
 
     program.info.texture_descriptors = tex_set
         .into_iter()
-        .map(|index| TexDescriptor { index, texture_type: 2, is_depth: false })
+        .map(|index| TexDescriptor {
+            index,
+            texture_type: 2,
+            is_depth: false,
+        })
         .collect();
 
     if uses_local_memory && program.info.local_memory_size == 0 {

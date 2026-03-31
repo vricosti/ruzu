@@ -48,19 +48,43 @@ impl IAppletCommonFunctions {
             (21, None, "TryPopFromAppletBoundChannel"),
             (40, None, "GetDisplayLogicalResolution"),
             (42, None, "SetDisplayMagnification"),
-            (50, Some(Self::set_home_button_double_click_enabled_handler), "SetHomeButtonDoubleClickEnabled"),
-            (51, Some(Self::get_home_button_double_click_enabled_handler), "GetHomeButtonDoubleClickEnabled"),
+            (
+                50,
+                Some(Self::set_home_button_double_click_enabled_handler),
+                "SetHomeButtonDoubleClickEnabled",
+            ),
+            (
+                51,
+                Some(Self::get_home_button_double_click_enabled_handler),
+                "GetHomeButtonDoubleClickEnabled",
+            ),
             (52, None, "IsHomeButtonShortPressedBlocked"),
             (60, None, "IsVrModeCurtainRequired"),
             (61, None, "IsSleepRequiredByHighTemperature"),
             (62, None, "IsSleepRequiredByLowBattery"),
-            (70, Some(Self::set_cpu_boost_request_priority_handler), "SetCpuBoostRequestPriority"),
-            (80, None, "SetHandlingCaptureButtonShortPressedMessageEnabledForApplet"),
-            (81, None, "SetHandlingCaptureButtonLongPressedMessageEnabledForApplet"),
+            (
+                70,
+                Some(Self::set_cpu_boost_request_priority_handler),
+                "SetCpuBoostRequestPriority",
+            ),
+            (
+                80,
+                None,
+                "SetHandlingCaptureButtonShortPressedMessageEnabledForApplet",
+            ),
+            (
+                81,
+                None,
+                "SetHandlingCaptureButtonLongPressedMessageEnabledForApplet",
+            ),
             (90, None, "OpenNamedChannelAsParent"),
             (91, None, "OpenNamedChannelAsChild"),
             (100, None, "SetApplicationCoreUsageMode"),
-            (300, Some(Self::get_current_application_id_handler), "GetCurrentApplicationId"),
+            (
+                300,
+                Some(Self::get_current_application_id_handler),
+                "GetCurrentApplicationId",
+            ),
         ]);
         Self {
             applet: None,
@@ -80,19 +104,43 @@ impl IAppletCommonFunctions {
             (21, None, "TryPopFromAppletBoundChannel"),
             (40, None, "GetDisplayLogicalResolution"),
             (42, None, "SetDisplayMagnification"),
-            (50, Some(Self::set_home_button_double_click_enabled_handler), "SetHomeButtonDoubleClickEnabled"),
-            (51, Some(Self::get_home_button_double_click_enabled_handler), "GetHomeButtonDoubleClickEnabled"),
+            (
+                50,
+                Some(Self::set_home_button_double_click_enabled_handler),
+                "SetHomeButtonDoubleClickEnabled",
+            ),
+            (
+                51,
+                Some(Self::get_home_button_double_click_enabled_handler),
+                "GetHomeButtonDoubleClickEnabled",
+            ),
             (52, None, "IsHomeButtonShortPressedBlocked"),
             (60, None, "IsVrModeCurtainRequired"),
             (61, None, "IsSleepRequiredByHighTemperature"),
             (62, None, "IsSleepRequiredByLowBattery"),
-            (70, Some(Self::set_cpu_boost_request_priority_handler), "SetCpuBoostRequestPriority"),
-            (80, None, "SetHandlingCaptureButtonShortPressedMessageEnabledForApplet"),
-            (81, None, "SetHandlingCaptureButtonLongPressedMessageEnabledForApplet"),
+            (
+                70,
+                Some(Self::set_cpu_boost_request_priority_handler),
+                "SetCpuBoostRequestPriority",
+            ),
+            (
+                80,
+                None,
+                "SetHandlingCaptureButtonShortPressedMessageEnabledForApplet",
+            ),
+            (
+                81,
+                None,
+                "SetHandlingCaptureButtonLongPressedMessageEnabledForApplet",
+            ),
             (90, None, "OpenNamedChannelAsParent"),
             (91, None, "OpenNamedChannelAsChild"),
             (100, None, "SetApplicationCoreUsageMode"),
-            (300, Some(Self::get_current_application_id_handler), "GetCurrentApplicationId"),
+            (
+                300,
+                Some(Self::get_current_application_id_handler),
+                "GetCurrentApplicationId",
+            ),
         ]);
         Self {
             applet: Some(applet),
@@ -114,7 +162,10 @@ impl IAppletCommonFunctions {
 
     /// Port of IAppletCommonFunctions::SetCpuBoostRequestPriority
     pub fn set_cpu_boost_request_priority(&self, _priority: i32) {
-        log::debug!("SetCpuBoostRequestPriority called with priority={}", _priority);
+        log::debug!(
+            "SetCpuBoostRequestPriority called with priority={}",
+            _priority
+        );
         if let Some(ref applet) = self.applet {
             applet.lock().unwrap().cpu_boost_request_priority = _priority;
         }
@@ -135,7 +186,8 @@ impl IAppletCommonFunctions {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAppletCommonFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAppletCommonFunctions) };
         let mut rp = RequestParser::new(ctx);
         let enabled = rp.pop_bool();
         service.set_home_button_double_click_enabled(enabled);
@@ -148,7 +200,8 @@ impl IAppletCommonFunctions {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAppletCommonFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAppletCommonFunctions) };
         let enabled = service.get_home_button_double_click_enabled();
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -160,7 +213,8 @@ impl IAppletCommonFunctions {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAppletCommonFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAppletCommonFunctions) };
         let mut rp = RequestParser::new(ctx);
         let priority = rp.pop_u32() as i32;
         service.set_cpu_boost_request_priority(priority);
@@ -173,7 +227,8 @@ impl IAppletCommonFunctions {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAppletCommonFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAppletCommonFunctions) };
         let app_id = service.get_current_application_id();
 
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);

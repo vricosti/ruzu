@@ -41,14 +41,14 @@ impl TelemetrySession {
     /// Upstream `AddInitialInfo` takes `AppLoader&`, `FileSystemController&`, and
     /// `ContentProvider&` to extract the program ID and name. This simplified version
     /// takes program_id and program_name directly; reads settings from the global singleton.
-    pub fn add_initial_info_basic(
-        &mut self,
-        program_id: u64,
-        program_name: Option<&str>,
-    ) {
+    pub fn add_initial_info_basic(&mut self, program_id: u64, program_name: Option<&str>) {
         let vals = settings::values();
         // Log one-time top-level information
-        self.add_field(FieldType::None, "TelemetryId", FieldValue::U64(get_telemetry_id()));
+        self.add_field(
+            FieldType::None,
+            "TelemetryId",
+            FieldValue::U64(get_telemetry_id()),
+        );
 
         // Log one-time session start information
         let init_time = SystemTime::now()
@@ -164,8 +164,7 @@ impl TelemetrySession {
 
     /// Add a field to the telemetry session.
     pub fn add_field(&mut self, field_type: FieldType, name: &str, value: FieldValue) {
-        self.field_collection
-            .add_field(field_type, name, value);
+        self.field_collection.add_field(field_type, name, value);
     }
 
     /// Submit a testcase.
@@ -194,7 +193,11 @@ impl Drop for TelemetrySession {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        self.add_field(FieldType::Session, "Shutdown_Time", FieldValue::I64(shutdown_time));
+        self.add_field(
+            FieldType::Session,
+            "Shutdown_Time",
+            FieldValue::I64(shutdown_time),
+        );
 
         // Use a null visitor (no web service in Rust port).
         // Matching C++ behavior when ENABLE_WEB_SERVICE is not defined.
@@ -268,7 +271,11 @@ fn generate_telemetry_id() -> u64 {
     std::process::id().hash(&mut hasher);
 
     let id = hasher.finish();
-    if id == 0 { 1 } else { id }
+    if id == 0 {
+        1
+    } else {
+        id
+    }
 }
 
 fn telemetry_id_path() -> PathBuf {

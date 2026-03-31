@@ -16,8 +16,8 @@ use crate::hle::service::nvdrv::core::container::{Container, SessionId};
 use crate::hle::service::nvdrv::core::nvmap::NvMap;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
-use crate::hle::service::nvdrv::nvdrv::Module;
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
+use crate::hle::service::nvdrv::nvdrv::Module;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,9 +118,8 @@ pub struct IoctlGetVaRegions {
     pub reserved: u32,
     pub regions: [VaRegion; 2],
 }
-const _: () = assert!(
-    std::mem::size_of::<IoctlGetVaRegions>() == 16 + std::mem::size_of::<VaRegion>() * 2
-);
+const _: () =
+    assert!(std::mem::size_of::<IoctlGetVaRegions>() == 16 + std::mem::size_of::<VaRegion>() * 2);
 
 struct Mapping {
     handle: u32,
@@ -265,7 +264,10 @@ impl NvHostAsGpu {
     }
 
     pub fn alloc_as_ex(&self, params: &mut IoctlAllocAsEx) -> NvResult {
-        log::debug!("nvhost_as_gpu::AllocAsEx called, big_page_size=0x{:X}", params.big_page_size);
+        log::debug!(
+            "nvhost_as_gpu::AllocAsEx called, big_page_size=0x{:X}",
+            params.big_page_size
+        );
 
         let mut vm = self.vm.lock().unwrap();
 
@@ -276,7 +278,10 @@ impl NvHostAsGpu {
 
         if params.big_page_size != 0 {
             if !params.big_page_size.is_power_of_two() {
-                log::error!("Non power-of-2 big page size: 0x{:X}!", params.big_page_size);
+                log::error!(
+                    "Non power-of-2 big page size: 0x{:X}!",
+                    params.big_page_size
+                );
                 return NvResult::BadValue;
             }
 
@@ -457,7 +462,10 @@ impl NvHostAsGpu {
     }
 
     pub fn remap(&self, entries: &[IoctlRemapEntry]) -> NvResult {
-        log::debug!("nvhost_as_gpu::Remap called, num_entries=0x{:X}", entries.len());
+        log::debug!(
+            "nvhost_as_gpu::Remap called, num_entries=0x{:X}",
+            entries.len()
+        );
 
         let vm = self.vm.lock().unwrap();
         if !vm.initialised {
@@ -609,7 +617,9 @@ impl NvHostAsGpu {
 
         if flags.contains(MappingFlags::FIXED) {
             let mut alloc_map = self.allocation_map.lock().unwrap();
-            let Some((alloc_start, alloc)) = alloc_map.range_mut(..=(params.offset as u64)).next_back() else {
+            let Some((alloc_start, alloc)) =
+                alloc_map.range_mut(..=(params.offset as u64)).next_back()
+            else {
                 self.nvmap().unpin_handle(params.handle);
                 return NvResult::BadValue;
             };
@@ -627,15 +637,18 @@ impl NvHostAsGpu {
             alloc.mappings.push(offset);
             let sparse_alloc = alloc.sparse;
             drop(alloc_map);
-            self.mapping_map.lock().unwrap().insert(offset, Mapping {
-                handle: params.handle,
-                ptr: device_address,
+            self.mapping_map.lock().unwrap().insert(
                 offset,
-                size,
-                fixed: true,
-                big_page: use_big_pages,
-                sparse_alloc,
-            });
+                Mapping {
+                    handle: params.handle,
+                    ptr: device_address,
+                    offset,
+                    size,
+                    fixed: true,
+                    big_page: use_big_pages,
+                    sparse_alloc,
+                },
+            );
             log::debug!(
                 "nvhost_as_gpu::MapBufferEx fixed result handle={} gpu_offset=0x{:X} device_address=0x{:X} size=0x{:X} big_page={}",
                 params.handle,
@@ -705,7 +718,10 @@ impl NvHostAsGpu {
     }
 
     pub fn unmap_buffer(&self, params: &mut IoctlUnmapBuffer) -> NvResult {
-        log::debug!("nvhost_as_gpu::UnmapBuffer called, offset=0x{:X}", params.offset);
+        log::debug!(
+            "nvhost_as_gpu::UnmapBuffer called, offset=0x{:X}",
+            params.offset
+        );
 
         let vm = self.vm.lock().unwrap();
         if !vm.initialised {
@@ -714,7 +730,11 @@ impl NvHostAsGpu {
         drop(vm);
 
         let mut mapping_map = self.mapping_map.lock().unwrap();
-        self.free_mapping_locked(&mut self.vm.lock().unwrap(), &mut mapping_map, params.offset as u64)
+        self.free_mapping_locked(
+            &mut self.vm.lock().unwrap(),
+            &mut mapping_map,
+            params.offset as u64,
+        )
     }
 
     pub fn bind_channel(&self, params: &mut IoctlBindChannel) -> NvResult {
@@ -754,7 +774,8 @@ impl NvHostAsGpu {
             offset: (small_page_allocator.get_va_start() as u64) << VM::PAGE_SIZE_BITS,
             page_size: VM::YUZU_PAGESIZE,
             _pad0: 0,
-            pages: (small_page_allocator.get_va_limit() - small_page_allocator.get_va_start()) as u64,
+            pages: (small_page_allocator.get_va_limit() - small_page_allocator.get_va_start())
+                as u64,
         };
         params.regions[1] = VaRegion {
             offset: (big_page_allocator.get_va_start() as u64) << vm.big_page_size_bits,
@@ -776,13 +797,7 @@ impl NvHostAsGpu {
 }
 
 impl NvDevice for NvHostAsGpu {
-    fn ioctl1(
-        &self,
-        _fd: DeviceFD,
-        command: Ioctl,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> NvResult {
+    fn ioctl1(&self, _fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
         match command.group() {
             b'A' => match command.cmd() {
                 0x1 => {
@@ -907,7 +922,9 @@ impl NvDevice for NvHostAsGpu {
     fn query_event(
         &self,
         event_id: u32,
-    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>> {
+    ) -> Option<
+        std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>,
+    > {
         log::error!("Unknown AS GPU Event {}", event_id);
         None
     }
@@ -925,8 +942,8 @@ mod tests {
     use crate::gpu_core::{GpuChannelHandle, GpuCoreInterface, GpuMemoryManagerHandle};
     use crate::hle::service::nvdrv::core::container::{Container, SessionId};
     use crate::hle::service::nvdrv::core::nvmap::HandleFlags;
-    use crate::hle::service::nvdrv::nvdrv::Module;
     use crate::hle::service::nvdrv::nvdata::NvResult;
+    use crate::hle::service::nvdrv::nvdrv::Module;
 
     #[derive(Default)]
     struct FakeGpuCore {
@@ -996,7 +1013,10 @@ mod tests {
         }
 
         fn init_address_space(&self, _memory_manager: Arc<dyn GpuMemoryManagerHandle>) {
-            self.ops.lock().unwrap().push("init_address_space".to_string());
+            self.ops
+                .lock()
+                .unwrap()
+                .push("init_address_space".to_string());
         }
 
         fn push_gpu_entries(&self, _channel_id: i32, _entries: crate::gpu_core::GpuCommandList) {}
@@ -1108,7 +1128,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(gpu_as.map_buffer_ex(&mut map), NvResult::Success);
-        assert_eq!(container.get_nv_map_file().get_handle_address(handle.id), 0x3000_0000);
+        assert_eq!(
+            container.get_nv_map_file().get_handle_address(handle.id),
+            0x3000_0000
+        );
 
         let mut free = super::IoctlFreeSpace {
             offset: space.offset,
@@ -1210,7 +1233,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(gpu_as.remap(&[entry]), NvResult::Success);
-        assert_eq!(container.get_nv_map_file().get_handle_address(handle.id), 0x5000_0000);
+        assert_eq!(
+            container.get_nv_map_file().get_handle_address(handle.id),
+            0x5000_0000
+        );
         assert_eq!(handle.lock_inner().pins, 1);
     }
 
@@ -1225,10 +1251,7 @@ mod tests {
         let mut params = super::IoctlBindChannel { fd };
 
         assert_eq!(gpu_as.bind_channel(&mut params), NvResult::Success);
-        assert!(module
-            .get_gpu_device(fd)
-            .unwrap()
-            .has_bound_address_space());
+        assert!(module.get_gpu_device(fd).unwrap().has_bound_address_space());
 
         std::mem::forget(module);
         std::mem::forget(system);

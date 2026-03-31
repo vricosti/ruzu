@@ -76,7 +76,13 @@ impl Layer {
             gl::CreateTextures(gl::TEXTURE_2D, 1, &mut texture);
             gl::TextureStorage2D(texture, 1, gl::RGBA8, 1, 1);
             let black: [u8; 4] = [0, 0, 0, 0];
-            gl::ClearTexImage(texture, 0, gl::RGBA, gl::UNSIGNED_BYTE, black.as_ptr() as *const _);
+            gl::ClearTexImage(
+                texture,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                black.as_ptr() as *const _,
+            );
         }
 
         Self {
@@ -177,7 +183,10 @@ impl Layer {
     /// this returns the existing texture (which will show black until GPU memory
     /// integration is complete). The texture is properly allocated by
     /// configure_framebuffer_texture().
-    fn load_fb_to_screen_info(&mut self, framebuffer: &FramebufferConfig) -> FramebufferTextureInfo {
+    fn load_fb_to_screen_info(
+        &mut self,
+        framebuffer: &FramebufferConfig,
+    ) -> FramebufferTextureInfo {
         // The full implementation would:
         // 1. let framebuffer_addr = framebuffer.address + framebuffer.offset as u64;
         // 2. Try rasterizer.accelerate_display(framebuffer, framebuffer_addr, framebuffer.stride)

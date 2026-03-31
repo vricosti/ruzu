@@ -47,13 +47,7 @@ impl AesXtsStorage {
     /// block_size must be aligned to AES_BLOCK_SIZE.
     ///
     /// Corresponds to upstream `AesXtsStorage::AesXtsStorage`.
-    pub fn new(
-        base: VirtualFile,
-        key1: &[u8],
-        key2: &[u8],
-        iv: &[u8],
-        block_size: usize,
-    ) -> Self {
+    pub fn new(base: VirtualFile, key1: &[u8], key2: &[u8], iv: &[u8], block_size: usize) -> Self {
         assert_eq!(key1.len(), KEY_SIZE / 2);
         assert_eq!(key2.len(), KEY_SIZE / 2);
         assert_eq!(iv.len(), IV_SIZE);
@@ -208,10 +202,7 @@ mod tests {
         AesXtsStorage::make_aes_xts_iv(&mut iv, 0x2000, 0x200);
         // block_index = 0x2000 / 0x200 = 0x10
         assert_eq!(&iv[..8], &[0u8; 8]);
-        assert_eq!(
-            &iv[8..],
-            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10]
-        );
+        assert_eq!(&iv[8..], &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10]);
     }
 
     #[test]

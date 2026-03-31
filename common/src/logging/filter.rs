@@ -59,7 +59,10 @@ impl Filter {
 
     fn parse_filter_rule(&mut self, rule: &str) {
         let Some(colon_pos) = rule.find(':') else {
-            log::error!("Invalid log filter. Must specify a log level after ':': {}", rule);
+            log::error!(
+                "Invalid log filter. Must specify a log level after ':': {}",
+                rule
+            );
             return;
         };
 

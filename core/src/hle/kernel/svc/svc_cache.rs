@@ -36,11 +36,7 @@ pub fn invalidate_process_data_cache(
 
 /// Stores process data cache.
 /// Upstream: UNIMPLEMENTED() — intentionally unimplemented.
-pub fn store_process_data_cache(
-    _process_handle: Handle,
-    _address: u64,
-    _size: u64,
-) -> ResultCode {
+pub fn store_process_data_cache(_process_handle: Handle, _address: u64, _size: u64) -> ResultCode {
     log::warn!("svc::StoreProcessDataCache: Upstream UNIMPLEMENTED");
     RESULT_NOT_IMPLEMENTED
 }
@@ -73,7 +69,10 @@ pub fn flush_process_data_cache(
 
     // Verify the region is within range.
     // Upstream: page_table.Contains(address, size)
-    if !process.page_table.contains(KProcessAddress::new(address), size as usize) {
+    if !process
+        .page_table
+        .contains(KProcessAddress::new(address), size as usize)
+    {
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
@@ -84,7 +83,8 @@ pub fn flush_process_data_cache(
     // is effectively a no-op on x86/host.
     log::debug!(
         "svc::FlushProcessDataCache: flushing address=0x{:X}, size=0x{:X} (no-op on HLE)",
-        address, size
+        address,
+        size
     );
 
     RESULT_SUCCESS

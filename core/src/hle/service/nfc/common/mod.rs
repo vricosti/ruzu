@@ -9,6 +9,6 @@
 //!
 //! Status: Stub - structures declared, methods stubbed.
 
+pub mod amiibo_crypto;
 pub mod device;
 pub mod device_manager;
-pub mod amiibo_crypto;

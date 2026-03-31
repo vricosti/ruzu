@@ -305,7 +305,8 @@ impl StaticService {
         if !self.setup_info.can_write_user_clock {
             return RESULT_PERMISSION_DENIED;
         }
-        self.automatic_correction_enabled.store(automatic_correction, Ordering::Relaxed);
+        self.automatic_correction_enabled
+            .store(automatic_correction, Ordering::Relaxed);
         // Upstream calls m_shared_memory.SetAutomaticCorrection(automatic_correction)
         // and then gets the current steady clock time point to call
         // m_user_system_clock.SetTimePointAndSignal(time_point) followed by
@@ -484,10 +485,7 @@ impl StaticService {
     }
 
     /// Helper to create a sub-service and push it as a domain object or move handle.
-    fn push_sub_service(
-        ctx: &mut HLERequestContext,
-        sub_service: Arc<dyn SessionRequestHandler>,
-    ) {
+    fn push_sub_service(ctx: &mut HLERequestContext, sub_service: Arc<dyn SessionRequestHandler>) {
         let is_domain = ctx
             .get_manager()
             .map_or(false, |manager| manager.lock().unwrap().is_domain());
@@ -528,20 +526,14 @@ impl StaticService {
     }
 
     /// GetStandardSteadyClock (cmd 2) handler.
-    fn get_standard_steady_clock_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_standard_steady_clock_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let sub = service.get_standard_steady_clock();
         Self::push_sub_service(ctx, Arc::new(sub));
     }
 
     /// GetTimeZoneService (cmd 3) handler.
-    fn get_time_zone_service_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_time_zone_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let sub = service.get_time_zone_service();
         Self::push_sub_service(ctx, Arc::new(sub));
@@ -698,7 +690,12 @@ impl StaticService {
                     "PSC::Time::StaticService::GetStandardUserSystemClockAutomaticCorrectionUpdatedTime -> {:?}",
                     time_point
                 );
-                let mut rb = ResponseBuilder::new(ctx, 2 + (core::mem::size_of::<SteadyClockTimePoint>() / 4) as u32, 0, 0);
+                let mut rb = ResponseBuilder::new(
+                    ctx,
+                    2 + (core::mem::size_of::<SteadyClockTimePoint>() / 4) as u32,
+                    0,
+                    0,
+                );
                 rb.push_result(RESULT_SUCCESS);
                 rb.push_raw(&time_point);
             }
@@ -734,10 +731,7 @@ impl StaticService {
     ///
     /// Upstream reads TimeType from input, calls GetClockSnapshot, and writes
     /// the ClockSnapshot to the output buffer (type B/C).
-    fn get_clock_snapshot_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_clock_snapshot_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let type_val = rp.pop_u32();
@@ -843,10 +837,7 @@ impl StaticService {
     }
 
     /// CalculateSpanBetween (cmd 501) handler.
-    fn calculate_span_between_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn calculate_span_between_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
 
         let buf_a = ctx.read_buffer(0);
@@ -895,7 +886,8 @@ impl StaticService {
         snapshot.user_context = *user_context;
         snapshot.network_context = *network_context;
         snapshot.steady_clock_time_point = self.steady_clock_time_point;
-        snapshot.is_automatic_correction_enabled = self.automatic_correction_enabled.load(Ordering::Relaxed);
+        snapshot.is_automatic_correction_enabled =
+            self.automatic_correction_enabled.load(Ordering::Relaxed);
 
         // Get location name from timezone.
         // Matches upstream: m_time_zone.GetLocationName(out_snapshot->location_name)
@@ -910,7 +902,9 @@ impl StaticService {
 
         // Compute user calendar time via TimeZone.
         // Matches upstream: m_time_zone.ToCalendarTimeWithMyRule(user_calendar_time, ..., user_time)
-        let (cal, cal_info) = self.time_zone.to_calendar_time_with_my_rule(snapshot.user_time)?;
+        let (cal, cal_info) = self
+            .time_zone
+            .to_calendar_time_with_my_rule(snapshot.user_time)?;
         snapshot.user_calendar_time = cal;
         snapshot.user_calendar_additional_time = cal_info;
 
@@ -925,7 +919,9 @@ impl StaticService {
 
         // Compute network calendar time via TimeZone.
         // Matches upstream: m_time_zone.ToCalendarTimeWithMyRule(network_calendar_time, ..., network_time)
-        let (cal, cal_info) = self.time_zone.to_calendar_time_with_my_rule(snapshot.network_time)?;
+        let (cal, cal_info) = self
+            .time_zone
+            .to_calendar_time_with_my_rule(snapshot.network_time)?;
         snapshot.network_calendar_time = cal;
         snapshot.network_calendar_additional_time = cal_info;
 

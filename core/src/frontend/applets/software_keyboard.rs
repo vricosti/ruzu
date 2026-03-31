@@ -311,9 +311,7 @@ impl SoftwareKeyboardApplet for DefaultSoftwareKeyboardApplet {
     }
 
     fn show_normal_keyboard(&self) {
-        log::warn!(
-            "(STUBBED) called, backend requested to show the normal software keyboard."
-        );
+        log::warn!("(STUBBED) called, backend requested to show the normal software keyboard.");
         self.submit_normal_text("zuyu");
     }
 
@@ -322,15 +320,11 @@ impl SoftwareKeyboardApplet for DefaultSoftwareKeyboardApplet {
         _text_check_result: SwkbdTextCheckResult,
         _text_check_message: String,
     ) {
-        log::warn!(
-            "(STUBBED) called, backend requested to show the text check dialog."
-        );
+        log::warn!("(STUBBED) called, backend requested to show the text check dialog.");
     }
 
     fn show_inline_keyboard(&self, appear_parameters: InlineAppearParameters) {
-        log::warn!(
-            "(STUBBED) called, backend requested to show the inline software keyboard."
-        );
+        log::warn!("(STUBBED) called, backend requested to show the inline software keyboard.");
 
         log::info!(
             "\nInlineAppearParameters:\
@@ -372,15 +366,11 @@ impl SoftwareKeyboardApplet for DefaultSoftwareKeyboardApplet {
     }
 
     fn hide_inline_keyboard(&self) {
-        log::warn!(
-            "(STUBBED) called, backend requested to hide the inline software keyboard."
-        );
+        log::warn!("(STUBBED) called, backend requested to hide the inline software keyboard.");
     }
 
     fn inline_text_changed(&self, text_parameters: InlineTextParameters) {
-        log::warn!(
-            "(STUBBED) called, backend requested to change the inline keyboard text."
-        );
+        log::warn!("(STUBBED) called, backend requested to change the inline keyboard text.");
 
         log::info!(
             "\nInlineTextParameters:\
@@ -400,8 +390,6 @@ impl SoftwareKeyboardApplet for DefaultSoftwareKeyboardApplet {
     }
 
     fn exit_keyboard(&self) {
-        log::warn!(
-            "(STUBBED) called, backend requested to exit the software keyboard."
-        );
+        log::warn!("(STUBBED) called, backend requested to exit the software keyboard.");
     }
 }

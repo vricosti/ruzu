@@ -111,8 +111,7 @@ impl ShaderCache {
                     // it spans. We do this by walking the entry's page range and removing
                     // the pointer. For the current page we handle it by not incrementing
                     // index (the entry at `index` is swapped with the last and removed).
-                    let entry_page_end =
-                        (entry.addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
+                    let entry_page_end = (entry.addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
                     let entry_page_start = entry.addr_start >> YUZU_PAGEBITS;
 
                     // Remove from OTHER pages first (not the current page, handled below).

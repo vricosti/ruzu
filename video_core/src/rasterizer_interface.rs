@@ -75,13 +75,7 @@ pub trait RasterizerInterface {
     // ── Uniform buffers ─────────────────────────────────────────────────
 
     /// Signal a uniform buffer binding.
-    fn bind_graphics_uniform_buffer(
-        &mut self,
-        stage: usize,
-        index: u32,
-        gpu_addr: u64,
-        size: u32,
-    );
+    fn bind_graphics_uniform_buffer(&mut self, stage: usize, index: u32, gpu_addr: u64, size: u32);
 
     /// Signal disabling of a uniform buffer.
     fn disable_graphics_uniform_buffer(&mut self, stage: usize, index: u32);

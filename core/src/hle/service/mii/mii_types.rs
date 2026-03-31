@@ -763,7 +763,9 @@ impl Nickname {
 
 impl Default for Nickname {
     fn default() -> Self {
-        Self { data: [0u16; MAX_NAME_SIZE] }
+        Self {
+            data: [0u16; MAX_NAME_SIZE],
+        }
     }
 }
 

@@ -9,10 +9,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::friend::Module;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::friend::Module;
 
 /// IPC command IDs for Friend interface
 pub mod commands {
@@ -36,8 +36,16 @@ impl Friend {
     pub fn new(system: crate::core::SystemRef, module: Arc<Module>, name: &str) -> Self {
         let handlers = build_handler_map(&[
             (commands::CREATE_FRIEND_SERVICE, None, "CreateFriendService"),
-            (commands::CREATE_NOTIFICATION_SERVICE, None, "CreateNotificationService"),
-            (commands::CREATE_DAEMON_SUSPEND_SESSION_SERVICE, None, "CreateDaemonSuspendSessionService"),
+            (
+                commands::CREATE_NOTIFICATION_SERVICE,
+                None,
+                "CreateNotificationService",
+            ),
+            (
+                commands::CREATE_DAEMON_SUSPEND_SESSION_SERVICE,
+                None,
+                "CreateDaemonSuspendSessionService",
+            ),
         ]);
 
         Self {
@@ -56,10 +64,7 @@ impl Friend {
     }
 
     /// CreateNotificationService (cmd 1)
-    pub fn create_notification_service(
-        &self,
-        uuid: u128,
-    ) -> super::friend::INotificationService {
+    pub fn create_notification_service(&self, uuid: u128) -> super::friend::INotificationService {
         log::debug!(
             "Friend({})::create_notification_service called, uuid={:#x}",
             self.name,
@@ -97,8 +102,8 @@ impl ServiceFramework for Friend {
 ///
 /// Corresponds to `LoopProcess` in upstream `friend.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     let module = Arc::new(super::friend::Module);
 

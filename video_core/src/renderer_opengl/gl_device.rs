@@ -95,14 +95,14 @@ impl Device {
 
         let has_warp_intrinsics = is_nvidia && has_ext("GL_NV_gpu_shader5");
         let has_shader_ballot = has_ext("GL_ARB_shader_ballot");
-        let has_vertex_viewport_layer = has_ext("GL_ARB_shader_viewport_layer_array")
-            || has_ext("GL_NV_viewport_array2");
+        let has_vertex_viewport_layer =
+            has_ext("GL_ARB_shader_viewport_layer_array") || has_ext("GL_NV_viewport_array2");
         let has_image_load_formatted = has_ext("GL_EXT_shader_image_load_formatted");
         let has_texture_shadow_lod = has_ext("GL_EXT_texture_shadow_lod");
         let has_vertex_buffer_unified_memory = has_ext("GL_NV_vertex_buffer_unified_memory");
         let has_astc = has_ext("GL_KHR_texture_compression_astc_ldr");
-        let has_variable_aoffi = has_ext("GL_AMD_gpu_shader_half_float")
-            || (is_nvidia && has_ext("GL_NV_gpu_shader5"));
+        let has_variable_aoffi =
+            has_ext("GL_AMD_gpu_shader_half_float") || (is_nvidia && has_ext("GL_NV_gpu_shader5"));
         let has_depth_buffer_float = has_ext("GL_NV_depth_buffer_float");
         let has_geometry_shader_passthrough = has_ext("GL_NV_geometry_shader_passthrough");
         let has_nv_gpu_shader5 = has_ext("GL_NV_gpu_shader5");

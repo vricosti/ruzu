@@ -68,10 +68,22 @@ impl IApplicationAccessor {
             (123, None, "GetApplicationLaunchProperty"),
             (124, None, "GetApplicationLaunchRequestInfo"),
             (130, None, "SetUsers"),
-            (131, Some(Self::check_rights_environment_available_handler), "CheckRightsEnvironmentAvailable"),
-            (132, Some(Self::get_ns_rights_environment_handle_handler), "GetNsRightsEnvironmentHandle"),
+            (
+                131,
+                Some(Self::check_rights_environment_available_handler),
+                "CheckRightsEnvironmentAvailable",
+            ),
+            (
+                132,
+                Some(Self::get_ns_rights_environment_handle_handler),
+                "GetNsRightsEnvironmentHandle",
+            ),
             (140, None, "GetDesirableUids"),
-            (150, Some(Self::report_application_exit_timeout_handler), "ReportApplicationExitTimeout"),
+            (
+                150,
+                Some(Self::report_application_exit_timeout_handler),
+                "ReportApplicationExitTimeout",
+            ),
             (160, None, "SetApplicationAttribute"),
             (170, None, "HasSaveDataAccessPermission"),
             (180, None, "PushToFriendInvitationStorageChannel"),
@@ -135,7 +147,8 @@ impl IApplicationAccessor {
     }
 
     fn start_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
         service.start();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -143,7 +156,8 @@ impl IApplicationAccessor {
     }
 
     fn request_exit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
         service.request_exit();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -151,7 +165,8 @@ impl IApplicationAccessor {
     }
 
     fn terminate_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
         service.terminate();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -162,7 +177,8 @@ impl IApplicationAccessor {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
         let available = service.check_rights_environment_available();
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -174,7 +190,8 @@ impl IApplicationAccessor {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
         let handle = service.get_ns_rights_environment_handle();
 
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
@@ -186,7 +203,8 @@ impl IApplicationAccessor {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
         service.report_application_exit_timeout();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);

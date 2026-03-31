@@ -68,14 +68,10 @@ impl FlatAddressSpaceMapBool {
                     let new_succ_idx = block_end_pred_idx;
                     self.finish_map(virt, new_succ_idx, block_end_succ_idx, size);
                 } else {
-                    self.blocks.insert(
-                        block_end_succ_idx,
-                        Block::new(virt_end, tail_mapped),
-                    );
-                    self.blocks.insert(
-                        block_end_succ_idx,
-                        Block::new(virt, true),
-                    );
+                    self.blocks
+                        .insert(block_end_succ_idx, Block::new(virt_end, tail_mapped));
+                    self.blocks
+                        .insert(block_end_succ_idx, Block::new(virt, true));
                     if let Some(ref cb) = self.unmap_callback {
                         cb(virt, size);
                     }
@@ -116,7 +112,10 @@ impl FlatAddressSpaceMapBool {
         }
 
         if self.blocks[start_succ_idx].virt > virt_end {
-            panic!("Unsorted block in AS map: virt: {:#X}", self.blocks[start_succ_idx].virt);
+            panic!(
+                "Unsorted block in AS map: virt: {:#X}",
+                self.blocks[start_succ_idx].virt
+            );
         } else if self.blocks[start_succ_idx].virt == virt_end {
             self.blocks.insert(start_succ_idx, Block::new(virt, true));
         } else {
@@ -167,7 +166,10 @@ impl FlatAddressSpaceMapBool {
             return;
         }
 
-        assert!(block_end_succ_idx < self.blocks.len(), "Unexpected Memory Manager state!");
+        assert!(
+            block_end_succ_idx < self.blocks.len(),
+            "Unexpected Memory Manager state!"
+        );
 
         if self.blocks[block_end_succ_idx].virt != virt_end {
             if self.blocks[block_end_pred_idx].virt >= virt {
@@ -177,14 +179,10 @@ impl FlatAddressSpaceMapBool {
                 let new_succ = block_end_pred_idx;
                 self.finish_unmap(virt, size, new_succ);
             } else {
-                self.blocks.insert(
-                    block_end_succ_idx,
-                    Block::new(virt_end, true),
-                );
-                self.blocks.insert(
-                    block_end_succ_idx,
-                    Block::new(virt, false),
-                );
+                self.blocks
+                    .insert(block_end_succ_idx, Block::new(virt_end, true));
+                self.blocks
+                    .insert(block_end_succ_idx, Block::new(virt, false));
                 if let Some(ref cb) = self.unmap_callback {
                     cb(virt, size);
                 }
@@ -288,10 +286,7 @@ impl FlatAllocator {
 
         // Avoid searching backwards in the address space if possible
         if alloc_end >= self.current_linear_alloc_end && alloc_end <= self.va_limit {
-            let succ_idx = self
-                .inner
-                .blocks
-                .partition_point(|b| b.virt < alloc_end);
+            let succ_idx = self.inner.blocks.partition_point(|b| b.virt < alloc_end);
             if succ_idx == 0 {
                 panic!("First block in AS map is invalid!");
             }

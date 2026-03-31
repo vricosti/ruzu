@@ -152,10 +152,7 @@ impl OGLProgram {
         Self { handle: 0 }
     }
 
-    pub fn create_from_source(
-        vertex_src: &str,
-        fragment_src: &str,
-    ) -> Result<Self, String> {
+    pub fn create_from_source(vertex_src: &str, fragment_src: &str) -> Result<Self, String> {
         unsafe {
             let vs = compile_shader(gl::VERTEX_SHADER, vertex_src)?;
             let fs = compile_shader(gl::FRAGMENT_SHADER, fragment_src)?;

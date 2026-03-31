@@ -201,11 +201,7 @@ impl RendererVulkan {
     ///
     /// Creates a temporary frame, draws framebuffers to it via blit_capture,
     /// and copies the result to a buffer for readback.
-    fn render_to_buffer(
-        &mut self,
-        _format: vk::Format,
-        _buffer_size: vk::DeviceSize,
-    ) {
+    fn render_to_buffer(&mut self, _format: vk::Format, _buffer_size: vk::DeviceSize) {
         // Requires full BlitScreen and Scheduler integration
     }
 
@@ -242,10 +238,7 @@ impl Drop for RendererVulkan {
 ///
 /// Enumerates physical devices, selects the one specified by user settings,
 /// and creates a logical Device wrapper.
-pub fn create_device(
-    _instance: vk::Instance,
-    _surface: vk::SurfaceKHR,
-) {
+pub fn create_device(_instance: vk::Instance, _surface: vk::SurfaceKHR) {
     // Full implementation requires:
     // 1. instance.enumerate_physical_devices()
     // 2. Select device based on Settings::values.vulkan_device
@@ -266,7 +259,10 @@ mod tests {
     #[test]
     fn nvidia_driver_version() {
         // Nvidia version 525.60.11 encodes differently
-        let s = get_driver_version(vk::DriverId::NVIDIA_PROPRIETARY, (525 << 22) | (60 << 14) | (11 << 6) | 0);
+        let s = get_driver_version(
+            vk::DriverId::NVIDIA_PROPRIETARY,
+            (525 << 22) | (60 << 14) | (11 << 6) | 0,
+        );
         assert!(s.starts_with("525.60.11."));
     }
 

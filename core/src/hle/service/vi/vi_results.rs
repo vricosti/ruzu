@@ -11,5 +11,4 @@ pub const RESULT_PERMISSION_DENIED: ResultCode =
     ResultCode::from_module_description(ErrorModule::VI, 5);
 pub const RESULT_NOT_SUPPORTED: ResultCode =
     ResultCode::from_module_description(ErrorModule::VI, 6);
-pub const RESULT_NOT_FOUND: ResultCode =
-    ResultCode::from_module_description(ErrorModule::VI, 7);
+pub const RESULT_NOT_FOUND: ResultCode = ResultCode::from_module_description(ErrorModule::VI, 7);

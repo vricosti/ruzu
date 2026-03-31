@@ -56,10 +56,22 @@ impl TS {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
             (commands::GET_TEMPERATURE_RANGE, None, "GetTemperatureRange"),
-            (commands::GET_TEMPERATURE, Some(TS::get_temperature_handler), "GetTemperature"),
+            (
+                commands::GET_TEMPERATURE,
+                Some(TS::get_temperature_handler),
+                "GetTemperature",
+            ),
             (commands::SET_MEASUREMENT_MODE, None, "SetMeasurementMode"),
-            (commands::GET_TEMPERATURE_MILLI_C, Some(TS::get_temperature_milli_c_handler), "GetTemperatureMilliC"),
-            (commands::OPEN_SESSION, Some(TS::open_session_handler), "OpenSession"),
+            (
+                commands::GET_TEMPERATURE_MILLI_C,
+                Some(TS::get_temperature_milli_c_handler),
+                "GetTemperatureMilliC",
+            ),
+            (
+                commands::OPEN_SESSION,
+                Some(TS::open_session_handler),
+                "OpenSession",
+            ),
         ]);
         Self {
             handlers,
@@ -102,7 +114,11 @@ impl TS {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const TS) };
         let mut rp = RequestParser::new(ctx);
         let location_raw = rp.pop_u32() as u8;
-        let location = if location_raw == 0 { Location::Internal } else { Location::External };
+        let location = if location_raw == 0 {
+            Location::Internal
+        } else {
+            Location::External
+        };
         let temp = service.get_temperature(location);
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -114,7 +130,11 @@ impl TS {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const TS) };
         let mut rp = RequestParser::new(ctx);
         let location_raw = rp.pop_u32() as u8;
-        let location = if location_raw == 0 { Location::Internal } else { Location::External };
+        let location = if location_raw == 0 {
+            Location::Internal
+        } else {
+            Location::External
+        };
         let temp = service.get_temperature_milli_c(location);
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -170,9 +190,21 @@ pub struct ISession {
 impl ISession {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (session_commands::GET_TEMPERATURE_RANGE, None, "GetTemperatureRange"),
-            (session_commands::SET_MEASUREMENT_MODE, None, "SetMeasurementMode"),
-            (session_commands::GET_TEMPERATURE, Some(ISession::get_temperature_handler), "GetTemperature"),
+            (
+                session_commands::GET_TEMPERATURE_RANGE,
+                None,
+                "GetTemperatureRange",
+            ),
+            (
+                session_commands::SET_MEASUREMENT_MODE,
+                None,
+                "SetMeasurementMode",
+            ),
+            (
+                session_commands::GET_TEMPERATURE,
+                Some(ISession::get_temperature_handler),
+                "GetTemperature",
+            ),
         ]);
         Self {
             handlers,

@@ -15,11 +15,7 @@ pub fn fmul(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let neg_a = bit(insn, 48);
     let sat = bit(insn, 50);
 
-    let a = if neg_a {
-        tv.ir.fp_neg_32(src_a)
-    } else {
-        src_a
-    };
+    let a = if neg_a { tv.ir.fp_neg_32(src_a) } else { src_a };
 
     let mut result = tv.ir.fp_mul_32(a, src_b);
 

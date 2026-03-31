@@ -56,14 +56,15 @@ impl TimeManager {
             Box::new(move || {
                 let ticks_ns = ticks();
                 let current_time_s = ticks_ns / 1_000_000_000;
-                Ok(crate::hle::service::psc::time::common::SteadyClockTimePoint {
-                    time_point: current_time_s,
-                    clock_source_id: [0u8; 16], // Will be set during initialization
-                })
+                Ok(
+                    crate::hle::service::psc::time::common::SteadyClockTimePoint {
+                        time_point: current_time_s,
+                        clock_source_id: [0u8; 16], // Will be set during initialization
+                    },
+                )
             })
                 as Box<
-                    dyn Fn()
-                        -> Result<
+                    dyn Fn() -> Result<
                             crate::hle::service::psc::time::common::SteadyClockTimePoint,
                             crate::hle::result::ResultCode,
                         > + Send
@@ -113,7 +114,8 @@ impl TimeManager {
         // initialization when the TimeManager is set up.
         let local_system_clock_context_writer = LocalSystemClockContextWriter::new();
         let network_system_clock_context_writer = NetworkSystemClockContextWriter::new();
-        let ephemeral_network_clock_context_writer = EphemeralNetworkSystemClockContextWriter::new();
+        let ephemeral_network_clock_context_writer =
+            EphemeralNetworkSystemClockContextWriter::new();
 
         Self {
             standard_steady_clock,

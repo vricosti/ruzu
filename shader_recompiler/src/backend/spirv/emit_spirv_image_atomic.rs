@@ -6,8 +6,8 @@
 //!
 //! Handles atomic operations on images (surface atomics).
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::Word;
 
 /// Image atomic add (U32).
 pub fn emit_image_atomic_iadd_32(

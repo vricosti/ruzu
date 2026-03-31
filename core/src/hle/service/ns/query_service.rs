@@ -11,8 +11,16 @@ pub const IQUERY_SERVICE_COMMANDS: &[(u32, bool, &str)] = &[
     (2, false, "QueryPlayStatisticsByUserAccountId"),
     (3, false, "QueryPlayStatisticsByNetworkServiceAccountId"),
     (4, false, "QueryPlayStatisticsByApplicationId"),
-    (5, true, "QueryPlayStatisticsByApplicationIdAndUserAccountId"),
-    (6, false, "QueryPlayStatisticsByApplicationIdAndNetworkServiceAccountId"),
+    (
+        5,
+        true,
+        "QueryPlayStatisticsByApplicationIdAndUserAccountId",
+    ),
+    (
+        6,
+        false,
+        "QueryPlayStatisticsByApplicationIdAndNetworkServiceAccountId",
+    ),
     (7, false, "QueryLastPlayTimeV0"),
     (8, false, "QueryPlayEvent"),
     (9, false, "GetAvailablePlayEventRange"),
@@ -22,10 +30,18 @@ pub const IQUERY_SERVICE_COMMANDS: &[(u32, bool, &str)] = &[
     (13, false, "QueryApplicationPlayStatisticsForSystemV0"),
     (14, false, "QueryRecentlyPlayedApplication"),
     (15, false, "GetRecentlyPlayedApplicationUpdateEvent"),
-    (16, false, "QueryApplicationPlayStatisticsByUserAccountIdForSystemV0"),
+    (
+        16,
+        false,
+        "QueryApplicationPlayStatisticsByUserAccountIdForSystemV0",
+    ),
     (17, false, "QueryLastPlayTime"),
     (18, false, "QueryApplicationPlayStatisticsForSystem"),
-    (19, false, "QueryApplicationPlayStatisticsByUserAccountIdForSystem"),
+    (
+        19,
+        false,
+        "QueryApplicationPlayStatisticsByUserAccountIdForSystem",
+    ),
 ];
 
 pub fn query_play_statistics_by_application_id_and_user_account_id(

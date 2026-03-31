@@ -536,18 +536,14 @@ mod tests {
         let mut output = vec![0u8; 4096];
         let input = vec![0xABu8; 256];
         // 16x16 surface, 1 bpp, subrect at (0,0) extent 4x4
-        swizzle_subrect(
-            &mut output, &input, 1, 16, 16, 1, 0, 0, 4, 4, 0, 0, 4,
-        );
+        swizzle_subrect(&mut output, &input, 1, 16, 16, 1, 0, 0, 4, 4, 0, 0, 4);
     }
 
     #[test]
     fn unswizzle_subrect_does_not_panic() {
         let mut output = vec![0u8; 256];
         let input = vec![0xCDu8; 4096];
-        unswizzle_subrect(
-            &mut output, &input, 1, 16, 16, 1, 0, 0, 4, 4, 0, 0, 4,
-        );
+        unswizzle_subrect(&mut output, &input, 1, 16, 16, 1, 0, 0, 4, 4, 0, 0, 4);
     }
 
     #[test]

@@ -8,8 +8,8 @@
 //! both explicit workgroup layout (8/16-bit access) and fallback bit-extract
 //! patterns for sub-word access.
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::Word;
 
 /// Helper: compute the word-aligned pointer into shared memory.
 fn shared_word(ctx: &mut SpirvEmitContext, _offset: Word) -> Word {
@@ -20,12 +20,7 @@ fn shared_word(ctx: &mut SpirvEmitContext, _offset: Word) -> Word {
 }
 
 /// Helper: extract bit offset and count for sub-word access.
-fn extract_args(
-    ctx: &mut SpirvEmitContext,
-    offset: Word,
-    mask: u32,
-    count: u32,
-) -> (Word, Word) {
+fn extract_args(ctx: &mut SpirvEmitContext, offset: Word, mask: u32, count: u32) -> (Word, Word) {
     let three = ctx.constant_u32(3);
     let shift = ctx
         .builder
@@ -92,10 +87,7 @@ pub fn emit_load_shared_u64(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
     let lo = shared_word(ctx, offset);
     // For the high word, offset + 4 bytes (index + 1)
     let one = ctx.constant_u32(4);
-    let hi_offset = ctx
-        .builder
-        .i_add(ctx.u32_type, None, offset, one)
-        .unwrap();
+    let hi_offset = ctx.builder.i_add(ctx.u32_type, None, offset, one).unwrap();
     let hi = shared_word(ctx, hi_offset);
     ctx.builder
         .composite_construct(ctx.u32_vec2_type, None, vec![lo, hi])

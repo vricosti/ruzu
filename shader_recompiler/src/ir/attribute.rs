@@ -237,10 +237,18 @@ impl Attribute {
     pub fn from_raw(value: u64) -> Option<Self> {
         // Use a safe transmute approach: validate the value range
         // Generic range is contiguous 32..160
-        if (32..160).contains(&value) || value == 24 || value == 25 || value == 26
-            || value == 27 || (28..32).contains(&value)
-            || (160..232).contains(&value) || value == 232
-            || value == 255 || value == 256 || value == 257 || value == 258
+        if (32..160).contains(&value)
+            || value == 24
+            || value == 25
+            || value == 26
+            || value == 27
+            || (28..32).contains(&value)
+            || (160..232).contains(&value)
+            || value == 232
+            || value == 255
+            || value == 256
+            || value == 257
+            || value == 258
         {
             // Safety: all values verified to be valid discriminants
             Some(unsafe { std::mem::transmute::<u64, Attribute>(value) })

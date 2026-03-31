@@ -102,7 +102,12 @@ fn adjust_mip_size(size: u32, level: u32) -> u32 {
 }
 
 /// Port of `AdjustMipBlockSize<GOB_EXTENT>(num_tiles, block_size, level)`.
-fn adjust_mip_block_size_impl(gob_extent: u32, num_tiles: u32, mut block_size: u32, mut level: u32) -> u32 {
+fn adjust_mip_block_size_impl(
+    gob_extent: u32,
+    num_tiles: u32,
+    mut block_size: u32,
+    mut level: u32,
+) -> u32 {
     loop {
         while block_size > 0 && num_tiles <= (1u32 << (block_size - 1)) * gob_extent {
             block_size -= 1;
@@ -144,7 +149,12 @@ fn adjust_tile_size_3d(size: Extent3D, tile_size: Extent2D) -> Extent3D {
 }
 
 /// Port of `AdjustMipBlockSize(Extent3D, Extent3D, u32, u32)`.
-fn adjust_mip_block_size_3d(num_tiles: Extent3D, block_size: Extent3D, level: u32, num_levels: u32) -> Extent3D {
+fn adjust_mip_block_size_3d(
+    num_tiles: Extent3D,
+    block_size: Extent3D,
+    level: u32,
+    num_levels: u32,
+) -> Extent3D {
     Extent3D {
         width: adjust_mip_block_size_impl(GOB_SIZE_X, num_tiles.width, block_size.width, level),
         height: adjust_mip_block_size_impl(GOB_SIZE_Y, num_tiles.height, block_size.height, level),
@@ -166,7 +176,12 @@ fn stride_alignment_gob(num_tiles: Extent3D, block: Extent3D, gob: Extent2D, bpp
 }
 
 /// Port of `StrideAlignment(Extent3D, Extent3D, u32, u32)`.
-fn stride_alignment(num_tiles: Extent3D, block: Extent3D, bpp_log2: u32, tile_width_spacing: u32) -> u32 {
+fn stride_alignment(
+    num_tiles: Extent3D,
+    block: Extent3D,
+    bpp_log2: u32,
+    tile_width_spacing: u32,
+) -> u32 {
     let g = gob_size(bpp_log2, block.height, tile_width_spacing);
     stride_alignment_gob(num_tiles, block, g, bpp_log2)
 }
@@ -197,7 +212,8 @@ fn block_linear_aligned_size(info: &ImageInfo, level: u32) -> Extent3D {
     };
     let bpp_log2 = bytes_per_block_log2_format(info.format);
     let alignment = stride_alignment(num_tiles, info.block(), bpp_log2, info.tile_width_spacing);
-    let mip_block = adjust_mip_block_size_3d(num_tiles, info.block(), 0, info.resources.levels as u32);
+    let mip_block =
+        adjust_mip_block_size_3d(num_tiles, info.block(), 0, info.resources.levels as u32);
     Extent3D {
         width: align_up_log2(num_tiles.width, alignment),
         height: align_up_log2(num_tiles.height, GOB_SIZE_Y_SHIFT + mip_block.height),
@@ -226,8 +242,14 @@ fn default_block_size(format: PixelFormat) -> Extent2D {
 /// Port of `NumLevelBlocks(info, level)`.
 fn num_level_blocks(info: &LevelInfo, level: u32) -> Extent3D {
     Extent3D {
-        width: div_ceil(adjust_mip_size(info.size.width, level), info.tile_size.width) << info.bpp_log2,
-        height: div_ceil(adjust_mip_size(info.size.height, level), info.tile_size.height),
+        width: div_ceil(
+            adjust_mip_size(info.size.width, level),
+            info.tile_size.width,
+        ) << info.bpp_log2,
+        height: div_ceil(
+            adjust_mip_size(info.size.height, level),
+            info.tile_size.height,
+        ),
         depth: adjust_mip_size(info.size.depth, level),
     }
 }
@@ -532,12 +554,8 @@ pub fn calculate_level_stride_alignment(info: &ImageInfo, level: u32) -> u32 {
     let tile_size = default_block_size(info.format);
     let level_size = adjust_mip_size_3d(info.size, level);
     let num_tiles = adjust_tile_size_3d(level_size, tile_size);
-    let block = adjust_mip_block_size_3d(
-        num_tiles,
-        info.block(),
-        level,
-        info.resources.levels as u32,
-    );
+    let block =
+        adjust_mip_block_size_3d(num_tiles, info.block(), level, info.resources.levels as u32);
     let bpp_log2 = bytes_per_block_log2_format(info.format);
     stride_alignment(num_tiles, block, bpp_log2, info.tile_width_spacing)
 }
@@ -723,8 +741,7 @@ pub fn convert_image(
             // gated behind Settings::values.astc_recompression. Those paths
             // are not yet implemented (requires Settings system and BCN compressor).
             let input_slice = &input[input_offset..];
-            let depth_layers = copy.image_subresource.num_layers as u32
-                * copy.image_extent.depth;
+            let depth_layers = copy.image_subresource.num_layers as u32 * copy.image_extent.depth;
             crate::textures::astc::decompress(
                 input_slice,
                 copy.image_extent.width,
@@ -1000,7 +1017,10 @@ fn resolve_overlap_right_address_3d(
         return None;
     }
     Some(SubresourceExtent {
-        levels: new_info.resources.levels.max(info.resources.levels + base.level),
+        levels: new_info
+            .resources
+            .levels
+            .max(info.resources.levels + base.level),
         layers: 1,
     })
 }
@@ -1036,8 +1056,14 @@ fn resolve_overlap_right_address_2d(
         return None;
     }
     Some(SubresourceExtent {
-        levels: new_info.resources.levels.max(info.resources.levels + base.level),
-        layers: new_info.resources.layers.max(info.resources.layers + base.layer),
+        levels: new_info
+            .resources
+            .levels
+            .max(info.resources.levels + base.level),
+        layers: new_info
+            .resources
+            .layers
+            .max(info.resources.layers + base.layer),
     })
 }
 
@@ -1108,7 +1134,12 @@ pub fn resolve_overlap(
     if !is_layer_stride_compatible(new_info, &overlap.info) {
         return None;
     }
-    if !surface::is_view_compatible(overlap.info.format, new_info.format, broken_views, native_bgr) {
+    if !surface::is_view_compatible(
+        overlap.info.format,
+        new_info.format,
+        broken_views,
+        native_bgr,
+    ) {
         return None;
     }
     if gpu_addr == overlap.gpu_addr {
@@ -1171,9 +1202,7 @@ pub fn find_subresource(
     if existing.image_type != candidate.image_type {
         return None;
     }
-    if !options.contains(RelaxedOptions::SAMPLES)
-        && existing.num_samples != candidate.num_samples
-    {
+    if !options.contains(RelaxedOptions::SAMPLES) && existing.num_samples != candidate.num_samples {
         return None;
     }
     if existing.resources.levels < candidate.resources.levels + base.level {
@@ -1203,7 +1232,15 @@ pub fn is_subresource(
     broken_views: bool,
     native_bgr: bool,
 ) -> bool {
-    find_subresource(candidate, image, candidate_addr, options, broken_views, native_bgr).is_some()
+    find_subresource(
+        candidate,
+        image,
+        candidate_addr,
+        options,
+        broken_views,
+        native_bgr,
+    )
+    .is_some()
 }
 
 /// Port of `IsSubCopy`.

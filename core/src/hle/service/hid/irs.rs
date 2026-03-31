@@ -27,22 +27,70 @@ impl Irs {
         let handlers = build_handler_map(&[
             (302, Some(Self::stub_success_handler), "ActivateIrsensor"),
             (303, Some(Self::stub_success_handler), "DeactivateIrsensor"),
-            (304, Some(Self::stub_success_handler), "GetIrsensorSharedMemoryHandle"),
+            (
+                304,
+                Some(Self::stub_success_handler),
+                "GetIrsensorSharedMemoryHandle",
+            ),
             (305, Some(Self::stub_success_handler), "StopImageProcessor"),
             (306, Some(Self::stub_success_handler), "RunMomentProcessor"),
-            (307, Some(Self::stub_success_handler), "RunClusteringProcessor"),
-            (308, Some(Self::stub_success_handler), "RunImageTransferProcessor"),
-            (309, Some(Self::stub_success_handler), "GetImageTransferProcessorState"),
-            (310, Some(Self::stub_success_handler), "RunTeraPluginProcessor"),
-            (311, Some(Self::stub_success_handler), "GetNpadIrCameraHandle"),
-            (312, Some(Self::stub_success_handler), "RunPointingProcessor"),
-            (313, Some(Self::stub_success_handler), "SuspendImageProcessor"),
-            (314, Some(Self::stub_success_handler), "CheckFirmwareVersion"),
+            (
+                307,
+                Some(Self::stub_success_handler),
+                "RunClusteringProcessor",
+            ),
+            (
+                308,
+                Some(Self::stub_success_handler),
+                "RunImageTransferProcessor",
+            ),
+            (
+                309,
+                Some(Self::stub_success_handler),
+                "GetImageTransferProcessorState",
+            ),
+            (
+                310,
+                Some(Self::stub_success_handler),
+                "RunTeraPluginProcessor",
+            ),
+            (
+                311,
+                Some(Self::stub_success_handler),
+                "GetNpadIrCameraHandle",
+            ),
+            (
+                312,
+                Some(Self::stub_success_handler),
+                "RunPointingProcessor",
+            ),
+            (
+                313,
+                Some(Self::stub_success_handler),
+                "SuspendImageProcessor",
+            ),
+            (
+                314,
+                Some(Self::stub_success_handler),
+                "CheckFirmwareVersion",
+            ),
             (315, Some(Self::stub_success_handler), "SetFunctionLevel"),
-            (316, Some(Self::stub_success_handler), "RunImageTransferExProcessor"),
+            (
+                316,
+                Some(Self::stub_success_handler),
+                "RunImageTransferExProcessor",
+            ),
             (317, Some(Self::stub_success_handler), "RunIrLedProcessor"),
-            (318, Some(Self::stub_success_handler), "StopImageProcessorAsync"),
-            (319, Some(Self::stub_success_handler), "ActivateIrsensorWithFunctionLevel"),
+            (
+                318,
+                Some(Self::stub_success_handler),
+                "StopImageProcessorAsync",
+            ),
+            (
+                319,
+                Some(Self::stub_success_handler),
+                "ActivateIrsensorWithFunctionLevel",
+            ),
         ]);
 
         Self {
@@ -92,10 +140,26 @@ impl IrsSys {
 
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (500, Some(Self::stub_success_handler), "SetAppletResourceUserId"),
-            (501, Some(Self::stub_success_handler), "RegisterAppletResourceUserId"),
-            (502, Some(Self::stub_success_handler), "UnregisterAppletResourceUserId"),
-            (503, Some(Self::stub_success_handler), "EnableAppletToGetInput"),
+            (
+                500,
+                Some(Self::stub_success_handler),
+                "SetAppletResourceUserId",
+            ),
+            (
+                501,
+                Some(Self::stub_success_handler),
+                "RegisterAppletResourceUserId",
+            ),
+            (
+                502,
+                Some(Self::stub_success_handler),
+                "UnregisterAppletResourceUserId",
+            ),
+            (
+                503,
+                Some(Self::stub_success_handler),
+                "EnableAppletToGetInput",
+            ),
         ]);
 
         Self {

@@ -66,32 +66,24 @@ impl BisFactory {
     /// Corresponds to upstream `BISFactory::BISFactory`.
     pub fn new(nand_root: VirtualDir, load_root: VirtualDir, dump_root: VirtualDir) -> Self {
         // Initialize system NAND registered cache.
-        let sysnand_cache = get_or_create_directory_relative(
-            nand_root.as_ref(),
-            "/system/Contents/registered",
-        )
-        .map(|dir| Box::new(RegisteredCache::new(dir)));
+        let sysnand_cache =
+            get_or_create_directory_relative(nand_root.as_ref(), "/system/Contents/registered")
+                .map(|dir| Box::new(RegisteredCache::new(dir)));
 
         // Initialize user NAND registered cache.
-        let usrnand_cache = get_or_create_directory_relative(
-            nand_root.as_ref(),
-            "/user/Contents/registered",
-        )
-        .map(|dir| Box::new(RegisteredCache::new(dir)));
+        let usrnand_cache =
+            get_or_create_directory_relative(nand_root.as_ref(), "/user/Contents/registered")
+                .map(|dir| Box::new(RegisteredCache::new(dir)));
 
         // Initialize system NAND placeholder cache.
-        let sysnand_placeholder = get_or_create_directory_relative(
-            nand_root.as_ref(),
-            "/system/Contents/placehld",
-        )
-        .map(|dir| Box::new(PlaceholderCache::new(dir)));
+        let sysnand_placeholder =
+            get_or_create_directory_relative(nand_root.as_ref(), "/system/Contents/placehld")
+                .map(|dir| Box::new(PlaceholderCache::new(dir)));
 
         // Initialize user NAND placeholder cache.
-        let usrnand_placeholder = get_or_create_directory_relative(
-            nand_root.as_ref(),
-            "/user/Contents/placehld",
-        )
-        .map(|dir| Box::new(PlaceholderCache::new(dir)));
+        let usrnand_placeholder =
+            get_or_create_directory_relative(nand_root.as_ref(), "/user/Contents/placehld")
+                .map(|dir| Box::new(PlaceholderCache::new(dir)));
 
         Self {
             nand_root,
@@ -156,10 +148,7 @@ impl BisFactory {
         if title_id == 0 || (title_id & 0xFFF) == 0x800 {
             return None;
         }
-        get_or_create_directory_relative(
-            self.load_root.as_ref(),
-            &format!("/{:016X}", title_id),
-        )
+        get_or_create_directory_relative(self.load_root.as_ref(), &format!("/{:016X}", title_id))
     }
 
     /// Get the modification dump root for a given title.
@@ -169,10 +158,7 @@ impl BisFactory {
         if title_id == 0 {
             return None;
         }
-        get_or_create_directory_relative(
-            self.dump_root.as_ref(),
-            &format!("/{:016X}", title_id),
-        )
+        get_or_create_directory_relative(self.dump_root.as_ref(), &format!("/{:016X}", title_id))
     }
 
     /// Open a BIS partition by ID.
@@ -211,7 +197,8 @@ impl BisFactory {
         use common::fs::path_util::{get_ruzu_path_string, RuzuPath};
 
         let nand_dir_path = get_ruzu_path_string(RuzuPath::NANDDir);
-        let nand_dir = file_system.open_directory(&nand_dir_path, super::fs_filesystem::OpenMode::READ)?;
+        let nand_dir =
+            file_system.open_directory(&nand_dir_path, super::fs_filesystem::OpenMode::READ)?;
 
         let mut pdm = PartitionDataManager::new(&nand_dir);
 
@@ -220,17 +207,14 @@ impl BisFactory {
         keys_guard.populate_from_partition_data(&mut pdm);
 
         match id {
-            BisPartitionId::CalibrationBinary => {
-                pdm.get_decrypted_prodinfo().cloned()
-            }
+            BisPartitionId::CalibrationBinary => pdm.get_decrypted_prodinfo().cloned(),
             BisPartitionId::BootConfigAndPackage2Part1
             | BisPartitionId::BootConfigAndPackage2Part2
             | BisPartitionId::BootConfigAndPackage2Part3
             | BisPartitionId::BootConfigAndPackage2Part4
             | BisPartitionId::BootConfigAndPackage2Part5
             | BisPartitionId::BootConfigAndPackage2Part6 => {
-                let new_id = (id as u8)
-                    - (BisPartitionId::BootConfigAndPackage2Part1 as u8)
+                let new_id = (id as u8) - (BisPartitionId::BootConfigAndPackage2Part1 as u8)
                     + (Package2Type::NormalMain as u8);
                 // Safety: new_id is within Package2Type range (0..6).
                 let pkg_type: Package2Type = unsafe { std::mem::transmute(new_id as usize) };
@@ -372,7 +356,9 @@ mod tests {
         // Title ID 0 should return None.
         assert!(factory.get_modification_load_root(0).is_none());
         // Update title IDs (& 0xFFF == 0x800) should return None.
-        assert!(factory.get_modification_load_root(0x0100000000000800).is_none());
+        assert!(factory
+            .get_modification_load_root(0x0100000000000800)
+            .is_none());
     }
 
     #[test]

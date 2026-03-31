@@ -7,12 +7,52 @@ use std::time::SystemTime;
 
 // Time zone strings — matches upstream constexpr array exactly
 const TIMEZONES: [&str; 46] = [
-    "GMT",       "GMT",       "CET",  "CST6CDT", "Cuba",    "EET",    "Egypt",     "Eire",
-    "EST",       "EST5EDT",   "GB",   "GB-Eire", "GMT",     "GMT+0",  "GMT-0",     "GMT0",
-    "Greenwich", "Hongkong",  "HST",  "Iceland", "Iran",    "Israel", "Jamaica",   "Japan",
-    "Kwajalein", "Libya",     "MET",  "MST",     "MST7MDT", "Navajo", "NZ",        "NZ-CHAT",
-    "Poland",    "Portugal",  "PRC",  "PST8PDT", "ROC",     "ROK",    "Singapore", "Turkey",
-    "UCT",       "Universal", "UTC",  "W-SU",    "WET",     "Zulu",
+    "GMT",
+    "GMT",
+    "CET",
+    "CST6CDT",
+    "Cuba",
+    "EET",
+    "Egypt",
+    "Eire",
+    "EST",
+    "EST5EDT",
+    "GB",
+    "GB-Eire",
+    "GMT",
+    "GMT+0",
+    "GMT-0",
+    "GMT0",
+    "Greenwich",
+    "Hongkong",
+    "HST",
+    "Iceland",
+    "Iran",
+    "Israel",
+    "Jamaica",
+    "Japan",
+    "Kwajalein",
+    "Libya",
+    "MET",
+    "MST",
+    "MST7MDT",
+    "Navajo",
+    "NZ",
+    "NZ-CHAT",
+    "Poland",
+    "Portugal",
+    "PRC",
+    "PST8PDT",
+    "ROC",
+    "ROK",
+    "Singapore",
+    "Turkey",
+    "UCT",
+    "Universal",
+    "UTC",
+    "W-SU",
+    "WET",
+    "Zulu",
 ];
 
 pub fn get_time_zone_strings() -> &'static [&'static str; 46] {
@@ -25,20 +65,14 @@ pub fn get_default_time_zone() -> String {
 
 /// Converts a broken-down time spec to cumulative seconds.
 /// Results are not comparable to seconds since Epoch — matching upstream.
-fn tm_spec_to_seconds(
-    tm_year: i32,
-    tm_yday: i32,
-    tm_hour: i32,
-    tm_min: i32,
-    tm_sec: i32,
-) -> i64 {
+fn tm_spec_to_seconds(tm_year: i32, tm_yday: i32, tm_hour: i32, tm_min: i32, tm_sec: i32) -> i64 {
     let year = tm_year - 1; // Years up to now
     let leap_years = year / 4 - year / 100;
     let mut cumulative = tm_year as i64;
     cumulative = cumulative * 365 + leap_years as i64 + tm_yday as i64; // Years to days
-    cumulative = cumulative * 24 + tm_hour as i64;  // Days to hours
-    cumulative = cumulative * 60 + tm_min as i64;   // Hours to minutes
-    cumulative = cumulative * 60 + tm_sec as i64;   // Minutes to seconds
+    cumulative = cumulative * 24 + tm_hour as i64; // Days to hours
+    cumulative = cumulative * 60 + tm_min as i64; // Hours to minutes
+    cumulative = cumulative * 60 + tm_sec as i64; // Minutes to seconds
     cumulative
 }
 
@@ -123,7 +157,10 @@ pub fn find_system_time_zone() -> String {
         if let Some(&tz) = OFF_TIMEZONES.get(&tz_index) {
             return tz.to_string();
         }
-        log::error!("Time zone {} not handled, defaulting to hour offset.", tz_index);
+        log::error!(
+            "Time zone {} not handled, defaulting to hour offset.",
+            tz_index
+        );
     }
 
     // For some reason the Etc/GMT times are reversed. GMT+6 contains -21600 as its offset,

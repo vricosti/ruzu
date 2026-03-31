@@ -190,8 +190,7 @@ impl OutputParcel {
         }
 
         let data_start = header.data_offset as usize;
-        output[data_start..data_start + self.data_buffer.len()]
-            .copy_from_slice(&self.data_buffer);
+        output[data_start..data_start + self.data_buffer.len()].copy_from_slice(&self.data_buffer);
 
         let obj_start = header.objects_offset as usize;
         output[obj_start..obj_start + self.object_buffer.len()]

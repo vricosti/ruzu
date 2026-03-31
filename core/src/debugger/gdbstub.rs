@@ -37,10 +37,7 @@ impl GdbStub {
     /// Create a new GDB stub.
     ///
     /// Corresponds to upstream `GDBStub::GDBStub`.
-    pub fn new(
-        _backend: &dyn DebuggerBackend,
-        is_64bit: bool,
-    ) -> Self {
+    pub fn new(_backend: &dyn DebuggerBackend, is_64bit: bool) -> Self {
         let arch: Box<dyn GdbStubArch> = if is_64bit {
             Box::new(GdbStubA64)
         } else {
@@ -80,11 +77,7 @@ impl DebuggerFrontend for GdbStub {
         // watch_type: 2=write, 3=read, 4=access
         let ctx = ThreadContext::default();
         let reply = self.arch.thread_status(&ctx, thread_id, GDB_STUB_SIGTRAP);
-        log::debug!(
-            "GDB watchpoint reply (type {}): {}",
-            watch_type,
-            reply
-        );
+        log::debug!("GDB watchpoint reply (type {}): {}", watch_type, reply);
     }
 
     fn client_data(&mut self, data: &[u8]) -> Vec<DebuggerAction> {
@@ -145,8 +138,8 @@ impl GdbStub {
         let command_body: Vec<u8> = self.current_command[1..end_pos].to_vec();
 
         // Extract and validate checksum
-        let checksum_str = std::str::from_utf8(&self.current_command[end_pos + 1..end_pos + 3])
-            .unwrap_or("00");
+        let checksum_str =
+            std::str::from_utf8(&self.current_command[end_pos + 1..end_pos + 3]).unwrap_or("00");
         let received_checksum = u8::from_str_radix(checksum_str, 16).unwrap_or(0);
         let computed_checksum = Self::calculate_checksum(&command_body);
 

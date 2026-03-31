@@ -82,7 +82,8 @@ impl PartialOrd for AlbumFileDateTime {
 
 impl Ord for AlbumFileDateTime {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.year.cmp(&other.year)
+        self.year
+            .cmp(&other.year)
             .then(self.month.cmp(&other.month))
             .then(self.day.cmp(&other.day))
             .then(self.hour.cmp(&other.hour))

@@ -22,8 +22,15 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 /// Sends a light sync request.
 ///
 /// Upstream: Gets KLightClientSession from handle table, calls SendSyncRequest(args).
-pub fn send_sync_request_light(system: &System, session_handle: Handle, args: &mut [u32; 7]) -> ResultCode {
-    log::trace!("svc::SendSyncRequestLight called, handle=0x{:08X}", session_handle);
+pub fn send_sync_request_light(
+    system: &System,
+    session_handle: Handle,
+    args: &mut [u32; 7],
+) -> ResultCode {
+    log::trace!(
+        "svc::SendSyncRequestLight called, handle=0x{:08X}",
+        session_handle
+    );
 
     // Get the light client session from its handle.
     // Upstream: GetCurrentProcess(kernel).GetHandleTable().GetObject<KLightClientSession>(session_handle)
@@ -53,8 +60,15 @@ pub fn send_sync_request_light(system: &System, session_handle: Handle, args: &m
 /// Replies and receives on a light session.
 ///
 /// Upstream: Gets KLightServerSession from handle table, calls ReplyAndReceive(args).
-pub fn reply_and_receive_light(system: &System, session_handle: Handle, args: &mut [u32; 7]) -> ResultCode {
-    log::trace!("svc::ReplyAndReceiveLight called, handle=0x{:08X}", session_handle);
+pub fn reply_and_receive_light(
+    system: &System,
+    session_handle: Handle,
+    args: &mut [u32; 7],
+) -> ResultCode {
+    log::trace!(
+        "svc::ReplyAndReceiveLight called, handle=0x{:08X}",
+        session_handle
+    );
 
     // Get the light server session from its handle.
     // Upstream: GetCurrentProcess(kernel).GetHandleTable().GetObject<KLightServerSession>(session_handle)

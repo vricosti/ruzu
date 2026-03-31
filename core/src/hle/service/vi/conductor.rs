@@ -101,7 +101,12 @@ impl Conductor {
         let c = VSYNC_COUNT.fetch_add(1, Ordering::Relaxed);
         let total_events: usize = self.vsync_managers.values().map(|m| m.event_count()).sum();
         if c < 5 || c % 300 == 0 {
-            log::info!("Conductor::process_vsync #{} managers={} total_events={}", c, self.vsync_managers.len(), total_events);
+            log::info!(
+                "Conductor::process_vsync #{} managers={} total_events={}",
+                c,
+                self.vsync_managers.len(),
+                total_events
+            );
         }
         for (_display_id, manager) in self.vsync_managers.iter() {
             manager.signal_vsync();
@@ -122,10 +127,10 @@ impl Drop for Conductor {
         // Unschedule the CoreTiming event.
         if let Some(ref event) = self.event {
             let core_timing = self.system.get().core_timing();
-            core_timing.lock().unwrap().unschedule_event(
-                event,
-                core_timing::UnscheduleEventType::NoWait,
-            );
+            core_timing
+                .lock()
+                .unwrap()
+                .unschedule_event(event, core_timing::UnscheduleEventType::NoWait);
             log::info!("Conductor: vsync timer stopped");
         }
     }

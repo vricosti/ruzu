@@ -25,18 +25,16 @@ pub struct SchedulerCallbacks {
 /// DisableScheduling callback matching upstream `KScheduler::DisableScheduling(kernel)`.
 /// Increments the current thread's disable_dispatch_count via the thread-local.
 fn default_disable_scheduling() {
-    if let Some(thread) = super::kernel::get_current_thread_pointer() {
-        let mut t = thread.lock().unwrap();
+    super::kernel::with_current_thread_fast_mut(|t| {
         debug_assert!(t.get_disable_dispatch_count() >= 0);
         t.disable_dispatch();
-    }
+    });
 }
 
 /// EnableScheduling callback matching upstream `KScheduler::EnableScheduling(kernel, cores_needing_scheduling)`.
 /// Decrements dispatch count. If it reaches 0, triggers rescheduling.
 fn default_enable_scheduling(_cores_needing_scheduling: u64) {
-    if let Some(thread) = super::kernel::get_current_thread_pointer() {
-        let mut t = thread.lock().unwrap();
+    super::kernel::with_current_thread_fast_mut(|t| {
         debug_assert!(t.get_disable_dispatch_count() >= 1);
 
         // Upstream: if no scheduler or phantom mode, use HLE reschedule path.
@@ -54,7 +52,7 @@ fn default_enable_scheduling(_cores_needing_scheduling: u64) {
             // KScheduler::enable_scheduling_with_scheduler when a scheduler is available.
             t.enable_dispatch();
         }
-    }
+    });
 }
 
 /// UpdateHighestPriorityThreads callback matching upstream
@@ -124,13 +122,14 @@ impl KAbstractSchedulerLock {
         if owner == 0 {
             return false;
         }
-        // Compare with the current thread's unique ID (thread_id stored as u64).
-        if let Some(current) = super::kernel::get_current_thread_pointer() {
-            let current_id = current.lock().unwrap().get_thread_id();
+        // Compare against the thread-local current thread id cache.
+        // Upstream compares a thread-local KThread* directly and does not
+        // relock the current thread object here.
+        if let Some(current_id) = super::kernel::get_current_thread_id_fast() {
             owner == current_id
+        } else if let Some(current_thread) = super::kernel::get_current_emu_thread() {
+            owner == current_thread.lock().unwrap().get_thread_id()
         } else {
-            // No current thread set — fall back to lock_count check
-            // for compatibility during initialization.
             self.m_lock_count.get() > 0
         }
     }
@@ -149,9 +148,12 @@ impl KAbstractSchedulerLock {
 
             // Upstream: m_owner_thread = GetCurrentThreadPointer(m_kernel)
             // Store the current thread's ID as owner marker.
-            let owner_id = super::kernel::get_current_thread_pointer()
-                .map(|t| t.lock().unwrap().get_thread_id())
-                .unwrap_or(1); // Use 1 as fallback during init
+            let owner_id = super::kernel::get_current_thread_id_fast()
+                .or_else(|| {
+                    super::kernel::get_current_emu_thread()
+                        .map(|thread| thread.lock().unwrap().get_thread_id())
+                })
+                .unwrap_or(1);
             self.m_owner_thread.store(owner_id, Ordering::Relaxed);
         }
 
@@ -170,12 +172,10 @@ impl KAbstractSchedulerLock {
         if new_count == 0 {
             std::sync::atomic::fence(Ordering::SeqCst);
 
-            let cores_needing_scheduling =
-                (self.callbacks.update_highest_priority_threads)();
+            let cores_needing_scheduling = (self.callbacks.update_highest_priority_threads)();
 
             self.m_owner_thread.store(0, Ordering::Relaxed);
             self.m_spin_lock.unlock();
-
             (self.callbacks.enable_scheduling)(cores_needing_scheduling);
         }
     }

@@ -78,25 +78,101 @@ pub struct PSM {
 impl PSM {
     pub fn new(system: crate::core::SystemRef) -> Self {
         let handlers = build_handler_map(&[
-            (commands::GET_BATTERY_CHARGE_PERCENTAGE, Some(PSM::get_battery_charge_percentage_handler), "GetBatteryChargePercentage"),
-            (commands::GET_CHARGER_TYPE, Some(PSM::get_charger_type_handler), "GetChargerType"),
-            (commands::ENABLE_BATTERY_CHARGING, None, "EnableBatteryCharging"),
-            (commands::DISABLE_BATTERY_CHARGING, None, "DisableBatteryCharging"),
-            (commands::IS_BATTERY_CHARGING_ENABLED, None, "IsBatteryChargingEnabled"),
-            (commands::ACQUIRE_CONTROLLER_POWER_SUPPLY, None, "AcquireControllerPowerSupply"),
-            (commands::RELEASE_CONTROLLER_POWER_SUPPLY, None, "ReleaseControllerPowerSupply"),
-            (commands::OPEN_SESSION, Some(PSM::open_session_handler), "OpenSession"),
-            (commands::ENABLE_ENOUGH_POWER_CHARGE_EMULATION, None, "EnableEnoughPowerChargeEmulation"),
-            (commands::DISABLE_ENOUGH_POWER_CHARGE_EMULATION, None, "DisableEnoughPowerChargeEmulation"),
-            (commands::ENABLE_FAST_BATTERY_CHARGING, None, "EnableFastBatteryCharging"),
-            (commands::DISABLE_FAST_BATTERY_CHARGING, None, "DisableFastBatteryCharging"),
-            (commands::GET_BATTERY_VOLTAGE_STATE, None, "GetBatteryVoltageState"),
-            (commands::GET_RAW_BATTERY_CHARGE_PERCENTAGE, None, "GetRawBatteryChargePercentage"),
-            (commands::IS_ENOUGH_POWER_SUPPLIED, None, "IsEnoughPowerSupplied"),
-            (commands::GET_BATTERY_AGE_PERCENTAGE, None, "GetBatteryAgePercentage"),
-            (commands::GET_BATTERY_CHARGE_INFO_EVENT, None, "GetBatteryChargeInfoEvent"),
-            (commands::GET_BATTERY_CHARGE_INFO_FIELDS, None, "GetBatteryChargeInfoFields"),
-            (commands::GET_BATTERY_CHARGE_CALIBRATED_EVENT, None, "GetBatteryChargeCalibratedEvent"),
+            (
+                commands::GET_BATTERY_CHARGE_PERCENTAGE,
+                Some(PSM::get_battery_charge_percentage_handler),
+                "GetBatteryChargePercentage",
+            ),
+            (
+                commands::GET_CHARGER_TYPE,
+                Some(PSM::get_charger_type_handler),
+                "GetChargerType",
+            ),
+            (
+                commands::ENABLE_BATTERY_CHARGING,
+                None,
+                "EnableBatteryCharging",
+            ),
+            (
+                commands::DISABLE_BATTERY_CHARGING,
+                None,
+                "DisableBatteryCharging",
+            ),
+            (
+                commands::IS_BATTERY_CHARGING_ENABLED,
+                None,
+                "IsBatteryChargingEnabled",
+            ),
+            (
+                commands::ACQUIRE_CONTROLLER_POWER_SUPPLY,
+                None,
+                "AcquireControllerPowerSupply",
+            ),
+            (
+                commands::RELEASE_CONTROLLER_POWER_SUPPLY,
+                None,
+                "ReleaseControllerPowerSupply",
+            ),
+            (
+                commands::OPEN_SESSION,
+                Some(PSM::open_session_handler),
+                "OpenSession",
+            ),
+            (
+                commands::ENABLE_ENOUGH_POWER_CHARGE_EMULATION,
+                None,
+                "EnableEnoughPowerChargeEmulation",
+            ),
+            (
+                commands::DISABLE_ENOUGH_POWER_CHARGE_EMULATION,
+                None,
+                "DisableEnoughPowerChargeEmulation",
+            ),
+            (
+                commands::ENABLE_FAST_BATTERY_CHARGING,
+                None,
+                "EnableFastBatteryCharging",
+            ),
+            (
+                commands::DISABLE_FAST_BATTERY_CHARGING,
+                None,
+                "DisableFastBatteryCharging",
+            ),
+            (
+                commands::GET_BATTERY_VOLTAGE_STATE,
+                None,
+                "GetBatteryVoltageState",
+            ),
+            (
+                commands::GET_RAW_BATTERY_CHARGE_PERCENTAGE,
+                None,
+                "GetRawBatteryChargePercentage",
+            ),
+            (
+                commands::IS_ENOUGH_POWER_SUPPLIED,
+                None,
+                "IsEnoughPowerSupplied",
+            ),
+            (
+                commands::GET_BATTERY_AGE_PERCENTAGE,
+                None,
+                "GetBatteryAgePercentage",
+            ),
+            (
+                commands::GET_BATTERY_CHARGE_INFO_EVENT,
+                None,
+                "GetBatteryChargeInfoEvent",
+            ),
+            (
+                commands::GET_BATTERY_CHARGE_INFO_FIELDS,
+                None,
+                "GetBatteryChargeInfoFields",
+            ),
+            (
+                commands::GET_BATTERY_CHARGE_CALIBRATED_EVENT,
+                None,
+                "GetBatteryChargeCalibratedEvent",
+            ),
         ]);
         Self {
             system,
@@ -133,7 +209,10 @@ impl PSM {
 
     // --- Handler bridge functions ---
 
-    fn get_battery_charge_percentage_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_battery_charge_percentage_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const PSM) };
         let percentage = service.get_battery_charge_percentage();
 
@@ -202,14 +281,36 @@ pub struct IPsmSession {
 
 impl IPsmSession {
     pub fn new() -> Self {
-        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new("IPsmSession".to_string());
-        let state_change_event_handle = service_context.create_event("IPsmSession::state_change_event".to_string());
+        let mut service_context =
+            crate::hle::service::kernel_helpers::ServiceContext::new("IPsmSession".to_string());
+        let state_change_event_handle =
+            service_context.create_event("IPsmSession::state_change_event".to_string());
         let handlers = build_handler_map(&[
-            (session_commands::BIND_STATE_CHANGE_EVENT, Some(IPsmSession::bind_state_change_event_handler), "BindStateChangeEvent"),
-            (session_commands::UNBIND_STATE_CHANGE_EVENT, Some(IPsmSession::unbind_state_change_event_handler), "UnbindStateChangeEvent"),
-            (session_commands::SET_CHARGER_TYPE_CHANGE_EVENT_ENABLED, Some(IPsmSession::set_charger_type_change_event_enabled_handler), "SetChargerTypeChangeEventEnabled"),
-            (session_commands::SET_POWER_SUPPLY_CHANGE_EVENT_ENABLED, Some(IPsmSession::set_power_supply_change_event_enabled_handler), "SetPowerSupplyChangeEventEnabled"),
-            (session_commands::SET_BATTERY_VOLTAGE_STATE_CHANGE_EVENT_ENABLED, Some(IPsmSession::set_battery_voltage_state_change_event_enabled_handler), "SetBatteryVoltageStateChangeEventEnabled"),
+            (
+                session_commands::BIND_STATE_CHANGE_EVENT,
+                Some(IPsmSession::bind_state_change_event_handler),
+                "BindStateChangeEvent",
+            ),
+            (
+                session_commands::UNBIND_STATE_CHANGE_EVENT,
+                Some(IPsmSession::unbind_state_change_event_handler),
+                "UnbindStateChangeEvent",
+            ),
+            (
+                session_commands::SET_CHARGER_TYPE_CHANGE_EVENT_ENABLED,
+                Some(IPsmSession::set_charger_type_change_event_enabled_handler),
+                "SetChargerTypeChangeEventEnabled",
+            ),
+            (
+                session_commands::SET_POWER_SUPPLY_CHANGE_EVENT_ENABLED,
+                Some(IPsmSession::set_power_supply_change_event_enabled_handler),
+                "SetPowerSupplyChangeEventEnabled",
+            ),
+            (
+                session_commands::SET_BATTERY_VOLTAGE_STATE_CHANGE_EVENT_ENABLED,
+                Some(IPsmSession::set_battery_voltage_state_change_event_enabled_handler),
+                "SetBatteryVoltageStateChangeEventEnabled",
+            ),
         ]);
         Self {
             should_signal_charger_type: AtomicBool::new(false),
@@ -248,7 +349,8 @@ impl IPsmSession {
             "IPsmSession::set_charger_type_change_event_enabled called, state={}",
             state
         );
-        self.should_signal_charger_type.store(state, Ordering::Relaxed);
+        self.should_signal_charger_type
+            .store(state, Ordering::Relaxed);
     }
 
     /// SetPowerSupplyChangeEventEnabled (cmd 3).
@@ -259,7 +361,8 @@ impl IPsmSession {
             "IPsmSession::set_power_supply_change_event_enabled called, state={}",
             state
         );
-        self.should_signal_power_supply.store(state, Ordering::Relaxed);
+        self.should_signal_power_supply
+            .store(state, Ordering::Relaxed);
     }
 
     /// SetBatteryVoltageStateChangeEventEnabled (cmd 4).
@@ -270,15 +373,21 @@ impl IPsmSession {
             "IPsmSession::set_battery_voltage_state_change_event_enabled called, state={}",
             state
         );
-        self.should_signal_battery_voltage.store(state, Ordering::Relaxed);
+        self.should_signal_battery_voltage
+            .store(state, Ordering::Relaxed);
     }
 
     /// Signal charger type changed (internal helper).
     ///
     /// Corresponds to `IPsmSession::SignalChargerTypeChanged` in upstream psm.cpp.
     pub fn signal_charger_type_changed(&self) {
-        if self.should_signal.load(Ordering::Relaxed) && self.should_signal_charger_type.load(Ordering::Relaxed) {
-            if let Some(event) = self.service_context.get_event(self.state_change_event_handle) {
+        if self.should_signal.load(Ordering::Relaxed)
+            && self.should_signal_charger_type.load(Ordering::Relaxed)
+        {
+            if let Some(event) = self
+                .service_context
+                .get_event(self.state_change_event_handle)
+            {
                 event.signal();
             }
         }
@@ -288,8 +397,13 @@ impl IPsmSession {
     ///
     /// Corresponds to `IPsmSession::SignalPowerSupplyChanged` in upstream psm.cpp.
     pub fn signal_power_supply_changed(&self) {
-        if self.should_signal.load(Ordering::Relaxed) && self.should_signal_power_supply.load(Ordering::Relaxed) {
-            if let Some(event) = self.service_context.get_event(self.state_change_event_handle) {
+        if self.should_signal.load(Ordering::Relaxed)
+            && self.should_signal_power_supply.load(Ordering::Relaxed)
+        {
+            if let Some(event) = self
+                .service_context
+                .get_event(self.state_change_event_handle)
+            {
                 event.signal();
             }
         }
@@ -299,8 +413,13 @@ impl IPsmSession {
     ///
     /// Corresponds to `IPsmSession::SignalBatteryVoltageStateChanged` in upstream psm.cpp.
     pub fn signal_battery_voltage_state_changed(&self) {
-        if self.should_signal.load(Ordering::Relaxed) && self.should_signal_battery_voltage.load(Ordering::Relaxed) {
-            if let Some(event) = self.service_context.get_event(self.state_change_event_handle) {
+        if self.should_signal.load(Ordering::Relaxed)
+            && self.should_signal_battery_voltage.load(Ordering::Relaxed)
+        {
+            if let Some(event) = self
+                .service_context
+                .get_event(self.state_change_event_handle)
+            {
                 event.signal();
             }
         }
@@ -309,8 +428,7 @@ impl IPsmSession {
     // --- Handler bridge functions ---
 
     fn bind_state_change_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service =
-            unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
         service.bind_state_change_event();
 
         if let Some(handle) = ctx.create_readable_event_handle(false) {
@@ -325,8 +443,7 @@ impl IPsmSession {
     }
 
     fn unbind_state_change_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service =
-            unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
         service.unbind_state_change_event();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -337,8 +454,7 @@ impl IPsmSession {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service =
-            unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
         let mut rp = RequestParser::new(ctx);
         let state = rp.pop_bool();
         service.set_charger_type_change_event_enabled(state);
@@ -351,8 +467,7 @@ impl IPsmSession {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service =
-            unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
         let mut rp = RequestParser::new(ctx);
         let state = rp.pop_bool();
         service.set_power_supply_change_event_enabled(state);
@@ -365,8 +480,7 @@ impl IPsmSession {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service =
-            unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
         let mut rp = RequestParser::new(ctx);
         let state = rp.pop_bool();
         service.set_battery_voltage_state_change_event_enabled(state);

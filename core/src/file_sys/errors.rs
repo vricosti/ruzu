@@ -45,8 +45,7 @@ pub const RESULT_INVALID_BUCKET_TREE_ENTRY_OFFSET: ResultCode = ResultCode::new(
 pub const RESULT_INVALID_BUCKET_TREE_ENTRY_SET_OFFSET: ResultCode =
     ResultCode::new(module::FS, 4037);
 pub const RESULT_INVALID_BUCKET_TREE_NODE_INDEX: ResultCode = ResultCode::new(module::FS, 4038);
-pub const RESULT_INVALID_BUCKET_TREE_VIRTUAL_OFFSET: ResultCode =
-    ResultCode::new(module::FS, 4039);
+pub const RESULT_INVALID_BUCKET_TREE_VIRTUAL_OFFSET: ResultCode = ResultCode::new(module::FS, 4039);
 pub const RESULT_ROM_NCA_INVALID_PATCH_META_DATA_HASH_TYPE: ResultCode =
     ResultCode::new(module::FS, 4084);
 pub const RESULT_ROM_NCA_INVALID_INTEGRITY_LAYER_INFO_OFFSET: ResultCode =
@@ -104,14 +103,10 @@ pub const RESULT_INVALID_NCA_META_DATA_HASH_DATA_SIZE: ResultCode =
     ResultCode::new(module::FS, 4548);
 pub const RESULT_INVALID_NCA_META_DATA_HASH_DATA_HASH: ResultCode =
     ResultCode::new(module::FS, 4549);
-pub const RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_A: ResultCode =
-    ResultCode::new(module::FS, 5324);
-pub const RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_B: ResultCode =
-    ResultCode::new(module::FS, 5325);
-pub const RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_C: ResultCode =
-    ResultCode::new(module::FS, 5326);
-pub const RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_D: ResultCode =
-    ResultCode::new(module::FS, 5327);
+pub const RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_A: ResultCode = ResultCode::new(module::FS, 5324);
+pub const RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_B: ResultCode = ResultCode::new(module::FS, 5325);
+pub const RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_C: ResultCode = ResultCode::new(module::FS, 5326);
+pub const RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_D: ResultCode = ResultCode::new(module::FS, 5327);
 pub const RESULT_UNEXPECTED_IN_PATH_A: ResultCode = ResultCode::new(module::FS, 5328);
 pub const RESULT_INVALID_ARGUMENT: ResultCode = ResultCode::new(module::FS, 6001);
 pub const RESULT_INVALID_PATH: ResultCode = ResultCode::new(module::FS, 6002);

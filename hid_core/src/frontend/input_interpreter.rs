@@ -65,7 +65,9 @@ impl InputInterpreter {
 
     /// The specified button is considered to be held down if it is pressed in all 9 button states.
     pub fn is_button_held(&self, button: NpadButton) -> bool {
-        self.button_states.iter().all(|state| state.contains(button))
+        self.button_states
+            .iter()
+            .all(|state| state.contains(button))
     }
 }
 

@@ -19,15 +19,32 @@ impl AlignmentMatchingStorage {
         assert!(data_align.is_power_of_two());
         assert!(buffer_align.is_power_of_two());
         assert!(data_align <= Self::DATA_ALIGN_MAX);
-        Self { base_storage: base, data_align, buffer_align }
+        Self {
+            base_storage: base,
+            data_align,
+            buffer_align,
+        }
     }
 
-    pub fn get_size(&self) -> usize { self.base_storage.get_size() }
+    pub fn get_size(&self) -> usize {
+        self.base_storage.get_size()
+    }
 
     pub fn read(&self, buffer: &mut [u8], offset: usize) -> usize {
-        if buffer.is_empty() { return 0; }
+        if buffer.is_empty() {
+            return 0;
+        }
         let mut work_buf = vec![0u8; self.data_align];
-        AlignmentMatchingStorageImpl::read(&self.base_storage, &mut work_buf, self.data_align, self.data_align, self.buffer_align, offset, buffer, buffer.len())
+        AlignmentMatchingStorageImpl::read(
+            &self.base_storage,
+            &mut work_buf,
+            self.data_align,
+            self.data_align,
+            self.buffer_align,
+            offset,
+            buffer,
+            buffer.len(),
+        )
     }
 
     pub fn write(&self, buffer: &[u8], offset: usize) -> usize {
@@ -58,15 +75,32 @@ impl AlignmentMatchingStoragePooledBuffer {
     pub fn new(base: VirtualFile, data_align: usize, buffer_align: usize) -> Self {
         assert!(data_align.is_power_of_two());
         assert!(buffer_align.is_power_of_two());
-        Self { base_storage: base, data_align, buffer_align }
+        Self {
+            base_storage: base,
+            data_align,
+            buffer_align,
+        }
     }
 
-    pub fn get_size(&self) -> usize { self.base_storage.get_size() }
+    pub fn get_size(&self) -> usize {
+        self.base_storage.get_size()
+    }
 
     pub fn read(&self, buffer: &mut [u8], offset: usize) -> usize {
-        if buffer.is_empty() { return 0; }
+        if buffer.is_empty() {
+            return 0;
+        }
         let mut work_buf = vec![0u8; self.data_align];
-        AlignmentMatchingStorageImpl::read(&self.base_storage, &mut work_buf, self.data_align, self.data_align, self.buffer_align, offset, buffer, buffer.len())
+        AlignmentMatchingStorageImpl::read(
+            &self.base_storage,
+            &mut work_buf,
+            self.data_align,
+            self.data_align,
+            self.buffer_align,
+            offset,
+            buffer,
+            buffer.len(),
+        )
     }
 
     pub fn write(&self, buffer: &[u8], offset: usize) -> usize {

@@ -13,10 +13,10 @@
 //!   - common/device_manager.h / common/device_manager.cpp
 //!   - common/amiibo_crypto.h / common/amiibo_crypto.cpp
 
-pub mod nfc;
-pub mod nfc_types;
-pub mod nfc_result;
-pub mod nfc_interface;
-pub mod mifare_types;
-pub mod mifare_result;
 pub mod common;
+pub mod mifare_result;
+pub mod mifare_types;
+pub mod nfc;
+pub mod nfc_interface;
+pub mod nfc_result;
+pub mod nfc_types;

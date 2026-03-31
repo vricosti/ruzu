@@ -270,9 +270,7 @@ pub mod response {
         // payload_length == sizeof(T) + sizeof(Type)
         let data_len = get_size_of_response_type(message_type);
         let type_size = std::mem::size_of::<u32>(); // sizeof(Type) == 4
-        if payload_length as usize != data_len + type_size
-            || data.len() < data_len + header_size
-        {
+        if payload_length as usize != data_len + type_size || data.len() < data_len + header_size {
             return None;
         }
 

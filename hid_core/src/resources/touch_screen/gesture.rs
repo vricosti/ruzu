@@ -7,8 +7,8 @@ use std::sync::Mutex;
 
 use common::ResultCode;
 
-use crate::resources::touch_screen::touch_screen_resource::TouchResource;
 use crate::resources::touch_screen::touch_screen_driver::TouchScreenDriver;
+use crate::resources::touch_screen::touch_screen_resource::TouchResource;
 
 /// Handles gesture requests from HID interfaces.
 /// Delegates to TouchResource for actual activation/deactivation.

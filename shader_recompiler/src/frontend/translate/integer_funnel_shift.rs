@@ -27,11 +27,17 @@ impl MaxShift {
     }
 }
 
-fn shf_impl(tv: &mut TranslatorVisitor, insn: u64, shift: Value, high_bits: Value, right_shift: bool) {
-    let dst         = field(insn, 0, 8);
+fn shf_impl(
+    tv: &mut TranslatorVisitor,
+    insn: u64,
+    shift: Value,
+    high_bits: Value,
+    right_shift: bool,
+) {
+    let dst = field(insn, 0, 8);
     let lo_bits_reg = field(insn, 8, 8);
-    let max_shift   = MaxShift::from_bits(field(insn, 37, 2));
-    let wrap        = bit(insn, 50);
+    let max_shift = MaxShift::from_bits(field(insn, 37, 2));
+    let wrap = bit(insn, 50);
 
     // If max_shift is Undefined, emit a no-op (upstream throws).
     if max_shift == MaxShift::Undefined {
@@ -78,28 +84,28 @@ fn shf_impl(tv: &mut TranslatorVisitor, insn: u64, shift: Value, high_bits: Valu
 
 /// SHF_l_reg — Funnel shift left, shift amount from register.
 pub fn shf_l_reg(tv: &mut TranslatorVisitor, insn: u64) {
-    let shift     = tv.get_reg20(insn);
+    let shift = tv.get_reg20(insn);
     let high_bits = tv.get_reg39(insn);
     shf_impl(tv, insn, shift, high_bits, false);
 }
 
 /// SHF_l_imm — Funnel shift left, shift amount from immediate.
 pub fn shf_l_imm(tv: &mut TranslatorVisitor, insn: u64) {
-    let shift     = tv.get_imm20(insn);
+    let shift = tv.get_imm20(insn);
     let high_bits = tv.get_reg39(insn);
     shf_impl(tv, insn, shift, high_bits, false);
 }
 
 /// SHF_r_reg — Funnel shift right, shift amount from register.
 pub fn shf_r_reg(tv: &mut TranslatorVisitor, insn: u64) {
-    let shift     = tv.get_reg20(insn);
+    let shift = tv.get_reg20(insn);
     let high_bits = tv.get_reg39(insn);
     shf_impl(tv, insn, shift, high_bits, true);
 }
 
 /// SHF_r_imm — Funnel shift right, shift amount from immediate.
 pub fn shf_r_imm(tv: &mut TranslatorVisitor, insn: u64) {
-    let shift     = tv.get_imm20(insn);
+    let shift = tv.get_imm20(insn);
     let high_bits = tv.get_reg39(insn);
     shf_impl(tv, insn, shift, high_bits, true);
 }

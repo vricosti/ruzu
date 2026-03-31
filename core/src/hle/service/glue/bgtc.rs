@@ -44,7 +44,9 @@ pub mod bgtc_sc_commands {
 pub struct BgtcT;
 
 impl BgtcT {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// Opens and returns an ITaskService instance.
     ///
@@ -61,7 +63,9 @@ impl BgtcT {
 pub struct ITaskService;
 
 impl ITaskService {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 /// BGTC_SC service ("bgtc:sc").
@@ -69,5 +73,7 @@ impl ITaskService {
 pub struct BgtcSC;
 
 impl BgtcSC {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }

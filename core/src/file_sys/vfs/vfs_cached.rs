@@ -141,8 +141,7 @@ mod tests {
     fn test_cached_vfs_directory() {
         let f1: VirtualFile =
             Arc::new(VectorVfsFile::new(vec![1, 2, 3], "a.bin".to_string(), None));
-        let f2: VirtualFile =
-            Arc::new(VectorVfsFile::new(vec![4, 5], "b.bin".to_string(), None));
+        let f2: VirtualFile = Arc::new(VectorVfsFile::new(vec![4, 5], "b.bin".to_string(), None));
 
         let inner_dir: VirtualDir = Arc::new(VectorVfsDirectory::new(
             vec![],

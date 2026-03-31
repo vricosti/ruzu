@@ -8,9 +8,9 @@
 //! Handles steady clock updates, filesystem timestamp updates, alarm processing,
 //! and power state changes.
 
-use crate::hle::service::psc::time::common::SystemClockContext;
 use super::alarm_worker::AlarmWorker;
 use super::pm_state_change_handler::PmStateChangeHandler;
+use crate::hle::service::psc::time::common::SystemClockContext;
 
 /// Event types processed in the TimeWorker thread loop.
 ///

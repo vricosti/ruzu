@@ -66,6 +66,9 @@ mod tests {
         crate::aes_ctr::decrypt_aes_ctr(&key, &[0u8; 16], &mut ctr_result);
 
         // They should produce DIFFERENT results
-        assert_ne!(ecb_result, ctr_result, "ECB decrypt and CTR-zero-IV should differ");
+        assert_ne!(
+            ecb_result, ctr_result,
+            "ECB decrypt and CTR-zero-IV should differ"
+        );
     }
 }

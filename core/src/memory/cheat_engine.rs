@@ -168,8 +168,9 @@ impl CheatParser for TextCheatParser {
                 let start = i + 1;
                 if let Some((name_size, name)) = extract_name(data, start, '}') {
                     let name_bytes = name.as_bytes();
-                    let copy_len =
-                        name_bytes.len().min(out[0].definition.readable_name.len() - 1);
+                    let copy_len = name_bytes
+                        .len()
+                        .min(out[0].definition.readable_name.len() - 1);
                     out[0].definition.readable_name[..copy_len]
                         .copy_from_slice(&name_bytes[..copy_len]);
                     let last = out[0].definition.readable_name.len() - 1;
@@ -188,8 +189,9 @@ impl CheatParser for TextCheatParser {
                 let start = i + 1;
                 if let Some((name_size, name)) = extract_name(data, start, ']') {
                     let name_bytes = name.as_bytes();
-                    let copy_len =
-                        name_bytes.len().min(out[idx].definition.readable_name.len() - 1);
+                    let copy_len = name_bytes
+                        .len()
+                        .min(out[idx].definition.readable_name.len() - 1);
                     out[idx].definition.readable_name[..copy_len]
                         .copy_from_slice(&name_bytes[..copy_len]);
                     let last = out[idx].definition.readable_name.len() - 1;

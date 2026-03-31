@@ -52,7 +52,10 @@ fn hash_combine_impl(h: usize, k: usize) -> usize {
 
     #[cfg(not(target_pointer_width = "64"))]
     {
-        h ^= k.wrapping_add(0x9e3779b9).wrapping_add(h << 6).wrapping_add(h >> 2);
+        h ^= k
+            .wrapping_add(0x9e3779b9)
+            .wrapping_add(h << 6)
+            .wrapping_add(h >> 2);
         h
     }
 }

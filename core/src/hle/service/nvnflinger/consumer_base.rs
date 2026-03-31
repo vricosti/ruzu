@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use super::buffer_item::BufferItem;
 use super::buffer_queue_consumer::BufferQueueConsumer;
 use super::buffer_queue_defs::NUM_BUFFER_SLOTS;
+use super::consumer_listener::IConsumerListener;
 use super::status::Status;
 use super::ui::fence::Fence;
 use super::ui::graphic_buffer::GraphicBuffer;
@@ -59,14 +60,13 @@ impl ConsumerBase {
         }
     }
 
-    pub fn connect(&self, controlled_by_app: bool) {
-        // In upstream, this calls consumer->Connect(shared_from_this(), controlled_by_app).
-        // The actual consumer connection depends on the BufferQueueConsumer infrastructure.
+    pub fn connect(&self, listener: Arc<dyn IConsumerListener>, controlled_by_app: bool) -> Status {
         if let Ok(inner) = self.inner.lock() {
             if let Some(ref consumer) = inner.consumer {
-                consumer.connect(controlled_by_app);
+                return consumer.connect(listener, controlled_by_app);
             }
         }
+        Status::NoInit
     }
 
     pub fn abandon(&self) {
@@ -84,7 +84,7 @@ impl ConsumerBase {
         }
         // Disconnect from the BufferQueue
         if let Some(ref consumer) = inner.consumer {
-            consumer.disconnect();
+            let _ = consumer.disconnect();
         }
         inner.consumer = None;
     }
@@ -128,11 +128,7 @@ impl ConsumerBase {
     pub fn on_sideband_stream_changed(&self) {}
 
     /// Acquire a buffer. Returns the buffer item and status.
-    pub fn acquire_buffer_locked(
-        &self,
-        item: &mut BufferItem,
-        _present_when_ns: i64,
-    ) -> Status {
+    pub fn acquire_buffer_locked(&self, item: &mut BufferItem, _present_when_ns: i64) -> Status {
         let mut inner = self.inner.lock().unwrap();
         let consumer = match &inner.consumer {
             Some(c) => Arc::clone(c),

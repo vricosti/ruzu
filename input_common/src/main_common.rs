@@ -177,8 +177,16 @@ impl InputSubsystemImpl {
         if engine.is_empty() || engine == "any" {
             return HashMap::new();
         }
-        if self.mouse.as_ref().map_or(false, |m| m.engine().get_engine_name() == engine) {
-            return self.mouse.as_ref().unwrap().get_analog_mapping_for_device(params);
+        if self
+            .mouse
+            .as_ref()
+            .map_or(false, |m| m.engine().get_engine_name() == engine)
+        {
+            return self
+                .mouse
+                .as_ref()
+                .unwrap()
+                .get_analog_mapping_for_device(params);
         }
         // Keyboard, touch_screen, tas_input, camera, virtual_amiibo, virtual_gamepad
         // don't have analog mappings — they use the default (empty).
@@ -215,7 +223,11 @@ impl InputSubsystemImpl {
         if engine.is_empty() || engine == "any" {
             return ButtonNames::Undefined;
         }
-        if self.mouse.as_ref().map_or(false, |m| m.engine().get_engine_name() == engine) {
+        if self
+            .mouse
+            .as_ref()
+            .map_or(false, |m| m.engine().get_engine_name() == engine)
+        {
             return self.mouse.as_ref().unwrap().get_ui_name(params);
         }
         ButtonNames::Invalid
@@ -372,7 +384,14 @@ impl InputSubsystem {
         let engine_name = params.get_str("engine", "");
         matches!(
             engine_name.as_str(),
-            "mouse" | "gcpad" | "cemuhookudp" | "tas" | "virtual_gamepad" | "sdl" | "joycon" | "android"
+            "mouse"
+                | "gcpad"
+                | "cemuhookudp"
+                | "tas"
+                | "virtual_gamepad"
+                | "sdl"
+                | "joycon"
+                | "android"
         )
     }
 

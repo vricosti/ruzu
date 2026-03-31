@@ -91,7 +91,9 @@ mod tests {
 
         let process = Arc::new(Mutex::new(process));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
-        let scheduler = Arc::new(Mutex::new(crate::hle::kernel::k_scheduler::KScheduler::new(0)));
+        let scheduler = Arc::new(Mutex::new(
+            crate::hle::kernel::k_scheduler::KScheduler::new(0),
+        ));
         {
             let mut thread = current_thread.lock().unwrap();
             thread.initialize_main_thread(0x200000, 0x250000, 0, 0x23f000, &process, 1, 1, false);
@@ -134,12 +136,18 @@ mod tests {
         let thread = process.get_thread_by_object_id(object_id).unwrap();
         drop(process);
 
-        assert!(thread.lock().unwrap().is_suspend_requested_type(SuspendType::Thread));
+        assert!(thread
+            .lock()
+            .unwrap()
+            .is_suspend_requested_type(SuspendType::Thread));
 
         assert_eq!(
             set_thread_activity(&system, handle, ThreadActivity::Runnable),
             RESULT_SUCCESS
         );
-        assert!(!thread.lock().unwrap().is_suspend_requested_type(SuspendType::Thread));
+        assert!(!thread
+            .lock()
+            .unwrap()
+            .is_suspend_requested_type(SuspendType::Thread));
     }
 }

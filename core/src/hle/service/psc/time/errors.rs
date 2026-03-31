@@ -13,10 +13,8 @@ pub const RESULT_CLOCK_UNINITIALIZED: ResultCode =
     ResultCode::from_module_description(ErrorModule::Time, 103);
 pub const RESULT_TIME_NOT_FOUND: ResultCode =
     ResultCode::from_module_description(ErrorModule::Time, 200);
-pub const RESULT_OVERFLOW: ResultCode =
-    ResultCode::from_module_description(ErrorModule::Time, 201);
-pub const RESULT_FAILED: ResultCode =
-    ResultCode::from_module_description(ErrorModule::Time, 801);
+pub const RESULT_OVERFLOW: ResultCode = ResultCode::from_module_description(ErrorModule::Time, 201);
+pub const RESULT_FAILED: ResultCode = ResultCode::from_module_description(ErrorModule::Time, 801);
 pub const RESULT_INVALID_ARGUMENT: ResultCode =
     ResultCode::from_module_description(ErrorModule::Time, 901);
 pub const RESULT_TIME_ZONE_OUT_OF_RANGE: ResultCode =

@@ -65,7 +65,9 @@ fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
         Opcode::SMax32 => ctx.add_line("u_0=uint(max(int(u_1),int(u_2)));"),
         Opcode::UMax32 => ctx.add_line("u_0=max(u_1,u_2);"),
         Opcode::BitFieldInsert => ctx.add_line("u_0=bitfieldInsert(u_1,u_2,int(u_3),int(u_4));"),
-        Opcode::BitFieldSExtract => ctx.add_line("u_0=uint(bitfieldExtract(int(u_1),int(u_2),int(u_3)));"),
+        Opcode::BitFieldSExtract => {
+            ctx.add_line("u_0=uint(bitfieldExtract(int(u_1),int(u_2),int(u_3)));")
+        }
         Opcode::BitFieldUExtract => ctx.add_line("u_0=bitfieldExtract(u_1,int(u_2),int(u_3));"),
 
         // Comparisons - float

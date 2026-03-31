@@ -5,12 +5,12 @@
 //!
 //! LBL (backlight) service ("lbl"). Most commands are implemented with state tracking.
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 /// BacklightSwitchStatus enum. Upstream: `BacklightSwitchStatus` in `lbl.cpp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,36 +45,132 @@ pub struct LBL {
 impl LBL {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (0, Some(Self::save_current_setting_handler), "SaveCurrentSetting"),
-            (1, Some(Self::load_current_setting_handler), "LoadCurrentSetting"),
-            (2, Some(Self::set_current_brightness_setting_handler), "SetCurrentBrightnessSetting"),
-            (3, Some(Self::get_current_brightness_setting_handler), "GetCurrentBrightnessSetting"),
+            (
+                0,
+                Some(Self::save_current_setting_handler),
+                "SaveCurrentSetting",
+            ),
+            (
+                1,
+                Some(Self::load_current_setting_handler),
+                "LoadCurrentSetting",
+            ),
+            (
+                2,
+                Some(Self::set_current_brightness_setting_handler),
+                "SetCurrentBrightnessSetting",
+            ),
+            (
+                3,
+                Some(Self::get_current_brightness_setting_handler),
+                "GetCurrentBrightnessSetting",
+            ),
             (4, None, "ApplyCurrentBrightnessSettingToBacklight"),
             (5, None, "GetBrightnessSettingAppliedToBacklight"),
-            (6, Some(Self::switch_backlight_on_handler), "SwitchBacklightOn"),
-            (7, Some(Self::switch_backlight_off_handler), "SwitchBacklightOff"),
-            (8, Some(Self::get_backlight_switch_status_handler), "GetBacklightSwitchStatus"),
+            (
+                6,
+                Some(Self::switch_backlight_on_handler),
+                "SwitchBacklightOn",
+            ),
+            (
+                7,
+                Some(Self::switch_backlight_off_handler),
+                "SwitchBacklightOff",
+            ),
+            (
+                8,
+                Some(Self::get_backlight_switch_status_handler),
+                "GetBacklightSwitchStatus",
+            ),
             (9, Some(Self::enable_dimming_handler), "EnableDimming"),
             (10, Some(Self::disable_dimming_handler), "DisableDimming"),
-            (11, Some(Self::is_dimming_enabled_handler), "IsDimmingEnabled"),
-            (12, Some(Self::enable_auto_brightness_control_handler), "EnableAutoBrightnessControl"),
-            (13, Some(Self::disable_auto_brightness_control_handler), "DisableAutoBrightnessControl"),
-            (14, Some(Self::is_auto_brightness_control_enabled_handler), "IsAutoBrightnessControlEnabled"),
-            (15, Some(Self::set_ambient_light_sensor_value_handler), "SetAmbientLightSensorValue"),
-            (16, Some(Self::get_ambient_light_sensor_value_handler), "GetAmbientLightSensorValue"),
-            (17, Some(Self::set_brightness_reflection_delay_level_handler), "SetBrightnessReflectionDelayLevel"),
-            (18, Some(Self::get_brightness_reflection_delay_level_handler), "GetBrightnessReflectionDelayLevel"),
-            (19, Some(Self::set_current_brightness_mapping_handler), "SetCurrentBrightnessMapping"),
-            (20, Some(Self::get_current_brightness_mapping_handler), "GetCurrentBrightnessMapping"),
-            (21, Some(Self::set_current_ambient_light_sensor_mapping_handler), "SetCurrentAmbientLightSensorMapping"),
-            (22, Some(Self::get_current_ambient_light_sensor_mapping_handler), "GetCurrentAmbientLightSensorMapping"),
-            (23, Some(Self::is_ambient_light_sensor_available_handler), "IsAmbientLightSensorAvailable"),
-            (24, Some(Self::set_current_brightness_setting_for_vr_mode_handler), "SetCurrentBrightnessSettingForVrMode"),
-            (25, Some(Self::get_current_brightness_setting_for_vr_mode_handler), "GetCurrentBrightnessSettingForVrMode"),
+            (
+                11,
+                Some(Self::is_dimming_enabled_handler),
+                "IsDimmingEnabled",
+            ),
+            (
+                12,
+                Some(Self::enable_auto_brightness_control_handler),
+                "EnableAutoBrightnessControl",
+            ),
+            (
+                13,
+                Some(Self::disable_auto_brightness_control_handler),
+                "DisableAutoBrightnessControl",
+            ),
+            (
+                14,
+                Some(Self::is_auto_brightness_control_enabled_handler),
+                "IsAutoBrightnessControlEnabled",
+            ),
+            (
+                15,
+                Some(Self::set_ambient_light_sensor_value_handler),
+                "SetAmbientLightSensorValue",
+            ),
+            (
+                16,
+                Some(Self::get_ambient_light_sensor_value_handler),
+                "GetAmbientLightSensorValue",
+            ),
+            (
+                17,
+                Some(Self::set_brightness_reflection_delay_level_handler),
+                "SetBrightnessReflectionDelayLevel",
+            ),
+            (
+                18,
+                Some(Self::get_brightness_reflection_delay_level_handler),
+                "GetBrightnessReflectionDelayLevel",
+            ),
+            (
+                19,
+                Some(Self::set_current_brightness_mapping_handler),
+                "SetCurrentBrightnessMapping",
+            ),
+            (
+                20,
+                Some(Self::get_current_brightness_mapping_handler),
+                "GetCurrentBrightnessMapping",
+            ),
+            (
+                21,
+                Some(Self::set_current_ambient_light_sensor_mapping_handler),
+                "SetCurrentAmbientLightSensorMapping",
+            ),
+            (
+                22,
+                Some(Self::get_current_ambient_light_sensor_mapping_handler),
+                "GetCurrentAmbientLightSensorMapping",
+            ),
+            (
+                23,
+                Some(Self::is_ambient_light_sensor_available_handler),
+                "IsAmbientLightSensorAvailable",
+            ),
+            (
+                24,
+                Some(Self::set_current_brightness_setting_for_vr_mode_handler),
+                "SetCurrentBrightnessSettingForVrMode",
+            ),
+            (
+                25,
+                Some(Self::get_current_brightness_setting_for_vr_mode_handler),
+                "GetCurrentBrightnessSettingForVrMode",
+            ),
             (26, Some(Self::enable_vr_mode_handler), "EnableVrMode"),
             (27, Some(Self::disable_vr_mode_handler), "DisableVrMode"),
-            (28, Some(Self::is_vr_mode_enabled_handler), "IsVrModeEnabled"),
-            (29, Some(Self::is_auto_brightness_control_supported_handler), "IsAutoBrightnessControlSupported"),
+            (
+                28,
+                Some(Self::is_vr_mode_enabled_handler),
+                "IsVrModeEnabled",
+            ),
+            (
+                29,
+                Some(Self::is_auto_brightness_control_supported_handler),
+                "IsAutoBrightnessControlSupported",
+            ),
         ]);
 
         Self {
@@ -107,7 +203,10 @@ impl LBL {
             log::error!("LBL: Brightness is infinite!");
             brightness = 0.0;
         }
-        log::debug!("LBL::set_current_brightness_setting called, brightness={}", brightness);
+        log::debug!(
+            "LBL::set_current_brightness_setting called, brightness={}",
+            brightness
+        );
         let mut s = self.state.lock().unwrap();
         s.current_brightness = brightness;
         s.update_instantly = true;
@@ -119,17 +218,26 @@ impl LBL {
             log::error!("LBL: Brightness is infinite!");
             brightness = 0.0;
         }
-        log::debug!("LBL::get_current_brightness_setting called, brightness={}", brightness);
+        log::debug!(
+            "LBL::get_current_brightness_setting called, brightness={}",
+            brightness
+        );
         brightness
     }
 
     pub fn switch_backlight_on(&self, fade_time: u64) {
-        log::warn!("(STUBBED) LBL::switch_backlight_on called, fade_time={}", fade_time);
+        log::warn!(
+            "(STUBBED) LBL::switch_backlight_on called, fade_time={}",
+            fade_time
+        );
         self.state.lock().unwrap().backlight_enabled = true;
     }
 
     pub fn switch_backlight_off(&self, fade_time: u64) {
-        log::warn!("(STUBBED) LBL::switch_backlight_off called, fade_time={}", fade_time);
+        log::warn!(
+            "(STUBBED) LBL::switch_backlight_off called, fade_time={}",
+            fade_time
+        );
         self.state.lock().unwrap().backlight_enabled = false;
     }
 
@@ -172,7 +280,10 @@ impl LBL {
     }
 
     pub fn set_ambient_light_sensor_value(&self, light_value: f32) {
-        log::debug!("LBL::set_ambient_light_sensor_value called, light_value={}", light_value);
+        log::debug!(
+            "LBL::set_ambient_light_sensor_value called, light_value={}",
+            light_value
+        );
         self.state.lock().unwrap().ambient_light_value = light_value;
     }
 
@@ -220,7 +331,10 @@ impl LBL {
             log::error!("LBL: Brightness is infinite!");
             brightness = 0.0;
         }
-        log::debug!("LBL::set_current_brightness_setting_for_vr_mode called, brightness={}", brightness);
+        log::debug!(
+            "LBL::set_current_brightness_setting_for_vr_mode called, brightness={}",
+            brightness
+        );
         self.state.lock().unwrap().current_vr_brightness = brightness;
     }
 
@@ -267,7 +381,10 @@ impl LBL {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn set_current_brightness_setting_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_current_brightness_setting_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let mut rp = RequestParser::new(ctx);
         let brightness = rp.pop_f32();
@@ -276,7 +393,10 @@ impl LBL {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_current_brightness_setting_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_current_brightness_setting_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let brightness = service.get_current_brightness_setting();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -302,7 +422,10 @@ impl LBL {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_backlight_switch_status_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_backlight_switch_status_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let status = service.get_backlight_switch_status();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -332,21 +455,30 @@ impl LBL {
         rb.push_bool(enabled);
     }
 
-    fn enable_auto_brightness_control_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn enable_auto_brightness_control_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         service.enable_auto_brightness_control();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn disable_auto_brightness_control_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn disable_auto_brightness_control_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         service.disable_auto_brightness_control();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn is_auto_brightness_control_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_auto_brightness_control_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let enabled = service.is_auto_brightness_control_enabled();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -354,7 +486,10 @@ impl LBL {
         rb.push_bool(enabled);
     }
 
-    fn set_ambient_light_sensor_value_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_ambient_light_sensor_value_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let mut rp = RequestParser::new(ctx);
         let value = rp.pop_f32();
@@ -363,7 +498,10 @@ impl LBL {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_ambient_light_sensor_value_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_ambient_light_sensor_value_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let value = service.get_ambient_light_sensor_value();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -371,14 +509,20 @@ impl LBL {
         rb.push_f32(value);
     }
 
-    fn set_brightness_reflection_delay_level_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_brightness_reflection_delay_level_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         service.set_brightness_reflection_delay_level();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_brightness_reflection_delay_level_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_brightness_reflection_delay_level_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let level = service.get_brightness_reflection_delay_level();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -386,35 +530,50 @@ impl LBL {
         rb.push_f32(level);
     }
 
-    fn set_current_brightness_mapping_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_current_brightness_mapping_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         service.set_current_brightness_mapping();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_current_brightness_mapping_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_current_brightness_mapping_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         service.get_current_brightness_mapping();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn set_current_ambient_light_sensor_mapping_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_current_ambient_light_sensor_mapping_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         service.set_current_ambient_light_sensor_mapping();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_current_ambient_light_sensor_mapping_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_current_ambient_light_sensor_mapping_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         service.get_current_ambient_light_sensor_mapping();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn is_ambient_light_sensor_available_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_ambient_light_sensor_available_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let available = service.is_ambient_light_sensor_available();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -422,7 +581,10 @@ impl LBL {
         rb.push_bool(available);
     }
 
-    fn set_current_brightness_setting_for_vr_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_current_brightness_setting_for_vr_mode_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let mut rp = RequestParser::new(ctx);
         let brightness = rp.pop_f32();
@@ -431,7 +593,10 @@ impl LBL {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_current_brightness_setting_for_vr_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_current_brightness_setting_for_vr_mode_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let brightness = service.get_current_brightness_setting_for_vr_mode();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -461,7 +626,10 @@ impl LBL {
         rb.push_bool(enabled);
     }
 
-    fn is_auto_brightness_control_supported_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_auto_brightness_control_supported_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const LBL) };
         let supported = service.is_auto_brightness_control_supported();
         // Upstream uses rb.Push<u8>(auto_brightness_supported)
@@ -475,30 +643,36 @@ impl SessionRequestHandler for LBL {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { "lbl" }
+    fn service_name(&self) -> &str {
+        "lbl"
+    }
 }
 
 impl ServiceFramework for LBL {
-    fn get_service_name(&self) -> &str { "lbl" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "lbl"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// Registers "lbl" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `lbl.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use std::sync::Arc;
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+    use std::sync::Arc;
 
     let mut server_manager = ServerManager::new(system);
 
     server_manager.register_named_service(
         "lbl",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(LBL::new())
-        }),
+        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(LBL::new()) }),
         64,
     );
 

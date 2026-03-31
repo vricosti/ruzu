@@ -7,21 +7,17 @@
 //! Handles constant buffer loads, attribute loads/stores, and other
 //! context-related operations.
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
-use crate::ir::{self, Opcode};
 use crate::ir::types::ShaderStage;
+use crate::ir::{self, Opcode};
+use rspirv::spirv::Word;
 
 // ── Low-level per-type emit functions (called from other modules) ─────────
 
 /// Emit a constant buffer load (U32).
 ///
 /// Matches upstream `EmitGetCbufU32(EmitContext&, Id, Id)`.
-pub fn emit_get_cbuf_u32(
-    ctx: &mut SpirvEmitContext,
-    _binding: Word,
-    _offset: Word,
-) -> Word {
+pub fn emit_get_cbuf_u32(ctx: &mut SpirvEmitContext, _binding: Word, _offset: Word) -> Word {
     log::trace!("SPIR-V: emit_get_cbuf_u32");
     ctx.builder.undef(ctx.u32_type, None)
 }
@@ -29,61 +25,37 @@ pub fn emit_get_cbuf_u32(
 /// Emit a constant buffer load (F32).
 ///
 /// Matches upstream `EmitGetCbufF32(EmitContext&, Id, Id)`.
-pub fn emit_get_cbuf_f32(
-    ctx: &mut SpirvEmitContext,
-    _binding: Word,
-    _offset: Word,
-) -> Word {
+pub fn emit_get_cbuf_f32(ctx: &mut SpirvEmitContext, _binding: Word, _offset: Word) -> Word {
     log::trace!("SPIR-V: emit_get_cbuf_f32");
     ctx.builder.undef(ctx.f32_type, None)
 }
 
 /// Emit a constant buffer load (S32).
-pub fn emit_get_cbuf_s32(
-    ctx: &mut SpirvEmitContext,
-    _binding: Word,
-    _offset: Word,
-) -> Word {
+pub fn emit_get_cbuf_s32(ctx: &mut SpirvEmitContext, _binding: Word, _offset: Word) -> Word {
     log::trace!("SPIR-V: emit_get_cbuf_s32");
     ctx.builder.undef(ctx.i32_type, None)
 }
 
 /// Emit a constant buffer load (U16).
-pub fn emit_get_cbuf_u16(
-    ctx: &mut SpirvEmitContext,
-    _binding: Word,
-    _offset: Word,
-) -> Word {
+pub fn emit_get_cbuf_u16(ctx: &mut SpirvEmitContext, _binding: Word, _offset: Word) -> Word {
     log::trace!("SPIR-V: emit_get_cbuf_u16");
     ctx.builder.undef(ctx.u32_type, None)
 }
 
 /// Emit a constant buffer load (S16).
-pub fn emit_get_cbuf_s16(
-    ctx: &mut SpirvEmitContext,
-    _binding: Word,
-    _offset: Word,
-) -> Word {
+pub fn emit_get_cbuf_s16(ctx: &mut SpirvEmitContext, _binding: Word, _offset: Word) -> Word {
     log::trace!("SPIR-V: emit_get_cbuf_s16");
     ctx.builder.undef(ctx.u32_type, None)
 }
 
 /// Emit a constant buffer load (U8).
-pub fn emit_get_cbuf_u8(
-    ctx: &mut SpirvEmitContext,
-    _binding: Word,
-    _offset: Word,
-) -> Word {
+pub fn emit_get_cbuf_u8(ctx: &mut SpirvEmitContext, _binding: Word, _offset: Word) -> Word {
     log::trace!("SPIR-V: emit_get_cbuf_u8");
     ctx.builder.undef(ctx.u32_type, None)
 }
 
 /// Emit a constant buffer load (S8).
-pub fn emit_get_cbuf_s8(
-    ctx: &mut SpirvEmitContext,
-    _binding: Word,
-    _offset: Word,
-) -> Word {
+pub fn emit_get_cbuf_s8(ctx: &mut SpirvEmitContext, _binding: Word, _offset: Word) -> Word {
     log::trace!("SPIR-V: emit_get_cbuf_s8");
     ctx.builder.undef(ctx.u32_type, None)
 }
@@ -91,10 +63,7 @@ pub fn emit_get_cbuf_s8(
 /// Emit a load of a shader input attribute.
 ///
 /// Matches upstream `EmitGetAttribute(EmitContext&, Id, u32)`.
-pub fn emit_get_attribute(
-    ctx: &mut SpirvEmitContext,
-    _attribute: Word,
-) -> Word {
+pub fn emit_get_attribute(ctx: &mut SpirvEmitContext, _attribute: Word) -> Word {
     log::trace!("SPIR-V: emit_get_attribute");
     ctx.builder.undef(ctx.f32_type, None)
 }
@@ -102,11 +71,7 @@ pub fn emit_get_attribute(
 /// Emit a store to a shader output attribute.
 ///
 /// Matches upstream `EmitSetAttribute(EmitContext&, Id, Id, u32)`.
-pub fn emit_set_attribute(
-    _ctx: &mut SpirvEmitContext,
-    _attribute: Word,
-    _value: Word,
-) {
+pub fn emit_set_attribute(_ctx: &mut SpirvEmitContext, _attribute: Word, _value: Word) {
     log::trace!("SPIR-V: emit_set_attribute");
 }
 
@@ -144,12 +109,7 @@ pub fn emit_set_sample_mask(_ctx: &mut SpirvEmitContext, _value: Word) {
 // ── IR-instruction dispatching helpers (called from spirv_emit_context) ───
 
 /// Dispatch GetCbufU32 / GetCbufF32 IR instructions.
-pub fn emit_get_cbuf(
-    ctx: &mut SpirvEmitContext,
-    inst: &ir::Inst,
-    block_idx: u32,
-    inst_idx: u32,
-) {
+pub fn emit_get_cbuf(ctx: &mut SpirvEmitContext, inst: &ir::Inst, block_idx: u32, inst_idx: u32) {
     let cbuf_idx = inst.arg(0).imm_u32();
     let byte_offset = ctx.resolve_value(inst.arg(1));
 
@@ -160,14 +120,20 @@ pub fn emit_get_cbuf(
 
     if let Some(&cbuf_var) = ctx.cbuf_vars.get(&cbuf_idx) {
         let four = ctx.builder.constant_bit32(ctx.u32_type, 4);
-        let index = ctx.builder.u_div(ctx.u32_type, None, byte_offset, four).unwrap();
+        let index = ctx
+            .builder
+            .u_div(ctx.u32_type, None, byte_offset, four)
+            .unwrap();
         let zero = ctx.const_zero_u32;
         let uniform_u32_ptr = ctx.uniform_u32_ptr;
         let ptr = ctx
             .builder
             .access_chain(uniform_u32_ptr, None, cbuf_var, vec![zero, index])
             .unwrap();
-        let loaded = ctx.builder.load(ctx.u32_type, None, ptr, None, vec![]).unwrap();
+        let loaded = ctx
+            .builder
+            .load(ctx.u32_type, None, ptr, None, vec![])
+            .unwrap();
 
         let id = if inst.opcode == Opcode::GetCbufF32 {
             ctx.builder.bitcast(ctx.f32_type, None, loaded).unwrap()
@@ -204,7 +170,10 @@ pub fn emit_get_attribute_inst(
                 .builder
                 .access_chain(output_f32_ptr, None, pos_var, vec![idx_const])
                 .unwrap();
-            let id = ctx.builder.load(ctx.f32_type, None, ptr, None, vec![]).unwrap();
+            let id = ctx
+                .builder
+                .load(ctx.f32_type, None, ptr, None, vec![])
+                .unwrap();
             ctx.set_value(block_idx, inst_idx, id);
         } else {
             let zero = ctx.const_zero_f32;
@@ -220,7 +189,10 @@ pub fn emit_get_attribute_inst(
                 .builder
                 .access_chain(input_f32_ptr, None, input_var, vec![idx_const])
                 .unwrap();
-            let id = ctx.builder.load(ctx.f32_type, None, ptr, None, vec![]).unwrap();
+            let id = ctx
+                .builder
+                .load(ctx.f32_type, None, ptr, None, vec![])
+                .unwrap();
             ctx.set_value(block_idx, inst_idx, id);
         } else {
             let zero = ctx.const_zero_f32;
@@ -316,7 +288,13 @@ pub fn emit_workgroup_id(ctx: &mut SpirvEmitContext) -> Word {
 /// Matches upstream `EmitLocalInvocationId`.
 pub fn emit_local_invocation_id(ctx: &mut SpirvEmitContext) -> Word {
     ctx.builder
-        .load(ctx.u32_vec3_type, None, ctx.local_invocation_id, None, vec![])
+        .load(
+            ctx.u32_vec3_type,
+            None,
+            ctx.local_invocation_id,
+            None,
+            vec![],
+        )
         .unwrap()
 }
 
@@ -363,22 +341,33 @@ pub fn emit_is_helper_invocation(ctx: &mut SpirvEmitContext) -> Word {
 
 /// Matches upstream `EmitYDirection`.
 pub fn emit_y_direction(ctx: &mut SpirvEmitContext) -> Word {
-    let value = if ctx.runtime_info.y_negate { -1.0f32 } else { 1.0f32 };
+    let value = if ctx.runtime_info.y_negate {
+        -1.0f32
+    } else {
+        1.0f32
+    };
     ctx.constant_f32(value)
 }
 
 /// Matches upstream `EmitResolutionDownFactor`.
 pub fn emit_resolution_down_factor(ctx: &mut SpirvEmitContext) -> Word {
     if ctx.profile.unified_descriptor_binding {
-        let pointer_type = ctx
-            .builder
-            .type_pointer(None, rspirv::spirv::StorageClass::PushConstant, ctx.f32_type);
+        let pointer_type = ctx.builder.type_pointer(
+            None,
+            rspirv::spirv::StorageClass::PushConstant,
+            ctx.f32_type,
+        );
         let index = ctx
             .builder
             .constant_bit32(ctx.u32_type, ctx.rescaling_downfactor_member_index);
         let pointer = ctx
             .builder
-            .access_chain(pointer_type, None, ctx.rescaling_push_constants, vec![index])
+            .access_chain(
+                pointer_type,
+                None,
+                ctx.rescaling_push_constants,
+                vec![index],
+            )
             .unwrap();
         ctx.builder
             .load(ctx.f32_type, None, pointer, None, vec![])
@@ -386,7 +375,13 @@ pub fn emit_resolution_down_factor(ctx: &mut SpirvEmitContext) -> Word {
     } else {
         let composite = ctx
             .builder
-            .load(ctx.f32_vec4_type, None, ctx.rescaling_uniform_constant, None, vec![])
+            .load(
+                ctx.f32_vec4_type,
+                None,
+                ctx.rescaling_uniform_constant,
+                None,
+                vec![],
+            )
             .unwrap();
         ctx.builder
             .composite_extract(ctx.f32_type, None, composite, vec![2])
@@ -397,15 +392,22 @@ pub fn emit_resolution_down_factor(ctx: &mut SpirvEmitContext) -> Word {
 /// Matches upstream `EmitRenderArea`.
 pub fn emit_render_area(ctx: &mut SpirvEmitContext) -> Word {
     if ctx.profile.unified_descriptor_binding {
-        let pointer_type = ctx
-            .builder
-            .type_pointer(None, rspirv::spirv::StorageClass::PushConstant, ctx.f32_vec4_type);
+        let pointer_type = ctx.builder.type_pointer(
+            None,
+            rspirv::spirv::StorageClass::PushConstant,
+            ctx.f32_vec4_type,
+        );
         let index = ctx
             .builder
             .constant_bit32(ctx.u32_type, ctx.render_are_member_index);
         let pointer = ctx
             .builder
-            .access_chain(pointer_type, None, ctx.render_area_push_constant, vec![index])
+            .access_chain(
+                pointer_type,
+                None,
+                ctx.render_area_push_constant,
+                vec![index],
+            )
             .unwrap();
         ctx.builder
             .load(ctx.f32_vec4_type, None, pointer, None, vec![])

@@ -120,7 +120,10 @@ impl NvHostNvDecCommon {
     }
 
     pub fn set_nvmap_fd(&self, params: &mut IoctlSetNvmapFD) -> NvResult {
-        log::debug!("nvhost_nvdec_common::SetNVMAPfd called, fd={}", params.nvmap_fd);
+        log::debug!(
+            "nvhost_nvdec_common::SetNVMAPfd called, fd={}",
+            params.nvmap_fd
+        );
         *self.nvmap_fd.lock().unwrap() = params.nvmap_fd;
         NvResult::Success
     }
@@ -132,7 +135,10 @@ impl NvHostNvDecCommon {
     }
 
     pub fn get_syncpoint(&self, params: &mut IoctlGetSyncpoint) -> NvResult {
-        log::debug!("nvhost_nvdec_common::GetSyncpoint called, id={}", params.param);
+        log::debug!(
+            "nvhost_nvdec_common::GetSyncpoint called, id={}",
+            params.param
+        );
         params.value = self.channel_syncpoint;
         NvResult::Success
     }

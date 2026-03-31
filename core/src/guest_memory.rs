@@ -199,8 +199,11 @@ impl<'a, M: GuestMemoryInterface, T: Copy + Default> GuestMemory<'a, M, T> {
                 self.memory
                     .read_block(self.addr, self.data_ptr as *mut u8, self.size_bytes());
             } else {
-                self.memory
-                    .read_block_unsafe(self.addr, self.data_ptr as *mut u8, self.size_bytes());
+                self.memory.read_block_unsafe(
+                    self.addr,
+                    self.data_ptr as *mut u8,
+                    self.size_bytes(),
+                );
             }
         }
     }

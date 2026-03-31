@@ -9,12 +9,12 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use super::apm::Module;
+use super::apm_controller::{Controller, CpuBoostMode, PerformanceConfiguration, PerformanceMode};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::apm::Module;
-use super::apm_controller::{Controller, CpuBoostMode, PerformanceConfiguration, PerformanceMode};
 
 /// IPC command IDs for APM
 pub mod apm_commands {
@@ -94,10 +94,7 @@ impl ISession {
             .set_performance_configuration(mode, config);
     }
 
-    pub fn get_performance_configuration(
-        &self,
-        mode: PerformanceMode,
-    ) -> PerformanceConfiguration {
+    pub fn get_performance_configuration(&self, mode: PerformanceMode) -> PerformanceConfiguration {
         log::debug!(
             "ISession::get_performance_configuration called, mode={:?}",
             mode
@@ -157,10 +154,7 @@ impl ISession {
         rb.push_u32(config as u32);
     }
 
-    fn set_cpu_overclock_enabled_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn set_cpu_overclock_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let session = unsafe { &*(this as *const dyn ServiceFramework as *const ISession) };
         let mut rp = RequestParser::new(ctx);
         session.set_cpu_overclock_enabled(rp.pop_bool());
@@ -240,11 +234,17 @@ impl APM {
 
     pub fn get_performance_mode(&self) -> PerformanceMode {
         log::debug!("APM({})::get_performance_mode called", self.name);
-        self.controller.lock().unwrap().get_current_performance_mode()
+        self.controller
+            .lock()
+            .unwrap()
+            .get_current_performance_mode()
     }
 
     pub fn is_cpu_overclock_enabled(&self) -> bool {
-        log::warn!("(STUBBED) APM({})::is_cpu_overclock_enabled called", self.name);
+        log::warn!(
+            "(STUBBED) APM({})::is_cpu_overclock_enabled called",
+            self.name
+        );
         false
     }
 
@@ -267,10 +267,7 @@ impl APM {
         rb.push_u32(mode as u32);
     }
 
-    fn is_cpu_overclock_enabled_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn is_cpu_overclock_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let apm = unsafe { &*(this as *const dyn ServiceFramework as *const APM) };
         let enabled = apm.is_cpu_overclock_enabled();
 
@@ -352,7 +349,10 @@ impl ApmSys {
 
     pub fn set_cpu_boost_mode(&self, mode: CpuBoostMode) {
         log::debug!("ApmSys::set_cpu_boost_mode called, mode={:?}", mode);
-        self.controller.lock().unwrap().set_from_cpu_boost_mode(mode);
+        self.controller
+            .lock()
+            .unwrap()
+            .set_from_cpu_boost_mode(mode);
     }
 
     pub fn get_current_performance_configuration(&self) -> PerformanceConfiguration {

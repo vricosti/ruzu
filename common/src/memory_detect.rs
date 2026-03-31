@@ -77,8 +77,9 @@ fn detect() -> MemoryInfo {
             status.dw_length = mem::size_of::<MemoryStatusEx>() as u32;
             if GlobalMemoryStatusEx(&mut status) != 0 {
                 mem_info.total_physical_memory = status.ull_total_phys;
-                mem_info.total_swap_memory =
-                    status.ull_total_page_file.saturating_sub(status.ull_total_phys);
+                mem_info.total_swap_memory = status
+                    .ull_total_page_file
+                    .saturating_sub(status.ull_total_phys);
             }
         }
     }

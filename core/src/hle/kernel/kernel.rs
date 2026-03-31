@@ -14,11 +14,11 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use super::super::service::server_manager::ServerManager;
 use super::k_memory_manager::KMemoryManager;
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
 use super::k_thread::KThread;
-use super::super::service::server_manager::ServerManager;
 
 use super::global_scheduler_context::GlobalSchedulerContext;
 use super::init::init_slab_setup::KSlabResourceCounts;
@@ -48,7 +48,11 @@ static KERNEL_PTR: std::sync::atomic::AtomicPtr<KernelCore> =
 /// Public accessor for KERNEL_PTR — used by GSC to interrupt cores on thread state changes.
 pub fn get_kernel_ref() -> Option<&'static KernelCore> {
     let ptr = KERNEL_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
+    }
 }
 
 /// Real scheduler callbacks that access the kernel via KERNEL_PTR.
@@ -61,40 +65,37 @@ static SCHEDULER_CALLBACKS: super::k_scheduler_lock::SchedulerCallbacks =
     };
 
 fn real_disable_scheduling() {
-    if let Some(thread) = get_current_thread_pointer() {
-        let mut t = thread.lock().unwrap();
+    with_current_thread_fast_mut(|t| {
         debug_assert!(t.get_disable_dispatch_count() >= 0);
         t.disable_dispatch();
-    }
+    });
 }
 
 fn real_enable_scheduling(cores_needing_scheduling: u64) {
-    if let Some(thread) = get_current_thread_pointer() {
-        let mut t = thread.lock().unwrap();
-        debug_assert!(t.get_disable_dispatch_count() >= 1);
-        if t.get_disable_dispatch_count() > 1 {
-            t.enable_dispatch();
-        } else {
-            t.enable_dispatch();
-            // Upstream: RescheduleCurrentCore if cores_needing_scheduling has our core.
-            // For now, trigger schedule on all cores that need it.
-            if cores_needing_scheduling != 0 {
-                drop(t); // release thread lock before touching schedulers
-                let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
-                if !kernel_ptr.is_null() {
-                    let kernel = unsafe { &*kernel_ptr };
-                    for core_id in 0..hardware_properties::NUM_CPU_CORES {
-                        if cores_needing_scheduling & (1u64 << core_id) != 0 {
-                            if let Some(sched) = kernel.scheduler(core_id as usize) {
-                                let s = sched.lock().unwrap();
-                                s.state.needs_scheduling.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
+    if kernel_ptr.is_null() {
+        return;
     }
+
+    let kernel = unsafe { &*kernel_ptr };
+    let current_thread = if get_current_thread_id_fast().is_some() {
+        get_current_emu_thread()
+    } else {
+        get_current_emu_thread()
+    };
+    if current_thread.is_none() {
+        KScheduler::reschedule_cores(cores_needing_scheduling);
+        return;
+    }
+    let current_scheduler = kernel.current_scheduler();
+
+    KScheduler::enable_scheduling_with_scheduler(
+        cores_needing_scheduling,
+        current_scheduler,
+        kernel
+            .is_phantom_mode_for_singlecore
+            .load(Ordering::Relaxed),
+    );
 }
 
 fn real_update_highest_priority_threads() -> u64 {
@@ -128,9 +129,7 @@ fn real_update_highest_priority_threads() -> u64 {
         let mut sched_guards: Vec<_> = sched_arcs.iter().map(|s| s.lock().unwrap()).collect();
 
         // Delegate to full implementation with idle core migration.
-        let result = KScheduler::update_highest_priority_threads_impl(
-            &mut sched_guards, &mut gsc,
-        );
+        let result = KScheduler::update_highest_priority_threads_impl(&mut sched_guards, &mut gsc);
         cores_needing_scheduling = result.0;
         migrations = result.1;
         // GSC lock released here.
@@ -143,7 +142,7 @@ fn real_update_highest_priority_threads() -> u64 {
         let gsc = gsc_arc.lock().unwrap();
         for (thread_id, new_core) in migrations {
             if let Some(thread) = gsc.get_thread_by_thread_id(thread_id) {
-                thread.lock().unwrap().core_id = new_core;
+                thread.lock().unwrap().set_active_core(new_core);
             }
         }
     }
@@ -156,6 +155,8 @@ fn real_update_highest_priority_threads() -> u64 {
 // Each physical core host thread (and any other host thread) stores its own current KThread.
 std::thread_local! {
     static CURRENT_THREAD: RefCell<Option<Weak<Mutex<KThread>>>> = RefCell::new(None);
+    static CURRENT_THREAD_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CURRENT_THREAD_PTR: std::cell::Cell<*mut KThread> = const { std::cell::Cell::new(std::ptr::null_mut()) };
     static HOST_DUMMY_THREAD: RefCell<Option<Arc<Mutex<KThread>>>> = const { RefCell::new(None) };
 }
 
@@ -205,6 +206,42 @@ pub fn set_current_emu_thread(thread: Option<&Arc<Mutex<KThread>>>) {
     CURRENT_THREAD.with(|cell| {
         *cell.borrow_mut() = thread.map(Arc::downgrade);
     });
+    CURRENT_THREAD_ID.with(|cell| {
+        cell.set(
+            thread
+                .map(|thread| thread.lock().unwrap().get_thread_id())
+                .unwrap_or(0),
+        );
+    });
+    CURRENT_THREAD_PTR.with(|cell| {
+        let ptr = thread
+            .map(|thread| {
+                let mut guard = thread.lock().unwrap();
+                (&mut *guard) as *mut KThread
+            })
+            .unwrap_or(std::ptr::null_mut());
+        cell.set(ptr);
+    });
+}
+
+pub fn get_current_thread_id_fast() -> Option<u64> {
+    let thread_id = CURRENT_THREAD_ID.with(|cell| cell.get());
+    if thread_id == 0 {
+        None
+    } else {
+        Some(thread_id)
+    }
+}
+
+pub fn with_current_thread_fast_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> Option<R> {
+    CURRENT_THREAD_PTR.with(|cell| {
+        let ptr = cell.get();
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { f(&mut *ptr) })
+        }
+    })
 }
 
 /// Get the current thread pointer for the calling host thread.
@@ -226,6 +263,17 @@ pub fn get_current_hardware_tick() -> Option<i64> {
     kernel
         .hardware_timer()
         .map(|timer| timer.lock().unwrap().get_tick())
+}
+
+/// Get the global hardware timer Arc for the active kernel instance.
+pub fn get_hardware_timer_arc() -> Option<Arc<Mutex<KHardwareTimer>>> {
+    let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
+    if kernel_ptr.is_null() {
+        return None;
+    }
+
+    let kernel = unsafe { &*kernel_ptr };
+    kernel.hardware_timer().cloned()
 }
 
 /// Constants from the upstream KernelCore::Impl.
@@ -262,7 +310,7 @@ pub struct KernelCore {
     schedulers: Vec<Arc<Mutex<KScheduler>>>,
     /// Per-core PhysicalCore instances.
     /// Upstream: `std::array<std::unique_ptr<Kernel::PhysicalCore>, NUM_CPU_CORES> cores`.
-    cores: Vec<PhysicalCore>,
+    cores: Vec<Arc<PhysicalCore>>,
 
     /// Per-core main threads.
     /// Upstream: created in `InitializePhysicalCores()` via `KThread::InitializeMainThread`.
@@ -383,7 +431,8 @@ impl KernelCore {
         self.global_object_list_container = Some(KAutoObjectWithListContainer::new());
         self.global_scheduler_context = Some(Arc::new(Mutex::new(GlobalSchedulerContext::new())));
 
-        self.is_phantom_mode_for_singlecore.store(false, Ordering::Relaxed);
+        self.is_phantom_mode_for_singlecore
+            .store(false, Ordering::Relaxed);
 
         // Initialize slab resource counts.
         super::init::init_slab_setup::initialize_slab_resource_counts(
@@ -401,7 +450,10 @@ impl KernelCore {
         // Store a raw pointer to self in a static for the callbacks to use.
         KERNEL_PTR.store(self as *mut KernelCore, Ordering::Release);
         if let Some(ref gsc) = self.global_scheduler_context {
-            gsc.lock().unwrap().m_scheduler_lock.set_callbacks(&SCHEDULER_CALLBACKS);
+            gsc.lock()
+                .unwrap()
+                .m_scheduler_lock
+                .set_callbacks(&SCHEDULER_CALLBACKS);
         }
 
         // Initialize preemption event.
@@ -474,7 +526,10 @@ impl KernelCore {
         }
         // Wire GSC so the thread's notify_state_transition can update PQ directly.
         if let Some(gsc) = self.global_scheduler_context() {
-            process.lock().unwrap().global_scheduler_context = Some(gsc.clone());
+            process
+                .lock()
+                .unwrap()
+                .set_global_scheduler_context(gsc.clone());
         }
 
         {
@@ -492,7 +547,10 @@ impl KernelCore {
         }
 
         // Upstream registers the thread before making it runnable.
-        process.lock().unwrap().register_thread_object(Arc::clone(&thread));
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(Arc::clone(&thread));
         self.register_kernel_object(thread.lock().unwrap().get_object_id());
 
         // Make the thread runnable. t.run() → set_state(RUNNABLE) →
@@ -513,7 +571,9 @@ impl KernelCore {
         // Verify the thread is in the priority queue.
         if let Some(gsc) = self.global_scheduler_context() {
             let gsc = gsc.lock().unwrap();
-            let front = gsc.m_priority_queue.get_scheduled_front(SERVICE_THREAD_CORE);
+            let front = gsc
+                .m_priority_queue
+                .get_scheduled_front(SERVICE_THREAD_CORE);
             log::info!(
                 "KernelCore::run_on_guest_core_process: '{}' thread_id={} core={} priority={} pq_front={:?}",
                 name, thread_id, SERVICE_THREAD_CORE, SERVICE_THREAD_PRIORITY, front
@@ -546,7 +606,10 @@ impl KernelCore {
             assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
             thread_guard.bind_self_reference(&thread);
         }
-        process.lock().unwrap().register_thread_object(Arc::clone(&thread));
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(Arc::clone(&thread));
 
         std::thread::Builder::new()
             .name(thread_name.clone())
@@ -590,9 +653,10 @@ impl KernelCore {
     pub fn schedule_preemption_event(&self, core_timing: &Arc<std::sync::Mutex<CoreTiming>>) {
         if let Some(ref event) = self.preemption_event {
             let interval = std::time::Duration::from_millis(10);
-            core_timing.lock().unwrap().schedule_looping_event(
-                interval, interval, event, false,
-            );
+            core_timing
+                .lock()
+                .unwrap()
+                .schedule_looping_event(interval, interval, event, false);
             log::info!("KernelCore: preemption event scheduled (10ms interval)");
         }
     }
@@ -680,7 +744,6 @@ impl KernelCore {
         for manager in server_managers {
             manager.lock().unwrap().request_stop();
         }
-
     }
 
     /// Port of upstream `KernelCore::RunServer`.
@@ -754,12 +817,12 @@ impl KernelCore {
     /// Get a physical core by index.
     /// Upstream: `KernelCore::PhysicalCore(id)`.
     pub fn physical_core(&self, id: usize) -> Option<&PhysicalCore> {
-        self.cores.get(id)
+        self.cores.get(id).map(Arc::as_ref)
     }
 
     /// Get a physical core mutably by index.
     pub fn physical_core_mut(&mut self, id: usize) -> Option<&mut PhysicalCore> {
-        self.cores.get_mut(id)
+        self.cores.get_mut(id).and_then(Arc::get_mut)
     }
 
     /// Get a per-core scheduler by index.
@@ -800,13 +863,14 @@ impl KernelCore {
     /// Get the physical core for the calling host thread.
     /// Upstream: `KernelCore::CurrentPhysicalCore()` (kernel.cpp:948).
     pub fn current_physical_core(&self) -> &PhysicalCore {
-        &self.cores[self.current_physical_core_index()]
+        self.cores[self.current_physical_core_index()].as_ref()
     }
 
     /// Get the physical core for the calling host thread (mutable).
     pub fn current_physical_core_mut(&mut self) -> &mut PhysicalCore {
         let idx = self.current_physical_core_index();
-        &mut self.cores[idx]
+        Arc::get_mut(&mut self.cores[idx])
+            .expect("current_physical_core_mut requires exclusive PhysicalCore ownership")
     }
 
     /// Register a CPU core thread by setting the thread-local host thread ID.
@@ -858,9 +922,7 @@ impl KernelCore {
     fn get_current_host_thread_id(&self) -> u32 {
         HOST_THREAD_ID.with(|id| {
             let this_id = id.get();
-            if !self.is_multicore
-                && this_id == self.single_core_thread_id.load(Ordering::Relaxed)
-            {
+            if !self.is_multicore && this_id == self.single_core_thread_id.load(Ordering::Relaxed) {
                 // In single-core mode, the single core thread ID maps to the
                 // current core index. Upstream reads system.GetCpuManager().CurrentCore().
                 // We return 0 as default; CpuManager.current_core rotates this.
@@ -1029,7 +1091,8 @@ impl KernelCore {
             // Upstream: done implicitly during ScheduleImplFiber's first yield.
             KScheduler::init_switch_fiber(&scheduler);
             self.schedulers.push(scheduler.clone());
-            self.cores.push(PhysicalCore::new(i, self.is_multicore));
+            self.cores
+                .push(Arc::new(PhysicalCore::new(i, self.is_multicore)));
 
             // Create main thread.
             // Upstream: auto* main_thread = KThread::Create(kernel);
@@ -1055,7 +1118,12 @@ impl KernelCore {
                     crate::cpu_manager::CpuManager::guest_activate(kernel);
                 });
 
-                t.initialize_kernel_main_thread(core_id, thread_id, object_id, Some(guest_activate_func));
+                t.initialize_kernel_main_thread(
+                    core_id,
+                    thread_id,
+                    object_id,
+                    Some(guest_activate_func),
+                );
                 t.bind_self_reference(&main_thread);
             }
             // Upstream: KThread::Register(kernel, main_thread) → adds to object list container.
@@ -1112,6 +1180,13 @@ impl KernelCore {
             self.main_threads.push(main_thread);
             self.idle_threads.push(idle_thread);
         }
+
+        // Rust adaptation: schedulers do not hold the upstream `KernelCore&`
+        // owner, so wire the created PhysicalCore set into every scheduler for
+        // save/load/interrupt paths that would otherwise go through `m_kernel`.
+        for scheduler in &self.schedulers {
+            scheduler.lock().unwrap().physical_cores = self.cores.clone();
+        }
     }
 }
 
@@ -1147,7 +1222,13 @@ mod tests {
         }
         .expect("service process should keep its thread object");
 
-        assert!(thread.lock().unwrap().parent.as_ref().and_then(Weak::upgrade).is_some());
+        assert!(thread
+            .lock()
+            .unwrap()
+            .parent
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some());
     }
 
     #[test]
@@ -1186,6 +1267,17 @@ mod tests {
             .get_current_emu_thread()
             .expect("existing thread should remain current");
         assert!(Arc::ptr_eq(&current, &thread));
+    }
+
+    #[test]
+    fn initialize_physical_cores_wires_physical_cores_into_each_scheduler() {
+        let mut kernel = KernelCore::new();
+        kernel.initialize();
+
+        for scheduler in &kernel.schedulers {
+            let scheduler = scheduler.lock().unwrap();
+            assert_eq!(scheduler.physical_cores.len(), kernel.cores.len());
+        }
     }
 }
 

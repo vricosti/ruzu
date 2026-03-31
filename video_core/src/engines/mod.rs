@@ -77,10 +77,7 @@ pub trait Engine: Send {
 
     /// Execute pending operations that need memory access (blit, DMA copy).
     /// Reads source data via `read_gpu`, returns writes to be applied.
-    fn execute_pending(
-        &mut self,
-        _read_gpu: &dyn Fn(u64, &mut [u8]),
-    ) -> Vec<PendingWrite> {
+    fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         vec![]
     }
 

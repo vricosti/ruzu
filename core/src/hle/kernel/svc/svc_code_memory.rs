@@ -30,10 +30,16 @@ fn is_valid_unmap_from_owner_code_memory_permission(perm: MemoryPermission) -> b
 ///
 /// Upstream: Creates KCodeMemory, verifies region is in range, initializes,
 /// registers, and adds to handle table.
-pub fn create_code_memory(system: &System, out: &mut Handle, address: u64, size: u64) -> ResultCode {
+pub fn create_code_memory(
+    system: &System,
+    out: &mut Handle,
+    address: u64,
+    size: u64,
+) -> ResultCode {
     log::trace!(
         "svc::CreateCodeMemory called, address=0x{:X}, size=0x{:X}",
-        address, size
+        address,
+        size
     );
 
     // Validate address / size.
@@ -162,11 +168,9 @@ pub fn control_code_memory(
             }
 
             // Upstream: code_mem->Unmap(address, size)
-            let result = process.page_table.unmap_memory(
-                addr_kpa,
-                addr_kpa,
-                size as usize,
-            );
+            let result = process
+                .page_table
+                .unmap_memory(addr_kpa, addr_kpa, size as usize);
             if result != 0 {
                 return ResultCode::new(result);
             }
@@ -187,12 +191,13 @@ pub fn control_code_memory(
             }
 
             // Upstream: code_mem->MapToOwner(address, size, perm)
-            let k_perm = crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(perm as u8);
-            let result = process.page_table.set_process_memory_permission(
-                addr_kpa,
-                size as usize,
-                k_perm,
+            let k_perm = crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(
+                perm as u8,
             );
+            let result =
+                process
+                    .page_table
+                    .set_process_memory_permission(addr_kpa, size as usize, k_perm);
             if result != 0 {
                 return ResultCode::new(result);
             }

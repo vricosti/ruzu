@@ -684,8 +684,9 @@ pub fn get_astc_block_size(format: PixelFormat) -> (u32, u32) {
 /// this returns the uncompressed size (RGBA8 equivalent).
 pub fn transcoded_astc_size(base_size: u64, format: PixelFormat) -> u64 {
     const RGBA8_PIXEL_SIZE: u64 = 4;
-    let base_block_size =
-        (default_block_width(format) as u64) * (default_block_height(format) as u64) * RGBA8_PIXEL_SIZE;
+    let base_block_size = (default_block_width(format) as u64)
+        * (default_block_height(format) as u64)
+        * RGBA8_PIXEL_SIZE;
     let bpb = bytes_per_block(format) as u64;
     if bpb == 0 {
         return 0;
@@ -763,10 +764,16 @@ mod tests {
 
     #[test]
     fn format_type_classification() {
-        assert_eq!(get_format_type(PixelFormat::A8B8G8R8Unorm), SurfaceType::ColorTexture);
+        assert_eq!(
+            get_format_type(PixelFormat::A8B8G8R8Unorm),
+            SurfaceType::ColorTexture
+        );
         assert_eq!(get_format_type(PixelFormat::D32Float), SurfaceType::Depth);
         assert_eq!(get_format_type(PixelFormat::S8Uint), SurfaceType::Stencil);
-        assert_eq!(get_format_type(PixelFormat::D24UnormS8Uint), SurfaceType::DepthStencil);
+        assert_eq!(
+            get_format_type(PixelFormat::D24UnormS8Uint),
+            SurfaceType::DepthStencil
+        );
     }
 
     #[test]
@@ -806,7 +813,10 @@ mod tests {
         assert_eq!(pixel_component_size_bits_integer(PixelFormat::R8Uint), 8);
         assert_eq!(pixel_component_size_bits_integer(PixelFormat::R16Uint), 16);
         assert_eq!(pixel_component_size_bits_integer(PixelFormat::R32Uint), 32);
-        assert_eq!(pixel_component_size_bits_integer(PixelFormat::A2B10G10R10Uint), 10);
+        assert_eq!(
+            pixel_component_size_bits_integer(PixelFormat::A2B10G10R10Uint),
+            10
+        );
         assert_eq!(pixel_component_size_bits_integer(PixelFormat::R32Float), 0);
     }
 

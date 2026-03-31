@@ -17,15 +17,15 @@
 //!   - news/ (service_creator, news_service, news_database_service, news_data_service,
 //!            newly_arrived_event_holder, overwrite_event_holder)
 
+pub mod backend;
 pub mod bcat;
 pub mod bcat_result;
+pub mod bcat_service;
 pub mod bcat_types;
 pub mod bcat_util;
-pub mod bcat_service;
-pub mod service_creator;
-pub mod delivery_cache_storage_service;
-pub mod delivery_cache_file_service;
 pub mod delivery_cache_directory_service;
+pub mod delivery_cache_file_service;
 pub mod delivery_cache_progress_service;
-pub mod backend;
+pub mod delivery_cache_storage_service;
 pub mod news;
+pub mod service_creator;

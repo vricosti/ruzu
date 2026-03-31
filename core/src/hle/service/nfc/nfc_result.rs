@@ -13,10 +13,8 @@ pub const RESULT_WRONG_APPLICATION_AREA_SIZE: ResultCode =
     ResultCode::from_module_description(ErrorModule::NFC, 68);
 pub const RESULT_WRONG_DEVICE_STATE: ResultCode =
     ResultCode::from_module_description(ErrorModule::NFC, 73);
-pub const RESULT_UNKNOWN_74: ResultCode =
-    ResultCode::from_module_description(ErrorModule::NFC, 74);
-pub const RESULT_UNKNOWN_76: ResultCode =
-    ResultCode::from_module_description(ErrorModule::NFC, 76);
+pub const RESULT_UNKNOWN_74: ResultCode = ResultCode::from_module_description(ErrorModule::NFC, 74);
+pub const RESULT_UNKNOWN_76: ResultCode = ResultCode::from_module_description(ErrorModule::NFC, 76);
 pub const RESULT_NFC_NOT_INITIALIZED: ResultCode =
     ResultCode::from_module_description(ErrorModule::NFC, 77);
 pub const RESULT_NFC_DISABLED: ResultCode =

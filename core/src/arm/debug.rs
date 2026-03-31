@@ -6,8 +6,8 @@
 
 use crate::arm::arm_interface::ThreadContext;
 use crate::arm::symbols;
-use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
 use crate::hardware_properties;
+use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
 use std::collections::BTreeMap;
 
 // The opaque types below serve as forward declarations matching upstream's
@@ -99,16 +99,12 @@ fn range_fits_memory_info(
 
 /// Helper: transmute opaque KProcess to real KProcess.
 /// SAFETY: The caller must ensure the pointer actually points to a real KProcess.
-unsafe fn real_process(
-    opaque: &KProcess,
-) -> &crate::hle::kernel::k_process::KProcess {
+unsafe fn real_process(opaque: &KProcess) -> &crate::hle::kernel::k_process::KProcess {
     &*(opaque as *const KProcess as *const crate::hle::kernel::k_process::KProcess)
 }
 
 /// Helper: transmute opaque KThread to real KThread.
-unsafe fn real_thread(
-    opaque: &KThread,
-) -> &crate::hle::kernel::k_thread::KThread {
+unsafe fn real_thread(opaque: &KThread) -> &crate::hle::kernel::k_thread::KThread {
     &*(opaque as *const KThread as *const crate::hle::kernel::k_thread::KThread)
 }
 
@@ -258,11 +254,7 @@ pub fn find_main_module_entrypoint(process: &KProcess) -> u64 {
 
 /// Invalidate instruction cache range across all CPU cores.
 /// Corresponds to upstream `Core::InvalidateInstructionCacheRange`.
-pub fn invalidate_instruction_cache_range(
-    _process: &KProcess,
-    _address: u64,
-    _size: u64,
-) {
+pub fn invalidate_instruction_cache_range(_process: &KProcess, _address: u64, _size: u64) {
     // Upstream: process->GetArmInterface(i)->InvalidateCacheRange(address, size)
     // for i in 0..NUM_CPU_CORES.
     // KProcess does not expose arm interfaces directly in ruzu.
@@ -308,16 +300,18 @@ pub fn get_backtrace_from_context(
         });
 
         if is_64bit {
-            if !can_walk_frame_record(fp, 16, |base, size| is_mapped_process_range(process, base, size))
-            {
+            if !can_walk_frame_record(fp, 16, |base, size| {
+                is_mapped_process_range(process, base, size)
+            }) {
                 break;
             }
             let new_fp = mem.read_64(fp);
             lr = mem.read_64(fp + 8);
             fp = new_fp;
         } else {
-            if !can_walk_frame_record(fp, 8, |base, size| is_mapped_process_range(process, base, size))
-            {
+            if !can_walk_frame_record(fp, 8, |base, size| {
+                is_mapped_process_range(process, base, size)
+            }) {
                 break;
             }
             let new_fp = mem.read_32(fp) as u64;
@@ -349,7 +343,9 @@ mod tests {
     #[test]
     fn can_walk_frame_record_requires_valid_range() {
         assert!(!can_walk_frame_record(0x1000, 8, |_, _| false));
-        assert!(can_walk_frame_record(0x1000, 8, |base, size| base == 0x1000 && size == 8));
+        assert!(can_walk_frame_record(0x1000, 8, |base, size| base
+            == 0x1000
+            && size == 8));
     }
 
     fn mapped_info(address: usize, size: usize, permission: KMemoryPermission) -> KMemoryInfo {
@@ -442,9 +438,7 @@ fn symbolicate_backtrace(
     }
 }
 
-fn find_modules_for_process(
-    process: &crate::hle::kernel::k_process::KProcess,
-) -> Modules {
+fn find_modules_for_process(process: &crate::hle::kernel::k_process::KProcess) -> Modules {
     let memory = process.get_shared_memory();
     let mem = memory.read().unwrap();
     let _is_64bit = process.is_64bit();

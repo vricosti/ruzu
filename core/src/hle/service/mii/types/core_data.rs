@@ -7,6 +7,7 @@
 //! CoreData: the core Mii data structure used internally.
 //! Size: 0x30 bytes in upstream (packed bit-fields + Nickname).
 
+use crate::hle::service::mii::mii_types::{Age, Race};
 use crate::hle::service::mii::mii_types::{
     BeardAndMustacheFlag, BeardType, CommonColor, EyeType, EyebrowType, FacelineColor,
     FacelineMake, FacelineType, FacelineWrinkle, FavoriteColor, FontRegion, Gender, GlassType,
@@ -17,7 +18,6 @@ use crate::hle::service::mii::mii_types::{
     MAX_MOUTH_ASPECT, MAX_MOUTH_SCALE, MAX_MOUTH_Y, MAX_MUSTACHE_SCALE, MAX_MUSTACHE_Y,
     MAX_NOSE_SCALE, MAX_NOSE_Y, MAX_REGION_MOVE, MAX_TYPE,
 };
-use crate::hle::service::mii::mii_types::{Age, Race};
 use crate::hle::service::mii::mii_util;
 use crate::hle::service::mii::types::raw_data;
 
@@ -56,20 +56,48 @@ impl StoreDataBitFields {
     //   [24:7]  hair_color
     //   [31:1]  type
 
-    pub fn hair_type(&self) -> u32 { get_bits(self.words[0], 0, 8) }
-    pub fn set_hair_type(&mut self, v: u32) { set_bits(&mut self.words[0], 0, 8, v); }
-    pub fn height(&self) -> u32 { get_bits(self.words[0], 8, 7) }
-    pub fn set_height(&mut self, v: u32) { set_bits(&mut self.words[0], 8, 7, v); }
-    pub fn mole_type(&self) -> u32 { get_bits(self.words[0], 15, 1) }
-    pub fn set_mole_type(&mut self, v: u32) { set_bits(&mut self.words[0], 15, 1, v); }
-    pub fn build(&self) -> u32 { get_bits(self.words[0], 16, 7) }
-    pub fn set_build(&mut self, v: u32) { set_bits(&mut self.words[0], 16, 7, v); }
-    pub fn hair_flip(&self) -> u32 { get_bits(self.words[0], 23, 1) }
-    pub fn set_hair_flip(&mut self, v: u32) { set_bits(&mut self.words[0], 23, 1, v); }
-    pub fn hair_color(&self) -> u32 { get_bits(self.words[0], 24, 7) }
-    pub fn set_hair_color(&mut self, v: u32) { set_bits(&mut self.words[0], 24, 7, v); }
-    pub fn type_val(&self) -> u32 { get_bits(self.words[0], 31, 1) }
-    pub fn set_type_val(&mut self, v: u32) { set_bits(&mut self.words[0], 31, 1, v); }
+    pub fn hair_type(&self) -> u32 {
+        get_bits(self.words[0], 0, 8)
+    }
+    pub fn set_hair_type(&mut self, v: u32) {
+        set_bits(&mut self.words[0], 0, 8, v);
+    }
+    pub fn height(&self) -> u32 {
+        get_bits(self.words[0], 8, 7)
+    }
+    pub fn set_height(&mut self, v: u32) {
+        set_bits(&mut self.words[0], 8, 7, v);
+    }
+    pub fn mole_type(&self) -> u32 {
+        get_bits(self.words[0], 15, 1)
+    }
+    pub fn set_mole_type(&mut self, v: u32) {
+        set_bits(&mut self.words[0], 15, 1, v);
+    }
+    pub fn build(&self) -> u32 {
+        get_bits(self.words[0], 16, 7)
+    }
+    pub fn set_build(&mut self, v: u32) {
+        set_bits(&mut self.words[0], 16, 7, v);
+    }
+    pub fn hair_flip(&self) -> u32 {
+        get_bits(self.words[0], 23, 1)
+    }
+    pub fn set_hair_flip(&mut self, v: u32) {
+        set_bits(&mut self.words[0], 23, 1, v);
+    }
+    pub fn hair_color(&self) -> u32 {
+        get_bits(self.words[0], 24, 7)
+    }
+    pub fn set_hair_color(&mut self, v: u32) {
+        set_bits(&mut self.words[0], 24, 7, v);
+    }
+    pub fn type_val(&self) -> u32 {
+        get_bits(self.words[0], 31, 1)
+    }
+    pub fn set_type_val(&mut self, v: u32) {
+        set_bits(&mut self.words[0], 31, 1, v);
+    }
 
     // word_1 layout:
     //   [0:7]   eye_color
@@ -78,16 +106,36 @@ impl StoreDataBitFields {
     //   [16:7]  mouth_color
     //   [24:7]  beard_color
 
-    pub fn eye_color(&self) -> u32 { get_bits(self.words[1], 0, 7) }
-    pub fn set_eye_color(&mut self, v: u32) { set_bits(&mut self.words[1], 0, 7, v); }
-    pub fn gender(&self) -> u32 { get_bits(self.words[1], 7, 1) }
-    pub fn set_gender(&mut self, v: u32) { set_bits(&mut self.words[1], 7, 1, v); }
-    pub fn eyebrow_color(&self) -> u32 { get_bits(self.words[1], 8, 7) }
-    pub fn set_eyebrow_color(&mut self, v: u32) { set_bits(&mut self.words[1], 8, 7, v); }
-    pub fn mouth_color(&self) -> u32 { get_bits(self.words[1], 16, 7) }
-    pub fn set_mouth_color(&mut self, v: u32) { set_bits(&mut self.words[1], 16, 7, v); }
-    pub fn beard_color(&self) -> u32 { get_bits(self.words[1], 24, 7) }
-    pub fn set_beard_color(&mut self, v: u32) { set_bits(&mut self.words[1], 24, 7, v); }
+    pub fn eye_color(&self) -> u32 {
+        get_bits(self.words[1], 0, 7)
+    }
+    pub fn set_eye_color(&mut self, v: u32) {
+        set_bits(&mut self.words[1], 0, 7, v);
+    }
+    pub fn gender(&self) -> u32 {
+        get_bits(self.words[1], 7, 1)
+    }
+    pub fn set_gender(&mut self, v: u32) {
+        set_bits(&mut self.words[1], 7, 1, v);
+    }
+    pub fn eyebrow_color(&self) -> u32 {
+        get_bits(self.words[1], 8, 7)
+    }
+    pub fn set_eyebrow_color(&mut self, v: u32) {
+        set_bits(&mut self.words[1], 8, 7, v);
+    }
+    pub fn mouth_color(&self) -> u32 {
+        get_bits(self.words[1], 16, 7)
+    }
+    pub fn set_mouth_color(&mut self, v: u32) {
+        set_bits(&mut self.words[1], 16, 7, v);
+    }
+    pub fn beard_color(&self) -> u32 {
+        get_bits(self.words[1], 24, 7)
+    }
+    pub fn set_beard_color(&mut self, v: u32) {
+        set_bits(&mut self.words[1], 24, 7, v);
+    }
 
     // word_2 layout:
     //   [0:7]   glasses_color
@@ -98,20 +146,48 @@ impl StoreDataBitFields {
     //   [24:5]  eye_y
     //   [29:3]  glasses_scale
 
-    pub fn glasses_color(&self) -> u32 { get_bits(self.words[2], 0, 7) }
-    pub fn set_glasses_color(&mut self, v: u32) { set_bits(&mut self.words[2], 0, 7, v); }
-    pub fn eye_type(&self) -> u32 { get_bits(self.words[2], 8, 6) }
-    pub fn set_eye_type(&mut self, v: u32) { set_bits(&mut self.words[2], 8, 6, v); }
-    pub fn region_move(&self) -> u32 { get_bits(self.words[2], 14, 2) }
-    pub fn set_region_move(&mut self, v: u32) { set_bits(&mut self.words[2], 14, 2, v); }
-    pub fn mouth_type(&self) -> u32 { get_bits(self.words[2], 16, 6) }
-    pub fn set_mouth_type(&mut self, v: u32) { set_bits(&mut self.words[2], 16, 6, v); }
-    pub fn font_region(&self) -> u32 { get_bits(self.words[2], 22, 2) }
-    pub fn set_font_region(&mut self, v: u32) { set_bits(&mut self.words[2], 22, 2, v); }
-    pub fn eye_y(&self) -> u32 { get_bits(self.words[2], 24, 5) }
-    pub fn set_eye_y(&mut self, v: u32) { set_bits(&mut self.words[2], 24, 5, v); }
-    pub fn glasses_scale(&self) -> u32 { get_bits(self.words[2], 29, 3) }
-    pub fn set_glasses_scale(&mut self, v: u32) { set_bits(&mut self.words[2], 29, 3, v); }
+    pub fn glasses_color(&self) -> u32 {
+        get_bits(self.words[2], 0, 7)
+    }
+    pub fn set_glasses_color(&mut self, v: u32) {
+        set_bits(&mut self.words[2], 0, 7, v);
+    }
+    pub fn eye_type(&self) -> u32 {
+        get_bits(self.words[2], 8, 6)
+    }
+    pub fn set_eye_type(&mut self, v: u32) {
+        set_bits(&mut self.words[2], 8, 6, v);
+    }
+    pub fn region_move(&self) -> u32 {
+        get_bits(self.words[2], 14, 2)
+    }
+    pub fn set_region_move(&mut self, v: u32) {
+        set_bits(&mut self.words[2], 14, 2, v);
+    }
+    pub fn mouth_type(&self) -> u32 {
+        get_bits(self.words[2], 16, 6)
+    }
+    pub fn set_mouth_type(&mut self, v: u32) {
+        set_bits(&mut self.words[2], 16, 6, v);
+    }
+    pub fn font_region(&self) -> u32 {
+        get_bits(self.words[2], 22, 2)
+    }
+    pub fn set_font_region(&mut self, v: u32) {
+        set_bits(&mut self.words[2], 22, 2, v);
+    }
+    pub fn eye_y(&self) -> u32 {
+        get_bits(self.words[2], 24, 5)
+    }
+    pub fn set_eye_y(&mut self, v: u32) {
+        set_bits(&mut self.words[2], 24, 5, v);
+    }
+    pub fn glasses_scale(&self) -> u32 {
+        get_bits(self.words[2], 29, 3)
+    }
+    pub fn set_glasses_scale(&mut self, v: u32) {
+        set_bits(&mut self.words[2], 29, 3, v);
+    }
 
     // word_3 layout:
     //   [0:5]   eyebrow_type
@@ -123,22 +199,54 @@ impl StoreDataBitFields {
     //   [24:5]  mouth_y
     //   [29:3]  eyebrow_aspect
 
-    pub fn eyebrow_type(&self) -> u32 { get_bits(self.words[3], 0, 5) }
-    pub fn set_eyebrow_type(&mut self, v: u32) { set_bits(&mut self.words[3], 0, 5, v); }
-    pub fn mustache_type(&self) -> u32 { get_bits(self.words[3], 5, 3) }
-    pub fn set_mustache_type(&mut self, v: u32) { set_bits(&mut self.words[3], 5, 3, v); }
-    pub fn nose_type(&self) -> u32 { get_bits(self.words[3], 8, 5) }
-    pub fn set_nose_type(&mut self, v: u32) { set_bits(&mut self.words[3], 8, 5, v); }
-    pub fn beard_type(&self) -> u32 { get_bits(self.words[3], 13, 3) }
-    pub fn set_beard_type(&mut self, v: u32) { set_bits(&mut self.words[3], 13, 3, v); }
-    pub fn nose_y(&self) -> u32 { get_bits(self.words[3], 16, 5) }
-    pub fn set_nose_y(&mut self, v: u32) { set_bits(&mut self.words[3], 16, 5, v); }
-    pub fn mouth_aspect(&self) -> u32 { get_bits(self.words[3], 21, 3) }
-    pub fn set_mouth_aspect(&mut self, v: u32) { set_bits(&mut self.words[3], 21, 3, v); }
-    pub fn mouth_y(&self) -> u32 { get_bits(self.words[3], 24, 5) }
-    pub fn set_mouth_y(&mut self, v: u32) { set_bits(&mut self.words[3], 24, 5, v); }
-    pub fn eyebrow_aspect(&self) -> u32 { get_bits(self.words[3], 29, 3) }
-    pub fn set_eyebrow_aspect(&mut self, v: u32) { set_bits(&mut self.words[3], 29, 3, v); }
+    pub fn eyebrow_type(&self) -> u32 {
+        get_bits(self.words[3], 0, 5)
+    }
+    pub fn set_eyebrow_type(&mut self, v: u32) {
+        set_bits(&mut self.words[3], 0, 5, v);
+    }
+    pub fn mustache_type(&self) -> u32 {
+        get_bits(self.words[3], 5, 3)
+    }
+    pub fn set_mustache_type(&mut self, v: u32) {
+        set_bits(&mut self.words[3], 5, 3, v);
+    }
+    pub fn nose_type(&self) -> u32 {
+        get_bits(self.words[3], 8, 5)
+    }
+    pub fn set_nose_type(&mut self, v: u32) {
+        set_bits(&mut self.words[3], 8, 5, v);
+    }
+    pub fn beard_type(&self) -> u32 {
+        get_bits(self.words[3], 13, 3)
+    }
+    pub fn set_beard_type(&mut self, v: u32) {
+        set_bits(&mut self.words[3], 13, 3, v);
+    }
+    pub fn nose_y(&self) -> u32 {
+        get_bits(self.words[3], 16, 5)
+    }
+    pub fn set_nose_y(&mut self, v: u32) {
+        set_bits(&mut self.words[3], 16, 5, v);
+    }
+    pub fn mouth_aspect(&self) -> u32 {
+        get_bits(self.words[3], 21, 3)
+    }
+    pub fn set_mouth_aspect(&mut self, v: u32) {
+        set_bits(&mut self.words[3], 21, 3, v);
+    }
+    pub fn mouth_y(&self) -> u32 {
+        get_bits(self.words[3], 24, 5)
+    }
+    pub fn set_mouth_y(&mut self, v: u32) {
+        set_bits(&mut self.words[3], 24, 5, v);
+    }
+    pub fn eyebrow_aspect(&self) -> u32 {
+        get_bits(self.words[3], 29, 3)
+    }
+    pub fn set_eyebrow_aspect(&mut self, v: u32) {
+        set_bits(&mut self.words[3], 29, 3, v);
+    }
 
     // word_4 layout:
     //   [0:5]   mustache_y
@@ -149,20 +257,48 @@ impl StoreDataBitFields {
     //   [21:3]  eye_scale
     //   [24:5]  mole_y
 
-    pub fn mustache_y(&self) -> u32 { get_bits(self.words[4], 0, 5) }
-    pub fn set_mustache_y(&mut self, v: u32) { set_bits(&mut self.words[4], 0, 5, v); }
-    pub fn eye_rotate(&self) -> u32 { get_bits(self.words[4], 5, 3) }
-    pub fn set_eye_rotate(&mut self, v: u32) { set_bits(&mut self.words[4], 5, 3, v); }
-    pub fn glasses_y(&self) -> u32 { get_bits(self.words[4], 8, 5) }
-    pub fn set_glasses_y(&mut self, v: u32) { set_bits(&mut self.words[4], 8, 5, v); }
-    pub fn eye_aspect(&self) -> u32 { get_bits(self.words[4], 13, 3) }
-    pub fn set_eye_aspect(&mut self, v: u32) { set_bits(&mut self.words[4], 13, 3, v); }
-    pub fn mole_x(&self) -> u32 { get_bits(self.words[4], 16, 5) }
-    pub fn set_mole_x(&mut self, v: u32) { set_bits(&mut self.words[4], 16, 5, v); }
-    pub fn eye_scale(&self) -> u32 { get_bits(self.words[4], 21, 3) }
-    pub fn set_eye_scale(&mut self, v: u32) { set_bits(&mut self.words[4], 21, 3, v); }
-    pub fn mole_y(&self) -> u32 { get_bits(self.words[4], 24, 5) }
-    pub fn set_mole_y(&mut self, v: u32) { set_bits(&mut self.words[4], 24, 5, v); }
+    pub fn mustache_y(&self) -> u32 {
+        get_bits(self.words[4], 0, 5)
+    }
+    pub fn set_mustache_y(&mut self, v: u32) {
+        set_bits(&mut self.words[4], 0, 5, v);
+    }
+    pub fn eye_rotate(&self) -> u32 {
+        get_bits(self.words[4], 5, 3)
+    }
+    pub fn set_eye_rotate(&mut self, v: u32) {
+        set_bits(&mut self.words[4], 5, 3, v);
+    }
+    pub fn glasses_y(&self) -> u32 {
+        get_bits(self.words[4], 8, 5)
+    }
+    pub fn set_glasses_y(&mut self, v: u32) {
+        set_bits(&mut self.words[4], 8, 5, v);
+    }
+    pub fn eye_aspect(&self) -> u32 {
+        get_bits(self.words[4], 13, 3)
+    }
+    pub fn set_eye_aspect(&mut self, v: u32) {
+        set_bits(&mut self.words[4], 13, 3, v);
+    }
+    pub fn mole_x(&self) -> u32 {
+        get_bits(self.words[4], 16, 5)
+    }
+    pub fn set_mole_x(&mut self, v: u32) {
+        set_bits(&mut self.words[4], 16, 5, v);
+    }
+    pub fn eye_scale(&self) -> u32 {
+        get_bits(self.words[4], 21, 3)
+    }
+    pub fn set_eye_scale(&mut self, v: u32) {
+        set_bits(&mut self.words[4], 21, 3, v);
+    }
+    pub fn mole_y(&self) -> u32 {
+        get_bits(self.words[4], 24, 5)
+    }
+    pub fn set_mole_y(&mut self, v: u32) {
+        set_bits(&mut self.words[4], 24, 5, v);
+    }
 
     // word_5 layout:
     //   [0:5]   glasses_type
@@ -173,20 +309,48 @@ impl StoreDataBitFields {
     //   [24:4]  faceline_makeup
     //   [28:4]  eye_x
 
-    pub fn glasses_type(&self) -> u32 { get_bits(self.words[5], 0, 5) }
-    pub fn set_glasses_type(&mut self, v: u32) { set_bits(&mut self.words[5], 0, 5, v); }
-    pub fn favorite_color(&self) -> u32 { get_bits(self.words[5], 8, 4) }
-    pub fn set_favorite_color(&mut self, v: u32) { set_bits(&mut self.words[5], 8, 4, v); }
-    pub fn faceline_type(&self) -> u32 { get_bits(self.words[5], 12, 4) }
-    pub fn set_faceline_type(&mut self, v: u32) { set_bits(&mut self.words[5], 12, 4, v); }
-    pub fn faceline_color(&self) -> u32 { get_bits(self.words[5], 16, 4) }
-    pub fn set_faceline_color(&mut self, v: u32) { set_bits(&mut self.words[5], 16, 4, v); }
-    pub fn faceline_wrinkle(&self) -> u32 { get_bits(self.words[5], 20, 4) }
-    pub fn set_faceline_wrinkle(&mut self, v: u32) { set_bits(&mut self.words[5], 20, 4, v); }
-    pub fn faceline_makeup(&self) -> u32 { get_bits(self.words[5], 24, 4) }
-    pub fn set_faceline_makeup(&mut self, v: u32) { set_bits(&mut self.words[5], 24, 4, v); }
-    pub fn eye_x(&self) -> u32 { get_bits(self.words[5], 28, 4) }
-    pub fn set_eye_x(&mut self, v: u32) { set_bits(&mut self.words[5], 28, 4, v); }
+    pub fn glasses_type(&self) -> u32 {
+        get_bits(self.words[5], 0, 5)
+    }
+    pub fn set_glasses_type(&mut self, v: u32) {
+        set_bits(&mut self.words[5], 0, 5, v);
+    }
+    pub fn favorite_color(&self) -> u32 {
+        get_bits(self.words[5], 8, 4)
+    }
+    pub fn set_favorite_color(&mut self, v: u32) {
+        set_bits(&mut self.words[5], 8, 4, v);
+    }
+    pub fn faceline_type(&self) -> u32 {
+        get_bits(self.words[5], 12, 4)
+    }
+    pub fn set_faceline_type(&mut self, v: u32) {
+        set_bits(&mut self.words[5], 12, 4, v);
+    }
+    pub fn faceline_color(&self) -> u32 {
+        get_bits(self.words[5], 16, 4)
+    }
+    pub fn set_faceline_color(&mut self, v: u32) {
+        set_bits(&mut self.words[5], 16, 4, v);
+    }
+    pub fn faceline_wrinkle(&self) -> u32 {
+        get_bits(self.words[5], 20, 4)
+    }
+    pub fn set_faceline_wrinkle(&mut self, v: u32) {
+        set_bits(&mut self.words[5], 20, 4, v);
+    }
+    pub fn faceline_makeup(&self) -> u32 {
+        get_bits(self.words[5], 24, 4)
+    }
+    pub fn set_faceline_makeup(&mut self, v: u32) {
+        set_bits(&mut self.words[5], 24, 4, v);
+    }
+    pub fn eye_x(&self) -> u32 {
+        get_bits(self.words[5], 28, 4)
+    }
+    pub fn set_eye_x(&mut self, v: u32) {
+        set_bits(&mut self.words[5], 28, 4, v);
+    }
 
     // word_6 layout:
     //   [0:4]   eyebrow_scale
@@ -198,22 +362,54 @@ impl StoreDataBitFields {
     //   [24:4]  mustache_scale
     //   [28:4]  mole_scale
 
-    pub fn eyebrow_scale(&self) -> u32 { get_bits(self.words[6], 0, 4) }
-    pub fn set_eyebrow_scale(&mut self, v: u32) { set_bits(&mut self.words[6], 0, 4, v); }
-    pub fn eyebrow_rotate(&self) -> u32 { get_bits(self.words[6], 4, 4) }
-    pub fn set_eyebrow_rotate(&mut self, v: u32) { set_bits(&mut self.words[6], 4, 4, v); }
-    pub fn eyebrow_x(&self) -> u32 { get_bits(self.words[6], 8, 4) }
-    pub fn set_eyebrow_x(&mut self, v: u32) { set_bits(&mut self.words[6], 8, 4, v); }
-    pub fn eyebrow_y(&self) -> u32 { get_bits(self.words[6], 12, 4) }
-    pub fn set_eyebrow_y(&mut self, v: u32) { set_bits(&mut self.words[6], 12, 4, v); }
-    pub fn nose_scale(&self) -> u32 { get_bits(self.words[6], 16, 4) }
-    pub fn set_nose_scale(&mut self, v: u32) { set_bits(&mut self.words[6], 16, 4, v); }
-    pub fn mouth_scale(&self) -> u32 { get_bits(self.words[6], 20, 4) }
-    pub fn set_mouth_scale(&mut self, v: u32) { set_bits(&mut self.words[6], 20, 4, v); }
-    pub fn mustache_scale(&self) -> u32 { get_bits(self.words[6], 24, 4) }
-    pub fn set_mustache_scale(&mut self, v: u32) { set_bits(&mut self.words[6], 24, 4, v); }
-    pub fn mole_scale(&self) -> u32 { get_bits(self.words[6], 28, 4) }
-    pub fn set_mole_scale(&mut self, v: u32) { set_bits(&mut self.words[6], 28, 4, v); }
+    pub fn eyebrow_scale(&self) -> u32 {
+        get_bits(self.words[6], 0, 4)
+    }
+    pub fn set_eyebrow_scale(&mut self, v: u32) {
+        set_bits(&mut self.words[6], 0, 4, v);
+    }
+    pub fn eyebrow_rotate(&self) -> u32 {
+        get_bits(self.words[6], 4, 4)
+    }
+    pub fn set_eyebrow_rotate(&mut self, v: u32) {
+        set_bits(&mut self.words[6], 4, 4, v);
+    }
+    pub fn eyebrow_x(&self) -> u32 {
+        get_bits(self.words[6], 8, 4)
+    }
+    pub fn set_eyebrow_x(&mut self, v: u32) {
+        set_bits(&mut self.words[6], 8, 4, v);
+    }
+    pub fn eyebrow_y(&self) -> u32 {
+        get_bits(self.words[6], 12, 4)
+    }
+    pub fn set_eyebrow_y(&mut self, v: u32) {
+        set_bits(&mut self.words[6], 12, 4, v);
+    }
+    pub fn nose_scale(&self) -> u32 {
+        get_bits(self.words[6], 16, 4)
+    }
+    pub fn set_nose_scale(&mut self, v: u32) {
+        set_bits(&mut self.words[6], 16, 4, v);
+    }
+    pub fn mouth_scale(&self) -> u32 {
+        get_bits(self.words[6], 20, 4)
+    }
+    pub fn set_mouth_scale(&mut self, v: u32) {
+        set_bits(&mut self.words[6], 20, 4, v);
+    }
+    pub fn mustache_scale(&self) -> u32 {
+        get_bits(self.words[6], 24, 4)
+    }
+    pub fn set_mustache_scale(&mut self, v: u32) {
+        set_bits(&mut self.words[6], 24, 4, v);
+    }
+    pub fn mole_scale(&self) -> u32 {
+        get_bits(self.words[6], 28, 4)
+    }
+    pub fn set_mole_scale(&mut self, v: u32) {
+        set_bits(&mut self.words[6], 28, 4, v);
+    }
 }
 
 impl Default for StoreDataBitFields {
@@ -254,7 +450,9 @@ impl CoreData {
     /// Matches upstream CoreData::BuildRandom.
     pub fn build_random(&mut self, mut age: Age, mut gender: Gender, mut race: Race) {
         if gender == Gender::All {
-            gender = unsafe { core::mem::transmute(mii_util::get_random_value::<u64>(0, Gender::MAX as u64) as u8) };
+            gender = unsafe {
+                core::mem::transmute(mii_util::get_random_value::<u64>(0, Gender::MAX as u64) as u8)
+            };
         }
 
         if age == Age::All {
@@ -281,7 +479,11 @@ impl CoreData {
 
         self.set_default();
         self.set_gender(gender);
-        self.set_favorite_color(unsafe { core::mem::transmute(mii_util::get_random_value::<u64>(0, FavoriteColor::MAX as u64) as u8) });
+        self.set_favorite_color(unsafe {
+            core::mem::transmute(
+                mii_util::get_random_value::<u64>(0, FavoriteColor::MAX as u64) as u8,
+            )
+        });
         self.set_region_move(0);
         self.set_font_region(FontRegion::Standard);
         self.set_type(0);
@@ -296,11 +498,13 @@ impl CoreData {
         let index: usize = 3 * (age as usize) + 9 * (gender as usize) + (race as usize);
 
         let faceline_type_info = &raw_data::RANDOM_MII_FACELINE[index];
-        let faceline_color_info = &raw_data::RANDOM_MII_FACELINE_COLOR[3 * (gender as usize) + (race as usize)];
+        let faceline_color_info =
+            &raw_data::RANDOM_MII_FACELINE_COLOR[3 * (gender as usize) + (race as usize)];
         let faceline_wrinkle_info = &raw_data::RANDOM_MII_FACELINE_WRINKLE[index];
         let faceline_makeup_info = &raw_data::RANDOM_MII_FACELINE_MAKEUP[index];
         let hair_type_info = &raw_data::RANDOM_MII_HAIR_TYPE[index];
-        let hair_color_info = &raw_data::RANDOM_MII_HAIR_COLOR[3 * (race as usize) + (age as usize)];
+        let hair_color_info =
+            &raw_data::RANDOM_MII_HAIR_COLOR[3 * (race as usize) + (age as usize)];
         let eye_type_info = &raw_data::RANDOM_MII_EYE_TYPE[index];
         let eye_color_info = &raw_data::RANDOM_MII_EYE_COLOR[race as usize];
         let eyebrow_type_info = &raw_data::RANDOM_MII_EYEBROW_TYPE[index];
@@ -309,37 +513,65 @@ impl CoreData {
         let glasses_type_info = &raw_data::RANDOM_MII_GLASS_TYPE[age as usize];
 
         self.data.set_faceline_type(
-            faceline_type_info.values[mii_util::get_random_value::<u64>(0, faceline_type_info.values_count as u64 - 1) as usize]
+            faceline_type_info.values[mii_util::get_random_value::<u64>(
+                0,
+                faceline_type_info.values_count as u64 - 1,
+            ) as usize],
         );
         self.data.set_faceline_color(
-            faceline_color_info.values[mii_util::get_random_value::<u64>(0, faceline_color_info.values_count as u64 - 1) as usize]
+            faceline_color_info.values[mii_util::get_random_value::<u64>(
+                0,
+                faceline_color_info.values_count as u64 - 1,
+            ) as usize],
         );
         self.data.set_faceline_wrinkle(
-            faceline_wrinkle_info.values[mii_util::get_random_value::<u64>(0, faceline_wrinkle_info.values_count as u64 - 1) as usize]
+            faceline_wrinkle_info.values[mii_util::get_random_value::<u64>(
+                0,
+                faceline_wrinkle_info.values_count as u64 - 1,
+            ) as usize],
         );
         self.data.set_faceline_makeup(
-            faceline_makeup_info.values[mii_util::get_random_value::<u64>(0, faceline_makeup_info.values_count as u64 - 1) as usize]
+            faceline_makeup_info.values[mii_util::get_random_value::<u64>(
+                0,
+                faceline_makeup_info.values_count as u64 - 1,
+            ) as usize],
         );
 
         self.data.set_hair_type(
-            hair_type_info.values[mii_util::get_random_value::<u64>(0, hair_type_info.values_count as u64 - 1) as usize]
+            hair_type_info.values[mii_util::get_random_value::<u64>(
+                0,
+                hair_type_info.values_count as u64 - 1,
+            ) as usize],
         );
         self.set_hair_color(raw_data::get_hair_color_from_ver3(
-            hair_color_info.values[mii_util::get_random_value::<u64>(0, hair_color_info.values_count as u64 - 1) as usize]
+            hair_color_info.values[mii_util::get_random_value::<u64>(
+                0,
+                hair_color_info.values_count as u64 - 1,
+            ) as usize],
         ) as u32);
-        self.set_hair_flip(unsafe { core::mem::transmute(mii_util::get_random_value::<u64>(0, HairFlip::MAX as u64) as u8) });
+        self.set_hair_flip(unsafe {
+            core::mem::transmute(mii_util::get_random_value::<u64>(0, HairFlip::MAX as u64) as u8)
+        });
 
         self.data.set_eye_type(
-            eye_type_info.values[mii_util::get_random_value::<u64>(0, eye_type_info.values_count as u64 - 1) as usize]
+            eye_type_info.values[mii_util::get_random_value::<u64>(
+                0,
+                eye_type_info.values_count as u64 - 1,
+            ) as usize],
         );
 
         let eye_rotate_1: usize = if gender != Gender::Male { 4 } else { 2 };
         let eye_rotate_2: i32 = if gender != Gender::Male { 3 } else { 4 };
-        let eye_rotate_offset = 32i32 - (raw_data::EYE_ROTATE_LOOKUP[eye_rotate_1] as i32) + eye_rotate_2;
-        let eye_rotate = 32i32 - (raw_data::EYE_ROTATE_LOOKUP[self.data.eye_type() as usize] as i32);
+        let eye_rotate_offset =
+            32i32 - (raw_data::EYE_ROTATE_LOOKUP[eye_rotate_1] as i32) + eye_rotate_2;
+        let eye_rotate =
+            32i32 - (raw_data::EYE_ROTATE_LOOKUP[self.data.eye_type() as usize] as i32);
 
         self.set_eye_color(raw_data::get_eye_color_from_ver3(
-            eye_color_info.values[mii_util::get_random_value::<u64>(0, eye_color_info.values_count as u64 - 1) as usize]
+            eye_color_info.values[mii_util::get_random_value::<u64>(
+                0,
+                eye_color_info.values_count as u64 - 1,
+            ) as usize],
         ) as u32);
         self.set_eye_scale(4);
         self.set_eye_aspect(3);
@@ -348,13 +580,18 @@ impl CoreData {
         self.set_eye_y((axis_y + 12) as u8);
 
         self.data.set_eyebrow_type(
-            eyebrow_type_info.values[mii_util::get_random_value::<u64>(0, eyebrow_type_info.values_count as u64 - 1) as usize]
+            eyebrow_type_info.values[mii_util::get_random_value::<u64>(
+                0,
+                eyebrow_type_info.values_count as u64 - 1,
+            ) as usize],
         );
 
         let eyebrow_rotate_1: usize = if race == Race::Asian { 6 } else { 0 };
         let eyebrow_y_val: u32 = if race == Race::Asian { 6 } else { 7 };
-        let eyebrow_rotate_offset = 32i32 - (raw_data::EYEBROW_ROTATE_LOOKUP[eyebrow_rotate_1] as i32) + 6;
-        let eyebrow_rotate = 32i32 - (raw_data::EYEBROW_ROTATE_LOOKUP[self.data.eyebrow_type() as usize] as i32);
+        let eyebrow_rotate_offset =
+            32i32 - (raw_data::EYEBROW_ROTATE_LOOKUP[eyebrow_rotate_1] as i32) + 6;
+        let eyebrow_rotate =
+            32i32 - (raw_data::EYEBROW_ROTATE_LOOKUP[self.data.eyebrow_type() as usize] as i32);
 
         self.set_eyebrow_color_raw(self.get_hair_color_raw());
         self.set_eyebrow_scale(4);
@@ -364,15 +601,25 @@ impl CoreData {
         self.set_eyebrow_y((axis_y + eyebrow_y_val) as u8);
 
         self.data.set_nose_type(
-            nose_type_info.values[mii_util::get_random_value::<u64>(0, nose_type_info.values_count as u64 - 1) as usize]
+            nose_type_info.values[mii_util::get_random_value::<u64>(
+                0,
+                nose_type_info.values_count as u64 - 1,
+            ) as usize],
         );
         self.set_nose_scale(if gender == Gender::Female { 3 } else { 4 });
         self.set_nose_y((axis_y + 9) as u8);
 
-        let mouth_color_val: i32 = if gender == Gender::Female { mii_util::get_random_value::<u64>(0, 3) as i32 } else { 0 };
+        let mouth_color_val: i32 = if gender == Gender::Female {
+            mii_util::get_random_value::<u64>(0, 3) as i32
+        } else {
+            0
+        };
 
         self.data.set_mouth_type(
-            mouth_type_info.values[mii_util::get_random_value::<u64>(0, mouth_type_info.values_count as u64 - 1) as usize]
+            mouth_type_info.values[mii_util::get_random_value::<u64>(
+                0,
+                mouth_type_info.values_count as u64 - 1,
+            ) as usize],
         );
         self.set_mouth_color(raw_data::get_mouth_color_from_ver3(mouth_color_val as u32) as u32);
         self.set_mouth_scale(4);
@@ -382,20 +629,34 @@ impl CoreData {
         self.set_beard_color_raw(self.get_hair_color_raw());
         self.set_mustache_scale(4);
 
-        if gender == Gender::Male && age != Age::Young && (mii_util::get_random_value::<u64>(0, 9) as i32) < 2 {
+        if gender == Gender::Male
+            && age != Age::Young
+            && (mii_util::get_random_value::<u64>(0, 9) as i32) < 2
+        {
             let mustache_and_beard_flag = BeardAndMustacheFlag::from_bits_truncate(
-                mii_util::get_random_value::<u64>(0, BeardAndMustacheFlag::ALL.bits() as u64) as u32
+                mii_util::get_random_value::<u64>(0, BeardAndMustacheFlag::ALL.bits() as u64)
+                    as u32,
             );
 
             let mut beard_type = BeardType::None;
             let mut mustache_type = MustacheType::None;
 
             if mustache_and_beard_flag.contains(BeardAndMustacheFlag::BEARD) {
-                beard_type = unsafe { core::mem::transmute(mii_util::get_random_value::<u64>(BeardType::MIN as u64, BeardType::MAX as u64) as u8) };
+                beard_type = unsafe {
+                    core::mem::transmute(mii_util::get_random_value::<u64>(
+                        BeardType::MIN as u64,
+                        BeardType::MAX as u64,
+                    ) as u8)
+                };
             }
 
             if mustache_and_beard_flag.contains(BeardAndMustacheFlag::MUSTACHE) {
-                mustache_type = unsafe { core::mem::transmute(mii_util::get_random_value::<u64>(MustacheType::MIN as u64, MustacheType::MAX as u64) as u8) };
+                mustache_type = unsafe {
+                    core::mem::transmute(mii_util::get_random_value::<u64>(
+                        MustacheType::MIN as u64,
+                        MustacheType::MAX as u64,
+                    ) as u8)
+                };
             }
 
             self.set_mustache_type_enum(mustache_type);

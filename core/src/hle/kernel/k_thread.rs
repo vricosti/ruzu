@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
+use super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep;
 use super::k_synchronization_object;
-use super::k_thread_queue::KThreadQueue;
-use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
-use super::k_synchronization_object::SynchronizationWaitSet;
 use super::k_synchronization_object::SynchronizationObjectState;
+use super::k_synchronization_object::SynchronizationWaitSet;
+use super::k_thread_queue::KThreadQueue;
+use super::k_thread_queue::KThreadQueueWithoutEndWait;
 use super::k_typed_address::{KProcessAddress, KVirtualAddress};
+use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
 use crate::arm::arm_interface::ThreadContext as ArmThreadContext;
 use crate::core::SystemRef;
 use crate::hardware_properties::NUM_CPU_CORES;
@@ -447,7 +449,12 @@ pub struct KThread {
     pub scheduler: Option<Weak<Mutex<KScheduler>>>,
     /// Direct reference to the GlobalSchedulerContext for PQ updates.
     /// Matches upstream's access via `KernelCore&` in `KScheduler::OnThreadStateChanged`.
-    pub global_scheduler_context: Option<Weak<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>>,
+    pub global_scheduler_context:
+        Option<Weak<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>>,
+    /// Non-owning pointer to the scheduler lock inside GlobalSchedulerContext.
+    /// This avoids taking the outer GlobalSchedulerContext mutex on paths such as Sleep(),
+    /// where upstream locks only the scheduler lock itself.
+    pub scheduler_lock_ptr: usize,
     /// Process schedule count, cloned from the owning KProcess.
     /// Used by notify_state_transition to pass to PQ push without locking the process.
     pub process_schedule_count: Option<Arc<std::sync::atomic::AtomicI64>>,
@@ -544,6 +551,14 @@ impl KThread {
         ctx.fpcr = self.thread_context.fpcr;
         ctx.fpsr = self.thread_context.fpsr;
         ctx.tpidr = self.thread_context.tpidr;
+
+        // Keep the A32 aliases coherent for the Rust-only runtime handoff path.
+        // Upstream A32 backends consume r[0..15] in SetContext(), while the
+        // Rust helper path also uses explicit fp/lr/sp/pc fields.
+        ctx.r[11] = ctx.fp;
+        ctx.r[13] = ctx.sp;
+        ctx.r[14] = ctx.lr;
+        ctx.r[15] = ctx.pc;
     }
 
     pub fn capture_guest_context(&mut self, ctx: &ArmThreadContext) {
@@ -557,6 +572,12 @@ impl KThread {
         self.thread_context.fpcr = ctx.fpcr;
         self.thread_context.fpsr = ctx.fpsr;
         self.thread_context.tpidr = ctx.tpidr;
+
+        // Keep the A32 aliases coherent for scheduler/runtime save-restore.
+        self.thread_context.r[11] = ctx.fp;
+        self.thread_context.r[13] = ctx.sp;
+        self.thread_context.r[14] = ctx.lr;
+        self.thread_context.r[15] = ctx.pc;
     }
 
     /// Create a new KThread with default/zero-initialized state.
@@ -577,6 +598,7 @@ impl KThread {
             parent: None,
             scheduler: None,
             global_scheduler_context: None,
+            scheduler_lock_ptr: 0,
             process_schedule_count: None,
             kernel_stack_top: KVirtualAddress::default(),
             light_ipc_data: None,
@@ -1043,8 +1065,10 @@ impl KThread {
         let lock_idx = match lock_idx {
             Some(idx) => idx,
             None => {
-                let lock_info =
-                    LockWithPriorityInheritanceInfo::new(waiter_address_key, waiter_is_kernel_address_key);
+                let lock_info = LockWithPriorityInheritanceInfo::new(
+                    waiter_address_key,
+                    waiter_is_kernel_address_key,
+                );
                 self.add_held_lock(lock_info);
                 self.held_lock_info_list.len() - 1
             }
@@ -1076,7 +1100,8 @@ impl KThread {
             .expect("RemoveWaiterImpl: lock info not found");
 
         // Remove the waiter; if the lock is now empty, remove it.
-        let is_empty = self.held_lock_info_list[lock_idx].remove_waiter(waiter_priority, waiter_thread_id);
+        let is_empty =
+            self.held_lock_info_list[lock_idx].remove_waiter(waiter_priority, waiter_thread_id);
         if is_empty {
             self.held_lock_info_list.remove(lock_idx);
         }
@@ -1156,7 +1181,8 @@ impl KThread {
         assert!(lock_info.get_waiter_count() > 0);
 
         // Remove the highest priority waiter to become the next owner.
-        let next_owner_key = lock_info.get_highest_priority_waiter()
+        let next_owner_key = lock_info
+            .get_highest_priority_waiter()
             .expect("RemoveWaiterByKey: lock has waiters but tree is empty");
 
         let next_owner_thread_id = next_owner_key.thread_id;
@@ -1253,7 +1279,8 @@ impl KThread {
                 .copied();
             if let Some(key) = found {
                 let is_kernel = self.held_lock_info_list[i].get_is_kernel_address_key();
-                let is_empty = self.held_lock_info_list[i].remove_waiter(key.priority, key.thread_id);
+                let is_empty =
+                    self.held_lock_info_list[i].remove_waiter(key.priority, key.thread_id);
                 if is_kernel {
                     self.num_kernel_waiters -= 1;
                 }
@@ -1308,6 +1335,14 @@ impl KThread {
     }
 
     pub fn begin_wait_synchronization(&mut self, wait_set: SynchronizationWaitSet, timeout: i64) {
+        if trace_waitstate_for_thread(self.thread_id) {
+            log::info!(
+                "KThread::begin_wait_synchronization tid={} timeout={} active_before={}",
+                self.thread_id,
+                timeout,
+                wait_set.is_active()
+            );
+        }
         self.synchronization_wait = wait_set;
         self.synced_index = -1;
         self.wait_result = RESULT_SUCCESS.get_inner_value();
@@ -1336,14 +1371,16 @@ impl KThread {
     }
 
     pub fn link_waiter(&mut self, process: &mut KProcess, thread_id: u64) {
-        self.sync_object
-            .link_waiter(process, super::k_synchronization_object::SynchronizationWaitNode {
+        self.sync_object.link_waiter(
+            process,
+            super::k_synchronization_object::SynchronizationWaitNode {
                 object_id: self.object_id,
                 handle: super::k_synchronization_object::SynchronizationWaitNodeHandle {
                     thread_id,
                     wait_index: 0,
                 },
-            });
+            },
+        );
     }
 
     pub fn unlink_waiter(&mut self, process: &mut KProcess, thread_id: u64) {
@@ -1387,6 +1424,8 @@ impl KThread {
         self.thread_context.r[0] = arg;
         self.thread_context.r[15] = entry_point;
         self.thread_context.r[13] = stack_top;
+        self.thread_context.sp = stack_top;
+        self.thread_context.pc = entry_point;
         self.thread_context.fpcr = 0;
         self.thread_context.fpsr = 0;
     }
@@ -1413,8 +1452,15 @@ impl KThread {
         is_64bit: bool,
     ) {
         self.initialize_main_thread_with_func(
-            entry_point, stack_top, virt_core, tls_address,
-            owner, thread_id, object_id, is_64bit, None,
+            entry_point,
+            stack_top,
+            virt_core,
+            tls_address,
+            owner,
+            thread_id,
+            object_id,
+            is_64bit,
+            None,
         );
     }
 
@@ -1446,7 +1492,15 @@ impl KThread {
             .set_affinity_mask(1u64 << phys_core);
         self.tls_address = KProcessAddress::new(tls_address);
         self.parent = Some(Arc::downgrade(owner));
-        self.scheduler = owner.lock().unwrap().scheduler.clone();
+        {
+            let owner_guard = owner.lock().unwrap();
+            self.scheduler = owner_guard.scheduler.clone();
+            self.global_scheduler_context = owner_guard
+                .global_scheduler_context
+                .as_ref()
+                .map(Arc::downgrade);
+            self.process_schedule_count = Some(Arc::clone(&owner_guard.schedule_count));
+        }
         self.stack_top = KProcessAddress::new(stack_top);
         self.argument = 0;
         self.core_id = phys_core;
@@ -1494,7 +1548,8 @@ impl KThread {
         object_id: u64,
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) {
-        let phys_core = crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[virt_core as usize];
+        let phys_core =
+            crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[virt_core as usize];
 
         self.object_id = object_id;
         self.thread_type = ThreadType::Main;
@@ -1566,8 +1621,16 @@ impl KThread {
         is_64bit: bool,
     ) -> u32 {
         self.initialize_user_thread_with_init_func(
-            entry_point, arg, stack_top, prio, virt_core,
-            owner, thread_id, object_id, is_64bit, None,
+            entry_point,
+            arg,
+            stack_top,
+            prio,
+            virt_core,
+            owner,
+            thread_id,
+            object_id,
+            is_64bit,
+            None,
         )
     }
 
@@ -1599,7 +1662,9 @@ impl KThread {
             let proc = owner.lock().unwrap();
             (
                 proc.scheduler.clone(),
-                proc.global_scheduler_context.as_ref().map(|g| Arc::downgrade(g)),
+                proc.global_scheduler_context
+                    .as_ref()
+                    .map(|g| Arc::downgrade(g)),
                 Some(Arc::clone(&proc.schedule_count)),
             )
         };
@@ -1631,7 +1696,9 @@ impl KThread {
         virt_core: i32,
         owner: Weak<Mutex<KProcess>>,
         scheduler: Option<Weak<Mutex<KScheduler>>>,
-        global_scheduler_context: Option<Weak<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>>,
+        global_scheduler_context: Option<
+            Weak<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>,
+        >,
         process_schedule_count: Option<Arc<std::sync::atomic::AtomicI64>>,
         tls_address: KProcessAddress,
         thread_id: u64,
@@ -1639,7 +1706,6 @@ impl KThread {
         is_64bit: bool,
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) -> u32 {
-        
         let phys_core = virt_core;
         self.object_id = object_id;
         self.thread_type = ThreadType::User;
@@ -1659,6 +1725,15 @@ impl KThread {
         self.parent = Some(owner);
         self.scheduler = scheduler;
         self.global_scheduler_context = global_scheduler_context;
+        self.scheduler_lock_ptr = self
+            .global_scheduler_context
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|gsc| {
+                let guard = gsc.lock().unwrap();
+                std::ptr::addr_of!(guard.m_scheduler_lock) as usize
+            })
+            .unwrap_or(0);
         self.process_schedule_count = process_schedule_count;
         self.signaled = false;
         let (termination_lock, _) = &*self.termination_wait_pair;
@@ -1735,9 +1810,17 @@ impl KThread {
                 .as_ref()
                 .map(Arc::downgrade)
         });
-        self.process_schedule_count = owner.map(|process| {
-            Arc::clone(&process.lock().unwrap().schedule_count)
-        });
+        self.scheduler_lock_ptr = self
+            .global_scheduler_context
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|gsc| {
+                let guard = gsc.lock().unwrap();
+                std::ptr::addr_of!(guard.m_scheduler_lock) as usize
+            })
+            .unwrap_or(0);
+        self.process_schedule_count =
+            owner.map(|process| Arc::clone(&process.lock().unwrap().schedule_count));
         self.core_id = core;
         self.current_core_id = core;
         self.wait_result = RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value();
@@ -1791,8 +1874,7 @@ impl KThread {
         self.virtual_ideal_core_id = core;
         self.physical_ideal_core_id = core;
         self.virtual_affinity_mask = 1u64 << core;
-        self.physical_affinity_mask
-            .set_affinity_mask(1u64 << core);
+        self.physical_affinity_mask.set_affinity_mask(1u64 << core);
         self.thread_state
             .store(ThreadState::INITIALIZED.bits(), Ordering::Relaxed);
         self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
@@ -1801,7 +1883,18 @@ impl KThread {
         self.scheduler = scheduler;
         {
             let proc = owner.lock().unwrap();
-            self.global_scheduler_context = proc.global_scheduler_context.as_ref().map(|g| Arc::downgrade(g));
+            self.global_scheduler_context = proc
+                .global_scheduler_context
+                .as_ref()
+                .map(|g| Arc::downgrade(g));
+            self.scheduler_lock_ptr = proc
+                .global_scheduler_context
+                .as_ref()
+                .map(|gsc| {
+                    let guard = gsc.lock().unwrap();
+                    std::ptr::addr_of!(guard.m_scheduler_lock) as usize
+                })
+                .unwrap_or(0);
             self.process_schedule_count = Some(Arc::clone(&proc.schedule_count));
         }
         self.core_id = core;
@@ -1835,8 +1928,29 @@ impl KThread {
 
         log::info!(
             "KThread::initialize_service_thread: thread_id={} priority={} core={}",
-            thread_id, priority, core
+            thread_id,
+            priority,
+            core
         );
+    }
+
+    /// Refresh cached process-owned scheduler links from the owning process.
+    ///
+    /// Upstream resolves this state through kernel owners rather than cached weak
+    /// references. The Rust port therefore needs an explicit backfill path when a
+    /// process acquires its scheduler/GSC after a thread already exists.
+    pub fn inherit_process_scheduler_state(&mut self, owner: &super::k_process::KProcess) {
+        self.scheduler = owner.scheduler.clone();
+        self.global_scheduler_context = owner.global_scheduler_context.as_ref().map(Arc::downgrade);
+        self.scheduler_lock_ptr = owner
+            .global_scheduler_context
+            .as_ref()
+            .map(|gsc| {
+                let guard = gsc.lock().unwrap();
+                std::ptr::addr_of!(guard.m_scheduler_lock) as usize
+            })
+            .unwrap_or(0);
+        self.process_schedule_count = Some(Arc::clone(&owner.schedule_count));
     }
 
     pub fn clone_fpu_status_from(&mut self, current: &KThread) {
@@ -2081,12 +2195,15 @@ impl KThread {
                 .as_ref()
                 .and_then(Weak::upgrade)
                 .or_else(|| {
-                    self.parent.as_ref().and_then(Weak::upgrade).and_then(|parent| {
-                        parent
-                            .lock()
-                            .unwrap()
-                            .get_thread_by_object_id(self.object_id)
-                    })
+                    self.parent
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .and_then(|parent| {
+                            parent
+                                .lock()
+                                .unwrap()
+                                .get_thread_by_object_id(self.object_id)
+                        })
                 });
 
             if let Some(worker_thread) = worker_thread {
@@ -2174,14 +2291,16 @@ impl KThread {
     pub fn request_terminate(&mut self) -> ThreadState {
         // Atomic CAS: only proceed if this is the first request.
         let mut expected = false;
-        let first_request = self.termination_requested.compare_exchange(
-            expected, true, Ordering::SeqCst, Ordering::SeqCst,
-        ).is_ok();
+        let first_request = self
+            .termination_requested
+            .compare_exchange(expected, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
 
         if first_request {
             // Fast path: if INITIALIZED, directly terminate.
             if self.get_state() == ThreadState::INITIALIZED {
-                self.thread_state.store(ThreadState::TERMINATED.bits(), Ordering::Relaxed);
+                self.thread_state
+                    .store(ThreadState::TERMINATED.bits(), Ordering::Relaxed);
                 return ThreadState::TERMINATED;
             }
 
@@ -2216,16 +2335,21 @@ impl KThread {
 
             // If WAITING, cancel the wait.
             if self.get_state() == ThreadState::WAITING {
-                if let Some(wq) = self.wait_queue {
+                if let Some(wq) = self.wait_queue.clone() {
                     wq.cancel_wait(self, RESULT_TERMINATION_REQUESTED.get_inner_value(), true);
                     // Thread transitioned WAITING → RUNNABLE — push to PQ.
                     // Upstream: OnThreadStateChanged auto-pushes.
                     if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-                        parent.lock().unwrap().push_back_to_priority_queue_with_props(
-                            self.thread_id, self.priority, self.core_id,
-                            self.physical_affinity_mask.get_affinity_mask(),
-                            self.thread_type == ThreadType::Dummy,
-                        );
+                        parent
+                            .lock()
+                            .unwrap()
+                            .push_back_to_priority_queue_with_props(
+                                self.thread_id,
+                                self.priority,
+                                self.core_id,
+                                self.physical_affinity_mask.get_affinity_mask(),
+                                self.thread_type == ThreadType::Dummy,
+                            );
                     }
                 }
             }
@@ -2303,6 +2427,15 @@ impl KThread {
     /// Matches upstream `KThread::SetState()`.
     pub fn set_state(&mut self, state: ThreadState) {
         let old_state = self.get_raw_state();
+        if trace_waitstate_for_thread(self.thread_id) {
+            log::info!(
+                "KThread::set_state tid={} old={:?} new_base={:?} wait_reason_before={:?}",
+                self.thread_id,
+                old_state,
+                state,
+                self.wait_reason_for_debugging
+            );
+        }
         self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::None);
         let new_state = (old_state & !ThreadState::MASK) | (state & ThreadState::MASK);
         self.thread_state.store(new_state.bits(), Ordering::Relaxed);
@@ -2323,7 +2456,11 @@ impl KThread {
         // Upstream: KScheduler::OnThreadStateChanged(kernel, this, old_state)
         // Updates the PQ directly via GetPriorityQueue(kernel).
         // We access the GSC directly (bypassing the process lock) to match upstream.
-        if let Some(gsc_arc) = self.global_scheduler_context.as_ref().and_then(Weak::upgrade) {
+        if let Some(gsc_arc) = self
+            .global_scheduler_context
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
             let thread_id = self.thread_id;
             let priority = self.priority;
             let active_core = self.core_id;
@@ -2344,11 +2481,10 @@ impl KThread {
 
         // Notify the scheduler for dispatch.
         if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
-            scheduler.lock().unwrap().on_thread_state_changed(
-                self.thread_id,
-                old_base,
-                new_base,
-            );
+            scheduler
+                .lock()
+                .unwrap()
+                .on_thread_state_changed(self.thread_id, old_base, new_base);
         }
     }
 
@@ -2390,7 +2526,8 @@ impl KThread {
         let _active_core = self.get_active_core();
         self.set_active_core(current_core);
         self.physical_ideal_core_id = current_core;
-        self.physical_affinity_mask.set_affinity_mask(1u64 << current_core);
+        self.physical_affinity_mask
+            .set_affinity_mask(1u64 << current_core);
 
         // Upstream: notify scheduler of affinity change if needed.
 
@@ -2452,11 +2589,16 @@ impl KThread {
             self.cancel_wait(RESULT_CANCELLED.get_inner_value(), true);
             // Push to PQ — upstream: OnThreadStateChanged auto-pushes.
             if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-                parent.lock().unwrap().push_back_to_priority_queue_with_props(
-                    self.thread_id, self.priority, self.core_id,
-                    self.physical_affinity_mask.get_affinity_mask(),
-                    self.thread_type == ThreadType::Dummy,
-                );
+                parent
+                    .lock()
+                    .unwrap()
+                    .push_back_to_priority_queue_with_props(
+                        self.thread_id,
+                        self.priority,
+                        self.core_id,
+                        self.physical_affinity_mask.get_affinity_mask(),
+                        self.thread_type == ThreadType::Dummy,
+                    );
             }
         } else {
             self.wait_cancelled = true;
@@ -2468,6 +2610,15 @@ impl KThread {
     /// Matches upstream `KThread::BeginWait(KThreadQueue* queue)`:
     /// sets state to Waiting and assigns the wait queue.
     pub fn begin_wait_with_queue(&mut self, wait_queue: KThreadQueue) {
+        if trace_waitstate_for_thread(self.thread_id) {
+            log::info!(
+                "KThread::begin_wait_with_queue tid={} end_wait_allowed={} has_notify_impl={} has_cancel_impl={}",
+                self.thread_id,
+                wait_queue.end_wait_allowed,
+                wait_queue.notify_available_impl.is_some(),
+                wait_queue.cancel_wait_impl.is_some()
+            );
+        }
         self.set_state(ThreadState::WAITING);
         self.wait_queue = Some(wait_queue);
     }
@@ -2495,7 +2646,7 @@ impl KThread {
         signaled_object_id: u64,
         result: u32,
     ) -> bool {
-        let Some(wait_queue) = self.wait_queue else {
+        let Some(wait_queue) = self.wait_queue.clone() else {
             return false;
         };
 
@@ -2505,6 +2656,14 @@ impl KThread {
     /// End wait with a result.
     /// Matches upstream `KThread::EndWait()`.
     pub fn end_wait(&mut self, _wait_result: u32) {
+        if trace_waitstate_for_thread(self.thread_id) {
+            log::info!(
+                "KThread::end_wait tid={} result=0x{:X} wait_reason={:?}",
+                self.thread_id,
+                _wait_result,
+                self.wait_reason_for_debugging
+            );
+        }
         self.sleep_deadline = None;
         self.waiting_lock_info = None;
         self.clear_wait_synchronization();
@@ -2513,6 +2672,7 @@ impl KThread {
 
         let wait_queue = self
             .wait_queue
+            .clone()
             .expect("KThread::end_wait requires wait_queue while waiting");
         wait_queue.end_wait(self, _wait_result);
     }
@@ -2528,6 +2688,7 @@ impl KThread {
 
         let wait_queue = self
             .wait_queue
+            .clone()
             .expect("KThread::cancel_wait requires wait_queue while waiting");
         wait_queue.cancel_wait(self, _wait_result, _cancel_timer_task);
     }
@@ -2570,15 +2731,42 @@ impl KThread {
         if timeout <= 0 {
             return RESULT_INVALID_STATE.get_inner_value();
         }
-        if self.is_termination_requested() {
-            return RESULT_TERMINATION_REQUESTED.get_inner_value();
-        }
 
         self.wait_result = RESULT_SUCCESS.get_inner_value();
-        self.sleep_deadline =
-            deadline_from_timeout_tick(timeout, super::kernel::get_current_hardware_tick());
-        self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Sleep);
-        self.begin_wait();
+        let current_tick = super::kernel::get_current_hardware_tick();
+        self.sleep_deadline = deadline_from_timeout_tick(timeout, current_tick);
+        let hardware_timer = super::kernel::get_hardware_timer_arc();
+        let mut wait_queue = KThreadQueueWithoutEndWait::new();
+        if self.scheduler_lock_ptr == 0 {
+            return RESULT_INVALID_STATE.get_inner_value();
+        }
+        let scheduler_lock_ptr =
+            self.scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock;
+
+        {
+            let scheduler_lock = unsafe { &*scheduler_lock_ptr };
+            let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
+                scheduler_lock,
+                hardware_timer.as_ref(),
+                self.thread_id,
+                (self as *mut KThread) as usize,
+                timeout,
+            );
+
+            if self.is_termination_requested() {
+                sleep_guard.cancel_sleep();
+                return RESULT_TERMINATION_REQUESTED.get_inner_value();
+            }
+
+            if let Some(timer) = timer {
+                wait_queue.base.set_hardware_timer(timer);
+            }
+
+            self.set_timer_task_time(timeout);
+            self.begin_wait_with_queue(wait_queue.base);
+            self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Sleep);
+        }
+
         RESULT_SUCCESS.get_inner_value()
     }
 
@@ -2662,8 +2850,7 @@ impl KThread {
                         {
                             let mut waiter_guard = waiter.lock().unwrap();
                             waiter_guard.set_waiting_lock_info(None);
-                            waiter_guard
-                                .cancel_wait(RESULT_INVALID_STATE.get_inner_value(), true);
+                            waiter_guard.cancel_wait(RESULT_INVALID_STATE.get_inner_value(), true);
                             // Waiter transitioned WAITING → RUNNABLE — push to PQ.
                             let (w_id, w_pri, w_core, w_aff, w_dummy) =
                                 super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(&waiter_guard);
@@ -2710,7 +2897,9 @@ impl KThread {
         if self.get_state() == ThreadState::WAITING {
             self.synced_index = -1;
             self.wait_result = RESULT_TIMED_OUT.get_inner_value();
-            self.cancel_wait(RESULT_TIMED_OUT.get_inner_value(), false);
+            if let Some(wait_queue) = self.wait_queue.clone() {
+                wait_queue.cancel_wait(self, RESULT_TIMED_OUT.get_inner_value(), false);
+            }
         }
     }
 
@@ -2750,12 +2939,7 @@ impl KThread {
 
     /// Set condition variable state.
     /// Upstream: ASSERT(m_waiting_lock_info == nullptr).
-    pub fn set_condition_variable(
-        &mut self,
-        address: KProcessAddress,
-        cv_key: u64,
-        value: u32,
-    ) {
+    pub fn set_condition_variable(&mut self, address: KProcessAddress, cv_key: u64, value: u32) {
         debug_assert!(
             self.waiting_lock_info.is_none(),
             "set_condition_variable: m_waiting_lock_info must be null"
@@ -2985,7 +3169,9 @@ mod tests {
         assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
         assert!(thread.is_suspend_requested_type(SuspendType::Thread));
         assert!(thread.is_suspended());
-        assert!(thread.get_raw_state().contains(ThreadState::THREAD_SUSPENDED));
+        assert!(thread
+            .get_raw_state()
+            .contains(ThreadState::THREAD_SUSPENDED));
     }
 
     #[test]
@@ -3078,7 +3264,8 @@ mod tests {
         let mut thread = KThread::new();
         thread.thread_id = 7;
 
-        let mut lock_info = LockWithPriorityInheritanceInfo::new(KProcessAddress::new(0x4000), true);
+        let mut lock_info =
+            LockWithPriorityInheritanceInfo::new(KProcessAddress::new(0x4000), true);
         lock_info.add_waiter(3, 10);
         lock_info.add_waiter(5, 11);
 
@@ -3121,7 +3308,8 @@ mod tests {
         owner.add_held_lock(lock_info);
 
         let mut has_waiters = false;
-        let result = owner.remove_waiter_by_key(KProcessAddress::new(0x5000), false, &mut has_waiters);
+        let result =
+            owner.remove_waiter_by_key(KProcessAddress::new(0x5000), false, &mut has_waiters);
 
         let (next_owner_thread_id, next_owner_priority, transfer_lock_info) =
             result.expect("expected next owner");
@@ -3168,6 +3356,38 @@ mod tests {
     }
 
     #[test]
+    fn initialize_main_thread_inherits_scheduler_context_from_owner() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.attach_scheduler(&scheduler);
+            process_guard.global_scheduler_context = Some(gsc.clone());
+        }
+
+        let mut thread = KThread::new();
+        thread.initialize_main_thread_with_func(
+            0x200000, 0x240000, 0, 0x23f000, &process, 17, 0x99, false, None,
+        );
+
+        let inherited_scheduler = thread
+            .scheduler
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .expect("main thread should inherit scheduler");
+        let inherited_gsc = thread
+            .global_scheduler_context
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .expect("main thread should inherit global scheduler context");
+
+        assert!(Arc::ptr_eq(&inherited_scheduler, &scheduler));
+        assert!(Arc::ptr_eq(&inherited_gsc, &gsc));
+        assert!(thread.process_schedule_count.is_some());
+    }
+
+    #[test]
     fn test_finalize_unregisters_thread_object_from_owner_process() {
         let process = Arc::new(Mutex::new(KProcess::new()));
         let thread = Arc::new(Mutex::new(KThread::new()));
@@ -3178,7 +3398,10 @@ mod tests {
             guard.object_id = 22;
             guard.parent = Some(Arc::downgrade(&process));
         }
-        process.lock().unwrap().register_thread_object(thread.clone());
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(thread.clone());
 
         thread.lock().unwrap().finalize();
 
@@ -3260,7 +3483,10 @@ mod tests {
             .needs_scheduling
             .store(false, Ordering::Relaxed);
 
-        assert_eq!(thread.set_core_mask(1, 0x2), RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            thread.set_core_mask(1, 0x2),
+            RESULT_SUCCESS.get_inner_value()
+        );
         assert!(scheduler.lock().unwrap().needs_scheduling());
     }
 
@@ -3294,5 +3520,38 @@ mod tests {
 
         assert!(remaining <= Duration::from_micros(100));
         assert!(remaining <= Duration::from_nanos(50_000));
+    }
+
+    #[test]
+    fn capture_and_restore_guest_context_keep_a32_alias_registers_in_sync() {
+        let mut thread = KThread::new();
+        let mut ctx = crate::arm::arm_interface::ThreadContext::default();
+        ctx.fp = 0x1111;
+        ctx.sp = 0x2222;
+        ctx.lr = 0x3333;
+        ctx.pc = 0x4444;
+        ctx.r[11] = 0xAAAA;
+        ctx.r[13] = 0xBBBB;
+        ctx.r[14] = 0xCCCC;
+        ctx.r[15] = 0xDDDD;
+
+        thread.capture_guest_context(&ctx);
+
+        assert_eq!(thread.thread_context.r[11], 0x1111);
+        assert_eq!(thread.thread_context.r[13], 0x2222);
+        assert_eq!(thread.thread_context.r[14], 0x3333);
+        assert_eq!(thread.thread_context.r[15], 0x4444);
+
+        let mut restored = crate::arm::arm_interface::ThreadContext::default();
+        thread.restore_guest_context(&mut restored);
+
+        assert_eq!(restored.fp, 0x1111);
+        assert_eq!(restored.sp, 0x2222);
+        assert_eq!(restored.lr, 0x3333);
+        assert_eq!(restored.pc, 0x4444);
+        assert_eq!(restored.r[11], 0x1111);
+        assert_eq!(restored.r[13], 0x2222);
+        assert_eq!(restored.r[14], 0x3333);
+        assert_eq!(restored.r[15], 0x4444);
     }
 }

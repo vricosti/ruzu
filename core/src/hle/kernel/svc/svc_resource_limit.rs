@@ -59,7 +59,8 @@ pub fn create_resource_limit(system: &System, out_handle: &mut Handle) -> Result
                 "svc::CreateResourceLimit: KProcess lacks resource_limit registry. \
                  The handle 0x{:08X} (object_id={}) cannot be resolved by \
                  Get/SetResourceLimitLimitValue until the registry is added.",
-                handle, object_id
+                handle,
+                object_id
             );
             RESULT_SUCCESS
         }
@@ -78,7 +79,8 @@ pub fn get_resource_limit_limit_value(
 ) -> ResultCode {
     log::debug!(
         "svc::GetResourceLimitLimitValue called, handle={:08X}, which={:?}",
-        resource_limit_handle, which
+        resource_limit_handle,
+        which
     );
 
     if !is_valid_resource_type(which) {
@@ -122,7 +124,8 @@ pub fn get_resource_limit_current_value(
 ) -> ResultCode {
     log::debug!(
         "svc::GetResourceLimitCurrentValue called, handle={:08X}, which={:?}",
-        resource_limit_handle, which
+        resource_limit_handle,
+        which
     );
 
     if !is_valid_resource_type(which) {
@@ -156,7 +159,9 @@ pub fn set_resource_limit_limit_value(
 ) -> ResultCode {
     log::debug!(
         "svc::SetResourceLimitLimitValue called, handle={:08X}, which={:?}, value={}",
-        resource_limit_handle, which, limit_value
+        resource_limit_handle,
+        which,
+        limit_value
     );
 
     if !is_valid_resource_type(which) {

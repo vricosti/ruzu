@@ -33,11 +33,31 @@ const MAX_ALLOWED_VOLUME: f32 = 1.0;
 impl IAudioController {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (0, Some(Self::set_expected_master_volume_handler), "SetExpectedMasterVolume"),
-            (1, Some(Self::get_main_applet_expected_master_volume_handler), "GetMainAppletExpectedMasterVolume"),
-            (2, Some(Self::get_library_applet_expected_master_volume_handler), "GetLibraryAppletExpectedMasterVolume"),
-            (3, Some(Self::change_main_applet_master_volume_handler), "ChangeMainAppletMasterVolume"),
-            (4, Some(Self::set_transparent_volume_rate_handler), "SetTransparentVolumeRate"),
+            (
+                0,
+                Some(Self::set_expected_master_volume_handler),
+                "SetExpectedMasterVolume",
+            ),
+            (
+                1,
+                Some(Self::get_main_applet_expected_master_volume_handler),
+                "GetMainAppletExpectedMasterVolume",
+            ),
+            (
+                2,
+                Some(Self::get_library_applet_expected_master_volume_handler),
+                "GetLibraryAppletExpectedMasterVolume",
+            ),
+            (
+                3,
+                Some(Self::change_main_applet_master_volume_handler),
+                "ChangeMainAppletMasterVolume",
+            ),
+            (
+                4,
+                Some(Self::set_transparent_volume_rate_handler),
+                "SetTransparentVolumeRate",
+            ),
         ]);
         Self {
             main_applet_volume: 0.25,
@@ -60,8 +80,7 @@ impl IAudioController {
             main_applet_volume,
             library_applet_volume
         );
-        self.main_applet_volume =
-            main_applet_volume.clamp(MIN_ALLOWED_VOLUME, MAX_ALLOWED_VOLUME);
+        self.main_applet_volume = main_applet_volume.clamp(MIN_ALLOWED_VOLUME, MAX_ALLOWED_VOLUME);
         self.library_applet_volume =
             library_applet_volume.clamp(MIN_ALLOWED_VOLUME, MAX_ALLOWED_VOLUME);
     }
@@ -109,7 +128,8 @@ impl IAudioController {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let _service = unsafe { &*(this as *const dyn ServiceFramework as *const IAudioController) };
+        let _service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAudioController) };
         let mut rp = RequestParser::new(ctx);
         let _ = (rp.pop_f32(), rp.pop_f32());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -133,14 +153,19 @@ impl IAudioController {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAudioController) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(service.get_library_applet_expected_master_volume().to_bits());
+        rb.push_u32(
+            service
+                .get_library_applet_expected_master_volume()
+                .to_bits(),
+        );
     }
 
     fn change_main_applet_master_volume_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let _service = unsafe { &*(this as *const dyn ServiceFramework as *const IAudioController) };
+        let _service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAudioController) };
         let mut rp = RequestParser::new(ctx);
         let _ = (rp.pop_f32(), rp.pop_i64());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -151,7 +176,8 @@ impl IAudioController {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let _service = unsafe { &*(this as *const dyn ServiceFramework as *const IAudioController) };
+        let _service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAudioController) };
         let mut rp = RequestParser::new(ctx);
         let _ = rp.pop_f32();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);

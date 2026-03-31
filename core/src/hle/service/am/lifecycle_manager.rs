@@ -424,7 +424,9 @@ impl LifecycleManager {
                         FocusState::InFocus => AppletMessage::ChangeIntoForeground,
                         FocusState::NotInFocus => AppletMessage::ChangeIntoBackground,
                         _ => {
-                            log::error!("Unexpected focus state in pop_message_in_order_of_priority");
+                            log::error!(
+                                "Unexpected focus state in pop_message_in_order_of_priority"
+                            );
                             AppletMessage::None
                         }
                     };
@@ -537,5 +539,4 @@ impl LifecycleManager {
         *handle = new_handle;
         Some(new_handle)
     }
-
 }

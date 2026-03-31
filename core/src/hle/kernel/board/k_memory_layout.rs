@@ -221,8 +221,7 @@ pub fn setup_device_physical_memory_regions(layout: &mut KMemoryLayout) {
 /// Set up DRAM physical memory regions.
 /// Port of upstream `Init::SetupDramPhysicalMemoryRegions`.
 pub fn setup_dram_physical_memory_regions(layout: &mut KMemoryLayout) {
-    let intended_memory_size =
-        super::k_system_control::init::get_intended_memory_size();
+    let intended_memory_size = super::k_system_control::init::get_intended_memory_size();
     let physical_memory_base_address =
         super::k_system_control::init::get_kernel_physical_base_address(DRAM_PHYSICAL_ADDRESS);
 
@@ -284,8 +283,7 @@ pub fn setup_pool_partition_memory_regions(layout: &mut KMemoryLayout) {
         let kernel_dram_region = layout
             .get_physical_memory_region_tree()
             .find_first_derived(K_MEMORY_REGION_TYPE_DRAM_KERNEL_BASE);
-        let kernel_dram_region =
-            kernel_dram_region.expect("Failed to find DramKernelBase region");
+        let kernel_dram_region = kernel_dram_region.expect("Failed to find DramKernelBase region");
         let addr = kernel_dram_region.get_address();
         assert!(
             addr % CARVEOUT_ALIGNMENT as u64 == 0,
@@ -305,10 +303,8 @@ pub fn setup_pool_partition_memory_regions(layout: &mut KMemoryLayout) {
     };
 
     // Get Application and Applet pool sizes.
-    let application_pool_size =
-        super::k_system_control::init::get_application_pool_size();
-    let applet_pool_size =
-        super::k_system_control::init::get_applet_pool_size();
+    let application_pool_size = super::k_system_control::init::get_application_pool_size();
+    let applet_pool_size = super::k_system_control::init::get_applet_pool_size();
     let unsafe_system_pool_min_size =
         super::k_system_control::init::get_minimum_non_secure_system_pool_size();
 
@@ -325,14 +321,11 @@ pub fn setup_pool_partition_memory_regions(layout: &mut KMemoryLayout) {
     let unsafe_system_pool_size = (applet_pool_start - unsafe_system_pool_start) as usize;
 
     // We want to arrange application pool depending on where the middle of DRAM is.
-    let dram_midpoint =
-        (dram_extents.get_address() + dram_extents.get_end_address()) / 2;
+    let dram_midpoint = (dram_extents.get_address() + dram_extents.get_end_address()) / 2;
     let mut cur_pool_attr: u32 = 0;
     let mut total_overhead_size: usize = 0;
 
-    if dram_extents.get_end_address() <= dram_midpoint
-        || dram_midpoint <= application_pool_start
-    {
+    if dram_extents.get_end_address() <= dram_midpoint || dram_midpoint <= application_pool_start {
         // Single application pool region.
         insert_pool_partition_region_into_both_trees(
             layout,
@@ -381,8 +374,7 @@ pub fn setup_pool_partition_memory_regions(layout: &mut KMemoryLayout) {
         K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_APPLET_POOL,
         &mut cur_pool_attr,
     );
-    total_overhead_size +=
-        KMemoryManager::calculate_management_overhead_size(applet_pool_size);
+    total_overhead_size += KMemoryManager::calculate_management_overhead_size(applet_pool_size);
 
     // Insert the nonsecure system pool.
     insert_pool_partition_region_into_both_trees(

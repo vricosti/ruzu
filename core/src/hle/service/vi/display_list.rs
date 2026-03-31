@@ -43,10 +43,9 @@ impl DisplayList {
     }
 
     pub fn get_display_by_name(&self, name: &DisplayName) -> Option<&Display> {
-        self.displays.iter().find(|d| {
-            d.is_initialized()
-                && d.get_display_name()[..] == name[..]
-        })
+        self.displays
+            .iter()
+            .find(|d| d.is_initialized() && d.get_display_name()[..] == name[..])
     }
 
     pub fn get_display_by_id(&self, display_id: u64) -> Option<&Display> {

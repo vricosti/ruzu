@@ -9,10 +9,10 @@ use crate::hid_types::{
     self, NpadBatteryLevel, NpadGcTriggerState, NpadStyleTag, SixAxisSensorProperties,
     SixAxisSensorState, Vec3f,
 };
-use crate::resources::npad::npad_types::*;
-use crate::resources::ring_lifo::Lifo;
 use crate::resources::debug_pad::debug_pad_types::DebugPadState;
 use crate::resources::keyboard::keyboard_types::KeyboardState;
+use crate::resources::npad::npad_types::*;
+use crate::resources::ring_lifo::Lifo;
 use crate::resources::system_buttons::system_button_types;
 use crate::resources::touch_screen::touch_types::*;
 

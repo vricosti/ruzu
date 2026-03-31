@@ -12,6 +12,7 @@ use super::core::container::SessionId;
 use super::nvdata::*;
 use super::nvdrv::Module;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::svc_common::PseudoHandle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -60,7 +61,8 @@ impl NvdrvInterface {
     }
 
     fn format_prefix_hex(bytes: &[u8], limit: usize) -> String {
-        bytes.iter()
+        bytes
+            .iter()
             .take(limit)
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<_>>()
@@ -110,7 +112,13 @@ impl NvdrvInterface {
     }
 
     /// Port of NVDRV::Ioctl1
-    pub fn ioctl1(&mut self, fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
+    pub fn ioctl1(
+        &mut self,
+        fd: DeviceFD,
+        command: Ioctl,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> NvResult {
         log::info!("Ioctl1 called fd={}, ioctl=0x{:08X}", fd, command.raw);
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
@@ -273,15 +281,18 @@ impl NvdrvInterface {
             return (NvResult::NotInitialized, None);
         }
 
-        let result = self.nvdrv.query_event(fd, event_id);
-        log::info!(
-            "NVDRV::QueryEvent fd={} event_id={} -> nv_result={:?} has_event={}",
-            fd,
-            event_id,
-            result.0,
-            result.1.is_some()
-        );
-        result
+        self.nvdrv.query_event(fd, event_id)
+    }
+
+    pub fn register_query_event_owner(
+        &self,
+        fd: DeviceFD,
+        event_id: u32,
+        process: Arc<Mutex<KProcess>>,
+        scheduler: Arc<Mutex<KScheduler>>,
+    ) {
+        self.nvdrv
+            .register_query_event_owner(fd, event_id, process, scheduler);
     }
 
     /// Port of NVDRV::SetAruid
@@ -336,7 +347,11 @@ impl NvdrvService {
                 (4, Some(Self::query_event_handler), "QueryEvent"),
                 (6, Some(Self::get_status_handler), "GetStatus"),
                 (8, Some(Self::set_aruid_handler), "SetAruid"),
-                (9, Some(Self::dump_graphics_memory_info_handler), "DumpGraphicsMemoryInfo"),
+                (
+                    9,
+                    Some(Self::dump_graphics_memory_info_handler),
+                    "DumpGraphicsMemoryInfo",
+                ),
                 (11, Some(Self::ioctl2_handler), "Ioctl2"),
                 (12, Some(Self::ioctl3_handler), "Ioctl3"),
                 (
@@ -509,11 +524,13 @@ impl NvdrvService {
             inline_input.len(),
             output.len()
         );
-        let nv_result = service
-            .interface
-            .lock()
-            .unwrap()
-            .ioctl2(fd, command, &input, &inline_input, &mut output);
+        let nv_result = service.interface.lock().unwrap().ioctl2(
+            fd,
+            command,
+            &input,
+            &inline_input,
+            &mut output,
+        );
         log::info!(
             "NVDRV::ioctl2_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
             fd,
@@ -542,11 +559,13 @@ impl NvdrvService {
             output.len(),
             inline_output.len()
         );
-        let nv_result = service
-            .interface
-            .lock()
-            .unwrap()
-            .ioctl3(fd, command, &input, &mut output, &mut inline_output);
+        let nv_result = service.interface.lock().unwrap().ioctl3(
+            fd,
+            command,
+            &input,
+            &mut output,
+            &mut inline_output,
+        );
         log::info!(
             "NVDRV::ioctl3_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
             fd,
@@ -603,7 +622,10 @@ impl NvdrvService {
 
         let is_valid = {
             let parent_guard = parent.lock().unwrap();
-            parent_guard.handle_table.get_object(process_handle).is_some()
+            parent_guard
+                .handle_table
+                .get_object(process_handle)
+                .is_some()
         };
 
         if !is_valid {
@@ -622,7 +644,22 @@ impl NvdrvService {
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let event_id = rp.pop_u32();
-        let (nv_result, maybe_event) = service.interface.lock().unwrap().query_event(fd, event_id);
+        let interface = service.interface.lock().unwrap();
+        let (nv_result, maybe_event) = interface.query_event(fd, event_id);
+        if maybe_event.is_some() {
+            if let Some(thread) = ctx.get_thread() {
+                let owner = {
+                    let thread_guard = thread.lock().unwrap();
+                    let process = thread_guard.parent.as_ref().and_then(|p| p.upgrade());
+                    let scheduler = thread_guard.scheduler.as_ref().and_then(|s| s.upgrade());
+                    process.zip(scheduler)
+                };
+                if let Some((process, scheduler)) = owner {
+                    interface.register_query_event_owner(fd, event_id, process, scheduler);
+                }
+            }
+        }
+        drop(interface);
         let copy_handle = maybe_event.and_then(|event| ctx.copy_handle_for_readable_event(event));
 
         if let Some(handle) = copy_handle {
@@ -651,7 +688,11 @@ impl NvdrvService {
 
     fn dump_graphics_memory_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
-        service.interface.lock().unwrap().dump_graphics_memory_info();
+        service
+            .interface
+            .lock()
+            .unwrap()
+            .dump_graphics_memory_info();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }

@@ -3,10 +3,10 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_fused_multiply_add.cpp
 
-use super::{bit, field, TranslatorVisitor};
 use super::half_floating_point_helper::{
     extract, half_precision_to_fmz_mode, merge_result, HalfPrecision, Merge, Swizzle,
 };
+use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::Value;
 
 /// Core HFMA2 implementation (inner `HFMA2` overloads from upstream).
@@ -25,7 +25,7 @@ fn hfma2_inner(
     sat: bool,
     precision: HalfPrecision,
 ) {
-    let dest_reg  = field(insn, 0, 8);
+    let dest_reg = field(insn, 0, 8);
     let src_a_reg = field(insn, 8, 8);
     let src_a_val = tv.x(src_a_reg);
 
@@ -69,9 +69,15 @@ fn hfma2_inner(
 
     let _ = half_precision_to_fmz_mode(precision);
     let (mut lhs, mut rhs) = if use_f32 {
-        (tv.ir.fp_fma_32(lhs_a, lhs_b, lhs_c), tv.ir.fp_fma_32(rhs_a, rhs_b, rhs_c))
+        (
+            tv.ir.fp_fma_32(lhs_a, lhs_b, lhs_c),
+            tv.ir.fp_fma_32(rhs_a, rhs_b, rhs_c),
+        )
     } else {
-        (tv.ir.fp_fma_16(lhs_a, lhs_b, lhs_c), tv.ir.fp_fma_16(rhs_a, rhs_b, rhs_c))
+        (
+            tv.ir.fp_fma_16(lhs_a, lhs_b, lhs_c),
+            tv.ir.fp_fma_16(rhs_a, rhs_b, rhs_c),
+        )
     };
 
     // FMZ mode: when A or B is zero, collapse to C (the addend).
@@ -113,77 +119,132 @@ fn hfma2_inner(
 /// HFMA2_reg — src_b from register [20:8], src_c from register [39:8].
 pub fn hfma2_reg(tv: &mut TranslatorVisitor, insn: u64) {
     let swizzle_b = Swizzle::from_u32(field(insn, 28, 2));
-    let sat       = bit(insn, 32);
-    let neg_b     = bit(insn, 31);
-    let neg_c     = bit(insn, 30);
+    let sat = bit(insn, 32);
+    let neg_b = bit(insn, 31);
+    let neg_c = bit(insn, 30);
     let swizzle_c = Swizzle::from_u32(field(insn, 35, 2));
     let precision = HalfPrecision::from_u32(field(insn, 37, 2));
     let swizzle_a = Swizzle::from_u32(field(insn, 47, 2));
-    let merge     = Merge::from_u32(field(insn, 49, 2));
-    let src_b     = tv.get_reg20(insn);
-    let src_c     = tv.get_reg39(insn);
-    hfma2_inner(tv, insn, merge, swizzle_a, neg_b, neg_c, swizzle_b, swizzle_c, src_b, src_c, sat, precision);
+    let merge = Merge::from_u32(field(insn, 49, 2));
+    let src_b = tv.get_reg20(insn);
+    let src_c = tv.get_reg39(insn);
+    hfma2_inner(
+        tv, insn, merge, swizzle_a, neg_b, neg_c, swizzle_b, swizzle_c, src_b, src_c, sat,
+        precision,
+    );
 }
 
 /// HFMA2_rc — src_b from register [39:8], src_c from constant buffer.
 pub fn hfma2_rc(tv: &mut TranslatorVisitor, insn: u64) {
-    let neg_c     = bit(insn, 51);
-    let sat       = bit(insn, 52);
+    let neg_c = bit(insn, 51);
+    let sat = bit(insn, 52);
     let swizzle_b = Swizzle::from_u32(field(insn, 53, 2));
-    let neg_b     = bit(insn, 56);
+    let neg_b = bit(insn, 56);
     let precision = HalfPrecision::from_u32(field(insn, 57, 2));
     let swizzle_a = Swizzle::from_u32(field(insn, 47, 2));
-    let merge     = Merge::from_u32(field(insn, 49, 2));
-    let src_b     = tv.get_reg39(insn);
-    let src_c     = tv.get_cbuf(insn);
-    hfma2_inner(tv, insn, merge, swizzle_a, neg_b, neg_c, swizzle_b, Swizzle::F32, src_b, src_c, sat, precision);
+    let merge = Merge::from_u32(field(insn, 49, 2));
+    let src_b = tv.get_reg39(insn);
+    let src_c = tv.get_cbuf(insn);
+    hfma2_inner(
+        tv,
+        insn,
+        merge,
+        swizzle_a,
+        neg_b,
+        neg_c,
+        swizzle_b,
+        Swizzle::F32,
+        src_b,
+        src_c,
+        sat,
+        precision,
+    );
 }
 
 /// HFMA2_cr — src_b from constant buffer, src_c from register [39:8].
 pub fn hfma2_cr(tv: &mut TranslatorVisitor, insn: u64) {
-    let neg_c     = bit(insn, 51);
-    let sat       = bit(insn, 52);
+    let neg_c = bit(insn, 51);
+    let sat = bit(insn, 52);
     let swizzle_c = Swizzle::from_u32(field(insn, 53, 2));
-    let neg_b     = bit(insn, 56);
+    let neg_b = bit(insn, 56);
     let precision = HalfPrecision::from_u32(field(insn, 57, 2));
     let swizzle_a = Swizzle::from_u32(field(insn, 47, 2));
-    let merge     = Merge::from_u32(field(insn, 49, 2));
-    let src_b     = tv.get_cbuf(insn);
-    let src_c     = tv.get_reg39(insn);
-    hfma2_inner(tv, insn, merge, swizzle_a, neg_b, neg_c, Swizzle::F32, swizzle_c, src_b, src_c, sat, precision);
+    let merge = Merge::from_u32(field(insn, 49, 2));
+    let src_b = tv.get_cbuf(insn);
+    let src_c = tv.get_reg39(insn);
+    hfma2_inner(
+        tv,
+        insn,
+        merge,
+        swizzle_a,
+        neg_b,
+        neg_c,
+        Swizzle::F32,
+        swizzle_c,
+        src_b,
+        src_c,
+        sat,
+        precision,
+    );
 }
 
 /// HFMA2_imm — src_b from 16-bit immediate pair, src_c from register [39:8].
 pub fn hfma2_imm(tv: &mut TranslatorVisitor, insn: u64) {
-    let neg_c     = bit(insn, 51);
-    let sat       = bit(insn, 52);
+    let neg_c = bit(insn, 51);
+    let sat = bit(insn, 52);
     let swizzle_c = Swizzle::from_u32(field(insn, 53, 2));
-    let neg_high  = bit(insn, 56);
-    let high      = field(insn, 30, 9);
-    let neg_low   = bit(insn, 29);
-    let low       = field(insn, 20, 9);
+    let neg_high = bit(insn, 56);
+    let high = field(insn, 30, 9);
+    let neg_low = bit(insn, 29);
+    let low = field(insn, 20, 9);
     let precision = HalfPrecision::from_u32(field(insn, 57, 2));
-    let imm: u32  = (low << 6)
-        | (if neg_low  { 1u32 } else { 0u32 } << 15)
+    let imm: u32 = (low << 6)
+        | (if neg_low { 1u32 } else { 0u32 } << 15)
         | (high << 22)
         | (if neg_high { 1u32 } else { 0u32 } << 31);
     let swizzle_a = Swizzle::from_u32(field(insn, 47, 2));
-    let merge     = Merge::from_u32(field(insn, 49, 2));
-    let src_b     = Value::ImmU32(imm);
-    let src_c     = tv.get_reg39(insn);
-    hfma2_inner(tv, insn, merge, swizzle_a, false, neg_c, Swizzle::H1H0, swizzle_c, src_b, src_c, sat, precision);
+    let merge = Merge::from_u32(field(insn, 49, 2));
+    let src_b = Value::ImmU32(imm);
+    let src_c = tv.get_reg39(insn);
+    hfma2_inner(
+        tv,
+        insn,
+        merge,
+        swizzle_a,
+        false,
+        neg_c,
+        Swizzle::H1H0,
+        swizzle_c,
+        src_b,
+        src_c,
+        sat,
+        precision,
+    );
 }
 
 /// HFMA2_32I — src_b from 32-bit immediate, src_c from register [0:8].
 pub fn hfma2_32i(tv: &mut TranslatorVisitor, insn: u64) {
     let src_c_reg = field(insn, 0, 8);
-    let imm: u32  = field(insn, 20, 32);
-    let neg_c     = bit(insn, 52);
+    let imm: u32 = field(insn, 20, 32);
+    let neg_c = bit(insn, 52);
     let swizzle_a = Swizzle::from_u32(field(insn, 53, 2));
     let precision = HalfPrecision::from_u32(field(insn, 55, 2));
-    let src_b     = Value::ImmU32(imm);
-    let src_c     = tv.x(src_c_reg);
-    hfma2_inner(tv, insn, Merge::H1H0, swizzle_a, false, neg_c, Swizzle::H1H0, Swizzle::H1H0, src_b, src_c, false, precision);
+    let src_b = Value::ImmU32(imm);
+    let src_c = tv.x(src_c_reg);
+    hfma2_inner(
+        tv,
+        insn,
+        Merge::H1H0,
+        swizzle_a,
+        false,
+        neg_c,
+        Swizzle::H1H0,
+        Swizzle::H1H0,
+        src_b,
+        src_c,
+        false,
+        precision,
+    );
 }
 
 /// Public entry-point stub used when a single dispatch opcode covers HFMA2.

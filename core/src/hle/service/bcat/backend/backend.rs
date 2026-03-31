@@ -28,9 +28,8 @@ pub struct ProgressServiceBackend {
 impl ProgressServiceBackend {
     pub fn new(event_name: &str) -> Self {
         let mut service_context = ServiceContext::new("ProgressServiceBackend".to_string());
-        let update_event_handle = service_context.create_event(
-            format!("ProgressServiceBackend:UpdateEvent:{}", event_name),
-        );
+        let update_event_handle = service_context
+            .create_event(format!("ProgressServiceBackend:UpdateEvent:{}", event_name));
         Self {
             impl_data: DeliveryCacheProgressImpl::default(),
             event_name: event_name.to_string(),
@@ -75,7 +74,8 @@ impl ProgressServiceBackend {
         let file_bytes = file_name.as_bytes();
         let dir_copy_len = std::cmp::min(dir_bytes.len(), 0x20);
         let file_copy_len = std::cmp::min(file_bytes.len(), 0x20);
-        self.impl_data.current_directory[..dir_copy_len].copy_from_slice(&dir_bytes[..dir_copy_len]);
+        self.impl_data.current_directory[..dir_copy_len]
+            .copy_from_slice(&dir_bytes[..dir_copy_len]);
         self.impl_data.current_file[..file_copy_len].copy_from_slice(&file_bytes[..file_copy_len]);
 
         self.signal_update();
@@ -129,7 +129,8 @@ impl Drop for ProgressServiceBackend {
 ///
 /// Corresponds to `BcatBackend` in upstream `backend.h`.
 pub trait BcatBackend {
-    fn synchronize(&mut self, title: TitleIdVersion, progress: &mut ProgressServiceBackend) -> bool;
+    fn synchronize(&mut self, title: TitleIdVersion, progress: &mut ProgressServiceBackend)
+        -> bool;
     fn synchronize_directory(
         &mut self,
         title: TitleIdVersion,
@@ -153,7 +154,11 @@ impl NullBcatBackend {
 }
 
 impl BcatBackend for NullBcatBackend {
-    fn synchronize(&mut self, title: TitleIdVersion, progress: &mut ProgressServiceBackend) -> bool {
+    fn synchronize(
+        &mut self,
+        title: TitleIdVersion,
+        progress: &mut ProgressServiceBackend,
+    ) -> bool {
         log::debug!(
             "NullBcatBackend::synchronize called, title_id={:016X}, build_id={:016X}",
             title.title_id,

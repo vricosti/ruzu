@@ -152,7 +152,9 @@ impl TimeManager {
                 enabled
             );
             let _updated_time = inner.get_user_system_clock_automatic_correction_updated_time();
-            log::info!("ISystemSettingsServer::GetUserSystemClockAutomaticCorrectionUpdatedTime called");
+            log::info!(
+                "ISystemSettingsServer::GetUserSystemClockAutomaticCorrectionUpdatedTime called"
+            );
         }
 
         // === SetupTimeZoneServiceCore ===
@@ -163,7 +165,9 @@ impl TimeManager {
         {
             let inner = set_sys_svc.inner.lock().unwrap();
             let name = inner.get_device_time_zone_location_name();
-            let name_str = std::str::from_utf8(&name).unwrap_or("").trim_end_matches('\0');
+            let name_str = std::str::from_utf8(&name)
+                .unwrap_or("")
+                .trim_end_matches('\0');
             log::info!("ISystemSettingsServer::GetDeviceTimeZoneLocationName called");
             drop(inner);
 
@@ -211,7 +215,9 @@ impl TimeManager {
 
             let time = inner.get_user_system_clock_automatic_correction_updated_time();
             inner.set_user_system_clock_automatic_correction_updated_time(time);
-            log::info!("ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionUpdatedTime called");
+            log::info!(
+                "ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionUpdatedTime called"
+            );
         }
 
         self.worker.initialize();

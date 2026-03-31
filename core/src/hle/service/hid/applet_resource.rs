@@ -106,12 +106,6 @@ impl IAppletResource {
             process.handle_table.add(object_id).ok()
         })();
 
-        log::debug!(
-            "IAppletResource::GetSharedMemoryHandle called, aruid={}, handle={:#x}",
-            service.aruid,
-            handle.unwrap_or(0)
-        );
-
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle.unwrap_or(0));

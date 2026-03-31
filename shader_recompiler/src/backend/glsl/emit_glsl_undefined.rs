@@ -7,8 +7,18 @@
 
 use super::glsl_emit_context::EmitContext;
 
-pub fn emit_undef_u1(ctx: &mut EmitContext) { ctx.add_line("b_0=false;"); }
-pub fn emit_undef_u8(ctx: &mut EmitContext) { ctx.add_line("u_0=0u;"); }
-pub fn emit_undef_u16(ctx: &mut EmitContext) { ctx.add_line("u_0=0u;"); }
-pub fn emit_undef_u32(ctx: &mut EmitContext) { ctx.add_line("u_0=0u;"); }
-pub fn emit_undef_u64(ctx: &mut EmitContext) { ctx.add_line("u64_0=0ul;"); }
+pub fn emit_undef_u1(ctx: &mut EmitContext) {
+    ctx.add_line("b_0=false;");
+}
+pub fn emit_undef_u8(ctx: &mut EmitContext) {
+    ctx.add_line("u_0=0u;");
+}
+pub fn emit_undef_u16(ctx: &mut EmitContext) {
+    ctx.add_line("u_0=0u;");
+}
+pub fn emit_undef_u32(ctx: &mut EmitContext) {
+    ctx.add_line("u_0=0u;");
+}
+pub fn emit_undef_u64(ctx: &mut EmitContext) {
+    ctx.add_line("u64_0=0ul;");
+}

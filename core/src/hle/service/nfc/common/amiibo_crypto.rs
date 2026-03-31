@@ -37,7 +37,7 @@ pub type DrgbOutput = [u8; 0x20];
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct HashSeed {
-    pub magic: u16,          // big-endian write_counter
+    pub magic: u16, // big-endian write_counter
     pub padding: [u8; 0xE],
     pub uid_1: TagUuid,
     pub uid_2: TagUuid,
@@ -101,15 +101,22 @@ pub fn is_amiibo_valid_encrypted(ntag_file: &EncryptedNtag215File) -> bool {
     // Read packed fields safely
     let uuid = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.uuid)) };
     let uuid_crc_check2 = ntag_file.uuid_crc_check2;
-    let static_lock = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.static_lock)) };
-    let compatibility_container = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.compatibility_container)) };
-    let dynamic_lock = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.dynamic_lock)) };
+    let static_lock =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.static_lock)) };
+    let compatibility_container = unsafe {
+        core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.compatibility_container))
+    };
+    let dynamic_lock =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.dynamic_lock)) };
     let cfg0 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.cfg0)) };
     let cfg1 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.cfg1)) };
 
-    let user_memory = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.user_memory)) };
-    let write_counter = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(user_memory.write_counter)) };
-    let model_info = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(user_memory.model_info)) };
+    let user_memory =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(ntag_file.user_memory)) };
+    let write_counter =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(user_memory.write_counter)) };
+    let model_info =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(user_memory.model_info)) };
 
     log::debug!("uuid_lock=0x{:x}", static_lock);
     log::debug!("compatibility_container=0x{:x}", compatibility_container);
@@ -325,10 +332,7 @@ pub fn encoded_data_to_nfc_data(encoded_data: &Ntag215File) -> EncryptedNtag215F
         );
         user_memory.keygen_salt = encoded_data.keygen_salt;
 
-        core::ptr::write_unaligned(
-            core::ptr::addr_of_mut!(nfc_data.user_memory),
-            user_memory,
-        );
+        core::ptr::write_unaligned(core::ptr::addr_of_mut!(nfc_data.user_memory), user_memory);
         core::ptr::write_unaligned(
             core::ptr::addr_of_mut!(nfc_data.dynamic_lock),
             core::ptr::read_unaligned(core::ptr::addr_of!(encoded_data.dynamic_lock)),
@@ -354,12 +358,9 @@ pub fn encoded_data_to_nfc_data(encoded_data: &Ntag215File) -> EncryptedNtag215F
 ///
 /// Corresponds to `GetSeed` in upstream.
 fn get_seed(data: &Ntag215File) -> HashSeed {
-    let write_counter = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!(data.write_counter))
-    };
-    let uid = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!(data.uid))
-    };
+    let write_counter =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(data.write_counter)) };
+    let uid = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(data.uid)) };
     HashSeed {
         magic: write_counter,
         padding: [0u8; 0xE],
@@ -379,7 +380,11 @@ fn generate_internal_key(key: &InternalKey, seed: &HashSeed) -> Vec<u8> {
     let mut output = Vec::with_capacity(string_size + seed_part1_len);
 
     // Copy whole type string (up to first null byte, like memccpy with '\0')
-    let null_pos = key.type_string.iter().position(|&b| b == 0).unwrap_or(string_size);
+    let null_pos = key
+        .type_string
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(string_size);
     output.extend_from_slice(&key.type_string[..null_pos]);
     // If null was found, include it; memccpy stops after copying the delimiter
     if null_pos < string_size {
@@ -487,8 +492,7 @@ fn crypto_step(ctx: &mut CryptoCtx, hmac_key: &HmacKey) -> DrgbOutput {
     ctx.used = true;
 
     // HMAC-SHA256
-    let mut mac = HmacSha256::new_from_slice(hmac_key)
-        .expect("HMAC key length is always valid");
+    let mut mac = HmacSha256::new_from_slice(hmac_key).expect("HMAC key length is always valid");
     mac.update(&ctx.buffer[..ctx.buffer_size]);
     let result = mac.finalize().into_bytes();
 
@@ -556,15 +560,13 @@ fn cipher(keys: &DerivedKeys, in_data: &Ntag215File, out_data: &mut Ntag215File)
     };
 
     // AES-128-CTR encrypt/decrypt the settings region
-    let mut ctr_cipher = Aes128Ctr::new(
-        keys.aes_key.as_ref().into(),
-        keys.aes_iv.as_ref().into(),
-    );
+    let mut ctr_cipher = Aes128Ctr::new(keys.aes_key.as_ref().into(), keys.aes_iv.as_ref().into());
 
     // Copy input encrypted region to output, then apply CTR in-place
     out_bytes[SETTINGS_START..SETTINGS_START + ENCRYPTED_DATA_SIZE]
         .copy_from_slice(&in_bytes[SETTINGS_START..SETTINGS_START + ENCRYPTED_DATA_SIZE]);
-    ctr_cipher.apply_keystream(&mut out_bytes[SETTINGS_START..SETTINGS_START + ENCRYPTED_DATA_SIZE]);
+    ctr_cipher
+        .apply_keystream(&mut out_bytes[SETTINGS_START..SETTINGS_START + ENCRYPTED_DATA_SIZE]);
 
     // Copy the rest of the data directly (non-encrypted fields)
     unsafe {
@@ -632,7 +634,11 @@ fn load_keys() -> Option<(InternalKey, InternalKey)> {
 
     const KEY_SIZE: usize = core::mem::size_of::<InternalKey>(); // 0x50
     if data.len() < KEY_SIZE * 2 {
-        log::error!("key_retail.bin too small: {} bytes, need {}", data.len(), KEY_SIZE * 2);
+        log::error!(
+            "key_retail.bin too small: {} bytes, need {}",
+            data.len(),
+            KEY_SIZE * 2
+        );
         return None;
     }
 
@@ -719,9 +725,8 @@ pub fn decode_amiibo(
     tag_data.hmac_data = data_hmac;
 
     // Validate HMACs
-    let encrypted_user_memory = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!(encrypted_tag_data.user_memory))
-    };
+    let encrypted_user_memory =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(encrypted_tag_data.user_memory)) };
 
     if tag_data.hmac_data != encrypted_user_memory.hmac_data {
         log::error!("hmac_data doesn't match");

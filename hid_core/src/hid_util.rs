@@ -25,9 +25,8 @@ pub fn is_npad_id_valid(npad_id: NpadIdType) -> bool {
 
 pub fn is_sixaxis_handle_valid(handle: &SixAxisSensorHandle) -> ResultCode {
     // Safety: transmute u8 to NpadIdType for validation
-    let npad_id_valid = is_npad_id_valid(unsafe {
-        std::mem::transmute::<u32, NpadIdType>(handle.npad_id as u32)
-    });
+    let npad_id_valid =
+        is_npad_id_valid(unsafe { std::mem::transmute::<u32, NpadIdType>(handle.npad_id as u32) });
     let device_index_valid = (handle.device_index as u8) < (DeviceIndex::MaxDeviceIndex as u8);
 
     if !npad_id_valid {
@@ -54,9 +53,7 @@ pub fn is_vibration_handle_valid(handle: &VibrationDeviceHandle) -> ResultCode {
         _ => return RESULT_VIBRATION_INVALID_STYLE_INDEX,
     }
 
-    if !is_npad_id_valid(unsafe {
-        std::mem::transmute::<u32, NpadIdType>(handle.npad_id as u32)
-    }) {
+    if !is_npad_id_valid(unsafe { std::mem::transmute::<u32, NpadIdType>(handle.npad_id as u32) }) {
         return RESULT_VIBRATION_INVALID_NPAD_ID;
     }
 

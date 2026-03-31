@@ -130,12 +130,12 @@ impl DeviceSession {
                 self.thread_event = Some(self.make_thread_event(stream.clone()));
             }
             if let Some(thread_event) = &self.thread_event {
-                self.system.lock().core_timing().lock().unwrap().schedule_looping_event(
-                    Duration::ZERO,
-                    INCREMENT_TIME,
-                    thread_event,
-                    false,
-                );
+                self.system
+                    .lock()
+                    .core_timing()
+                    .lock()
+                    .unwrap()
+                    .schedule_looping_event(Duration::ZERO, INCREMENT_TIME, thread_event, false);
             }
             self.started = true;
         }
@@ -150,7 +150,9 @@ impl DeviceSession {
             if let Some(thread_event) = &self.thread_event {
                 self.system
                     .lock()
-                    .core_timing().lock().unwrap()
+                    .core_timing()
+                    .lock()
+                    .unwrap()
                     .unschedule_event(thread_event, UnscheduleEventType::NoWait);
             }
         }

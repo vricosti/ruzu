@@ -367,9 +367,7 @@ impl SslConnectionBackend for SslConnectionBackendOpenSsl {
 /// Corresponds to `CreateSSLConnectionBackend` in upstream ssl_backend_openssl.cpp.
 pub fn create_ssl_connection_backend() -> Result<Box<dyn SslConnectionBackend>, ResultCode> {
     if !is_initialized() {
-        log::error!(
-            "Can't create SSL connection because OpenSSL one-time initialization failed"
-        );
+        log::error!("Can't create SSL connection because OpenSSL one-time initialization failed");
         return Err(RESULT_INTERNAL_ERROR);
     }
 

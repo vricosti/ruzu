@@ -156,28 +156,56 @@ const _: () = assert!(std::mem::size_of::<NPadSystemProperties>() == 0x8);
 
 impl NPadSystemProperties {
     pub fn set_is_charging_joy_dual(&mut self, val: bool) {
-        if val { self.raw |= 1 << 0; } else { self.raw &= !(1 << 0); }
+        if val {
+            self.raw |= 1 << 0;
+        } else {
+            self.raw &= !(1 << 0);
+        }
     }
     pub fn set_is_charging_joy_left(&mut self, val: bool) {
-        if val { self.raw |= 1 << 1; } else { self.raw &= !(1 << 1); }
+        if val {
+            self.raw |= 1 << 1;
+        } else {
+            self.raw &= !(1 << 1);
+        }
     }
     pub fn set_is_charging_joy_right(&mut self, val: bool) {
-        if val { self.raw |= 1 << 2; } else { self.raw &= !(1 << 2); }
+        if val {
+            self.raw |= 1 << 2;
+        } else {
+            self.raw &= !(1 << 2);
+        }
     }
     pub fn set_is_powered_joy_dual(&mut self, val: bool) {
-        if val { self.raw |= 1 << 3; } else { self.raw &= !(1 << 3); }
+        if val {
+            self.raw |= 1 << 3;
+        } else {
+            self.raw &= !(1 << 3);
+        }
     }
     pub fn set_is_powered_joy_left(&mut self, val: bool) {
-        if val { self.raw |= 1 << 4; } else { self.raw &= !(1 << 4); }
+        if val {
+            self.raw |= 1 << 4;
+        } else {
+            self.raw &= !(1 << 4);
+        }
     }
     pub fn set_is_powered_joy_right(&mut self, val: bool) {
-        if val { self.raw |= 1 << 5; } else { self.raw &= !(1 << 5); }
+        if val {
+            self.raw |= 1 << 5;
+        } else {
+            self.raw &= !(1 << 5);
+        }
     }
 }
 
 impl NpadSystemButtonProperties {
     pub fn set_is_home_button_protection_enabled(&mut self, val: bool) {
-        if val { self.raw |= 1 << 0; } else { self.raw &= !(1 << 0); }
+        if val {
+            self.raw |= 1 << 0;
+        } else {
+            self.raw &= !(1 << 0);
+        }
     }
 }
 
@@ -281,34 +309,90 @@ pub struct FeatureType {
 const _: () = assert!(std::mem::size_of::<FeatureType>() == 8);
 
 impl FeatureType {
-    pub fn has_left_analog_stick(&self) -> bool { (self.raw & (1 << 0)) != 0 }
-    pub fn has_right_analog_stick(&self) -> bool { (self.raw & (1 << 1)) != 0 }
-    pub fn has_left_joy_six_axis_sensor(&self) -> bool { (self.raw & (1 << 2)) != 0 }
-    pub fn has_right_joy_six_axis_sensor(&self) -> bool { (self.raw & (1 << 3)) != 0 }
-    pub fn has_fullkey_joy_six_axis_sensor(&self) -> bool { (self.raw & (1 << 4)) != 0 }
-    pub fn has_left_lra_vibration_device(&self) -> bool { (self.raw & (1 << 5)) != 0 }
-    pub fn has_right_lra_vibration_device(&self) -> bool { (self.raw & (1 << 6)) != 0 }
-    pub fn has_gc_vibration_device(&self) -> bool { (self.raw & (1 << 7)) != 0 }
-    pub fn has_erm_vibration_device(&self) -> bool { (self.raw & (1 << 8)) != 0 }
-    pub fn has_left_joy_rail_bus(&self) -> bool { (self.raw & (1 << 9)) != 0 }
-    pub fn has_right_joy_rail_bus(&self) -> bool { (self.raw & (1 << 10)) != 0 }
-    pub fn has_internal_bus(&self) -> bool { (self.raw & (1 << 11)) != 0 }
-    pub fn is_palma(&self) -> bool { (self.raw & (1 << 12)) != 0 }
-    pub fn has_nfc(&self) -> bool { (self.raw & (1 << 13)) != 0 }
-    pub fn has_ir_sensor(&self) -> bool { (self.raw & (1 << 14)) != 0 }
-    pub fn is_analog_stick_calibration_supported(&self) -> bool { (self.raw & (1 << 15)) != 0 }
-    pub fn is_six_axis_sensor_user_calibration_supported(&self) -> bool { (self.raw & (1 << 16)) != 0 }
-    pub fn has_left_right_joy_battery(&self) -> bool { (self.raw & (1 << 17)) != 0 }
-    pub fn has_fullkey_battery(&self) -> bool { (self.raw & (1 << 18)) != 0 }
-    pub fn is_disconnect_controller_if_battery_none(&self) -> bool { (self.raw & (1 << 19)) != 0 }
-    pub fn has_controller_color(&self) -> bool { (self.raw & (1 << 20)) != 0 }
-    pub fn has_grip_color(&self) -> bool { (self.raw & (1 << 21)) != 0 }
-    pub fn has_identification_code(&self) -> bool { (self.raw & (1 << 22)) != 0 }
-    pub fn has_bluetooth_address(&self) -> bool { (self.raw & (1 << 23)) != 0 }
-    pub fn has_mcu(&self) -> bool { (self.raw & (1 << 24)) != 0 }
-    pub fn has_notification_led(&self) -> bool { (self.raw & (1 << 25)) != 0 }
-    pub fn has_directional_buttons(&self) -> bool { (self.raw & (1 << 26)) != 0 }
-    pub fn has_indicator_led(&self) -> bool { (self.raw & (1 << 27)) != 0 }
+    pub fn has_left_analog_stick(&self) -> bool {
+        (self.raw & (1 << 0)) != 0
+    }
+    pub fn has_right_analog_stick(&self) -> bool {
+        (self.raw & (1 << 1)) != 0
+    }
+    pub fn has_left_joy_six_axis_sensor(&self) -> bool {
+        (self.raw & (1 << 2)) != 0
+    }
+    pub fn has_right_joy_six_axis_sensor(&self) -> bool {
+        (self.raw & (1 << 3)) != 0
+    }
+    pub fn has_fullkey_joy_six_axis_sensor(&self) -> bool {
+        (self.raw & (1 << 4)) != 0
+    }
+    pub fn has_left_lra_vibration_device(&self) -> bool {
+        (self.raw & (1 << 5)) != 0
+    }
+    pub fn has_right_lra_vibration_device(&self) -> bool {
+        (self.raw & (1 << 6)) != 0
+    }
+    pub fn has_gc_vibration_device(&self) -> bool {
+        (self.raw & (1 << 7)) != 0
+    }
+    pub fn has_erm_vibration_device(&self) -> bool {
+        (self.raw & (1 << 8)) != 0
+    }
+    pub fn has_left_joy_rail_bus(&self) -> bool {
+        (self.raw & (1 << 9)) != 0
+    }
+    pub fn has_right_joy_rail_bus(&self) -> bool {
+        (self.raw & (1 << 10)) != 0
+    }
+    pub fn has_internal_bus(&self) -> bool {
+        (self.raw & (1 << 11)) != 0
+    }
+    pub fn is_palma(&self) -> bool {
+        (self.raw & (1 << 12)) != 0
+    }
+    pub fn has_nfc(&self) -> bool {
+        (self.raw & (1 << 13)) != 0
+    }
+    pub fn has_ir_sensor(&self) -> bool {
+        (self.raw & (1 << 14)) != 0
+    }
+    pub fn is_analog_stick_calibration_supported(&self) -> bool {
+        (self.raw & (1 << 15)) != 0
+    }
+    pub fn is_six_axis_sensor_user_calibration_supported(&self) -> bool {
+        (self.raw & (1 << 16)) != 0
+    }
+    pub fn has_left_right_joy_battery(&self) -> bool {
+        (self.raw & (1 << 17)) != 0
+    }
+    pub fn has_fullkey_battery(&self) -> bool {
+        (self.raw & (1 << 18)) != 0
+    }
+    pub fn is_disconnect_controller_if_battery_none(&self) -> bool {
+        (self.raw & (1 << 19)) != 0
+    }
+    pub fn has_controller_color(&self) -> bool {
+        (self.raw & (1 << 20)) != 0
+    }
+    pub fn has_grip_color(&self) -> bool {
+        (self.raw & (1 << 21)) != 0
+    }
+    pub fn has_identification_code(&self) -> bool {
+        (self.raw & (1 << 22)) != 0
+    }
+    pub fn has_bluetooth_address(&self) -> bool {
+        (self.raw & (1 << 23)) != 0
+    }
+    pub fn has_mcu(&self) -> bool {
+        (self.raw & (1 << 24)) != 0
+    }
+    pub fn has_notification_led(&self) -> bool {
+        (self.raw & (1 << 25)) != 0
+    }
+    pub fn has_directional_buttons(&self) -> bool {
+        (self.raw & (1 << 26)) != 0
+    }
+    pub fn has_indicator_led(&self) -> bool {
+        (self.raw & (1 << 27)) != 0
+    }
 }
 
 /// This is nn::hid::AssignmentStyle
@@ -320,12 +404,24 @@ pub struct AssignmentStyle {
 const _: () = assert!(std::mem::size_of::<AssignmentStyle>() == 4);
 
 impl AssignmentStyle {
-    pub fn is_external_assigned(&self) -> bool { (self.raw & (1 << 0)) != 0 }
-    pub fn is_external_left_assigned(&self) -> bool { (self.raw & (1 << 1)) != 0 }
-    pub fn is_external_right_assigned(&self) -> bool { (self.raw & (1 << 2)) != 0 }
-    pub fn is_handheld_assigned(&self) -> bool { (self.raw & (1 << 3)) != 0 }
-    pub fn is_handheld_left_assigned(&self) -> bool { (self.raw & (1 << 4)) != 0 }
-    pub fn is_handheld_right_assigned(&self) -> bool { (self.raw & (1 << 5)) != 0 }
+    pub fn is_external_assigned(&self) -> bool {
+        (self.raw & (1 << 0)) != 0
+    }
+    pub fn is_external_left_assigned(&self) -> bool {
+        (self.raw & (1 << 1)) != 0
+    }
+    pub fn is_external_right_assigned(&self) -> bool {
+        (self.raw & (1 << 2)) != 0
+    }
+    pub fn is_handheld_assigned(&self) -> bool {
+        (self.raw & (1 << 3)) != 0
+    }
+    pub fn is_handheld_left_assigned(&self) -> bool {
+        (self.raw & (1 << 4)) != 0
+    }
+    pub fn is_handheld_right_assigned(&self) -> bool {
+        (self.raw & (1 << 5)) != 0
+    }
 }
 
 /// This is nn::hid::server::IAbstractedPad::InternalFlags
@@ -337,25 +433,59 @@ pub struct InternalFlags {
 const _: () = assert!(std::mem::size_of::<InternalFlags>() == 4);
 
 impl InternalFlags {
-    pub fn is_bound(&self) -> bool { (self.raw & (1 << 0)) != 0 }
-    pub fn is_connected(&self) -> bool { (self.raw & (1 << 1)) != 0 }
-    pub fn is_battery_low_ovln_required(&self) -> bool { (self.raw & (1 << 2)) != 0 }
+    pub fn is_bound(&self) -> bool {
+        (self.raw & (1 << 0)) != 0
+    }
+    pub fn is_connected(&self) -> bool {
+        (self.raw & (1 << 1)) != 0
+    }
+    pub fn is_battery_low_ovln_required(&self) -> bool {
+        (self.raw & (1 << 2)) != 0
+    }
     pub fn set_is_battery_low_ovln_required(&mut self, val: bool) {
-        if val { self.raw |= 1 << 2; } else { self.raw &= !(1 << 2); }
+        if val {
+            self.raw |= 1 << 2;
+        } else {
+            self.raw &= !(1 << 2);
+        }
     }
-    pub fn is_battery_low_ovln_delay_required(&self) -> bool { (self.raw & (1 << 3)) != 0 }
-    pub fn is_sample_received(&self) -> bool { (self.raw & (1 << 4)) != 0 }
-    pub fn is_virtual_input(&self) -> bool { (self.raw & (1 << 5)) != 0 }
-    pub fn is_wired(&self) -> bool { (self.raw & (1 << 6)) != 0 }
-    pub fn use_center_clamp(&self) -> bool { (self.raw & (1 << 8)) != 0 }
+    pub fn is_battery_low_ovln_delay_required(&self) -> bool {
+        (self.raw & (1 << 3)) != 0
+    }
+    pub fn is_sample_received(&self) -> bool {
+        (self.raw & (1 << 4)) != 0
+    }
+    pub fn is_virtual_input(&self) -> bool {
+        (self.raw & (1 << 5)) != 0
+    }
+    pub fn is_wired(&self) -> bool {
+        (self.raw & (1 << 6)) != 0
+    }
+    pub fn use_center_clamp(&self) -> bool {
+        (self.raw & (1 << 8)) != 0
+    }
     pub fn set_use_center_clamp(&mut self, val: bool) {
-        if val { self.raw |= 1 << 8; } else { self.raw &= !(1 << 8); }
+        if val {
+            self.raw |= 1 << 8;
+        } else {
+            self.raw &= !(1 << 8);
+        }
     }
-    pub fn has_virtual_six_axis_sensor_acceleration(&self) -> bool { (self.raw & (1 << 9)) != 0 }
-    pub fn has_virtual_six_axis_sensor_angle(&self) -> bool { (self.raw & (1 << 10)) != 0 }
-    pub fn is_debug_pad(&self) -> bool { (self.raw & (1 << 11)) != 0 }
+    pub fn has_virtual_six_axis_sensor_acceleration(&self) -> bool {
+        (self.raw & (1 << 9)) != 0
+    }
+    pub fn has_virtual_six_axis_sensor_angle(&self) -> bool {
+        (self.raw & (1 << 10)) != 0
+    }
+    pub fn is_debug_pad(&self) -> bool {
+        (self.raw & (1 << 11)) != 0
+    }
     pub fn set_is_connected(&mut self, val: bool) {
-        if val { self.raw |= 1 << 1; } else { self.raw &= !(1 << 1); }
+        if val {
+            self.raw |= 1 << 1;
+        } else {
+            self.raw &= !(1 << 1);
+        }
     }
 }
 
@@ -391,37 +521,85 @@ pub struct NpadStatus {
 const _: () = assert!(std::mem::size_of::<NpadStatus>() == 4);
 
 impl NpadStatus {
-    pub fn is_supported_styleset_set(&self) -> bool { (self.raw & (1 << 0)) != 0 }
+    pub fn is_supported_styleset_set(&self) -> bool {
+        (self.raw & (1 << 0)) != 0
+    }
     pub fn set_is_supported_styleset_set(&mut self, val: bool) {
-        if val { self.raw |= 1 << 0; } else { self.raw &= !(1 << 0); }
+        if val {
+            self.raw |= 1 << 0;
+        } else {
+            self.raw &= !(1 << 0);
+        }
     }
-    pub fn is_hold_type_set(&self) -> bool { (self.raw & (1 << 1)) != 0 }
+    pub fn is_hold_type_set(&self) -> bool {
+        (self.raw & (1 << 1)) != 0
+    }
     pub fn set_is_hold_type_set(&mut self, val: bool) {
-        if val { self.raw |= 1 << 1; } else { self.raw &= !(1 << 1); }
+        if val {
+            self.raw |= 1 << 1;
+        } else {
+            self.raw &= !(1 << 1);
+        }
     }
-    pub fn lr_assignment_mode(&self) -> bool { (self.raw & (1 << 2)) != 0 }
+    pub fn lr_assignment_mode(&self) -> bool {
+        (self.raw & (1 << 2)) != 0
+    }
     pub fn set_lr_assignment_mode(&mut self, val: bool) {
-        if val { self.raw |= 1 << 2; } else { self.raw &= !(1 << 2); }
+        if val {
+            self.raw |= 1 << 2;
+        } else {
+            self.raw &= !(1 << 2);
+        }
     }
-    pub fn assigning_single_on_sl_sr_press(&self) -> bool { (self.raw & (1 << 3)) != 0 }
+    pub fn assigning_single_on_sl_sr_press(&self) -> bool {
+        (self.raw & (1 << 3)) != 0
+    }
     pub fn set_assigning_single_on_sl_sr_press(&mut self, val: bool) {
-        if val { self.raw |= 1 << 3; } else { self.raw &= !(1 << 3); }
+        if val {
+            self.raw |= 1 << 3;
+        } else {
+            self.raw &= !(1 << 3);
+        }
     }
-    pub fn is_full_policy(&self) -> bool { (self.raw & (1 << 4)) != 0 }
+    pub fn is_full_policy(&self) -> bool {
+        (self.raw & (1 << 4)) != 0
+    }
     pub fn set_is_full_policy(&mut self, val: bool) {
-        if val { self.raw |= 1 << 4; } else { self.raw &= !(1 << 4); }
+        if val {
+            self.raw |= 1 << 4;
+        } else {
+            self.raw &= !(1 << 4);
+        }
     }
-    pub fn is_policy(&self) -> bool { (self.raw & (1 << 5)) != 0 }
+    pub fn is_policy(&self) -> bool {
+        (self.raw & (1 << 5)) != 0
+    }
     pub fn set_is_policy(&mut self, val: bool) {
-        if val { self.raw |= 1 << 5; } else { self.raw &= !(1 << 5); }
+        if val {
+            self.raw |= 1 << 5;
+        } else {
+            self.raw &= !(1 << 5);
+        }
     }
-    pub fn use_center_clamp(&self) -> bool { (self.raw & (1 << 6)) != 0 }
+    pub fn use_center_clamp(&self) -> bool {
+        (self.raw & (1 << 6)) != 0
+    }
     pub fn set_use_center_clamp(&mut self, val: bool) {
-        if val { self.raw |= 1 << 6; } else { self.raw &= !(1 << 6); }
+        if val {
+            self.raw |= 1 << 6;
+        } else {
+            self.raw &= !(1 << 6);
+        }
     }
-    pub fn system_ext_state(&self) -> bool { (self.raw & (1 << 7)) != 0 }
+    pub fn system_ext_state(&self) -> bool {
+        (self.raw & (1 << 7)) != 0
+    }
     pub fn set_system_ext_state(&mut self, val: bool) {
-        if val { self.raw |= 1 << 7; } else { self.raw &= !(1 << 7); }
+        if val {
+            self.raw |= 1 << 7;
+        } else {
+            self.raw &= !(1 << 7);
+        }
     }
 }
 

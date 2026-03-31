@@ -75,10 +75,22 @@ fn sign_extend(value: u64, bitsize: u64, regsize: u64) -> u64 {
 
 fn vector_get_element(value: U128, bitsize: u64) -> U128 {
     match bitsize {
-        8 => U128 { lo: value.lo & 0xFF, hi: 0 },
-        16 => U128 { lo: value.lo & 0xFFFF, hi: 0 },
-        32 => U128 { lo: value.lo & 0xFFFF_FFFF, hi: 0 },
-        64 => U128 { lo: value.lo, hi: 0 },
+        8 => U128 {
+            lo: value.lo & 0xFF,
+            hi: 0,
+        },
+        16 => U128 {
+            lo: value.lo & 0xFFFF,
+            hi: 0,
+        },
+        32 => U128 {
+            lo: value.lo & 0xFFFF_FFFF,
+            hi: 0,
+        },
+        64 => U128 {
+            lo: value.lo,
+            hi: 0,
+        },
         _ => value,
     }
 }
@@ -169,14 +181,44 @@ impl<'a, M: MemoryAccess> InterpreterVisitor<'a, M> {
         let signed_extend: bool;
 
         match option.zero_extend() {
-            0b000 => { val &= 0xFF; len = 8; signed_extend = false; }           // UXTB
-            0b001 => { val &= 0xFFFF; len = 16; signed_extend = false; }        // UXTH
-            0b010 => { val &= 0xFFFF_FFFF; len = 32; signed_extend = false; }   // UXTW
-            0b011 => { len = 64; signed_extend = false; }                        // UXTX
-            0b100 => { val &= 0xFF; len = 8; signed_extend = true; }            // SXTB
-            0b101 => { val &= 0xFFFF; len = 16; signed_extend = true; }         // SXTH
-            0b110 => { val &= 0xFFFF_FFFF; len = 32; signed_extend = true; }    // SXTW
-            0b111 => { len = 64; signed_extend = true; }                         // SXTX
+            0b000 => {
+                val &= 0xFF;
+                len = 8;
+                signed_extend = false;
+            } // UXTB
+            0b001 => {
+                val &= 0xFFFF;
+                len = 16;
+                signed_extend = false;
+            } // UXTH
+            0b010 => {
+                val &= 0xFFFF_FFFF;
+                len = 32;
+                signed_extend = false;
+            } // UXTW
+            0b011 => {
+                len = 64;
+                signed_extend = false;
+            } // UXTX
+            0b100 => {
+                val &= 0xFF;
+                len = 8;
+                signed_extend = true;
+            } // SXTB
+            0b101 => {
+                val &= 0xFFFF;
+                len = 16;
+                signed_extend = true;
+            } // SXTH
+            0b110 => {
+                val &= 0xFFFF_FFFF;
+                len = 32;
+                signed_extend = true;
+            } // SXTW
+            0b111 => {
+                len = 64;
+                signed_extend = true;
+            } // SXTX
             _ => unreachable!(),
         }
 
@@ -229,15 +271,26 @@ impl<'a, M: MemoryAccess> InterpreterVisitor<'a, M> {
     ///
     /// Corresponds to upstream `InterpreterVisitor::RegisterImmediate`.
     pub fn register_immediate(
-        &mut self, wback: bool, postindex: bool, scale: usize, offset: u64,
-        size: Imm<2>, opc: Imm<2>, rn: Reg, rt: Reg,
+        &mut self,
+        wback: bool,
+        postindex: bool,
+        scale: usize,
+        offset: u64,
+        size: Imm<2>,
+        opc: Imm<2>,
+        rn: Reg,
+        rt: Reg,
     ) -> bool {
         let memop: MemOp;
         let mut signed = false;
         let regsize: u64;
 
         if !opc.bit(1) {
-            memop = if opc.bit(0) { MemOp::Load } else { MemOp::Store };
+            memop = if opc.bit(0) {
+                MemOp::Load
+            } else {
+                MemOp::Store
+            };
             regsize = if size.zero_extend() == 0b11 { 64 } else { 32 };
         } else if size.zero_extend() == 0b11 {
             memop = MemOp::Prefetch;
@@ -257,7 +310,11 @@ impl<'a, M: MemoryAccess> InterpreterVisitor<'a, M> {
             return false;
         }
 
-        let mut address = if rn == Reg::SP { self.get_sp() } else { self.get_reg(rn) };
+        let mut address = if rn == Reg::SP {
+            self.get_sp()
+        } else {
+            self.get_reg(rn)
+        };
         if !postindex {
             address = address.wrapping_add(offset);
         }
@@ -285,8 +342,16 @@ impl<'a, M: MemoryAccess> InterpreterVisitor<'a, M> {
         }
 
         if wback {
-            let final_addr = if postindex { address.wrapping_add(offset) } else { address };
-            if rn == Reg::SP { self.set_sp(final_addr); } else { self.set_reg(rn, final_addr); }
+            let final_addr = if postindex {
+                address.wrapping_add(offset)
+            } else {
+                address
+            };
+            if rn == Reg::SP {
+                self.set_sp(final_addr);
+            } else {
+                self.set_reg(rn, final_addr);
+            }
         }
 
         true
@@ -296,13 +361,23 @@ impl<'a, M: MemoryAccess> InterpreterVisitor<'a, M> {
     ///
     /// Corresponds to upstream `InterpreterVisitor::SIMDImmediate`.
     pub fn simd_immediate(
-        &mut self, wback: bool, postindex: bool, scale: usize, offset: u64,
-        memop: MemOp, rn: Reg, vt: Vec,
+        &mut self,
+        wback: bool,
+        postindex: bool,
+        scale: usize,
+        offset: u64,
+        memop: MemOp,
+        rn: Reg,
+        vt: Vec,
     ) -> bool {
         let datasize = 8u64 << scale;
         let dbytes = (datasize / 8) as usize;
 
-        let mut address = if rn == Reg::SP { self.get_sp() } else { self.get_reg(rn) };
+        let mut address = if rn == Reg::SP {
+            self.get_sp()
+        } else {
+            self.get_reg(rn)
+        };
         if !postindex {
             address = address.wrapping_add(offset);
         }
@@ -330,8 +405,16 @@ impl<'a, M: MemoryAccess> InterpreterVisitor<'a, M> {
         }
 
         if wback {
-            let final_addr = if postindex { address.wrapping_add(offset) } else { address };
-            if rn == Reg::SP { self.set_sp(final_addr); } else { self.set_reg(rn, final_addr); }
+            let final_addr = if postindex {
+                address.wrapping_add(offset)
+            } else {
+                address
+            };
+            if rn == Reg::SP {
+                self.set_sp(final_addr);
+            } else {
+                self.set_reg(rn, final_addr);
+            }
         }
 
         true
@@ -341,23 +424,39 @@ impl<'a, M: MemoryAccess> InterpreterVisitor<'a, M> {
     ///
     /// Corresponds to upstream `InterpreterVisitor::RegisterOffset`.
     pub fn register_offset(
-        &mut self, scale: usize, shift: u8, size: Imm<2>, opc_1: Imm<1>, opc_0: Imm<1>,
-        rm: Reg, option: Imm<3>, rn: Reg, rt: Reg,
+        &mut self,
+        scale: usize,
+        shift: u8,
+        size: Imm<2>,
+        opc_1: Imm<1>,
+        opc_0: Imm<1>,
+        rm: Reg,
+        option: Imm<3>,
+        rn: Reg,
+        rt: Reg,
     ) -> bool {
         let memop: MemOp;
         let regsize: u64;
         let mut signed = false;
 
         if opc_1.zero_extend() == 0 {
-            memop = if opc_0.zero_extend() == 1 { MemOp::Load } else { MemOp::Store };
+            memop = if opc_0.zero_extend() == 1 {
+                MemOp::Load
+            } else {
+                MemOp::Store
+            };
             regsize = if size.zero_extend() == 0b11 { 64 } else { 32 };
         } else if size.zero_extend() == 0b11 {
             memop = MemOp::Prefetch;
-            if opc_0.zero_extend() == 1 { return false; }
+            if opc_0.zero_extend() == 1 {
+                return false;
+            }
             regsize = 64;
         } else {
             memop = MemOp::Load;
-            if size.zero_extend() == 0b10 && opc_0.zero_extend() == 1 { return false; }
+            if size.zero_extend() == 0b10 && opc_0.zero_extend() == 1 {
+                return false;
+            }
             regsize = if opc_0.zero_extend() == 1 { 32 } else { 64 };
             signed = true;
         }
@@ -366,7 +465,11 @@ impl<'a, M: MemoryAccess> InterpreterVisitor<'a, M> {
         let dbytes = (datasize / 8) as usize;
         let offset = self.extend_reg(64, rm, option, shift);
 
-        let mut address = if rn == Reg::SP { self.get_sp() } else { self.get_reg(rn) };
+        let mut address = if rn == Reg::SP {
+            self.get_sp()
+        } else {
+            self.get_reg(rn)
+        };
         address = address.wrapping_add(offset);
 
         match memop {
@@ -395,15 +498,29 @@ impl<'a, M: MemoryAccess> InterpreterVisitor<'a, M> {
     ///
     /// Corresponds to upstream `InterpreterVisitor::SIMDOffset`.
     pub fn simd_offset(
-        &mut self, scale: usize, shift: u8, opc_0: Imm<1>, rm: Reg, option: Imm<3>,
-        rn: Reg, vt: Vec,
+        &mut self,
+        scale: usize,
+        shift: u8,
+        opc_0: Imm<1>,
+        rm: Reg,
+        option: Imm<3>,
+        rn: Reg,
+        vt: Vec,
     ) -> bool {
-        let memop = if opc_0.zero_extend() == 1 { MemOp::Load } else { MemOp::Store };
+        let memop = if opc_0.zero_extend() == 1 {
+            MemOp::Load
+        } else {
+            MemOp::Store
+        };
         let datasize = 8u64 << scale;
         let dbytes = (datasize / 8) as usize;
 
         let offset = self.extend_reg(64, rm, option, shift);
-        let mut address = if rn == Reg::SP { self.get_sp() } else { self.get_reg(rn) };
+        let mut address = if rn == Reg::SP {
+            self.get_sp()
+        } else {
+            self.get_reg(rn)
+        };
         address = address.wrapping_add(offset);
 
         match memop {
@@ -486,14 +603,25 @@ impl<'a, M: MemoryAccess> VisitorBase for InterpreterVisitor<'a, M> {
     }
 
     fn stp_ldp_gen(
-        &mut self, opc: Imm<2>, not_postindex: bool, wback: bool, l: Imm<1>,
-        imm7: Imm<7>, rt2: Reg, rn: Reg, rt: Reg,
+        &mut self,
+        opc: Imm<2>,
+        not_postindex: bool,
+        wback: bool,
+        l: Imm<1>,
+        imm7: Imm<7>,
+        rt2: Reg,
+        rn: Reg,
+        rt: Reg,
     ) -> bool {
         if (l.zero_extend() == 0 && opc.bit(0)) || opc.zero_extend() == 0b11 {
             return false;
         }
 
-        let memop = if l.zero_extend() == 1 { MemOp::Load } else { MemOp::Store };
+        let memop = if l.zero_extend() == 1 {
+            MemOp::Load
+        } else {
+            MemOp::Store
+        };
         if memop == MemOp::Load && wback && (rt == rn || rt2 == rn) && rn != Reg::R31 {
             return false;
         }
@@ -504,7 +632,11 @@ impl<'a, M: MemoryAccess> VisitorBase for InterpreterVisitor<'a, M> {
             return false;
         }
 
-        let mut address = if rn == Reg::SP { self.get_sp() } else { self.get_reg(rn) };
+        let mut address = if rn == Reg::SP {
+            self.get_sp()
+        } else {
+            self.get_reg(rn)
+        };
         let postindex = !not_postindex;
         let signed = opc.bit(0);
         let scale = 2 + if opc.bit(1) { 1 } else { 0 };
@@ -523,13 +655,15 @@ impl<'a, M: MemoryAccess> VisitorBase for InterpreterVisitor<'a, M> {
                 let b1 = d1.to_le_bytes();
                 let b2 = d2.to_le_bytes();
                 self.memory.write_block(address, &b1[..dbytes]);
-                self.memory.write_block(address + dbytes as u64, &b2[..dbytes]);
+                self.memory
+                    .write_block(address + dbytes as u64, &b2[..dbytes]);
             }
             MemOp::Load => {
                 let mut b1 = [0u8; 8];
                 let mut b2 = [0u8; 8];
                 self.memory.read_block(address, &mut b1[..dbytes]);
-                self.memory.read_block(address + dbytes as u64, &mut b2[..dbytes]);
+                self.memory
+                    .read_block(address + dbytes as u64, &mut b2[..dbytes]);
                 let d1 = u64::from_le_bytes(b1);
                 let d2 = u64::from_le_bytes(b2);
                 if signed {
@@ -544,26 +678,49 @@ impl<'a, M: MemoryAccess> VisitorBase for InterpreterVisitor<'a, M> {
         }
 
         if wback {
-            let final_addr = if postindex { address.wrapping_add(offset) } else { address };
-            if rn == Reg::SP { self.set_sp(final_addr); } else { self.set_reg(rn, final_addr); }
+            let final_addr = if postindex {
+                address.wrapping_add(offset)
+            } else {
+                address
+            };
+            if rn == Reg::SP {
+                self.set_sp(final_addr);
+            } else {
+                self.set_reg(rn, final_addr);
+            }
         }
 
         true
     }
 
     fn stp_ldp_fpsimd(
-        &mut self, opc: Imm<2>, not_postindex: bool, wback: bool, l: Imm<1>,
-        imm7: Imm<7>, vt2: Vec, rn: Reg, vt: Vec,
+        &mut self,
+        opc: Imm<2>,
+        not_postindex: bool,
+        wback: bool,
+        l: Imm<1>,
+        imm7: Imm<7>,
+        vt2: Vec,
+        rn: Reg,
+        vt: Vec,
     ) -> bool {
         if opc.zero_extend() == 0b11 {
             return false;
         }
-        let memop = if l.zero_extend() == 1 { MemOp::Load } else { MemOp::Store };
+        let memop = if l.zero_extend() == 1 {
+            MemOp::Load
+        } else {
+            MemOp::Store
+        };
         if memop == MemOp::Load && vt == vt2 {
             return false;
         }
 
-        let mut address = if rn == Reg::SP { self.get_sp() } else { self.get_reg(rn) };
+        let mut address = if rn == Reg::SP {
+            self.get_sp()
+        } else {
+            self.get_reg(rn)
+        };
         let postindex = !not_postindex;
         let scale = 2 + opc.zero_extend() as usize;
         let datasize = 8u64 << scale;
@@ -585,17 +742,27 @@ impl<'a, M: MemoryAccess> VisitorBase for InterpreterVisitor<'a, M> {
                 b2[..8].copy_from_slice(&d2.lo.to_le_bytes());
                 b2[8..16].copy_from_slice(&d2.hi.to_le_bytes());
                 self.memory.write_block(address, &b1[..dbytes]);
-                self.memory.write_block(address + dbytes as u64, &b2[..dbytes]);
+                self.memory
+                    .write_block(address + dbytes as u64, &b2[..dbytes]);
             }
             MemOp::Load => {
                 let mut b1 = [0u8; 16];
                 let mut b2 = [0u8; 16];
                 self.memory.read_block(address, &mut b1[..dbytes]);
-                self.memory.read_block(address + dbytes as u64, &mut b2[..dbytes]);
+                self.memory
+                    .read_block(address + dbytes as u64, &mut b2[..dbytes]);
                 let lo1 = u64::from_le_bytes(b1[..8].try_into().unwrap_or([0; 8]));
-                let hi1 = if dbytes > 8 { u64::from_le_bytes(b1[8..16].try_into().unwrap_or([0; 8])) } else { 0 };
+                let hi1 = if dbytes > 8 {
+                    u64::from_le_bytes(b1[8..16].try_into().unwrap_or([0; 8]))
+                } else {
+                    0
+                };
                 let lo2 = u64::from_le_bytes(b2[..8].try_into().unwrap_or([0; 8]));
-                let hi2 = if dbytes > 8 { u64::from_le_bytes(b2[8..16].try_into().unwrap_or([0; 8])) } else { 0 };
+                let hi2 = if dbytes > 8 {
+                    u64::from_le_bytes(b2[8..16].try_into().unwrap_or([0; 8]))
+                } else {
+                    0
+                };
                 self.set_vec(vt, U128 { lo: lo1, hi: hi1 });
                 self.set_vec(vt2, U128 { lo: lo2, hi: hi2 });
             }
@@ -603,16 +770,29 @@ impl<'a, M: MemoryAccess> VisitorBase for InterpreterVisitor<'a, M> {
         }
 
         if wback {
-            let final_addr = if postindex { address.wrapping_add(offset) } else { address };
-            if rn == Reg::SP { self.set_sp(final_addr); } else { self.set_reg(rn, final_addr); }
+            let final_addr = if postindex {
+                address.wrapping_add(offset)
+            } else {
+                address
+            };
+            if rn == Reg::SP {
+                self.set_sp(final_addr);
+            } else {
+                self.set_reg(rn, final_addr);
+            }
         }
 
         true
     }
 
     fn strx_ldrx_imm_1(
-        &mut self, size: Imm<2>, opc: Imm<2>, imm9: Imm<9>, not_postindex: bool,
-        rn: Reg, rt: Reg,
+        &mut self,
+        size: Imm<2>,
+        opc: Imm<2>,
+        imm9: Imm<9>,
+        not_postindex: bool,
+        rn: Reg,
+        rt: Reg,
     ) -> bool {
         let wback = true;
         let postindex = !not_postindex;
@@ -622,120 +802,187 @@ impl<'a, M: MemoryAccess> VisitorBase for InterpreterVisitor<'a, M> {
     }
 
     fn strx_ldrx_imm_2(
-        &mut self, size: Imm<2>, opc: Imm<2>, imm12: Imm<12>, rn: Reg, rt: Reg,
+        &mut self,
+        size: Imm<2>,
+        opc: Imm<2>,
+        imm12: Imm<12>,
+        rn: Reg,
+        rt: Reg,
     ) -> bool {
         let scale = size.zero_extend() as usize;
         let offset = imm12.zero_extend_u64() << scale;
         self.register_immediate(false, false, scale, offset, size, opc, rn, rt)
     }
 
-    fn sturx_ldurx(
-        &mut self, size: Imm<2>, opc: Imm<2>, imm9: Imm<9>, rn: Reg, rt: Reg,
-    ) -> bool {
+    fn sturx_ldurx(&mut self, size: Imm<2>, opc: Imm<2>, imm9: Imm<9>, rn: Reg, rt: Reg) -> bool {
         let scale = size.zero_extend() as usize;
         let offset = imm9.sign_extend_u64();
         self.register_immediate(false, false, scale, offset, size, opc, rn, rt)
     }
 
     fn str_imm_fpsimd_1(
-        &mut self, size: Imm<2>, opc_1: Imm<1>, imm9: Imm<9>, not_postindex: bool,
-        rn: Reg, vt: Vec,
+        &mut self,
+        size: Imm<2>,
+        opc_1: Imm<1>,
+        imm9: Imm<9>,
+        not_postindex: bool,
+        rn: Reg,
+        vt: Vec,
     ) -> bool {
         let scale = ((opc_1.zero_extend() << 2) | size.zero_extend()) as usize;
-        if scale > 4 { return false; }
+        if scale > 4 {
+            return false;
+        }
         let offset = imm9.sign_extend_u64();
         self.simd_immediate(true, !not_postindex, scale, offset, MemOp::Store, rn, vt)
     }
 
     fn str_imm_fpsimd_2(
-        &mut self, size: Imm<2>, opc_1: Imm<1>, imm12: Imm<12>, rn: Reg, vt: Vec,
+        &mut self,
+        size: Imm<2>,
+        opc_1: Imm<1>,
+        imm12: Imm<12>,
+        rn: Reg,
+        vt: Vec,
     ) -> bool {
         let scale = ((opc_1.zero_extend() << 2) | size.zero_extend()) as usize;
-        if scale > 4 { return false; }
+        if scale > 4 {
+            return false;
+        }
         let offset = imm12.zero_extend_u64() << scale;
         self.simd_immediate(false, false, scale, offset, MemOp::Store, rn, vt)
     }
 
     fn ldr_imm_fpsimd_1(
-        &mut self, size: Imm<2>, opc_1: Imm<1>, imm9: Imm<9>, not_postindex: bool,
-        rn: Reg, vt: Vec,
+        &mut self,
+        size: Imm<2>,
+        opc_1: Imm<1>,
+        imm9: Imm<9>,
+        not_postindex: bool,
+        rn: Reg,
+        vt: Vec,
     ) -> bool {
         let scale = ((opc_1.zero_extend() << 2) | size.zero_extend()) as usize;
-        if scale > 4 { return false; }
+        if scale > 4 {
+            return false;
+        }
         let offset = imm9.sign_extend_u64();
         self.simd_immediate(true, !not_postindex, scale, offset, MemOp::Load, rn, vt)
     }
 
     fn ldr_imm_fpsimd_2(
-        &mut self, size: Imm<2>, opc_1: Imm<1>, imm12: Imm<12>, rn: Reg, vt: Vec,
+        &mut self,
+        size: Imm<2>,
+        opc_1: Imm<1>,
+        imm12: Imm<12>,
+        rn: Reg,
+        vt: Vec,
     ) -> bool {
         let scale = ((opc_1.zero_extend() << 2) | size.zero_extend()) as usize;
-        if scale > 4 { return false; }
+        if scale > 4 {
+            return false;
+        }
         let offset = imm12.zero_extend_u64() << scale;
         self.simd_immediate(false, false, scale, offset, MemOp::Load, rn, vt)
     }
 
-    fn stur_fpsimd(
-        &mut self, size: Imm<2>, opc_1: Imm<1>, imm9: Imm<9>, rn: Reg, vt: Vec,
-    ) -> bool {
+    fn stur_fpsimd(&mut self, size: Imm<2>, opc_1: Imm<1>, imm9: Imm<9>, rn: Reg, vt: Vec) -> bool {
         let scale = ((opc_1.zero_extend() << 2) | size.zero_extend()) as usize;
-        if scale > 4 { return false; }
+        if scale > 4 {
+            return false;
+        }
         let offset = imm9.sign_extend_u64();
         self.simd_immediate(false, false, scale, offset, MemOp::Store, rn, vt)
     }
 
-    fn ldur_fpsimd(
-        &mut self, size: Imm<2>, opc_1: Imm<1>, imm9: Imm<9>, rn: Reg, vt: Vec,
-    ) -> bool {
+    fn ldur_fpsimd(&mut self, size: Imm<2>, opc_1: Imm<1>, imm9: Imm<9>, rn: Reg, vt: Vec) -> bool {
         let scale = ((opc_1.zero_extend() << 2) | size.zero_extend()) as usize;
-        if scale > 4 { return false; }
+        if scale > 4 {
+            return false;
+        }
         let offset = imm9.sign_extend_u64();
         self.simd_immediate(false, false, scale, offset, MemOp::Load, rn, vt)
     }
 
     fn strx_reg(
-        &mut self, size: Imm<2>, opc_1: Imm<1>, rm: Reg, option: Imm<3>, s: bool,
-        rn: Reg, rt: Reg,
+        &mut self,
+        size: Imm<2>,
+        opc_1: Imm<1>,
+        rm: Reg,
+        option: Imm<3>,
+        s: bool,
+        rn: Reg,
+        rt: Reg,
     ) -> bool {
         let opc_0 = Imm::<1>::new(0);
         let scale = size.zero_extend() as usize;
         let shift = if s { scale as u8 } else { 0 };
-        if !option.bit(1) { return false; }
+        if !option.bit(1) {
+            return false;
+        }
         self.register_offset(scale, shift, size, opc_1, opc_0, rm, option, rn, rt)
     }
 
     fn ldrx_reg(
-        &mut self, size: Imm<2>, opc_1: Imm<1>, rm: Reg, option: Imm<3>, s: bool,
-        rn: Reg, rt: Reg,
+        &mut self,
+        size: Imm<2>,
+        opc_1: Imm<1>,
+        rm: Reg,
+        option: Imm<3>,
+        s: bool,
+        rn: Reg,
+        rt: Reg,
     ) -> bool {
         let opc_0 = Imm::<1>::new(1);
         let scale = size.zero_extend() as usize;
         let shift = if s { scale as u8 } else { 0 };
-        if !option.bit(1) { return false; }
+        if !option.bit(1) {
+            return false;
+        }
         self.register_offset(scale, shift, size, opc_1, opc_0, rm, option, rn, rt)
     }
 
     fn str_reg_fpsimd(
-        &mut self, size: Imm<2>, opc_1: Imm<1>, rm: Reg, option: Imm<3>, s: bool,
-        rn: Reg, vt: Vec,
+        &mut self,
+        size: Imm<2>,
+        opc_1: Imm<1>,
+        rm: Reg,
+        option: Imm<3>,
+        s: bool,
+        rn: Reg,
+        vt: Vec,
     ) -> bool {
         let opc_0 = Imm::<1>::new(0);
         let scale = ((opc_1.zero_extend() << 2) | size.zero_extend()) as usize;
-        if scale > 4 { return false; }
+        if scale > 4 {
+            return false;
+        }
         let shift = if s { scale as u8 } else { 0 };
-        if !option.bit(1) { return false; }
+        if !option.bit(1) {
+            return false;
+        }
         self.simd_offset(scale, shift, opc_0, rm, option, rn, vt)
     }
 
     fn ldr_reg_fpsimd(
-        &mut self, size: Imm<2>, opc_1: Imm<1>, rm: Reg, option: Imm<3>, s: bool,
-        rn: Reg, vt: Vec,
+        &mut self,
+        size: Imm<2>,
+        opc_1: Imm<1>,
+        rm: Reg,
+        option: Imm<3>,
+        s: bool,
+        rn: Reg,
+        vt: Vec,
     ) -> bool {
         let opc_0 = Imm::<1>::new(1);
         let scale = ((opc_1.zero_extend() << 2) | size.zero_extend()) as usize;
-        if scale > 4 { return false; }
+        if scale > 4 {
+            return false;
+        }
         let shift = if s { scale as u8 } else { 0 };
-        if !option.bit(1) { return false; }
+        if !option.bit(1) {
+            return false;
+        }
         self.simd_offset(scale, shift, opc_0, rm, option, rn, vt)
     }
 }

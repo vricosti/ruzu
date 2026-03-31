@@ -91,12 +91,7 @@ impl KTransferMemory {
 
     /// Map the transfer memory into the current process.
     /// Port of upstream `KTransferMemory::Map`.
-    pub fn map(
-        &mut self,
-        _address: u64,
-        size: usize,
-        map_perm: MemoryPermission,
-    ) -> ResultCode {
+    pub fn map(&mut self, _address: u64, size: usize, map_perm: MemoryPermission) -> ResultCode {
         let pg = match self.m_page_group {
             Some(ref pg) => pg,
             None => return ResultCode::new(0xCA01),

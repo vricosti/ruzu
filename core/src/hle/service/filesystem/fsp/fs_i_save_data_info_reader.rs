@@ -52,9 +52,11 @@ impl ISaveDataInfoReader {
         Self {
             _info: Vec::new(),
             _next_entry_index: 0,
-            handlers: build_handler_map(&[
-                (0, Some(Self::read_save_data_info_handler), "ReadSaveDataInfo"),
-            ]),
+            handlers: build_handler_map(&[(
+                0,
+                Some(Self::read_save_data_info_handler),
+                "ReadSaveDataInfo",
+            )]),
             handlers_tipc: BTreeMap::new(),
         }
     }

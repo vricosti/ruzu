@@ -13,12 +13,12 @@
 //!   - time_zone_binary.h / time_zone_binary.cpp
 //!   - worker.h / worker.cpp
 
-pub mod manager;
-pub mod r#static;
 pub mod alarm_worker;
 pub mod file_timestamp_worker;
+pub mod manager;
 pub mod pm_state_change_handler;
 pub mod standard_steady_clock_resource;
+pub mod r#static;
 pub mod time_zone;
 pub mod time_zone_binary;
 pub mod worker;

@@ -3,8 +3,8 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_set_predicate.cpp
 
-use super::{bit, field, TranslatorVisitor};
 use super::half_floating_point_helper::{extract, Swizzle};
+use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::{Pred, Value};
 
 /// Perform a floating-point comparison for HSETP2.
@@ -19,43 +19,61 @@ fn fp_compare_hsetp(
 ) -> Value {
     if is_f32 {
         match cmp {
-            0  => tv.ir.imm_u1(false),
-            1  => tv.ir.fp_ord_less_than_32(a, b),
-            2  => tv.ir.fp_ord_equal_32(a, b),
-            3  => tv.ir.fp_ord_less_than_equal_32(a, b),
-            4  => tv.ir.fp_ord_greater_than_32(a, b),
-            5  => tv.ir.fp_ord_not_equal_32(a, b),
-            6  => tv.ir.fp_ord_greater_than_equal_32(a, b),
-            7  => { let na = tv.ir.fp_is_nan_32(a); let nb = tv.ir.fp_is_nan_32(b); let e = tv.ir.logical_or(na, nb); tv.ir.logical_not(e) }
-            8  => { let na = tv.ir.fp_is_nan_32(a); let nb = tv.ir.fp_is_nan_32(b); tv.ir.logical_or(na, nb) }
-            9  => tv.ir.fp_unord_less_than_32(a, b),
+            0 => tv.ir.imm_u1(false),
+            1 => tv.ir.fp_ord_less_than_32(a, b),
+            2 => tv.ir.fp_ord_equal_32(a, b),
+            3 => tv.ir.fp_ord_less_than_equal_32(a, b),
+            4 => tv.ir.fp_ord_greater_than_32(a, b),
+            5 => tv.ir.fp_ord_not_equal_32(a, b),
+            6 => tv.ir.fp_ord_greater_than_equal_32(a, b),
+            7 => {
+                let na = tv.ir.fp_is_nan_32(a);
+                let nb = tv.ir.fp_is_nan_32(b);
+                let e = tv.ir.logical_or(na, nb);
+                tv.ir.logical_not(e)
+            }
+            8 => {
+                let na = tv.ir.fp_is_nan_32(a);
+                let nb = tv.ir.fp_is_nan_32(b);
+                tv.ir.logical_or(na, nb)
+            }
+            9 => tv.ir.fp_unord_less_than_32(a, b),
             10 => tv.ir.fp_unord_equal_32(a, b),
             11 => tv.ir.fp_unord_less_than_32(a, b),
             12 => tv.ir.fp_unord_greater_than_32(a, b),
             13 => tv.ir.fp_unord_not_equal_32(a, b),
             14 => tv.ir.fp_unord_greater_than_32(a, b),
             15 => tv.ir.imm_u1(true),
-            _  => tv.ir.imm_u1(false),
+            _ => tv.ir.imm_u1(false),
         }
     } else {
         match cmp {
-            0  => tv.ir.imm_u1(false),
-            1  => tv.ir.fp_ord_less_than_16(a, b),
-            2  => tv.ir.fp_ord_equal_16(a, b),
-            3  => tv.ir.fp_ord_less_than_equal_16(a, b),
-            4  => tv.ir.fp_ord_greater_than_16(a, b),
-            5  => tv.ir.fp_ord_not_equal_16(a, b),
-            6  => tv.ir.fp_ord_greater_than_equal_16(a, b),
-            7  => { let na = tv.ir.fp_is_nan_16(a); let nb = tv.ir.fp_is_nan_16(b); let e = tv.ir.logical_or(na, nb); tv.ir.logical_not(e) }
-            8  => { let na = tv.ir.fp_is_nan_16(a); let nb = tv.ir.fp_is_nan_16(b); tv.ir.logical_or(na, nb) }
-            9  => tv.ir.fp_unord_less_than_16(a, b),
+            0 => tv.ir.imm_u1(false),
+            1 => tv.ir.fp_ord_less_than_16(a, b),
+            2 => tv.ir.fp_ord_equal_16(a, b),
+            3 => tv.ir.fp_ord_less_than_equal_16(a, b),
+            4 => tv.ir.fp_ord_greater_than_16(a, b),
+            5 => tv.ir.fp_ord_not_equal_16(a, b),
+            6 => tv.ir.fp_ord_greater_than_equal_16(a, b),
+            7 => {
+                let na = tv.ir.fp_is_nan_16(a);
+                let nb = tv.ir.fp_is_nan_16(b);
+                let e = tv.ir.logical_or(na, nb);
+                tv.ir.logical_not(e)
+            }
+            8 => {
+                let na = tv.ir.fp_is_nan_16(a);
+                let nb = tv.ir.fp_is_nan_16(b);
+                tv.ir.logical_or(na, nb)
+            }
+            9 => tv.ir.fp_unord_less_than_16(a, b),
             10 => tv.ir.fp_unord_equal_16(a, b),
             11 => tv.ir.fp_unord_less_than_equal_16(a, b),
             12 => tv.ir.fp_unord_greater_than_16(a, b),
             13 => tv.ir.fp_unord_not_equal_16(a, b),
             14 => tv.ir.fp_unord_greater_than_equal_16(a, b),
             15 => tv.ir.imm_u1(true),
-            _  => tv.ir.imm_u1(false),
+            _ => tv.ir.imm_u1(false),
         }
     }
 }
@@ -81,16 +99,16 @@ fn hsetp2_inner(
     compare_op: u32,
     h_and: bool,
 ) {
-    let src_a_reg    = field(insn, 8, 8);
-    let dest_pred_a  = Pred(field(insn, 3, 3) as u8);
-    let dest_pred_b  = Pred(field(insn, 0, 3) as u8);
-    let pred_idx     = field(insn, 39, 3);
-    let neg_pred     = bit(insn, 42);
-    let neg_a        = bit(insn, 43);
-    let bop          = field(insn, 45, 2);
-    let abs_a        = bit(insn, 44);
-    let ftz          = bit(insn, 6);
-    let swizzle_a    = Swizzle::from_u32(field(insn, 47, 2));
+    let src_a_reg = field(insn, 8, 8);
+    let dest_pred_a = Pred(field(insn, 3, 3) as u8);
+    let dest_pred_b = Pred(field(insn, 0, 3) as u8);
+    let pred_idx = field(insn, 39, 3);
+    let neg_pred = bit(insn, 42);
+    let neg_a = bit(insn, 43);
+    let bop = field(insn, 45, 2);
+    let abs_a = bit(insn, 44);
+    let ftz = bit(insn, 6);
+    let swizzle_a = Swizzle::from_u32(field(insn, 47, 2));
 
     let src_a_val = tv.x(src_a_reg);
     let (mut lhs_a, mut rhs_a) = extract(tv, src_a_val, swizzle_a);
@@ -147,39 +165,57 @@ fn hsetp2_inner(
 
 /// HSETP2_reg — source B from register.
 pub fn hsetp2_reg(tv: &mut TranslatorVisitor, insn: u64) {
-    let abs_b      = bit(insn, 30);
-    let h_and      = bit(insn, 49);
-    let neg_b      = bit(insn, 31);
+    let abs_b = bit(insn, 30);
+    let h_and = bit(insn, 49);
+    let neg_b = bit(insn, 31);
     let compare_op = field(insn, 35, 4);
-    let swizzle_b  = Swizzle::from_u32(field(insn, 28, 2));
-    let src_b      = tv.get_reg20(insn);
+    let swizzle_b = Swizzle::from_u32(field(insn, 28, 2));
+    let src_b = tv.get_reg20(insn);
     hsetp2_inner(tv, insn, src_b, neg_b, abs_b, swizzle_b, compare_op, h_and);
 }
 
 /// HSETP2_cbuf — source B from constant buffer.
 pub fn hsetp2_cbuf(tv: &mut TranslatorVisitor, insn: u64) {
-    let h_and      = bit(insn, 53);
-    let abs_b      = bit(insn, 54);
-    let neg_b      = bit(insn, 56);
+    let h_and = bit(insn, 53);
+    let abs_b = bit(insn, 54);
+    let neg_b = bit(insn, 56);
     let compare_op = field(insn, 49, 4);
-    let src_b      = tv.get_cbuf(insn);
-    hsetp2_inner(tv, insn, src_b, neg_b, abs_b, Swizzle::F32, compare_op, h_and);
+    let src_b = tv.get_cbuf(insn);
+    hsetp2_inner(
+        tv,
+        insn,
+        src_b,
+        neg_b,
+        abs_b,
+        Swizzle::F32,
+        compare_op,
+        h_and,
+    );
 }
 
 /// HSETP2_imm — source B from 16-bit immediate pair.
 pub fn hsetp2_imm(tv: &mut TranslatorVisitor, insn: u64) {
-    let h_and      = bit(insn, 53);
+    let h_and = bit(insn, 53);
     let compare_op = field(insn, 49, 4);
-    let neg_high   = bit(insn, 56);
-    let high       = field(insn, 30, 9);
-    let neg_low    = bit(insn, 29);
-    let low        = field(insn, 20, 9);
-    let imm: u32   = (low << 6)
-        | (if neg_low  { 1u32 } else { 0u32 } << 15)
+    let neg_high = bit(insn, 56);
+    let high = field(insn, 30, 9);
+    let neg_low = bit(insn, 29);
+    let low = field(insn, 20, 9);
+    let imm: u32 = (low << 6)
+        | (if neg_low { 1u32 } else { 0u32 } << 15)
         | (high << 22)
         | (if neg_high { 1u32 } else { 0u32 } << 31);
     let src_b = Value::ImmU32(imm);
-    hsetp2_inner(tv, insn, src_b, false, false, Swizzle::H1H0, compare_op, h_and);
+    hsetp2_inner(
+        tv,
+        insn,
+        src_b,
+        false,
+        false,
+        Swizzle::H1H0,
+        compare_op,
+        h_and,
+    );
 }
 
 /// Public entry-point stub used when a single dispatch opcode covers HSETP2.

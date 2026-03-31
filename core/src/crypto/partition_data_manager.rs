@@ -102,32 +102,32 @@ const KEYBLOB_SOURCE_HASHES: [[u8; 0x20]; 32] = [
     hex_string_to_array("8E9795928E1C4428E1B78F0BE724D7294D6934689C11B190943923B9D5B85903"), // 03
     hex_string_to_array("95FA33AF95AFF9D9B61D164655B32710ED8D615D46C7D6CC3CC70481B686B402"), // 04
     hex_string_to_array("3F5BE7B3C8B1ABD8C10B4B703D44766BA08730562C172A4FE0D6B866B3E2DB3E"), // 05
-    [0u8; 0x20], // 06
-    [0u8; 0x20], // 07
-    [0u8; 0x20], // 08
-    [0u8; 0x20], // 09
-    [0u8; 0x20], // 0A
-    [0u8; 0x20], // 0B
-    [0u8; 0x20], // 0C
-    [0u8; 0x20], // 0D
-    [0u8; 0x20], // 0E
-    [0u8; 0x20], // 0F
-    [0u8; 0x20], // 10
-    [0u8; 0x20], // 11
-    [0u8; 0x20], // 12
-    [0u8; 0x20], // 13
-    [0u8; 0x20], // 14
-    [0u8; 0x20], // 15
-    [0u8; 0x20], // 16
-    [0u8; 0x20], // 17
-    [0u8; 0x20], // 18
-    [0u8; 0x20], // 19
-    [0u8; 0x20], // 1A
-    [0u8; 0x20], // 1B
-    [0u8; 0x20], // 1C
-    [0u8; 0x20], // 1D
-    [0u8; 0x20], // 1E
-    [0u8; 0x20], // 1F
+    [0u8; 0x20],                                                                             // 06
+    [0u8; 0x20],                                                                             // 07
+    [0u8; 0x20],                                                                             // 08
+    [0u8; 0x20],                                                                             // 09
+    [0u8; 0x20],                                                                             // 0A
+    [0u8; 0x20],                                                                             // 0B
+    [0u8; 0x20],                                                                             // 0C
+    [0u8; 0x20],                                                                             // 0D
+    [0u8; 0x20],                                                                             // 0E
+    [0u8; 0x20],                                                                             // 0F
+    [0u8; 0x20],                                                                             // 10
+    [0u8; 0x20],                                                                             // 11
+    [0u8; 0x20],                                                                             // 12
+    [0u8; 0x20],                                                                             // 13
+    [0u8; 0x20],                                                                             // 14
+    [0u8; 0x20],                                                                             // 15
+    [0u8; 0x20],                                                                             // 16
+    [0u8; 0x20],                                                                             // 17
+    [0u8; 0x20],                                                                             // 18
+    [0u8; 0x20],                                                                             // 19
+    [0u8; 0x20],                                                                             // 1A
+    [0u8; 0x20],                                                                             // 1B
+    [0u8; 0x20],                                                                             // 1C
+    [0u8; 0x20],                                                                             // 1D
+    [0u8; 0x20],                                                                             // 1E
+    [0u8; 0x20],                                                                             // 1F
 ];
 
 // Master key hashes. Corresponds to upstream `master_key_hashes`.
@@ -143,27 +143,27 @@ const MASTER_KEY_HASHES: [[u8; 0x20]; 32] = [
     hex_string_to_array("2998E2E23609BC2675FF062A2D64AF5B1B78DFF463B24119D64A1B64F01B2D51"), // 08
     hex_string_to_array("9D486A98067C44B37CF173D3BF577891EB6081FF6B4A166347D9DBBF7025076B"), // 09
     hex_string_to_array("4EC5A237A75A083A9C5F6CF615601522A7F822D06BD4BA32612C9CEBBB29BD45"), // 0A
-    [0u8; 0x20], // 0B
-    [0u8; 0x20], // 0C
-    [0u8; 0x20], // 0D
-    [0u8; 0x20], // 0E
-    [0u8; 0x20], // 0F
-    [0u8; 0x20], // 10
-    [0u8; 0x20], // 11
-    [0u8; 0x20], // 12
-    [0u8; 0x20], // 13
-    [0u8; 0x20], // 14
-    [0u8; 0x20], // 15
-    [0u8; 0x20], // 16
-    [0u8; 0x20], // 17
-    [0u8; 0x20], // 18
-    [0u8; 0x20], // 19
-    [0u8; 0x20], // 1A
-    [0u8; 0x20], // 1B
-    [0u8; 0x20], // 1C
-    [0u8; 0x20], // 1D
-    [0u8; 0x20], // 1E
-    [0u8; 0x20], // 1F
+    [0u8; 0x20],                                                                             // 0B
+    [0u8; 0x20],                                                                             // 0C
+    [0u8; 0x20],                                                                             // 0D
+    [0u8; 0x20],                                                                             // 0E
+    [0u8; 0x20],                                                                             // 0F
+    [0u8; 0x20],                                                                             // 10
+    [0u8; 0x20],                                                                             // 11
+    [0u8; 0x20],                                                                             // 12
+    [0u8; 0x20],                                                                             // 13
+    [0u8; 0x20],                                                                             // 14
+    [0u8; 0x20],                                                                             // 15
+    [0u8; 0x20],                                                                             // 16
+    [0u8; 0x20],                                                                             // 17
+    [0u8; 0x20],                                                                             // 18
+    [0u8; 0x20],                                                                             // 19
+    [0u8; 0x20],                                                                             // 1A
+    [0u8; 0x20],                                                                             // 1B
+    [0u8; 0x20],                                                                             // 1C
+    [0u8; 0x20],                                                                             // 1D
+    [0u8; 0x20],                                                                             // 1E
+    [0u8; 0x20],                                                                             // 1F
 ];
 
 /// Calculate MAX_KEYBLOB_SOURCE_HASH: the highest non-zero keyblob source hash index + 1.
@@ -433,7 +433,10 @@ impl PartitionDataManager {
                 revision
             );
         }
-        find_key_from_hex(&self.package1_decrypted_bytes, &KEYBLOB_SOURCE_HASHES[revision])
+        find_key_from_hex(
+            &self.package1_decrypted_bytes,
+            &KEYBLOB_SOURCE_HASHES[revision],
+        )
     }
 
     // =========================================================================
@@ -489,11 +492,7 @@ impl PartitionDataManager {
     /// Decrypt a Package2 file.
     /// Requires package2 keys to have been derived.
     /// Corresponds to upstream `DecryptPackage2`.
-    pub fn decrypt_package2(
-        &mut self,
-        package2_keys: &[[u8; 16]; 0x20],
-        pkg_type: Package2Type,
-    ) {
+    pub fn decrypt_package2(&mut self, package2_keys: &[[u8; 16]; 0x20], pkg_type: Package2Type) {
         let pkg_file = match self.package2[pkg_type as usize].as_ref() {
             Some(f) => f.clone(),
             None => return,
@@ -559,11 +558,8 @@ impl PartitionDataManager {
         cipher.transcode(&section1_raw, &mut section1_dec, Op::Decrypt);
 
         // Parse INI from decrypted section
-        let ini_file: VirtualFile = Arc::new(VectorVfsFile::new(
-            section1_dec,
-            "ini".to_string(),
-            None,
-        ));
+        let ini_file: VirtualFile =
+            Arc::new(VectorVfsFile::new(section1_dec, "ini".to_string(), None));
         let ini = INI::new(&ini_file);
         if ini.get_status() != ResultStatus::Success {
             return;
@@ -597,18 +593,12 @@ impl PartitionDataManager {
     }
 
     /// Get the decompressed FS section from Package2.
-    pub fn get_package2_fs_decompressed(
-        &self,
-        pkg_type: Package2Type,
-    ) -> &[u8] {
+    pub fn get_package2_fs_decompressed(&self, pkg_type: Package2Type) -> &[u8] {
         &self.package2_fs[pkg_type as usize]
     }
 
     /// Get the decompressed SPL section from Package2.
-    pub fn get_package2_spl_decompressed(
-        &self,
-        pkg_type: Package2Type,
-    ) -> &[u8] {
+    pub fn get_package2_spl_decompressed(&self, pkg_type: Package2Type) -> &[u8] {
         &self.package2_spl[pkg_type as usize]
     }
 

@@ -41,7 +41,11 @@ pub fn wait_process_wide_key_atomic(
                 .map(|ht| ht.lock().unwrap().get_tick())
                 .unwrap_or(0);
             let t = hardware_tick + offset_tick + 2;
-            if t <= 0 { i64::MAX } else { t }
+            if t <= 0 {
+                i64::MAX
+            } else {
+                t
+            }
         } else {
             i64::MAX
         }
@@ -71,12 +75,14 @@ pub fn wait_process_wide_key_atomic(
 pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
     log::trace!(
         "svc::SignalProcessWideKey called, cv_key=0x{:X}, count=0x{:08X}",
-        cv_key, count
+        cv_key,
+        count
     );
 
     // Upstream: Common::AlignDown(cv_key, sizeof(u32))
     let aligned_cv_key = cv_key & !3u64;
-    system.current_process_arc()
+    system
+        .current_process_arc()
         .lock()
         .unwrap()
         .signal_condition_variable(aligned_cv_key, count);

@@ -21,9 +21,7 @@ pub struct HardwareComposer {
 
 impl HardwareComposer {
     pub fn new() -> Self {
-        Self {
-            layers: Vec::new(),
-        }
+        Self { layers: Vec::new() }
     }
 
     /// Clear the layer list for a new composition pass.

@@ -46,7 +46,12 @@ pub fn read_string_from_file(path: &Path, _file_type: FileType) -> String {
         return String::new();
     }
 
-    let mut io_file = IOFile::new(path, FileAccessMode::Read, FileType::BinaryFile, FileShareFlag::ShareReadOnly);
+    let mut io_file = IOFile::new(
+        path,
+        FileAccessMode::Read,
+        FileType::BinaryFile,
+        FileShareFlag::ShareReadOnly,
+    );
     let size = io_file.get_size();
     io_file.read_string(size as usize)
 }
@@ -61,7 +66,12 @@ pub fn write_string_to_file(path: &Path, _file_type: FileType, string: &str) -> 
         return 0;
     }
 
-    let mut io_file = IOFile::new(path, FileAccessMode::Write, FileType::BinaryFile, FileShareFlag::ShareReadOnly);
+    let mut io_file = IOFile::new(
+        path,
+        FileAccessMode::Write,
+        FileType::BinaryFile,
+        FileShareFlag::ShareReadOnly,
+    );
     io_file.write_string(string)
 }
 
@@ -74,7 +84,12 @@ pub fn append_string_to_file(path: &Path, _file_type: FileType, string: &str) ->
         return 0;
     }
 
-    let mut io_file = IOFile::new(path, FileAccessMode::Append, FileType::BinaryFile, FileShareFlag::ShareReadOnly);
+    let mut io_file = IOFile::new(
+        path,
+        FileAccessMode::Append,
+        FileType::BinaryFile,
+        FileShareFlag::ShareReadOnly,
+    );
     io_file.write_string(string)
 }
 
@@ -165,14 +180,8 @@ impl IOFile {
                 .create(true)
                 .truncate(true)
                 .open(path),
-            FileAccessMode::ReadWrite => OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path),
-            FileAccessMode::Append => OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(path),
+            FileAccessMode::ReadWrite => OpenOptions::new().read(true).write(true).open(path),
+            FileAccessMode::Append => OpenOptions::new().append(true).create(true).open(path),
             FileAccessMode::ReadAppend => OpenOptions::new()
                 .read(true)
                 .append(true)

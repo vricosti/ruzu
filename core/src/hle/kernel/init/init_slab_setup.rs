@@ -105,30 +105,36 @@ pub fn calculate_total_slab_heap_size(counts: &KSlabResourceCounts) -> usize {
     // These must match the actual Rust struct sizes; using conservative estimates.
     let slab_entries: &[(usize, usize, usize)] = &[
         // (alignment, object_size, count)
-        (8, 4096, counts.num_k_process),                       // KProcess
-        (8, 1024, counts.num_k_thread),                        // KThread
-        (8, 128,  counts.num_k_event),                         // KEvent
-        (8, 256,  counts.num_k_port),                          // KPort
-        (8, 256,  counts.num_k_session * 2),                   // KSessionRequest
-        (8, 128,  counts.num_k_shared_memory),                 // KSharedMemory
-        (8, 32,   counts.num_k_shared_memory * 8),             // KSharedMemoryInfo
-        (8, 128,  counts.num_k_transfer_memory),               // KTransferMemory
-        (8, 128,  counts.num_k_code_memory),                   // KCodeMemory
-        (8, 128,  counts.num_k_device_address_space),          // KDeviceAddressSpace
-        (8, 256,  counts.num_k_session),                       // KSession
-        (8, 4096, counts.num_k_process +
-                  (counts.num_k_process + counts.num_k_thread) / 8), // KThreadLocalPage
-        (8, 64,   counts.num_k_resource_limit),                // KResourceLimit
-        (8, 96,   counts.num_k_thread + counts.num_k_debug),  // KEventInfo
-        (8, 128,  counts.num_k_debug),                         // KDebug
-        (8, 4096, counts.num_k_process),                       // KSecureSystemResource
-        (8, 64,   counts.num_k_thread),                        // KThreadLockInfo
+        (8, 4096, counts.num_k_process),             // KProcess
+        (8, 1024, counts.num_k_thread),              // KThread
+        (8, 128, counts.num_k_event),                // KEvent
+        (8, 256, counts.num_k_port),                 // KPort
+        (8, 256, counts.num_k_session * 2),          // KSessionRequest
+        (8, 128, counts.num_k_shared_memory),        // KSharedMemory
+        (8, 32, counts.num_k_shared_memory * 8),     // KSharedMemoryInfo
+        (8, 128, counts.num_k_transfer_memory),      // KTransferMemory
+        (8, 128, counts.num_k_code_memory),          // KCodeMemory
+        (8, 128, counts.num_k_device_address_space), // KDeviceAddressSpace
+        (8, 256, counts.num_k_session),              // KSession
+        (
+            8,
+            4096,
+            counts.num_k_process + (counts.num_k_process + counts.num_k_thread) / 8,
+        ), // KThreadLocalPage
+        (8, 64, counts.num_k_resource_limit),        // KResourceLimit
+        (8, 96, counts.num_k_thread + counts.num_k_debug), // KEventInfo
+        (8, 128, counts.num_k_debug),                // KDebug
+        (8, 4096, counts.num_k_process),             // KSecureSystemResource
+        (8, 64, counts.num_k_thread),                // KThreadLockInfo
     ];
 
     let mut size = 0usize;
     for &(align, obj_size, count) in slab_entries {
         size += align;
-        size += common::alignment::align_up((obj_size * count) as u64, std::mem::align_of::<usize>() as u64) as usize;
+        size += common::alignment::align_up(
+            (obj_size * count) as u64,
+            std::mem::align_of::<usize>() as u64,
+        ) as usize;
     }
 
     size += KERNEL_SLAB_HEAP_GAP_SIZE;

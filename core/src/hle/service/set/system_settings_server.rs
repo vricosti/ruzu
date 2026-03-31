@@ -8,11 +8,11 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use super::settings_types::*;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::settings_types::*;
 
 /// Settings file version, matching upstream SETTINGS_VERSION.
 const SETTINGS_VERSION: u32 = 4;
@@ -393,7 +393,10 @@ impl ISystemSettingsServer {
     }
 
     pub fn get_audio_output_mode(&self, target: AudioOutputModeTarget) -> AudioOutputMode {
-        log::debug!("ISystemSettingsServer::GetAudioOutputMode called, target={:?}", target);
+        log::debug!(
+            "ISystemSettingsServer::GetAudioOutputMode called, target={:?}",
+            target
+        );
         match target {
             AudioOutputModeTarget::Hdmi => self.audio_output_mode_hdmi,
             AudioOutputModeTarget::Speaker => self.audio_output_mode_speaker,
@@ -668,12 +671,16 @@ impl ISystemSettingsServer {
     }
 
     pub fn get_user_system_clock_automatic_correction_updated_time(&self) -> [u8; 0x18] {
-        log::debug!("ISystemSettingsServer::GetUserSystemClockAutomaticCorrectionUpdatedTime called");
+        log::debug!(
+            "ISystemSettingsServer::GetUserSystemClockAutomaticCorrectionUpdatedTime called"
+        );
         self.user_system_clock_automatic_correction_updated_time
     }
 
     pub fn set_user_system_clock_automatic_correction_updated_time(&mut self, time: [u8; 0x18]) {
-        log::debug!("ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionUpdatedTime called");
+        log::debug!(
+            "ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionUpdatedTime called"
+        );
         self.user_system_clock_automatic_correction_updated_time = time;
         self.set_save_needed();
     }
@@ -748,72 +755,111 @@ impl ISystemSettingsServer {
 ///
 /// Keys are (category, name) -> Vec<u8> raw value bytes.
 fn get_settings() -> BTreeMap<String, BTreeMap<String, Vec<u8>>> {
-    fn to_bytes_u64(v: u64) -> Vec<u8> { v.to_le_bytes().to_vec() }
-    fn to_bytes_i32(v: i32) -> Vec<u8> { v.to_le_bytes().to_vec() }
-    fn to_bytes_bool(v: bool) -> Vec<u8> { vec![v as u8] }
+    fn to_bytes_u64(v: u64) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+    fn to_bytes_i32(v: i32) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+    fn to_bytes_bool(v: bool) -> Vec<u8> {
+        vec![v as u8]
+    }
 
     let mut ret: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
 
     // AM / hbloader
-    ret.entry("hbloader".into()).or_default()
+    ret.entry("hbloader".into())
+        .or_default()
         .insert("applet_heap_size".into(), to_bytes_u64(0x0));
-    ret.entry("hbloader".into()).or_default()
-        .insert("applet_heap_reservation_size".into(), to_bytes_u64(0x8600000));
+    ret.entry("hbloader".into()).or_default().insert(
+        "applet_heap_reservation_size".into(),
+        to_bytes_u64(0x8600000),
+    );
 
     // Time
-    ret.entry("time".into()).or_default()
-        .insert("notify_time_to_fs_interval_seconds".into(), to_bytes_i32(600));
-    ret.entry("time".into()).or_default()
-        .insert("standard_network_clock_sufficient_accuracy_minutes".into(), to_bytes_i32(43200));
-    ret.entry("time".into()).or_default()
-        .insert("standard_steady_clock_rtc_update_interval_minutes".into(), to_bytes_i32(5));
-    ret.entry("time".into()).or_default()
-        .insert("standard_steady_clock_test_offset_minutes".into(), to_bytes_i32(0));
-    ret.entry("time".into()).or_default()
-        .insert("standard_user_clock_initial_year".into(), to_bytes_i32(2023));
+    ret.entry("time".into()).or_default().insert(
+        "notify_time_to_fs_interval_seconds".into(),
+        to_bytes_i32(600),
+    );
+    ret.entry("time".into()).or_default().insert(
+        "standard_network_clock_sufficient_accuracy_minutes".into(),
+        to_bytes_i32(43200),
+    );
+    ret.entry("time".into()).or_default().insert(
+        "standard_steady_clock_rtc_update_interval_minutes".into(),
+        to_bytes_i32(5),
+    );
+    ret.entry("time".into()).or_default().insert(
+        "standard_steady_clock_test_offset_minutes".into(),
+        to_bytes_i32(0),
+    );
+    ret.entry("time".into()).or_default().insert(
+        "standard_user_clock_initial_year".into(),
+        to_bytes_i32(2023),
+    );
 
     // HID
-    ret.entry("hid".into()).or_default()
+    ret.entry("hid".into())
+        .or_default()
         .insert("has_rail_interface".into(), to_bytes_bool(true));
-    ret.entry("hid".into()).or_default()
+    ret.entry("hid".into())
+        .or_default()
         .insert("has_sio_mcu".into(), to_bytes_bool(true));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("enables_debugpad".into(), to_bytes_bool(true));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("manages_devices".into(), to_bytes_bool(true));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("manages_touch_ic_i2c".into(), to_bytes_bool(true));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("emulate_future_device".into(), to_bytes_bool(false));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("emulate_mcu_hardware_error".into(), to_bytes_bool(false));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("enables_rail".into(), to_bytes_bool(true));
-    ret.entry("hid_debug".into()).or_default()
-        .insert("emulate_firmware_update_failure".into(), to_bytes_bool(false));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into()).or_default().insert(
+        "emulate_firmware_update_failure".into(),
+        to_bytes_bool(false),
+    );
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("failure_firmware_update".into(), to_bytes_i32(0));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("ble_disabled".into(), to_bytes_bool(false));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("dscale_disabled".into(), to_bytes_bool(false));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("force_handheld".into(), to_bytes_bool(true));
-    ret.entry("hid_debug".into()).or_default()
+    ret.entry("hid_debug".into())
+        .or_default()
         .insert("disabled_features_per_id".into(), vec![0u8; 0xa8]);
-    ret.entry("hid_debug".into()).or_default()
-        .insert("touch_firmware_auto_update_disabled".into(), to_bytes_bool(false));
+    ret.entry("hid_debug".into()).or_default().insert(
+        "touch_firmware_auto_update_disabled".into(),
+        to_bytes_bool(false),
+    );
 
     // Mii
-    ret.entry("mii".into()).or_default()
+    ret.entry("mii".into())
+        .or_default()
         .insert("is_db_test_mode_enabled".into(), to_bytes_bool(false));
 
     // Settings
-    ret.entry("settings_debug".into()).or_default()
+    ret.entry("settings_debug".into())
+        .or_default()
         .insert("is_debug_mode_enabled".into(), to_bytes_bool(false));
 
     // Error
-    ret.entry("err".into()).or_default()
+    ret.entry("err".into())
+        .or_default()
         .insert("applet_auto_close".into(), to_bytes_bool(false));
 
     ret
@@ -823,9 +869,7 @@ fn get_settings() -> BTreeMap<String, BTreeMap<String, Vec<u8>>> {
 ///
 /// Corresponds to upstream `GetFirmwareVersionImpl` in system_settings_server.cpp.
 /// This is a simplified version that returns default firmware info.
-pub fn get_firmware_version_impl(
-    fw_type: GetFirmwareVersionType,
-) -> FirmwareVersionFormat {
+pub fn get_firmware_version_impl(fw_type: GetFirmwareVersionType) -> FirmwareVersionFormat {
     log::debug!("GetFirmwareVersionImpl called, type={:?}", fw_type);
 
     let mut out = FirmwareVersionFormat::default();
@@ -865,93 +909,441 @@ impl SystemSettingsService {
             handlers: build_handler_map(&[
                 // Matches upstream system_settings_server.cpp constructor function table.
                 // All commands that upstream wires to a non-null handler are included here.
-                (commands::SET_LANGUAGE_CODE, Some(Self::set_language_code_handler), "SetLanguageCode"),
-                (commands::GET_FIRMWARE_VERSION, Some(Self::get_firmware_version_handler), "GetFirmwareVersion"),
-                (commands::GET_FIRMWARE_VERSION2, Some(Self::get_firmware_version2_handler), "GetFirmwareVersion2"),
-                (commands::GET_LOCK_SCREEN_FLAG, Some(Self::get_lock_screen_flag_handler), "GetLockScreenFlag"),
-                (commands::SET_LOCK_SCREEN_FLAG, Some(Self::set_lock_screen_flag_handler), "SetLockScreenFlag"),
-                (commands::GET_EXTERNAL_STEADY_CLOCK_SOURCE_ID, Some(Self::get_external_steady_clock_source_id_handler), "GetExternalSteadyClockSourceId"),
-                (commands::SET_EXTERNAL_STEADY_CLOCK_SOURCE_ID, Some(Self::set_external_steady_clock_source_id_handler), "SetExternalSteadyClockSourceId"),
-                (commands::GET_USER_SYSTEM_CLOCK_CONTEXT, Some(Self::get_user_system_clock_context_handler), "GetUserSystemClockContext"),
-                (commands::SET_USER_SYSTEM_CLOCK_CONTEXT, Some(Self::set_user_system_clock_context_handler), "SetUserSystemClockContext"),
-                (commands::GET_ACCOUNT_SETTINGS, Some(Self::get_account_settings_handler), "GetAccountSettings"),
-                (commands::SET_ACCOUNT_SETTINGS, Some(Self::set_account_settings_handler), "SetAccountSettings"),
-                (commands::GET_EULA_VERSIONS, Some(Self::get_eula_versions_handler), "GetEulaVersions"),
-                (commands::SET_EULA_VERSIONS, Some(Self::set_eula_versions_handler), "SetEulaVersions"),
-                (commands::GET_COLOR_SET_ID, Some(Self::get_color_set_id_handler), "GetColorSetId"),
-                (commands::SET_COLOR_SET_ID, Some(Self::set_color_set_id_handler), "SetColorSetId"),
-                (commands::GET_NOTIFICATION_SETTINGS, Some(Self::get_notification_settings_handler), "GetNotificationSettings"),
-                (commands::SET_NOTIFICATION_SETTINGS, Some(Self::set_notification_settings_handler), "SetNotificationSettings"),
-                (commands::GET_ACCOUNT_NOTIFICATION_SETTINGS, Some(Self::get_account_notification_settings_handler), "GetAccountNotificationSettings"),
-                (commands::SET_ACCOUNT_NOTIFICATION_SETTINGS, Some(Self::set_account_notification_settings_handler), "SetAccountNotificationSettings"),
-                (commands::GET_VIBRATION_MASTER_VOLUME, Some(Self::get_vibration_master_volume_handler), "GetVibrationMasterVolume"),
-                (commands::SET_VIBRATION_MASTER_VOLUME, Some(Self::set_vibration_master_volume_handler), "SetVibrationMasterVolume"),
-                (commands::GET_SETTINGS_ITEM_VALUE_SIZE, Some(Self::get_settings_item_value_size_handler), "GetSettingsItemValueSize"),
-                (commands::GET_SETTINGS_ITEM_VALUE, Some(Self::get_settings_item_value_handler), "GetSettingsItemValue"),
-                (commands::GET_TV_SETTINGS, Some(Self::get_tv_settings_handler), "GetTvSettings"),
-                (commands::SET_TV_SETTINGS, Some(Self::set_tv_settings_handler), "SetTvSettings"),
-                (commands::GET_AUDIO_OUTPUT_MODE, Some(Self::get_audio_output_mode_handler), "GetAudioOutputMode"),
-                (commands::SET_AUDIO_OUTPUT_MODE, Some(Self::set_audio_output_mode_handler), "SetAudioOutputMode"),
-                (commands::GET_SPEAKER_AUTO_MUTE_FLAG, Some(Self::get_speaker_auto_mute_flag_handler), "GetSpeakerAutoMuteFlag"),
-                (commands::SET_SPEAKER_AUTO_MUTE_FLAG, Some(Self::set_speaker_auto_mute_flag_handler), "SetSpeakerAutoMuteFlag"),
-                (commands::GET_QUEST_FLAG, Some(Self::get_quest_flag_handler), "GetQuestFlag"),
-                (commands::SET_QUEST_FLAG, Some(Self::set_quest_flag_handler), "SetQuestFlag"),
-                (commands::GET_DEVICE_TIME_ZONE_LOCATION_NAME, Some(Self::get_device_time_zone_location_name_handler), "GetDeviceTimeZoneLocationName"),
-                (commands::SET_DEVICE_TIME_ZONE_LOCATION_NAME, Some(Self::set_device_time_zone_location_name_handler), "SetDeviceTimeZoneLocationName"),
-                (commands::SET_REGION_CODE, Some(Self::set_region_code_handler), "SetRegionCode"),
-                (commands::GET_NETWORK_SYSTEM_CLOCK_CONTEXT, Some(Self::get_network_system_clock_context_handler), "GetNetworkSystemClockContext"),
-                (commands::SET_NETWORK_SYSTEM_CLOCK_CONTEXT, Some(Self::set_network_system_clock_context_handler), "SetNetworkSystemClockContext"),
-                (commands::IS_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, Some(Self::is_user_system_clock_automatic_correction_enabled_handler), "IsUserSystemClockAutomaticCorrectionEnabled"),
-                (commands::SET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED, Some(Self::set_user_system_clock_automatic_correction_enabled_handler), "SetUserSystemClockAutomaticCorrectionEnabled"),
-                (commands::GET_DEBUG_MODE_FLAG, Some(Self::get_debug_mode_flag_handler), "GetDebugModeFlag"),
-                (commands::GET_PRIMARY_ALBUM_STORAGE, Some(Self::get_primary_album_storage_handler), "GetPrimaryAlbumStorage"),
-                (commands::SET_PRIMARY_ALBUM_STORAGE, Some(Self::set_primary_album_storage_handler), "SetPrimaryAlbumStorage"),
-                (commands::GET_BATTERY_LOT, Some(Self::get_battery_lot_handler), "GetBatteryLot"),
-                (commands::GET_SERIAL_NUMBER, Some(Self::get_serial_number_handler), "GetSerialNumber"),
-                (commands::GET_NFC_ENABLE_FLAG, Some(Self::get_nfc_enable_flag_handler), "GetNfcEnableFlag"),
-                (commands::SET_NFC_ENABLE_FLAG, Some(Self::set_nfc_enable_flag_handler), "SetNfcEnableFlag"),
-                (commands::GET_SLEEP_SETTINGS, Some(Self::get_sleep_settings_handler), "GetSleepSettings"),
-                (commands::SET_SLEEP_SETTINGS, Some(Self::set_sleep_settings_handler), "SetSleepSettings"),
-                (commands::GET_WIRELESS_LAN_ENABLE_FLAG, Some(Self::get_wireless_lan_enable_flag_handler), "GetWirelessLanEnableFlag"),
-                (commands::SET_WIRELESS_LAN_ENABLE_FLAG, Some(Self::set_wireless_lan_enable_flag_handler), "SetWirelessLanEnableFlag"),
-                (commands::GET_INITIAL_LAUNCH_SETTINGS, Some(Self::get_initial_launch_settings_handler), "GetInitialLaunchSettings"),
-                (commands::SET_INITIAL_LAUNCH_SETTINGS, Some(Self::set_initial_launch_settings_handler), "SetInitialLaunchSettings"),
-                (commands::GET_DEVICE_NICK_NAME, Some(Self::get_device_nick_name_handler), "GetDeviceNickName"),
-                (commands::SET_DEVICE_NICK_NAME, Some(Self::set_device_nick_name_handler), "SetDeviceNickName"),
-                (commands::GET_PRODUCT_MODEL, Some(Self::get_product_model_handler), "GetProductModel"),
-                (commands::GET_BLUETOOTH_ENABLE_FLAG, Some(Self::get_bluetooth_enable_flag_handler), "GetBluetoothEnableFlag"),
-                (commands::SET_BLUETOOTH_ENABLE_FLAG, Some(Self::set_bluetooth_enable_flag_handler), "SetBluetoothEnableFlag"),
-                (commands::GET_MII_AUTHOR_ID, Some(Self::get_mii_author_id_handler), "GetMiiAuthorId"),
-                (commands::GET_AUTO_UPDATE_ENABLE_FLAG, Some(Self::get_auto_update_enable_flag_handler), "GetAutoUpdateEnableFlag"),
-                (commands::SET_AUTO_UPDATE_ENABLE_FLAG, Some(Self::set_auto_update_enable_flag_handler), "SetAutoUpdateEnableFlag"),
-                (commands::GET_BATTERY_PERCENTAGE_FLAG, Some(Self::get_battery_percentage_flag_handler), "GetBatteryPercentageFlag"),
-                (commands::SET_BATTERY_PERCENTAGE_FLAG, Some(Self::set_battery_percentage_flag_handler), "SetBatteryPercentageFlag"),
-                (commands::SET_EXTERNAL_STEADY_CLOCK_INTERNAL_OFFSET, Some(Self::set_external_steady_clock_internal_offset_handler), "SetExternalSteadyClockInternalOffset"),
-                (commands::GET_EXTERNAL_STEADY_CLOCK_INTERNAL_OFFSET, Some(Self::get_external_steady_clock_internal_offset_handler), "GetExternalSteadyClockInternalOffset"),
-                (commands::GET_HEADPHONE_VOLUME_UPDATE_FLAG, Some(Self::get_headphone_volume_update_flag_handler), "GetHeadphoneVolumeUpdateFlag"),
-                (commands::SET_HEADPHONE_VOLUME_UPDATE_FLAG, Some(Self::set_headphone_volume_update_flag_handler), "SetHeadphoneVolumeUpdateFlag"),
-                (commands::GET_PUSH_NOTIFICATION_ACTIVITY_MODE_ON_SLEEP, Some(Self::get_push_notification_activity_mode_on_sleep_handler), "GetPushNotificationActivityModeOnSleep"),
-                (commands::SET_PUSH_NOTIFICATION_ACTIVITY_MODE_ON_SLEEP, Some(Self::set_push_notification_activity_mode_on_sleep_handler), "SetPushNotificationActivityModeOnSleep"),
-                (commands::GET_ERROR_REPORT_SHARE_PERMISSION, Some(Self::get_error_report_share_permission_handler), "GetErrorReportSharePermission"),
-                (commands::SET_ERROR_REPORT_SHARE_PERMISSION, Some(Self::set_error_report_share_permission_handler), "SetErrorReportSharePermission"),
-                (commands::GET_APPLET_LAUNCH_FLAGS, Some(Self::get_applet_launch_flags_handler), "GetAppletLaunchFlags"),
-                (commands::SET_APPLET_LAUNCH_FLAGS, Some(Self::set_applet_launch_flags_handler), "SetAppletLaunchFlags"),
-                (commands::GET_KEYBOARD_LAYOUT, Some(Self::get_keyboard_layout_handler), "GetKeyboardLayout"),
-                (commands::SET_KEYBOARD_LAYOUT, Some(Self::set_keyboard_layout_handler), "SetKeyboardLayout"),
-                (commands::GET_DEVICE_TIME_ZONE_LOCATION_UPDATED_TIME, Some(Self::get_device_time_zone_location_updated_time_handler), "GetDeviceTimeZoneLocationUpdatedTime"),
-                (commands::SET_DEVICE_TIME_ZONE_LOCATION_UPDATED_TIME, Some(Self::set_device_time_zone_location_updated_time_handler), "SetDeviceTimeZoneLocationUpdatedTime"),
-                (commands::GET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME, Some(Self::get_user_system_clock_automatic_correction_updated_time_handler), "GetUserSystemClockAutomaticCorrectionUpdatedTime"),
-                (commands::SET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME, Some(Self::set_user_system_clock_automatic_correction_updated_time_handler), "SetUserSystemClockAutomaticCorrectionUpdatedTime"),
-                (commands::GET_CHINESE_TRADITIONAL_INPUT_METHOD, Some(Self::get_chinese_traditional_input_method_handler), "GetChineseTraditionalInputMethod"),
-                (commands::GET_HOME_MENU_SCHEME, Some(Self::get_home_menu_scheme_handler), "GetHomeMenuScheme"),
-                (commands::GET_PLATFORM_REGION, Some(Self::get_platform_region_handler), "GetPlatformRegion"),
-                (commands::SET_PLATFORM_REGION, Some(Self::set_platform_region_handler), "SetPlatformRegion"),
-                (commands::GET_HOME_MENU_SCHEME_MODEL, Some(Self::get_home_menu_scheme_model_handler), "GetHomeMenuSchemeModel"),
-                (commands::GET_TOUCH_SCREEN_MODE, Some(Self::get_touch_screen_mode_handler), "GetTouchScreenMode"),
-                (commands::SET_TOUCH_SCREEN_MODE, Some(Self::set_touch_screen_mode_handler), "SetTouchScreenMode"),
-                (commands::GET_FIELD_TESTING_FLAG, Some(Self::get_field_testing_flag_handler), "GetFieldTestingFlag"),
-                (commands::GET_PANEL_CRC_MODE, Some(Self::get_panel_crc_mode_handler), "GetPanelCrcMode"),
-                (commands::SET_PANEL_CRC_MODE, Some(Self::set_panel_crc_mode_handler), "SetPanelCrcMode"),
+                (
+                    commands::SET_LANGUAGE_CODE,
+                    Some(Self::set_language_code_handler),
+                    "SetLanguageCode",
+                ),
+                (
+                    commands::GET_FIRMWARE_VERSION,
+                    Some(Self::get_firmware_version_handler),
+                    "GetFirmwareVersion",
+                ),
+                (
+                    commands::GET_FIRMWARE_VERSION2,
+                    Some(Self::get_firmware_version2_handler),
+                    "GetFirmwareVersion2",
+                ),
+                (
+                    commands::GET_LOCK_SCREEN_FLAG,
+                    Some(Self::get_lock_screen_flag_handler),
+                    "GetLockScreenFlag",
+                ),
+                (
+                    commands::SET_LOCK_SCREEN_FLAG,
+                    Some(Self::set_lock_screen_flag_handler),
+                    "SetLockScreenFlag",
+                ),
+                (
+                    commands::GET_EXTERNAL_STEADY_CLOCK_SOURCE_ID,
+                    Some(Self::get_external_steady_clock_source_id_handler),
+                    "GetExternalSteadyClockSourceId",
+                ),
+                (
+                    commands::SET_EXTERNAL_STEADY_CLOCK_SOURCE_ID,
+                    Some(Self::set_external_steady_clock_source_id_handler),
+                    "SetExternalSteadyClockSourceId",
+                ),
+                (
+                    commands::GET_USER_SYSTEM_CLOCK_CONTEXT,
+                    Some(Self::get_user_system_clock_context_handler),
+                    "GetUserSystemClockContext",
+                ),
+                (
+                    commands::SET_USER_SYSTEM_CLOCK_CONTEXT,
+                    Some(Self::set_user_system_clock_context_handler),
+                    "SetUserSystemClockContext",
+                ),
+                (
+                    commands::GET_ACCOUNT_SETTINGS,
+                    Some(Self::get_account_settings_handler),
+                    "GetAccountSettings",
+                ),
+                (
+                    commands::SET_ACCOUNT_SETTINGS,
+                    Some(Self::set_account_settings_handler),
+                    "SetAccountSettings",
+                ),
+                (
+                    commands::GET_EULA_VERSIONS,
+                    Some(Self::get_eula_versions_handler),
+                    "GetEulaVersions",
+                ),
+                (
+                    commands::SET_EULA_VERSIONS,
+                    Some(Self::set_eula_versions_handler),
+                    "SetEulaVersions",
+                ),
+                (
+                    commands::GET_COLOR_SET_ID,
+                    Some(Self::get_color_set_id_handler),
+                    "GetColorSetId",
+                ),
+                (
+                    commands::SET_COLOR_SET_ID,
+                    Some(Self::set_color_set_id_handler),
+                    "SetColorSetId",
+                ),
+                (
+                    commands::GET_NOTIFICATION_SETTINGS,
+                    Some(Self::get_notification_settings_handler),
+                    "GetNotificationSettings",
+                ),
+                (
+                    commands::SET_NOTIFICATION_SETTINGS,
+                    Some(Self::set_notification_settings_handler),
+                    "SetNotificationSettings",
+                ),
+                (
+                    commands::GET_ACCOUNT_NOTIFICATION_SETTINGS,
+                    Some(Self::get_account_notification_settings_handler),
+                    "GetAccountNotificationSettings",
+                ),
+                (
+                    commands::SET_ACCOUNT_NOTIFICATION_SETTINGS,
+                    Some(Self::set_account_notification_settings_handler),
+                    "SetAccountNotificationSettings",
+                ),
+                (
+                    commands::GET_VIBRATION_MASTER_VOLUME,
+                    Some(Self::get_vibration_master_volume_handler),
+                    "GetVibrationMasterVolume",
+                ),
+                (
+                    commands::SET_VIBRATION_MASTER_VOLUME,
+                    Some(Self::set_vibration_master_volume_handler),
+                    "SetVibrationMasterVolume",
+                ),
+                (
+                    commands::GET_SETTINGS_ITEM_VALUE_SIZE,
+                    Some(Self::get_settings_item_value_size_handler),
+                    "GetSettingsItemValueSize",
+                ),
+                (
+                    commands::GET_SETTINGS_ITEM_VALUE,
+                    Some(Self::get_settings_item_value_handler),
+                    "GetSettingsItemValue",
+                ),
+                (
+                    commands::GET_TV_SETTINGS,
+                    Some(Self::get_tv_settings_handler),
+                    "GetTvSettings",
+                ),
+                (
+                    commands::SET_TV_SETTINGS,
+                    Some(Self::set_tv_settings_handler),
+                    "SetTvSettings",
+                ),
+                (
+                    commands::GET_AUDIO_OUTPUT_MODE,
+                    Some(Self::get_audio_output_mode_handler),
+                    "GetAudioOutputMode",
+                ),
+                (
+                    commands::SET_AUDIO_OUTPUT_MODE,
+                    Some(Self::set_audio_output_mode_handler),
+                    "SetAudioOutputMode",
+                ),
+                (
+                    commands::GET_SPEAKER_AUTO_MUTE_FLAG,
+                    Some(Self::get_speaker_auto_mute_flag_handler),
+                    "GetSpeakerAutoMuteFlag",
+                ),
+                (
+                    commands::SET_SPEAKER_AUTO_MUTE_FLAG,
+                    Some(Self::set_speaker_auto_mute_flag_handler),
+                    "SetSpeakerAutoMuteFlag",
+                ),
+                (
+                    commands::GET_QUEST_FLAG,
+                    Some(Self::get_quest_flag_handler),
+                    "GetQuestFlag",
+                ),
+                (
+                    commands::SET_QUEST_FLAG,
+                    Some(Self::set_quest_flag_handler),
+                    "SetQuestFlag",
+                ),
+                (
+                    commands::GET_DEVICE_TIME_ZONE_LOCATION_NAME,
+                    Some(Self::get_device_time_zone_location_name_handler),
+                    "GetDeviceTimeZoneLocationName",
+                ),
+                (
+                    commands::SET_DEVICE_TIME_ZONE_LOCATION_NAME,
+                    Some(Self::set_device_time_zone_location_name_handler),
+                    "SetDeviceTimeZoneLocationName",
+                ),
+                (
+                    commands::SET_REGION_CODE,
+                    Some(Self::set_region_code_handler),
+                    "SetRegionCode",
+                ),
+                (
+                    commands::GET_NETWORK_SYSTEM_CLOCK_CONTEXT,
+                    Some(Self::get_network_system_clock_context_handler),
+                    "GetNetworkSystemClockContext",
+                ),
+                (
+                    commands::SET_NETWORK_SYSTEM_CLOCK_CONTEXT,
+                    Some(Self::set_network_system_clock_context_handler),
+                    "SetNetworkSystemClockContext",
+                ),
+                (
+                    commands::IS_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED,
+                    Some(Self::is_user_system_clock_automatic_correction_enabled_handler),
+                    "IsUserSystemClockAutomaticCorrectionEnabled",
+                ),
+                (
+                    commands::SET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_ENABLED,
+                    Some(Self::set_user_system_clock_automatic_correction_enabled_handler),
+                    "SetUserSystemClockAutomaticCorrectionEnabled",
+                ),
+                (
+                    commands::GET_DEBUG_MODE_FLAG,
+                    Some(Self::get_debug_mode_flag_handler),
+                    "GetDebugModeFlag",
+                ),
+                (
+                    commands::GET_PRIMARY_ALBUM_STORAGE,
+                    Some(Self::get_primary_album_storage_handler),
+                    "GetPrimaryAlbumStorage",
+                ),
+                (
+                    commands::SET_PRIMARY_ALBUM_STORAGE,
+                    Some(Self::set_primary_album_storage_handler),
+                    "SetPrimaryAlbumStorage",
+                ),
+                (
+                    commands::GET_BATTERY_LOT,
+                    Some(Self::get_battery_lot_handler),
+                    "GetBatteryLot",
+                ),
+                (
+                    commands::GET_SERIAL_NUMBER,
+                    Some(Self::get_serial_number_handler),
+                    "GetSerialNumber",
+                ),
+                (
+                    commands::GET_NFC_ENABLE_FLAG,
+                    Some(Self::get_nfc_enable_flag_handler),
+                    "GetNfcEnableFlag",
+                ),
+                (
+                    commands::SET_NFC_ENABLE_FLAG,
+                    Some(Self::set_nfc_enable_flag_handler),
+                    "SetNfcEnableFlag",
+                ),
+                (
+                    commands::GET_SLEEP_SETTINGS,
+                    Some(Self::get_sleep_settings_handler),
+                    "GetSleepSettings",
+                ),
+                (
+                    commands::SET_SLEEP_SETTINGS,
+                    Some(Self::set_sleep_settings_handler),
+                    "SetSleepSettings",
+                ),
+                (
+                    commands::GET_WIRELESS_LAN_ENABLE_FLAG,
+                    Some(Self::get_wireless_lan_enable_flag_handler),
+                    "GetWirelessLanEnableFlag",
+                ),
+                (
+                    commands::SET_WIRELESS_LAN_ENABLE_FLAG,
+                    Some(Self::set_wireless_lan_enable_flag_handler),
+                    "SetWirelessLanEnableFlag",
+                ),
+                (
+                    commands::GET_INITIAL_LAUNCH_SETTINGS,
+                    Some(Self::get_initial_launch_settings_handler),
+                    "GetInitialLaunchSettings",
+                ),
+                (
+                    commands::SET_INITIAL_LAUNCH_SETTINGS,
+                    Some(Self::set_initial_launch_settings_handler),
+                    "SetInitialLaunchSettings",
+                ),
+                (
+                    commands::GET_DEVICE_NICK_NAME,
+                    Some(Self::get_device_nick_name_handler),
+                    "GetDeviceNickName",
+                ),
+                (
+                    commands::SET_DEVICE_NICK_NAME,
+                    Some(Self::set_device_nick_name_handler),
+                    "SetDeviceNickName",
+                ),
+                (
+                    commands::GET_PRODUCT_MODEL,
+                    Some(Self::get_product_model_handler),
+                    "GetProductModel",
+                ),
+                (
+                    commands::GET_BLUETOOTH_ENABLE_FLAG,
+                    Some(Self::get_bluetooth_enable_flag_handler),
+                    "GetBluetoothEnableFlag",
+                ),
+                (
+                    commands::SET_BLUETOOTH_ENABLE_FLAG,
+                    Some(Self::set_bluetooth_enable_flag_handler),
+                    "SetBluetoothEnableFlag",
+                ),
+                (
+                    commands::GET_MII_AUTHOR_ID,
+                    Some(Self::get_mii_author_id_handler),
+                    "GetMiiAuthorId",
+                ),
+                (
+                    commands::GET_AUTO_UPDATE_ENABLE_FLAG,
+                    Some(Self::get_auto_update_enable_flag_handler),
+                    "GetAutoUpdateEnableFlag",
+                ),
+                (
+                    commands::SET_AUTO_UPDATE_ENABLE_FLAG,
+                    Some(Self::set_auto_update_enable_flag_handler),
+                    "SetAutoUpdateEnableFlag",
+                ),
+                (
+                    commands::GET_BATTERY_PERCENTAGE_FLAG,
+                    Some(Self::get_battery_percentage_flag_handler),
+                    "GetBatteryPercentageFlag",
+                ),
+                (
+                    commands::SET_BATTERY_PERCENTAGE_FLAG,
+                    Some(Self::set_battery_percentage_flag_handler),
+                    "SetBatteryPercentageFlag",
+                ),
+                (
+                    commands::SET_EXTERNAL_STEADY_CLOCK_INTERNAL_OFFSET,
+                    Some(Self::set_external_steady_clock_internal_offset_handler),
+                    "SetExternalSteadyClockInternalOffset",
+                ),
+                (
+                    commands::GET_EXTERNAL_STEADY_CLOCK_INTERNAL_OFFSET,
+                    Some(Self::get_external_steady_clock_internal_offset_handler),
+                    "GetExternalSteadyClockInternalOffset",
+                ),
+                (
+                    commands::GET_HEADPHONE_VOLUME_UPDATE_FLAG,
+                    Some(Self::get_headphone_volume_update_flag_handler),
+                    "GetHeadphoneVolumeUpdateFlag",
+                ),
+                (
+                    commands::SET_HEADPHONE_VOLUME_UPDATE_FLAG,
+                    Some(Self::set_headphone_volume_update_flag_handler),
+                    "SetHeadphoneVolumeUpdateFlag",
+                ),
+                (
+                    commands::GET_PUSH_NOTIFICATION_ACTIVITY_MODE_ON_SLEEP,
+                    Some(Self::get_push_notification_activity_mode_on_sleep_handler),
+                    "GetPushNotificationActivityModeOnSleep",
+                ),
+                (
+                    commands::SET_PUSH_NOTIFICATION_ACTIVITY_MODE_ON_SLEEP,
+                    Some(Self::set_push_notification_activity_mode_on_sleep_handler),
+                    "SetPushNotificationActivityModeOnSleep",
+                ),
+                (
+                    commands::GET_ERROR_REPORT_SHARE_PERMISSION,
+                    Some(Self::get_error_report_share_permission_handler),
+                    "GetErrorReportSharePermission",
+                ),
+                (
+                    commands::SET_ERROR_REPORT_SHARE_PERMISSION,
+                    Some(Self::set_error_report_share_permission_handler),
+                    "SetErrorReportSharePermission",
+                ),
+                (
+                    commands::GET_APPLET_LAUNCH_FLAGS,
+                    Some(Self::get_applet_launch_flags_handler),
+                    "GetAppletLaunchFlags",
+                ),
+                (
+                    commands::SET_APPLET_LAUNCH_FLAGS,
+                    Some(Self::set_applet_launch_flags_handler),
+                    "SetAppletLaunchFlags",
+                ),
+                (
+                    commands::GET_KEYBOARD_LAYOUT,
+                    Some(Self::get_keyboard_layout_handler),
+                    "GetKeyboardLayout",
+                ),
+                (
+                    commands::SET_KEYBOARD_LAYOUT,
+                    Some(Self::set_keyboard_layout_handler),
+                    "SetKeyboardLayout",
+                ),
+                (
+                    commands::GET_DEVICE_TIME_ZONE_LOCATION_UPDATED_TIME,
+                    Some(Self::get_device_time_zone_location_updated_time_handler),
+                    "GetDeviceTimeZoneLocationUpdatedTime",
+                ),
+                (
+                    commands::SET_DEVICE_TIME_ZONE_LOCATION_UPDATED_TIME,
+                    Some(Self::set_device_time_zone_location_updated_time_handler),
+                    "SetDeviceTimeZoneLocationUpdatedTime",
+                ),
+                (
+                    commands::GET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME,
+                    Some(Self::get_user_system_clock_automatic_correction_updated_time_handler),
+                    "GetUserSystemClockAutomaticCorrectionUpdatedTime",
+                ),
+                (
+                    commands::SET_USER_SYSTEM_CLOCK_AUTOMATIC_CORRECTION_UPDATED_TIME,
+                    Some(Self::set_user_system_clock_automatic_correction_updated_time_handler),
+                    "SetUserSystemClockAutomaticCorrectionUpdatedTime",
+                ),
+                (
+                    commands::GET_CHINESE_TRADITIONAL_INPUT_METHOD,
+                    Some(Self::get_chinese_traditional_input_method_handler),
+                    "GetChineseTraditionalInputMethod",
+                ),
+                (
+                    commands::GET_HOME_MENU_SCHEME,
+                    Some(Self::get_home_menu_scheme_handler),
+                    "GetHomeMenuScheme",
+                ),
+                (
+                    commands::GET_PLATFORM_REGION,
+                    Some(Self::get_platform_region_handler),
+                    "GetPlatformRegion",
+                ),
+                (
+                    commands::SET_PLATFORM_REGION,
+                    Some(Self::set_platform_region_handler),
+                    "SetPlatformRegion",
+                ),
+                (
+                    commands::GET_HOME_MENU_SCHEME_MODEL,
+                    Some(Self::get_home_menu_scheme_model_handler),
+                    "GetHomeMenuSchemeModel",
+                ),
+                (
+                    commands::GET_TOUCH_SCREEN_MODE,
+                    Some(Self::get_touch_screen_mode_handler),
+                    "GetTouchScreenMode",
+                ),
+                (
+                    commands::SET_TOUCH_SCREEN_MODE,
+                    Some(Self::set_touch_screen_mode_handler),
+                    "SetTouchScreenMode",
+                ),
+                (
+                    commands::GET_FIELD_TESTING_FLAG,
+                    Some(Self::get_field_testing_flag_handler),
+                    "GetFieldTestingFlag",
+                ),
+                (
+                    commands::GET_PANEL_CRC_MODE,
+                    Some(Self::get_panel_crc_mode_handler),
+                    "GetPanelCrcMode",
+                ),
+                (
+                    commands::SET_PANEL_CRC_MODE,
+                    Some(Self::set_panel_crc_mode_handler),
+                    "SetPanelCrcMode",
+                ),
             ]),
             handlers_tipc: BTreeMap::new(),
         }
@@ -967,10 +1359,18 @@ impl SystemSettingsService {
         let svc = Self::as_self(this);
         let inner = svc.inner.lock().unwrap();
         let fw = inner.get_firmware_version();
-        log::info!("ISystemSettingsServer::GetFirmwareVersion -> {}.{}.{}", fw.major, fw.minor, fw.micro);
+        log::info!(
+            "ISystemSettingsServer::GetFirmwareVersion -> {}.{}.{}",
+            fw.major,
+            fw.minor,
+            fw.micro
+        );
         // FirmwareVersionFormat is 0x100 bytes, written to output buffer
         let bytes = unsafe {
-            std::slice::from_raw_parts(&fw as *const FirmwareVersionFormat as *const u8, std::mem::size_of::<FirmwareVersionFormat>())
+            std::slice::from_raw_parts(
+                &fw as *const FirmwareVersionFormat as *const u8,
+                std::mem::size_of::<FirmwareVersionFormat>(),
+            )
         };
         ctx.write_buffer(bytes, 0);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -981,40 +1381,58 @@ impl SystemSettingsService {
         Self::get_firmware_version_handler(this, ctx);
     }
 
-    fn get_external_steady_clock_source_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_external_steady_clock_source_id_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let inner = svc.inner.lock().unwrap();
         let id = inner.get_external_steady_clock_source_id();
         let id_str = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
             id[0],id[1],id[2],id[3], id[4],id[5], id[6],id[7], id[8],id[9], id[10],id[11],id[12],id[13],id[14],id[15]);
-        log::info!("ISystemSettingsServer::GetExternalSteadyClockSourceId -> {}", id_str);
+        log::info!(
+            "ISystemSettingsServer::GetExternalSteadyClockSourceId -> {}",
+            id_str
+        );
         // UUID is 16 bytes, returned inline in response
         let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         // Push 16 bytes as 4 u32s
         for i in 0..4 {
-            let word = u32::from_le_bytes([id[i*4], id[i*4+1], id[i*4+2], id[i*4+3]]);
+            let word = u32::from_le_bytes([id[i * 4], id[i * 4 + 1], id[i * 4 + 2], id[i * 4 + 3]]);
             rb.push_u32(word);
         }
     }
 
-    fn set_external_steady_clock_source_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_external_steady_clock_source_id_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let mut id = [0u8; 16];
         for i in 0..4 {
             let word = rp.pop_u32();
-            id[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+            id[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         let id_str = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
             id[0],id[1],id[2],id[3], id[4],id[5], id[6],id[7], id[8],id[9], id[10],id[11],id[12],id[13],id[14],id[15]);
-        log::info!("ISystemSettingsServer::SetExternalSteadyClockSourceId({})", id_str);
-        svc.inner.lock().unwrap().set_external_steady_clock_source_id(id);
+        log::info!(
+            "ISystemSettingsServer::SetExternalSteadyClockSourceId({})",
+            id_str
+        );
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_external_steady_clock_source_id(id);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_user_system_clock_context_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_user_system_clock_context_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let inner = svc.inner.lock().unwrap();
         let context = inner.get_user_system_clock_context();
@@ -1022,26 +1440,40 @@ impl SystemSettingsService {
         let mut rb = ResponseBuilder::new(ctx, 2 + 8, 0, 0); // 0x20 bytes = 8 u32s
         rb.push_result(RESULT_SUCCESS);
         for i in 0..8 {
-            let word = u32::from_le_bytes([context[i*4], context[i*4+1], context[i*4+2], context[i*4+3]]);
+            let word = u32::from_le_bytes([
+                context[i * 4],
+                context[i * 4 + 1],
+                context[i * 4 + 2],
+                context[i * 4 + 3],
+            ]);
             rb.push_u32(word);
         }
     }
 
-    fn set_user_system_clock_context_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_user_system_clock_context_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let mut context = [0u8; 0x20];
         for i in 0..8 {
             let word = rp.pop_u32();
-            context[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+            context[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         log::info!("ISystemSettingsServer::SetUserSystemClockContext called");
-        svc.inner.lock().unwrap().set_user_system_clock_context(context);
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_user_system_clock_context(context);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_vibration_master_volume_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_vibration_master_volume_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let vol = svc.inner.lock().unwrap().get_vibration_master_volume();
         log::info!("ISystemSettingsServer::GetVibrationMasterVolume -> {}", vol);
@@ -1050,7 +1482,10 @@ impl SystemSettingsService {
         rb.push_u32(vol.to_bits());
     }
 
-    fn set_vibration_master_volume_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_vibration_master_volume_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let vol = rp.pop_f32();
@@ -1060,11 +1495,23 @@ impl SystemSettingsService {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_device_time_zone_location_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_device_time_zone_location_name_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
-        let name = svc.inner.lock().unwrap().get_device_time_zone_location_name();
-        let name_str = std::str::from_utf8(&name).unwrap_or("").trim_end_matches('\0');
-        log::info!("ISystemSettingsServer::GetDeviceTimeZoneLocationName -> \"{}\"", name_str);
+        let name = svc
+            .inner
+            .lock()
+            .unwrap()
+            .get_device_time_zone_location_name();
+        let name_str = std::str::from_utf8(&name)
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        log::info!(
+            "ISystemSettingsServer::GetDeviceTimeZoneLocationName -> \"{}\"",
+            name_str
+        );
         // LocationName is 0x24 bytes = 9 u32s
         let mut rb = ResponseBuilder::new(ctx, 2 + 9, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1078,7 +1525,10 @@ impl SystemSettingsService {
         }
     }
 
-    fn set_device_time_zone_location_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_device_time_zone_location_name_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let mut name = [0u8; 0x24];
@@ -1086,109 +1536,190 @@ impl SystemSettingsService {
             let word = rp.pop_u32();
             let start = i * 4;
             let end = (start + 4).min(0x24);
-            name[start..end].copy_from_slice(&word.to_le_bytes()[..end-start]);
+            name[start..end].copy_from_slice(&word.to_le_bytes()[..end - start]);
         }
-        let name_str = std::str::from_utf8(&name).unwrap_or("").trim_end_matches('\0');
-        log::info!("ISystemSettingsServer::SetDeviceTimeZoneLocationName(\"{}\")", name_str);
-        svc.inner.lock().unwrap().set_device_time_zone_location_name(name);
+        let name_str = std::str::from_utf8(&name)
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        log::info!(
+            "ISystemSettingsServer::SetDeviceTimeZoneLocationName(\"{}\")",
+            name_str
+        );
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_device_time_zone_location_name(name);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_network_system_clock_context_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_network_system_clock_context_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let context = svc.inner.lock().unwrap().get_network_system_clock_context();
         log::info!("ISystemSettingsServer::GetNetworkSystemClockContext called");
         let mut rb = ResponseBuilder::new(ctx, 2 + 8, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         for i in 0..8 {
-            let word = u32::from_le_bytes([context[i*4], context[i*4+1], context[i*4+2], context[i*4+3]]);
+            let word = u32::from_le_bytes([
+                context[i * 4],
+                context[i * 4 + 1],
+                context[i * 4 + 2],
+                context[i * 4 + 3],
+            ]);
             rb.push_u32(word);
         }
     }
 
-    fn set_network_system_clock_context_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_network_system_clock_context_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let mut context = [0u8; 0x20];
         for i in 0..8 {
             let word = rp.pop_u32();
-            context[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+            context[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         log::info!("ISystemSettingsServer::SetNetworkSystemClockContext called");
-        svc.inner.lock().unwrap().set_network_system_clock_context(context);
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_network_system_clock_context(context);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn is_user_system_clock_automatic_correction_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_user_system_clock_automatic_correction_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
-        let enabled = svc.inner.lock().unwrap().is_user_system_clock_automatic_correction_enabled();
-        log::info!("ISystemSettingsServer::IsUserSystemClockAutomaticCorrectionEnabled -> {}", enabled);
+        let enabled = svc
+            .inner
+            .lock()
+            .unwrap()
+            .is_user_system_clock_automatic_correction_enabled();
+        log::info!(
+            "ISystemSettingsServer::IsUserSystemClockAutomaticCorrectionEnabled -> {}",
+            enabled
+        );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(enabled as u32);
     }
 
-    fn set_user_system_clock_automatic_correction_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_user_system_clock_automatic_correction_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let enabled = rp.pop_bool();
-        log::info!("ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionEnabled({})", enabled);
-        svc.inner.lock().unwrap().set_user_system_clock_automatic_correction_enabled(enabled);
+        log::info!(
+            "ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionEnabled({})",
+            enabled
+        );
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_user_system_clock_automatic_correction_enabled(enabled);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_device_time_zone_location_updated_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_device_time_zone_location_updated_time_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
-        let time = svc.inner.lock().unwrap().get_device_time_zone_location_updated_time();
+        let time = svc
+            .inner
+            .lock()
+            .unwrap()
+            .get_device_time_zone_location_updated_time();
         log::info!("ISystemSettingsServer::GetDeviceTimeZoneLocationUpdatedTime called");
         // SteadyClockTimePoint is 0x18 bytes = 6 u32s
         let mut rb = ResponseBuilder::new(ctx, 2 + 6, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         for i in 0..6 {
-            let word = u32::from_le_bytes([time[i*4], time[i*4+1], time[i*4+2], time[i*4+3]]);
+            let word = u32::from_le_bytes([
+                time[i * 4],
+                time[i * 4 + 1],
+                time[i * 4 + 2],
+                time[i * 4 + 3],
+            ]);
             rb.push_u32(word);
         }
     }
 
-    fn set_device_time_zone_location_updated_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_device_time_zone_location_updated_time_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let mut time = [0u8; 0x18];
         for i in 0..6 {
             let word = rp.pop_u32();
-            time[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+            time[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         log::info!("ISystemSettingsServer::SetDeviceTimeZoneLocationUpdatedTime called");
-        svc.inner.lock().unwrap().set_device_time_zone_location_updated_time(time);
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_device_time_zone_location_updated_time(time);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_user_system_clock_automatic_correction_updated_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_user_system_clock_automatic_correction_updated_time_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
-        let time = svc.inner.lock().unwrap().get_user_system_clock_automatic_correction_updated_time();
-        log::info!("ISystemSettingsServer::GetUserSystemClockAutomaticCorrectionUpdatedTime called");
+        let time = svc
+            .inner
+            .lock()
+            .unwrap()
+            .get_user_system_clock_automatic_correction_updated_time();
+        log::info!(
+            "ISystemSettingsServer::GetUserSystemClockAutomaticCorrectionUpdatedTime called"
+        );
         let mut rb = ResponseBuilder::new(ctx, 2 + 6, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         for i in 0..6 {
-            let word = u32::from_le_bytes([time[i*4], time[i*4+1], time[i*4+2], time[i*4+3]]);
+            let word = u32::from_le_bytes([
+                time[i * 4],
+                time[i * 4 + 1],
+                time[i * 4 + 2],
+                time[i * 4 + 3],
+            ]);
             rb.push_u32(word);
         }
     }
 
-    fn set_user_system_clock_automatic_correction_updated_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_user_system_clock_automatic_correction_updated_time_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let mut time = [0u8; 0x18];
         for i in 0..6 {
             let word = rp.pop_u32();
-            time[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+            time[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
-        log::info!("ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionUpdatedTime called");
-        svc.inner.lock().unwrap().set_user_system_clock_automatic_correction_updated_time(time);
+        log::info!(
+            "ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionUpdatedTime called"
+        );
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_user_system_clock_automatic_correction_updated_time(time);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1207,7 +1738,10 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let id = rp.pop_u32();
         log::debug!("ISystemSettingsServer::SetColorSetId({})", id);
-        svc.inner.lock().unwrap().set_color_set_id(unsafe { std::mem::transmute(id) });
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_color_set_id(unsafe { std::mem::transmute(id) });
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1226,7 +1760,10 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let mode = rp.pop_u32();
         log::debug!("ISystemSettingsServer::SetTouchScreenMode({})", mode);
-        svc.inner.lock().unwrap().set_touch_screen_mode(unsafe { std::mem::transmute(mode) });
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_touch_screen_mode(unsafe { std::mem::transmute(mode) });
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1245,20 +1782,39 @@ impl SystemSettingsService {
         rb.push_u32(1); // ProductModel::NX
     }
 
-    fn set_external_steady_clock_internal_offset_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_external_steady_clock_internal_offset_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let offset = rp.pop_i64();
-        log::info!("ISystemSettingsServer::SetExternalSteadyClockInternalOffset({})", offset);
-        svc.inner.lock().unwrap().set_external_steady_clock_internal_offset(offset);
+        log::info!(
+            "ISystemSettingsServer::SetExternalSteadyClockInternalOffset({})",
+            offset
+        );
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_external_steady_clock_internal_offset(offset);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_external_steady_clock_internal_offset_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_external_steady_clock_internal_offset_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
-        let offset = svc.inner.lock().unwrap().get_external_steady_clock_internal_offset();
-        log::info!("ISystemSettingsServer::GetExternalSteadyClockInternalOffset -> {}", offset);
+        let offset = svc
+            .inner
+            .lock()
+            .unwrap()
+            .get_external_steady_clock_internal_offset();
+        log::info!(
+            "ISystemSettingsServer::GetExternalSteadyClockInternalOffset -> {}",
+            offset
+        );
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u64(offset as u64);
@@ -1271,7 +1827,10 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let code = rp.pop_u64();
         log::info!("ISystemSettingsServer::SetLanguageCode(0x{:x})", code);
-        svc.inner.lock().unwrap().set_language_code(unsafe { std::mem::transmute::<u64, LanguageCode>(code) });
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_language_code(unsafe { std::mem::transmute::<u64, LanguageCode>(code) });
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1298,7 +1857,10 @@ impl SystemSettingsService {
     fn get_account_settings_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let settings = svc.inner.lock().unwrap().get_account_settings();
-        log::info!("ISystemSettingsServer::GetAccountSettings -> flags={}", settings.flags);
+        log::info!(
+            "ISystemSettingsServer::GetAccountSettings -> flags={}",
+            settings.flags
+        );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(settings.flags);
@@ -1309,7 +1871,10 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let flags = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetAccountSettings(flags={})", flags);
-        svc.inner.lock().unwrap().set_account_settings(AccountSettings { flags });
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_account_settings(AccountSettings { flags });
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1379,16 +1944,25 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let settings: NotificationSettings = rp.pop_raw();
         log::info!("ISystemSettingsServer::SetNotificationSettings called");
-        svc.inner.lock().unwrap().set_notification_settings(settings);
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_notification_settings(settings);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_account_notification_settings_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_account_notification_settings_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let inner = svc.inner.lock().unwrap();
         let (count, settings) = inner.get_account_notification_settings();
-        log::info!("ISystemSettingsServer::GetAccountNotificationSettings -> count={}", count);
+        log::info!(
+            "ISystemSettingsServer::GetAccountNotificationSettings -> count={}",
+            count
+        );
         if !settings.is_empty() {
             let bytes = unsafe {
                 std::slice::from_raw_parts(
@@ -1403,7 +1977,10 @@ impl SystemSettingsService {
         rb.push_u32(count as u32);
     }
 
-    fn set_account_notification_settings_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_account_notification_settings_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let buf = ctx.read_buffer(0);
         let item_size = std::mem::size_of::<AccountNotificationSettings>();
@@ -1421,13 +1998,22 @@ impl SystemSettingsService {
             }
             settings.push(item);
         }
-        log::info!("ISystemSettingsServer::SetAccountNotificationSettings(count={})", count);
-        svc.inner.lock().unwrap().set_account_notification_settings(settings);
+        log::info!(
+            "ISystemSettingsServer::SetAccountNotificationSettings(count={})",
+            count
+        );
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_account_notification_settings(settings);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_settings_item_value_size_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_settings_item_value_size_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         // Upstream reads category and name from HipcPointer buffers (X descriptors)
         let category_buf = ctx.read_buffer(0);
         let name_buf = ctx.read_buffer(1);
@@ -1439,7 +2025,11 @@ impl SystemSettingsService {
             .unwrap_or("")
             .trim_end_matches('\0')
             .to_string();
-        log::debug!("ISystemSettingsServer::GetSettingsItemValueSize(category={}, name={})", category, name);
+        log::debug!(
+            "ISystemSettingsServer::GetSettingsItemValueSize(category={}, name={})",
+            category,
+            name
+        );
 
         let settings = get_settings();
         let size = settings
@@ -1449,10 +2039,17 @@ impl SystemSettingsService {
             .unwrap_or(0);
 
         if size == 0 {
-            log::warn!("GetSettingsItemValueSize: unknown setting {}.{}", category, name);
+            log::warn!(
+                "GetSettingsItemValueSize: unknown setting {}.{}",
+                category,
+                name
+            );
             // Return ResultUnknown (module 105 = SET, error 1)
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(ResultCode::from_module_description(ErrorModule::Settings, 1));
+            rb.push_result(ResultCode::from_module_description(
+                ErrorModule::Settings,
+                1,
+            ));
             return;
         }
 
@@ -1473,7 +2070,11 @@ impl SystemSettingsService {
             .unwrap_or("")
             .trim_end_matches('\0')
             .to_string();
-        log::info!("ISystemSettingsServer::GetSettingsItemValue(category={}, name={})", category, name);
+        log::info!(
+            "ISystemSettingsServer::GetSettingsItemValue(category={}, name={})",
+            category,
+            name
+        );
 
         let settings = get_settings();
         if let Some(value) = settings.get(&category).and_then(|cat| cat.get(&name)) {
@@ -1482,9 +2083,16 @@ impl SystemSettingsService {
             rb.push_result(RESULT_SUCCESS);
             rb.push_u64(written as u64);
         } else {
-            log::warn!("GetSettingsItemValue: unknown setting {}.{}", category, name);
+            log::warn!(
+                "GetSettingsItemValue: unknown setting {}.{}",
+                category,
+                name
+            );
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(ResultCode::from_module_description(ErrorModule::Settings, 1));
+            rb.push_result(ResultCode::from_module_description(
+                ErrorModule::Settings,
+                1,
+            ));
         }
     }
 
@@ -1520,7 +2128,11 @@ impl SystemSettingsService {
         let target_val = rp.pop_u32();
         let target: AudioOutputModeTarget = unsafe { std::mem::transmute(target_val) };
         let mode = svc.inner.lock().unwrap().get_audio_output_mode(target);
-        log::info!("ISystemSettingsServer::GetAudioOutputMode(target={:?}) -> {:?}", target, mode);
+        log::info!(
+            "ISystemSettingsServer::GetAudioOutputMode(target={:?}) -> {:?}",
+            target,
+            mode
+        );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(mode as u32);
@@ -1533,13 +2145,23 @@ impl SystemSettingsService {
         let mode_val = rp.pop_u32();
         let target: AudioOutputModeTarget = unsafe { std::mem::transmute(target_val) };
         let mode: AudioOutputMode = unsafe { std::mem::transmute(mode_val) };
-        log::info!("ISystemSettingsServer::SetAudioOutputMode(target={:?}, mode={:?})", target, mode);
-        svc.inner.lock().unwrap().set_audio_output_mode(target, mode);
+        log::info!(
+            "ISystemSettingsServer::SetAudioOutputMode(target={:?}, mode={:?})",
+            target,
+            mode
+        );
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_audio_output_mode(target, mode);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_speaker_auto_mute_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_speaker_auto_mute_flag_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let flag = svc.inner.lock().unwrap().get_speaker_auto_mute_flag();
         log::info!("ISystemSettingsServer::GetSpeakerAutoMuteFlag -> {}", flag);
@@ -1548,7 +2170,10 @@ impl SystemSettingsService {
         rb.push_u32(flag as u32);
     }
 
-    fn set_speaker_auto_mute_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_speaker_auto_mute_flag_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let flag = rp.pop_bool();
@@ -1572,7 +2197,10 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let flag = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetQuestFlag({})", flag);
-        svc.inner.lock().unwrap().set_quest_flag(unsafe { std::mem::transmute::<u8, QuestFlag>(flag as u8) });
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_quest_flag(unsafe { std::mem::transmute::<u8, QuestFlag>(flag as u8) });
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1582,7 +2210,10 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let region = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetRegionCode({})", region);
-        svc.inner.lock().unwrap().set_region_code(unsafe { std::mem::transmute(region) });
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_region_code(unsafe { std::mem::transmute(region) });
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1590,7 +2221,10 @@ impl SystemSettingsService {
     fn get_primary_album_storage_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let storage = svc.inner.lock().unwrap().get_primary_album_storage();
-        log::info!("ISystemSettingsServer::GetPrimaryAlbumStorage -> {:?}", storage);
+        log::info!(
+            "ISystemSettingsServer::GetPrimaryAlbumStorage -> {:?}",
+            storage
+        );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(storage as u32);
@@ -1601,7 +2235,10 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let storage = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetPrimaryAlbumStorage({})", storage);
-        svc.inner.lock().unwrap().set_primary_album_storage(unsafe { std::mem::transmute(storage) });
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_primary_album_storage(unsafe { std::mem::transmute(storage) });
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1683,16 +2320,25 @@ impl SystemSettingsService {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_wireless_lan_enable_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_wireless_lan_enable_flag_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let flag = svc.inner.lock().unwrap().get_wireless_lan_enable_flag();
-        log::info!("ISystemSettingsServer::GetWirelessLanEnableFlag -> {}", flag);
+        log::info!(
+            "ISystemSettingsServer::GetWirelessLanEnableFlag -> {}",
+            flag
+        );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(flag as u32);
     }
 
-    fn set_wireless_lan_enable_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_wireless_lan_enable_flag_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let flag = rp.pop_bool();
@@ -1702,7 +2348,10 @@ impl SystemSettingsService {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_initial_launch_settings_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_initial_launch_settings_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let settings = svc.inner.lock().unwrap().get_initial_launch_settings();
         log::info!("ISystemSettingsServer::GetInitialLaunchSettings called");
@@ -1718,12 +2367,18 @@ impl SystemSettingsService {
         rb.push_raw_bytes(bytes);
     }
 
-    fn set_initial_launch_settings_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_initial_launch_settings_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let settings: InitialLaunchSettings = rp.pop_raw();
         log::info!("ISystemSettingsServer::SetInitialLaunchSettings called");
-        svc.inner.lock().unwrap().set_initial_launch_settings(settings);
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_initial_launch_settings(settings);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1731,8 +2386,13 @@ impl SystemSettingsService {
     fn get_device_nick_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let name = svc.inner.lock().unwrap().get_device_nick_name();
-        let name_str = std::str::from_utf8(&name).unwrap_or("").trim_end_matches('\0');
-        log::info!("ISystemSettingsServer::GetDeviceNickName -> \"{}\"", name_str);
+        let name_str = std::str::from_utf8(&name)
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        log::info!(
+            "ISystemSettingsServer::GetDeviceNickName -> \"{}\"",
+            name_str
+        );
         // DeviceNickName is 0x80 bytes, written to output buffer (HipcMapAlias)
         ctx.write_buffer(&name, 0);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1745,7 +2405,9 @@ impl SystemSettingsService {
         let mut name = [0u8; 0x80];
         let len = buf.len().min(0x80);
         name[..len].copy_from_slice(&buf[..len]);
-        let name_str = std::str::from_utf8(&name).unwrap_or("").trim_end_matches('\0');
+        let name_str = std::str::from_utf8(&name)
+            .unwrap_or("")
+            .trim_end_matches('\0');
         log::info!("ISystemSettingsServer::SetDeviceNickName(\"{}\")", name_str);
         svc.inner.lock().unwrap().set_device_nick_name(name);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1781,12 +2443,15 @@ impl SystemSettingsService {
         let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         for i in 0..4 {
-            let word = u32::from_le_bytes([id[i*4], id[i*4+1], id[i*4+2], id[i*4+3]]);
+            let word = u32::from_le_bytes([id[i * 4], id[i * 4 + 1], id[i * 4 + 2], id[i * 4 + 3]]);
             rb.push_u32(word);
         }
     }
 
-    fn get_auto_update_enable_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_auto_update_enable_flag_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let flag = svc.inner.lock().unwrap().get_auto_update_enable_flag();
         log::info!("ISystemSettingsServer::GetAutoUpdateEnableFlag -> {}", flag);
@@ -1795,7 +2460,10 @@ impl SystemSettingsService {
         rb.push_u32(flag as u32);
     }
 
-    fn set_auto_update_enable_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_auto_update_enable_flag_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let flag = rp.pop_bool();
@@ -1805,16 +2473,25 @@ impl SystemSettingsService {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_battery_percentage_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_battery_percentage_flag_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let flag = svc.inner.lock().unwrap().get_battery_percentage_flag();
-        log::info!("ISystemSettingsServer::GetBatteryPercentageFlag -> {}", flag);
+        log::info!(
+            "ISystemSettingsServer::GetBatteryPercentageFlag -> {}",
+            flag
+        );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(flag as u32);
     }
 
-    fn set_battery_percentage_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_battery_percentage_flag_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let flag = rp.pop_bool();
@@ -1824,59 +2501,112 @@ impl SystemSettingsService {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_headphone_volume_update_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_headphone_volume_update_flag_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let flag = svc.inner.lock().unwrap().get_headphone_volume_update_flag();
-        log::info!("ISystemSettingsServer::GetHeadphoneVolumeUpdateFlag -> {}", flag);
+        log::info!(
+            "ISystemSettingsServer::GetHeadphoneVolumeUpdateFlag -> {}",
+            flag
+        );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(flag as u32);
     }
 
-    fn set_headphone_volume_update_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_headphone_volume_update_flag_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let flag = rp.pop_bool();
-        log::info!("ISystemSettingsServer::SetHeadphoneVolumeUpdateFlag({})", flag);
-        svc.inner.lock().unwrap().set_headphone_volume_update_flag(flag);
+        log::info!(
+            "ISystemSettingsServer::SetHeadphoneVolumeUpdateFlag({})",
+            flag
+        );
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_headphone_volume_update_flag(flag);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_push_notification_activity_mode_on_sleep_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_push_notification_activity_mode_on_sleep_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
-        let mode = svc.inner.lock().unwrap().get_push_notification_activity_mode_on_sleep();
-        log::info!("ISystemSettingsServer::GetPushNotificationActivityModeOnSleep -> {}", mode);
+        let mode = svc
+            .inner
+            .lock()
+            .unwrap()
+            .get_push_notification_activity_mode_on_sleep();
+        log::info!(
+            "ISystemSettingsServer::GetPushNotificationActivityModeOnSleep -> {}",
+            mode
+        );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_i32(mode);
     }
 
-    fn set_push_notification_activity_mode_on_sleep_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_push_notification_activity_mode_on_sleep_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let mode = rp.pop_i32();
-        log::info!("ISystemSettingsServer::SetPushNotificationActivityModeOnSleep({})", mode);
-        svc.inner.lock().unwrap().set_push_notification_activity_mode_on_sleep(mode);
+        log::info!(
+            "ISystemSettingsServer::SetPushNotificationActivityModeOnSleep({})",
+            mode
+        );
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_push_notification_activity_mode_on_sleep(mode);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_error_report_share_permission_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_error_report_share_permission_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
-        let perm = svc.inner.lock().unwrap().get_error_report_share_permission();
-        log::info!("ISystemSettingsServer::GetErrorReportSharePermission -> {:?}", perm);
+        let perm = svc
+            .inner
+            .lock()
+            .unwrap()
+            .get_error_report_share_permission();
+        log::info!(
+            "ISystemSettingsServer::GetErrorReportSharePermission -> {:?}",
+            perm
+        );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(perm as u32);
     }
 
-    fn set_error_report_share_permission_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_error_report_share_permission_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let perm = rp.pop_u32();
-        log::info!("ISystemSettingsServer::SetErrorReportSharePermission({})", perm);
-        svc.inner.lock().unwrap().set_error_report_share_permission(unsafe { std::mem::transmute(perm) });
+        log::info!(
+            "ISystemSettingsServer::SetErrorReportSharePermission({})",
+            perm
+        );
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_error_report_share_permission(unsafe { std::mem::transmute(perm) });
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1914,15 +2644,28 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let layout = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetKeyboardLayout({})", layout);
-        svc.inner.lock().unwrap().set_keyboard_layout(unsafe { std::mem::transmute(layout) });
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_keyboard_layout(unsafe { std::mem::transmute(layout) });
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_chinese_traditional_input_method_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_chinese_traditional_input_method_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
-        let method = svc.inner.lock().unwrap().get_chinese_traditional_input_method();
-        log::info!("ISystemSettingsServer::GetChineseTraditionalInputMethod -> {:?}", method);
+        let method = svc
+            .inner
+            .lock()
+            .unwrap()
+            .get_chinese_traditional_input_method();
+        log::info!(
+            "ISystemSettingsServer::GetChineseTraditionalInputMethod -> {:?}",
+            method
+        );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(method as u32);
@@ -1956,12 +2699,18 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let region = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetPlatformRegion({})", region);
-        svc.inner.lock().unwrap().set_platform_region(unsafe { std::mem::transmute(region) });
+        svc.inner
+            .lock()
+            .unwrap()
+            .set_platform_region(unsafe { std::mem::transmute(region) });
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_home_menu_scheme_model_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_home_menu_scheme_model_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let model = svc.inner.lock().unwrap().get_home_menu_scheme_model();
         log::info!("ISystemSettingsServer::GetHomeMenuSchemeModel -> {}", model);
@@ -2006,13 +2755,21 @@ impl SessionRequestHandler for SystemSettingsService {
     fn service_name(&self) -> &str {
         ServiceFramework::get_service_name(self)
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ServiceFramework for SystemSettingsService {
-    fn get_service_name(&self) -> &str { "set:sys" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "set:sys"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 #[cfg(test)]

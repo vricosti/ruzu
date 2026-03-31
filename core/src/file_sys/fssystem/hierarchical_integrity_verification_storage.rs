@@ -23,9 +23,8 @@ pub struct HierarchicalIntegrityVerificationLevelInformation {
     pub reserved: [u8; 4],
 }
 
-const _: () = assert!(
-    std::mem::size_of::<HierarchicalIntegrityVerificationLevelInformation>() == 0x18
-);
+const _: () =
+    assert!(std::mem::size_of::<HierarchicalIntegrityVerificationLevelInformation>() == 0x18);
 
 /// Hierarchical integrity verification information.
 /// Corresponds to upstream `HierarchicalIntegrityVerificationInformation`.
@@ -33,8 +32,7 @@ const _: () = assert!(
 #[repr(C)]
 pub struct HierarchicalIntegrityVerificationInformation {
     pub max_layers: u32,
-    pub info:
-        [HierarchicalIntegrityVerificationLevelInformation; INTEGRITY_MAX_LAYER_COUNT - 1],
+    pub info: [HierarchicalIntegrityVerificationLevelInformation; INTEGRITY_MAX_LAYER_COUNT - 1],
     pub seed: HashSalt,
 }
 

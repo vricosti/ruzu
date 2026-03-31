@@ -6,8 +6,8 @@
 //!
 //! Implements subgroup operations: vote, ballot, shuffle, and derivatives.
 
-use rspirv::spirv::{self, Word};
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::{self, Word};
 
 /// Get the subgroup scope constant.
 fn subgroup_scope(ctx: &mut SpirvEmitContext) -> Word {
@@ -172,14 +172,10 @@ pub fn emit_dpdy_fine(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 /// Emit DPdxCoarse: `OpDPdxCoarse`.
 pub fn emit_dpdx_coarse(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder
-        .d_pdx_coarse(ctx.f32_type, None, value)
-        .unwrap()
+    ctx.builder.d_pdx_coarse(ctx.f32_type, None, value).unwrap()
 }
 
 /// Emit DPdyCoarse: `OpDPdyCoarse`.
 pub fn emit_dpdy_coarse(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder
-        .d_pdy_coarse(ctx.f32_type, None, value)
-        .unwrap()
+    ctx.builder.d_pdy_coarse(ctx.f32_type, None, value).unwrap()
 }

@@ -41,25 +41,61 @@ impl IApplicationDisplayService {
             display_vsync_events: Mutex::new(BTreeMap::new()),
             handlers: build_handler_map(&[
                 (100, Some(Self::get_relay_service), "GetRelayService"),
-                (101, Some(Self::get_system_display_service), "GetSystemDisplayService"),
-                (102, Some(Self::get_manager_display_service), "GetManagerDisplayService"),
-                (103, Some(Self::get_relay_service), "GetIndirectDisplayTransactionService"),
+                (
+                    101,
+                    Some(Self::get_system_display_service),
+                    "GetSystemDisplayService",
+                ),
+                (
+                    102,
+                    Some(Self::get_manager_display_service),
+                    "GetManagerDisplayService",
+                ),
+                (
+                    103,
+                    Some(Self::get_relay_service),
+                    "GetIndirectDisplayTransactionService",
+                ),
                 (1000, Some(Self::list_displays), "ListDisplays"),
                 (1010, Some(Self::open_display), "OpenDisplay"),
                 (1011, Some(Self::open_default_display), "OpenDefaultDisplay"),
                 (1020, Some(Self::close_display), "CloseDisplay"),
                 (1101, Some(Self::stub_ok), "SetDisplayEnabled"),
-                (1102, Some(Self::get_display_resolution), "GetDisplayResolution"),
+                (
+                    1102,
+                    Some(Self::get_display_resolution),
+                    "GetDisplayResolution",
+                ),
                 (2020, Some(Self::open_layer), "OpenLayer"),
                 (2021, Some(Self::close_layer), "CloseLayer"),
                 (2030, Some(Self::create_stray_layer), "CreateStrayLayer"),
                 (2031, Some(Self::destroy_stray_layer), "DestroyStrayLayer"),
-                (2101, Some(Self::set_layer_scaling_mode), "SetLayerScalingMode"),
-                (2102, Some(Self::convert_scaling_mode_handler), "ConvertScalingMode"),
-                (2450, Some(Self::get_indirect_layer_image_map), "GetIndirectLayerImageMap"),
+                (
+                    2101,
+                    Some(Self::set_layer_scaling_mode),
+                    "SetLayerScalingMode",
+                ),
+                (
+                    2102,
+                    Some(Self::convert_scaling_mode_handler),
+                    "ConvertScalingMode",
+                ),
+                (
+                    2450,
+                    Some(Self::get_indirect_layer_image_map),
+                    "GetIndirectLayerImageMap",
+                ),
                 (2451, None, "GetIndirectLayerImageCropMap"),
-                (2460, Some(Self::get_indirect_layer_image_required_memory_info), "GetIndirectLayerImageRequiredMemoryInfo"),
-                (5202, Some(Self::get_display_vsync_event), "GetDisplayVsyncEvent"),
+                (
+                    2460,
+                    Some(Self::get_indirect_layer_image_required_memory_info),
+                    "GetIndirectLayerImageRequiredMemoryInfo",
+                ),
+                (
+                    5202,
+                    Some(Self::get_display_vsync_event),
+                    "GetDisplayVsyncEvent",
+                ),
                 (5203, None, "GetDisplayVsyncEventForDebug"),
             ]),
             handlers_tipc: BTreeMap::new(),
@@ -76,7 +112,10 @@ impl IApplicationDisplayService {
         let svc = Self::as_self(this);
         log::info!("IApplicationDisplayService::GetRelayService called");
         let binder_driver = svc.container.get_binder_driver();
-        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, binder_driver);
+        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(
+            ctx,
+            binder_driver,
+        );
     }
 
     /// cmd 101: GetSystemDisplayService
@@ -85,7 +124,9 @@ impl IApplicationDisplayService {
         log::warn!("IApplicationDisplayService::GetSystemDisplayService (STUBBED)");
         let sub: Arc<dyn SessionRequestHandler> =
             Arc::new(ISystemDisplayService::new(Arc::clone(&svc.container)));
-        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
+        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(
+            ctx, sub,
+        );
     }
 
     /// cmd 102: GetManagerDisplayService
@@ -94,7 +135,9 @@ impl IApplicationDisplayService {
         log::warn!("IApplicationDisplayService::GetManagerDisplayService (STUBBED)");
         let sub: Arc<dyn SessionRequestHandler> =
             Arc::new(IManagerDisplayService::new(Arc::clone(&svc.container)));
-        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
+        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(
+            ctx, sub,
+        );
     }
 
     /// cmd 1000: ListDisplays
@@ -179,7 +222,10 @@ impl IApplicationDisplayService {
     fn get_display_resolution(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let display_id = rp.pop_u64();
-        log::debug!("IApplicationDisplayService::GetDisplayResolution({})", display_id);
+        log::debug!(
+            "IApplicationDisplayService::GetDisplayResolution({})",
+            display_id
+        );
         let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u64(DisplayResolution::UndockedWidth as u64);
@@ -203,7 +249,11 @@ impl IApplicationDisplayService {
         let layer_id = rp.pop_u64();
         let aruid = rp.pop_u64();
 
-        log::info!("IApplicationDisplayService::OpenLayer(layer_id={}, aruid={:#x})", layer_id, aruid);
+        log::info!(
+            "IApplicationDisplayService::OpenLayer(layer_id={}, aruid={:#x})",
+            layer_id,
+            aruid
+        );
 
         // Open display first
         if let Err(err) = svc.container.open_display(&display_name) {
@@ -261,7 +311,11 @@ impl IApplicationDisplayService {
         let _padding = rp.pop_u32(); // align to u64
         let display_id = rp.pop_u64();
 
-        log::info!("IApplicationDisplayService::CreateStrayLayer(flags={}, display_id={})", flags, display_id);
+        log::info!(
+            "IApplicationDisplayService::CreateStrayLayer(flags={}, display_id={})",
+            flags,
+            display_id
+        );
 
         match svc.container.create_stray_layer(display_id) {
             Ok((producer_binder_id, layer_id)) => {
@@ -290,7 +344,10 @@ impl IApplicationDisplayService {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let layer_id = rp.pop_u64();
-        log::info!("IApplicationDisplayService::DestroyStrayLayer({})", layer_id);
+        log::info!(
+            "IApplicationDisplayService::DestroyStrayLayer({})",
+            layer_id
+        );
 
         {
             let mut ids = svc.stray_layer_ids.lock().unwrap();
@@ -316,7 +373,10 @@ impl IApplicationDisplayService {
     fn convert_scaling_mode_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let mode_val = rp.pop_u32();
-        log::debug!("IApplicationDisplayService::ConvertScalingMode({})", mode_val);
+        log::debug!(
+            "IApplicationDisplayService::ConvertScalingMode({})",
+            mode_val
+        );
 
         let mode = unsafe { std::mem::transmute::<u32, NintendoScaleMode>(mode_val) };
         match convert_scaling_mode(mode) {
@@ -342,11 +402,18 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 2460: GetIndirectLayerImageRequiredMemoryInfo
-    fn get_indirect_layer_image_required_memory_info(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_indirect_layer_image_required_memory_info(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let mut rp = RequestParser::new(ctx);
         let width = rp.pop_i64();
         let height = rp.pop_i64();
-        log::debug!("IApplicationDisplayService::GetIndirectLayerImageRequiredMemoryInfo(w={}, h={})", width, height);
+        log::debug!(
+            "IApplicationDisplayService::GetIndirectLayerImageRequiredMemoryInfo(w={}, h={})",
+            width,
+            height
+        );
 
         let (size, alignment) = get_indirect_layer_image_required_memory_info(width, height);
         let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
@@ -365,13 +432,19 @@ impl IApplicationDisplayService {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let display_id = rp.pop_u64();
-        log::info!("IApplicationDisplayService::GetDisplayVsyncEvent(display_id={})", display_id);
+        log::info!(
+            "IApplicationDisplayService::GetDisplayVsyncEvent(display_id={})",
+            display_id
+        );
 
         // Upstream: only one vsync event per display_id per service instance.
         {
             let events = svc.display_vsync_events.lock().unwrap();
             if events.contains_key(&display_id) {
-                log::warn!("GetDisplayVsyncEvent: already fetched for display_id={}", display_id);
+                log::warn!(
+                    "GetDisplayVsyncEvent: already fetched for display_id={}",
+                    display_id
+                );
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(vi_results::RESULT_PERMISSION_DENIED);
                 return;
@@ -402,12 +475,20 @@ impl IApplicationDisplayService {
         ));
 
         // Link the event to the Conductor for this display.
-        svc.container.link_vsync_event(display_id, Arc::clone(&event));
+        svc.container
+            .link_vsync_event(display_id, Arc::clone(&event));
 
         // Store for cleanup on drop.
-        svc.display_vsync_events.lock().unwrap().insert(display_id, event);
+        svc.display_vsync_events
+            .lock()
+            .unwrap()
+            .insert(display_id, event);
 
-        log::info!("GetDisplayVsyncEvent: created vsync event handle={:#x} for display_id={}", handle, display_id);
+        log::info!(
+            "GetDisplayVsyncEvent: created vsync event handle={:#x} for display_id={}",
+            handle,
+            display_id
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -442,9 +523,15 @@ impl SessionRequestHandler for IApplicationDisplayService {
 }
 
 impl ServiceFramework for IApplicationDisplayService {
-    fn get_service_name(&self) -> &str { "IApplicationDisplayService" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "IApplicationDisplayService"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 // -- Pure logic helpers matching upstream --

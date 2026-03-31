@@ -5,8 +5,7 @@
 
 use super::bucket_tree::BucketTree;
 use super::compression_common::{
-    CompressionType, GetDecompressorFunction, COMPRESSION_BLOCK_ALIGNMENT,
-    compression_type_utility,
+    compression_type_utility, CompressionType, GetDecompressorFunction, COMPRESSION_BLOCK_ALIGNMENT,
 };
 use super::pooled_buffer::PooledBuffer;
 use crate::file_sys::errors::*;
@@ -241,12 +240,8 @@ impl CompressedStorage {
         let core_size = self.core.get_size()?;
 
         // Initialize our cache manager.
-        self.cache_manager.initialize(
-            core_size,
-            cache_size_0,
-            cache_size_1,
-            max_cache_entries,
-        )?;
+        self.cache_manager
+            .initialize(core_size, cache_size_0, cache_size_1, max_cache_entries)?;
 
         Ok(())
     }
@@ -326,7 +321,12 @@ impl VfsFile for CompressedStorage {
         let actual_len = length.min(buffer.len());
         if self
             .cache_manager
-            .read(&self.core, offset as i64, &mut buffer[..actual_len], actual_len)
+            .read(
+                &self.core,
+                offset as i64,
+                &mut buffer[..actual_len],
+                actual_len,
+            )
             .is_ok()
         {
             actual_len

@@ -7,12 +7,12 @@
 
 use std::sync::Mutex;
 
+use super::steady_clock_core::{SteadyClockCoreImpl, SteadyClockCoreState};
 use crate::hle::result::ResultCode;
 use crate::hle::service::psc::time::common::{
     ClockSourceId, ContinuousAdjustmentTimePoint, SteadyClockTimePoint,
 };
 use crate::hle::service::psc::time::errors::RESULT_NOT_IMPLEMENTED;
-use super::steady_clock_core::{SteadyClockCoreImpl, SteadyClockCoreState};
 
 pub struct StandardSteadyClockCore {
     pub state: SteadyClockCoreState,
@@ -109,8 +109,11 @@ impl StandardSteadyClockCore {
         self.continuous_adjustment_time_point.rtc_offset = uptime_ns;
         self.continuous_adjustment_time_point.shift_amount =
             if expected_time == in_time { 0 } else { 14 };
-        self.continuous_adjustment_time_point.diff_scale =
-            if expected_time == in_time { 0 } else { new_diff };
+        self.continuous_adjustment_time_point.diff_scale = if expected_time == in_time {
+            0
+        } else {
+            new_diff
+        };
         self.continuous_adjustment_time_point.lower = expected_time;
     }
 }

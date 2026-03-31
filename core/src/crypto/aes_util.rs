@@ -83,8 +83,8 @@ impl CipherState {
     }
 
     fn transcode_ecb(&self, src: &[u8], dest: &mut [u8], op: Op) {
-        use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
         use aes::cipher::generic_array::GenericArray;
+        use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 
         let block_size = 16;
         let len = src.len().min(dest.len());

@@ -40,9 +40,8 @@ impl GraphicsPipelineKey {
     /// Hash the key, considering only relevant bytes (smaller if xfb not enabled).
     pub fn hash_key(&self) -> u64 {
         let size = self.size();
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(self as *const Self as *const u8, size)
-        };
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, size) };
         let mut h: u64 = 0xcbf29ce484222325;
         for &b in bytes {
             h ^= b as u64;
@@ -139,10 +138,7 @@ impl GraphicsPipeline {
             uses_local_memory: false,
             num_xfb_attribs: 0,
             num_xfb_buffers_active: 0,
-            xfb_attribs: vec![
-                0i32;
-                128 * XFB_ENTRY_STRIDE * NUM_TRANSFORM_FEEDBACK_BUFFERS
-            ],
+            xfb_attribs: vec![0i32; 128 * XFB_ENTRY_STRIDE * NUM_TRANSFORM_FEEDBACK_BUFFERS],
             built_mutex: Mutex::new(true),
             built_condvar: Condvar::new(),
             built_fence: std::ptr::null(),
@@ -209,9 +205,7 @@ impl GraphicsPipeline {
             return false;
         }
         // Check if the GL fence has been signaled
-        let status = unsafe {
-            gl::ClientWaitSync(self.built_fence, 0, 0)
-        };
+        let status = unsafe { gl::ClientWaitSync(self.built_fence, 0, 0) };
         if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED {
             unsafe {
                 gl::DeleteSync(self.built_fence);
@@ -326,10 +320,10 @@ pub fn transform_feedback_enum(location: u32) -> (i32, i32) {
     const GL_POSITION: i32 = 0x1203;
     match index {
         7 => (GL_POSITION, 0),
-        40 => (0x852C_i32, 0),  // GL_PRIMARY_COLOR_NV
-        41 => (0x852D_i32, 0),  // GL_SECONDARY_COLOR_NV
-        42 => (0x8C77_i32, 0),  // GL_BACK_PRIMARY_COLOR_NV
-        43 => (0x8C78_i32, 0),  // GL_BACK_SECONDARY_COLOR_NV
+        40 => (0x852C_i32, 0), // GL_PRIMARY_COLOR_NV
+        41 => (0x852D_i32, 0), // GL_SECONDARY_COLOR_NV
+        42 => (0x8C77_i32, 0), // GL_BACK_PRIMARY_COLOR_NV
+        43 => (0x8C78_i32, 0), // GL_BACK_SECONDARY_COLOR_NV
         _ => {
             log::warn!("Unimplemented transform feedback index={}", index);
             (GL_POSITION, 0)

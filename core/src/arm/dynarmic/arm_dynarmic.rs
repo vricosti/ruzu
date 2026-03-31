@@ -69,8 +69,11 @@ mod linux_impl {
         // Chain to old handler.
         let old_handler = OLD_SEGV.sa_sigaction;
         if old_handler != 0 && old_handler != libc::SIG_DFL && old_handler != libc::SIG_IGN {
-            let handler_fn: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
-                std::mem::transmute(old_handler);
+            let handler_fn: unsafe extern "C" fn(
+                libc::c_int,
+                *mut libc::siginfo_t,
+                *mut libc::c_void,
+            ) = std::mem::transmute(old_handler);
             handler_fn(sig, info, ctx);
         }
     }
@@ -119,7 +122,9 @@ impl ScopedJitExecution {
         {
             // Transmute the opaque process to get its Memory pointer.
             // The process is passed as &dyn Any but is actually a KProcess.
-            if let Some(real_process) = process.downcast_ref::<crate::hle::kernel::k_process::KProcess>() {
+            if let Some(real_process) =
+                process.downcast_ref::<crate::hle::kernel::k_process::KProcess>()
+            {
                 let memory = real_process.get_shared_memory();
                 let mem_guard = memory.read().unwrap();
                 let mem_ptr = &*mem_guard as *const _ as *const crate::memory::memory::Memory;

@@ -4,8 +4,8 @@
 //! SPIR-V conversion emission — maps to zuyu's
 //! `backend/spirv/emit_spirv_convert.cpp`.
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::Word;
 
 // ── Helpers matching upstream anonymous namespace ─────────────────────────
 
@@ -127,16 +127,12 @@ pub fn emit_convert_u64_f64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 /// ConvertU64U32: `OpUConvert` U32 -> U64.
 pub fn emit_convert_u64_u32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder
-        .u_convert(ctx.u64_type, None, value)
-        .unwrap()
+    ctx.builder.u_convert(ctx.u64_type, None, value).unwrap()
 }
 
 /// ConvertU32U64: `OpUConvert` U64 -> U32.
 pub fn emit_convert_u32_u64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder
-        .u_convert(ctx.u32_type, None, value)
-        .unwrap()
+    ctx.builder.u_convert(ctx.u32_type, None, value).unwrap()
 }
 
 // ── Signed integer-to-float conversions ──────────────────────────────────
@@ -214,14 +210,10 @@ pub fn emit_convert_f32_u64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 /// ConvertF32F64: `OpFConvert` F64 -> F32.
 pub fn emit_convert_f32_f64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder
-        .f_convert(ctx.f32_type, None, value)
-        .unwrap()
+    ctx.builder.f_convert(ctx.f32_type, None, value).unwrap()
 }
 
 /// ConvertF64F32: `OpFConvert` F32 -> F64.
 pub fn emit_convert_f64_f32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder
-        .f_convert(ctx.f64_type, None, value)
-        .unwrap()
+    ctx.builder.f_convert(ctx.f64_type, None, value).unwrap()
 }

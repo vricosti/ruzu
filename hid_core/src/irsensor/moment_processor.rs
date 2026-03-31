@@ -191,16 +191,14 @@ impl MomentProcessor {
     pub fn set_config(&mut self, config: PackedMomentProcessorConfig) {
         self.current_config.camera_config.exposure_time = config.camera_config.exposure_time;
         self.current_config.camera_config.gain = config.camera_config.gain as u32;
-        self.current_config.camera_config.is_negative_used =
-            config.camera_config.is_negative_used;
+        self.current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
         self.current_config.camera_config.light_target = unsafe {
-            std::mem::transmute::<u32, CameraLightTarget>(
-                config.camera_config.light_target as u32,
-            )
+            std::mem::transmute::<u32, CameraLightTarget>(config.camera_config.light_target as u32)
         };
         self.current_config.window_of_interest = config.window_of_interest;
-        self.current_config.preprocess =
-            unsafe { std::mem::transmute::<u32, MomentProcessorPreprocess>(config.preprocess as u32) };
+        self.current_config.preprocess = unsafe {
+            std::mem::transmute::<u32, MomentProcessorPreprocess>(config.preprocess as u32)
+        };
         self.current_config.preprocess_intensity_threshold =
             config.preprocess_intensity_threshold as u32;
     }

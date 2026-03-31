@@ -24,8 +24,11 @@ pub struct IApplicationProxyService {
 
 impl IApplicationProxyService {
     pub fn new(window_system: Arc<Mutex<WindowSystem>>) -> Self {
-        let handlers =
-            build_handler_map(&[(0, Some(Self::open_application_proxy_handler), "OpenApplicationProxy")]);
+        let handlers = build_handler_map(&[(
+            0,
+            Some(Self::open_application_proxy_handler),
+            "OpenApplicationProxy",
+        )]);
         Self {
             window_system,
             handlers,
@@ -38,26 +41,35 @@ impl IApplicationProxyService {
     /// Upstream calls GetAppletFromProcessId(pid) via WindowSystem::GetByAppletResourceUserId
     /// to find the existing applet for the calling process, then wraps it in an
     /// IApplicationProxy.
-    pub fn open_application_proxy(&self, pid: u64) -> Option<Arc<Mutex<crate::hle::service::am::applet::Applet>>> {
-        log::debug!("IApplicationProxyService::OpenApplicationProxy called, pid={:#x}", pid);
+    pub fn open_application_proxy(
+        &self,
+        pid: u64,
+    ) -> Option<Arc<Mutex<crate::hle::service::am::applet::Applet>>> {
+        log::debug!(
+            "IApplicationProxyService::OpenApplicationProxy called, pid={:#x}",
+            pid
+        );
         self.window_system
             .lock()
             .unwrap()
             .get_by_applet_resource_user_id(pid)
     }
 
-    fn open_application_proxy_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let service = unsafe {
-            &*(this as *const dyn ServiceFramework as *const IApplicationProxyService)
-        };
+    fn open_application_proxy_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxyService) };
         let pid = if ctx.get_pid() != 0 {
             ctx.get_pid()
         } else {
             ctx.get_thread()
-                .and_then(|thread| thread.lock().unwrap().parent.as_ref().and_then(|p| p.upgrade()))
+                .and_then(|thread| {
+                    thread
+                        .lock()
+                        .unwrap()
+                        .parent
+                        .as_ref()
+                        .and_then(|p| p.upgrade())
+                })
                 .map(|process| process.lock().unwrap().get_process_id())
                 .unwrap_or(0)
         };
@@ -68,13 +80,17 @@ impl IApplicationProxyService {
             rb.push_result(RESULT_UNKNOWN);
             return;
         };
-        log::debug!(
-            "OpenApplicationProxy: found applet for pid={:#x}",
-            pid
-        );
+        log::debug!("OpenApplicationProxy: found applet for pid={:#x}", pid);
         let process = ctx
             .get_thread()
-            .and_then(|thread| thread.lock().unwrap().parent.as_ref().and_then(|p| p.upgrade()))
+            .and_then(|thread| {
+                thread
+                    .lock()
+                    .unwrap()
+                    .parent
+                    .as_ref()
+                    .and_then(|p| p.upgrade())
+            })
             .map(|process| process as Arc<Mutex<KProcess>>);
         let proxy = Arc::new(super::application_proxy::IApplicationProxy::new(
             applet,

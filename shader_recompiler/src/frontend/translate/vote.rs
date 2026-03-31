@@ -48,10 +48,9 @@ impl<'a> TranslatorVisitor<'a> {
         let vote_op = VoteOp::from_raw((insn >> 48) & 3);
 
         // Get the source predicate
-        let vote_pred = self.ir.get_pred(
-            crate::ir::value::Pred(pred_a_idx as u8),
-            neg_pred_a,
-        );
+        let vote_pred = self
+            .ir
+            .get_pred(crate::ir::value::Pred(pred_a_idx as u8), neg_pred_a);
 
         // Perform the vote operation
         let result = match vote_op {
@@ -61,10 +60,8 @@ impl<'a> TranslatorVisitor<'a> {
         };
 
         // Set the destination predicate
-        self.ir.set_pred(
-            crate::ir::value::Pred(pred_b_idx as u8),
-            result,
-        );
+        self.ir
+            .set_pred(crate::ir::value::Pred(pred_b_idx as u8), result);
 
         // Set the destination register to the ballot result
         let ballot = self.ir.subgroup_ballot(vote_pred);

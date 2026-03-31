@@ -91,7 +91,6 @@ pub struct GenericEnvironment {
     pub has_unbound_instructions: bool,
     pub has_hle_engine_state: bool,
     pub is_proprietary_driver: bool,
-
     // In the full port: gpu_memory: &MemoryManager,
 }
 
@@ -340,8 +339,9 @@ impl FileEnvironment {
         // Read code words (code_size bytes, rounded up to u64 boundary)
         let num_words = code_size.div_ceil(8) as usize;
         self.code.resize(num_words, 0);
-        let code_bytes =
-            unsafe { std::slice::from_raw_parts_mut(self.code.as_mut_ptr() as *mut u8, code_size as usize) };
+        let code_bytes = unsafe {
+            std::slice::from_raw_parts_mut(self.code.as_mut_ptr() as *mut u8, code_size as usize)
+        };
         file.read_exact(code_bytes).unwrap_or(());
 
         for _ in 0..num_texture_types {
@@ -364,7 +364,8 @@ impl FileEnvironment {
         for _ in 0..num_texture_pixel_formats {
             let key = read_u32(file);
             let fmt_raw = read_u32(file);
-            self.texture_pixel_formats.insert(key, TexturePixelFormat(fmt_raw));
+            self.texture_pixel_formats
+                .insert(key, TexturePixelFormat(fmt_raw));
         }
         for _ in 0..num_cbuf_values {
             let key = read_u64(file);
@@ -512,9 +513,8 @@ fn serialize_generic_environment(
     file.write_all(&stage_raw.to_le_bytes())?;
 
     // Write code as bytes
-    let code_byte_slice = unsafe {
-        std::slice::from_raw_parts(env.code.as_ptr() as *const u8, code_size as usize)
-    };
+    let code_byte_slice =
+        unsafe { std::slice::from_raw_parts(env.code.as_ptr() as *const u8, code_size as usize) };
     file.write_all(code_byte_slice)?;
 
     for (&key, &texture_type) in &env.texture_types {

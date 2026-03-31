@@ -89,8 +89,14 @@ pub struct Controller {
 impl Controller {
     pub fn new() -> Self {
         let mut configs = HashMap::new();
-        configs.insert(PerformanceMode::Normal as i32, DEFAULT_PERFORMANCE_CONFIGURATION);
-        configs.insert(PerformanceMode::Boost as i32, DEFAULT_PERFORMANCE_CONFIGURATION);
+        configs.insert(
+            PerformanceMode::Normal as i32,
+            DEFAULT_PERFORMANCE_CONFIGURATION,
+        );
+        configs.insert(
+            PerformanceMode::Boost as i32,
+            DEFAULT_PERFORMANCE_CONFIGURATION,
+        );
         Self { configs }
     }
 
@@ -108,7 +114,10 @@ impl Controller {
             self.set_clock_speed(mhz);
             self.configs.insert(mode as i32, config);
         } else {
-            log::error!("Invalid performance configuration value provided: {:?}", config);
+            log::error!(
+                "Invalid performance configuration value provided: {:?}",
+                config
+            );
         }
     }
 

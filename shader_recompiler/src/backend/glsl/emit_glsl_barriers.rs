@@ -7,6 +7,12 @@
 
 use super::glsl_emit_context::EmitContext;
 
-pub fn emit_barrier(ctx: &mut EmitContext) { ctx.add_line("barrier();"); }
-pub fn emit_workgroup_memory_barrier(ctx: &mut EmitContext) { ctx.add_line("groupMemoryBarrier();"); }
-pub fn emit_device_memory_barrier(ctx: &mut EmitContext) { ctx.add_line("memoryBarrier();"); }
+pub fn emit_barrier(ctx: &mut EmitContext) {
+    ctx.add_line("barrier();");
+}
+pub fn emit_workgroup_memory_barrier(ctx: &mut EmitContext) {
+    ctx.add_line("groupMemoryBarrier();");
+}
+pub fn emit_device_memory_barrier(ctx: &mut EmitContext) {
+    ctx.add_line("memoryBarrier();");
+}

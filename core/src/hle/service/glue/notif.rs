@@ -119,7 +119,11 @@ impl NotificationServiceImpl {
         alarm_setting: &AlarmSetting,
         _application_parameter: &[u8],
     ) -> ResultCode {
-        if let Some(alarm) = self.alarms.iter_mut().find(|a| a.alarm_setting_id == alarm_setting.alarm_setting_id) {
+        if let Some(alarm) = self
+            .alarms
+            .iter_mut()
+            .find(|a| a.alarm_setting_id == alarm_setting.alarm_setting_id)
+        {
             *alarm = *alarm_setting;
         }
         log::warn!("(STUBBED) update_alarm_setting called");
@@ -131,13 +135,20 @@ impl NotificationServiceImpl {
         for i in 0..count {
             out_alarms[i] = self.alarms[i];
         }
-        log::info!("list_alarm_settings called, alarm_count={}", self.alarms.len());
+        log::info!(
+            "list_alarm_settings called, alarm_count={}",
+            self.alarms.len()
+        );
         (RESULT_SUCCESS, count as i32)
     }
 
     pub fn delete_alarm_setting(&mut self, alarm_setting_id: AlarmSettingId) -> ResultCode {
-        self.alarms.retain(|a| a.alarm_setting_id != alarm_setting_id);
-        log::info!("delete_alarm_setting called, alarm_setting_id={}", alarm_setting_id);
+        self.alarms
+            .retain(|a| a.alarm_setting_id != alarm_setting_id);
+        log::info!(
+            "delete_alarm_setting called, alarm_setting_id={}",
+            alarm_setting_id
+        );
         RESULT_SUCCESS
     }
 

@@ -46,10 +46,8 @@ pub fn create_session(
     // Use unique IDs for the server and client session objects in the handle table.
     static NEXT_SESSION_OBJ_ID: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0x8000_0000);
-    let server_object_id =
-        NEXT_SESSION_OBJ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let client_object_id =
-        NEXT_SESSION_OBJ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let server_object_id = NEXT_SESSION_OBJ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let client_object_id = NEXT_SESSION_OBJ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     if is_light {
         // Create and initialize a KLightSession.
@@ -120,8 +118,7 @@ pub fn accept_session(system: &System, out: &mut Handle, port_handle: Handle) ->
     // Allocate a unique object ID for the accepted session.
     static NEXT_ACCEPT_OBJ_ID: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0xA000_0000);
-    let server_object_id =
-        NEXT_ACCEPT_OBJ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let server_object_id = NEXT_ACCEPT_OBJ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Add the server session to the handle table.
     let handle = match process.handle_table.add(server_object_id) {

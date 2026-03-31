@@ -176,9 +176,7 @@ pub fn is_unc_path_default(path: &[u8]) -> bool {
 /// Check if a path starts with a Windows drive letter (e.g., `C:`).
 /// Corresponds to C++ `IsWindowsDrive`.
 pub fn is_windows_drive(path: &[u8]) -> bool {
-    path.len() >= 2
-        && (path[0].is_ascii_alphabetic())
-        && path[1] == DRIVE_SEPARATOR
+    path.len() >= 2 && (path[0].is_ascii_alphabetic()) && path[1] == DRIVE_SEPARATOR
 }
 
 /// Check if a path is a Windows-style path.
@@ -220,9 +218,7 @@ pub fn is_path_relative(path: &[u8]) -> bool {
 pub fn is_current_directory(path: &[u8]) -> bool {
     !path.is_empty()
         && path[0] == DOT
-        && (path.len() == 1
-            || path[1] == NULL_TERMINATOR
-            || path[1] == DIRECTORY_SEPARATOR)
+        && (path.len() == 1 || path[1] == NULL_TERMINATOR || path[1] == DIRECTORY_SEPARATOR)
 }
 
 /// Check if a path component is the parent directory (`..` or `../`).
@@ -231,9 +227,7 @@ pub fn is_parent_directory(path: &[u8]) -> bool {
     path.len() >= 2
         && path[0] == DOT
         && path[1] == DOT
-        && (path.len() == 2
-            || path[2] == NULL_TERMINATOR
-            || path[2] == DIRECTORY_SEPARATOR)
+        && (path.len() == 2 || path[2] == NULL_TERMINATOR || path[2] == DIRECTORY_SEPARATOR)
 }
 
 /// Check if a path starts with current or parent directory.
@@ -281,8 +275,16 @@ pub fn is_sub_path(lhs: &[u8], rhs: &[u8]) -> bool {
     // Character-by-character comparison
     let mut i = 0;
     loop {
-        let l = if i < lhs.len() { lhs[i] } else { NULL_TERMINATOR };
-        let r = if i < rhs.len() { rhs[i] } else { NULL_TERMINATOR };
+        let l = if i < lhs.len() {
+            lhs[i]
+        } else {
+            NULL_TERMINATOR
+        };
+        let r = if i < rhs.len() {
+            rhs[i]
+        } else {
+            NULL_TERMINATOR
+        };
 
         if l == NULL_TERMINATOR {
             return r == DIRECTORY_SEPARATOR;
@@ -358,7 +360,8 @@ impl PathNormalizer {
                 && i + 2 < src.len()
                 && src[i] == DOT
                 && src[i + 1] == DOT
-                && (src[i + 2] == DIRECTORY_SEPARATOR || src[i + 2] == ALTERNATE_DIRECTORY_SEPARATOR)
+                && (src[i + 2] == DIRECTORY_SEPARATOR
+                    || src[i + 2] == ALTERNATE_DIRECTORY_SEPARATOR)
             {
                 dst[i - 1] = DIRECTORY_SEPARATOR;
                 dst[i] = DOT;
@@ -503,9 +506,7 @@ impl PathNormalizer {
         match state {
             PathState::Start => Err(RESULT_INVALID_PATH_FORMAT),
             PathState::Normal | PathState::FirstSeparator => Ok((true, len)),
-            PathState::Separator | PathState::CurrentDir | PathState::ParentDir => {
-                Ok((false, len))
-            }
+            PathState::Separator | PathState::CurrentDir | PathState::ParentDir => Ok((false, len)),
         }
     }
 
@@ -767,7 +768,10 @@ impl PathFormatter {
         };
 
         let mut mount_len: usize = 0;
-        while mount_len < max_mount_len && mount_len < path.len() && path[mount_len] != NULL_TERMINATOR {
+        while mount_len < max_mount_len
+            && mount_len < path.len()
+            && path[mount_len] != NULL_TERMINATOR
+        {
             let c = path[mount_len];
 
             if c == DRIVE_SEPARATOR {
@@ -783,10 +787,7 @@ impl PathFormatter {
         }
 
         // Check if we actually have a mount name
-        if mount_len <= 2
-            || mount_len > path.len()
-            || path[mount_len - 1] != DRIVE_SEPARATOR
-        {
+        if mount_len <= 2 || mount_len > path.len() || path[mount_len - 1] != DRIVE_SEPARATOR {
             return Ok((0, 0));
         }
 
@@ -879,10 +880,7 @@ impl PathFormatter {
 
         // Handle path start
         let mut cur_offset: usize = 0;
-        if has_mount_name
-            && !path.is_empty()
-            && path[0] == DIRECTORY_SEPARATOR
-        {
+        if has_mount_name && !path.is_empty() && path[0] == DIRECTORY_SEPARATOR {
             if path.len() >= 3
                 && path[1] == ALTERNATE_DIRECTORY_SEPARATOR
                 && path[2] == ALTERNATE_DIRECTORY_SEPARATOR
@@ -926,7 +924,12 @@ impl PathFormatter {
                 out.clear();
                 out.extend_from_slice(&cur_path[..win_path_len]);
                 out.push(NULL_TERMINATOR);
-                replace(out, win_path_len, ALTERNATE_DIRECTORY_SEPARATOR, DIRECTORY_SEPARATOR);
+                replace(
+                    out,
+                    win_path_len,
+                    ALTERNATE_DIRECTORY_SEPARATOR,
+                    DIRECTORY_SEPARATOR,
+                );
             }
 
             return Ok((cur_offset + win_path_len, win_path_len));
@@ -948,7 +951,12 @@ impl PathFormatter {
                 out.clear();
                 out.extend_from_slice(&cur_path[..dos_prefix_len]);
                 out.push(NULL_TERMINATOR);
-                replace(out, dos_prefix_len, DIRECTORY_SEPARATOR, ALTERNATE_DIRECTORY_SEPARATOR);
+                replace(
+                    out,
+                    dos_prefix_len,
+                    DIRECTORY_SEPARATOR,
+                    ALTERNATE_DIRECTORY_SEPARATOR,
+                );
             }
 
             return Ok((cur_offset + dos_prefix_len, dos_prefix_len));
@@ -1021,7 +1029,12 @@ impl PathFormatter {
                 out.clear();
                 out.extend_from_slice(&cur_path[..unc_prefix_len]);
                 out.push(NULL_TERMINATOR);
-                replace(out, unc_prefix_len, DIRECTORY_SEPARATOR, ALTERNATE_DIRECTORY_SEPARATOR);
+                replace(
+                    out,
+                    unc_prefix_len,
+                    DIRECTORY_SEPARATOR,
+                    ALTERNATE_DIRECTORY_SEPARATOR,
+                );
             }
 
             return Ok((cur_offset + unc_prefix_len, unc_prefix_len));
@@ -1034,10 +1047,7 @@ impl PathFormatter {
     /// Check whether a path is normalized according to the given flags.
     /// Returns (is_normalized, total_path_length).
     /// Corresponds to C++ `PathFormatter::IsNormalized`.
-    pub fn is_normalized(
-        path: &[u8],
-        flags: &PathFlags,
-    ) -> Result<(bool, usize), ResultCode> {
+    pub fn is_normalized(path: &[u8], flags: &PathFlags) -> Result<(bool, usize), ResultCode> {
         // Verify that the path is valid UTF-8
         check_utf8(path)?;
 
@@ -1308,7 +1318,12 @@ impl PathFormatter {
             let mut replaced = vec![0u8; src_len + 1];
             replaced[..src_len].copy_from_slice(&src[..src_len]);
             replaced[src_len] = NULL_TERMINATOR;
-            replace(&mut replaced, src_len, ALTERNATE_DIRECTORY_SEPARATOR, DIRECTORY_SEPARATOR);
+            replace(
+                &mut replaced,
+                src_len,
+                ALTERNATE_DIRECTORY_SEPARATOR,
+                DIRECTORY_SEPARATOR,
+            );
 
             let _dummy = PathNormalizer::normalize(
                 &mut dst[cur_pos..],

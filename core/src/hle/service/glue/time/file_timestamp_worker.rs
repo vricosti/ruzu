@@ -27,9 +27,7 @@ pub struct FileTimestampWorker {
 
 impl FileTimestampWorker {
     pub fn new() -> Self {
-        Self {
-            initialized: false,
-        }
+        Self { initialized: false }
     }
 
     /// Update the filesystem's POSIX time from the system clock.

@@ -85,15 +85,11 @@ impl BlitImageHelper {
             gl::ColorMaski(0, gl::TRUE, gl::TRUE, gl::TRUE, gl::TRUE);
             gl::DepthRangeIndexed(0, 0.0, 0.0);
 
-            program_manager.bind_present_programs(
-                self.full_screen_vert,
-                self.blit_color_to_color_frag,
-            );
+            program_manager
+                .bind_present_programs(self.full_screen_vert, self.blit_color_to_color_frag);
 
-            let scale_x = (src_region.end.x - src_region.start.x) as f32
-                / src_size.width as f32;
-            let scale_y = (src_region.end.y - src_region.start.y) as f32
-                / src_size.height as f32;
+            let scale_x = (src_region.end.x - src_region.start.x) as f32 / src_size.width as f32;
+            let scale_y = (src_region.end.y - src_region.start.y) as f32 / src_size.height as f32;
             gl::ProgramUniform2f(self.full_screen_vert, 0, scale_x, scale_y);
 
             let offset_x = src_region.start.x as f32 / src_size.width as f32;

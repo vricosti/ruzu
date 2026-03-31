@@ -76,14 +76,17 @@ impl KReadableEvent {
     }
 
     pub fn link_waiter(&mut self, process: &mut KProcess, thread_id: u64) {
-        self.sync_object
-            .link_waiter(process, crate::hle::kernel::k_synchronization_object::SynchronizationWaitNode {
+        self.sync_object.link_waiter(
+            process,
+            crate::hle::kernel::k_synchronization_object::SynchronizationWaitNode {
                 object_id: self.object_id,
-                handle: crate::hle::kernel::k_synchronization_object::SynchronizationWaitNodeHandle {
-                    thread_id,
-                    wait_index: 0,
-                },
-            });
+                handle:
+                    crate::hle::kernel::k_synchronization_object::SynchronizationWaitNodeHandle {
+                        thread_id,
+                        wait_index: 0,
+                    },
+            },
+        );
     }
 
     pub fn unlink_waiter(&mut self, process: &mut KProcess, thread_id: u64) {
@@ -142,7 +145,10 @@ mod tests {
         assert!(!event.is_signaled());
         let mut process = KProcess::new();
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
-        assert_eq!(event.signal(&mut process, &scheduler), RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            event.signal(&mut process, &scheduler),
+            RESULT_SUCCESS.get_inner_value()
+        );
         assert!(event.is_signaled());
         assert_eq!(event.clear(), RESULT_SUCCESS.get_inner_value());
         assert!(!event.is_signaled());

@@ -384,12 +384,15 @@ impl RoomMember {
         _token: &str,
     ) {
         log::warn!("RoomMember::join: ENet networking layer not ported; setting state to Error");
-        self.room_member_impl.set_error(RoomMemberError::CouldNotConnect);
+        self.room_member_impl
+            .set_error(RoomMemberError::CouldNotConnect);
     }
 
     /// Sends a proxy packet to the room.
     pub fn send_proxy_packet(&self, _packet: &ProxyPacket) {
-        log::warn!("RoomMember::send_proxy_packet: ENet networking layer not ported; packet dropped");
+        log::warn!(
+            "RoomMember::send_proxy_packet: ENet networking layer not ported; packet dropped"
+        );
     }
 
     /// Sends an LDN packet to the room.
@@ -399,7 +402,9 @@ impl RoomMember {
 
     /// Sends a chat message to the room.
     pub fn send_chat_message(&self, _message: &str) {
-        log::warn!("RoomMember::send_chat_message: ENet networking layer not ported; message dropped");
+        log::warn!(
+            "RoomMember::send_chat_message: ENet networking layer not ported; message dropped"
+        );
     }
 
     /// Sends the current game info to the room.
@@ -408,7 +413,9 @@ impl RoomMember {
         if !self.is_connected() {
             return;
         }
-        log::warn!("RoomMember::send_game_info: ENet networking layer not ported; game info not sent");
+        log::warn!(
+            "RoomMember::send_game_info: ENet networking layer not ported; game info not sent"
+        );
     }
 
     /// Sends a moderation request to the room.
@@ -430,7 +437,9 @@ impl RoomMember {
         if !self.is_connected() {
             return;
         }
-        log::warn!("RoomMember::request_ban_list: ENet networking layer not ported; request dropped");
+        log::warn!(
+            "RoomMember::request_ban_list: ENet networking layer not ported; request dropped"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -535,8 +544,7 @@ impl RoomMember {
 
     /// Leaves the current room.
     pub fn leave(&self) {
-        self.room_member_impl
-            .set_state(RoomMemberState::Idle);
+        self.room_member_impl.set_state(RoomMemberState::Idle);
         // NOTE: loop_thread join and enet_host_destroy not ported.
     }
 }

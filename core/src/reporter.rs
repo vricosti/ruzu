@@ -78,7 +78,11 @@ fn get_path(report_type: &str, title_id: u64, timestamp: &str) -> PathBuf {
 fn save_to_file(json: &serde_json::Value, filename: &PathBuf) {
     if let Some(parent) = filename.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            log::error!("Failed to create path for '{}' to save report: {}", filename.display(), e);
+            log::error!(
+                "Failed to create path for '{}' to save report: {}",
+                filename.display(),
+                e
+            );
             return;
         }
     }
@@ -91,7 +95,11 @@ fn save_to_file(json: &serde_json::Value, filename: &PathBuf) {
             }
         }
         Err(e) => {
-            log::error!("Failed to create report file '{}': {}", filename.display(), e);
+            log::error!(
+                "Failed to create report file '{}': {}",
+                filename.display(),
+                e
+            );
         }
     }
 }
@@ -209,8 +217,15 @@ impl Reporter {
         out["yuzu_version"] = get_ruzu_version_data();
         out["report_common"] = get_report_common_data(title_id, result, &timestamp, None);
 
-        let mut proc_out =
-            get_processor_state_data(arch, entry_point, sp, pc, pstate, registers, Some(backtrace));
+        let mut proc_out = get_processor_state_data(
+            arch,
+            entry_point,
+            sp,
+            pc,
+            pstate,
+            registers,
+            Some(backtrace),
+        );
         proc_out["set_flags"] = serde_json::Value::String(format!("{:016X}", set_flags));
         proc_out["afsr0"] = serde_json::Value::String(format!("{:016X}", afsr0));
         proc_out["afsr1"] = serde_json::Value::String(format!("{:016X}", afsr1));
@@ -322,12 +337,10 @@ impl Reporter {
         let data_out: Vec<String> = data.iter().map(|d| hex::encode(d)).collect();
 
         if let Some(pid) = process_id {
-            out["play_report_process_id"] =
-                serde_json::Value::String(format!("{:016X}", pid));
+            out["play_report_process_id"] = serde_json::Value::String(format!("{:016X}", pid));
         }
 
-        out["play_report_type"] =
-            serde_json::Value::String(format!("{:02}", report_type as u8));
+        out["play_report_type"] = serde_json::Value::String(format!("{:02}", report_type as u8));
         out["play_report_data"] = serde_json::to_value(data_out).unwrap_or_default();
 
         save_to_file(&out, &get_path("play_report", title_id, &timestamp));
@@ -396,10 +409,7 @@ impl Reporter {
             "service_name": service_name,
         });
 
-        save_to_file(
-            &out,
-            &get_path("unimpl_func_report", title_id, &timestamp),
-        );
+        save_to_file(&out, &get_path("unimpl_func_report", title_id, &timestamp));
     }
 
     /// Save a user-initiated debug report.

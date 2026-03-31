@@ -601,7 +601,13 @@ impl OpusDecoder {
             .map(|data| data.to_vec())
             .unwrap_or_default();
         let mut output = vec![0; output_data_size];
-        let decode_start_time = system.lock().core_timing().lock().unwrap().get_global_time_us().as_micros() as u64;
+        let decode_start_time = system
+            .lock()
+            .core_timing()
+            .lock()
+            .unwrap()
+            .get_global_time_us()
+            .as_micros() as u64;
 
         let mut decoded_samples = 0;
         let mut time_taken = 0;
@@ -653,7 +659,13 @@ impl OpusDecoder {
         };
 
         let mut shared = binding.lock();
-        let decode_end_time = system.lock().core_timing().lock().unwrap().get_global_time_us().as_micros() as u64;
+        let decode_end_time = system
+            .lock()
+            .core_timing()
+            .lock()
+            .unwrap()
+            .get_global_time_us()
+            .as_micros() as u64;
         let core_timing_time_taken = decode_end_time.saturating_sub(decode_start_time);
         if core_timing_time_taken != 0 {
             time_taken = core_timing_time_taken;

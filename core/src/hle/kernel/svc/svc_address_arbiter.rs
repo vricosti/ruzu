@@ -66,7 +66,10 @@ pub fn wait_for_address(
 ) -> ResultCode {
     log::trace!(
         "svc::WaitForAddress called, address=0x{:X}, arb_type={:?}, value=0x{:X}, timeout_ns={}",
-        address, arb_type, value, timeout_ns
+        address,
+        arb_type,
+        value,
+        timeout_ns
     );
 
     // Validate input.
@@ -91,7 +94,11 @@ pub fn wait_for_address(
                 .map(|ht| ht.lock().unwrap().get_tick())
                 .unwrap_or(0);
             let t = hardware_tick + offset_tick + 2;
-            if t <= 0 { i64::MAX } else { t }
+            if t <= 0 {
+                i64::MAX
+            } else {
+                t
+            }
         } else {
             i64::MAX
         }
@@ -117,7 +124,10 @@ pub fn signal_to_address(
 ) -> ResultCode {
     log::trace!(
         "svc::SignalToAddress called, address=0x{:X}, signal_type={:?}, value=0x{:X}, count=0x{:X}",
-        address, signal_type, value, count
+        address,
+        signal_type,
+        value,
+        count
     );
 
     // Validate input.

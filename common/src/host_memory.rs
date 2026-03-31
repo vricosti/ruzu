@@ -78,7 +78,10 @@ impl HostMemoryImpl {
             );
             if backing_base == libc::MAP_FAILED {
                 libc::close(fd);
-                return Err(format!("mmap backing failed: {}", std::io::Error::last_os_error()));
+                return Err(format!(
+                    "mmap backing failed: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
 
             // Map virtual address space
@@ -166,10 +169,8 @@ impl HostMemoryImpl {
         }
 
         // Merge with adjacent placeholder mappings
-        let (merged_pointer, merged_size) = unsafe {
-            self.free_manager
-                .free_block(self.virtual_base.add(vo), len)
-        };
+        let (merged_pointer, merged_size) =
+            unsafe { self.free_manager.free_block(self.virtual_base.add(vo), len) };
 
         unsafe {
             let ret = libc::mmap(
@@ -184,7 +185,14 @@ impl HostMemoryImpl {
         }
     }
 
-    fn protect(&self, virtual_offset: usize, length: usize, read: bool, write: bool, _execute: bool) {
+    fn protect(
+        &self,
+        virtual_offset: usize,
+        length: usize,
+        read: bool,
+        write: bool,
+        _execute: bool,
+    ) {
         let (mut vo, mut len) = (virtual_offset, length);
         self.adjust_map(&mut vo, &mut len);
         if len == 0 {
@@ -200,11 +208,7 @@ impl HostMemoryImpl {
         }
 
         unsafe {
-            let ret = libc::mprotect(
-                self.virtual_base.add(vo) as *mut libc::c_void,
-                len,
-                flags,
-            );
+            let ret = libc::mprotect(self.virtual_base.add(vo) as *mut libc::c_void, len, flags);
             assert!(ret == 0, "mprotect failed");
         }
     }
@@ -249,8 +253,13 @@ impl HostMemoryImpl {
 impl Drop for HostMemoryImpl {
     fn drop(&mut self) {
         unsafe {
-            if self.virtual_map_base != libc::MAP_FAILED as *mut u8 && !self.virtual_map_base.is_null() {
-                libc::munmap(self.virtual_map_base as *mut libc::c_void, self.virtual_size);
+            if self.virtual_map_base != libc::MAP_FAILED as *mut u8
+                && !self.virtual_map_base.is_null()
+            {
+                libc::munmap(
+                    self.virtual_map_base as *mut libc::c_void,
+                    self.virtual_size,
+                );
             }
             if self.backing_base != libc::MAP_FAILED as *mut u8 && !self.backing_base.is_null() {
                 libc::munmap(self.backing_base as *mut libc::c_void, self.backing_size);
@@ -294,7 +303,8 @@ impl HostMemory {
 
                     if !virtual_base.is_null() {
                         // Ensure virtual base is aligned to HUGE_PAGE_SIZE
-                        let aligned = align_up(virtual_base as u64, HUGE_PAGE_SIZE as u64) as *mut u8;
+                        let aligned =
+                            align_up(virtual_base as u64, HUGE_PAGE_SIZE as u64) as *mut u8;
                         virtual_base_offset = aligned as usize - virtual_base as usize;
                         virtual_base = aligned;
                     }
@@ -310,10 +320,7 @@ impl HostMemory {
                     };
                 }
                 Err(e) => {
-                    error!(
-                        "Fastmem unavailable ({}), falling back to VirtualBuffer",
-                        e
-                    );
+                    error!("Fastmem unavailable ({}), falling back to VirtualBuffer", e);
                 }
             }
         }

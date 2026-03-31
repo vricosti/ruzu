@@ -13,8 +13,8 @@
 //! `CreateSharedContext` returns a `DummyContext`, mirroring the Vulkan
 //! variant, since there is no real graphics context to share.
 
-use std::ffi::CStr;
 use sdl2::sys as sdl;
+use std::ffi::CStr;
 
 use super::emu_window_sdl2::{DummyContext, EmuWindowSdl2};
 

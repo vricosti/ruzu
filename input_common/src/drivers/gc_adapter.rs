@@ -7,8 +7,8 @@
 
 use common::input::{ButtonNames, DriverResult, VibrationStatus};
 use common::param_package::ParamPackage;
-use common::settings_input::native_button;
 use common::settings_input::native_analog;
+use common::settings_input::native_button;
 use common::uuid::UUID;
 
 use crate::input_engine::{InputEngine, PadIdentifier};
@@ -333,20 +333,14 @@ impl GCAdapter {
 
         for (i, &button) in B1_BUTTONS.iter().enumerate() {
             let button_status = (b1 & (1u8 << i)) != 0;
-            self.engine.set_button(
-                &self.pads[port].identifier,
-                button as i32,
-                button_status,
-            );
+            self.engine
+                .set_button(&self.pads[port].identifier, button as i32, button_status);
         }
 
         for (j, &button) in B2_BUTTONS.iter().enumerate() {
             let button_status = (b2 & (1u8 << j)) != 0;
-            self.engine.set_button(
-                &self.pads[port].identifier,
-                button as i32,
-                button_status,
-            );
+            self.engine
+                .set_button(&self.pads[port].identifier, button as i32, button_status);
         }
     }
 
@@ -378,11 +372,8 @@ impl GCAdapter {
             }
             let axis_status =
                 (axis_value as f32 - self.pads[port].axis_origin[index] as f32) / 100.0;
-            self.engine.set_axis(
-                &self.pads[port].identifier,
-                index as i32,
-                axis_status,
-            );
+            self.engine
+                .set_axis(&self.pads[port].identifier, index as i32, axis_status);
         }
     }
 
@@ -404,9 +395,7 @@ impl GCAdapter {
 
     /// Port of GCAdapter::IsPayloadCorrect
     fn is_payload_correct(&mut self, adapter_payload: &AdapterPayload, payload_size: i32) -> bool {
-        if payload_size != adapter_payload.len() as i32
-            || adapter_payload[0] != LIBUSB_DT_HID
-        {
+        if payload_size != adapter_payload.len() as i32 || adapter_payload[0] != LIBUSB_DT_HID {
             log::debug!(
                 "Error reading payload (size: {}, type: {:02x})",
                 payload_size,

@@ -253,10 +253,38 @@ pub enum DebugThreadParam {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardwareBreakPointRegisterName {
-    I0 = 0, I1 = 1, I2 = 2, I3 = 3, I4 = 4, I5 = 5, I6 = 6, I7 = 7,
-    I8 = 8, I9 = 9, I10 = 10, I11 = 11, I12 = 12, I13 = 13, I14 = 14, I15 = 15,
-    D0 = 16, D1 = 17, D2 = 18, D3 = 19, D4 = 20, D5 = 21, D6 = 22, D7 = 23,
-    D8 = 24, D9 = 25, D10 = 26, D11 = 27, D12 = 28, D13 = 29, D14 = 30, D15 = 31,
+    I0 = 0,
+    I1 = 1,
+    I2 = 2,
+    I3 = 3,
+    I4 = 4,
+    I5 = 5,
+    I6 = 6,
+    I7 = 7,
+    I8 = 8,
+    I9 = 9,
+    I10 = 10,
+    I11 = 11,
+    I12 = 12,
+    I13 = 13,
+    I14 = 14,
+    I15 = 15,
+    D0 = 16,
+    D1 = 17,
+    D2 = 18,
+    D3 = 19,
+    D4 = 20,
+    D5 = 21,
+    D6 = 22,
+    D7 = 23,
+    D8 = 24,
+    D9 = 25,
+    D10 = 26,
+    D11 = 27,
+    D12 = 28,
+    D13 = 29,
+    D14 = 30,
+    D15 = 31,
 }
 
 /// Limitable resource types.
@@ -336,13 +364,45 @@ pub enum InterruptType {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceName {
-    Afi = 0, Avpc = 1, Dc = 2, Dcb = 3, Hc = 4, Hda = 5, Isp2 = 6,
-    MsencNvenc = 7, Nv = 8, Nv2 = 9, Ppcs = 10, Sata = 11, Vi = 12, Vic = 13,
-    XusbHost = 14, XusbDev = 15, Tsec = 16, Ppcs1 = 17, Dc1 = 18,
-    Sdmmc1a = 19, Sdmmc2a = 20, Sdmmc3a = 21, Sdmmc4a = 22, Isp2b = 23,
-    Gpu = 24, Gpub = 25, Ppcs2 = 26, Nvdec = 27, Ape = 28, Se = 29,
-    Nvjpg = 30, Hc1 = 31, Se1 = 32, Axiap = 33, Etr = 34, Tsecb = 35,
-    Tsec1 = 36, Tsecb1 = 37, Nvdec1 = 38,
+    Afi = 0,
+    Avpc = 1,
+    Dc = 2,
+    Dcb = 3,
+    Hc = 4,
+    Hda = 5,
+    Isp2 = 6,
+    MsencNvenc = 7,
+    Nv = 8,
+    Nv2 = 9,
+    Ppcs = 10,
+    Sata = 11,
+    Vi = 12,
+    Vic = 13,
+    XusbHost = 14,
+    XusbDev = 15,
+    Tsec = 16,
+    Ppcs1 = 17,
+    Dc1 = 18,
+    Sdmmc1a = 19,
+    Sdmmc2a = 20,
+    Sdmmc3a = 21,
+    Sdmmc4a = 22,
+    Isp2b = 23,
+    Gpu = 24,
+    Gpub = 25,
+    Ppcs2 = 26,
+    Nvdec = 27,
+    Ape = 28,
+    Se = 29,
+    Nvjpg = 30,
+    Hc1 = 31,
+    Se1 = 32,
+    Axiap = 33,
+    Etr = 34,
+    Tsecb = 35,
+    Tsec1 = 36,
+    Tsecb1 = 37,
+    Nvdec1 = 38,
 }
 
 /// System info type for GetSystemInfo.
@@ -389,8 +449,8 @@ pub enum ProcessActivity {
 pub struct MemoryInfo {
     pub base_address: u64,
     pub size: u64,
-    pub state: u32,     // MemoryState
-    pub attribute: u32, // MemoryAttribute
+    pub state: u32,      // MemoryState
+    pub attribute: u32,  // MemoryAttribute
     pub permission: u32, // MemoryPermission
     pub ipc_count: u32,
     pub device_count: u32,

@@ -99,7 +99,12 @@ impl<T> KDynamicSlabHeap<T> {
             let used = self.used.fetch_add(1, Ordering::Relaxed) + 1;
             let mut peak = self.peak.load(Ordering::Relaxed);
             while peak < used {
-                match self.peak.compare_exchange_weak(peak, used, Ordering::Relaxed, Ordering::Relaxed) {
+                match self.peak.compare_exchange_weak(
+                    peak,
+                    used,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => break,
                     Err(actual) => peak = actual,
                 }

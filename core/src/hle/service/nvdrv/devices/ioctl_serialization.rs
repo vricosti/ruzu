@@ -27,11 +27,7 @@ where
     if copy_in > 0 {
         // Safety: T is Copy and repr(C), we copy raw bytes
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                input.as_ptr(),
-                &mut fixed as *mut T as *mut u8,
-                copy_in,
-            );
+            std::ptr::copy_nonoverlapping(input.as_ptr(), &mut fixed as *mut T as *mut u8, copy_in);
         }
     }
 
@@ -113,11 +109,7 @@ where
     let copy_in = fixed_size.min(input.len());
     if copy_in > 0 {
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                input.as_ptr(),
-                &mut fixed as *mut T as *mut u8,
-                copy_in,
-            );
+            std::ptr::copy_nonoverlapping(input.as_ptr(), &mut fixed as *mut T as *mut u8, copy_in);
         }
     }
 
@@ -241,11 +233,7 @@ where
     let copy_in = fixed_size.min(input.len());
     if copy_in > 0 {
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                input.as_ptr(),
-                &mut fixed as *mut T as *mut u8,
-                copy_in,
-            );
+            std::ptr::copy_nonoverlapping(input.as_ptr(), &mut fixed as *mut T as *mut u8, copy_in);
         }
     }
 

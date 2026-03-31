@@ -33,7 +33,11 @@ impl UniquePad {
     ///   header.last_entry_index = 0
     ///
     /// Note: upstream does NOT lock shared_mutex for UniquePad (unlike other controllers).
-    pub fn on_update(&mut self, shared_memory: &mut UniquePadSharedMemoryFormat, timestamp_ns: i64) {
+    pub fn on_update(
+        &mut self,
+        shared_memory: &mut UniquePadSharedMemoryFormat,
+        timestamp_ns: i64,
+    ) {
         shared_memory.header.timestamp = timestamp_ns;
         shared_memory.header.total_entry_count = 17;
         shared_memory.header.entry_count = 0;

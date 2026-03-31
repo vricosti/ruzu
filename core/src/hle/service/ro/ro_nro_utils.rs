@@ -6,12 +6,12 @@
 //!
 //! NRO memory mapping utility functions.
 
+use super::ro_results;
 use crate::hle::kernel::k_memory_block::PAGE_SIZE;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
 use crate::hle::kernel::svc::svc_types::MemoryPermission;
 use crate::hle::result::ResultCode;
-use super::ro_results;
 
 /// A region of process memory to be mapped.
 ///
@@ -125,7 +125,9 @@ fn ensure_guard_pages(
     }
 
     // Ensure page after mapping is unmapped.
-    let info_after = process.page_table.query_info((map_address + map_size) as usize);
+    let info_after = process
+        .page_table
+        .query_info((map_address + map_size) as usize);
     match info_after {
         Some(info) if info.get_svc_state() == SvcMemoryState::Free as u32 => {}
         _ => {
@@ -146,8 +148,7 @@ fn map_process_code_memory(
 ) -> Result<u64, ResultCode> {
     let alias_code_start =
         process.page_table.get_alias_code_region_start().get() / PAGE_SIZE as u64;
-    let alias_code_size =
-        process.page_table.get_alias_code_region_size() as u64 / PAGE_SIZE as u64;
+    let alias_code_size = process.page_table.get_alias_code_region_size() as u64 / PAGE_SIZE as u64;
 
     for _trial in 0..64 {
         // Generate a new trial address.
@@ -166,11 +167,7 @@ fn map_process_code_memory(
                 if result != 0 {
                     // Unmap what we've mapped so far (regions 0..i).
                     if i > 0 {
-                        let _ = unmap_process_code_memory(
-                            process,
-                            mapped_address,
-                            &regions[..i],
-                        );
+                        let _ = unmap_process_code_memory(process, mapped_address, &regions[..i]);
                     }
                     return Err(ResultCode::new(result));
                 }

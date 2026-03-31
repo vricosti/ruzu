@@ -93,9 +93,7 @@ impl<V: Copy + PartialEq> RangeMap<V> {
     /// Find the entry with the largest key <= address.
     fn get_first_element_before_or_on(&self, address: i64) -> Option<(&i64, &V)> {
         // range ..=address gives all keys <= address, we want the last one
-        self.container
-            .range(..=address)
-            .next_back()
+        self.container.range(..=address).next_back()
     }
 
     fn get_first_value_within(&self, address: i64) -> V {
@@ -107,7 +105,12 @@ impl<V: Copy + PartialEq> RangeMap<V> {
                 if let Some((_, &val)) = self.container.range(..address).next_back() {
                     return val;
                 }
-                return self.container.range(address..).next().map(|(_, &v)| v).unwrap_or(self.null_value);
+                return self
+                    .container
+                    .range(address..)
+                    .next()
+                    .map(|(_, &v)| v)
+                    .unwrap_or(self.null_value);
             }
         }
         // Get the entry just before address
@@ -115,7 +118,11 @@ impl<V: Copy + PartialEq> RangeMap<V> {
             Some((_, &val)) => val,
             None => {
                 // If begin, return begin's value
-                self.container.values().next().copied().unwrap_or(self.null_value)
+                self.container
+                    .values()
+                    .next()
+                    .copied()
+                    .unwrap_or(self.null_value)
             }
         }
     }
@@ -127,7 +134,11 @@ impl<V: Copy + PartialEq> RangeMap<V> {
             Some((_, &val)) => val,
             None => {
                 // Would be a bug per C++ comment
-                self.container.values().next().copied().unwrap_or(self.null_value)
+                self.container
+                    .values()
+                    .next()
+                    .copied()
+                    .unwrap_or(self.null_value)
             }
         }
     }

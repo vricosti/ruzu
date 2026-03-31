@@ -38,7 +38,10 @@ pub struct Condition {
 
 impl Condition {
     pub fn always() -> Self {
-        Self { pred: 7, negated: false }
+        Self {
+            pred: 7,
+            negated: false,
+        }
     }
 
     pub fn is_always(&self) -> bool {

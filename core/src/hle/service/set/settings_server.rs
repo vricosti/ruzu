@@ -8,15 +8,15 @@
 
 use std::collections::BTreeMap;
 
-use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::key_code_map::*;
 use super::settings_types::{
     KeyboardLayout, Language, LanguageCode, SystemRegionCode, AVAILABLE_LANGUAGE_CODES,
     LANGUAGE_TO_LAYOUT,
 };
+use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Constants matching upstream settings_server.cpp.
 const PRE_4_0_0_MAX_ENTRIES: usize = 0xF;
@@ -49,7 +49,10 @@ fn copy_key_code_map(src: &[u8]) -> KeyCodeMap {
 /// Internal key code map lookup by keyboard layout and language code.
 ///
 /// Corresponds to `GetKeyCodeMapImpl` in upstream settings_server.cpp.
-fn get_key_code_map_impl(keyboard_layout: KeyboardLayout, language_code: LanguageCode) -> KeyCodeMap {
+fn get_key_code_map_impl(
+    keyboard_layout: KeyboardLayout,
+    language_code: LanguageCode,
+) -> KeyCodeMap {
     let src = match keyboard_layout {
         KeyboardLayout::Japanese => KEY_CODE_MAP_JAPANESE,
         KeyboardLayout::EnglishUs => {
@@ -117,18 +120,66 @@ pub struct ISettingsServer {
 impl ISettingsServer {
     fn build_handlers() -> BTreeMap<u32, FunctionInfo> {
         build_handler_map(&[
-            (commands::GET_LANGUAGE_CODE, Some(Self::get_language_code_handler), "GetLanguageCode"),
-            (commands::GET_AVAILABLE_LANGUAGE_CODES, Some(Self::get_available_language_codes_handler), "GetAvailableLanguageCodes"),
-            (commands::MAKE_LANGUAGE_CODE, Some(Self::make_language_code_handler), "MakeLanguageCode"),
-            (commands::GET_AVAILABLE_LANGUAGE_CODE_COUNT, Some(Self::get_available_language_code_count_handler), "GetAvailableLanguageCodeCount"),
-            (commands::GET_REGION_CODE, Some(Self::get_region_code_handler), "GetRegionCode"),
-            (commands::GET_AVAILABLE_LANGUAGE_CODES2, Some(Self::get_available_language_codes2_handler), "GetAvailableLanguageCodes2"),
-            (commands::GET_AVAILABLE_LANGUAGE_CODE_COUNT2, Some(Self::get_available_language_code_count2_handler), "GetAvailableLanguageCodeCount2"),
-            (commands::GET_KEY_CODE_MAP, Some(Self::get_key_code_map_handler), "GetKeyCodeMap"),
-            (commands::GET_QUEST_FLAG, Some(Self::get_quest_flag_handler), "GetQuestFlag"),
-            (commands::GET_KEY_CODE_MAP2, Some(Self::get_key_code_map2_handler), "GetKeyCodeMap2"),
-            (commands::GET_FIRMWARE_VERSION_FOR_DEBUG, None, "GetFirmwareVersionForDebug"),
-            (commands::GET_DEVICE_NICK_NAME, Some(Self::get_device_nick_name_handler), "GetDeviceNickName"),
+            (
+                commands::GET_LANGUAGE_CODE,
+                Some(Self::get_language_code_handler),
+                "GetLanguageCode",
+            ),
+            (
+                commands::GET_AVAILABLE_LANGUAGE_CODES,
+                Some(Self::get_available_language_codes_handler),
+                "GetAvailableLanguageCodes",
+            ),
+            (
+                commands::MAKE_LANGUAGE_CODE,
+                Some(Self::make_language_code_handler),
+                "MakeLanguageCode",
+            ),
+            (
+                commands::GET_AVAILABLE_LANGUAGE_CODE_COUNT,
+                Some(Self::get_available_language_code_count_handler),
+                "GetAvailableLanguageCodeCount",
+            ),
+            (
+                commands::GET_REGION_CODE,
+                Some(Self::get_region_code_handler),
+                "GetRegionCode",
+            ),
+            (
+                commands::GET_AVAILABLE_LANGUAGE_CODES2,
+                Some(Self::get_available_language_codes2_handler),
+                "GetAvailableLanguageCodes2",
+            ),
+            (
+                commands::GET_AVAILABLE_LANGUAGE_CODE_COUNT2,
+                Some(Self::get_available_language_code_count2_handler),
+                "GetAvailableLanguageCodeCount2",
+            ),
+            (
+                commands::GET_KEY_CODE_MAP,
+                Some(Self::get_key_code_map_handler),
+                "GetKeyCodeMap",
+            ),
+            (
+                commands::GET_QUEST_FLAG,
+                Some(Self::get_quest_flag_handler),
+                "GetQuestFlag",
+            ),
+            (
+                commands::GET_KEY_CODE_MAP2,
+                Some(Self::get_key_code_map2_handler),
+                "GetKeyCodeMap2",
+            ),
+            (
+                commands::GET_FIRMWARE_VERSION_FOR_DEBUG,
+                None,
+                "GetFirmwareVersionForDebug",
+            ),
+            (
+                commands::GET_DEVICE_NICK_NAME,
+                Some(Self::get_device_nick_name_handler),
+                "GetDeviceNickName",
+            ),
         ])
     }
 
@@ -285,12 +336,18 @@ impl ISettingsServer {
         rb.push_u64(code as u64);
     }
 
-    fn get_available_language_codes_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_available_language_codes_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
         let max_entries = ctx.get_write_buffer_size(0) / std::mem::size_of::<LanguageCode>();
         let (count, codes) = service.get_available_language_codes(max_entries);
 
-        let bytes: Vec<u8> = codes.iter().flat_map(|c| (*c as u64).to_le_bytes()).collect();
+        let bytes: Vec<u8> = codes
+            .iter()
+            .flat_map(|c| (*c as u64).to_le_bytes())
+            .collect();
         ctx.write_buffer(&bytes, 0);
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -316,7 +373,10 @@ impl ISettingsServer {
         }
     }
 
-    fn get_available_language_code_count_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_available_language_code_count_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
         let count = service.get_available_language_code_count();
 
@@ -334,12 +394,18 @@ impl ISettingsServer {
         rb.push_u32(region as u32);
     }
 
-    fn get_available_language_codes2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_available_language_codes2_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
         let max_entries = ctx.get_write_buffer_size(0) / std::mem::size_of::<LanguageCode>();
         let (count, codes) = service.get_available_language_codes2(max_entries);
 
-        let bytes: Vec<u8> = codes.iter().flat_map(|c| (*c as u64).to_le_bytes()).collect();
+        let bytes: Vec<u8> = codes
+            .iter()
+            .flat_map(|c| (*c as u64).to_le_bytes())
+            .collect();
         ctx.write_buffer(&bytes, 0);
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -347,7 +413,10 @@ impl ISettingsServer {
         rb.push_i32(count);
     }
 
-    fn get_available_language_code_count2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_available_language_code_count2_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
         let count = service.get_available_language_code_count2();
 

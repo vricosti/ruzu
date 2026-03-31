@@ -5,10 +5,10 @@
 //!
 //! TickBasedSteadyClockCore: a steady clock driven by CoreTiming ticks.
 
+use super::steady_clock_core::{SteadyClockCoreImpl, SteadyClockCoreState};
 use crate::hle::result::ResultCode;
 use crate::hle::service::psc::time::common::{ClockSourceId, SteadyClockTimePoint};
 use crate::hle::service::psc::time::errors::RESULT_NOT_IMPLEMENTED;
-use super::steady_clock_core::{SteadyClockCoreImpl, SteadyClockCoreState};
 
 /// TickBasedSteadyClockCore uses CoreTiming ticks to derive the current time.
 ///

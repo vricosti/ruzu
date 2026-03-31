@@ -182,6 +182,9 @@ impl BufferQueueCoreInner {
         // In upstream this waits on is_allocating_condition while is_allocating is true.
         // Since we hold the mutex via MutexGuard, this would need to use the outer
         // Condvar. For now we just assert we are not allocating.
-        assert!(!self.is_allocating, "BufferQueueCore: unexpected allocation in progress");
+        assert!(
+            !self.is_allocating,
+            "BufferQueueCore: unexpected allocation in progress"
+        );
     }
 }

@@ -74,10 +74,7 @@ impl SdmcFactory {
         if title_id == 0 || (title_id & 0xFFF) == 0x800 {
             return None;
         }
-        get_or_create_directory_relative(
-            self.sd_mod_dir.as_ref(),
-            &format!("/{:016X}", title_id),
-        )
+        get_or_create_directory_relative(self.sd_mod_dir.as_ref(), &format!("/{:016X}", title_id))
     }
 
     /// Get the SD card content directory.

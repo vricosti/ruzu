@@ -188,14 +188,16 @@ mod tests {
         // At sector 0, the Nintendo big-endian tweak matches the IEEE little-endian
         // tweak (both are all zeros), so this verifies the core XTS cipher logic.
         let key: Key256 = [0u8; 32];
-        let expected_ciphertext = hex::decode(
-            "917cf69ebd68b2ec9b9fe9a3eadda692cd43d2f59598ed858c02c2652fbf922e",
-        )
-        .unwrap();
+        let expected_ciphertext =
+            hex::decode("917cf69ebd68b2ec9b9fe9a3eadda692cd43d2f59598ed858c02c2652fbf922e")
+                .unwrap();
 
         let mut data = vec![0u8; 32];
         encrypt_aes_xts(&key, 0, 32, &mut data);
-        assert_eq!(data, expected_ciphertext, "encrypt mismatch vs IEEE vector 0");
+        assert_eq!(
+            data, expected_ciphertext,
+            "encrypt mismatch vs IEEE vector 0"
+        );
 
         decrypt_aes_xts(&key, 0, 32, &mut data);
         assert_eq!(data, vec![0u8; 32], "decrypt mismatch vs IEEE vector 0");
@@ -215,12 +217,7 @@ mod tests {
         }
     }
 
-    fn encrypt_xts_sector(
-        data_key: &Aes128,
-        tweak_key: &Aes128,
-        sector_num: u64,
-        data: &mut [u8],
-    ) {
+    fn encrypt_xts_sector(data_key: &Aes128, tweak_key: &Aes128, sector_num: u64, data: &mut [u8]) {
         let num_blocks = data.len() / AES_BLOCK_SIZE;
         if num_blocks == 0 {
             return;

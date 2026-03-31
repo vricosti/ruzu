@@ -24,6 +24,7 @@ pub mod commands {
 ///
 /// Corresponds to `IParentalControlServiceFactory` in upstream.
 pub struct IParentalControlServiceFactory {
+    system: crate::core::SystemRef,
     name: String,
     capability: super::pctl_types::Capability,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -31,7 +32,11 @@ pub struct IParentalControlServiceFactory {
 }
 
 impl IParentalControlServiceFactory {
-    pub fn new(name: &str, capability: super::pctl_types::Capability) -> Self {
+    pub fn new(
+        system: crate::core::SystemRef,
+        name: &str,
+        capability: super::pctl_types::Capability,
+    ) -> Self {
         let handlers = build_handler_map(&[
             (
                 commands::CREATE_SERVICE,
@@ -45,6 +50,7 @@ impl IParentalControlServiceFactory {
             ),
         ]);
         Self {
+            system,
             name: name.to_string(),
             capability,
             handlers,
@@ -56,11 +62,12 @@ impl IParentalControlServiceFactory {
         let factory = unsafe {
             &*(this as *const dyn ServiceFramework as *const IParentalControlServiceFactory)
         };
-        let service: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
-            Arc::new(super::parental_control_service::IParentalControlService::new(
-                crate::core::SystemRef::null(),
+        let service: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> = Arc::new(
+            super::parental_control_service::IParentalControlService::new(
+                factory.system,
                 factory.capability,
-            ));
+            ),
+        );
 
         // Use the same domain/non-domain dispatch pattern as IApplicationProxy.
         let is_domain = ctx

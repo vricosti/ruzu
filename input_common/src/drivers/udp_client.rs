@@ -218,10 +218,7 @@ impl UdpClient {
                 let pad_identifier = self.get_pad_identifier(pad_index);
                 let mut identifier = ParamPackage::default();
                 identifier.set_str("engine", self.engine.get_engine_name().to_string());
-                identifier.set_str(
-                    "display",
-                    format!("UDP Controller {}", pad_identifier.pad),
-                );
+                identifier.set_str("display", format!("UDP Controller {}", pad_identifier.pad));
                 identifier.set_str("guid", pad_identifier.guid.raw_string());
                 identifier.set_int("port", pad_identifier.port as i32);
                 identifier.set_int("pad", pad_identifier.pad as i32);
@@ -256,10 +253,7 @@ impl UdpClient {
             (native_button::Values::LStick, PadButton::L3),
             (native_button::Values::RStick, PadButton::R3),
             (native_button::Values::Home, PadButton::Home),
-            (
-                native_button::Values::Screenshot,
-                PadButton::TouchHardPress,
-            ),
+            (native_button::Values::Screenshot, PadButton::TouchHardPress),
         ];
 
         if !params.has("guid") || !params.has("port") || !params.has("pad") {
@@ -328,10 +322,7 @@ impl UdpClient {
         right_motion_params.set_int("pad", params.get_int("pad", 0));
         right_motion_params.set_int("motion", 0);
 
-        mapping.insert(
-            native_motion::Values::MotionLeft as i32,
-            left_motion_params,
-        );
+        mapping.insert(native_motion::Values::MotionLeft as i32, left_motion_params);
         mapping.insert(
             native_motion::Values::MotionRight as i32,
             right_motion_params,
@@ -427,13 +418,8 @@ impl UdpClient {
         if parts.len() == 4 {
             let ip_val: u32 = parts
                 .iter()
-                .fold(0u32, |acc, p| {
-                    (acc << 8) | p.parse::<u32>().unwrap_or(0)
-                });
-            let hex_host = format!(
-                "00000000-0000-0000-0000-0000{:06x}",
-                ip_val
-            );
+                .fold(0u32, |acc, p| (acc << 8) | p.parse::<u32>().unwrap_or(0));
+            let hex_host = format!("00000000-0000-0000-0000-0000{:06x}", ip_val);
             UUID::from_string(&hex_host)
         } else {
             UUID::default()

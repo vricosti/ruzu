@@ -89,7 +89,8 @@ impl RealVfsFilesystem {
         parent_path: Option<String>,
         perms: OpenMode,
     ) -> Option<VirtualFile> {
-        let sanitized = path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
+        let sanitized =
+            path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
 
         // Check cache
         {
@@ -175,7 +176,8 @@ impl VfsFilesystem for RealVfsFilesystem {
     }
 
     fn get_entry_type(&self, path: &str) -> VfsEntryType {
-        let sanitized = path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
+        let sanitized =
+            path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
         let p = Path::new(&sanitized);
         if !fs_ops::exists(p) {
             return VfsEntryType::None;
@@ -207,7 +209,8 @@ impl VfsFilesystem for RealVfsFilesystem {
     }
 
     fn delete_file(&self, path: &str) -> bool {
-        let sanitized = path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
+        let sanitized =
+            path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
         {
             let mut cache = self.cache.lock().unwrap();
             cache.remove(&sanitized);
@@ -220,7 +223,8 @@ impl VfsFilesystem for RealVfsFilesystem {
     }
 
     fn create_directory(&self, path: &str, _perms: OpenMode) -> Option<VirtualDir> {
-        let sanitized = path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
+        let sanitized =
+            path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
         if !fs_ops::create_dirs(Path::new(&sanitized)) {
             return None;
         }
@@ -233,8 +237,10 @@ impl VfsFilesystem for RealVfsFilesystem {
     }
 
     fn move_directory(&self, old_path: &str, new_path: &str) -> Option<VirtualDir> {
-        let old = path_util::sanitize_path(old_path, path_util::DirectorySeparator::PlatformDefault);
-        let new = path_util::sanitize_path(new_path, path_util::DirectorySeparator::PlatformDefault);
+        let old =
+            path_util::sanitize_path(old_path, path_util::DirectorySeparator::PlatformDefault);
+        let new =
+            path_util::sanitize_path(new_path, path_util::DirectorySeparator::PlatformDefault);
         if !fs_ops::rename_dir(Path::new(&old), Path::new(&new)) {
             return None;
         }
@@ -242,7 +248,8 @@ impl VfsFilesystem for RealVfsFilesystem {
     }
 
     fn delete_directory(&self, path: &str) -> bool {
-        let sanitized = path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
+        let sanitized =
+            path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
         fs_ops::remove_dir_recursively(Path::new(&sanitized))
     }
 }
@@ -257,7 +264,8 @@ impl RealVfsFilesystem {
     }
 
     pub fn arc_create_file(self: &Arc<Self>, path: &str, perms: OpenMode) -> Option<VirtualFile> {
-        let sanitized = path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
+        let sanitized =
+            path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
         {
             let mut cache = self.cache.lock().unwrap();
             cache.remove(&sanitized);
@@ -287,8 +295,10 @@ impl RealVfsFilesystem {
     }
 
     pub fn arc_move_file(self: &Arc<Self>, old_path: &str, new_path: &str) -> Option<VirtualFile> {
-        let old = path_util::sanitize_path(old_path, path_util::DirectorySeparator::PlatformDefault);
-        let new = path_util::sanitize_path(new_path, path_util::DirectorySeparator::PlatformDefault);
+        let old =
+            path_util::sanitize_path(old_path, path_util::DirectorySeparator::PlatformDefault);
+        let new =
+            path_util::sanitize_path(new_path, path_util::DirectorySeparator::PlatformDefault);
         {
             let mut cache = self.cache.lock().unwrap();
             cache.remove(&old);
@@ -301,7 +311,8 @@ impl RealVfsFilesystem {
     }
 
     pub fn arc_open_directory(self: &Arc<Self>, path: &str, perms: OpenMode) -> Option<VirtualDir> {
-        let sanitized = path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
+        let sanitized =
+            path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
         Some(Arc::new(RealVfsDirectory::new(
             Arc::clone(self),
             sanitized,
@@ -314,7 +325,8 @@ impl RealVfsFilesystem {
         path: &str,
         perms: OpenMode,
     ) -> Option<VirtualDir> {
-        let sanitized = path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
+        let sanitized =
+            path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
         if !fs_ops::create_dirs(Path::new(&sanitized)) {
             return None;
         }

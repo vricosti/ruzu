@@ -29,10 +29,22 @@ impl IAudioInManager {
         let handlers = build_handler_map(&[
             (0, Some(Self::list_audio_ins_handler), "ListAudioIns"),
             (1, Some(Self::open_audio_in_handler), "OpenAudioIn"),
-            (2, Some(Self::list_audio_ins_auto_handler), "ListAudioInsAuto"),
+            (
+                2,
+                Some(Self::list_audio_ins_auto_handler),
+                "ListAudioInsAuto",
+            ),
             (3, Some(Self::open_audio_in_auto_handler), "OpenAudioInAuto"),
-            (4, Some(Self::list_audio_ins_auto_filtered_handler), "ListAudioInsAutoFiltered"),
-            (5, Some(Self::open_audio_in_protocol_specified_handler), "OpenAudioInProtocolSpecified"),
+            (
+                4,
+                Some(Self::list_audio_ins_auto_filtered_handler),
+                "ListAudioInsAutoFiltered",
+            ),
+            (
+                5,
+                Some(Self::open_audio_in_protocol_specified_handler),
+                "OpenAudioInProtocolSpecified",
+            ),
         ]);
         Self {
             handlers,

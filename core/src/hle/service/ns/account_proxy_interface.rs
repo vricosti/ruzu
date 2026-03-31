@@ -29,9 +29,8 @@ pub struct IAccountProxyInterface {
 
 impl IAccountProxyInterface {
     pub fn new() -> Self {
-        let handlers = build_handler_map(&[
-            (commands::CREATE_USER_ACCOUNT, None, "CreateUserAccount"),
-        ]);
+        let handlers =
+            build_handler_map(&[(commands::CREATE_USER_ACCOUNT, None, "CreateUserAccount")]);
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),

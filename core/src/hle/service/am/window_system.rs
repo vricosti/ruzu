@@ -56,7 +56,6 @@ struct WindowSystemInner {
     should_exit: bool,
 }
 
-
 impl WindowSystem {
     pub fn new() -> Self {
         Self {
@@ -124,7 +123,10 @@ impl WindowSystem {
                 assert!(inner.home_menu_aruid.is_none(), "Home menu already tracked");
                 inner.home_menu_aruid = Some(aruid);
             } else if is_application {
-                assert!(inner.application_aruid.is_none(), "Application already tracked");
+                assert!(
+                    inner.application_aruid.is_none(),
+                    "Application already tracked"
+                );
                 inner.application_aruid = Some(aruid);
             }
         }
@@ -203,7 +205,8 @@ impl WindowSystem {
         let inner = self.lock.lock().unwrap();
         for (_aruid, applet) in &inner.applets {
             let mut a = applet.lock().unwrap();
-            a.lifecycle_manager.on_operation_and_performance_mode_changed();
+            a.lifecycle_manager
+                .on_operation_and_performance_mode_changed();
         }
     }
 

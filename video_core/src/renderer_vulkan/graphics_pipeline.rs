@@ -97,8 +97,13 @@ impl GraphicsPipelineCache {
 
         // Create pipeline layout and pipeline
         let (pipeline_layout, descriptor_set_layout) = self.create_pipeline_layout()?;
-        let pipeline =
-            self.create_graphics_pipeline(vs_module, fs_module, pipeline_layout, render_pass, draw)?;
+        let pipeline = self.create_graphics_pipeline(
+            vs_module,
+            fs_module,
+            pipeline_layout,
+            render_pass,
+            draw,
+        )?;
 
         debug!(
             "GraphicsPipelineCache: compiled new pipeline (vs_hash=0x{:016X}, fs_hash=0x{:016X})",
@@ -134,7 +139,9 @@ impl GraphicsPipelineCache {
         }
 
         let runtime_info = RuntimeInfo::default();
-        let compiled = self.shader_cache.get_or_compile(&code, ShaderStage::Vertex, &runtime_info);
+        let compiled = self
+            .shader_cache
+            .get_or_compile(&code, ShaderStage::Vertex, &runtime_info);
         Some(compiled.clone())
     }
 
@@ -155,7 +162,9 @@ impl GraphicsPipelineCache {
         }
 
         let runtime_info = RuntimeInfo::default();
-        let compiled = self.shader_cache.get_or_compile(&code, ShaderStage::Fragment, &runtime_info);
+        let compiled =
+            self.shader_cache
+                .get_or_compile(&code, ShaderStage::Fragment, &runtime_info);
         Some(compiled.clone())
     }
 
@@ -166,15 +175,16 @@ impl GraphicsPipelineCache {
         match unsafe { self.device.create_shader_module(&create_info, None) } {
             Ok(m) => Some(m),
             Err(e) => {
-                warn!("GraphicsPipelineCache: failed to create shader module: {:?}", e);
+                warn!(
+                    "GraphicsPipelineCache: failed to create shader module: {:?}",
+                    e
+                );
                 None
             }
         }
     }
 
-    fn create_pipeline_layout(
-        &self,
-    ) -> Option<(vk::PipelineLayout, vk::DescriptorSetLayout)> {
+    fn create_pipeline_layout(&self) -> Option<(vk::PipelineLayout, vk::DescriptorSetLayout)> {
         // Create descriptor set layout (empty for now — will add UBO/sampler bindings)
         let layout_info = vk::DescriptorSetLayoutCreateInfo::builder().build();
         let desc_layout = unsafe {
@@ -305,11 +315,8 @@ impl GraphicsPipelineCache {
             .build();
 
         match unsafe {
-            self.device.create_graphics_pipelines(
-                vk::PipelineCache::null(),
-                &[pipeline_info],
-                None,
-            )
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
         } {
             Ok(pipelines) => Some(pipelines[0]),
             Err((_, e)) => {

@@ -10,17 +10,19 @@
 use crate::core_timing::CoreTiming;
 use crate::cpu_manager::CpuManager;
 use crate::device_memory::DeviceMemory;
-use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
 use crate::file_sys::fs_filesystem::OpenMode;
 use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
+use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
 use crate::hardware_properties;
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_thread::KThread;
 use crate::hle::kernel::kernel::KernelCore;
-use crate::hle::service::server_manager::ServerManager;
-use crate::hle::service::am::applet_manager::{AppletManager, FrontendAppletParameters, LaunchType};
 use crate::hle::service::am::am_types::{AppletId, AppletType};
+use crate::hle::service::am::applet_manager::{
+    AppletManager, FrontendAppletParameters, LaunchType,
+};
+use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 use crate::memory::memory::Memory;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
@@ -131,11 +133,13 @@ pub struct System {
 
     /// Filesystem controller (process registrations, factory management).
     /// Upstream: `FileSystemController& GetFileSystemController()`.
-    filesystem_controller: Arc<StdMutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
+    filesystem_controller:
+        Arc<StdMutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
 
     /// Content provider union for NCA/content lookups.
     /// Upstream: `std::unique_ptr<FileSys::ContentProviderUnion> content_provider`.
-    content_provider: Option<Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>>,
+    content_provider:
+        Option<Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>>,
 
     /// Telemetry session for collecting and submitting usage data.
     /// Upstream: `std::unique_ptr<Core::TelemetrySession> telemetry_session`.
@@ -247,7 +251,6 @@ pub struct System {
     // dispatch) and match the role of upstream `Core::System&` as passed to SVC
     // handlers. Upstream SVC handlers receive `Core::System&` and derive
     // process, scheduler, memory, etc. from it.
-
     /// The current application process, wrapped for shared access.
     /// Set by the frontend after `System::load()` returns.
     /// Upstream: `system.CurrentProcess()`.
@@ -354,7 +357,10 @@ impl System {
         // In C++: is_multicore = Settings::values.use_multi_core.GetValue()
         self.is_multicore = *common::settings::values().use_multi_core.get_value();
 
-        self.core_timing.lock().unwrap().set_multicore(self.is_multicore);
+        self.core_timing
+            .lock()
+            .unwrap()
+            .set_multicore(self.is_multicore);
         // In C++: core_timing.Initialize([&system]() { system.RegisterHostThread(); });
         self.core_timing.lock().unwrap().initialize(|| {
             // Host thread registration placeholder.
@@ -368,7 +374,10 @@ impl System {
 
         // Provide the VFS to the filesystem controller so it can create SaveDataFactory instances.
         if let Some(ref vfs) = self.virtual_filesystem {
-            self.filesystem_controller.lock().unwrap().set_filesystem(vfs.clone());
+            self.filesystem_controller
+                .lock()
+                .unwrap()
+                .set_filesystem(vfs.clone());
         }
 
         self.cpu_manager.set_multicore(self.is_multicore);
@@ -381,7 +390,11 @@ impl System {
         kernel.set_multicore(self.is_multicore);
         self.kernel = Some(kernel);
 
-        log::info!("System: initialized (multicore={}, async_gpu={})", self.is_multicore, self.is_async_gpu);
+        log::info!(
+            "System: initialized (multicore={}, async_gpu={})",
+            self.is_multicore,
+            self.is_async_gpu
+        );
     }
 
     /// Initialize the kernel and CPU manager.
@@ -393,7 +406,10 @@ impl System {
         // Set it here since Rust can't pass &self during construction.
         let system_ref = SystemRef::from_ref(self);
 
-        let kernel = self.kernel.as_mut().expect("kernel must be created in initialize()");
+        let kernel = self
+            .kernel
+            .as_mut()
+            .expect("kernel must be created in initialize()");
 
         // Upstream: ReinitializeIfNecessary() checks if multicore/memory layout
         // changed and re-runs Initialize() if so. We just call initialize() directly.
@@ -410,17 +426,29 @@ impl System {
             const SECURE_POOL_OFFSET: u64 = 0xF000_0000; // 3.75 GiB into DRAM
             const SECURE_POOL_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
             let secure_pool_base = dram_memory_map::BASE + SECURE_POOL_OFFSET;
-            kernel
-                .memory_manager_mut()
-                .initialize_pool(Pool::SECURE, secure_pool_base, SECURE_POOL_SIZE);
+            kernel.memory_manager_mut().initialize_pool(
+                Pool::SECURE,
+                secure_pool_base,
+                SECURE_POOL_SIZE,
+            );
         }
 
         // Provide CoreTiming to the kernel so guest thread functions can access it.
-        self.kernel.as_mut().unwrap().set_core_timing(self.core_timing.clone());
+        self.kernel
+            .as_mut()
+            .unwrap()
+            .set_core_timing(self.core_timing.clone());
+        self.kernel
+            .as_ref()
+            .unwrap()
+            .wire_hardware_timer(self.core_timing.clone());
 
         // Schedule preemption event (10ms interval) and start timer thread.
         // Upstream: InitializePreemption in kernel.cpp schedules a looping event.
-        self.kernel.as_ref().unwrap().schedule_preemption_event(&self.core_timing);
+        self.kernel
+            .as_ref()
+            .unwrap()
+            .schedule_preemption_event(&self.core_timing);
         CoreTiming::start_timer_thread(self.core_timing.clone());
 
         // Upstream: cpu_manager.Initialize() — creates barrier and spawns per-core
@@ -478,7 +506,11 @@ impl System {
         let mm_ptr = self.kernel.as_mut().unwrap().memory_manager_mut() as *mut _;
         let system_ref = SystemRef::from_ref(self);
         let _services = crate::hle::service::services::Services::new(
-            &service_manager, system_ref, dm_ptr, mm_ptr, self.filesystem_controller.clone(),
+            &service_manager,
+            system_ref,
+            dm_ptr,
+            mm_ptr,
+            self.filesystem_controller.clone(),
         );
 
         // Upstream: is_powered_on = true, exit_locked = false, exit_requested = false
@@ -500,7 +532,9 @@ impl System {
         // Phase 1: Initialize kernel (upstream: InitializeKernel(system))
         self.initialize_kernel();
 
-        let vfs = self.virtual_filesystem.as_ref()
+        let vfs = self
+            .virtual_filesystem
+            .as_ref()
             .expect("VFS must be created in initialize()");
 
         // Open the game file.
@@ -589,7 +623,9 @@ impl System {
         // Upstream: applet_manager.CreateAndInsertByFrontendAppletParameters(process, params)
         // followed by applet->process->Run() at the end of SetWindowSystem.
         if let Some(process) = self.current_process.take() {
-            let lp = self.load_parameters.as_ref()
+            let lp = self
+                .load_parameters
+                .as_ref()
                 .expect("loader must provide process launch parameters");
             let is_64bit = process.is_64bit();
             let priority = lp.main_thread_priority;
@@ -597,13 +633,19 @@ impl System {
 
             // Wrap in Arc<Mutex<>> — run() needs self_reference for thread creation.
             let process_arc = Arc::new(StdMutex::new(process));
-            process_arc.lock().unwrap().bind_self_reference(&process_arc);
+            process_arc
+                .lock()
+                .unwrap()
+                .bind_self_reference(&process_arc);
 
             // Wire the global scheduler context and per-core scheduler so the
             // process can update priority queues when threads become runnable.
             if let Some(ref kernel) = self.kernel {
                 if let Some(gsc) = kernel.global_scheduler_context() {
-                    process_arc.lock().unwrap().global_scheduler_context = Some(gsc.clone());
+                    process_arc
+                        .lock()
+                        .unwrap()
+                        .set_global_scheduler_context(gsc.clone());
                 }
                 // Attach core-0's scheduler to the process.
                 if let Some(scheduler) = kernel.scheduler(0) {
@@ -654,7 +696,10 @@ impl System {
 
             // Use kernel's ID allocators to avoid collisions with per-core threads.
             let (app_thread_id, app_object_id) = if let Some(ref kernel) = self.kernel {
-                (kernel.create_new_thread_id(), kernel.create_new_object_id() as u64)
+                (
+                    kernel.create_new_thread_id(),
+                    kernel.create_new_object_id() as u64,
+                )
             } else {
                 (1, 1)
             };
@@ -667,25 +712,26 @@ impl System {
             // params and notifies the CV. SetWindowSystem (running on the
             // am:SetWindowSystem thread) will wake, build the applet, track it,
             // and then call process->Run() with the run params we pass here.
-            self.applet_manager.create_and_insert_by_frontend_applet_parameters(
-                process_arc.clone(),
-                FrontendAppletParameters {
-                    program_id: app_program_id,
-                    applet_id: AppletId::Application,
-                    applet_type: AppletType::Application,
-                    launch_type: LaunchType::FrontendInitiated,
-                    program_index: 0,
-                    previous_program_index: -1,
-                },
-                crate::hle::service::am::applet_manager::PendingRunParameters {
-                    priority,
-                    stack_size,
-                    main_thread_id: app_thread_id,
-                    main_object_id: app_object_id,
-                    is_64bit,
-                    init_func: guest_thread_func,
-                },
-            );
+            self.applet_manager
+                .create_and_insert_by_frontend_applet_parameters(
+                    process_arc.clone(),
+                    FrontendAppletParameters {
+                        program_id: app_program_id,
+                        applet_id: AppletId::Application,
+                        applet_type: AppletType::Application,
+                        launch_type: LaunchType::FrontendInitiated,
+                        program_index: 0,
+                        previous_program_index: -1,
+                    },
+                    crate::hle::service::am::applet_manager::PendingRunParameters {
+                        priority,
+                        stack_size,
+                        main_thread_id: app_thread_id,
+                        main_object_id: app_object_id,
+                        is_64bit,
+                        init_func: guest_thread_func,
+                    },
+                );
 
             self.current_process_arc = Some(process_arc);
         }
@@ -735,9 +781,8 @@ impl System {
 
         // Log last frame performance stats if game was loaded
         if let Some(ref perf_stats) = self.perf_stats {
-            let perf_results = perf_stats.get_and_reset_stats(
-                self.core_timing.lock().unwrap().get_global_time_us()
-            );
+            let perf_results = perf_stats
+                .get_and_reset_stats(self.core_timing.lock().unwrap().get_global_time_us());
             log::info!(
                 "Shutdown stats: speed={:.1}%, fps={:.1}, frametime={:.3}ms",
                 perf_results.emulation_speed * 100.0,
@@ -790,7 +835,8 @@ impl System {
 
     /// Set the shutting down state.
     pub fn set_shutting_down(&self, shutting_down: bool) {
-        self.is_shutting_down.store(shutting_down, Ordering::Relaxed);
+        self.is_shutting_down
+            .store(shutting_down, Ordering::Relaxed);
     }
 
     /// Stall the application (pause with lock held).
@@ -822,17 +868,16 @@ impl System {
     }
 
     /// Get the telemetry session mutably.
-    pub fn telemetry_session_mut(&mut self) -> Option<&mut crate::telemetry_session::TelemetrySession> {
+    pub fn telemetry_session_mut(
+        &mut self,
+    ) -> Option<&mut crate::telemetry_session::TelemetrySession> {
         self.telemetry_session.as_mut()
     }
 
     /// Set the Host1x core subsystem.
     /// Called by the frontend after System::load() since video_core does not
     /// depend on core. Upstream: created in SetupForApplicationProcess() (core.cpp:277).
-    pub fn set_host1x_core(
-        &mut self,
-        host1x: Box<dyn crate::host1x_core::Host1xCoreInterface>,
-    ) {
+    pub fn set_host1x_core(&mut self, host1x: Box<dyn crate::host1x_core::Host1xCoreInterface>) {
         self.host1x_core = Some(host1x);
     }
 
@@ -842,9 +887,7 @@ impl System {
         self.host1x_core.as_deref()
     }
 
-    pub fn host1x_core_mut(
-        &mut self,
-    ) -> Option<&mut dyn crate::host1x_core::Host1xCoreInterface> {
+    pub fn host1x_core_mut(&mut self) -> Option<&mut dyn crate::host1x_core::Host1xCoreInterface> {
         self.host1x_core.as_deref_mut()
     }
 
@@ -869,13 +912,18 @@ impl System {
 
     /// Set the content provider.
     /// Upstream: `system.SetContentProvider(make_unique<ContentProviderUnion>())`.
-    pub fn set_content_provider(&mut self, provider: Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>) {
+    pub fn set_content_provider(
+        &mut self,
+        provider: Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>,
+    ) {
         self.content_provider = Some(provider);
     }
 
     /// Get the content provider.
     /// Upstream: `system.GetContentProvider()`.
-    pub fn get_content_provider(&self) -> Option<&Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>> {
+    pub fn get_content_provider(
+        &self,
+    ) -> Option<&Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>> {
         self.content_provider.as_ref()
     }
 
@@ -1004,9 +1052,9 @@ impl System {
     /// Gets and resets performance statistics.
     pub fn get_and_reset_perf_stats(&self) -> PerfStatsResults {
         match &self.perf_stats {
-            Some(stats) => stats.get_and_reset_stats(
-                self.core_timing.lock().unwrap().get_global_time_us()
-            ),
+            Some(stats) => {
+                stats.get_and_reset_stats(self.core_timing.lock().unwrap().get_global_time_us())
+            }
             None => PerfStatsResults::default(),
         }
     }
@@ -1107,7 +1155,10 @@ impl System {
         main_thread: Arc<StdMutex<crate::hle::kernel::k_thread::KThread>>,
     ) {
         let thread_id = main_thread.lock().unwrap().get_thread_id();
-        log::info!("register_application_thread: called, thread_id={}", thread_id);
+        log::info!(
+            "register_application_thread: called, thread_id={}",
+            thread_id
+        );
         // Upstream: KProcess::Run() owns all scheduler registration for the
         // application thread (AddThread, PushBack, highest_priority_thread_id).
         // By the time we reach here the thread is already in the GSC thread list
@@ -1260,9 +1311,7 @@ impl System {
 
     /// Get the current process Arc. Panics if not set.
     /// Upstream: `Kernel::GetCurrentProcess(kernel)`.
-    pub fn current_process_arc(
-        &self,
-    ) -> &Arc<StdMutex<crate::hle::kernel::k_process::KProcess>> {
+    pub fn current_process_arc(&self) -> &Arc<StdMutex<crate::hle::kernel::k_process::KProcess>> {
         self.current_process_arc
             .as_ref()
             .expect("current_process_arc not set; call set_current_process_arc() first")
@@ -1430,7 +1479,8 @@ impl System {
 
         // Get core 0's ARM interface from the process for the main execution loop.
         // Upstream: PhysicalCore gets this via process->GetArmInterface(core_index).
-        let mut jit_holder = process.lock().unwrap().arm_interfaces[0].take()
+        let mut jit_holder = process.lock().unwrap().arm_interfaces[0]
+            .take()
             .expect("ARM interface must exist after initialize_interfaces");
         let jit: &mut dyn ArmInterface = jit_holder.as_mut();
 
@@ -1450,15 +1500,17 @@ impl System {
             .and_then(|kernel| kernel.physical_core(0))
             .map(|core| core as *const _)
             .expect("kernel physical core 0 must exist after System::initialize");
-        unsafe { &*physical_core }
-            .initialize_guest_runtime(main_thread.clone(), &mut *jit, &mut ctx);
+        unsafe { &*physical_core }.initialize_guest_runtime(
+            main_thread.clone(),
+            &mut *jit,
+            &mut ctx,
+        );
 
         // Upstream: physical_core.cpp:158 — SetTpidrroEl0(GetInteger(thread->GetTlsAddress()))
         jit.set_tpidrro_el0(tls_base);
 
         // SVC dispatch loop.
-        let dummy_thread =
-            unsafe { &mut *(&mut 0u32 as *mut u32 as *mut OpaqueKThread) };
+        let dummy_thread = unsafe { &mut *(&mut 0u32 as *mut u32 as *mut OpaqueKThread) };
 
         let mut total_iteration = 0u32;
         let mut total_svc_count = 0u32;

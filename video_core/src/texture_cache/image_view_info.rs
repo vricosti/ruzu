@@ -70,9 +70,7 @@ impl ImageViewInfo {
     /// Full implementation requires TICEntry from Tegra::Texture, which is not
     /// yet ported.  Returns a default `ImageViewInfo` and logs a warning.
     pub fn from_tic_entry(_config: &(), _base_layer: i32) -> Self {
-        log::warn!(
-            "ImageViewInfo::from_tic_entry: TICEntry not yet ported — returning default"
-        );
+        log::warn!("ImageViewInfo::from_tic_entry: TICEntry not yet ported — returning default");
         Self::default()
     }
 

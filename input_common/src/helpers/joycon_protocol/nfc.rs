@@ -381,11 +381,7 @@ impl NfcProtocol {
     ///
     /// NOTE: Polls SendNextPackageRequest in a loop reading MCUCommandResponse.
     /// Depends on the hidapi handle.
-    fn is_tag_in_range(
-        &mut self,
-        _data: &mut TagFoundData,
-        _timeout_limit: usize,
-    ) -> DriverResult {
+    fn is_tag_in_range(&mut self, _data: &mut TagFoundData, _timeout_limit: usize) -> DriverResult {
         log::warn!("is_tag_in_range: no hidapi handle available");
         DriverResult::Timeout
     }

@@ -250,7 +250,11 @@ type IntegerEncodedVector = Vec<IntegerEncodedValue>;
 
 /// Port of `DecodeTritBlock` from `astc.cpp`.
 /// Implements the algorithm in ASTC spec section C.2.12.
-fn decode_trit_block(bits: &mut InputBitStream, result: &mut IntegerEncodedVector, n_bits_per_value: u32) {
+fn decode_trit_block(
+    bits: &mut InputBitStream,
+    result: &mut IntegerEncodedVector,
+    n_bits_per_value: u32,
+) {
     let mut m = [0u32; 5];
     let mut t = [0u32; 5];
 
@@ -309,7 +313,11 @@ fn decode_trit_block(bits: &mut InputBitStream, result: &mut IntegerEncodedVecto
 
 /// Port of `DecodeQuintBlock` from `astc.cpp`.
 /// Implements the algorithm in ASTC spec section C.2.12.
-fn decode_quint_block(bits: &mut InputBitStream, result: &mut IntegerEncodedVector, n_bits_per_value: u32) {
+fn decode_quint_block(
+    bits: &mut InputBitStream,
+    result: &mut IntegerEncodedVector,
+    n_bits_per_value: u32,
+) {
     let mut m = [0u32; 3];
     let mut q = [0u32; 3];
 
@@ -859,7 +867,12 @@ fn decode_color_values(
     // We now have enough to decode our integer sequence.
     let mut decoded_color_values = IntegerEncodedVector::new();
     let mut color_stream = InputBitStream::new(data, 0);
-    decode_integer_sequence(&mut decoded_color_values, &mut color_stream, range, n_values);
+    decode_integer_sequence(
+        &mut decoded_color_values,
+        &mut color_stream,
+        range,
+        n_values,
+    );
 
     // Once we have the decoded values, we need to dequantize them to the 0-255 range
     // This procedure is outlined in ASTC spec C.2.13
@@ -888,7 +901,10 @@ fn decode_color_values(
                     1 => (0u32, 204u32),
                     2 => {
                         let b_bit = (bitval >> 1) & 1;
-                        ((b_bit << 8) | (b_bit << 4) | (b_bit << 2) | (b_bit << 1), 93)
+                        (
+                            (b_bit << 8) | (b_bit << 4) | (b_bit << 2) | (b_bit << 1),
+                            93,
+                        )
                     }
                     3 => {
                         let cb = (bitval >> 1) & 3;
@@ -1145,7 +1161,12 @@ fn bit_transfer_signed(a: i32, b: i32) -> (i32, i32) {
 
 /// Port of `BlueContract` from `astc.cpp` (C.2.14).
 fn blue_contract(a: i32, r: i32, g: i32, b: i32) -> Pixel {
-    Pixel::new((a) as i32, ((r + b) >> 1) as i32, ((g + b) >> 1) as i32, b as i32)
+    Pixel::new(
+        (a) as i32,
+        ((r + b) >> 1) as i32,
+        ((g + b) >> 1) as i32,
+        b as i32,
+    )
 }
 
 /// Port of `hash52` from `astc.cpp` (C.2.21).
@@ -1164,7 +1185,14 @@ fn hash52(mut p: u32) -> u32 {
 }
 
 /// Port of `SelectPartition` from `astc.cpp` (C.2.21).
-fn select_partition(seed: i32, mut x: i32, mut y: i32, mut z: i32, partition_count: i32, small_block: bool) -> u32 {
+fn select_partition(
+    seed: i32,
+    mut x: i32,
+    mut y: i32,
+    mut z: i32,
+    partition_count: i32,
+    small_block: bool,
+) -> u32 {
     if partition_count == 1 {
         return 0;
     }
@@ -1264,7 +1292,11 @@ fn select_2d_partition(seed: i32, x: i32, y: i32, partition_count: i32, small_bl
 
 /// Port of `ComputeEndpoints` from `astc.cpp` (C.2.14).
 /// Returns (ep1, ep2) to avoid double-mutable-borrow issues with Rust's borrow checker.
-fn compute_endpoints(color_values: &[u32], idx: &mut usize, color_endpoint_mode: u32) -> (Pixel, Pixel) {
+fn compute_endpoints(
+    color_values: &[u32],
+    idx: &mut usize,
+    color_endpoint_mode: u32,
+) -> (Pixel, Pixel) {
     let mut ep1 = Pixel::new_default();
     let mut ep2 = Pixel::new_default();
     // Helper: read N u32 values from color_values starting at *idx, advance idx
@@ -1311,9 +1343,11 @@ fn compute_endpoints(color_values: &[u32], idx: &mut usize, color_endpoint_mode:
         5 => {
             let mut v = read_int_values!(4);
             let (a, b) = bit_transfer_signed(v[1], v[0]);
-            v[1] = a; v[0] = b;
+            v[1] = a;
+            v[0] = b;
             let (a, b) = bit_transfer_signed(v[3], v[2]);
-            v[3] = a; v[2] = b;
+            v[3] = a;
+            v[2] = b;
             ep1 = Pixel::new(v[2], v[0], v[0], v[0]);
             ep2 = Pixel::new(v[2] + v[3], v[0] + v[1], v[0] + v[1], v[0] + v[1]);
             ep1.clamp_byte();
@@ -1342,11 +1376,14 @@ fn compute_endpoints(color_values: &[u32], idx: &mut usize, color_endpoint_mode:
         9 => {
             let mut v = read_int_values!(6);
             let (a, b) = bit_transfer_signed(v[1], v[0]);
-            v[1] = a; v[0] = b;
+            v[1] = a;
+            v[0] = b;
             let (a, b) = bit_transfer_signed(v[3], v[2]);
-            v[3] = a; v[2] = b;
+            v[3] = a;
+            v[2] = b;
             let (a, b) = bit_transfer_signed(v[5], v[4]);
-            v[5] = a; v[4] = b;
+            v[5] = a;
+            v[4] = b;
             if v[1] + v[3] + v[5] >= 0 {
                 ep1 = Pixel::new(0xFF, v[0], v[2], v[4]);
                 ep2 = Pixel::new(0xFF, v[0] + v[1], v[2] + v[3], v[4] + v[5]);
@@ -1380,13 +1417,17 @@ fn compute_endpoints(color_values: &[u32], idx: &mut usize, color_endpoint_mode:
         13 => {
             let mut v = read_int_values!(8);
             let (a, b) = bit_transfer_signed(v[1], v[0]);
-            v[1] = a; v[0] = b;
+            v[1] = a;
+            v[0] = b;
             let (a, b) = bit_transfer_signed(v[3], v[2]);
-            v[3] = a; v[2] = b;
+            v[3] = a;
+            v[2] = b;
             let (a, b) = bit_transfer_signed(v[5], v[4]);
-            v[5] = a; v[4] = b;
+            v[5] = a;
+            v[4] = b;
             let (a, b) = bit_transfer_signed(v[7], v[6]);
-            v[7] = a; v[6] = b;
+            v[7] = a;
+            v[6] = b;
             if v[1] + v[3] + v[5] >= 0 {
                 ep1 = Pixel::new(v[6], v[0], v[2], v[4]);
                 ep2 = Pixel::new(v[7] + v[6], v[0] + v[1], v[2] + v[3], v[4] + v[5]);
@@ -1408,7 +1449,12 @@ fn compute_endpoints(color_values: &[u32], idx: &mut usize, color_endpoint_mode:
 // ── Block decompression ──────────────────────────────────────────────────────
 
 /// Port of `FillVoidExtentLDR` from `astc.cpp`.
-fn fill_void_extent_ldr(strm: &mut InputBitStream, out_buf: &mut [u32], block_width: u32, block_height: u32) {
+fn fill_void_extent_ldr(
+    strm: &mut InputBitStream,
+    out_buf: &mut [u32],
+    block_width: u32,
+    block_height: u32,
+) {
     // Don't actually care about the void extent, just read the bits...
     for _ in 0..4 {
         strm.read_bits(13);
@@ -1449,7 +1495,12 @@ fn reverse_byte(b: u8) -> u8 {
 }
 
 /// Port of `DecompressBlock` from `astc.cpp`.
-fn decompress_block(in_buf: &[u8; 16], block_width: u32, block_height: u32, out_buf: &mut [u32; 144]) {
+fn decompress_block(
+    in_buf: &[u8; 16],
+    block_width: u32,
+    block_height: u32,
+    out_buf: &mut [u32; 144],
+) {
     let mut strm = InputBitStream::new(in_buf, 0);
     let weight_params = decode_block_info(&mut strm);
 
@@ -1471,13 +1522,19 @@ fn decompress_block(in_buf: &[u8; 16], block_width: u32, block_height: u32, out_
     }
 
     if weight_params.width > block_width {
-        debug_assert!(false, "Texel weight grid width should be smaller than block width");
+        debug_assert!(
+            false,
+            "Texel weight grid width should be smaller than block width"
+        );
         fill_error(out_buf, block_width, block_height);
         return;
     }
 
     if weight_params.height > block_height {
-        debug_assert!(false, "Texel weight grid height should be smaller than block height");
+        debug_assert!(
+            false,
+            "Texel weight grid height should be smaller than block height"
+        );
         fill_error(out_buf, block_width, block_height);
         return;
     }
@@ -1487,7 +1544,10 @@ fn decompress_block(in_buf: &[u8; 16], block_width: u32, block_height: u32, out_
     debug_assert!(n_partitions <= 4);
 
     if n_partitions == 4 && weight_params.dual_plane {
-        debug_assert!(false, "Dual plane mode is incompatible with four partition blocks");
+        debug_assert!(
+            false,
+            "Dual plane mode is incompatible with four partition blocks"
+        );
         fill_error(out_buf, block_width, block_height);
         return;
     }
@@ -1582,7 +1642,10 @@ fn decompress_block(in_buf: &[u8; 16], block_width: u32, block_height: u32, out_
     for i in 0..n_partitions as usize {
         debug_assert!(color_endpoint_mode[i] < 16);
     }
-    debug_assert_eq!(strm.bits_read() as u32 + weight_params.get_packed_bit_size(), 128);
+    debug_assert_eq!(
+        strm.bits_read() as u32 + weight_params.get_packed_bit_size(),
+        128
+    );
 
     // Decode both color data and texel weight data
     let mut color_values = [0u32; 32]; // Four values, two endpoints, four maximum partitions
@@ -1597,11 +1660,8 @@ fn decompress_block(in_buf: &[u8; 16], block_width: u32, block_height: u32, out_
     let mut endpoints = [[Pixel::new_default(); 2]; 4];
     let mut color_values_idx = 0usize;
     for i in 0..n_partitions as usize {
-        let (ep1, ep2) = compute_endpoints(
-            &color_values,
-            &mut color_values_idx,
-            color_endpoint_mode[i],
-        );
+        let (ep1, ep2) =
+            compute_endpoints(&color_values, &mut color_values_idx, color_endpoint_mode[i]);
         endpoints[i][0] = ep1;
         endpoints[i][1] = ep2;
     }
@@ -1640,7 +1700,13 @@ fn decompress_block(in_buf: &[u8; 16], block_width: u32, block_height: u32, out_
 
     // Blocks can be at most 12x12, so we can have as many as 144 weights
     let mut weights = [[0u32; 144]; 2];
-    unquantize_texel_weights(&mut weights, &texel_weight_values, &weight_params, block_width, block_height);
+    unquantize_texel_weights(
+        &mut weights,
+        &texel_weight_values,
+        &weight_params,
+        block_width,
+        block_height,
+    );
 
     // Now that we have endpoints and weights, we can interpolate and generate
     // the proper decoding...
@@ -1657,8 +1723,10 @@ fn decompress_block(in_buf: &[u8; 16], block_width: u32, block_height: u32, out_
 
             let mut p = Pixel::new_default();
             for c in 0..4usize {
-                let c0 = replicate_byte_to_16(endpoints[partition as usize][0].component(c) as usize);
-                let c1 = replicate_byte_to_16(endpoints[partition as usize][1].component(c) as usize);
+                let c0 =
+                    replicate_byte_to_16(endpoints[partition as usize][0].component(c) as usize);
+                let c1 =
+                    replicate_byte_to_16(endpoints[partition as usize][1].component(c) as usize);
 
                 let mut plane = 0usize;
                 if weight_params.dual_plane && (((plane_idx + 1) & 3) == c as u32) {

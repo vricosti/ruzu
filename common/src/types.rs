@@ -97,10 +97,7 @@ mod tests {
         assert_eq!(align_down(0, PAGE_SIZE_U64), 0);
         assert_eq!(align_down(1, PAGE_SIZE_U64), 0);
         assert_eq!(align_down(PAGE_SIZE_U64, PAGE_SIZE_U64), PAGE_SIZE_U64);
-        assert_eq!(
-            align_down(PAGE_SIZE_U64 + 1, PAGE_SIZE_U64),
-            PAGE_SIZE_U64
-        );
+        assert_eq!(align_down(PAGE_SIZE_U64 + 1, PAGE_SIZE_U64), PAGE_SIZE_U64);
     }
 
     #[test]

@@ -54,28 +54,92 @@ impl ISystemUpdateControl {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
             (commands::HAS_DOWNLOADED, None, "HasDownloaded"),
-            (commands::REQUEST_CHECK_LATEST_UPDATE, None, "RequestCheckLatestUpdate"),
-            (commands::REQUEST_DOWNLOAD_LATEST_UPDATE, None, "RequestDownloadLatestUpdate"),
+            (
+                commands::REQUEST_CHECK_LATEST_UPDATE,
+                None,
+                "RequestCheckLatestUpdate",
+            ),
+            (
+                commands::REQUEST_DOWNLOAD_LATEST_UPDATE,
+                None,
+                "RequestDownloadLatestUpdate",
+            ),
             (commands::GET_DOWNLOAD_PROGRESS, None, "GetDownloadProgress"),
-            (commands::APPLY_DOWNLOADED_UPDATE, None, "ApplyDownloadedUpdate"),
-            (commands::REQUEST_PREPARE_CARD_UPDATE, None, "RequestPrepareCardUpdate"),
-            (commands::GET_PREPARE_CARD_UPDATE_PROGRESS, None, "GetPrepareCardUpdateProgress"),
-            (commands::HAS_PREPARED_CARD_UPDATE, None, "HasPreparedCardUpdate"),
+            (
+                commands::APPLY_DOWNLOADED_UPDATE,
+                None,
+                "ApplyDownloadedUpdate",
+            ),
+            (
+                commands::REQUEST_PREPARE_CARD_UPDATE,
+                None,
+                "RequestPrepareCardUpdate",
+            ),
+            (
+                commands::GET_PREPARE_CARD_UPDATE_PROGRESS,
+                None,
+                "GetPrepareCardUpdateProgress",
+            ),
+            (
+                commands::HAS_PREPARED_CARD_UPDATE,
+                None,
+                "HasPreparedCardUpdate",
+            ),
             (commands::APPLY_CARD_UPDATE, None, "ApplyCardUpdate"),
-            (commands::GET_DOWNLOADED_EULA_DATA_SIZE, None, "GetDownloadedEulaDataSize"),
-            (commands::GET_DOWNLOADED_EULA_DATA, None, "GetDownloadedEulaData"),
+            (
+                commands::GET_DOWNLOADED_EULA_DATA_SIZE,
+                None,
+                "GetDownloadedEulaDataSize",
+            ),
+            (
+                commands::GET_DOWNLOADED_EULA_DATA,
+                None,
+                "GetDownloadedEulaData",
+            ),
             (commands::SETUP_CARD_UPDATE, None, "SetupCardUpdate"),
-            (commands::GET_PREPARED_CARD_UPDATE_EULA_DATA_SIZE, None, "GetPreparedCardUpdateEulaDataSize"),
-            (commands::GET_PREPARED_CARD_UPDATE_EULA_DATA, None, "GetPreparedCardUpdateEulaData"),
-            (commands::SETUP_CARD_UPDATE_VIA_SYSTEM_UPDATER, None, "SetupCardUpdateViaSystemUpdater"),
+            (
+                commands::GET_PREPARED_CARD_UPDATE_EULA_DATA_SIZE,
+                None,
+                "GetPreparedCardUpdateEulaDataSize",
+            ),
+            (
+                commands::GET_PREPARED_CARD_UPDATE_EULA_DATA,
+                None,
+                "GetPreparedCardUpdateEulaData",
+            ),
+            (
+                commands::SETUP_CARD_UPDATE_VIA_SYSTEM_UPDATER,
+                None,
+                "SetupCardUpdateViaSystemUpdater",
+            ),
             (commands::HAS_RECEIVED, None, "HasReceived"),
-            (commands::REQUEST_RECEIVE_SYSTEM_UPDATE, None, "RequestReceiveSystemUpdate"),
+            (
+                commands::REQUEST_RECEIVE_SYSTEM_UPDATE,
+                None,
+                "RequestReceiveSystemUpdate",
+            ),
             (commands::GET_RECEIVE_PROGRESS, None, "GetReceiveProgress"),
             (commands::APPLY_RECEIVED_UPDATE, None, "ApplyReceivedUpdate"),
-            (commands::GET_RECEIVED_EULA_DATA_SIZE, None, "GetReceivedEulaDataSize"),
-            (commands::GET_RECEIVED_EULA_DATA, None, "GetReceivedEulaData"),
-            (commands::SETUP_TO_RECEIVE_SYSTEM_UPDATE, None, "SetupToReceiveSystemUpdate"),
-            (commands::REQUEST_CHECK_LATEST_UPDATE_INCLUDES_REBOOTLESS_UPDATE, None, "RequestCheckLatestUpdateIncludesRebootlessUpdate"),
+            (
+                commands::GET_RECEIVED_EULA_DATA_SIZE,
+                None,
+                "GetReceivedEulaDataSize",
+            ),
+            (
+                commands::GET_RECEIVED_EULA_DATA,
+                None,
+                "GetReceivedEulaData",
+            ),
+            (
+                commands::SETUP_TO_RECEIVE_SYSTEM_UPDATE,
+                None,
+                "SetupToReceiveSystemUpdate",
+            ),
+            (
+                commands::REQUEST_CHECK_LATEST_UPDATE_INCLUDES_REBOOTLESS_UPDATE,
+                None,
+                "RequestCheckLatestUpdateIncludesRebootlessUpdate",
+            ),
         ]);
         Self {
             handlers,

@@ -95,11 +95,9 @@ pub struct IBluetoothUser {
 
 impl IBluetoothUser {
     pub fn new() -> Self {
-        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
-            "bt".to_string(),
-        );
-        let register_event_handle =
-            service_context.create_event("BT:RegisterEvent".to_string());
+        let mut service_context =
+            crate::hle::service::kernel_helpers::ServiceContext::new("bt".to_string());
+        let register_event_handle = service_context.create_event("BT:RegisterEvent".to_string());
         Self {
             service_context,
             register_event_handle,
@@ -146,9 +144,6 @@ pub fn loop_process(system: crate::core::SystemRef) {
     log::debug!("BtDrv::LoopProcess called");
 
     let mut server_manager = ServerManager::new(system);
-    crate::hle::service::services::register_stub_services(
-        &mut server_manager,
-        &["btdrv", "bt"],
-    );
+    crate::hle::service::services::register_stub_services(&mut server_manager, &["btdrv", "bt"]);
     ServerManager::run_server(server_manager);
 }

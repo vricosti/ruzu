@@ -13,7 +13,11 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Exits the current process.
 pub fn exit_process(system: &System) {
-    let process_id = system.current_process_arc().lock().unwrap().get_process_id();
+    let process_id = system
+        .current_process_arc()
+        .lock()
+        .unwrap()
+        .get_process_id();
     log::info!("svc::ExitProcess called for process {}", process_id);
 
     KProcess::exit_with_current_thread(system.current_process_arc());
@@ -120,35 +124,38 @@ pub fn get_process_info(
 ) -> ResultCode {
     log::debug!(
         "svc::GetProcessInfo called, handle=0x{:08X}, type={:?}",
-        process_handle, info_type
+        process_handle,
+        info_type
     );
 
     // Get the process from the handle.
     // For pseudo-handle or handle 0 -> current process.
-    let process_arc = if process_handle == PseudoHandle::CurrentProcess as Handle
-        || process_handle == 0
-    {
-        system.current_process_arc()
-    } else {
-        let current = system.current_process_arc();
-        let guard = current.lock().unwrap();
-        match guard.handle_table.get_object(process_handle) {
-            Some(_) => {
-                drop(guard);
-                system.current_process_arc()
+    let process_arc =
+        if process_handle == PseudoHandle::CurrentProcess as Handle || process_handle == 0 {
+            system.current_process_arc()
+        } else {
+            let current = system.current_process_arc();
+            let guard = current.lock().unwrap();
+            match guard.handle_table.get_object(process_handle) {
+                Some(_) => {
+                    drop(guard);
+                    system.current_process_arc()
+                }
+                None => {
+                    log::error!(
+                        "Process handle does not exist, process_handle=0x{:08X}",
+                        process_handle
+                    );
+                    return RESULT_INVALID_HANDLE;
+                }
             }
-            None => {
-                log::error!(
-                    "Process handle does not exist, process_handle=0x{:08X}",
-                    process_handle
-                );
-                return RESULT_INVALID_HANDLE;
-            }
-        }
-    };
+        };
 
     if !matches!(info_type, ProcessInfoType::ProcessState) {
-        log::error!("Expected info_type to be ProcessState but got {:?}", info_type);
+        log::error!(
+            "Expected info_type to be ProcessState but got {:?}",
+            info_type
+        );
         return RESULT_INVALID_ENUM_VALUE;
     }
 

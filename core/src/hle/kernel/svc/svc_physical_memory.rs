@@ -54,14 +54,22 @@ pub fn set_heap_size_current_process(
         return validation;
     }
 
-    let (result, address) = system.current_process_arc().lock().unwrap().set_heap_size(size as usize);
+    let (result, address) = system
+        .current_process_arc()
+        .lock()
+        .unwrap()
+        .set_heap_size(size as usize);
     *out_address = address.get();
     ResultCode::new(result)
 }
 
 /// Maps memory at a desired address.
 pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode {
-    log::debug!("svc::MapPhysicalMemory called, addr=0x{:016X}, size=0x{:X}", addr, size);
+    log::debug!(
+        "svc::MapPhysicalMemory called, addr=0x{:016X}, size=0x{:X}",
+        addr,
+        size
+    );
 
     if !is_4kb_aligned(addr) {
         log::error!("Address is not aligned to 4KB, 0x{:016X}", addr);
@@ -91,19 +99,26 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
     if !process.page_table.contains(addr_kpa, size as usize) {
         log::error!(
             "Address is not within the address space, addr=0x{:016X}, size=0x{:016X}",
-            addr, size
+            addr,
+            size
         );
         return RESULT_INVALID_MEMORY_REGION;
     }
 
     // The base page table's map_physical_memory checks is_in_alias_region internally.
-    let result = process.page_table.map_physical_memory(addr_kpa, size as usize);
+    let result = process
+        .page_table
+        .map_physical_memory(addr_kpa, size as usize);
     ResultCode::new(result)
 }
 
 /// Unmaps memory previously mapped via MapPhysicalMemory.
 pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode {
-    log::debug!("svc::UnmapPhysicalMemory called, addr=0x{:016X}, size=0x{:X}", addr, size);
+    log::debug!(
+        "svc::UnmapPhysicalMemory called, addr=0x{:016X}, size=0x{:X}",
+        addr,
+        size
+    );
 
     if !is_4kb_aligned(addr) {
         log::error!("Address is not aligned to 4KB, 0x{:016X}", addr);
@@ -130,13 +145,16 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
     if !process.page_table.contains(addr_kpa, size as usize) {
         log::error!(
             "Address is not within the address space, addr=0x{:016X}, size=0x{:016X}",
-            addr, size
+            addr,
+            size
         );
         return RESULT_INVALID_MEMORY_REGION;
     }
 
     // The base page table's unmap_physical_memory checks is_in_alias_region internally.
-    let result = process.page_table.unmap_physical_memory(addr_kpa, size as usize);
+    let result = process
+        .page_table
+        .unmap_physical_memory(addr_kpa, size as usize);
     ResultCode::new(result)
 }
 

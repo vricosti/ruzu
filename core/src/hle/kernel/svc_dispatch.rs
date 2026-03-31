@@ -441,7 +441,8 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             // IN: size=arg32[1]; OUT: ret=arg32[0], out_address=arg32[1]
             let size = get_arg32(args, 1) as u64;
             let mut heap_base = 0;
-            let result = svc_physical_memory::set_heap_size_current_process(system, &mut heap_base, size);
+            let result =
+                svc_physical_memory::set_heap_size_current_process(system, &mut heap_base, size);
             log::info!("  SetHeapSize({:#x}) -> heap at {:#x}", size, heap_base);
             set_arg32(args, 0, result.get_inner_value());
             set_arg32(args, 1, heap_base as u32);
@@ -603,8 +604,12 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let handle = get_arg32(args, 1);
             let mut out_priority = 0;
             let result = svc_thread::get_thread_priority(system, &mut out_priority, handle);
-            log::info!("  GetThreadPriority(handle={:#x}) -> result={:#x}, priority={}",
-                handle, result.get_inner_value(), out_priority);
+            log::info!(
+                "  GetThreadPriority(handle={:#x}) -> result={:#x}, priority={}",
+                handle,
+                result.get_inner_value(),
+                out_priority
+            );
             set_arg32(args, 0, result.get_inner_value());
             set_arg32(args, 1, out_priority as u32);
         }
@@ -613,16 +618,27 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let handle = get_arg32(args, 0);
             let priority = get_arg32(args, 1) as i32;
             let result = svc_thread::set_thread_priority(system, handle, priority);
-            log::info!("  SetThreadPriority(handle={:#x}, priority={}) -> result={:#x}",
-                handle, priority, result.get_inner_value());
+            log::info!(
+                "  SetThreadPriority(handle={:#x}, priority={}) -> result={:#x}",
+                handle,
+                priority,
+                result.get_inner_value()
+            );
             if result.is_error() {
                 let process = system.current_process_arc().lock().unwrap();
                 let prio_mask = process.get_priority_mask();
                 let prio_check = process.check_thread_priority(priority);
-                log::error!("  priority_mask={:#018x}, check_thread_priority({})={}",
-                    prio_mask, priority, prio_check);
-                log::error!("  Handle table dump: count={}, table_size={}",
-                    process.handle_table.count, process.handle_table.table_size);
+                log::error!(
+                    "  priority_mask={:#018x}, check_thread_priority({})={}",
+                    prio_mask,
+                    priority,
+                    prio_check
+                );
+                log::error!(
+                    "  Handle table dump: count={}, table_size={}",
+                    process.handle_table.count,
+                    process.handle_table.table_size
+                );
                 for i in 0..std::cmp::min(process.handle_table.count as usize + 2, 10) {
                     let obj = process.handle_table.objects[i];
                     let li = unsafe { process.handle_table.entry_infos[i].linear_id };
@@ -634,9 +650,12 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 // Check the specific index
                 let (idx, lid, _) = crate::hle::kernel::k_handle_table::decode_handle(handle);
                 log::error!("  Decoded handle: index={}, linear_id={}", idx, lid);
-                log::error!("  At index {}: object_id={}, entry linear_id={}",
-                    idx, process.handle_table.objects[idx as usize],
-                    unsafe { process.handle_table.entry_infos[idx as usize].linear_id });
+                log::error!(
+                    "  At index {}: object_id={}, entry linear_id={}",
+                    idx,
+                    process.handle_table.objects[idx as usize],
+                    unsafe { process.handle_table.entry_infos[idx as usize].linear_id }
+                );
             }
             set_arg32(args, 0, result.get_inner_value());
         }
@@ -665,7 +684,11 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::GetCurrentProcessorNumber) => {
             // IN: (none); OUT: ret=arg32[0]
-            set_arg32(args, 0, svc_processor::get_current_processor_number(system) as u32);
+            set_arg32(
+                args,
+                0,
+                svc_processor::get_current_processor_number(system) as u32,
+            );
         }
         Some(SvcId::GetThreadId) => {
             // IN: handle=arg32[1]; OUT: ret=arg32[0], tid=scatter64[1,2]
@@ -815,7 +838,8 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         // =====================================================================
         Some(SvcId::ConnectToNamedPort) => {
             let mut out = 0;
-            let result = svc_port::connect_to_named_port(system, &mut out, get_arg32(args, 1) as u64);
+            let result =
+                svc_port::connect_to_named_port(system, &mut out, get_arg32(args, 1) as u64);
             set_arg32(args, 0, result.get_inner_value());
             set_arg32(args, 1, out);
         }
@@ -920,8 +944,13 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let address = get_arg32(args, 1) as u64;
             let size = get_arg32(args, 2) as u64;
             let perm = get_arg32(args, 3);
-            let map_perm = unsafe { std::mem::transmute::<u32, crate::hle::kernel::svc::svc_types::MemoryPermission>(perm) };
-            let result = svc_shared_memory::map_shared_memory(system, handle, address, size, map_perm);
+            let map_perm = unsafe {
+                std::mem::transmute::<u32, crate::hle::kernel::svc::svc_types::MemoryPermission>(
+                    perm,
+                )
+            };
+            let result =
+                svc_shared_memory::map_shared_memory(system, handle, address, size, map_perm);
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::UnmapSharedMemory) => {
@@ -990,8 +1019,12 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 // Try reading strings at known addresses from the step trace
                 for addr in [0x20bc7fau64, 0x20bc827, 0x2244ec7] {
                     let mut buf = vec![0u8; 128];
-                    for i in 0..128u64 { buf[i as usize] = m.read_8(addr + i); }
-                    if let Some(end) = buf.iter().position(|&b| b == 0) { buf.truncate(end); }
+                    for i in 0..128u64 {
+                        buf[i as usize] = m.read_8(addr + i);
+                    }
+                    if let Some(end) = buf.iter().position(|&b| b == 0) {
+                        buf.truncate(end);
+                    }
                     if let Ok(s) = String::from_utf8(buf.clone()) {
                         if !s.is_empty() && s.len() < 120 {
                             eprintln!("  [{addr:#x}] = \"{s}\"");
@@ -999,7 +1032,10 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                     }
                 }
             }
-            eprintln!("!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) — GAME ABORTED !!!", reason, info1, info2);
+            eprintln!(
+                "!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) — GAME ABORTED !!!",
+                reason, info1, info2
+            );
             svc_exception::break_execution(system, reason, info1, info2);
             std::process::exit(1);
         }
@@ -1249,7 +1285,8 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
         Some(SvcId::SetHeapSize) => {
             let size = get_arg64(args, 1);
             let mut heap_base = 0;
-            let result = svc_physical_memory::set_heap_size_current_process(system, &mut heap_base, size);
+            let result =
+                svc_physical_memory::set_heap_size_current_process(system, &mut heap_base, size);
             set_arg64(args, 0, result.get_inner_value() as u64);
             set_arg64(args, 1, heap_base);
         }
@@ -1329,8 +1366,11 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::GetThreadPriority) => {
             let mut out_priority = 0;
-            let result =
-                svc_thread::get_thread_priority(system, &mut out_priority, get_arg64(args, 1) as u32);
+            let result = svc_thread::get_thread_priority(
+                system,
+                &mut out_priority,
+                get_arg64(args, 1) as u32,
+            );
             set_arg64(args, 0, result.get_inner_value() as u64);
             set_arg64(args, 1, out_priority as u64);
         }
@@ -1365,7 +1405,11 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetCurrentProcessorNumber) => {
-            set_arg64(args, 0, svc_processor::get_current_processor_number(system) as u64);
+            set_arg64(
+                args,
+                0,
+                svc_processor::get_current_processor_number(system) as u64,
+            );
         }
         Some(SvcId::CloseHandle) => {
             let result = svc_synchronization::close_handle(system, get_arg64(args, 0) as u32);
@@ -1390,7 +1434,8 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::GetThreadId) => {
             let mut out_thread_id = 0;
-            let result = svc_thread::get_thread_id(system, &mut out_thread_id, get_arg64(args, 1) as u32);
+            let result =
+                svc_thread::get_thread_id(system, &mut out_thread_id, get_arg64(args, 1) as u32);
             set_arg64(args, 0, result.get_inner_value() as u64);
             set_arg64(args, 1, out_thread_id);
         }
@@ -1398,7 +1443,10 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             let reason = get_arg64(args, 0) as u32;
             let info1 = get_arg64(args, 1);
             let info2 = get_arg64(args, 2);
-            eprintln!("!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) — GAME ABORTED !!!", reason, info1, info2);
+            eprintln!(
+                "!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) — GAME ABORTED !!!",
+                reason, info1, info2
+            );
             svc_exception::break_execution(system, reason, info1, info2);
             std::process::exit(1);
         }
@@ -1479,9 +1527,20 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         let svc_name = SvcId::from_u32(imm).map_or("???".to_string(), |s| format!("{:?}", s));
 
         // Log SVC entry
-        eprintln!("SVC[{:04}] #{:#04x} ({}) IN  args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-            seq, imm, svc_name,
-            args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+        eprintln!(
+            "SVC[{:04}] #{:#04x} ({}) IN  args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            seq,
+            imm,
+            svc_name,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7]
+        );
 
         // For SendSyncRequest, dump TLS before
         if imm == 0x21 {
@@ -1490,7 +1549,9 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                 if let Some(thread) = system.current_thread() {
                     let tls = thread.lock().unwrap().get_tls_address().get();
                     let mut words = [0u32; 16];
-                    for i in 0..16 { words[i] = m.read_32(tls + i as u64 * 4); }
+                    for i in 0..16 {
+                        words[i] = m.read_32(tls + i as u64 * 4);
+                    }
                     eprintln!("  TLS_REQ [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
                         tls, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
                         words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
@@ -1498,12 +1559,27 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             }
         }
 
-        if is_64bit { call64(system, imm, args); } else { call32(system, imm, args); }
+        if is_64bit {
+            call64(system, imm, args);
+        } else {
+            call32(system, imm, args);
+        }
 
         // Log SVC exit
-        eprintln!("SVC[{:04}] #{:#04x} ({}) OUT args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-            seq, imm, svc_name,
-            args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+        eprintln!(
+            "SVC[{:04}] #{:#04x} ({}) OUT args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            seq,
+            imm,
+            svc_name,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7]
+        );
 
         // For SendSyncRequest, dump TLS after (response)
         if imm == 0x21 {
@@ -1512,7 +1588,9 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                 if let Some(thread) = system.current_thread() {
                     let tls = thread.lock().unwrap().get_tls_address().get();
                     let mut words = [0u32; 16];
-                    for i in 0..16 { words[i] = m.read_32(tls + i as u64 * 4); }
+                    for i in 0..16 {
+                        words[i] = m.read_32(tls + i as u64 * 4);
+                    }
                     eprintln!("  TLS_RSP [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
                         tls, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
                         words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
@@ -1520,7 +1598,11 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             }
         }
     } else {
-        if is_64bit { call64(system, imm, args); } else { call32(system, imm, args); }
+        if is_64bit {
+            call64(system, imm, args);
+        } else {
+            call32(system, imm, args);
+        }
     }
 
     // Upstream reaches the equivalent behavior when the scheduler lock is

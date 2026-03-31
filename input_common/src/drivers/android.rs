@@ -72,26 +72,14 @@ impl Android {
 
     /// Sets the status of a button on a specific controller.
     /// Port of Android::SetButtonState
-    pub fn set_button_state(
-        &mut self,
-        guid: &str,
-        port: usize,
-        button_id: i32,
-        value: bool,
-    ) {
+    pub fn set_button_state(&mut self, guid: &str, port: usize, button_id: i32, value: bool) {
         let identifier = self.get_identifier(guid, port);
         self.engine.set_button(&identifier, button_id, value);
     }
 
     /// Sets the status of an axis on a specific controller.
     /// Port of Android::SetAxisPosition
-    pub fn set_axis_position(
-        &mut self,
-        guid: &str,
-        port: usize,
-        axis_id: i32,
-        value: f32,
-    ) {
+    pub fn set_axis_position(&mut self, guid: &str, port: usize, axis_id: i32, value: f32) {
         let identifier = self.get_identifier(guid, port);
         self.engine.set_axis(&identifier, axis_id, value);
     }

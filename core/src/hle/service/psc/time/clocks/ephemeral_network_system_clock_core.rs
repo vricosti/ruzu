@@ -6,9 +6,9 @@
 //! EphemeralNetworkSystemClockCore: an ephemeral network system clock.
 //! Upstream has no additional methods beyond SystemClockCore.
 
+use super::system_clock_core::SystemClockCore;
 use crate::hle::result::ResultCode;
 use crate::hle::service::psc::time::common::SteadyClockTimePoint;
-use super::system_clock_core::SystemClockCore;
 
 /// EphemeralNetworkSystemClockCore wraps SystemClockCore with no additional behavior.
 /// Upstream: `class EphemeralNetworkSystemClockCore : public SystemClockCore { ... };`
@@ -19,9 +19,7 @@ pub struct EphemeralNetworkSystemClockCore {
 
 impl EphemeralNetworkSystemClockCore {
     pub fn new(
-        get_time_point: Box<
-            dyn Fn() -> Result<SteadyClockTimePoint, ResultCode> + Send + Sync,
-        >,
+        get_time_point: Box<dyn Fn() -> Result<SteadyClockTimePoint, ResultCode> + Send + Sync>,
     ) -> Self {
         Self {
             clock: SystemClockCore::new(get_time_point),

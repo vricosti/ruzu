@@ -8,9 +8,9 @@
 //! This is the most complex LDN service, handling network scanning, access point
 //! management, station connections, and LAN discovery.
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::lan_discovery::LANDiscovery;
-use super::ldn_types::{State, DisconnectReason};
+use super::ldn_types::{DisconnectReason, State};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// IPC command table for IUserLocalCommunicationService.
 ///
@@ -65,7 +65,10 @@ impl IUserLocalCommunicationService {
         } else {
             State::Error
         };
-        log::info!("IUserLocalCommunicationService::get_state called, state={:?}", state);
+        log::info!(
+            "IUserLocalCommunicationService::get_state called, state={:?}",
+            state
+        );
         (RESULT_SUCCESS, state)
     }
 
@@ -77,7 +80,9 @@ impl IUserLocalCommunicationService {
 
     /// Cmd 104: SetWirelessControllerRestriction
     pub fn set_wireless_controller_restriction(&self) -> ResultCode {
-        log::warn!("(STUBBED) IUserLocalCommunicationService::set_wireless_controller_restriction called");
+        log::warn!(
+            "(STUBBED) IUserLocalCommunicationService::set_wireless_controller_restriction called"
+        );
         RESULT_SUCCESS
     }
 

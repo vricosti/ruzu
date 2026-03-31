@@ -11,13 +11,13 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
+use super::ro_nro_utils;
+use super::ro_results;
+use super::ro_types::{ModuleId, NroHeader, NrrHeader, NrrKind};
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::ro_nro_utils;
-use super::ro_results;
-use super::ro_types::{ModuleId, NroHeader, NrrHeader, NrrKind};
 
 // Convenience definitions — matches upstream ro.cpp.
 const MAX_SESSIONS: usize = 0x3;
@@ -214,7 +214,9 @@ impl ProcessContext {
         let hash: Sha256Hash = {
             let size = nro_header.get_size() as u64;
 
-            let process_arc = self.process.as_ref()
+            let process_arc = self
+                .process
+                .as_ref()
                 .ok_or(ro_results::RESULT_INVALID_PROCESS)?;
             let process = process_arc.lock().unwrap();
             let mem = process.process_memory.read().unwrap();
@@ -254,7 +256,9 @@ impl ProcessContext {
         expected_bss_size: u64,
     ) -> Result<(ModuleId, u64, u64, u64), ResultCode> {
         // Ensure we have a process to work on.
-        let process_arc = self.process.as_ref()
+        let process_arc = self
+            .process
+            .as_ref()
             .ok_or(ro_results::RESULT_INVALID_PROCESS)?;
 
         // Read the NRO header from process memory.
@@ -431,11 +435,7 @@ impl RoContext {
     }
 
     /// Validate that a context matches a process ID.
-    pub fn validate_process(
-        &self,
-        context_id: usize,
-        process_id: u64,
-    ) -> Result<(), ResultCode> {
+    pub fn validate_process(&self, context_id: usize, process_id: u64) -> Result<(), ResultCode> {
         if context_id as u64 == INVALID_CONTEXT_ID {
             return Err(ro_results::RESULT_INVALID_PROCESS);
         }
@@ -471,7 +471,8 @@ impl RoContext {
         let nrr_index = context.get_free_nrr_info_index()?;
 
         // Ensure we have a valid process to read from.
-        let process_arc = context.get_process()
+        let process_arc = context
+            .get_process()
             .ok_or(ro_results::RESULT_INVALID_PROCESS)?
             .clone();
 
@@ -481,9 +482,8 @@ impl RoContext {
             let mem = process.process_memory.read().unwrap();
             let header_bytes = mem.read_bytes(nrr_address, std::mem::size_of::<NrrHeader>());
             assert!(header_bytes.len() >= std::mem::size_of::<NrrHeader>());
-            let header: NrrHeader = unsafe {
-                std::ptr::read_unaligned(header_bytes.as_ptr() as *const NrrHeader)
-            };
+            let header: NrrHeader =
+                unsafe { std::ptr::read_unaligned(header_bytes.as_ptr() as *const NrrHeader) };
             (header.get_num_hashes() as usize, header.get_hashes_offset())
         };
 
@@ -498,10 +498,7 @@ impl RoContext {
         if hash_data_size > 0 {
             let process = process_arc.lock().unwrap();
             let mem = process.process_memory.read().unwrap();
-            let hash_bytes = mem.read_bytes(
-                nrr_address + hashes_offset as u64,
-                hash_data_size,
-            );
+            let hash_bytes = mem.read_bytes(nrr_address + hashes_offset as u64, hash_data_size);
             for i in 0..num_hashes {
                 let offset = i * 32;
                 let mut hash = [0u8; 32];
@@ -580,7 +577,8 @@ impl RoContext {
         context.nro_infos[nro_index].bss_heap_size = bss_size;
 
         // Get the process for page table operations.
-        let process_arc = context.get_process()
+        let process_arc = context
+            .get_process()
             .ok_or(ro_results::RESULT_INVALID_PROCESS)?
             .clone();
 
@@ -650,7 +648,8 @@ impl RoContext {
                 rx_size,
                 ro_size,
                 rw_size + bss_size,
-            ).map_err(|e| {
+            )
+            .map_err(|e| {
                 // On permission failure, unmap the NRO.
                 let _ = ro_nro_utils::unmap_nro(
                     &mut process,
@@ -699,8 +698,7 @@ impl RoContext {
         context.nro_infos[nro_index] = NroInfo::default();
 
         // Get the process for unmapping.
-        let process_arc = context.get_process()
-            .cloned();
+        let process_arc = context.get_process().cloned();
 
         // Unmap using backup info.
         if let Some(process_arc) = process_arc {
@@ -790,21 +788,29 @@ impl SessionRequestHandler for RoInterface {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { &self.name }
+    fn service_name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl ServiceFramework for RoInterface {
-    fn get_service_name(&self) -> &str { &self.name }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        &self.name
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// LoopProcess — registers "ldr:ro" and "ro:1" services.
 ///
 /// Corresponds to `Service::RO::LoopProcess` in upstream ro.cpp.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     let mut server_manager = ServerManager::new(system);
 
@@ -814,7 +820,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             name,
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
+                    &svc_name,
+                ))
             }),
             16,
         );

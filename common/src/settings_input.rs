@@ -117,10 +117,7 @@ pub mod native_vibration {
     pub const VIBRATION_HID_END: i32 = NUM_VIBRATIONS as i32;
     pub const NUM_VIBRATIONS_HID: usize = NUM_VIBRATIONS;
 
-    pub const MAPPING: [&str; NUM_VIBRATIONS] = [
-        "left_vibration_device",
-        "right_vibration_device",
-    ];
+    pub const MAPPING: [&str; NUM_VIBRATIONS] = ["left_vibration_device", "right_vibration_device"];
 }
 
 // ── NativeMotion ────────────────────────────────────────────────────────────
@@ -161,9 +158,7 @@ pub mod native_mouse_button {
     pub const MOUSE_HID_END: i32 = NUM_MOUSE_BUTTONS as i32;
     pub const NUM_MOUSE_HID: usize = NUM_MOUSE_BUTTONS;
 
-    pub const MAPPING: [&str; NUM_MOUSE_BUTTONS] = [
-        "left", "right", "middle", "forward", "back",
-    ];
+    pub const MAPPING: [&str; NUM_MOUSE_BUTTONS] = ["left", "right", "middle", "forward", "back"];
 }
 
 // ── NativeMouseWheel ────────────────────────────────────────────────────────

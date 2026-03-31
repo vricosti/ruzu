@@ -34,7 +34,11 @@ impl INewsDatabaseService {
             (commands::COUNT, None, "Count"),
             (commands::COUNT_WITH_KEY, None, "CountWithKey"),
             (commands::UPDATE_INTEGER_VALUE, None, "UpdateIntegerValue"),
-            (commands::UPDATE_INTEGER_VALUE_WITH_ADDITION, None, "UpdateIntegerValueWithAddition"),
+            (
+                commands::UPDATE_INTEGER_VALUE_WITH_ADDITION,
+                None,
+                "UpdateIntegerValueWithAddition",
+            ),
             (commands::UPDATE_STRING_VALUE, None, "UpdateStringValue"),
             (commands::GET_LIST, None, "GetList"),
         ]);

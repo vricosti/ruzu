@@ -4,8 +4,8 @@
 //! SPIR-V floating point emission — maps to zuyu's
 //! `backend/spirv/emit_spirv_floating_point.cpp`.
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::Word;
 
 /// FPAdd32: `OpFAdd` F32.
 pub fn emit_fp_add_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
@@ -31,11 +31,17 @@ pub fn emit_fp_div_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 pub fn emit_fp_fma_32(ctx: &mut SpirvEmitContext, a: Word, b: Word, c: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 50 /* Fma */, vec![
-            rspirv::dr::Operand::IdRef(a),
-            rspirv::dr::Operand::IdRef(b),
-            rspirv::dr::Operand::IdRef(c),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            50, /* Fma */
+            vec![
+                rspirv::dr::Operand::IdRef(a),
+                rspirv::dr::Operand::IdRef(b),
+                rspirv::dr::Operand::IdRef(c),
+            ],
+        )
         .unwrap()
 }
 
@@ -48,9 +54,13 @@ pub fn emit_fp_neg_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_abs_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 4 /* FAbs */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            4, /* FAbs */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -58,10 +68,13 @@ pub fn emit_fp_abs_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_min_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 37 /* FMin */, vec![
-            rspirv::dr::Operand::IdRef(a),
-            rspirv::dr::Operand::IdRef(b),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            37, /* FMin */
+            vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
         .unwrap()
 }
 
@@ -69,10 +82,13 @@ pub fn emit_fp_min_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 pub fn emit_fp_max_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 40 /* FMax */, vec![
-            rspirv::dr::Operand::IdRef(a),
-            rspirv::dr::Operand::IdRef(b),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            40, /* FMax */
+            vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
         .unwrap()
 }
 
@@ -85,11 +101,17 @@ pub fn emit_fp_clamp_32(
 ) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 43 /* FClamp */, vec![
-            rspirv::dr::Operand::IdRef(value),
-            rspirv::dr::Operand::IdRef(min_val),
-            rspirv::dr::Operand::IdRef(max_val),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            43, /* FClamp */
+            vec![
+                rspirv::dr::Operand::IdRef(value),
+                rspirv::dr::Operand::IdRef(min_val),
+                rspirv::dr::Operand::IdRef(max_val),
+            ],
+        )
         .unwrap()
 }
 
@@ -97,9 +119,13 @@ pub fn emit_fp_clamp_32(
 pub fn emit_fp_sqrt_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 31 /* Sqrt */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            31, /* Sqrt */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -127,9 +153,13 @@ pub fn emit_fp_recip_sqrt_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_sin(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 13 /* Sin */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            13, /* Sin */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -137,9 +167,13 @@ pub fn emit_fp_sin(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_cos(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 14 /* Cos */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            14, /* Cos */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -147,9 +181,13 @@ pub fn emit_fp_cos(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_exp2(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 29 /* Exp2 */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            29, /* Exp2 */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -157,9 +195,13 @@ pub fn emit_fp_exp2(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_log2(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 30 /* Log2 */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            30, /* Log2 */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -167,9 +209,13 @@ pub fn emit_fp_log2(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_floor_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 8 /* Floor */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            8, /* Floor */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -177,9 +223,13 @@ pub fn emit_fp_floor_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_ceil_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 9 /* Ceil */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            9, /* Ceil */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -187,9 +237,13 @@ pub fn emit_fp_ceil_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_trunc_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f32_type, None, glsl_set, 3 /* Trunc */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.f32_type,
+            None,
+            glsl_set,
+            3, /* Trunc */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -211,9 +265,7 @@ pub fn emit_fp_round_even_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 /// FPOrdEqual32: `OpFOrdEqual`.
 pub fn emit_fp_ord_equal_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
-    ctx.builder
-        .f_ord_equal(ctx.bool_type, None, a, b)
-        .unwrap()
+    ctx.builder.f_ord_equal(ctx.bool_type, None, a, b).unwrap()
 }
 
 /// FPOrdNotEqual32: `OpFOrdNotEqual`.
@@ -291,11 +343,17 @@ pub fn emit_fp_mul_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 pub fn emit_fp_fma_64(ctx: &mut SpirvEmitContext, a: Word, b: Word, c: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f64_type, None, glsl_set, 50 /* Fma */, vec![
-            rspirv::dr::Operand::IdRef(a),
-            rspirv::dr::Operand::IdRef(b),
-            rspirv::dr::Operand::IdRef(c),
-        ])
+        .ext_inst(
+            ctx.f64_type,
+            None,
+            glsl_set,
+            50, /* Fma */
+            vec![
+                rspirv::dr::Operand::IdRef(a),
+                rspirv::dr::Operand::IdRef(b),
+                rspirv::dr::Operand::IdRef(c),
+            ],
+        )
         .unwrap()
 }
 
@@ -308,9 +366,13 @@ pub fn emit_fp_neg_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_abs_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f64_type, None, glsl_set, 4 /* FAbs */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.f64_type,
+            None,
+            glsl_set,
+            4, /* FAbs */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -318,10 +380,13 @@ pub fn emit_fp_abs_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_fp_min_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f64_type, None, glsl_set, 37 /* FMin */, vec![
-            rspirv::dr::Operand::IdRef(a),
-            rspirv::dr::Operand::IdRef(b),
-        ])
+        .ext_inst(
+            ctx.f64_type,
+            None,
+            glsl_set,
+            37, /* FMin */
+            vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
         .unwrap()
 }
 
@@ -329,9 +394,12 @@ pub fn emit_fp_min_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 pub fn emit_fp_max_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.f64_type, None, glsl_set, 40 /* FMax */, vec![
-            rspirv::dr::Operand::IdRef(a),
-            rspirv::dr::Operand::IdRef(b),
-        ])
+        .ext_inst(
+            ctx.f64_type,
+            None,
+            glsl_set,
+            40, /* FMax */
+            vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
         .unwrap()
 }

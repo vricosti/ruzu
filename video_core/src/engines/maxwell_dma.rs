@@ -55,7 +55,13 @@ impl MaxwellDMA {
     }
 
     /// Corresponds to upstream `MaxwellDMA::CallMultiMethod`.
-    pub fn call_multi_method(&mut self, method: u32, args: &[u32], _amount: u32, _methods_pending: u32) {
+    pub fn call_multi_method(
+        &mut self,
+        method: u32,
+        args: &[u32],
+        _amount: u32,
+        _methods_pending: u32,
+    ) {
         for &arg in args {
             self.call_method(method, arg, false);
         }
@@ -181,10 +187,7 @@ impl Engine for MaxwellDMA {
         }
     }
 
-    fn execute_pending(
-        &mut self,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-    ) -> Vec<PendingWrite> {
+    fn execute_pending(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         if !self.pending_launch {
             return vec![];
         }
@@ -216,7 +219,12 @@ impl Engine for MaxwellDMA {
 
         log::debug!(
             "MaxwellDMA: copy executed {}x{} (pi={} po={}) src=0x{:X} -> dst=0x{:X}",
-            ll, lines, pi, po, self.src_addr(), self.dst_addr()
+            ll,
+            lines,
+            pi,
+            po,
+            self.src_addr(),
+            self.dst_addr()
         );
 
         vec![PendingWrite {
@@ -283,7 +291,8 @@ mod tests {
 
     #[test]
     fn test_bind_rasterizer_stores_reference() {
-        let syncpoints = std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let syncpoints =
+            std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
         let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
         let mut eng = MaxwellDMA::new();
         assert!(eng.rasterizer.is_none());
@@ -355,7 +364,7 @@ mod tests {
         assert_eq!(writes[0].gpu_va, 0x2000);
         let dst = &writes[0].data;
         assert_eq!(dst.len(), 32); // 2 lines * pitch_out=16
-        // Line 0: 4 bytes copied + 12 zeros.
+                                   // Line 0: 4 bytes copied + 12 zeros.
         assert_eq!(&dst[0..4], &[1, 2, 3, 4]);
         assert_eq!(&dst[4..16], &[0; 12]);
         // Line 1: 4 bytes copied + 12 zeros.

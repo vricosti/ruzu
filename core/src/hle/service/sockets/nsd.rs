@@ -87,7 +87,11 @@ impl Nsd {
         let handlers = build_handler_map(&[
             (5, None, "GetSettingUrl"),
             (10, None, "GetSettingName"),
-            (11, Some(Nsd::get_environment_identifier_handler), "GetEnvironmentIdentifier"),
+            (
+                11,
+                Some(Nsd::get_environment_identifier_handler),
+                "GetEnvironmentIdentifier",
+            ),
             (12, None, "GetDeviceId"),
             (13, None, "DeleteSettings"),
             (14, None, "ImportSettings"),
@@ -108,7 +112,11 @@ impl Nsd {
             (62, None, "DeleteSaveDataOfFsForTest"),
             (63, None, "IsChangeEnvironmentIdentifierDisabled"),
             (64, None, "SetWithoutDomainExchangeFqdns"),
-            (100, Some(Nsd::get_application_server_environment_type_handler), "GetApplicationServerEnvironmentType"),
+            (
+                100,
+                Some(Nsd::get_application_server_environment_type_handler),
+                "GetApplicationServerEnvironmentType",
+            ),
             (101, None, "SetApplicationServerEnvironmentType"),
             (102, None, "DeleteApplicationServerEnvironmentType"),
         ]);
@@ -177,7 +185,9 @@ impl Nsd {
     fn resolve_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Nsd) };
         let fqdn_buf = ctx.read_buffer(0);
-        let fqdn_in = String::from_utf8_lossy(&fqdn_buf).trim_end_matches('\0').to_string();
+        let fqdn_in = String::from_utf8_lossy(&fqdn_buf)
+            .trim_end_matches('\0')
+            .to_string();
 
         match svc.resolve(&fqdn_in) {
             Ok(fqdn_out) => {
@@ -195,7 +205,9 @@ impl Nsd {
     fn resolve_ex_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Nsd) };
         let fqdn_buf = ctx.read_buffer(0);
-        let fqdn_in = String::from_utf8_lossy(&fqdn_buf).trim_end_matches('\0').to_string();
+        let fqdn_in = String::from_utf8_lossy(&fqdn_buf)
+            .trim_end_matches('\0')
+            .to_string();
 
         match svc.resolve_ex(&fqdn_in) {
             Ok(fqdn_out) => {
@@ -212,7 +224,10 @@ impl Nsd {
         }
     }
 
-    fn get_environment_identifier_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_environment_identifier_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Nsd) };
         let env_id = svc.get_environment_identifier();
         ctx.write_buffer(&env_id.identifier, 0);
@@ -220,7 +235,10 @@ impl Nsd {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_application_server_environment_type_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_application_server_environment_type_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Nsd) };
         let env_type = svc.get_application_server_environment_type();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);

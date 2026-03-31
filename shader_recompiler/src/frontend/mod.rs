@@ -4,20 +4,20 @@
 //! Maxwell shader frontend: decoder, CFG analysis, structured control flow,
 //! and translator that emits IR.
 
-pub mod maxwell_opcodes;
 pub mod control_flow;
 pub mod decode;
 pub mod indirect_branch_table_track;
 pub mod instruction;
 pub mod location;
+pub mod maxwell_opcodes;
 pub mod structured_control_flow;
 pub mod translate;
 pub mod translate_program;
 
 #[cfg(test)]
 mod tests {
-    use super::maxwell_opcodes::{decode_opcode, MaxwellOpcode};
     use super::control_flow;
+    use super::maxwell_opcodes::{decode_opcode, MaxwellOpcode};
 
     // ── Opcode decoder tests ─────────────────────────────────────────
 

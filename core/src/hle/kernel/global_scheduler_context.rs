@@ -18,7 +18,8 @@ use super::k_thread::{KThread, ThreadState, ThreadType};
 pub const HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY: i32 = 2;
 
 /// Preemption priorities for each core (indices 0-3).
-pub const PREEMPTION_PRIORITIES: [u32; hardware_properties::NUM_CPU_CORES as usize] = [59, 59, 59, 63];
+pub const PREEMPTION_PRIORITIES: [u32; hardware_properties::NUM_CPU_CORES as usize] =
+    [59, 59, 59, 63];
 
 /// The global scheduler context.
 ///
@@ -103,7 +104,8 @@ impl GlobalSchedulerContext {
 
         if old_state == ThreadState::RUNNABLE {
             // Was runnable, now not — remove from PQ.
-            self.m_priority_queue.remove(thread_id, priority, active_core, affinity, is_dummy);
+            self.m_priority_queue
+                .remove(thread_id, priority, active_core, affinity, is_dummy);
             self.m_priority_queue.increment_scheduled_count(thread_id);
             self.m_scheduler_update_needed
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -114,7 +116,11 @@ impl GlobalSchedulerContext {
         } else if new_state == ThreadState::RUNNABLE {
             // Was not runnable, now is — add to PQ.
             self.m_priority_queue.push_back(
-                thread_id, priority, active_core, affinity, is_dummy,
+                thread_id,
+                priority,
+                active_core,
+                affinity,
+                is_dummy,
                 process_schedule_count,
             );
             self.m_priority_queue.increment_scheduled_count(thread_id);
@@ -136,6 +142,7 @@ impl GlobalSchedulerContext {
                 }
             }
         }
+
     }
 
     /// Called when a thread's priority changes while it is Runnable.
@@ -152,8 +159,13 @@ impl GlobalSchedulerContext {
         _member_id: u64,
     ) {
         self.m_priority_queue.change_priority(
-            old_priority, is_running, _member_id,
-            new_priority, active_core, affinity, is_dummy,
+            old_priority,
+            is_running,
+            _member_id,
+            new_priority,
+            active_core,
+            affinity,
+            is_dummy,
         );
         self.m_scheduler_update_needed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -172,8 +184,13 @@ impl GlobalSchedulerContext {
         is_dummy: bool,
     ) {
         self.m_priority_queue.change_affinity_mask(
-            prev_core, prev_affinity, thread_id,
-            new_core, new_affinity, priority, is_dummy,
+            prev_core,
+            prev_affinity,
+            thread_id,
+            new_core,
+            new_affinity,
+            priority,
+            is_dummy,
         );
         self.m_scheduler_update_needed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -191,7 +208,12 @@ impl GlobalSchedulerContext {
         process_schedule_count: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     ) {
         self.m_priority_queue.push_back(
-            thread_id, priority, active_core, affinity, is_dummy, process_schedule_count,
+            thread_id,
+            priority,
+            active_core,
+            affinity,
+            is_dummy,
+            process_schedule_count,
         );
         self.m_scheduler_update_needed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -205,7 +227,8 @@ impl GlobalSchedulerContext {
         affinity: u64,
         is_dummy: bool,
     ) {
-        self.m_priority_queue.remove(thread_id, priority, active_core, affinity, is_dummy);
+        self.m_priority_queue
+            .remove(thread_id, priority, active_core, affinity, is_dummy);
         self.m_scheduler_update_needed
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -221,14 +244,20 @@ impl GlobalSchedulerContext {
         active_core: i32,
         is_dummy: bool,
     ) -> Option<u64> {
-        let result = self.m_priority_queue.move_to_scheduled_back(thread_id, priority, active_core, is_dummy);
+        let result = self.m_priority_queue.move_to_scheduled_back(
+            thread_id,
+            priority,
+            active_core,
+            is_dummy,
+        );
         self.m_scheduler_update_needed
             .store(true, std::sync::atomic::Ordering::Release);
         result
     }
 
     pub fn get_scheduled_next(&self, core: i32, thread_id: u64, priority: i32) -> Option<u64> {
-        self.m_priority_queue.get_scheduled_next(core, thread_id, priority)
+        self.m_priority_queue
+            .get_scheduled_next(core, thread_id, priority)
     }
 
     // -- PreemptThreads --
@@ -236,14 +265,19 @@ impl GlobalSchedulerContext {
     pub fn preempt_threads(&mut self) {
         for core_id in 0..hardware_properties::NUM_CPU_CORES {
             let priority = PREEMPTION_PRIORITIES[core_id as usize] as i32;
-            let top_thread_id = self.m_priority_queue.get_scheduled_front_at_priority(core_id as i32, priority);
+            let top_thread_id = self
+                .m_priority_queue
+                .get_scheduled_front_at_priority(core_id as i32, priority);
             if let Some(top_id) = top_thread_id {
                 // Look up cached properties for this thread
-                let (t_priority, t_core, t_dummy) = self.m_priority_queue
+                let (t_priority, t_core, t_dummy) = self
+                    .m_priority_queue
                     .get_thread_props(top_id)
                     .map(|p| (p.priority, p.active_core, p.is_dummy))
                     .unwrap_or((priority, core_id as i32, false));
-                let _ = self.m_priority_queue.move_to_scheduled_back(top_id, t_priority, t_core, t_dummy);
+                let _ = self
+                    .m_priority_queue
+                    .move_to_scheduled_back(top_id, t_priority, t_core, t_dummy);
             }
         }
     }
@@ -263,7 +297,10 @@ impl GlobalSchedulerContext {
     }
 
     pub fn unregister_dummy_thread_for_wakeup(&self, thread_id: u64) {
-        self.m_woken_dummy_threads.lock().unwrap().remove(&thread_id);
+        self.m_woken_dummy_threads
+            .lock()
+            .unwrap()
+            .remove(&thread_id);
     }
 
     pub fn wakeup_waiting_dummy_threads(&self) {
@@ -274,9 +311,10 @@ impl GlobalSchedulerContext {
 
         let thread_list = self.m_thread_list.lock().unwrap();
         for thread_id in &thread_ids {
-            if let Some(thread) = thread_list.iter().find(|t| {
-                t.lock().unwrap().get_thread_id() == *thread_id
-            }) {
+            if let Some(thread) = thread_list
+                .iter()
+                .find(|t| t.lock().unwrap().get_thread_id() == *thread_id)
+            {
                 thread.lock().unwrap().dummy_thread_end_wait();
             }
         }

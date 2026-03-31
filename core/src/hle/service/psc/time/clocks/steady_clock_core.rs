@@ -6,8 +6,8 @@
 //! SteadyClockCore: abstract base for steady clocks. Upstream is a virtual base class;
 //! here we use a trait.
 
-use crate::hle::result::ResultCode;
 use super::super::common::SteadyClockTimePoint;
+use crate::hle::result::ResultCode;
 
 /// One second in nanoseconds.
 const ONE_SECOND_NS: i64 = 1_000_000_000;

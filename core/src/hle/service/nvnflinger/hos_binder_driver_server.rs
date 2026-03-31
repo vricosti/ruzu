@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_readable_event::KReadableEvent;
+
 use super::binder::IBinder;
 
 /// Manages registered binder objects by ID.
@@ -55,7 +57,14 @@ impl HosBinderDriverServer {
     }
 
     /// Perform a binder transaction.
-    pub fn transact(&self, id: i32, code: u32, parcel_data: &[u8], parcel_reply: &mut [u8], flags: u32) {
+    pub fn transact(
+        &self,
+        id: i32,
+        code: u32,
+        parcel_data: &[u8],
+        parcel_reply: &mut [u8],
+        flags: u32,
+    ) {
         if let Some(binder) = self.try_get_binder(id) {
             binder.transact(code, parcel_data, parcel_reply, flags);
         } else {
@@ -64,7 +73,7 @@ impl HosBinderDriverServer {
     }
 
     /// Get the native handle from a binder.
-    pub fn get_native_handle(&self, id: i32, type_id: u32) -> Option<u32> {
+    pub fn get_native_handle(&self, id: i32, type_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
         if let Some(binder) = self.try_get_binder(id) {
             binder.get_native_handle(type_id)
         } else {
@@ -87,17 +96,19 @@ impl Default for HosBinderDriverServer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::HosBinderDriverServer;
+    use crate::hle::kernel::k_readable_event::KReadableEvent;
     use crate::hle::service::nvnflinger::binder::IBinder;
 
     struct DummyBinder;
 
     impl IBinder for DummyBinder {
-        fn transact(&self, _code: u32, _parcel_data: &[u8], _parcel_reply: &mut [u8], _flags: u32) {}
+        fn transact(&self, _code: u32, _parcel_data: &[u8], _parcel_reply: &mut [u8], _flags: u32) {
+        }
 
-        fn get_native_handle(&self, _type_id: u32) -> Option<u32> {
+        fn get_native_handle(&self, _type_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
             None
         }
     }

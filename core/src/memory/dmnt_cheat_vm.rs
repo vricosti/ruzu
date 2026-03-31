@@ -353,7 +353,8 @@ pub const MAXIMUM_PROGRAM_OPCODE_COUNT: usize = 0x400;
 pub const NUM_REGISTERS: usize = 0x10;
 pub const NUM_READABLE_STATIC_REGISTERS: usize = 0x80;
 pub const NUM_WRITABLE_STATIC_REGISTERS: usize = 0x80;
-pub const NUM_STATIC_REGISTERS: usize = NUM_READABLE_STATIC_REGISTERS + NUM_WRITABLE_STATIC_REGISTERS;
+pub const NUM_STATIC_REGISTERS: usize =
+    NUM_READABLE_STATIC_REGISTERS + NUM_WRITABLE_STATIC_REGISTERS;
 
 pub struct DmntCheatVm {
     callbacks: Box<dyn VmCallbacks>,
@@ -481,9 +482,9 @@ impl DmntCheatVm {
     ) -> u64 {
         let base = match mem_type {
             0 => metadata.main_nso_extents.base, // MainNso
-            1 => metadata.heap_extents.base,      // Heap
-            2 => metadata.alias_extents.base,     // Alias
-            3 => metadata.aslr_extents.base,      // Aslr
+            1 => metadata.heap_extents.base,     // Heap
+            2 => metadata.alias_extents.base,    // Alias
+            3 => metadata.aslr_extents.base,     // Aslr
             _ => 0,
         };
         base + rel_address
@@ -543,8 +544,7 @@ impl DmntCheatVm {
                     .command_log(&format!("Value:     {:X}\n", op.value));
             }
             CheatVmOpcodeVariant::LoadRegisterMemory(op) => {
-                self.callbacks
-                    .command_log("Opcode: Load Register Memory\n");
+                self.callbacks.command_log("Opcode: Load Register Memory\n");
                 self.callbacks
                     .command_log(&format!("Bit Width: {:X}\n", op.bit_width));
                 self.callbacks
@@ -589,8 +589,7 @@ impl DmntCheatVm {
                 let bit_width = 1u32 << ((first >> 24) & 0xF);
                 let mem_type = (first >> 20) & 0xF;
                 let offset_register = (first >> 16) & 0xF;
-                let rel_address = ((first & 0xFFFF) as u64) << 32
-                    | self.read_program_u32() as u64;
+                let rel_address = ((first & 0xFFFF) as u64) << 32 | self.read_program_u32() as u64;
                 let value = self.read_vm_int(bit_width);
                 CheatVmOpcodeVariant::StoreStatic(StoreStaticOpcode {
                     bit_width,
@@ -606,8 +605,7 @@ impl DmntCheatVm {
                 let bit_width = 1u32 << ((first >> 24) & 0xF);
                 let mem_type = (first >> 20) & 0xF;
                 let cond_type = (first >> 16) & 0xF;
-                let rel_address = ((first & 0xFFFF) as u64) << 32
-                    | self.read_program_u32() as u64;
+                let rel_address = ((first & 0xFFFF) as u64) << 32 | self.read_program_u32() as u64;
                 let value = self.read_vm_int(bit_width);
                 CheatVmOpcodeVariant::BeginConditional(BeginConditionalOpcode {
                     bit_width,
@@ -639,8 +637,7 @@ impl DmntCheatVm {
             // LoadRegisterStatic (4)
             4 => {
                 let reg_index = (first >> 20) & 0xF;
-                let value = ((first & 0xFFFFF) as u64) << 32
-                    | self.read_program_u32() as u64;
+                let value = ((first & 0xFFFFF) as u64) << 32 | self.read_program_u32() as u64;
                 CheatVmOpcodeVariant::LoadRegisterStatic(LoadRegisterStaticOpcode {
                     reg_index,
                     value,
@@ -652,8 +649,7 @@ impl DmntCheatVm {
                 let mem_type = (first >> 20) & 0xF;
                 let reg_index = (first >> 16) & 0xF;
                 let load_from_reg = ((first >> 12) & 0xF) != 0;
-                let rel_address = ((first & 0xFFF) as u64) << 32
-                    | self.read_program_u32() as u64;
+                let rel_address = ((first & 0xFFF) as u64) << 32 | self.read_program_u32() as u64;
                 CheatVmOpcodeVariant::LoadRegisterMemory(LoadRegisterMemoryOpcode {
                     bit_width,
                     mem_type,
@@ -713,17 +709,15 @@ impl DmntCheatVm {
                 } else {
                     VmInt::default()
                 };
-                CheatVmOpcodeVariant::PerformArithmeticRegister(
-                    PerformArithmeticRegisterOpcode {
-                        bit_width,
-                        math_type,
-                        dst_reg_index,
-                        src_reg_1_index,
-                        src_reg_2_index,
-                        has_immediate,
-                        value,
-                    },
-                )
+                CheatVmOpcodeVariant::PerformArithmeticRegister(PerformArithmeticRegisterOpcode {
+                    bit_width,
+                    math_type,
+                    dst_reg_index,
+                    src_reg_1_index,
+                    src_reg_2_index,
+                    has_immediate,
+                    value,
+                })
             }
             // StoreRegisterToAddress (10)
             10 => {
@@ -847,9 +841,8 @@ impl DmntCheatVm {
             }
             // DoubleExtendedWidth (0xF)
             0xF => {
-                let sub_type = ((first >> 24) & 0xF) << 8
-                    | ((first >> 20) & 0xF) << 4
-                    | ((first >> 16) & 0xF);
+                let sub_type =
+                    ((first >> 24) & 0xF) << 8 | ((first >> 20) & 0xF) << 4 | ((first >> 16) & 0xF);
                 let full_type = 0xF00 | (sub_type & 0xFF);
                 match full_type {
                     0xFF0 => CheatVmOpcodeVariant::PauseProcess(PauseProcessOpcode),
@@ -914,15 +907,11 @@ impl DmntCheatVm {
         match bit_width {
             1 | 2 => {
                 let word = self.read_program_u32();
-                VmInt {
-                    bit64: word as u64,
-                }
+                VmInt { bit64: word as u64 }
             }
             4 => {
                 let word = self.read_program_u32();
-                VmInt {
-                    bit64: word as u64,
-                }
+                VmInt { bit64: word as u64 }
             }
             8 => {
                 let hi = self.read_program_u32() as u64;
@@ -942,11 +931,9 @@ impl DmntCheatVm {
     fn execute_opcode(&mut self, opcode: &CheatVmOpcode, metadata: &CheatProcessMetadata) {
         match &opcode.opcode {
             CheatVmOpcodeVariant::StoreStatic(op) => {
-                let address = Self::get_cheat_process_address(
-                    metadata,
-                    op.mem_type,
-                    op.rel_address,
-                ) + self.registers[op.offset_register as usize];
+                let address =
+                    Self::get_cheat_process_address(metadata, op.mem_type, op.rel_address)
+                        + self.registers[op.offset_register as usize];
                 let value = Self::get_vm_int(op.value, op.bit_width);
                 self.write_value_to_address(address, op.bit_width, value);
             }
@@ -1027,8 +1014,7 @@ impl DmntCheatVm {
                     0 => {} // None
                     1 => {
                         // Reg
-                        address =
-                            address.wrapping_add(self.registers[op.ofs_reg_index as usize]);
+                        address = address.wrapping_add(self.registers[op.ofs_reg_index as usize]);
                     }
                     2 => {
                         // Imm
@@ -1067,24 +1053,20 @@ impl DmntCheatVm {
                 let rhs = match op.comp_type {
                     0 => {
                         // MemoryRelAddr
-                        let addr = Self::get_cheat_process_address(
-                            metadata,
-                            op.mem_type,
-                            op.rel_address,
-                        );
+                        let addr =
+                            Self::get_cheat_process_address(metadata, op.mem_type, op.rel_address);
                         self.read_value_from_address(addr, op.bit_width)
                     }
                     1 => {
                         // MemoryOfsReg
                         let base = Self::get_cheat_process_address(metadata, op.mem_type, 0);
-                        let addr =
-                            base.wrapping_add(self.registers[op.ofs_reg_index as usize]);
+                        let addr = base.wrapping_add(self.registers[op.ofs_reg_index as usize]);
                         self.read_value_from_address(addr, op.bit_width)
                     }
                     2 => {
                         // RegisterRelAddr
-                        let addr = self.registers[op.addr_reg_index as usize]
-                            .wrapping_add(op.rel_address);
+                        let addr =
+                            self.registers[op.addr_reg_index as usize].wrapping_add(op.rel_address);
                         self.read_value_from_address(addr, op.bit_width)
                     }
                     3 => {
@@ -1180,24 +1162,20 @@ impl DmntCheatVm {
                 let value = match op.val_type {
                     0 => {
                         // MemoryRelAddr
-                        let addr = Self::get_cheat_process_address(
-                            metadata,
-                            op.mem_type,
-                            op.rel_address,
-                        );
+                        let addr =
+                            Self::get_cheat_process_address(metadata, op.mem_type, op.rel_address);
                         self.read_value_from_address(addr, op.bit_width)
                     }
                     1 => {
                         // MemoryOfsReg
                         let base = Self::get_cheat_process_address(metadata, op.mem_type, 0);
-                        let addr =
-                            base.wrapping_add(self.registers[op.ofs_reg_index as usize]);
+                        let addr = base.wrapping_add(self.registers[op.ofs_reg_index as usize]);
                         self.read_value_from_address(addr, op.bit_width)
                     }
                     2 => {
                         // RegisterRelAddr
-                        let addr = self.registers[op.addr_reg_index as usize]
-                            .wrapping_add(op.rel_address);
+                        let addr =
+                            self.registers[op.addr_reg_index as usize].wrapping_add(op.rel_address);
                         self.read_value_from_address(addr, op.bit_width)
                     }
                     3 => {
@@ -1223,8 +1201,7 @@ impl DmntCheatVm {
     fn read_value_from_address(&self, address: u64, bit_width: u32) -> u64 {
         let mut buf = [0u8; 8];
         let size = bit_width.min(8) as usize;
-        self.callbacks
-            .memory_read_unsafe(address, &mut buf[..size]);
+        self.callbacks.memory_read_unsafe(address, &mut buf[..size]);
         match size {
             1 => buf[0] as u64,
             2 => u16::from_le_bytes([buf[0], buf[1]]) as u64,
@@ -1287,16 +1264,16 @@ impl DmntCheatVm {
         };
 
         let result = match math_type {
-            0 => lhs.wrapping_add(rhs),         // Addition
-            1 => lhs.wrapping_sub(rhs),         // Subtraction
-            2 => lhs.wrapping_mul(rhs),         // Multiplication
-            3 => lhs << (rhs & 0x3F),           // LeftShift
-            4 => lhs >> (rhs & 0x3F),           // RightShift
-            5 => lhs & rhs,                     // LogicalAnd
-            6 => lhs | rhs,                     // LogicalOr
-            7 => !lhs,                          // LogicalNot
-            8 => lhs ^ rhs,                     // LogicalXor
-            9 => lhs,                           // None
+            0 => lhs.wrapping_add(rhs), // Addition
+            1 => lhs.wrapping_sub(rhs), // Subtraction
+            2 => lhs.wrapping_mul(rhs), // Multiplication
+            3 => lhs << (rhs & 0x3F),   // LeftShift
+            4 => lhs >> (rhs & 0x3F),   // RightShift
+            5 => lhs & rhs,             // LogicalAnd
+            6 => lhs | rhs,             // LogicalOr
+            7 => !lhs,                  // LogicalNot
+            8 => lhs ^ rhs,             // LogicalXor
+            9 => lhs,                   // None
             _ => lhs,
         };
 

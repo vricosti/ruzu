@@ -316,10 +316,7 @@ mod tests {
         assert!(sph.ps_output_enabled(0, 2)); // RT0.B
         assert!(sph.ps_output_enabled(0, 3)); // RT0.A
         assert!(!sph.ps_output_enabled(1, 0)); // RT1 disabled
-        assert_eq!(
-            sph.ps_input_generic_imap(0, 0),
-            PixelImap::Perspective
-        );
+        assert_eq!(sph.ps_input_generic_imap(0, 0), PixelImap::Perspective);
     }
 
     #[test]

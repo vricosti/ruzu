@@ -8,9 +8,9 @@
 //! linked into per-pool chains. Each Impl wraps a KPageHeap for block allocation
 //! and maintains per-page reference counts.
 
-use std::sync::Mutex;
 use super::k_memory_block::PAGE_SIZE;
 use super::k_page_heap::KPageHeap;
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Pool
@@ -93,7 +93,10 @@ impl Impl {
 
         log::debug!(
             "KMemoryManager::Impl::initialize: pool={:?}, addr={:#x}, size={:#x} ({} pages)",
-            pool, address, size, num_pages
+            pool,
+            address,
+            size,
+            num_pages
         );
     }
 
@@ -120,7 +123,8 @@ impl Impl {
     /// Allocate aligned pages from the heap.
     /// Upstream: `Impl::AllocateAligned`.
     fn allocate_aligned(&mut self, heap_index: i32, num_pages: usize, align_pages: usize) -> u64 {
-        self.m_heap.allocate_aligned(heap_index, num_pages, align_pages)
+        self.m_heap
+            .allocate_aligned(heap_index, num_pages, align_pages)
     }
 
     /// Free pages back to the heap.
@@ -137,7 +141,8 @@ impl Impl {
             self.m_page_reference_counts[index] += 1;
             debug_assert_eq!(
                 self.m_page_reference_counts[index], 1,
-                "OpenFirst: ref count must be 1 at index {}", index
+                "OpenFirst: ref count must be 1 at index {}",
+                index
             );
             index += 1;
         }
@@ -152,7 +157,8 @@ impl Impl {
             self.m_page_reference_counts[index] += 1;
             debug_assert!(
                 self.m_page_reference_counts[index] > 1,
-                "Open: ref count must be > 1 at index {}", index
+                "Open: ref count must be > 1 at index {}",
+                index
             );
             index += 1;
         }
@@ -169,7 +175,8 @@ impl Impl {
         while index < end {
             debug_assert!(
                 self.m_page_reference_counts[index] > 0,
-                "Close: ref count must be > 0 at index {}", index
+                "Close: ref count must be > 0 at index {}",
+                index
             );
             self.m_page_reference_counts[index] -= 1;
             let ref_count = self.m_page_reference_counts[index];
@@ -277,7 +284,10 @@ impl KMemoryManager {
 
         log::info!(
             "KMemoryManager: initialized pool {:?} at {:#x}..{:#x} ({:#x} bytes)",
-            pool, phys_start, phys_start + size as u64, size
+            pool,
+            phys_start,
+            phys_start + size as u64,
+            size
         );
     }
 
@@ -312,10 +322,7 @@ impl KMemoryManager {
         // Find a manager for this pool and try to allocate.
         let manager_idx = self.m_pool_managers_head[pool_index];
         let Some(idx) = manager_idx else {
-            log::error!(
-                "AllocateAndOpenContinuous: no manager for pool {:?}",
-                pool
-            );
+            log::error!("AllocateAndOpenContinuous: no manager for pool {:?}", pool);
             return 0;
         };
 
@@ -325,7 +332,8 @@ impl KMemoryManager {
         if allocated_block == 0 {
             log::error!(
                 "AllocateAndOpenContinuous: allocation failed for {} pages in pool {:?}",
-                num_pages, pool
+                num_pages,
+                pool
             );
             return 0;
         }
@@ -335,7 +343,9 @@ impl KMemoryManager {
 
         log::debug!(
             "AllocateAndOpenContinuous: allocated {} pages at {:#x} from pool {:?}",
-            num_pages, allocated_block, pool
+            num_pages,
+            allocated_block,
+            pool
         );
 
         allocated_block
@@ -375,7 +385,8 @@ impl KMemoryManager {
         let _lk = self.m_pool_locks[pool_index].lock().unwrap();
         log::trace!(
             "InitializeOptimizedMemory: process_id={:#x}, pool={:?}",
-            process_id, pool
+            process_id,
+            pool
         );
         0 // RESULT_SUCCESS
     }
@@ -386,7 +397,8 @@ impl KMemoryManager {
         let _lk = self.m_pool_locks[pool_index].lock().unwrap();
         log::trace!(
             "FinalizeOptimizedMemory: process_id={:#x}, pool={:?}",
-            process_id, pool
+            process_id,
+            pool
         );
     }
 
@@ -422,12 +434,9 @@ impl KMemoryManager {
 
     pub fn calculate_management_overhead_size(region_size: usize) -> usize {
         let ref_count_size = (region_size / PAGE_SIZE) * std::mem::size_of::<u16>();
-        let optimize_map_size = (common::alignment::align_up(
-            (region_size / PAGE_SIZE) as u64,
-            64,
-        ) as usize
-            / 64)
-            * std::mem::size_of::<u64>();
+        let optimize_map_size =
+            (common::alignment::align_up((region_size / PAGE_SIZE) as u64, 64) as usize / 64)
+                * std::mem::size_of::<u64>();
         let manager_meta_size = common::alignment::align_up(
             (optimize_map_size + ref_count_size) as u64,
             PAGE_SIZE as u64,
@@ -444,10 +453,7 @@ impl KMemoryManager {
                 return manager;
             }
         }
-        panic!(
-            "KMemoryManager: no manager for address {:#x}",
-            address
-        );
+        panic!("KMemoryManager: no manager for address {:#x}", address);
     }
 }
 

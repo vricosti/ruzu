@@ -87,8 +87,7 @@ impl<'a> ResponseBuilder<'a> {
         };
         ctx.write_size = raw_data_size;
 
-        let always_move =
-            (flags as u32 & ResponseBuilderFlags::AlwaysMoveHandles as u32) != 0;
+        let always_move = (flags as u32 & ResponseBuilderFlags::AlwaysMoveHandles as u32) != 0;
 
         let num_handles_to_move;
         let num_domain_objects;
@@ -209,7 +208,9 @@ impl<'a> ResponseBuilder<'a> {
     /// We store a KAutoObjectRef; handle resolution happens in WriteToOutgoing.
     pub fn push_copy_objects(&mut self, handle: u32) {
         use super::hle_ipc::KAutoObjectRef;
-        self.context.outgoing_copy_objects.push(KAutoObjectRef::Handle(handle));
+        self.context
+            .outgoing_copy_objects
+            .push(KAutoObjectRef::Handle(handle));
     }
 
     /// Push a move handle into the outgoing move objects list.
@@ -219,7 +220,9 @@ impl<'a> ResponseBuilder<'a> {
     /// after handle_table.Add() in WriteToOutgoingCommandBuffer().
     pub fn push_move_objects(&mut self, handle: u32) {
         use super::hle_ipc::KAutoObjectRef;
-        self.context.outgoing_move_objects.push(KAutoObjectRef::Handle(handle));
+        self.context
+            .outgoing_move_objects
+            .push(KAutoObjectRef::Handle(handle));
     }
 
     /// Push an IPC interface (service object) as a move handle or domain object.
@@ -231,8 +234,12 @@ impl<'a> ResponseBuilder<'a> {
     /// move handle.
     ///
     /// In domain mode: adds the service object as a domain object.
-    pub fn push_ipc_interface(&mut self, iface: std::sync::Arc<dyn super::hle_ipc::SessionRequestHandler>) {
-        let is_domain = self.context
+    pub fn push_ipc_interface(
+        &mut self,
+        iface: std::sync::Arc<dyn super::hle_ipc::SessionRequestHandler>,
+    ) {
+        let is_domain = self
+            .context
             .get_manager()
             .map_or(false, |m| m.lock().unwrap().is_domain());
 
@@ -248,30 +255,38 @@ impl<'a> ResponseBuilder<'a> {
             //   context->AddMoveObject(&session->GetClientSession());
 
             // Get the parent manager's ServerManager reference.
-            let parent_server_manager = self.context.get_manager()
+            let parent_server_manager = self
+                .context
+                .get_manager()
                 .and_then(|m| m.lock().unwrap().get_server_manager().cloned());
 
             // Create child manager linked to same ServerManager.
             let child_manager = if let Some(ref sm) = parent_server_manager {
                 std::sync::Arc::new(std::sync::Mutex::new(
-                    super::hle_ipc::SessionRequestManager::new_with_server_manager(sm.clone())
+                    super::hle_ipc::SessionRequestManager::new_with_server_manager(sm.clone()),
                 ))
             } else {
                 std::sync::Arc::new(std::sync::Mutex::new(
-                    super::hle_ipc::SessionRequestManager::new()
+                    super::hle_ipc::SessionRequestManager::new(),
                 ))
             };
             child_manager.lock().unwrap().set_session_handler(iface);
 
             // Create session and get handle.
-            let handle = self.context.create_session_with_manager(child_manager.clone()).unwrap_or(0);
+            let handle = self
+                .context
+                .create_session_with_manager(child_manager.clone())
+                .unwrap_or(0);
 
             // Register with ServerManager (matching upstream line 164).
             if let Some(sm) = parent_server_manager {
                 // Get server session from the context's last created session.
                 // The session was just created by create_session_with_manager.
                 if let Some(server_session) = self.context.last_created_server_session.take() {
-                    let _ = sm.lock().unwrap().register_session(server_session, child_manager);
+                    let _ = sm
+                        .lock()
+                        .unwrap()
+                        .register_session(server_session, child_manager);
                 }
             }
 
@@ -392,7 +407,10 @@ impl<'a> RequestParser<'a> {
 
     /// Creates a new RequestParser from a raw command buffer.
     pub fn from_buffer(ctx: &'a HLERequestContext) -> Self {
-        Self { context: ctx, index: 0 }
+        Self {
+            context: ctx,
+            index: 0,
+        }
     }
 
     /// Pop a u32 value.
@@ -501,8 +519,8 @@ mod tests {
     use super::*;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::KThread;
-    use crate::hle::service::hle_ipc::{SessionRequestHandler, SessionRequestManager};
     use crate::hle::result::ResultCode;
+    use crate::hle::service::hle_ipc::{SessionRequestHandler, SessionRequestManager};
     use std::sync::{Arc, Mutex};
 
     struct TestHandler;
@@ -560,7 +578,8 @@ mod tests {
             mem.allocate(tls_address, 0x1000);
         }
 
-        let mut ctx = HLERequestContext::new_with_thread(thread, shared_memory.clone(), tls_address);
+        let mut ctx =
+            HLERequestContext::new_with_thread(thread, shared_memory.clone(), tls_address);
         let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
         ctx.set_session_request_manager(manager);
 
@@ -583,6 +602,11 @@ mod tests {
         let mem = shared_memory.read().unwrap();
         let handle_word = mem.read_32(tls_address + 12);
         assert_eq!(handle_word, handle);
-        assert!(process.lock().unwrap().handle_table.get_object(handle).is_some());
+        assert!(process
+            .lock()
+            .unwrap()
+            .handle_table
+            .get_object(handle)
+            .is_some());
     }
 }

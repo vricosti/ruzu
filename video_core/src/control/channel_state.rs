@@ -131,10 +131,7 @@ impl ChannelState {
     /// In the current port, this forwards the rasterizer reference through the
     /// same owner list as upstream.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
-        log::debug!(
-            "ChannelState::bind_rasterizer bind_id={}",
-            self.bind_id
-        );
+        log::debug!("ChannelState::bind_rasterizer bind_id={}", self.bind_id);
         if let Some(ref mut dma) = self.dma_pusher {
             dma.bind_rasterizer(rasterizer);
         }

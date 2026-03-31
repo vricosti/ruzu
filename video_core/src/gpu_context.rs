@@ -138,11 +138,11 @@ impl GpuContext {
     /// Create a new GPU context with default engines and null backend.
     pub fn new() -> Self {
         let engines: Vec<Option<Box<dyn crate::engines::Engine>>> = vec![
-            Some(Box::new(Maxwell3D::new())),       // subchannel 0
-            Some(Box::new(KeplerCompute::new())),   // subchannel 1
-            Some(Box::new(InlineToMemory::new())),  // subchannel 2
-            Some(Box::new(Fermi2D::new())),         // subchannel 3
-            Some(Box::new(MaxwellDMA::new())),      // subchannel 4
+            Some(Box::new(Maxwell3D::new())),      // subchannel 0
+            Some(Box::new(KeplerCompute::new())),  // subchannel 1
+            Some(Box::new(InlineToMemory::new())), // subchannel 2
+            Some(Box::new(Fermi2D::new())),        // subchannel 3
+            Some(Box::new(MaxwellDMA::new())),     // subchannel 4
         ];
 
         Self {
@@ -172,7 +172,11 @@ impl GpuContext {
     /// Used for OpenGL and Null rasterizers. For Vulkan, use
     /// `set_vulkan_renderer` instead (needs the concrete type for
     /// `render_draw_calls`).
-    pub fn set_rasterizer(&self, rasterizer: Box<dyn RasterizerInterface + Send>, mode: RenderMode) {
+    pub fn set_rasterizer(
+        &self,
+        rasterizer: Box<dyn RasterizerInterface + Send>,
+        mode: RenderMode,
+    ) {
         log::info!("GpuContext: rasterizer installed, mode={:?}", mode);
         *self.rasterizer.lock() = Some(rasterizer);
         *self.render_mode.lock() = mode;
@@ -260,14 +264,13 @@ impl GpuContext {
                     // Try Vulkan rendering, fall back to software on failure.
                     let mut vk_renderer = self.vulkan_renderer.lock();
                     if let Some(ref mut renderer) = *vk_renderer {
-                        let result = renderer.render_draw_calls(
-                            &draw_calls,
-                            &gpu_read,
-                            framebuffer,
-                        );
+                        let result =
+                            renderer.render_draw_calls(&draw_calls, &gpu_read, framebuffer);
                         framebuffer = result;
                     } else {
-                        log::warn!("GpuContext: Vulkan mode but no renderer — falling back to software");
+                        log::warn!(
+                            "GpuContext: Vulkan mode but no renderer — falling back to software"
+                        );
                         framebuffer = self.render_software(
                             &draw_calls,
                             &gpu_read,
@@ -279,12 +282,8 @@ impl GpuContext {
                 RenderMode::Software | RenderMode::OpenGL => {
                     // OpenGL rasterizer lives in the presenter; GPU context
                     // falls back to software for draw call processing.
-                    framebuffer = self.render_software(
-                        &draw_calls,
-                        &gpu_read,
-                        framebuffer,
-                        &mut write_backs,
-                    );
+                    framebuffer =
+                        self.render_software(&draw_calls, &gpu_read, framebuffer, &mut write_backs);
                 }
             }
         }
@@ -310,20 +309,15 @@ impl GpuContext {
         framebuffer: Option<crate::engines::Framebuffer>,
         write_backs: &mut Vec<GpuWriteBack>,
     ) -> Option<crate::engines::Framebuffer> {
-        let raster_writes: std::sync::Mutex<Vec<GpuWriteBack>> =
-            std::sync::Mutex::new(Vec::new());
+        let raster_writes: std::sync::Mutex<Vec<GpuWriteBack>> = std::sync::Mutex::new(Vec::new());
         let gpu_write = |gpu_va: u64, data: &[u8]| {
             raster_writes.lock().unwrap().push(GpuWriteBack {
                 gpu_va,
                 data: data.to_vec(),
             });
         };
-        let rasterized = SoftwareRasterizer::render_draw_calls(
-            draw_calls,
-            gpu_read,
-            &gpu_write,
-            framebuffer,
-        );
+        let rasterized =
+            SoftwareRasterizer::render_draw_calls(draw_calls, gpu_read, &gpu_write, framebuffer);
         write_backs.extend(raster_writes.into_inner().unwrap());
         rasterized
     }

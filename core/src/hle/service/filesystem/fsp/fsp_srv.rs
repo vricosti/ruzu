@@ -137,7 +137,8 @@ pub struct FspSrv {
     access_log_mode: std::sync::Mutex<AccessLogMode>,
     program_id: std::sync::Mutex<u64>,
     /// Upstream: `std::shared_ptr<SaveDataController> save_data_controller`.
-    save_data_controller: std::sync::Mutex<Option<super::super::save_data_controller::SaveDataController>>,
+    save_data_controller:
+        std::sync::Mutex<Option<super::super::save_data_controller::SaveDataController>>,
     /// Upstream: `std::shared_ptr<RomFsController> romfs_controller`.
     romfs_controller: std::sync::Mutex<Option<super::super::romfs_controller::RomFsController>>,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -155,13 +156,41 @@ impl FspSrv {
             save_data_controller: std::sync::Mutex::new(None),
             romfs_controller: std::sync::Mutex::new(None),
             handlers: build_handler_map(&[
-                (1, Some(Self::set_current_process_handler), "SetCurrentProcess"),
-                (18, Some(Self::open_sd_card_file_system_handler), "OpenSdCardFileSystem"),
-                (200, Some(Self::open_data_storage_by_current_process_handler), "OpenDataStorageByCurrentProcess"),
-                (203, Some(Self::open_patch_data_storage_by_current_process_handler), "OpenPatchDataStorageByCurrentProcess"),
-                (1004, Some(Self::set_global_access_log_mode_handler), "SetGlobalAccessLogMode"),
-                (1005, Some(Self::get_global_access_log_mode_handler), "GetGlobalAccessLogMode"),
-                (1011, Some(Self::get_program_index_for_access_log_handler), "GetProgramIndexForAccessLog"),
+                (
+                    1,
+                    Some(Self::set_current_process_handler),
+                    "SetCurrentProcess",
+                ),
+                (
+                    18,
+                    Some(Self::open_sd_card_file_system_handler),
+                    "OpenSdCardFileSystem",
+                ),
+                (
+                    200,
+                    Some(Self::open_data_storage_by_current_process_handler),
+                    "OpenDataStorageByCurrentProcess",
+                ),
+                (
+                    203,
+                    Some(Self::open_patch_data_storage_by_current_process_handler),
+                    "OpenPatchDataStorageByCurrentProcess",
+                ),
+                (
+                    1004,
+                    Some(Self::set_global_access_log_mode_handler),
+                    "SetGlobalAccessLogMode",
+                ),
+                (
+                    1005,
+                    Some(Self::get_global_access_log_mode_handler),
+                    "GetGlobalAccessLogMode",
+                ),
+                (
+                    1011,
+                    Some(Self::get_program_index_for_access_log_handler),
+                    "GetProgramIndexForAccessLog",
+                ),
             ]),
             handlers_tipc: BTreeMap::new(),
         }
@@ -196,7 +225,10 @@ impl FspSrv {
         }
     }
 
-    fn push_interface_response(ctx: &mut HLERequestContext, object: Arc<dyn SessionRequestHandler>) {
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
         let is_domain = ctx
             .get_manager()
             .map_or(false, |manager| manager.lock().unwrap().is_domain());
@@ -237,7 +269,8 @@ impl FspSrv {
                 *service.romfs_controller.lock().unwrap() = Some(romfs_ctrl);
                 log::info!(
                     "FspSrv::SetCurrentProcess: pid={:#x}, program_id={:#018x}",
-                    pid, program_id,
+                    pid,
+                    program_id,
                 );
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
@@ -306,7 +339,10 @@ impl FspSrv {
         Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
     }
 
-    fn set_global_access_log_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_global_access_log_mode_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
         let mode_raw = ctx.command_buffer()[ctx.get_data_payload_offset() as usize + 2];
         let mode = match mode_raw {
@@ -321,7 +357,10 @@ impl FspSrv {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_global_access_log_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_global_access_log_mode_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
         let mode = *service.access_log_mode.lock().unwrap() as u32;
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -329,7 +368,10 @@ impl FspSrv {
         rb.push_u32(mode);
     }
 
-    fn get_program_index_for_access_log_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_program_index_for_access_log_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
         let version = AccessLogVersion::LATEST as u32;
         let program_index = *service.access_log_program_index.lock().unwrap();

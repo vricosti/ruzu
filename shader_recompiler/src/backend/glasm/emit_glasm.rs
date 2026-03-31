@@ -190,7 +190,10 @@ fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
         // Attributes and context
         Opcode::GetAttribute | Opcode::SetAttribute | Opcode::GetCbufU32 | Opcode::GetCbufF32 => {
             // Complex operations handled through context_get_set
-            ctx.add_line(&format!("; {} (complex, context-dependent)", inst.opcode.name()));
+            ctx.add_line(&format!(
+                "; {} (complex, context-dependent)",
+                inst.opcode.name()
+            ));
         }
 
         // Conversion

@@ -13,8 +13,8 @@
 use core::cmp::Ordering;
 use core::fmt;
 use core::ops::{
-    Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div,
-    DivAssign, Mul, MulAssign, Neg, Not, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
+    Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div, DivAssign,
+    Mul, MulAssign, Neg, Not, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
 };
 
 /// A fixed-point number with `I` integer bits and `F` fractional bits.
@@ -325,13 +325,7 @@ impl<const I: usize, const F: usize> ShrAssign<i32> for FixedPoint<I, F> {
 
 impl<const I: usize, const F: usize> fmt::Debug for FixedPoint<I, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "FixedPoint<{}, {}>({})",
-            I,
-            F,
-            self.to_f64()
-        )
+        write!(f, "FixedPoint<{}, {}>({})", I, F, self.to_f64())
     }
 }
 

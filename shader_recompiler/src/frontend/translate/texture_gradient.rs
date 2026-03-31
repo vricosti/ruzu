@@ -12,7 +12,10 @@ use super::TranslatorVisitor;
 /// Not yet implemented: requires explicit-derivative texture IR opcode.
 /// Emits a no-op and logs a warning.
 pub fn txd(tv: &mut TranslatorVisitor, insn: u64) {
-    log::warn!("TXD: texture gradient fetch not yet implemented — emitting no-op (insn={:#018x})", insn);
+    log::warn!(
+        "TXD: texture gradient fetch not yet implemented — emitting no-op (insn={:#018x})",
+        insn
+    );
     let dst = tv.dst_reg(insn);
     tv.set_x(dst, crate::ir::value::Value::ImmU32(0));
 }

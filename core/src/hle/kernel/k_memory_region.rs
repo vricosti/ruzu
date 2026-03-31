@@ -235,11 +235,7 @@ impl KMemoryRegionTree {
         None
     }
 
-    pub fn find_by_type_and_attribute(
-        &self,
-        type_id: u32,
-        attr: u32,
-    ) -> Option<&KMemoryRegion> {
+    pub fn find_by_type_and_attribute(&self, type_id: u32, attr: u32) -> Option<&KMemoryRegion> {
         for region in self.regions.values() {
             if region.get_type() == type_id && region.get_attributes() == attr {
                 return Some(region);
@@ -300,13 +296,7 @@ impl KMemoryRegionTree {
         extents
     }
 
-    pub fn insert_directly(
-        &mut self,
-        address: u64,
-        last_address: u64,
-        attr: u32,
-        type_id: u32,
-    ) {
+    pub fn insert_directly(&mut self, address: u64, last_address: u64, attr: u32, type_id: u32) {
         let region = KMemoryRegion::new_with_attr(address, last_address, attr, type_id);
         self.regions.insert(address, region);
     }

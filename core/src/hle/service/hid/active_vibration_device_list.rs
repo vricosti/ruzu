@@ -66,9 +66,11 @@ impl IActiveVibrationDeviceList {
     }
 
     pub fn new(resource_manager: Arc<parking_lot::Mutex<ResourceManager>>) -> Self {
-        let handlers = build_handler_map(&[
-            (0, Some(Self::activate_vibration_device), "ActivateVibrationDevice"),
-        ]);
+        let handlers = build_handler_map(&[(
+            0,
+            Some(Self::activate_vibration_device),
+            "ActivateVibrationDevice",
+        )]);
 
         Self {
             handlers,

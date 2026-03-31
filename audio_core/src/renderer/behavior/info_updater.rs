@@ -312,9 +312,19 @@ impl<'a> InfoUpdater<'a> {
         memory_pool_count: u32,
     ) -> Result {
         if self.behavior().is_effect_info_version2_supported() {
-            self.update_effects_version2(effect_context, renderer_active, memory_pools, memory_pool_count)
+            self.update_effects_version2(
+                effect_context,
+                renderer_active,
+                memory_pools,
+                memory_pool_count,
+            )
         } else {
-            self.update_effects_version1(effect_context, renderer_active, memory_pools, memory_pool_count)
+            self.update_effects_version1(
+                effect_context,
+                renderer_active,
+                memory_pools,
+                memory_pool_count,
+            )
         }
     }
 
@@ -335,8 +345,7 @@ impl<'a> InfoUpdater<'a> {
         }
         let in_params = unsafe {
             std::slice::from_raw_parts(
-                self.input_origin[self.input_offset..].as_ptr()
-                    as *const EffectInParameterVersion1,
+                self.input_origin[self.input_offset..].as_ptr() as *const EffectInParameterVersion1,
                 effect_count as usize,
             )
         };
@@ -392,8 +401,7 @@ impl<'a> InfoUpdater<'a> {
         }
         let in_params = unsafe {
             std::slice::from_raw_parts(
-                self.input_origin[self.input_offset..].as_ptr()
-                    as *const EffectInParameterVersion2,
+                self.input_origin[self.input_offset..].as_ptr() as *const EffectInParameterVersion2,
                 effect_count as usize,
             )
         };
@@ -424,9 +432,7 @@ impl<'a> InfoUpdater<'a> {
                     {
                         effect.initialize_result_state(result_state);
                     }
-                    if let Some(result_state) =
-                        effect_context.get_result_state_mut(index as u32)
-                    {
+                    if let Some(result_state) = effect_context.get_result_state_mut(index as u32) {
                         effect.initialize_result_state(result_state);
                     }
                 }

@@ -151,9 +151,7 @@ impl ImageInfo {
     ///
     /// Requires Fermi2D engine types not yet ported.
     pub fn from_fermi2d_surface(_config: &()) -> Self {
-        log::warn!(
-            "ImageInfo::from_fermi2d_surface: Fermi2D not yet ported — returning default"
-        );
+        log::warn!("ImageInfo::from_fermi2d_surface: Fermi2D not yet ported — returning default");
         Self::default()
     }
 

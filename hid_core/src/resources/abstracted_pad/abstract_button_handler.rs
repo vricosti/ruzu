@@ -88,7 +88,12 @@ impl NpadAbstractButtonHandler {
     // The following methods update specific lifo buffers per style.
     // Upstream C++ also has TODO stubs for these.
 
-    fn update_npad_fullkey_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
+    fn update_npad_fullkey_lifo(
+        &mut self,
+        _style_tag: NpadStyleTag,
+        _style_index: i32,
+        _aruid: u64,
+    ) {
         // Upstream TODO: not yet implemented in C++ upstream
     }
 
@@ -96,15 +101,30 @@ impl NpadAbstractButtonHandler {
         // Upstream TODO: not yet implemented in C++ upstream
     }
 
-    fn update_joycon_dual_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
+    fn update_joycon_dual_lifo(
+        &mut self,
+        _style_tag: NpadStyleTag,
+        _style_index: i32,
+        _aruid: u64,
+    ) {
         // Upstream TODO: not yet implemented in C++ upstream
     }
 
-    fn update_joycon_left_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
+    fn update_joycon_left_lifo(
+        &mut self,
+        _style_tag: NpadStyleTag,
+        _style_index: i32,
+        _aruid: u64,
+    ) {
         // Upstream TODO: not yet implemented in C++ upstream
     }
 
-    fn update_joycon_right_lifo(&mut self, _style_tag: NpadStyleTag, _style_index: i32, _aruid: u64) {
+    fn update_joycon_right_lifo(
+        &mut self,
+        _style_tag: NpadStyleTag,
+        _style_index: i32,
+        _aruid: u64,
+    ) {
         // Upstream TODO: not yet implemented in C++ upstream
     }
 

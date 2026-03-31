@@ -20,15 +20,9 @@ pub enum SyntaxNode {
     /// A basic block to execute.
     Block(u32),
     /// If-then: condition, body block, merge block.
-    If {
-        cond: Value,
-        body: u32,
-        merge: u32,
-    },
+    If { cond: Value, body: u32, merge: u32 },
     /// End of an if-then region.
-    EndIf {
-        merge: u32,
-    },
+    EndIf { merge: u32 },
     /// Loop: body block, continue block, merge (break target) block.
     Loop {
         body: u32,
@@ -42,11 +36,7 @@ pub enum SyntaxNode {
         merge: u32,
     },
     /// Break out of a loop: condition, merge (loop merge) block, skip block.
-    Break {
-        cond: Value,
-        merge: u32,
-        skip: u32,
-    },
+    Break { cond: Value, merge: u32, skip: u32 },
     /// Return from the shader.
     Return,
     /// Unreachable code marker.
@@ -146,8 +136,15 @@ pub struct ShaderInfo {
 impl ShaderInfo {
     /// Register use of a constant buffer.
     pub fn register_cbuf(&mut self, index: u32) {
-        if !self.constant_buffer_descriptors.iter().any(|d| d.index == index) {
-            self.constant_buffer_descriptors.push(CbufDescriptor { index, size: 0x10000 });
+        if !self
+            .constant_buffer_descriptors
+            .iter()
+            .any(|d| d.index == index)
+        {
+            self.constant_buffer_descriptors.push(CbufDescriptor {
+                index,
+                size: 0x10000,
+            });
         }
     }
 

@@ -140,9 +140,8 @@ impl PerfStats {
             return PerfStatsResults::default();
         }
 
-        let system_us_per_second = (current_system_time_us - inner.reset_point_system_us)
-            .as_micros() as f64
-            / interval;
+        let system_us_per_second =
+            (current_system_time_us - inner.reset_point_system_us).as_micros() as f64 / interval;
         let current_frames = self.game_frames.load(Ordering::Relaxed) as f64;
         let current_fps = current_frames / interval;
 
@@ -216,8 +215,7 @@ impl SpeedLimiter {
         let sleep_scale = speed_limit_percent as f64 / 100.0;
 
         // Max lag caused by slow frames
-        let max_lag_time_us =
-            (25_000.0 / sleep_scale) as i64; // 25ms in microseconds, scaled
+        let max_lag_time_us = (25_000.0 / sleep_scale) as i64; // 25ms in microseconds, scaled
 
         let elapsed_system_us = current_system_time_us
             .saturating_sub(self.previous_system_time_us)
@@ -235,8 +233,7 @@ impl SpeedLimiter {
             let sleep_duration = Duration::from_micros(self.speed_limiting_delta_err as u64);
             std::thread::sleep(sleep_duration);
             let now_after_sleep = Instant::now();
-            self.speed_limiting_delta_err -=
-                (now_after_sleep - now).as_micros() as i64;
+            self.speed_limiting_delta_err -= (now_after_sleep - now).as_micros() as i64;
             now = now_after_sleep;
         }
 

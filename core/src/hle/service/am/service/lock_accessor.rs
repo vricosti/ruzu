@@ -34,12 +34,9 @@ impl ILockAccessor {
             (3, Some(Self::get_event_handler), "GetEvent"),
             (4, Some(Self::is_locked_handler), "IsLocked"),
         ]);
-        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
-            "ILockAccessor".to_string(),
-        );
-        let event_handle = service_context.create_event(
-            "ILockAccessor:Event".to_string(),
-        );
+        let mut service_context =
+            crate::hle::service::kernel_helpers::ServiceContext::new("ILockAccessor".to_string());
+        let event_handle = service_context.create_event("ILockAccessor:Event".to_string());
         // Upstream signals the event in the constructor.
         if let Some(event) = service_context.get_event(event_handle) {
             event.signal();
@@ -60,7 +57,10 @@ impl ILockAccessor {
         let accessor = unsafe { &*(this as *const dyn ServiceFramework as *const ILockAccessor) };
         let mut rp = RequestParser::new(ctx);
         let return_handle = rp.pop_bool();
-        log::info!("ILockAccessor::TryLock called, return_handle={}", return_handle);
+        log::info!(
+            "ILockAccessor::TryLock called, return_handle={}",
+            return_handle
+        );
 
         let is_locked;
         {

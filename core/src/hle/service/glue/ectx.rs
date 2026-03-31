@@ -23,7 +23,9 @@ pub mod context_registrar_commands {
 pub struct EctxAW;
 
 impl EctxAW {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// Creates and returns an IContextRegistrar instance.
     ///
@@ -40,7 +42,9 @@ impl EctxAW {
 pub struct IContextRegistrar;
 
 impl IContextRegistrar {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     pub fn complete(&self, _unk: u32, _value: &[u8]) -> (ResultCode, u32) {
         (RESULT_SUCCESS, 0)

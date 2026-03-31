@@ -6,7 +6,7 @@
 use super::{bit, field, TranslatorVisitor};
 
 fn dadd_impl(tv: &mut TranslatorVisitor, insn: u64, src_b: crate::ir::value::Value) {
-    let dst  = field(insn, 0, 8);
+    let dst = field(insn, 0, 8);
     let src_a_reg = field(insn, 8, 8);
 
     let abs_a = bit(insn, 46);
@@ -15,8 +15,8 @@ fn dadd_impl(tv: &mut TranslatorVisitor, insn: u64, src_b: crate::ir::value::Val
     let neg_b = bit(insn, 45);
 
     let src_a = tv.d(src_a_reg);
-    let op_a  = tv.ir.fp_abs_neg_64(src_a, abs_a, neg_a);
-    let op_b  = tv.ir.fp_abs_neg_64(src_b, abs_b, neg_b);
+    let op_a = tv.ir.fp_abs_neg_64(src_a, abs_a, neg_a);
+    let op_b = tv.ir.fp_abs_neg_64(src_b, abs_b, neg_b);
 
     let result = tv.ir.fp_add_64(op_a, op_b);
     tv.set_d(dst, result);

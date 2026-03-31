@@ -29,7 +29,11 @@ impl FspPr {
                 (0, Some(Self::stub_handler), "RegisterProgram"),
                 (1, Some(Self::stub_handler), "UnregisterProgram"),
                 (2, Some(Self::stub_handler), "SetCurrentProcess"),
-                (256, Some(Self::stub_handler), "SetEnabledProgramVerification"),
+                (
+                    256,
+                    Some(Self::stub_handler),
+                    "SetEnabledProgramVerification",
+                ),
             ]),
             handlers_tipc: BTreeMap::new(),
         }
@@ -75,7 +79,10 @@ impl ServiceFramework for FspPr {
                 return;
             }
         }
-        log::warn!("fsp:pr: unimplemented command '{}' returned stub success", cmd);
+        log::warn!(
+            "fsp:pr: unimplemented command '{}' returned stub success",
+            cmd
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }

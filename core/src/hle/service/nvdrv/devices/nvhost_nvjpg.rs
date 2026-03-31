@@ -38,13 +38,7 @@ impl NvHostNvJpg {
 }
 
 impl NvDevice for NvHostNvJpg {
-    fn ioctl1(
-        &self,
-        _fd: DeviceFD,
-        command: Ioctl,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> NvResult {
+    fn ioctl1(&self, _fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
         match command.group() {
             b'H' => match command.cmd() {
                 0x1 => {

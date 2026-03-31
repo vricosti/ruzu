@@ -70,15 +70,16 @@ impl ResourcePool {
         let gpu_tick = ms.known_gpu_tick();
 
         // Search helper: finds a free slot in [begin..end)
-        let search = |ticks: &mut [u64], begin: usize, end: usize, current_tick: u64| -> Option<usize> {
-            for iterator in begin..end {
-                if gpu_tick >= ticks[iterator] {
-                    ticks[iterator] = current_tick;
-                    return Some(iterator);
+        let search =
+            |ticks: &mut [u64], begin: usize, end: usize, current_tick: u64| -> Option<usize> {
+                for iterator in begin..end {
+                    if gpu_tick >= ticks[iterator] {
+                        ticks[iterator] = current_tick;
+                        return Some(iterator);
+                    }
                 }
-            }
-            None
-        };
+                None
+            };
 
         let current_tick = ms.current_tick();
         let ticks_len = self.ticks.len();

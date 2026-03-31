@@ -61,8 +61,7 @@ impl Block {
 
         let align = if nbs != 0 { 1u64 << nbs } else { 1u64 << bs };
         let aligned_addr = common::alignment::align_down(addr, align);
-        let aligned_end =
-            common::alignment::align_up(addr + size as u64, align);
+        let aligned_end = common::alignment::align_up(addr + size as u64, align);
 
         self.heap_address = aligned_addr;
         self.end_offset = ((aligned_end - aligned_addr) / (1u64 << bs)) as usize;
@@ -111,7 +110,8 @@ impl Block {
             cur_block_size
         };
         KPageBitmap::calculate_management_overhead_size(
-            (align * 2 + common::alignment::align_up(region_size as u64, align as u64) as usize) / cur_block_size,
+            (align * 2 + common::alignment::align_up(region_size as u64, align as u64) as usize)
+                / cur_block_size,
         )
     }
 }
@@ -235,7 +235,10 @@ impl KPageHeap {
             if addr != 0 {
                 let allocated_size = self.blocks[i as usize].get_size();
                 if allocated_size > needed_size {
-                    self.free(addr + needed_size as u64, (allocated_size - needed_size) / PAGE_SIZE);
+                    self.free(
+                        addr + needed_size as u64,
+                        (allocated_size - needed_size) / PAGE_SIZE,
+                    );
                 }
                 return addr;
             }
@@ -253,8 +256,8 @@ impl KPageHeap {
             let mut max_blocks = self.num_blocks as i32;
             let mut possible_alignments: usize = 0;
             for i in index..max_blocks {
-                possible_alignments += (1 + ((self.blocks[i as usize].get_size() - needed_size)
-                    >> align_shift))
+                possible_alignments += (1
+                    + ((self.blocks[i as usize].get_size() - needed_size) >> align_shift))
                     * self.blocks[i as usize].get_num_free_blocks();
                 if possible_alignments >= MINIMUM_POSSIBLE_ALIGNMENTS {
                     max_blocks = i + 1;
@@ -328,8 +331,7 @@ impl KPageHeap {
         while big_index >= 0 {
             let block_size = self.blocks[big_index as usize].get_size() as u64;
             let big_start = common::alignment::align_up(start, block_size);
-            let big_end =
-                common::alignment::align_down(end, block_size);
+            let big_end = common::alignment::align_down(end, block_size);
             if big_start < big_end {
                 let mut block = big_start;
                 while block < big_end {

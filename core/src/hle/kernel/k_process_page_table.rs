@@ -147,12 +147,7 @@ impl KProcessPageTable {
         self.base.set_max_heap_size(size)
     }
 
-    pub fn set_memory_permission(
-        &mut self,
-        addr: KProcessAddress,
-        size: usize,
-        perm: u32,
-    ) -> u32 {
+    pub fn set_memory_permission(&mut self, addr: KProcessAddress, size: usize, perm: u32) -> u32 {
         self.base.set_memory_permission(
             addr.get() as usize,
             size,
@@ -167,15 +162,18 @@ impl KProcessPageTable {
         mask: u32,
         attr: u32,
     ) -> u32 {
-        self.base.set_memory_attribute(addr.get() as usize, size, mask, attr)
+        self.base
+            .set_memory_attribute(addr.get() as usize, size, mask, attr)
     }
 
     pub fn map_memory(&mut self, dst: KProcessAddress, src: KProcessAddress, size: usize) -> u32 {
-        self.base.map_memory(dst.get() as usize, src.get() as usize, size)
+        self.base
+            .map_memory(dst.get() as usize, src.get() as usize, size)
     }
 
     pub fn unmap_memory(&mut self, dst: KProcessAddress, src: KProcessAddress, size: usize) -> u32 {
-        self.base.unmap_memory(dst.get() as usize, src.get() as usize, size)
+        self.base
+            .unmap_memory(dst.get() as usize, src.get() as usize, size)
     }
 
     pub fn map_physical_memory(&mut self, addr: KProcessAddress, size: usize) -> u32 {
@@ -204,7 +202,8 @@ impl KProcessPageTable {
         size: usize,
         perm: KMemoryPermission,
     ) -> u32 {
-        self.base.set_process_memory_permission(addr.get() as usize, size, perm)
+        self.base
+            .set_process_memory_permission(addr.get() as usize, size, perm)
     }
 
     // -- Query --
@@ -257,8 +256,14 @@ impl KProcessPageTable {
         perm: KMemoryPermission,
     ) -> (u32, KProcessAddress) {
         let (result, addr) = self.base.map_pages_find_free(
-            num_pages, alignment, phys_addr, is_pa_valid,
-            region_start.get() as usize, region_num_pages, state, perm,
+            num_pages,
+            alignment,
+            phys_addr,
+            is_pa_valid,
+            region_start.get() as usize,
+            region_num_pages,
+            state,
+            perm,
         );
         (result, KProcessAddress::new(addr as u64))
     }
@@ -270,7 +275,8 @@ impl KProcessPageTable {
         state: super::k_memory_block::KMemoryState,
         perm: KMemoryPermission,
     ) -> u32 {
-        self.base.map_pages_at_address(addr.get() as usize, num_pages, state, perm)
+        self.base
+            .map_pages_at_address(addr.get() as usize, num_pages, state, perm)
     }
 
     pub fn unmap_pages(
@@ -288,15 +294,13 @@ impl KProcessPageTable {
         size: usize,
         perm: KMemoryPermission,
     ) -> u32 {
-        self.base.lock_for_transfer_memory(addr.get() as usize, size, perm)
+        self.base
+            .lock_for_transfer_memory(addr.get() as usize, size, perm)
     }
 
-    pub fn unlock_for_transfer_memory(
-        &mut self,
-        addr: KProcessAddress,
-        size: usize,
-    ) -> u32 {
-        self.base.unlock_for_transfer_memory(addr.get() as usize, size)
+    pub fn unlock_for_transfer_memory(&mut self, addr: KProcessAddress, size: usize) -> u32 {
+        self.base
+            .unlock_for_transfer_memory(addr.get() as usize, size)
     }
 
     // -- IPC memory locking --
@@ -307,25 +311,39 @@ impl KProcessPageTable {
         addr: KProcessAddress,
         size: usize,
     ) -> u32 {
-        self.base.lock_for_ipc_user_buffer(out_paddr, addr.get() as usize, size)
+        self.base
+            .lock_for_ipc_user_buffer(out_paddr, addr.get() as usize, size)
     }
 
     pub fn unlock_for_ipc_user_buffer(&mut self, addr: KProcessAddress, size: usize) -> u32 {
-        self.base.unlock_for_ipc_user_buffer(addr.get() as usize, size)
+        self.base
+            .unlock_for_ipc_user_buffer(addr.get() as usize, size)
     }
 
     // -- Code memory mapping --
 
     /// Map code memory: copies src pages to dst, reprotects src.
     /// Upstream: `KProcessPageTable::MapCodeMemory`.
-    pub fn map_code_memory(&mut self, dst: KProcessAddress, src: KProcessAddress, size: usize) -> u32 {
-        self.base.map_code_memory(dst.get() as usize, src.get() as usize, size)
+    pub fn map_code_memory(
+        &mut self,
+        dst: KProcessAddress,
+        src: KProcessAddress,
+        size: usize,
+    ) -> u32 {
+        self.base
+            .map_code_memory(dst.get() as usize, src.get() as usize, size)
     }
 
     /// Unmap code memory: unmaps dst, restores src permissions.
     /// Upstream: `KProcessPageTable::UnmapCodeMemory`.
-    pub fn unmap_code_memory(&mut self, dst: KProcessAddress, src: KProcessAddress, size: usize) -> u32 {
-        self.base.unmap_code_memory(dst.get() as usize, src.get() as usize, size)
+    pub fn unmap_code_memory(
+        &mut self,
+        dst: KProcessAddress,
+        src: KProcessAddress,
+        size: usize,
+    ) -> u32 {
+        self.base
+            .unmap_code_memory(dst.get() as usize, src.get() as usize, size)
     }
 
     // -- Memory bridge --
@@ -347,7 +365,8 @@ impl KProcessPageTable {
         state: super::k_memory_block::KMemoryState,
         perm: KMemoryPermission,
     ) -> u32 {
-        self.base.map_page_group(addr.get() as usize, pg, state, perm)
+        self.base
+            .map_page_group(addr.get() as usize, pg, state, perm)
     }
 
     /// Unmap a KPageGroup from the process address space.
@@ -375,21 +394,15 @@ impl KProcessPageTable {
     // These directly modify the base fields. Will be removed once
     // KProcess::load_from_metadata calls initialize_for_process instead.
 
-    pub fn configure_address_space(
-        &mut self,
-        start: KProcessAddress,
-        size: usize,
-        width: u32,
-    ) {
+    pub fn configure_address_space(&mut self, start: KProcessAddress, size: usize, width: u32) {
         let base = self.get_base_mut();
         base.m_address_space_start = start.get() as usize;
         base.m_address_space_end = start.get() as usize + size;
         base.m_address_space_width = width;
         // Initialize the block manager for this address space.
-        let _ = base.m_memory_block_manager.initialize(
-            base.m_address_space_start,
-            base.m_address_space_end,
-        );
+        let _ = base
+            .m_memory_block_manager
+            .initialize(base.m_address_space_start, base.m_address_space_end);
         // Initialize the page table implementation (Common::PageTable).
         // Upstream does this in InitializeForProcess; here we do it in the
         // legacy path as well so that Operate() can write page table entries.

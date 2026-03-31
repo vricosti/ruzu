@@ -169,8 +169,13 @@ impl NvMapDevice {
         let session_id = sessions.get(&fd).copied().unwrap_or_default();
         drop(sessions);
 
-        let result =
-            handle.alloc(params.flags, params.align, params.kind, params.address, session_id);
+        let result = handle.alloc(
+            params.flags,
+            params.align,
+            params.kind,
+            params.address,
+            session_id,
+        );
         if result != NvResult::Success {
             log::error!("Object failed to allocate, handle={:08X}", params.handle);
             return result;
@@ -190,10 +195,16 @@ impl NvMapDevice {
 
         let before_info = {
             let process_guard = process.lock().unwrap();
-            process_guard.page_table.get_base().query_info(params.address as usize)
+            process_guard
+                .page_table
+                .get_base()
+                .query_info(params.address as usize)
         };
         if params.handle == 8 {
-            log::debug!("nvmap::IocAlloc before lock handle=8 info={:?}", before_info);
+            log::debug!(
+                "nvmap::IocAlloc before lock handle=8 info={:?}",
+                before_info
+            );
         }
 
         let handle_size = {
@@ -211,7 +222,10 @@ impl NvMapDevice {
                     KMemoryPermission::NONE,
                     true,
                 );
-            let after_info = process_guard.page_table.get_base().query_info(params.address as usize);
+            let after_info = process_guard
+                .page_table
+                .get_base()
+                .query_info(params.address as usize);
             (lock_result, after_info)
         };
         if params.handle == 8 {
@@ -368,13 +382,7 @@ pub fn write_struct<T: Copy>(output: &mut [u8], val: &T) {
 }
 
 impl NvDevice for NvMapDevice {
-    fn ioctl1(
-        &self,
-        fd: DeviceFD,
-        command: Ioctl,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> NvResult {
+    fn ioctl1(&self, fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
         match command.group() {
             0x1 => match command.cmd() {
                 0x1 => {

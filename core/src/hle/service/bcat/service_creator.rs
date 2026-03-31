@@ -9,12 +9,12 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::backend::{BcatBackend, NullBcatBackend};
 use super::bcat_service::IBcatService;
 use super::delivery_cache_storage_service::IDeliveryCacheStorageService;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for IServiceCreator
 pub mod commands {
@@ -37,10 +37,26 @@ impl IServiceCreator {
     pub fn new(name: &str) -> Self {
         let handlers = build_handler_map(&[
             (commands::CREATE_BCAT_SERVICE, None, "CreateBcatService"),
-            (commands::CREATE_DELIVERY_CACHE_STORAGE_SERVICE, None, "CreateDeliveryCacheStorageService"),
-            (commands::CREATE_DELIVERY_CACHE_STORAGE_SERVICE_WITH_APPLICATION_ID, None, "CreateDeliveryCacheStorageServiceWithApplicationId"),
-            (commands::CREATE_DELIVERY_CACHE_PROGRESS_SERVICE, None, "CreateDeliveryCacheProgressService"),
-            (commands::CREATE_DELIVERY_CACHE_PROGRESS_SERVICE_WITH_APPLICATION_ID, None, "CreateDeliveryCacheProgressServiceWithApplicationId"),
+            (
+                commands::CREATE_DELIVERY_CACHE_STORAGE_SERVICE,
+                None,
+                "CreateDeliveryCacheStorageService",
+            ),
+            (
+                commands::CREATE_DELIVERY_CACHE_STORAGE_SERVICE_WITH_APPLICATION_ID,
+                None,
+                "CreateDeliveryCacheStorageServiceWithApplicationId",
+            ),
+            (
+                commands::CREATE_DELIVERY_CACHE_PROGRESS_SERVICE,
+                None,
+                "CreateDeliveryCacheProgressService",
+            ),
+            (
+                commands::CREATE_DELIVERY_CACHE_PROGRESS_SERVICE_WITH_APPLICATION_ID,
+                None,
+                "CreateDeliveryCacheProgressServiceWithApplicationId",
+            ),
         ]);
 
         // Upstream: backend = CreateBackendFromSettings(system_, [this](u64 tid) { return fsc.GetBCATDirectory(tid); });

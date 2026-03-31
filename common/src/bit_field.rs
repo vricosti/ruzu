@@ -101,7 +101,9 @@ pub const fn mask_u64(position: usize, bits: usize) -> u64 {
 /// `position` is the bit offset from LSB, `bits` is the width.
 #[inline]
 pub fn extract_unsigned<T: BitFieldStorage>(storage: T, position: usize, bits: usize) -> T {
-    let mask = (!T::ZERO).wrapping_shr((T::BITS - bits) as u32).wrapping_shl(position as u32);
+    let mask = (!T::ZERO)
+        .wrapping_shr((T::BITS - bits) as u32)
+        .wrapping_shl(position as u32);
     (storage & mask).wrapping_shr(position as u32)
 }
 
@@ -119,14 +121,18 @@ pub fn extract_signed<T: BitFieldStorage>(storage: T, position: usize, bits: usi
 /// Format (pack) a value into a bitfield position.
 #[inline]
 pub fn format_value<T: BitFieldStorage>(value: T, position: usize, bits: usize) -> T {
-    let mask = (!T::ZERO).wrapping_shr((T::BITS - bits) as u32).wrapping_shl(position as u32);
+    let mask = (!T::ZERO)
+        .wrapping_shr((T::BITS - bits) as u32)
+        .wrapping_shl(position as u32);
     value.wrapping_shl(position as u32) & mask
 }
 
 /// Assign a value to a bitfield within existing storage.
 #[inline]
 pub fn assign<T: BitFieldStorage>(storage: T, value: T, position: usize, bits: usize) -> T {
-    let mask = (!T::ZERO).wrapping_shr((T::BITS - bits) as u32).wrapping_shl(position as u32);
+    let mask = (!T::ZERO)
+        .wrapping_shr((T::BITS - bits) as u32)
+        .wrapping_shl(position as u32);
     (storage & !mask) | format_value(value, position, bits)
 }
 

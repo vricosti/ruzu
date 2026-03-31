@@ -87,10 +87,7 @@ fn is_microsoft_dozen(device_name: &str) -> bool {
 /// 2. Prefer Nvidia > AMD > Intel
 /// 3. Prefer discrete GPUs
 /// 4. Sort by name descending (higher model numbers first)
-pub fn sort_physical_devices(
-    devices: &mut Vec<vk::PhysicalDevice>,
-    instance: &ash::Instance,
-) {
+pub fn sort_physical_devices(devices: &mut Vec<vk::PhysicalDevice>, instance: &ash::Instance) {
     // We need properties for sorting. Collect them once.
     let get_props = |dev: vk::PhysicalDevice| -> vk::PhysicalDeviceProperties {
         unsafe { instance.get_physical_device_properties(dev) }
@@ -98,14 +95,8 @@ pub fn sort_physical_devices(
 
     // Sort by name descending
     devices.sort_by(|&a, &b| {
-        let name_a = unsafe {
-            CStr::from_ptr(get_props(a).device_name.as_ptr())
-                .to_string_lossy()
-        };
-        let name_b = unsafe {
-            CStr::from_ptr(get_props(b).device_name.as_ptr())
-                .to_string_lossy()
-        };
+        let name_a = unsafe { CStr::from_ptr(get_props(a).device_name.as_ptr()).to_string_lossy() };
+        let name_b = unsafe { CStr::from_ptr(get_props(b).device_name.as_ptr()).to_string_lossy() };
         name_b.cmp(&name_a)
     });
 
@@ -133,14 +124,8 @@ pub fn sort_physical_devices(
 
     // Demote Microsoft Dozen devices
     devices.sort_by(|&a, &b| {
-        let name_a = unsafe {
-            CStr::from_ptr(get_props(a).device_name.as_ptr())
-                .to_string_lossy()
-        };
-        let name_b = unsafe {
-            CStr::from_ptr(get_props(b).device_name.as_ptr())
-                .to_string_lossy()
-        };
+        let name_a = unsafe { CStr::from_ptr(get_props(a).device_name.as_ptr()).to_string_lossy() };
+        let name_b = unsafe { CStr::from_ptr(get_props(b).device_name.as_ptr()).to_string_lossy() };
         let a_dozen = is_microsoft_dozen(&name_a);
         let b_dozen = is_microsoft_dozen(&name_b);
         a_dozen.cmp(&b_dozen)
@@ -294,22 +279,14 @@ pub fn available_version(entry: &ash::Entry) -> u32 {
 pub fn enumerate_instance_extension_properties(
     entry: &ash::Entry,
 ) -> Option<Vec<vk::ExtensionProperties>> {
-    unsafe {
-        entry
-            .enumerate_instance_extension_properties(None)
-            .ok()
-    }
+    unsafe { entry.enumerate_instance_extension_properties(None).ok() }
 }
 
 /// Enumerates instance layer properties.
 ///
 /// Port of `vk::EnumerateInstanceLayerProperties`.
-pub fn enumerate_instance_layer_properties(
-    entry: &ash::Entry,
-) -> Option<Vec<vk::LayerProperties>> {
-    unsafe {
-        entry.enumerate_instance_layer_properties().ok()
-    }
+pub fn enumerate_instance_layer_properties(entry: &ash::Entry) -> Option<Vec<vk::LayerProperties>> {
+    unsafe { entry.enumerate_instance_layer_properties().ok() }
 }
 
 // ---------------------------------------------------------------------------

@@ -7,10 +7,10 @@
 //! MiiManager: high-level Mii management, building random/default Miis,
 //! and coordinating between the database and the Mii types.
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::mii_database_manager::DatabaseManager;
 use super::mii_types::{Age, Gender, Race};
 use super::types::store_data::StoreData;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// MiiManager coordinates Mii operations.
 pub struct MiiManager {

@@ -30,19 +30,84 @@ pub struct KAddressSpaceInfo {
 
 /// The address space info table matching upstream exactly.
 static ADDRESS_SPACE_INFOS: [KAddressSpaceInfo; 13] = [
-    KAddressSpaceInfo { bit_width: 32, address: 2 * MI_B,        size: 1 * GI_B - 2 * MI_B,   info_type: AddressSpaceInfoType::MapSmall },
-    KAddressSpaceInfo { bit_width: 32, address: 1 * GI_B,        size: 4 * GI_B - 1 * GI_B,   info_type: AddressSpaceInfoType::MapLarge },
-    KAddressSpaceInfo { bit_width: 32, address: SIZE_INVALID,     size: 1 * GI_B,               info_type: AddressSpaceInfoType::Alias },
-    KAddressSpaceInfo { bit_width: 32, address: SIZE_INVALID,     size: 1 * GI_B,               info_type: AddressSpaceInfoType::Heap },
-    KAddressSpaceInfo { bit_width: 36, address: 128 * MI_B,      size: 2 * GI_B - 128 * MI_B,  info_type: AddressSpaceInfoType::MapSmall },
-    KAddressSpaceInfo { bit_width: 36, address: 2 * GI_B,        size: 64 * GI_B - 2 * GI_B,   info_type: AddressSpaceInfoType::MapLarge },
-    KAddressSpaceInfo { bit_width: 36, address: SIZE_INVALID,     size: 8 * GI_B,               info_type: AddressSpaceInfoType::Heap },
-    KAddressSpaceInfo { bit_width: 36, address: SIZE_INVALID,     size: 6 * GI_B,               info_type: AddressSpaceInfoType::Alias },
-    KAddressSpaceInfo { bit_width: 39, address: 128 * MI_B,      size: 512 * GI_B - 128 * MI_B, info_type: AddressSpaceInfoType::Map39Bit },
-    KAddressSpaceInfo { bit_width: 39, address: SIZE_INVALID,     size: 64 * GI_B,              info_type: AddressSpaceInfoType::MapSmall },
-    KAddressSpaceInfo { bit_width: 39, address: SIZE_INVALID,     size: 8 * GI_B,               info_type: AddressSpaceInfoType::Heap },
-    KAddressSpaceInfo { bit_width: 39, address: SIZE_INVALID,     size: 64 * GI_B,              info_type: AddressSpaceInfoType::Alias },
-    KAddressSpaceInfo { bit_width: 39, address: SIZE_INVALID,     size: 2 * GI_B,               info_type: AddressSpaceInfoType::Stack },
+    KAddressSpaceInfo {
+        bit_width: 32,
+        address: 2 * MI_B,
+        size: 1 * GI_B - 2 * MI_B,
+        info_type: AddressSpaceInfoType::MapSmall,
+    },
+    KAddressSpaceInfo {
+        bit_width: 32,
+        address: 1 * GI_B,
+        size: 4 * GI_B - 1 * GI_B,
+        info_type: AddressSpaceInfoType::MapLarge,
+    },
+    KAddressSpaceInfo {
+        bit_width: 32,
+        address: SIZE_INVALID,
+        size: 1 * GI_B,
+        info_type: AddressSpaceInfoType::Alias,
+    },
+    KAddressSpaceInfo {
+        bit_width: 32,
+        address: SIZE_INVALID,
+        size: 1 * GI_B,
+        info_type: AddressSpaceInfoType::Heap,
+    },
+    KAddressSpaceInfo {
+        bit_width: 36,
+        address: 128 * MI_B,
+        size: 2 * GI_B - 128 * MI_B,
+        info_type: AddressSpaceInfoType::MapSmall,
+    },
+    KAddressSpaceInfo {
+        bit_width: 36,
+        address: 2 * GI_B,
+        size: 64 * GI_B - 2 * GI_B,
+        info_type: AddressSpaceInfoType::MapLarge,
+    },
+    KAddressSpaceInfo {
+        bit_width: 36,
+        address: SIZE_INVALID,
+        size: 8 * GI_B,
+        info_type: AddressSpaceInfoType::Heap,
+    },
+    KAddressSpaceInfo {
+        bit_width: 36,
+        address: SIZE_INVALID,
+        size: 6 * GI_B,
+        info_type: AddressSpaceInfoType::Alias,
+    },
+    KAddressSpaceInfo {
+        bit_width: 39,
+        address: 128 * MI_B,
+        size: 512 * GI_B - 128 * MI_B,
+        info_type: AddressSpaceInfoType::Map39Bit,
+    },
+    KAddressSpaceInfo {
+        bit_width: 39,
+        address: SIZE_INVALID,
+        size: 64 * GI_B,
+        info_type: AddressSpaceInfoType::MapSmall,
+    },
+    KAddressSpaceInfo {
+        bit_width: 39,
+        address: SIZE_INVALID,
+        size: 8 * GI_B,
+        info_type: AddressSpaceInfoType::Heap,
+    },
+    KAddressSpaceInfo {
+        bit_width: 39,
+        address: SIZE_INVALID,
+        size: 64 * GI_B,
+        info_type: AddressSpaceInfoType::Alias,
+    },
+    KAddressSpaceInfo {
+        bit_width: 39,
+        address: SIZE_INVALID,
+        size: 2 * GI_B,
+        info_type: AddressSpaceInfoType::Stack,
+    },
 ];
 
 fn get_address_space_info(
@@ -54,7 +119,10 @@ fn get_address_space_info(
             return info;
         }
     }
-    panic!("Could not find AddressSpaceInfo for width={}, type={:?}", width, info_type);
+    panic!(
+        "Could not find AddressSpaceInfo for width={}, type={:?}",
+        width, info_type
+    );
 }
 
 impl KAddressSpaceInfo {

@@ -87,7 +87,11 @@ impl ISystemDisplayService {
         let z_value = rp.pop_u32();
         let _padding = rp.pop_u32();
         let layer_id = rp.pop_u64();
-        log::warn!("ISystemDisplayService::SetLayerZ (STUBBED) layer_id={}, z_value={}", layer_id, z_value);
+        log::warn!(
+            "ISystemDisplayService::SetLayerZ (STUBBED) layer_id={}, z_value={}",
+            layer_id,
+            z_value
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -100,7 +104,11 @@ impl ISystemDisplayService {
         let visible = rp.pop_u32() != 0;
         let _padding = rp.pop_u32();
         let layer_id = rp.pop_u64();
-        log::debug!("ISystemDisplayService::SetLayerVisibility layer_id={}, visible={}", layer_id, visible);
+        log::debug!(
+            "ISystemDisplayService::SetLayerVisibility layer_id={}, visible={}",
+            layer_id,
+            visible
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -109,7 +117,10 @@ impl ISystemDisplayService {
     fn list_display_modes(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let display_id = rp.pop_u64();
-        log::warn!("ISystemDisplayService::ListDisplayModes (STUBBED) display_id={}", display_id);
+        log::warn!(
+            "ISystemDisplayService::ListDisplayModes (STUBBED) display_id={}",
+            display_id
+        );
 
         let mode = DisplayMode {
             width: 1920,
@@ -134,7 +145,10 @@ impl ISystemDisplayService {
     fn get_display_mode(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let display_id = rp.pop_u64();
-        log::warn!("ISystemDisplayService::GetDisplayMode (STUBBED) display_id={}", display_id);
+        log::warn!(
+            "ISystemDisplayService::GetDisplayMode (STUBBED) display_id={}",
+            display_id
+        );
 
         let mode = if common::settings::is_docked_mode(&common::settings::values()) {
             DisplayMode {
@@ -168,7 +182,10 @@ impl ISystemDisplayService {
     fn open_shared_layer(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let layer_id = rp.pop_u64();
-        log::info!("ISystemDisplayService::OpenSharedLayer (STUBBED) layer_id={}", layer_id);
+        log::info!(
+            "ISystemDisplayService::OpenSharedLayer (STUBBED) layer_id={}",
+            layer_id
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -177,7 +194,10 @@ impl ISystemDisplayService {
     fn connect_shared_layer(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let layer_id = rp.pop_u64();
-        log::info!("ISystemDisplayService::ConnectSharedLayer (STUBBED) layer_id={}", layer_id);
+        log::info!(
+            "ISystemDisplayService::ConnectSharedLayer (STUBBED) layer_id={}",
+            layer_id
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -193,7 +213,13 @@ impl SessionRequestHandler for ISystemDisplayService {
 }
 
 impl ServiceFramework for ISystemDisplayService {
-    fn get_service_name(&self) -> &str { "vi::ISystemDisplayService" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "vi::ISystemDisplayService"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }

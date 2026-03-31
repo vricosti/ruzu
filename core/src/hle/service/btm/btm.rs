@@ -6,11 +6,11 @@
 //!
 //! Bluetooth management service registration and IBtm.
 
-use std::collections::BTreeMap;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
 
 /// IBtm — main Bluetooth management service.
 pub struct IBtm {
@@ -128,13 +128,21 @@ impl SessionRequestHandler for IBtm {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { "btm" }
+    fn service_name(&self) -> &str {
+        "btm"
+    }
 }
 
 impl ServiceFramework for IBtm {
-    fn get_service_name(&self) -> &str { "btm" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "btm"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// Registers "btm", "btm:dbg", "btm:sys", "btm:u" services.
@@ -154,9 +162,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     server_manager.register_named_service(
         "btm",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(IBtm::new())
-        }),
+        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(IBtm::new()) }),
         16,
     );
 

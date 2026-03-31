@@ -73,6 +73,31 @@ impl KHardwareTimerBase {
         }
     }
 
+    /// Remove and return all tasks whose time has elapsed, along with the next
+    /// task time if one remains.
+    ///
+    /// Rust uses this helper when the caller needs to process expired tasks
+    /// after releasing the mutable borrow of `KHardwareTimerBase`.
+    pub fn collect_expired_tasks(&mut self, cur_time: i64) -> (Vec<TimerTaskId>, i64) {
+        let mut fired = Vec::new();
+
+        loop {
+            let next = match self.m_next_task {
+                Some((time, id)) => (time, id),
+                None => return (fired, 0),
+            };
+
+            if next.0 > cur_time {
+                return (fired, next.0);
+            }
+
+            let task_id = next.1;
+            let task_time = next.0;
+            self.remove_task_from_tree(task_id, task_time);
+            fired.push(task_id);
+        }
+    }
+
     /// Register an absolute timer task. Returns true if this task is now
     /// the earliest (i.e., the interrupt should be re-armed).
     pub fn register_absolute_task_impl(&mut self, task_id: TimerTaskId, task_time: i64) -> bool {

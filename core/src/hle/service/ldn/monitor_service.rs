@@ -6,8 +6,8 @@
 //!
 //! IMonitorService: LDN monitoring service.
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::ldn_types::State;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// IPC command table for IMonitorService.
 ///
@@ -27,9 +27,7 @@ pub struct IMonitorService {
 
 impl IMonitorService {
     pub fn new() -> Self {
-        Self {
-            state: State::None,
-        }
+        Self { state: State::None }
     }
 
     /// Cmd 0: GetStateForMonitor

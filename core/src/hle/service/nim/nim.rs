@@ -209,9 +209,8 @@ impl IEnsureNetworkClockAvailabilityService {
         let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
             "IEnsureNetworkClockAvailabilityService".to_string(),
         );
-        let finished_event_handle = service_context.create_event(
-            "IEnsureNetworkClockAvailabilityService:FinishEvent".to_string(),
-        );
+        let finished_event_handle = service_context
+            .create_event("IEnsureNetworkClockAvailabilityService:FinishEvent".to_string());
         Self {
             service_context,
             finished_event_handle,
@@ -311,8 +310,8 @@ impl NTC {
 ///
 /// Corresponds to `LoopProcess` in upstream nim.cpp.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     let mut server_manager = ServerManager::new(system);
 
@@ -321,9 +320,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
         sm.register_named_service(
             name,
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(
-                    crate::hle::service::services::GenericStubService::new(&svc_name),
-                )
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
+                    &svc_name,
+                ))
             }),
             64,
         );

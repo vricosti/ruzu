@@ -123,8 +123,8 @@ impl Default for FramebufferLayout {
 ///
 /// Corresponds to upstream anonymous `MaxRectangle`.
 fn max_rectangle(window_area: &Rectangle, screen_aspect_ratio: f32) -> Rectangle {
-    let scale = (window_area.get_width() as f32)
-        .min(window_area.get_height() as f32 / screen_aspect_ratio);
+    let scale =
+        (window_area.get_width() as f32).min(window_area.get_height() as f32 / screen_aspect_ratio);
     Rectangle::new(
         0,
         0,

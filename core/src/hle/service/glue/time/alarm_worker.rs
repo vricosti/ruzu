@@ -143,19 +143,13 @@ impl AlarmWorker {
     /// Schedule the CoreTiming timer event at the given duration from now.
     fn schedule_timer(&self, duration: Duration) {
         if let (Some(ref ct), Some(ref evt)) = (&self.core_timing, &self.timer_timing_event) {
-            ct.lock()
-                .unwrap()
-                .schedule_event(duration, evt, false);
+            ct.lock().unwrap().schedule_event(duration, evt, false);
         }
     }
 
     /// Get the closest pending alarm.
     /// Port of upstream `AlarmWorker::GetClosestAlarmInfo`.
-    fn get_closest_alarm_info(
-        &self,
-        out_alarm_info: &mut AlarmInfo,
-        out_time: &mut i64,
-    ) -> bool {
+    fn get_closest_alarm_info(&self, out_alarm_info: &mut AlarmInfo, out_time: &mut i64) -> bool {
         let Some(ref tm) = self.time_manager else {
             return false;
         };

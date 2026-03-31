@@ -8,12 +8,15 @@
 
 use std::sync::Mutex;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::common::{
     CalendarAdditionalInfo, CalendarTime, LocationName, RuleVersion, SteadyClockTimePoint,
 };
 use super::errors::RESULT_TIME_ZONE_NOT_FOUND;
-pub use super::tzif::{TzRule, TtInfo, CalendarTimeInternal, localsub, time1, is_leap, TM_YEAR_BASE, detzcode, detzcode64, parse_posix_tz};
+pub use super::tzif::{
+    detzcode, detzcode64, is_leap, localsub, parse_posix_tz, time1, CalendarTimeInternal, TtInfo,
+    TzRule, TM_YEAR_BASE,
+};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// TimeZone manages timezone location, rules, and time conversions.
 pub struct TimeZone {
@@ -104,7 +107,11 @@ impl TimeZone {
         };
 
         let mut name = [0u8; 8];
-        let abbr_len = internal.tm_zone.iter().position(|&c| c == 0).unwrap_or(internal.tm_zone.len());
+        let abbr_len = internal
+            .tm_zone
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(internal.tm_zone.len());
         let copy_len = abbr_len.min(name.len() - 1);
         name[..copy_len].copy_from_slice(&internal.tm_zone[..copy_len]);
 
@@ -328,7 +335,10 @@ mod tests {
     fn test_detzcode64() {
         assert_eq!(detzcode64(&[0, 0, 0, 0, 0, 0, 0, 0]), 0);
         assert_eq!(detzcode64(&[0, 0, 0, 0, 0, 0, 0, 1]), 1);
-        assert_eq!(detzcode64(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), -1);
+        assert_eq!(
+            detzcode64(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            -1
+        );
     }
 
     #[test]

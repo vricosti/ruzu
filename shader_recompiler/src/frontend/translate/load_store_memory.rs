@@ -38,17 +38,23 @@ pub fn ldg(tv: &mut TranslatorVisitor, insn: u64) {
     match size {
         0 => {
             // U8
-            let val = tv.ir.load_global_32(Value::Inst(addr_with_offset.inst_ref()));
+            let val = tv
+                .ir
+                .load_global_32(Value::Inst(addr_with_offset.inst_ref()));
             tv.set_x(dst, val);
         }
         2 => {
             // U32 (32 bits)
-            let val = tv.ir.load_global_32(Value::Inst(addr_with_offset.inst_ref()));
+            let val = tv
+                .ir
+                .load_global_32(Value::Inst(addr_with_offset.inst_ref()));
             tv.set_x(dst, val);
         }
         _ => {
             // Default to 32-bit load
-            let val = tv.ir.load_global_32(Value::Inst(addr_with_offset.inst_ref()));
+            let val = tv
+                .ir
+                .load_global_32(Value::Inst(addr_with_offset.inst_ref()));
             tv.set_x(dst, val);
         }
     }

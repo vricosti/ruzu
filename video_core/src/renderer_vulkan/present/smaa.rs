@@ -97,22 +97,24 @@ impl Smaa {
 
         // Create static images (area + search textures)
         // Area texture dimensions from smaa_area_tex.h: AREATEX_WIDTH=160, AREATEX_HEIGHT=560
-        let area_extent = vk::Extent2D { width: 160, height: 560 };
+        let area_extent = vk::Extent2D {
+            width: 160,
+            height: 560,
+        };
         // Search texture dimensions from smaa_search_tex.h: SEARCHTEX_WIDTH=64, SEARCHTEX_HEIGHT=16
-        let search_extent = vk::Extent2D { width: 64, height: 16 };
+        let search_extent = vk::Extent2D {
+            width: 64,
+            height: 16,
+        };
 
-        let area_image = util::create_wrapped_image(
-            &device, allocator, area_extent, vk::Format::R8G8_UNORM,
-        );
-        let search_image = util::create_wrapped_image(
-            &device, allocator, search_extent, vk::Format::R8_UNORM,
-        );
-        let area_view = util::create_wrapped_image_view(
-            &device, area_image, vk::Format::R8G8_UNORM,
-        );
-        let search_view = util::create_wrapped_image_view(
-            &device, search_image, vk::Format::R8_UNORM,
-        );
+        let area_image =
+            util::create_wrapped_image(&device, allocator, area_extent, vk::Format::R8G8_UNORM);
+        let search_image =
+            util::create_wrapped_image(&device, allocator, search_extent, vk::Format::R8_UNORM);
+        let area_view =
+            util::create_wrapped_image_view(&device, area_image, vk::Format::R8G8_UNORM);
+        let search_view =
+            util::create_wrapped_image_view(&device, search_image, vk::Format::R8_UNORM);
 
         let static_images = [area_image, search_image];
         let static_image_views = [area_view, search_view];
@@ -121,22 +123,30 @@ impl Smaa {
         let mut dynamic_images = Vec::with_capacity(image_count);
         for _i in 0..image_count {
             let blend_image = util::create_wrapped_image(
-                &device, allocator, extent, vk::Format::R16G16B16A16_SFLOAT,
+                &device,
+                allocator,
+                extent,
+                vk::Format::R16G16B16A16_SFLOAT,
             );
-            let edges_image = util::create_wrapped_image(
-                &device, allocator, extent, vk::Format::R16G16_SFLOAT,
-            );
+            let edges_image =
+                util::create_wrapped_image(&device, allocator, extent, vk::Format::R16G16_SFLOAT);
             let output_image = util::create_wrapped_image(
-                &device, allocator, extent, vk::Format::R16G16B16A16_SFLOAT,
+                &device,
+                allocator,
+                extent,
+                vk::Format::R16G16B16A16_SFLOAT,
             );
             let blend_view = util::create_wrapped_image_view(
-                &device, blend_image, vk::Format::R16G16B16A16_SFLOAT,
+                &device,
+                blend_image,
+                vk::Format::R16G16B16A16_SFLOAT,
             );
-            let edges_view = util::create_wrapped_image_view(
-                &device, edges_image, vk::Format::R16G16_SFLOAT,
-            );
+            let edges_view =
+                util::create_wrapped_image_view(&device, edges_image, vk::Format::R16G16_SFLOAT);
             let output_view = util::create_wrapped_image_view(
-                &device, output_image, vk::Format::R16G16B16A16_SFLOAT,
+                &device,
+                output_image,
+                vk::Format::R16G16B16A16_SFLOAT,
             );
             dynamic_images.push(SmaaImages {
                 descriptor_sets: Vec::new(),
@@ -148,25 +158,30 @@ impl Smaa {
 
         // Create render passes
         let renderpass_edges = util::create_wrapped_render_pass(
-            &device, vk::Format::R16G16_SFLOAT, vk::ImageLayout::UNDEFINED,
+            &device,
+            vk::Format::R16G16_SFLOAT,
+            vk::ImageLayout::UNDEFINED,
         );
         let renderpass_blend = util::create_wrapped_render_pass(
-            &device, vk::Format::R16G16B16A16_SFLOAT, vk::ImageLayout::UNDEFINED,
+            &device,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageLayout::UNDEFINED,
         );
         let renderpass_neighborhood = util::create_wrapped_render_pass(
-            &device, vk::Format::R16G16B16A16_SFLOAT, vk::ImageLayout::UNDEFINED,
+            &device,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageLayout::UNDEFINED,
         );
         let renderpasses = [renderpass_edges, renderpass_blend, renderpass_neighborhood];
 
         // Create framebuffers
         for imgs in &mut dynamic_images {
-            imgs.framebuffers[SmaaStage::EdgeDetection as usize] =
-                util::create_wrapped_framebuffer(
-                    &device,
-                    renderpasses[SmaaStage::EdgeDetection as usize],
-                    imgs.image_views[DynamicImageType::Edges as usize],
-                    extent,
-                );
+            imgs.framebuffers[SmaaStage::EdgeDetection as usize] = util::create_wrapped_framebuffer(
+                &device,
+                renderpasses[SmaaStage::EdgeDetection as usize],
+                imgs.image_views[DynamicImageType::Edges as usize],
+                extent,
+            );
             imgs.framebuffers[SmaaStage::BlendingWeightCalculation as usize] =
                 util::create_wrapped_framebuffer(
                     &device,
@@ -227,20 +242,15 @@ impl Smaa {
         let ds_layouts: Vec<vk::DescriptorSetLayout> =
             descriptor_set_layouts.iter().copied().collect();
         for imgs in &mut dynamic_images {
-            imgs.descriptor_sets = util::create_wrapped_descriptor_sets(
-                &device,
-                descriptor_pool,
-                &ds_layouts,
-            );
+            imgs.descriptor_sets =
+                util::create_wrapped_descriptor_sets(&device, descriptor_pool, &ds_layouts);
         }
 
         // Create pipeline layouts
         let mut pipeline_layouts = [vk::PipelineLayout::null(); MAX_SMAA_STAGE];
         for i in 0..MAX_SMAA_STAGE {
-            pipeline_layouts[i] = util::create_wrapped_pipeline_layout(
-                &device,
-                descriptor_set_layouts[i],
-            );
+            pipeline_layouts[i] =
+                util::create_wrapped_pipeline_layout(&device, descriptor_set_layouts[i]);
         }
 
         // Create pipelines

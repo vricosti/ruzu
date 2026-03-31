@@ -6,15 +6,18 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::core::syncpoint_manager::SyncpointManager;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
-use crate::hle::service::nvdrv::nvdrv::EventInterface;
 use crate::hle::service::nvdrv::nvdata::*;
+use crate::hle::service::nvdrv::nvdrv::EventInterface;
 
 /// Union for SyncpointEventValue bit fields.
 #[repr(C)]
@@ -53,6 +56,12 @@ struct InternalEvent {
     assigned_value: u32,
     registered: bool,
     wait_handle: Option<u64>,
+    owner: Option<QueriedEventOwner>,
+}
+
+struct QueriedEventOwner {
+    process: Weak<Mutex<KProcess>>,
+    scheduler: Weak<Mutex<KScheduler>>,
 }
 
 impl Default for InternalEvent {
@@ -65,6 +74,7 @@ impl Default for InternalEvent {
             assigned_value: 0,
             registered: false,
             wait_handle: None,
+            owner: None,
         }
     }
 }
@@ -169,7 +179,10 @@ impl NvHostCtrl {
         String::from_utf8_lossy(&bytes[..len]).into_owned()
     }
 
-    pub fn new(events_interface: Arc<EventInterface>, syncpoint_manager: &SyncpointManager) -> Self {
+    pub fn new(
+        events_interface: Arc<EventInterface>,
+        syncpoint_manager: &SyncpointManager,
+    ) -> Self {
         let mut events = Vec::with_capacity(MAX_NV_EVENTS as usize);
         for _ in 0..MAX_NV_EVENTS {
             events.push(InternalEvent::default());
@@ -192,13 +205,15 @@ impl NvHostCtrl {
             self.events_interface
                 .create_event(&format!("NVCTRL::NvEvent_{}", event_id)),
         );
-        event.status
+        event
+            .status
             .store(EventState::Available as u32, Ordering::Release);
         event.registered = true;
         event.fails = 0;
         event.assigned_syncpt = 0;
         event.assigned_value = 0;
         event.wait_handle = None;
+        event.owner = None;
         *mask |= 1u64 << event_id;
     }
 
@@ -207,14 +222,40 @@ impl NvHostCtrl {
         if let Some(readable_event) = event.readable_event.take() {
             self.events_interface.free_event(readable_event);
         }
-        event.status
+        event
+            .status
             .store(EventState::Available as u32, Ordering::Release);
         event.registered = false;
         event.assigned_syncpt = 0;
         event.assigned_value = 0;
         event.wait_handle = None;
         event.fails = 0;
+        event.owner = None;
         *mask &= !(1u64 << event_id);
+    }
+
+    fn signal_event_from_slot(events: &Arc<Mutex<Vec<InternalEvent>>>, slot: u32) {
+        let owner_and_event = {
+            let events_guard = events.lock().unwrap();
+            let event = &events_guard[slot as usize];
+            (
+                event
+                    .owner
+                    .as_ref()
+                    .and_then(|owner| Some((owner.process.upgrade()?, owner.scheduler.upgrade()?))),
+                event.readable_event.clone(),
+            )
+        };
+
+        let (Some((process, scheduler)), Some(readable_event)) = owner_and_event else {
+            return;
+        };
+
+        let mut process = process.lock().unwrap();
+        readable_event
+            .lock()
+            .unwrap()
+            .signal(&mut process, &scheduler);
     }
 
     fn free_event_locked(
@@ -240,7 +281,12 @@ impl NvHostCtrl {
         NvResult::Success
     }
 
-    fn find_free_nv_event(&self, events: &mut [InternalEvent], mask: &mut u64, syncpoint_id: u32) -> u32 {
+    fn find_free_nv_event(
+        &self,
+        events: &mut [InternalEvent],
+        mask: &mut u64,
+        syncpoint_id: u32,
+    ) -> u32 {
         let mut slot = MAX_NV_EVENTS;
         let mut free_slot = MAX_NV_EVENTS;
 
@@ -381,22 +427,22 @@ impl NvHostCtrl {
                         fence_id,
                         target_value,
                         Box::new(move || {
-                            let mut events = events_ref.lock().unwrap();
-                            let event = &mut events[slot as usize];
-                            if event.status.swap(EventState::Signalling as u32, Ordering::AcqRel)
-                                == EventState::Waiting as u32
-                            {
-                                if let Some(readable_event) = &event.readable_event {
-                                    let mut process =
-                                        system.get().current_process_arc().lock().unwrap();
-                                    let scheduler = system.get().scheduler_arc();
-                                    readable_event
-                                        .lock()
-                                        .unwrap()
-                                        .signal(&mut process, &scheduler);
-                                }
+                            let should_signal = {
+                                let mut events = events_ref.lock().unwrap();
+                                let event = &mut events[slot as usize];
+                                event
+                                    .status
+                                    .swap(EventState::Signalling as u32, Ordering::AcqRel)
+                                    == EventState::Waiting as u32
+                            };
+
+                            if should_signal {
+                                let _ = system;
+                                Self::signal_event_from_slot(&events_ref, slot);
                             }
-                            event
+
+                            let mut events = events_ref.lock().unwrap();
+                            events[slot as usize]
                                 .status
                                 .store(EventState::Signalled as u32, Ordering::Release);
                         }),
@@ -418,7 +464,10 @@ impl NvHostCtrl {
 
     pub fn ioc_ctrl_event_register(&self, params: &mut IocCtrlEventRegisterParams) -> NvResult {
         let event_id = params.user_event_id;
-        log::debug!("nvhost_ctrl::IocCtrlEventRegister called, user_event_id: {:X}", event_id);
+        log::debug!(
+            "nvhost_ctrl::IocCtrlEventRegister called, user_event_id: {:X}",
+            event_id
+        );
         if event_id >= MAX_NV_EVENTS {
             return NvResult::BadParameter;
         }
@@ -439,7 +488,10 @@ impl NvHostCtrl {
 
     pub fn ioc_ctrl_event_unregister(&self, params: &mut IocCtrlEventUnregisterParams) -> NvResult {
         let event_id = params.user_event_id & 0x00FF;
-        log::debug!("nvhost_ctrl::IocCtrlEventUnregister called, user_event_id: {:X}", event_id);
+        log::debug!(
+            "nvhost_ctrl::IocCtrlEventUnregister called, user_event_id: {:X}",
+            event_id
+        );
 
         if event_id >= MAX_NV_EVENTS {
             return NvResult::BadParameter;
@@ -455,7 +507,10 @@ impl NvHostCtrl {
         params: &mut IocCtrlEventUnregisterBatchParams,
     ) -> NvResult {
         let mut event_mask = params.user_events;
-        log::debug!("nvhost_ctrl::IocCtrlEventUnregisterBatch called, event_mask: {:X}", event_mask);
+        log::debug!(
+            "nvhost_ctrl::IocCtrlEventUnregisterBatch called, event_mask: {:X}",
+            event_mask
+        );
 
         let mut mask = self.events_mask.lock().unwrap();
         let mut events = self.events.lock().unwrap();
@@ -474,7 +529,10 @@ impl NvHostCtrl {
 
     pub fn ioc_ctrl_clear_event_wait(&self, params: &mut IocCtrlEventClearParams) -> NvResult {
         let event_id = params.event_id.slot() as u32;
-        log::debug!("nvhost_ctrl::IocCtrlClearEventWait called, event_id: {:X}", event_id);
+        log::debug!(
+            "nvhost_ctrl::IocCtrlClearEventWait called, event_id: {:X}",
+            event_id
+        );
 
         if event_id >= MAX_NV_EVENTS {
             return NvResult::BadParameter;
@@ -487,7 +545,9 @@ impl NvHostCtrl {
             return NvResult::Success;
         }
 
-        if event.status.swap(EventState::Cancelling as u32, Ordering::AcqRel)
+        if event
+            .status
+            .swap(EventState::Cancelling as u32, Ordering::AcqRel)
             == EventState::Waiting as u32
         {
             if let Some(wait_handle) = event.wait_handle.take() {
@@ -497,7 +557,8 @@ impl NvHostCtrl {
             self.syncpoint_manager().update_min(event.assigned_syncpt);
         }
         event.fails += 1;
-        event.status
+        event
+            .status
             .store(EventState::Cancelled as u32, Ordering::Release);
         if let Some(readable_event) = &event.readable_event {
             let _ = readable_event.lock().unwrap().clear();
@@ -511,10 +572,12 @@ impl NvHostCtrl {
 mod tests {
     use std::sync::Arc;
 
-    use super::{IocCtrlEventClearParams, IocCtrlEventRegisterParams, IocCtrlEventWaitParams, NvHostCtrl};
+    use super::{
+        IocCtrlEventClearParams, IocCtrlEventRegisterParams, IocCtrlEventWaitParams, NvHostCtrl,
+    };
     use crate::core::{System, SystemRef};
-    use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
     use crate::hle::service::nvdrv::core::syncpoint_manager::SyncpointManager;
+    use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
     use crate::hle::service::nvdrv::nvdata::{NvFence, NvResult};
     use crate::hle::service::nvdrv::nvdrv::EventInterface;
 
@@ -539,7 +602,10 @@ mod tests {
 
         assert_eq!(result, NvResult::Timeout);
         assert!(params.value.event_allocated());
-        assert_eq!(params.value.syncpoint_id_for_allocation() as u32, fence_id & 0x0FFF);
+        assert_eq!(
+            params.value.syncpoint_id_for_allocation() as u32,
+            fence_id & 0x0FFF
+        );
         assert!(ctrl.query_event(params.value.raw).is_some());
 
         std::mem::forget(system);
@@ -552,26 +618,26 @@ mod tests {
         let syncpoints = SyncpointManager::new();
         let ctrl = NvHostCtrl::new(events, &syncpoints);
         let mut register = IocCtrlEventRegisterParams { user_event_id: 2 };
-        assert_eq!(ctrl.ioc_ctrl_event_register(&mut register), NvResult::Success);
+        assert_eq!(
+            ctrl.ioc_ctrl_event_register(&mut register),
+            NvResult::Success
+        );
 
         let mut clear = IocCtrlEventClearParams {
             event_id: super::SyncpointEventValue { raw: 2 },
         };
 
-        assert_eq!(ctrl.ioc_ctrl_clear_event_wait(&mut clear), NvResult::Success);
+        assert_eq!(
+            ctrl.ioc_ctrl_clear_event_wait(&mut clear),
+            NvResult::Success
+        );
 
         std::mem::forget(system);
     }
 }
 
 impl NvDevice for NvHostCtrl {
-    fn ioctl1(
-        &self,
-        _fd: DeviceFD,
-        command: Ioctl,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> NvResult {
+    fn ioctl1(&self, _fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
         match command.group() {
             0x0 => match command.cmd() {
                 0x1b => {
@@ -683,5 +749,33 @@ impl NvDevice for NvHostCtrl {
 
         log::error!("Slot:{}, SyncpointID:{}, requested", slot, syncpoint_id);
         None
+    }
+
+    fn register_query_event_owner(
+        &self,
+        event_id: u32,
+        process: Arc<Mutex<KProcess>>,
+        scheduler: Arc<Mutex<KScheduler>>,
+    ) {
+        let desired_event = SyncpointEventValue { raw: event_id };
+        let allocated = desired_event.event_allocated();
+        let slot = if allocated {
+            desired_event.partial_slot()
+        } else {
+            desired_event.slot() as u32
+        };
+
+        if slot >= MAX_NV_EVENTS {
+            return;
+        }
+
+        let mut events = self.events.lock().unwrap();
+        let event = &mut events[slot as usize];
+        if event.registered {
+            event.owner = Some(QueriedEventOwner {
+                process: Arc::downgrade(&process),
+                scheduler: Arc::downgrade(&scheduler),
+            });
+        }
     }
 }

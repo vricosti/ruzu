@@ -29,12 +29,9 @@ pub struct INewlyArrivedEventHolder {
 
 impl INewlyArrivedEventHolder {
     pub fn new() -> Self {
-        let handlers = build_handler_map(&[
-            (commands::GET, None, "Get"),
-        ]);
+        let handlers = build_handler_map(&[(commands::GET, None, "Get")]);
 
-        let mut service_context =
-            ServiceContext::new("INewlyArrivedEventHolder".to_string());
+        let mut service_context = ServiceContext::new("INewlyArrivedEventHolder".to_string());
         let arrived_event_handle =
             service_context.create_event("INewlyArrivedEventHolder::ArrivedEvent".to_string());
 

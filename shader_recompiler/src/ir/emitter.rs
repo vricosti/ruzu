@@ -137,11 +137,17 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn get_goto_variable(&mut self, index: u32) -> Value {
-        self.emit(Inst::new(Opcode::GetGotoVariable, vec![Value::ImmU32(index)]))
+        self.emit(Inst::new(
+            Opcode::GetGotoVariable,
+            vec![Value::ImmU32(index)],
+        ))
     }
 
     pub fn set_goto_variable(&mut self, index: u32, value: Value) {
-        self.emit_void(Inst::new(Opcode::SetGotoVariable, vec![Value::ImmU32(index), value]));
+        self.emit_void(Inst::new(
+            Opcode::SetGotoVariable,
+            vec![Value::ImmU32(index), value],
+        ));
     }
 
     // ── Constant buffer ───────────────────────────────────────────────
@@ -173,11 +179,17 @@ impl<'a> Emitter<'a> {
     // ── Attributes ────────────────────────────────────────────────────
 
     pub fn get_attribute(&mut self, attr: Attribute, vertex: Value) -> Value {
-        self.emit(Inst::new(Opcode::GetAttribute, vec![Value::Attribute(attr), vertex]))
+        self.emit(Inst::new(
+            Opcode::GetAttribute,
+            vec![Value::Attribute(attr), vertex],
+        ))
     }
 
     pub fn get_attribute_u32(&mut self, attr: Attribute, vertex: Value) -> Value {
-        self.emit(Inst::new(Opcode::GetAttributeU32, vec![Value::Attribute(attr), vertex]))
+        self.emit(Inst::new(
+            Opcode::GetAttributeU32,
+            vec![Value::Attribute(attr), vertex],
+        ))
     }
 
     pub fn set_attribute(&mut self, attr: Attribute, value: Value, vertex: Value) {
@@ -192,7 +204,10 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn set_attribute_indexed(&mut self, offset: Value, value: Value, vertex: Value) {
-        self.emit_void(Inst::new(Opcode::SetAttributeIndexed, vec![offset, value, vertex]));
+        self.emit_void(Inst::new(
+            Opcode::SetAttributeIndexed,
+            vec![offset, value, vertex],
+        ));
     }
 
     pub fn get_patch(&mut self, patch: Patch) -> Value {
@@ -200,11 +215,17 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn set_patch(&mut self, patch: Patch, value: Value) {
-        self.emit_void(Inst::new(Opcode::SetPatch, vec![Value::Patch(patch), value]));
+        self.emit_void(Inst::new(
+            Opcode::SetPatch,
+            vec![Value::Patch(patch), value],
+        ));
     }
 
     pub fn set_frag_color(&mut self, rt_index: Value, component: Value, value: Value) {
-        self.emit_void(Inst::new(Opcode::SetFragColor, vec![rt_index, component, value]));
+        self.emit_void(Inst::new(
+            Opcode::SetFragColor,
+            vec![rt_index, component, value],
+        ));
     }
 
     pub fn set_sample_mask(&mut self, value: Value) {
@@ -284,7 +305,11 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn fp_add_32_with_control(&mut self, a: Value, b: Value, control: FpControl) -> Value {
-        self.emit(Inst::with_flags(Opcode::FPAdd32, vec![a, b], control.to_u32()))
+        self.emit(Inst::with_flags(
+            Opcode::FPAdd32,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_sub_32(&mut self, a: Value, b: Value) -> Value {
@@ -296,7 +321,11 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn fp_mul_32_with_control(&mut self, a: Value, b: Value, control: FpControl) -> Value {
-        self.emit(Inst::with_flags(Opcode::FPMul32, vec![a, b], control.to_u32()))
+        self.emit(Inst::with_flags(
+            Opcode::FPMul32,
+            vec![a, b],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_div_32(&mut self, a: Value, b: Value) -> Value {
@@ -314,7 +343,11 @@ impl<'a> Emitter<'a> {
         c: Value,
         control: FpControl,
     ) -> Value {
-        self.emit(Inst::with_flags(Opcode::FPFma32, vec![a, b, c], control.to_u32()))
+        self.emit(Inst::with_flags(
+            Opcode::FPFma32,
+            vec![a, b, c],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_min_32(&mut self, a: Value, b: Value) -> Value {
@@ -507,16 +540,31 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::BitwiseNot32, vec![a]))
     }
 
-    pub fn bit_field_insert(&mut self, base: Value, insert: Value, offset: Value, count: Value) -> Value {
-        self.emit(Inst::new(Opcode::BitFieldInsert, vec![base, insert, offset, count]))
+    pub fn bit_field_insert(
+        &mut self,
+        base: Value,
+        insert: Value,
+        offset: Value,
+        count: Value,
+    ) -> Value {
+        self.emit(Inst::new(
+            Opcode::BitFieldInsert,
+            vec![base, insert, offset, count],
+        ))
     }
 
     pub fn bit_field_s_extract(&mut self, base: Value, offset: Value, count: Value) -> Value {
-        self.emit(Inst::new(Opcode::BitFieldSExtract, vec![base, offset, count]))
+        self.emit(Inst::new(
+            Opcode::BitFieldSExtract,
+            vec![base, offset, count],
+        ))
     }
 
     pub fn bit_field_u_extract(&mut self, base: Value, offset: Value, count: Value) -> Value {
-        self.emit(Inst::new(Opcode::BitFieldUExtract, vec![base, offset, count]))
+        self.emit(Inst::new(
+            Opcode::BitFieldUExtract,
+            vec![base, offset, count],
+        ))
     }
 
     pub fn bit_reverse_32(&mut self, a: Value) -> Value {
@@ -691,40 +739,37 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::CompositeConstructU32x2, vec![a, b]))
     }
 
-    pub fn composite_construct_u32x4(
-        &mut self,
-        a: Value,
-        b: Value,
-        c: Value,
-        d: Value,
-    ) -> Value {
+    pub fn composite_construct_u32x4(&mut self, a: Value, b: Value, c: Value, d: Value) -> Value {
         self.emit(Inst::new(Opcode::CompositeConstructU32x4, vec![a, b, c, d]))
     }
 
     pub fn composite_extract_u32x2(&mut self, vector: Value, index: Value) -> Value {
-        self.emit(Inst::new(Opcode::CompositeExtractU32x2, vec![vector, index]))
+        self.emit(Inst::new(
+            Opcode::CompositeExtractU32x2,
+            vec![vector, index],
+        ))
     }
 
     pub fn composite_extract_u32x4(&mut self, vector: Value, index: Value) -> Value {
-        self.emit(Inst::new(Opcode::CompositeExtractU32x4, vec![vector, index]))
+        self.emit(Inst::new(
+            Opcode::CompositeExtractU32x4,
+            vec![vector, index],
+        ))
     }
 
     pub fn composite_construct_f32x2(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::CompositeConstructF32x2, vec![a, b]))
     }
 
-    pub fn composite_construct_f32x4(
-        &mut self,
-        a: Value,
-        b: Value,
-        c: Value,
-        d: Value,
-    ) -> Value {
+    pub fn composite_construct_f32x4(&mut self, a: Value, b: Value, c: Value, d: Value) -> Value {
         self.emit(Inst::new(Opcode::CompositeConstructF32x4, vec![a, b, c, d]))
     }
 
     pub fn composite_extract_f32x4(&mut self, vector: Value, index: Value) -> Value {
-        self.emit(Inst::new(Opcode::CompositeExtractF32x4, vec![vector, index]))
+        self.emit(Inst::new(
+            Opcode::CompositeExtractF32x4,
+            vec![vector, index],
+        ))
     }
 
     // ── Memory ────────────────────────────────────────────────────────
@@ -750,17 +795,15 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn write_storage_32(&mut self, binding: Value, offset: Value, value: Value) {
-        self.emit_void(Inst::new(Opcode::WriteStorage32, vec![binding, offset, value]));
+        self.emit_void(Inst::new(
+            Opcode::WriteStorage32,
+            vec![binding, offset, value],
+        ));
     }
 
     // ── Texture ───────────────────────────────────────────────────────
 
-    pub fn image_sample_implicit_lod(
-        &mut self,
-        handle: Value,
-        coords: Value,
-        info: u32,
-    ) -> Value {
+    pub fn image_sample_implicit_lod(&mut self, handle: Value, coords: Value, info: u32) -> Value {
         self.emit(Inst::with_flags(
             Opcode::ImageSampleImplicitLod,
             vec![handle, coords],
@@ -782,13 +825,7 @@ impl<'a> Emitter<'a> {
         ))
     }
 
-    pub fn image_fetch(
-        &mut self,
-        handle: Value,
-        coords: Value,
-        lod: Value,
-        info: u32,
-    ) -> Value {
+    pub fn image_fetch(&mut self, handle: Value, coords: Value, lod: Value, info: u32) -> Value {
         self.emit(Inst::with_flags(
             Opcode::ImageFetch,
             vec![handle, coords, lod],
@@ -804,12 +841,7 @@ impl<'a> Emitter<'a> {
         ))
     }
 
-    pub fn image_gather(
-        &mut self,
-        handle: Value,
-        coords: Value,
-        info: u32,
-    ) -> Value {
+    pub fn image_gather(&mut self, handle: Value, coords: Value, info: u32) -> Value {
         self.emit(Inst::with_flags(
             Opcode::ImageGather,
             vec![handle, coords],
@@ -850,7 +882,10 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn shuffle_index(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
-        self.emit(Inst::new(Opcode::ShuffleIndex, vec![value, index, seg_mask]))
+        self.emit(Inst::new(
+            Opcode::ShuffleIndex,
+            vec![value, index, seg_mask],
+        ))
     }
 
     pub fn subgroup_eq_mask(&mut self) -> Value {
@@ -1084,11 +1119,17 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn composite_extract_f16x2(&mut self, vec: Value, index: u32) -> Value {
-        self.emit(Inst::new(Opcode::CompositeExtractF16x2, vec![vec, Value::ImmU32(index)]))
+        self.emit(Inst::new(
+            Opcode::CompositeExtractF16x2,
+            vec![vec, Value::ImmU32(index)],
+        ))
     }
 
     pub fn composite_insert_f16x2(&mut self, vec: Value, val: Value, index: u32) -> Value {
-        self.emit(Inst::new(Opcode::CompositeInsertF16x2, vec![vec, val, Value::ImmU32(index)]))
+        self.emit(Inst::new(
+            Opcode::CompositeInsertF16x2,
+            vec![vec, val, Value::ImmU32(index)],
+        ))
     }
 
     // ── 64-bit integer packing ────────────────────────────────────────
@@ -1102,7 +1143,10 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn composite_extract_u32x2_idx(&mut self, vec: Value, index: u32) -> Value {
-        self.emit(Inst::new(Opcode::CompositeExtractU32x2, vec![vec, Value::ImmU32(index)]))
+        self.emit(Inst::new(
+            Opcode::CompositeExtractU32x2,
+            vec![vec, Value::ImmU32(index)],
+        ))
     }
 
     // ── 64-bit shift ──────────────────────────────────────────────────

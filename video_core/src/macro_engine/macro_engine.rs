@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 
 use super::macro_hle::HleMacro;
-use common::container_hash::hash_u32_slice;
 use crate::engines::maxwell_3d::Maxwell3D;
+use common::container_hash::hash_u32_slice;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -353,8 +353,7 @@ impl MacroEngine {
         parameters: &[u32],
         mut refresh_parameters: R,
         compile_fn: F,
-    )
-    where
+    ) where
         F: FnOnce(&[u32]) -> Box<dyn CachedMacro>,
         R: FnMut(),
     {
@@ -431,7 +430,6 @@ impl MacroEngine {
             lle.execute(parameters, method);
         }
     }
-
 }
 
 // ── Factory ──────────────────────────────────────────────────────────────────
@@ -522,19 +520,21 @@ mod tests {
 
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_compile = std::sync::Arc::clone(&captured);
-        engine.execute(0x101, &[0], || {}, move |code| {
-            *captured_compile.lock().unwrap() = code.to_vec();
-            struct NoopMacro;
-            impl CachedMacro for NoopMacro {
-                fn execute(&mut self, _parameters: &[u32], _method: u32) {}
-            }
-            Box::new(NoopMacro)
-        });
-
-        assert_eq!(
-            &*captured.lock().unwrap(),
-            &[0x22222222, 0x33333333]
+        engine.execute(
+            0x101,
+            &[0],
+            || {},
+            move |code| {
+                *captured_compile.lock().unwrap() = code.to_vec();
+                struct NoopMacro;
+                impl CachedMacro for NoopMacro {
+                    fn execute(&mut self, _parameters: &[u32], _method: u32) {}
+                }
+                Box::new(NoopMacro)
+            },
         );
+
+        assert_eq!(&*captured.lock().unwrap(), &[0x22222222, 0x33333333]);
     }
 
     #[test]

@@ -8,13 +8,13 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::arm::arm_interface::{
-    ArmInterface, ArmInterfaceBase, Architecture, DebugWatchpoint, HaltReason, KProcess,
-    KThread, ThreadContext,
+    Architecture, ArmInterface, ArmInterfaceBase, DebugWatchpoint, HaltReason, KProcess, KThread,
+    ThreadContext,
 };
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
 
-use rdynarmic::jit_config::{UserCallbacks, JitConfig, OptimizationFlag};
+use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
 /// Translate rdynarmic's HaltReason to core's HaltReason.
 ///
@@ -152,8 +152,15 @@ impl DynarmicCallbacks32 {
             .as_ref()
             .map(|cm| cm.lock().unwrap().fastmem_pointer())
             .unwrap_or(std::ptr::null_mut()) as *const u8;
-        log::info!("DynarmicCallbacks32: core_memory={} fastmem_ptr={:?}",
-            if core_memory.is_some() { "wired" } else { "fallback" }, fastmem_ptr);
+        log::info!(
+            "DynarmicCallbacks32: core_memory={} fastmem_ptr={:?}",
+            if core_memory.is_some() {
+                "wired"
+            } else {
+                "fallback"
+            },
+            fastmem_ptr
+        );
         Self {
             parent: parent_ptr,
             core_memory,
@@ -171,7 +178,10 @@ impl DynarmicCallbacks32 {
     /// Corresponds to upstream's `m_parent` reference.
     fn parent(&self) -> &ArmDynarmic32 {
         let ptr = self.parent.load(Ordering::Acquire);
-        debug_assert!(!ptr.is_null(), "DynarmicCallbacks32::parent() called before parent pointer was set");
+        debug_assert!(
+            !ptr.is_null(),
+            "DynarmicCallbacks32::parent() called before parent pointer was set"
+        );
         unsafe { &*ptr }
     }
 
@@ -196,7 +206,11 @@ impl DynarmicCallbacks32 {
     /// Matches upstream's `m_memory` reference (Core::Memory::Memory&).
     /// Panics if core_memory is not wired (only happens in tests).
     fn mem(&self) -> std::sync::MutexGuard<'_, Memory> {
-        self.core_memory.as_ref().expect("core_memory not wired").lock().unwrap()
+        self.core_memory
+            .as_ref()
+            .expect("core_memory not wired")
+            .lock()
+            .unwrap()
     }
 
     /// Matches upstream `DynarmicCallbacks32::CheckMemoryAccess`.
@@ -204,7 +218,6 @@ impl DynarmicCallbacks32 {
     fn check_memory_access(&self, _addr: u64, _size: u64) -> bool {
         true
     }
-
 }
 
 impl UserCallbacks for DynarmicCallbacks32 {
@@ -212,9 +225,8 @@ impl UserCallbacks for DynarmicCallbacks32 {
         // Lock-free fast path using cached fastmem pointer, matching upstream's
         // direct m_memory.Read32(vaddr) without any synchronization.
         if !self.fastmem_ptr.is_null() {
-            let value = unsafe {
-                (self.fastmem_ptr.add(vaddr as usize) as *const u32).read_unaligned()
-            };
+            let value =
+                unsafe { (self.fastmem_ptr.add(vaddr as usize) as *const u32).read_unaligned() };
             return Some(value);
         }
         // Fallback (tests without fastmem): lock and read
@@ -262,19 +274,27 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
-        if self.check_memory_access(vaddr, 1) { self.mem().write_8(vaddr, value); }
+        if self.check_memory_access(vaddr, 1) {
+            self.mem().write_8(vaddr, value);
+        }
     }
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
-        if self.check_memory_access(vaddr, 2) { self.mem().write_16(vaddr, value); }
+        if self.check_memory_access(vaddr, 2) {
+            self.mem().write_16(vaddr, value);
+        }
     }
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
-        if self.check_memory_access(vaddr, 4) { self.mem().write_32(vaddr, value); }
+        if self.check_memory_access(vaddr, 4) {
+            self.mem().write_32(vaddr, value);
+        }
     }
 
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
-        if self.check_memory_access(vaddr, 8) { self.mem().write_64(vaddr, value); }
+        if self.check_memory_access(vaddr, 8) {
+            self.mem().write_64(vaddr, value);
+        }
     }
 
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
@@ -321,15 +341,29 @@ impl UserCallbacks for DynarmicCallbacks32 {
         self.check_memory_access(vaddr, 8) && self.mem().write_exclusive_64(vaddr, value, expected)
     }
 
-    fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64, expected_lo: u64, expected_hi: u64) -> bool {
-        self.check_memory_access(vaddr, 16) && self.mem().write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
+    fn exclusive_write_128(
+        &mut self,
+        vaddr: u64,
+        value_lo: u64,
+        value_hi: u64,
+        expected_lo: u64,
+        expected_hi: u64,
+    ) -> bool {
+        self.check_memory_access(vaddr, 16)
+            && self
+                .mem()
+                .write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
     }
 
     fn exclusive_clear(&mut self) {
         // Upstream: m_parent.m_exclusive_monitor.ClearProcessor(m_parent.m_core_index)
         let parent = self.parent();
         if !parent.exclusive_monitor.is_null() {
-            unsafe { (*parent.exclusive_monitor).get_monitor().clear_processor(parent.core_index) };
+            unsafe {
+                (*parent.exclusive_monitor)
+                    .get_monitor()
+                    .clear_processor(parent.core_index)
+            };
         }
     }
 
@@ -355,7 +389,9 @@ impl UserCallbacks for DynarmicCallbacks32 {
                 log::error!("Cannot execute instruction at unmapped address {:#08x}", pc);
                 // Upstream: ReturnException(pc, PrefetchAbort)
                 // Store the exception address so the parent can retrieve it.
-                self.parent().last_exception_address.store(pc, Ordering::Relaxed);
+                self.parent()
+                    .last_exception_address
+                    .store(pc, Ordering::Relaxed);
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
             _ => {
@@ -363,9 +399,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
                 let mut ctx = ThreadContext::default();
                 self.parent().get_context(&mut ctx);
 
-                if pc as u32 == 0x01D1_DD20
-                    && !LOGGED_UDF_CONTEXT.swap(true, Ordering::Relaxed)
-                {
+                if pc as u32 == 0x01D1_DD20 && !LOGGED_UDF_CONTEXT.swap(true, Ordering::Relaxed) {
                     let read32 = |addr: u64, this: &mut Self| -> u32 {
                         if this.check_memory_access(addr, 4) {
                             this.mem().read_32(addr)
@@ -781,11 +815,18 @@ impl UserCallbacks for DynarmicCallbacks32 {
                             &self.mem(),
                             false,
                         );
-                        for &addr in &[0x01D1_DD20u64, 0x01D2_2C00, 0x0201_F5CC, 0x0202_0F28, 0x0202_93C4] {
+                        for &addr in &[
+                            0x01D1_DD20u64,
+                            0x01D2_2C00,
+                            0x0201_F5CC,
+                            0x0202_0F28,
+                            0x0202_93C4,
+                        ] {
                             log::error!(
                                 "UDF symbol {:08X} -> {}",
                                 addr as u32,
-                                crate::arm::symbols::get_symbol_name(&syms, addr).unwrap_or("<none>"),
+                                crate::arm::symbols::get_symbol_name(&syms, addr)
+                                    .unwrap_or("<none>"),
                             );
                         }
                     }
@@ -822,8 +863,13 @@ impl UserCallbacks for DynarmicCallbacks32 {
         }
         // Divide by number of CPU cores, minimum 1 tick.
         // Matches upstream: amortized_ticks = max(ticks / NUM_CPU_CORES, 1)
-        let amortized_ticks = std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
-        self.parent().core_timing.lock().unwrap().add_ticks(amortized_ticks);
+        let amortized_ticks =
+            std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
+        self.parent()
+            .core_timing
+            .lock()
+            .unwrap()
+            .add_ticks(amortized_ticks);
     }
 
     /// Matches upstream `DynarmicCallbacks32::GetTicksRemaining`:
@@ -858,10 +904,10 @@ pub struct ArmDynarmic32 {
     // Settings, etc. Currently these are passed individually (core_timing, uses_wall_clock)
     // to avoid circular dependency with System which owns the ARM backends.
     // When System stabilizes, this can be replaced with a reference.
-
     /// Upstream: `DynarmicExclusiveMonitor& m_exclusive_monitor`.
     /// Passed to JitConfig::global_monitor for cross-core LDXR/STXR synchronization.
-    exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
+    exclusive_monitor:
+        *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
 
     /// Core index for this CPU.
     /// Upstream: `m_core_index`.
@@ -939,8 +985,7 @@ impl ArmDynarmic32 {
                 u32::from_str_radix(digits, 16)
                     .ok()
                     .or_else(|| trimmed.parse::<u32>().ok())
-            })
-        {
+            }) {
             optimization_flags_from_mask(mask)
         } else if std::env::var("RUZU_A32_NO_OPTIMIZATIONS")
             .ok()
@@ -963,19 +1008,34 @@ impl ArmDynarmic32 {
             } else {
                 Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
             },
-            fastmem_pointer: if std::env::var("RUZU_NO_FASTMEM").is_ok() { None } else { fastmem_pointer },
+            fastmem_pointer: if std::env::var("RUZU_NO_FASTMEM").is_ok() {
+                None
+            } else {
+                fastmem_pointer
+            },
         };
 
-        log::warn!("ArmDynarmic32: fastmem_pointer={:?} cycle_counting={} optimizations={:#x}",
-            fastmem_pointer.map(|p| p as usize), !uses_wall_clock, optimizations.bits());
+        log::warn!(
+            "ArmDynarmic32: fastmem_pointer={:?} cycle_counting={} optimizations={:#x}",
+            fastmem_pointer.map(|p| p as usize),
+            !uses_wall_clock,
+            optimizations.bits()
+        );
 
         let jit = match rdynarmic::A32Jit::new(config) {
             Ok(jit) => {
-                log::info!("ArmDynarmic32: JIT created successfully for core {}", core_index);
+                log::info!(
+                    "ArmDynarmic32: JIT created successfully for core {}",
+                    core_index
+                );
                 Some(jit)
             }
             Err(e) => {
-                log::error!("ArmDynarmic32: Failed to create JIT for core {}: {}", core_index, e);
+                log::error!(
+                    "ArmDynarmic32: Failed to create JIT for core {}: {}",
+                    core_index,
+                    e
+                );
                 None
             }
         };
@@ -1082,11 +1142,12 @@ impl ArmInterface for ArmDynarmic32 {
         let trace_start = parse_trace_hex_env("RUZU_A32_TRACE_RANGE_START");
         let trace_end = parse_trace_hex_env("RUZU_A32_TRACE_RANGE_END");
         let trace_limit = parse_trace_u32_env("RUZU_A32_TRACE_LIMIT").unwrap_or(0);
-        let trace_search_limit =
-            parse_trace_u32_env("RUZU_A32_TRACE_SEARCH_LIMIT").unwrap_or(0);
+        let trace_search_limit = parse_trace_u32_env("RUZU_A32_TRACE_SEARCH_LIMIT").unwrap_or(0);
         if let (Some(start), Some(end)) = (trace_start, trace_end) {
             let current_pc = jit.get_register(15);
-            if trace_limit > 0 && (current_pc >= start && current_pc < end || trace_search_limit > 0) {
+            if trace_limit > 0
+                && (current_pc >= start && current_pc < end || trace_search_limit > 0)
+            {
                 let mut last_hr = rdynarmic::halt_reason::HaltReason::empty();
                 let mut entered_range = current_pc >= start && current_pc < end;
                 let mut logged_steps = 0u32;

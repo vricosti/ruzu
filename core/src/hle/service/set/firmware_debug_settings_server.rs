@@ -39,15 +39,39 @@ pub struct IFirmwareDebugSettingsServer {
 impl IFirmwareDebugSettingsServer {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (commands::SET_SETTINGS_ITEM_VALUE, None, "SetSettingsItemValue"),
-            (commands::RESET_SETTINGS_ITEM_VALUE, None, "ResetSettingsItemValue"),
-            (commands::CREATE_SETTINGS_ITEM_KEY_ITERATOR, None, "CreateSettingsItemKeyIterator"),
+            (
+                commands::SET_SETTINGS_ITEM_VALUE,
+                None,
+                "SetSettingsItemValue",
+            ),
+            (
+                commands::RESET_SETTINGS_ITEM_VALUE,
+                None,
+                "ResetSettingsItemValue",
+            ),
+            (
+                commands::CREATE_SETTINGS_ITEM_KEY_ITERATOR,
+                None,
+                "CreateSettingsItemKeyIterator",
+            ),
             (commands::READ_SETTINGS, None, "ReadSettings"),
             (commands::RESET_SETTINGS, None, "ResetSettings"),
-            (commands::SET_WEB_INSPECTOR_FLAG, None, "SetWebInspectorFlag"),
+            (
+                commands::SET_WEB_INSPECTOR_FLAG,
+                None,
+                "SetWebInspectorFlag",
+            ),
             (commands::SET_ALLOWED_SSL_HOSTS, None, "SetAllowedSslHosts"),
-            (commands::SET_HOST_FS_MOUNT_POINT, None, "SetHostFsMountPoint"),
-            (commands::SET_MEMORY_USAGE_RATE_FLAG, None, "SetMemoryUsageRateFlag"),
+            (
+                commands::SET_HOST_FS_MOUNT_POINT,
+                None,
+                "SetHostFsMountPoint",
+            ),
+            (
+                commands::SET_MEMORY_USAGE_RATE_FLAG,
+                None,
+                "SetMemoryUsageRateFlag",
+            ),
         ]);
         Self {
             handlers,

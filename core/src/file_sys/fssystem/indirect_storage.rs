@@ -108,19 +108,11 @@ impl IndirectStorage {
     /// node data, and entry data in sequence.
     ///
     /// Corresponds to upstream `IndirectStorage::Initialize(VirtualFile table_storage)`.
-    pub fn initialize_from_table(
-        &mut self,
-        table_storage: VirtualFile,
-    ) -> Result<(), ResultCode> {
+    pub fn initialize_from_table(&mut self, table_storage: VirtualFile) -> Result<(), ResultCode> {
         // Read and verify the bucket tree header.
         let mut header_buf = [0u8; std::mem::size_of::<BucketTreeHeader>()];
-        table_storage.read(
-            &mut header_buf,
-            std::mem::size_of::<BucketTreeHeader>(),
-            0,
-        );
-        let header: BucketTreeHeader =
-            unsafe { *(header_buf.as_ptr() as *const BucketTreeHeader) };
+        table_storage.read(&mut header_buf, std::mem::size_of::<BucketTreeHeader>(), 0);
+        let header: BucketTreeHeader = unsafe { *(header_buf.as_ptr() as *const BucketTreeHeader) };
         header.verify()?;
 
         // Determine extents.
@@ -225,16 +217,20 @@ impl IndirectStorage {
         }
 
         // Use operate_per_entry to read from the correct storage for each range.
-        self.operate_per_entry(offset as i64, size as i64, |storage, data_offset, cur_offset, cur_size| {
-            let buf_offset = (cur_offset - offset as i64) as usize;
-            let read_size = cur_size as usize;
-            storage.read(
-                &mut buffer[buf_offset..buf_offset + read_size],
-                read_size,
-                data_offset as usize,
-            );
-            Ok(())
-        });
+        self.operate_per_entry(
+            offset as i64,
+            size as i64,
+            |storage, data_offset, cur_offset, cur_size| {
+                let buf_offset = (cur_offset - offset as i64) as usize;
+                let read_size = cur_size as usize;
+                storage.read(
+                    &mut buffer[buf_offset..buf_offset + read_size],
+                    read_size,
+                    data_offset as usize,
+                );
+                Ok(())
+            },
+        );
 
         size
     }
@@ -247,13 +243,14 @@ impl IndirectStorage {
     ///    offset, compute the data range, then call the function.
     ///
     /// Corresponds to upstream `IndirectStorage::OperatePerEntry<false, true>`.
-    fn operate_per_entry<F>(
-        &self,
-        offset: i64,
-        size: i64,
-        mut func: F,
-    ) where
-        F: FnMut(&crate::file_sys::vfs::vfs_types::VirtualFile, i64, i64, i64) -> Result<(), common::ResultCode>,
+    fn operate_per_entry<F>(&self, offset: i64, size: i64, mut func: F)
+    where
+        F: FnMut(
+            &crate::file_sys::vfs::vfs_types::VirtualFile,
+            i64,
+            i64,
+            i64,
+        ) -> Result<(), common::ResultCode>,
     {
         assert!(offset >= 0);
         assert!(size >= 0);
@@ -337,7 +334,12 @@ impl IndirectStorage {
 
             // Operate on the range using the captured cur_entry (not the advanced visitor).
             if let Some(ref storage) = self.data_storage[cur_entry.storage_index as usize] {
-                let _ = func(storage, cur_entry_phys_offset + data_offset, cur_offset, cur_size);
+                let _ = func(
+                    storage,
+                    cur_entry_phys_offset + data_offset,
+                    cur_offset,
+                    cur_size,
+                );
             }
 
             cur_offset += cur_size;

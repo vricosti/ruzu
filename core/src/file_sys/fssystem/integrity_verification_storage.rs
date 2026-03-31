@@ -113,7 +113,10 @@ impl IntegrityVerificationStorage {
         let upper = std::cmp::max(upper_layer_verif_block_size, HASH_SIZE);
         self.upper_layer_verification_block_size = upper;
         self.upper_layer_verification_block_order = ilog2(upper as u32) as i64;
-        assert!(self.upper_layer_verification_block_size == 1i64 << self.upper_layer_verification_block_order);
+        assert!(
+            self.upper_layer_verification_block_size
+                == 1i64 << self.upper_layer_verification_block_order
+        );
 
         // Set data.
         self.is_real_data = is_real_data;

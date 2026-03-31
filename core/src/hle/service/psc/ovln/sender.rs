@@ -5,13 +5,14 @@
 
 use super::ovln_types::{MessageFlags, OverlayNotification};
 
-pub const ISENDER_COMMANDS: &[(u32, bool, &str)] = &[
-    (0, true, "Send"),
-    (1, false, "GetUnreceivedMessageCount"),
-];
+pub const ISENDER_COMMANDS: &[(u32, bool, &str)] =
+    &[(0, true, "Send"), (1, false, "GetUnreceivedMessageCount")];
 
 pub fn send(notification: &OverlayNotification, flags: MessageFlags) {
-    let data: String = notification.iter().map(|m| format!("{:016X} ", m)).collect();
+    let data: String = notification
+        .iter()
+        .map(|m| format!("{:016X} ", m))
+        .collect();
     log::warn!(
         "(STUBBED) ISender::Send called, flags={} notification={}",
         flags.raw,

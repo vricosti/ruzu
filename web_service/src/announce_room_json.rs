@@ -108,11 +108,7 @@ impl Backend for RoomJson {
         }
         // NOTE: Would DELETE /lobby/{room_id} in a detached task. Stubbed.
         let path = format!("/lobby/{}", self.room_id);
-        let mut client = Client::new(
-            self.host.clone(),
-            self.username.clone(),
-            self.token.clone(),
-        );
+        let mut client = Client::new(self.host.clone(), self.username.clone(), self.token.clone());
         let _ = client.delete_json(&path, "", false);
     }
 }
@@ -124,15 +120,7 @@ mod tests {
     #[test]
     fn test_room_json_set_room_information() {
         let mut rj = RoomJson::new("https://example.com", "user", "token");
-        rj.set_room_information(
-            "Test",
-            "Desc",
-            1234,
-            4,
-            1,
-            true,
-            &GameInfo::default(),
-        );
+        rj.set_room_information("Test", "Desc", 1234, 4, 1, true, &GameInfo::default());
         assert_eq!(rj.room.information.name, "Test");
         assert_eq!(rj.room.information.port, 1234);
         assert!(rj.room.has_password);

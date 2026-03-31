@@ -58,8 +58,9 @@ impl BufferCache {
         let null_buffer = unsafe { device.create_buffer(&buf_info, None)? };
 
         let mem_reqs = unsafe { device.get_buffer_memory_requirements(null_buffer) };
-        let mem_type = find_device_local_memory(&instance, physical_device, mem_reqs.memory_type_bits)
-            .unwrap_or(0);
+        let mem_type =
+            find_device_local_memory(&instance, physical_device, mem_reqs.memory_type_bits)
+                .unwrap_or(0);
         let alloc_info = vk::MemoryAllocateInfo::builder()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mem_type)
@@ -119,9 +120,12 @@ impl BufferCache {
         };
 
         let mem_reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let mem_type =
-            find_device_local_memory(&self.instance, self.physical_device, mem_reqs.memory_type_bits)
-                .unwrap_or(0);
+        let mem_type = find_device_local_memory(
+            &self.instance,
+            self.physical_device,
+            mem_reqs.memory_type_bits,
+        )
+        .unwrap_or(0);
 
         let alloc_info = vk::MemoryAllocateInfo::builder()
             .allocation_size(mem_reqs.size)
@@ -147,11 +151,7 @@ impl BufferCache {
             let mut host_data = vec![0u8; size as usize];
             read_gpu(gpu_va, &mut host_data);
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    host_data.as_ptr(),
-                    staging.mapped,
-                    size as usize,
-                );
+                std::ptr::copy_nonoverlapping(host_data.as_ptr(), staging.mapped, size as usize);
             }
 
             // Record copy command
@@ -231,7 +231,10 @@ impl BufferCache {
     /// Invalidate a cached buffer range (mark as stale).
     pub fn invalidate(&mut self, gpu_va: u64) {
         if let Some(old) = self.cache.remove(&gpu_va) {
-            debug!("BufferCache: invalidated buffer at GPU VA 0x{:016X}", gpu_va);
+            debug!(
+                "BufferCache: invalidated buffer at GPU VA 0x{:016X}",
+                gpu_va
+            );
             unsafe {
                 self.device.destroy_buffer(old.buffer, None);
                 self.device.free_memory(old.memory, None);

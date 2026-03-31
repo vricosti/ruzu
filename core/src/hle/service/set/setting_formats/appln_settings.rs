@@ -46,8 +46,14 @@ impl Default for ApplnSettings {
 impl core::fmt::Debug for ApplnSettings {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ApplnSettings")
-            .field("service_discovery_control_settings", &self.service_discovery_control_settings)
-            .field("in_repair_process_enable_flag", &self.in_repair_process_enable_flag)
+            .field(
+                "service_discovery_control_settings",
+                &self.service_discovery_control_settings,
+            )
+            .field(
+                "in_repair_process_enable_flag",
+                &self.in_repair_process_enable_flag,
+            )
             .finish()
     }
 }

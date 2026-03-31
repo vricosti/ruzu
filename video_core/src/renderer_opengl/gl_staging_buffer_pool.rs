@@ -142,12 +142,8 @@ impl StagingBuffers {
                 std::ptr::null(),
                 persistent_flags,
             );
-            map = gl::MapNamedBufferRange(
-                buffer,
-                0,
-                next_pow2_size as isize,
-                persistent_map_flags,
-            ) as *mut u8;
+            map = gl::MapNamedBufferRange(buffer, 0, next_pow2_size as isize, persistent_map_flags)
+                as *mut u8;
         }
 
         self.allocs.push(StagingBufferAlloc {
@@ -183,9 +179,7 @@ impl StagingBuffers {
                 if sync_index >= known_unsignaled_index {
                     continue;
                 }
-                let status = unsafe {
-                    gl::ClientWaitSync(sync, gl::SYNC_FLUSH_COMMANDS_BIT, 0)
-                };
+                let status = unsafe { gl::ClientWaitSync(sync, gl::SYNC_FLUSH_COMMANDS_BIT, 0) };
                 if status == gl::TIMEOUT_EXPIRED || status == gl::WAIT_FAILED {
                     known_unsignaled_index = known_unsignaled_index.min(sync_index);
                     continue;
@@ -245,18 +239,9 @@ impl StreamBuffer {
 
         unsafe {
             gl::CreateBuffers(1, &mut buffer);
-            gl::NamedBufferStorage(
-                buffer,
-                STREAM_BUFFER_SIZE as isize,
-                std::ptr::null(),
-                flags,
-            );
-            mapped_pointer = gl::MapNamedBufferRange(
-                buffer,
-                0,
-                STREAM_BUFFER_SIZE as isize,
-                flags,
-            ) as *mut u8;
+            gl::NamedBufferStorage(buffer, STREAM_BUFFER_SIZE as isize, std::ptr::null(), flags);
+            mapped_pointer =
+                gl::MapNamedBufferRange(buffer, 0, STREAM_BUFFER_SIZE as isize, flags) as *mut u8;
         }
 
         let mut fences = [std::ptr::null(); NUM_SYNCS];
@@ -404,11 +389,7 @@ impl StagingBufferPool {
     /// Request a download staging buffer.
     ///
     /// Port of `StagingBufferPool::RequestDownloadBuffer`.
-    pub fn request_download_buffer(
-        &mut self,
-        size: usize,
-        deferred: bool,
-    ) -> StagingBufferMap {
+    pub fn request_download_buffer(&mut self, size: usize, deferred: bool) -> StagingBufferMap {
         self.download_buffers.request_map(size, false, deferred)
     }
 

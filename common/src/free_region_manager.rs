@@ -136,8 +136,7 @@ mod tests {
         mgr.allocate_block(alloc_addr as *mut u8, alloc_size);
 
         // Free the block back - should merge
-        let (merged_ptr, merged_size) =
-            mgr.free_block(alloc_addr as *mut u8, alloc_size);
+        let (merged_ptr, merged_size) = mgr.free_block(alloc_addr as *mut u8, alloc_size);
         assert_eq!(merged_ptr as usize, base);
         assert_eq!(merged_size, size);
     }

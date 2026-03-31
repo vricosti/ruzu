@@ -121,10 +121,7 @@ impl SpirvEmitContext {
         builder.capability(spirv::Capability::Sampled1D);
         builder.capability(spirv::Capability::SampledCubeArray);
 
-        builder.memory_model(
-            spirv::AddressingModel::Logical,
-            spirv::MemoryModel::GLSL450,
-        );
+        builder.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
 
         let glsl_ext = builder.ext_inst_import("GLSL.std.450");
 
@@ -246,12 +243,9 @@ impl SpirvEmitContext {
                             spirv::StorageClass::Input,
                             self.f32_vec4_type,
                         );
-                        let var = self.builder.variable(
-                            vec4_ptr,
-                            None,
-                            spirv::StorageClass::Input,
-                            None,
-                        );
+                        let var =
+                            self.builder
+                                .variable(vec4_ptr, None, spirv::StorageClass::Input, None);
                         self.builder.decorate(
                             var,
                             spirv::Decoration::Location,
@@ -269,12 +263,9 @@ impl SpirvEmitContext {
                             spirv::StorageClass::Input,
                             self.f32_vec4_type,
                         );
-                        let var = self.builder.variable(
-                            vec4_ptr,
-                            None,
-                            spirv::StorageClass::Input,
-                            None,
-                        );
+                        let var =
+                            self.builder
+                                .variable(vec4_ptr, None, spirv::StorageClass::Input, None);
                         self.builder.decorate(
                             var,
                             spirv::Decoration::Location,
@@ -296,12 +287,9 @@ impl SpirvEmitContext {
                         spirv::StorageClass::Output,
                         self.f32_vec4_type,
                     );
-                    let var = self.builder.variable(
-                        vec4_ptr,
-                        None,
-                        spirv::StorageClass::Output,
-                        None,
-                    );
+                    let var =
+                        self.builder
+                            .variable(vec4_ptr, None, spirv::StorageClass::Output, None);
                     self.builder.decorate(
                         var,
                         spirv::Decoration::BuiltIn,
@@ -337,12 +325,9 @@ impl SpirvEmitContext {
                     spirv::StorageClass::Output,
                     self.f32_vec4_type,
                 );
-                let var = self.builder.variable(
-                    vec4_ptr,
-                    None,
-                    spirv::StorageClass::Output,
-                    None,
-                );
+                let var = self
+                    .builder
+                    .variable(vec4_ptr, None, spirv::StorageClass::Output, None);
                 self.builder.decorate(
                     var,
                     spirv::Decoration::Location,
@@ -365,7 +350,8 @@ impl SpirvEmitContext {
             );
 
             let struct_type = self.builder.type_struct(vec![array_type]);
-            self.builder.decorate(struct_type, spirv::Decoration::Block, vec![]);
+            self.builder
+                .decorate(struct_type, spirv::Decoration::Block, vec![]);
             self.builder.member_decorate(
                 struct_type,
                 0,
@@ -374,9 +360,11 @@ impl SpirvEmitContext {
             );
 
             let ptr_type =
-                self.builder.type_pointer(None, spirv::StorageClass::Uniform, struct_type);
-            let var =
-                self.builder.variable(ptr_type, None, spirv::StorageClass::Uniform, None);
+                self.builder
+                    .type_pointer(None, spirv::StorageClass::Uniform, struct_type);
+            let var = self
+                .builder
+                .variable(ptr_type, None, spirv::StorageClass::Uniform, None);
             self.builder.decorate(
                 var,
                 spirv::Decoration::DescriptorSet,
@@ -409,12 +397,9 @@ impl SpirvEmitContext {
                 spirv::StorageClass::UniformConstant,
                 sampled_image,
             );
-            let var = self.builder.variable(
-                ptr_type,
-                None,
-                spirv::StorageClass::UniformConstant,
-                None,
-            );
+            let var =
+                self.builder
+                    .variable(ptr_type, None, spirv::StorageClass::UniformConstant, None);
             self.builder.decorate(
                 var,
                 spirv::Decoration::DescriptorSet,
@@ -578,7 +563,8 @@ impl SpirvEmitContext {
             ShaderStage::TessellationEval => spirv::ExecutionModel::TessellationEvaluation,
         };
 
-        self.builder.entry_point(exec_model, main_fn, "main", interface);
+        self.builder
+            .entry_point(exec_model, main_fn, "main", interface);
 
         if self.stage == ShaderStage::Fragment {
             self.builder
@@ -729,8 +715,7 @@ impl SpirvEmitContext {
             Opcode::FPOrdGreaterThan32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id =
-                    super::emit_spirv_floating_point::emit_fp_ord_greater_than_32(self, a, b);
+                let id = super::emit_spirv_floating_point::emit_fp_ord_greater_than_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPOrdLessThanEqual32 => {
@@ -743,9 +728,8 @@ impl SpirvEmitContext {
             Opcode::FPOrdGreaterThanEqual32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id = super::emit_spirv_floating_point::emit_fp_ord_greater_than_equal_32(
-                    self, a, b,
-                );
+                let id =
+                    super::emit_spirv_floating_point::emit_fp_ord_greater_than_equal_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPUnordEqual32 => {
@@ -757,8 +741,7 @@ impl SpirvEmitContext {
             Opcode::FPUnordNotEqual32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id =
-                    super::emit_spirv_floating_point::emit_fp_unord_not_equal_32(self, a, b);
+                let id = super::emit_spirv_floating_point::emit_fp_unord_not_equal_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPUnordLessThan32 => {
@@ -771,8 +754,7 @@ impl SpirvEmitContext {
             Opcode::FPUnordGreaterThan32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id =
-                    super::emit_spirv_floating_point::emit_fp_ord_greater_than_32(self, a, b);
+                let id = super::emit_spirv_floating_point::emit_fp_ord_greater_than_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPIsNan32 => {
@@ -1050,14 +1032,12 @@ impl SpirvEmitContext {
             }
             Opcode::BitCastU32F32 => {
                 let a = self.resolve_value(inst.arg(0));
-                let id =
-                    super::emit_spirv_bitwise_conversion::emit_bit_cast_u32_f32(self, a);
+                let id = super::emit_spirv_bitwise_conversion::emit_bit_cast_u32_f32(self, a);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::BitCastF32U32 => {
                 let a = self.resolve_value(inst.arg(0));
-                let id =
-                    super::emit_spirv_bitwise_conversion::emit_bit_cast_f32_u32(self, a);
+                let id = super::emit_spirv_bitwise_conversion::emit_bit_cast_f32_u32(self, a);
                 self.set_value(block_idx, inst_idx, id);
             }
 
@@ -1065,8 +1045,7 @@ impl SpirvEmitContext {
             Opcode::CompositeConstructF32x2 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id =
-                    super::emit_spirv_composite::emit_composite_construct_f32x2(self, a, b);
+                let id = super::emit_spirv_composite::emit_composite_construct_f32x2(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::CompositeConstructF32x4 => {
@@ -1081,8 +1060,7 @@ impl SpirvEmitContext {
             Opcode::CompositeConstructU32x2 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
-                let id =
-                    super::emit_spirv_composite::emit_composite_construct_u32x2(self, a, b);
+                let id = super::emit_spirv_composite::emit_composite_construct_u32x2(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::CompositeConstructU32x4 => {
@@ -1176,15 +1154,35 @@ impl SpirvEmitContext {
 
             // ── Register/predicate access — these are handled during
             //    SSA construction and don't emit SPIR-V directly ───────
-            Opcode::GetRegister | Opcode::SetRegister | Opcode::GetPred | Opcode::SetPred
-            | Opcode::Phi | Opcode::Identity | Opcode::Void | Opcode::Prologue
-            | Opcode::Epilogue | Opcode::GetZeroFromOp | Opcode::GetSignFromOp
-            | Opcode::GetCarryFromOp | Opcode::GetOverflowFromOp | Opcode::GetZFlag
-            | Opcode::SetZFlag | Opcode::GetSFlag | Opcode::SetSFlag | Opcode::GetCFlag
-            | Opcode::SetCFlag | Opcode::GetOFlag | Opcode::SetOFlag | Opcode::ConditionRef
-            | Opcode::Reference | Opcode::PhiMove | Opcode::GetGotoVariable
-            | Opcode::SetGotoVariable | Opcode::GetIndirectBranchVariable
-            | Opcode::SetIndirectBranchVariable | Opcode::Join => {
+            Opcode::GetRegister
+            | Opcode::SetRegister
+            | Opcode::GetPred
+            | Opcode::SetPred
+            | Opcode::Phi
+            | Opcode::Identity
+            | Opcode::Void
+            | Opcode::Prologue
+            | Opcode::Epilogue
+            | Opcode::GetZeroFromOp
+            | Opcode::GetSignFromOp
+            | Opcode::GetCarryFromOp
+            | Opcode::GetOverflowFromOp
+            | Opcode::GetZFlag
+            | Opcode::SetZFlag
+            | Opcode::GetSFlag
+            | Opcode::SetSFlag
+            | Opcode::GetCFlag
+            | Opcode::SetCFlag
+            | Opcode::GetOFlag
+            | Opcode::SetOFlag
+            | Opcode::ConditionRef
+            | Opcode::Reference
+            | Opcode::PhiMove
+            | Opcode::GetGotoVariable
+            | Opcode::SetGotoVariable
+            | Opcode::GetIndirectBranchVariable
+            | Opcode::SetIndirectBranchVariable
+            | Opcode::Join => {
                 // No SPIR-V emission needed
             }
 
@@ -1227,7 +1225,10 @@ impl SpirvEmitContext {
             }
 
             // Undefined values
-            Opcode::UndefU1 | Opcode::UndefU8 | Opcode::UndefU16 | Opcode::UndefU32
+            Opcode::UndefU1
+            | Opcode::UndefU8
+            | Opcode::UndefU16
+            | Opcode::UndefU32
             | Opcode::UndefU64 => {
                 let result_type = match inst.opcode {
                     Opcode::UndefU1 => self.bool_type,
@@ -1249,9 +1250,10 @@ impl SpirvEmitContext {
     /// Get or create a SPIR-V constant for an IR value.
     pub fn resolve_value(&mut self, value: &ir::Value) -> spirv::Word {
         match value {
-            ir::Value::Inst(r) => {
-                *self.values.get(&(r.block, r.inst)).unwrap_or(&self.const_zero_u32)
-            }
+            ir::Value::Inst(r) => *self
+                .values
+                .get(&(r.block, r.inst))
+                .unwrap_or(&self.const_zero_u32),
             ir::Value::ImmU32(v) => self.builder.constant_bit32(self.u32_type, *v),
             ir::Value::ImmF32(v) => self.builder.constant_bit32(self.f32_type, v.to_bits()),
             ir::Value::ImmU1(v) => {

@@ -7,14 +7,14 @@
 
 use std::collections::BTreeMap;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::common::{
     CalendarAdditionalInfo, CalendarTime, LocationName, RuleVersion, SteadyClockTimePoint,
 };
 use super::errors::{RESULT_NOT_IMPLEMENTED, RESULT_PERMISSION_DENIED};
 use super::time_zone::{TimeZone, TzRule};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for ITimeZoneService.
 ///
@@ -51,20 +51,64 @@ pub struct TimeZoneService {
 impl TimeZoneService {
     fn build_handlers() -> BTreeMap<u32, FunctionInfo> {
         build_handler_map(&[
-            (commands::GET_DEVICE_LOCATION_NAME, None, "GetDeviceLocationName"),
-            (commands::SET_DEVICE_LOCATION_NAME, None, "SetDeviceLocationName"),
-            (commands::GET_TOTAL_LOCATION_NAME_COUNT, None, "GetTotalLocationNameCount"),
-            (commands::LOAD_LOCATION_NAME_LIST, None, "LoadLocationNameList"),
+            (
+                commands::GET_DEVICE_LOCATION_NAME,
+                None,
+                "GetDeviceLocationName",
+            ),
+            (
+                commands::SET_DEVICE_LOCATION_NAME,
+                None,
+                "SetDeviceLocationName",
+            ),
+            (
+                commands::GET_TOTAL_LOCATION_NAME_COUNT,
+                None,
+                "GetTotalLocationNameCount",
+            ),
+            (
+                commands::LOAD_LOCATION_NAME_LIST,
+                None,
+                "LoadLocationNameList",
+            ),
             (commands::LOAD_TIME_ZONE_RULE, None, "LoadTimeZoneRule"),
-            (commands::GET_TIME_ZONE_RULE_VERSION, None, "GetTimeZoneRuleVersion"),
-            (commands::GET_DEVICE_LOCATION_NAME_AND_UPDATED_TIME, None, "GetDeviceLocationNameAndUpdatedTime"),
-            (commands::SET_DEVICE_LOCATION_NAME_WITH_TIME_ZONE_RULE, None, "SetDeviceLocationNameWithTimeZoneRule"),
-            (commands::PARSE_TIME_ZONE_BINARY, None, "ParseTimeZoneBinary"),
-            (commands::GET_DEVICE_LOCATION_NAME_OPERATION_EVENT_READABLE_HANDLE, None, "GetDeviceLocationNameOperationEventReadableHandle"),
+            (
+                commands::GET_TIME_ZONE_RULE_VERSION,
+                None,
+                "GetTimeZoneRuleVersion",
+            ),
+            (
+                commands::GET_DEVICE_LOCATION_NAME_AND_UPDATED_TIME,
+                None,
+                "GetDeviceLocationNameAndUpdatedTime",
+            ),
+            (
+                commands::SET_DEVICE_LOCATION_NAME_WITH_TIME_ZONE_RULE,
+                None,
+                "SetDeviceLocationNameWithTimeZoneRule",
+            ),
+            (
+                commands::PARSE_TIME_ZONE_BINARY,
+                None,
+                "ParseTimeZoneBinary",
+            ),
+            (
+                commands::GET_DEVICE_LOCATION_NAME_OPERATION_EVENT_READABLE_HANDLE,
+                None,
+                "GetDeviceLocationNameOperationEventReadableHandle",
+            ),
             (commands::TO_CALENDAR_TIME, None, "ToCalendarTime"),
-            (commands::TO_CALENDAR_TIME_WITH_MY_RULE, None, "ToCalendarTimeWithMyRule"),
+            (
+                commands::TO_CALENDAR_TIME_WITH_MY_RULE,
+                None,
+                "ToCalendarTimeWithMyRule",
+            ),
             (commands::TO_POSIX_TIME, None, "ToPosixTime"),
-            (commands::TO_POSIX_TIME_WITH_MY_RULE, None, "ToPosixTimeWithMyRule"),
+            (
+                commands::TO_POSIX_TIME_WITH_MY_RULE,
+                None,
+                "ToPosixTimeWithMyRule",
+            ),
         ])
     }
 
@@ -78,10 +122,7 @@ impl TimeZoneService {
     }
 
     /// Create with an existing TimeZone reference (for when wired to TimeManager).
-    pub fn with_time_zone(
-        can_write_timezone_device_location: bool,
-        time_zone: TimeZone,
-    ) -> Self {
+    pub fn with_time_zone(can_write_timezone_device_location: bool, time_zone: TimeZone) -> Self {
         Self {
             can_write_timezone_device_location,
             time_zone,
@@ -113,9 +154,7 @@ impl TimeZoneService {
 
     /// LoadLocationNameList (cmd 3).
     pub fn load_location_name_list(&self) -> ResultCode {
-        log::debug!(
-            "PSC::Time::TimeZoneService::LoadLocationNameList called. Not implemented!"
-        );
+        log::debug!("PSC::Time::TimeZoneService::LoadLocationNameList called. Not implemented!");
         RESULT_NOT_IMPLEMENTED
     }
 
@@ -135,9 +174,7 @@ impl TimeZoneService {
     pub fn get_device_location_name_and_updated_time(
         &self,
     ) -> Result<(LocationName, SteadyClockTimePoint), ResultCode> {
-        log::debug!(
-            "PSC::Time::TimeZoneService::GetDeviceLocationNameAndUpdatedTime called"
-        );
+        log::debug!("PSC::Time::TimeZoneService::GetDeviceLocationNameAndUpdatedTime called");
         let name = self.time_zone.get_location_name()?;
         let time_point = self.time_zone.get_time_point()?;
         Ok((name, time_point))
@@ -149,9 +186,7 @@ impl TimeZoneService {
         location_name: &LocationName,
         binary: &[u8],
     ) -> ResultCode {
-        log::debug!(
-            "PSC::Time::TimeZoneService::SetDeviceLocationNameWithTimeZoneRule called"
-        );
+        log::debug!("PSC::Time::TimeZoneService::SetDeviceLocationNameWithTimeZoneRule called");
         if !self.can_write_timezone_device_location {
             return RESULT_PERMISSION_DENIED;
         }

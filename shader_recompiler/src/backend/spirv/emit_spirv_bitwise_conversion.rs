@@ -4,8 +4,8 @@
 //! SPIR-V bitwise conversion emission — maps to zuyu's
 //! `backend/spirv/emit_spirv_bitwise_conversion.cpp`.
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::Word;
 
 /// Emit `OpBitcast` U32 <- F32.
 ///
@@ -32,9 +32,7 @@ pub fn emit_pack_uint2x32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 ///
 /// Matches upstream `EmitUnpackUint2x32(EmitContext&, Id)`.
 pub fn emit_unpack_uint2x32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder
-        .bitcast(ctx.u32_vec2_type, None, value)
-        .unwrap()
+    ctx.builder.bitcast(ctx.u32_vec2_type, None, value).unwrap()
 }
 
 /// Emit `OpBitcast` U32 <- F16x2 (PackFloat2x16).
@@ -55,7 +53,5 @@ pub fn emit_pack_double2x32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 ///
 /// Matches upstream `EmitUnpackDouble2x32(EmitContext&, Id)`.
 pub fn emit_unpack_double2x32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder
-        .bitcast(ctx.u32_vec2_type, None, value)
-        .unwrap()
+    ctx.builder.bitcast(ctx.u32_vec2_type, None, value).unwrap()
 }

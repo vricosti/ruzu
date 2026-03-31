@@ -24,9 +24,7 @@ use std::sync::{Arc, Mutex};
 use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 
-use crate::hle::service::hle_ipc::{
-    SessionRequestHandlerFactory, SessionRequestHandlerPtr,
-};
+use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
 
 /// Generic stub service that accepts any IPC command and returns success.
 ///
@@ -110,12 +108,17 @@ impl Services {
         system: crate::core::SystemRef,
         device_memory: *const crate::device_memory::DeviceMemory,
         memory_manager: *mut crate::hle::kernel::k_memory_manager::KMemoryManager,
-        filesystem_controller: Arc<Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
+        filesystem_controller: Arc<
+            Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>,
+        >,
     ) -> Self {
         let dm_addr = device_memory as usize;
         let mm_addr = memory_manager as usize;
-        let kernel_ref =
-            if !system.is_null() { system.get().kernel().map(|k| k as *const _ as usize) } else { None };
+        let kernel_ref = if !system.is_null() {
+            system.get().kernel().map(|k| k as *const _ as usize)
+        } else {
+            None
+        };
 
         // Upstream: system.GetFileSystemController().CreateFactories(*system.GetFilesystem(), false);
         {
@@ -128,7 +131,8 @@ impl Services {
         macro_rules! host_service {
             ($name:expr, $body:expr) => {
                 if let Some(kptr) = kernel_ref {
-                    let kernel = unsafe { &*(kptr as *const crate::hle::kernel::kernel::KernelCore) };
+                    let kernel =
+                        unsafe { &*(kptr as *const crate::hle::kernel::kernel::KernelCore) };
                     kernel.run_on_host_core_process($name, Box::new($body));
                 } else {
                     ($body)();
@@ -137,22 +141,38 @@ impl Services {
         }
 
         let sm = service_manager.clone();
-        host_service!("audio", move || { Self::loop_process_audio(&sm, system); });
+        host_service!("audio", move || {
+            Self::loop_process_audio(&sm, system);
+        });
         let sm = service_manager.clone();
         let fsc = filesystem_controller.clone();
-        host_service!("FS", move || { Self::loop_process_filesystem(&sm, system, fsc); });
+        host_service!("FS", move || {
+            Self::loop_process_filesystem(&sm, system, fsc);
+        });
         let sm = service_manager.clone();
-        host_service!("jit", move || { Self::loop_process_jit(&sm, system); });
+        host_service!("jit", move || {
+            Self::loop_process_jit(&sm, system);
+        });
         let sm = service_manager.clone();
-        host_service!("ldn", move || { Self::loop_process_ldn(&sm, system); });
+        host_service!("ldn", move || {
+            Self::loop_process_ldn(&sm, system);
+        });
         let sm = service_manager.clone();
-        host_service!("Loader", move || { Self::loop_process_loader(&sm, system); });
+        host_service!("Loader", move || {
+            Self::loop_process_loader(&sm, system);
+        });
         let sm = service_manager.clone();
-        host_service!("nvservices", move || { Self::loop_process_nvservices(&sm, system); });
+        host_service!("nvservices", move || {
+            Self::loop_process_nvservices(&sm, system);
+        });
         let sm = service_manager.clone();
-        host_service!("bsdsocket", move || { Self::loop_process_bsdsocket(&sm, system); });
+        host_service!("bsdsocket", move || {
+            Self::loop_process_bsdsocket(&sm, system);
+        });
         let sm = service_manager.clone();
-        host_service!("vi", move || { Self::loop_process_vi(&sm, system); });
+        host_service!("vi", move || {
+            Self::loop_process_vi(&sm, system);
+        });
 
         // ── Guest core processes (upstream: RunOnGuestCoreProcess) ──
         // Each service gets a KThread fiber on guest core 3, priority 16.
@@ -163,7 +183,8 @@ impl Services {
         macro_rules! guest_service {
             ($name:expr, $body:expr) => {
                 if let Some(kptr) = kernel_ref {
-                    let kernel = unsafe { &*(kptr as *const crate::hle::kernel::kernel::KernelCore) };
+                    let kernel =
+                        unsafe { &*(kptr as *const crate::hle::kernel::kernel::KernelCore) };
                     kernel.run_on_guest_core_process($name, Box::new($body));
                 } else {
                     ($body)();
@@ -178,99 +199,193 @@ impl Services {
         });
 
         let sm = service_manager.clone();
-        guest_service!("account", move || { Self::loop_process_account(&sm, system); });
+        guest_service!("account", move || {
+            Self::loop_process_account(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("am", move || { crate::hle::service::am::am::loop_process(&sm, system); });
+        guest_service!("am", move || {
+            crate::hle::service::am::am::loop_process(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("aoc", move || { crate::hle::service::aoc::addon_content_manager::loop_process(&sm, system); });
+        guest_service!("aoc", move || {
+            crate::hle::service::aoc::addon_content_manager::loop_process(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("apm", move || { crate::hle::service::apm::apm::loop_process(&sm, system); });
+        guest_service!("apm", move || {
+            crate::hle::service::apm::apm::loop_process(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("bcat", move || { Self::loop_process_bcat(&sm, system); });
+        guest_service!("bcat", move || {
+            Self::loop_process_bcat(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("bpc", move || { Self::loop_process_bpc(&sm, system); });
+        guest_service!("bpc", move || {
+            Self::loop_process_bpc(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("btdrv", move || { Self::loop_process_btdrv(&sm, system); });
+        guest_service!("btdrv", move || {
+            Self::loop_process_btdrv(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("btm", move || { Self::loop_process_btm(&sm, system); });
+        guest_service!("btm", move || {
+            Self::loop_process_btm(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("capsrv", move || { Self::loop_process_capsrv(&sm, system); });
+        guest_service!("capsrv", move || {
+            Self::loop_process_capsrv(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("erpt", move || { Self::loop_process_erpt(&sm, system); });
+        guest_service!("erpt", move || {
+            Self::loop_process_erpt(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("es", move || { Self::loop_process_es(&sm, system); });
+        guest_service!("es", move || {
+            Self::loop_process_es(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("eupld", move || { Self::loop_process_eupld(&sm, system); });
+        guest_service!("eupld", move || {
+            Self::loop_process_eupld(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("fatal", move || { Self::loop_process_fatal(&sm, system); });
+        guest_service!("fatal", move || {
+            Self::loop_process_fatal(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("fgm", move || { Self::loop_process_fgm(&sm, system); });
+        guest_service!("fgm", move || {
+            Self::loop_process_fgm(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("friends", move || { Self::loop_process_friends(&sm, system); });
+        guest_service!("friends", move || {
+            Self::loop_process_friends(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("settings", move || { Self::loop_process_settings(&sm, system); });
+        guest_service!("settings", move || {
+            Self::loop_process_settings(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("psc", move || { Self::loop_process_psc(&sm, system); });
+        guest_service!("psc", move || {
+            Self::loop_process_psc(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("glue", move || { crate::hle::service::glue::glue::loop_process(&sm, system, dm_addr, mm_addr); });
+        guest_service!("glue", move || {
+            crate::hle::service::glue::glue::loop_process(&sm, system, dm_addr, mm_addr);
+        });
         let sm = service_manager.clone();
-        guest_service!("grc", move || { Self::loop_process_grc(&sm, system); });
+        guest_service!("grc", move || {
+            Self::loop_process_grc(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("hid", move || { Self::loop_process_hid(&sm, system); });
+        guest_service!("hid", move || {
+            Self::loop_process_hid(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("lbl", move || { Self::loop_process_lbl(&sm, system); });
+        guest_service!("lbl", move || {
+            Self::loop_process_lbl(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("LogManager.Prod", move || { Self::loop_process_lm(&sm, system); });
+        guest_service!("LogManager.Prod", move || {
+            Self::loop_process_lm(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("mig", move || { Self::loop_process_mig(&sm, system); });
+        guest_service!("mig", move || {
+            Self::loop_process_mig(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("mii", move || { Self::loop_process_mii(&sm, system); });
+        guest_service!("mii", move || {
+            Self::loop_process_mii(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("mm", move || { Self::loop_process_mm(&sm, system); });
+        guest_service!("mm", move || {
+            Self::loop_process_mm(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("mnpp", move || { Self::loop_process_mnpp(&sm, system); });
+        guest_service!("mnpp", move || {
+            Self::loop_process_mnpp(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("nvnflinger", move || { Self::loop_process_nvnflinger(&sm, system); });
+        guest_service!("nvnflinger", move || {
+            Self::loop_process_nvnflinger(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("NCM", move || { Self::loop_process_ncm(&sm, system); });
+        guest_service!("NCM", move || {
+            Self::loop_process_ncm(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("nfc", move || { Self::loop_process_nfc(&sm, system); });
+        guest_service!("nfc", move || {
+            Self::loop_process_nfc(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("nfp", move || { Self::loop_process_nfp(&sm, system); });
+        guest_service!("nfp", move || {
+            Self::loop_process_nfp(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("ngc", move || { Self::loop_process_ngc(&sm, system); });
+        guest_service!("ngc", move || {
+            Self::loop_process_ngc(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("nifm", move || { Self::loop_process_nifm(&sm, system); });
+        guest_service!("nifm", move || {
+            Self::loop_process_nifm(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("nim", move || { Self::loop_process_nim(&sm, system); });
+        guest_service!("nim", move || {
+            Self::loop_process_nim(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("npns", move || { Self::loop_process_npns(&sm, system); });
+        guest_service!("npns", move || {
+            Self::loop_process_npns(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("ns", move || { Self::loop_process_ns(&sm, system); });
+        guest_service!("ns", move || {
+            Self::loop_process_ns(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("olsc", move || { Self::loop_process_olsc(&sm, system); });
+        guest_service!("olsc", move || {
+            Self::loop_process_olsc(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("omm", move || { Self::loop_process_omm(&sm, system); });
+        guest_service!("omm", move || {
+            Self::loop_process_omm(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("pcie", move || { Self::loop_process_pcie(&sm, system); });
+        guest_service!("pcie", move || {
+            Self::loop_process_pcie(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("pctl", move || { crate::hle::service::pctl::pctl::loop_process(&sm, system); });
+        guest_service!("pctl", move || {
+            crate::hle::service::pctl::pctl::loop_process(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("pcv", move || { Self::loop_process_pcv(&sm, system); });
+        guest_service!("pcv", move || {
+            Self::loop_process_pcv(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("prepo", move || { Self::loop_process_prepo(&sm, system); });
+        guest_service!("prepo", move || {
+            Self::loop_process_prepo(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("ProcessManager", move || { Self::loop_process_pm(&sm, system); });
+        guest_service!("ProcessManager", move || {
+            Self::loop_process_pm(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("ptm", move || { Self::loop_process_ptm(&sm, system); });
+        guest_service!("ptm", move || {
+            Self::loop_process_ptm(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("ro", move || { Self::loop_process_ro(&sm, system); });
+        guest_service!("ro", move || {
+            Self::loop_process_ro(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("spl", move || { Self::loop_process_spl(&sm, system); });
+        guest_service!("spl", move || {
+            Self::loop_process_spl(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("ssl", move || { Self::loop_process_ssl(&sm, system); });
+        guest_service!("ssl", move || {
+            Self::loop_process_ssl(&sm, system);
+        });
         let sm = service_manager.clone();
-        guest_service!("usb", move || { Self::loop_process_usb(&sm, system); });
+        guest_service!("usb", move || {
+            Self::loop_process_usb(&sm, system);
+        });
 
         log::info!("Services: all service processes launched");
         Self {}
@@ -386,9 +501,11 @@ impl Services {
         // time:m — real PSC::Time::ServiceManager
         server_manager.register_named_service(
             "time:m",
-            Box::new(|| -> Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> {
-                Arc::new(super::psc::time::service_manager::TimeServiceManager::new())
-            }),
+            Box::new(
+                || -> Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> {
+                    Arc::new(super::psc::time::service_manager::TimeServiceManager::new())
+                },
+            ),
             64,
         );
         // time:su, time:al as stubs for now
@@ -411,9 +528,8 @@ impl Services {
     fn loop_process_lm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
         // LM has a real implementation.
         let mut server_manager = ServerManager::new(system);
-        let factory: SessionRequestHandlerFactory = Box::new(|| {
-            Arc::new(crate::hle::service::lm::lm::LM::new())
-        });
+        let factory: SessionRequestHandlerFactory =
+            Box::new(|| Arc::new(crate::hle::service::lm::lm::LM::new()));
         server_manager.register_named_service("lm", factory, 64);
         ServerManager::run_server(server_manager);
     }
@@ -548,9 +664,8 @@ impl Drop for Services {
 pub fn register_stub_services(server_manager: &mut ServerManager, names: &[&str]) {
     for &name in names {
         let svc_name = name.to_string();
-        let factory: SessionRequestHandlerFactory = Box::new(move || {
-            Arc::new(GenericStubService::new(&svc_name))
-        });
+        let factory: SessionRequestHandlerFactory =
+            Box::new(move || Arc::new(GenericStubService::new(&svc_name)));
         server_manager.register_named_service(name, factory, 64);
     }
 }
@@ -567,7 +682,13 @@ mod tests {
         let fsc = Arc::new(Mutex::new(
             crate::hle::service::filesystem::filesystem::FileSystemController::new(),
         ));
-        let _services = Services::new(&sm, crate::core::SystemRef::null(), std::ptr::null(), std::ptr::null_mut(), fsc);
+        let _services = Services::new(
+            &sm,
+            crate::core::SystemRef::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            fsc,
+        );
 
         // Verify some services are registered.
         let sm_lock = sm.lock().unwrap();

@@ -71,7 +71,8 @@ mod tests {
 
     #[test]
     fn test_compress_decompress() {
-        let original = b"Hello, World! This is a test of LZ4 compression. Repeated data: AAAAAAAAAAAAAAA";
+        let original =
+            b"Hello, World! This is a test of LZ4 compression. Repeated data: AAAAAAAAAAAAAAA";
         let compressed = compress_data_lz4(original);
         assert!(!compressed.is_empty());
 

@@ -139,8 +139,7 @@ mod tests {
     fn make_ticket(key_type: u8, revision: u8, rights_id: &[u8; 16]) -> Vec<u8> {
         let mut data = vec![0u8; MIN_TICKET_SIZE];
         // Title key block at 0x180
-        data[TITLE_KEY_BLOCK_OFFSET..TITLE_KEY_BLOCK_OFFSET + 16]
-            .copy_from_slice(&[0xAA; 16]);
+        data[TITLE_KEY_BLOCK_OFFSET..TITLE_KEY_BLOCK_OFFSET + 16].copy_from_slice(&[0xAA; 16]);
         // Title key type
         data[TITLE_KEY_TYPE_OFFSET] = key_type;
         // Key revision
@@ -169,7 +168,10 @@ mod tests {
     #[test]
     fn test_ticket_too_small() {
         let data = vec![0u8; 16];
-        assert!(matches!(Ticket::parse(&data), Err(TicketError::TooSmall(_))));
+        assert!(matches!(
+            Ticket::parse(&data),
+            Err(TicketError::TooSmall(_))
+        ));
     }
 
     #[test]

@@ -96,13 +96,11 @@ impl Packet {
     }
 
     pub fn read_i16(&mut self) -> Option<i16> {
-        self.read_raw(2)
-            .map(|b| i16::from_be_bytes([b[0], b[1]]))
+        self.read_raw(2).map(|b| i16::from_be_bytes([b[0], b[1]]))
     }
 
     pub fn read_u16(&mut self) -> Option<u16> {
-        self.read_raw(2)
-            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        self.read_raw(2).map(|b| u16::from_be_bytes([b[0], b[1]]))
     }
 
     pub fn read_i32(&mut self) -> Option<i32> {
@@ -143,8 +141,8 @@ impl Packet {
         if !self.check_size(length) {
             return None;
         }
-        let s = String::from_utf8_lossy(&self.data[self.read_pos..self.read_pos + length])
-            .into_owned();
+        let s =
+            String::from_utf8_lossy(&self.data[self.read_pos..self.read_pos + length]).into_owned();
         self.read_pos += length;
         Some(s)
     }

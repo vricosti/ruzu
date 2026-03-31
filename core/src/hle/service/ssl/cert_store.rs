@@ -45,8 +45,7 @@ impl CertStore {
 
         self.for_each_certificate(certificate_ids, |_id, cert| {
             if offset + cert.der_data.len() <= out_data.len() {
-                out_data[offset..offset + cert.der_data.len()]
-                    .copy_from_slice(&cert.der_data);
+                out_data[offset..offset + cert.der_data.len()].copy_from_slice(&cert.der_data);
                 offset += cert.der_data.len();
                 num_entries += 1;
             }

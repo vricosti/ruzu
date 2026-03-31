@@ -9,12 +9,12 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use super::backend::{BcatBackend, ProgressServiceBackend};
+use super::bcat_types::*;
+use super::delivery_cache_progress_service::IDeliveryCacheProgressService;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::bcat_types::*;
-use super::backend::{BcatBackend, ProgressServiceBackend};
-use super::delivery_cache_progress_service::IDeliveryCacheProgressService;
 
 /// IPC command IDs for IBcatService
 pub mod commands {
@@ -57,31 +57,103 @@ pub struct IBcatService {
 impl IBcatService {
     pub fn new(backend: Arc<Mutex<dyn BcatBackend + Send>>) -> Self {
         let handlers = build_handler_map(&[
-            (commands::REQUEST_SYNC_DELIVERY_CACHE, None, "RequestSyncDeliveryCache"),
-            (commands::REQUEST_SYNC_DELIVERY_CACHE_WITH_DIRECTORY_NAME, None, "RequestSyncDeliveryCacheWithDirectoryName"),
-            (commands::CANCEL_SYNC_DELIVERY_CACHE_REQUEST, None, "CancelSyncDeliveryCacheRequest"),
-            (commands::REQUEST_SYNC_DELIVERY_CACHE_WITH_APPLICATION_ID, None, "RequestSyncDeliveryCacheWithApplicationId"),
-            (commands::REQUEST_SYNC_DELIVERY_CACHE_WITH_APPLICATION_ID_AND_DIRECTORY_NAME, None, "RequestSyncDeliveryCacheWithApplicationIdAndDirectoryName"),
-            (commands::GET_DELIVERY_CACHE_STORAGE_UPDATE_NOTIFIER, None, "GetDeliveryCacheStorageUpdateNotifier"),
-            (commands::REQUEST_SUSPEND_DELIVERY_TASK, None, "RequestSuspendDeliveryTask"),
-            (commands::REGISTER_SYSTEM_APPLICATION_DELIVERY_TASK, None, "RegisterSystemApplicationDeliveryTask"),
-            (commands::UNREGISTER_SYSTEM_APPLICATION_DELIVERY_TASK, None, "UnregisterSystemApplicationDeliveryTask"),
-            (commands::SET_SYSTEM_APPLICATION_DELIVERY_TASK_TIMER, None, "SetSystemApplicationDeliveryTaskTimer"),
+            (
+                commands::REQUEST_SYNC_DELIVERY_CACHE,
+                None,
+                "RequestSyncDeliveryCache",
+            ),
+            (
+                commands::REQUEST_SYNC_DELIVERY_CACHE_WITH_DIRECTORY_NAME,
+                None,
+                "RequestSyncDeliveryCacheWithDirectoryName",
+            ),
+            (
+                commands::CANCEL_SYNC_DELIVERY_CACHE_REQUEST,
+                None,
+                "CancelSyncDeliveryCacheRequest",
+            ),
+            (
+                commands::REQUEST_SYNC_DELIVERY_CACHE_WITH_APPLICATION_ID,
+                None,
+                "RequestSyncDeliveryCacheWithApplicationId",
+            ),
+            (
+                commands::REQUEST_SYNC_DELIVERY_CACHE_WITH_APPLICATION_ID_AND_DIRECTORY_NAME,
+                None,
+                "RequestSyncDeliveryCacheWithApplicationIdAndDirectoryName",
+            ),
+            (
+                commands::GET_DELIVERY_CACHE_STORAGE_UPDATE_NOTIFIER,
+                None,
+                "GetDeliveryCacheStorageUpdateNotifier",
+            ),
+            (
+                commands::REQUEST_SUSPEND_DELIVERY_TASK,
+                None,
+                "RequestSuspendDeliveryTask",
+            ),
+            (
+                commands::REGISTER_SYSTEM_APPLICATION_DELIVERY_TASK,
+                None,
+                "RegisterSystemApplicationDeliveryTask",
+            ),
+            (
+                commands::UNREGISTER_SYSTEM_APPLICATION_DELIVERY_TASK,
+                None,
+                "UnregisterSystemApplicationDeliveryTask",
+            ),
+            (
+                commands::SET_SYSTEM_APPLICATION_DELIVERY_TASK_TIMER,
+                None,
+                "SetSystemApplicationDeliveryTaskTimer",
+            ),
             (commands::SET_PASSPHRASE, None, "SetPassphrase"),
             (commands::UNKNOWN_30101, None, "Unknown30101"),
             (commands::UNKNOWN_30102, None, "Unknown30102"),
-            (commands::REGISTER_BACKGROUND_DELIVERY_TASK, None, "RegisterBackgroundDeliveryTask"),
-            (commands::UNREGISTER_BACKGROUND_DELIVERY_TASK, None, "UnregisterBackgroundDeliveryTask"),
+            (
+                commands::REGISTER_BACKGROUND_DELIVERY_TASK,
+                None,
+                "RegisterBackgroundDeliveryTask",
+            ),
+            (
+                commands::UNREGISTER_BACKGROUND_DELIVERY_TASK,
+                None,
+                "UnregisterBackgroundDeliveryTask",
+            ),
             (commands::BLOCK_DELIVERY_TASK, None, "BlockDeliveryTask"),
             (commands::UNBLOCK_DELIVERY_TASK, None, "UnblockDeliveryTask"),
-            (commands::SET_DELIVERY_TASK_TIMER, None, "SetDeliveryTaskTimer"),
-            (commands::REGISTER_SYSTEM_APPLICATION_DELIVERY_TASKS, None, "RegisterSystemApplicationDeliveryTasks"),
-            (commands::ENUMERATE_BACKGROUND_DELIVERY_TASK, None, "EnumerateBackgroundDeliveryTask"),
+            (
+                commands::SET_DELIVERY_TASK_TIMER,
+                None,
+                "SetDeliveryTaskTimer",
+            ),
+            (
+                commands::REGISTER_SYSTEM_APPLICATION_DELIVERY_TASKS,
+                None,
+                "RegisterSystemApplicationDeliveryTasks",
+            ),
+            (
+                commands::ENUMERATE_BACKGROUND_DELIVERY_TASK,
+                None,
+                "EnumerateBackgroundDeliveryTask",
+            ),
             (commands::UNKNOWN_90101, None, "Unknown90101"),
             (commands::GET_DELIVERY_LIST, None, "GetDeliveryList"),
-            (commands::CLEAR_DELIVERY_CACHE_STORAGE, None, "ClearDeliveryCacheStorage"),
-            (commands::CLEAR_DELIVERY_TASK_SUBSCRIPTION_STATUS, None, "ClearDeliveryTaskSubscriptionStatus"),
-            (commands::GET_PUSH_NOTIFICATION_LOG, None, "GetPushNotificationLog"),
+            (
+                commands::CLEAR_DELIVERY_CACHE_STORAGE,
+                None,
+                "ClearDeliveryCacheStorage",
+            ),
+            (
+                commands::CLEAR_DELIVERY_TASK_SUBSCRIPTION_STATUS,
+                None,
+                "ClearDeliveryTaskSubscriptionStatus",
+            ),
+            (
+                commands::GET_PUSH_NOTIFICATION_LOG,
+                None,
+                "GetPushNotificationLog",
+            ),
             (commands::UNKNOWN_90301, None, "Unknown90301"),
         ]);
 
@@ -125,10 +197,8 @@ impl IBcatService {
         &mut self,
         name_raw: &DirectoryName,
     ) -> (ResultCode, Arc<IDeliveryCacheProgressService>) {
-        let name = common::string_util::string_from_fixed_zero_terminated_buffer(
-            name_raw,
-            name_raw.len(),
-        );
+        let name =
+            common::string_util::string_from_fixed_zero_terminated_buffer(name_raw, name_raw.len());
 
         log::debug!(
             "IBcatService::request_sync_delivery_cache_with_directory_name called, name={}",
@@ -192,10 +262,7 @@ impl IBcatService {
         }
         if !self.backend.lock().unwrap().clear(application_id) {
             // Upstream: FileSys::ResultPermissionDenied — module FS(2), description 6400
-            return ResultCode::from_module_description(
-                crate::hle::result::ErrorModule::FS,
-                6400,
-            );
+            return ResultCode::from_module_description(crate::hle::result::ErrorModule::FS, 6400);
         }
         RESULT_SUCCESS
     }

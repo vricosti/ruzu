@@ -55,7 +55,10 @@ impl RendererNull {
             return;
         }
         self.base_data.current_frame += 1;
-        trace!("RendererNull::composite frame={}", self.base_data.current_frame);
+        trace!(
+            "RendererNull::composite frame={}",
+            self.base_data.current_frame
+        );
     }
 
     /// Get a zeroed applet capture buffer.
@@ -141,7 +144,12 @@ mod tests {
             stride: 1280,
             pixel_format: crate::framebuffer_config::AndroidPixelFormat(0),
             transform_flags: crate::framebuffer_config::BufferTransformFlags(0),
-            crop_rect: crate::framebuffer_config::RectI { left: 0, top: 0, right: 1280, bottom: 720 },
+            crop_rect: crate::framebuffer_config::RectI {
+                left: 0,
+                top: 0,
+                right: 1280,
+                bottom: 720,
+            },
             blending: crate::framebuffer_config::BlendMode::Opaque,
         }
     }

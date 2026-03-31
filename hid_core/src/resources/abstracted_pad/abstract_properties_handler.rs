@@ -136,9 +136,7 @@ impl NpadAbstractPropertiesHandler {
         NpadInterfaceType::None
     }
 
-    pub fn get_npad_full_key_grip_color(
-        &self,
-    ) -> Result<(NpadColor, NpadColor), ResultCode> {
+    pub fn get_npad_full_key_grip_color(&self) -> Result<(NpadColor, NpadColor), ResultCode> {
         if self.applet_ui_type.footer != AppletFooterUiType::SwitchProController {
             return Err(hid_result::RESULT_NPAD_IS_NOT_PRO_CONTROLLER);
         }
@@ -146,9 +144,7 @@ impl NpadAbstractPropertiesHandler {
         Err(hid_result::RESULT_NPAD_IS_NOT_PRO_CONTROLLER)
     }
 
-    pub fn get_npad_left_right_interface_type(
-        &self,
-    ) -> (NpadInterfaceType, NpadInterfaceType) {
+    pub fn get_npad_left_right_interface_type(&self) -> (NpadInterfaceType, NpadInterfaceType) {
         // Upstream iterates abstract pads checking assignment_style
         (NpadInterfaceType::None, NpadInterfaceType::None)
     }

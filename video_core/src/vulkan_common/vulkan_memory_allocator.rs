@@ -88,10 +88,7 @@ const ALLOCATION_CHUNK_SIZES: &[u64] = &[
 ///
 /// Port of `AllocationChunkSize` from `vulkan_memory_allocator.cpp`.
 fn allocation_chunk_size(required_size: u64) -> u64 {
-    match ALLOCATION_CHUNK_SIZES
-        .iter()
-        .find(|&&s| s >= required_size)
-    {
+    match ALLOCATION_CHUNK_SIZES.iter().find(|&&s| s >= required_size) {
         Some(&size) => size,
         None => {
             // Align up to 4 MiB
@@ -159,12 +156,7 @@ impl MemoryCommit {
     }
 
     /// Creates a commit from the given parameters.
-    fn from_parts(
-        allocation_index: usize,
-        memory: vk::DeviceMemory,
-        begin: u64,
-        end: u64,
-    ) -> Self {
+    fn from_parts(allocation_index: usize, memory: vk::DeviceMemory, begin: u64, end: u64) -> Self {
         Self {
             allocation_index: Some(allocation_index),
             memory,
@@ -253,9 +245,7 @@ impl MemoryAllocation {
             end: alloc + size,
         };
         // Insert sorted by begin
-        let pos = self
-            .commits
-            .partition_point(|r| r.begin <= alloc);
+        let pos = self.commits.partition_point(|r| r.begin <= alloc);
         self.commits.insert(pos, range);
         Some((alloc, alloc + size))
     }
@@ -477,12 +467,8 @@ impl MemoryAllocator {
             }
         };
 
-        self.allocations.push(MemoryAllocation::new(
-            memory,
-            size,
-            flags,
-            type_index,
-        ));
+        self.allocations
+            .push(MemoryAllocation::new(memory, size, flags, type_index));
         Ok(true)
     }
 
@@ -505,10 +491,7 @@ impl MemoryAllocator {
         }
         if flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) {
             // Try without device local
-            return self.try_commit(
-                requirements,
-                flags & !vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            );
+            return self.try_commit(requirements, flags & !vk::MemoryPropertyFlags::DEVICE_LOCAL);
         }
         None
     }
@@ -525,16 +508,12 @@ impl MemoryAllocator {
             return flags;
         }
         if flags.contains(vk::MemoryPropertyFlags::HOST_CACHED) {
-            return self.memory_property_flags(
-                type_mask,
-                flags & !vk::MemoryPropertyFlags::HOST_CACHED,
-            );
+            return self
+                .memory_property_flags(type_mask, flags & !vk::MemoryPropertyFlags::HOST_CACHED);
         }
         if flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) {
-            return self.memory_property_flags(
-                type_mask,
-                flags & !vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            );
+            return self
+                .memory_property_flags(type_mask, flags & !vk::MemoryPropertyFlags::DEVICE_LOCAL);
         }
         log::error!("No compatible memory types found");
         vk::MemoryPropertyFlags::empty()
@@ -561,8 +540,7 @@ impl MemoryAllocator {
                 if freed && self.allocations[idx].is_empty() {
                     // Free the Vulkan memory and remove the allocation
                     unsafe {
-                        self.device
-                            .free_memory(self.allocations[idx].memory, None);
+                        self.device.free_memory(self.allocations[idx].memory, None);
                     }
                     self.allocations.remove(idx);
                 }

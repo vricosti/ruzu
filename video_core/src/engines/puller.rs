@@ -11,8 +11,8 @@ use crate::control::channel_state::ChannelState;
 use crate::engines::engine_interface::EngineInterface;
 use crate::engines::engine_interface::EngineTypes;
 use crate::query_cache::types::QueryPropertiesFlags;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -304,7 +304,10 @@ impl Puller {
     /// Bind a rasterizer interface to this puller.
     ///
     /// Corresponds to `Puller::BindRasterizer`.
-    pub fn bind_rasterizer(&mut self, rasterizer: &dyn crate::rasterizer_interface::RasterizerInterface) {
+    pub fn bind_rasterizer(
+        &mut self,
+        rasterizer: &dyn crate::rasterizer_interface::RasterizerInterface,
+    ) {
         let raw: *const dyn crate::rasterizer_interface::RasterizerInterface = rasterizer;
         self.rasterizer = Some(unsafe { std::mem::transmute(raw) });
     }
@@ -340,8 +343,8 @@ impl Puller {
         self.memory_manager
             .lock()
             .read_block_unsafe(gpu_va, &mut bytes, &|cpu_addr, output| {
-            let _ = gpu.read_guest_memory(cpu_addr, output);
-        });
+                let _ = gpu.read_guest_memory(cpu_addr, output);
+            });
         u32::from_le_bytes(bytes)
     }
 
@@ -515,34 +518,57 @@ impl Puller {
         match engine {
             EngineID::MaxwellB => {
                 if let Some(engine) = channel_state.maxwell_3d.as_mut() {
-                    engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                    engine.call_method(
+                        method_call.method,
+                        method_call.argument,
+                        method_call.is_last_call(),
+                    );
                 } else {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static DROP_COUNT: AtomicU32 = AtomicU32::new(0);
                     let c = DROP_COUNT.fetch_add(1, Ordering::Relaxed);
                     if c < 5 {
-                        log::warn!("Puller: MaxwellB method {:#x} DROPPED (maxwell_3d is None)", method_call.method);
+                        log::warn!(
+                            "Puller: MaxwellB method {:#x} DROPPED (maxwell_3d is None)",
+                            method_call.method
+                        );
                     }
                 }
             }
             EngineID::KeplerInlineToMemoryB => {
                 if let Some(engine) = channel_state.kepler_memory.as_mut() {
-                    engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                    engine.call_method(
+                        method_call.method,
+                        method_call.argument,
+                        method_call.is_last_call(),
+                    );
                 }
             }
             EngineID::FermiTwodA => {
                 if let Some(engine) = channel_state.fermi_2d.as_mut() {
-                    engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                    engine.call_method(
+                        method_call.method,
+                        method_call.argument,
+                        method_call.is_last_call(),
+                    );
                 }
             }
             EngineID::KeplerComputeB => {
                 if let Some(engine) = channel_state.kepler_compute.as_mut() {
-                    engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                    engine.call_method(
+                        method_call.method,
+                        method_call.argument,
+                        method_call.is_last_call(),
+                    );
                 }
             }
             EngineID::MaxwellDmaCopyA => {
                 if let Some(engine) = channel_state.maxwell_dma.as_mut() {
-                    engine.call_method(method_call.method, method_call.argument, method_call.is_last_call());
+                    engine.call_method(
+                        method_call.method,
+                        method_call.argument,
+                        method_call.is_last_call(),
+                    );
                 }
             }
         }
@@ -596,7 +622,6 @@ impl Puller {
             }
         }
     }
-
 
     // ── Private helpers ─────────────────────────────────────────────────
 
@@ -669,10 +694,7 @@ impl Puller {
                 }
             }
         } else {
-            log::error!(
-                "Unimplemented engine {:04X}",
-                method_call.argument
-            );
+            log::error!("Unimplemented engine {:04X}", method_call.argument);
         }
     }
 
@@ -683,18 +705,10 @@ impl Puller {
         let action = self.regs.fence_action();
         match action.op() {
             FenceOperation::Acquire => {
-                log::info!(
-                    "Puller::process_fence_action_method Acquire syncpoint={}",
-                    action.syncpoint_id()
-                );
                 self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(false));
             }
             FenceOperation::Increment => {
                 let syncpoint_id = action.syncpoint_id();
-                log::info!(
-                    "Puller::process_fence_action_method Increment syncpoint={}",
-                    syncpoint_id
-                );
                 self.with_rasterizer_mut(|rasterizer| rasterizer.signal_sync_point(syncpoint_id));
             }
         }
@@ -722,11 +736,13 @@ impl Puller {
                     0,
                     Arc::new(move |gpu_addr, bytes| {
                         let gpu = unsafe { &*(gpu as *const crate::gpu::Gpu) };
-                        memory_manager
-                            .lock()
-                            .write_block_unsafe(gpu_addr, bytes, &mut |cpu_addr, data| {
+                        memory_manager.lock().write_block_unsafe(
+                            gpu_addr,
+                            bytes,
+                            &mut |cpu_addr, data| {
                                 gpu.write_guest_memory(cpu_addr, data);
-                            });
+                            },
+                        );
                     }),
                 )
             });
@@ -801,11 +817,13 @@ impl Puller {
                 0,
                 Arc::new(move |gpu_addr, bytes| {
                     let gpu = unsafe { &*(gpu as *const crate::gpu::Gpu) };
-                    memory_manager
-                        .lock()
-                        .write_block_unsafe(gpu_addr, bytes, &mut |cpu_addr, data| {
+                    memory_manager.lock().write_block_unsafe(
+                        gpu_addr,
+                        bytes,
+                        &mut |cpu_addr, data| {
                             gpu.write_guest_memory(cpu_addr, data);
-                        });
+                        },
+                    );
                 }),
             )
         });
@@ -816,7 +834,9 @@ impl Default for Puller {
     fn default() -> Self {
         Self::new(
             std::ptr::null(),
-            Arc::new(parking_lot::Mutex::new(crate::memory_manager::MemoryManager::default())),
+            Arc::new(parking_lot::Mutex::new(
+                crate::memory_manager::MemoryManager::default(),
+            )),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
@@ -877,11 +897,17 @@ mod tests {
             false
         }
         fn get_flush_area(&self, addr: u64, _size: u64) -> RasterizerDownloadArea {
-            RasterizerDownloadArea { start_address: addr, end_address: addr, preemptive: true }
+            RasterizerDownloadArea {
+                start_address: addr,
+                end_address: addr,
+                preemptive: true,
+            }
         }
         fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
         fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
-        fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool { false }
+        fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
+            false
+        }
         fn invalidate_gpu_cache(&mut self) {}
         fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
         fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
@@ -893,7 +919,13 @@ mod tests {
         fn tiled_cache_barrier(&mut self) {}
         fn flush_commands(&mut self) {}
         fn tick_frame(&mut self) {}
-        fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
+        fn accelerate_inline_to_memory(
+            &mut self,
+            _address: u64,
+            _copy_size: usize,
+            _memory: &[u8],
+        ) {
+        }
     }
 
     #[test]

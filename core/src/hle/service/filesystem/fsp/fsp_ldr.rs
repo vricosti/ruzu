@@ -73,7 +73,10 @@ impl ServiceFramework for FspLdr {
                 return;
             }
         }
-        log::warn!("fsp:ldr: unimplemented command '{}' returned stub success", cmd);
+        log::warn!(
+            "fsp:ldr: unimplemented command '{}' returned stub success",
+            cmd
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }

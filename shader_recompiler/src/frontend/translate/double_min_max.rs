@@ -7,14 +7,14 @@ use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::{Pred, Value};
 
 fn dmnmx_impl(tv: &mut TranslatorVisitor, insn: u64, src_b: Value) {
-    let dst       = field(insn, 0, 8);
+    let dst = field(insn, 0, 8);
     let src_a_reg = field(insn, 8, 8);
-    let pred_idx  = field(insn, 39, 3);
-    let neg_pred  = bit(insn, 42);
-    let neg_b     = bit(insn, 45);
-    let abs_a     = bit(insn, 46);
-    let neg_a     = bit(insn, 48);
-    let abs_b     = bit(insn, 49);
+    let pred_idx = field(insn, 39, 3);
+    let neg_pred = bit(insn, 42);
+    let neg_b = bit(insn, 45);
+    let abs_a = bit(insn, 46);
+    let neg_a = bit(insn, 48);
+    let abs_b = bit(insn, 49);
 
     let pred = tv.ir.get_pred(Pred(pred_idx as u8), neg_pred);
     let src_a = tv.d(src_a_reg);

@@ -7,5 +7,5 @@
 
 pub mod compute_shaders;
 pub mod fragment_shaders;
-pub mod vertex_shaders;
 pub mod glsl_includes;
+pub mod vertex_shaders;

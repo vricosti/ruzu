@@ -25,26 +25,30 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         Some(thread) => thread,
         None => return RESULT_INVALID_HANDLE,
     };
-    let (tls_address, thread_id, saved_tpidr) = {
+    let tls_address = {
         let thread = current_thread.lock().unwrap();
-        (
-            thread.get_tls_address().get(),
-            thread.thread_id,
-            thread.thread_context.tpidr,
-        )
+        thread.get_tls_address().get()
     };
 
     let (client_session, shared_memory) = {
         let process = system.current_process_arc().lock().unwrap();
         let Some(object_id) = process.handle_table.get_object(session_handle) else {
-            log::error!("  SendSyncRequest: handle {:#x} not in handle table", session_handle);
+            log::error!(
+                "  SendSyncRequest: handle {:#x} not in handle table",
+                session_handle
+            );
             return RESULT_INVALID_HANDLE;
         };
         let Some(client_session) = process.get_client_session_by_object_id(object_id) else {
-            log::error!("  SendSyncRequest: object_id {} not a client session", object_id);
+            log::error!(
+                "  SendSyncRequest: object_id {} not a client session",
+                object_id
+            );
             return RESULT_INVALID_HANDLE;
         };
-        process.num_ipc_messages.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        process
+            .num_ipc_messages
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (client_session, process.get_shared_memory())
     };
 
@@ -56,12 +60,8 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     // Create context with thread/memory references (matches upstream constructor).
     // Upstream: HLERequestContext(kernel, memory, server_session, thread)
     // where memory = client_thread->GetOwnerProcess()->GetMemory()
-    let debug_memory = shared_memory.clone();
-    let mut context = HLERequestContext::new_with_thread(
-        current_thread,
-        shared_memory,
-        tls_address,
-    );
+    let mut context =
+        HLERequestContext::new_with_thread(current_thread, shared_memory, tls_address);
     // Set the Memory bridge for TLS access — matches upstream's
     // memory.GetPointer(client_message) for reading the command buffer.
     if let Some(memory) = system.get_svc_memory() {
@@ -92,142 +92,6 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         is_domain,
         context.get_command(),
     );
-
-    if context.get_command_type() == ipc::CommandType::Invalid {
-        let runtime_tpidr = {
-            let core_id = system.cpu_manager.current_core();
-            let mut process = system.current_process_arc().lock().unwrap();
-            if let Some(jit) = process.get_arm_interface_mut(core_id) {
-                let mut ctx = crate::arm::arm_interface::ThreadContext::default();
-                jit.get_context(&mut ctx);
-                ctx.tpidr
-            } else {
-                0
-            }
-        };
-        if let Some(memory) = system.get_svc_memory() {
-            let m = memory.lock().unwrap();
-            log::error!(
-                "  SendSyncRequest INVALID CMD: thread_id={} handle={:#x} tls={:#x} saved_tpidr={:#x} runtime_tpidr={:#x} service={} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                thread_id,
-                session_handle,
-                tls_address,
-                saved_tpidr,
-                runtime_tpidr,
-                session_handler_name,
-                m.read_32(tls_address),
-                m.read_32(tls_address + 4),
-                m.read_32(tls_address + 8),
-                m.read_32(tls_address + 12),
-                m.read_32(tls_address + 16),
-                m.read_32(tls_address + 20),
-                m.read_32(tls_address + 24),
-                m.read_32(tls_address + 28),
-            );
-            if tls_address >= 0x200 {
-                let prev_tls = tls_address - 0x200;
-                log::error!(
-                    "  SendSyncRequest INVALID CMD neighbor-0x200: addr={:#x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                    prev_tls,
-                    m.read_32(prev_tls),
-                    m.read_32(prev_tls + 4),
-                    m.read_32(prev_tls + 8),
-                    m.read_32(prev_tls + 12),
-                    m.read_32(prev_tls + 16),
-                    m.read_32(prev_tls + 20),
-                    m.read_32(prev_tls + 24),
-                    m.read_32(prev_tls + 28),
-                );
-            }
-            if tls_address >= 0x400 {
-                let prev_prev_tls = tls_address - 0x400;
-                log::error!(
-                    "  SendSyncRequest INVALID CMD neighbor-0x400: addr={:#x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                    prev_prev_tls,
-                    m.read_32(prev_prev_tls),
-                    m.read_32(prev_prev_tls + 4),
-                    m.read_32(prev_prev_tls + 8),
-                    m.read_32(prev_prev_tls + 12),
-                    m.read_32(prev_prev_tls + 16),
-                    m.read_32(prev_prev_tls + 20),
-                    m.read_32(prev_prev_tls + 24),
-                    m.read_32(prev_prev_tls + 28),
-                );
-            }
-        } else {
-            let mem = debug_memory.read().unwrap();
-            log::error!(
-                "  SendSyncRequest INVALID CMD: thread_id={} handle={:#x} tls={:#x} saved_tpidr={:#x} runtime_tpidr={:#x} service={} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                thread_id,
-                session_handle,
-                tls_address,
-                saved_tpidr,
-                runtime_tpidr,
-                session_handler_name,
-                mem.read_32(tls_address),
-                mem.read_32(tls_address + 4),
-                mem.read_32(tls_address + 8),
-                mem.read_32(tls_address + 12),
-                mem.read_32(tls_address + 16),
-                mem.read_32(tls_address + 20),
-                mem.read_32(tls_address + 24),
-                mem.read_32(tls_address + 28),
-            );
-            if tls_address >= 0x200 {
-                let prev_tls = tls_address - 0x200;
-                log::error!(
-                    "  SendSyncRequest INVALID CMD neighbor-0x200: addr={:#x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                    prev_tls,
-                    mem.read_32(prev_tls),
-                    mem.read_32(prev_tls + 4),
-                    mem.read_32(prev_tls + 8),
-                    mem.read_32(prev_tls + 12),
-                    mem.read_32(prev_tls + 16),
-                    mem.read_32(prev_tls + 20),
-                    mem.read_32(prev_tls + 24),
-                    mem.read_32(prev_tls + 28),
-                );
-            }
-            if tls_address >= 0x400 {
-                let prev_prev_tls = tls_address - 0x400;
-                log::error!(
-                    "  SendSyncRequest INVALID CMD neighbor-0x400: addr={:#x} words=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                    prev_prev_tls,
-                    mem.read_32(prev_prev_tls),
-                    mem.read_32(prev_prev_tls + 4),
-                    mem.read_32(prev_prev_tls + 8),
-                    mem.read_32(prev_prev_tls + 12),
-                    mem.read_32(prev_prev_tls + 16),
-                    mem.read_32(prev_prev_tls + 20),
-                    mem.read_32(prev_prev_tls + 24),
-                    mem.read_32(prev_prev_tls + 28),
-                );
-            }
-        }
-    }
-
-    // Debug: if handle is 0, the game didn't receive the previous response correctly
-    if session_handle == 0 {
-        if let Some(memory) = system.get_svc_memory() {
-            let m = memory.lock().unwrap();
-            log::error!(
-                "  SendSyncRequest with handle=0! TLS at send time: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                m.read_32(tls_address), m.read_32(tls_address + 4),
-                m.read_32(tls_address + 8), m.read_32(tls_address + 12),
-                m.read_32(tls_address + 16), m.read_32(tls_address + 20),
-                m.read_32(tls_address + 24), m.read_32(tls_address + 28),
-            );
-        } else {
-            let mem = debug_memory.read().unwrap();
-            log::error!(
-                "  SendSyncRequest with handle=0! TLS at send time: [{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                mem.read_32(tls_address), mem.read_32(tls_address + 4),
-                mem.read_32(tls_address + 8), mem.read_32(tls_address + 12),
-                mem.read_32(tls_address + 16), mem.read_32(tls_address + 20),
-                mem.read_32(tls_address + 24), mem.read_32(tls_address + 28),
-            );
-        }
-    }
 
     // Dispatch to service handler.
     let result = complete_sync_request(&request_manager, &mut context);
@@ -332,7 +196,9 @@ mod tests {
             mem.allocate(0x2395000, 0x4000);
         }
 
-        let scheduler = Arc::new(Mutex::new(crate::hle::kernel::k_scheduler::KScheduler::new(0)));
+        let scheduler = Arc::new(Mutex::new(
+            crate::hle::kernel::k_scheduler::KScheduler::new(0),
+        ));
         scheduler.lock().unwrap().initialize(1, 0, 0);
         let shared_memory = process.lock().unwrap().get_shared_memory();
 
@@ -345,7 +211,13 @@ mod tests {
     }
 
     fn get_tls_base(system: &System) -> u64 {
-        system.current_thread().unwrap().lock().unwrap().get_tls_address().get()
+        system
+            .current_thread()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_tls_address()
+            .get()
     }
 
     fn write_named_port(system: &System, address: u64, name: &str) {
@@ -417,7 +289,10 @@ mod tests {
         assert_eq!(send_sync_request(&system, session_handle), RESULT_SUCCESS);
 
         let mem = system.shared_process_memory().read().unwrap();
-        assert_eq!(mem.read_32(tls_base + 0x18), RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            mem.read_32(tls_base + 0x18),
+            RESULT_SUCCESS.get_inner_value()
+        );
         assert_eq!(mem.read_32(tls_base + 0x1C), 0);
     }
 
@@ -438,15 +313,19 @@ mod tests {
         );
         let service_manager = system.service_manager().unwrap();
         request_context.set_service_manager(service_manager);
-        let lm_handler: SessionRequestHandlerPtr =
-            Arc::new(crate::hle::service::lm::lm::LM::new());
-        let lm_handle = request_context.create_session_for_service(lm_handler).unwrap();
+        let lm_handler: SessionRequestHandlerPtr = Arc::new(crate::hle::service::lm::lm::LM::new());
+        let lm_handle = request_context
+            .create_session_for_service(lm_handler)
+            .unwrap();
 
         write_control_query_pointer_buffer_size_request(&system);
         assert_eq!(send_sync_request(&system, lm_handle), RESULT_SUCCESS);
 
         let mem = system.shared_process_memory().read().unwrap();
-        assert_eq!(mem.read_32(tls_base + 0x18), RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            mem.read_32(tls_base + 0x18),
+            RESULT_SUCCESS.get_inner_value()
+        );
         assert_eq!(mem.read_32(tls_base + 0x1C), 0);
         assert_eq!(mem.read_32(tls_base + 0x20), 0x8000);
     }
@@ -481,9 +360,10 @@ pub fn send_sync_request_with_user_buffer(
         let mut process = system.current_process_arc().lock().unwrap();
         let msg_addr = crate::hle::kernel::k_typed_address::KProcessAddress::new(message);
         let mut paddr: u64 = 0;
-        let lock_result = process
-            .page_table
-            .lock_for_ipc_user_buffer(&mut paddr, msg_addr, buffer_size as usize);
+        let lock_result =
+            process
+                .page_table
+                .lock_for_ipc_user_buffer(&mut paddr, msg_addr, buffer_size as usize);
         if lock_result != 0 {
             return ResultCode::new(lock_result);
         }
@@ -566,7 +446,16 @@ pub fn reply_and_receive(
     reply_target: Handle,
     timeout_ns: i64,
 ) -> ResultCode {
-    reply_and_receive_impl(system, out_index, 0, 0, handles, num_handles, reply_target, timeout_ns)
+    reply_and_receive_impl(
+        system,
+        out_index,
+        0,
+        0,
+        handles,
+        num_handles,
+        reply_target,
+        timeout_ns,
+    )
 }
 
 /// Replies and receives with a user-provided message buffer.
@@ -602,9 +491,10 @@ pub fn reply_and_receive_with_user_buffer(
         let mut process = system.current_process_arc().lock().unwrap();
         let msg_addr = crate::hle::kernel::k_typed_address::KProcessAddress::new(message);
         let mut paddr: u64 = 0;
-        let lock_result = process
-            .page_table
-            .lock_for_ipc_user_buffer(&mut paddr, msg_addr, buffer_size as usize);
+        let lock_result =
+            process
+                .page_table
+                .lock_for_ipc_user_buffer(&mut paddr, msg_addr, buffer_size as usize);
         if lock_result != 0 {
             return ResultCode::new(lock_result);
         }

@@ -599,8 +599,8 @@ impl KMemoryBlock {
         block.m_permission = self.m_permission;
         block.m_original_permission = self.m_original_permission;
         block.m_attribute = self.m_attribute;
-        block.m_disable_merge_attribute = self.m_disable_merge_attribute
-            & KMemoryBlockDisableMergeAttribute::ALL_LEFT;
+        block.m_disable_merge_attribute =
+            self.m_disable_merge_attribute & KMemoryBlockDisableMergeAttribute::ALL_LEFT;
         block.m_ipc_disable_merge_count = self.m_ipc_disable_merge_count;
         block.m_device_disable_merge_left_count = self.m_device_disable_merge_left_count;
         block.m_device_disable_merge_right_count = 0;

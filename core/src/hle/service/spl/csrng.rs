@@ -40,9 +40,7 @@ impl Csrng {
                 .unwrap_or(0)
         });
 
-        let handlers = build_handler_map(&[
-            (0, None, "GenerateRandomBytes"),
-        ]);
+        let handlers = build_handler_map(&[(0, None, "GenerateRandomBytes")]);
 
         Self {
             handlers,
@@ -55,10 +53,7 @@ impl Csrng {
     ///
     /// Corresponds to `Module::Interface::GenerateRandomBytes` in upstream.
     pub fn generate_random_bytes(&self, buf: &mut [u8]) {
-        log::debug!(
-            "CSRNG::generate_random_bytes called, size={}",
-            buf.len()
-        );
+        log::debug!("CSRNG::generate_random_bytes called, size={}", buf.len());
         // Use a simple PRNG. For proper emulation, this should use a
         // cryptographic RNG. Upstream uses std::mt19937 with
         // uniform_int_distribution<u16>.

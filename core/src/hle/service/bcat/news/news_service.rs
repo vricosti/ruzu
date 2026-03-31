@@ -44,23 +44,51 @@ impl INewsService {
         let handlers = build_handler_map(&[
             (commands::POST_LOCAL_NEWS, None, "PostLocalNews"),
             (commands::SET_PASSPHRASE, None, "SetPassphrase"),
-            (commands::GET_SUBSCRIPTION_STATUS, None, "GetSubscriptionStatus"),
+            (
+                commands::GET_SUBSCRIPTION_STATUS,
+                None,
+                "GetSubscriptionStatus",
+            ),
             (commands::GET_TOPIC_LIST, None, "GetTopicList"),
             (commands::UNKNOWN_30110, None, "Unknown30110"),
-            (commands::IS_SYSTEM_UPDATE_REQUIRED, None, "IsSystemUpdateRequired"),
+            (
+                commands::IS_SYSTEM_UPDATE_REQUIRED,
+                None,
+                "IsSystemUpdateRequired",
+            ),
             (commands::UNKNOWN_30201, None, "Unknown30201"),
             (commands::UNKNOWN_30210, None, "Unknown30210"),
-            (commands::REQUEST_IMMEDIATE_RECEPTION, None, "RequestImmediateReception"),
+            (
+                commands::REQUEST_IMMEDIATE_RECEPTION,
+                None,
+                "RequestImmediateReception",
+            ),
             (commands::DECODE_ARCHIVE_FILE, None, "DecodeArchiveFile"),
             (commands::UNKNOWN_30500, None, "Unknown30500"),
             (commands::UNKNOWN_30900, None, "Unknown30900"),
             (commands::UNKNOWN_30901, None, "Unknown30901"),
             (commands::UNKNOWN_30902, None, "Unknown30902"),
-            (commands::SET_SUBSCRIPTION_STATUS, None, "SetSubscriptionStatus"),
-            (commands::REQUEST_AUTO_SUBSCRIPTION, None, "RequestAutoSubscription"),
+            (
+                commands::SET_SUBSCRIPTION_STATUS,
+                None,
+                "SetSubscriptionStatus",
+            ),
+            (
+                commands::REQUEST_AUTO_SUBSCRIPTION,
+                None,
+                "RequestAutoSubscription",
+            ),
             (commands::CLEAR_STORAGE, None, "ClearStorage"),
-            (commands::CLEAR_SUBSCRIPTION_STATUS_ALL, None, "ClearSubscriptionStatusAll"),
-            (commands::GET_NEWS_DATABASE_DUMP, None, "GetNewsDatabaseDump"),
+            (
+                commands::CLEAR_SUBSCRIPTION_STATUS_ALL,
+                None,
+                "ClearSubscriptionStatusAll",
+            ),
+            (
+                commands::GET_NEWS_DATABASE_DUMP,
+                None,
+                "GetNewsDatabaseDump",
+            ),
         ]);
 
         Self {

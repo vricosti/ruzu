@@ -58,7 +58,8 @@ impl TinyMT {
 
         for i in 1..MINIMUM_INIT_ITERATIONS {
             let mixed = xor_by_shifted30(self.state.data[(i - 1) % NUM_STATE_WORDS]);
-            self.state.data[i % NUM_STATE_WORDS] ^= mixed.wrapping_mul(PARAM_MULT).wrapping_add(i as u32);
+            self.state.data[i % NUM_STATE_WORDS] ^=
+                mixed.wrapping_mul(PARAM_MULT).wrapping_add(i as u32);
         }
 
         self.finalize_initialization();
@@ -251,8 +252,8 @@ fn generate_initial_value_plus(state: &mut TinyMTState, index: usize, value: u32
     let i2 = (index + 2) % NUM_STATE_WORDS;
     let i3 = (index + 3) % NUM_STATE_WORDS;
 
-    let x = xor_by_shifted27(state.data[i0] ^ state.data[i1] ^ state.data[i3])
-        .wrapping_mul(PARAM_PLUS);
+    let x =
+        xor_by_shifted27(state.data[i0] ^ state.data[i1] ^ state.data[i3]).wrapping_mul(PARAM_PLUS);
     let y = x.wrapping_add(index as u32).wrapping_add(value);
 
     state.data[i0] = y;

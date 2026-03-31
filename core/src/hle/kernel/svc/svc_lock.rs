@@ -20,7 +20,9 @@ pub fn arbitrate_lock(
 ) -> ResultCode {
     log::trace!(
         "svc::ArbitrateLock called thread_handle=0x{:08X}, address=0x{:X}, tag=0x{:08X}",
-        thread_handle, address, tag
+        thread_handle,
+        address,
+        tag
     );
 
     // Validate the input address.
@@ -35,13 +37,15 @@ pub fn arbitrate_lock(
         return RESULT_INVALID_HANDLE;
     };
 
-    KConditionVariable::wait_for_address(
+    let result = KConditionVariable::wait_for_address(
         system.current_process_arc(),
         &current_thread,
         thread_handle,
         address,
         tag,
-    )
+    );
+
+    result
 }
 
 /// Unlocks a mutex.
@@ -60,5 +64,11 @@ pub fn arbitrate_unlock(system: &System, address: u64) -> ResultCode {
         return RESULT_INVALID_HANDLE;
     };
 
-    KConditionVariable::signal_to_address(system.current_process_arc(), &current_thread, address)
+    let result = KConditionVariable::signal_to_address(
+        system.current_process_arc(),
+        &current_thread,
+        address,
+    );
+
+    result
 }

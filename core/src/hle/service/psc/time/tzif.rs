@@ -59,7 +59,11 @@ pub fn is_leap(y: i64) -> bool {
 }
 
 fn is_leap_idx(y: i64) -> usize {
-    if is_leap(y) { 1 } else { 0 }
+    if is_leap(y) {
+        1
+    } else {
+        0
+    }
 }
 
 fn leaps_thru_end_of_nonneg(y: i64) -> i64 {
@@ -189,7 +193,9 @@ impl TzRule {
         if idx >= self.chars.len() {
             return b"";
         }
-        let end = self.chars[idx..].iter().position(|&c| c == 0)
+        let end = self.chars[idx..]
+            .iter()
+            .position(|&c| c == 0)
             .map(|p| idx + p)
             .unwrap_or(self.chars.len());
         &self.chars[idx..end]
@@ -230,7 +236,7 @@ impl TzRule {
                 + v1_charcnt                        // chars
                 + v1_leapcnt * (4 + 4)              // lsinfos (4-byte in V1)
                 + v1_ttisstdcnt                     // ttisstds
-                + v1_ttisutcnt;                     // ttisuts
+                + v1_ttisutcnt; // ttisuts
             let v2_header_offset = (TZIF_HEADER_SIZE as i64 + v1_datablock_size) as usize;
 
             if binary.len() < v2_header_offset + TZIF_HEADER_SIZE {
@@ -265,12 +271,18 @@ impl TzRule {
         let charcnt = detzcode(&header_and_data[40..44]);
 
         // Validate counts
-        if !(0 <= leapcnt && (leapcnt as usize) < TZ_MAX_LEAPS
-            && 0 <= typecnt && (typecnt as usize) < TZ_MAX_TYPES
-            && 0 <= timecnt_orig && (timecnt_orig as usize) < TZ_MAX_TIMES
-            && 0 <= charcnt && (charcnt as usize) < TZ_MAX_CHARS
-            && 0 <= ttisstdcnt && (ttisstdcnt as usize) < TZ_MAX_TYPES
-            && 0 <= ttisutcnt && (ttisutcnt as usize) < TZ_MAX_TYPES)
+        if !(0 <= leapcnt
+            && (leapcnt as usize) < TZ_MAX_LEAPS
+            && 0 <= typecnt
+            && (typecnt as usize) < TZ_MAX_TYPES
+            && 0 <= timecnt_orig
+            && (timecnt_orig as usize) < TZ_MAX_TIMES
+            && 0 <= charcnt
+            && (charcnt as usize) < TZ_MAX_CHARS
+            && 0 <= ttisstdcnt
+            && (ttisstdcnt as usize) < TZ_MAX_TYPES
+            && 0 <= ttisutcnt
+            && (ttisutcnt as usize) < TZ_MAX_TYPES)
         {
             return None;
         }
@@ -287,8 +299,7 @@ impl TzRule {
             return None;
         }
 
-        if !((ttisstdcnt == typecnt || ttisstdcnt == 0)
-            && (ttisutcnt == typecnt || ttisutcnt == 0))
+        if !((ttisstdcnt == typecnt || ttisstdcnt == 0) && (ttisutcnt == typecnt || ttisutcnt == 0))
         {
             return None;
         }
@@ -506,9 +517,7 @@ impl TzRule {
                 let repeatat = sp.ats[0] + SECSPERREPEAT;
                 let repeattype = sp.types[0] as usize;
                 for i in 1..sp.timecnt as usize {
-                    if sp.ats[i] == repeatat
-                        && sp.typesequiv(sp.types[i] as usize, repeattype)
-                    {
+                    if sp.ats[i] == repeatat && sp.typesequiv(sp.types[i] as usize, repeattype) {
                         sp.goback = true;
                         break;
                     }
@@ -518,9 +527,7 @@ impl TzRule {
                 let repeatat = sp.ats[sp.timecnt as usize - 1] - SECSPERREPEAT;
                 let repeattype = sp.types[sp.timecnt as usize - 1] as usize;
                 for i in (0..sp.timecnt as usize - 1).rev() {
-                    if sp.ats[i] == repeatat
-                        && sp.typesequiv(sp.types[i] as usize, repeattype)
-                    {
+                    if sp.ats[i] == repeatat && sp.typesequiv(sp.types[i] as usize, repeattype) {
                         sp.goahead = true;
                         break;
                     }
@@ -823,11 +830,7 @@ fn increment_overflow32(lp: &mut i64, m: i32) -> bool {
 
 /// Matching upstream `time2sub`: binary search for a time_t that produces the
 /// requested broken-down time.
-fn time2sub(
-    sp: &TzRule,
-    tmp_in: &CalendarTimeInternal,
-    do_norm_secs: bool,
-) -> Option<i64> {
+fn time2sub(sp: &TzRule, tmp_in: &CalendarTimeInternal, do_norm_secs: bool) -> Option<i64> {
     let mut yourtm = tmp_in.clone();
 
     if do_norm_secs {
@@ -908,12 +911,22 @@ fn time2sub(
     let mut hi: i64 = TIME_T_MAX;
     loop {
         let t = lo / 2 + hi / 2;
-        let t = if t < lo { lo } else if t > hi { hi } else { t };
+        let t = if t < lo {
+            lo
+        } else if t > hi {
+            hi
+        } else {
+            t
+        };
 
         let dir = if let Some(mytm) = localsub(sp, t) {
             tmcomp(&mytm, &yourtm)
         } else {
-            if t > 0 { 1 } else { -1 }
+            if t > 0 {
+                1
+            } else {
+                -1
+            }
         };
 
         if dir != 0 {
@@ -1090,9 +1103,7 @@ pub fn parse_posix_tz(tz_str: &[u8]) -> Option<TzRule> {
     }
 
     // Parse DST offset (optional; default = stdoffset - 1 hour)
-    let (dstoffset, rest) = if !rest.is_empty()
-        && !rest.starts_with(',')
-        && !rest.starts_with(';')
+    let (dstoffset, rest) = if !rest.is_empty() && !rest.starts_with(',') && !rest.starts_with(';')
     {
         parse_tz_offset(rest)?
     } else {
@@ -1221,9 +1232,7 @@ fn transtime(year: i32, rule: &PosixTzRule, offset: i64) -> i64 {
             }
             v
         }
-        RuleType::DayOfYear => {
-            rule.r_day as i64 * SECSPERDAY
-        }
+        RuleType::DayOfYear => rule.r_day as i64 * SECSPERDAY,
         RuleType::MonthNthDayOfWeek => {
             let leap_idx = if leapyear { 1 } else { 0 };
             let m1 = (rule.r_mon + 9) % 12 + 1;
@@ -1281,7 +1290,8 @@ fn parse_tz_name(s: &str) -> Option<(&str, &str)> {
         let end = rest.find('>')?;
         Some((&rest[..end], &rest[end + 1..]))
     } else {
-        let end = s.find(|c: char| c.is_ascii_digit() || c == ',' || c == '-' || c == '+')
+        let end = s
+            .find(|c: char| c.is_ascii_digit() || c == ',' || c == '-' || c == '+')
             .unwrap_or(s.len());
         if end == 0 {
             return None;
@@ -1336,35 +1346,48 @@ fn parse_tz_num(s: &str) -> Option<(i32, &str)> {
 fn parse_tz_rule(s: &str) -> Option<(PosixTzRule, &str)> {
     let (rule, rest) = if s.starts_with('J') {
         let (day, rest) = parse_tz_num(&s[1..])?;
-        (PosixTzRule {
-            r_type: RuleType::JulianDay,
-            r_day: day,
-            r_week: 0,
-            r_mon: 0,
-            r_time: 2 * SECSPERHOUR,
-        }, rest)
+        (
+            PosixTzRule {
+                r_type: RuleType::JulianDay,
+                r_day: day,
+                r_week: 0,
+                r_mon: 0,
+                r_time: 2 * SECSPERHOUR,
+            },
+            rest,
+        )
     } else if s.starts_with('M') {
         let (mon, rest) = parse_tz_num(&s[1..])?;
-        if !rest.starts_with('.') { return None; }
+        if !rest.starts_with('.') {
+            return None;
+        }
         let (week, rest) = parse_tz_num(&rest[1..])?;
-        if !rest.starts_with('.') { return None; }
+        if !rest.starts_with('.') {
+            return None;
+        }
         let (day, rest) = parse_tz_num(&rest[1..])?;
-        (PosixTzRule {
-            r_type: RuleType::MonthNthDayOfWeek,
-            r_day: day,
-            r_week: week,
-            r_mon: mon,
-            r_time: 2 * SECSPERHOUR,
-        }, rest)
+        (
+            PosixTzRule {
+                r_type: RuleType::MonthNthDayOfWeek,
+                r_day: day,
+                r_week: week,
+                r_mon: mon,
+                r_time: 2 * SECSPERHOUR,
+            },
+            rest,
+        )
     } else if s.starts_with(|c: char| c.is_ascii_digit()) {
         let (day, rest) = parse_tz_num(s)?;
-        (PosixTzRule {
-            r_type: RuleType::DayOfYear,
-            r_day: day,
-            r_week: 0,
-            r_mon: 0,
-            r_time: 2 * SECSPERHOUR,
-        }, rest)
+        (
+            PosixTzRule {
+                r_type: RuleType::DayOfYear,
+                r_day: day,
+                r_week: 0,
+                r_mon: 0,
+                r_time: 2 * SECSPERHOUR,
+            },
+            rest,
+        )
     } else {
         return None;
     };

@@ -314,7 +314,9 @@ mod tests {
     #[test]
     fn test_dry_read_clamps_to_file_size() {
         let ifile = IFile::new(make_test_file(&[1, 2, 3]));
-        let out = ifile.dry_read(1, 100, &ReadOption::NONE, OpenMode::READ).unwrap();
+        let out = ifile
+            .dry_read(1, 100, &ReadOption::NONE, OpenMode::READ)
+            .unwrap();
         assert_eq!(out, 2);
     }
 

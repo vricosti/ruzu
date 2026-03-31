@@ -123,8 +123,7 @@ impl RendererOpenGL {
         let state_tracker = StateTracker::new();
 
         // Initialize blit screen pipeline
-        let blit_screen = BlitScreen::new()
-            .map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
+        let blit_screen = BlitScreen::new().map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
 
         // Initialize rasterizer
         let rasterizer = RasterizerOpenGL::new(&device, syncpoints);
@@ -139,8 +138,7 @@ impl RendererOpenGL {
                 if ptr.is_null() {
                     return false;
                 }
-                let s = std::ffi::CStr::from_ptr(ptr as *const _)
-                    .to_string_lossy();
+                let s = std::ffi::CStr::from_ptr(ptr as *const _).to_string_lossy();
                 s == "GL_KHR_debug"
             });
 
@@ -277,7 +275,11 @@ impl RendererOpenGL {
             return;
         }
 
-        let layout = self.base_data.settings.screenshot_framebuffer_layout.clone();
+        let layout = self
+            .base_data
+            .settings
+            .screenshot_framebuffer_layout
+            .clone();
         let dst = self.base_data.settings.screenshot_bits;
 
         self.render_to_buffer(framebuffers, &layout, dst);
@@ -473,11 +475,10 @@ impl RendererBase for RendererOpenGL {
         // Without EmuWindow reference stored in the renderer, use current layout.
         let layout = &self.framebuffer_layout;
         if layout.width > 0 && layout.height > 0 {
-            self.framebuffer_layout =
-                ruzu_core::frontend::framebuffer_layout::default_frame_layout(
-                    layout.width,
-                    layout.height,
-                );
+            self.framebuffer_layout = ruzu_core::frontend::framebuffer_layout::default_frame_layout(
+                layout.width,
+                layout.height,
+            );
         }
     }
 

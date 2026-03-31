@@ -69,12 +69,9 @@ impl TouchScreen {
         };
         let identifier = default_identifier();
         self.fingers[index].is_active = true;
-        self.engine
-            .set_button(&identifier, index as i32, true);
-        self.engine
-            .set_axis(&identifier, (index * 2) as i32, x);
-        self.engine
-            .set_axis(&identifier, (index * 2 + 1) as i32, y);
+        self.engine.set_button(&identifier, index as i32, true);
+        self.engine.set_axis(&identifier, (index * 2) as i32, x);
+        self.engine.set_axis(&identifier, (index * 2 + 1) as i32, y);
     }
 
     /// Signals and creates a new touch point with this finger id.
@@ -106,10 +103,8 @@ impl TouchScreen {
         };
         let identifier = default_identifier();
         self.fingers[index].is_enabled = false;
-        self.engine
-            .set_button(&identifier, index as i32, false);
-        self.engine
-            .set_axis(&identifier, (index * 2) as i32, 0.0);
+        self.engine.set_button(&identifier, index as i32, false);
+        self.engine.set_axis(&identifier, (index * 2) as i32, 0.0);
         self.engine
             .set_axis(&identifier, (index * 2 + 1) as i32, 0.0);
     }

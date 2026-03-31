@@ -124,8 +124,7 @@ impl KeplerMemory {
             EXEC_REG => {
                 // Sync upload registers from the register array
                 self.upload_state.regs = self.regs.upload();
-                self.upload_state
-                    .process_exec(self.regs.exec_linear());
+                self.upload_state.process_exec(self.regs.exec_linear());
             }
             DATA_REG => {
                 self.upload_state.regs = self.regs.upload();

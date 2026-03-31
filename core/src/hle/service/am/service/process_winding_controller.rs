@@ -23,7 +23,8 @@ pub struct IProcessWindingController {
 
 impl IProcessWindingController {
     pub fn new(applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
-        let handlers = build_handler_map(&[(0, Some(Self::get_launch_reason_handler), "GetLaunchReason")]);
+        let handlers =
+            build_handler_map(&[(0, Some(Self::get_launch_reason_handler), "GetLaunchReason")]);
         Self {
             applet,
             handlers,
@@ -32,7 +33,8 @@ impl IProcessWindingController {
     }
 
     fn get_launch_reason_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IProcessWindingController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IProcessWindingController) };
         let applet = service.applet.lock().unwrap();
         let launch_reason = applet.launch_reason;
         drop(applet);

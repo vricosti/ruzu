@@ -23,8 +23,7 @@ pub struct IDaemonController {
 
 impl IDaemonController {
     pub fn new() -> Self {
-        let s: Option<fn(&dyn ServiceFramework, &mut HLERequestContext)> =
-            Some(Self::stub_handler);
+        let s: Option<fn(&dyn ServiceFramework, &mut HLERequestContext)> = Some(Self::stub_handler);
         let handlers = build_handler_map(&[
             (0, s, "GetAutoTransferEnabledForAccountAndApplication"),
             (1, s, "SetAutoTransferEnabledForAccountAndApplication"),

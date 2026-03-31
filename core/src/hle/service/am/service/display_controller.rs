@@ -50,12 +50,36 @@ pub struct IDisplayController {
 impl IDisplayController {
     pub fn new(applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>) -> Self {
         let handlers = build_handler_map(&[
-            (7, Some(Self::get_caller_applet_capture_image_ex_handler), "GetCallerAppletCaptureImageEx"),
-            (8, Some(Self::take_screen_shot_of_own_layer_handler), "TakeScreenShotOfOwnLayer"),
-            (20, Some(Self::clear_capture_buffer_handler), "ClearCaptureBuffer"),
-            (25, Some(Self::release_last_foreground_capture_shared_buffer_handler), "ReleaseLastForegroundCaptureSharedBuffer"),
-            (27, Some(Self::release_caller_applet_capture_shared_buffer_handler), "ReleaseCallerAppletCaptureSharedBuffer"),
-            (23, Some(Self::release_last_application_capture_shared_buffer_handler), "ReleaseLastApplicationCaptureSharedBuffer"),
+            (
+                7,
+                Some(Self::get_caller_applet_capture_image_ex_handler),
+                "GetCallerAppletCaptureImageEx",
+            ),
+            (
+                8,
+                Some(Self::take_screen_shot_of_own_layer_handler),
+                "TakeScreenShotOfOwnLayer",
+            ),
+            (
+                20,
+                Some(Self::clear_capture_buffer_handler),
+                "ClearCaptureBuffer",
+            ),
+            (
+                25,
+                Some(Self::release_last_foreground_capture_shared_buffer_handler),
+                "ReleaseLastForegroundCaptureSharedBuffer",
+            ),
+            (
+                27,
+                Some(Self::release_caller_applet_capture_shared_buffer_handler),
+                "ReleaseCallerAppletCaptureSharedBuffer",
+            ),
+            (
+                23,
+                Some(Self::release_last_application_capture_shared_buffer_handler),
+                "ReleaseLastApplicationCaptureSharedBuffer",
+            ),
         ]);
         Self {
             applet,
@@ -99,7 +123,8 @@ impl IDisplayController {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(service.get_caller_applet_capture_image_ex());
@@ -109,7 +134,8 @@ impl IDisplayController {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
         let mut rp = RequestParser::new(ctx);
         service.take_screen_shot_of_own_layer(rp.pop_bool(), rp.pop_i32());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -117,7 +143,8 @@ impl IDisplayController {
     }
 
     fn clear_capture_buffer_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
         let mut rp = RequestParser::new(ctx);
         service.clear_capture_buffer(rp.pop_bool(), rp.pop_i32(), rp.pop_u32());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -128,7 +155,8 @@ impl IDisplayController {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
         service.release_last_foreground_capture_shared_buffer();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -138,7 +166,8 @@ impl IDisplayController {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
         service.release_caller_applet_capture_shared_buffer();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -148,7 +177,8 @@ impl IDisplayController {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
         service.release_last_application_capture_shared_buffer();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);

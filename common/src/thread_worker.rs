@@ -62,32 +62,37 @@ impl<S: Send + 'static> StatefulThreadWorker<S> {
             let shared_clone = shared.clone();
             let name_clone = name.clone();
             let maker = state_maker.clone();
-            threads.push(thread::Builder::new().name(name_clone).spawn(move || {
-                let mut state = maker();
-                loop {
-                    let task;
-                    {
-                        let mut queue = shared_clone.queue.lock().unwrap();
-                        if queue.is_empty() {
-                            shared_clone.wait_condition.notify_all();
+            threads.push(
+                thread::Builder::new()
+                    .name(name_clone)
+                    .spawn(move || {
+                        let mut state = maker();
+                        loop {
+                            let task;
+                            {
+                                let mut queue = shared_clone.queue.lock().unwrap();
+                                if queue.is_empty() {
+                                    shared_clone.wait_condition.notify_all();
+                                }
+                                queue = shared_clone
+                                    .condition
+                                    .wait_while(queue, |q| {
+                                        q.is_empty() && !shared_clone.stop.load(Ordering::Acquire)
+                                    })
+                                    .unwrap();
+                                if shared_clone.stop.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                task = queue.pop_front().unwrap();
+                            }
+                            task(&mut state);
+                            shared_clone.work_done.fetch_add(1, Ordering::Release);
                         }
-                        queue = shared_clone
-                            .condition
-                            .wait_while(queue, |q| {
-                                q.is_empty() && !shared_clone.stop.load(Ordering::Acquire)
-                            })
-                            .unwrap();
-                        if shared_clone.stop.load(Ordering::Acquire) {
-                            break;
-                        }
-                        task = queue.pop_front().unwrap();
-                    }
-                    task(&mut state);
-                    shared_clone.work_done.fetch_add(1, Ordering::Release);
-                }
-                shared_clone.workers_stopped.fetch_add(1, Ordering::Release);
-                shared_clone.wait_condition.notify_all();
-            }).expect("failed to spawn worker thread"));
+                        shared_clone.workers_stopped.fetch_add(1, Ordering::Release);
+                        shared_clone.wait_condition.notify_all();
+                    })
+                    .expect("failed to spawn worker thread"),
+            );
         }
 
         Self { shared, threads }

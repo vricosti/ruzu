@@ -99,7 +99,9 @@ impl JoyconPoller {
 
         if let Some(ref cb) = self.callbacks {
             if let Some(ref f) = cb.on_battery_data {
-                let battery = Battery { raw: data.battery_status };
+                let battery = Battery {
+                    raw: data.battery_status,
+                };
                 f(battery);
             }
         }
@@ -186,8 +188,7 @@ impl JoyconPoller {
         // SAFETY: packed field reads — copy to locals first
         let btn2 = input.button_input[2];
         let btn1 = input.button_input[1];
-        let raw_button =
-            btn2 as u32 | (((btn1 & 0b00101001) as u32) << 16);
+        let raw_button = btn2 as u32 | (((btn1 & 0b00101001) as u32) << 16);
 
         if let Some(ref cb) = self.callbacks {
             if let Some(ref f) = cb.on_button_data {
@@ -203,8 +204,10 @@ impl JoyconPoller {
         let ls2 = input.left_stick_state[2];
         let raw_left_axis_x = (ls0 as u16) | (((ls1 & 0xf) as u16) << 8);
         let raw_left_axis_y = ((ls1 >> 4) as u16) | ((ls2 as u16) << 4);
-        let left_axis_x = self.get_axis_value(raw_left_axis_x, &self.left_stick_calibration.x.clone());
-        let left_axis_y = self.get_axis_value(raw_left_axis_y, &self.left_stick_calibration.y.clone());
+        let left_axis_x =
+            self.get_axis_value(raw_left_axis_x, &self.left_stick_calibration.x.clone());
+        let left_axis_y =
+            self.get_axis_value(raw_left_axis_y, &self.left_stick_calibration.y.clone());
 
         if let Some(ref cb) = self.callbacks {
             if let Some(ref f) = cb.on_stick_data {
@@ -323,8 +326,7 @@ impl JoyconPoller {
         let btn0 = input.button_input[0];
         let btn1 = input.button_input[1];
         let btn2 = input.button_input[2];
-        let raw_button =
-            (btn2 as u32) | ((btn0 as u32) << 8) | ((btn1 as u32) << 16);
+        let raw_button = (btn2 as u32) | ((btn0 as u32) << 8) | ((btn1 as u32) << 16);
 
         if let Some(ref cb) = self.callbacks {
             if let Some(ref f) = cb.on_button_data {

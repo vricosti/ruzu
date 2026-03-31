@@ -32,9 +32,21 @@ pub struct IReadOnlyApplicationRecordInterface {
 impl IReadOnlyApplicationRecordInterface {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (commands::HAS_APPLICATION_RECORD, None, "HasApplicationRecord"),
-            (commands::NOTIFY_APPLICATION_FAILURE, None, "NotifyApplicationFailure"),
-            (commands::IS_DATA_CORRUPTED_RESULT, None, "IsDataCorruptedResult"),
+            (
+                commands::HAS_APPLICATION_RECORD,
+                None,
+                "HasApplicationRecord",
+            ),
+            (
+                commands::NOTIFY_APPLICATION_FAILURE,
+                None,
+                "NotifyApplicationFailure",
+            ),
+            (
+                commands::IS_DATA_CORRUPTED_RESULT,
+                None,
+                "IsDataCorruptedResult",
+            ),
         ]);
         Self {
             handlers,

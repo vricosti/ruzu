@@ -197,8 +197,7 @@ fn apply_layered_fs(
         None => return,
     };
 
-    let layered_ext =
-        LayeredVfsDirectory::make_layered_directory(layers_ext, String::new());
+    let layered_ext = LayeredVfsDirectory::make_layered_directory(layers_ext, String::new());
 
     let packed = match create_romfs(Some(layered), layered_ext) {
         Some(f) => f,
@@ -316,7 +315,9 @@ impl<'a> PatchManager<'a> {
         }
 
         // LayeredExeFS
-        let load_dir = self.fs_controller.and_then(|fc| fc.get_modification_load_root(self.title_id));
+        let load_dir = self
+            .fs_controller
+            .and_then(|fc| fc.get_modification_load_root(self.title_id));
         let sdmc_load_dir = self
             .fs_controller
             .and_then(|fc| fc.get_sdmc_modification_load_root(self.title_id));
@@ -343,9 +344,7 @@ impl<'a> PatchManager<'a> {
         }
         layers.push(exefs.clone());
 
-        if let Some(layered) =
-            LayeredVfsDirectory::make_layered_directory(layers, String::new())
-        {
+        if let Some(layered) = LayeredVfsDirectory::make_layered_directory(layers, String::new()) {
             log::info!("    ExeFS: LayeredExeFS patches applied successfully");
             exefs = layered;
         }
@@ -369,11 +368,7 @@ impl<'a> PatchManager<'a> {
 
     /// Collect IPS/IPSwitch patches from patch directories matching a build ID.
     /// Corresponds to upstream `PatchManager::CollectPatches`.
-    fn collect_patches(
-        &self,
-        patch_dirs: &[VirtualDir],
-        build_id: &str,
-    ) -> Vec<VirtualFile> {
+    fn collect_patches(&self, patch_dirs: &[VirtualDir], build_id: &str) -> Vec<VirtualFile> {
         let disabled = get_disabled_addons(self.title_id);
         let nso_build_id = format!("{:0<64}", build_id);
         let mut out = Vec::new();
@@ -457,9 +452,7 @@ impl<'a> PatchManager<'a> {
                 .fs_controller
                 .and_then(|fc| fc.get_modification_dump_root(self.title_id))
             {
-                if let Some(nso_dir) =
-                    get_or_create_directory_relative(dump_dir.as_ref(), "/nso")
-                {
+                if let Some(nso_dir) = get_or_create_directory_relative(dump_dir.as_ref(), "/nso") {
                     let filename = format!("{}-{}.nso", name, build_id);
                     if let Some(file) = nso_dir.create_file(&filename) {
                         file.resize(nso.len());
@@ -471,7 +464,10 @@ impl<'a> PatchManager<'a> {
 
         log::info!("Patching NSO for name={}, build_id={}", name, build_id);
 
-        let load_dir = match self.fs_controller.and_then(|fc| fc.get_modification_load_root(self.title_id)) {
+        let load_dir = match self
+            .fs_controller
+            .and_then(|fc| fc.get_modification_load_root(self.title_id))
+        {
             Some(dir) => dir,
             None => {
                 log::error!(
@@ -497,11 +493,8 @@ impl<'a> PatchManager<'a> {
                         );
                     }
                 }
-                let source: VirtualFile = Arc::new(VectorVfsFile::new(
-                    out.clone(),
-                    String::new(),
-                    None,
-                ));
+                let source: VirtualFile =
+                    Arc::new(VectorVfsFile::new(out.clone(), String::new(), None));
                 if let Some(patched) = super::ips_layer::patch_ips(&source, patch_file) {
                     let size = patched.get_size();
                     let mut buf = vec![0u8; size];
@@ -517,13 +510,9 @@ impl<'a> PatchManager<'a> {
                         );
                     }
                 }
-                let compiler =
-                    super::ips_layer::IpSwitchCompiler::new(patch_file.clone());
-                let source: VirtualFile = Arc::new(VectorVfsFile::new(
-                    out.clone(),
-                    String::new(),
-                    None,
-                ));
+                let compiler = super::ips_layer::IpSwitchCompiler::new(patch_file.clone());
+                let source: VirtualFile =
+                    Arc::new(VectorVfsFile::new(out.clone(), String::new(), None));
                 if let Some(patched) = compiler.apply(&source) {
                     let size = patched.get_size();
                     let mut buf = vec![0u8; size];
@@ -561,7 +550,10 @@ impl<'a> PatchManager<'a> {
             name
         );
 
-        let load_dir = match self.fs_controller.and_then(|fc| fc.get_modification_load_root(self.title_id)) {
+        let load_dir = match self
+            .fs_controller
+            .and_then(|fc| fc.get_modification_load_root(self.title_id))
+        {
             Some(dir) => dir,
             None => {
                 log::error!(
@@ -616,7 +608,9 @@ impl<'a> PatchManager<'a> {
             .map(|cp| cp.has_entry(update_tid, ContentRecordType::Program))
             .unwrap_or(false)
         {
-            let meta_ver = self.content_provider.and_then(|cp| cp.get_entry_version(update_tid));
+            let meta_ver = self
+                .content_provider
+                .and_then(|cp| cp.get_entry_version(update_tid));
             if meta_ver.unwrap_or(0) == 0 {
                 out.push(update_patch);
             } else {
@@ -630,7 +624,10 @@ impl<'a> PatchManager<'a> {
         }
 
         // General Mods (LayeredFS and IPS)
-        if let Some(mod_dir) = self.fs_controller.and_then(|fc| fc.get_modification_load_root(self.title_id)) {
+        if let Some(mod_dir) = self
+            .fs_controller
+            .and_then(|fc| fc.get_modification_load_root(self.title_id))
+        {
             for mod_subdir in mod_dir.get_subdirectories() {
                 let mut types = String::new();
 
@@ -663,16 +660,10 @@ impl<'a> PatchManager<'a> {
                     }
                 }
 
-                if is_dir_valid_and_non_empty(&find_subdirectory_caseless(
-                    &mod_subdir,
-                    "romfs",
-                )) {
+                if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&mod_subdir, "romfs")) {
                     append_comma_if_not_empty(&mut types, "LayeredFS");
                 }
-                if is_dir_valid_and_non_empty(&find_subdirectory_caseless(
-                    &mod_subdir,
-                    "cheats",
-                )) {
+                if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&mod_subdir, "cheats")) {
                     append_comma_if_not_empty(&mut types, "Cheats");
                 }
 
@@ -698,12 +689,10 @@ impl<'a> PatchManager<'a> {
             .and_then(|fc| fc.get_sdmc_modification_load_root(self.title_id))
         {
             let mut types = String::new();
-            if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&sdmc_mod_dir, "exefs"))
-            {
+            if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&sdmc_mod_dir, "exefs")) {
                 append_comma_if_not_empty(&mut types, "LayeredExeFS");
             }
-            if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&sdmc_mod_dir, "romfs"))
-            {
+            if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&sdmc_mod_dir, "romfs")) {
                 append_comma_if_not_empty(&mut types, "LayeredFS");
             }
 
@@ -723,7 +712,9 @@ impl<'a> PatchManager<'a> {
         // DLC
         let dlc_entries = self
             .content_provider
-            .map(|cp| cp.list_entries_filter(Some(TitleType::AOC), Some(ContentRecordType::Data), None))
+            .map(|cp| {
+                cp.list_entries_filter(Some(TitleType::AOC), Some(ContentRecordType::Data), None)
+            })
             .unwrap_or_default();
         let cp_ref = self.content_provider;
         let title_id_copy = self.title_id;
@@ -734,8 +725,7 @@ impl<'a> PatchManager<'a> {
                     && cp_ref
                         .and_then(|cp| cp.get_entry(entry.title_id, ContentRecordType::Data))
                         .map(|nca| {
-                            nca.get_status()
-                                == super::partition_filesystem::ResultStatus::Success
+                            nca.get_status() == super::partition_filesystem::ResultStatus::Success
                         })
                         .unwrap_or(false)
             })
@@ -820,8 +810,7 @@ impl<'a> PatchManager<'a> {
             ApplicationLanguage, LanguageCode as NsLanguageCode,
         };
 
-        let language_index =
-            *common::settings::values().language_index.get_value() as u32 as usize;
+        let language_index = *common::settings::values().language_index.get_value() as u32 as usize;
         let set_language_code =
             crate::hle::service::set::settings_server::get_language_code_from_index(language_index);
         // Both settings_types::LanguageCode and ns::language::LanguageCode are #[repr(u64)]
@@ -892,9 +881,7 @@ impl<'a> PatchManager<'a> {
                 // We pass None for base_nca since NCA::new takes Option<&NCA>.
                 // A full implementation would require passing the base NCA for BKTR patching.
                 let new_nca = NCA::new(raw, None);
-                if new_nca.get_status()
-                    == super::partition_filesystem::ResultStatus::Success
-                {
+                if new_nca.get_status() == super::partition_filesystem::ResultStatus::Success {
                     if let Some(new_romfs) = new_nca.get_romfs() {
                         log::info!(
                             "    RomFS: Update ({}) applied successfully",
@@ -910,9 +897,7 @@ impl<'a> PatchManager<'a> {
                 }
             } else if let Some(packed_raw) = packed_update_raw {
                 let new_nca = NCA::new(packed_raw, None);
-                if new_nca.get_status()
-                    == super::partition_filesystem::ResultStatus::Success
-                {
+                if new_nca.get_status() == super::partition_filesystem::ResultStatus::Success {
                     if let Some(new_romfs) = new_nca.get_romfs() {
                         log::info!("    RomFS: Update (PACKED) applied successfully");
                         romfs = new_romfs;

@@ -87,9 +87,7 @@ impl ControllerApplet for DefaultControllerApplet {
         callback: ReconfigureCallback,
         parameters: &ControllerParameters,
     ) {
-        log::info!(
-            "called, deducing the best configuration based on the given parameters!"
-        );
+        log::info!("called, deducing the best configuration based on the given parameters!");
 
         let min_supported_players = if parameters.enable_single_mode {
             1

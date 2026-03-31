@@ -55,11 +55,7 @@ fn read_from_user(memory: &SharedProcessMemory, address: u64) -> (bool, i32) {
 /// Atomically decrement the value at `address` if it is less than `value`.
 /// Port of upstream `DecrementIfLessThan`.
 /// Upstream uses ExclusiveMonitor CAS loop. We use a write lock for atomicity.
-fn decrement_if_less_than(
-    memory: &SharedProcessMemory,
-    address: u64,
-    value: i32,
-) -> (bool, i32) {
+fn decrement_if_less_than(memory: &SharedProcessMemory, address: u64, value: i32) -> (bool, i32) {
     let mut mem = memory.write().unwrap();
     let current_value = mem.read_32(address) as i32;
 
@@ -191,12 +187,7 @@ impl KAddressArbiter {
 
     /// Signal and atomically increment the value at address if equal.
     /// Port of upstream `KAddressArbiter::SignalAndIncrementIfEqual`.
-    fn signal_and_increment_if_equal(
-        &self,
-        addr: u64,
-        value: i32,
-        count: i32,
-    ) -> ResultCode {
+    fn signal_and_increment_if_equal(&self, addr: u64, value: i32, count: i32) -> ResultCode {
         let memory = match self.current_memory() {
             Some(m) => m,
             None => return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY,
@@ -238,9 +229,17 @@ impl KAddressArbiter {
         };
 
         let new_value = if count <= 0 {
-            if has_waiters { value - 2 } else { value + 1 }
+            if has_waiters {
+                value - 2
+            } else {
+                value + 1
+            }
         } else if has_waiters {
-            if waiter_count_at_addr - 1 < count { value - 1 } else { value }
+            if waiter_count_at_addr - 1 < count {
+                value - 1
+            } else {
+                value
+            }
         } else {
             value + 1
         };

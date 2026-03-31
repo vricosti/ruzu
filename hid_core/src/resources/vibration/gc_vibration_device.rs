@@ -57,10 +57,7 @@ impl NpadGcVibrationDevice {
     }
 
     /// Port of NpadGcVibrationDevice::SendVibrationGcErmCommand.
-    pub fn send_vibration_gc_erm_command(
-        &self,
-        mut command: VibrationGcErmCommand,
-    ) -> ResultCode {
+    pub fn send_vibration_gc_erm_command(&self, mut command: VibrationGcErmCommand) -> ResultCode {
         if !self.is_mounted {
             return ResultCode::SUCCESS;
         }

@@ -97,10 +97,7 @@ impl EngineInterfaceState {
 
     /// Consume the sink by calling the provided callback for each deferred write,
     /// then clear the sink. This is the default `ConsumeSinkImpl` behavior.
-    pub fn default_consume_sink(
-        &mut self,
-        mut call_method: impl FnMut(u32, u32, bool),
-    ) {
+    pub fn default_consume_sink(&mut self, mut call_method: impl FnMut(u32, u32, bool)) {
         for &(method, value) in &self.method_sink {
             call_method(method, value, true);
         }

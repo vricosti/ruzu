@@ -30,7 +30,11 @@ impl INewsDataService {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
             (commands::OPEN, None, "Open"),
-            (commands::OPEN_WITH_NEWS_RECORD_V1, None, "OpenWithNewsRecordV1"),
+            (
+                commands::OPEN_WITH_NEWS_RECORD_V1,
+                None,
+                "OpenWithNewsRecordV1",
+            ),
             (commands::READ, None, "Read"),
             (commands::GET_SIZE, None, "GetSize"),
             (commands::OPEN_WITH_NEWS_RECORD, None, "OpenWithNewsRecord"),

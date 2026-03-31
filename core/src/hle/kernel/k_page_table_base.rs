@@ -20,7 +20,7 @@ use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_memory_layout::KERNEL_ASLR_ALIGNMENT;
 use super::k_memory_manager;
 use super::k_resource_limit::{KResourceLimit, LimitableResource};
-use super::svc_types::{ADDRESS_SPACE_MASK, CreateProcessFlag, MemoryState as SvcMemoryState};
+use super::svc_types::{CreateProcessFlag, MemoryState as SvcMemoryState, ADDRESS_SPACE_MASK};
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::result::ResultCode;
 use crate::memory::memory::Memory;
@@ -263,7 +263,8 @@ impl KPageTableBase {
         self.m_heap_region_end - self.m_heap_region_start
     }
     pub fn get_current_heap_size(&self) -> usize {
-        self.m_current_heap_end.saturating_sub(self.m_heap_region_start)
+        self.m_current_heap_end
+            .saturating_sub(self.m_heap_region_start)
     }
     pub fn get_alias_region_start(&self) -> usize {
         self.m_alias_region_start
@@ -304,7 +305,11 @@ impl KPageTableBase {
     }
 
     pub fn get_num_guard_pages(&self) -> usize {
-        if self.m_is_kernel { 1 } else { 4 }
+        if self.m_is_kernel {
+            1
+        } else {
+            4
+        }
     }
 
     /// Port of GetAddressSpaceWidth(Svc::CreateProcessFlag).
@@ -314,13 +319,16 @@ impl KPageTableBase {
     ///   AddressSpace32BitWithoutAlias = 2<<1 = 4
     ///   AddressSpace64Bit = 3<<1 = 6
     pub fn get_address_space_width_from_flags(flags: u32) -> usize {
-        use super::svc_types::{ADDRESS_SPACE_MASK, CreateProcessFlag};
+        use super::svc_types::{CreateProcessFlag, ADDRESS_SPACE_MASK};
         match flags & ADDRESS_SPACE_MASK {
             x if x == CreateProcessFlag::ADDRESS_SPACE_64_BIT.bits() => 39,
             x if x == CreateProcessFlag::ADDRESS_SPACE_64_BIT_DEPRECATED.bits() => 36,
             x if x == CreateProcessFlag::ADDRESS_SPACE_32_BIT.bits() => 32,
             x if x == CreateProcessFlag::ADDRESS_SPACE_32_BIT_WITHOUT_ALIAS.bits() => 32,
-            other => panic!("Invalid address space flag: flags={:#x}, masked={:#x}", flags, other),
+            other => panic!(
+                "Invalid address space flag: flags={:#x}, masked={:#x}",
+                flags, other
+            ),
         }
     }
 
@@ -344,9 +352,8 @@ impl KPageTableBase {
             Ipc | NonSecureIpc | NonDeviceIpc => self.m_alias_region_start,
             Stack => self.m_stack_region_start,
             Static | ThreadLocal => self.m_kernel_map_region_start,
-            Io | Shared | AliasCode | AliasCodeData
-            | Transferred | SharedTransferred | SharedCode
-            | GeneratedCode | CodeOut | Coverage | Insecure => {
+            Io | Shared | AliasCode | AliasCodeData | Transferred | SharedTransferred
+            | SharedCode | GeneratedCode | CodeOut | Coverage | Insecure => {
                 self.m_alias_code_region_start
             }
             Code | CodeData => self.m_code_region_start,
@@ -368,12 +375,9 @@ impl KPageTableBase {
                 self.m_alias_region_end - self.m_alias_region_start
             }
             Stack => self.m_stack_region_end - self.m_stack_region_start,
-            Static | ThreadLocal => {
-                self.m_kernel_map_region_end - self.m_kernel_map_region_start
-            }
-            Io | Shared | AliasCode | AliasCodeData
-            | Transferred | SharedTransferred | SharedCode
-            | GeneratedCode | CodeOut | Coverage | Insecure => {
+            Static | ThreadLocal => self.m_kernel_map_region_end - self.m_kernel_map_region_start,
+            Io | Shared | AliasCode | AliasCodeData | Transferred | SharedTransferred
+            | SharedCode | GeneratedCode | CodeOut | Coverage | Insecure => {
                 self.m_alias_code_region_end - self.m_alias_code_region_start
             }
             Code | CodeData => self.m_code_region_end - self.m_code_region_start,
@@ -427,10 +431,9 @@ impl KPageTableBase {
 
     /// Default ignore attribute for CheckMemoryState.
     /// Matches upstream `DefaultMemoryIgnoreAttr`.
-    pub const DEFAULT_MEMORY_IGNORE_ATTR: KMemoryAttribute =
-        KMemoryAttribute::from_bits_truncate(
-            KMemoryAttribute::IPC_LOCKED.bits() | KMemoryAttribute::DEVICE_SHARED.bits(),
-        );
+    pub const DEFAULT_MEMORY_IGNORE_ATTR: KMemoryAttribute = KMemoryAttribute::from_bits_truncate(
+        KMemoryAttribute::IPC_LOCKED.bits() | KMemoryAttribute::DEVICE_SHARED.bits(),
+    );
 
     /// Check that a single block's state/perm/attr match expectations.
     /// Matches upstream `CheckMemoryState(const KMemoryInfo&, ...)`.
@@ -473,7 +476,10 @@ impl KPageTableBase {
 
         let mut iter = self.m_memory_block_manager.find_iterator(addr);
         let Some(first_block) = iter.next() else {
-            return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), 0);
+            return (
+                svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                0,
+            );
         };
         let mut info = first_block.get_memory_info();
 
@@ -495,7 +501,10 @@ impl KPageTableBase {
             }
 
             let Some(next_block) = iter.next() else {
-                return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), 0);
+                return (
+                    svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                    0,
+                );
             };
             info = next_block.get_memory_info();
         }
@@ -521,13 +530,25 @@ impl KPageTableBase {
         attr_mask: KMemoryAttribute,
         attr: KMemoryAttribute,
         ignore_attr: KMemoryAttribute,
-    ) -> (u32, Option<KMemoryState>, Option<KMemoryPermission>, Option<KMemoryAttribute>, usize) {
+    ) -> (
+        u32,
+        Option<KMemoryState>,
+        Option<KMemoryPermission>,
+        Option<KMemoryAttribute>,
+        usize,
+    ) {
         let last_addr = addr + size - 1;
         let mut blocks_needed: usize = 0;
 
         let mut iter = self.m_memory_block_manager.find_iterator(addr);
         let Some(first_block) = iter.next() else {
-            return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), None, None, None, 0);
+            return (
+                svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                None,
+                None,
+                None,
+                0,
+            );
         };
 
         // If start address isn't aligned to block start, need a split.
@@ -543,13 +564,31 @@ impl KPageTableBase {
         loop {
             // All blocks must have the same state/perm/attr (ignoring ignore_attr).
             if info.m_state != first_state {
-                return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), None, None, None, 0);
+                return (
+                    svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                    None,
+                    None,
+                    None,
+                    0,
+                );
             }
             if info.m_permission != first_perm {
-                return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), None, None, None, 0);
+                return (
+                    svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                    None,
+                    None,
+                    None,
+                    0,
+                );
             }
             if (info.m_attribute | ignore_attr) != (first_attr | ignore_attr) {
-                return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), None, None, None, 0);
+                return (
+                    svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                    None,
+                    None,
+                    None,
+                    0,
+                );
             }
 
             // Check against the provided masks.
@@ -565,7 +604,13 @@ impl KPageTableBase {
             }
 
             let Some(next_block) = iter.next() else {
-                return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), None, None, None, 0);
+                return (
+                    svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                    None,
+                    None,
+                    None,
+                    0,
+                );
             };
             info = next_block.get_memory_info();
         }
@@ -576,7 +621,13 @@ impl KPageTableBase {
         }
 
         let out_attr = first_attr & !ignore_attr;
-        (0, Some(first_state), Some(first_perm), Some(out_attr), blocks_needed)
+        (
+            0,
+            Some(first_state),
+            Some(first_perm),
+            Some(out_attr),
+            blocks_needed,
+        )
     }
 
     /// Convenience: check memory state, discarding output.
@@ -593,7 +644,14 @@ impl KPageTableBase {
         attr: KMemoryAttribute,
     ) -> u32 {
         let (result, _, _, _, _) = self.check_memory_state_range(
-            addr, size, state_mask, state, perm_mask, perm, attr_mask, attr,
+            addr,
+            size,
+            state_mask,
+            state,
+            perm_mask,
+            perm,
+            attr_mask,
+            attr,
             Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         result
@@ -652,7 +710,9 @@ impl KPageTableBase {
 
         // Adjust for 32-bit without alias.
         // Upstream: AddressSpace32BitWithoutAlias = 2 << 1 = 4
-        if (as_flags & ADDRESS_SPACE_MASK) == CreateProcessFlag::ADDRESS_SPACE_32_BIT_WITHOUT_ALIAS.bits() {
+        if (as_flags & ADDRESS_SPACE_MASK)
+            == CreateProcessFlag::ADDRESS_SPACE_32_BIT_WITHOUT_ALIAS.bits()
+        {
             heap_region_size += alias_region_size;
             alias_region_size = 0;
         }
@@ -668,14 +728,16 @@ impl KPageTableBase {
             heap_region_size = get_space_size(AddressSpaceInfoType::Heap);
             stack_region_size = get_space_size(AddressSpaceInfoType::Stack);
             kernel_map_region_size = get_space_size(AddressSpaceInfoType::MapSmall);
-            self.m_code_region_start = self.m_address_space_start + aslr_space_start
+            self.m_code_region_start = self.m_address_space_start
+                + aslr_space_start
                 + get_space_start(AddressSpaceInfoType::Map39Bit);
             self.m_code_region_end =
                 self.m_code_region_start + get_space_size(AddressSpaceInfoType::Map39Bit);
             self.m_alias_code_region_start = self.m_code_region_start;
             self.m_alias_code_region_end = self.m_code_region_end;
             process_code_start = code_address & !(REGION_ALIGNMENT - 1);
-            process_code_end = (code_address + code_size + REGION_ALIGNMENT - 1) & !(REGION_ALIGNMENT - 1);
+            process_code_end =
+                (code_address + code_size + REGION_ALIGNMENT - 1) & !(REGION_ALIGNMENT - 1);
         } else {
             stack_region_size = 0;
             kernel_map_region_size = 0;
@@ -710,7 +772,8 @@ impl KPageTableBase {
             alloc_start = process_code_end;
             alloc_size = end - process_code_end;
         }
-        let needed_size = alias_region_size + heap_region_size + stack_region_size + kernel_map_region_size;
+        let needed_size =
+            alias_region_size + heap_region_size + stack_region_size + kernel_map_region_size;
         if alloc_size < needed_size {
             return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
         }
@@ -724,7 +787,9 @@ impl KPageTableBase {
                 0
             };
             let gen = |max: usize| -> usize {
-                if max == 0 { return 0; }
+                if max == 0 {
+                    return 0;
+                }
                 use std::collections::hash_map::DefaultHasher;
                 use std::hash::{Hash, Hasher};
                 let mut h = DefaultHasher::new();
@@ -735,7 +800,12 @@ impl KPageTableBase {
                     .hash(&mut h);
                 (h.finish() as usize % (max + 1)) * REGION_ALIGNMENT
             };
-            (gen(max_units), gen(max_units), gen(max_units), gen(max_units))
+            (
+                gen(max_units),
+                gen(max_units),
+                gen(max_units),
+                gen(max_units),
+            )
         } else {
             (0, 0, 0, 0)
         };
@@ -826,10 +896,10 @@ impl KPageTableBase {
         } else {
             k_memory_manager::Direction::FromFront
         };
-        self.m_allocate_option =
-            ((pool & k_memory_manager::Pool::MASK) << k_memory_manager::Pool::SHIFT)
-                | ((direction as u32 & k_memory_manager::Direction::MASK)
-                    << k_memory_manager::Direction::SHIFT);
+        self.m_allocate_option = ((pool & k_memory_manager::Pool::MASK)
+            << k_memory_manager::Pool::SHIFT)
+            | ((direction as u32 & k_memory_manager::Direction::MASK)
+                << k_memory_manager::Direction::SHIFT);
 
         // Validate regions inside address space.
         debug_assert!(self.m_alias_region_start >= self.m_address_space_start);
@@ -854,12 +924,19 @@ impl KPageTableBase {
             "KPageTableBase::InitializeForProcess: width={}, code=[{:#x}..{:#x}], \
              alias_code=[{:#x}..{:#x}], heap=[{:#x}..{:#x}], alias=[{:#x}..{:#x}], \
              stack=[{:#x}..{:#x}], kmap=[{:#x}..{:#x}]",
-            as_width, self.m_code_region_start, self.m_code_region_end,
-            self.m_alias_code_region_start, self.m_alias_code_region_end,
-            self.m_heap_region_start, self.m_heap_region_end,
-            self.m_alias_region_start, self.m_alias_region_end,
-            self.m_stack_region_start, self.m_stack_region_end,
-            self.m_kernel_map_region_start, self.m_kernel_map_region_end,
+            as_width,
+            self.m_code_region_start,
+            self.m_code_region_end,
+            self.m_alias_code_region_start,
+            self.m_alias_code_region_end,
+            self.m_heap_region_start,
+            self.m_heap_region_end,
+            self.m_alias_region_start,
+            self.m_alias_region_end,
+            self.m_stack_region_start,
+            self.m_stack_region_end,
+            self.m_kernel_map_region_start,
+            self.m_kernel_map_region_end,
         );
 
         0 // success
@@ -894,7 +971,9 @@ impl KPageTableBase {
 
     /// Convert KMemoryPermission to Common::MemoryPermission.
     /// Matches upstream `ConvertToMemoryPermission`.
-    fn convert_to_memory_permission(perm: KMemoryPermission) -> crate::memory::memory::MemoryPermission {
+    fn convert_to_memory_permission(
+        perm: KMemoryPermission,
+    ) -> crate::memory::memory::MemoryPermission {
         use crate::memory::memory::MemoryPermission;
         let mut perms = MemoryPermission::empty();
         if perm.contains(KMemoryPermission::USER_READ) {
@@ -978,7 +1057,10 @@ impl KPageTableBase {
                 0
             }
             _ => {
-                log::error!("KPageTableBase::Operate: unhandled operation {:?}", operation);
+                log::error!(
+                    "KPageTableBase::Operate: unhandled operation {:?}",
+                    operation
+                );
                 svc_results::RESULT_INVALID_STATE.get_inner_value()
             }
         }
@@ -1025,8 +1107,7 @@ impl KPageTableBase {
                         (h.finish() as usize % ((max_offset_pages * PAGE_SIZE / alignment) + 1))
                             * alignment
                     };
-                    let candidate =
-                        ((region_start + random_offset) & !(alignment - 1)) + offset;
+                    let candidate = ((region_start + random_offset) & !(alignment - 1)) + offset;
 
                     if let Some(info) = self.m_memory_block_manager.query_info(candidate) {
                         if info.m_state != KMemoryState::FREE {
@@ -1066,26 +1147,32 @@ impl KPageTableBase {
                             .hash(&mut h);
                         h.finish() as usize % (max_offset_pages + 1)
                     };
-                    address = self.m_memory_block_manager.find_free_area(
-                        region_start + offset_pages * PAGE_SIZE,
-                        region_num_pages.saturating_sub(offset_pages),
-                        num_pages,
-                        alignment,
-                        offset,
-                        guard_pages,
-                    ).unwrap_or(0);
+                    address = self
+                        .m_memory_block_manager
+                        .find_free_area(
+                            region_start + offset_pages * PAGE_SIZE,
+                            region_num_pages.saturating_sub(offset_pages),
+                            num_pages,
+                            alignment,
+                            offset,
+                            guard_pages,
+                        )
+                        .unwrap_or(0);
                 }
             }
             // Find the first free area (no ASLR or fallback).
             if address == 0 {
-                address = self.m_memory_block_manager.find_free_area(
-                    region_start,
-                    region_num_pages,
-                    num_pages,
-                    alignment,
-                    offset,
-                    guard_pages,
-                ).unwrap_or(0);
+                address = self
+                    .m_memory_block_manager
+                    .find_free_area(
+                        region_start,
+                        region_num_pages,
+                        num_pages,
+                        alignment,
+                        offset,
+                        guard_pages,
+                    )
+                    .unwrap_or(0);
             }
         }
 
@@ -1249,7 +1336,10 @@ impl KPageTableBase {
         // In our emulator, DeviceMemory is pre-allocated and may contain stale data,
         // so we must explicitly zero the heap region after mapping.
         if let Some(memory) = &self.m_memory {
-            memory.lock().unwrap().zero_block(cur_address as u64, allocation_size);
+            memory
+                .lock()
+                .unwrap()
+                .zero_block(cur_address as u64, allocation_size);
         }
 
         memory_reservation.commit();
@@ -1317,10 +1407,14 @@ impl KPageTableBase {
         // Check current memory state — verify the region can be reprotected.
         // Upstream: state_mask = FlagCanReprotect, state = FlagCanReprotect
         let (result, out_state, _out_perm, _out_attr, _) = self.check_memory_state_range(
-            addr, size,
-            KMemoryState::FLAG_CAN_REPROTECT, KMemoryState::FLAG_CAN_REPROTECT,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            addr,
+            size,
+            KMemoryState::FLAG_CAN_REPROTECT,
+            KMemoryState::FLAG_CAN_REPROTECT,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
             Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
@@ -1371,13 +1465,7 @@ impl KPageTableBase {
 
     /// Set memory attribute for a range.
     /// Matches upstream `KPageTableBase::SetMemoryAttribute`.
-    pub fn set_memory_attribute(
-        &mut self,
-        addr: usize,
-        size: usize,
-        mask: u32,
-        attr: u32,
-    ) -> u32 {
+    pub fn set_memory_attribute(&mut self, addr: usize, size: usize, mask: u32, attr: u32) -> u32 {
         let num_pages = size / PAGE_SIZE;
         let mask_attr = KMemoryAttribute::from_bits_truncate(mask as u8);
         let set_attr = KMemoryAttribute::from_bits_truncate(attr as u8);
@@ -1401,9 +1489,14 @@ impl KPageTableBase {
         );
         let ignore_attr = KMemoryAttribute::from_bits_truncate(!attr_test_mask.bits());
         let (result, _out_state, out_perm, out_attr, _) = self.check_memory_state_range(
-            addr, size, state_test_mask, state_test_mask,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            attr_test_mask, KMemoryAttribute::NONE,
+            addr,
+            size,
+            state_test_mask,
+            state_test_mask,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            attr_test_mask,
+            KMemoryAttribute::NONE,
             ignore_attr,
         );
         if result != 0 {
@@ -1425,7 +1518,11 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::NONE,
             };
             let op_result = self.operate(
-                addr, num_pages, 0, false, properties,
+                addr,
+                num_pages,
+                0,
+                false,
+                properties,
                 OperationType::ChangePermissionsAndRefreshAndFlush,
             );
             if op_result != 0 {
@@ -1434,9 +1531,8 @@ impl KPageTableBase {
         }
 
         // Update the blocks via UpdateAttribute.
-        self.m_memory_block_manager.update_attribute(
-            addr, num_pages, mask_attr, set_attr,
-        );
+        self.m_memory_block_manager
+            .update_attribute(addr, num_pages, mask_attr, set_attr);
         0
     }
 
@@ -1449,22 +1545,34 @@ impl KPageTableBase {
 
         // Check source state — must be aliasable and UserReadWrite.
         let (result, out_src_state, _, _, _) = self.check_memory_state_range(
-            src, size,
-            KMemoryState::FLAG_CAN_ALIAS, KMemoryState::FLAG_CAN_ALIAS,
-            KMemoryPermission::from_bits_truncate(0xFF), KMemoryPermission::USER_READ_WRITE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            src,
+            size,
+            KMemoryState::FLAG_CAN_ALIAS,
+            KMemoryState::FLAG_CAN_ALIAS,
+            KMemoryPermission::from_bits_truncate(0xFF),
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
             Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         // Check destination state — must be Free.
         let result = self.check_memory_state(
-            dst, size,
-            KMemoryState::MASK, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::NONE, KMemoryAttribute::NONE,
+            dst,
+            size,
+            KMemoryState::MASK,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         let src_state = out_src_state.unwrap_or(KMemoryState::NORMAL);
 
@@ -1473,39 +1581,73 @@ impl KPageTableBase {
             KMemoryPermission::KERNEL_READ.bits() | KMemoryPermission::NOT_MAPPED.bits(),
         );
         let src_props = KPageProperties {
-            perm: src_new_perm, io: false, uncached: false,
+            perm: src_new_perm,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD_BODY_TAIL,
         };
-        let op_result = self.operate(src, num_pages, 0, false, src_props, OperationType::ChangePermissions);
-        if op_result != 0 { return op_result; }
+        let op_result = self.operate(
+            src,
+            num_pages,
+            0,
+            false,
+            src_props,
+            OperationType::ChangePermissions,
+        );
+        if op_result != 0 {
+            return op_result;
+        }
 
         // Map dst using the same physical pages as src.
         let phys_addr = crate::device_memory::dram_memory_map::BASE + src as u64;
         let dst_props = KPageProperties {
-            perm: KMemoryPermission::USER_READ_WRITE, io: false, uncached: false,
+            perm: KMemoryPermission::USER_READ_WRITE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op_result = self.operate(dst, num_pages, phys_addr, true, dst_props, OperationType::Map);
+        let op_result = self.operate(
+            dst,
+            num_pages,
+            phys_addr,
+            true,
+            dst_props,
+            OperationType::Map,
+        );
         if op_result != 0 {
             // Revert source on failure.
             let revert_props = KPageProperties {
-                perm: KMemoryPermission::USER_READ_WRITE, io: false, uncached: false,
+                perm: KMemoryPermission::USER_READ_WRITE,
+                io: false,
+                uncached: false,
                 disable_merge_attributes: DisableMergeAttribute::ENABLE_HEAD_BODY_TAIL,
             };
-            let _ = self.operate(src, num_pages, 0, false, revert_props, OperationType::ChangePermissions);
+            let _ = self.operate(
+                src,
+                num_pages,
+                0,
+                false,
+                revert_props,
+                OperationType::ChangePermissions,
+            );
             return op_result;
         }
 
         // Update source block.
         self.m_memory_block_manager.update(
-            src, num_pages, src_state, src_new_perm,
+            src,
+            num_pages,
+            src_state,
+            src_new_perm,
             KMemoryAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
         // Update destination block.
         self.m_memory_block_manager.update(
-            dst, num_pages, KMemoryState::STACK,
+            dst,
+            num_pages,
+            KMemoryState::STACK,
             KMemoryPermission::USER_READ_WRITE,
             KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
@@ -1521,48 +1663,81 @@ impl KPageTableBase {
 
         // Check source is locked/aliased.
         let result = self.check_memory_state(
-            src, size,
-            KMemoryState::FLAG_CAN_ALIAS, KMemoryState::FLAG_CAN_ALIAS,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::LOCKED,
+            src,
+            size,
+            KMemoryState::FLAG_CAN_ALIAS,
+            KMemoryState::FLAG_CAN_ALIAS,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::LOCKED,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         // Check destination is Stack.
         let result = self.check_memory_state(
-            dst, size,
-            KMemoryState::MASK, KMemoryState::STACK,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            dst,
+            size,
+            KMemoryState::MASK,
+            KMemoryState::STACK,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         // Unmap the destination.
         let unmap_props = KPageProperties {
-            perm: KMemoryPermission::NONE, io: false, uncached: false,
+            perm: KMemoryPermission::NONE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op_result = self.operate(dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
-        if op_result != 0 { return op_result; }
+        if op_result != 0 {
+            return op_result;
+        }
 
         // Restore source permissions.
         let restore_props = KPageProperties {
-            perm: KMemoryPermission::USER_READ_WRITE, io: false, uncached: false,
+            perm: KMemoryPermission::USER_READ_WRITE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::ENABLE_AND_MERGE_HEAD_BODY_TAIL,
         };
-        let op_result = self.operate(src, num_pages, 0, false, restore_props, OperationType::ChangePermissions);
-        if op_result != 0 { return op_result; }
+        let op_result = self.operate(
+            src,
+            num_pages,
+            0,
+            false,
+            restore_props,
+            OperationType::ChangePermissions,
+        );
+        if op_result != 0 {
+            return op_result;
+        }
 
         // Update blocks.
         self.m_memory_block_manager.update(
-            src, num_pages, KMemoryState::NORMAL,
-            KMemoryPermission::USER_READ_WRITE, KMemoryAttribute::NONE,
+            src,
+            num_pages,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::LOCKED,
         );
         self.m_memory_block_manager.update(
-            dst, num_pages, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryAttribute::NONE,
+            dst,
+            num_pages,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
         );
@@ -1600,7 +1775,14 @@ impl KPageTableBase {
             state.bits() | KMemoryState::FLAG_REFERENCE_COUNTED.bits(),
         );
         let (result, out_state, out_old_perm, out_old_attr, _) = self.check_memory_state_range(
-            addr, size, check_state_mask, check_state, perm_mask, perm, attr_mask, attr,
+            addr,
+            size,
+            check_state_mask,
+            check_state,
+            perm_mask,
+            perm,
+            attr_mask,
+            attr,
             Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
@@ -1616,7 +1798,11 @@ impl KPageTableBase {
         *out_paddr = crate::device_memory::dram_memory_map::BASE + addr as u64;
 
         // Determine new perm and attr.
-        let effective_new_perm = if new_perm != KMemoryPermission::NONE { new_perm } else { old_perm };
+        let effective_new_perm = if new_perm != KMemoryPermission::NONE {
+            new_perm
+        } else {
+            old_perm
+        };
         let new_attr = KMemoryAttribute::from_bits_truncate(old_attr.bits() | lock_attr.bits());
 
         // Change permissions if needed.
@@ -1629,7 +1815,12 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD_BODY_TAIL,
             };
             let op_result = self.operate(
-                addr, num_pages, 0, false, properties, OperationType::ChangePermissions,
+                addr,
+                num_pages,
+                0,
+                false,
+                properties,
+                OperationType::ChangePermissions,
             );
             if op_result != 0 {
                 return op_result;
@@ -1638,7 +1829,11 @@ impl KPageTableBase {
 
         // Update block manager.
         self.m_memory_block_manager.update(
-            addr, num_pages, old_state, effective_new_perm, new_attr,
+            addr,
+            num_pages,
+            old_state,
+            effective_new_perm,
+            new_attr,
             KMemoryBlockDisableMergeAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
@@ -1674,7 +1869,14 @@ impl KPageTableBase {
             state.bits() | KMemoryState::FLAG_REFERENCE_COUNTED.bits(),
         );
         let (result, out_state, out_old_perm, out_old_attr, _) = self.check_memory_state_range(
-            addr, size, check_state_mask, check_state, perm_mask, perm, attr_mask, attr,
+            addr,
+            size,
+            check_state_mask,
+            check_state,
+            perm_mask,
+            perm,
+            attr_mask,
+            attr,
             Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
@@ -1685,7 +1887,11 @@ impl KPageTableBase {
         let old_perm = out_old_perm.unwrap_or(KMemoryPermission::NONE);
         let old_attr = out_old_attr.unwrap_or(KMemoryAttribute::NONE);
 
-        let effective_new_perm = if new_perm != KMemoryPermission::NONE { new_perm } else { old_perm };
+        let effective_new_perm = if new_perm != KMemoryPermission::NONE {
+            new_perm
+        } else {
+            old_perm
+        };
         let new_attr = KMemoryAttribute::from_bits_truncate(old_attr.bits() & !lock_attr.bits());
 
         // Change permissions if needed.
@@ -1698,7 +1904,12 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::ENABLE_AND_MERGE_HEAD_BODY_TAIL,
             };
             let op_result = self.operate(
-                addr, num_pages, 0, false, properties, OperationType::ChangePermissions,
+                addr,
+                num_pages,
+                0,
+                false,
+                properties,
+                OperationType::ChangePermissions,
             );
             if op_result != 0 {
                 return op_result;
@@ -1707,7 +1918,11 @@ impl KPageTableBase {
 
         // Update block manager.
         self.m_memory_block_manager.update(
-            addr, num_pages, old_state, effective_new_perm, new_attr,
+            addr,
+            num_pages,
+            old_state,
+            effective_new_perm,
+            new_attr,
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::LOCKED,
         );
@@ -1717,9 +1932,16 @@ impl KPageTableBase {
 
     /// Lock memory for IPC user buffer.
     /// Matches upstream `KPageTableBase::LockForIpcUserBuffer`.
-    pub fn lock_for_ipc_user_buffer(&mut self, out_paddr: &mut u64, addr: usize, size: usize) -> u32 {
+    pub fn lock_for_ipc_user_buffer(
+        &mut self,
+        out_paddr: &mut u64,
+        addr: usize,
+        size: usize,
+    ) -> u32 {
         self.lock_memory_and_open(
-            out_paddr, addr, size,
+            out_paddr,
+            addr,
+            size,
             KMemoryState::FLAG_CAN_IPC_USER_BUFFER,
             KMemoryState::FLAG_CAN_IPC_USER_BUFFER,
             KMemoryPermission::from_bits_truncate(0xFF), // All
@@ -1738,7 +1960,8 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::UnlockForIpcUserBuffer`.
     pub fn unlock_for_ipc_user_buffer(&mut self, addr: usize, size: usize) -> u32 {
         self.unlock_memory(
-            addr, size,
+            addr,
+            size,
             KMemoryState::FLAG_CAN_IPC_USER_BUFFER,
             KMemoryState::FLAG_CAN_IPC_USER_BUFFER,
             KMemoryPermission::NONE,
@@ -1768,21 +1991,40 @@ impl KPageTableBase {
 
         // Map the pages.
         let properties = KPageProperties {
-            perm, io: false, uncached: false,
+            perm,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op_result = self.operate(addr, num_pages, phys_addr, true, properties, OperationType::Map);
-        if op_result != 0 { return op_result; }
+        let op_result = self.operate(
+            addr,
+            num_pages,
+            phys_addr,
+            true,
+            properties,
+            OperationType::Map,
+        );
+        if op_result != 0 {
+            return op_result;
+        }
 
         // Update block manager.
         self.m_memory_block_manager.update(
-            addr, num_pages, KMemoryState::STATIC, perm,
+            addr,
+            num_pages,
+            KMemoryState::STATIC,
+            perm,
             KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
 
-        log::debug!("KPageTableBase::map_static(phys={:#x}, size={:#x}) -> va={:#x}", phys_addr, size, addr);
+        log::debug!(
+            "KPageTableBase::map_static(phys={:#x}, size={:#x}) -> va={:#x}",
+            phys_addr,
+            size,
+            addr
+        );
         0
     }
 
@@ -1802,21 +2044,40 @@ impl KPageTableBase {
 
         // Map the pages.
         let properties = KPageProperties {
-            perm, io: true, uncached: true,
+            perm,
+            io: true,
+            uncached: true,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op_result = self.operate(addr, num_pages, phys_addr, true, properties, OperationType::Map);
-        if op_result != 0 { return op_result; }
+        let op_result = self.operate(
+            addr,
+            num_pages,
+            phys_addr,
+            true,
+            properties,
+            OperationType::Map,
+        );
+        if op_result != 0 {
+            return op_result;
+        }
 
         // Update block manager.
         self.m_memory_block_manager.update(
-            addr, num_pages, KMemoryState::IO_REGISTER, perm,
+            addr,
+            num_pages,
+            KMemoryState::IO_REGISTER,
+            perm,
             KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
 
-        log::debug!("KPageTableBase::map_io(phys={:#x}, size={:#x}) -> va={:#x}", phys_addr, size, addr);
+        log::debug!(
+            "KPageTableBase::map_io(phys={:#x}, size={:#x}) -> va={:#x}",
+            phys_addr,
+            size,
+            addr
+        );
         0
     }
 
@@ -1825,7 +2086,10 @@ impl KPageTableBase {
     pub fn map_region(&mut self, _region_type: u32, _perm: KMemoryPermission) -> u32 {
         // Upstream: looks up the region in KMemoryLayout, gets physical address/size,
         // delegates to MapStatic. KMemoryLayout is not yet ported.
-        log::debug!("KPageTableBase::map_region(type={}) — KMemoryLayout not yet ported", _region_type);
+        log::debug!(
+            "KPageTableBase::map_region(type={}) — KMemoryLayout not yet ported",
+            _region_type
+        );
         0
     }
 
@@ -1847,7 +2111,10 @@ impl KPageTableBase {
         debug_assert!(alignment >= PAGE_SIZE && alignment % PAGE_SIZE == 0);
 
         if !self.can_contain_k(region_start, region_num_pages * PAGE_SIZE, state) {
-            return (svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), 0);
+            return (
+                svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                0,
+            );
         }
         if num_pages >= region_num_pages {
             return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
@@ -1855,7 +2122,12 @@ impl KPageTableBase {
 
         // Find free area.
         let addr = self.find_free_area(
-            region_start, region_num_pages, num_pages, alignment, 0, self.get_num_guard_pages(),
+            region_start,
+            region_num_pages,
+            num_pages,
+            alignment,
+            0,
+            self.get_num_guard_pages(),
         );
         if addr == 0 {
             return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
@@ -1863,35 +2135,67 @@ impl KPageTableBase {
 
         // Verify the area is free.
         let result = self.check_memory_state(
-            addr, num_pages * PAGE_SIZE,
-            KMemoryState::MASK, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::NONE, KMemoryAttribute::NONE,
+            addr,
+            num_pages * PAGE_SIZE,
+            KMemoryState::MASK,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
         );
-        if result != 0 { return (result, 0); }
+        if result != 0 {
+            return (result, 0);
+        }
 
         // Map.
         if is_pa_valid {
             let properties = KPageProperties {
-                perm, io: false, uncached: false,
+                perm,
+                io: false,
+                uncached: false,
                 disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
             };
-            let op_result = self.operate(addr, num_pages, phys_addr, true, properties, OperationType::Map);
-            if op_result != 0 { return (op_result, 0); }
+            let op_result = self.operate(
+                addr,
+                num_pages,
+                phys_addr,
+                true,
+                properties,
+                OperationType::Map,
+            );
+            if op_result != 0 {
+                return (op_result, 0);
+            }
         } else {
             // Allocate and map — use DramMemoryMap::Base + addr as phys.
             let auto_phys = crate::device_memory::dram_memory_map::BASE + addr as u64;
             let properties = KPageProperties {
-                perm, io: false, uncached: false,
+                perm,
+                io: false,
+                uncached: false,
                 disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
             };
-            let op_result = self.operate(addr, num_pages, auto_phys, true, properties, OperationType::Map);
-            if op_result != 0 { return (op_result, 0); }
+            let op_result = self.operate(
+                addr,
+                num_pages,
+                auto_phys,
+                true,
+                properties,
+                OperationType::Map,
+            );
+            if op_result != 0 {
+                return (op_result, 0);
+            }
         }
 
         // Update blocks.
         self.m_memory_block_manager.update(
-            addr, num_pages, state, perm, KMemoryAttribute::NONE,
+            addr,
+            num_pages,
+            state,
+            perm,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
@@ -1915,25 +2219,46 @@ impl KPageTableBase {
 
         // Check the target area is free.
         let result = self.check_memory_state(
-            addr, size,
-            KMemoryState::MASK, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::NONE, KMemoryAttribute::NONE,
+            addr,
+            size,
+            KMemoryState::MASK,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         // Allocate and map.
         let phys_addr = crate::device_memory::dram_memory_map::BASE + addr as u64;
         let properties = KPageProperties {
-            perm, io: false, uncached: false,
+            perm,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op_result = self.operate(addr, num_pages, phys_addr, true, properties, OperationType::Map);
-        if op_result != 0 { return op_result; }
+        let op_result = self.operate(
+            addr,
+            num_pages,
+            phys_addr,
+            true,
+            properties,
+            OperationType::Map,
+        );
+        if op_result != 0 {
+            return op_result;
+        }
 
         // Update blocks.
         self.m_memory_block_manager.update(
-            addr, num_pages, state, perm, KMemoryAttribute::NONE,
+            addr,
+            num_pages,
+            state,
+            perm,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
@@ -1950,25 +2275,38 @@ impl KPageTableBase {
 
         // Check the state matches.
         let result = self.check_memory_state(
-            addr, size,
-            KMemoryState::MASK, state,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            addr,
+            size,
+            KMemoryState::MASK,
+            state,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         // Unmap.
         let unmap_props = KPageProperties {
-            perm: KMemoryPermission::NONE, io: false, uncached: false,
+            perm: KMemoryPermission::NONE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op_result = self.operate(addr, num_pages, 0, false, unmap_props, OperationType::Unmap);
-        if op_result != 0 { return op_result; }
+        if op_result != 0 {
+            return op_result;
+        }
 
         // Update blocks.
         self.m_memory_block_manager.update(
-            addr, num_pages, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryAttribute::NONE,
+            addr,
+            num_pages,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
         );
@@ -1989,10 +2327,14 @@ impl KPageTableBase {
 
         // Check current state — must be Code-flagged.
         let (result, out_state, out_perm, _out_attr, _) = self.check_memory_state_range(
-            addr, size,
-            KMemoryState::FLAG_CODE, KMemoryState::FLAG_CODE,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            addr,
+            size,
+            KMemoryState::FLAG_CODE,
+            KMemoryState::FLAG_CODE,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
             Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
@@ -2069,15 +2411,29 @@ impl KPageTableBase {
         let phys_addr = crate::device_memory::dram_memory_map::BASE + addr as u64;
 
         let properties = KPageProperties {
-            perm: KMemoryPermission::USER_READ_WRITE, io: false, uncached: false,
+            perm: KMemoryPermission::USER_READ_WRITE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op_result = self.operate(addr, num_pages, phys_addr, true, properties, OperationType::Map);
-        if op_result != 0 { return op_result; }
+        let op_result = self.operate(
+            addr,
+            num_pages,
+            phys_addr,
+            true,
+            properties,
+            OperationType::Map,
+        );
+        if op_result != 0 {
+            return op_result;
+        }
 
         self.m_memory_block_manager.update(
-            addr, num_pages, KMemoryState::NORMAL,
-            KMemoryPermission::USER_READ_WRITE, KMemoryAttribute::NONE,
+            addr,
+            num_pages,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
@@ -2094,21 +2450,34 @@ impl KPageTableBase {
         let num_pages = size / PAGE_SIZE;
 
         let unmap_props = KPageProperties {
-            perm: KMemoryPermission::NONE, io: false, uncached: false,
+            perm: KMemoryPermission::NONE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op_result = self.operate(
-            addr, num_pages, 0, false, unmap_props, OperationType::UnmapPhysical,
+            addr,
+            num_pages,
+            0,
+            false,
+            unmap_props,
+            OperationType::UnmapPhysical,
         );
-        if op_result != 0 { return op_result; }
+        if op_result != 0 {
+            return op_result;
+        }
 
         self.m_memory_block_manager.update(
-            addr, num_pages, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryAttribute::NONE,
+            addr,
+            num_pages,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
         );
-        self.m_mapped_physical_memory_size = self.m_mapped_physical_memory_size.saturating_sub(size);
+        self.m_mapped_physical_memory_size =
+            self.m_mapped_physical_memory_size.saturating_sub(size);
         0
     }
 
@@ -2124,10 +2493,15 @@ impl KPageTableBase {
     ) -> u32 {
         let mut paddr = 0u64;
         self.lock_memory_and_open(
-            &mut paddr, addr, size,
-            KMemoryState::FLAG_CAN_TRANSFER, KMemoryState::FLAG_CAN_TRANSFER,
-            KMemoryPermission::from_bits_truncate(0xFF), KMemoryPermission::USER_READ_WRITE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            &mut paddr,
+            addr,
+            size,
+            KMemoryState::FLAG_CAN_TRANSFER,
+            KMemoryState::FLAG_CAN_TRANSFER,
+            KMemoryPermission::from_bits_truncate(0xFF),
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
             perm,
             KMemoryAttribute::LOCKED,
         )
@@ -2137,10 +2511,14 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::UnlockForTransferMemory`.
     pub fn unlock_for_transfer_memory(&mut self, addr: usize, size: usize) -> u32 {
         self.unlock_memory(
-            addr, size,
-            KMemoryState::FLAG_CAN_TRANSFER, KMemoryState::FLAG_CAN_TRANSFER,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::LOCKED,
+            addr,
+            size,
+            KMemoryState::FLAG_CAN_TRANSFER,
+            KMemoryState::FLAG_CAN_TRANSFER,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::LOCKED,
             KMemoryPermission::USER_READ_WRITE,
             KMemoryAttribute::LOCKED,
         )
@@ -2158,20 +2536,34 @@ impl KPageTableBase {
 
         // Check source: Normal, UserReadWrite.
         let (result, _, _, _, _) = self.check_memory_state_range(
-            src, size, KMemoryState::MASK, KMemoryState::NORMAL,
-            KMemoryPermission::from_bits_truncate(0xFF), KMemoryPermission::USER_READ_WRITE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            src,
+            size,
+            KMemoryState::MASK,
+            KMemoryState::NORMAL,
+            KMemoryPermission::from_bits_truncate(0xFF),
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
             Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         // Check destination: Free.
         let result = self.check_memory_state(
-            dst, size, KMemoryState::MASK, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::NONE, KMemoryAttribute::NONE,
+            dst,
+            size,
+            KMemoryState::MASK,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         let new_perm = KMemoryPermission::from_bits_truncate(
             KMemoryPermission::KERNEL_READ.bits() | KMemoryPermission::NOT_MAPPED.bits(),
@@ -2179,37 +2571,72 @@ impl KPageTableBase {
 
         // Reprotect source.
         let src_props = KPageProperties {
-            perm: new_perm, io: false, uncached: false,
+            perm: new_perm,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD_BODY_TAIL,
         };
-        let op = self.operate(src, num_pages, 0, false, src_props, OperationType::ChangePermissions);
-        if op != 0 { return op; }
+        let op = self.operate(
+            src,
+            num_pages,
+            0,
+            false,
+            src_props,
+            OperationType::ChangePermissions,
+        );
+        if op != 0 {
+            return op;
+        }
 
         // Map dst using same physical pages.
         let phys_addr = crate::device_memory::dram_memory_map::BASE + src as u64;
         let dst_props = KPageProperties {
-            perm: new_perm, io: false, uncached: false,
+            perm: new_perm,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op = self.operate(dst, num_pages, phys_addr, true, dst_props, OperationType::Map);
+        let op = self.operate(
+            dst,
+            num_pages,
+            phys_addr,
+            true,
+            dst_props,
+            OperationType::Map,
+        );
         if op != 0 {
             let revert = KPageProperties {
-                perm: KMemoryPermission::USER_READ_WRITE, io: false, uncached: false,
+                perm: KMemoryPermission::USER_READ_WRITE,
+                io: false,
+                uncached: false,
                 disable_merge_attributes: DisableMergeAttribute::ENABLE_HEAD_BODY_TAIL,
             };
-            let _ = self.operate(src, num_pages, 0, false, revert, OperationType::ChangePermissions);
+            let _ = self.operate(
+                src,
+                num_pages,
+                0,
+                false,
+                revert,
+                OperationType::ChangePermissions,
+            );
             return op;
         }
 
         // Update blocks.
         self.m_memory_block_manager.update(
-            src, num_pages, KMemoryState::NORMAL, new_perm,
+            src,
+            num_pages,
+            KMemoryState::NORMAL,
+            new_perm,
             KMemoryAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
         self.m_memory_block_manager.update(
-            dst, num_pages, KMemoryState::ALIAS_CODE, new_perm,
+            dst,
+            num_pages,
+            KMemoryState::ALIAS_CODE,
+            new_perm,
             KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
@@ -2228,38 +2655,66 @@ impl KPageTableBase {
 
         // Check source: Normal, Locked.
         let result = self.check_memory_state(
-            src, size, KMemoryState::MASK, KMemoryState::NORMAL,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::LOCKED,
+            src,
+            size,
+            KMemoryState::MASK,
+            KMemoryState::NORMAL,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::LOCKED,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         // Unmap dst.
         let unmap_props = KPageProperties {
-            perm: KMemoryPermission::NONE, io: false, uncached: false,
+            perm: KMemoryPermission::NONE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op = self.operate(dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
-        if op != 0 { return op; }
+        if op != 0 {
+            return op;
+        }
 
         // Restore source permissions.
         let restore_props = KPageProperties {
-            perm: KMemoryPermission::USER_READ_WRITE, io: false, uncached: false,
+            perm: KMemoryPermission::USER_READ_WRITE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::ENABLE_AND_MERGE_HEAD_BODY_TAIL,
         };
-        let op = self.operate(src, num_pages, 0, false, restore_props, OperationType::ChangePermissions);
-        if op != 0 { return op; }
+        let op = self.operate(
+            src,
+            num_pages,
+            0,
+            false,
+            restore_props,
+            OperationType::ChangePermissions,
+        );
+        if op != 0 {
+            return op;
+        }
 
         // Update blocks.
         self.m_memory_block_manager.update(
-            dst, num_pages, KMemoryState::NONE,
-            KMemoryPermission::NONE, KMemoryAttribute::NONE,
+            dst,
+            num_pages,
+            KMemoryState::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
         );
         self.m_memory_block_manager.update(
-            src, num_pages, KMemoryState::NORMAL,
-            KMemoryPermission::USER_READ_WRITE, KMemoryAttribute::NONE,
+            src,
+            num_pages,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::LOCKED,
         );
@@ -2276,23 +2731,37 @@ impl KPageTableBase {
         }
 
         let result = self.check_memory_state(
-            addr, size, KMemoryState::MASK, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::NONE, KMemoryAttribute::NONE,
+            addr,
+            size,
+            KMemoryState::MASK,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         let phys_addr = crate::device_memory::dram_memory_map::BASE + addr as u64;
         let props = KPageProperties {
-            perm: KMemoryPermission::USER_READ_WRITE, io: false, uncached: false,
+            perm: KMemoryPermission::USER_READ_WRITE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
         let op = self.operate(addr, num_pages, phys_addr, true, props, OperationType::Map);
-        if op != 0 { return op; }
+        if op != 0 {
+            return op;
+        }
 
         self.m_memory_block_manager.update(
-            addr, num_pages, KMemoryState::INSECURE,
-            KMemoryPermission::USER_READ_WRITE, KMemoryAttribute::NONE,
+            addr,
+            num_pages,
+            KMemoryState::INSECURE,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
@@ -2308,22 +2777,36 @@ impl KPageTableBase {
         }
 
         let result = self.check_memory_state(
-            addr, size, KMemoryState::MASK, KMemoryState::INSECURE,
-            KMemoryPermission::from_bits_truncate(0xFF), KMemoryPermission::USER_READ_WRITE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            addr,
+            size,
+            KMemoryState::MASK,
+            KMemoryState::INSECURE,
+            KMemoryPermission::from_bits_truncate(0xFF),
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         let unmap_props = KPageProperties {
-            perm: KMemoryPermission::NONE, io: false, uncached: false,
+            perm: KMemoryPermission::NONE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op = self.operate(addr, num_pages, 0, false, unmap_props, OperationType::Unmap);
-        if op != 0 { return op; }
+        if op != 0 {
+            return op;
+        }
 
         self.m_memory_block_manager.update(
-            addr, num_pages, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryAttribute::NONE,
+            addr,
+            num_pages,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
         );
@@ -2337,7 +2820,10 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::GetSize`.
     pub fn get_size_by_state(&self, state: KMemoryState) -> usize {
         let mut total = 0usize;
-        for block in self.m_memory_block_manager.find_iterator(self.m_address_space_start) {
+        for block in self
+            .m_memory_block_manager
+            .find_iterator(self.m_address_space_start)
+        {
             let info = block.get_memory_info();
             if info.get_state() == state {
                 total += info.get_size();
@@ -2346,12 +2832,21 @@ impl KPageTableBase {
         total
     }
 
-    pub fn get_code_size(&self) -> usize { self.get_size_by_state(KMemoryState::CODE) }
-    pub fn get_code_data_size(&self) -> usize { self.get_size_by_state(KMemoryState::CODE_DATA) }
-    pub fn get_alias_code_size(&self) -> usize { self.get_size_by_state(KMemoryState::ALIAS_CODE) }
-    pub fn get_alias_code_data_size(&self) -> usize { self.get_size_by_state(KMemoryState::ALIAS_CODE_DATA) }
+    pub fn get_code_size(&self) -> usize {
+        self.get_size_by_state(KMemoryState::CODE)
+    }
+    pub fn get_code_data_size(&self) -> usize {
+        self.get_size_by_state(KMemoryState::CODE_DATA)
+    }
+    pub fn get_alias_code_size(&self) -> usize {
+        self.get_size_by_state(KMemoryState::ALIAS_CODE)
+    }
+    pub fn get_alias_code_data_size(&self) -> usize {
+        self.get_size_by_state(KMemoryState::ALIAS_CODE_DATA)
+    }
     pub fn get_normal_memory_size(&self) -> usize {
-        self.m_current_heap_end.saturating_sub(self.m_heap_region_start)
+        self.m_current_heap_end
+            .saturating_sub(self.m_heap_region_start)
             + self.m_mapped_physical_memory_size
     }
 
@@ -2371,10 +2866,19 @@ impl KPageTableBase {
         attr: KMemoryAttribute,
     ) -> Option<(u64, usize, bool)> {
         let (result, _, _, _, _) = self.check_memory_state_range(
-            addr, size, state_mask, state, perm_mask, perm, attr_mask, attr,
+            addr,
+            size,
+            state_mask,
+            state,
+            perm_mask,
+            perm,
+            attr_mask,
+            attr,
             Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
-        if result != 0 { return None; }
+        if result != 0 {
+            return None;
+        }
 
         // Physical address = DramMemoryMap::Base + virtual address.
         let phys_addr = crate::device_memory::dram_memory_map::BASE + addr as u64;
@@ -2417,7 +2921,10 @@ impl KPageTableBase {
     /// Copy memory between linear (kernel) and user address spaces.
     /// Matches upstream `KPageTableBase::CopyMemoryFromLinearToUser`.
     pub fn copy_memory_from_linear_to_user(
-        &self, _dst: usize, _size: usize, _src_state: KMemoryState,
+        &self,
+        _dst: usize,
+        _size: usize,
+        _src_state: KMemoryState,
         _src_test_perm: KMemoryPermission,
     ) -> u32 {
         // In our emulator, all memory is in the same backing.
@@ -2426,30 +2933,33 @@ impl KPageTableBase {
     }
 
     /// Matches upstream `KPageTableBase::CopyMemoryFromLinearToKernel`.
-    pub fn copy_memory_from_linear_to_kernel(
-        &self, _dst: usize, _size: usize,
-    ) -> u32 {
+    pub fn copy_memory_from_linear_to_kernel(&self, _dst: usize, _size: usize) -> u32 {
         0
     }
 
     /// Matches upstream `KPageTableBase::CopyMemoryFromUserToLinear`.
     pub fn copy_memory_from_user_to_linear(
-        &self, _dst: usize, _size: usize, _dst_state: KMemoryState,
+        &self,
+        _dst: usize,
+        _size: usize,
+        _dst_state: KMemoryState,
     ) -> u32 {
         0
     }
 
     /// Matches upstream `KPageTableBase::CopyMemoryFromKernelToLinear`.
-    pub fn copy_memory_from_kernel_to_linear(
-        &self, _dst: usize, _size: usize,
-    ) -> u32 {
+    pub fn copy_memory_from_kernel_to_linear(&self, _dst: usize, _size: usize) -> u32 {
         0
     }
 
     /// Matches upstream `KPageTableBase::CopyMemoryFromHeapToHeap`.
     pub fn copy_memory_from_heap_to_heap(
-        &self, _dst_table: &KPageTableBase, _src: usize, _size: usize,
-        _src_state: KMemoryState, _dst_state: KMemoryState,
+        &self,
+        _dst_table: &KPageTableBase,
+        _src: usize,
+        _size: usize,
+        _src_state: KMemoryState,
+        _dst_state: KMemoryState,
     ) -> u32 {
         0
     }
@@ -2458,8 +2968,11 @@ impl KPageTableBase {
 
     /// Matches upstream `KPageTableBase::SetupForIpcClient`.
     pub fn setup_for_ipc_client(
-        &mut self, _addr: usize, _size: usize,
-        _test_perm: KMemoryPermission, _dst_state: KMemoryState,
+        &mut self,
+        _addr: usize,
+        _size: usize,
+        _test_perm: KMemoryPermission,
+        _dst_state: KMemoryState,
     ) -> u32 {
         // Full IPC client setup: locks pages, creates mapping for server.
         // In our emulator, IPC buffers are directly accessible.
@@ -2468,23 +2981,34 @@ impl KPageTableBase {
 
     /// Matches upstream `KPageTableBase::SetupForIpcServer`.
     pub fn setup_for_ipc_server(
-        &mut self, _out_addr: &mut usize, _size: usize,
-        _src_addr: usize, _test_perm: KMemoryPermission,
-        _dst_state: KMemoryState, _src_table: &mut KPageTableBase, _send: bool,
+        &mut self,
+        _out_addr: &mut usize,
+        _size: usize,
+        _src_addr: usize,
+        _test_perm: KMemoryPermission,
+        _dst_state: KMemoryState,
+        _src_table: &mut KPageTableBase,
+        _send: bool,
     ) -> u32 {
         0
     }
 
     /// Matches upstream `KPageTableBase::CleanupForIpcServer`.
     pub fn cleanup_for_ipc_server(
-        &mut self, _addr: usize, _size: usize, _dst_state: KMemoryState,
+        &mut self,
+        _addr: usize,
+        _size: usize,
+        _dst_state: KMemoryState,
     ) -> u32 {
         0
     }
 
     /// Matches upstream `KPageTableBase::CleanupForIpcClient`.
     pub fn cleanup_for_ipc_client(
-        &mut self, _addr: usize, _size: usize, _dst_state: KMemoryState,
+        &mut self,
+        _addr: usize,
+        _size: usize,
+        _dst_state: KMemoryState,
     ) -> u32 {
         0
     }
@@ -2493,13 +3017,23 @@ impl KPageTableBase {
 
     /// Lock memory for code memory operations.
     /// Matches upstream `KPageTableBase::LockForCodeMemory`.
-    pub fn lock_for_code_memory(&mut self, addr: usize, size: usize, perm: KMemoryPermission) -> u32 {
+    pub fn lock_for_code_memory(
+        &mut self,
+        addr: usize,
+        size: usize,
+        perm: KMemoryPermission,
+    ) -> u32 {
         let mut paddr = 0u64;
         self.lock_memory_and_open(
-            &mut paddr, addr, size,
-            KMemoryState::FLAG_CAN_CODE_ALIAS, KMemoryState::FLAG_CAN_CODE_ALIAS,
-            KMemoryPermission::from_bits_truncate(0xFF), KMemoryPermission::USER_READ_WRITE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::NONE,
+            &mut paddr,
+            addr,
+            size,
+            KMemoryState::FLAG_CAN_CODE_ALIAS,
+            KMemoryState::FLAG_CAN_CODE_ALIAS,
+            KMemoryPermission::from_bits_truncate(0xFF),
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
             perm,
             KMemoryAttribute::LOCKED,
         )
@@ -2509,10 +3043,14 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::UnlockForCodeMemory`.
     pub fn unlock_for_code_memory(&mut self, addr: usize, size: usize) -> u32 {
         self.unlock_memory(
-            addr, size,
-            KMemoryState::FLAG_CAN_CODE_ALIAS, KMemoryState::FLAG_CAN_CODE_ALIAS,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF), KMemoryAttribute::LOCKED,
+            addr,
+            size,
+            KMemoryState::FLAG_CAN_CODE_ALIAS,
+            KMemoryState::FLAG_CAN_CODE_ALIAS,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::LOCKED,
             KMemoryPermission::USER_READ_WRITE,
             KMemoryAttribute::LOCKED,
         )
@@ -2522,8 +3060,11 @@ impl KPageTableBase {
 
     /// Matches upstream `KPageTableBase::LockForMapDeviceAddressSpace`.
     pub fn lock_for_map_device_address_space(
-        &mut self, addr: usize, size: usize,
-        perm: KMemoryPermission, is_aligned: bool,
+        &mut self,
+        addr: usize,
+        size: usize,
+        perm: KMemoryPermission,
+        is_aligned: bool,
     ) -> u32 {
         let state_flag = if is_aligned {
             KMemoryState::FLAG_CAN_ALIGNED_DEVICE_MAP
@@ -2554,9 +3095,9 @@ impl KPageTableBase {
         }
 
         let old_state = out_old_state.unwrap_or(KMemoryState::FREE);
-        let _was_io =
-            Self::k_state_to_svc(old_state & KMemoryState::from_bits_truncate(KMemoryState::MASK.bits()))
-                == SvcMemoryState::Io;
+        let _was_io = Self::k_state_to_svc(
+            old_state & KMemoryState::from_bits_truncate(KMemoryState::MASK.bits()),
+        ) == SvcMemoryState::Io;
 
         self.m_memory_block_manager.update_lock(
             addr,
@@ -2607,29 +3148,49 @@ impl KPageTableBase {
     // -- IO Region Mapping --
 
     /// Matches upstream `KPageTableBase::MapIoRegion`.
-    pub fn map_io_region(&mut self, dst: usize, phys_addr: u64, size: usize, perm: KMemoryPermission) -> u32 {
+    pub fn map_io_region(
+        &mut self,
+        dst: usize,
+        phys_addr: u64,
+        size: usize,
+        perm: KMemoryPermission,
+    ) -> u32 {
         let num_pages = size / PAGE_SIZE;
         if !self.contains_range(dst, size) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
         let result = self.check_memory_state(
-            dst, size, KMemoryState::MASK, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::NONE, KMemoryAttribute::NONE,
+            dst,
+            size,
+            KMemoryState::MASK,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         let props = KPageProperties {
-            perm, io: true, uncached: true,
+            perm,
+            io: true,
+            uncached: true,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
         let op = self.operate(dst, num_pages, phys_addr, true, props, OperationType::Map);
-        if op != 0 { return op; }
+        if op != 0 {
+            return op;
+        }
 
         self.m_memory_block_manager.update(
-            dst, num_pages, KMemoryState::IO_REGISTER,
-            perm, KMemoryAttribute::NONE,
+            dst,
+            num_pages,
+            KMemoryState::IO_REGISTER,
+            perm,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
@@ -2644,22 +3205,36 @@ impl KPageTableBase {
         }
 
         let result = self.check_memory_state(
-            dst, size, KMemoryState::MASK, KMemoryState::IO_REGISTER,
-            KMemoryPermission::NONE, KMemoryPermission::NONE,
-            KMemoryAttribute::NONE, KMemoryAttribute::NONE,
+            dst,
+            size,
+            KMemoryState::MASK,
+            KMemoryState::IO_REGISTER,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
         );
-        if result != 0 { return result; }
+        if result != 0 {
+            return result;
+        }
 
         let unmap_props = KPageProperties {
-            perm: KMemoryPermission::NONE, io: false, uncached: false,
+            perm: KMemoryPermission::NONE,
+            io: false,
+            uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op = self.operate(dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
-        if op != 0 { return op; }
+        if op != 0 {
+            return op;
+        }
 
         self.m_memory_block_manager.update(
-            dst, num_pages, KMemoryState::FREE,
-            KMemoryPermission::NONE, KMemoryAttribute::NONE,
+            dst,
+            num_pages,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
         );
@@ -2891,9 +3466,10 @@ mod tests {
         let mut page_table = KPageTableBase::new();
         page_table.m_address_space_start = 0x1000_0000;
         page_table.m_address_space_end = 0x1000_4000;
-        page_table
-            .m_memory_block_manager
-            .initialize(page_table.m_address_space_start, page_table.m_address_space_end);
+        page_table.m_memory_block_manager.initialize(
+            page_table.m_address_space_start,
+            page_table.m_address_space_end,
+        );
 
         page_table.m_memory_block_manager.update(
             page_table.m_address_space_start,

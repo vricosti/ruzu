@@ -5,10 +5,10 @@
 //!
 //! MIG_USR service ("mig:user"). All commands are unimplemented stubs.
 
-use std::collections::BTreeMap;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
 
 /// MIG_USR service ("mig:user"). All stubs.
 pub struct MigUsr {
@@ -43,21 +43,29 @@ impl SessionRequestHandler for MigUsr {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { "mig:user" }
+    fn service_name(&self) -> &str {
+        "mig:user"
+    }
 }
 
 impl ServiceFramework for MigUsr {
-    fn get_service_name(&self) -> &str { "mig:user" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "mig:user"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// Registers "mig:usr" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `mig.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     let mut server_manager = ServerManager::new(system);
 
@@ -66,9 +74,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
         sm.register_named_service(
             name,
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(
-                    crate::hle::service::services::GenericStubService::new(&svc_name),
-                )
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
+                    &svc_name,
+                ))
             }),
             64,
         );

@@ -237,7 +237,9 @@ impl<'a, T> Iterator for SlotVectorIter<'a, T> {
         let id = SlotId {
             index: self.current,
         };
-        let value = self.slot_vector.values[self.current as usize].as_ref().unwrap();
+        let value = self.slot_vector.values[self.current as usize]
+            .as_ref()
+            .unwrap();
         self.current = self.slot_vector.find_next_set(self.current);
         Some((id, value))
     }

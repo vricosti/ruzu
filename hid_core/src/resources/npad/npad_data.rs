@@ -208,13 +208,12 @@ impl NPadData {
     }
 
     pub fn set_home_protection_enabled(&mut self, is_enabled: bool, npad_id: NpadIdType) {
-        self.is_unintended_home_button_input_protection
-            [hid_util::npad_id_type_to_index(npad_id)] = is_enabled;
+        self.is_unintended_home_button_input_protection[hid_util::npad_id_type_to_index(npad_id)] =
+            is_enabled;
     }
 
     pub fn get_home_protection_enabled(&self, npad_id: NpadIdType) -> bool {
-        self.is_unintended_home_button_input_protection
-            [hid_util::npad_id_type_to_index(npad_id)]
+        self.is_unintended_home_button_input_protection[hid_util::npad_id_type_to_index(npad_id)]
     }
 
     pub fn set_capture_button_assignment(
@@ -235,10 +234,7 @@ impl NPadData {
         }
     }
 
-    pub fn get_npad_capture_button_assignment_list(
-        &self,
-        out_list: &mut [NpadButton],
-    ) -> usize {
+    pub fn get_npad_capture_button_assignment_list(&self, out_list: &mut [NpadButton]) -> usize {
         for i in 0..out_list.len() {
             let style_set = hid_util::get_styleset_by_index(i);
             if (style_set & self.supported_npad_style_set).is_empty()

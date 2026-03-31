@@ -192,9 +192,9 @@ impl VirtualAmiibo {
             }
 
             let data_len = out_data.data[i].data.len();
-            out_data.data[i].data.copy_from_slice(
-                &self.nfc_data[sector_index..sector_index + data_len],
-            );
+            out_data.data[i]
+                .data
+                .copy_from_slice(&self.nfc_data[sector_index..sector_index + data_len]);
         }
 
         NfcState::Success

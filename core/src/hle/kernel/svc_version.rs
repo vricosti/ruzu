@@ -65,8 +65,10 @@ pub const SUPPORTED_KERNEL_MAJOR_VERSION: u32 = convert_to_svc_major_version(15)
 /// Highest supported SVC minor version.
 pub const SUPPORTED_KERNEL_MINOR_VERSION: u32 = convert_to_svc_minor_version(3);
 /// Highest supported kernel version (encoded).
-pub const SUPPORTED_KERNEL_VERSION: u32 =
-    encode_kernel_version(SUPPORTED_KERNEL_MAJOR_VERSION, SUPPORTED_KERNEL_MINOR_VERSION);
+pub const SUPPORTED_KERNEL_VERSION: u32 = encode_kernel_version(
+    SUPPORTED_KERNEL_MAJOR_VERSION,
+    SUPPORTED_KERNEL_MINOR_VERSION,
+);
 
 #[cfg(test)]
 mod tests {

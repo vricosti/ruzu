@@ -80,7 +80,8 @@ impl KDynamicPageManager {
             return Err(());
         }
 
-        self.size = common::alignment::align_down((size - overhead_size) as u64, PAGE_SIZE as u64) as usize;
+        self.size =
+            common::alignment::align_down((size - overhead_size) as u64, PAGE_SIZE as u64) as usize;
         self.count = self.size / PAGE_SIZE;
 
         let allocatable_size =
@@ -90,8 +91,8 @@ impl KDynamicPageManager {
         // Free pages to bitmap.
         for i in 0..self.count {
             self.page_bitmap.set_bit(
-                ((self.address + (i * PAGE_SIZE) as u64 - self.aligned_address)
-                    / PAGE_SIZE as u64) as usize,
+                ((self.address + (i * PAGE_SIZE) as u64 - self.aligned_address) / PAGE_SIZE as u64)
+                    as usize,
             );
         }
 

@@ -64,12 +64,7 @@ impl BpcR {
 /// Neither BPC nor BPC_R implement SessionRequestHandler yet (all commands are
 /// nullptr in upstream), so we use stub services.
 pub fn loop_process(system: crate::core::SystemRef) {
-    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(
-        system,
-    );
-    crate::hle::service::services::register_stub_services(
-        &mut server_manager,
-        &["bpc", "bpc:r"],
-    );
+    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(system);
+    crate::hle::service::services::register_stub_services(&mut server_manager, &["bpc", "bpc:r"]);
     crate::hle::service::server_manager::ServerManager::run_server(server_manager);
 }

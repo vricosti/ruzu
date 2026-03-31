@@ -129,9 +129,7 @@ pub trait VfsDirectory: Send + Sync {
     /// Returns the file with filename matching name. Returns None if directory doesn't have a
     /// file with name.
     fn get_file(&self, name: &str) -> Option<VirtualFile> {
-        self.get_files()
-            .into_iter()
-            .find(|f| f.get_name() == name)
+        self.get_files().into_iter().find(|f| f.get_name() == name)
     }
 
     /// Returns a struct containing the file's timestamp.
@@ -545,10 +543,9 @@ impl VfsFilesystem for DefaultVfsFilesystem {
 
     fn delete_file(&self, path: &str) -> bool {
         let path = path_util::sanitize_path(path, path_util::DirectorySeparator::ForwardSlash);
-        let parent = match self.open_directory(
-            path_util::get_parent_path(&path).as_str(),
-            OpenMode::WRITE,
-        ) {
+        let parent = match self
+            .open_directory(path_util::get_parent_path(&path).as_str(), OpenMode::WRITE)
+        {
             Some(p) => p,
             None => return false,
         };
@@ -616,10 +613,9 @@ impl VfsFilesystem for DefaultVfsFilesystem {
 
     fn delete_directory(&self, path: &str) -> bool {
         let path = path_util::sanitize_path(path, path_util::DirectorySeparator::ForwardSlash);
-        let parent = match self.open_directory(
-            path_util::get_parent_path(&path).as_str(),
-            OpenMode::WRITE,
-        ) {
+        let parent = match self
+            .open_directory(path_util::get_parent_path(&path).as_str(), OpenMode::WRITE)
+        {
             Some(p) => p,
             None => return false,
         };
@@ -646,9 +642,7 @@ pub trait ReadOnlyVfsDirectory: Send + Sync {
 
     // Optional overrides for read-only directories
     fn get_file(&self, name: &str) -> Option<VirtualFile> {
-        self.get_files()
-            .into_iter()
-            .find(|f| f.get_name() == name)
+        self.get_files().into_iter().find(|f| f.get_name() == name)
     }
 
     fn get_subdirectory(&self, name: &str) -> Option<VirtualDir> {

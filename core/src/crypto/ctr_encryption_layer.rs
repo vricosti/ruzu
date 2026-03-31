@@ -62,14 +62,15 @@ impl VfsFile for CtrEncryptionLayer {
         if sector_offset == 0 {
             self.update_iv(self.base_offset + offset);
             let raw = self.base_layer.base.read_bytes(length, offset);
-            self.cipher
-                .lock()
-                .transcode(&raw, data, Op::Decrypt);
+            self.cipher.lock().transcode(&raw, data, Op::Decrypt);
             return length;
         }
 
         // Offset does not fall on block boundary (0x10)
-        let mut block = self.base_layer.base.read_bytes(0x10, offset - sector_offset);
+        let mut block = self
+            .base_layer
+            .base
+            .read_bytes(0x10, offset - sector_offset);
         self.update_iv(self.base_offset + offset - sector_offset);
         let mut decrypted = vec![0u8; block.len()];
         self.cipher

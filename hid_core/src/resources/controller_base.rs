@@ -73,10 +73,7 @@ impl ControllerActivation {
     }
 
     /// Port of ControllerBase::SetAppletResource.
-    pub fn set_applet_resource(
-        &mut self,
-        resource: Arc<Mutex<AppletResource>>,
-    ) {
+    pub fn set_applet_resource(&mut self, resource: Arc<Mutex<AppletResource>>) {
         self.applet_resource = Some(resource);
     }
 

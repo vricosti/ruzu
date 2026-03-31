@@ -166,13 +166,7 @@ impl Buffer {
         let mut texture: u32 = 0;
         unsafe {
             gl::CreateTextures(gl::TEXTURE_BUFFER, 1, &mut texture);
-            gl::TextureBufferRange(
-                texture,
-                format,
-                self.handle,
-                offset as isize,
-                size as isize,
-            );
+            gl::TextureBufferRange(texture, format, self.handle, offset as isize, size as isize);
         }
         self.views.push(BufferView {
             offset,
@@ -341,6 +335,18 @@ impl BufferCacheParams {
     pub const USE_MEMORY_MAPS: bool = true;
     pub const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = true;
     pub const USE_MEMORY_MAPS_FOR_UPLOADS: bool = false;
+}
+
+impl crate::buffer_cache::buffer_cache_base::BufferCacheParams for BufferCacheParams {
+    const IS_OPENGL: bool = Self::IS_OPENGL;
+    const HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS: bool =
+        Self::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS;
+    const HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT: bool = Self::HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT;
+    const NEEDS_BIND_UNIFORM_INDEX: bool = Self::NEEDS_BIND_UNIFORM_INDEX;
+    const NEEDS_BIND_STORAGE_INDEX: bool = Self::NEEDS_BIND_STORAGE_INDEX;
+    const USE_MEMORY_MAPS: bool = Self::USE_MEMORY_MAPS;
+    const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = Self::SEPARATE_IMAGE_BUFFER_BINDINGS;
+    const USE_MEMORY_MAPS_FOR_UPLOADS: bool = Self::USE_MEMORY_MAPS_FOR_UPLOADS;
 }
 
 #[cfg(test)]

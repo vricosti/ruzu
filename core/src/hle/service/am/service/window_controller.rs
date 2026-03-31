@@ -32,14 +32,26 @@ pub struct IWindowController {
 impl IWindowController {
     pub fn new(applet: Arc<Mutex<Applet>>) -> Self {
         let handlers = build_handler_map(&[
-            (1, Some(Self::get_applet_resource_user_id_handler), "GetAppletResourceUserId"),
+            (
+                1,
+                Some(Self::get_applet_resource_user_id_handler),
+                "GetAppletResourceUserId",
+            ),
             (
                 2,
                 Some(Self::get_applet_resource_user_id_of_caller_applet_handler),
                 "GetAppletResourceUserIdOfCallerApplet",
             ),
-            (10, Some(Self::acquire_foreground_rights_handler), "AcquireForegroundRights"),
-            (11, Some(Self::release_foreground_rights_handler), "ReleaseForegroundRights"),
+            (
+                10,
+                Some(Self::acquire_foreground_rights_handler),
+                "AcquireForegroundRights",
+            ),
+            (
+                11,
+                Some(Self::release_foreground_rights_handler),
+                "ReleaseForegroundRights",
+            ),
             (
                 12,
                 Some(Self::reject_to_change_into_background_handler),
@@ -50,7 +62,11 @@ impl IWindowController {
                 Some(Self::set_applet_window_visibility_handler),
                 "SetAppletWindowVisibility",
             ),
-            (21, Some(Self::set_applet_gpu_time_slice_handler), "SetAppletGpuTimeSlice"),
+            (
+                21,
+                Some(Self::set_applet_gpu_time_slice_handler),
+                "SetAppletGpuTimeSlice",
+            ),
         ]);
         Self {
             applet,
@@ -94,14 +110,18 @@ impl IWindowController {
 
     /// Port of IWindowController::SetAppletGpuTimeSlice
     pub fn set_applet_gpu_time_slice(&self, time_slice: i64) {
-        log::warn!("(STUBBED) SetAppletGpuTimeSlice called, time_slice={}", time_slice);
+        log::warn!(
+            "(STUBBED) SetAppletGpuTimeSlice called, time_slice={}",
+            time_slice
+        );
     }
 
     fn get_applet_resource_user_id_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u64(service.get_applet_resource_user_id());
@@ -111,21 +131,24 @@ impl IWindowController {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u64(service.get_applet_resource_user_id_of_caller_applet());
     }
 
     fn acquire_foreground_rights_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
         service.acquire_foreground_rights();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     fn release_foreground_rights_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
         service.release_foreground_rights();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -135,7 +158,8 @@ impl IWindowController {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
         service.reject_to_change_into_background();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -145,18 +169,17 @@ impl IWindowController {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
         let mut rp = RequestParser::new(ctx);
         service.set_applet_window_visibility(rp.pop_bool());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn set_applet_gpu_time_slice_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
+    fn set_applet_gpu_time_slice_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IWindowController) };
         let mut rp = RequestParser::new(ctx);
         service.set_applet_gpu_time_slice(rp.pop_i64());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);

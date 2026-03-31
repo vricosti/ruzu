@@ -247,12 +247,7 @@ impl Uint8Pass {
     ///
     /// Dispatches the uint8-to-uint16 conversion compute shader.
     /// Returns `(buffer, offset)` pair for the assembled index buffer.
-    pub fn assemble(
-        &self,
-        device: &ash::Device,
-        cmdbuf: vk::CommandBuffer,
-        num_vertices: u32,
-    ) {
+    pub fn assemble(&self, device: &ash::Device, cmdbuf: vk::CommandBuffer, num_vertices: u32) {
         let num_workgroups = (num_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
 
         unsafe {
@@ -361,11 +356,7 @@ impl ConditionalRenderingResolvePass {
     /// Port of `ConditionalRenderingResolvePass::Resolve`.
     ///
     /// Dispatches the conditional rendering resolve compute shader.
-    pub fn resolve(
-        &self,
-        device: &ash::Device,
-        cmdbuf: vk::CommandBuffer,
-    ) {
+    pub fn resolve(&self, device: &ash::Device, cmdbuf: vk::CommandBuffer) {
         let read_barrier = vk::MemoryBarrier {
             s_type: vk::StructureType::MEMORY_BARRIER,
             p_next: std::ptr::null(),

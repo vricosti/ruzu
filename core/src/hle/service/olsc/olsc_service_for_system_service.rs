@@ -102,9 +102,21 @@ impl IOlscServiceForSystemService {
     pub fn new(system: crate::core::SystemRef) -> Self {
         let s = Some(Self::stub_handler as fn(&dyn ServiceFramework, &mut HLERequestContext));
         let handlers = build_handler_map(&[
-            (0, Some(Self::open_transfer_task_list_controller_handler), "OpenTransferTaskListController"),
-            (1, Some(Self::open_remote_storage_controller_handler), "OpenRemoteStorageController"),
-            (2, Some(Self::open_daemon_controller_handler), "OpenDaemonController"),
+            (
+                0,
+                Some(Self::open_transfer_task_list_controller_handler),
+                "OpenTransferTaskListController",
+            ),
+            (
+                1,
+                Some(Self::open_remote_storage_controller_handler),
+                "OpenRemoteStorageController",
+            ),
+            (
+                2,
+                Some(Self::open_daemon_controller_handler),
+                "OpenDaemonController",
+            ),
             (10, s, "Unknown10"),
             (11, s, "Unknown11"),
             (12, s, "Unknown12"),
@@ -115,7 +127,11 @@ impl IOlscServiceForSystemService {
             (103, s, "GetLastErrorInfo"),
             (104, s, "GetLastErrorEventHolder"),
             (105, s, "GetLastTransferTaskErrorInfo"),
-            (200, Some(Self::get_data_transfer_policy_info_handler), "GetDataTransferPolicyInfo"),
+            (
+                200,
+                Some(Self::get_data_transfer_policy_info_handler),
+                "GetDataTransferPolicyInfo",
+            ),
             (201, s, "RemoveDataTransferPolicyInfo"),
             (202, s, "UpdateDataTransferPolicyOld"),
             (203, s, "UpdateDataTransferPolicy"),
@@ -207,7 +223,10 @@ impl IOlscServiceForSystemService {
     /// Upstream returns shared_from_this(); we create a new instance since state is minimal.
     pub fn clone_service(&self) -> (ResultCode, IOlscServiceForSystemService) {
         log::info!("IOlscServiceForSystemService::clone_service called");
-        (RESULT_SUCCESS, IOlscServiceForSystemService::new(self.system))
+        (
+            RESULT_SUCCESS,
+            IOlscServiceForSystemService::new(self.system),
+        )
     }
 
     // --- Handler bridge functions ---
@@ -263,10 +282,7 @@ impl IOlscServiceForSystemService {
         }
     }
 
-    fn open_daemon_controller_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn open_daemon_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::info!("IOlscServiceForSystemService::OpenDaemonController called");
         let service: std::sync::Arc<dyn SessionRequestHandler> =
             std::sync::Arc::new(IDaemonController::new());
@@ -298,10 +314,7 @@ impl IOlscServiceForSystemService {
         rb.push_u32(0);
     }
 
-    fn clone_service_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn clone_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::info!("IOlscServiceForSystemService::CloneService called");
         let svc = unsafe {
             &*(this as *const dyn ServiceFramework as *const IOlscServiceForSystemService)

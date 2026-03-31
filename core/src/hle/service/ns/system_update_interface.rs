@@ -8,10 +8,10 @@
 
 use std::collections::BTreeMap;
 
+use super::ns_types::BackgroundNetworkUpdateState;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::ns_types::BackgroundNetworkUpdateState;
 
 /// IPC command table for ISystemUpdateInterface.
 ///
@@ -47,23 +47,71 @@ pub struct ISystemUpdateInterface {
 impl ISystemUpdateInterface {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (commands::GET_BACKGROUND_NETWORK_UPDATE_STATE, None, "GetBackgroundNetworkUpdateState"),
-            (commands::OPEN_SYSTEM_UPDATE_CONTROL, None, "OpenSystemUpdateControl"),
-            (commands::NOTIFY_EX_FAT_DRIVER_REQUIRED, None, "NotifyExFatDriverRequired"),
-            (commands::CLEAR_EX_FAT_DRIVER_STATUS_FOR_DEBUG, None, "ClearExFatDriverStatusForDebug"),
-            (commands::REQUEST_BACKGROUND_NETWORK_UPDATE, None, "RequestBackgroundNetworkUpdate"),
-            (commands::NOTIFY_BACKGROUND_NETWORK_UPDATE, None, "NotifyBackgroundNetworkUpdate"),
-            (commands::NOTIFY_EX_FAT_DRIVER_DOWNLOADED_FOR_DEBUG, None, "NotifyExFatDriverDownloadedForDebug"),
-            (commands::GET_SYSTEM_UPDATE_NOTIFICATION_EVENT_FOR_CONTENT_DELIVERY, None, "GetSystemUpdateNotificationEventForContentDelivery"),
-            (commands::NOTIFY_SYSTEM_UPDATE_FOR_CONTENT_DELIVERY, None, "NotifySystemUpdateForContentDelivery"),
+            (
+                commands::GET_BACKGROUND_NETWORK_UPDATE_STATE,
+                None,
+                "GetBackgroundNetworkUpdateState",
+            ),
+            (
+                commands::OPEN_SYSTEM_UPDATE_CONTROL,
+                None,
+                "OpenSystemUpdateControl",
+            ),
+            (
+                commands::NOTIFY_EX_FAT_DRIVER_REQUIRED,
+                None,
+                "NotifyExFatDriverRequired",
+            ),
+            (
+                commands::CLEAR_EX_FAT_DRIVER_STATUS_FOR_DEBUG,
+                None,
+                "ClearExFatDriverStatusForDebug",
+            ),
+            (
+                commands::REQUEST_BACKGROUND_NETWORK_UPDATE,
+                None,
+                "RequestBackgroundNetworkUpdate",
+            ),
+            (
+                commands::NOTIFY_BACKGROUND_NETWORK_UPDATE,
+                None,
+                "NotifyBackgroundNetworkUpdate",
+            ),
+            (
+                commands::NOTIFY_EX_FAT_DRIVER_DOWNLOADED_FOR_DEBUG,
+                None,
+                "NotifyExFatDriverDownloadedForDebug",
+            ),
+            (
+                commands::GET_SYSTEM_UPDATE_NOTIFICATION_EVENT_FOR_CONTENT_DELIVERY,
+                None,
+                "GetSystemUpdateNotificationEventForContentDelivery",
+            ),
+            (
+                commands::NOTIFY_SYSTEM_UPDATE_FOR_CONTENT_DELIVERY,
+                None,
+                "NotifySystemUpdateForContentDelivery",
+            ),
             (commands::PREPARE_SHUTDOWN, None, "PrepareShutdown"),
             (commands::UNKNOWN_12, None, "Unknown12"),
             (commands::UNKNOWN_13, None, "Unknown13"),
             (commands::UNKNOWN_14, None, "Unknown14"),
             (commands::UNKNOWN_15, None, "Unknown15"),
-            (commands::DESTROY_SYSTEM_UPDATE_TASK, None, "DestroySystemUpdateTask"),
-            (commands::REQUEST_SEND_SYSTEM_UPDATE, None, "RequestSendSystemUpdate"),
-            (commands::GET_SEND_SYSTEM_UPDATE_PROGRESS, None, "GetSendSystemUpdateProgress"),
+            (
+                commands::DESTROY_SYSTEM_UPDATE_TASK,
+                None,
+                "DestroySystemUpdateTask",
+            ),
+            (
+                commands::REQUEST_SEND_SYSTEM_UPDATE,
+                None,
+                "RequestSendSystemUpdate",
+            ),
+            (
+                commands::GET_SEND_SYSTEM_UPDATE_PROGRESS,
+                None,
+                "GetSendSystemUpdateProgress",
+            ),
         ]);
         Self {
             handlers,

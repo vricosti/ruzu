@@ -123,8 +123,7 @@ pub fn patch_ips(source: &VirtualFile, ips: &VirtualFile) -> Option<VirtualFile>
             if real_offset as usize + read_size > in_data.len() {
                 read_size = in_data.len() - real_offset as usize;
             }
-            let actual =
-                ips.read(&mut in_data[real_offset as usize..], read_size, offset);
+            let actual = ips.read(&mut in_data[real_offset as usize..], read_size, offset);
             if actual != data_size as usize {
                 return None;
             }
@@ -217,8 +216,7 @@ fn hex_string_to_array_20(hex: &str) -> [u8; 0x20] {
     let padded = format!("{:0<64}", hex);
     let mut result = [0u8; 0x20];
     for i in 0..0x20 {
-        result[i] =
-            u8::from_str_radix(&padded[i * 2..i * 2 + 2], 16).unwrap_or(0);
+        result[i] = u8::from_str_radix(&padded[i * 2..i * 2 + 2], 16).unwrap_or(0);
     }
     result
 }
@@ -352,9 +350,7 @@ impl IpSwitchCompiler {
                     i += 1;
                     let patch_line = &lines[i];
 
-                    if starts_with(patch_line, "@enabled")
-                        || starts_with(patch_line, "@disabled")
-                    {
+                    if starts_with(patch_line, "@enabled") || starts_with(patch_line, "@disabled") {
                         i -= 1;
                         break;
                     }
@@ -370,8 +366,7 @@ impl IpSwitchCompiler {
                     }
 
                     let offset_str = &patch_line[..8];
-                    let mut offset =
-                        u64::from_str_radix(offset_str, 16).unwrap_or(0);
+                    let mut offset = u64::from_str_radix(offset_str, 16).unwrap_or(0);
                     offset = (offset as i64 + self.offset_shift) as u64;
 
                     let replace: Vec<u8>;
@@ -455,8 +450,7 @@ impl IpSwitchCompiler {
                 if offset + replace_size > in_data.len() {
                     replace_size = in_data.len() - offset;
                 }
-                in_data[offset..offset + replace_size]
-                    .copy_from_slice(&replace[..replace_size]);
+                in_data[offset..offset + replace_size].copy_from_slice(&replace[..replace_size]);
             }
         }
 
@@ -488,8 +482,14 @@ mod tests {
 
     #[test]
     fn test_hex_string_to_vec() {
-        assert_eq!(hex_string_to_vec("DEADBEEF", false), vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(hex_string_to_vec("DEADBEEF", true), vec![0xEF, 0xBE, 0xAD, 0xDE]);
+        assert_eq!(
+            hex_string_to_vec("DEADBEEF", false),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        assert_eq!(
+            hex_string_to_vec("DEADBEEF", true),
+            vec![0xEF, 0xBE, 0xAD, 0xDE]
+        );
     }
 
     #[test]
@@ -505,7 +505,13 @@ mod tests {
 
     #[test]
     fn test_escape_string_sequences() {
-        assert_eq!(escape_string_sequences("hello\\nworld".to_string()), "hello\nworld");
-        assert_eq!(escape_string_sequences("tab\\there".to_string()), "tab\there");
+        assert_eq!(
+            escape_string_sequences("hello\\nworld".to_string()),
+            "hello\nworld"
+        );
+        assert_eq!(
+            escape_string_sequences("tab\\there".to_string()),
+            "tab\there"
+        );
     }
 }

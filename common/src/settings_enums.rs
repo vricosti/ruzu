@@ -417,9 +417,7 @@ impl Category {
             Category::Core => "Core",
             Category::Cpu | Category::CpuDebug | Category::CpuUnsafe => "Cpu",
             Category::Overlay => "Overlay",
-            Category::Renderer | Category::RendererAdvanced | Category::RendererDebug => {
-                "Renderer"
-            }
+            Category::Renderer | Category::RendererAdvanced | Category::RendererDebug => "Renderer",
             Category::System | Category::SystemAudio => "System",
             Category::DataStorage => "Data Storage",
             Category::Debugging | Category::DebuggingGraphics => "Debugging",

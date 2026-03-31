@@ -296,7 +296,10 @@ impl RegAlloc {
 
     fn alloc(&mut self, is_long: bool) -> Id {
         let (num_regs, use_set) = if is_long {
-            (&mut self.num_used_long_registers, &mut self.long_register_use)
+            (
+                &mut self.num_used_long_registers,
+                &mut self.long_register_use,
+            )
         } else {
             (&mut self.num_used_registers, &mut self.register_use)
         };

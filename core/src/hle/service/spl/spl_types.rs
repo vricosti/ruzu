@@ -168,9 +168,7 @@ const _: () = assert!(std::mem::size_of::<AesKey>() == AES_128_KEY_SIZE);
 
 impl AesKey {
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(self.data64.as_ptr() as *const u8, AES_128_KEY_SIZE)
-        }
+        unsafe { std::slice::from_raw_parts(self.data64.as_ptr() as *const u8, AES_128_KEY_SIZE) }
     }
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         unsafe {

@@ -16,9 +16,7 @@ fn is_valid_shared_memory_permission(perm: MemoryPermission) -> bool {
 }
 
 /// Convert SVC MemoryPermission to KSharedMemory MemoryPermission.
-fn to_shmem_perm(
-    perm: MemoryPermission,
-) -> crate::hle::kernel::k_shared_memory::MemoryPermission {
+fn to_shmem_perm(perm: MemoryPermission) -> crate::hle::kernel::k_shared_memory::MemoryPermission {
     match perm {
         MemoryPermission::Read => crate::hle::kernel::k_shared_memory::MemoryPermission::Read,
         MemoryPermission::ReadWrite => {
@@ -40,7 +38,10 @@ pub fn map_shared_memory(
 ) -> ResultCode {
     log::info!(
         "svc::MapSharedMemory called, handle=0x{:X}, addr=0x{:X}, size=0x{:X}, perm={:?}",
-        shmem_handle, address, size, map_perm
+        shmem_handle,
+        address,
+        size,
+        map_perm
     );
 
     // Validate input.
@@ -70,6 +71,45 @@ pub fn map_shared_memory(
                 "svc::MapSharedMemory: handle {:#x} not in handle table",
                 shmem_handle
             );
+            if let Some(current_thread) = system.current_thread() {
+                let thread = current_thread.lock().unwrap();
+                log::error!(
+                    "svc::MapSharedMemory invalid handle context: tid={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+                    thread.get_thread_id(),
+                    thread.thread_context.pc,
+                    thread.thread_context.lr,
+                    thread.thread_context.sp
+                );
+                if let Some(parent) = thread.parent.as_ref().and_then(|w| w.upgrade()) {
+                    let process = parent.lock().unwrap();
+                    let arm_ctx = crate::arm::arm_interface::ThreadContext {
+                        r: thread.thread_context.r,
+                        fp: thread.thread_context.fp,
+                        lr: thread.thread_context.lr,
+                        sp: thread.thread_context.sp,
+                        pc: thread.thread_context.pc,
+                        pstate: thread.thread_context.pstate,
+                        padding: thread.thread_context.padding,
+                        v: thread.thread_context.v,
+                        fpcr: thread.thread_context.fpcr,
+                        fpsr: thread.thread_context.fpsr,
+                        tpidr: thread.thread_context.tpidr,
+                    };
+                    for entry in crate::arm::debug::get_backtrace_from_context(&process, &arm_ctx)
+                        .iter()
+                        .take(12)
+                    {
+                        log::error!(
+                            "svc::MapSharedMemory backtrace: module={} addr=0x{:X} original=0x{:X} offset=0x{:X} symbol={}",
+                            entry.module,
+                            entry.address,
+                            entry.original_address,
+                            entry.offset,
+                            entry.name
+                        );
+                    }
+                }
+            }
             return RESULT_INVALID_HANDLE;
         }
     };
@@ -86,17 +126,15 @@ pub fn map_shared_memory(
     };
 
     // Validate that the address can contain shared memory.
-    if !process
-        .page_table
-        .can_contain(
-            crate::hle::kernel::k_typed_address::KProcessAddress::new(address),
-            size as usize,
-            KMemoryState::SHARED,
-        )
-    {
+    if !process.page_table.can_contain(
+        crate::hle::kernel::k_typed_address::KProcessAddress::new(address),
+        size as usize,
+        KMemoryState::SHARED,
+    ) {
         log::error!(
             "svc::MapSharedMemory: address {:#x} size {:#x} cannot contain Shared",
-            address, size
+            address,
+            size
         );
         return RESULT_INVALID_CURRENT_MEMORY;
     }
@@ -112,13 +150,13 @@ pub fn map_shared_memory(
     if result.is_success() {
         log::info!(
             "svc::MapSharedMemory: mapped handle={:#x} at {:#x} size={:#x} perm={:?}",
-            shmem_handle, address, size, map_perm
+            shmem_handle,
+            address,
+            size,
+            map_perm
         );
     } else {
-        log::error!(
-            "svc::MapSharedMemory: map failed, result={:?}",
-            result
-        );
+        log::error!("svc::MapSharedMemory: map failed, result={:?}", result);
     }
 
     result

@@ -75,7 +75,9 @@ impl DebugPad {
             self.next_state.r_stick = stick_state.right;
         }
 
-        shared_memory.debug_pad_lifo.write_next_entry(self.next_state);
+        shared_memory
+            .debug_pad_lifo
+            .write_next_entry(self.next_state);
     }
 }
 

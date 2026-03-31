@@ -6,25 +6,33 @@
 //! WaitSynchronization, CancelSynchronization, SynchronizePreemptionState).
 
 use crate::core::System;
+use crate::hle::kernel::k_synchronization_object;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, ARGUMENT_HANDLE_COUNT_MAX};
-use crate::hle::kernel::k_synchronization_object;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 fn synchronization_timeout_tick_from_ns(current_tick: i64, timeout_ns: i64) -> i64 {
     debug_assert!(timeout_ns > 0);
 
-    let timeout = current_tick
-        .saturating_add(timeout_ns)
-        .saturating_add(2);
-    if timeout <= 0 { i64::MAX } else { timeout }
+    let timeout = current_tick.saturating_add(timeout_ns).saturating_add(2);
+    if timeout <= 0 {
+        i64::MAX
+    } else {
+        timeout
+    }
 }
 
 /// Closes a handle.
 pub fn close_handle(system: &System, handle: Handle) -> ResultCode {
     log::trace!("svc::CloseHandle closing handle 0x{:08X}", handle);
 
-    if system.current_process_arc().lock().unwrap().handle_table.remove(handle) {
+    if system
+        .current_process_arc()
+        .lock()
+        .unwrap()
+        .handle_table
+        .remove(handle)
+    {
         RESULT_SUCCESS
     } else {
         RESULT_INVALID_HANDLE
@@ -61,7 +69,9 @@ pub fn wait_synchronization(
 ) -> ResultCode {
     log::trace!(
         "svc::WaitSynchronization called user_handles=0x{:x}, num_handles={}, timeout_ns={}",
-        user_handles, num_handles, timeout_ns
+        user_handles,
+        num_handles,
+        timeout_ns
     );
 
     // Ensure number of handles is valid.
@@ -184,7 +194,8 @@ pub fn cancel_synchronization(system: &System, handle: Handle) -> ResultCode {
 /// clear interrupt flag, unpin.
 pub fn synchronize_preemption_state(system: &System) {
     // Lock the scheduler.
-    let binding = system.scheduler_arc(); let scheduler = binding.lock().unwrap();
+    let binding = system.scheduler_arc();
+    let scheduler = binding.lock().unwrap();
 
     // Get the current core ID and current thread.
     let core_id = match system.kernel() {
@@ -248,9 +259,14 @@ mod tests {
                 .thread_state
                 .store(ThreadState::RUNNABLE.bits(), Ordering::Relaxed);
         }
-        process.lock().unwrap().register_thread_object(current_thread);
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(current_thread);
 
-        let scheduler = Arc::new(Mutex::new(crate::hle::kernel::k_scheduler::KScheduler::new(0)));
+        let scheduler = Arc::new(Mutex::new(
+            crate::hle::kernel::k_scheduler::KScheduler::new(0),
+        ));
         scheduler.lock().unwrap().initialize(1, 0, 0);
         let shared_memory = process.lock().unwrap().get_shared_memory();
 
@@ -271,7 +287,10 @@ mod tests {
             svc_event::create_event(&system, &mut write_handle, &mut read_handle),
             RESULT_SUCCESS
         );
-        assert_eq!(svc_event::signal_event(&system, write_handle), RESULT_SUCCESS);
+        assert_eq!(
+            svc_event::signal_event(&system, write_handle),
+            RESULT_SUCCESS
+        );
         assert_eq!(reset_signal(&system, read_handle), RESULT_SUCCESS);
     }
 
@@ -284,7 +303,10 @@ mod tests {
             svc_event::create_event(&system, &mut write_handle, &mut read_handle),
             RESULT_SUCCESS
         );
-        assert_eq!(svc_event::signal_event(&system, write_handle), RESULT_SUCCESS);
+        assert_eq!(
+            svc_event::signal_event(&system, write_handle),
+            RESULT_SUCCESS
+        );
 
         {
             let process = system.current_process_arc().lock().unwrap();
@@ -348,7 +370,10 @@ mod tests {
         let system_ref = crate::core::SystemRef::from_ref(&system);
         let waiter = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            assert_eq!(svc_event::signal_event(system_ref.get(), write_handle), RESULT_SUCCESS);
+            assert_eq!(
+                svc_event::signal_event(system_ref.get(), write_handle),
+                RESULT_SUCCESS
+            );
         });
 
         let mut out_index = -1;
@@ -361,7 +386,8 @@ mod tests {
         waiter.join().unwrap();
 
         let current_thread = {
-            system.current_process_arc()
+            system
+                .current_process_arc()
                 .lock()
                 .unwrap()
                 .get_thread_by_thread_id(1)
@@ -369,10 +395,16 @@ mod tests {
         };
 
         let thread = current_thread.lock().unwrap();
-        assert_eq!(thread.get_state(), crate::hle::kernel::k_thread::ThreadState::RUNNABLE);
+        assert_eq!(
+            thread.get_state(),
+            crate::hle::kernel::k_thread::ThreadState::RUNNABLE
+        );
         assert_eq!(thread.get_synced_index(), 0);
         assert_eq!(thread.get_wait_result(), RESULT_SUCCESS.get_inner_value());
-        assert_eq!(thread.thread_context.r[0], RESULT_SUCCESS.get_inner_value() as u64);
+        assert_eq!(
+            thread.thread_context.r[0],
+            RESULT_SUCCESS.get_inner_value() as u64
+        );
         assert_eq!(thread.thread_context.r[1], 0);
     }
 
@@ -393,7 +425,8 @@ mod tests {
         }
 
         let current_thread = {
-            system.current_process_arc()
+            system
+                .current_process_arc()
                 .lock()
                 .unwrap()
                 .get_thread_by_thread_id(1)
@@ -420,7 +453,15 @@ mod tests {
 
         let mut thread_handle = 0;
         assert_eq!(
-            svc_thread::create_thread(&system, &mut thread_handle, 0x201000, 0x1234, 0x260000, 44, 0),
+            svc_thread::create_thread(
+                &system,
+                &mut thread_handle,
+                0x201000,
+                0x1234,
+                0x260000,
+                44,
+                0
+            ),
             RESULT_SUCCESS
         );
 
@@ -461,7 +502,8 @@ mod tests {
         exiter.join().unwrap();
 
         let current_thread = {
-            system.current_process_arc()
+            system
+                .current_process_arc()
                 .lock()
                 .unwrap()
                 .get_thread_by_thread_id(1)
@@ -475,7 +517,10 @@ mod tests {
         );
         assert_eq!(thread.get_synced_index(), 0);
         assert_eq!(thread.get_wait_result(), RESULT_SUCCESS.get_inner_value());
-        assert_eq!(thread.thread_context.r[0], RESULT_SUCCESS.get_inner_value() as u64);
+        assert_eq!(
+            thread.thread_context.r[0],
+            RESULT_SUCCESS.get_inner_value() as u64
+        );
         assert_eq!(thread.thread_context.r[1], 0);
     }
 
@@ -505,7 +550,8 @@ mod tests {
         assert_eq!(out_index, -1);
 
         let current_thread = {
-            system.current_process_arc()
+            system
+                .current_process_arc()
                 .lock()
                 .unwrap()
                 .get_thread_by_thread_id(1)
@@ -516,7 +562,11 @@ mod tests {
             crate::hle::kernel::k_thread::ThreadState::WAITING
         );
 
-        system.current_process_arc().lock().unwrap().set_debug_break();
+        system
+            .current_process_arc()
+            .lock()
+            .unwrap()
+            .set_debug_break();
 
         let thread = current_thread.lock().unwrap();
         assert_eq!(

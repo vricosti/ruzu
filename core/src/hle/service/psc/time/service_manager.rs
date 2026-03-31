@@ -34,16 +34,56 @@ impl TimeServiceManager {
                 (5, Some(Self::stub_ok), "GetStaticServiceAsAdmin"),
                 (6, Some(Self::stub_ok), "GetStaticServiceAsRepair"),
                 (7, Some(Self::stub_ok), "GetStaticServiceAsServiceManager"),
-                (10, Some(Self::setup_standard_steady_clock_core), "SetupStandardSteadyClockCore"),
-                (11, Some(Self::setup_standard_local_system_clock_core), "SetupStandardLocalSystemClockCore"),
-                (12, Some(Self::setup_standard_network_system_clock_core), "SetupStandardNetworkSystemClockCore"),
-                (13, Some(Self::setup_standard_user_system_clock_core), "SetupStandardUserSystemClockCore"),
-                (14, Some(Self::setup_time_zone_service_core), "SetupTimeZoneServiceCore"),
-                (15, Some(Self::setup_ephemeral_network_system_clock_core), "SetupEphemeralNetworkSystemClockCore"),
-                (50, Some(Self::stub_ok), "GetStandardLocalClockOperationEvent"),
-                (51, Some(Self::stub_ok), "GetStandardNetworkClockOperationEventForServiceManager"),
-                (52, Some(Self::stub_ok), "GetEphemeralNetworkClockOperationEventForServiceManager"),
-                (53, Some(Self::stub_ok), "GetStandardUserSystemClockAutomaticCorrectionUpdatedEvent"),
+                (
+                    10,
+                    Some(Self::setup_standard_steady_clock_core),
+                    "SetupStandardSteadyClockCore",
+                ),
+                (
+                    11,
+                    Some(Self::setup_standard_local_system_clock_core),
+                    "SetupStandardLocalSystemClockCore",
+                ),
+                (
+                    12,
+                    Some(Self::setup_standard_network_system_clock_core),
+                    "SetupStandardNetworkSystemClockCore",
+                ),
+                (
+                    13,
+                    Some(Self::setup_standard_user_system_clock_core),
+                    "SetupStandardUserSystemClockCore",
+                ),
+                (
+                    14,
+                    Some(Self::setup_time_zone_service_core),
+                    "SetupTimeZoneServiceCore",
+                ),
+                (
+                    15,
+                    Some(Self::setup_ephemeral_network_system_clock_core),
+                    "SetupEphemeralNetworkSystemClockCore",
+                ),
+                (
+                    50,
+                    Some(Self::stub_ok),
+                    "GetStandardLocalClockOperationEvent",
+                ),
+                (
+                    51,
+                    Some(Self::stub_ok),
+                    "GetStandardNetworkClockOperationEventForServiceManager",
+                ),
+                (
+                    52,
+                    Some(Self::stub_ok),
+                    "GetEphemeralNetworkClockOperationEventForServiceManager",
+                ),
+                (
+                    53,
+                    Some(Self::stub_ok),
+                    "GetStandardUserSystemClockAutomaticCorrectionUpdatedEvent",
+                ),
                 (60, Some(Self::stub_ok), "SetStandardSteadyClockBaseTime"),
                 (200, Some(Self::stub_ok), "GetClosestAlarmUpdatedEvent"),
                 (201, Some(Self::stub_ok), "CheckAndSignalAlarms"),
@@ -69,19 +109,28 @@ impl TimeServiceManager {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn setup_standard_local_system_clock_core(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn setup_standard_local_system_clock_core(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::info!("PSC::Time::ServiceManager::SetupStandardLocalSystemClockCore called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn setup_standard_network_system_clock_core(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn setup_standard_network_system_clock_core(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::info!("PSC::Time::ServiceManager::SetupStandardNetworkSystemClockCore called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn setup_standard_user_system_clock_core(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn setup_standard_user_system_clock_core(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::info!("PSC::Time::ServiceManager::SetupStandardUserSystemClockCore called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -93,7 +142,10 @@ impl TimeServiceManager {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn setup_ephemeral_network_system_clock_core(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn setup_ephemeral_network_system_clock_core(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::info!("PSC::Time::ServiceManager::SetupEphemeralNetworkSystemClockCore called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -112,11 +164,19 @@ impl SessionRequestHandler for TimeServiceManager {
     fn service_name(&self) -> &str {
         ServiceFramework::get_service_name(self)
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ServiceFramework for TimeServiceManager {
-    fn get_service_name(&self) -> &str { "time:m" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "time:m"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }

@@ -28,11 +28,27 @@ pub struct IAudioRendererManager {
 impl IAudioRendererManager {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (0, Some(Self::open_audio_renderer_handler), "OpenAudioRenderer"),
-            (1, Some(Self::get_work_buffer_size_handler), "GetWorkBufferSize"),
-            (2, Some(Self::get_audio_device_service_handler), "GetAudioDeviceService"),
+            (
+                0,
+                Some(Self::open_audio_renderer_handler),
+                "OpenAudioRenderer",
+            ),
+            (
+                1,
+                Some(Self::get_work_buffer_size_handler),
+                "GetWorkBufferSize",
+            ),
+            (
+                2,
+                Some(Self::get_audio_device_service_handler),
+                "GetAudioDeviceService",
+            ),
             (3, None, "OpenAudioRendererForManualExecution"),
-            (4, Some(Self::get_audio_device_service_with_revision_info_handler), "GetAudioDeviceServiceWithRevisionInfo"),
+            (
+                4,
+                Some(Self::get_audio_device_service_with_revision_info_handler),
+                "GetAudioDeviceServiceWithRevisionInfo",
+            ),
         ]);
         Self {
             num_audio_devices: std::sync::atomic::AtomicU32::new(0),
@@ -66,8 +82,12 @@ impl IAudioRendererManager {
     fn get_audio_device_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::info!("IAudioRendererManager::GetAudioDeviceService");
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        let device_num = svc.num_audio_devices.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let device = Arc::new(super::audio_device::IAudioDevice::new(0, 0x52455631, device_num)); // 'REV1'
+        let device_num = svc
+            .num_audio_devices
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let device = Arc::new(super::audio_device::IAudioDevice::new(
+            0, 0x52455631, device_num,
+        )); // 'REV1'
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_ipc_interface(device);
@@ -81,7 +101,9 @@ impl IAudioRendererManager {
     ) {
         log::info!("IAudioRendererManager::GetAudioDeviceServiceWithRevisionInfo");
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        let device_num = svc.num_audio_devices.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let device_num = svc
+            .num_audio_devices
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let device = Arc::new(super::audio_device::IAudioDevice::new(0, 0, device_num));
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);

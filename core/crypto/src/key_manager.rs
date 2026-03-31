@@ -231,10 +231,7 @@ mod tests {
             parse_key_line("header_key = 00112233"),
             Some(("header_key", "00112233"))
         );
-        assert_eq!(
-            parse_key_line("  key  =  aabb  "),
-            Some(("key", "aabb"))
-        );
+        assert_eq!(parse_key_line("  key  =  aabb  "), Some(("key", "aabb")));
         assert_eq!(parse_key_line("# comment"), None);
         assert_eq!(parse_key_line(""), None);
         assert_eq!(parse_key_line("no_equals"), None);

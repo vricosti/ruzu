@@ -160,9 +160,7 @@ impl Stick {
     fn get_angle(&self, now: Instant) -> f32 {
         let mut new_angle = self.angle;
 
-        let mut time_difference = now
-            .duration_since(self.last_update)
-            .as_secs_f32();
+        let mut time_difference = now.duration_since(self.last_update).as_secs_f32();
         if time_difference > 0.5 {
             time_difference = 0.5;
         }
@@ -199,7 +197,10 @@ impl Stick {
         status.x.properties = STICK_PROPERTIES;
         status.y.properties = STICK_PROPERTIES;
 
-        if *common::settings::values().emulate_analog_keyboard.get_value() {
+        if *common::settings::values()
+            .emulate_analog_keyboard
+            .get_value()
+        {
             let now = std::time::Instant::now();
             let angle = self.get_angle(now);
             status.x.raw_value = angle.cos() * self.amplitude;
@@ -240,9 +241,7 @@ impl Stick {
         }
 
         let now = Instant::now();
-        let time_difference = now
-            .duration_since(self.last_update)
-            .as_millis() as u64;
+        let time_difference = now.duration_since(self.last_update).as_millis() as u64;
 
         if time_difference < 10 {
             // Disable analog mode if inputs are too fast

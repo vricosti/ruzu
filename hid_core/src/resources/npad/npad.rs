@@ -124,13 +124,11 @@ impl NPad {
         aruid: u64,
         supported_style_set: NpadStyleSet,
     ) -> ResultCode {
-        self.npad_resource.set_supported_npad_style_set(aruid, supported_style_set)
+        self.npad_resource
+            .set_supported_npad_style_set(aruid, supported_style_set)
     }
 
-    pub fn get_supported_npad_style_set(
-        &self,
-        aruid: u64,
-    ) -> Result<NpadStyleSet, ResultCode> {
+    pub fn get_supported_npad_style_set(&self, aruid: u64) -> Result<NpadStyleSet, ResultCode> {
         self.npad_resource.get_supported_npad_style_set(aruid)
     }
 
@@ -139,7 +137,8 @@ impl NPad {
         aruid: u64,
         supported_npad_list: &[NpadIdType],
     ) -> ResultCode {
-        self.npad_resource.set_supported_npad_id_type(aruid, supported_npad_list)
+        self.npad_resource
+            .set_supported_npad_id_type(aruid, supported_npad_list)
     }
 
     pub fn set_npad_joy_hold_type(&mut self, aruid: u64, hold_type: NpadJoyHoldType) -> ResultCode {
@@ -155,7 +154,8 @@ impl NPad {
         aruid: u64,
         mode: NpadHandheldActivationMode,
     ) -> ResultCode {
-        self.npad_resource.set_npad_handheld_activation_mode(aruid, mode)
+        self.npad_resource
+            .set_npad_handheld_activation_mode(aruid, mode)
     }
 
     pub fn get_npad_handheld_activation_mode(
@@ -165,7 +165,10 @@ impl NPad {
         self.npad_resource.get_npad_handheld_activation_mode(aruid)
     }
 
-    pub fn set_npad_communication_mode(&mut self, _communication_mode: NpadCommunicationMode) -> ResultCode {
+    pub fn set_npad_communication_mode(
+        &mut self,
+        _communication_mode: NpadCommunicationMode,
+    ) -> ResultCode {
         ResultCode::SUCCESS
     }
 
@@ -190,11 +193,13 @@ impl NPad {
     }
 
     pub fn apply_npad_system_common_policy(&mut self, aruid: u64) -> ResultCode {
-        self.npad_resource.apply_npad_system_common_policy(aruid, false)
+        self.npad_resource
+            .apply_npad_system_common_policy(aruid, false)
     }
 
     pub fn apply_npad_system_common_policy_full(&mut self, aruid: u64) -> ResultCode {
-        self.npad_resource.apply_npad_system_common_policy(aruid, true)
+        self.npad_resource
+            .apply_npad_system_common_policy(aruid, true)
     }
 
     pub fn clear_npad_system_common_policy(&mut self, aruid: u64) -> ResultCode {
@@ -219,12 +224,17 @@ impl NPad {
 
     /// Port of NPad::AssigningSingleOnSlSrPress.
     pub fn assigning_single_on_sl_sr_press(&mut self, aruid: u64, is_enabled: bool) -> ResultCode {
-        let is_currently_enabled = match self.npad_resource.is_assigning_single_on_sl_sr_press_enabled(aruid) {
+        let is_currently_enabled = match self
+            .npad_resource
+            .is_assigning_single_on_sl_sr_press_enabled(aruid)
+        {
             Ok(v) => v,
             Err(e) => return ResultCode(e.raw()),
         };
         if is_enabled != is_currently_enabled {
-            let result = self.npad_resource.set_assigning_single_on_sl_sr_press(aruid, is_enabled);
+            let result = self
+                .npad_resource
+                .set_assigning_single_on_sl_sr_press(aruid, is_enabled);
             return result;
         }
         ResultCode::SUCCESS
@@ -241,7 +251,10 @@ impl NPad {
 
     /// Port of NPad::GetMaskedSupportedNpadStyleSet.
     pub fn get_masked_supported_npad_style_set(&self, aruid: u64) -> (ResultCode, NpadStyleSet) {
-        match self.npad_resource.get_masked_supported_npad_style_set(aruid) {
+        match self
+            .npad_resource
+            .get_masked_supported_npad_style_set(aruid)
+        {
             Ok(style_set) => (ResultCode::SUCCESS, style_set),
             Err(e) => {
                 if e == hid_result::RESULT_UNDEFINED_STYLESET {
@@ -257,8 +270,14 @@ impl NPad {
     /// Upstream additionally iterates abstracted_pads and calls
     /// abstracted_pad->EnableAppletToGetInput(aruid) on success.
     /// AbstractedPad integration is not yet wired up.
-    pub fn set_npad_system_ext_state_enabled(&mut self, aruid: u64, is_enabled: bool) -> ResultCode {
-        let result = self.npad_resource.set_npad_system_ext_state_enabled(aruid, is_enabled);
+    pub fn set_npad_system_ext_state_enabled(
+        &mut self,
+        aruid: u64,
+        is_enabled: bool,
+    ) -> ResultCode {
+        let result = self
+            .npad_resource
+            .set_npad_system_ext_state_enabled(aruid, is_enabled);
         if result.is_success() {
             // Upstream: for (auto& abstract_pad : abstracted_pads) {
             //     abstract_pad->EnableAppletToGetInput(aruid);
@@ -271,8 +290,7 @@ impl NPad {
     /// Port of NPad::EnableAppletToGetInput.
     /// Upstream iterates abstracted_pads and calls EnableAppletToGetInput(aruid).
     /// Requires AbstractedPad array to be stored in NPad, which is not yet wired up.
-    pub fn enable_applet_to_get_input(&mut self, _aruid: u64) {
-    }
+    pub fn enable_applet_to_get_input(&mut self, _aruid: u64) {}
 
     pub fn npad_resource(&self) -> &NPadResource {
         &self.npad_resource

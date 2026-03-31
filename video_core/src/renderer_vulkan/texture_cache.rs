@@ -183,10 +183,7 @@ impl TextureCache {
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             ),
-            (
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            ) => (
+            (vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL) => (
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags::TRANSFER_READ,
@@ -198,10 +195,7 @@ impl TextureCache {
                 vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
                 vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
             ),
-            (
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            ) => (
+            (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => (
                 vk::AccessFlags::TRANSFER_READ,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE,

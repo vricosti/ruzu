@@ -327,11 +327,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::WriteMemory`
     pub fn write_memory(&mut self, device_addr: VAddr, size: u64) {
-        if self.memory_tracker.is_region_gpu_modified(device_addr, size) {
+        if self
+            .memory_tracker
+            .is_region_gpu_modified(device_addr, size)
+        {
             self.clear_download(device_addr, size);
-            self.gpu_modified_ranges.subtract(device_addr, size as usize);
+            self.gpu_modified_ranges
+                .subtract(device_addr, size as usize);
         }
-        self.memory_tracker.mark_region_as_cpu_modified(device_addr, size);
+        self.memory_tracker
+            .mark_region_as_cpu_modified(device_addr, size);
     }
 
     /// Notify the cache about a cached (deferred) CPU write.
@@ -378,7 +383,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if !is_dirty {
             return false;
         }
-        if self.memory_tracker.is_region_gpu_modified(device_addr, size) {
+        if self
+            .memory_tracker
+            .is_region_gpu_modified(device_addr, size)
+        {
             return true;
         }
         self.write_memory(device_addr, size);
@@ -425,7 +433,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let device_addr_end_aligned =
             (device_addr + size + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1);
 
-        if self.memory_tracker.is_region_preflushable(device_addr, size) {
+        if self
+            .memory_tracker
+            .is_region_preflushable(device_addr, size)
+        {
             return Some(RasterizerDownloadArea {
                 start_address: device_addr_start_aligned,
                 end_address: device_addr_end_aligned,
@@ -463,7 +474,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return false;
         }
         let aligned_start = dest_address & !(DEVICE_PAGESIZE - 1);
-        let aligned_end = (dest_address + copy_size as u64 + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1);
+        let aligned_end =
+            (dest_address + copy_size as u64 + DEVICE_PAGESIZE - 1) & !(DEVICE_PAGESIZE - 1);
         if !self.is_region_gpu_modified(aligned_start, (aligned_end - aligned_start) as usize) {
             return false;
         }
@@ -615,8 +627,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 cs.fast_bound_uniform_buffers.fill(0);
             }
             cs.dirty_uniform_buffers.fill(!0u32);
-            cs.uniform_buffer_binding_sizes = [[0u32; NUM_GRAPHICS_UNIFORM_BUFFERS as usize];
-                NUM_STAGES as usize];
+            cs.uniform_buffer_binding_sizes =
+                [[0u32; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize];
         }
         cs.enabled_uniform_buffer_masks = *mask;
         cs.uniform_buffer_sizes = Some(Box::new(*sizes));
@@ -853,8 +865,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
         cs.enabled_compute_texture_buffers |= 1u32 << tbo_index;
-        cs.written_compute_texture_buffers |=
-            if is_written { 1u32 } else { 0u32 } << tbo_index;
+        cs.written_compute_texture_buffers |= if is_written { 1u32 } else { 0u32 } << tbo_index;
         if P::SEPARATE_IMAGE_BUFFER_BINDINGS {
             cs.image_compute_texture_buffers |= if is_image { 1u32 } else { 0u32 } << tbo_index;
         }
@@ -935,7 +946,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 let device_addr_end = (device_addr + size as u64 + 63) & !63u64;
                 let new_size = device_addr_end - device_addr_start;
                 self.clear_download(device_addr_start, new_size);
-                self.gpu_modified_ranges.subtract(device_addr_start, new_size as usize);
+                self.gpu_modified_ranges
+                    .subtract(device_addr_start, new_size as usize);
             }
             _ => {}
         }
@@ -1078,8 +1090,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             rt.pre_copy_barrier();
             for (copy, buffer_id) in &mut downloads {
                 copy.dst_offset += download_staging.offset;
-                let orig_device_addr =
-                    self.slot_buffers[*buffer_id].cpu_addr() + copy.src_offset;
+                let orig_device_addr = self.slot_buffers[*buffer_id].cpu_addr() + copy.src_offset;
                 self.async_downloads
                     .add(orig_device_addr, copy.size as usize);
                 let copies = [*copy];
@@ -1260,9 +1271,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Upstream: `BufferCache<P>::IsRegionGpuModified`
     pub fn is_region_gpu_modified(&self, addr: VAddr, size: usize) -> bool {
         let mut found = false;
-        self.gpu_modified_ranges.for_each_in_range(addr, size, |_start, _end| {
-            found = true;
-        });
+        self.gpu_modified_ranges
+            .for_each_in_range(addr, size, |_start, _end| {
+                found = true;
+            });
         found
     }
 
@@ -1294,7 +1306,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::IsRegionCpuModified`
     pub fn is_region_cpu_modified(&mut self, addr: VAddr, size: usize) -> bool {
-        self.memory_tracker.is_region_cpu_modified(addr, size as u64)
+        self.memory_tracker
+            .is_region_cpu_modified(addr, size as u64)
     }
 
     // -----------------------------------------------------------------------
@@ -1421,14 +1434,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let tick_threshold = self.frame_tick.saturating_sub(ticks_to_destroy) as i64;
         let mut remaining = num_iterations;
         let mut to_delete: Vec<BufferId> = Vec::new();
-        self.lru_cache.for_each_item_below(tick_threshold, |buffer_id| {
-            if remaining == 0 {
-                return true; // stop
-            }
-            remaining -= 1;
-            to_delete.push(buffer_id);
-            false // continue
-        });
+        self.lru_cache
+            .for_each_item_below(tick_threshold, |buffer_id| {
+                if remaining == 0 {
+                    return true; // stop
+                }
+                remaining -= 1;
+                to_delete.push(buffer_id);
+                false // continue
+            });
         for buffer_id in to_delete {
             self.download_buffer_memory(buffer_id);
             self.delete_buffer(buffer_id, false);
@@ -1605,7 +1619,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         let use_fast_buffer = binding.buffer_id != NULL_BUFFER_ID
             && size <= skip_cache_size
-            && !self.memory_tracker.is_region_gpu_modified(device_addr, size as u64);
+            && !self
+                .memory_tracker
+                .is_region_gpu_modified(device_addr, size as u64);
 
         if use_fast_buffer {
             // Upstream fast path: either BindMappedUniformBuffer or PushFastUniformBuffer.
@@ -2111,24 +2127,23 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
 
         // Helper closure: translate GPU address and create binding.
-        let resolve_binding =
-            |cache: &mut Self, gpu_addr: u64, size: u64| -> Binding {
-                let device_addr = cache
-                    .gpu_memory
-                    .as_ref()
-                    .and_then(|gm| gm.gpu_to_cpu_address(gpu_addr));
-                match device_addr {
-                    Some(addr) => {
-                        let buffer_id = cache.find_buffer(addr, size as u32);
-                        Binding {
-                            device_addr: addr,
-                            size: size as u32,
-                            buffer_id,
-                        }
+        let resolve_binding = |cache: &mut Self, gpu_addr: u64, size: u64| -> Binding {
+            let device_addr = cache
+                .gpu_memory
+                .as_ref()
+                .and_then(|gm| gm.gpu_to_cpu_address(gpu_addr));
+            match device_addr {
+                Some(addr) => {
+                    let buffer_id = cache.find_buffer(addr, size as u32);
+                    Binding {
+                        device_addr: addr,
+                        size: size as u32,
+                        buffer_id,
                     }
-                    None => NULL_BINDING,
                 }
-            };
+                None => NULL_BINDING,
+            }
+        };
 
         // Upstream: if (current_draw_indirect->include_count) { update count binding }
         if params.include_count {
@@ -2308,7 +2323,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         drop(cs);
 
         // Get launch description from engine state.
-        let launch_info = self.engine_state.as_ref().map(|es| es.get_compute_launch_info());
+        let launch_info = self
+            .engine_state
+            .as_ref()
+            .map(|es| es.get_compute_launch_info());
 
         let mut bits = mask;
         let mut idx: u32 = 0;
@@ -2417,7 +2435,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.memory_tracker
             .mark_region_as_gpu_modified(device_addr, size as u64);
         self.gpu_modified_ranges.add(device_addr, size as usize);
-        self.uncommitted_gpu_modified_ranges.add(device_addr, size as usize);
+        self.uncommitted_gpu_modified_ranges
+            .add(device_addr, size as usize);
     }
 
     /// Find or create a buffer covering `[device_addr, device_addr+size)`.
@@ -2583,7 +2602,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let overlap = self.resolve_overlaps(device_addr, wanted_size);
         let size = (overlap.end - overlap.begin) as u32;
 
-        let new_buffer_id = self.slot_buffers.insert(BufferBase::new(overlap.begin, size as u64));
+        let new_buffer_id = self
+            .slot_buffers
+            .insert(BufferBase::new(overlap.begin, size as u64));
         if let Some(ref mut rt) = self.runtime {
             rt.clear_buffer(new_buffer_id, 0, size as u64, 0);
         }
@@ -2728,8 +2749,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
         for copy in copies {
-            let device_addr =
-                self.slot_buffers[_buffer_id].cpu_addr() + copy.dst_offset;
+            let device_addr = self.slot_buffers[_buffer_id].cpu_addr() + copy.dst_offset;
             // Ensure immediate buffer is large enough.
             if self.immediate_buffer_alloc.len() < largest_copy as usize {
                 self.immediate_buffer_alloc.resize(largest_copy as usize, 0);
@@ -2773,8 +2793,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             // device_memory.ReadBlockUnsafe(device_addr, src_pointer, copy.size)
             if let Some(ref dm) = self.device_memory {
                 for copy in copies.iter() {
-                    let device_addr =
-                        self.slot_buffers[buffer_id].cpu_addr() + copy.dst_offset;
+                    let device_addr = self.slot_buffers[buffer_id].cpu_addr() + copy.dst_offset;
                     let src_start = copy.src_offset as usize;
                     let src_end = src_start + copy.size as usize;
                     if src_end <= staging.mapped_span.len() {
@@ -2811,12 +2830,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// NOTE: runtime memory maps, staging buffer, and device_memory.WriteBlockUnsafe
     /// are not yet available.
-    fn download_buffer_memory_range(
-        &mut self,
-        buffer_id: BufferId,
-        device_addr: VAddr,
-        size: u64,
-    ) {
+    fn download_buffer_memory_range(&mut self, buffer_id: BufferId, device_addr: VAddr, size: u64) {
         // Collect the ranges that need to be downloaded via memory_tracker.
         // We split the logic into two phases to avoid the borrow conflict:
         // Phase 1: collect download ranges from memory_tracker (borrows memory_tracker).
@@ -2860,7 +2874,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
 
             self.clear_download(device_addr_out, range_size);
-            self.gpu_modified_ranges.subtract(device_addr_out, range_size as usize);
+            self.gpu_modified_ranges
+                .subtract(device_addr_out, range_size as usize);
         }
 
         if total_size_bytes == 0 {
@@ -2893,8 +2908,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     for (i, copy) in adjusted_copies.iter().enumerate() {
                         let copy_device_addr =
                             self.slot_buffers[buffer_id].cpu_addr() + copies[i].src_offset;
-                        let dst_offset =
-                            (copy.dst_offset - download_staging.offset) as usize;
+                        let dst_offset = (copy.dst_offset - download_staging.offset) as usize;
                         let end = dst_offset + copies[i].size as usize;
                         if end <= mapped_memory.len() {
                             dm.write_block_unsafe(
@@ -2974,8 +2988,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
             cs.dirty_uniform_buffers.fill(!0u32);
-            cs.uniform_buffer_binding_sizes = [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize];
-                NUM_STAGES as usize];
+            cs.uniform_buffer_binding_sizes =
+                [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize];
         }
 
         cs.has_deleted_buffers = true;
@@ -2987,7 +3001,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 let b = &self.slot_buffers[buffer_id];
                 (b.cpu_addr(), b.size_bytes() as u64)
             };
-            self.memory_tracker.mark_region_as_cpu_modified(cpu_addr, size_bytes);
+            self.memory_tracker
+                .mark_region_as_cpu_modified(cpu_addr, size_bytes);
         }
 
         self.unregister(buffer_id);
@@ -2998,12 +3013,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Build a storage buffer binding from a GPU virtual SSBO address.
     ///
     /// Upstream: `BufferCache<P>::StorageBufferBinding`
-    fn storage_buffer_binding(
-        &self,
-        ssbo_addr: u64,
-        cbuf_index: u32,
-        is_written: bool,
-    ) -> Binding {
+    fn storage_buffer_binding(&self, ssbo_addr: u64, cbuf_index: u32, is_written: bool) -> Binding {
         let Some(ref gm) = self.gpu_memory else {
             log::warn!(
                 "storage_buffer_binding: gpu_memory not available for cbuf_index {}",
@@ -3155,7 +3165,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     fn clear_download(&mut self, base_addr: VAddr, size: u64) {
         // Upstream: async_downloads.DeleteAll(base_addr, size);
         self.async_downloads.subtract(base_addr, size as usize);
-        self.uncommitted_gpu_modified_ranges.subtract(base_addr, size as usize);
+        self.uncommitted_gpu_modified_ranges
+            .subtract(base_addr, size as usize);
         for range_set in self.committed_gpu_modified_ranges.iter_mut() {
             range_set.subtract(base_addr, size as usize);
         }

@@ -324,10 +324,8 @@ mod tests {
 
     #[test]
     fn test_vector_vfs_directory() {
-        let f1: VirtualFile =
-            Arc::new(VectorVfsFile::new(vec![1], "a.bin".to_string(), None));
-        let f2: VirtualFile =
-            Arc::new(VectorVfsFile::new(vec![2], "b.bin".to_string(), None));
+        let f1: VirtualFile = Arc::new(VectorVfsFile::new(vec![1], "a.bin".to_string(), None));
+        let f2: VirtualFile = Arc::new(VectorVfsFile::new(vec![2], "b.bin".to_string(), None));
         let dir = VectorVfsDirectory::new(vec![f1, f2], vec![], "root".to_string(), None);
 
         assert_eq!(dir.get_name(), "root");

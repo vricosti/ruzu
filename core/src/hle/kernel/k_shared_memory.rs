@@ -35,9 +35,7 @@ fn convert_to_k_memory_permission(perm: MemoryPermission) -> KMemoryPermission {
         MemoryPermission::None => KMemoryPermission::NONE,
         MemoryPermission::Read => KMemoryPermission::USER_READ,
         MemoryPermission::Write => KMemoryPermission::USER_WRITE,
-        MemoryPermission::ReadWrite => {
-            KMemoryPermission::USER_READ | KMemoryPermission::USER_WRITE
-        }
+        MemoryPermission::ReadWrite => KMemoryPermission::USER_READ | KMemoryPermission::USER_WRITE,
         MemoryPermission::Execute => KMemoryPermission::USER_EXECUTE,
         MemoryPermission::ReadExecute => {
             KMemoryPermission::USER_READ | KMemoryPermission::USER_EXECUTE
@@ -112,10 +110,8 @@ impl KSharedMemory {
         let num_pages = aligned_size / PAGE_SIZE;
 
         // Allocate physical pages from the Secure pool (from back, matching upstream).
-        let option =
-            KMemoryManager::encode_option(Pool::SECURE, Direction::FromBack);
-        self.m_physical_address =
-            memory_manager.allocate_and_open_continuous(num_pages, 1, option);
+        let option = KMemoryManager::encode_option(Pool::SECURE, Direction::FromBack);
+        self.m_physical_address = memory_manager.allocate_and_open_continuous(num_pages, 1, option);
         if self.m_physical_address == 0 {
             log::error!(
                 "KSharedMemory::initialize: failed to allocate {} pages from Secure pool",
@@ -132,9 +128,7 @@ impl KSharedMemory {
         self.m_is_initialized = true;
 
         // Zero the allocated memory.
-        let ptr = unsafe {
-            (*self.m_device_memory).get_pointer(self.m_physical_address)
-        };
+        let ptr = unsafe { (*self.m_device_memory).get_pointer(self.m_physical_address) };
         if !ptr.is_null() {
             unsafe {
                 std::ptr::write_bytes(ptr, 0, aligned_size);
@@ -143,7 +137,9 @@ impl KSharedMemory {
 
         log::debug!(
             "KSharedMemory::initialize: allocated {} pages at phys={:#x}, size={:#x}",
-            num_pages, self.m_physical_address, aligned_size
+            num_pages,
+            self.m_physical_address,
+            aligned_size
         );
 
         ResultCode::new(0)
@@ -162,8 +158,7 @@ impl KSharedMemory {
             return std::ptr::null();
         }
         unsafe {
-            (*self.m_device_memory)
-                .get_pointer_const(self.m_physical_address + offset as u64)
+            (*self.m_device_memory).get_pointer_const(self.m_physical_address + offset as u64)
         }
     }
 
@@ -172,10 +167,7 @@ impl KSharedMemory {
         if self.m_device_memory.is_null() || !self.m_is_initialized {
             return std::ptr::null_mut();
         }
-        unsafe {
-            (*self.m_device_memory)
-                .get_pointer(self.m_physical_address + offset as u64)
-        }
+        unsafe { (*self.m_device_memory).get_pointer(self.m_physical_address + offset as u64) }
     }
 
     /// Map the shared memory into a target process's address space.
@@ -230,11 +222,8 @@ impl KSharedMemory {
             None => return ResultCode::new(0xCA01),
         };
 
-        let result = page_table.unmap_page_group(
-            KProcessAddress::new(address),
-            pg,
-            KMemoryState::SHARED,
-        );
+        let result =
+            page_table.unmap_page_group(KProcessAddress::new(address), pg, KMemoryState::SHARED);
         ResultCode::new(result)
     }
 

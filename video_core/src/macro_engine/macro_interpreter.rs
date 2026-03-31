@@ -7,8 +7,8 @@
 //! execution backend when JIT compilation is unavailable or disabled.
 
 use super::macro_engine::{
-    AluOperation, BranchCondition, CachedMacro, MethodAddress, Opcode, Operation,
-    ResultOperation, NUM_MACRO_REGISTERS,
+    AluOperation, BranchCondition, CachedMacro, MethodAddress, Opcode, Operation, ResultOperation,
+    NUM_MACRO_REGISTERS,
 };
 
 // ── MacroInterpreterImpl ─────────────────────────────────────────────────────
@@ -130,10 +130,7 @@ impl MacroInterpreterImpl {
 
         // Update the program counter if we were delayed
         if let Some(delayed) = self.delayed_pc.take() {
-            assert!(
-                is_delay_slot,
-                "delayed_pc set but not in a delay slot"
-            );
+            assert!(is_delay_slot, "delayed_pc set but not in a delay slot");
             self.pc = delayed;
         }
 
@@ -165,16 +162,14 @@ impl MacroInterpreterImpl {
                 let dst_val = self.get_register(opcode.src_a());
                 let src = self.get_register(opcode.src_b());
 
-                let result =
-                    ((src >> dst_val) & opcode.get_bitfield_mask()) << opcode.bf_dst_bit();
+                let result = ((src >> dst_val) & opcode.get_bitfield_mask()) << opcode.bf_dst_bit();
                 self.process_result(opcode.result_operation(), opcode.dst(), result);
             }
             Operation::ExtractShiftLeftRegister => {
                 let dst_val = self.get_register(opcode.src_a());
                 let src = self.get_register(opcode.src_b());
 
-                let result =
-                    ((src >> opcode.bf_src_bit()) & opcode.get_bitfield_mask()) << dst_val;
+                let result = ((src >> opcode.bf_src_bit()) & opcode.get_bitfield_mask()) << dst_val;
                 self.process_result(opcode.result_operation(), opcode.dst(), result);
             }
             Operation::Read => {
@@ -194,8 +189,7 @@ impl MacroInterpreterImpl {
                 if taken {
                     // Ignore the delay slot if the branch has the annul bit.
                     if opcode.branch_annul() {
-                        self.pc =
-                            (base_address as i32 + opcode.get_branch_target()) as u32;
+                        self.pc = (base_address as i32 + opcode.get_branch_target()) as u32;
                         return true;
                     }
 
@@ -247,7 +241,9 @@ impl MacroInterpreterImpl {
             }
             AluOperation::SubtractWithBorrow => {
                 let borrow = if self.carry_flag { 0u64 } else { 1u64 };
-                let result = (src_a as u64).wrapping_sub(src_b as u64).wrapping_sub(borrow);
+                let result = (src_a as u64)
+                    .wrapping_sub(src_b as u64)
+                    .wrapping_sub(borrow);
                 self.carry_flag = result < 0x100000000;
                 result as u32
             }
@@ -392,7 +388,11 @@ impl MacroInterpreterImpl {
             0
         };
         if self.trace_steps_remaining > 0 {
-            log::info!("MacroTrace read method=0x{:X} value=0x{:08X}", method, value);
+            log::info!(
+                "MacroTrace read method=0x{:X} value=0x{:08X}",
+                method,
+                value
+            );
         }
         value
     }

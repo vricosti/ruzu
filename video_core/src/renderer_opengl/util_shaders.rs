@@ -98,7 +98,15 @@ impl UtilShaders {
             gl::UseProgram(self.astc_decoder_program);
 
             // Bind output image
-            gl::BindImageTexture(0, dst_image, level as i32, gl::TRUE, layer as i32, gl::WRITE_ONLY, gl::RGBA8);
+            gl::BindImageTexture(
+                0,
+                dst_image,
+                level as i32,
+                gl::TRUE,
+                layer as i32,
+                gl::WRITE_ONLY,
+                gl::RGBA8,
+            );
 
             // Bind source buffer
             gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
@@ -142,7 +150,15 @@ impl UtilShaders {
         let store_fmt = store_format(bytes_per_block);
         unsafe {
             gl::UseProgram(self.block_linear_unswizzle_2d_program);
-            gl::BindImageTexture(0, dst_image, level as i32, gl::TRUE, 0, gl::WRITE_ONLY, store_fmt);
+            gl::BindImageTexture(
+                0,
+                dst_image,
+                level as i32,
+                gl::TRUE,
+                0,
+                gl::WRITE_ONLY,
+                store_fmt,
+            );
             gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
             gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 1, self.swizzle_table_buffer);
 
@@ -179,7 +195,15 @@ impl UtilShaders {
         let store_fmt = store_format(bytes_per_block);
         unsafe {
             gl::UseProgram(self.block_linear_unswizzle_3d_program);
-            gl::BindImageTexture(0, dst_image, level as i32, gl::TRUE, 0, gl::WRITE_ONLY, store_fmt);
+            gl::BindImageTexture(
+                0,
+                dst_image,
+                level as i32,
+                gl::TRUE,
+                0,
+                gl::WRITE_ONLY,
+                store_fmt,
+            );
             gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
             gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 1, self.swizzle_table_buffer);
 
@@ -217,7 +241,15 @@ impl UtilShaders {
         let store_fmt = store_format(bytes_per_block);
         unsafe {
             gl::UseProgram(self.pitch_unswizzle_program);
-            gl::BindImageTexture(0, dst_image, level as i32, gl::TRUE, 0, gl::WRITE_ONLY, store_fmt);
+            gl::BindImageTexture(
+                0,
+                dst_image,
+                level as i32,
+                gl::TRUE,
+                0,
+                gl::WRITE_ONLY,
+                store_fmt,
+            );
             gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
 
             gl::Uniform1ui(0, width);
@@ -250,7 +282,15 @@ impl UtilShaders {
         }
         unsafe {
             gl::UseProgram(self.copy_bc4_program);
-            gl::BindImageTexture(0, dst_image, level as i32, gl::TRUE, 0, gl::WRITE_ONLY, gl::RGBA8);
+            gl::BindImageTexture(
+                0,
+                dst_image,
+                level as i32,
+                gl::TRUE,
+                0,
+                gl::WRITE_ONLY,
+                gl::RGBA8,
+            );
             gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, src_buffer);
 
             gl::Uniform1ui(0, width);
@@ -267,13 +307,7 @@ impl UtilShaders {
     /// Convert S8D24 depth-stencil format.
     ///
     /// Port of `UtilShaders::ConvertS8D24`.
-    pub fn convert_s8d24(
-        &self,
-        dst_image: u32,
-        src_buffer: u32,
-        width: u32,
-        height: u32,
-    ) {
+    pub fn convert_s8d24(&self, dst_image: u32, src_buffer: u32, width: u32, height: u32) {
         if self.convert_s8d24_program == 0 {
             log::warn!("Convert S8D24 program not compiled");
             return;

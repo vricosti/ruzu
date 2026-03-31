@@ -80,7 +80,10 @@ impl<T: Default + Clone> ScratchBuffer<T> {
 
     /// Swap contents with another scratch buffer.
     pub fn swap(&mut self, other: &mut ScratchBuffer<T>) {
-        std::mem::swap(&mut self.last_requested_size, &mut other.last_requested_size);
+        std::mem::swap(
+            &mut self.last_requested_size,
+            &mut other.last_requested_size,
+        );
         std::mem::swap(&mut self.buffer, &mut other.buffer);
     }
 

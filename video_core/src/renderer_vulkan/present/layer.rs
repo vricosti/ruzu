@@ -135,11 +135,8 @@ impl Layer {
 
         // Create descriptor sets
         let layouts = vec![layout; image_count];
-        let descriptor_sets = util::create_wrapped_descriptor_sets(
-            &device,
-            descriptor_pool,
-            &layouts,
-        );
+        let descriptor_sets =
+            util::create_wrapped_descriptor_sets(&device, descriptor_pool, &layouts);
 
         Layer {
             device,
@@ -213,8 +210,7 @@ impl Layer {
 
     /// Port of `Layer::SetMatrixData`.
     fn set_matrix_data(data: &mut PresentPushConstants, layout: &FramebufferLayout) {
-        data.modelview_matrix =
-            make_orthographic_matrix(layout.width as f32, layout.height as f32);
+        data.modelview_matrix = make_orthographic_matrix(layout.width as f32, layout.height as f32);
     }
 
     /// Port of `Layer::SetVertexData`.
@@ -267,14 +263,20 @@ impl Layer {
 
     /// Port of `Layer::CalculateBufferSize`.
     fn calculate_buffer_size(&self, framebuffer: &FramebufferConfig) -> u64 {
-        get_size_in_bytes(framebuffer.stride, framebuffer.height, framebuffer.pixel_format)
-            * self.image_count as u64
+        get_size_in_bytes(
+            framebuffer.stride,
+            framebuffer.height,
+            framebuffer.pixel_format,
+        ) * self.image_count as u64
     }
 
     /// Port of `Layer::GetRawImageOffset`.
     fn get_raw_image_offset(&self, framebuffer: &FramebufferConfig, image_index: usize) -> u64 {
-        get_size_in_bytes(framebuffer.stride, framebuffer.height, framebuffer.pixel_format)
-            * image_index as u64
+        get_size_in_bytes(
+            framebuffer.stride,
+            framebuffer.height,
+            framebuffer.pixel_format,
+        ) * image_index as u64
     }
 
     /// Port of `Layer::ReleaseRawImages`.
@@ -290,7 +292,11 @@ impl Layer {
     ///
     /// Recreates raw images and staging buffer if the framebuffer dimensions
     /// or pixel format have changed.
-    pub fn refresh_resources(&mut self, framebuffer: &FramebufferConfig, allocator: &vk::DeviceMemory) {
+    pub fn refresh_resources(
+        &mut self,
+        framebuffer: &FramebufferConfig,
+        allocator: &vk::DeviceMemory,
+    ) {
         if Some(framebuffer.pixel_format) == self.pixel_format
             && framebuffer.width == self.raw_width
             && framebuffer.height == self.raw_height
@@ -317,7 +323,8 @@ impl Layer {
             .resize(self.image_count, vk::ImageView::null());
 
         for i in 0..self.image_count {
-            self.raw_images[i] = util::create_wrapped_image(&self.device, allocator, extent, format);
+            self.raw_images[i] =
+                util::create_wrapped_image(&self.device, allocator, extent, format);
             self.raw_image_views[i] =
                 util::create_wrapped_image_view(&self.device, self.raw_images[i], format);
         }

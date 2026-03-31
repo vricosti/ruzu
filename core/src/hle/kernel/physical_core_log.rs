@@ -3,8 +3,8 @@
 // To disable all debug tracing, comment out the `use` in physical_core.rs.
 
 use crate::arm::arm_interface::ThreadContext;
-use std::sync::{Arc, Mutex};
 use crate::hle::kernel::k_process::KProcess;
+use std::sync::{Arc, Mutex};
 
 /// State for the instruction ring buffer used to capture the last N instructions
 /// before an abort handler is entered.
@@ -30,10 +30,8 @@ impl InstructionRingBuffer {
             ctx.pc,
             insn,
             [
-                ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3],
-                ctx.r[4], ctx.r[5], ctx.r[6], ctx.r[7],
-                ctx.r[8], ctx.r[9], ctx.r[10], ctx.r[11],
-                ctx.r[12], ctx.sp, ctx.lr, 0,
+                ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3], ctx.r[4], ctx.r[5], ctx.r[6], ctx.r[7],
+                ctx.r[8], ctx.r[9], ctx.r[10], ctx.r[11], ctx.r[12], ctx.sp, ctx.lr, 0,
             ],
         );
         self.idx = (self.idx + 1) % Self::SIZE;
@@ -54,7 +52,9 @@ impl InstructionRingBuffer {
         if ctx.pc == 0x200908 {
             log::error!(
                 "=== rtld init check: R0={:#x} (0=OK, non-0=FAIL) module_r5={:#x} r6={:#x} ===",
-                ctx.r[0], ctx.r[5], ctx.r[6]
+                ctx.r[0],
+                ctx.r[5],
+                ctx.r[6]
             );
         }
     }

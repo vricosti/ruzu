@@ -7,5 +7,9 @@
 
 use super::glsl_emit_context::EmitContext;
 
-pub fn emit_join(_ctx: &mut EmitContext) { panic!("Join shouldn't be emitted"); }
-pub fn emit_demote_to_helper_invocation(ctx: &mut EmitContext) { ctx.add_line("discard;"); }
+pub fn emit_join(_ctx: &mut EmitContext) {
+    panic!("Join shouldn't be emitted");
+}
+pub fn emit_demote_to_helper_invocation(ctx: &mut EmitContext) {
+    ctx.add_line("discard;");
+}

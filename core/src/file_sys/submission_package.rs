@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use super::content_archive::{is_directory_exefs, NCA, NCAContentType};
+use super::content_archive::{is_directory_exefs, NCAContentType, NCA};
 use super::nca_metadata::{ContentRecordType, TitleType, CNMT};
 use super::partition_filesystem::{PartitionFilesystem, ResultStatus};
 use super::vfs::vfs::{VfsDirectory, VfsFile};
@@ -111,9 +111,7 @@ impl NSP {
         }
 
         let ids = self.get_program_title_ids();
-        ids.into_iter()
-            .find(|tid| (tid & 0x800) == 0)
-            .unwrap_or(0)
+        ids.into_iter().find(|tid| (tid & 0x800) == 0).unwrap_or(0)
     }
 
     pub fn get_extracted_title_id(&self) -> u64 {
@@ -172,9 +170,7 @@ impl NSP {
         out
     }
 
-    pub fn get_ncas(
-        &self,
-    ) -> &BTreeMap<u64, BTreeMap<(u8, u8), Arc<NCA>>> {
+    pub fn get_ncas(&self) -> &BTreeMap<u64, BTreeMap<(u8, u8), Arc<NCA>>> {
         &self.ncas
     }
 
@@ -220,10 +216,7 @@ impl NSP {
 
             let ticket = crate::crypto::key_manager::Ticket::read_from_bytes(&raw_data);
             if !keys_guard.add_ticket(&ticket) {
-                log::warn!(
-                    "Could not load NSP ticket {}",
-                    ticket_file.get_name()
-                );
+                log::warn!("Could not load NSP ticket {}", ticket_file.get_name());
             }
         }
     }
@@ -247,9 +240,7 @@ impl NSP {
             }
 
             let nca = Arc::new(NCA::new(outer_file.clone(), None));
-            if nca.get_status() != ResultStatus::Success
-                || nca.get_subdirectories().is_empty()
-            {
+            if nca.get_status() != ResultStatus::Success || nca.get_subdirectories().is_empty() {
                 log::warn!(
                     "read_ncas: failed to parse cnmt NCA '{}': status={:?}",
                     name,
@@ -279,11 +270,8 @@ impl NSP {
 
                 for rec in cnmt.get_content_records() {
                     // Convert NCA ID (16 bytes) to lowercase hex string.
-                    let id_string: String = rec
-                        .nca_id
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect();
+                    let id_string: String =
+                        rec.nca_id.iter().map(|b| format!("{:02x}", b)).collect();
                     let nca_filename = format!("{}.nca", id_string);
 
                     let next_file = self.pfs.get_file(&nca_filename);

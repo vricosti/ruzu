@@ -64,8 +64,10 @@ pub fn shfl(v: &mut TranslatorVisitor<'_>, insn: u64) {
     };
 
     // clamp = mask[4:0], seg_mask = mask[12:8]
-    let clamp = v.ir.bit_field_u_extract(src_b, Value::ImmU32(0), Value::ImmU32(5));
-    let seg_mask = v.ir.bit_field_u_extract(src_b, Value::ImmU32(8), Value::ImmU32(5));
+    let clamp =
+        v.ir.bit_field_u_extract(src_b, Value::ImmU32(0), Value::ImmU32(5));
+    let seg_mask =
+        v.ir.bit_field_u_extract(src_b, Value::ImmU32(8), Value::ImmU32(5));
 
     let value = v.x(src_reg);
     let result = match mode {
@@ -73,7 +75,10 @@ pub fn shfl(v: &mut TranslatorVisitor<'_>, insn: u64) {
         1 | 2 | 3 => {
             // UP/DOWN/BFLY shuffle variants — emit ShuffleIndex as fallback
             // (upstream has full ShuffleUp/Down/Butterfly but emitter only exposes ShuffleIndex)
-            log::warn!("SHFL mode {} not fully implemented, using IDX fallback", mode);
+            log::warn!(
+                "SHFL mode {} not fully implemented, using IDX fallback",
+                mode
+            );
             let _ = clamp; // used in full implementation
             v.ir.shuffle_index(value, src_a, seg_mask)
         }

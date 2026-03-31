@@ -61,8 +61,8 @@ pub fn identity_removal_pass(program: &mut Program) {
 
     // Phase 3: Remove Identity and Void instructions.
     for block in &mut program.blocks {
-        block.instructions.retain(|inst| {
-            inst.opcode != Opcode::Identity && inst.opcode != Opcode::Void
-        });
+        block
+            .instructions
+            .retain(|inst| inst.opcode != Opcode::Identity && inst.opcode != Opcode::Void);
     }
 }

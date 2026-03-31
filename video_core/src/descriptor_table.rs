@@ -65,7 +65,12 @@ impl<const ENTRY_SIZE: usize> DescriptorTable<ENTRY_SIZE> {
         index: u32,
         gpu_read: &dyn Fn(u64, &mut [u8]),
     ) -> ([u8; ENTRY_SIZE], bool) {
-        assert!(index <= self.limit, "descriptor index {} exceeds limit {}", index, self.limit);
+        assert!(
+            index <= self.limit,
+            "descriptor index {} exceeds limit {}",
+            index,
+            self.limit
+        );
 
         let gpu_va = self.gpu_addr + (index as u64) * (ENTRY_SIZE as u64);
         let mut buffer = [0u8; ENTRY_SIZE];

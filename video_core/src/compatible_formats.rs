@@ -241,8 +241,7 @@ const VIEW_CLASS_8_BITS: &[PixelFormat] = &[
 const VIEW_CLASS_RGTC1_RED: &[PixelFormat] = &[PixelFormat::BC4Unorm, PixelFormat::BC4Snorm];
 const VIEW_CLASS_RGTC2_RG: &[PixelFormat] = &[PixelFormat::BC5Unorm, PixelFormat::BC5Snorm];
 const VIEW_CLASS_BPTC_UNORM: &[PixelFormat] = &[PixelFormat::BC7Unorm, PixelFormat::BC7Srgb];
-const VIEW_CLASS_BPTC_FLOAT: &[PixelFormat] =
-    &[PixelFormat::BC6hSfloat, PixelFormat::BC6hUfloat];
+const VIEW_CLASS_BPTC_FLOAT: &[PixelFormat] = &[PixelFormat::BC6hSfloat, PixelFormat::BC6hUfloat];
 
 const VIEW_CLASS_ASTC_4X4_RGBA: &[PixelFormat] =
     &[PixelFormat::Astc2d4x4Unorm, PixelFormat::Astc2d4x4Srgb];

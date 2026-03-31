@@ -6,8 +6,8 @@
 //!
 //! Handles atomic operations on shared memory and storage buffers (SSBOs).
 
-use rspirv::spirv::{self, Word};
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::{self, Word};
 
 /// Get device scope and relaxed semantics for atomic operations.
 ///
@@ -21,81 +21,49 @@ fn atomic_args(ctx: &mut SpirvEmitContext) -> (Word, Word) {
 /// Shared memory atomic add (U32).
 ///
 /// Matches upstream `SharedAtomicU32` + `OpAtomicIAdd`.
-pub fn emit_shared_atomic_iadd_32(
-    ctx: &mut SpirvEmitContext,
-    _offset: Word,
-    _value: Word,
-) -> Word {
+pub fn emit_shared_atomic_iadd_32(ctx: &mut SpirvEmitContext, _offset: Word, _value: Word) -> Word {
     log::trace!("SPIR-V: emit_shared_atomic_iadd_32");
     ctx.builder.undef(ctx.u32_type, None)
 }
 
 /// Shared memory atomic min (signed U32).
-pub fn emit_shared_atomic_smin_32(
-    ctx: &mut SpirvEmitContext,
-    _offset: Word,
-    _value: Word,
-) -> Word {
+pub fn emit_shared_atomic_smin_32(ctx: &mut SpirvEmitContext, _offset: Word, _value: Word) -> Word {
     log::trace!("SPIR-V: emit_shared_atomic_smin_32");
     ctx.builder.undef(ctx.u32_type, None)
 }
 
 /// Shared memory atomic max (signed U32).
-pub fn emit_shared_atomic_smax_32(
-    ctx: &mut SpirvEmitContext,
-    _offset: Word,
-    _value: Word,
-) -> Word {
+pub fn emit_shared_atomic_smax_32(ctx: &mut SpirvEmitContext, _offset: Word, _value: Word) -> Word {
     log::trace!("SPIR-V: emit_shared_atomic_smax_32");
     ctx.builder.undef(ctx.u32_type, None)
 }
 
 /// Shared memory atomic min (unsigned U32).
-pub fn emit_shared_atomic_umin_32(
-    ctx: &mut SpirvEmitContext,
-    _offset: Word,
-    _value: Word,
-) -> Word {
+pub fn emit_shared_atomic_umin_32(ctx: &mut SpirvEmitContext, _offset: Word, _value: Word) -> Word {
     log::trace!("SPIR-V: emit_shared_atomic_umin_32");
     ctx.builder.undef(ctx.u32_type, None)
 }
 
 /// Shared memory atomic max (unsigned U32).
-pub fn emit_shared_atomic_umax_32(
-    ctx: &mut SpirvEmitContext,
-    _offset: Word,
-    _value: Word,
-) -> Word {
+pub fn emit_shared_atomic_umax_32(ctx: &mut SpirvEmitContext, _offset: Word, _value: Word) -> Word {
     log::trace!("SPIR-V: emit_shared_atomic_umax_32");
     ctx.builder.undef(ctx.u32_type, None)
 }
 
 /// Shared memory atomic AND (U32).
-pub fn emit_shared_atomic_and_32(
-    ctx: &mut SpirvEmitContext,
-    _offset: Word,
-    _value: Word,
-) -> Word {
+pub fn emit_shared_atomic_and_32(ctx: &mut SpirvEmitContext, _offset: Word, _value: Word) -> Word {
     log::trace!("SPIR-V: emit_shared_atomic_and_32");
     ctx.builder.undef(ctx.u32_type, None)
 }
 
 /// Shared memory atomic OR (U32).
-pub fn emit_shared_atomic_or_32(
-    ctx: &mut SpirvEmitContext,
-    _offset: Word,
-    _value: Word,
-) -> Word {
+pub fn emit_shared_atomic_or_32(ctx: &mut SpirvEmitContext, _offset: Word, _value: Word) -> Word {
     log::trace!("SPIR-V: emit_shared_atomic_or_32");
     ctx.builder.undef(ctx.u32_type, None)
 }
 
 /// Shared memory atomic XOR (U32).
-pub fn emit_shared_atomic_xor_32(
-    ctx: &mut SpirvEmitContext,
-    _offset: Word,
-    _value: Word,
-) -> Word {
+pub fn emit_shared_atomic_xor_32(ctx: &mut SpirvEmitContext, _offset: Word, _value: Word) -> Word {
     log::trace!("SPIR-V: emit_shared_atomic_xor_32");
     ctx.builder.undef(ctx.u32_type, None)
 }

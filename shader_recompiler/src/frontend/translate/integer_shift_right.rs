@@ -53,7 +53,8 @@ fn shr_inner(tv: &mut TranslatorVisitor, insn: u64, shift: Value) {
         let clamped = if is_signed {
             // negative (signed) -> -1 (all ones), non-negative -> 0
             let is_negative = tv.ir.s_less_than(result, Value::ImmU32(0));
-            tv.ir.select_u32(is_negative, Value::ImmU32(u32::MAX), Value::ImmU32(0))
+            tv.ir
+                .select_u32(is_negative, Value::ImmU32(u32::MAX), Value::ImmU32(0))
         } else {
             Value::ImmU32(0)
         };

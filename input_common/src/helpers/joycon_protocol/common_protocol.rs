@@ -175,11 +175,7 @@ impl JoyconCommonProtocol {
     ///
     /// Upstream calls SendMCUData(SetDeviceMode) in a loop until output.mcu_data[6] matches
     /// the requested mode. Depends on the hidapi handle.
-    pub fn wait_set_mcu_mode(
-        &mut self,
-        _report_mode: ReportMode,
-        _mode: McuMode,
-    ) -> DriverResult {
+    pub fn wait_set_mcu_mode(&mut self, _report_mode: ReportMode, _mode: McuMode) -> DriverResult {
         log::warn!("wait_set_mcu_mode: no hidapi handle available");
         DriverResult::Timeout
     }
@@ -233,7 +229,9 @@ pub struct ScopedSetBlocking {
 impl ScopedSetBlocking {
     pub fn new(protocol: &mut JoyconCommonProtocol) -> Self {
         protocol.set_blocking();
-        Self { protocol: protocol as *mut _ }
+        Self {
+            protocol: protocol as *mut _,
+        }
     }
 }
 

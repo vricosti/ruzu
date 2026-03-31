@@ -12,13 +12,15 @@ use std::sync::Mutex;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use crate::hle::service::psc::time::common::{
     CalendarAdditionalInfo, CalendarTime, LocationName, RuleVersion, SteadyClockTimePoint,
 };
-use crate::hle::service::psc::time::errors::{RESULT_PERMISSION_DENIED, RESULT_TIME_ZONE_NOT_FOUND};
+use crate::hle::service::psc::time::errors::{
+    RESULT_PERMISSION_DENIED, RESULT_TIME_ZONE_NOT_FOUND,
+};
 use crate::hle::service::psc::time::time_zone::TzRule;
 use crate::hle::service::psc::time::time_zone_service::TimeZoneService as PscTimeZoneService;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::time_zone_binary::TimeZoneBinary;
 
@@ -68,20 +70,64 @@ pub struct TimeZoneService {
 impl TimeZoneService {
     fn build_handlers() -> BTreeMap<u32, FunctionInfo> {
         build_handler_map(&[
-            (commands::GET_DEVICE_LOCATION_NAME, None, "GetDeviceLocationName"),
-            (commands::SET_DEVICE_LOCATION_NAME, None, "SetDeviceLocationName"),
-            (commands::GET_TOTAL_LOCATION_NAME_COUNT, None, "GetTotalLocationNameCount"),
-            (commands::LOAD_LOCATION_NAME_LIST, None, "LoadLocationNameList"),
+            (
+                commands::GET_DEVICE_LOCATION_NAME,
+                None,
+                "GetDeviceLocationName",
+            ),
+            (
+                commands::SET_DEVICE_LOCATION_NAME,
+                None,
+                "SetDeviceLocationName",
+            ),
+            (
+                commands::GET_TOTAL_LOCATION_NAME_COUNT,
+                None,
+                "GetTotalLocationNameCount",
+            ),
+            (
+                commands::LOAD_LOCATION_NAME_LIST,
+                None,
+                "LoadLocationNameList",
+            ),
             (commands::LOAD_TIME_ZONE_RULE, None, "LoadTimeZoneRule"),
-            (commands::GET_TIME_ZONE_RULE_VERSION, None, "GetTimeZoneRuleVersion"),
-            (commands::GET_DEVICE_LOCATION_NAME_AND_UPDATED_TIME, None, "GetDeviceLocationNameAndUpdatedTime"),
-            (commands::SET_DEVICE_LOCATION_NAME_WITH_TIME_ZONE_RULE, None, "SetDeviceLocationNameWithTimeZoneRule"),
-            (commands::PARSE_TIME_ZONE_BINARY, None, "ParseTimeZoneBinary"),
-            (commands::GET_DEVICE_LOCATION_NAME_OPERATION_EVENT_READABLE_HANDLE, None, "GetDeviceLocationNameOperationEventReadableHandle"),
+            (
+                commands::GET_TIME_ZONE_RULE_VERSION,
+                None,
+                "GetTimeZoneRuleVersion",
+            ),
+            (
+                commands::GET_DEVICE_LOCATION_NAME_AND_UPDATED_TIME,
+                None,
+                "GetDeviceLocationNameAndUpdatedTime",
+            ),
+            (
+                commands::SET_DEVICE_LOCATION_NAME_WITH_TIME_ZONE_RULE,
+                None,
+                "SetDeviceLocationNameWithTimeZoneRule",
+            ),
+            (
+                commands::PARSE_TIME_ZONE_BINARY,
+                None,
+                "ParseTimeZoneBinary",
+            ),
+            (
+                commands::GET_DEVICE_LOCATION_NAME_OPERATION_EVENT_READABLE_HANDLE,
+                None,
+                "GetDeviceLocationNameOperationEventReadableHandle",
+            ),
             (commands::TO_CALENDAR_TIME, None, "ToCalendarTime"),
-            (commands::TO_CALENDAR_TIME_WITH_MY_RULE, None, "ToCalendarTimeWithMyRule"),
+            (
+                commands::TO_CALENDAR_TIME_WITH_MY_RULE,
+                None,
+                "ToCalendarTimeWithMyRule",
+            ),
             (commands::TO_POSIX_TIME, None, "ToPosixTime"),
-            (commands::TO_POSIX_TIME_WITH_MY_RULE, None, "ToPosixTimeWithMyRule"),
+            (
+                commands::TO_POSIX_TIME_WITH_MY_RULE,
+                None,
+                "ToPosixTimeWithMyRule",
+            ),
         ])
     }
 
@@ -183,10 +229,7 @@ impl TimeZoneService {
     ///
     /// Corresponds to `TimeZoneService::LoadLocationNameList` in upstream.
     /// Upstream delegates to `m_time_zone_binary.GetTimeZoneLocationList`.
-    pub fn load_location_name_list(
-        &self,
-        index: u32,
-    ) -> Result<Vec<LocationName>, ResultCode> {
+    pub fn load_location_name_list(&self, index: u32) -> Result<Vec<LocationName>, ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::LoadLocationNameList called");
         let _lock = self.mutex.lock().unwrap();
         let mut tz_binary = self.time_zone_binary.lock().unwrap();
@@ -234,9 +277,7 @@ impl TimeZoneService {
     pub fn get_device_location_name_and_updated_time(
         &self,
     ) -> Result<(LocationName, SteadyClockTimePoint), ResultCode> {
-        log::debug!(
-            "Glue::Time::TimeZoneService::GetDeviceLocationNameAndUpdatedTime called"
-        );
+        log::debug!("Glue::Time::TimeZoneService::GetDeviceLocationNameAndUpdatedTime called");
         self.wrapped_service
             .lock()
             .unwrap()
@@ -281,18 +322,14 @@ impl TimeZoneService {
     ///
     /// Corresponds to `TimeZoneService::ToPosixTime` in upstream.
     /// Delegates to `m_wrapped_service->ToPosixTime`.
-    pub fn to_posix_time(
-        &self,
-        calendar: &CalendarTime,
-        rule: &TzRule,
-    ) -> Result<i64, ResultCode> {
+    pub fn to_posix_time(&self, calendar: &CalendarTime, rule: &TzRule) -> Result<i64, ResultCode> {
         log::debug!("Glue::Time::TimeZoneService::ToPosixTime called");
         let mut out_times = [0i64; 2];
-        let count = self
-            .wrapped_service
-            .lock()
-            .unwrap()
-            .to_posix_time(&mut out_times, calendar, rule)?;
+        let count =
+            self.wrapped_service
+                .lock()
+                .unwrap()
+                .to_posix_time(&mut out_times, calendar, rule)?;
         if count == 0 {
             return Ok(0);
         }

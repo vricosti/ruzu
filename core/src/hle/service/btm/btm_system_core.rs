@@ -6,13 +6,13 @@
 //!
 //! IBtmSystemCore — Bluetooth system core interface.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// IBtmSystemCore.
 ///
@@ -36,7 +36,8 @@ impl IBtmSystemCore {
         let radio_handle = service_context.create_event("IBtmSystemCore::RadioEvent".to_string());
         let radio_event = service_context.get_event(radio_handle).unwrap();
 
-        let audio_handle = service_context.create_event("IBtmSystemCore::AudioDeviceConnectionEvent".to_string());
+        let audio_handle =
+            service_context.create_event("IBtmSystemCore::AudioDeviceConnectionEvent".to_string());
         let audio_device_connection_event = service_context.get_event(audio_handle).unwrap();
 
         let handlers = build_handler_map(&[
@@ -98,11 +99,19 @@ impl SessionRequestHandler for IBtmSystemCore {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { "IBtmSystemCore" }
+    fn service_name(&self) -> &str {
+        "IBtmSystemCore"
+    }
 }
 
 impl ServiceFramework for IBtmSystemCore {
-    fn get_service_name(&self) -> &str { "IBtmSystemCore" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "IBtmSystemCore"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }

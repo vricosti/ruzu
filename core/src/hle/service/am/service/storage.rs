@@ -35,7 +35,11 @@ impl IStorage {
             Arc::new(Mutex::new(BufferLibraryAppletStorage::new(data)));
         let handlers = build_handler_map(&[
             (0, Some(Self::open_handler), "Open"),
-            (1, Some(Self::open_transfer_storage_handler), "OpenTransferStorage"),
+            (
+                1,
+                Some(Self::open_transfer_storage_handler),
+                "OpenTransferStorage",
+            ),
         ]);
         Self {
             backing,

@@ -938,7 +938,8 @@ impl System {
         self.core
             .lock()
             .core_timing()
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .get_global_time_ns()
             .as_nanos() as u64
     }
@@ -1533,7 +1534,10 @@ mod tests {
         system.start();
         system.send_command_to_dsp();
 
-        assert_eq!(audio_renderer.lock().get_command_buffer_process(0), process as *mut ());
+        assert_eq!(
+            audio_renderer.lock().get_command_buffer_process(0),
+            process as *mut ()
+        );
 
         unsafe {
             drop(Box::from_raw(process));

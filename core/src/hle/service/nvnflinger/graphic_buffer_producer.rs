@@ -44,15 +44,15 @@ impl QueueBufferInput {
     pub fn deflate(
         &self,
     ) -> (
-        i64,                    // timestamp
-        bool,                   // is_auto_timestamp
-        Rectangle<i32>,         // crop
-        NativeWindowScalingMode,// scaling_mode
-        NativeWindowTransform,  // transform
-        u32,                    // sticky_transform
-        bool,                   // async
-        i32,                    // swap_interval
-        Fence,                  // fence
+        i64,                     // timestamp
+        bool,                    // is_auto_timestamp
+        Rectangle<i32>,          // crop
+        NativeWindowScalingMode, // scaling_mode
+        NativeWindowTransform,   // transform
+        u32,                     // sticky_transform
+        bool,                    // async
+        i32,                     // swap_interval
+        Fence,                   // fence
     ) {
         (
             self.timestamp,
@@ -85,10 +85,21 @@ impl QueueBufferOutput {
     }
 
     pub fn deflate(&self) -> (u32, u32, u32, u32) {
-        (self.width, self.height, self.transform_hint, self.num_pending_buffers)
+        (
+            self.width,
+            self.height,
+            self.transform_hint,
+            self.num_pending_buffers,
+        )
     }
 
-    pub fn inflate(&mut self, width: u32, height: u32, transform_hint: u32, num_pending_buffers: u32) {
+    pub fn inflate(
+        &mut self,
+        width: u32,
+        height: u32,
+        transform_hint: u32,
+        num_pending_buffers: u32,
+    ) {
         self.width = width;
         self.height = height;
         self.transform_hint = transform_hint;

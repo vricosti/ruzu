@@ -7,7 +7,7 @@
 use crate::core::System;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
-use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE, PseudoHandle};
+use crate::hle::kernel::svc_common::{Handle, PseudoHandle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Gets system/memory information for the current process.
@@ -23,7 +23,9 @@ pub fn get_info(
 ) -> ResultCode {
     log::trace!(
         "svc::GetInfo called info_id={:?}, info_sub_id=0x{:X}, handle=0x{:08X}",
-        info_id_type, info_sub_id, handle
+        info_id_type,
+        info_sub_id,
+        handle
     );
 
     match info_id_type {
@@ -205,9 +207,7 @@ pub fn get_info(
 
         InfoType::InitialProcessIdRange => {
             // Upstream: STUBBED — returns 0 for privileged process id bounds.
-            log::warn!(
-                "svc::GetInfo(InitialProcessIdRange): Upstream STUBBED, returned 0"
-            );
+            log::warn!("svc::GetInfo(InitialProcessIdRange): Upstream STUBBED, returned 0");
             *result = 0;
             RESULT_SUCCESS
         }
@@ -217,7 +217,8 @@ pub fn get_info(
             if info_sub_id != 0xFFFF_FFFF_FFFF_FFFF && info_sub_id >= NUM_CPUS {
                 log::error!(
                     "Core count is out of range, expected {} but got {}",
-                    NUM_CPUS, info_sub_id
+                    NUM_CPUS,
+                    info_sub_id
                 );
                 return RESULT_INVALID_COMBINATION;
             }
@@ -230,10 +231,7 @@ pub fn get_info(
             let _thread_obj_id = match process.handle_table.get_object(handle) {
                 Some(id) => id,
                 None => {
-                    log::error!(
-                        "Thread handle does not exist, handle=0x{:08X}",
-                        handle
-                    );
+                    log::error!("Thread handle does not exist, handle=0x{:08X}", handle);
                     return RESULT_INVALID_HANDLE;
                 }
             };
@@ -288,10 +286,7 @@ pub fn get_info(
         }
 
         _ => {
-            log::error!(
-                "Unimplemented svcGetInfo id=0x{:X}",
-                info_id_type as u32
-            );
+            log::error!("Unimplemented svcGetInfo id=0x{:X}", info_id_type as u32);
             RESULT_INVALID_ENUM_VALUE
         }
     }

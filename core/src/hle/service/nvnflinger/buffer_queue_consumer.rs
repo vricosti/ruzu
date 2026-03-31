@@ -10,11 +10,14 @@
 
 use std::sync::Arc;
 
+use crate::hle::kernel::k_readable_event::KReadableEvent;
+
 use super::binder::IBinder;
 use super::buffer_item::BufferItem;
 use super::buffer_queue_core::BufferQueueCore;
 use super::buffer_queue_defs::NUM_BUFFER_SLOTS;
 use super::buffer_slot::BufferState;
+use super::consumer_listener::IConsumerListener;
 use super::parcel::{InputParcel, OutputParcel};
 use super::status::Status;
 use super::ui::fence::Fence;
@@ -204,14 +207,29 @@ impl BufferQueueConsumer {
         Status::NoError
     }
 
-    pub fn connect(&self, controlled_by_app: bool) {
+    pub fn connect(
+        &self,
+        consumer_listener: Arc<dyn IConsumerListener>,
+        controlled_by_app: bool,
+    ) -> Status {
         let mut inner = self.core.mutex.lock().unwrap();
+        if inner.is_abandoned {
+            log::error!("BufferQueueConsumer: BufferQueue has been abandoned");
+            return Status::NoInit;
+        }
+        inner.consumer_listener = Some(consumer_listener);
         inner.consumer_controlled_by_app = controlled_by_app;
+        Status::NoError
     }
 
-    pub fn disconnect(&self) {
+    pub fn disconnect(&self) -> Status {
         log::debug!("BufferQueueConsumer::disconnect called");
         let mut inner = self.core.mutex.lock().unwrap();
+
+        if inner.consumer_listener.is_none() {
+            log::error!("BufferQueueConsumer: no consumer is connected");
+            return Status::BadValue;
+        }
 
         inner.is_abandoned = true;
         inner.consumer_listener = None;
@@ -219,6 +237,7 @@ impl BufferQueueConsumer {
         inner.free_all_buffers_locked();
         drop(inner);
         self.core.signal_dequeue_condition();
+        Status::NoError
     }
 
     pub fn get_released_buffers(&self, out_slot_mask: &mut u64) {
@@ -282,7 +301,9 @@ impl IBinder for BufferQueueConsumer {
                 let mut item = BufferItem::default();
                 let present_when = parcel_in.read::<i64>();
                 status = self.acquire_buffer(&mut item, present_when);
-                log::warn!("BufferQueueConsumer::transact AcquireBuffer flattening is unimplemented");
+                log::warn!(
+                    "BufferQueueConsumer::transact AcquireBuffer flattening is unimplemented"
+                );
             }
             x if x == TransactionId::ReleaseBuffer as u32 => {
                 let slot = parcel_in.read::<i32>();
@@ -326,8 +347,11 @@ impl IBinder for BufferQueueConsumer {
         parcel_reply[..copy_len].copy_from_slice(&serialized[..copy_len]);
     }
 
-    fn get_native_handle(&self, type_id: u32) -> Option<u32> {
-        log::warn!("BufferQueueConsumer::get_native_handle type_id={} (STUBBED)", type_id);
+    fn get_native_handle(&self, type_id: u32) -> Option<Arc<std::sync::Mutex<KReadableEvent>>> {
+        log::error!(
+            "BufferQueueConsumer::get_native_handle called type_id={}",
+            type_id
+        );
         None
     }
 }

@@ -23,10 +23,18 @@ pub const IDYNAMIC_RIGHTS_INTERFACE_COMMANDS: &[(u32, bool, &str)] = &[
     (18, true, "NotifyApplicationRightsCheckStart"),
     (19, false, "UpdateUserList"),
     (20, false, "IsRightsLostUser"),
-    (21, false, "SetRequiredAddOnContentsOnContentsAvailabilityTransition"),
+    (
+        21,
+        false,
+        "SetRequiredAddOnContentsOnContentsAvailabilityTransition",
+    ),
     (22, false, "GetLimitedApplicationLicense"),
     (23, false, "GetLimitedApplicationLicenseUpgradableEvent"),
-    (24, false, "NotifyLimitedApplicationLicenseUpgradableEventForDebug"),
+    (
+        24,
+        false,
+        "NotifyLimitedApplicationLicenseUpgradableEventForDebug",
+    ),
     (25, false, "RequestProceedDynamicRightsState"),
 ];
 

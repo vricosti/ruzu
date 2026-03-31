@@ -29,12 +29,9 @@ pub struct IOverwriteEventHolder {
 
 impl IOverwriteEventHolder {
     pub fn new() -> Self {
-        let handlers = build_handler_map(&[
-            (commands::GET, None, "Get"),
-        ]);
+        let handlers = build_handler_map(&[(commands::GET, None, "Get")]);
 
-        let mut service_context =
-            ServiceContext::new("IOverwriteEventHolder".to_string());
+        let mut service_context = ServiceContext::new("IOverwriteEventHolder".to_string());
         let overwrite_event_handle =
             service_context.create_event("IOverwriteEventHolder::OverwriteEvent".to_string());
 
@@ -58,7 +55,8 @@ impl IOverwriteEventHolder {
 
 impl Drop for IOverwriteEventHolder {
     fn drop(&mut self) {
-        self.service_context.close_event(self.overwrite_event_handle);
+        self.service_context
+            .close_event(self.overwrite_event_handle);
     }
 }
 

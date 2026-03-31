@@ -10,12 +10,12 @@
 
 use common::ResultCode;
 
-use crate::hid_result;
-use crate::hid_types::TouchScreenModeForNx;
-use crate::resources::applet_resource::ARUID_INDEX_MAX;
 use super::gesture_handler::GestureHandler;
 use super::touch_screen_driver::TouchScreenDriver;
 use super::touch_types::*;
+use crate::hid_result;
+use crate::hid_types::TouchScreenModeForNx;
+use crate::resources::applet_resource::ARUID_INDEX_MAX;
 
 /// Gesture update period: 4ms (1000Hz), matching upstream GestureUpdatePeriod.
 pub const GESTURE_UPDATE_PERIOD_NS: u64 = 4 * 1000 * 1000;
@@ -69,9 +69,7 @@ impl TouchResource {
 
     /// Port of TouchResource::ActivateTouch() (no-aruid version).
     pub fn activate_touch(&mut self, touch_driver: &mut TouchScreenDriver) -> ResultCode {
-        if self.global_ref_counter == i32::MAX - 1
-            || self.touch_ref_counter == i32::MAX - 1
-        {
+        if self.global_ref_counter == i32::MAX - 1 || self.touch_ref_counter == i32::MAX - 1 {
             return hid_result::RESULT_TOUCH_OVERFLOW;
         }
 
@@ -112,9 +110,7 @@ impl TouchResource {
 
     /// Port of TouchResource::ActivateGesture() (no-aruid version).
     pub fn activate_gesture(&mut self, touch_driver: &mut TouchScreenDriver) -> ResultCode {
-        if self.global_ref_counter == i32::MAX - 1
-            || self.gesture_ref_counter == i32::MAX - 1
-        {
+        if self.global_ref_counter == i32::MAX - 1 || self.gesture_ref_counter == i32::MAX - 1 {
             return hid_result::RESULT_GESTURE_OVERFLOW;
         }
 
@@ -275,10 +271,7 @@ impl TouchResource {
     }
 
     /// Port of TouchResource::ProcessTouchScreenAutoTune.
-    pub fn process_touch_screen_auto_tune(
-        &self,
-        touch_driver: &TouchScreenDriver,
-    ) -> ResultCode {
+    pub fn process_touch_screen_auto_tune(&self, touch_driver: &TouchScreenDriver) -> ResultCode {
         touch_driver.process_touch_screen_auto_tune();
         ResultCode::SUCCESS
     }
@@ -487,9 +480,11 @@ impl TouchResource {
         for i in 0..(self.current_touch_state.entry_count as usize) {
             let state = &mut self.current_touch_state.states[i];
             state.position_x = ((self.magnification_y * state.position_x as f32)
-                + (self.offset_x * TOUCH_SENSOR_WIDTH as f32)) as u32;
+                + (self.offset_x * TOUCH_SENSOR_WIDTH as f32))
+                as u32;
             state.position_y = ((self.magnification_y * state.position_y as f32)
-                + (self.offset_x * TOUCH_SENSOR_HEIGHT as f32)) as u32;
+                + (self.offset_x * TOUCH_SENSOR_HEIGHT as f32))
+                as u32;
             state.diameter_x = (self.magnification_x * state.diameter_x as f32) as u32;
             state.diameter_y = (self.magnification_y * state.diameter_y as f32) as u32;
         }
@@ -537,7 +532,6 @@ impl TouchResource {
 
         // Upstream: input_event->Signal()
     }
-
 
     /// Access the current touch state (for testing or external consumers).
     pub fn current_touch_state(&self) -> &TouchScreenState {

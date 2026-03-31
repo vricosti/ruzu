@@ -74,8 +74,7 @@ impl DeviceMemory {
     pub unsafe fn get_pointer_const(&self, addr: u64) -> *const u8 {
         self.buffer
             .backing_base_pointer()
-            .add((addr - dram_memory_map::BASE) as usize)
-            as *const u8
+            .add((addr - dram_memory_map::BASE) as usize) as *const u8
     }
 
     /// Gets a mutable pointer from a raw physical address (no base offset).

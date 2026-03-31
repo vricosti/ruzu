@@ -126,7 +126,10 @@ impl CpuManager {
         // Upstream: for (core = 0; core < num_cores; core++)
         //   core_data[core].host_thread = jthread([this, core](token) { RunThread(token, core); });
         for core in 0..self.num_cores {
-            let barrier = self.gpu_barrier.clone().expect("gpu_barrier must be set before spawn_threads");
+            let barrier = self
+                .gpu_barrier
+                .clone()
+                .expect("gpu_barrier must be set before spawn_threads");
             let stop = self.stop_requested.clone();
             let is_mc = self.is_multicore;
             let is_ag = self.is_async_gpu;
@@ -139,11 +142,23 @@ impl CpuManager {
             // Upstream: core_data[core].host_thread =
             //   std::jthread([this, core](stop_token token) { RunThread(token, core); });
             let handle = std::thread::Builder::new()
-                .name(if is_mc { format!("CPUCore_{}", core) } else { "CPUThread".to_string() })
+                .name(if is_mc {
+                    format!("CPUCore_{}", core)
+                } else {
+                    "CPUThread".to_string()
+                })
                 .spawn(move || {
                     // Safety: kernel_ptr is valid for the lifetime of this thread.
                     let kernel = unsafe { &*(kp as *const KernelCore) };
-                    Self::run_thread_on_core(kernel, core, is_mc, is_ag, &barrier, &stop, &host_ctx_slot);
+                    Self::run_thread_on_core(
+                        kernel,
+                        core,
+                        is_mc,
+                        is_ag,
+                        &barrier,
+                        &stop,
+                        &host_ctx_slot,
+                    );
                 })
                 .expect("Failed to spawn CPU thread");
 
@@ -220,7 +235,7 @@ impl CpuManager {
                 &*guard as *const super::hle::kernel::k_scheduler::KScheduler
                     as *mut super::hle::kernel::k_scheduler::KScheduler
             }; // Mutex guard dropped here
-            // Safety: core OS thread; scheduler Arc keeps pointer valid; cooperative fibers.
+               // Safety: core OS thread; scheduler Arc keeps pointer valid; cooperative fibers.
             unsafe {
                 super::hle::kernel::k_scheduler::KScheduler::schedule_raw_if_needed(sched_ptr);
             }
@@ -247,9 +262,9 @@ impl CpuManager {
                 &*guard as *const super::hle::kernel::k_scheduler::KScheduler
                     as *mut super::hle::kernel::k_scheduler::KScheduler
             }; // Mutex guard dropped here
-            // Safety: we're on the core OS thread; the scheduler Arc keeps the
-            // pointer valid; fibers are cooperative so no other fiber on this
-            // thread runs concurrently.
+               // Safety: we're on the core OS thread; the scheduler Arc keeps the
+               // pointer valid; fibers are cooperative so no other fiber on this
+               // thread runs concurrently.
             unsafe {
                 super::hle::kernel::k_scheduler::KScheduler::activate_and_schedule_raw(sched_ptr);
             }
@@ -349,18 +364,6 @@ impl CpuManager {
     /// Runs on the guest fiber. Calls PhysicalCore::RunThread in a loop,
     /// handling interrupts between runs.
     pub fn multi_core_run_guest_thread(kernel: &KernelCore) {
-        log::info!("multi_core_run_guest_thread: ENTERED on core {}", kernel.current_physical_core_index());
-
-
-
-        let cur_thread = super::hle::kernel::kernel::get_current_thread_pointer();
-        log::info!(
-            "multi_core_run_guest_thread: current_thread={}, has_parent={}",
-            cur_thread.as_ref().map(|t| t.lock().unwrap().get_thread_id()).unwrap_or(u64::MAX),
-            cur_thread.as_ref().map(|t| t.lock().unwrap().parent.is_some()).unwrap_or(false),
-        );
-
-
         // Upstream: auto* thread = Kernel::GetCurrentThreadPointer(kernel);
         // kernel.CurrentScheduler()->OnThreadStart();
         // Upstream: kernel.CurrentScheduler()->OnThreadStart();
@@ -403,7 +406,10 @@ impl CpuManager {
     /// Upstream: `PhysicalCore::RunThread(KThread*)` (physical_core.cpp:22-146).
     /// Gets the ARM interface from thread->GetOwnerProcess()->GetArmInterface(core_index),
     /// then runs the JIT until an interrupt, SVC, or halt.
-    fn run_guest_thread_once(kernel: &KernelCore, physical_core: &super::hle::kernel::physical_core::PhysicalCore) {
+    fn run_guest_thread_once(
+        kernel: &KernelCore,
+        physical_core: &super::hle::kernel::physical_core::PhysicalCore,
+    ) {
         use crate::arm::arm_interface::KThread as OpaqueKThread;
 
         let thread_arc = match super::hle::kernel::kernel::get_current_thread_pointer() {
@@ -433,6 +439,15 @@ impl CpuManager {
         // Get the ARM interface from the process for this core.
         // Upstream: auto* interface = process->GetArmInterface(m_core_index);
         let mut process = parent_arc.lock().unwrap();
+        let scheduler = match process
+            .scheduler
+            .as_ref()
+            .and_then(|scheduler| scheduler.upgrade())
+        {
+            Some(scheduler) => scheduler,
+            None => return,
+        };
+        let is_64bit = process.is_64bit();
         let jit = match process.get_arm_interface_mut(core_index) {
             Some(j) => j as *mut _ as *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
             None => {
@@ -454,375 +469,69 @@ impl CpuManager {
         unsafe {
             let jit_ref = &mut **jit;
             let opaque = &mut *(thread_ptr as *mut OpaqueKThread);
+            use crate::arm::arm_interface::HaltReason;
 
-            // Upstream PhysicalCore::RunThread loop (physical_core.cpp:65-145):
-            // NOTE: upstream does NOT call SetContext here — context is loaded
-            // once by the scheduler's Reload during context switches. The JIT
-            // maintains its own register state across run_thread() calls.
-            // Runs the JIT, handles the halt reason, loops until interrupt/return.
-            loop {
-                if cfg!(feature = "step_tracer") {
-                    use std::sync::atomic::{AtomicBool, Ordering};
-                    static THREAD_TRACE_DONE: AtomicBool = AtomicBool::new(false);
-                    if !THREAD_TRACE_DONE.load(Ordering::Relaxed) {
-                        let trace_thread_id = std::env::var("RUZU_TRACE_THREAD_ID")
-                            .ok()
-                            .and_then(|s| s.trim().parse::<u64>().ok());
-                        let trace_pc = std::env::var("RUZU_TRACE_THREAD_PC")
-                            .ok()
-                            .and_then(|s| {
-                                let s = s.trim();
-                                let s = s
-                                    .strip_prefix("0x")
-                                    .or_else(|| s.strip_prefix("0X"))
-                                    .unwrap_or(s);
-                                u32::from_str_radix(s, 16).ok()
-                            });
-                        let trace_steps = std::env::var("RUZU_TRACE_THREAD_STEPS")
-                            .ok()
-                            .and_then(|s| s.trim().parse::<u32>().ok())
-                            .unwrap_or(200_000);
-
-                        if let (Some(expected_tid), Some(expected_pc)) = (trace_thread_id, trace_pc) {
-                            let should_trace = {
-                                let thread = thread_arc.lock().unwrap();
-                                if thread.get_thread_id() != expected_tid {
-                                    false
-                                } else {
-                                    let mut ctx = crate::arm::arm_interface::ThreadContext::default();
-                                    jit_ref.get_context(&mut ctx);
-                                    ctx.pc as u32 == expected_pc
-                                }
-                            };
-
-                            if should_trace {
-                                eprintln!(
-                                    "=== THREAD TRACE activated for tid={} at pc={:#010x} ===",
-                                    expected_tid, expected_pc
-                                );
-                                let mut trace_file = std::fs::File::create("/tmp/ruzu_thread_trace.bin")
-                                    .expect("cannot create thread trace file");
-                                use std::io::Write;
-                                for step in 0..trace_steps {
-                                    let op = &mut *(thread_ptr as *mut crate::arm::arm_interface::KThread);
-                                    let h = jit_ref.step_thread(op);
-                                    let mut c = crate::arm::arm_interface::ThreadContext::default();
-                                    jit_ref.get_context(&mut c);
-                                    let mut regs = [0u32; 17];
-                                    for i in 0..16 {
-                                        regs[i] = c.r[i] as u32;
-                                    }
-                                    regs[16] = c.pstate;
-                                    let bytes: &[u8] = std::slice::from_raw_parts(
-                                        regs.as_ptr() as *const u8,
-                                        68,
-                                    );
-                                    let _ = trace_file.write_all(bytes);
-                                    if step % 10_000 == 0 {
-                                        eprintln!(
-                                            "THREAD_STEP {:6} PC={:#010x} SP={:#010x} LR={:#010x} R0={:#010x}",
-                                            step, c.pc, c.sp, c.lr, c.r[0]
-                                        );
-                                    }
-                                    if h.contains(crate::arm::arm_interface::HaltReason::SUPERVISOR_CALL) {
-                                        let svc = jit_ref.get_svc_number();
-                                        let mut a = [0u64; 8];
-                                        jit_ref.get_svc_arguments(&mut a);
-                                        eprintln!(
-                                            "THREAD_SVC imm=0x{:02x} step={} args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}]",
-                                            svc, step, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]
-                                        );
-                                        let sr = kernel.system();
-                                        if !sr.is_null() {
-                                            let sys = sr.get();
-                                            crate::hle::kernel::svc_dispatch::call(sys, svc, false, &mut a);
-                                            jit_ref.set_svc_arguments(&a);
-                                        }
-                                    }
-                                }
-                                eprintln!("=== THREAD TRACE completed after {} steps ===", trace_steps);
-                                THREAD_TRACE_DONE.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
+            {
+                let thread = thread_arc.lock().unwrap();
+                if thread.has_dpc() && thread.is_termination_requested() {
+                    return;
                 }
+            }
 
-                // Check termination.
-                {
-                    let thread = thread_arc.lock().unwrap();
-                    if thread.has_dpc() && thread.is_termination_requested() {
-                        break;
-                    }
-                }
+            if physical_core.is_interrupted() {
+                return;
+            }
 
-                // Enter context — mark running on physical core.
-                if physical_core.is_interrupted() {
-                    break;
-                }
-                physical_core.set_running(
-                    jit_ref as *mut dyn crate::arm::arm_interface::ArmInterface,
-                    thread_ptr,
-                );
+            physical_core.set_running(
+                jit_ref as *mut dyn crate::arm::arm_interface::ArmInterface,
+                thread_ptr,
+            );
+            let event = physical_core.run_thread(jit_ref, opaque);
+            physical_core.clear_running();
 
-                // Run the JIT.
-                let hr = jit_ref.run_thread(opaque);
-
-                // Exit context — clear running.
-                physical_core.clear_running();
-
-
-                // Step-trace after SVC N (RUZU_STEP_AFTER_SVC=N).
-                // Enabled at compile time via cfg. Steps all instructions from that
-                // point, dispatching SVCs inline with full args + TLS logging, and
-                // exiting on svcBreak. Disabled by default to avoid overhead.
-                //
-                // To enable: change `cfg!(feature = "step_tracer")` to `true` below,
-                // or use: cargo build --features step_tracer
-                #[allow(unreachable_code)]
-                if cfg!(feature = "step_tracer") { // old step tracer (pre-dispatch, DO NOT USE)
-                    use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
-                    static SVC_N: AtomicU32 = AtomicU32::new(0);
-                    static ACTIVE: AtomicBool = AtomicBool::new(false);
-                    static DONE: AtomicBool = AtomicBool::new(false);
-                    if !DONE.load(Ordering::Relaxed) {
-                        let threshold: Option<u32> = {
-                            use std::sync::OnceLock;
-                            static V: OnceLock<Option<u32>> = OnceLock::new();
-                            *V.get_or_init(|| std::env::var("RUZU_STEP_AFTER_SVC").ok().and_then(|s| s.trim().parse().ok()))
-                        };
-                        if let Some(t) = threshold {
-                            if hr.contains(crate::arm::arm_interface::HaltReason::SUPERVISOR_CALL) {
-                                if SVC_N.fetch_add(1, Ordering::Relaxed) == t {
-                                    ACTIVE.store(true, Ordering::Relaxed);
-                                    eprintln!("=== STEP TRACE activated after SVC#{} ===", t);
-                                }
-                            }
-                            if ACTIVE.load(Ordering::Relaxed) {
-                                // Write binary register trace: each step = 17 u32s (R0-R15 + CPSR)
-                                let mut trace_file = std::fs::File::create("/tmp/ruzu_reg_trace.bin")
-                                    .expect("cannot create trace file");
-                                use std::io::Write;
-                                for step in 0..500_000u32 {
-                                    let op = unsafe { &mut *(thread_ptr as *mut crate::arm::arm_interface::KThread) };
-                                    let h = jit_ref.step_thread(op);
-                                    // Dump all registers
-                                    {
-                                        let mut c = crate::arm::arm_interface::ThreadContext::default();
-                                        jit_ref.get_context(&mut c);
-                                        let mut regs = [0u32; 17];
-                                        for i in 0..16 { regs[i] = c.r[i] as u32; }
-                                        regs[16] = c.pstate;
-                                        let bytes: &[u8] = unsafe {
-                                            std::slice::from_raw_parts(regs.as_ptr() as *const u8, 68)
-                                        };
-                                        let _ = trace_file.write_all(bytes);
-                                    }
-                                    if step % 10_000 == 0 {
-                                        let mut c = crate::arm::arm_interface::ThreadContext::default();
-                                        jit_ref.get_context(&mut c);
-                                        eprintln!("STEP {:6} PC={:#010x} SP={:#010x} LR={:#010x} R0={:#010x}",
-                                            step, c.pc, c.sp, c.lr, c.r[0]);
-                                    }
-                                    if h.contains(crate::arm::arm_interface::HaltReason::SUPERVISOR_CALL) {
-                                        let svc = jit_ref.get_svc_number();
-                                        let mut args = [0u64; 8];
-                                        jit_ref.get_svc_arguments(&mut args);
-                                        let mut c = crate::arm::arm_interface::ThreadContext::default();
-                                        jit_ref.get_context(&mut c);
-                                        eprintln!("SVC_IN  imm=0x{:02x} step={} core=0 tid=0 args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}]",
-                                            svc, step, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
-                                        // For SendSyncRequest, dump TLS before
-                                        if svc == 0x21 {
-                                            let sr = kernel.system();
-                                            if !sr.is_null() {
-                                                let sys = sr.get();
-                                                if let Some(memory) = sys.get_svc_memory() {
-                                                    let m = memory.lock().unwrap();
-                                                    let tls = c.r[1] as u64; // R1 often has TLS in args but let's use actual TLS
-                                                    if let Some(thread) = sys.current_thread() {
-                                                        let tls_addr = thread.lock().unwrap().get_tls_address().get();
-                                                        let mut w = [0u32; 16];
-                                                        for i in 0..16 { w[i] = m.read_32(tls_addr + i as u64 * 4); }
-                                                        eprintln!("  TLS_REQ [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
-                                                            tls_addr, w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11],w[12],w[13],w[14],w[15]);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // Dispatch
-                                        let sr = kernel.system();
-                                        if !sr.is_null() {
-                                            let sys = sr.get();
-                                            crate::hle::kernel::svc_dispatch::call(sys, svc, false, &mut args);
-                                            jit_ref.set_svc_arguments(&args);
-                                        }
-                                        eprintln!("SVC_OUT imm=0x{:02x} args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}]",
-                                            svc, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
-                                        // For SendSyncRequest, dump TLS after
-                                        if svc == 0x21 {
-                                            let sr2 = kernel.system();
-                                            if !sr2.is_null() {
-                                                let sys2 = sr2.get();
-                                                if let Some(memory) = sys2.get_svc_memory() {
-                                                    let m = memory.lock().unwrap();
-                                                    if let Some(thread) = sys2.current_thread() {
-                                                        let tls_addr = thread.lock().unwrap().get_tls_address().get();
-                                                        let mut w = [0u32; 16];
-                                                        for i in 0..16 { w[i] = m.read_32(tls_addr + i as u64 * 4); }
-                                                        eprintln!("  TLS_RSP [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
-                                                            tls_addr, w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11],w[12],w[13],w[14],w[15]);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if svc == 0x26 {
-                                            eprintln!("=== svcBreak — exiting ===");
-                                            DONE.store(true, Ordering::Relaxed);
-                                            ACTIVE.store(false, Ordering::Relaxed);
-                                            std::process::exit(1);
-                                        }
-                                    }
-                                }
-                                eprintln!("=== step limit reached (500K) ===");
-                                DONE.store(true, Ordering::Relaxed);
-                                ACTIVE.store(false, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                } // cfg!(feature = "step_tracer")
-
-                // Handle halt reason (upstream physical_core.cpp:100-144).
-                use crate::arm::arm_interface::HaltReason;
-                let supervisor_call = hr.contains(HaltReason::SUPERVISOR_CALL);
-                let interrupt = hr.contains(HaltReason::BREAK_LOOP);
-
-
-
-                if supervisor_call {
-                    // Upstream: Svc::Call(system, interface->GetSvcNumber())
-                    // (svc.cpp:4425-4441)
-                    //
-                    // 1. SaveSvcArguments: read R0-R7 from JIT
-                    // 2. Call32/Call64: dispatch SVC, modifies args in-place
-                    // 3. LoadSvcArguments: write modified args back to JIT
-                    let svc_number = jit_ref.get_svc_number();
-                    log::debug!("SVC #{:#x} dispatching", svc_number);
-
+            match event {
+                crate::hle::kernel::physical_core::PhysicalCoreExecutionEvent::SupervisorCall {
+                    svc_num,
+                    mut svc_args,
+                } => {
+                    let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
                     let system_ref = kernel.system();
                     if !system_ref.is_null() {
                         let system = system_ref.get();
-                        let is_64bit = {
-                            let thread = thread_arc.lock().unwrap();
-                            thread.parent.as_ref()
-                                .and_then(|p| p.upgrade())
-                                .map(|p| p.lock().unwrap().is_64bit())
-                                .unwrap_or(false)
-                        };
-
-                        // Upstream: kernel.CurrentPhysicalCore().SaveSvcArguments(process, args)
-                        let mut svc_args = [0u64; 8];
-                        jit_ref.get_svc_arguments(&mut svc_args);
-
-                        // Dispatch the SVC.
                         crate::hle::kernel::svc_dispatch::call(
-                            system, svc_number, is_64bit, &mut svc_args,
+                            system,
+                            svc_num,
+                            is_64bit,
+                            &mut svc_args,
                         );
-
-                        // Upstream: kernel.CurrentPhysicalCore().LoadSvcArguments(process, args)
                         jit_ref.set_svc_arguments(&svc_args);
-                    } else {
-                        log::warn!("SVC #{:#x}: no System reference available", svc_number);
-                    }
-
-                    // Step tracer — activated AFTER SVC dispatch so registers are correct.
-                    // Enable with RUZU_STEP_AFTER_SVC=N env var.
-                    if cfg!(feature = "step_tracer") {
-                        use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
-                        static SVC_N2: AtomicU32 = AtomicU32::new(0);
-                        static ACTIVE2: AtomicBool = AtomicBool::new(false);
-                        static DONE2: AtomicBool = AtomicBool::new(false);
-                        if !DONE2.load(Ordering::Relaxed) {
-                            let threshold: Option<u32> = {
-                                use std::sync::OnceLock;
-                                static V2: OnceLock<Option<u32>> = OnceLock::new();
-                                *V2.get_or_init(|| std::env::var("RUZU_STEP_AFTER_SVC").ok().and_then(|s| s.trim().parse().ok()))
-                            };
-                            if let Some(t) = threshold {
-                                let n = SVC_N2.fetch_add(1, Ordering::Relaxed);
-                                if n == t {
-                                    ACTIVE2.store(true, Ordering::Relaxed);
-                                    eprintln!("=== STEP TRACE activated after SVC#{} (post-dispatch) ===", t);
-                                }
-                                if ACTIVE2.load(Ordering::Relaxed) {
-                                    let mut trace_file = std::fs::File::create("/tmp/ruzu_reg_trace.bin")
-                                        .expect("cannot create trace file");
-                                    use std::io::Write;
-                                    for step in 0..500_000u32 {
-                                        let op = unsafe { &mut *(thread_ptr as *mut crate::arm::arm_interface::KThread) };
-                                        let h = jit_ref.step_thread(op);
-                                        let mut c = crate::arm::arm_interface::ThreadContext::default();
-                                        jit_ref.get_context(&mut c);
-                                        let mut regs = [0u32; 17];
-                                        for i in 0..16 { regs[i] = c.r[i] as u32; }
-                                        regs[16] = c.pstate;
-                                        let bytes: &[u8] = unsafe {
-                                            std::slice::from_raw_parts(regs.as_ptr() as *const u8, 68)
-                                        };
-                                        let _ = trace_file.write_all(bytes);
-                                        if step % 10_000 == 0 {
-                                            eprintln!("STEP {:6} PC={:#010x} SP={:#010x} R0={:#010x}",
-                                                step, c.pc, c.sp, c.r[0]);
-                                        }
-                                        if h.contains(crate::arm::arm_interface::HaltReason::SUPERVISOR_CALL) {
-                                            let svc = jit_ref.get_svc_number();
-                                            if svc == 0x26 {
-                                                eprintln!("=== svcBreak at step {} ===", step);
-                                                DONE2.store(true, Ordering::Relaxed);
-                                                ACTIVE2.store(false, Ordering::Relaxed);
-                                                std::process::exit(1);
-                                            }
-                                            let sr = kernel.system();
-                                            if !sr.is_null() {
-                                                let sys = sr.get();
-                                                let mut a = [0u64; 8];
-                                                jit_ref.get_svc_arguments(&mut a);
-                                                crate::hle::kernel::svc_dispatch::call(sys, svc, false, &mut a);
-                                                jit_ref.set_svc_arguments(&a);
-                                            }
-                                        }
-                                    }
-                                    DONE2.store(true, Ordering::Relaxed);
-                                    ACTIVE2.store(false, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-
-                    // SVC handled, return to MultiCoreRunGuestThread loop.
-                    break;
-                }
-
-                if interrupt {
-                    break;
-                }
-
-                // Any other non-empty halt reason — break.
-                if !hr.is_empty() {
-                    break;
-                }
-
-                // hr.is_empty() → quantum expired naturally (get_ticks_remaining() hit 0).
-                // In multicore mode, the CoreTiming timer thread handles event
-                // processing and the preemption interrupt breaks the JIT out of
-                // tight loops. In single-core mode, we advance CoreTiming here.
-                if !kernel.is_multicore() {
-                    if let Some(ct) = kernel.core_timing() {
-                        let mut ct_lock = ct.lock().unwrap();
-                        let _ = ct_lock.advance();
-                        ct_lock.reset_ticks();
+                        let mut thread_context =
+                            crate::arm::arm_interface::ThreadContext::default();
+                        physical_core.handoff_after_svc(
+                            jit_ref,
+                            &mut thread_context,
+                            &scheduler,
+                            &parent_arc,
+                        );
+                        // Upstream `PhysicalCore::RunThread()` returns immediately after
+                        // `Svc::Call(...)`, letting the outer scheduler logic decide whether
+                        // another thread should run. Do the same here instead of relying on a
+                        // heuristic snapshot of the current thread state, which can already be
+                        // stale again once timer callbacks or wait wakeups race with the host
+                        // callback thread.
+                        let _ = current_thread_id;
+                        Self::reschedule_current_core_raw(kernel);
                     }
                 }
-                // Continue the inner JIT loop — quantum is fresh, let interrupt check decide.
+                crate::hle::kernel::physical_core::PhysicalCoreExecutionEvent::Halted(
+                    halt_reason,
+                ) => {
+                    let interrupt = halt_reason.contains(HaltReason::BREAK_LOOP);
+                    let data_abort = halt_reason.contains(HaltReason::DATA_ABORT);
+                    let prefetch_abort = halt_reason.contains(HaltReason::PREFETCH_ABORT);
+                    let breakpoint = halt_reason.contains(HaltReason::INSTRUCTION_BREAKPOINT);
+
+                }
             }
         }
     }
@@ -884,7 +593,12 @@ impl CpuManager {
             let core_timing = core_timing.clone();
             let current_core = AtomicUsize::new(0);
             let mut idle_count: usize = 0;
-            Self::single_core_run_guest_thread(kernel, &core_timing, &current_core, &mut idle_count);
+            Self::single_core_run_guest_thread(
+                kernel,
+                &core_timing,
+                &current_core,
+                &mut idle_count,
+            );
         } else {
             log::error!("SingleCoreRunGuestThread: no CoreTiming available");
         }
@@ -1108,7 +822,10 @@ impl CpuManager {
                     drop(scheduler);
 
                     // Upstream: Common::Fiber::YieldTo(data.host_context, *thread->GetHostContext());
-                    log::info!("RunThread core {}: yielding from host fiber to main thread fiber", core);
+                    log::info!(
+                        "RunThread core {}: yielding from host fiber to main thread fiber",
+                        core
+                    );
                     Fiber::yield_to(Arc::downgrade(&host_ctx), &thread_host_ctx);
                     log::info!("RunThread core {}: returned from main thread fiber", core);
                 } else {

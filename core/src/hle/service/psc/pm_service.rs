@@ -3,6 +3,4 @@
 
 //! Port of zuyu/src/core/hle/service/psc/pm_service.cpp/.h
 
-pub const IPM_SERVICE_COMMANDS: &[(u32, bool, &str)] = &[
-    (0, true, "GetPmModule"),
-];
+pub const IPM_SERVICE_COMMANDS: &[(u32, bool, &str)] = &[(0, true, "GetPmModule")];

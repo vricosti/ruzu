@@ -54,9 +54,7 @@ impl ErrorUploadRequest {
 /// Neither ErrorUploadContext nor ErrorUploadRequest implement SessionRequestHandler yet,
 /// so we use stub services.
 pub fn loop_process(system: crate::core::SystemRef) {
-    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(
-        system,
-    );
+    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(system);
     crate::hle::service::services::register_stub_services(
         &mut server_manager,
         &["eupld:c", "eupld:r"],

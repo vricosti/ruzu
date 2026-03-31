@@ -247,8 +247,7 @@ impl BaseConfig {
                 array_key.push('\\');
             }
 
-            if !skip_array_index
-                || (self.array_stack.len() - 1 != i && self.array_stack.len() > 1)
+            if !skip_array_index || (self.array_stack.len() - 1 != i && self.array_stack.len() > 1)
             {
                 array_key.push_str(&entry.index.to_string());
                 array_key.push('\\');

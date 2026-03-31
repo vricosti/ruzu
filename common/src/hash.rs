@@ -21,7 +21,10 @@ impl PairHash {
         let h2 = hasher2.finish();
 
         // boost::hash_combine equivalent
-        seed ^= h2.wrapping_add(0x9e3779b9).wrapping_add(seed << 6).wrapping_add(seed >> 2);
+        seed ^= h2
+            .wrapping_add(0x9e3779b9)
+            .wrapping_add(seed << 6)
+            .wrapping_add(seed >> 2);
         seed
     }
 }
