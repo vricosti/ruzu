@@ -11,10 +11,12 @@ use parking_lot::Mutex;
 use common::ResultCode;
 
 use crate::hid_core::HIDCore;
-use crate::hid_types::*;
 use crate::hid_result;
+use crate::hid_types::*;
 use crate::hid_util;
-use crate::resources::applet_resource::{AppletResource, AppletResourceHolder, HandheldConfig, ARUID_INDEX_MAX, SYSTEM_ARUID};
+use crate::resources::applet_resource::{
+    AppletResource, AppletResourceHolder, HandheldConfig, SYSTEM_ARUID,
+};
 use crate::resources::debug_pad::debug_pad::DebugPad;
 use crate::resources::digitizer::digitizer::Digitizer;
 use crate::resources::hid_firmware_settings::HidFirmwareSettings;
@@ -75,10 +77,7 @@ pub struct ResourceManager {
 }
 
 impl ResourceManager {
-    pub fn new(
-        firmware_settings: Arc<HidFirmwareSettings>,
-        hid_core: Arc<Mutex<HIDCore>>,
-    ) -> Self {
+    pub fn new(firmware_settings: Arc<HidFirmwareSettings>, hid_core: Arc<Mutex<HIDCore>>) -> Self {
         Self {
             is_initialized: false,
             shared_mutex: parking_lot::RwLock::new(()),
@@ -261,7 +260,9 @@ impl ResourceManager {
         let _lock = self.shared_mutex.write();
         let mut result = ResultCode::SUCCESS;
         if let Some(ref resource) = self.applet_resource {
-            result = resource.lock().register_applet_resource_user_id(aruid, enable_input);
+            result = resource
+                .lock()
+                .register_applet_resource_user_id(aruid, enable_input);
             if result.is_error() {
                 return result;
             }
@@ -280,6 +281,20 @@ impl ResourceManager {
         if let Some(ref npad) = self.npad {
             npad.lock().unregister_applet_resource_user_id(aruid);
         }
+    }
+
+    /// Port of upstream `ResourceManager::GetSharedMemoryHandle`.
+    ///
+    /// The upstream owner returns a `Kernel::KSharedMemory*`. The Rust port
+    /// preserves method ownership and validation here, but returns the
+    /// validated applet-resource slot index because `hid_core` cannot name
+    /// kernel types without a `core` dependency cycle.
+    pub fn get_shared_memory_handle(&self, aruid: u64) -> Result<usize, ResultCode> {
+        let _lock = self.shared_mutex.read();
+        let Some(ref resource) = self.applet_resource else {
+            return Err(hid_result::RESULT_SHARED_MEMORY_NOT_INITIALIZED);
+        };
+        resource.lock().get_shared_memory_handle(aruid)
     }
 
     pub fn free_applet_resource_id(&self, aruid: u64) {
@@ -323,7 +338,9 @@ impl ResourceManager {
     pub fn set_aruid_valid_for_vibration(&self, aruid: u64, is_enabled: bool) -> ResultCode {
         let _lock = self.shared_mutex.write();
         if let Some(ref resource) = self.applet_resource {
-            let _has_changed = resource.lock().set_aruid_valid_for_vibration(aruid, is_enabled);
+            let _has_changed = resource
+                .lock()
+                .set_aruid_valid_for_vibration(aruid, is_enabled);
             // Upstream: if has_changed, iterates npad->GetAllVibrationDevices() (but the
             // loop body is an upstream TODO). Also checks vibration_handler session aruid.
         }
@@ -433,10 +450,11 @@ impl ResourceManager {
             return;
         }
 
-        let shared_memory: *mut crate::resources::shared_memory_format::SharedMemoryFormat = match ar_guard.get_shared_memory_format_mut(active_aruid) {
-            Some(sm) => sm as *mut _,
-            None => return,
-        };
+        let shared_memory: *mut crate::resources::shared_memory_format::SharedMemoryFormat =
+            match ar_guard.get_shared_memory_format_mut(active_aruid) {
+                Some(sm) => sm as *mut _,
+                None => return,
+            };
         // SAFETY: We hold the applet_resource lock and shared_mutex read lock,
         // so no other thread can modify the shared memory concurrently.
         let shared_memory = unsafe { &mut *shared_memory };
@@ -502,7 +520,9 @@ impl ResourceManager {
             let home_buttons = controller.get_home_buttons();
             cb.on_update(
                 &mut shared_memory.capture_button,
-                CaptureButtonState { raw: home_buttons.raw },
+                CaptureButtonState {
+                    raw: home_buttons.raw,
+                },
             );
         }
     }
@@ -547,10 +567,11 @@ impl ResourceManager {
             return;
         }
 
-        let shared_memory: *mut crate::resources::shared_memory_format::SharedMemoryFormat = match ar_guard.get_shared_memory_format_mut(active_aruid) {
-            Some(sm) => sm as *mut _,
-            None => return,
-        };
+        let shared_memory: *mut crate::resources::shared_memory_format::SharedMemoryFormat =
+            match ar_guard.get_shared_memory_format_mut(active_aruid) {
+                Some(sm) => sm as *mut _,
+                None => return,
+            };
         let shared_memory = unsafe { &mut *shared_memory };
 
         let hc_guard = hid_core.lock();
@@ -644,7 +665,8 @@ impl ResourceManager {
             if let Some(shared_memory) = ar_guard.get_shared_memory_format_mut(active_aruid) {
                 let mut csa = console_six_axis.lock();
                 // Upstream reads motion from EmulatedConsole::GetMotion()
-                let motion_status = crate::resources::six_axis::console_six_axis::ConsoleMotionStatus::default();
+                let motion_status =
+                    crate::resources::six_axis::console_six_axis::ConsoleMotionStatus::default();
                 csa.on_update(&mut shared_memory.console, &motion_status);
             }
         }

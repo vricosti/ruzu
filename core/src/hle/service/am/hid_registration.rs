@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use hid_core::resource_manager::ResourceManager;
 
+use crate::core::SystemRef;
 use crate::hle::service::os::process::Process;
 
 /// Port of HidRegistration
@@ -35,13 +36,30 @@ impl HidRegistration {
     /// Upstream constructor calls:
     /// - RegisterAppletResourceUserId(pid, true)
     /// - SetAruidValidForVibration(pid, true)
-    pub fn new(process: &Process, resource_manager: Option<Arc<parking_lot::Mutex<ResourceManager>>>) -> Self {
+    pub fn new(system: SystemRef, process: &Process) -> Self {
         let pid = process.get_process_id();
+        let resource_manager = if !system.is_null() {
+            system.get().service_manager().map(|service_manager| {
+                let handler = crate::hle::service::sm::sm::ServiceManager::get_service_blocking(
+                    &service_manager,
+                    "hid",
+                );
+                handler
+                    .as_any()
+                    .downcast_ref::<crate::hle::service::hid::hid_server::IHidServer>()
+                    .map(|hid_server| hid_server.get_resource_manager())
+            })
+            .flatten()
+        } else {
+            None
+        };
 
-        if let Some(ref rm) = resource_manager {
-            let rm = rm.lock();
-            rm.register_applet_resource_user_id(pid, true);
-            rm.set_aruid_valid_for_vibration(pid, true);
+        if process.is_initialized() {
+            if let Some(ref rm) = resource_manager {
+                let rm = rm.lock();
+                rm.register_applet_resource_user_id(pid, true);
+                rm.set_aruid_valid_for_vibration(pid, true);
+            }
         }
 
         Self {
@@ -70,10 +88,12 @@ impl Drop for HidRegistration {
     /// - SetAruidValidForVibration(pid, false)
     /// - UnregisterAppletResourceUserId(pid)
     fn drop(&mut self) {
-        if let Some(ref rm) = self.resource_manager {
-            let rm = rm.lock();
-            rm.set_aruid_valid_for_vibration(self.pid, false);
-            rm.unregister_applet_resource_user_id(self.pid);
+        if unsafe { self.process.as_ref() }.is_some_and(|process| process.is_initialized()) {
+            if let Some(ref rm) = self.resource_manager {
+                let rm = rm.lock();
+                rm.set_aruid_valid_for_vibration(self.pid, false);
+                rm.unregister_applet_resource_user_id(self.pid);
+            }
         }
     }
 }
