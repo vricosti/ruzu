@@ -4,8 +4,8 @@
 //! SPIR-V composite operation emission — maps to zuyu's
 //! `backend/spirv/emit_spirv_composite.cpp`.
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::Word;
 
 // ── U32 composite operations ─────────────────────────────────────────────
 

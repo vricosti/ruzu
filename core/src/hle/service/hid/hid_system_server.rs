@@ -33,14 +33,20 @@ impl IHidSystemServer {
     // ===== Commands that are nullptr in upstream (no handler) but we need a named stub =====
 
     /// Upstream: nullptr (cmd 31)
-    fn send_keyboard_lock_key_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn send_keyboard_lock_key_event_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SendKeyboardLockKeyEvent called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 101)
-    fn acquire_home_button_event_handle_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_home_button_event_handle_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) AcquireHomeButtonEventHandle called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -54,7 +60,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 121)
-    fn acquire_sleep_button_event_handle_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_sleep_button_event_handle_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) AcquireSleepButtonEventHandle called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -68,7 +77,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 141)
-    fn acquire_capture_button_event_handle_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_capture_button_event_handle_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) AcquireCaptureButtonEventHandle called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -86,7 +98,10 @@ impl IHidSystemServer {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let platform_config = server.firmware_settings.get_platform_config();
 
-        log::info!("GetPlatformConfig called, platform_config={}", platform_config.raw);
+        log::info!(
+            "GetPlatformConfig called, platform_config={}",
+            platform_config.raw
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -94,7 +109,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 210)
-    fn acquire_nfc_device_update_event_handle_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_nfc_device_update_event_handle_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) AcquireNfcDeviceUpdateEventHandle called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -108,7 +126,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 212)
-    fn acquire_nfc_activate_event_handle_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_nfc_activate_event_handle_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) AcquireNfcActivateEventHandle called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -122,7 +143,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 214)
-    fn get_xcd_handle_for_npad_with_nfc_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_xcd_handle_for_npad_with_nfc_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetXcdHandleForNpadWithNfc called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -136,7 +160,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 230)
-    fn acquire_ir_sensor_event_handle_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_ir_sensor_event_handle_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) AcquireIrSensorEventHandle called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -157,7 +184,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 233)
-    fn get_xcd_handle_for_npad_with_ir_sensor_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_xcd_handle_for_npad_with_ir_sensor_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetXcdHandleForNpadWithIrSensor called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -171,7 +201,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::ApplyNpadSystemCommonPolicy (cmd 303)
-    fn apply_npad_system_common_policy_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn apply_npad_system_common_policy_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
@@ -190,7 +223,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::EnableAssigningSingleOnSlSrPress (cmd 304)
-    fn enable_assigning_single_on_sl_sr_press_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn enable_assigning_single_on_sl_sr_press_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
@@ -207,7 +243,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::DisableAssigningSingleOnSlSrPress (cmd 305)
-    fn disable_assigning_single_on_sl_sr_press_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn disable_assigning_single_on_sl_sr_press_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
@@ -231,7 +270,10 @@ impl IHidSystemServer {
         let (result, npad_id) = if let Some(npad) = rm.get_npad() {
             npad.lock().get_last_active_npad()
         } else {
-            (common::ResultCode::SUCCESS, hid_core::hid_types::NpadIdType::Player1)
+            (
+                common::ResultCode::SUCCESS,
+                hid_core::hid_types::NpadIdType::Player1,
+            )
         };
 
         log::debug!("GetLastActiveNpad called, npad_id={:?}", npad_id);
@@ -242,14 +284,20 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 307)
-    fn get_npad_system_ext_style_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_npad_system_ext_style_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetNpadSystemExtStyle called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::ApplyNpadSystemCommonPolicyFull (cmd 308)
-    fn apply_npad_system_common_policy_full_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn apply_npad_system_common_policy_full_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
@@ -268,11 +316,17 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::GetNpadFullKeyGripColor (cmd 309)
-    fn get_npad_full_key_grip_color_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_npad_full_key_grip_color_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let mut rp = RequestParser::new(ctx);
         let npad_id = rp.pop_u32();
 
-        log::debug!("(STUBBED) GetNpadFullKeyGripColor called, npad_id={}", npad_id);
+        log::debug!(
+            "(STUBBED) GetNpadFullKeyGripColor called, npad_id={}",
+            npad_id
+        );
 
         // Upstream also has a TODO here: "Get colors from Npad"
         // Default-initialized NpadColor (all zeros) matches upstream stub behavior.
@@ -286,7 +340,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::GetMaskedSupportedNpadStyleSet (cmd 310)
-    fn get_masked_supported_npad_style_set_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_masked_supported_npad_style_set_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
@@ -306,14 +363,20 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 311)
-    fn set_npad_player_led_blinking_device_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_npad_player_led_blinking_device_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetNpadPlayerLedBlinkingDevice called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::SetSupportedNpadStyleSetAll (cmd 312)
-    fn set_supported_npad_style_set_all_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_supported_npad_style_set_all_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
@@ -322,7 +385,8 @@ impl IHidSystemServer {
 
         let rm = server.resource_manager.lock();
         if let Some(npad) = rm.get_npad() {
-            npad.lock().set_supported_npad_style_set(aruid, NpadStyleSet::ALL);
+            npad.lock()
+                .set_supported_npad_style_set(aruid, NpadStyleSet::ALL);
         }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -330,11 +394,17 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::GetNpadCaptureButtonAssignment (cmd 313)
-    fn get_npad_capture_button_assignment_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_npad_capture_button_assignment_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
 
-        log::debug!("(STUBBED) GetNpadCaptureButtonAssignment called, aruid={}", aruid);
+        log::debug!(
+            "(STUBBED) GetNpadCaptureButtonAssignment called, aruid={}",
+            aruid
+        );
 
         // Stubbed: return empty list (count = 0)
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
@@ -343,18 +413,27 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 314)
-    fn get_applet_footer_ui_type_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_applet_footer_ui_type_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetAppletFooterUiType called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::GetAppletDetailedUiType (cmd 315)
-    fn get_applet_detailed_ui_type_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_applet_detailed_ui_type_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let mut rp = RequestParser::new(ctx);
         let npad_id = rp.pop_u32();
 
-        log::debug!("(STUBBED) GetAppletDetailedUiType called, npad_id={}", npad_id);
+        log::debug!(
+            "(STUBBED) GetAppletDetailedUiType called, npad_id={}",
+            npad_id
+        );
 
         // Stubbed: push default AppletDetailedUiType (0)
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -376,11 +455,17 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::GetNpadLeftRightInterfaceType (cmd 317)
-    fn get_npad_left_right_interface_type_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_npad_left_right_interface_type_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let mut rp = RequestParser::new(ctx);
         let npad_id = rp.pop_u32();
 
-        log::debug!("(STUBBED) GetNpadLeftRightInterfaceType called, npad_id={}", npad_id);
+        log::debug!(
+            "(STUBBED) GetNpadLeftRightInterfaceType called, npad_id={}",
+            npad_id
+        );
 
         // Upstream returns two NpadInterfaceType::Bluetooth (each u8)
         // ResponseBuilder sizes: 2 base + 2 data words = 4 (two u8s fit in one u32 word,
@@ -418,11 +503,17 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::GetUniquePadsFromNpad (cmd 321)
-    fn get_unique_pads_from_npad_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_unique_pads_from_npad_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let mut rp = RequestParser::new(ctx);
         let npad_id = rp.pop_u32();
 
-        log::debug!("(STUBBED) GetUniquePadsFromNpad called, npad_id={}", npad_id);
+        log::debug!(
+            "(STUBBED) GetUniquePadsFromNpad called, npad_id={}",
+            npad_id
+        );
 
         // Stubbed: return empty list (count = 0)
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -431,23 +522,30 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::SetNpadSystemExtStateEnabled (cmd 322)
-    fn set_npad_system_ext_state_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_npad_system_ext_state_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let is_enabled = rp.pop_bool();
         let _padding = rp.pop_u32(); // 7 bytes padding (4 bytes consumed here)
         let _padding2 = rp.pop_u16(); // 2 more bytes
-        let _padding3 = rp.pop_u8();  // 1 more byte -- total 7 bytes padding
+        let _padding3 = rp.pop_u8(); // 1 more byte -- total 7 bytes padding
         let aruid = rp.pop_u64();
 
         log::info!(
             "SetNpadSystemExtStateEnabled called, is_enabled={}, aruid={}",
-            is_enabled, aruid
+            is_enabled,
+            aruid
         );
 
         let rm = server.resource_manager.lock();
         let result = if let Some(npad) = rm.get_npad() {
-            to_ipc_result(npad.lock().set_npad_system_ext_state_enabled(aruid, is_enabled))
+            to_ipc_result(
+                npad.lock()
+                    .set_npad_system_ext_state_enabled(aruid, is_enabled),
+            )
         } else {
             RESULT_SUCCESS
         };
@@ -457,14 +555,20 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 323)
-    fn get_last_active_unique_pad_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_last_active_unique_pad_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetLastActiveUniquePad called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 324)
-    fn get_unique_pad_button_set_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_unique_pad_button_set_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetUniquePadButtonSet called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -478,49 +582,70 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 326)
-    fn get_unique_pad_applet_detailed_ui_type_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_unique_pad_applet_detailed_ui_type_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetUniquePadAppletDetailedUiType called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 327)
-    fn get_abstracted_pad_id_data_from_npad_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_abstracted_pad_id_data_from_npad_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetAbstractedPadIdDataFromNpad called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 328)
-    fn attach_abstracted_pad_to_npad_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn attach_abstracted_pad_to_npad_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) AttachAbstractedPadToNpad called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 329)
-    fn detach_abstracted_pad_all_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn detach_abstracted_pad_all_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) DetachAbstractedPadAll called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 330)
-    fn check_abstracted_pad_connection_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn check_abstracted_pad_connection_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) CheckAbstractedPadConnection called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 500)
-    fn set_applet_resource_user_id_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_applet_resource_user_id_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetAppletResourceUserId called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::RegisterAppletResourceUserId (cmd 501)
-    fn register_applet_resource_user_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn register_applet_resource_user_id_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let enable_input = rp.pop_bool();
@@ -551,10 +676,7 @@ impl IHidSystemServer {
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
 
-        log::info!(
-            "UnregisterAppletResourceUserId called, aruid={}",
-            aruid
-        );
+        log::info!("UnregisterAppletResourceUserId called, aruid={}", aruid);
 
         server
             .resource_manager
@@ -566,7 +688,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::EnableAppletToGetInput (cmd 503)
-    fn enable_applet_to_get_input_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn enable_applet_to_get_input_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let is_enabled = rp.pop_bool();
@@ -579,14 +704,20 @@ impl IHidSystemServer {
             aruid
         );
 
-        server.resource_manager.lock().enable_input(aruid, is_enabled);
+        server
+            .resource_manager
+            .lock()
+            .enable_input(aruid, is_enabled);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::SetAruidValidForVibration (cmd 504)
-    fn set_aruid_valid_for_vibration_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_aruid_valid_for_vibration_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let is_enabled = rp.pop_bool();
@@ -595,10 +726,14 @@ impl IHidSystemServer {
 
         log::info!(
             "SetAruidValidForVibration called, is_enabled={}, aruid={}",
-            is_enabled, aruid
+            is_enabled,
+            aruid
         );
 
-        server.resource_manager.lock().set_aruid_valid_for_vibration(aruid, is_enabled);
+        server
+            .resource_manager
+            .lock()
+            .set_aruid_valid_for_vibration(aruid, is_enabled);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -606,7 +741,10 @@ impl IHidSystemServer {
 
     /// Upstream: IHidSystemServer::EnableAppletToGetSixAxisSensor (cmd 505)
     /// Note: upstream calls EnableTouchScreen despite the name.
-    fn enable_applet_to_get_six_axis_sensor_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn enable_applet_to_get_six_axis_sensor_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let is_enabled = rp.pop_bool();
@@ -615,18 +753,25 @@ impl IHidSystemServer {
 
         log::info!(
             "EnableAppletToGetSixAxisSensor called, is_enabled={}, aruid={}",
-            is_enabled, aruid
+            is_enabled,
+            aruid
         );
 
         // Upstream calls EnableTouchScreen here (yes, this is intentional in upstream)
-        server.resource_manager.lock().enable_touch_screen(aruid, is_enabled);
+        server
+            .resource_manager
+            .lock()
+            .enable_touch_screen(aruid, is_enabled);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::EnableAppletToGetPadInput (cmd 506)
-    fn enable_applet_to_get_pad_input_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn enable_applet_to_get_pad_input_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let is_enabled = rp.pop_bool();
@@ -635,7 +780,8 @@ impl IHidSystemServer {
 
         log::info!(
             "EnableAppletToGetPadInput called, is_enabled={}, aruid={}",
-            is_enabled, aruid
+            is_enabled,
+            aruid
         );
 
         let rm = server.resource_manager.lock();
@@ -649,7 +795,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::EnableAppletToGetTouchScreen (cmd 507)
-    fn enable_applet_to_get_touch_screen_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn enable_applet_to_get_touch_screen_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let is_enabled = rp.pop_bool();
@@ -658,17 +807,24 @@ impl IHidSystemServer {
 
         log::info!(
             "EnableAppletToGetTouchScreen called, is_enabled={}, aruid={}",
-            is_enabled, aruid
+            is_enabled,
+            aruid
         );
 
-        server.resource_manager.lock().enable_touch_screen(aruid, is_enabled);
+        server
+            .resource_manager
+            .lock()
+            .enable_touch_screen(aruid, is_enabled);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::SetVibrationMasterVolume (cmd 510)
-    fn set_vibration_master_volume_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_vibration_master_volume_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let master_volume = rp.pop_f32();
@@ -686,10 +842,14 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::GetVibrationMasterVolume (cmd 511)
-    fn get_vibration_master_volume_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_vibration_master_volume_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
 
-        let (result, master_volume) = if let Some(npad) = server.resource_manager.lock().get_npad() {
+        let (result, master_volume) = if let Some(npad) = server.resource_manager.lock().get_npad()
+        {
             match npad.lock().get_vibration_master_volume() {
                 Ok(vol) => (RESULT_SUCCESS, vol),
                 Err(e) => (to_ipc_result(e), 0.0f32),
@@ -706,7 +866,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::BeginPermitVibrationSession (cmd 512)
-    fn begin_permit_vibration_session_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn begin_permit_vibration_session_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
@@ -724,7 +887,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::EndPermitVibrationSession (cmd 513)
-    fn end_permit_vibration_session_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn end_permit_vibration_session_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         log::info!("EndPermitVibrationSession called");
 
@@ -769,7 +935,10 @@ impl IHidSystemServer {
     /// Upstream: IHidSystemServer::IsJoyConRailEnabled (cmd 523)
     fn is_joy_con_rail_enabled_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let is_attached = true;
-        log::warn!("(STUBBED) IsJoyConRailEnabled called, is_attached={}", is_attached);
+        log::warn!(
+            "(STUBBED) IsJoyConRailEnabled called, is_attached={}",
+            is_attached
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -784,9 +953,15 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::IsJoyConAttachedOnAllRail (cmd 525)
-    fn is_joy_con_attached_on_all_rail_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_joy_con_attached_on_all_rail_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let is_attached = true;
-        log::debug!("(STUBBED) IsJoyConAttachedOnAllRail called, is_attached={}", is_attached);
+        log::debug!(
+            "(STUBBED) IsJoyConAttachedOnAllRail called, is_attached={}",
+            is_attached
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -794,35 +969,50 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 540)
-    fn acquire_play_report_controller_usage_update_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_play_report_controller_usage_update_event_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) AcquirePlayReportControllerUsageUpdateEvent called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 541)
-    fn get_play_report_controller_usages_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_play_report_controller_usages_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetPlayReportControllerUsages called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 542)
-    fn acquire_play_report_registered_device_update_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_play_report_registered_device_update_event_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) AcquirePlayReportRegisteredDeviceUpdateEvent called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 543)
-    fn get_registered_devices_old_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_registered_devices_old_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetRegisteredDevicesOld called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::AcquireConnectionTriggerTimeoutEvent (cmd 544)
-    fn acquire_connection_trigger_timeout_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_connection_trigger_timeout_event_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::info!("(STUBBED) AcquireConnectionTriggerTimeoutEvent called");
 
         // Upstream: rb{ctx, 2, 1} + PushCopyObjects(event). Stubbed with handle=0.
@@ -839,7 +1029,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::AcquireDeviceRegisteredEventForControllerSupport (cmd 546)
-    fn acquire_device_registered_event_for_controller_support_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_device_registered_event_for_controller_support_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::info!("(STUBBED) AcquireDeviceRegisteredEventForControllerSupport called");
 
         // Upstream: rb{ctx, 2, 1} + PushCopyObjects(event). Stubbed with handle=0.
@@ -849,7 +1042,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 547)
-    fn get_allowed_bluetooth_links_count_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_allowed_bluetooth_links_count_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetAllowedBluetoothLinksCount called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -866,7 +1062,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 549)
-    fn get_connectable_registered_devices_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_connectable_registered_devices_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetConnectableRegisteredDevices called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -880,7 +1079,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::AcquireUniquePadConnectionEventHandle (cmd 702)
-    fn acquire_unique_pad_connection_event_handle_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_unique_pad_connection_event_handle_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) AcquireUniquePadConnectionEventHandle called");
 
         // Upstream: rb{ctx, 2, 1} + PushCopyObjects(event). Stubbed with handle=0.
@@ -899,7 +1101,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::AcquireJoyDetachOnBluetoothOffEventHandle (cmd 751)
-    fn acquire_joy_detach_on_bluetooth_off_event_handle_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_joy_detach_on_bluetooth_off_event_handle_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::info!("(STUBBED) AcquireJoyDetachOnBluetoothOffEventHandle called");
 
         // Upstream: rb{ctx, 2, 1} + PushCopyObjects(event). Stubbed with handle=0.
@@ -909,42 +1114,60 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 800)
-    fn list_six_axis_sensor_handles_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn list_six_axis_sensor_handles_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) ListSixAxisSensorHandles called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 801)
-    fn is_six_axis_sensor_user_calibration_supported_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_six_axis_sensor_user_calibration_supported_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsSixAxisSensorUserCalibrationSupported called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 802)
-    fn reset_six_axis_sensor_calibration_values_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn reset_six_axis_sensor_calibration_values_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) ResetSixAxisSensorCalibrationValues called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 803)
-    fn start_six_axis_sensor_user_calibration_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn start_six_axis_sensor_user_calibration_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) StartSixAxisSensorUserCalibration called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 804)
-    fn cancel_six_axis_sensor_user_calibration_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn cancel_six_axis_sensor_user_calibration_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) CancelSixAxisSensorUserCalibration called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 805)
-    fn get_unique_pad_bluetooth_address_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_unique_pad_bluetooth_address_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetUniquePadBluetoothAddress called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -972,56 +1195,80 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 809)
-    fn get_unique_pad_serial_number_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_unique_pad_serial_number_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetUniquePadSerialNumber called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 810)
-    fn get_unique_pad_controller_number_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_unique_pad_controller_number_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetUniquePadControllerNumber called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 811)
-    fn get_six_axis_sensor_user_calibration_stage_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_six_axis_sensor_user_calibration_stage_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetSixAxisSensorUserCalibrationStage called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 812)
-    fn get_console_unique_six_axis_sensor_handle_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_console_unique_six_axis_sensor_handle_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetConsoleUniqueSixAxisSensorHandle called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 821)
-    fn start_analog_stick_manual_calibration_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn start_analog_stick_manual_calibration_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) StartAnalogStickManualCalibration called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 822)
-    fn retry_current_analog_stick_manual_calibration_stage_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn retry_current_analog_stick_manual_calibration_stage_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) RetryCurrentAnalogStickManualCalibrationStage called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 823)
-    fn cancel_analog_stick_manual_calibration_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn cancel_analog_stick_manual_calibration_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) CancelAnalogStickManualCalibration called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 824)
-    fn reset_analog_stick_manual_calibration_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn reset_analog_stick_manual_calibration_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) ResetAnalogStickManualCalibration called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1035,58 +1282,85 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 826)
-    fn get_analog_stick_manual_calibration_stage_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_analog_stick_manual_calibration_stage_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetAnalogStickManualCalibrationStage called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 827)
-    fn is_analog_stick_button_pressed_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_analog_stick_button_pressed_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsAnalogStickButtonPressed called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 828)
-    fn is_analog_stick_in_release_position_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_analog_stick_in_release_position_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsAnalogStickInReleasePosition called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 829)
-    fn is_analog_stick_in_circumference_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_analog_stick_in_circumference_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsAnalogStickInCircumference called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 830)
-    fn set_notification_led_pattern_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_notification_led_pattern_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetNotificationLedPattern called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 831)
-    fn set_notification_led_pattern_with_timeout_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_notification_led_pattern_with_timeout_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetNotificationLedPatternWithTimeout called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 832)
-    fn prepare_hids_for_notification_wake_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn prepare_hids_for_notification_wake_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) PrepareHidsForNotificationWake called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::IsUsbFullKeyControllerEnabled (cmd 850)
-    fn is_usb_full_key_controller_enabled_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_usb_full_key_controller_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let is_enabled = false;
-        log::warn!("(STUBBED) IsUsbFullKeyControllerEnabled called, is_enabled={}", is_enabled);
+        log::warn!(
+            "(STUBBED) IsUsbFullKeyControllerEnabled called, is_enabled={}",
+            is_enabled
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1094,11 +1368,17 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::EnableUsbFullKeyController (cmd 851)
-    fn enable_usb_full_key_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn enable_usb_full_key_controller_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let mut rp = RequestParser::new(ctx);
         let is_enabled = rp.pop_bool();
 
-        log::warn!("(STUBBED) EnableUsbFullKeyController called, is_enabled={}", is_enabled);
+        log::warn!(
+            "(STUBBED) EnableUsbFullKeyController called, is_enabled={}",
+            is_enabled
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1112,9 +1392,15 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::IsHandheldButtonPressedOnConsoleMode (cmd 870)
-    fn is_handheld_button_pressed_on_console_mode_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_handheld_button_pressed_on_console_mode_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let button_pressed = false;
-        log::debug!("(STUBBED) IsHandheldButtonPressedOnConsoleMode called, is_enabled={}", button_pressed);
+        log::debug!(
+            "(STUBBED) IsHandheldButtonPressedOnConsoleMode called, is_enabled={}",
+            button_pressed
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1136,7 +1422,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::InitializeFirmwareUpdate (cmd 1000)
-    fn initialize_firmware_update_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn initialize_firmware_update_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) InitializeFirmwareUpdate called");
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1151,21 +1440,30 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1002)
-    fn get_available_firmware_version_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_available_firmware_version_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetAvailableFirmwareVersion called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1003)
-    fn is_firmware_update_available_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_firmware_update_available_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsFirmwareUpdateAvailable called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::CheckFirmwareUpdateRequired (cmd 1004)
-    fn check_firmware_update_required_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn check_firmware_update_required_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) CheckFirmwareUpdateRequired called");
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1187,7 +1485,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1007)
-    fn get_firmware_update_state_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_firmware_update_state_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetFirmwareUpdateState called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1201,7 +1502,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1009)
-    fn acquire_audio_control_event_handle_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn acquire_audio_control_event_handle_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) AcquireAudioControlEventHandle called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1222,42 +1526,60 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1050)
-    fn is_six_axis_sensor_accurate_user_calibration_supported_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_six_axis_sensor_accurate_user_calibration_supported_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsSixAxisSensorAccurateUserCalibrationSupported called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1051)
-    fn start_six_axis_sensor_accurate_user_calibration_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn start_six_axis_sensor_accurate_user_calibration_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) StartSixAxisSensorAccurateUserCalibration called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1052)
-    fn cancel_six_axis_sensor_accurate_user_calibration_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn cancel_six_axis_sensor_accurate_user_calibration_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) CancelSixAxisSensorAccurateUserCalibration called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1053)
-    fn get_six_axis_sensor_accurate_user_calibration_state_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_six_axis_sensor_accurate_user_calibration_state_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetSixAxisSensorAccurateUserCalibrationState called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1100)
-    fn get_hidbus_system_service_object_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_hidbus_system_service_object_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetHidbusSystemServiceObject called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::SetFirmwareHotfixUpdateSkipEnabled (cmd 1120)
-    fn set_firmware_hotfix_update_skip_enabled_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_firmware_hotfix_update_skip_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) SetFirmwareHotfixUpdateSkipEnabled called");
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1265,7 +1587,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::InitializeUsbFirmwareUpdate (cmd 1130)
-    fn initialize_usb_firmware_update_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn initialize_usb_firmware_update_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) InitializeUsbFirmwareUpdate called");
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1273,7 +1598,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::FinalizeUsbFirmwareUpdate (cmd 1131)
-    fn finalize_usb_firmware_update_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn finalize_usb_firmware_update_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) FinalizeUsbFirmwareUpdate called");
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1281,7 +1609,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::CheckUsbFirmwareUpdateRequired (cmd 1132)
-    fn check_usb_firmware_update_required_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn check_usb_firmware_update_required_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) CheckUsbFirmwareUpdateRequired called");
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1289,21 +1620,30 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1133)
-    fn start_usb_firmware_update_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn start_usb_firmware_update_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) StartUsbFirmwareUpdate called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1134)
-    fn get_usb_firmware_update_state_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_usb_firmware_update_state_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetUsbFirmwareUpdateState called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::InitializeUsbFirmwareUpdateWithoutMemory (cmd 1135)
-    fn initialize_usb_firmware_update_without_memory_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn initialize_usb_firmware_update_without_memory_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) InitializeUsbFirmwareUpdateWithoutMemory called");
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1311,7 +1651,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::SetTouchScreenMagnification (cmd 1150)
-    fn set_touch_screen_magnification_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_touch_screen_magnification_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let mut rp = RequestParser::new(ctx);
         let point1x = rp.pop_f32();
         let point1y = rp.pop_f32();
@@ -1320,7 +1663,10 @@ impl IHidSystemServer {
 
         log::info!(
             "(STUBBED) SetTouchScreenMagnification called, point1=({},{}), point2=({},{})",
-            point1x, point1y, point2x, point2y
+            point1x,
+            point1y,
+            point2x,
+            point2y
         );
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1328,7 +1674,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::GetTouchScreenFirmwareVersion (cmd 1151)
-    fn get_touch_screen_firmware_version_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_touch_screen_firmware_version_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::info!("(STUBBED) GetTouchScreenFirmwareVersion called");
 
         // Upstream: rb{ctx, 6}, pushes FirmwareVersion (4 u32 words = 16 bytes)
@@ -1342,7 +1691,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::SetTouchScreenDefaultConfiguration (cmd 1152)
-    fn set_touch_screen_default_configuration_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_touch_screen_default_configuration_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::info!("(STUBBED) SetTouchScreenDefaultConfiguration called");
 
         // Upstream parses TouchScreenConfigurationForNx, applies it. Stubbed here.
@@ -1351,7 +1703,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::GetTouchScreenDefaultConfiguration (cmd 1153)
-    fn get_touch_screen_default_configuration_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_touch_screen_default_configuration_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::info!("(STUBBED) GetTouchScreenDefaultConfiguration called");
 
         // Upstream: rb{ctx, 6}, pushes TouchScreenConfigurationForNx (4 u32 words)
@@ -1365,46 +1720,67 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1154)
-    fn is_firmware_available_for_notification_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_firmware_available_for_notification_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsFirmwareAvailableForNotification called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::SetForceHandheldStyleVibration (cmd 1155)
-    fn set_force_handheld_style_vibration_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_force_handheld_style_vibration_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let mut rp = RequestParser::new(ctx);
         let is_forced = rp.pop_bool();
 
-        log::info!("(STUBBED) SetForceHandheldStyleVibration called, is_forced={}", is_forced);
+        log::info!(
+            "(STUBBED) SetForceHandheldStyleVibration called, is_forced={}",
+            is_forced
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1156)
-    fn send_connection_trigger_without_timeout_event_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn send_connection_trigger_without_timeout_event_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SendConnectionTriggerWithoutTimeoutEvent called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1157)
-    fn cancel_connection_trigger_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn cancel_connection_trigger_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) CancelConnectionTrigger called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1200)
-    fn is_button_config_supported_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_button_config_supported_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsButtonConfigSupported called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1201)
-    fn is_button_config_embedded_supported_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_button_config_embedded_supported_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsButtonConfigEmbeddedSupported called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1418,21 +1794,30 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1203)
-    fn delete_button_config_embedded_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn delete_button_config_embedded_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) DeleteButtonConfigEmbedded called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1204)
-    fn set_button_config_enabled_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_button_config_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetButtonConfigEnabled called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1205)
-    fn set_button_config_embedded_enabled_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_button_config_embedded_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetButtonConfigEmbeddedEnabled called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1446,14 +1831,20 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1207)
-    fn is_button_config_embedded_enabled_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_button_config_embedded_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsButtonConfigEmbeddedEnabled called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1208)
-    fn set_button_config_embedded_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_button_config_embedded_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetButtonConfigEmbedded called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1481,7 +1872,10 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1212)
-    fn get_button_config_embedded_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_button_config_embedded_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetButtonConfigEmbedded called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1509,156 +1903,225 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1250)
-    fn is_custom_button_config_supported_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_custom_button_config_supported_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsCustomButtonConfigSupported called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1251)
-    fn is_default_button_config_embedded_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_default_button_config_embedded_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsDefaultButtonConfigEmbedded called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1252)
-    fn is_default_button_config_full_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_default_button_config_full_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsDefaultButtonConfigFull called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1253)
-    fn is_default_button_config_left_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_default_button_config_left_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsDefaultButtonConfigLeft called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1254)
-    fn is_default_button_config_right_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_default_button_config_right_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsDefaultButtonConfigRight called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1255)
-    fn is_button_config_storage_embedded_empty_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_button_config_storage_embedded_empty_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsButtonConfigStorageEmbeddedEmpty called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1256)
-    fn is_button_config_storage_full_empty_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_button_config_storage_full_empty_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsButtonConfigStorageFullEmpty called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1257)
-    fn is_button_config_storage_left_empty_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_button_config_storage_left_empty_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsButtonConfigStorageLeftEmpty called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1258)
-    fn is_button_config_storage_right_empty_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_button_config_storage_right_empty_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) IsButtonConfigStorageRightEmpty called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1259)
-    fn get_button_config_storage_embedded_deprecated_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_button_config_storage_embedded_deprecated_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetButtonConfigStorageEmbeddedDeprecated called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1260)
-    fn get_button_config_storage_full_deprecated_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_button_config_storage_full_deprecated_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetButtonConfigStorageFullDeprecated called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1261)
-    fn get_button_config_storage_left_deprecated_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_button_config_storage_left_deprecated_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetButtonConfigStorageLeftDeprecated called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1262)
-    fn get_button_config_storage_right_deprecated_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_button_config_storage_right_deprecated_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetButtonConfigStorageRightDeprecated called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1263)
-    fn set_button_config_storage_embedded_deprecated_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_button_config_storage_embedded_deprecated_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetButtonConfigStorageEmbeddedDeprecated called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1264)
-    fn set_button_config_storage_full_deprecated_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_button_config_storage_full_deprecated_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetButtonConfigStorageFullDeprecated called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1265)
-    fn set_button_config_storage_left_deprecated_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_button_config_storage_left_deprecated_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetButtonConfigStorageLeftDeprecated called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1266)
-    fn set_button_config_storage_right_deprecated_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_button_config_storage_right_deprecated_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetButtonConfigStorageRightDeprecated called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1267)
-    fn delete_button_config_storage_embedded_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn delete_button_config_storage_embedded_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) DeleteButtonConfigStorageEmbedded called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1268)
-    fn delete_button_config_storage_full_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn delete_button_config_storage_full_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) DeleteButtonConfigStorageFull called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1269)
-    fn delete_button_config_storage_left_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn delete_button_config_storage_left_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) DeleteButtonConfigStorageLeft called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1270)
-    fn delete_button_config_storage_right_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn delete_button_config_storage_right_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) DeleteButtonConfigStorageRight called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::IsUsingCustomButtonConfig (cmd 1271)
-    fn is_using_custom_button_config_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_using_custom_button_config_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let is_enabled = false;
-        log::debug!("(STUBBED) IsUsingCustomButtonConfig called, is_enabled={}", is_enabled);
+        log::debug!(
+            "(STUBBED) IsUsingCustomButtonConfig called, is_enabled={}",
+            is_enabled
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1666,9 +2129,15 @@ impl IHidSystemServer {
     }
 
     /// Upstream: IHidSystemServer::IsAnyCustomButtonConfigEnabled (cmd 1272)
-    fn is_any_custom_button_config_enabled_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_any_custom_button_config_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let is_enabled = false;
-        log::debug!("(STUBBED) IsAnyCustomButtonConfigEnabled called, is_enabled={}", is_enabled);
+        log::debug!(
+            "(STUBBED) IsAnyCustomButtonConfigEnabled called, is_enabled={}",
+            is_enabled
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1676,133 +2145,190 @@ impl IHidSystemServer {
     }
 
     /// Upstream: nullptr (cmd 1273)
-    fn set_all_custom_button_config_enabled_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_all_custom_button_config_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetAllCustomButtonConfigEnabled called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1274)
-    fn set_default_button_config_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_default_button_config_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetDefaultButtonConfig called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1275)
-    fn set_all_default_button_config_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_all_default_button_config_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetAllDefaultButtonConfig called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1276)
-    fn set_hid_button_config_embedded_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_hid_button_config_embedded_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetHidButtonConfigEmbedded called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1277)
-    fn set_hid_button_config_full_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_hid_button_config_full_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetHidButtonConfigFull called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1278)
-    fn set_hid_button_config_left_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_hid_button_config_left_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetHidButtonConfigLeft called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1279)
-    fn set_hid_button_config_right_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_hid_button_config_right_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetHidButtonConfigRight called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1280)
-    fn get_hid_button_config_embedded_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_hid_button_config_embedded_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetHidButtonConfigEmbedded called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1281)
-    fn get_hid_button_config_full_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_hid_button_config_full_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetHidButtonConfigFull called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1282)
-    fn get_hid_button_config_left_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_hid_button_config_left_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetHidButtonConfigLeft called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1283)
-    fn get_hid_button_config_right_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_hid_button_config_right_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetHidButtonConfigRight called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1284)
-    fn get_button_config_storage_embedded_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_button_config_storage_embedded_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetButtonConfigStorageEmbedded called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1285)
-    fn get_button_config_storage_full_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_button_config_storage_full_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetButtonConfigStorageFull called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1286)
-    fn get_button_config_storage_left_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_button_config_storage_left_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetButtonConfigStorageLeft called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1287)
-    fn get_button_config_storage_right_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_button_config_storage_right_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) GetButtonConfigStorageRight called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1288)
-    fn set_button_config_storage_embedded_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_button_config_storage_embedded_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetButtonConfigStorageEmbedded called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1289)
-    fn set_button_config_storage_full_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_button_config_storage_full_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) SetButtonConfigStorageFull called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1290)
-    fn delete_button_config_storage_right_1290_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn delete_button_config_storage_right_1290_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) DeleteButtonConfigStorageRight (1290) called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 1291)
-    fn delete_button_config_storage_right_1291_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn delete_button_config_storage_right_1291_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("(STUBBED) DeleteButtonConfigStorageRight (1291) called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -1814,206 +2340,986 @@ impl IHidSystemServer {
     ) -> Self {
         // clang-format off
         let handlers = build_handler_map(&[
-            (31, Some(Self::send_keyboard_lock_key_event_handler), "SendKeyboardLockKeyEvent"),
-            (101, Some(Self::acquire_home_button_event_handle_handler), "AcquireHomeButtonEventHandle"),
-            (111, Some(Self::activate_home_button_handler), "ActivateHomeButton"),
-            (121, Some(Self::acquire_sleep_button_event_handle_handler), "AcquireSleepButtonEventHandle"),
-            (131, Some(Self::activate_sleep_button_handler), "ActivateSleepButton"),
-            (141, Some(Self::acquire_capture_button_event_handle_handler), "AcquireCaptureButtonEventHandle"),
-            (151, Some(Self::activate_capture_button_handler), "ActivateCaptureButton"),
-            (161, Some(Self::get_platform_config_handler), "GetPlatformConfig"),
-            (210, Some(Self::acquire_nfc_device_update_event_handle_handler), "AcquireNfcDeviceUpdateEventHandle"),
-            (211, Some(Self::get_npads_with_nfc_handler), "GetNpadsWithNfc"),
-            (212, Some(Self::acquire_nfc_activate_event_handle_handler), "AcquireNfcActivateEventHandle"),
+            (
+                31,
+                Some(Self::send_keyboard_lock_key_event_handler),
+                "SendKeyboardLockKeyEvent",
+            ),
+            (
+                101,
+                Some(Self::acquire_home_button_event_handle_handler),
+                "AcquireHomeButtonEventHandle",
+            ),
+            (
+                111,
+                Some(Self::activate_home_button_handler),
+                "ActivateHomeButton",
+            ),
+            (
+                121,
+                Some(Self::acquire_sleep_button_event_handle_handler),
+                "AcquireSleepButtonEventHandle",
+            ),
+            (
+                131,
+                Some(Self::activate_sleep_button_handler),
+                "ActivateSleepButton",
+            ),
+            (
+                141,
+                Some(Self::acquire_capture_button_event_handle_handler),
+                "AcquireCaptureButtonEventHandle",
+            ),
+            (
+                151,
+                Some(Self::activate_capture_button_handler),
+                "ActivateCaptureButton",
+            ),
+            (
+                161,
+                Some(Self::get_platform_config_handler),
+                "GetPlatformConfig",
+            ),
+            (
+                210,
+                Some(Self::acquire_nfc_device_update_event_handle_handler),
+                "AcquireNfcDeviceUpdateEventHandle",
+            ),
+            (
+                211,
+                Some(Self::get_npads_with_nfc_handler),
+                "GetNpadsWithNfc",
+            ),
+            (
+                212,
+                Some(Self::acquire_nfc_activate_event_handle_handler),
+                "AcquireNfcActivateEventHandle",
+            ),
             (213, Some(Self::activate_nfc_handler), "ActivateNfc"),
-            (214, Some(Self::get_xcd_handle_for_npad_with_nfc_handler), "GetXcdHandleForNpadWithNfc"),
+            (
+                214,
+                Some(Self::get_xcd_handle_for_npad_with_nfc_handler),
+                "GetXcdHandleForNpadWithNfc",
+            ),
             (215, Some(Self::is_nfc_activated_handler), "IsNfcActivated"),
-            (230, Some(Self::acquire_ir_sensor_event_handle_handler), "AcquireIrSensorEventHandle"),
-            (231, Some(Self::activate_ir_sensor_handler), "ActivateIrSensor"),
-            (232, Some(Self::get_ir_sensor_state_handler), "GetIrSensorState"),
-            (233, Some(Self::get_xcd_handle_for_npad_with_ir_sensor_handler), "GetXcdHandleForNpadWithIrSensor"),
-            (301, Some(Self::activate_npad_system_handler), "ActivateNpadSystem"),
-            (303, Some(Self::apply_npad_system_common_policy_handler), "ApplyNpadSystemCommonPolicy"),
-            (304, Some(Self::enable_assigning_single_on_sl_sr_press_handler), "EnableAssigningSingleOnSlSrPress"),
-            (305, Some(Self::disable_assigning_single_on_sl_sr_press_handler), "DisableAssigningSingleOnSlSrPress"),
-            (306, Some(Self::get_last_active_npad_handler), "GetLastActiveNpad"),
-            (307, Some(Self::get_npad_system_ext_style_handler), "GetNpadSystemExtStyle"),
-            (308, Some(Self::apply_npad_system_common_policy_full_handler), "ApplyNpadSystemCommonPolicyFull"),
-            (309, Some(Self::get_npad_full_key_grip_color_handler), "GetNpadFullKeyGripColor"),
-            (310, Some(Self::get_masked_supported_npad_style_set_handler), "GetMaskedSupportedNpadStyleSet"),
-            (311, Some(Self::set_npad_player_led_blinking_device_handler), "SetNpadPlayerLedBlinkingDevice"),
-            (312, Some(Self::set_supported_npad_style_set_all_handler), "SetSupportedNpadStyleSetAll"),
-            (313, Some(Self::get_npad_capture_button_assignment_handler), "GetNpadCaptureButtonAssignment"),
-            (314, Some(Self::get_applet_footer_ui_type_handler), "GetAppletFooterUiType"),
-            (315, Some(Self::get_applet_detailed_ui_type_handler), "GetAppletDetailedUiType"),
-            (316, Some(Self::get_npad_interface_type_handler), "GetNpadInterfaceType"),
-            (317, Some(Self::get_npad_left_right_interface_type_handler), "GetNpadLeftRightInterfaceType"),
+            (
+                230,
+                Some(Self::acquire_ir_sensor_event_handle_handler),
+                "AcquireIrSensorEventHandle",
+            ),
+            (
+                231,
+                Some(Self::activate_ir_sensor_handler),
+                "ActivateIrSensor",
+            ),
+            (
+                232,
+                Some(Self::get_ir_sensor_state_handler),
+                "GetIrSensorState",
+            ),
+            (
+                233,
+                Some(Self::get_xcd_handle_for_npad_with_ir_sensor_handler),
+                "GetXcdHandleForNpadWithIrSensor",
+            ),
+            (
+                301,
+                Some(Self::activate_npad_system_handler),
+                "ActivateNpadSystem",
+            ),
+            (
+                303,
+                Some(Self::apply_npad_system_common_policy_handler),
+                "ApplyNpadSystemCommonPolicy",
+            ),
+            (
+                304,
+                Some(Self::enable_assigning_single_on_sl_sr_press_handler),
+                "EnableAssigningSingleOnSlSrPress",
+            ),
+            (
+                305,
+                Some(Self::disable_assigning_single_on_sl_sr_press_handler),
+                "DisableAssigningSingleOnSlSrPress",
+            ),
+            (
+                306,
+                Some(Self::get_last_active_npad_handler),
+                "GetLastActiveNpad",
+            ),
+            (
+                307,
+                Some(Self::get_npad_system_ext_style_handler),
+                "GetNpadSystemExtStyle",
+            ),
+            (
+                308,
+                Some(Self::apply_npad_system_common_policy_full_handler),
+                "ApplyNpadSystemCommonPolicyFull",
+            ),
+            (
+                309,
+                Some(Self::get_npad_full_key_grip_color_handler),
+                "GetNpadFullKeyGripColor",
+            ),
+            (
+                310,
+                Some(Self::get_masked_supported_npad_style_set_handler),
+                "GetMaskedSupportedNpadStyleSet",
+            ),
+            (
+                311,
+                Some(Self::set_npad_player_led_blinking_device_handler),
+                "SetNpadPlayerLedBlinkingDevice",
+            ),
+            (
+                312,
+                Some(Self::set_supported_npad_style_set_all_handler),
+                "SetSupportedNpadStyleSetAll",
+            ),
+            (
+                313,
+                Some(Self::get_npad_capture_button_assignment_handler),
+                "GetNpadCaptureButtonAssignment",
+            ),
+            (
+                314,
+                Some(Self::get_applet_footer_ui_type_handler),
+                "GetAppletFooterUiType",
+            ),
+            (
+                315,
+                Some(Self::get_applet_detailed_ui_type_handler),
+                "GetAppletDetailedUiType",
+            ),
+            (
+                316,
+                Some(Self::get_npad_interface_type_handler),
+                "GetNpadInterfaceType",
+            ),
+            (
+                317,
+                Some(Self::get_npad_left_right_interface_type_handler),
+                "GetNpadLeftRightInterfaceType",
+            ),
             (318, Some(Self::has_battery_handler), "HasBattery"),
-            (319, Some(Self::has_left_right_battery_handler), "HasLeftRightBattery"),
-            (321, Some(Self::get_unique_pads_from_npad_handler), "GetUniquePadsFromNpad"),
-            (322, Some(Self::set_npad_system_ext_state_enabled_handler), "SetNpadSystemExtStateEnabled"),
-            (323, Some(Self::get_last_active_unique_pad_handler), "GetLastActiveUniquePad"),
-            (324, Some(Self::get_unique_pad_button_set_handler), "GetUniquePadButtonSet"),
-            (325, Some(Self::get_unique_pad_color_handler), "GetUniquePadColor"),
-            (326, Some(Self::get_unique_pad_applet_detailed_ui_type_handler), "GetUniquePadAppletDetailedUiType"),
-            (327, Some(Self::get_abstracted_pad_id_data_from_npad_handler), "GetAbstractedPadIdDataFromNpad"),
-            (328, Some(Self::attach_abstracted_pad_to_npad_handler), "AttachAbstractedPadToNpad"),
-            (329, Some(Self::detach_abstracted_pad_all_handler), "DetachAbstractedPadAll"),
-            (330, Some(Self::check_abstracted_pad_connection_handler), "CheckAbstractedPadConnection"),
-            (500, Some(Self::set_applet_resource_user_id_handler), "SetAppletResourceUserId"),
-            (501, Some(Self::register_applet_resource_user_id_handler), "RegisterAppletResourceUserId"),
-            (502, Some(Self::unregister_applet_resource_user_id_handler), "UnregisterAppletResourceUserId"),
-            (503, Some(Self::enable_applet_to_get_input_handler), "EnableAppletToGetInput"),
-            (504, Some(Self::set_aruid_valid_for_vibration_handler), "SetAruidValidForVibration"),
-            (505, Some(Self::enable_applet_to_get_six_axis_sensor_handler), "EnableAppletToGetSixAxisSensor"),
-            (506, Some(Self::enable_applet_to_get_pad_input_handler), "EnableAppletToGetPadInput"),
-            (507, Some(Self::enable_applet_to_get_touch_screen_handler), "EnableAppletToGetTouchScreen"),
-            (510, Some(Self::set_vibration_master_volume_handler), "SetVibrationMasterVolume"),
-            (511, Some(Self::get_vibration_master_volume_handler), "GetVibrationMasterVolume"),
-            (512, Some(Self::begin_permit_vibration_session_handler), "BeginPermitVibrationSession"),
-            (513, Some(Self::end_permit_vibration_session_handler), "EndPermitVibrationSession"),
+            (
+                319,
+                Some(Self::has_left_right_battery_handler),
+                "HasLeftRightBattery",
+            ),
+            (
+                321,
+                Some(Self::get_unique_pads_from_npad_handler),
+                "GetUniquePadsFromNpad",
+            ),
+            (
+                322,
+                Some(Self::set_npad_system_ext_state_enabled_handler),
+                "SetNpadSystemExtStateEnabled",
+            ),
+            (
+                323,
+                Some(Self::get_last_active_unique_pad_handler),
+                "GetLastActiveUniquePad",
+            ),
+            (
+                324,
+                Some(Self::get_unique_pad_button_set_handler),
+                "GetUniquePadButtonSet",
+            ),
+            (
+                325,
+                Some(Self::get_unique_pad_color_handler),
+                "GetUniquePadColor",
+            ),
+            (
+                326,
+                Some(Self::get_unique_pad_applet_detailed_ui_type_handler),
+                "GetUniquePadAppletDetailedUiType",
+            ),
+            (
+                327,
+                Some(Self::get_abstracted_pad_id_data_from_npad_handler),
+                "GetAbstractedPadIdDataFromNpad",
+            ),
+            (
+                328,
+                Some(Self::attach_abstracted_pad_to_npad_handler),
+                "AttachAbstractedPadToNpad",
+            ),
+            (
+                329,
+                Some(Self::detach_abstracted_pad_all_handler),
+                "DetachAbstractedPadAll",
+            ),
+            (
+                330,
+                Some(Self::check_abstracted_pad_connection_handler),
+                "CheckAbstractedPadConnection",
+            ),
+            (
+                500,
+                Some(Self::set_applet_resource_user_id_handler),
+                "SetAppletResourceUserId",
+            ),
+            (
+                501,
+                Some(Self::register_applet_resource_user_id_handler),
+                "RegisterAppletResourceUserId",
+            ),
+            (
+                502,
+                Some(Self::unregister_applet_resource_user_id_handler),
+                "UnregisterAppletResourceUserId",
+            ),
+            (
+                503,
+                Some(Self::enable_applet_to_get_input_handler),
+                "EnableAppletToGetInput",
+            ),
+            (
+                504,
+                Some(Self::set_aruid_valid_for_vibration_handler),
+                "SetAruidValidForVibration",
+            ),
+            (
+                505,
+                Some(Self::enable_applet_to_get_six_axis_sensor_handler),
+                "EnableAppletToGetSixAxisSensor",
+            ),
+            (
+                506,
+                Some(Self::enable_applet_to_get_pad_input_handler),
+                "EnableAppletToGetPadInput",
+            ),
+            (
+                507,
+                Some(Self::enable_applet_to_get_touch_screen_handler),
+                "EnableAppletToGetTouchScreen",
+            ),
+            (
+                510,
+                Some(Self::set_vibration_master_volume_handler),
+                "SetVibrationMasterVolume",
+            ),
+            (
+                511,
+                Some(Self::get_vibration_master_volume_handler),
+                "GetVibrationMasterVolume",
+            ),
+            (
+                512,
+                Some(Self::begin_permit_vibration_session_handler),
+                "BeginPermitVibrationSession",
+            ),
+            (
+                513,
+                Some(Self::end_permit_vibration_session_handler),
+                "EndPermitVibrationSession",
+            ),
             (514, Some(Self::unknown514_handler), "Unknown514"),
-            (520, Some(Self::enable_handheld_hids_handler), "EnableHandheldHids"),
-            (521, Some(Self::disable_handheld_hids_handler), "DisableHandheldHids"),
-            (522, Some(Self::set_joy_con_rail_enabled_handler), "SetJoyConRailEnabled"),
-            (523, Some(Self::is_joy_con_rail_enabled_handler), "IsJoyConRailEnabled"),
-            (524, Some(Self::is_handheld_hids_enabled_handler), "IsHandheldHidsEnabled"),
-            (525, Some(Self::is_joy_con_attached_on_all_rail_handler), "IsJoyConAttachedOnAllRail"),
-            (540, Some(Self::acquire_play_report_controller_usage_update_event_handler), "AcquirePlayReportControllerUsageUpdateEvent"),
-            (541, Some(Self::get_play_report_controller_usages_handler), "GetPlayReportControllerUsages"),
-            (542, Some(Self::acquire_play_report_registered_device_update_event_handler), "AcquirePlayReportRegisteredDeviceUpdateEvent"),
-            (543, Some(Self::get_registered_devices_old_handler), "GetRegisteredDevicesOld"),
-            (544, Some(Self::acquire_connection_trigger_timeout_event_handler), "AcquireConnectionTriggerTimeoutEvent"),
-            (545, Some(Self::send_connection_trigger_handler), "SendConnectionTrigger"),
-            (546, Some(Self::acquire_device_registered_event_for_controller_support_handler), "AcquireDeviceRegisteredEventForControllerSupport"),
-            (547, Some(Self::get_allowed_bluetooth_links_count_handler), "GetAllowedBluetoothLinksCount"),
-            (548, Some(Self::get_registered_devices_handler), "GetRegisteredDevices"),
-            (549, Some(Self::get_connectable_registered_devices_handler), "GetConnectableRegisteredDevices"),
-            (700, Some(Self::activate_unique_pad_handler), "ActivateUniquePad"),
-            (702, Some(Self::acquire_unique_pad_connection_event_handle_handler), "AcquireUniquePadConnectionEventHandle"),
-            (703, Some(Self::get_unique_pad_ids_handler), "GetUniquePadIds"),
-            (751, Some(Self::acquire_joy_detach_on_bluetooth_off_event_handle_handler), "AcquireJoyDetachOnBluetoothOffEventHandle"),
-            (800, Some(Self::list_six_axis_sensor_handles_handler), "ListSixAxisSensorHandles"),
-            (801, Some(Self::is_six_axis_sensor_user_calibration_supported_handler), "IsSixAxisSensorUserCalibrationSupported"),
-            (802, Some(Self::reset_six_axis_sensor_calibration_values_handler), "ResetSixAxisSensorCalibrationValues"),
-            (803, Some(Self::start_six_axis_sensor_user_calibration_handler), "StartSixAxisSensorUserCalibration"),
-            (804, Some(Self::cancel_six_axis_sensor_user_calibration_handler), "CancelSixAxisSensorUserCalibration"),
-            (805, Some(Self::get_unique_pad_bluetooth_address_handler), "GetUniquePadBluetoothAddress"),
-            (806, Some(Self::disconnect_unique_pad_handler), "DisconnectUniquePad"),
-            (807, Some(Self::get_unique_pad_type_handler), "GetUniquePadType"),
-            (808, Some(Self::get_unique_pad_interface_handler), "GetUniquePadInterface"),
-            (809, Some(Self::get_unique_pad_serial_number_handler), "GetUniquePadSerialNumber"),
-            (810, Some(Self::get_unique_pad_controller_number_handler), "GetUniquePadControllerNumber"),
-            (811, Some(Self::get_six_axis_sensor_user_calibration_stage_handler), "GetSixAxisSensorUserCalibrationStage"),
-            (812, Some(Self::get_console_unique_six_axis_sensor_handle_handler), "GetConsoleUniqueSixAxisSensorHandle"),
-            (821, Some(Self::start_analog_stick_manual_calibration_handler), "StartAnalogStickManualCalibration"),
-            (822, Some(Self::retry_current_analog_stick_manual_calibration_stage_handler), "RetryCurrentAnalogStickManualCalibrationStage"),
-            (823, Some(Self::cancel_analog_stick_manual_calibration_handler), "CancelAnalogStickManualCalibration"),
-            (824, Some(Self::reset_analog_stick_manual_calibration_handler), "ResetAnalogStickManualCalibration"),
-            (825, Some(Self::get_analog_stick_state_handler), "GetAnalogStickState"),
-            (826, Some(Self::get_analog_stick_manual_calibration_stage_handler), "GetAnalogStickManualCalibrationStage"),
-            (827, Some(Self::is_analog_stick_button_pressed_handler), "IsAnalogStickButtonPressed"),
-            (828, Some(Self::is_analog_stick_in_release_position_handler), "IsAnalogStickInReleasePosition"),
-            (829, Some(Self::is_analog_stick_in_circumference_handler), "IsAnalogStickInCircumference"),
-            (830, Some(Self::set_notification_led_pattern_handler), "SetNotificationLedPattern"),
-            (831, Some(Self::set_notification_led_pattern_with_timeout_handler), "SetNotificationLedPatternWithTimeout"),
-            (832, Some(Self::prepare_hids_for_notification_wake_handler), "PrepareHidsForNotificationWake"),
-            (850, Some(Self::is_usb_full_key_controller_enabled_handler), "IsUsbFullKeyControllerEnabled"),
-            (851, Some(Self::enable_usb_full_key_controller_handler), "EnableUsbFullKeyController"),
+            (
+                520,
+                Some(Self::enable_handheld_hids_handler),
+                "EnableHandheldHids",
+            ),
+            (
+                521,
+                Some(Self::disable_handheld_hids_handler),
+                "DisableHandheldHids",
+            ),
+            (
+                522,
+                Some(Self::set_joy_con_rail_enabled_handler),
+                "SetJoyConRailEnabled",
+            ),
+            (
+                523,
+                Some(Self::is_joy_con_rail_enabled_handler),
+                "IsJoyConRailEnabled",
+            ),
+            (
+                524,
+                Some(Self::is_handheld_hids_enabled_handler),
+                "IsHandheldHidsEnabled",
+            ),
+            (
+                525,
+                Some(Self::is_joy_con_attached_on_all_rail_handler),
+                "IsJoyConAttachedOnAllRail",
+            ),
+            (
+                540,
+                Some(Self::acquire_play_report_controller_usage_update_event_handler),
+                "AcquirePlayReportControllerUsageUpdateEvent",
+            ),
+            (
+                541,
+                Some(Self::get_play_report_controller_usages_handler),
+                "GetPlayReportControllerUsages",
+            ),
+            (
+                542,
+                Some(Self::acquire_play_report_registered_device_update_event_handler),
+                "AcquirePlayReportRegisteredDeviceUpdateEvent",
+            ),
+            (
+                543,
+                Some(Self::get_registered_devices_old_handler),
+                "GetRegisteredDevicesOld",
+            ),
+            (
+                544,
+                Some(Self::acquire_connection_trigger_timeout_event_handler),
+                "AcquireConnectionTriggerTimeoutEvent",
+            ),
+            (
+                545,
+                Some(Self::send_connection_trigger_handler),
+                "SendConnectionTrigger",
+            ),
+            (
+                546,
+                Some(Self::acquire_device_registered_event_for_controller_support_handler),
+                "AcquireDeviceRegisteredEventForControllerSupport",
+            ),
+            (
+                547,
+                Some(Self::get_allowed_bluetooth_links_count_handler),
+                "GetAllowedBluetoothLinksCount",
+            ),
+            (
+                548,
+                Some(Self::get_registered_devices_handler),
+                "GetRegisteredDevices",
+            ),
+            (
+                549,
+                Some(Self::get_connectable_registered_devices_handler),
+                "GetConnectableRegisteredDevices",
+            ),
+            (
+                700,
+                Some(Self::activate_unique_pad_handler),
+                "ActivateUniquePad",
+            ),
+            (
+                702,
+                Some(Self::acquire_unique_pad_connection_event_handle_handler),
+                "AcquireUniquePadConnectionEventHandle",
+            ),
+            (
+                703,
+                Some(Self::get_unique_pad_ids_handler),
+                "GetUniquePadIds",
+            ),
+            (
+                751,
+                Some(Self::acquire_joy_detach_on_bluetooth_off_event_handle_handler),
+                "AcquireJoyDetachOnBluetoothOffEventHandle",
+            ),
+            (
+                800,
+                Some(Self::list_six_axis_sensor_handles_handler),
+                "ListSixAxisSensorHandles",
+            ),
+            (
+                801,
+                Some(Self::is_six_axis_sensor_user_calibration_supported_handler),
+                "IsSixAxisSensorUserCalibrationSupported",
+            ),
+            (
+                802,
+                Some(Self::reset_six_axis_sensor_calibration_values_handler),
+                "ResetSixAxisSensorCalibrationValues",
+            ),
+            (
+                803,
+                Some(Self::start_six_axis_sensor_user_calibration_handler),
+                "StartSixAxisSensorUserCalibration",
+            ),
+            (
+                804,
+                Some(Self::cancel_six_axis_sensor_user_calibration_handler),
+                "CancelSixAxisSensorUserCalibration",
+            ),
+            (
+                805,
+                Some(Self::get_unique_pad_bluetooth_address_handler),
+                "GetUniquePadBluetoothAddress",
+            ),
+            (
+                806,
+                Some(Self::disconnect_unique_pad_handler),
+                "DisconnectUniquePad",
+            ),
+            (
+                807,
+                Some(Self::get_unique_pad_type_handler),
+                "GetUniquePadType",
+            ),
+            (
+                808,
+                Some(Self::get_unique_pad_interface_handler),
+                "GetUniquePadInterface",
+            ),
+            (
+                809,
+                Some(Self::get_unique_pad_serial_number_handler),
+                "GetUniquePadSerialNumber",
+            ),
+            (
+                810,
+                Some(Self::get_unique_pad_controller_number_handler),
+                "GetUniquePadControllerNumber",
+            ),
+            (
+                811,
+                Some(Self::get_six_axis_sensor_user_calibration_stage_handler),
+                "GetSixAxisSensorUserCalibrationStage",
+            ),
+            (
+                812,
+                Some(Self::get_console_unique_six_axis_sensor_handle_handler),
+                "GetConsoleUniqueSixAxisSensorHandle",
+            ),
+            (
+                821,
+                Some(Self::start_analog_stick_manual_calibration_handler),
+                "StartAnalogStickManualCalibration",
+            ),
+            (
+                822,
+                Some(Self::retry_current_analog_stick_manual_calibration_stage_handler),
+                "RetryCurrentAnalogStickManualCalibrationStage",
+            ),
+            (
+                823,
+                Some(Self::cancel_analog_stick_manual_calibration_handler),
+                "CancelAnalogStickManualCalibration",
+            ),
+            (
+                824,
+                Some(Self::reset_analog_stick_manual_calibration_handler),
+                "ResetAnalogStickManualCalibration",
+            ),
+            (
+                825,
+                Some(Self::get_analog_stick_state_handler),
+                "GetAnalogStickState",
+            ),
+            (
+                826,
+                Some(Self::get_analog_stick_manual_calibration_stage_handler),
+                "GetAnalogStickManualCalibrationStage",
+            ),
+            (
+                827,
+                Some(Self::is_analog_stick_button_pressed_handler),
+                "IsAnalogStickButtonPressed",
+            ),
+            (
+                828,
+                Some(Self::is_analog_stick_in_release_position_handler),
+                "IsAnalogStickInReleasePosition",
+            ),
+            (
+                829,
+                Some(Self::is_analog_stick_in_circumference_handler),
+                "IsAnalogStickInCircumference",
+            ),
+            (
+                830,
+                Some(Self::set_notification_led_pattern_handler),
+                "SetNotificationLedPattern",
+            ),
+            (
+                831,
+                Some(Self::set_notification_led_pattern_with_timeout_handler),
+                "SetNotificationLedPatternWithTimeout",
+            ),
+            (
+                832,
+                Some(Self::prepare_hids_for_notification_wake_handler),
+                "PrepareHidsForNotificationWake",
+            ),
+            (
+                850,
+                Some(Self::is_usb_full_key_controller_enabled_handler),
+                "IsUsbFullKeyControllerEnabled",
+            ),
+            (
+                851,
+                Some(Self::enable_usb_full_key_controller_handler),
+                "EnableUsbFullKeyController",
+            ),
             (852, Some(Self::is_usb_connected_handler), "IsUsbConnected"),
-            (870, Some(Self::is_handheld_button_pressed_on_console_mode_handler), "IsHandheldButtonPressedOnConsoleMode"),
-            (900, Some(Self::activate_input_detector_handler), "ActivateInputDetector"),
-            (901, Some(Self::notify_input_detector_handler), "NotifyInputDetector"),
-            (1000, Some(Self::initialize_firmware_update_handler), "InitializeFirmwareUpdate"),
-            (1001, Some(Self::get_firmware_version_handler), "GetFirmwareVersion"),
-            (1002, Some(Self::get_available_firmware_version_handler), "GetAvailableFirmwareVersion"),
-            (1003, Some(Self::is_firmware_update_available_handler), "IsFirmwareUpdateAvailable"),
-            (1004, Some(Self::check_firmware_update_required_handler), "CheckFirmwareUpdateRequired"),
-            (1005, Some(Self::start_firmware_update_handler), "StartFirmwareUpdate"),
-            (1006, Some(Self::abort_firmware_update_handler), "AbortFirmwareUpdate"),
-            (1007, Some(Self::get_firmware_update_state_handler), "GetFirmwareUpdateState"),
-            (1008, Some(Self::activate_audio_control_handler), "ActivateAudioControl"),
-            (1009, Some(Self::acquire_audio_control_event_handle_handler), "AcquireAudioControlEventHandle"),
-            (1010, Some(Self::get_audio_control_states_handler), "GetAudioControlStates"),
-            (1011, Some(Self::deactivate_audio_control_handler), "DeactivateAudioControl"),
-            (1050, Some(Self::is_six_axis_sensor_accurate_user_calibration_supported_handler), "IsSixAxisSensorAccurateUserCalibrationSupported"),
-            (1051, Some(Self::start_six_axis_sensor_accurate_user_calibration_handler), "StartSixAxisSensorAccurateUserCalibration"),
-            (1052, Some(Self::cancel_six_axis_sensor_accurate_user_calibration_handler), "CancelSixAxisSensorAccurateUserCalibration"),
-            (1053, Some(Self::get_six_axis_sensor_accurate_user_calibration_state_handler), "GetSixAxisSensorAccurateUserCalibrationState"),
-            (1100, Some(Self::get_hidbus_system_service_object_handler), "GetHidbusSystemServiceObject"),
-            (1120, Some(Self::set_firmware_hotfix_update_skip_enabled_handler), "SetFirmwareHotfixUpdateSkipEnabled"),
-            (1130, Some(Self::initialize_usb_firmware_update_handler), "InitializeUsbFirmwareUpdate"),
-            (1131, Some(Self::finalize_usb_firmware_update_handler), "FinalizeUsbFirmwareUpdate"),
-            (1132, Some(Self::check_usb_firmware_update_required_handler), "CheckUsbFirmwareUpdateRequired"),
-            (1133, Some(Self::start_usb_firmware_update_handler), "StartUsbFirmwareUpdate"),
-            (1134, Some(Self::get_usb_firmware_update_state_handler), "GetUsbFirmwareUpdateState"),
-            (1135, Some(Self::initialize_usb_firmware_update_without_memory_handler), "InitializeUsbFirmwareUpdateWithoutMemory"),
-            (1150, Some(Self::set_touch_screen_magnification_handler), "SetTouchScreenMagnification"),
-            (1151, Some(Self::get_touch_screen_firmware_version_handler), "GetTouchScreenFirmwareVersion"),
-            (1152, Some(Self::set_touch_screen_default_configuration_handler), "SetTouchScreenDefaultConfiguration"),
-            (1153, Some(Self::get_touch_screen_default_configuration_handler), "GetTouchScreenDefaultConfiguration"),
-            (1154, Some(Self::is_firmware_available_for_notification_handler), "IsFirmwareAvailableForNotification"),
-            (1155, Some(Self::set_force_handheld_style_vibration_handler), "SetForceHandheldStyleVibration"),
-            (1156, Some(Self::send_connection_trigger_without_timeout_event_handler), "SendConnectionTriggerWithoutTimeoutEvent"),
-            (1157, Some(Self::cancel_connection_trigger_handler), "CancelConnectionTrigger"),
-            (1200, Some(Self::is_button_config_supported_handler), "IsButtonConfigSupported"),
-            (1201, Some(Self::is_button_config_embedded_supported_handler), "IsButtonConfigEmbeddedSupported"),
-            (1202, Some(Self::delete_button_config_handler), "DeleteButtonConfig"),
-            (1203, Some(Self::delete_button_config_embedded_handler), "DeleteButtonConfigEmbedded"),
-            (1204, Some(Self::set_button_config_enabled_handler), "SetButtonConfigEnabled"),
-            (1205, Some(Self::set_button_config_embedded_enabled_handler), "SetButtonConfigEmbeddedEnabled"),
-            (1206, Some(Self::is_button_config_enabled_handler), "IsButtonConfigEnabled"),
-            (1207, Some(Self::is_button_config_embedded_enabled_handler), "IsButtonConfigEmbeddedEnabled"),
-            (1208, Some(Self::set_button_config_embedded_handler), "SetButtonConfigEmbedded"),
-            (1209, Some(Self::set_button_config_full_handler), "SetButtonConfigFull"),
-            (1210, Some(Self::set_button_config_left_handler), "SetButtonConfigLeft"),
-            (1211, Some(Self::set_button_config_right_handler), "SetButtonConfigRight"),
-            (1212, Some(Self::get_button_config_embedded_handler), "GetButtonConfigEmbedded"),
-            (1213, Some(Self::get_button_config_full_handler), "GetButtonConfigFull"),
-            (1214, Some(Self::get_button_config_left_handler), "GetButtonConfigLeft"),
-            (1215, Some(Self::get_button_config_right_handler), "GetButtonConfigRight"),
-            (1250, Some(Self::is_custom_button_config_supported_handler), "IsCustomButtonConfigSupported"),
-            (1251, Some(Self::is_default_button_config_embedded_handler), "IsDefaultButtonConfigEmbedded"),
-            (1252, Some(Self::is_default_button_config_full_handler), "IsDefaultButtonConfigFull"),
-            (1253, Some(Self::is_default_button_config_left_handler), "IsDefaultButtonConfigLeft"),
-            (1254, Some(Self::is_default_button_config_right_handler), "IsDefaultButtonConfigRight"),
-            (1255, Some(Self::is_button_config_storage_embedded_empty_handler), "IsButtonConfigStorageEmbeddedEmpty"),
-            (1256, Some(Self::is_button_config_storage_full_empty_handler), "IsButtonConfigStorageFullEmpty"),
-            (1257, Some(Self::is_button_config_storage_left_empty_handler), "IsButtonConfigStorageLeftEmpty"),
-            (1258, Some(Self::is_button_config_storage_right_empty_handler), "IsButtonConfigStorageRightEmpty"),
-            (1259, Some(Self::get_button_config_storage_embedded_deprecated_handler), "GetButtonConfigStorageEmbeddedDeprecated"),
-            (1260, Some(Self::get_button_config_storage_full_deprecated_handler), "GetButtonConfigStorageFullDeprecated"),
-            (1261, Some(Self::get_button_config_storage_left_deprecated_handler), "GetButtonConfigStorageLeftDeprecated"),
-            (1262, Some(Self::get_button_config_storage_right_deprecated_handler), "GetButtonConfigStorageRightDeprecated"),
-            (1263, Some(Self::set_button_config_storage_embedded_deprecated_handler), "SetButtonConfigStorageEmbeddedDeprecated"),
-            (1264, Some(Self::set_button_config_storage_full_deprecated_handler), "SetButtonConfigStorageFullDeprecated"),
-            (1265, Some(Self::set_button_config_storage_left_deprecated_handler), "SetButtonConfigStorageLeftDeprecated"),
-            (1266, Some(Self::set_button_config_storage_right_deprecated_handler), "SetButtonConfigStorageRightDeprecated"),
-            (1267, Some(Self::delete_button_config_storage_embedded_handler), "DeleteButtonConfigStorageEmbedded"),
-            (1268, Some(Self::delete_button_config_storage_full_handler), "DeleteButtonConfigStorageFull"),
-            (1269, Some(Self::delete_button_config_storage_left_handler), "DeleteButtonConfigStorageLeft"),
-            (1270, Some(Self::delete_button_config_storage_right_handler), "DeleteButtonConfigStorageRight"),
-            (1271, Some(Self::is_using_custom_button_config_handler), "IsUsingCustomButtonConfig"),
-            (1272, Some(Self::is_any_custom_button_config_enabled_handler), "IsAnyCustomButtonConfigEnabled"),
-            (1273, Some(Self::set_all_custom_button_config_enabled_handler), "SetAllCustomButtonConfigEnabled"),
-            (1274, Some(Self::set_default_button_config_handler), "SetDefaultButtonConfig"),
-            (1275, Some(Self::set_all_default_button_config_handler), "SetAllDefaultButtonConfig"),
-            (1276, Some(Self::set_hid_button_config_embedded_handler), "SetHidButtonConfigEmbedded"),
-            (1277, Some(Self::set_hid_button_config_full_handler), "SetHidButtonConfigFull"),
-            (1278, Some(Self::set_hid_button_config_left_handler), "SetHidButtonConfigLeft"),
-            (1279, Some(Self::set_hid_button_config_right_handler), "SetHidButtonConfigRight"),
-            (1280, Some(Self::get_hid_button_config_embedded_handler), "GetHidButtonConfigEmbedded"),
-            (1281, Some(Self::get_hid_button_config_full_handler), "GetHidButtonConfigFull"),
-            (1282, Some(Self::get_hid_button_config_left_handler), "GetHidButtonConfigLeft"),
-            (1283, Some(Self::get_hid_button_config_right_handler), "GetHidButtonConfigRight"),
-            (1284, Some(Self::get_button_config_storage_embedded_handler), "GetButtonConfigStorageEmbedded"),
-            (1285, Some(Self::get_button_config_storage_full_handler), "GetButtonConfigStorageFull"),
-            (1286, Some(Self::get_button_config_storage_left_handler), "GetButtonConfigStorageLeft"),
-            (1287, Some(Self::get_button_config_storage_right_handler), "GetButtonConfigStorageRight"),
-            (1288, Some(Self::set_button_config_storage_embedded_handler), "SetButtonConfigStorageEmbedded"),
-            (1289, Some(Self::set_button_config_storage_full_handler), "SetButtonConfigStorageFull"),
-            (1290, Some(Self::delete_button_config_storage_right_1290_handler), "DeleteButtonConfigStorageRight"),
-            (1291, Some(Self::delete_button_config_storage_right_1291_handler), "DeleteButtonConfigStorageRight"),
+            (
+                870,
+                Some(Self::is_handheld_button_pressed_on_console_mode_handler),
+                "IsHandheldButtonPressedOnConsoleMode",
+            ),
+            (
+                900,
+                Some(Self::activate_input_detector_handler),
+                "ActivateInputDetector",
+            ),
+            (
+                901,
+                Some(Self::notify_input_detector_handler),
+                "NotifyInputDetector",
+            ),
+            (
+                1000,
+                Some(Self::initialize_firmware_update_handler),
+                "InitializeFirmwareUpdate",
+            ),
+            (
+                1001,
+                Some(Self::get_firmware_version_handler),
+                "GetFirmwareVersion",
+            ),
+            (
+                1002,
+                Some(Self::get_available_firmware_version_handler),
+                "GetAvailableFirmwareVersion",
+            ),
+            (
+                1003,
+                Some(Self::is_firmware_update_available_handler),
+                "IsFirmwareUpdateAvailable",
+            ),
+            (
+                1004,
+                Some(Self::check_firmware_update_required_handler),
+                "CheckFirmwareUpdateRequired",
+            ),
+            (
+                1005,
+                Some(Self::start_firmware_update_handler),
+                "StartFirmwareUpdate",
+            ),
+            (
+                1006,
+                Some(Self::abort_firmware_update_handler),
+                "AbortFirmwareUpdate",
+            ),
+            (
+                1007,
+                Some(Self::get_firmware_update_state_handler),
+                "GetFirmwareUpdateState",
+            ),
+            (
+                1008,
+                Some(Self::activate_audio_control_handler),
+                "ActivateAudioControl",
+            ),
+            (
+                1009,
+                Some(Self::acquire_audio_control_event_handle_handler),
+                "AcquireAudioControlEventHandle",
+            ),
+            (
+                1010,
+                Some(Self::get_audio_control_states_handler),
+                "GetAudioControlStates",
+            ),
+            (
+                1011,
+                Some(Self::deactivate_audio_control_handler),
+                "DeactivateAudioControl",
+            ),
+            (
+                1050,
+                Some(Self::is_six_axis_sensor_accurate_user_calibration_supported_handler),
+                "IsSixAxisSensorAccurateUserCalibrationSupported",
+            ),
+            (
+                1051,
+                Some(Self::start_six_axis_sensor_accurate_user_calibration_handler),
+                "StartSixAxisSensorAccurateUserCalibration",
+            ),
+            (
+                1052,
+                Some(Self::cancel_six_axis_sensor_accurate_user_calibration_handler),
+                "CancelSixAxisSensorAccurateUserCalibration",
+            ),
+            (
+                1053,
+                Some(Self::get_six_axis_sensor_accurate_user_calibration_state_handler),
+                "GetSixAxisSensorAccurateUserCalibrationState",
+            ),
+            (
+                1100,
+                Some(Self::get_hidbus_system_service_object_handler),
+                "GetHidbusSystemServiceObject",
+            ),
+            (
+                1120,
+                Some(Self::set_firmware_hotfix_update_skip_enabled_handler),
+                "SetFirmwareHotfixUpdateSkipEnabled",
+            ),
+            (
+                1130,
+                Some(Self::initialize_usb_firmware_update_handler),
+                "InitializeUsbFirmwareUpdate",
+            ),
+            (
+                1131,
+                Some(Self::finalize_usb_firmware_update_handler),
+                "FinalizeUsbFirmwareUpdate",
+            ),
+            (
+                1132,
+                Some(Self::check_usb_firmware_update_required_handler),
+                "CheckUsbFirmwareUpdateRequired",
+            ),
+            (
+                1133,
+                Some(Self::start_usb_firmware_update_handler),
+                "StartUsbFirmwareUpdate",
+            ),
+            (
+                1134,
+                Some(Self::get_usb_firmware_update_state_handler),
+                "GetUsbFirmwareUpdateState",
+            ),
+            (
+                1135,
+                Some(Self::initialize_usb_firmware_update_without_memory_handler),
+                "InitializeUsbFirmwareUpdateWithoutMemory",
+            ),
+            (
+                1150,
+                Some(Self::set_touch_screen_magnification_handler),
+                "SetTouchScreenMagnification",
+            ),
+            (
+                1151,
+                Some(Self::get_touch_screen_firmware_version_handler),
+                "GetTouchScreenFirmwareVersion",
+            ),
+            (
+                1152,
+                Some(Self::set_touch_screen_default_configuration_handler),
+                "SetTouchScreenDefaultConfiguration",
+            ),
+            (
+                1153,
+                Some(Self::get_touch_screen_default_configuration_handler),
+                "GetTouchScreenDefaultConfiguration",
+            ),
+            (
+                1154,
+                Some(Self::is_firmware_available_for_notification_handler),
+                "IsFirmwareAvailableForNotification",
+            ),
+            (
+                1155,
+                Some(Self::set_force_handheld_style_vibration_handler),
+                "SetForceHandheldStyleVibration",
+            ),
+            (
+                1156,
+                Some(Self::send_connection_trigger_without_timeout_event_handler),
+                "SendConnectionTriggerWithoutTimeoutEvent",
+            ),
+            (
+                1157,
+                Some(Self::cancel_connection_trigger_handler),
+                "CancelConnectionTrigger",
+            ),
+            (
+                1200,
+                Some(Self::is_button_config_supported_handler),
+                "IsButtonConfigSupported",
+            ),
+            (
+                1201,
+                Some(Self::is_button_config_embedded_supported_handler),
+                "IsButtonConfigEmbeddedSupported",
+            ),
+            (
+                1202,
+                Some(Self::delete_button_config_handler),
+                "DeleteButtonConfig",
+            ),
+            (
+                1203,
+                Some(Self::delete_button_config_embedded_handler),
+                "DeleteButtonConfigEmbedded",
+            ),
+            (
+                1204,
+                Some(Self::set_button_config_enabled_handler),
+                "SetButtonConfigEnabled",
+            ),
+            (
+                1205,
+                Some(Self::set_button_config_embedded_enabled_handler),
+                "SetButtonConfigEmbeddedEnabled",
+            ),
+            (
+                1206,
+                Some(Self::is_button_config_enabled_handler),
+                "IsButtonConfigEnabled",
+            ),
+            (
+                1207,
+                Some(Self::is_button_config_embedded_enabled_handler),
+                "IsButtonConfigEmbeddedEnabled",
+            ),
+            (
+                1208,
+                Some(Self::set_button_config_embedded_handler),
+                "SetButtonConfigEmbedded",
+            ),
+            (
+                1209,
+                Some(Self::set_button_config_full_handler),
+                "SetButtonConfigFull",
+            ),
+            (
+                1210,
+                Some(Self::set_button_config_left_handler),
+                "SetButtonConfigLeft",
+            ),
+            (
+                1211,
+                Some(Self::set_button_config_right_handler),
+                "SetButtonConfigRight",
+            ),
+            (
+                1212,
+                Some(Self::get_button_config_embedded_handler),
+                "GetButtonConfigEmbedded",
+            ),
+            (
+                1213,
+                Some(Self::get_button_config_full_handler),
+                "GetButtonConfigFull",
+            ),
+            (
+                1214,
+                Some(Self::get_button_config_left_handler),
+                "GetButtonConfigLeft",
+            ),
+            (
+                1215,
+                Some(Self::get_button_config_right_handler),
+                "GetButtonConfigRight",
+            ),
+            (
+                1250,
+                Some(Self::is_custom_button_config_supported_handler),
+                "IsCustomButtonConfigSupported",
+            ),
+            (
+                1251,
+                Some(Self::is_default_button_config_embedded_handler),
+                "IsDefaultButtonConfigEmbedded",
+            ),
+            (
+                1252,
+                Some(Self::is_default_button_config_full_handler),
+                "IsDefaultButtonConfigFull",
+            ),
+            (
+                1253,
+                Some(Self::is_default_button_config_left_handler),
+                "IsDefaultButtonConfigLeft",
+            ),
+            (
+                1254,
+                Some(Self::is_default_button_config_right_handler),
+                "IsDefaultButtonConfigRight",
+            ),
+            (
+                1255,
+                Some(Self::is_button_config_storage_embedded_empty_handler),
+                "IsButtonConfigStorageEmbeddedEmpty",
+            ),
+            (
+                1256,
+                Some(Self::is_button_config_storage_full_empty_handler),
+                "IsButtonConfigStorageFullEmpty",
+            ),
+            (
+                1257,
+                Some(Self::is_button_config_storage_left_empty_handler),
+                "IsButtonConfigStorageLeftEmpty",
+            ),
+            (
+                1258,
+                Some(Self::is_button_config_storage_right_empty_handler),
+                "IsButtonConfigStorageRightEmpty",
+            ),
+            (
+                1259,
+                Some(Self::get_button_config_storage_embedded_deprecated_handler),
+                "GetButtonConfigStorageEmbeddedDeprecated",
+            ),
+            (
+                1260,
+                Some(Self::get_button_config_storage_full_deprecated_handler),
+                "GetButtonConfigStorageFullDeprecated",
+            ),
+            (
+                1261,
+                Some(Self::get_button_config_storage_left_deprecated_handler),
+                "GetButtonConfigStorageLeftDeprecated",
+            ),
+            (
+                1262,
+                Some(Self::get_button_config_storage_right_deprecated_handler),
+                "GetButtonConfigStorageRightDeprecated",
+            ),
+            (
+                1263,
+                Some(Self::set_button_config_storage_embedded_deprecated_handler),
+                "SetButtonConfigStorageEmbeddedDeprecated",
+            ),
+            (
+                1264,
+                Some(Self::set_button_config_storage_full_deprecated_handler),
+                "SetButtonConfigStorageFullDeprecated",
+            ),
+            (
+                1265,
+                Some(Self::set_button_config_storage_left_deprecated_handler),
+                "SetButtonConfigStorageLeftDeprecated",
+            ),
+            (
+                1266,
+                Some(Self::set_button_config_storage_right_deprecated_handler),
+                "SetButtonConfigStorageRightDeprecated",
+            ),
+            (
+                1267,
+                Some(Self::delete_button_config_storage_embedded_handler),
+                "DeleteButtonConfigStorageEmbedded",
+            ),
+            (
+                1268,
+                Some(Self::delete_button_config_storage_full_handler),
+                "DeleteButtonConfigStorageFull",
+            ),
+            (
+                1269,
+                Some(Self::delete_button_config_storage_left_handler),
+                "DeleteButtonConfigStorageLeft",
+            ),
+            (
+                1270,
+                Some(Self::delete_button_config_storage_right_handler),
+                "DeleteButtonConfigStorageRight",
+            ),
+            (
+                1271,
+                Some(Self::is_using_custom_button_config_handler),
+                "IsUsingCustomButtonConfig",
+            ),
+            (
+                1272,
+                Some(Self::is_any_custom_button_config_enabled_handler),
+                "IsAnyCustomButtonConfigEnabled",
+            ),
+            (
+                1273,
+                Some(Self::set_all_custom_button_config_enabled_handler),
+                "SetAllCustomButtonConfigEnabled",
+            ),
+            (
+                1274,
+                Some(Self::set_default_button_config_handler),
+                "SetDefaultButtonConfig",
+            ),
+            (
+                1275,
+                Some(Self::set_all_default_button_config_handler),
+                "SetAllDefaultButtonConfig",
+            ),
+            (
+                1276,
+                Some(Self::set_hid_button_config_embedded_handler),
+                "SetHidButtonConfigEmbedded",
+            ),
+            (
+                1277,
+                Some(Self::set_hid_button_config_full_handler),
+                "SetHidButtonConfigFull",
+            ),
+            (
+                1278,
+                Some(Self::set_hid_button_config_left_handler),
+                "SetHidButtonConfigLeft",
+            ),
+            (
+                1279,
+                Some(Self::set_hid_button_config_right_handler),
+                "SetHidButtonConfigRight",
+            ),
+            (
+                1280,
+                Some(Self::get_hid_button_config_embedded_handler),
+                "GetHidButtonConfigEmbedded",
+            ),
+            (
+                1281,
+                Some(Self::get_hid_button_config_full_handler),
+                "GetHidButtonConfigFull",
+            ),
+            (
+                1282,
+                Some(Self::get_hid_button_config_left_handler),
+                "GetHidButtonConfigLeft",
+            ),
+            (
+                1283,
+                Some(Self::get_hid_button_config_right_handler),
+                "GetHidButtonConfigRight",
+            ),
+            (
+                1284,
+                Some(Self::get_button_config_storage_embedded_handler),
+                "GetButtonConfigStorageEmbedded",
+            ),
+            (
+                1285,
+                Some(Self::get_button_config_storage_full_handler),
+                "GetButtonConfigStorageFull",
+            ),
+            (
+                1286,
+                Some(Self::get_button_config_storage_left_handler),
+                "GetButtonConfigStorageLeft",
+            ),
+            (
+                1287,
+                Some(Self::get_button_config_storage_right_handler),
+                "GetButtonConfigStorageRight",
+            ),
+            (
+                1288,
+                Some(Self::set_button_config_storage_embedded_handler),
+                "SetButtonConfigStorageEmbedded",
+            ),
+            (
+                1289,
+                Some(Self::set_button_config_storage_full_handler),
+                "SetButtonConfigStorageFull",
+            ),
+            (
+                1290,
+                Some(Self::delete_button_config_storage_right_1290_handler),
+                "DeleteButtonConfigStorageRight",
+            ),
+            (
+                1291,
+                Some(Self::delete_button_config_storage_right_1291_handler),
+                "DeleteButtonConfigStorageRight",
+            ),
         ]);
         // clang-format on
 

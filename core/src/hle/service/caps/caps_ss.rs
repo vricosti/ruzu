@@ -9,13 +9,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::hle::result::ResultCode;
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::caps_manager::AlbumManager;
 use super::caps_types::{
     AlbumFileId, AlbumReportOption, ApplicationAlbumEntry, ScreenShotAttribute,
 };
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IScreenShotService.
 pub mod commands {
@@ -123,12 +123,8 @@ impl IScreenShotService {
         let mut manager = self.manager.lock().unwrap();
         manager.flip_vertically_on_write(false);
         let mut entry = ApplicationAlbumEntry::default();
-        let result = manager.save_edited_screen_shot(
-            &mut entry,
-            _attribute,
-            file_id,
-            image_data_buffer,
-        );
+        let result =
+            manager.save_edited_screen_shot(&mut entry, _attribute, file_id, image_data_buffer);
         if result.is_success() {
             Ok(entry)
         } else {

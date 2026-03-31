@@ -22,9 +22,9 @@ pub const NS_SERVICE_GETTER_NAMES: &[&str] =
 ///
 /// Corresponds to `Service::NS::LoopProcess` in upstream ns.cpp.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use std::sync::Arc;
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+    use std::sync::Arc;
 
     log::debug!("NS::LoopProcess called");
 
@@ -74,7 +74,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "pdm:qry",
             Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+                Arc::new(crate::hle::service::services::GenericStubService::new(
+                    &svc_name,
+                ))
             }),
             64,
         );
@@ -82,28 +84,18 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     // pl:s -> IPlatformServiceManager
     {
-        let pl_s: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> = Arc::new(
-            super::platform_service_manager::IPlatformServiceManager::new(system, "pl:s"),
-        );
+        let pl_s: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
+            Arc::new(super::platform_service_manager::IPlatformServiceManager::new(system, "pl:s"));
         let pl_s_clone = Arc::clone(&pl_s);
-        server_manager.register_named_service(
-            "pl:s",
-            Box::new(move || pl_s_clone.clone()),
-            64,
-        );
+        server_manager.register_named_service("pl:s", Box::new(move || pl_s_clone.clone()), 64);
     }
 
     // pl:u -> IPlatformServiceManager
     {
-        let pl_u: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> = Arc::new(
-            super::platform_service_manager::IPlatformServiceManager::new(system, "pl:u"),
-        );
+        let pl_u: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
+            Arc::new(super::platform_service_manager::IPlatformServiceManager::new(system, "pl:u"));
         let pl_u_clone = Arc::clone(&pl_u);
-        server_manager.register_named_service(
-            "pl:u",
-            Box::new(move || pl_u_clone.clone()),
-            64,
-        );
+        server_manager.register_named_service("pl:u", Box::new(move || pl_u_clone.clone()), 64);
     }
 
     ServerManager::run_server(server_manager);

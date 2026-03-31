@@ -9,15 +9,15 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use common::settings;
 use crate::dma_pusher::CommandList;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::rasterizer_download_area::RasterizerDownloadArea;
 use crate::renderer_base::RendererBase;
+use common::settings;
+use ruzu_core::core::SystemRef;
 use ruzu_core::gpu_core::{
     GpuChannelHandle, GpuCommandList, GpuCoreInterface, GpuMemoryManagerHandle,
 };
-use ruzu_core::core::SystemRef;
 
 struct VideoGpuChannelHandle {
     gpu: *const Gpu,
@@ -151,7 +151,8 @@ pub struct Gpu {
 
     /// Registered GPU channels.
     /// Upstream: `std::unordered_map<s32, std::shared_ptr<ChannelState>> channels`.
-    channels: Mutex<HashMap<i32, Arc<parking_lot::Mutex<crate::control::channel_state::ChannelState>>>>,
+    channels:
+        Mutex<HashMap<i32, Arc<parking_lot::Mutex<crate::control::channel_state::ChannelState>>>>,
 
     /// Owner-local bridge for GPU VA command fetches that still need core guest memory access.
     /// This is a temporary Rust adaptation until `video_core::MemoryManager` owns the same
@@ -197,9 +198,7 @@ impl Gpu {
     ///   `scheduler{std::make_unique<Control::Scheduler>(gpu)}`
     /// We defer it because Rust cannot take `&self` in the constructor.
     pub fn init_scheduler(&self) {
-        let scheduler = unsafe {
-            crate::control::scheduler::Scheduler::new(self as *const Gpu)
-        };
+        let scheduler = unsafe { crate::control::scheduler::Scheduler::new(self as *const Gpu) };
         *self.scheduler.lock().unwrap() = Some(Box::new(scheduler));
     }
 
@@ -215,7 +214,10 @@ impl Gpu {
         // Upstream also does:
         // host1x.MemoryManager().BindInterface(rasterizer);
         // host1x.GMMU().BindRasterizer(rasterizer);
-        log::info!("Gpu::bind_renderer: renderer bound (vendor: {})", renderer.get_device_vendor());
+        log::info!(
+            "Gpu::bind_renderer: renderer bound (vendor: {})",
+            renderer.get_device_vendor()
+        );
         *self.renderer.lock().unwrap() = Some(renderer);
     }
 
@@ -247,14 +249,10 @@ impl Gpu {
     }
 
     fn rasterizer_ptr(&self) -> Option<*mut dyn crate::rasterizer_interface::RasterizerInterface> {
-        (*self.rasterizer.lock().unwrap())
-            .map(|raw| unsafe { std::mem::transmute(raw) })
+        (*self.rasterizer.lock().unwrap()).map(|raw| unsafe { std::mem::transmute(raw) })
     }
 
-    pub fn set_guest_memory_reader(
-        &self,
-        reader: Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>,
-    ) {
+    pub fn set_guest_memory_reader(&self, reader: Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>) {
         *self.guest_memory_reader.lock().unwrap() = Some(reader);
     }
 
@@ -267,10 +265,7 @@ impl Gpu {
     }
 
     /// Set the guest memory writer callback.
-    pub fn set_guest_memory_writer(
-        &self,
-        writer: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
-    ) {
+    pub fn set_guest_memory_writer(&self, writer: Arc<dyn Fn(u64, &[u8]) + Send + Sync>) {
         *self.guest_memory_writer.lock().unwrap() = Some(writer);
     }
 
@@ -285,11 +280,17 @@ impl Gpu {
     /// Create a new GPU channel and register it with the scheduler.
     ///
     /// Matches upstream `GPU::Impl::CreateChannel(s32 channel_id)`.
-    pub fn create_channel(&self, channel_id: i32) -> Arc<parking_lot::Mutex<crate::control::channel_state::ChannelState>> {
+    pub fn create_channel(
+        &self,
+        channel_id: i32,
+    ) -> Arc<parking_lot::Mutex<crate::control::channel_state::ChannelState>> {
         let channel_state = Arc::new(parking_lot::Mutex::new(
             crate::control::channel_state::ChannelState::new(channel_id),
         ));
-        self.channels.lock().unwrap().insert(channel_id, channel_state.clone());
+        self.channels
+            .lock()
+            .unwrap()
+            .insert(channel_id, channel_state.clone());
 
         // Register with scheduler.
         if let Some(ref mut scheduler) = *self.scheduler.lock().unwrap() {
@@ -351,7 +352,10 @@ impl Gpu {
         // Returns the next fence counter value.
         // Stubbed until rasterizer integration is complete.
         let fence = self.current_sync_fence.load(Ordering::Relaxed) + 1;
-        log::warn!("Gpu::request_flush: rasterizer not integrated, returning fence {}", fence);
+        log::warn!(
+            "Gpu::request_flush: rasterizer not integrated, returning fence {}",
+            fence
+        );
         fence
     }
 
@@ -464,7 +468,10 @@ impl Gpu {
     /// Push GPU command entries to be processed.
     /// Matches upstream `GPU::Impl::PushGPUEntries(s32, CommandList&&)`.
     pub fn push_gpu_entries(&self, channel: i32, entries: CommandList) {
-        self.gpu_thread.lock().unwrap().submit_list(channel, entries);
+        self.gpu_thread
+            .lock()
+            .unwrap()
+            .submit_list(channel, entries);
     }
 
     /// Notify rasterizer about a CPU read.
@@ -489,7 +496,10 @@ impl Gpu {
     /// Invalidate a region.
     /// Matches upstream `GPU::Impl::InvalidateRegion(DAddr, u64)`.
     pub fn invalidate_region(&self, addr: DAddr, size: u64) {
-        self.gpu_thread.lock().unwrap().invalidate_region(addr, size);
+        self.gpu_thread
+            .lock()
+            .unwrap()
+            .invalidate_region(addr, size);
     }
 
     /// Notify rasterizer of a CPU write.
@@ -504,7 +514,10 @@ impl Gpu {
     /// Flush and invalidate a region.
     /// Matches upstream `GPU::Impl::FlushAndInvalidateRegion(DAddr, u64)`.
     pub fn flush_and_invalidate_region(&self, addr: DAddr, size: u64) {
-        self.gpu_thread.lock().unwrap().flush_and_invalidate_region(addr, size);
+        self.gpu_thread
+            .lock()
+            .unwrap()
+            .flush_and_invalidate_region(addr, size);
     }
 
     /// Request framebuffer compositing.
@@ -579,8 +592,11 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
 
         let gpu = unsafe { &*self.gpu };
         channel_state.init(gpu, program_id);
-        log::info!("VideoGpuChannelHandle::init_channel: program_id={:#x} maxwell_3d={}",
-            program_id, channel_state.maxwell_3d.is_some());
+        log::info!(
+            "VideoGpuChannelHandle::init_channel: program_id={:#x} maxwell_3d={}",
+            program_id,
+            channel_state.maxwell_3d.is_some()
+        );
         if let Some(rasterizer) = gpu.rasterizer_ptr() {
             let rasterizer = unsafe { &mut *rasterizer };
             channel_state.bind_rasterizer(rasterizer);
@@ -755,7 +771,13 @@ mod tests {
         fn tiled_cache_barrier(&mut self) {}
         fn flush_commands(&mut self) {}
         fn tick_frame(&mut self) {}
-        fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
+        fn accelerate_inline_to_memory(
+            &mut self,
+            _address: u64,
+            _copy_size: usize,
+            _memory: &[u8],
+        ) {
+        }
         fn initialize_channel(&mut self, channel_id: i32) {
             self.initialized_channels.lock().unwrap().push(channel_id);
         }

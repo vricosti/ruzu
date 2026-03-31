@@ -127,7 +127,8 @@ impl SessionMappings {
         } else {
             let dyn_index = index - NUM_STATIC_MAPPINGS;
             if dyn_index >= self.dynamic_mappings.len() {
-                self.dynamic_mappings.resize(dyn_index + 1, Mapping::default());
+                self.dynamic_mappings
+                    .resize(dyn_index + 1, Mapping::default());
             }
             self.dynamic_mappings[dyn_index].set(client, server, size, state);
         }

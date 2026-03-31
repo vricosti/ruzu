@@ -7,14 +7,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::bcat_types::DirectoryName;
+use super::delivery_cache_directory_service::IDeliveryCacheDirectoryService;
+use super::delivery_cache_file_service::IDeliveryCacheFileService;
 use crate::file_sys::vfs::vfs::VfsDirectory;
 use crate::file_sys::vfs::vfs_types::VirtualDir;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::bcat_types::DirectoryName;
-use super::delivery_cache_file_service::IDeliveryCacheFileService;
-use super::delivery_cache_directory_service::IDeliveryCacheDirectoryService;
 
 /// IPC command IDs for IDeliveryCacheStorageService
 pub mod commands {
@@ -36,8 +36,16 @@ impl IDeliveryCacheStorageService {
     pub fn new(root: VirtualDir) -> Self {
         let handlers = build_handler_map(&[
             (commands::CREATE_FILE_SERVICE, None, "CreateFileService"),
-            (commands::CREATE_DIRECTORY_SERVICE, None, "CreateDirectoryService"),
-            (commands::ENUMERATE_DELIVERY_CACHE_DIRECTORY, None, "EnumerateDeliveryCacheDirectory"),
+            (
+                commands::CREATE_DIRECTORY_SERVICE,
+                None,
+                "CreateDirectoryService",
+            ),
+            (
+                commands::ENUMERATE_DELIVERY_CACHE_DIRECTORY,
+                None,
+                "EnumerateDeliveryCacheDirectory",
+            ),
         ]);
 
         Self {
@@ -70,7 +78,10 @@ impl IDeliveryCacheStorageService {
             out_directories.len()
         );
 
-        let count = std::cmp::min(out_directories.len(), self.entries.len() - self.next_read_index);
+        let count = std::cmp::min(
+            out_directories.len(),
+            self.entries.len() - self.next_read_index,
+        );
         for i in 0..count {
             out_directories[i] = self.entries[self.next_read_index + i];
         }

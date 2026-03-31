@@ -4,8 +4,8 @@
 //! SPIR-V integer operation emission — maps to zuyu's
 //! `backend/spirv/emit_spirv_integer.cpp`.
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::Word;
 
 /// IAdd32: `OpIAdd`.
 pub fn emit_iadd_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
@@ -31,9 +31,13 @@ pub fn emit_ineg_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_iabs_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.u32_type, None, glsl_set, 5 /* SAbs */, vec![
-            rspirv::dr::Operand::IdRef(value),
-        ])
+        .ext_inst(
+            ctx.u32_type,
+            None,
+            glsl_set,
+            5, /* SAbs */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
         .unwrap()
 }
 
@@ -52,11 +56,7 @@ pub fn emit_shift_right_logical_32(ctx: &mut SpirvEmitContext, base: Word, shift
 }
 
 /// ShiftRightArithmetic32: `OpShiftRightArithmetic`.
-pub fn emit_shift_right_arithmetic_32(
-    ctx: &mut SpirvEmitContext,
-    base: Word,
-    shift: Word,
-) -> Word {
+pub fn emit_shift_right_arithmetic_32(ctx: &mut SpirvEmitContext, base: Word, shift: Word) -> Word {
     ctx.builder
         .shift_right_arithmetic(ctx.u32_type, None, base, shift)
         .unwrap()
@@ -64,9 +64,7 @@ pub fn emit_shift_right_arithmetic_32(
 
 /// BitwiseAnd32: `OpBitwiseAnd`.
 pub fn emit_bitwise_and_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
-    ctx.builder
-        .bitwise_and(ctx.u32_type, None, a, b)
-        .unwrap()
+    ctx.builder.bitwise_and(ctx.u32_type, None, a, b).unwrap()
 }
 
 /// BitwiseOr32: `OpBitwiseOr`.
@@ -76,9 +74,7 @@ pub fn emit_bitwise_or_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word 
 
 /// BitwiseXor32: `OpBitwiseXor`.
 pub fn emit_bitwise_xor_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
-    ctx.builder
-        .bitwise_xor(ctx.u32_type, None, a, b)
-        .unwrap()
+    ctx.builder.bitwise_xor(ctx.u32_type, None, a, b).unwrap()
 }
 
 /// BitwiseNot32: `OpNot`.
@@ -130,9 +126,7 @@ pub fn emit_bit_count_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 
 /// BitReverse32: `OpBitReverse`.
 pub fn emit_bit_reverse_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
-    ctx.builder
-        .bit_reverse(ctx.u32_type, None, value)
-        .unwrap()
+    ctx.builder.bit_reverse(ctx.u32_type, None, value).unwrap()
 }
 
 /// FindSMsb32: `OpExtInst FindSMsb`.
@@ -167,10 +161,13 @@ pub fn emit_find_u_msb_32(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_s_min_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.u32_type, None, glsl_set, 39 /* SMin */, vec![
-            rspirv::dr::Operand::IdRef(a),
-            rspirv::dr::Operand::IdRef(b),
-        ])
+        .ext_inst(
+            ctx.u32_type,
+            None,
+            glsl_set,
+            39, /* SMin */
+            vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
         .unwrap()
 }
 
@@ -178,10 +175,13 @@ pub fn emit_s_min_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 pub fn emit_s_max_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.u32_type, None, glsl_set, 42 /* SMax */, vec![
-            rspirv::dr::Operand::IdRef(a),
-            rspirv::dr::Operand::IdRef(b),
-        ])
+        .ext_inst(
+            ctx.u32_type,
+            None,
+            glsl_set,
+            42, /* SMax */
+            vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
         .unwrap()
 }
 
@@ -189,10 +189,13 @@ pub fn emit_s_max_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 pub fn emit_u_min_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.u32_type, None, glsl_set, 38 /* UMin */, vec![
-            rspirv::dr::Operand::IdRef(a),
-            rspirv::dr::Operand::IdRef(b),
-        ])
+        .ext_inst(
+            ctx.u32_type,
+            None,
+            glsl_set,
+            38, /* UMin */
+            vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
         .unwrap()
 }
 
@@ -200,10 +203,13 @@ pub fn emit_u_min_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 pub fn emit_u_max_32(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     let glsl_set = ctx.glsl_ext;
     ctx.builder
-        .ext_inst(ctx.u32_type, None, glsl_set, 41 /* UMax */, vec![
-            rspirv::dr::Operand::IdRef(a),
-            rspirv::dr::Operand::IdRef(b),
-        ])
+        .ext_inst(
+            ctx.u32_type,
+            None,
+            glsl_set,
+            41, /* UMax */
+            vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
         .unwrap()
 }
 
@@ -216,23 +222,17 @@ pub fn emit_i_equal(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
 
 /// INotEqual: `OpINotEqual`.
 pub fn emit_i_not_equal(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
-    ctx.builder
-        .i_not_equal(ctx.bool_type, None, a, b)
-        .unwrap()
+    ctx.builder.i_not_equal(ctx.bool_type, None, a, b).unwrap()
 }
 
 /// SLessThan: `OpSLessThan`.
 pub fn emit_s_less_than(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
-    ctx.builder
-        .s_less_than(ctx.bool_type, None, a, b)
-        .unwrap()
+    ctx.builder.s_less_than(ctx.bool_type, None, a, b).unwrap()
 }
 
 /// ULessThan: `OpULessThan`.
 pub fn emit_u_less_than(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
-    ctx.builder
-        .u_less_than(ctx.bool_type, None, a, b)
-        .unwrap()
+    ctx.builder.u_less_than(ctx.bool_type, None, a, b).unwrap()
 }
 
 /// SLessThanEqual: `OpSLessThanEqual`.

@@ -36,7 +36,11 @@ impl ILibraryAppletCreator {
             (1, None, "TerminateAllLibraryApplets"),
             (2, None, "AreAnyLibraryAppletsLeft"),
             (10, Some(Self::create_storage_handler), "CreateStorage"),
-            (11, Some(Self::create_transfer_memory_storage_handler), "CreateTransferMemoryStorage"),
+            (
+                11,
+                Some(Self::create_transfer_memory_storage_handler),
+                "CreateTransferMemoryStorage",
+            ),
             (12, None, "CreateHandleStorage"),
         ]);
         Self {

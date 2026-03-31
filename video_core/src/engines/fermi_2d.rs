@@ -62,7 +62,13 @@ impl Fermi2D {
     }
 
     /// Corresponds to upstream `Fermi2D::CallMultiMethod`.
-    pub fn call_multi_method(&mut self, method: u32, args: &[u32], _amount: u32, _methods_pending: u32) {
+    pub fn call_multi_method(
+        &mut self,
+        method: u32,
+        args: &[u32],
+        _amount: u32,
+        _methods_pending: u32,
+    ) {
         for &arg in args {
             self.call_method(method, arg, false);
         }
@@ -208,10 +214,7 @@ impl Engine for Fermi2D {
         }
     }
 
-    fn execute_pending(
-        &mut self,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-    ) -> Vec<PendingWrite> {
+    fn execute_pending(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         if !self.pending_blit {
             return vec![];
         }
@@ -250,8 +253,13 @@ impl Engine for Fermi2D {
 
         log::debug!(
             "Fermi2D: blit executed {}x{} (sp={} dp={} cw={}) src=0x{:X} -> dst=0x{:X}",
-            copy_width, height, sp, dp, copy_width,
-            self.src_addr(), self.dst_addr()
+            copy_width,
+            height,
+            sp,
+            dp,
+            copy_width,
+            self.src_addr(),
+            self.dst_addr()
         );
 
         vec![PendingWrite {
@@ -332,7 +340,8 @@ mod tests {
 
     #[test]
     fn test_bind_rasterizer_stores_reference() {
-        let syncpoints = std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let syncpoints =
+            std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
         let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
         let mut eng = Fermi2D::new();
         assert!(eng.rasterizer.is_none());

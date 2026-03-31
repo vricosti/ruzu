@@ -470,7 +470,12 @@ impl core::fmt::Display for ResultCode {
         if self.is_success() {
             write!(f, "Success")
         } else {
-            write!(f, "Error(module={}, desc={})", self.get_module_raw(), self.get_description())
+            write!(
+                f,
+                "Error(module={}, desc={})",
+                self.get_module_raw(),
+                self.get_description()
+            )
         }
     }
 }

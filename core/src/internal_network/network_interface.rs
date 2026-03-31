@@ -156,7 +156,10 @@ fn find_gateway_linux(iface_name: &str) -> u32 {
 ///
 /// Corresponds to upstream `Network::GetSelectedNetworkInterface`.
 pub fn get_selected_network_interface() -> Option<NetworkInterface> {
-    let selected_name = common::settings::values().network_interface.get_value().clone();
+    let selected_name = common::settings::values()
+        .network_interface
+        .get_value()
+        .clone();
     let interfaces = get_available_network_interfaces();
     if interfaces.is_empty() {
         log::error!("GetAvailableNetworkInterfaces returned no interfaces");
@@ -167,10 +170,7 @@ pub fn get_selected_network_interface() -> Option<NetworkInterface> {
         return Some(iface.clone());
     }
 
-    log::error!(
-        "Selected network interface '{}' not found",
-        selected_name
-    );
+    log::error!("Selected network interface '{}' not found", selected_name);
     None
 }
 

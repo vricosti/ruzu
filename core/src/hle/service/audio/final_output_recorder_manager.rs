@@ -37,9 +37,7 @@ pub struct IFinalOutputRecorderManager {
 
 impl IFinalOutputRecorderManager {
     pub fn new() -> Self {
-        let handlers = build_handler_map(&[
-            (0, None, "OpenFinalOutputRecorder"),
-        ]);
+        let handlers = build_handler_map(&[(0, None, "OpenFinalOutputRecorder")]);
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),

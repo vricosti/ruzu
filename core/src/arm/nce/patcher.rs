@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use super::instructions::{Svc, Mrs, Msr, Exclusive, SystemRegister};
+use super::instructions::{Exclusive, Mrs, Msr, Svc, SystemRegister};
 
 /// Maximum relative branch distance for ARM64 B instruction (128 MiB).
 const MAX_RELATIVE_BRANCH: usize = 128 * 1024 * 1024;
@@ -147,9 +147,15 @@ impl Patcher {
     /// (would need its own patcher).
     ///
     /// Corresponds to upstream `Patcher::PatchText(PhysicalMemory&, CodeSet::Segment&)`.
-    pub fn patch_text(&mut self, program_image: &[u8], code_offset: usize, code_size: usize) -> bool {
+    pub fn patch_text(
+        &mut self,
+        program_image: &[u8],
+        code_offset: usize,
+        code_size: usize,
+    ) -> bool {
         let image_size = program_image.len();
-        if self.total_program_size + image_size > MAX_RELATIVE_BRANCH && self.total_program_size > 0 {
+        if self.total_program_size + image_size > MAX_RELATIVE_BRANCH && self.total_program_size > 0
+        {
             return false;
         }
 
@@ -184,7 +190,11 @@ impl Patcher {
                 });
                 // Upstream: self.write_svc_trampoline(next_offset, svc.get_value());
                 // Requires oaknut-equivalent ARM64 code generation.
-                log::trace!("Patcher: SVC #{} at offset {:#x}", svc.get_value(), this_offset);
+                log::trace!(
+                    "Patcher: SVC #{} at offset {:#x}",
+                    svc.get_value(),
+                    this_offset
+                );
                 continue;
             }
 

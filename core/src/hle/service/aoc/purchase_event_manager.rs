@@ -101,10 +101,7 @@ impl IPurchaseEventManager {
         Err(RESULT_NO_PURCHASED_PRODUCT_INFO_AVAILABLE)
     }
 
-    fn get_purchased_event_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_purchased_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IPurchaseEventManager) };
         service.get_purchased_event();

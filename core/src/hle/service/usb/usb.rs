@@ -35,38 +35,52 @@ pub mod pd_cradle_commands {
 
 pub struct IDsInterface;
 impl IDsInterface {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 pub struct IDsRootSession;
 impl IDsRootSession {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 pub struct IClientEpSession;
 impl IClientEpSession {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 pub struct IClientIfSession;
 impl IClientIfSession {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 pub struct IClientRootSession;
 impl IClientRootSession {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 pub struct IPdSession;
 impl IPdSession {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 /// IPdManager ("usb:pd").
 pub struct IPdManager;
 impl IPdManager {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     pub fn open_session(&self) -> IPdSession {
         log::debug!("IPdManager::open_session called");
@@ -76,13 +90,17 @@ impl IPdManager {
 
 pub struct IPdCradleSession;
 impl IPdCradleSession {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 /// IPdCradleManager ("usb:pd:c").
 pub struct IPdCradleManager;
 impl IPdCradleManager {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     pub fn open_cradle_session(&self) -> IPdCradleSession {
         log::debug!("IPdCradleManager::open_cradle_session called");
@@ -93,15 +111,17 @@ impl IPdCradleManager {
 /// IPmMainService ("usb:pm"). All stubs.
 pub struct IPmMainService;
 impl IPmMainService {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 /// Registers "usb:ds", "usb:hs", "usb:pd", "usb:pd:c", "usb:pm" services.
 ///
 /// Corresponds to `LoopProcess` in upstream `usb.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     let mut server_manager = ServerManager::new(system);
 
@@ -111,7 +131,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             name,
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
+                    &svc_name,
+                ))
             }),
             16,
         );

@@ -3,28 +3,28 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/video_multiply_add.cpp
 
-use super::{bit, field, TranslatorVisitor};
 use super::video_helper::{extract_video_operand_value, get_video_source_width, VideoWidth};
+use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::Value;
 
 /// VMAD — Video multiply-add.
 ///
 /// Computes `dest = ExtractVideoOp(src_a) * ExtractVideoOp(src_b) + src_c`.
 pub fn vmad(tv: &mut TranslatorVisitor, insn: u64) {
-    let dest_reg      = field(insn, 0, 8);
-    let src_b_imm     = field(insn, 20, 16);
-    let src_b_sel     = field(insn, 28, 2);
-    let src_b_width   = VideoWidth::from_u32(field(insn, 29, 2));
-    let src_a_sel     = field(insn, 36, 2);
-    let src_a_width   = VideoWidth::from_u32(field(insn, 37, 2));
-    let cc            = bit(insn, 47);
-    let src_a_sign    = bit(insn, 48);
-    let src_b_sign    = bit(insn, 49);
-    let is_src_b_reg  = bit(insn, 50);
-    let scale         = field(insn, 51, 2);
-    let src_c_neg     = bit(insn, 53);
-    let src_a_neg     = bit(insn, 54);
-    let sat           = bit(insn, 55);
+    let dest_reg = field(insn, 0, 8);
+    let src_b_imm = field(insn, 20, 16);
+    let src_b_sel = field(insn, 28, 2);
+    let src_b_width = VideoWidth::from_u32(field(insn, 29, 2));
+    let src_a_sel = field(insn, 36, 2);
+    let src_a_width = VideoWidth::from_u32(field(insn, 37, 2));
+    let cc = bit(insn, 47);
+    let src_a_sign = bit(insn, 48);
+    let src_b_sign = bit(insn, 49);
+    let is_src_b_reg = bit(insn, 50);
+    let scale = field(insn, 51, 2);
+    let src_c_neg = bit(insn, 53);
+    let src_a_neg = bit(insn, 54);
+    let sat = bit(insn, 55);
 
     if cc {
         log::warn!("VMAD: CC not supported (insn={:#018x})", insn);
@@ -62,6 +62,6 @@ pub fn vmad(tv: &mut TranslatorVisitor, insn: u64) {
 
     // result = op_a * op_b + src_c
     let product = tv.ir.imul_32(op_a, op_b);
-    let result  = tv.ir.iadd_32(product, src_c_val);
+    let result = tv.ir.iadd_32(product, src_c_val);
     tv.set_x(dest_reg, result);
 }

@@ -469,8 +469,8 @@ pub fn decode_opcode(insn: u64) -> Option<MaxwellOpcode> {
         0x63B => return Some(FSETP_cbuf),
         0x43B => return Some(FSETP_imm),
         0x23A => return Some(FCMP_reg),
-        0x63A => return Some(FCMP_imm),   // overloaded
-        0x43A => return Some(FCMP_cr),    // overloaded
+        0x63A => return Some(FCMP_imm), // overloaded
+        0x43A => return Some(FCMP_cr),  // overloaded
         0x22C => return Some(FCHK_reg),
         0x62C => return Some(FCHK_cbuf),
         0x42C => return Some(FCHK_imm),

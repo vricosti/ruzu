@@ -74,16 +74,17 @@ impl IrsProtocol {
             result = self.protocol.enable_mcu(true);
         }
         if result == DriverResult::Success {
-            result = self.protocol.wait_set_mcu_mode(
-                ReportMode::NfcIrMode60Hz,
-                McuMode::Standby,
-            );
+            result = self
+                .protocol
+                .wait_set_mcu_mode(ReportMode::NfcIrMode60Hz, McuMode::Standby);
         }
         if result == DriverResult::Success {
             result = self.protocol.configure_mcu();
         }
         if result == DriverResult::Success {
-            result = self.protocol.wait_set_mcu_mode(ReportMode::NfcIrMode60Hz, McuMode::Ir);
+            result = self
+                .protocol
+                .wait_set_mcu_mode(ReportMode::NfcIrMode60Hz, McuMode::Ir);
         }
         if result == DriverResult::Success {
             result = self.configure_irs();
@@ -157,17 +158,14 @@ impl IrsProtocol {
     /// Port of IrsProtocol::RequestImage
     pub fn request_image(&mut self, buffer: &mut [u8]) -> DriverResult {
         let fragments_val = self.fragments as u8;
-        let next_packet_fragment =
-            (self.packet_fragment + 1) % (fragments_val + 1);
+        let next_packet_fragment = (self.packet_fragment + 1) % (fragments_val + 1);
 
         if buffer.len() > 52 && buffer[0] == 0x31 && buffer[49] == 0x03 {
             let new_packet_fragment = buffer[52];
             if new_packet_fragment == next_packet_fragment {
                 self.packet_fragment = next_packet_fragment;
                 let dest_offset = 300 * self.packet_fragment as usize;
-                if buffer.len() >= 59 + 300
-                    && self.buf_image.len() >= dest_offset + 300
-                {
+                if buffer.len() >= 59 + 300 && self.buf_image.len() >= dest_offset + 300 {
                     self.buf_image[dest_offset..dest_offset + 300]
                         .copy_from_slice(&buffer[59..59 + 300]);
                 }

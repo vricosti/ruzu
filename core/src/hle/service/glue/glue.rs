@@ -169,8 +169,7 @@ pub fn loop_process(
 /// Helper to register a stub service on a ServerManager.
 fn register_stub(server_manager: &mut ServerManager, name: &str) {
     let svc_name = name.to_string();
-    let factory: SessionRequestHandlerFactory = Box::new(move || {
-        Arc::new(GenericStubService::new(&svc_name))
-    });
+    let factory: SessionRequestHandlerFactory =
+        Box::new(move || Arc::new(GenericStubService::new(&svc_name)));
     server_manager.register_named_service(name, factory, 64);
 }

@@ -13,10 +13,7 @@ use crate::ir::program::Program;
 ///
 /// Not yet implemented: requires full CFG construction, block translation loop,
 /// and structured control-flow AST building.
-pub fn translate_program(
-    _instructions: &[u64],
-    stage: crate::ir::types::ShaderStage,
-) -> Program {
+pub fn translate_program(_instructions: &[u64], stage: crate::ir::types::ShaderStage) -> Program {
     log::warn!("TranslateProgram not yet implemented — returning empty program");
     Program::new(stage)
 }
@@ -25,10 +22,7 @@ pub fn translate_program(
 ///
 /// Not yet implemented: requires dual-vertex-specific CFG merging and
 /// `JoinTextureInfo`/`JoinStorageInfo` pass invocation.
-pub fn merge_dual_vertex_programs(
-    _vertex_a: &mut Program,
-    _vertex_b: &mut Program,
-) -> Program {
+pub fn merge_dual_vertex_programs(_vertex_a: &mut Program, _vertex_b: &mut Program) -> Program {
     log::warn!("MergeDualVertexPrograms not yet implemented — returning empty program");
     Program::new(crate::ir::types::ShaderStage::Vertex)
 }
@@ -46,9 +40,7 @@ pub fn convert_legacy_to_generic(
 /// Generate a passthrough geometry shader for layer emulation.
 ///
 /// Not yet implemented: requires generating a full passthrough GS IR program.
-pub fn generate_geometry_passthrough(
-    _source_program: &mut Program,
-) -> Program {
+pub fn generate_geometry_passthrough(_source_program: &mut Program) -> Program {
     log::warn!("GenerateGeometryPassthrough not yet implemented — returning empty program");
     Program::new(crate::ir::types::ShaderStage::Vertex)
 }

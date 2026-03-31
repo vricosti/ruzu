@@ -13,17 +13,17 @@ pub mod k_auto_object;
 pub mod k_synchronization_object;
 
 // Slab allocators
-pub mod k_slab_heap;
 pub mod k_dynamic_slab_heap;
+pub mod k_slab_heap;
 pub mod slab_helpers;
 
 // Locks and synchronization primitives
-pub mod k_spin_lock;
-pub mod k_scoped_lock;
-pub mod k_light_lock;
 pub mod k_light_condition_variable;
+pub mod k_light_lock;
 pub mod k_scheduler_lock;
+pub mod k_scoped_lock;
 pub mod k_scoped_scheduler_lock_and_sleep;
+pub mod k_spin_lock;
 
 // Scheduling and thread management support
 pub mod k_affinity_mask;
@@ -61,8 +61,8 @@ pub mod physical_memory;
 
 // SVC (Supervisor Call) types and results
 pub mod svc_common;
-pub mod svc_types;
 pub mod svc_results;
+pub mod svc_types;
 pub mod svc_version;
 
 // SVC handler implementations

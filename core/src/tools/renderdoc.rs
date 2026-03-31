@@ -102,7 +102,8 @@ impl RenderdocApi {
                 // Call RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, &api_ptr).
                 // The function signature is: int RENDERDOC_GetAPI(int version, void** api_ptr)
                 // eRENDERDOC_API_Version_1_6_0 = 10600
-                type GetApiFn = unsafe extern "C" fn(version: i32, api_ptr: *mut *mut std::ffi::c_void) -> i32;
+                type GetApiFn =
+                    unsafe extern "C" fn(version: i32, api_ptr: *mut *mut std::ffi::c_void) -> i32;
                 let get_api: GetApiFn = std::mem::transmute(get_api_sym);
                 let mut api_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
                 let ret = get_api(10600, &mut api_ptr);
@@ -111,9 +112,7 @@ impl RenderdocApi {
                     return None;
                 }
                 log::info!("RenderDoc API loaded successfully");
-                Some(RdocApi {
-                    _api_ptr: api_ptr,
-                })
+                Some(RdocApi { _api_ptr: api_ptr })
             }
         }
 

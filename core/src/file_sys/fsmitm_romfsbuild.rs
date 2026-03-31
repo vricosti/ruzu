@@ -88,7 +88,7 @@ struct RomFSBuildFileContext {
     entry_offset: u32,
     offset: u64,
     size: u64,
-    parent: Option<usize>, // index into directories vec
+    parent: Option<usize>,  // index into directories vec
     sibling: Option<usize>, // index into files vec
     source: VirtualFile,
 }
@@ -273,9 +273,7 @@ impl RomFSBuildContext {
                 continue;
             }
 
-            let child_ext_dir = ext_dir
-                .as_ref()
-                .and_then(|ext| ext.get_subdirectory(&name));
+            let child_ext_dir = ext_dir.as_ref().and_then(|ext| ext.get_subdirectory(&name));
             self.visit_directory(child_romfs_dir, child_ext_dir, child_idx);
         }
     }
@@ -283,8 +281,8 @@ impl RomFSBuildContext {
     fn add_directory(&mut self, _parent_idx: usize, dir_ctx: RomFSBuildDirectoryContext) -> bool {
         self.num_dirs += 1;
         let name_len = dir_ctx.path_len - dir_ctx.cur_path_ofs;
-        self.dir_table_size += std::mem::size_of::<RomFSDirectoryEntry>() as u64
-            + align_up_u32(name_len, 4) as u64;
+        self.dir_table_size +=
+            std::mem::size_of::<RomFSDirectoryEntry>() as u64 + align_up_u32(name_len, 4) as u64;
         self.directories.push(dir_ctx);
         true
     }
@@ -292,8 +290,8 @@ impl RomFSBuildContext {
     fn add_file(&mut self, _parent_idx: usize, file_ctx: RomFSBuildFileContext) {
         self.num_files += 1;
         let name_len = file_ctx.path_len - file_ctx.cur_path_ofs;
-        self.file_table_size += std::mem::size_of::<RomFSFileEntry>() as u64
-            + align_up_u32(name_len, 4) as u64;
+        self.file_table_size +=
+            std::mem::size_of::<RomFSFileEntry>() as u64 + align_up_u32(name_len, 4) as u64;
         self.files.push(file_ctx);
     }
 
@@ -355,7 +353,8 @@ impl RomFSBuildContext {
             self.file_partition_size += file.size;
             file.entry_offset = entry_offset;
             let name_len = file.path_len - file.cur_path_ofs;
-            entry_offset += std::mem::size_of::<RomFSFileEntry>() as u32 + align_up_u32(name_len, 4);
+            entry_offset +=
+                std::mem::size_of::<RomFSFileEntry>() as u32 + align_up_u32(name_len, 4);
         }
 
         // Assign file sibling/parent ownership (reverse iteration)
@@ -387,8 +386,8 @@ impl RomFSBuildContext {
         for dir in &mut self.directories {
             dir.entry_offset = entry_offset;
             let name_len = dir.path_len - dir.cur_path_ofs;
-            entry_offset += std::mem::size_of::<RomFSDirectoryEntry>() as u32
-                + align_up_u32(name_len, 4);
+            entry_offset +=
+                std::mem::size_of::<RomFSDirectoryEntry>() as u32 + align_up_u32(name_len, 4);
         }
 
         // Assign directory sibling/child ownership (reverse iteration, skip root)
@@ -431,7 +430,10 @@ impl RomFSBuildContext {
             )
             .to_vec()
         };
-        out.push((0, Arc::new(VectorVfsFile::new(header_data, String::new(), None))));
+        out.push((
+            0,
+            Arc::new(VectorVfsFile::new(header_data, String::new(), None)),
+        ));
 
         // Populate file table entries
         let dir_ht_size = self.dir_hash_table_size as usize;
@@ -497,8 +499,7 @@ impl RomFSBuildContext {
             for b in &mut metadata[name_start..name_start + aligned_name_size] {
                 *b = 0;
             }
-            let name_bytes =
-                &self.files[i].path.as_bytes()[self.files[i].cur_path_ofs as usize..];
+            let name_bytes = &self.files[i].path.as_bytes()[self.files[i].cur_path_ofs as usize..];
             let copy_len = name_size as usize;
             metadata[name_start..name_start + copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
@@ -511,8 +512,7 @@ impl RomFSBuildContext {
 
         // Populate directory table entries
         for i in 0..self.directories.len() {
-            let is_root = i == 0
-                || self.directories[i].path == root_path;
+            let is_root = i == 0 || self.directories[i].path == root_path;
 
             let parent_entry_offset = if is_root {
                 0

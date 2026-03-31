@@ -3,17 +3,18 @@
 
 //! Port of zuyu/src/core/hle/service/bcat/bcat_util.h
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::bcat_result::RESULT_INVALID_ARGUMENT;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// For a name to be valid it must be non-empty, must have a null terminating character as the final
 /// char, can only contain numbers, letters, underscores and a hyphen if directory and a period if
 /// file.
 pub fn verify_name_valid_internal(name: &[u8; 0x20], match_char: u8) -> ResultCode {
     let null_chars = name.iter().filter(|&&c| c == 0).count();
-    let bad_chars = name.iter().filter(|&&c| {
-        !c.is_ascii_alphanumeric() && c != b'_' && c != match_char && c != 0
-    }).count();
+    let bad_chars = name
+        .iter()
+        .filter(|&&c| !c.is_ascii_alphanumeric() && c != b'_' && c != match_char && c != 0)
+        .count();
 
     if null_chars == 0x20 || null_chars == 0 || bad_chars != 0 || name[0x1F] != 0 {
         log::error!("BCAT: Name passed was invalid!");

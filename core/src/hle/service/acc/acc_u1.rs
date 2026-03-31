@@ -68,15 +68,35 @@ impl AccU1 {
     ) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(AccU1::get_user_count_handler), "GetUserCount"),
-            (1, Some(AccU1::get_user_existence_handler), "GetUserExistence"),
+            (
+                1,
+                Some(AccU1::get_user_existence_handler),
+                "GetUserExistence",
+            ),
             (2, Some(AccU1::list_all_users_handler), "ListAllUsers"),
             (3, Some(AccU1::list_open_users_handler), "ListOpenUsers"),
-            (4, Some(AccU1::get_last_opened_user_handler), "GetLastOpenedUser"),
+            (
+                4,
+                Some(AccU1::get_last_opened_user_handler),
+                "GetLastOpenedUser",
+            ),
             (5, Some(AccU1::get_profile_handler), "GetProfile"),
             (6, None, "GetProfileDigest"),
-            (50, Some(AccU1::is_user_registration_request_permitted_handler), "IsUserRegistrationRequestPermitted"),
-            (51, Some(AccU1::try_select_user_without_interaction_handler), "TrySelectUserWithoutInteraction"),
-            (60, Some(AccU1::list_open_context_stored_users_handler), "ListOpenContextStoredUsers"),
+            (
+                50,
+                Some(AccU1::is_user_registration_request_permitted_handler),
+                "IsUserRegistrationRequestPermitted",
+            ),
+            (
+                51,
+                Some(AccU1::try_select_user_without_interaction_handler),
+                "TrySelectUserWithoutInteraction",
+            ),
+            (
+                60,
+                Some(AccU1::list_open_context_stored_users_handler),
+                "ListOpenContextStoredUsers",
+            ),
             (99, None, "DebugActivateOpenContextRetention"),
             (100, None, "GetUserRegistrationNotifier"),
             (101, None, "GetUserStateChangeNotifier"),
@@ -91,10 +111,22 @@ impl AccU1 {
             (113, None, "GetSaveDataThumbnailExistence"),
             (120, None, "ListOpenUsersInApplication"),
             (130, None, "ActivateOpenContextRetention"),
-            (140, Some(AccU1::list_qualified_users_handler), "ListQualifiedUsers"),
+            (
+                140,
+                Some(AccU1::list_qualified_users_handler),
+                "ListQualifiedUsers",
+            ),
             (150, None, "AuthenticateApplicationAsync"),
-            (151, None, "EnsureSignedDeviceIdentifierCacheForNintendoAccountAsync"),
-            (152, None, "LoadSignedDeviceIdentifierCacheForNintendoAccount"),
+            (
+                151,
+                None,
+                "EnsureSignedDeviceIdentifierCacheForNintendoAccountAsync",
+            ),
+            (
+                152,
+                None,
+                "LoadSignedDeviceIdentifierCacheForNintendoAccount",
+            ),
             (190, None, "GetUserLastOpenedApplication"),
             (191, None, "ActivateOpenContextHolder"),
             (997, None, "DebugInvalidateTokenCacheForUser"),
@@ -134,10 +166,7 @@ impl AccU1 {
         let pm = svc.interface.profile_manager.lock().unwrap();
         let (_rc, users) = svc.interface.list_all_users(&pm);
         let user_bytes = unsafe {
-            std::slice::from_raw_parts(
-                users.as_ptr() as *const u8,
-                std::mem::size_of_val(&users),
-            )
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
         };
         ctx.write_buffer(user_bytes, 0);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -149,10 +178,7 @@ impl AccU1 {
         let pm = svc.interface.profile_manager.lock().unwrap();
         let (_rc, users) = svc.interface.list_open_users(&pm);
         let user_bytes = unsafe {
-            std::slice::from_raw_parts(
-                users.as_ptr() as *const u8,
-                std::mem::size_of_val(&users),
-            )
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
         };
         ctx.write_buffer(user_bytes, 0);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -174,9 +200,14 @@ impl AccU1 {
         let uuid = rp.pop_raw::<u128>();
         let (_rc, iprofile) = svc.interface.get_profile(uuid);
 
-        let is_domain = ctx.get_manager().map_or(false, |m| m.lock().unwrap().is_domain());
-        let move_handle = if is_domain { 0 } else {
-            ctx.create_session_for_service(iprofile.clone()).unwrap_or(0)
+        let is_domain = ctx
+            .get_manager()
+            .map_or(false, |m| m.lock().unwrap().is_domain());
+        let move_handle = if is_domain {
+            0
+        } else {
+            ctx.create_session_for_service(iprofile.clone())
+                .unwrap_or(0)
         };
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
@@ -188,7 +219,10 @@ impl AccU1 {
         }
     }
 
-    fn is_user_registration_request_permitted_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_user_registration_request_permitted_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
         let (_rc, permitted) = svc.interface.is_user_registration_request_permitted();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -196,7 +230,10 @@ impl AccU1 {
         rb.push_bool(permitted);
     }
 
-    fn try_select_user_without_interaction_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn try_select_user_without_interaction_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
         let pm = svc.interface.profile_manager.lock().unwrap();
         let (_rc, uuid) = svc.interface.try_select_user_without_interaction(&pm);
@@ -205,15 +242,15 @@ impl AccU1 {
         rb.push_raw(&uuid);
     }
 
-    fn list_open_context_stored_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn list_open_context_stored_users_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
         let pm = svc.interface.profile_manager.lock().unwrap();
         let (_rc, users) = svc.interface.list_open_context_stored_users(&pm);
         let user_bytes = unsafe {
-            std::slice::from_raw_parts(
-                users.as_ptr() as *const u8,
-                std::mem::size_of_val(&users),
-            )
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
         };
         ctx.write_buffer(user_bytes, 0);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -225,10 +262,7 @@ impl AccU1 {
         let pm = svc.interface.profile_manager.lock().unwrap();
         let (_rc, users) = svc.interface.list_qualified_users(&pm);
         let user_bytes = unsafe {
-            std::slice::from_raw_parts(
-                users.as_ptr() as *const u8,
-                std::mem::size_of_val(&users),
-            )
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
         };
         ctx.write_buffer(user_bytes, 0);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);

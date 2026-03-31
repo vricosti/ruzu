@@ -12,12 +12,12 @@ use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, FrontFace, IndexFormat, PolygonMode,
     PrimitiveTopology, StencilOp, VertexAttribSize, VertexAttribType,
 };
-use shader_recompiler::stage::Stage;
 use crate::texture_cache::format_lookup_table::PixelFormat;
 use crate::textures::texture::{
     DepthCompareFunc, MsaaMode, SamplerReduction, SwizzleSource, TextureFilter,
     TextureMipmapFilter, WrapMode,
 };
+use shader_recompiler::stage::Stage;
 
 // ---------------------------------------------------------------------------
 // FormatInfo
@@ -46,111 +46,417 @@ struct FormatTuple {
 /// Texture format table indexed by PixelFormat.
 /// Port of anonymous `tex_format_tuples[]` in maxwell_to_vk.cpp.
 const TEX_FORMAT_TUPLES: &[FormatTuple] = &[
-    FormatTuple { format: vk::Format::A8B8G8R8_UNORM_PACK32, usage: ATTACHABLE | STORAGE },    // A8B8G8R8_UNORM
-    FormatTuple { format: vk::Format::A8B8G8R8_SNORM_PACK32, usage: ATTACHABLE | STORAGE },    // A8B8G8R8_SNORM
-    FormatTuple { format: vk::Format::A8B8G8R8_SINT_PACK32, usage: ATTACHABLE | STORAGE },     // A8B8G8R8_SINT
-    FormatTuple { format: vk::Format::A8B8G8R8_UINT_PACK32, usage: ATTACHABLE | STORAGE },     // A8B8G8R8_UINT
-    FormatTuple { format: vk::Format::R5G6B5_UNORM_PACK16, usage: ATTACHABLE },                // R5G6B5_UNORM
-    FormatTuple { format: vk::Format::B5G6R5_UNORM_PACK16, usage: 0 },                         // B5G6R5_UNORM
-    FormatTuple { format: vk::Format::A1R5G5B5_UNORM_PACK16, usage: ATTACHABLE },              // A1R5G5B5_UNORM
-    FormatTuple { format: vk::Format::A2B10G10R10_UNORM_PACK32, usage: ATTACHABLE | STORAGE }, // A2B10G10R10_UNORM
-    FormatTuple { format: vk::Format::A2B10G10R10_UINT_PACK32, usage: ATTACHABLE | STORAGE },  // A2B10G10R10_UINT
-    FormatTuple { format: vk::Format::A2R10G10B10_UNORM_PACK32, usage: ATTACHABLE },           // A2R10G10B10_UNORM
-    FormatTuple { format: vk::Format::A1R5G5B5_UNORM_PACK16, usage: ATTACHABLE },              // A1B5G5R5_UNORM (flipped with swizzle)
-    FormatTuple { format: vk::Format::R5G5B5A1_UNORM_PACK16, usage: 0 },                      // A5B5G5R1_UNORM (specially swizzled)
-    FormatTuple { format: vk::Format::R8_UNORM, usage: ATTACHABLE | STORAGE },                 // R8_UNORM
-    FormatTuple { format: vk::Format::R8_SNORM, usage: ATTACHABLE | STORAGE },                 // R8_SNORM
-    FormatTuple { format: vk::Format::R8_SINT, usage: ATTACHABLE | STORAGE },                  // R8_SINT
-    FormatTuple { format: vk::Format::R8_UINT, usage: ATTACHABLE | STORAGE },                  // R8_UINT
-    FormatTuple { format: vk::Format::R16G16B16A16_SFLOAT, usage: ATTACHABLE | STORAGE },      // R16G16B16A16_FLOAT
-    FormatTuple { format: vk::Format::R16G16B16A16_UNORM, usage: ATTACHABLE | STORAGE },       // R16G16B16A16_UNORM
-    FormatTuple { format: vk::Format::R16G16B16A16_SNORM, usage: ATTACHABLE | STORAGE },       // R16G16B16A16_SNORM
-    FormatTuple { format: vk::Format::R16G16B16A16_SINT, usage: ATTACHABLE | STORAGE },        // R16G16B16A16_SINT
-    FormatTuple { format: vk::Format::R16G16B16A16_UINT, usage: ATTACHABLE | STORAGE },        // R16G16B16A16_UINT
-    FormatTuple { format: vk::Format::B10G11R11_UFLOAT_PACK32, usage: ATTACHABLE | STORAGE },  // B10G11R11_FLOAT
-    FormatTuple { format: vk::Format::R32G32B32A32_UINT, usage: ATTACHABLE | STORAGE },        // R32G32B32A32_UINT
-    FormatTuple { format: vk::Format::BC1_RGBA_UNORM_BLOCK, usage: 0 },                       // BC1_RGBA_UNORM
-    FormatTuple { format: vk::Format::BC2_UNORM_BLOCK, usage: 0 },                            // BC2_UNORM
-    FormatTuple { format: vk::Format::BC3_UNORM_BLOCK, usage: 0 },                            // BC3_UNORM
-    FormatTuple { format: vk::Format::BC4_UNORM_BLOCK, usage: 0 },                            // BC4_UNORM
-    FormatTuple { format: vk::Format::BC4_SNORM_BLOCK, usage: 0 },                            // BC4_SNORM
-    FormatTuple { format: vk::Format::BC5_UNORM_BLOCK, usage: 0 },                            // BC5_UNORM
-    FormatTuple { format: vk::Format::BC5_SNORM_BLOCK, usage: 0 },                            // BC5_SNORM
-    FormatTuple { format: vk::Format::BC7_UNORM_BLOCK, usage: 0 },                            // BC7_UNORM
-    FormatTuple { format: vk::Format::BC6H_UFLOAT_BLOCK, usage: 0 },                          // BC6H_UFLOAT
-    FormatTuple { format: vk::Format::BC6H_SFLOAT_BLOCK, usage: 0 },                          // BC6H_SFLOAT
-    FormatTuple { format: vk::Format::ASTC_4X4_UNORM_BLOCK, usage: 0 },                       // ASTC_2D_4X4_UNORM
-    FormatTuple { format: vk::Format::B8G8R8A8_UNORM, usage: ATTACHABLE | STORAGE },          // B8G8R8A8_UNORM
-    FormatTuple { format: vk::Format::R32G32B32A32_SFLOAT, usage: ATTACHABLE | STORAGE },     // R32G32B32A32_FLOAT
-    FormatTuple { format: vk::Format::R32G32B32A32_SINT, usage: ATTACHABLE | STORAGE },       // R32G32B32A32_SINT
-    FormatTuple { format: vk::Format::R32G32_SFLOAT, usage: ATTACHABLE | STORAGE },           // R32G32_FLOAT
-    FormatTuple { format: vk::Format::R32G32_SINT, usage: ATTACHABLE | STORAGE },             // R32G32_SINT
-    FormatTuple { format: vk::Format::R32_SFLOAT, usage: ATTACHABLE | STORAGE },              // R32_FLOAT
-    FormatTuple { format: vk::Format::R16_SFLOAT, usage: ATTACHABLE | STORAGE },              // R16_FLOAT
-    FormatTuple { format: vk::Format::R16_UNORM, usage: ATTACHABLE | STORAGE },               // R16_UNORM
-    FormatTuple { format: vk::Format::R16_SNORM, usage: ATTACHABLE | STORAGE },               // R16_SNORM
-    FormatTuple { format: vk::Format::R16_UINT, usage: ATTACHABLE | STORAGE },                // R16_UINT
-    FormatTuple { format: vk::Format::R16_SINT, usage: ATTACHABLE | STORAGE },                // R16_SINT
-    FormatTuple { format: vk::Format::R16G16_UNORM, usage: ATTACHABLE | STORAGE },            // R16G16_UNORM
-    FormatTuple { format: vk::Format::R16G16_SFLOAT, usage: ATTACHABLE | STORAGE },           // R16G16_FLOAT
-    FormatTuple { format: vk::Format::R16G16_UINT, usage: ATTACHABLE | STORAGE },             // R16G16_UINT
-    FormatTuple { format: vk::Format::R16G16_SINT, usage: ATTACHABLE | STORAGE },             // R16G16_SINT
-    FormatTuple { format: vk::Format::R16G16_SNORM, usage: ATTACHABLE | STORAGE },            // R16G16_SNORM
-    FormatTuple { format: vk::Format::R32G32B32_SFLOAT, usage: 0 },                           // R32G32B32_FLOAT
-    FormatTuple { format: vk::Format::A8B8G8R8_SRGB_PACK32, usage: ATTACHABLE },              // A8B8G8R8_SRGB
-    FormatTuple { format: vk::Format::R8G8_UNORM, usage: ATTACHABLE | STORAGE },              // R8G8_UNORM
-    FormatTuple { format: vk::Format::R8G8_SNORM, usage: ATTACHABLE | STORAGE },              // R8G8_SNORM
-    FormatTuple { format: vk::Format::R8G8_SINT, usage: ATTACHABLE | STORAGE },               // R8G8_SINT
-    FormatTuple { format: vk::Format::R8G8_UINT, usage: ATTACHABLE | STORAGE },               // R8G8_UINT
-    FormatTuple { format: vk::Format::R32G32_UINT, usage: ATTACHABLE | STORAGE },             // R32G32_UINT
-    FormatTuple { format: vk::Format::R16G16B16A16_SFLOAT, usage: ATTACHABLE | STORAGE },     // R16G16B16X16_FLOAT
-    FormatTuple { format: vk::Format::R32_UINT, usage: ATTACHABLE | STORAGE },                // R32_UINT
-    FormatTuple { format: vk::Format::R32_SINT, usage: ATTACHABLE | STORAGE },                // R32_SINT
-    FormatTuple { format: vk::Format::ASTC_8X8_UNORM_BLOCK, usage: 0 },                       // ASTC_2D_8X8_UNORM
-    FormatTuple { format: vk::Format::ASTC_8X5_UNORM_BLOCK, usage: 0 },                       // ASTC_2D_8X5_UNORM
-    FormatTuple { format: vk::Format::ASTC_5X4_UNORM_BLOCK, usage: 0 },                       // ASTC_2D_5X4_UNORM
-    FormatTuple { format: vk::Format::B8G8R8A8_SRGB, usage: ATTACHABLE },                     // B8G8R8A8_SRGB
-    FormatTuple { format: vk::Format::BC1_RGBA_SRGB_BLOCK, usage: 0 },                        // BC1_RGBA_SRGB
-    FormatTuple { format: vk::Format::BC2_SRGB_BLOCK, usage: 0 },                             // BC2_SRGB
-    FormatTuple { format: vk::Format::BC3_SRGB_BLOCK, usage: 0 },                             // BC3_SRGB
-    FormatTuple { format: vk::Format::BC7_SRGB_BLOCK, usage: 0 },                             // BC7_SRGB
-    FormatTuple { format: vk::Format::A4B4G4R4_UNORM_PACK16, usage: 0 },                      // A4B4G4R4_UNORM
-    FormatTuple { format: vk::Format::R4G4_UNORM_PACK8, usage: 0 },                           // G4R4_UNORM
-    FormatTuple { format: vk::Format::ASTC_4X4_SRGB_BLOCK, usage: 0 },                        // ASTC_2D_4X4_SRGB
-    FormatTuple { format: vk::Format::ASTC_8X8_SRGB_BLOCK, usage: 0 },                        // ASTC_2D_8X8_SRGB
-    FormatTuple { format: vk::Format::ASTC_8X5_SRGB_BLOCK, usage: 0 },                        // ASTC_2D_8X5_SRGB
-    FormatTuple { format: vk::Format::ASTC_5X4_SRGB_BLOCK, usage: 0 },                        // ASTC_2D_5X4_SRGB
-    FormatTuple { format: vk::Format::ASTC_5X5_UNORM_BLOCK, usage: 0 },                       // ASTC_2D_5X5_UNORM
-    FormatTuple { format: vk::Format::ASTC_5X5_SRGB_BLOCK, usage: 0 },                        // ASTC_2D_5X5_SRGB
-    FormatTuple { format: vk::Format::ASTC_10X8_UNORM_BLOCK, usage: 0 },                      // ASTC_2D_10X8_UNORM
-    FormatTuple { format: vk::Format::ASTC_10X8_SRGB_BLOCK, usage: 0 },                       // ASTC_2D_10X8_SRGB
-    FormatTuple { format: vk::Format::ASTC_6X6_UNORM_BLOCK, usage: 0 },                       // ASTC_2D_6X6_UNORM
-    FormatTuple { format: vk::Format::ASTC_6X6_SRGB_BLOCK, usage: 0 },                        // ASTC_2D_6X6_SRGB
-    FormatTuple { format: vk::Format::ASTC_10X6_UNORM_BLOCK, usage: 0 },                      // ASTC_2D_10X6_UNORM
-    FormatTuple { format: vk::Format::ASTC_10X6_SRGB_BLOCK, usage: 0 },                       // ASTC_2D_10X6_SRGB
-    FormatTuple { format: vk::Format::ASTC_10X5_UNORM_BLOCK, usage: 0 },                      // ASTC_2D_10X5_UNORM
-    FormatTuple { format: vk::Format::ASTC_10X5_SRGB_BLOCK, usage: 0 },                       // ASTC_2D_10X5_SRGB
-    FormatTuple { format: vk::Format::ASTC_10X10_UNORM_BLOCK, usage: 0 },                     // ASTC_2D_10X10_UNORM
-    FormatTuple { format: vk::Format::ASTC_10X10_SRGB_BLOCK, usage: 0 },                      // ASTC_2D_10X10_SRGB
-    FormatTuple { format: vk::Format::ASTC_12X10_UNORM_BLOCK, usage: 0 },                     // ASTC_2D_12X10_UNORM
-    FormatTuple { format: vk::Format::ASTC_12X10_SRGB_BLOCK, usage: 0 },                      // ASTC_2D_12X10_SRGB
-    FormatTuple { format: vk::Format::ASTC_12X12_UNORM_BLOCK, usage: 0 },                     // ASTC_2D_12X12_UNORM
-    FormatTuple { format: vk::Format::ASTC_12X12_SRGB_BLOCK, usage: 0 },                      // ASTC_2D_12X12_SRGB
-    FormatTuple { format: vk::Format::ASTC_8X6_UNORM_BLOCK, usage: 0 },                       // ASTC_2D_8X6_UNORM
-    FormatTuple { format: vk::Format::ASTC_8X6_SRGB_BLOCK, usage: 0 },                        // ASTC_2D_8X6_SRGB
-    FormatTuple { format: vk::Format::ASTC_6X5_UNORM_BLOCK, usage: 0 },                       // ASTC_2D_6X5_UNORM
-    FormatTuple { format: vk::Format::ASTC_6X5_SRGB_BLOCK, usage: 0 },                        // ASTC_2D_6X5_SRGB
-    FormatTuple { format: vk::Format::E5B9G9R9_UFLOAT_PACK32, usage: 0 },                     // E5B9G9R9_FLOAT
+    FormatTuple {
+        format: vk::Format::A8B8G8R8_UNORM_PACK32,
+        usage: ATTACHABLE | STORAGE,
+    }, // A8B8G8R8_UNORM
+    FormatTuple {
+        format: vk::Format::A8B8G8R8_SNORM_PACK32,
+        usage: ATTACHABLE | STORAGE,
+    }, // A8B8G8R8_SNORM
+    FormatTuple {
+        format: vk::Format::A8B8G8R8_SINT_PACK32,
+        usage: ATTACHABLE | STORAGE,
+    }, // A8B8G8R8_SINT
+    FormatTuple {
+        format: vk::Format::A8B8G8R8_UINT_PACK32,
+        usage: ATTACHABLE | STORAGE,
+    }, // A8B8G8R8_UINT
+    FormatTuple {
+        format: vk::Format::R5G6B5_UNORM_PACK16,
+        usage: ATTACHABLE,
+    }, // R5G6B5_UNORM
+    FormatTuple {
+        format: vk::Format::B5G6R5_UNORM_PACK16,
+        usage: 0,
+    }, // B5G6R5_UNORM
+    FormatTuple {
+        format: vk::Format::A1R5G5B5_UNORM_PACK16,
+        usage: ATTACHABLE,
+    }, // A1R5G5B5_UNORM
+    FormatTuple {
+        format: vk::Format::A2B10G10R10_UNORM_PACK32,
+        usage: ATTACHABLE | STORAGE,
+    }, // A2B10G10R10_UNORM
+    FormatTuple {
+        format: vk::Format::A2B10G10R10_UINT_PACK32,
+        usage: ATTACHABLE | STORAGE,
+    }, // A2B10G10R10_UINT
+    FormatTuple {
+        format: vk::Format::A2R10G10B10_UNORM_PACK32,
+        usage: ATTACHABLE,
+    }, // A2R10G10B10_UNORM
+    FormatTuple {
+        format: vk::Format::A1R5G5B5_UNORM_PACK16,
+        usage: ATTACHABLE,
+    }, // A1B5G5R5_UNORM (flipped with swizzle)
+    FormatTuple {
+        format: vk::Format::R5G5B5A1_UNORM_PACK16,
+        usage: 0,
+    }, // A5B5G5R1_UNORM (specially swizzled)
+    FormatTuple {
+        format: vk::Format::R8_UNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // R8_UNORM
+    FormatTuple {
+        format: vk::Format::R8_SNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // R8_SNORM
+    FormatTuple {
+        format: vk::Format::R8_SINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R8_SINT
+    FormatTuple {
+        format: vk::Format::R8_UINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R8_UINT
+    FormatTuple {
+        format: vk::Format::R16G16B16A16_SFLOAT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16B16A16_FLOAT
+    FormatTuple {
+        format: vk::Format::R16G16B16A16_UNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16B16A16_UNORM
+    FormatTuple {
+        format: vk::Format::R16G16B16A16_SNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16B16A16_SNORM
+    FormatTuple {
+        format: vk::Format::R16G16B16A16_SINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16B16A16_SINT
+    FormatTuple {
+        format: vk::Format::R16G16B16A16_UINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16B16A16_UINT
+    FormatTuple {
+        format: vk::Format::B10G11R11_UFLOAT_PACK32,
+        usage: ATTACHABLE | STORAGE,
+    }, // B10G11R11_FLOAT
+    FormatTuple {
+        format: vk::Format::R32G32B32A32_UINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R32G32B32A32_UINT
+    FormatTuple {
+        format: vk::Format::BC1_RGBA_UNORM_BLOCK,
+        usage: 0,
+    }, // BC1_RGBA_UNORM
+    FormatTuple {
+        format: vk::Format::BC2_UNORM_BLOCK,
+        usage: 0,
+    }, // BC2_UNORM
+    FormatTuple {
+        format: vk::Format::BC3_UNORM_BLOCK,
+        usage: 0,
+    }, // BC3_UNORM
+    FormatTuple {
+        format: vk::Format::BC4_UNORM_BLOCK,
+        usage: 0,
+    }, // BC4_UNORM
+    FormatTuple {
+        format: vk::Format::BC4_SNORM_BLOCK,
+        usage: 0,
+    }, // BC4_SNORM
+    FormatTuple {
+        format: vk::Format::BC5_UNORM_BLOCK,
+        usage: 0,
+    }, // BC5_UNORM
+    FormatTuple {
+        format: vk::Format::BC5_SNORM_BLOCK,
+        usage: 0,
+    }, // BC5_SNORM
+    FormatTuple {
+        format: vk::Format::BC7_UNORM_BLOCK,
+        usage: 0,
+    }, // BC7_UNORM
+    FormatTuple {
+        format: vk::Format::BC6H_UFLOAT_BLOCK,
+        usage: 0,
+    }, // BC6H_UFLOAT
+    FormatTuple {
+        format: vk::Format::BC6H_SFLOAT_BLOCK,
+        usage: 0,
+    }, // BC6H_SFLOAT
+    FormatTuple {
+        format: vk::Format::ASTC_4X4_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_4X4_UNORM
+    FormatTuple {
+        format: vk::Format::B8G8R8A8_UNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // B8G8R8A8_UNORM
+    FormatTuple {
+        format: vk::Format::R32G32B32A32_SFLOAT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R32G32B32A32_FLOAT
+    FormatTuple {
+        format: vk::Format::R32G32B32A32_SINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R32G32B32A32_SINT
+    FormatTuple {
+        format: vk::Format::R32G32_SFLOAT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R32G32_FLOAT
+    FormatTuple {
+        format: vk::Format::R32G32_SINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R32G32_SINT
+    FormatTuple {
+        format: vk::Format::R32_SFLOAT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R32_FLOAT
+    FormatTuple {
+        format: vk::Format::R16_SFLOAT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16_FLOAT
+    FormatTuple {
+        format: vk::Format::R16_UNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16_UNORM
+    FormatTuple {
+        format: vk::Format::R16_SNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16_SNORM
+    FormatTuple {
+        format: vk::Format::R16_UINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16_UINT
+    FormatTuple {
+        format: vk::Format::R16_SINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16_SINT
+    FormatTuple {
+        format: vk::Format::R16G16_UNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16_UNORM
+    FormatTuple {
+        format: vk::Format::R16G16_SFLOAT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16_FLOAT
+    FormatTuple {
+        format: vk::Format::R16G16_UINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16_UINT
+    FormatTuple {
+        format: vk::Format::R16G16_SINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16_SINT
+    FormatTuple {
+        format: vk::Format::R16G16_SNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16_SNORM
+    FormatTuple {
+        format: vk::Format::R32G32B32_SFLOAT,
+        usage: 0,
+    }, // R32G32B32_FLOAT
+    FormatTuple {
+        format: vk::Format::A8B8G8R8_SRGB_PACK32,
+        usage: ATTACHABLE,
+    }, // A8B8G8R8_SRGB
+    FormatTuple {
+        format: vk::Format::R8G8_UNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // R8G8_UNORM
+    FormatTuple {
+        format: vk::Format::R8G8_SNORM,
+        usage: ATTACHABLE | STORAGE,
+    }, // R8G8_SNORM
+    FormatTuple {
+        format: vk::Format::R8G8_SINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R8G8_SINT
+    FormatTuple {
+        format: vk::Format::R8G8_UINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R8G8_UINT
+    FormatTuple {
+        format: vk::Format::R32G32_UINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R32G32_UINT
+    FormatTuple {
+        format: vk::Format::R16G16B16A16_SFLOAT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R16G16B16X16_FLOAT
+    FormatTuple {
+        format: vk::Format::R32_UINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R32_UINT
+    FormatTuple {
+        format: vk::Format::R32_SINT,
+        usage: ATTACHABLE | STORAGE,
+    }, // R32_SINT
+    FormatTuple {
+        format: vk::Format::ASTC_8X8_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_8X8_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_8X5_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_8X5_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_5X4_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_5X4_UNORM
+    FormatTuple {
+        format: vk::Format::B8G8R8A8_SRGB,
+        usage: ATTACHABLE,
+    }, // B8G8R8A8_SRGB
+    FormatTuple {
+        format: vk::Format::BC1_RGBA_SRGB_BLOCK,
+        usage: 0,
+    }, // BC1_RGBA_SRGB
+    FormatTuple {
+        format: vk::Format::BC2_SRGB_BLOCK,
+        usage: 0,
+    }, // BC2_SRGB
+    FormatTuple {
+        format: vk::Format::BC3_SRGB_BLOCK,
+        usage: 0,
+    }, // BC3_SRGB
+    FormatTuple {
+        format: vk::Format::BC7_SRGB_BLOCK,
+        usage: 0,
+    }, // BC7_SRGB
+    FormatTuple {
+        format: vk::Format::A4B4G4R4_UNORM_PACK16,
+        usage: 0,
+    }, // A4B4G4R4_UNORM
+    FormatTuple {
+        format: vk::Format::R4G4_UNORM_PACK8,
+        usage: 0,
+    }, // G4R4_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_4X4_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_4X4_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_8X8_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_8X8_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_8X5_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_8X5_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_5X4_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_5X4_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_5X5_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_5X5_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_5X5_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_5X5_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_10X8_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_10X8_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_10X8_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_10X8_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_6X6_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_6X6_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_6X6_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_6X6_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_10X6_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_10X6_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_10X6_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_10X6_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_10X5_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_10X5_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_10X5_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_10X5_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_10X10_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_10X10_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_10X10_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_10X10_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_12X10_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_12X10_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_12X10_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_12X10_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_12X12_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_12X12_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_12X12_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_12X12_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_8X6_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_8X6_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_8X6_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_8X6_SRGB
+    FormatTuple {
+        format: vk::Format::ASTC_6X5_UNORM_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_6X5_UNORM
+    FormatTuple {
+        format: vk::Format::ASTC_6X5_SRGB_BLOCK,
+        usage: 0,
+    }, // ASTC_2D_6X5_SRGB
+    FormatTuple {
+        format: vk::Format::E5B9G9R9_UFLOAT_PACK32,
+        usage: 0,
+    }, // E5B9G9R9_FLOAT
     // Depth formats
-    FormatTuple { format: vk::Format::D32_SFLOAT, usage: ATTACHABLE },                        // D32_FLOAT
-    FormatTuple { format: vk::Format::D16_UNORM, usage: ATTACHABLE },                         // D16_UNORM
-    FormatTuple { format: vk::Format::X8_D24_UNORM_PACK32, usage: ATTACHABLE },               // X8_D24_UNORM
+    FormatTuple {
+        format: vk::Format::D32_SFLOAT,
+        usage: ATTACHABLE,
+    }, // D32_FLOAT
+    FormatTuple {
+        format: vk::Format::D16_UNORM,
+        usage: ATTACHABLE,
+    }, // D16_UNORM
+    FormatTuple {
+        format: vk::Format::X8_D24_UNORM_PACK32,
+        usage: ATTACHABLE,
+    }, // X8_D24_UNORM
     // Stencil formats
-    FormatTuple { format: vk::Format::S8_UINT, usage: ATTACHABLE },                           // S8_UINT
+    FormatTuple {
+        format: vk::Format::S8_UINT,
+        usage: ATTACHABLE,
+    }, // S8_UINT
     // DepthStencil formats
-    FormatTuple { format: vk::Format::D24_UNORM_S8_UINT, usage: ATTACHABLE },                 // D24_UNORM_S8_UINT
-    FormatTuple { format: vk::Format::D24_UNORM_S8_UINT, usage: ATTACHABLE },                 // S8_UINT_D24_UNORM (emulated)
-    FormatTuple { format: vk::Format::D32_SFLOAT_S8_UINT, usage: ATTACHABLE },                // D32_FLOAT_S8_UINT
+    FormatTuple {
+        format: vk::Format::D24_UNORM_S8_UINT,
+        usage: ATTACHABLE,
+    }, // D24_UNORM_S8_UINT
+    FormatTuple {
+        format: vk::Format::D24_UNORM_S8_UINT,
+        usage: ATTACHABLE,
+    }, // S8_UINT_D24_UNORM (emulated)
+    FormatTuple {
+        format: vk::Format::D32_SFLOAT_S8_UINT,
+        usage: ATTACHABLE,
+    }, // D32_FLOAT_S8_UINT
 ];
 
 /// Returns true if the pixel format is a depth or stencil format.
@@ -293,12 +599,8 @@ pub fn primitive_topology(topology: PrimitiveTopology) -> vk::PrimitiveTopology 
         PrimitiveTopology::Triangles => vk::PrimitiveTopology::TRIANGLE_LIST,
         PrimitiveTopology::TriangleStrip => vk::PrimitiveTopology::TRIANGLE_STRIP,
         PrimitiveTopology::TriangleFan => vk::PrimitiveTopology::TRIANGLE_FAN,
-        PrimitiveTopology::LinesAdjacency => {
-            vk::PrimitiveTopology::LINE_LIST_WITH_ADJACENCY
-        }
-        PrimitiveTopology::LineStripAdjacency => {
-            vk::PrimitiveTopology::LINE_STRIP_WITH_ADJACENCY
-        }
+        PrimitiveTopology::LinesAdjacency => vk::PrimitiveTopology::LINE_LIST_WITH_ADJACENCY,
+        PrimitiveTopology::LineStripAdjacency => vk::PrimitiveTopology::LINE_STRIP_WITH_ADJACENCY,
         PrimitiveTopology::TrianglesAdjacency => {
             vk::PrimitiveTopology::TRIANGLE_LIST_WITH_ADJACENCY
         }
@@ -344,9 +646,7 @@ pub fn vertex_format(
             VertexAttribSize::R8 | VertexAttribSize::A8 => vk::Format::R8_UNORM,
             VertexAttribSize::R8G8 | VertexAttribSize::G8R8 => vk::Format::R8G8_UNORM,
             VertexAttribSize::R8G8B8 => vk::Format::R8G8B8_UNORM,
-            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => {
-                vk::Format::R8G8B8A8_UNORM
-            }
+            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => vk::Format::R8G8B8A8_UNORM,
             VertexAttribSize::R16 => vk::Format::R16_UNORM,
             VertexAttribSize::R16G16 => vk::Format::R16G16_UNORM,
             VertexAttribSize::R16G16B16 => vk::Format::R16G16B16_UNORM,
@@ -358,9 +658,7 @@ pub fn vertex_format(
             VertexAttribSize::R8 | VertexAttribSize::A8 => vk::Format::R8_SNORM,
             VertexAttribSize::R8G8 | VertexAttribSize::G8R8 => vk::Format::R8G8_SNORM,
             VertexAttribSize::R8G8B8 => vk::Format::R8G8B8_SNORM,
-            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => {
-                vk::Format::R8G8B8A8_SNORM
-            }
+            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => vk::Format::R8G8B8A8_SNORM,
             VertexAttribSize::R16 => vk::Format::R16_SNORM,
             VertexAttribSize::R16G16 => vk::Format::R16G16_SNORM,
             VertexAttribSize::R16G16B16 => vk::Format::R16G16B16_SNORM,
@@ -372,9 +670,7 @@ pub fn vertex_format(
             VertexAttribSize::R8 | VertexAttribSize::A8 => vk::Format::R8_USCALED,
             VertexAttribSize::R8G8 | VertexAttribSize::G8R8 => vk::Format::R8G8_USCALED,
             VertexAttribSize::R8G8B8 => vk::Format::R8G8B8_USCALED,
-            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => {
-                vk::Format::R8G8B8A8_USCALED
-            }
+            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => vk::Format::R8G8B8A8_USCALED,
             VertexAttribSize::R16 => vk::Format::R16_USCALED,
             VertexAttribSize::R16G16 => vk::Format::R16G16_USCALED,
             VertexAttribSize::R16G16B16 => vk::Format::R16G16B16_USCALED,
@@ -386,9 +682,7 @@ pub fn vertex_format(
             VertexAttribSize::R8 | VertexAttribSize::A8 => vk::Format::R8_SSCALED,
             VertexAttribSize::R8G8 | VertexAttribSize::G8R8 => vk::Format::R8G8_SSCALED,
             VertexAttribSize::R8G8B8 => vk::Format::R8G8B8_SSCALED,
-            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => {
-                vk::Format::R8G8B8A8_SSCALED
-            }
+            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => vk::Format::R8G8B8A8_SSCALED,
             VertexAttribSize::R16 => vk::Format::R16_SSCALED,
             VertexAttribSize::R16G16 => vk::Format::R16G16_SSCALED,
             VertexAttribSize::R16G16B16 => vk::Format::R16G16B16_SSCALED,
@@ -400,9 +694,7 @@ pub fn vertex_format(
             VertexAttribSize::R8 | VertexAttribSize::A8 => vk::Format::R8_UINT,
             VertexAttribSize::R8G8 | VertexAttribSize::G8R8 => vk::Format::R8G8_UINT,
             VertexAttribSize::R8G8B8 => vk::Format::R8G8B8_UINT,
-            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => {
-                vk::Format::R8G8B8A8_UINT
-            }
+            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => vk::Format::R8G8B8A8_UINT,
             VertexAttribSize::R16 => vk::Format::R16_UINT,
             VertexAttribSize::R16G16 => vk::Format::R16G16_UINT,
             VertexAttribSize::R16G16B16 => vk::Format::R16G16B16_UINT,
@@ -418,9 +710,7 @@ pub fn vertex_format(
             VertexAttribSize::R8 | VertexAttribSize::A8 => vk::Format::R8_SINT,
             VertexAttribSize::R8G8 | VertexAttribSize::G8R8 => vk::Format::R8G8_SINT,
             VertexAttribSize::R8G8B8 => vk::Format::R8G8B8_SINT,
-            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => {
-                vk::Format::R8G8B8A8_SINT
-            }
+            VertexAttribSize::R8G8B8A8 | VertexAttribSize::X8B8G8R8 => vk::Format::R8G8B8A8_SINT,
             VertexAttribSize::R16 => vk::Format::R16_SINT,
             VertexAttribSize::R16G16 => vk::Format::R16G16_SINT,
             VertexAttribSize::R16G16B16 => vk::Format::R16G16B16_SINT,
@@ -606,10 +896,9 @@ pub fn msaa_mode(mode: MsaaMode) -> vk::SampleCountFlags {
         MsaaMode::Msaa2x2 | MsaaMode::Msaa2x2Vc4 | MsaaMode::Msaa2x2Vc12 => {
             vk::SampleCountFlags::TYPE_4
         }
-        MsaaMode::Msaa4x2
-        | MsaaMode::Msaa4x2D3d
-        | MsaaMode::Msaa4x2Vc8
-        | MsaaMode::Msaa4x2Vc24 => vk::SampleCountFlags::TYPE_8,
+        MsaaMode::Msaa4x2 | MsaaMode::Msaa4x2D3d | MsaaMode::Msaa4x2Vc8 | MsaaMode::Msaa4x2Vc24 => {
+            vk::SampleCountFlags::TYPE_8
+        }
         MsaaMode::Msaa4x4 => vk::SampleCountFlags::TYPE_16,
     }
 }
@@ -620,14 +909,8 @@ mod tests {
 
     #[test]
     fn test_shader_stage_vertex() {
-        assert_eq!(
-            shader_stage(Stage::VertexB),
-            vk::ShaderStageFlags::VERTEX
-        );
-        assert_eq!(
-            shader_stage(Stage::VertexA),
-            vk::ShaderStageFlags::VERTEX
-        );
+        assert_eq!(shader_stage(Stage::VertexB), vk::ShaderStageFlags::VERTEX);
+        assert_eq!(shader_stage(Stage::VertexA), vk::ShaderStageFlags::VERTEX);
     }
 
     #[test]
@@ -658,9 +941,18 @@ mod tests {
 
     #[test]
     fn test_index_format() {
-        assert_eq!(index_format(IndexFormat::UnsignedByte), vk::IndexType::UINT8_EXT);
-        assert_eq!(index_format(IndexFormat::UnsignedShort), vk::IndexType::UINT16);
-        assert_eq!(index_format(IndexFormat::UnsignedInt), vk::IndexType::UINT32);
+        assert_eq!(
+            index_format(IndexFormat::UnsignedByte),
+            vk::IndexType::UINT8_EXT
+        );
+        assert_eq!(
+            index_format(IndexFormat::UnsignedShort),
+            vk::IndexType::UINT16
+        );
+        assert_eq!(
+            index_format(IndexFormat::UnsignedInt),
+            vk::IndexType::UINT32
+        );
     }
 
     #[test]
@@ -704,9 +996,15 @@ mod tests {
 
     #[test]
     fn test_swizzle_source() {
-        assert_eq!(swizzle_source(SwizzleSource::Zero), vk::ComponentSwizzle::ZERO);
+        assert_eq!(
+            swizzle_source(SwizzleSource::Zero),
+            vk::ComponentSwizzle::ZERO
+        );
         assert_eq!(swizzle_source(SwizzleSource::R), vk::ComponentSwizzle::R);
-        assert_eq!(swizzle_source(SwizzleSource::OneInt), vk::ComponentSwizzle::ONE);
+        assert_eq!(
+            swizzle_source(SwizzleSource::OneInt),
+            vk::ComponentSwizzle::ONE
+        );
     }
 
     #[test]
@@ -764,7 +1062,11 @@ mod tests {
 
     #[test]
     fn test_vertex_format_float_r32g32b32a32() {
-        let fmt = vertex_format(false, VertexAttribType::Float, VertexAttribSize::R32G32B32A32);
+        let fmt = vertex_format(
+            false,
+            VertexAttribType::Float,
+            VertexAttribSize::R32G32B32A32,
+        );
         assert_eq!(fmt, vk::Format::R32G32B32A32_SFLOAT);
     }
 

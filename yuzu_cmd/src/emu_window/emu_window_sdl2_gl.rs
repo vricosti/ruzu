@@ -14,8 +14,8 @@
 //! context to implement the `GraphicsContext` interface (swap buffers,
 //! make-current / done-current).
 
-use std::ffi::CStr;
 use sdl2::sys as sdl;
+use std::ffi::CStr;
 
 use super::emu_window_sdl2::EmuWindowSdl2;
 
@@ -153,11 +153,8 @@ impl EmuWindowSdl2Gl {
         // Maps to SDL_GL_SetAttribute calls in upstream constructor.
         // macOS only supports up to OpenGL 4.1 core profile (no compatibility profile).
         #[cfg(target_os = "macos")]
-        let (gl_major, gl_minor, gl_profile) = (
-            4,
-            1,
-            sdl::SDL_GLprofile::SDL_GL_CONTEXT_PROFILE_CORE as i32,
-        );
+        let (gl_major, gl_minor, gl_profile) =
+            (4, 1, sdl::SDL_GLprofile::SDL_GL_CONTEXT_PROFILE_CORE as i32);
         #[cfg(not(target_os = "macos"))]
         let (gl_major, gl_minor, gl_profile) = (
             4,
@@ -167,10 +164,7 @@ impl EmuWindowSdl2Gl {
         unsafe {
             sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_CONTEXT_MAJOR_VERSION, gl_major);
             sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_CONTEXT_MINOR_VERSION, gl_minor);
-            sdl::SDL_GL_SetAttribute(
-                sdl::SDL_GLattr::SDL_GL_CONTEXT_PROFILE_MASK,
-                gl_profile,
-            );
+            sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_CONTEXT_PROFILE_MASK, gl_profile);
             sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_DOUBLEBUFFER, 1);
             sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_RED_SIZE, 8);
             sdl::SDL_GL_SetAttribute(sdl::SDL_GLattr::SDL_GL_GREEN_SIZE, 8);
@@ -256,7 +250,9 @@ impl EmuWindowSdl2Gl {
 
         // Maps to: OnResize(); OnMinimalClientAreaChangeRequest(...); SDL_PumpEvents()
         instance.base.on_resize();
-        instance.base.on_minimal_client_area_change_request(256, 256);
+        instance
+            .base
+            .on_minimal_client_area_change_request(256, 256);
         unsafe { sdl::SDL_PumpEvents() };
 
         // Log GL version info.

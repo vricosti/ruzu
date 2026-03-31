@@ -125,8 +125,7 @@ impl KResourceLimit {
         if self.m_current_values[index] + value <= self.m_limit_values[index] {
             self.m_current_values[index] += value;
             self.m_current_hints[index] += value;
-            self.m_peak_values[index] =
-                self.m_peak_values[index].max(self.m_current_values[index]);
+            self.m_peak_values[index] = self.m_peak_values[index].max(self.m_current_values[index]);
             return true;
         }
 
@@ -196,15 +195,27 @@ mod tests {
         rl.initialize();
         rl.set_limit_value(LimitableResource::PhysicalMemoryMax, 1000)
             .unwrap();
-        assert_eq!(rl.get_limit_value(LimitableResource::PhysicalMemoryMax), 1000);
-        assert_eq!(rl.get_free_value(LimitableResource::PhysicalMemoryMax), 1000);
+        assert_eq!(
+            rl.get_limit_value(LimitableResource::PhysicalMemoryMax),
+            1000
+        );
+        assert_eq!(
+            rl.get_free_value(LimitableResource::PhysicalMemoryMax),
+            1000
+        );
 
         assert!(rl.reserve(LimitableResource::PhysicalMemoryMax, 500));
-        assert_eq!(rl.get_current_value(LimitableResource::PhysicalMemoryMax), 500);
+        assert_eq!(
+            rl.get_current_value(LimitableResource::PhysicalMemoryMax),
+            500
+        );
         assert_eq!(rl.get_free_value(LimitableResource::PhysicalMemoryMax), 500);
 
         rl.release(LimitableResource::PhysicalMemoryMax, 500);
-        assert_eq!(rl.get_current_value(LimitableResource::PhysicalMemoryMax), 0);
+        assert_eq!(
+            rl.get_current_value(LimitableResource::PhysicalMemoryMax),
+            0
+        );
     }
 
     #[test]
@@ -216,7 +227,10 @@ mod tests {
         );
         assert_eq!(rl.get_limit_value(LimitableResource::ThreadCountMax), 800);
         assert_eq!(rl.get_limit_value(LimitableResource::EventCountMax), 900);
-        assert_eq!(rl.get_limit_value(LimitableResource::TransferMemoryCountMax), 200);
+        assert_eq!(
+            rl.get_limit_value(LimitableResource::TransferMemoryCountMax),
+            200
+        );
         assert_eq!(rl.get_limit_value(LimitableResource::SessionCountMax), 1133);
     }
 }

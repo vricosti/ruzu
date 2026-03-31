@@ -78,13 +78,12 @@ impl SDLSink {
             }
         };
 
-        let output_device = if target_device_name != AUTO_DEVICE_NAME
-            && !target_device_name.is_empty()
-        {
-            target_device_name.to_string()
-        } else {
-            String::new()
-        };
+        let output_device =
+            if target_device_name != AUTO_DEVICE_NAME && !target_device_name.is_empty() {
+                target_device_name.to_string()
+            } else {
+                String::new()
+            };
 
         Self {
             audio_subsystem,

@@ -41,9 +41,7 @@ impl Eq for PadIdentifier {}
 impl Hash for PadIdentifier {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Port of std::hash<PadIdentifier> from input_engine.h
-        let hash_value = self.guid.hash_value()
-            ^ ((self.port as u64) << 32)
-            ^ (self.pad as u64);
+        let hash_value = self.guid.hash_value() ^ ((self.port as u64) << 32) ^ (self.pad as u64);
         hash_value.hash(state);
     }
 }
@@ -466,11 +464,7 @@ impl InputEngine {
             );
             return BasicMotion::default();
         };
-        controller
-            .motions
-            .get(&motion)
-            .cloned()
-            .unwrap_or_default()
+        controller.motions.get(&motion).cloned().unwrap_or_default()
     }
 
     /// Port of InputEngine::GetCamera
@@ -510,11 +504,7 @@ impl InputEngine {
         let pairs: Vec<_> = self
             .controller_list
             .iter()
-            .flat_map(|(id, data)| {
-                data.buttons
-                    .keys()
-                    .map(move |&button| (id.clone(), button))
-            })
+            .flat_map(|(id, data)| data.buttons.keys().map(move |&button| (id.clone(), button)))
             .collect();
         for (id, button) in pairs {
             self.set_button(&id, button, false);
@@ -584,12 +574,8 @@ impl InputEngine {
     fn trigger_on_button_change(&self, identifier: &PadIdentifier, button: i32, value: bool) {
         let _lock = self.mutex_callback.lock();
         for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(
-                poller,
-                identifier,
-                EngineInputType::Button,
-                button,
-            ) {
+            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Button, button)
+            {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
@@ -658,12 +644,7 @@ impl InputEngine {
     fn trigger_on_axis_change(&self, identifier: &PadIdentifier, axis: i32, value: f32) {
         let _lock = self.mutex_callback.lock();
         for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(
-                poller,
-                identifier,
-                EngineInputType::Analog,
-                axis,
-            ) {
+            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Analog, axis) {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
@@ -692,12 +673,7 @@ impl InputEngine {
     fn trigger_on_battery_change(&self, identifier: &PadIdentifier, _value: BatteryLevel) {
         let _lock = self.mutex_callback.lock();
         for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(
-                poller,
-                identifier,
-                EngineInputType::Battery,
-                0,
-            ) {
+            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Battery, 0) {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
@@ -710,12 +686,7 @@ impl InputEngine {
     fn trigger_on_color_change(&self, identifier: &PadIdentifier, _value: BodyColorStatus) {
         let _lock = self.mutex_callback.lock();
         for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(
-                poller,
-                identifier,
-                EngineInputType::Color,
-                0,
-            ) {
+            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Color, 0) {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
@@ -733,12 +704,8 @@ impl InputEngine {
     ) {
         let _lock = self.mutex_callback.lock();
         for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(
-                poller,
-                identifier,
-                EngineInputType::Motion,
-                motion,
-            ) {
+            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Motion, motion)
+            {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
@@ -781,12 +748,7 @@ impl InputEngine {
     fn trigger_on_camera_change(&self, identifier: &PadIdentifier, _value: &CameraStatus) {
         let _lock = self.mutex_callback.lock();
         for poller in self.callback_list.values() {
-            if !Self::is_input_identifier_equal(
-                poller,
-                identifier,
-                EngineInputType::Camera,
-                0,
-            ) {
+            if !Self::is_input_identifier_equal(poller, identifier, EngineInputType::Camera, 0) {
                 continue;
             }
             if let Some(ref on_change) = poller.callback.on_change {
@@ -834,10 +796,7 @@ impl InputEngine {
 // free-standing helpers since InputEngine is used via composition.
 
 /// Default implementation for SetLeds virtual method
-pub fn default_set_leds(
-    _identifier: &PadIdentifier,
-    _led_status: &LedStatus,
-) -> DriverResult {
+pub fn default_set_leds(_identifier: &PadIdentifier, _led_status: &LedStatus) -> DriverResult {
     DriverResult::NotSupported
 }
 

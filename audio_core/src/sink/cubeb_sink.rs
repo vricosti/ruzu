@@ -155,9 +155,7 @@ impl Sink for CubebSink {
         let state_callback = |_: cubeb::State| {};
 
         let mut builder = cubeb::StreamBuilder::<i16>::new();
-        builder
-            .name(name.to_string())
-            .latency(minimum_latency);
+        builder.name(name.to_string()).latency(minimum_latency);
 
         if stream_type == StreamType::In {
             builder

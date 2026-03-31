@@ -80,7 +80,11 @@ fn hash_len0to16(s: &[u8]) -> u64 {
     if len >= 4 {
         let mul = K2.wrapping_add((len as u64) * 2);
         let a = fetch32(s);
-        return hash_len16_mul((len as u64).wrapping_add(a << 3), fetch32(&s[len - 4..]), mul);
+        return hash_len16_mul(
+            (len as u64).wrapping_add(a << 3),
+            fetch32(&s[len - 4..]),
+            mul,
+        );
     }
     if len > 0 {
         let a = s[0] as u64;
@@ -88,10 +92,8 @@ fn hash_len0to16(s: &[u8]) -> u64 {
         let c = s[len - 1] as u64;
         let y = a.wrapping_add(b << 8) as u32;
         let z = (len as u32).wrapping_add((c as u32) << 2);
-        return shift_mix(
-            (y as u64).wrapping_mul(K2) ^ (z as u64).wrapping_mul(K0),
-        )
-        .wrapping_mul(K2);
+        return shift_mix((y as u64).wrapping_mul(K2) ^ (z as u64).wrapping_mul(K0))
+            .wrapping_mul(K2);
     }
     K2
 }
@@ -107,12 +109,20 @@ fn hash_len17to32(s: &[u8]) -> u64 {
         rotate(a.wrapping_add(b), 43)
             .wrapping_add(rotate(c, 30))
             .wrapping_add(d),
-        a.wrapping_add(rotate(b.wrapping_add(K2), 18)).wrapping_add(c),
+        a.wrapping_add(rotate(b.wrapping_add(K2), 18))
+            .wrapping_add(c),
         mul,
     )
 }
 
-fn weak_hash_len32_with_seeds(w: u64, x: u64, y: u64, z: u64, mut a: u64, mut b: u64) -> (u64, u64) {
+fn weak_hash_len32_with_seeds(
+    w: u64,
+    x: u64,
+    y: u64,
+    z: u64,
+    mut a: u64,
+    mut b: u64,
+) -> (u64, u64) {
     a = a.wrapping_add(w);
     b = rotate(b.wrapping_add(a).wrapping_add(z), 21);
     let c = a;
@@ -144,18 +154,30 @@ fn hash_len33to64(s: &[u8]) -> u64 {
     let f = fetch64(&s[24..]).wrapping_mul(9);
     let g = fetch64(&s[len - 8..]);
     let h = fetch64(&s[len - 16..]).wrapping_mul(mul);
-    let u = rotate(a.wrapping_add(g), 43)
-        .wrapping_add(rotate(b, 30).wrapping_add(c).wrapping_mul(9));
+    let u =
+        rotate(a.wrapping_add(g), 43).wrapping_add(rotate(b, 30).wrapping_add(c).wrapping_mul(9));
     let v = ((a.wrapping_add(g)) ^ d).wrapping_add(f).wrapping_add(1);
-    let w = (u.wrapping_add(v)).wrapping_mul(mul).swap_bytes().wrapping_add(h);
+    let w = (u.wrapping_add(v))
+        .wrapping_mul(mul)
+        .swap_bytes()
+        .wrapping_add(h);
     let x = rotate(e.wrapping_add(f), 42).wrapping_add(c);
-    let y = ((v.wrapping_add(w)).wrapping_mul(mul).swap_bytes().wrapping_add(g)).wrapping_mul(mul);
+    let y = ((v.wrapping_add(w))
+        .wrapping_mul(mul)
+        .swap_bytes()
+        .wrapping_add(g))
+    .wrapping_mul(mul);
     let z = e.wrapping_add(f).wrapping_add(c);
     let a2 = ((x.wrapping_add(z)).wrapping_mul(mul).wrapping_add(y))
         .swap_bytes()
         .wrapping_add(b);
-    let b2 = shift_mix((z.wrapping_add(a2)).wrapping_mul(mul).wrapping_add(d).wrapping_add(h))
-        .wrapping_mul(mul);
+    let b2 = shift_mix(
+        (z.wrapping_add(a2))
+            .wrapping_mul(mul)
+            .wrapping_add(d)
+            .wrapping_add(h),
+    )
+    .wrapping_mul(mul);
     b2.wrapping_add(x)
 }
 
@@ -203,7 +225,11 @@ pub fn city_hash64(s: &[u8]) -> u64 {
         x ^= w.1;
         y = y.wrapping_add(v.0).wrapping_add(fetch64(&s[offset + 40..]));
         z = rotate(z.wrapping_add(w.0), 33).wrapping_mul(K1);
-        v = weak_hash_len32_with_seeds_from_buf(&s[offset..], v.1.wrapping_mul(K1), x.wrapping_add(w.0));
+        v = weak_hash_len32_with_seeds_from_buf(
+            &s[offset..],
+            v.1.wrapping_mul(K1),
+            x.wrapping_add(w.0),
+        );
         w = weak_hash_len32_with_seeds_from_buf(
             &s[offset + 32..],
             z.wrapping_add(w.1),
@@ -254,7 +280,10 @@ fn city_murmur(s: &[u8], seed: [u64; 2]) -> [u64; 2] {
     } else {
         // len > 16
         c = hash_len16(fetch64(&s[len - 8..]).wrapping_add(K1), a);
-        d = hash_len16(b.wrapping_add(len as u64), c.wrapping_add(fetch64(&s[len - 16..])));
+        d = hash_len16(
+            b.wrapping_add(len as u64),
+            c.wrapping_add(fetch64(&s[len - 16..])),
+        );
         a = a.wrapping_add(d);
         let mut offset = 0usize;
         let mut remaining = l;
@@ -293,10 +322,14 @@ pub fn city_hash128_with_seed(s: &[u8], seed: [u64; 2]) -> [u64; 2] {
     let mut z = (len as u64).wrapping_mul(K1);
 
     let v_first = rotate(y ^ K1, 49).wrapping_mul(K1).wrapping_add(fetch64(s));
-    let v_second = rotate(v_first, 42).wrapping_mul(K1).wrapping_add(fetch64(&s[8..]));
+    let v_second = rotate(v_first, 42)
+        .wrapping_mul(K1)
+        .wrapping_add(fetch64(&s[8..]));
     v = (v_first, v_second);
 
-    let w_first = rotate(y.wrapping_add(z), 35).wrapping_mul(K1).wrapping_add(x);
+    let w_first = rotate(y.wrapping_add(z), 35)
+        .wrapping_mul(K1)
+        .wrapping_add(x);
     let w_second = rotate(x.wrapping_add(fetch64(&s[88..])), 53).wrapping_mul(K1);
     w = (w_first, w_second);
 
@@ -306,17 +339,25 @@ pub fn city_hash128_with_seed(s: &[u8], seed: [u64; 2]) -> [u64; 2] {
     loop {
         // First 64-byte chunk
         x = rotate(
-            x.wrapping_add(y).wrapping_add(v.0).wrapping_add(fetch64(&s[offset + 8..])),
+            x.wrapping_add(y)
+                .wrapping_add(v.0)
+                .wrapping_add(fetch64(&s[offset + 8..])),
             37,
-        ).wrapping_mul(K1);
+        )
+        .wrapping_mul(K1);
         y = rotate(
             y.wrapping_add(v.1).wrapping_add(fetch64(&s[offset + 48..])),
             42,
-        ).wrapping_mul(K1);
+        )
+        .wrapping_mul(K1);
         x ^= w.1;
         y = y.wrapping_add(v.0).wrapping_add(fetch64(&s[offset + 40..]));
         z = rotate(z.wrapping_add(w.0), 33).wrapping_mul(K1);
-        v = weak_hash_len32_with_seeds_from_buf(&s[offset..], v.1.wrapping_mul(K1), x.wrapping_add(w.0));
+        v = weak_hash_len32_with_seeds_from_buf(
+            &s[offset..],
+            v.1.wrapping_mul(K1),
+            x.wrapping_add(w.0),
+        );
         w = weak_hash_len32_with_seeds_from_buf(
             &s[offset + 32..],
             z.wrapping_add(w.1),
@@ -327,17 +368,25 @@ pub fn city_hash128_with_seed(s: &[u8], seed: [u64; 2]) -> [u64; 2] {
 
         // Second 64-byte chunk
         x = rotate(
-            x.wrapping_add(y).wrapping_add(v.0).wrapping_add(fetch64(&s[offset + 8..])),
+            x.wrapping_add(y)
+                .wrapping_add(v.0)
+                .wrapping_add(fetch64(&s[offset + 8..])),
             37,
-        ).wrapping_mul(K1);
+        )
+        .wrapping_mul(K1);
         y = rotate(
             y.wrapping_add(v.1).wrapping_add(fetch64(&s[offset + 48..])),
             42,
-        ).wrapping_mul(K1);
+        )
+        .wrapping_mul(K1);
         x ^= w.1;
         y = y.wrapping_add(v.0).wrapping_add(fetch64(&s[offset + 40..]));
         z = rotate(z.wrapping_add(w.0), 33).wrapping_mul(K1);
-        v = weak_hash_len32_with_seeds_from_buf(&s[offset..], v.1.wrapping_mul(K1), x.wrapping_add(w.0));
+        v = weak_hash_len32_with_seeds_from_buf(
+            &s[offset..],
+            v.1.wrapping_mul(K1),
+            x.wrapping_add(w.0),
+        );
         w = weak_hash_len32_with_seeds_from_buf(
             &s[offset + 32..],
             z.wrapping_add(w.1),
@@ -362,8 +411,11 @@ pub fn city_hash128_with_seed(s: &[u8], seed: [u64; 2]) -> [u64; 2] {
     let mut tail_done = 0;
     while tail_done < remaining {
         tail_done += 32;
-        y = rotate(x.wrapping_add(y), 42).wrapping_mul(K0).wrapping_add(v.1);
-        w.0 = w.0.wrapping_add(fetch64(&s[offset + remaining - tail_done + 16..]));
+        y = rotate(x.wrapping_add(y), 42)
+            .wrapping_mul(K0)
+            .wrapping_add(v.1);
+        w.0 =
+            w.0.wrapping_add(fetch64(&s[offset + remaining - tail_done + 16..]));
         x = x.wrapping_mul(K0).wrapping_add(w.0);
         z = z.wrapping_add(w.1.wrapping_add(fetch64(&s[offset + remaining - tail_done..])));
         w.1 = w.1.wrapping_add(v.0);

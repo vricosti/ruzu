@@ -9,11 +9,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::power_state_request_manager::PowerStateRequestManager;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::power_state_request_manager::PowerStateRequestManager;
 
 /// IPC command IDs for IPowerStateRequestHandler.
 ///
@@ -40,8 +40,16 @@ pub struct PowerStateRequestHandler {
 impl PowerStateRequestHandler {
     pub fn new(power_state_request_manager: Arc<PowerStateRequestManager>) -> Self {
         let handlers = build_handler_map(&[
-            (commands::GET_POWER_STATE_REQUEST_EVENT_READABLE_HANDLE, None, "GetPowerStateRequestEventReadableHandle"),
-            (commands::GET_AND_CLEAR_POWER_STATE_REQUEST, None, "GetAndClearPowerStateRequest"),
+            (
+                commands::GET_POWER_STATE_REQUEST_EVENT_READABLE_HANDLE,
+                None,
+                "GetPowerStateRequestEventReadableHandle",
+            ),
+            (
+                commands::GET_AND_CLEAR_POWER_STATE_REQUEST,
+                None,
+                "GetAndClearPowerStateRequest",
+            ),
         ]);
         Self {
             power_state_request_manager,

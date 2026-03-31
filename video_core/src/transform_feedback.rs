@@ -108,7 +108,7 @@ const VECTORS: [u32; 44] = [
     208, // gl_TexCoord[4]
     212, // gl_TexCoord[5]
     216, // gl_TexCoord[6]
-    // 220, // gl_TexCoord[7] -- not included since array is 44
+         // 220, // gl_TexCoord[7] -- not included since array is 44
 ];
 
 /// Generate transform feedback varyings from the given state.

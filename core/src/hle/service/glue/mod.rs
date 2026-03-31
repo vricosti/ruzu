@@ -14,11 +14,11 @@
 //!            pm_state_change_handler, standard_steady_clock_resource,
 //!            time_zone, time_zone_binary, worker)
 
-pub mod glue;
-pub mod errors;
 pub mod arp;
 pub mod bgtc;
 pub mod ectx;
-pub mod notif;
+pub mod errors;
+pub mod glue;
 pub mod glue_manager;
+pub mod notif;
 pub mod time;

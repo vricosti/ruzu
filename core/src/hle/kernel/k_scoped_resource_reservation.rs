@@ -5,8 +5,8 @@
 //! KScopedResourceReservation: RAII guard that reserves a resource from a
 //! KResourceLimit and releases it on drop unless committed.
 
-use std::sync::{Arc, Mutex};
 use super::k_resource_limit::{KResourceLimit, LimitableResource};
+use std::sync::{Arc, Mutex};
 
 /// RAII guard for resource limit reservations.
 ///

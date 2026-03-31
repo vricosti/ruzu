@@ -3,8 +3,8 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_add.cpp
 
-use super::{bit, field, TranslatorVisitor};
 use super::half_floating_point_helper::{extract, merge_result, Merge, Swizzle};
+use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::Value;
 
 /// Core HADD2 implementation (both inner `HADD2` overloads from upstream).
@@ -22,7 +22,7 @@ fn hadd2_inner(
     swizzle_b: Swizzle,
     src_b: Value,
 ) {
-    let dest_reg  = field(insn, 0, 8);
+    let dest_reg = field(insn, 0, 8);
     let src_a_reg = field(insn, 8, 8);
     let src_a_val = tv.x(src_a_reg);
 
@@ -90,11 +90,11 @@ fn hadd2_inner(
 
 /// Decode common modifier fields shared by reg/cbuf variants.
 fn hadd2_mods(tv: &mut TranslatorVisitor, insn: u64) -> (Merge, bool, bool, bool, bool, Swizzle) {
-    let merge     = Merge::from_u32(field(insn, 49, 2));
-    let ftz       = bit(insn, 39);
-    let neg_a     = bit(insn, 43);
-    let abs_a     = bit(insn, 44);
-    let sat       = false; // sat decoded per-variant
+    let merge = Merge::from_u32(field(insn, 49, 2));
+    let ftz = bit(insn, 39);
+    let neg_a = bit(insn, 43);
+    let abs_a = bit(insn, 44);
+    let sat = false; // sat decoded per-variant
     let swizzle_a = Swizzle::from_u32(field(insn, 47, 2));
     let _ = sat;
     (merge, ftz, neg_a, abs_a, false, swizzle_a)
@@ -102,50 +102,91 @@ fn hadd2_mods(tv: &mut TranslatorVisitor, insn: u64) -> (Merge, bool, bool, bool
 
 /// HADD2_reg — source B from register (bit [20:8]).
 pub fn hadd2_reg(tv: &mut TranslatorVisitor, insn: u64) {
-    let sat       = bit(insn, 32);
-    let neg_b     = bit(insn, 31);
-    let abs_b     = bit(insn, 30);
+    let sat = bit(insn, 32);
+    let neg_b = bit(insn, 31);
+    let abs_b = bit(insn, 30);
     let swizzle_b = Swizzle::from_u32(field(insn, 28, 2));
     let (merge, ftz, neg_a, abs_a, _, swizzle_a) = hadd2_mods(tv, insn);
     let src_b = tv.get_reg20(insn);
-    hadd2_inner(tv, insn, merge, ftz, sat, abs_a, neg_a, swizzle_a, abs_b, neg_b, swizzle_b, src_b);
+    hadd2_inner(
+        tv, insn, merge, ftz, sat, abs_a, neg_a, swizzle_a, abs_b, neg_b, swizzle_b, src_b,
+    );
 }
 
 /// HADD2_cbuf — source B from constant buffer.
 pub fn hadd2_cbuf(tv: &mut TranslatorVisitor, insn: u64) {
-    let sat   = bit(insn, 52);
+    let sat = bit(insn, 52);
     let neg_b = bit(insn, 56);
     let abs_b = bit(insn, 54);
     let (merge, ftz, neg_a, abs_a, _, swizzle_a) = hadd2_mods(tv, insn);
     let src_b = tv.get_cbuf(insn);
-    hadd2_inner(tv, insn, merge, ftz, sat, abs_a, neg_a, swizzle_a, abs_b, neg_b, Swizzle::F32, src_b);
+    hadd2_inner(
+        tv,
+        insn,
+        merge,
+        ftz,
+        sat,
+        abs_a,
+        neg_a,
+        swizzle_a,
+        abs_b,
+        neg_b,
+        Swizzle::F32,
+        src_b,
+    );
 }
 
 /// HADD2_imm — source B from 16-bit immediate pair.
 pub fn hadd2_imm(tv: &mut TranslatorVisitor, insn: u64) {
-    let sat      = bit(insn, 52);
+    let sat = bit(insn, 52);
     let neg_high = bit(insn, 56);
-    let high     = field(insn, 30, 9);
-    let neg_low  = bit(insn, 29);
-    let low      = field(insn, 20, 9);
+    let high = field(insn, 30, 9);
+    let neg_low = bit(insn, 29);
+    let low = field(insn, 20, 9);
     let imm: u32 = (low << 6)
-        | (if neg_low  { 1u32 } else { 0u32 } << 15)
+        | (if neg_low { 1u32 } else { 0u32 } << 15)
         | (high << 22)
         | (if neg_high { 1u32 } else { 0u32 } << 31);
     let (merge, ftz, neg_a, abs_a, _, swizzle_a) = hadd2_mods(tv, insn);
     let src_b = Value::ImmU32(imm);
-    hadd2_inner(tv, insn, merge, ftz, sat, abs_a, neg_a, swizzle_a, false, false, Swizzle::H1H0, src_b);
+    hadd2_inner(
+        tv,
+        insn,
+        merge,
+        ftz,
+        sat,
+        abs_a,
+        neg_a,
+        swizzle_a,
+        false,
+        false,
+        Swizzle::H1H0,
+        src_b,
+    );
 }
 
 /// HADD2_32I — source B from 32-bit immediate; uses explicit Merge::H1H0 and individual fields.
 pub fn hadd2_32i(tv: &mut TranslatorVisitor, insn: u64) {
-    let ftz       = bit(insn, 55);
-    let sat       = bit(insn, 52);
-    let neg_a     = bit(insn, 56);
+    let ftz = bit(insn, 55);
+    let sat = bit(insn, 52);
+    let neg_a = bit(insn, 56);
     let swizzle_a = Swizzle::from_u32(field(insn, 53, 2));
-    let imm: u32  = field(insn, 20, 32);
-    let src_b     = Value::ImmU32(imm);
-    hadd2_inner(tv, insn, Merge::H1H0, ftz, sat, false, neg_a, swizzle_a, false, false, Swizzle::H1H0, src_b);
+    let imm: u32 = field(insn, 20, 32);
+    let src_b = Value::ImmU32(imm);
+    hadd2_inner(
+        tv,
+        insn,
+        Merge::H1H0,
+        ftz,
+        sat,
+        false,
+        neg_a,
+        swizzle_a,
+        false,
+        false,
+        Swizzle::H1H0,
+        src_b,
+    );
 }
 
 /// Public entry-point stub used when a single dispatch opcode covers HADD2.

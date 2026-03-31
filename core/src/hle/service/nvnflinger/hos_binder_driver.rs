@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -33,10 +33,7 @@ pub struct IHosBinderDriver {
 }
 
 impl IHosBinderDriver {
-    pub fn new(
-        server: Arc<HosBinderDriverServer>,
-        surface_flinger: Arc<SurfaceFlinger>,
-    ) -> Self {
+    pub fn new(server: Arc<HosBinderDriverServer>, surface_flinger: Arc<SurfaceFlinger>) -> Self {
         Self {
             server,
             surface_flinger,
@@ -44,7 +41,11 @@ impl IHosBinderDriver {
                 (0, Some(Self::transact_parcel_handler), "TransactParcel"),
                 (1, Some(Self::adjust_refcount_handler), "AdjustRefcount"),
                 (2, Some(Self::get_native_handle_handler), "GetNativeHandle"),
-                (3, Some(Self::transact_parcel_auto_handler), "TransactParcelAuto"),
+                (
+                    3,
+                    Some(Self::transact_parcel_auto_handler),
+                    "TransactParcelAuto",
+                ),
             ]),
             handlers_tipc: BTreeMap::new(),
         }
@@ -71,7 +72,9 @@ impl IHosBinderDriver {
 
         log::debug!(
             "IHOSBinderDriver::TransactParcel id={}, transaction={}, flags={}",
-            id, transaction_id, flags
+            id,
+            transaction_id,
+            flags
         );
 
         let parcel_data = ctx.read_buffer(0);
@@ -82,7 +85,9 @@ impl IHosBinderDriver {
             binder.transact(transaction_id, &parcel_data, &mut parcel_reply, flags);
             log::info!(
                 "TransactParcel response: id={} txn={} reply_len={} first_bytes=[{:02x?}]",
-                id, transaction_id, parcel_reply.len(),
+                id,
+                transaction_id,
+                parcel_reply.len(),
                 &parcel_reply[..parcel_reply.len().min(32)]
             );
         } else {
@@ -112,7 +117,9 @@ impl IHosBinderDriver {
         let type_val = rp.pop_i32();
         log::warn!(
             "IHOSBinderDriver::AdjustRefcount (STUBBED) id={}, addval={}, type={}",
-            id, addval, type_val
+            id,
+            addval,
+            type_val
         );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -124,25 +131,46 @@ impl IHosBinderDriver {
         let mut rp = RequestParser::new(ctx);
         let id = rp.pop_i32();
         let type_id = rp.pop_u32();
-        log::warn!(
-            "IHOSBinderDriver::GetNativeHandle (STUBBED) id={}, type_id={}",
-            id, type_id
+        log::debug!(
+            "IHOSBinderDriver::GetNativeHandle id={}, type_id={}",
+            id,
+            type_id
         );
+        let Some(binder) = svc.server.try_get_binder(id) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
 
-        // Upstream returns a copy handle to a KReadableEvent from the binder's
-        // buffer queue (buffer-available event). When a buffer is available for
-        // dequeue, this event is signaled.
-        // For now, create a pre-signaled event so the game doesn't block.
-        // TODO: wire to actual buffer queue buffer-available signaling.
-        if let Some(handle) = ctx.create_readable_event_handle(true) {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
-        } else {
+        let Some(readable_event) = binder.get_native_handle(type_id) else {
             let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
             rb.push_result(RESULT_SUCCESS);
             rb.push_copy_objects(0);
+            return;
+        };
+
+        if let Some(thread) = ctx.get_thread() {
+            let thread_guard = thread.lock().unwrap();
+            if let (Some(parent), Some(scheduler)) = (
+                thread_guard
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| parent.upgrade()),
+                thread_guard
+                    .scheduler
+                    .as_ref()
+                    .and_then(|scheduler| scheduler.upgrade()),
+            ) {
+                binder.register_native_handle_owner(parent, scheduler);
+            }
         }
+
+        let handle = ctx
+            .copy_handle_for_readable_event(readable_event)
+            .unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
     }
 
     /// cmd 3: TransactParcelAuto (same as TransactParcel but with AutoSelect buffers)

@@ -3,8 +3,8 @@
 
 //! SPIR-V barrier emission — maps to zuyu's `backend/spirv/emit_spirv_barriers.cpp`.
 
-use rspirv::spirv;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv;
 
 /// Emit a memory barrier at the given scope.
 ///

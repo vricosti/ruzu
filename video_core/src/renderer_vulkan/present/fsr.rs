@@ -155,11 +155,8 @@ impl Fsr {
         // Create descriptor sets (2 per image, one for EASU and one for RCAS)
         let layouts = vec![descriptor_set_layout; MAX_FSR_STAGE];
         for imgs in &mut dynamic_images {
-            imgs.descriptor_sets = util::create_wrapped_descriptor_sets(
-                &device,
-                descriptor_pool,
-                &layouts,
-            );
+            imgs.descriptor_sets =
+                util::create_wrapped_descriptor_sets(&device, descriptor_pool, &layouts);
         }
 
         // Pipeline layout with push constants

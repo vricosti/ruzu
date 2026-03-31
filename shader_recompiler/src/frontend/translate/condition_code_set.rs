@@ -17,7 +17,10 @@ use super::TranslatorVisitor;
 ///
 /// Not fully implemented: requires condition-code flag IR (GetZFlag / GetFlowTestResult).
 pub fn cset(tv: &mut TranslatorVisitor, insn: u64) {
-    log::warn!("CSET: condition code IR not yet ported — emitting zero result (insn={:#018x})", insn);
+    log::warn!(
+        "CSET: condition code IR not yet ported — emitting zero result (insn={:#018x})",
+        insn
+    );
     let dst = tv.dst_reg(insn);
     tv.set_x(dst, crate::ir::value::Value::ImmU32(0));
 }
@@ -28,11 +31,15 @@ pub fn cset(tv: &mut TranslatorVisitor, insn: u64) {
 ///
 /// Not fully implemented: requires condition-code flag IR (GetFlowTestResult).
 pub fn csetp(tv: &mut TranslatorVisitor, insn: u64) {
-    log::warn!("CSETP: condition code IR not yet ported — emitting false predicates (insn={:#018x})", insn);
+    log::warn!(
+        "CSETP: condition code IR not yet ported — emitting false predicates (insn={:#018x})",
+        insn
+    );
     // Set both destination predicates to false.
     let dst_pred_b = super::field(insn, 0, 3);
     let dst_pred_a = super::field(insn, 3, 3);
     let f = tv.ir.imm_u1(false);
-    tv.ir.set_pred(crate::ir::value::Pred(dst_pred_b as u8), f.clone());
+    tv.ir
+        .set_pred(crate::ir::value::Pred(dst_pred_b as u8), f.clone());
     tv.ir.set_pred(crate::ir::value::Pred(dst_pred_a as u8), f);
 }

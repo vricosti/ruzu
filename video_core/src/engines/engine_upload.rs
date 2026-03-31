@@ -180,15 +180,10 @@ impl State {
     /// Append multiple data words to the transfer buffer with flush context.
     ///
     /// Corresponds to `State::ProcessData(const u32*, size_t)`.
-    pub fn process_data_multi_with_ctx(
-        &mut self,
-        data: &[u32],
-        ctx: &mut FlushContext<'_>,
-    ) {
+    pub fn process_data_multi_with_ctx(&mut self, data: &[u32], ctx: &mut FlushContext<'_>) {
         // Safe conversion: reinterpret &[u32] as &[u8] matching C++ reinterpret_cast.
-        let byte_view: &[u8] = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-        };
+        let byte_view: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         let buffer: Vec<u8> = byte_view.to_vec();
         self.process_data_bytes(&buffer, ctx);
     }
@@ -210,8 +205,7 @@ impl State {
         let sub_copy_size = std::cmp::min(4, self.copy_size - self.write_offset) as usize;
         let bytes = data.to_le_bytes();
         let offset = self.write_offset as usize;
-        self.inner_buffer[offset..offset + sub_copy_size]
-            .copy_from_slice(&bytes[..sub_copy_size]);
+        self.inner_buffer[offset..offset + sub_copy_size].copy_from_slice(&bytes[..sub_copy_size]);
         self.write_offset += sub_copy_size as u32;
     }
 
@@ -221,11 +215,7 @@ impl State {
     /// Upstream logic:
     ///   - Linear: iterate lines, call rasterizer->AccelerateInlineToMemory per line.
     ///   - Block-linear: compute BPP shift, read GPU memory, swizzle subrect, write back.
-    fn process_data_bytes(
-        &mut self,
-        read_buffer: &[u8],
-        ctx: &mut FlushContext<'_>,
-    ) {
+    fn process_data_bytes(&mut self, read_buffer: &[u8], ctx: &mut FlushContext<'_>) {
         let address = self.regs.dest.address();
         if self.is_linear {
             // Linear copy: iterate lines, call rasterizer->AccelerateInlineToMemory

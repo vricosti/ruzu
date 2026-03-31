@@ -65,11 +65,7 @@ unsafe impl Send for ArmNce {}
 
 impl ArmNce {
     /// Corresponds to upstream `ArmNce::ArmNce(System&, bool, size_t)`.
-    pub fn new(
-        system: *mut std::ffi::c_void,
-        _uses_wall_clock: bool,
-        core_index: usize,
-    ) -> Self {
+    pub fn new(system: *mut std::ffi::c_void, _uses_wall_clock: bool, core_index: usize) -> Self {
         let mut nce = Self {
             system,
             core_index,
@@ -221,8 +217,11 @@ impl ArmNce {
                 // The signal handler (BreakFromRunCodeSignalHandler) will
                 // save guest context and return to the host.
                 unsafe {
-                    libc::syscall(libc::SYS_tkill, self.thread_id as libc::c_long,
-                                  BREAK_FROM_RUN_CODE_SIGNAL as libc::c_long);
+                    libc::syscall(
+                        libc::SYS_tkill,
+                        self.thread_id as libc::c_long,
+                        BREAK_FROM_RUN_CODE_SIGNAL as libc::c_long,
+                    );
                 }
             }
         }

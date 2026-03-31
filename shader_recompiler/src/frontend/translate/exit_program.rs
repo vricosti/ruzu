@@ -42,9 +42,13 @@ impl<'a> TranslatorVisitor<'a> {
         let r1 = self.f(1);
         let r2 = self.f(2);
         let r3 = self.f(3);
-        self.ir.set_frag_color(Value::ImmU32(0), Value::ImmU32(0), r0);
-        self.ir.set_frag_color(Value::ImmU32(0), Value::ImmU32(1), r1);
-        self.ir.set_frag_color(Value::ImmU32(0), Value::ImmU32(2), r2);
-        self.ir.set_frag_color(Value::ImmU32(0), Value::ImmU32(3), r3);
+        self.ir
+            .set_frag_color(Value::ImmU32(0), Value::ImmU32(0), r0);
+        self.ir
+            .set_frag_color(Value::ImmU32(0), Value::ImmU32(1), r1);
+        self.ir
+            .set_frag_color(Value::ImmU32(0), Value::ImmU32(2), r2);
+        self.ir
+            .set_frag_color(Value::ImmU32(0), Value::ImmU32(3), r3);
     }
 }

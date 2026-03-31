@@ -102,7 +102,10 @@ impl fmt::Display for Type {
 impl Type {
     /// Check if this is a scalar integer type.
     pub fn is_integer(self) -> bool {
-        matches!(self, Type::U1 | Type::U8 | Type::U16 | Type::U32 | Type::U64)
+        matches!(
+            self,
+            Type::U1 | Type::U8 | Type::U16 | Type::U32 | Type::U64
+        )
     }
 
     /// Check if this is a scalar float type.

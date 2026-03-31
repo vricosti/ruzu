@@ -86,13 +86,19 @@ impl VfsFile for OffsetVfsFile {
     }
 
     fn read(&self, data: &mut [u8], length: usize, r_offset: usize) -> usize {
-        self.file
-            .read(data, self.trim_to_fit(length, r_offset), self.offset + r_offset)
+        self.file.read(
+            data,
+            self.trim_to_fit(length, r_offset),
+            self.offset + r_offset,
+        )
     }
 
     fn write(&self, data: &[u8], length: usize, r_offset: usize) -> usize {
-        self.file
-            .write(data, self.trim_to_fit(length, r_offset), self.offset + r_offset)
+        self.file.write(
+            data,
+            self.trim_to_fit(length, r_offset),
+            self.offset + r_offset,
+        )
     }
 
     fn read_byte(&self, r_offset: usize) -> Option<u8> {
@@ -186,11 +192,8 @@ mod tests {
 
     #[test]
     fn test_offset_vfs_file_name_fallback() {
-        let backing: VirtualFile = Arc::new(VectorVfsFile::new(
-            vec![0],
-            "backing.bin".to_string(),
-            None,
-        ));
+        let backing: VirtualFile =
+            Arc::new(VectorVfsFile::new(vec![0], "backing.bin".to_string(), None));
         let offset_file = OffsetVfsFile::new(backing, 1, 0, String::new());
         assert_eq!(offset_file.get_name(), "backing.bin");
     }

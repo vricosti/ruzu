@@ -53,7 +53,8 @@ impl KEvent {
             return RESULT_SUCCESS.get_inner_value();
         }
 
-        let Some(readable_event) = process.get_readable_event_by_object_id(self.readable_event_id) else {
+        let Some(readable_event) = process.get_readable_event_by_object_id(self.readable_event_id)
+        else {
             return RESULT_SUCCESS.get_inner_value();
         };
         let result = readable_event.lock().unwrap().signal(process, scheduler);
@@ -67,7 +68,8 @@ impl KEvent {
             return RESULT_SUCCESS.get_inner_value();
         }
 
-        let Some(readable_event) = process.get_readable_event_by_object_id(self.readable_event_id) else {
+        let Some(readable_event) = process.get_readable_event_by_object_id(self.readable_event_id)
+        else {
             return RESULT_SUCCESS.get_inner_value();
         };
         let result = readable_event.lock().unwrap().clear();

@@ -28,13 +28,7 @@ impl NvDispDisp0 {
 }
 
 impl NvDevice for NvDispDisp0 {
-    fn ioctl1(
-        &self,
-        _fd: DeviceFD,
-        command: Ioctl,
-        _input: &[u8],
-        _output: &mut [u8],
-    ) -> NvResult {
+    fn ioctl1(&self, _fd: DeviceFD, command: Ioctl, _input: &[u8], _output: &mut [u8]) -> NvResult {
         log::error!("Unimplemented ioctl={:08X}", command.raw);
         NvResult::NotImplemented
     }
@@ -69,7 +63,9 @@ impl NvDevice for NvDispDisp0 {
     fn query_event(
         &self,
         event_id: u32,
-    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>> {
+    ) -> Option<
+        std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>,
+    > {
         log::error!("Unknown DISP Event {}", event_id);
         None
     }

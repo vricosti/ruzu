@@ -18,8 +18,8 @@
 //! `CreateSharedContext` returns a `DummyContext` — Vulkan does not need a
 //! shared GL-style context.
 
-use std::ffi::CStr;
 use sdl2::sys as sdl;
+use std::ffi::CStr;
 
 use super::emu_window_sdl2::{DummyContext, EmuWindowSdl2};
 
@@ -80,10 +80,7 @@ impl EmuWindowSdl2Vk {
         let wm_result = unsafe { sdl::SDL_GetWindowWMInfo(render_window, &mut wm) };
         if wm_result == sdl::SDL_bool::SDL_FALSE {
             let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();
-            log::error!(
-                "Failed to get information from the window manager: {}",
-                err
-            );
+            log::error!("Failed to get information from the window manager: {}", err);
             std::process::exit(1);
         }
 

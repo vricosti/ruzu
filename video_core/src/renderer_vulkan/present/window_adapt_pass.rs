@@ -68,11 +68,8 @@ impl WindowAdaptPass {
         let vertex_shader = vk::ShaderModule::null();
 
         // Create render pass
-        let render_pass = util::create_wrapped_render_pass(
-            &device,
-            frame_format,
-            vk::ImageLayout::UNDEFINED,
-        );
+        let render_pass =
+            util::create_wrapped_render_pass(&device, frame_format, vk::ImageLayout::UNDEFINED);
 
         // Create pipelines
         let opaque_pipeline = util::create_wrapped_pipeline(
@@ -163,9 +160,7 @@ impl WindowAdaptPass {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 color_attachment: 0,
                 clear_value: vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: bg_color,
-                    },
+                    color: vk::ClearColorValue { float32: bg_color },
                 },
             };
             let clear_rect = vk::ClearRect {
@@ -181,8 +176,11 @@ impl WindowAdaptPass {
 
             // Draw each layer
             for i in 0..layer_count {
-                self.device
-                    .cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, graphics_pipelines[i]);
+                self.device.cmd_bind_pipeline(
+                    cmdbuf,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    graphics_pipelines[i],
+                );
 
                 let constants_bytes: &[u8] = std::slice::from_raw_parts(
                     &push_constants_list[i] as *const PresentPushConstants as *const u8,

@@ -8,13 +8,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::arm::arm_interface::{
-    ArmInterface, ArmInterfaceBase, Architecture, DebugWatchpoint, HaltReason, KProcess,
-    KThread, ThreadContext,
+    Architecture, ArmInterface, ArmInterfaceBase, DebugWatchpoint, HaltReason, KProcess, KThread,
+    ThreadContext,
 };
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
 
-use rdynarmic::jit_config::{UserCallbacks, JitConfig, OptimizationFlag};
+use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
 /// Translate rdynarmic's HaltReason to core's HaltReason.
 ///
@@ -78,7 +78,8 @@ struct DynarmicCallbacks64 {
     /// Last exception address reported by dynarmic.
     last_exception_address: Arc<AtomicU64>,
     /// Shared exclusive monitor backing Dynarmic's global monitor state.
-    exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
+    exclusive_monitor:
+        *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
     /// CPU core index associated with this callback/JIT instance.
     core_index: usize,
 }
@@ -148,26 +149,38 @@ impl UserCallbacks for DynarmicCallbacks64 {
 
     fn memory_read_8(&self, vaddr: u64) -> u8 {
         self.check_memory_access(vaddr, 1);
-        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_8(vaddr) }
-        else { self.memory.read().unwrap().read_8(vaddr) }
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().read_8(vaddr)
+        } else {
+            self.memory.read().unwrap().read_8(vaddr)
+        }
     }
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
         self.check_memory_access(vaddr, 2);
-        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_16(vaddr) }
-        else { self.memory.read().unwrap().read_16(vaddr) }
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().read_16(vaddr)
+        } else {
+            self.memory.read().unwrap().read_16(vaddr)
+        }
     }
 
     fn memory_read_32(&self, vaddr: u64) -> u32 {
         self.check_memory_access(vaddr, 4);
-        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_32(vaddr) }
-        else { self.memory.read().unwrap().read_32(vaddr) }
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().read_32(vaddr)
+        } else {
+            self.memory.read().unwrap().read_32(vaddr)
+        }
     }
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
         self.check_memory_access(vaddr, 8);
-        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().read_64(vaddr) }
-        else { self.memory.read().unwrap().read_64(vaddr) }
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().read_64(vaddr)
+        } else {
+            self.memory.read().unwrap().read_64(vaddr)
+        }
     }
 
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
@@ -182,31 +195,53 @@ impl UserCallbacks for DynarmicCallbacks64 {
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
-        if !self.check_memory_access(vaddr, 1) { return; }
-        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_8(vaddr, value); }
-        else { self.memory.write().unwrap().write_8(vaddr, value); }
+        if !self.check_memory_access(vaddr, 1) {
+            return;
+        }
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().write_8(vaddr, value);
+        } else {
+            self.memory.write().unwrap().write_8(vaddr, value);
+        }
     }
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
-        if !self.check_memory_access(vaddr, 2) { return; }
-        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_16(vaddr, value); }
-        else { self.memory.write().unwrap().write_16(vaddr, value); }
+        if !self.check_memory_access(vaddr, 2) {
+            return;
+        }
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().write_16(vaddr, value);
+        } else {
+            self.memory.write().unwrap().write_16(vaddr, value);
+        }
     }
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
-        if !self.check_memory_access(vaddr, 4) { return; }
-        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_32(vaddr, value); }
-        else { self.memory.write().unwrap().write_32(vaddr, value); }
+        if !self.check_memory_access(vaddr, 4) {
+            return;
+        }
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().write_32(vaddr, value);
+        } else {
+            self.memory.write().unwrap().write_32(vaddr, value);
+        }
     }
 
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
-        if !self.check_memory_access(vaddr, 8) { return; }
-        if let Some(ref cm) = self.core_memory { cm.lock().unwrap().write_64(vaddr, value); }
-        else { self.memory.write().unwrap().write_64(vaddr, value); }
+        if !self.check_memory_access(vaddr, 8) {
+            return;
+        }
+        if let Some(ref cm) = self.core_memory {
+            cm.lock().unwrap().write_64(vaddr, value);
+        } else {
+            self.memory.write().unwrap().write_64(vaddr, value);
+        }
     }
 
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
-        if !self.check_memory_access(vaddr, 16) { return; }
+        if !self.check_memory_access(vaddr, 16) {
+            return;
+        }
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
             m.write_64(vaddr, value_lo);
@@ -251,7 +286,9 @@ impl UserCallbacks for DynarmicCallbacks64 {
     fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
         self.check_memory_access(vaddr, 2)
             && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_16(vaddr, value, expected)
+                cm.lock()
+                    .unwrap()
+                    .write_exclusive_16(vaddr, value, expected)
             } else {
                 self.memory_write_16(vaddr, value);
                 true
@@ -261,7 +298,9 @@ impl UserCallbacks for DynarmicCallbacks64 {
     fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
         self.check_memory_access(vaddr, 4)
             && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_32(vaddr, value, expected)
+                cm.lock()
+                    .unwrap()
+                    .write_exclusive_32(vaddr, value, expected)
             } else {
                 self.memory_write_32(vaddr, value);
                 true
@@ -271,17 +310,32 @@ impl UserCallbacks for DynarmicCallbacks64 {
     fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
         self.check_memory_access(vaddr, 8)
             && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_64(vaddr, value, expected)
+                cm.lock()
+                    .unwrap()
+                    .write_exclusive_64(vaddr, value, expected)
             } else {
                 self.memory_write_64(vaddr, value);
                 true
             }
     }
 
-    fn exclusive_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64, expected_lo: u64, expected_hi: u64) -> bool {
+    fn exclusive_write_128(
+        &mut self,
+        vaddr: u64,
+        value_lo: u64,
+        value_hi: u64,
+        expected_lo: u64,
+        expected_hi: u64,
+    ) -> bool {
         self.check_memory_access(vaddr, 16)
             && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
+                cm.lock().unwrap().write_exclusive_128(
+                    vaddr,
+                    value_lo,
+                    value_hi,
+                    expected_lo,
+                    expected_hi,
+                )
             } else {
                 self.memory_write_128(vaddr, value_lo, value_hi);
                 true
@@ -290,7 +344,11 @@ impl UserCallbacks for DynarmicCallbacks64 {
 
     fn exclusive_clear(&mut self) {
         if !self.exclusive_monitor.is_null() {
-            unsafe { (*self.exclusive_monitor).get_monitor().clear_processor(self.core_index) };
+            unsafe {
+                (*self.exclusive_monitor)
+                    .get_monitor()
+                    .clear_processor(self.core_index)
+            };
         }
     }
 
@@ -300,13 +358,20 @@ impl UserCallbacks for DynarmicCallbacks64 {
         // 1 = InvalidateAllToPoU (IC IALLU) — invalidate entire icache
         match op {
             0 => {
-                log::trace!("IC IVAU @ {:#x} (no-op, cache invalidation handled at JIT level)", vaddr);
+                log::trace!(
+                    "IC IVAU @ {:#x} (no-op, cache invalidation handled at JIT level)",
+                    vaddr
+                );
             }
             1 => {
                 log::trace!("IC IALLU (no-op, cache invalidation handled at JIT level)");
             }
             _ => {
-                log::warn!("Unknown instruction_cache_operation op={} vaddr={:#x}", op, vaddr);
+                log::warn!(
+                    "Unknown instruction_cache_operation op={} vaddr={:#x}",
+                    op,
+                    vaddr
+                );
             }
         }
     }
@@ -330,7 +395,8 @@ impl UserCallbacks for DynarmicCallbacks64 {
         self.last_exception_address.store(pc, Ordering::Relaxed);
         log::error!(
             "DynarmicCallbacks64::exception_raised(pc={:#x}, exception={:#x})",
-            pc, exception
+            pc,
+            exception
         );
         // Dump instruction window around exception PC
         if let Some(ref cm) = self.core_memory {
@@ -359,7 +425,8 @@ impl UserCallbacks for DynarmicCallbacks64 {
         if self.uses_wall_clock {
             return;
         }
-        let amortized_ticks = std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
+        let amortized_ticks =
+            std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
         self.core_timing.lock().unwrap().add_ticks(amortized_ticks);
     }
 
@@ -384,10 +451,10 @@ pub struct ArmDynarmic64 {
     // Settings, etc. Currently these are passed individually (core_timing, uses_wall_clock)
     // to avoid circular dependency with System which owns the ARM backends.
     // When System stabilizes, this can be replaced with a reference.
-
     /// Upstream: `DynarmicExclusiveMonitor& m_exclusive_monitor`.
     /// Passed to JitConfig::global_monitor for cross-core LDXR/STXR synchronization.
-    exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
+    exclusive_monitor:
+        *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
 
     /// Core index for this CPU
     core_index: usize,
@@ -437,9 +504,14 @@ impl ArmDynarmic64 {
         let svc = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
         let callbacks = DynarmicCallbacks64::new(
-            shared_memory, core_memory, svc.clone(),
-            uses_wall_clock, core_timing, last_exception_address.clone(),
-            exclusive_monitor, core_index,
+            shared_memory,
+            core_memory,
+            svc.clone(),
+            uses_wall_clock,
+            core_timing,
+            last_exception_address.clone(),
+            exclusive_monitor,
+            core_index,
         );
 
         // Configure JIT
@@ -461,11 +533,18 @@ impl ArmDynarmic64 {
         // Create the JIT
         let jit = match rdynarmic::A64Jit::new(config) {
             Ok(jit) => {
-                log::info!("ArmDynarmic64: JIT created successfully for core {}", core_index);
+                log::info!(
+                    "ArmDynarmic64: JIT created successfully for core {}",
+                    core_index
+                );
                 Some(jit)
             }
             Err(e) => {
-                log::error!("ArmDynarmic64: Failed to create JIT for core {}: {}", core_index, e);
+                log::error!(
+                    "ArmDynarmic64: Failed to create JIT for core {}: {}",
+                    core_index,
+                    e
+                );
                 None
             }
         };

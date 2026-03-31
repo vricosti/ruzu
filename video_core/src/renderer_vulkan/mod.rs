@@ -66,8 +66,8 @@ use crate::engines::maxwell_3d::{
 };
 use crate::engines::Framebuffer;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
-use shader_recompiler::{BackendProfile as Profile, PipelineCache};
 use crate::syncpoint::SyncpointManager;
+use shader_recompiler::{BackendProfile as Profile, PipelineCache};
 
 use buffer_cache::BufferCache;
 use descriptor_pool::DescriptorPool;
@@ -214,13 +214,11 @@ impl RasterizerVulkan {
         let pipeline_cache = GraphicsPipelineCache::new(device.clone(), shader_cache);
 
         // Create buffer cache
-        let buffer_cache =
-            BufferCache::new(device.clone(), instance.clone(), physical_device)
-                .map_err(|e| RendererError::InitFailed(format!("buffer cache: {:?}", e)))?;
+        let buffer_cache = BufferCache::new(device.clone(), instance.clone(), physical_device)
+            .map_err(|e| RendererError::InitFailed(format!("buffer cache: {:?}", e)))?;
 
         // Create texture cache
-        let texture_cache =
-            TextureCache::new(device.clone(), instance.clone(), physical_device);
+        let texture_cache = TextureCache::new(device.clone(), instance.clone(), physical_device);
 
         // Create default render pass
         let default_render_pass = create_default_render_pass(&device)?;
@@ -562,8 +560,12 @@ impl RasterizerVulkan {
                     y: draw.scissors[0].min_y as i32,
                 },
                 extent: vk::Extent2D {
-                    width: draw.scissors[0].max_x.saturating_sub(draw.scissors[0].min_x),
-                    height: draw.scissors[0].max_y.saturating_sub(draw.scissors[0].min_y),
+                    width: draw.scissors[0]
+                        .max_x
+                        .saturating_sub(draw.scissors[0].min_x),
+                    height: draw.scissors[0]
+                        .max_y
+                        .saturating_sub(draw.scissors[0].min_y),
                 },
             }
         } else {
@@ -647,7 +649,8 @@ impl RasterizerVulkan {
                 continue;
             }
             // Estimate buffer size from stride × vertex_count
-            let size = (stream.stride as u64) * (draw.vertex_count.max(draw.index_buffer_count) as u64);
+            let size =
+                (stream.stride as u64) * (draw.vertex_count.max(draw.index_buffer_count) as u64);
             if size == 0 {
                 continue;
             }
@@ -697,11 +700,7 @@ impl RasterizerVulkan {
 
     // ── Framebuffer resize ────────────────────────────────────────────────
 
-    fn resize_framebuffer(
-        &mut self,
-        new_width: u32,
-        new_height: u32,
-    ) -> Result<(), RendererError> {
+    fn resize_framebuffer(&mut self, new_width: u32, new_height: u32) -> Result<(), RendererError> {
         unsafe {
             self.device.device_wait_idle().ok();
         }
@@ -1365,10 +1364,7 @@ mod tests {
 
     #[test]
     fn test_map_blend_factor() {
-        assert_eq!(
-            map_blend_factor(BlendFactor::One),
-            vk::BlendFactor::ONE
-        );
+        assert_eq!(map_blend_factor(BlendFactor::One), vk::BlendFactor::ONE);
         assert_eq!(
             map_blend_factor(BlendFactor::SrcAlpha),
             vk::BlendFactor::SRC_ALPHA

@@ -35,15 +35,9 @@ struct Stats {
 /// of the statistic's format.
 fn get_uint64(statistic: &vk::PipelineExecutableStatisticKHR) -> u64 {
     match statistic.format {
-        vk::PipelineExecutableStatisticFormatKHR::INT64 => unsafe {
-            statistic.value.i64 as u64
-        },
-        vk::PipelineExecutableStatisticFormatKHR::UINT64 => unsafe {
-            statistic.value.u64
-        },
-        vk::PipelineExecutableStatisticFormatKHR::FLOAT64 => unsafe {
-            statistic.value.f64 as u64
-        },
+        vk::PipelineExecutableStatisticFormatKHR::INT64 => unsafe { statistic.value.i64 as u64 },
+        vk::PipelineExecutableStatisticFormatKHR::UINT64 => unsafe { statistic.value.u64 },
+        vk::PipelineExecutableStatisticFormatKHR::FLOAT64 => unsafe { statistic.value.f64 as u64 },
         _ => 0,
     }
 }
@@ -59,8 +53,7 @@ fn get_uint64(statistic: &vk::PipelineExecutableStatisticKHR) -> u64 {
 pub struct PipelineStatistics {
     device: ash::Device,
     /// Extension function pointers for pipeline executable properties.
-    pipeline_executable_properties_fn:
-        ash::extensions::khr::PipelineExecutableProperties,
+    pipeline_executable_properties_fn: ash::extensions::khr::PipelineExecutableProperties,
     collected_stats: Mutex<Vec<Stats>>,
 }
 
@@ -81,9 +74,7 @@ impl PipelineStatistics {
     /// Queries pipeline executable properties and statistics for the given
     /// pipeline and accumulates them.
     pub fn collect(&self, pipeline: vk::Pipeline) {
-        let pipeline_info = vk::PipelineInfoKHR::builder()
-            .pipeline(pipeline)
-            .build();
+        let pipeline_info = vk::PipelineInfoKHR::builder().pipeline(pipeline).build();
 
         let properties = unsafe {
             self.pipeline_executable_properties_fn

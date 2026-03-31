@@ -13,10 +13,10 @@
 //!   - profile_manager.h / profile_manager.cpp
 
 pub mod acc;
-pub mod errors;
 pub mod acc_aa;
 pub mod acc_su;
 pub mod acc_u0;
 pub mod acc_u1;
 pub mod async_context;
+pub mod errors;
 pub mod profile_manager;

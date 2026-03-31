@@ -19,7 +19,9 @@ fn simple_random_bytes(buf: &mut [u8]) {
     seed.hash(&mut h);
     let mut state = h.finish();
     for byte in buf.iter_mut() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *byte = (state >> 33) as u8;
     }
 }

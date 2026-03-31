@@ -46,7 +46,11 @@ pub fn create_wrapped_image(
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .build();
 
-    unsafe { device.create_image(&image_ci, None).expect("Failed to create wrapped image") }
+    unsafe {
+        device
+            .create_image(&image_ci, None)
+            .expect("Failed to create wrapped image")
+    }
 }
 
 /// Port of `TransitionImageLayout`.
@@ -192,11 +196,7 @@ pub fn download_color_image(
 /// Port of `ClearColorImage`.
 ///
 /// Transitions image to GENERAL from UNDEFINED, then clears it.
-pub fn clear_color_image(
-    device: &ash::Device,
-    cmdbuf: vk::CommandBuffer,
-    image: vk::Image,
-) {
+pub fn clear_color_image(device: &ash::Device, cmdbuf: vk::CommandBuffer, image: vk::Image) {
     transition_image_layout(
         device,
         cmdbuf,
@@ -345,10 +345,7 @@ pub fn create_wrapped_framebuffer(
 // ---------------------------------------------------------------------------
 
 /// Port of `CreateWrappedSampler`.
-pub fn create_wrapped_sampler(
-    device: &ash::Device,
-    filter: vk::Filter,
-) -> vk::Sampler {
+pub fn create_wrapped_sampler(device: &ash::Device, filter: vk::Filter) -> vk::Sampler {
     let sampler_ci = vk::SamplerCreateInfo::builder()
         .mag_filter(filter)
         .min_filter(filter)
@@ -433,13 +430,8 @@ pub fn create_nearest_neighbor_sampler(device: &ash::Device) -> vk::Sampler {
 // ---------------------------------------------------------------------------
 
 /// Port of `CreateWrappedShaderModule`.
-pub fn create_wrapped_shader_module(
-    device: &ash::Device,
-    code: &[u32],
-) -> vk::ShaderModule {
-    let shader_ci = vk::ShaderModuleCreateInfo::builder()
-        .code(code)
-        .build();
+pub fn create_wrapped_shader_module(device: &ash::Device, code: &[u32]) -> vk::ShaderModule {
+    let shader_ci = vk::ShaderModuleCreateInfo::builder().code(code).build();
 
     unsafe {
         device
@@ -669,7 +661,14 @@ pub fn create_wrapped_pipeline(
             | vk::ColorComponentFlags::B
             | vk::ColorComponentFlags::A,
     };
-    create_wrapped_pipeline_impl(device, renderpass, layout, vert_shader, frag_shader, blending)
+    create_wrapped_pipeline_impl(
+        device,
+        renderpass,
+        layout,
+        vert_shader,
+        frag_shader,
+        blending,
+    )
 }
 
 /// Port of `CreateWrappedPremultipliedBlendingPipeline`.
@@ -693,7 +692,14 @@ pub fn create_wrapped_premultiplied_blending_pipeline(
             | vk::ColorComponentFlags::B
             | vk::ColorComponentFlags::A,
     };
-    create_wrapped_pipeline_impl(device, renderpass, layout, vert_shader, frag_shader, blending)
+    create_wrapped_pipeline_impl(
+        device,
+        renderpass,
+        layout,
+        vert_shader,
+        frag_shader,
+        blending,
+    )
 }
 
 /// Port of `CreateWrappedCoverageBlendingPipeline`.
@@ -717,7 +723,14 @@ pub fn create_wrapped_coverage_blending_pipeline(
             | vk::ColorComponentFlags::B
             | vk::ColorComponentFlags::A,
     };
-    create_wrapped_pipeline_impl(device, renderpass, layout, vert_shader, frag_shader, blending)
+    create_wrapped_pipeline_impl(
+        device,
+        renderpass,
+        layout,
+        vert_shader,
+        frag_shader,
+        blending,
+    )
 }
 
 // ---------------------------------------------------------------------------

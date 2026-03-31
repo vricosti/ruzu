@@ -7,9 +7,6 @@
 //! The Container manages displays, layers, and the binder/surface flinger
 //! infrastructure. It is the central coordinator for the VI service.
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::SessionRequestHandler;
 use crate::hle::service::nvnflinger::hos_binder_driver::IHosBinderDriver;
@@ -17,6 +14,7 @@ use crate::hle::service::nvnflinger::hos_binder_driver_server::HosBinderDriverSe
 use crate::hle::service::nvnflinger::surface_flinger::SurfaceFlinger;
 use crate::hle::service::os::event::Event;
 use crate::hle::service::sm::sm::ServiceManager;
+use std::sync::{Arc, Mutex};
 
 use super::conductor::Conductor;
 use super::display_list::DisplayList;
@@ -78,12 +76,7 @@ impl Container {
             .get()
             .service_manager()
             .expect("Container::new: missing ServiceManager");
-        let binder_driver = ServiceManager::get_service_blocking(
-            &service_manager,
-            "dispdrv",
-            Duration::from_secs(5),
-        )
-        .expect("Container::new: timed out waiting for dispdrv");
+        let binder_driver = ServiceManager::get_service_blocking(&service_manager, "dispdrv");
         let binder_driver_impl = binder_driver
             .as_any()
             .downcast_ref::<IHosBinderDriver>()
@@ -248,7 +241,12 @@ impl Container {
 
         let layer = inner
             .layers
-            .create_layer(owner_aruid, display_id, consumer_binder_id, producer_binder_id)
+            .create_layer(
+                owner_aruid,
+                display_id,
+                consumer_binder_id,
+                producer_binder_id,
+            )
             .ok_or(vi_results::RESULT_NOT_FOUND)?;
 
         surface_flinger.create_layer(consumer_binder_id);

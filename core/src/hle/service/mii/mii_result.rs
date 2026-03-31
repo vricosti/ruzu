@@ -11,10 +11,8 @@ pub const RESULT_INVALID_ARGUMENT: ResultCode =
     ResultCode::from_module_description(ErrorModule::Mii, 1);
 pub const RESULT_INVALID_ARGUMENT_SIZE: ResultCode =
     ResultCode::from_module_description(ErrorModule::Mii, 2);
-pub const RESULT_NOT_UPDATED: ResultCode =
-    ResultCode::from_module_description(ErrorModule::Mii, 3);
-pub const RESULT_NOT_FOUND: ResultCode =
-    ResultCode::from_module_description(ErrorModule::Mii, 4);
+pub const RESULT_NOT_UPDATED: ResultCode = ResultCode::from_module_description(ErrorModule::Mii, 3);
+pub const RESULT_NOT_FOUND: ResultCode = ResultCode::from_module_description(ErrorModule::Mii, 4);
 pub const RESULT_DATABASE_FULL: ResultCode =
     ResultCode::from_module_description(ErrorModule::Mii, 5);
 pub const RESULT_INVALID_CHAR_INFO: ResultCode =

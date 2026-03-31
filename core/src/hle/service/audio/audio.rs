@@ -50,7 +50,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
     server_manager.register_named_service(
         "audrec:u",
         Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::final_output_recorder_manager::IFinalOutputRecorderManager::new())
+            std::sync::Arc::new(
+                super::final_output_recorder_manager::IFinalOutputRecorderManager::new(),
+            )
         }),
         16,
     );
@@ -66,7 +68,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
     server_manager.register_named_service(
         "hwopus",
         Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::hardware_opus_decoder_manager::IHardwareOpusDecoderManager::new())
+            std::sync::Arc::new(
+                super::hardware_opus_decoder_manager::IHardwareOpusDecoderManager::new(),
+            )
         }),
         16,
     );

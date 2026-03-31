@@ -148,10 +148,7 @@ impl ShaderCache {
     /// Create a new compute pipeline.
     ///
     /// Port of `ShaderCache::CreateComputePipeline()`.
-    fn create_compute_pipeline(
-        &mut self,
-        _key: &ComputePipelineKey,
-    ) -> Option<ComputePipeline> {
+    fn create_compute_pipeline(&mut self, _key: &ComputePipelineKey) -> Option<ComputePipeline> {
         // In the full implementation:
         // 1. Read compute shader from KeplerCompute engine state
         // 2. Create shader environment

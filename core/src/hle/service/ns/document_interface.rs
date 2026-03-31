@@ -33,9 +33,21 @@ pub struct IDocumentInterface {
 impl IDocumentInterface {
     pub fn new(system: crate::core::SystemRef) -> Self {
         let handlers = build_handler_map(&[
-            (commands::GET_APPLICATION_CONTENT_PATH, None, "GetApplicationContentPath"),
-            (commands::RESOLVE_APPLICATION_CONTENT_PATH, None, "ResolveApplicationContentPath"),
-            (commands::GET_RUNNING_APPLICATION_PROGRAM_ID, None, "GetRunningApplicationProgramId"),
+            (
+                commands::GET_APPLICATION_CONTENT_PATH,
+                None,
+                "GetApplicationContentPath",
+            ),
+            (
+                commands::RESOLVE_APPLICATION_CONTENT_PATH,
+                None,
+                "ResolveApplicationContentPath",
+            ),
+            (
+                commands::GET_RUNNING_APPLICATION_PROGRAM_ID,
+                None,
+                "GetRunningApplicationProgramId",
+            ),
         ]);
         Self {
             handlers,

@@ -8,13 +8,15 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::arm::arm_interface::{ArmInterface, HaltReason, KThread as OpaqueKThread, ThreadContext};
+use crate::arm::arm_interface::{
+    ArmInterface, HaltReason, KThread as OpaqueKThread, ThreadContext,
+};
 use crate::core::System;
 use crate::hle::kernel::svc_dispatch::{self, SvcArgs};
 
-use super::{k_process::KProcess, k_scheduler::KScheduler, k_thread::KThread};
 #[cfg(feature = "debug-logs")]
 use super::physical_core_log;
+use super::{k_process::KProcess, k_scheduler::KScheduler, k_thread::KThread};
 
 pub enum PhysicalCoreExecutionControl {
     Continue,
@@ -140,41 +142,20 @@ impl PhysicalCore {
         &self,
         jit: &mut dyn ArmInterface,
         thread_context: &mut ThreadContext,
-        scheduler: &Arc<Mutex<KScheduler>>,
-        process: &Arc<Mutex<KProcess>>,
+        _scheduler: &Arc<Mutex<KScheduler>>,
+        _process: &Arc<Mutex<KProcess>>,
     ) {
-        let mut runtime_guard = self.m_runtime.lock().unwrap();
-        let Some(runtime) = runtime_guard.as_mut() else {
+        let runtime_guard = self.m_runtime.lock().unwrap();
+        let Some(runtime) = runtime_guard.as_ref() else {
             return;
         };
 
         jit.get_context(thread_context);
-        let current_thread_id = {
-            let mut current_thread = runtime.m_current_thread.lock().unwrap();
-            current_thread.capture_guest_context(thread_context);
-            current_thread.get_thread_id()
-        };
-        let next_thread = scheduler
+        runtime
+            .m_current_thread
             .lock()
             .unwrap()
-            .wait_for_next_thread(process, current_thread_id);
-        let Some(next_thread) = next_thread else {
-            return;
-        };
-
-        let next_thread_id = next_thread.lock().unwrap().get_thread_id();
-        if next_thread_id != current_thread_id {
-            let current_thread_arc = Arc::clone(&runtime.m_current_thread);
-            KScheduler::unlock_thread_context_for_runtime(&current_thread_arc);
-            while !KScheduler::lock_thread_context_for_runtime(&next_thread) {
-                std::hint::spin_loop();
-            }
-        }
-
-        self.restore_thread_to_jit(jit, thread_context, &next_thread);
-        if next_thread_id != current_thread_id {
-            runtime.m_current_thread = next_thread;
-        }
+            .capture_guest_context(thread_context);
     }
 
     pub fn dispatch_supervisor_call(
@@ -191,7 +172,10 @@ impl PhysicalCore {
     ) {
         svc_dispatch::call(system, svc_num, is_64bit, svc_args);
         jit.set_svc_arguments(svc_args);
-        log::trace!("dispatch_supervisor_call: before handoff (svc=0x{:x})", svc_num);
+        log::trace!(
+            "dispatch_supervisor_call: before handoff (svc=0x{:x})",
+            svc_num
+        );
         self.handoff_after_svc(jit, thread_context, scheduler, process);
         if let Some(threshold) = std::env::var("RUZU_LOG_AFTER_SVC")
             .ok()
@@ -217,7 +201,10 @@ impl PhysicalCore {
                 );
             }
         }
-        log::trace!("dispatch_supervisor_call: after handoff (svc=0x{:x})", svc_num);
+        log::trace!(
+            "dispatch_supervisor_call: after handoff (svc=0x{:x})",
+            svc_num
+        );
     }
 
     pub fn run_loop<FSvc, FHalt>(
@@ -234,7 +221,13 @@ impl PhysicalCore {
     ) -> (u32, u32, PhysicalCoreExecutionControl)
     where
         FSvc: FnMut(u32, &mut SvcArgs, &ThreadContext, u32, u32) -> PhysicalCoreExecutionControl,
-        FHalt: FnMut(HaltReason, Option<u64>, &ThreadContext, u32, u32) -> PhysicalCoreExecutionControl,
+        FHalt: FnMut(
+            HaltReason,
+            Option<u64>,
+            &ThreadContext,
+            u32,
+            u32,
+        ) -> PhysicalCoreExecutionControl,
     {
         let mut svc_count = 0u32;
         let mut iteration = 0u32;
@@ -281,7 +274,13 @@ impl PhysicalCore {
                 }
                 #[cfg(feature = "debug-logs")]
                 {
-                    let insn = process.lock().unwrap().process_memory.read().unwrap().read_32(thread_context.pc);
+                    let insn = process
+                        .lock()
+                        .unwrap()
+                        .process_memory
+                        .read()
+                        .unwrap()
+                        .read_32(thread_context.pc);
                     ring_buf.record(thread_context, insn);
                     ring_buf.check_initlibc0_entry(thread_context);
                     ring_buf.check_rtld_init_return(thread_context);
@@ -292,7 +291,10 @@ impl PhysicalCore {
             }
 
             match event {
-                PhysicalCoreExecutionEvent::SupervisorCall { svc_num, mut svc_args } => {
+                PhysicalCoreExecutionEvent::SupervisorCall {
+                    svc_num,
+                    mut svc_args,
+                } => {
                     svc_count += 1;
                     jit.get_context(thread_context);
 
@@ -379,9 +381,10 @@ impl PhysicalCore {
         if let Some(jit) = process.get_arm_interface_mut(self.m_core_index) {
             let k_ctx = &thread.thread_context;
             // Safety: both ThreadContext types have identical layout.
-            let arm_ctx: &crate::arm::arm_interface::ThreadContext =
-                unsafe { &*(k_ctx as *const super::k_thread::ThreadContext
-                    as *const crate::arm::arm_interface::ThreadContext) };
+            let arm_ctx: &crate::arm::arm_interface::ThreadContext = unsafe {
+                &*(k_ctx as *const super::k_thread::ThreadContext
+                    as *const crate::arm::arm_interface::ThreadContext)
+            };
             jit.set_context(arm_ctx);
             jit.set_tpidrro_el0(thread.get_tls_address().get());
             log::info!(
@@ -405,9 +408,10 @@ impl PhysicalCore {
         let process = parent.lock().unwrap();
         if let Some(jit) = process.get_arm_interface(self.m_core_index) {
             let k_ctx = &mut thread.thread_context;
-            let arm_ctx: &mut crate::arm::arm_interface::ThreadContext =
-                unsafe { &mut *(k_ctx as *mut super::k_thread::ThreadContext
-                    as *mut crate::arm::arm_interface::ThreadContext) };
+            let arm_ctx: &mut crate::arm::arm_interface::ThreadContext = unsafe {
+                &mut *(k_ctx as *mut super::k_thread::ThreadContext
+                    as *mut crate::arm::arm_interface::ThreadContext)
+            };
             jit.get_context(arm_ctx);
         }
     }
@@ -417,7 +421,58 @@ impl PhysicalCore {
     pub fn log_backtrace(&self) {
         // Upstream: gets current process, gets arm_interface,
         // calls interface->LogBacktrace(process).
-        log::debug!("PhysicalCore::log_backtrace: core={}", self.m_core_index);
+        let state = self.m_guard.lock().unwrap();
+        let current_thread = state.m_current_thread;
+        let arm_interface = state.m_arm_interface;
+        drop(state);
+
+        let Some(thread_ptr) = current_thread else {
+            log::debug!(
+                "PhysicalCore::log_backtrace: core={} no current thread",
+                self.m_core_index
+            );
+            return;
+        };
+
+        let thread = unsafe { &*thread_ptr };
+        let Some(parent) = thread.parent.as_ref().and_then(|w| w.upgrade()) else {
+            log::debug!(
+                "PhysicalCore::log_backtrace: core={} tid={} has no parent process",
+                self.m_core_index,
+                thread.get_thread_id()
+            );
+            return;
+        };
+
+        let mut ctx = crate::arm::arm_interface::ThreadContext::default();
+        if let Some(jit_ptr) = arm_interface {
+            let jit = unsafe { &*jit_ptr };
+            jit.get_context(&mut ctx);
+        } else {
+            let k_ctx = &thread.thread_context;
+            ctx.r = k_ctx.r;
+            ctx.fp = k_ctx.fp;
+            ctx.lr = k_ctx.lr;
+            ctx.sp = k_ctx.sp;
+            ctx.pc = k_ctx.pc;
+            ctx.pstate = k_ctx.pstate;
+            ctx.padding = k_ctx.padding;
+            ctx.v = k_ctx.v;
+            ctx.fpcr = k_ctx.fpcr;
+            ctx.fpsr = k_ctx.fpsr;
+            ctx.tpidr = k_ctx.tpidr;
+        }
+
+        let process = parent.lock().unwrap();
+        log::error!(
+            "PhysicalCore::log_backtrace: core={} tid={} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X}",
+            self.m_core_index,
+            thread.get_thread_id(),
+            ctx.pc,
+            ctx.lr,
+            ctx.sp
+        );
+        crate::arm::arm_interface::ArmInterfaceBase::new(false).log_backtrace(&process, &ctx);
     }
 
     /// Wait for an interrupt.
@@ -430,7 +485,11 @@ impl PhysicalCore {
 
     /// Set the arm interface and thread currently running on this core.
     /// Called at the start of RunThread, matching upstream's pattern.
-    pub fn set_running(&self, arm_interface: *mut dyn crate::arm::arm_interface::ArmInterface, thread: *mut KThread) {
+    pub fn set_running(
+        &self,
+        arm_interface: *mut dyn crate::arm::arm_interface::ArmInterface,
+        thread: *mut KThread,
+    ) {
         let mut state = self.m_guard.lock().unwrap();
         state.m_arm_interface = Some(arm_interface);
         state.m_current_thread = Some(thread);
@@ -654,7 +713,11 @@ mod tests {
             HaltReason::BREAK_LOOP,
             HaltReason::BREAK_LOOP,
         ]));
-        physical_core.initialize_guest_runtime(current_thread.clone(), &mut jit, &mut thread_context);
+        physical_core.initialize_guest_runtime(
+            current_thread.clone(),
+            &mut jit,
+            &mut thread_context,
+        );
 
         current_thread.lock().unwrap().request_terminate();
 
@@ -691,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_after_svc_restores_same_thread_context_after_wait() {
+    fn handoff_after_svc_captures_current_thread_context_without_switching() {
         let mut system = System::new_for_test();
 
         let mut process = KProcess::new();
@@ -728,38 +791,25 @@ mod tests {
         let physical_core = PhysicalCore::new(0, false);
         let mut thread_context = ThreadContext::default();
         let mut jit = TestArmInterface::new(VecDeque::new());
-        physical_core.initialize_guest_runtime(current_thread.clone(), &mut jit, &mut thread_context);
+        physical_core.initialize_guest_runtime(
+            current_thread.clone(),
+            &mut jit,
+            &mut thread_context,
+        );
 
         jit.context.r[0] = 0xAA;
         jit.context.pc = 0x200100;
 
-        {
-            let mut process_guard = process.lock().unwrap();
-            process_guard.remove_from_priority_queue(1);
-        }
-        current_thread.lock().unwrap().begin_wait();
-
-        let woke_thread = Arc::new(AtomicBool::new(false));
-        let woke_thread_flag = woke_thread.clone();
-        let current_thread_for_waker = current_thread.clone();
-        let process_for_waker = process.clone();
-        let wake_handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            {
-                let mut thread = current_thread_for_waker.lock().unwrap();
-                thread.thread_context.r[0] = 0x55;
-                thread.thread_context.pc = 0x200200;
-                thread.end_wait(0);
-            }
-            process_for_waker.lock().unwrap().push_back_to_priority_queue(1);
-            woke_thread_flag.store(true, Ordering::SeqCst);
-        });
-
         physical_core.handoff_after_svc(&mut jit, &mut thread_context, &scheduler, &process);
-        wake_handle.join().unwrap();
 
-        assert!(woke_thread.load(Ordering::SeqCst));
-        assert_eq!(jit.context.r[0], 0x55);
-        assert_eq!(jit.context.pc, 0x200200);
+        let thread = current_thread.lock().unwrap();
+        assert_eq!(thread.thread_context.r[0], 0xAA);
+        assert_eq!(thread.thread_context.r[15], 0x200100);
+        assert_eq!(jit.context.r[0], 0xAA);
+        assert_eq!(jit.context.pc, 0x200100);
+        assert_eq!(
+            scheduler.lock().unwrap().get_scheduler_current_thread_id(),
+            Some(1)
+        );
     }
 }

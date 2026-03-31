@@ -44,54 +44,74 @@ const GL_COMPRESSED_RGBA_S3TC_DXT5_EXT: u32 = 0x83F3;
 /// Corresponds to `OpenGL::MaxwellToGL::FORMAT_TABLE`.
 /// NOTE: Only a representative subset is included here. The full table has MaxPixelFormat entries.
 pub static FORMAT_TABLE: &[FormatTuple] = &[
-    FormatTuple::new(gl::RGBA8, gl::RGBA, gl::UNSIGNED_INT_8_8_8_8_REV),     // A8B8G8R8_UNORM
-    FormatTuple::new(gl::RGBA8_SNORM, gl::RGBA, gl::BYTE),                   // A8B8G8R8_SNORM
-    FormatTuple::new(gl::RGBA8I, gl::RGBA_INTEGER, gl::BYTE),                // A8B8G8R8_SINT
-    FormatTuple::new(gl::RGBA8UI, gl::RGBA_INTEGER, gl::UNSIGNED_BYTE),      // A8B8G8R8_UINT
-    FormatTuple::new(gl::RGB565, gl::RGB, gl::UNSIGNED_SHORT_5_6_5),         // R5G6B5_UNORM
-    FormatTuple::new(gl::RGB565, gl::RGB, gl::UNSIGNED_SHORT_5_6_5_REV),     // B5G6R5_UNORM
+    FormatTuple::new(gl::RGBA8, gl::RGBA, gl::UNSIGNED_INT_8_8_8_8_REV), // A8B8G8R8_UNORM
+    FormatTuple::new(gl::RGBA8_SNORM, gl::RGBA, gl::BYTE),               // A8B8G8R8_SNORM
+    FormatTuple::new(gl::RGBA8I, gl::RGBA_INTEGER, gl::BYTE),            // A8B8G8R8_SINT
+    FormatTuple::new(gl::RGBA8UI, gl::RGBA_INTEGER, gl::UNSIGNED_BYTE),  // A8B8G8R8_UINT
+    FormatTuple::new(gl::RGB565, gl::RGB, gl::UNSIGNED_SHORT_5_6_5),     // R5G6B5_UNORM
+    FormatTuple::new(gl::RGB565, gl::RGB, gl::UNSIGNED_SHORT_5_6_5_REV), // B5G6R5_UNORM
     FormatTuple::new(gl::RGB5_A1, gl::BGRA, gl::UNSIGNED_SHORT_1_5_5_5_REV), // A1R5G5B5_UNORM
     FormatTuple::new(gl::RGB10_A2, gl::RGBA, gl::UNSIGNED_INT_2_10_10_10_REV), // A2B10G10R10_UNORM
-    FormatTuple::new(gl::RGB10_A2UI, gl::RGBA_INTEGER, gl::UNSIGNED_INT_2_10_10_10_REV), // A2B10G10R10_UINT
-    FormatTuple::new(gl::R8, gl::RED, gl::UNSIGNED_BYTE),                    // R8_UNORM
-    FormatTuple::new(gl::R8_SNORM, gl::RED, gl::BYTE),                       // R8_SNORM
-    FormatTuple::new(gl::R8I, gl::RED_INTEGER, gl::BYTE),                    // R8_SINT
-    FormatTuple::new(gl::R8UI, gl::RED_INTEGER, gl::UNSIGNED_BYTE),          // R8_UINT
-    FormatTuple::new(gl::RGBA16F, gl::RGBA, gl::HALF_FLOAT),                 // R16G16B16A16_FLOAT
-    FormatTuple::new(gl::RGBA16, gl::RGBA, gl::UNSIGNED_SHORT),              // R16G16B16A16_UNORM
-    FormatTuple::new(gl::R11F_G11F_B10F, gl::RGB, gl::UNSIGNED_INT_10F_11F_11F_REV), // B10G11R11_FLOAT
-    FormatTuple::new(gl::RGBA32UI, gl::RGBA_INTEGER, gl::UNSIGNED_INT),      // R32G32B32A32_UINT
-    FormatTuple::compressed(GL_COMPRESSED_RGBA_S3TC_DXT1_EXT),              // BC1_RGBA_UNORM
-    FormatTuple::compressed(GL_COMPRESSED_RGBA_S3TC_DXT3_EXT),              // BC2_UNORM
-    FormatTuple::compressed(GL_COMPRESSED_RGBA_S3TC_DXT5_EXT),              // BC3_UNORM
-    FormatTuple::compressed(gl::COMPRESSED_RED_RGTC1),                       // BC4_UNORM
-    FormatTuple::compressed(gl::COMPRESSED_SIGNED_RED_RGTC1),                // BC4_SNORM
-    FormatTuple::compressed(gl::COMPRESSED_RG_RGTC2),                        // BC5_UNORM
-    FormatTuple::compressed(gl::COMPRESSED_SIGNED_RG_RGTC2),                 // BC5_SNORM
-    FormatTuple::compressed(gl::COMPRESSED_RGBA_BPTC_UNORM),                 // BC7_UNORM
-    FormatTuple::compressed(gl::COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT),         // BC6H_UFLOAT
-    FormatTuple::compressed(gl::COMPRESSED_RGB_BPTC_SIGNED_FLOAT),           // BC6H_SFLOAT
-    FormatTuple::new(gl::RGBA32F, gl::RGBA, gl::FLOAT),                      // R32G32B32A32_FLOAT
-    FormatTuple::new(gl::RGBA32I, gl::RGBA_INTEGER, gl::INT),                // R32G32B32A32_SINT
-    FormatTuple::new(gl::RG32F, gl::RG, gl::FLOAT),                          // R32G32_FLOAT
-    FormatTuple::new(gl::R32F, gl::RED, gl::FLOAT),                           // R32_FLOAT
-    FormatTuple::new(gl::R16F, gl::RED, gl::HALF_FLOAT),                      // R16_FLOAT
-    FormatTuple::new(gl::R16, gl::RED, gl::UNSIGNED_SHORT),                   // R16_UNORM
-    FormatTuple::new(gl::R16UI, gl::RED_INTEGER, gl::UNSIGNED_SHORT),         // R16_UINT
-    FormatTuple::new(gl::R16I, gl::RED_INTEGER, gl::SHORT),                   // R16_SINT
-    FormatTuple::new(gl::RG16F, gl::RG, gl::HALF_FLOAT),                     // R16G16_FLOAT
-    FormatTuple::new(gl::RG16UI, gl::RG_INTEGER, gl::UNSIGNED_SHORT),        // R16G16_UINT
+    FormatTuple::new(
+        gl::RGB10_A2UI,
+        gl::RGBA_INTEGER,
+        gl::UNSIGNED_INT_2_10_10_10_REV,
+    ), // A2B10G10R10_UINT
+    FormatTuple::new(gl::R8, gl::RED, gl::UNSIGNED_BYTE),                // R8_UNORM
+    FormatTuple::new(gl::R8_SNORM, gl::RED, gl::BYTE),                   // R8_SNORM
+    FormatTuple::new(gl::R8I, gl::RED_INTEGER, gl::BYTE),                // R8_SINT
+    FormatTuple::new(gl::R8UI, gl::RED_INTEGER, gl::UNSIGNED_BYTE),      // R8_UINT
+    FormatTuple::new(gl::RGBA16F, gl::RGBA, gl::HALF_FLOAT),             // R16G16B16A16_FLOAT
+    FormatTuple::new(gl::RGBA16, gl::RGBA, gl::UNSIGNED_SHORT),          // R16G16B16A16_UNORM
+    FormatTuple::new(
+        gl::R11F_G11F_B10F,
+        gl::RGB,
+        gl::UNSIGNED_INT_10F_11F_11F_REV,
+    ), // B10G11R11_FLOAT
+    FormatTuple::new(gl::RGBA32UI, gl::RGBA_INTEGER, gl::UNSIGNED_INT),  // R32G32B32A32_UINT
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_S3TC_DXT1_EXT),           // BC1_RGBA_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_S3TC_DXT3_EXT),           // BC2_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_S3TC_DXT5_EXT),           // BC3_UNORM
+    FormatTuple::compressed(gl::COMPRESSED_RED_RGTC1),                   // BC4_UNORM
+    FormatTuple::compressed(gl::COMPRESSED_SIGNED_RED_RGTC1),            // BC4_SNORM
+    FormatTuple::compressed(gl::COMPRESSED_RG_RGTC2),                    // BC5_UNORM
+    FormatTuple::compressed(gl::COMPRESSED_SIGNED_RG_RGTC2),             // BC5_SNORM
+    FormatTuple::compressed(gl::COMPRESSED_RGBA_BPTC_UNORM),             // BC7_UNORM
+    FormatTuple::compressed(gl::COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT),     // BC6H_UFLOAT
+    FormatTuple::compressed(gl::COMPRESSED_RGB_BPTC_SIGNED_FLOAT),       // BC6H_SFLOAT
+    FormatTuple::new(gl::RGBA32F, gl::RGBA, gl::FLOAT),                  // R32G32B32A32_FLOAT
+    FormatTuple::new(gl::RGBA32I, gl::RGBA_INTEGER, gl::INT),            // R32G32B32A32_SINT
+    FormatTuple::new(gl::RG32F, gl::RG, gl::FLOAT),                      // R32G32_FLOAT
+    FormatTuple::new(gl::R32F, gl::RED, gl::FLOAT),                      // R32_FLOAT
+    FormatTuple::new(gl::R16F, gl::RED, gl::HALF_FLOAT),                 // R16_FLOAT
+    FormatTuple::new(gl::R16, gl::RED, gl::UNSIGNED_SHORT),              // R16_UNORM
+    FormatTuple::new(gl::R16UI, gl::RED_INTEGER, gl::UNSIGNED_SHORT),    // R16_UINT
+    FormatTuple::new(gl::R16I, gl::RED_INTEGER, gl::SHORT),              // R16_SINT
+    FormatTuple::new(gl::RG16F, gl::RG, gl::HALF_FLOAT),                 // R16G16_FLOAT
+    FormatTuple::new(gl::RG16UI, gl::RG_INTEGER, gl::UNSIGNED_SHORT),    // R16G16_UINT
     FormatTuple::new(gl::SRGB8_ALPHA8, gl::RGBA, gl::UNSIGNED_INT_8_8_8_8_REV), // A8B8G8R8_SRGB
-    FormatTuple::new(gl::RG8, gl::RG, gl::UNSIGNED_BYTE),                    // R8G8_UNORM
-    FormatTuple::new(gl::RG8UI, gl::RG_INTEGER, gl::UNSIGNED_BYTE),          // R8G8_UINT
-    FormatTuple::new(gl::RG32UI, gl::RG_INTEGER, gl::UNSIGNED_INT),          // R32G32_UINT
-    FormatTuple::new(gl::R32UI, gl::RED_INTEGER, gl::UNSIGNED_INT),          // R32_UINT
-    FormatTuple::new(gl::R32I, gl::RED_INTEGER, gl::INT),                    // R32_SINT
+    FormatTuple::new(gl::RG8, gl::RG, gl::UNSIGNED_BYTE),                // R8G8_UNORM
+    FormatTuple::new(gl::RG8UI, gl::RG_INTEGER, gl::UNSIGNED_BYTE),      // R8G8_UINT
+    FormatTuple::new(gl::RG32UI, gl::RG_INTEGER, gl::UNSIGNED_INT),      // R32G32_UINT
+    FormatTuple::new(gl::R32UI, gl::RED_INTEGER, gl::UNSIGNED_INT),      // R32_UINT
+    FormatTuple::new(gl::R32I, gl::RED_INTEGER, gl::INT),                // R32_SINT
     FormatTuple::new(gl::DEPTH_COMPONENT32F, gl::DEPTH_COMPONENT, gl::FLOAT), // D32_FLOAT
-    FormatTuple::new(gl::DEPTH_COMPONENT16, gl::DEPTH_COMPONENT, gl::UNSIGNED_SHORT), // D16_UNORM
-    FormatTuple::new(gl::STENCIL_INDEX8, gl::STENCIL, gl::UNSIGNED_BYTE),    // S8_UINT
-    FormatTuple::new(gl::DEPTH24_STENCIL8, gl::DEPTH_STENCIL, gl::UNSIGNED_INT_24_8), // D24_UNORM_S8_UINT
-    FormatTuple::new(gl::DEPTH32F_STENCIL8, gl::DEPTH_STENCIL, gl::FLOAT_32_UNSIGNED_INT_24_8_REV), // D32_FLOAT_S8_UINT
+    FormatTuple::new(
+        gl::DEPTH_COMPONENT16,
+        gl::DEPTH_COMPONENT,
+        gl::UNSIGNED_SHORT,
+    ), // D16_UNORM
+    FormatTuple::new(gl::STENCIL_INDEX8, gl::STENCIL, gl::UNSIGNED_BYTE), // S8_UINT
+    FormatTuple::new(
+        gl::DEPTH24_STENCIL8,
+        gl::DEPTH_STENCIL,
+        gl::UNSIGNED_INT_24_8,
+    ), // D24_UNORM_S8_UINT
+    FormatTuple::new(
+        gl::DEPTH32F_STENCIL8,
+        gl::DEPTH_STENCIL,
+        gl::FLOAT_32_UNSIGNED_INT_24_8_REV,
+    ), // D32_FLOAT_S8_UINT
 ];
 
 /// Look up the format tuple for a given pixel format index.
@@ -368,9 +388,7 @@ pub fn vertex_format(attrib_type: u32, size: u32) -> u32 {
         },
         // SNorm, SScaled, SInt
         1 | 6 | 3 => match size {
-            0x01 | 0x02 | 0x03 | 0x05 | 0x0A | 0x13 | 0x18 | 0x1D | 0x32 | 0x33 | 0x34 => {
-                gl::BYTE
-            }
+            0x01 | 0x02 | 0x03 | 0x05 | 0x0A | 0x13 | 0x18 | 0x1D | 0x32 | 0x33 | 0x34 => gl::BYTE,
             0x0F | 0x1B => gl::SHORT,
             0x04 | 0x12 => gl::INT,
             0x30 => gl::INT_2_10_10_10_REV,

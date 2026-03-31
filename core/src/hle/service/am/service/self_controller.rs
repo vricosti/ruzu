@@ -80,8 +80,16 @@ impl ISelfController {
             (0, Some(Self::exit_handler), "Exit"),
             (1, Some(Self::lock_exit_handler), "LockExit"),
             (2, Some(Self::unlock_exit_handler), "UnlockExit"),
-            (9, Some(Self::get_library_applet_launchable_event_handler), "GetLibraryAppletLaunchableEvent"),
-            (10, Some(Self::set_screen_shot_permission_handler), "SetScreenShotPermission"),
+            (
+                9,
+                Some(Self::get_library_applet_launchable_event_handler),
+                "GetLibraryAppletLaunchableEvent",
+            ),
+            (
+                10,
+                Some(Self::set_screen_shot_permission_handler),
+                "SetScreenShotPermission",
+            ),
             (
                 11,
                 Some(Self::set_operation_mode_changed_notification_handler),
@@ -92,14 +100,46 @@ impl ISelfController {
                 Some(Self::set_performance_mode_changed_notification_handler),
                 "SetPerformanceModeChangedNotification",
             ),
-            (13, Some(Self::set_focus_handling_mode_handler), "SetFocusHandlingMode"),
-            (14, Some(Self::set_restart_message_enabled_handler), "SetRestartMessageEnabled"),
-            (16, Some(Self::set_out_of_focus_suspending_enabled_handler), "SetOutOfFocusSuspendingEnabled"),
-            (40, Some(Self::create_managed_display_layer_handler), "CreateManagedDisplayLayer"),
-            (62, Some(Self::set_idle_time_detection_extension_handler), "SetIdleTimeDetectionExtension"),
-            (63, Some(Self::get_idle_time_detection_extension_handler), "GetIdleTimeDetectionExtension"),
-            (68, Some(Self::set_auto_sleep_disabled_handler), "SetAutoSleepDisabled"),
-            (91, Some(Self::get_accumulated_suspended_tick_changed_event_handler), "GetAccumulatedSuspendedTickChangedEvent"),
+            (
+                13,
+                Some(Self::set_focus_handling_mode_handler),
+                "SetFocusHandlingMode",
+            ),
+            (
+                14,
+                Some(Self::set_restart_message_enabled_handler),
+                "SetRestartMessageEnabled",
+            ),
+            (
+                16,
+                Some(Self::set_out_of_focus_suspending_enabled_handler),
+                "SetOutOfFocusSuspendingEnabled",
+            ),
+            (
+                40,
+                Some(Self::create_managed_display_layer_handler),
+                "CreateManagedDisplayLayer",
+            ),
+            (
+                62,
+                Some(Self::set_idle_time_detection_extension_handler),
+                "SetIdleTimeDetectionExtension",
+            ),
+            (
+                63,
+                Some(Self::get_idle_time_detection_extension_handler),
+                "GetIdleTimeDetectionExtension",
+            ),
+            (
+                68,
+                Some(Self::set_auto_sleep_disabled_handler),
+                "SetAutoSleepDisabled",
+            ),
+            (
+                91,
+                Some(Self::get_accumulated_suspended_tick_changed_event_handler),
+                "GetAccumulatedSuspendedTickChangedEvent",
+            ),
         ]);
         Self {
             applet,
@@ -126,7 +166,10 @@ impl ISelfController {
 
     /// Port of ISelfController::SetOperationModeChangedNotification
     pub fn set_operation_mode_changed_notification(&self, enabled: bool) {
-        log::info!("SetOperationModeChangedNotification called, enabled={}", enabled);
+        log::info!(
+            "SetOperationModeChangedNotification called, enabled={}",
+            enabled
+        );
         let mut applet = self.applet.lock().unwrap();
         applet
             .lifecycle_manager
@@ -135,7 +178,10 @@ impl ISelfController {
 
     /// Port of ISelfController::SetPerformanceModeChangedNotification
     pub fn set_performance_mode_changed_notification(&self, enabled: bool) {
-        log::info!("SetPerformanceModeChangedNotification called, enabled={}", enabled);
+        log::info!(
+            "SetPerformanceModeChangedNotification called, enabled={}",
+            enabled
+        );
         let mut applet = self.applet.lock().unwrap();
         applet
             .lifecycle_manager
@@ -146,7 +192,9 @@ impl ISelfController {
     pub fn set_focus_handling_mode(&self, notify: bool, background: bool, suspend: bool) {
         log::info!(
             "SetFocusHandlingMode called, notify={} background={} suspend={}",
-            notify, background, suspend
+            notify,
+            background,
+            suspend
         );
         let mut applet = self.applet.lock().unwrap();
         applet
@@ -168,7 +216,10 @@ impl ISelfController {
 
     /// Port of ISelfController::SetHandlesRequestToDisplay
     pub fn set_handles_request_to_display(&self, enable: bool) {
-        log::warn!("(STUBBED) SetHandlesRequestToDisplay called, enable={}", enable);
+        log::warn!(
+            "(STUBBED) SetHandlesRequestToDisplay called, enable={}",
+            enable
+        );
     }
 
     /// Port of ISelfController::ApproveToDisplay
@@ -178,7 +229,10 @@ impl ISelfController {
 
     /// Port of ISelfController::SetAutoSleepDisabled
     pub fn set_auto_sleep_disabled(&self, is_auto_sleep_disabled: bool) {
-        log::debug!("SetAutoSleepDisabled called, is_auto_sleep_disabled={}", is_auto_sleep_disabled);
+        log::debug!(
+            "SetAutoSleepDisabled called, is_auto_sleep_disabled={}",
+            is_auto_sleep_disabled
+        );
     }
 
     /// Port of ISelfController::IsAutoSleepDisabled
@@ -240,10 +294,7 @@ impl ISelfController {
     /// SetFocusHandlingMode (cmd 13).
     /// Matches upstream: locks applet, sets notification enabled + handling mode,
     /// calls UpdateSuspensionStateLocked.
-    fn set_focus_handling_mode_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn set_focus_handling_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         let mut rp = RequestParser::new(ctx);
         // CMIF packs consecutive bools as bytes in one u32 word.
@@ -252,7 +303,12 @@ impl ISelfController {
         let notify = (packed & 0xFF) != 0;
         let _background = ((packed >> 8) & 0xFF) != 0;
         let suspend = ((packed >> 16) & 0xFF) != 0;
-        log::info!("SetFocusHandlingMode: notify={} background={} suspend={}", notify, _background, suspend);
+        log::info!(
+            "SetFocusHandlingMode: notify={} background={} suspend={}",
+            notify,
+            _background,
+            suspend
+        );
 
         service.set_focus_handling_mode(notify, _background, suspend);
 
@@ -330,7 +386,9 @@ impl ISelfController {
         log::info!("SetRestartMessageEnabled: enabled={}", enabled);
 
         let mut applet = service.applet.lock().unwrap();
-        applet.lifecycle_manager.set_resume_notification_enabled(enabled);
+        applet
+            .lifecycle_manager
+            .set_resume_notification_enabled(enabled);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -426,10 +484,7 @@ impl ISelfController {
 
     /// SetAutoSleepDisabled (cmd 68).
     /// Matches upstream: locks applet, stores bool.
-    fn set_auto_sleep_disabled_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn set_auto_sleep_disabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         let mut rp = RequestParser::new(ctx);
         let disabled = rp.pop_bool();

@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::engine_upload;
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
+use super::engine_upload;
 use super::{ClassId, Engine, Framebuffer, PendingWrite, ENGINE_REG_COUNT};
 use crate::descriptor_table::{TicTable, TscTable};
 use crate::macro_engine::macro_engine::{get_macro_engine, MacroEngine};
@@ -50,8 +50,12 @@ impl Maxwell3DPtr {
 /// Convert upstream byte offset (from ASSERT_REG_POSITION) to word index.
 /// Matches upstream `MAXWELL3D_REG_INDEX(field) = offsetof(Regs, field) / sizeof(u32)`.
 macro_rules! reg_index {
-    ($byte_offset:expr) => { $byte_offset / 4 };
-    ($base:expr, +$field:expr) => { $base / 4 + $field };
+    ($byte_offset:expr) => {
+        $byte_offset / 4
+    };
+    ($base:expr, +$field:expr) => {
+        $base / 4 + $field
+    };
 }
 const RT_BASE: u32 = reg_index!(0x0800);
 /// Words per render target.
@@ -425,7 +429,10 @@ impl PrimitiveTopology {
             13 => Self::TriangleStripAdjacency,
             14 => Self::Patches,
             _ => {
-                log::warn!("Maxwell3D: unknown topology {}, defaulting to Triangles", value & 0xFFFF);
+                log::warn!(
+                    "Maxwell3D: unknown topology {}, defaulting to Triangles",
+                    value & 0xFFFF
+                );
                 Self::Triangles
             }
         }
@@ -448,7 +455,10 @@ impl IndexFormat {
             1 => Self::UnsignedShort,
             2 => Self::UnsignedInt,
             _ => {
-                log::warn!("Maxwell3D: unknown index format {}, defaulting to UnsignedInt", value);
+                log::warn!(
+                    "Maxwell3D: unknown index format {}, defaulting to UnsignedInt",
+                    value
+                );
                 Self::UnsignedInt
             }
         }
@@ -620,7 +630,10 @@ impl ComparisonOp {
             7 | 0x206 => Self::GreaterEqual,
             8 | 0x207 => Self::Always,
             _ => {
-                log::warn!("Maxwell3D: unknown ComparisonOp 0x{:X}, defaulting to Always", value);
+                log::warn!(
+                    "Maxwell3D: unknown ComparisonOp 0x{:X}, defaulting to Always",
+                    value
+                );
                 Self::Always
             }
         }
@@ -646,7 +659,10 @@ impl BlendEquation {
             4 | 0x8007 => Self::Min,
             5 | 0x8008 => Self::Max,
             _ => {
-                log::warn!("Maxwell3D: unknown BlendEquation 0x{:X}, defaulting to Add", value);
+                log::warn!(
+                    "Maxwell3D: unknown BlendEquation 0x{:X}, defaulting to Add",
+                    value
+                );
                 Self::Add
             }
         }
@@ -700,7 +716,10 @@ impl BlendFactor {
             0x13 | 0xC003 => Self::ConstantAlpha,
             0x14 | 0xC004 => Self::OneMinusConstantAlpha,
             _ => {
-                log::warn!("Maxwell3D: unknown BlendFactor 0x{:X}, defaulting to One", value);
+                log::warn!(
+                    "Maxwell3D: unknown BlendFactor 0x{:X}, defaulting to One",
+                    value
+                );
                 Self::One
             }
         }
@@ -732,7 +751,10 @@ impl StencilOp {
             7 | 0x8507 => Self::Incr,
             8 | 0x8508 => Self::Decr,
             _ => {
-                log::warn!("Maxwell3D: unknown StencilOp 0x{:X}, defaulting to Keep", value);
+                log::warn!(
+                    "Maxwell3D: unknown StencilOp 0x{:X}, defaulting to Keep",
+                    value
+                );
                 Self::Keep
             }
         }
@@ -754,7 +776,10 @@ impl CullFace {
             0x0405 => Self::Back,
             0x0408 => Self::FrontAndBack,
             _ => {
-                log::warn!("Maxwell3D: unknown CullFace 0x{:X}, defaulting to Back", value);
+                log::warn!(
+                    "Maxwell3D: unknown CullFace 0x{:X}, defaulting to Back",
+                    value
+                );
                 Self::Back
             }
         }
@@ -774,7 +799,10 @@ impl FrontFace {
             0x0900 => Self::CW,
             0x0901 => Self::CCW,
             _ => {
-                log::warn!("Maxwell3D: unknown FrontFace 0x{:X}, defaulting to CCW", value);
+                log::warn!(
+                    "Maxwell3D: unknown FrontFace 0x{:X}, defaulting to CCW",
+                    value
+                );
                 Self::CCW
             }
         }
@@ -796,7 +824,10 @@ impl PolygonMode {
             0x1B01 => Self::Line,
             0x1B02 => Self::Fill,
             _ => {
-                log::warn!("Maxwell3D: unknown PolygonMode 0x{:X}, defaulting to Fill", value);
+                log::warn!(
+                    "Maxwell3D: unknown PolygonMode 0x{:X}, defaulting to Fill",
+                    value
+                );
                 Self::Fill
             }
         }
@@ -816,7 +847,10 @@ impl DepthMode {
             0 => Self::MinusOneToOne,
             1 => Self::ZeroToOne,
             _ => {
-                log::warn!("Maxwell3D: unknown DepthMode {}, defaulting to ZeroToOne", value);
+                log::warn!(
+                    "Maxwell3D: unknown DepthMode {}, defaulting to ZeroToOne",
+                    value
+                );
                 Self::ZeroToOne
             }
         }
@@ -899,10 +933,12 @@ impl VertexAttribSize {
     /// Number of components.
     pub fn component_count(&self) -> u32 {
         match self {
-            Self::R32G32B32A32 | Self::R16G16B16A16 | Self::R8G8B8A8
-            | Self::A2B10G10R10 | Self::X8B8G8R8 => 4,
-            Self::R32G32B32 | Self::R16G16B16 | Self::R8G8B8
-            | Self::B10G11R11 => 3,
+            Self::R32G32B32A32
+            | Self::R16G16B16A16
+            | Self::R8G8B8A8
+            | Self::A2B10G10R10
+            | Self::X8B8G8R8 => 4,
+            Self::R32G32B32 | Self::R16G16B16 | Self::R8G8B8 | Self::B10G11R11 => 3,
             Self::R32G32 | Self::R16G16 | Self::R8G8 | Self::G8R8 => 2,
             Self::R32 | Self::R16 | Self::R8 | Self::A8 => 1,
             Self::Invalid => 0,
@@ -1906,9 +1942,8 @@ impl Maxwell3D {
         f: impl FnOnce(&mut dyn RasterizerInterface) -> R,
     ) -> Option<R> {
         let raw = self.rasterizer?;
-        let rasterizer = unsafe {
-            &mut *std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
-        };
+        let rasterizer =
+            unsafe { &mut *std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw) };
         Some(f(rasterizer))
     }
 
@@ -1994,9 +2029,9 @@ impl Maxwell3D {
         let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
             return;
         };
-        let rasterizer_raw = self
-            .rasterizer
-            .map(|raw| unsafe { std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw) });
+        let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
+            std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
+        });
         let writer = self.guest_memory_writer.as_ref().cloned();
         let mut write_cpu = move |addr: u64, bytes: &[u8]| {
             if let Some(writer) = writer.as_ref() {
@@ -2019,9 +2054,9 @@ impl Maxwell3D {
         let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
             return;
         };
-        let rasterizer_raw = self
-            .rasterizer
-            .map(|raw| unsafe { std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw) });
+        let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
+            std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
+        });
         let writer = self.guest_memory_writer.as_ref().cloned();
         let mut write_cpu = move |addr: u64, bytes: &[u8]| {
             if let Some(writer) = writer.as_ref() {
@@ -2035,7 +2070,8 @@ impl Maxwell3D {
             memory_manager: &*memory_manager,
             write_cpu_mem: &mut write_cpu,
         };
-        self.upload_state.process_data_multi_with_ctx(data, &mut ctx);
+        self.upload_state
+            .process_data_multi_with_ctx(data, &mut ctx);
     }
 
     /// Width of render target `index`.
@@ -2254,18 +2290,12 @@ impl Maxwell3D {
             cull_enable: self.regs[CULL_TEST_ENABLE as usize] != 0,
             front_face: FrontFace::from_raw(self.regs[FRONT_FACE as usize]),
             cull_face: CullFace::from_raw(self.regs[CULL_FACE as usize]),
-            polygon_mode_front: PolygonMode::from_raw(
-                self.regs[POLYGON_MODE_FRONT as usize],
-            ),
-            polygon_mode_back: PolygonMode::from_raw(
-                self.regs[POLYGON_MODE_BACK as usize],
-            ),
+            polygon_mode_front: PolygonMode::from_raw(self.regs[POLYGON_MODE_FRONT as usize]),
+            polygon_mode_back: PolygonMode::from_raw(self.regs[POLYGON_MODE_BACK as usize]),
             line_width_smooth: f32::from_bits(self.regs[LINE_WIDTH_SMOOTH as usize]),
             line_width_aliased: f32::from_bits(self.regs[LINE_WIDTH_ALIASED as usize]),
             depth_bias: f32::from_bits(self.regs[DEPTH_BIAS as usize]),
-            slope_scale_depth_bias: f32::from_bits(
-                self.regs[SLOPE_SCALE_DEPTH_BIAS as usize],
-            ),
+            slope_scale_depth_bias: f32::from_bits(self.regs[SLOPE_SCALE_DEPTH_BIAS as usize]),
             depth_bias_clamp: f32::from_bits(self.regs[DEPTH_BIAS_CLAMP as usize]),
         }
     }
@@ -2317,8 +2347,7 @@ impl Maxwell3D {
         let tic_limit = self.regs[(TEX_HEADER_POOL_BASE + 2) as usize];
         self.tic_table.synchronize(tic_addr, tic_limit);
 
-        let linked =
-            self.regs[SAMPLER_BINDING as usize] == SamplerBinding::ViaHeaderBinding as u32;
+        let linked = self.regs[SAMPLER_BINDING as usize] == SamplerBinding::ViaHeaderBinding as u32;
         let tsc_addr = self.tex_sampler_pool_address();
         let tsc_limit = if linked {
             tic_limit
@@ -2355,8 +2384,7 @@ impl Maxwell3D {
     /// Decode a texture handle into `(tic_id, tsc_id)` based on sampler
     /// binding mode.
     pub fn decode_texture_handle(&self, handle: u32) -> (u32, u32) {
-        let linked =
-            self.regs[SAMPLER_BINDING as usize] == SamplerBinding::ViaHeaderBinding as u32;
+        let linked = self.regs[SAMPLER_BINDING as usize] == SamplerBinding::ViaHeaderBinding as u32;
         if linked {
             // Same index for both TIC and TSC.
             (handle, handle)
@@ -2445,10 +2473,7 @@ impl Maxwell3D {
     // ── Constant buffer accessors ────────────────────────────────────────
 
     /// Read constant buffer bindings for a shader stage (0..4).
-    pub fn const_buffer_bindings(
-        &self,
-        stage: usize,
-    ) -> &[ConstBufferBinding; MAX_CB_SLOTS] {
+    pub fn const_buffer_bindings(&self, stage: usize) -> &[ConstBufferBinding; MAX_CB_SLOTS] {
         &self.cb_bindings[stage]
     }
 
@@ -2649,11 +2674,7 @@ impl Maxwell3D {
 
     /// Build a DrawCall from current register state with the given instance
     /// count and optional inline index data.
-    fn build_draw_call(
-        &self,
-        instance_count: u32,
-        inline_index_data: Vec<u8>,
-    ) -> DrawCall {
+    fn build_draw_call(&self, instance_count: u32, inline_index_data: Vec<u8>) -> DrawCall {
         // Collect active vertex streams (scan all 32 slots).
         let mut vertex_streams = Vec::new();
         for i in 0..32 {
@@ -2790,11 +2811,7 @@ impl Maxwell3D {
             );
         } else {
             self.cb_bindings[stage][slot] = ConstBufferBinding::default();
-            log::trace!(
-                "Maxwell3D: CB_BIND stage={} slot={} disabled",
-                stage,
-                slot
-            );
+            log::trace!("Maxwell3D: CB_BIND stage={} slot={} disabled", stage, slot);
         }
     }
 }
@@ -2872,7 +2889,9 @@ impl Maxwell3D {
             m if m == IB_BASE + IB_OFF_FIRST => true,
             m if m == IB_BASE + IB_OFF_COUNT => true,
             DRAW_INLINE_INDEX => true,
-            INDEX_BUFFER32_SUBSEQUENT | INDEX_BUFFER16_SUBSEQUENT | INDEX_BUFFER8_SUBSEQUENT => true,
+            INDEX_BUFFER32_SUBSEQUENT | INDEX_BUFFER16_SUBSEQUENT | INDEX_BUFFER8_SUBSEQUENT => {
+                true
+            }
             INDEX_BUFFER32_FIRST | INDEX_BUFFER16_FIRST | INDEX_BUFFER8_FIRST => true,
             INLINE_INDEX_2X16_EVEN | INLINE_INDEX_4X8_INDEX0 => true,
             VERTEX_ARRAY_INSTANCE_FIRST | VERTEX_ARRAY_INSTANCE_SUBSEQUENT => true,
@@ -3041,16 +3060,14 @@ impl Maxwell3D {
                 let odd = (self.regs[INLINE_INDEX_2X16_EVEN as usize] >> 16) & 0xFFFF;
                 self.inline_index_data
                     .extend_from_slice(&even.to_le_bytes());
-                self.inline_index_data
-                    .extend_from_slice(&odd.to_le_bytes());
+                self.inline_index_data.extend_from_slice(&odd.to_le_bytes());
                 self.draw_mode = DrawMode::InlineIndex;
             }
             INLINE_INDEX_4X8_INDEX0 => {
                 let raw = self.regs[INLINE_INDEX_4X8_INDEX0 as usize];
                 for shift in [0, 8, 16, 24] {
                     let idx = (raw >> shift) & 0xFF;
-                    self.inline_index_data
-                        .extend_from_slice(&idx.to_le_bytes());
+                    self.inline_index_data.extend_from_slice(&idx.to_le_bytes());
                 }
                 self.draw_mode = DrawMode::InlineIndex;
             }
@@ -3350,10 +3367,8 @@ impl Maxwell3D {
                         buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp placeholder
                         buf
                     };
-                    self.pending_semaphore_writes.push(PendingWrite {
-                        gpu_va,
-                        data,
-                    });
+                    self.pending_semaphore_writes
+                        .push(PendingWrite { gpu_va, data });
                 }
             }
             ReportOperation::Acquire => {
@@ -3375,7 +3390,8 @@ impl Maxwell3D {
                     0 => self.execute_on = false,
                     1 => self.execute_on = true,
                     2..=4 => {
-                        let condition_address = ((self.regs[RENDER_ENABLE_BASE as usize] as u64) << 32)
+                        let condition_address = ((self.regs[RENDER_ENABLE_BASE as usize] as u64)
+                            << 32)
                             | self.regs[(RENDER_ENABLE_BASE + 1) as usize] as u64;
                         let mut compare_bytes = [0u8; 24];
                         if !self.read_gpu_block(condition_address, &mut compare_bytes) {
@@ -3393,12 +3409,10 @@ impl Maxwell3D {
                         self.execute_on = match mode {
                             2 => initial_sequence != 0 && initial_mode != 0,
                             3 => {
-                                initial_sequence == current_sequence
-                                    && initial_mode == current_mode
+                                initial_sequence == current_sequence && initial_mode == current_mode
                             }
                             4 => {
-                                initial_sequence != current_sequence
-                                    || initial_mode != current_mode
+                                initial_sequence != current_sequence || initial_mode != current_mode
                             }
                             _ => unreachable!(),
                         };
@@ -3766,10 +3780,7 @@ impl Engine for Maxwell3D {
         self.pending_framebuffer.take()
     }
 
-    fn execute_pending(
-        &mut self,
-        _read_gpu: &dyn Fn(u64, &mut [u8]),
-    ) -> Vec<PendingWrite> {
+    fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         std::mem::take(&mut self.pending_semaphore_writes)
     }
 
@@ -3869,13 +3880,21 @@ mod tests {
         fn release_fences(&mut self, _force: bool) {}
         fn flush_all(&mut self) {}
         fn flush_region(&mut self, _addr: u64, _size: u64) {}
-        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool { false }
+        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+            false
+        }
         fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
-            RasterizerDownloadArea { start_address: addr, end_address: addr + size, preemptive: false }
+            RasterizerDownloadArea {
+                start_address: addr,
+                end_address: addr + size,
+                preemptive: false,
+            }
         }
         fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
         fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
-        fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool { false }
+        fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
+            false
+        }
         fn invalidate_gpu_cache(&mut self) {}
         fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
         fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
@@ -3887,7 +3906,13 @@ mod tests {
         fn tiled_cache_barrier(&mut self) {}
         fn flush_commands(&mut self) {}
         fn tick_frame(&mut self) {}
-        fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
+        fn accelerate_inline_to_memory(
+            &mut self,
+            _address: u64,
+            _copy_size: usize,
+            _memory: &[u8],
+        ) {
+        }
     }
 
     // ── Existing tests ───────────────────────────────────────────────────
@@ -3972,7 +3997,9 @@ mod tests {
         let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5); // R|G|B|A
         engine.handle_clear_surface(flags);
 
-        let fb = engine.take_framebuffer().expect("Should produce framebuffer");
+        let fb = engine
+            .take_framebuffer()
+            .expect("Should produce framebuffer");
         assert_eq!(fb.gpu_va, 0x1000);
         assert_eq!(fb.width, 4);
         assert_eq!(fb.height, 2);
@@ -4061,7 +4088,9 @@ mod tests {
         let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
         engine.write_reg(CLEAR_SURFACE, flags);
 
-        let fb = engine.take_framebuffer().expect("Should produce framebuffer");
+        let fb = engine
+            .take_framebuffer()
+            .expect("Should produce framebuffer");
         assert_eq!(fb.gpu_va, 0x5000);
         assert_eq!(fb.width, 8);
         assert_eq!(fb.height, 4);
@@ -4290,7 +4319,10 @@ mod tests {
         // GL encoding
         assert_eq!(BlendEquation::from_raw(0x8006), BlendEquation::Add);
         assert_eq!(BlendEquation::from_raw(0x800A), BlendEquation::Subtract);
-        assert_eq!(BlendEquation::from_raw(0x800B), BlendEquation::ReverseSubtract);
+        assert_eq!(
+            BlendEquation::from_raw(0x800B),
+            BlendEquation::ReverseSubtract
+        );
         assert_eq!(BlendEquation::from_raw(0x8007), BlendEquation::Min);
         assert_eq!(BlendEquation::from_raw(0x8008), BlendEquation::Max);
     }
@@ -4307,7 +4339,10 @@ mod tests {
         assert_eq!(BlendFactor::from_raw(0x4001), BlendFactor::One);
         assert_eq!(BlendFactor::from_raw(0x4302), BlendFactor::SrcAlpha);
         assert_eq!(BlendFactor::from_raw(0xC001), BlendFactor::ConstantColor);
-        assert_eq!(BlendFactor::from_raw(0xC903), BlendFactor::OneMinusSrc1Alpha);
+        assert_eq!(
+            BlendFactor::from_raw(0xC903),
+            BlendFactor::OneMinusSrc1Alpha
+        );
     }
 
     #[test]
@@ -4353,7 +4388,7 @@ mod tests {
 
         // Enable blend for RT0.
         engine.regs[base + 9] = 1; // enable[0]
-        // Set separate alpha, color Add SrcAlpha/OneMinusSrcAlpha, alpha Add One/Zero.
+                                   // Set separate alpha, color Add SrcAlpha/OneMinusSrcAlpha, alpha Add One/Zero.
         engine.regs[base] = 1; // separate_alpha
         engine.regs[base + 1] = 1; // color_op = Add (D3D)
         engine.regs[base + 2] = 0x05; // color_src = SrcAlpha (D3D)
@@ -4659,15 +4694,30 @@ mod tests {
 
     #[test]
     fn test_vertex_attrib_size_values() {
-        assert_eq!(VertexAttribSize::from_raw(0x01), VertexAttribSize::R32G32B32A32);
-        assert_eq!(VertexAttribSize::from_raw(0x02), VertexAttribSize::R32G32B32);
-        assert_eq!(VertexAttribSize::from_raw(0x03), VertexAttribSize::R16G16B16A16);
+        assert_eq!(
+            VertexAttribSize::from_raw(0x01),
+            VertexAttribSize::R32G32B32A32
+        );
+        assert_eq!(
+            VertexAttribSize::from_raw(0x02),
+            VertexAttribSize::R32G32B32
+        );
+        assert_eq!(
+            VertexAttribSize::from_raw(0x03),
+            VertexAttribSize::R16G16B16A16
+        );
         assert_eq!(VertexAttribSize::from_raw(0x04), VertexAttribSize::R32G32);
         assert_eq!(VertexAttribSize::from_raw(0x0A), VertexAttribSize::R8G8B8A8);
         assert_eq!(VertexAttribSize::from_raw(0x12), VertexAttribSize::R32);
         assert_eq!(VertexAttribSize::from_raw(0x1D), VertexAttribSize::R8);
-        assert_eq!(VertexAttribSize::from_raw(0x30), VertexAttribSize::A2B10G10R10);
-        assert_eq!(VertexAttribSize::from_raw(0x31), VertexAttribSize::B10G11R11);
+        assert_eq!(
+            VertexAttribSize::from_raw(0x30),
+            VertexAttribSize::A2B10G10R10
+        );
+        assert_eq!(
+            VertexAttribSize::from_raw(0x31),
+            VertexAttribSize::B10G11R11
+        );
         assert_eq!(VertexAttribSize::from_raw(0x34), VertexAttribSize::A8);
         assert_eq!(VertexAttribSize::from_raw(0xFF), VertexAttribSize::Invalid);
     }
@@ -4731,10 +4781,7 @@ mod tests {
         // Attrib 0: buffer=3, not constant, offset=16, size=R32G32B32A32(0x01),
         // type=Float(7), no bgra.
         // bits[4:0]=3, bit[6]=0, bits[20:7]=16, bits[26:21]=0x01, bits[29:27]=7, bit[31]=0
-        let raw = 3u32
-            | (16 << 7)
-            | (0x01 << 21)
-            | (7 << 27);
+        let raw = 3u32 | (16 << 7) | (0x01 << 21) | (7 << 27);
         engine.regs[VERTEX_ATTRIB_BASE as usize] = raw;
 
         let info = engine.vertex_attrib_info(0);
@@ -4756,7 +4803,7 @@ mod tests {
             | (1 << 6)       // constant
             | (0x0A << 21)   // R8G8B8A8
             | (2 << 27)      // UNorm
-            | (1 << 31);     // bgra
+            | (1 << 31); // bgra
         engine.regs[(VERTEX_ATTRIB_BASE + 5) as usize] = raw;
 
         let info = engine.vertex_attrib_info(5);
@@ -4778,8 +4825,8 @@ mod tests {
         // word0: enabled=1, type=VertexB(1) at bits[7:4]
         engine.regs[base] = 1 | (1 << 4);
         engine.regs[base + 1] = 0x100; // offset
-        engine.regs[base + 3] = 64;    // register_count
-        engine.regs[base + 4] = 0;     // binding_group
+        engine.regs[base + 3] = 64; // register_count
+        engine.regs[base + 4] = 0; // binding_group
 
         let info = engine.shader_stage_info(1);
         assert!(info.enabled);
@@ -4919,7 +4966,10 @@ mod tests {
         let draws = engine.take_draw_calls();
         assert_eq!(draws[0].vertex_attribs.len(), 2);
         assert_eq!(draws[0].vertex_attribs[0].size, VertexAttribSize::R32G32B32);
-        assert_eq!(draws[0].vertex_attribs[0].attrib_type, VertexAttribType::Float);
+        assert_eq!(
+            draws[0].vertex_attribs[0].attrib_type,
+            VertexAttribType::Float
+        );
         assert_eq!(draws[0].vertex_attribs[1].offset, 12);
         assert_eq!(draws[0].vertex_attribs[1].size, VertexAttribSize::R8G8B8A8);
     }
@@ -4944,10 +4994,16 @@ mod tests {
 
         let draws = engine.take_draw_calls();
         assert!(draws[0].shader_stages[1].enabled);
-        assert_eq!(draws[0].shader_stages[1].program_type, ShaderStageType::VertexB);
+        assert_eq!(
+            draws[0].shader_stages[1].program_type,
+            ShaderStageType::VertexB
+        );
         assert_eq!(draws[0].shader_stages[1].offset, 0x100);
         assert!(draws[0].shader_stages[5].enabled);
-        assert_eq!(draws[0].shader_stages[5].program_type, ShaderStageType::Fragment);
+        assert_eq!(
+            draws[0].shader_stages[5].program_type,
+            ShaderStageType::Fragment
+        );
         // Slot 0 should be disabled.
         assert!(!draws[0].shader_stages[0].enabled);
     }
@@ -5084,7 +5140,7 @@ mod tests {
             | (3 << 22)  // y_source = G
             | (4 << 25)  // z_source = B
             | (5 << 28); // w_source = A
-        // word1: addr_low
+                         // word1: addr_low
         words[1] = 0x0010_0000;
         // word2: addr_high[15:0]=0x0001, header_version=BlockLinear(3) at bits[23:21]
         words[2] = 0x0001 | (3 << 21);
@@ -5118,7 +5174,7 @@ mod tests {
     fn test_texture_descriptor_block_height_depth() {
         let mut words = [0u32; 8];
         words[0] = 0x1D; // A8B8G8R8
-        // word3: block_height=3 at bits[5:3], block_depth=2 at bits[8:6], max_mip=0
+                         // word3: block_height=3 at bits[5:3], block_depth=2 at bits[8:6], max_mip=0
         words[3] = (3 << 3) | (2 << 6);
         let desc = TextureDescriptor::from_words(&words);
         assert_eq!(desc.block_height, 3);
@@ -5129,7 +5185,7 @@ mod tests {
     fn test_texture_descriptor_srgb_3d() {
         let mut words = [0u32; 8];
         words[0] = 0x1D; // A8B8G8R8, all other fields zero
-        // word4: srgb_conversion=1 at bit[22], texture_type=Texture3D(2) at [26:23], width=63(+1=64)
+                         // word4: srgb_conversion=1 at bit[22], texture_type=Texture3D(2) at [26:23], width=63(+1=64)
         words[4] = 63 | (1 << 22) | (2 << 23);
         // word5: height=63(+1=64), depth=31(+1=32) at [29:16]
         words[5] = 63 | (31 << 16);
@@ -5147,8 +5203,8 @@ mod tests {
     fn test_texture_descriptor_buffer() {
         let mut words = [0u32; 8];
         words[0] = 0x09; // R32
-        // word2: header_version=OneDBuffer(0) — already zero
-        // word4: texture_type=Buffer1D(6) at [26:23], width=255(+1=256)
+                         // word2: header_version=OneDBuffer(0) — already zero
+                         // word4: texture_type=Buffer1D(6) at [26:23], width=255(+1=256)
         words[4] = 255 | (6 << 23);
         words[5] = 0; // height=0+1=1, depth=0+1=1
 
@@ -5219,32 +5275,47 @@ mod tests {
 
         // anisotropy = 0 → 1x
         words[0] = 0;
-        assert_eq!(SamplerDescriptor::from_words(&words).anisotropy_multiplier(), 1);
+        assert_eq!(
+            SamplerDescriptor::from_words(&words).anisotropy_multiplier(),
+            1
+        );
 
         // anisotropy = 1 → 2x
         words[0] = 1 << 20;
-        assert_eq!(SamplerDescriptor::from_words(&words).anisotropy_multiplier(), 2);
+        assert_eq!(
+            SamplerDescriptor::from_words(&words).anisotropy_multiplier(),
+            2
+        );
 
         // anisotropy = 2 → 4x
         words[0] = 2 << 20;
-        assert_eq!(SamplerDescriptor::from_words(&words).anisotropy_multiplier(), 4);
+        assert_eq!(
+            SamplerDescriptor::from_words(&words).anisotropy_multiplier(),
+            4
+        );
 
         // anisotropy = 3 → 8x
         words[0] = 3 << 20;
-        assert_eq!(SamplerDescriptor::from_words(&words).anisotropy_multiplier(), 8);
+        assert_eq!(
+            SamplerDescriptor::from_words(&words).anisotropy_multiplier(),
+            8
+        );
 
         // anisotropy = 4 → 16x
         words[0] = 4 << 20;
-        assert_eq!(SamplerDescriptor::from_words(&words).anisotropy_multiplier(), 16);
+        assert_eq!(
+            SamplerDescriptor::from_words(&words).anisotropy_multiplier(),
+            16
+        );
     }
 
     #[test]
     fn test_tex_header_pool_address() {
         let mut engine = Maxwell3D::new();
         let base = TEX_HEADER_POOL_BASE as usize;
-        engine.regs[base] = 0x0002;       // addr_high
-        engine.regs[base + 1] = 0x4000;   // addr_low
-        engine.regs[base + 2] = 1024;     // limit
+        engine.regs[base] = 0x0002; // addr_high
+        engine.regs[base + 1] = 0x4000; // addr_low
+        engine.regs[base + 2] = 1024; // limit
 
         assert_eq!(engine.tex_header_pool_address(), 0x0002_0000_4000);
         assert_eq!(engine.tex_header_pool_limit(), 1024);
@@ -5254,9 +5325,9 @@ mod tests {
     fn test_tex_sampler_pool_address() {
         let mut engine = Maxwell3D::new();
         let base = TEX_SAMPLER_POOL_BASE as usize;
-        engine.regs[base] = 0x0003;       // addr_high
-        engine.regs[base + 1] = 0x8000;   // addr_low
-        engine.regs[base + 2] = 512;      // limit
+        engine.regs[base] = 0x0003; // addr_high
+        engine.regs[base + 1] = 0x8000; // addr_low
+        engine.regs[base + 2] = 512; // limit
 
         assert_eq!(engine.tex_sampler_pool_address(), 0x0003_0000_8000);
         assert_eq!(engine.tex_sampler_pool_limit(), 512);
@@ -5618,7 +5689,10 @@ mod tests {
         assert_eq!(ReportOperation::from_raw(2), ReportOperation::ReportOnly);
         assert_eq!(ReportOperation::from_raw(3), ReportOperation::Trap);
         // Bits above [1:0] are ignored for operation extraction.
-        assert_eq!(ReportOperation::from_raw(0xFFFF_FF00), ReportOperation::Release);
+        assert_eq!(
+            ReportOperation::from_raw(0xFFFF_FF00),
+            ReportOperation::Release
+        );
     }
 
     #[test]
@@ -5755,7 +5829,10 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.query_writes.len(), 1);
         assert_eq!(calls.query_writes[0].0, 0x7000);
-        assert_eq!(calls.query_writes[0].1, 0x1122_3344u32.to_le_bytes().to_vec());
+        assert_eq!(
+            calls.query_writes[0].1,
+            0x1122_3344u32.to_le_bytes().to_vec()
+        );
         drop(calls);
 
         let writes = writes.lock().unwrap();
@@ -5801,9 +5878,7 @@ mod tests {
     fn test_refresh_parameters_updates_dirty_macro_segments() {
         let gpu = crate::gpu::Gpu::new(false, false);
         gpu.set_guest_memory_reader(std::sync::Arc::new(|addr, output| {
-            let backing = [
-                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-            ];
+            let backing = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
             let start = (addr - 0x2000) as usize;
             output.copy_from_slice(&backing[start..start + output.len()]);
         }));
@@ -5906,15 +5981,15 @@ mod tests {
         let code = [
             macro_add_imm(2, false, 2, 0, method_raw as i32), // MoveAndSetMethod
             macro_add_imm(4, false, 3, 1, 0),                 // MoveAndSend r1
-            macro_add_imm(0, true, 4, 0, 0),                  // IgnoreAndFetch(exit), fetch param[1] into r4
+            macro_add_imm(0, true, 4, 0, 0), // IgnoreAndFetch(exit), fetch param[1] into r4
         ];
         // But we need to also send param[1]. Let me simplify:
         // Macro: MoveAndSetMethod, then FetchAndSend (fetch param[1], send r1),
         //        then exit.
         let code = [
             macro_add_imm(2, false, 2, 0, method_raw as i32), // MoveAndSetMethod r2=method
-            macro_add_imm(3, false, 3, 1, 0),                 // FetchAndSend: fetch param[1]→r3, send r1
-            macro_add_imm(4, true, 4, 3, 0),                  // MoveAndSend r4=r3, send r3, exit
+            macro_add_imm(3, false, 3, 1, 0), // FetchAndSend: fetch param[1]→r3, send r1
+            macro_add_imm(4, true, 4, 3, 0),  // MoveAndSend r4=r3, send r3, exit
         ];
 
         engine.write_reg(LOAD_MME_INSTRUCTION_PTR, 0);
@@ -5925,7 +6000,7 @@ mod tests {
         engine.write_reg(LOAD_MME_START_ADDR, 0);
 
         // Call with params [0xAA, 0xBB].
-        engine.write_reg(MACRO_METHODS_START, 0xAA);    // First param (even method = new macro).
+        engine.write_reg(MACRO_METHODS_START, 0xAA); // First param (even method = new macro).
         engine.write_reg(MACRO_METHODS_START + 1, 0xBB); // Second param (odd = append).
         engine.flush_macro();
 
@@ -6180,7 +6255,9 @@ mod tests {
         let memory_manager = Arc::new(parking_lot::Mutex::new(
             crate::memory_manager::MemoryManager::new_with_geometry(1, 32, 0x1_0000_0000, 16, 12),
         ));
-        memory_manager.lock().map(0x10000, 0x9000_0000, 0x1000, 0, false);
+        memory_manager
+            .lock()
+            .map(0x10000, 0x9000_0000, 0x1000, 0, false);
         let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
         let writes_clone = Arc::clone(&writes);
         engine.set_memory_manager(Arc::clone(&memory_manager));
@@ -6244,7 +6321,7 @@ mod tests {
         let mut engine = Maxwell3D::new();
         // Enable shadow RAM tracking.
         engine.call_method(SHADOW_RAM_CONTROL, 1, true); // Track
-        // Write a value through call_method.
+                                                         // Write a value through call_method.
         engine.call_method(0x200, 0xDEAD, true);
         // Shadow state should have the tracked value.
         assert_eq!(engine.shadow_state[0x200], 0xDEAD);
@@ -6262,7 +6339,7 @@ mod tests {
 
         // Switch to Replay mode.
         engine.call_method(SHADOW_RAM_CONTROL, 3, true); // Replay
-        // Write a different value — should use shadow state instead.
+                                                         // Write a different value — should use shadow state instead.
         engine.call_method(0x200, 0xBBBB, true);
         // Regs should have the shadow value (0xAAAA), not the written value.
         assert_eq!(engine.regs[0x200], 0xAAAA);
@@ -6472,7 +6549,7 @@ mod tests {
         engine.call_method(REPORT_SEMAPHORE_BASE, 0, true); // addr_high
         engine.call_method(REPORT_SEMAPHORE_BASE + 1, 0x5000, true); // addr_low
         engine.call_method(REPORT_SEMAPHORE_BASE + 2, 0xCAFE, true); // payload
-        // Trigger: Release (0), short query (bit 28 set).
+                                                                     // Trigger: Release (0), short query (bit 28 set).
         let query_val = (1 << 28) | 0; // short_query=1, operation=Release
         engine.call_method(REPORT_SEMAPHORE_QUERY, query_val, true);
 

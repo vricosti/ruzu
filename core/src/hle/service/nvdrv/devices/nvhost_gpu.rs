@@ -19,8 +19,8 @@ use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::core::syncpoint_manager::SyncpointManager;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
-use crate::hle::service::nvdrv::nvdrv::EventInterface;
 use crate::hle::service::nvdrv::nvdata::*;
+use crate::hle::service::nvdrv::nvdrv::EventInterface;
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,7 +285,11 @@ impl NvHostGpu {
 
     pub fn zcull_bind(&self, params: &mut IoctlZCullBind) -> NvResult {
         *self.zcull_params.lock().unwrap() = *params;
-        log::debug!("nvhost_gpu::ZCullBind called, gpu_va={:X}, mode={:X}", params.gpu_va, params.mode);
+        log::debug!(
+            "nvhost_gpu::ZCullBind called, gpu_va={:X}, mode={:X}",
+            params.gpu_va,
+            params.mode
+        );
         NvResult::Success
     }
 
@@ -301,7 +305,10 @@ impl NvHostGpu {
 
     pub fn set_channel_priority(&self, params: &mut IoctlChannelSetPriority) -> NvResult {
         *self.channel_priority.lock().unwrap() = params.priority;
-        log::debug!("nvhost_gpu::SetChannelPriority (STUBBED) called, priority={:X}", params.priority);
+        log::debug!(
+            "nvhost_gpu::SetChannelPriority (STUBBED) called, priority={:X}",
+            params.priority
+        );
         NvResult::Success
     }
 
@@ -328,7 +335,9 @@ impl NvHostGpu {
             .unwrap_or(0);
         self.channel_state.init_channel(program_id);
         let channel_syncpoint = self.channel_syncpoint.load(Ordering::Acquire);
-        params.fence_out = self.syncpoint_manager().get_syncpoint_fence(channel_syncpoint);
+        params.fence_out = self
+            .syncpoint_manager()
+            .get_syncpoint_fence(channel_syncpoint);
         NvResult::Success
     }
 
@@ -361,17 +370,6 @@ impl NvHostGpu {
             .get()
             .gpu_core()
             .expect("GPU core must remain available while nvhost_gpu is alive");
-        log::info!(
-            "nvhost_gpu::SubmitGPFIFOImpl bind_id={} syncpoint={} fence_in={{id:{}, value:{}}} flags=0x{:X} entries={} prefetch={}",
-            bind_id,
-            channel_syncpoint,
-            params.fence.id,
-            params.fence.value,
-            params.flags,
-            entries.command_lists.len(),
-            entries.prefetch_command_list.len()
-        );
-
         if params.fence_wait() {
             if params.increment_value() {
                 return NvResult::BadParameter;
@@ -402,12 +400,6 @@ impl NvHostGpu {
             }
         }
 
-        log::info!(
-            "nvhost_gpu::SubmitGPFIFOImpl result fence_out={{id:{}, value:{}}} flags=0x{:X}",
-            params.fence.id,
-            params.fence.value,
-            params.flags
-        );
         params.flags = 0;
         NvResult::Success
     }
@@ -433,7 +425,8 @@ impl NvHostGpu {
                 return NvResult::InvalidState;
             };
             let bytes = process.read_memory_vec(params.address, command_count * entry_size);
-            bytes.chunks_exact(entry_size)
+            bytes
+                .chunks_exact(entry_size)
                 .take(command_count)
                 .map(|chunk| GpuCommandListHeader {
                     raw: u64::from_le_bytes(chunk.try_into().unwrap()),
@@ -467,11 +460,7 @@ impl NvHostGpu {
         )
     }
 
-    pub fn submit_gpfifo_base2(
-        &self,
-        params: &mut IoctlSubmitGpfifo,
-        commands: &[u8],
-    ) -> NvResult {
+    pub fn submit_gpfifo_base2(&self, params: &mut IoctlSubmitGpfifo, commands: &[u8]) -> NvResult {
         let command_count = params.num_entries as usize;
         let entry_size = std::mem::size_of::<GpuCommandListHeader>();
         let available_entries = commands.len() / entry_size;
@@ -507,18 +496,27 @@ impl NvHostGpu {
     }
 
     pub fn get_waitbase(&self, params: &mut IoctlGetWaitbase) -> NvResult {
-        log::info!("nvhost_gpu::GetWaitbase called, unknown=0x{:X}", params.unknown);
+        log::info!(
+            "nvhost_gpu::GetWaitbase called, unknown=0x{:X}",
+            params.unknown
+        );
         params.value = 0;
         NvResult::Success
     }
 
     pub fn channel_set_timeout(&self, params: &mut IoctlChannelSetTimeout) -> NvResult {
-        log::info!("nvhost_gpu::ChannelSetTimeout called, timeout=0x{:X}", params.timeout);
+        log::info!(
+            "nvhost_gpu::ChannelSetTimeout called, timeout=0x{:X}",
+            params.timeout
+        );
         NvResult::Success
     }
 
     pub fn channel_set_timeslice(&self, params: &mut IoctlSetTimeslice) -> NvResult {
-        log::info!("nvhost_gpu::ChannelSetTimeslice called, timeslice=0x{:X}", params.timeslice);
+        log::info!(
+            "nvhost_gpu::ChannelSetTimeslice called, timeslice=0x{:X}",
+            params.timeslice
+        );
         *self.channel_timeslice.lock().unwrap() = params.timeslice;
         NvResult::Success
     }
@@ -544,13 +542,7 @@ impl Drop for NvHostGpu {
 }
 
 impl NvDevice for NvHostGpu {
-    fn ioctl1(
-        &self,
-        fd: DeviceFD,
-        command: Ioctl,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> NvResult {
+    fn ioctl1(&self, fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
         match command.group() {
             0x0 => match command.cmd() {
                 0x3 => {
@@ -738,10 +730,10 @@ mod tests {
     use crate::gpu_core::{
         GpuChannelHandle, GpuCommandList, GpuCoreInterface, GpuMemoryManagerHandle,
     };
-    use crate::hle::service::nvdrv::nvdrv::EventInterface;
     use crate::hle::service::nvdrv::core::container::Container;
     use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
     use crate::hle::service::nvdrv::nvdata::{NvFence, NvResult};
+    use crate::hle::service::nvdrv::nvdrv::EventInterface;
 
     #[derive(Default)]
     struct FakeGpuCore {
@@ -768,7 +760,15 @@ mod tests {
             self
         }
 
-        fn map(&self, _gpu_addr: u64, _device_addr: u64, _size: u64, _kind: u32, _is_big_pages: bool) {}
+        fn map(
+            &self,
+            _gpu_addr: u64,
+            _device_addr: u64,
+            _size: u64,
+            _kind: u32,
+            _is_big_pages: bool,
+        ) {
+        }
 
         fn map_sparse(&self, _gpu_addr: u64, _size: u64, _is_big_pages: bool) {}
 
@@ -806,8 +806,14 @@ mod tests {
         let mut system = crate::core::System::new_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore::default()));
         let container = Container::new();
-        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(&system)));
-        let gpu = NvHostGpu::new(crate::core::SystemRef::from_ref(&system), events, &container);
+        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(
+            &system,
+        )));
+        let gpu = NvHostGpu::new(
+            crate::core::SystemRef::from_ref(&system),
+            events,
+            &container,
+        );
         let mut params = IoctlAllocGpfifoEx2::default();
 
         let result = gpu.alloc_gpfifo_ex2(&mut params, 1);
@@ -821,8 +827,14 @@ mod tests {
         let mut system = crate::core::System::new_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore::default()));
         let container = Container::new();
-        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(&system)));
-        let gpu = NvHostGpu::new(crate::core::SystemRef::from_ref(&system), events, &container);
+        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(
+            &system,
+        )));
+        let gpu = NvHostGpu::new(
+            crate::core::SystemRef::from_ref(&system),
+            events,
+            &container,
+        );
         let mut alloc = IoctlAllocGpfifoEx2::default();
         assert_eq!(gpu.alloc_gpfifo_ex2(&mut alloc, 1), NvResult::Success);
 
@@ -858,8 +870,14 @@ mod tests {
         let mut system = crate::core::System::new_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore::default()));
         let container = Container::new();
-        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(&system)));
-        let gpu = NvHostGpu::new(crate::core::SystemRef::from_ref(&system), events, &container);
+        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(
+            &system,
+        )));
+        let gpu = NvHostGpu::new(
+            crate::core::SystemRef::from_ref(&system),
+            events,
+            &container,
+        );
 
         assert!(gpu.query_event(1).is_some());
         assert!(gpu.query_event(2).is_some());

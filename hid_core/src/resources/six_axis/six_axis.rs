@@ -246,20 +246,14 @@ impl SixAxis {
 
     /// Port of SixAxis::LoadSixAxisSensorCalibrationParameter.
     /// Returns a reference to the calibration data for the given handle.
-    pub fn get_sixaxis_calibration(
-        &self,
-        sixaxis_handle: &SixAxisSensorHandle,
-    ) -> &[u8; 0x744] {
+    pub fn get_sixaxis_calibration(&self, sixaxis_handle: &SixAxisSensorHandle) -> &[u8; 0x744] {
         let sixaxis = self.get_sixaxis_state(sixaxis_handle);
         &sixaxis.calibration
     }
 
     /// Port of SixAxis::GetSixAxisSensorIcInformation.
     /// Returns a reference to the IC information data for the given handle.
-    pub fn get_sixaxis_ic_information(
-        &self,
-        sixaxis_handle: &SixAxisSensorHandle,
-    ) -> &[u8; 0xC8] {
+    pub fn get_sixaxis_ic_information(&self, sixaxis_handle: &SixAxisSensorHandle) -> &[u8; 0xC8] {
         let sixaxis = self.get_sixaxis_state(sixaxis_handle);
         &sixaxis.ic_information
     }
@@ -288,9 +282,7 @@ impl SixAxis {
     ) -> &mut SixaxisParameters {
         let controller = self.get_controller_from_handle_mut(sixaxis_handle);
         match sixaxis_handle.npad_type {
-            NpadStyleIndex::Fullkey | NpadStyleIndex::Pokeball => {
-                &mut controller.sixaxis_fullkey
-            }
+            NpadStyleIndex::Fullkey | NpadStyleIndex::Pokeball => &mut controller.sixaxis_fullkey,
             NpadStyleIndex::Handheld => &mut controller.sixaxis_handheld,
             NpadStyleIndex::JoyconDual => {
                 if sixaxis_handle.device_index == DeviceIndex::Left {

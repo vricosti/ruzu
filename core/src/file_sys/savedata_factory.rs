@@ -29,8 +29,7 @@ fn should_save_data_be_automatically_created(
     attr.save_type == SaveDataType::Cache
         || attr.save_type == SaveDataType::Temporary
         || (space == SaveDataSpaceId::User
-            && (attr.save_type == SaveDataType::Account
-                || attr.save_type == SaveDataType::Device)
+            && (attr.save_type == SaveDataType::Account || attr.save_type == SaveDataType::Device)
             && attr.program_id == 0
             && attr.system_save_data_id == 0)
 }
@@ -181,7 +180,10 @@ impl SaveDataFactory {
             }
             _ => {
                 log::error!("Unrecognized SaveDataType: {:?}", save_type);
-                format!("{}save/unknown_{:X}/{:016X}", out, save_type as u8, title_id)
+                format!(
+                    "{}save/unknown_{:X}/{:016X}",
+                    out, save_type as u8, title_id
+                )
             }
         }
     }
@@ -361,7 +363,10 @@ mod tests {
     fn test_get_user_game_save_data_root_legacy() {
         let user_id: UserId = [0x0123456789ABCDEF, 0xFEDCBA9876543210];
         let result = SaveDataFactory::get_user_game_save_data_root(user_id, false);
-        assert_eq!(result, "/user/save/0000000000000000/FEDCBA98765432100123456789ABCDEF");
+        assert_eq!(
+            result,
+            "/user/save/0000000000000000/FEDCBA98765432100123456789ABCDEF"
+        );
     }
 
     #[test]

@@ -74,8 +74,11 @@ pub fn set_process_memory_permission(
     }
 
     // Set the memory permission.
-    let k_perm = crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(perm as u8);
-    let result = process.page_table.set_process_memory_permission(addr_kpa, size as usize, k_perm);
+    let k_perm =
+        crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(perm as u8);
+    let result = process
+        .page_table
+        .set_process_memory_permission(addr_kpa, size as usize, k_perm);
     ResultCode::new(result)
 }
 
@@ -89,7 +92,10 @@ pub fn map_process_memory(
 ) -> ResultCode {
     log::trace!(
         "svc::MapProcessMemory called, dst=0x{:X}, handle=0x{:X}, src=0x{:X}, size=0x{:X}",
-        dst_address, process_handle, src_address, size
+        dst_address,
+        process_handle,
+        src_address,
+        size
     );
 
     if dst_address % PAGE_SIZE != 0 {
@@ -140,7 +146,9 @@ pub fn map_process_memory(
 
     // Upstream: Create page group from src, map to dst.
     // For now, do a direct memory copy mapping.
-    let result = process.page_table.map_memory(dst_kpa, src_kpa, size as usize);
+    let result = process
+        .page_table
+        .map_memory(dst_kpa, src_kpa, size as usize);
     ResultCode::new(result)
 }
 
@@ -154,7 +162,10 @@ pub fn unmap_process_memory(
 ) -> ResultCode {
     log::trace!(
         "svc::UnmapProcessMemory called, dst=0x{:X}, handle=0x{:X}, src=0x{:X}, size=0x{:X}",
-        dst_address, process_handle, src_address, size
+        dst_address,
+        process_handle,
+        src_address,
+        size
     );
 
     if dst_address % PAGE_SIZE != 0 {
@@ -198,7 +209,9 @@ pub fn unmap_process_memory(
         return RESULT_INVALID_MEMORY_REGION;
     }
 
-    let result = process.page_table.unmap_memory(dst_kpa, src_kpa, size as usize);
+    let result = process
+        .page_table
+        .unmap_memory(dst_kpa, src_kpa, size as usize);
     ResultCode::new(result)
 }
 
@@ -228,11 +241,19 @@ pub fn map_process_code_memory(
         return RESULT_INVALID_SIZE;
     }
     if !is_valid_address_range(dst_address, size) {
-        log::error!("Destination address range overflows (0x{:016X}, 0x{:016X})", dst_address, size);
+        log::error!(
+            "Destination address range overflows (0x{:016X}, 0x{:016X})",
+            dst_address,
+            size
+        );
         return RESULT_INVALID_CURRENT_MEMORY;
     }
     if !is_valid_address_range(src_address, size) {
-        log::error!("Source address range overflows (0x{:016X}, 0x{:016X})", src_address, size);
+        log::error!(
+            "Source address range overflows (0x{:016X}, 0x{:016X})",
+            src_address,
+            size
+        );
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
@@ -240,7 +261,10 @@ pub fn map_process_code_memory(
     let process_arc = match process_arc {
         Some(p) => p,
         None => {
-            log::error!("Invalid process handle specified (handle=0x{:08X})", process_handle);
+            log::error!(
+                "Invalid process handle specified (handle=0x{:08X})",
+                process_handle
+            );
             return RESULT_INVALID_HANDLE;
         }
     };
@@ -251,7 +275,8 @@ pub fn map_process_code_memory(
     if !process.page_table.contains(src_kpa, size as usize) {
         log::error!(
             "Source address range is not within the address space (0x{:016X}, 0x{:016X})",
-            src_address, size
+            src_address,
+            size
         );
         return RESULT_INVALID_CURRENT_MEMORY;
     }
@@ -259,7 +284,9 @@ pub fn map_process_code_memory(
     // Upstream: page_table.MapCodeMemory(dst_address, src_address, size)
     // Needs: KPageTableBase::map_code_memory
     let dst_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(dst_address);
-    let result = process.page_table.map_memory(dst_kpa, src_kpa, size as usize);
+    let result = process
+        .page_table
+        .map_memory(dst_kpa, src_kpa, size as usize);
     ResultCode::new(result)
 }
 
@@ -289,11 +316,19 @@ pub fn unmap_process_code_memory(
         return RESULT_INVALID_SIZE;
     }
     if !is_valid_address_range(dst_address, size) {
-        log::error!("Destination address range overflows (0x{:016X}, 0x{:016X})", dst_address, size);
+        log::error!(
+            "Destination address range overflows (0x{:016X}, 0x{:016X})",
+            dst_address,
+            size
+        );
         return RESULT_INVALID_CURRENT_MEMORY;
     }
     if !is_valid_address_range(src_address, size) {
-        log::error!("Source address range overflows (0x{:016X}, 0x{:016X})", src_address, size);
+        log::error!(
+            "Source address range overflows (0x{:016X}, 0x{:016X})",
+            src_address,
+            size
+        );
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
@@ -301,7 +336,10 @@ pub fn unmap_process_code_memory(
     let process_arc = match process_arc {
         Some(p) => p,
         None => {
-            log::error!("Invalid process handle specified (handle=0x{:08X})", process_handle);
+            log::error!(
+                "Invalid process handle specified (handle=0x{:08X})",
+                process_handle
+            );
             return RESULT_INVALID_HANDLE;
         }
     };
@@ -312,14 +350,17 @@ pub fn unmap_process_code_memory(
     if !process.page_table.contains(src_kpa, size as usize) {
         log::error!(
             "Source address range is not within the address space (0x{:016X}, 0x{:016X})",
-            src_address, size
+            src_address,
+            size
         );
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
     // Upstream: page_table.UnmapCodeMemory(dst_address, src_address, size)
     let dst_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(dst_address);
-    let result = process.page_table.unmap_memory(dst_kpa, src_kpa, size as usize);
+    let result = process
+        .page_table
+        .unmap_memory(dst_kpa, src_kpa, size as usize);
     ResultCode::new(result)
 }
 

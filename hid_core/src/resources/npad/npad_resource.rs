@@ -8,7 +8,9 @@ use common::ResultCode;
 use crate::hid_result;
 use crate::hid_types::*;
 use crate::hid_util;
-use crate::resources::applet_resource::{DataStatusFlag, RegistrationStatus, ARUID_INDEX_MAX, SYSTEM_ARUID};
+use crate::resources::applet_resource::{
+    DataStatusFlag, RegistrationStatus, ARUID_INDEX_MAX, SYSTEM_ARUID,
+};
 use crate::resources::npad::npad_data::NPadData;
 use crate::resources::npad::npad_types::*;
 
@@ -107,9 +109,15 @@ impl NPadResource {
         None
     }
 
-    pub fn apply_npad_system_common_policy(&mut self, aruid: u64, is_full_policy: bool) -> ResultCode {
+    pub fn apply_npad_system_common_policy(
+        &mut self,
+        aruid: u64,
+        is_full_policy: bool,
+    ) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            self.state[idx].data.set_npad_system_common_policy(is_full_policy);
+            self.state[idx]
+                .data
+                .set_npad_system_common_policy(is_full_policy);
             return ResultCode::SUCCESS;
         }
         hid_result::RESULT_ARUID_NOT_REGISTERED
@@ -123,7 +131,11 @@ impl NPadResource {
         hid_result::RESULT_ARUID_NOT_REGISTERED
     }
 
-    pub fn set_supported_npad_style_set(&mut self, aruid: u64, style_set: NpadStyleSet) -> ResultCode {
+    pub fn set_supported_npad_style_set(
+        &mut self,
+        aruid: u64,
+        style_set: NpadStyleSet,
+    ) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             self.state[idx].data.set_supported_npad_style_set(style_set);
             return ResultCode::SUCCESS;
@@ -140,7 +152,10 @@ impl NPadResource {
 
     pub fn is_supported_npad_style_set(&self, aruid: u64) -> Result<bool, ResultCode> {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            return Ok(self.state[idx].data.get_npad_status().is_supported_styleset_set());
+            return Ok(self.state[idx]
+                .data
+                .get_npad_status()
+                .is_supported_styleset_set());
         }
         Err(hid_result::RESULT_ARUID_NOT_REGISTERED)
     }
@@ -179,7 +194,9 @@ impl NPadResource {
         activation_mode: NpadHandheldActivationMode,
     ) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            self.state[idx].data.set_handheld_activation_mode(activation_mode);
+            self.state[idx]
+                .data
+                .set_handheld_activation_mode(activation_mode);
             return ResultCode::SUCCESS;
         }
         hid_result::RESULT_ARUID_NOT_REGISTERED
@@ -201,14 +218,18 @@ impl NPadResource {
         supported_npad_list: &[NpadIdType],
     ) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            return self.state[idx].data.set_supported_npad_id_type(supported_npad_list);
+            return self.state[idx]
+                .data
+                .set_supported_npad_id_type(supported_npad_list);
         }
         hid_result::RESULT_ARUID_NOT_REGISTERED
     }
 
     pub fn is_controller_supported(&self, aruid: u64, style_index: NpadStyleIndex) -> bool {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            return self.state[idx].data.is_npad_style_index_supported(style_index);
+            return self.state[idx]
+                .data
+                .is_npad_style_index_supported(style_index);
         }
         false
     }
@@ -228,11 +249,18 @@ impl NPadResource {
         Err(hid_result::RESULT_ARUID_NOT_REGISTERED)
     }
 
-    pub fn set_assigning_single_on_sl_sr_press(&mut self, aruid: u64, is_enabled: bool) -> ResultCode {
+    pub fn set_assigning_single_on_sl_sr_press(
+        &mut self,
+        aruid: u64,
+        is_enabled: bool,
+    ) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            self.state[idx].data.set_assigning_single_on_sl_sr_press(is_enabled);
+            self.state[idx]
+                .data
+                .set_assigning_single_on_sl_sr_press(is_enabled);
             if self.active_data_aruid == aruid {
-                self.active_data.set_assigning_single_on_sl_sr_press(is_enabled);
+                self.active_data
+                    .set_assigning_single_on_sl_sr_press(is_enabled);
             }
             return ResultCode::SUCCESS;
         }
@@ -240,7 +268,10 @@ impl NPadResource {
     }
 
     /// Port of NPadResource::IsAssigningSingleOnSlSrPressEnabled.
-    pub fn is_assigning_single_on_sl_sr_press_enabled(&self, aruid: u64) -> Result<bool, ResultCode> {
+    pub fn is_assigning_single_on_sl_sr_press_enabled(
+        &self,
+        aruid: u64,
+    ) -> Result<bool, ResultCode> {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             return Ok(self.state[idx].data.get_assigning_single_on_sl_sr_press());
         }
@@ -248,18 +279,19 @@ impl NPadResource {
     }
 
     /// Port of NPadResource::GetMaskedSupportedNpadStyleSet.
-    pub fn get_masked_supported_npad_style_set(&self, aruid: u64) -> Result<NpadStyleSet, ResultCode> {
+    pub fn get_masked_supported_npad_style_set(
+        &self,
+        aruid: u64,
+    ) -> Result<NpadStyleSet, ResultCode> {
         if aruid == SYSTEM_ARUID {
-            return Ok(
-                NpadStyleSet::FULLKEY
-                    | NpadStyleSet::HANDHELD
-                    | NpadStyleSet::JOY_DUAL
-                    | NpadStyleSet::JOY_LEFT
-                    | NpadStyleSet::JOY_RIGHT
-                    | NpadStyleSet::PALMA
-                    | NpadStyleSet::SYSTEM_EXT
-                    | NpadStyleSet::SYSTEM,
-            );
+            return Ok(NpadStyleSet::FULLKEY
+                | NpadStyleSet::HANDHELD
+                | NpadStyleSet::JOY_DUAL
+                | NpadStyleSet::JOY_LEFT
+                | NpadStyleSet::JOY_RIGHT
+                | NpadStyleSet::PALMA
+                | NpadStyleSet::SYSTEM_EXT
+                | NpadStyleSet::SYSTEM);
         }
 
         if let Some(idx) = self.get_index_from_aruid(aruid) {
@@ -345,23 +377,37 @@ impl NPadResource {
         is_enabled: bool,
     ) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            self.state[idx].data.set_home_protection_enabled(is_enabled, npad_id);
+            self.state[idx]
+                .data
+                .set_home_protection_enabled(is_enabled, npad_id);
             return ResultCode::SUCCESS;
         }
         hid_result::RESULT_ARUID_NOT_REGISTERED
     }
 
-    pub fn set_npad_analog_stick_use_center_clamp(&mut self, aruid: u64, is_enabled: bool) -> ResultCode {
+    pub fn set_npad_analog_stick_use_center_clamp(
+        &mut self,
+        aruid: u64,
+        is_enabled: bool,
+    ) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            self.state[idx].data.set_npad_analog_stick_use_center_clamp(is_enabled);
+            self.state[idx]
+                .data
+                .set_npad_analog_stick_use_center_clamp(is_enabled);
             return ResultCode::SUCCESS;
         }
         hid_result::RESULT_ARUID_NOT_REGISTERED
     }
 
-    pub fn set_npad_system_ext_state_enabled(&mut self, aruid: u64, is_enabled: bool) -> ResultCode {
+    pub fn set_npad_system_ext_state_enabled(
+        &mut self,
+        aruid: u64,
+        is_enabled: bool,
+    ) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            self.state[idx].data.set_npad_system_ext_state_enabled(is_enabled);
+            self.state[idx]
+                .data
+                .set_npad_system_ext_state_enabled(is_enabled);
             return ResultCode::SUCCESS;
         }
         hid_result::RESULT_ARUID_NOT_REGISTERED
@@ -456,12 +502,15 @@ impl NPadResource {
         }
 
         self.state[aruid_index].flag.set_is_assigned(true);
-        self.state[aruid_index].data.clear_npad_system_common_policy();
+        self.state[aruid_index]
+            .data
+            .clear_npad_system_common_policy();
         self.state[aruid_index].npad_revision = NpadRevision::Revision0;
 
         if self.active_data_aruid == aruid {
             self.default_hold_type = self.active_data.get_npad_joy_hold_type();
-            self.active_data.set_npad_joy_hold_type(self.default_hold_type);
+            self.active_data
+                .set_npad_joy_hold_type(self.default_hold_type);
         }
         ResultCode::SUCCESS
     }
@@ -478,5 +527,4 @@ impl NPadResource {
         self.ref_counter += 1;
         ResultCode::SUCCESS
     }
-
 }

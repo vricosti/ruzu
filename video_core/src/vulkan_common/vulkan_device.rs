@@ -75,10 +75,8 @@ mod alternatives {
         vk::Format::D16_UNORM_S8_UINT,
     ];
 
-    pub const DEPTH24_UNORM_DONTCARE8: &[vk::Format] = &[
-        vk::Format::D32_SFLOAT,
-        vk::Format::D16_UNORM,
-    ];
+    pub const DEPTH24_UNORM_DONTCARE8: &[vk::Format] =
+        &[vk::Format::D32_SFLOAT, vk::Format::D16_UNORM];
 
     pub const DEPTH16_UNORM_STENCIL8_UINT: &[vk::Format] = &[
         vk::Format::D24_UNORM_S8_UINT,
@@ -361,10 +359,8 @@ impl Device {
             props.api_version
         };
 
-        let device_name = unsafe {
-            CStr::from_ptr(device_properties.device_name.as_ptr())
-                .to_string_lossy()
-        };
+        let device_name =
+            unsafe { CStr::from_ptr(device_properties.device_name.as_ptr()).to_string_lossy() };
         log::info!("Vulkan device: {}", device_name);
         log::info!(
             "Vulkan API version: {}.{}.{}",
@@ -500,9 +496,7 @@ impl Device {
     ///
     /// Port of `Device::GetDriverName`.
     pub fn get_driver_name(&self) -> String {
-        let name = unsafe {
-            CStr::from_ptr(self.driver_properties.driver_name.as_ptr())
-        };
+        let name = unsafe { CStr::from_ptr(self.driver_properties.driver_name.as_ptr()) };
         name.to_string_lossy().into_owned()
     }
 
@@ -548,9 +542,7 @@ impl Device {
 
     /// Returns the device name.
     pub fn get_model_name(&self) -> String {
-        let name = unsafe {
-            CStr::from_ptr(self.device_properties.device_name.as_ptr())
-        };
+        let name = unsafe { CStr::from_ptr(self.device_properties.device_name.as_ptr()) };
         name.to_string_lossy().into_owned()
     }
 
@@ -568,12 +560,16 @@ impl Device {
 
     /// Returns uniform buffer alignment requirement.
     pub fn get_uniform_buffer_alignment(&self) -> vk::DeviceSize {
-        self.device_properties.limits.min_uniform_buffer_offset_alignment
+        self.device_properties
+            .limits
+            .min_uniform_buffer_offset_alignment
     }
 
     /// Returns storage buffer alignment requirement.
     pub fn get_storage_buffer_alignment(&self) -> vk::DeviceSize {
-        self.device_properties.limits.min_storage_buffer_offset_alignment
+        self.device_properties
+            .limits
+            .min_storage_buffer_offset_alignment
     }
 
     /// Returns the maximum range for storage buffers.
@@ -628,7 +624,9 @@ impl Device {
 
     /// Returns true if formatless image load is supported.
     pub fn is_formatless_image_load_supported(&self) -> bool {
-        self.device_features.shader_storage_image_read_without_format != 0
+        self.device_features
+            .shader_storage_image_read_without_format
+            != 0
     }
 
     /// Returns the maximum number of push descriptors.

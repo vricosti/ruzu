@@ -38,11 +38,9 @@ impl<'a> TranslatorVisitor<'a> {
                 // InnerCoverage — returns whether this is a helper invocation
                 let helper = self.ir.is_helper_invocation();
                 let not_helper = self.ir.logical_not(helper);
-                let result = self.ir.select_u32(
-                    not_helper,
-                    Value::ImmU32(0xFFFFFFFF),
-                    Value::ImmU32(0),
-                );
+                let result =
+                    self.ir
+                        .select_u32(not_helper, Value::ImmU32(0xFFFFFFFF), Value::ImmU32(0));
                 self.set_x(dst, result);
             }
             _ => {

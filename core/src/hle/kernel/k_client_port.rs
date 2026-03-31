@@ -94,7 +94,12 @@ impl KClientPort {
             let new_sessions = cur_sessions + 1;
             if self
                 .num_sessions
-                .compare_exchange_weak(cur_sessions, new_sessions, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(
+                    cur_sessions,
+                    new_sessions,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 // Atomically update peak tracking.
@@ -105,7 +110,12 @@ impl KClientPort {
                     }
                     if self
                         .peak_sessions
-                        .compare_exchange_weak(peak, new_sessions, Ordering::Relaxed, Ordering::Relaxed)
+                        .compare_exchange_weak(
+                            peak,
+                            new_sessions,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
                         .is_ok()
                     {
                         break;

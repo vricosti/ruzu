@@ -112,7 +112,9 @@ impl HardwareContext {
     pub fn get_supported_device_types() -> Vec<u32> {
         // Stubbed — requires FFmpeg C bindings to enumerate AV_HWDEVICE_TYPE_* values.
         // Upstream: FFmpeg::HardwareContext::GetSupportedDeviceTypes() in ffmpeg.cpp
-        log::warn!("FFmpeg::HardwareContext::get_supported_device_types: FFmpeg bindings not available");
+        log::warn!(
+            "FFmpeg::HardwareContext::get_supported_device_types: FFmpeg bindings not available"
+        );
         Vec::new()
     }
 
@@ -124,7 +126,9 @@ impl HardwareContext {
         // Stubbed — requires FFmpeg C bindings to create and attach an AVBufferRef
         // hardware device context to the AVCodecContext.
         // Upstream: FFmpeg::HardwareContext::InitializeForDecoder() in ffmpeg.cpp
-        log::warn!("FFmpeg::HardwareContext::initialize_for_decoder: FFmpeg bindings not available");
+        log::warn!(
+            "FFmpeg::HardwareContext::initialize_for_decoder: FFmpeg bindings not available"
+        );
         false
     }
 }
@@ -153,7 +157,9 @@ impl DecoderContext {
         // Stubbed — requires FFmpeg C bindings to set AVCodecContext hw_device_ctx
         // and get_format callback.
         // Upstream: FFmpeg::DecoderContext::InitializeHardwareDecoder() in ffmpeg.cpp
-        log::warn!("FFmpeg::DecoderContext::initialize_hardware_decoder: FFmpeg bindings not available");
+        log::warn!(
+            "FFmpeg::DecoderContext::initialize_hardware_decoder: FFmpeg bindings not available"
+        );
     }
 
     pub fn open_context(&mut self, _decoder: &Decoder) -> bool {

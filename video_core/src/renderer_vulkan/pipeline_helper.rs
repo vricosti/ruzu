@@ -58,11 +58,7 @@ impl DescriptorLayoutBuilder {
     }
 
     /// Port of `DescriptorLayoutBuilder::CanUsePushDescriptor`.
-    pub fn can_use_push_descriptor(
-        &self,
-        max_push_descriptors: u32,
-        is_supported: bool,
-    ) -> bool {
+    pub fn can_use_push_descriptor(&self, max_push_descriptors: u32, is_supported: bool) -> bool {
         is_supported && self.num_descriptors <= max_push_descriptors
     }
 

@@ -40,9 +40,7 @@ pub struct LayerStack {
 
 impl LayerStack {
     pub fn new() -> Self {
-        Self {
-            layers: Vec::new(),
-        }
+        Self { layers: Vec::new() }
     }
 
     pub fn find_layer(&self, consumer_id: i32) -> Option<Arc<Layer>> {

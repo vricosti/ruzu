@@ -115,16 +115,26 @@ impl HIDCore {
 
     pub fn set_supported_style_tag(&mut self, style_tag: NpadStyleTag) {
         self.supported_style_tag.raw = style_tag.raw;
-        self.player_1.set_supported_npad_style_tag(self.supported_style_tag);
-        self.player_2.set_supported_npad_style_tag(self.supported_style_tag);
-        self.player_3.set_supported_npad_style_tag(self.supported_style_tag);
-        self.player_4.set_supported_npad_style_tag(self.supported_style_tag);
-        self.player_5.set_supported_npad_style_tag(self.supported_style_tag);
-        self.player_6.set_supported_npad_style_tag(self.supported_style_tag);
-        self.player_7.set_supported_npad_style_tag(self.supported_style_tag);
-        self.player_8.set_supported_npad_style_tag(self.supported_style_tag);
-        self.other.set_supported_npad_style_tag(self.supported_style_tag);
-        self.handheld.set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_1
+            .set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_2
+            .set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_3
+            .set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_4
+            .set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_5
+            .set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_6
+            .set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_7
+            .set_supported_npad_style_tag(self.supported_style_tag);
+        self.player_8
+            .set_supported_npad_style_tag(self.supported_style_tag);
+        self.other
+            .set_supported_npad_style_tag(self.supported_style_tag);
+        self.handheld
+            .set_supported_npad_style_tag(self.supported_style_tag);
     }
 
     pub fn get_supported_style_tag(&self) -> NpadStyleTag {

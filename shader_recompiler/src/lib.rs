@@ -29,9 +29,9 @@
 //! - `ir_opt` — Optimization passes (constant propagation, DCE, etc.)
 //! - `pipeline_cache` — Shader compilation and caching
 
-pub mod ir;
-pub mod frontend;
 pub mod backend;
+pub mod frontend;
+pub mod ir;
 pub mod ir_opt;
 pub mod pipeline_cache;
 
@@ -49,6 +49,6 @@ pub mod varying_state;
 
 // Re-export public API
 pub use backend::Profile as BackendProfile;
-pub use pipeline_cache::{compile_shader, CompiledShader, PipelineCache, ShaderKey};
 pub use ir::types::ShaderStage;
+pub use pipeline_cache::{compile_shader, CompiledShader, PipelineCache, ShaderKey};
 pub use runtime_info::RuntimeInfo;

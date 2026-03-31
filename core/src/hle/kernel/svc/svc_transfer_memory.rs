@@ -70,8 +70,11 @@ pub fn create_transfer_memory(
     }
 
     // Lock the memory for transfer.
-    let k_perm = crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(map_perm as u8);
-    let lock_result = process.page_table.lock_for_transfer_memory(addr_kpa, size as usize, k_perm);
+    let k_perm =
+        crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(map_perm as u8);
+    let lock_result = process
+        .page_table
+        .lock_for_transfer_memory(addr_kpa, size as usize, k_perm);
     if lock_result != 0 {
         return ResultCode::new(lock_result);
     }
@@ -88,7 +91,9 @@ pub fn create_transfer_memory(
         }
         Err(_) => {
             // Unlock on failure.
-            process.page_table.unlock_for_transfer_memory(addr_kpa, size as usize);
+            process
+                .page_table
+                .unlock_for_transfer_memory(addr_kpa, size as usize);
             *out = 0;
             return RESULT_OUT_OF_HANDLES;
         }
@@ -145,8 +150,12 @@ pub fn map_transfer_memory(
 
     // Upstream: trmem->Map(address, size, map_perm)
     // For now, mark the memory as mapped by setting permissions.
-    let k_perm = crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(map_perm as u8);
-    let result = process.page_table.set_memory_permission(addr_kpa, size as usize, k_perm.bits() as u32);
+    let k_perm =
+        crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(map_perm as u8);
+    let result =
+        process
+            .page_table
+            .set_memory_permission(addr_kpa, size as usize, k_perm.bits() as u32);
     ResultCode::new(result)
 }
 
@@ -194,6 +203,8 @@ pub fn unmap_transfer_memory(
 
     // Upstream: trmem->Unmap(address, size)
     // Unlock the transfer memory region.
-    let result = process.page_table.unlock_for_transfer_memory(addr_kpa, size as usize);
+    let result = process
+        .page_table
+        .unlock_for_transfer_memory(addr_kpa, size as usize);
     ResultCode::new(result)
 }

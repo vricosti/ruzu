@@ -409,7 +409,9 @@ impl DecoderImpl for H264 {
         // at picture_info_offset, compose SPS/PPS headers via H264BitWriter, and append
         // the raw bitstream from frame_bitstream_offset.
         // Upstream: H264::ComposeFrame() in video_core/host1x/codecs/h264.cpp
-        log::warn!("H264::compose_frame: not yet implemented (requires memory manager integration)");
+        log::warn!(
+            "H264::compose_frame: not yet implemented (requires memory manager integration)"
+        );
         Vec::new()
     }
 

@@ -92,9 +92,7 @@ fn allocate_pool(
     let mut pool_sizes = Vec::with_capacity(6);
     let info = &bank.info;
 
-    let add = |pool_sizes: &mut Vec<vk::DescriptorPoolSize>,
-               ty: vk::DescriptorType,
-               count: u32| {
+    let add = |pool_sizes: &mut Vec<vk::DescriptorPoolSize>, ty: vk::DescriptorType, count: u32| {
         if count > 0 {
             pool_sizes.push(vk::DescriptorPoolSize {
                 ty,
@@ -286,8 +284,7 @@ impl DescriptorPool {
 
         // Double-check after acquiring write lock
         for (i, bank_info) in state.bank_infos.iter().enumerate() {
-            if (bank_info.score - reqs.score).abs() < SCORE_THRESHOLD
-                && bank_info.is_superset(reqs)
+            if (bank_info.score - reqs.score).abs() < SCORE_THRESHOLD && bank_info.is_superset(reqs)
             {
                 return Ok(*state.banks[i].pools.last().unwrap());
             }
@@ -315,8 +312,7 @@ impl DescriptorPool {
     fn grow_bank(&self, reqs: &DescriptorBankInfo) -> Result<vk::DescriptorPool, vk::Result> {
         let mut state = self.banks_lock.write().unwrap();
         for (i, bank_info) in state.bank_infos.iter().enumerate() {
-            if (bank_info.score - reqs.score).abs() < SCORE_THRESHOLD
-                && bank_info.is_superset(reqs)
+            if (bank_info.score - reqs.score).abs() < SCORE_THRESHOLD && bank_info.is_superset(reqs)
             {
                 allocate_pool(&self.device, &mut state.banks[i], self.sets_per_pool)?;
                 return Ok(*state.banks[i].pools.last().unwrap());

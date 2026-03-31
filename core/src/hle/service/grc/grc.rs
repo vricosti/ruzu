@@ -5,10 +5,10 @@
 //!
 //! GRC service ("grc:c"). All commands are unimplemented stubs.
 
-use std::collections::BTreeMap;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
 
 /// GRC service ("grc:c"). All stubs.
 pub struct GRC {
@@ -37,13 +37,21 @@ impl SessionRequestHandler for GRC {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { "grc:c" }
+    fn service_name(&self) -> &str {
+        "grc:c"
+    }
 }
 
 impl ServiceFramework for GRC {
-    fn get_service_name(&self) -> &str { "grc:c" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "grc:c"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// Registers "grc:c" service.
@@ -60,9 +68,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     server_manager.register_named_service(
         "grc:c",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(GRC::new())
-        }),
+        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(GRC::new()) }),
         16,
     );
 

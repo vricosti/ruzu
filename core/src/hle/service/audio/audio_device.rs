@@ -44,20 +44,76 @@ pub struct IAudioDevice {
 impl IAudioDevice {
     pub fn new(applet_resource_user_id: u64, revision: u32, device_num: u32) -> Self {
         let handlers = build_handler_map(&[
-            (0, Some(Self::list_audio_device_name_handler), "ListAudioDeviceName"),
-            (1, Some(Self::set_audio_device_output_volume_handler), "SetAudioDeviceOutputVolume"),
-            (2, Some(Self::get_audio_device_output_volume_handler), "GetAudioDeviceOutputVolume"),
-            (3, Some(Self::get_active_audio_device_name_handler), "GetActiveAudioDeviceName"),
-            (4, Some(Self::query_audio_device_system_event_handler), "QueryAudioDeviceSystemEvent"),
-            (5, Some(Self::get_active_channel_count_handler), "GetActiveChannelCount"),
-            (6, Some(Self::list_audio_device_name_auto_handler), "ListAudioDeviceNameAuto"),
-            (7, Some(Self::set_audio_device_output_volume_auto_handler), "SetAudioDeviceOutputVolumeAuto"),
-            (8, Some(Self::get_audio_device_output_volume_auto_handler), "GetAudioDeviceOutputVolumeAuto"),
-            (10, Some(Self::get_active_audio_device_name_auto_handler), "GetActiveAudioDeviceNameAuto"),
-            (11, Some(Self::query_audio_device_input_event_handler), "QueryAudioDeviceInputEvent"),
-            (12, Some(Self::query_audio_device_output_event_handler), "QueryAudioDeviceOutputEvent"),
-            (13, Some(Self::get_active_audio_output_device_name_handler), "GetActiveAudioOutputDeviceName"),
-            (14, Some(Self::list_audio_output_device_name_handler), "ListAudioOutputDeviceName"),
+            (
+                0,
+                Some(Self::list_audio_device_name_handler),
+                "ListAudioDeviceName",
+            ),
+            (
+                1,
+                Some(Self::set_audio_device_output_volume_handler),
+                "SetAudioDeviceOutputVolume",
+            ),
+            (
+                2,
+                Some(Self::get_audio_device_output_volume_handler),
+                "GetAudioDeviceOutputVolume",
+            ),
+            (
+                3,
+                Some(Self::get_active_audio_device_name_handler),
+                "GetActiveAudioDeviceName",
+            ),
+            (
+                4,
+                Some(Self::query_audio_device_system_event_handler),
+                "QueryAudioDeviceSystemEvent",
+            ),
+            (
+                5,
+                Some(Self::get_active_channel_count_handler),
+                "GetActiveChannelCount",
+            ),
+            (
+                6,
+                Some(Self::list_audio_device_name_auto_handler),
+                "ListAudioDeviceNameAuto",
+            ),
+            (
+                7,
+                Some(Self::set_audio_device_output_volume_auto_handler),
+                "SetAudioDeviceOutputVolumeAuto",
+            ),
+            (
+                8,
+                Some(Self::get_audio_device_output_volume_auto_handler),
+                "GetAudioDeviceOutputVolumeAuto",
+            ),
+            (
+                10,
+                Some(Self::get_active_audio_device_name_auto_handler),
+                "GetActiveAudioDeviceNameAuto",
+            ),
+            (
+                11,
+                Some(Self::query_audio_device_input_event_handler),
+                "QueryAudioDeviceInputEvent",
+            ),
+            (
+                12,
+                Some(Self::query_audio_device_output_event_handler),
+                "QueryAudioDeviceOutputEvent",
+            ),
+            (
+                13,
+                Some(Self::get_active_audio_output_device_name_handler),
+                "GetActiveAudioOutputDeviceName",
+            ),
+            (
+                14,
+                Some(Self::list_audio_output_device_name_handler),
+                "ListAudioOutputDeviceName",
+            ),
         ]);
         Self {
             _applet_resource_user_id: applet_resource_user_id,
@@ -75,7 +131,10 @@ impl IAudioDevice {
 
     /// Ensure the shared event exists, creating it lazily. Returns a handle for the caller.
     /// Upstream creates the event in the constructor and signals it immediately.
-    fn get_or_create_event(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) -> Option<u32> {
+    fn get_or_create_event(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) -> Option<u32> {
         let svc = Self::as_self(this);
         let mut event_guard = svc.event.lock().unwrap();
 
@@ -96,10 +155,7 @@ impl IAudioDevice {
         ctx.write_buffer(name, 0);
     }
 
-    fn list_audio_device_name_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn list_audio_device_name_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioDevice::ListAudioDeviceName");
         Self::write_device_name(ctx);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -144,7 +200,10 @@ impl IAudioDevice {
     ) {
         log::info!("IAudioDevice::QueryAudioDeviceSystemEvent");
         if let Some(handle) = Self::get_or_create_event(this, ctx) {
-            log::info!("IAudioDevice::QueryAudioDeviceSystemEvent handle={:#x}", handle);
+            log::info!(
+                "IAudioDevice::QueryAudioDeviceSystemEvent handle={:#x}",
+                handle
+            );
             let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
             rb.push_result(RESULT_SUCCESS);
             rb.push_copy_objects(handle);
@@ -155,10 +214,7 @@ impl IAudioDevice {
         }
     }
 
-    fn get_active_channel_count_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_active_channel_count_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioDevice::GetActiveChannelCount");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);

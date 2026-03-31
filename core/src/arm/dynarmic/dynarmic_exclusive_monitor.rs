@@ -38,30 +38,26 @@ impl DynarmicExclusiveMonitor {
 impl ExclusiveMonitor for DynarmicExclusiveMonitor {
     fn exclusive_read8(&mut self, core_index: usize, addr: VAddr) -> u8 {
         let mem = self.memory.clone();
-        self.monitor.read_and_mark(core_index, addr, || {
-            mem.lock().unwrap().read_8(addr)
-        })
+        self.monitor
+            .read_and_mark(core_index, addr, || mem.lock().unwrap().read_8(addr))
     }
 
     fn exclusive_read16(&mut self, core_index: usize, addr: VAddr) -> u16 {
         let mem = self.memory.clone();
-        self.monitor.read_and_mark(core_index, addr, || {
-            mem.lock().unwrap().read_16(addr)
-        })
+        self.monitor
+            .read_and_mark(core_index, addr, || mem.lock().unwrap().read_16(addr))
     }
 
     fn exclusive_read32(&mut self, core_index: usize, addr: VAddr) -> u32 {
         let mem = self.memory.clone();
-        self.monitor.read_and_mark(core_index, addr, || {
-            mem.lock().unwrap().read_32(addr)
-        })
+        self.monitor
+            .read_and_mark(core_index, addr, || mem.lock().unwrap().read_32(addr))
     }
 
     fn exclusive_read64(&mut self, core_index: usize, addr: VAddr) -> u64 {
         let mem = self.memory.clone();
-        self.monitor.read_and_mark(core_index, addr, || {
-            mem.lock().unwrap().read_64(addr)
-        })
+        self.monitor
+            .read_and_mark(core_index, addr, || mem.lock().unwrap().read_64(addr))
     }
 
     fn exclusive_read128(&mut self, core_index: usize, addr: VAddr) -> u128 {
@@ -80,40 +76,59 @@ impl ExclusiveMonitor for DynarmicExclusiveMonitor {
 
     fn exclusive_write8(&mut self, core_index: usize, vaddr: VAddr, value: u8) -> bool {
         let mem = self.memory.clone();
-        self.monitor.do_exclusive_operation(core_index, vaddr, |expected: u8| {
-            mem.lock().unwrap().write_exclusive_8(vaddr, value, expected)
-        })
+        self.monitor
+            .do_exclusive_operation(core_index, vaddr, |expected: u8| {
+                mem.lock()
+                    .unwrap()
+                    .write_exclusive_8(vaddr, value, expected)
+            })
     }
 
     fn exclusive_write16(&mut self, core_index: usize, vaddr: VAddr, value: u16) -> bool {
         let mem = self.memory.clone();
-        self.monitor.do_exclusive_operation(core_index, vaddr, |expected: u16| {
-            mem.lock().unwrap().write_exclusive_16(vaddr, value, expected)
-        })
+        self.monitor
+            .do_exclusive_operation(core_index, vaddr, |expected: u16| {
+                mem.lock()
+                    .unwrap()
+                    .write_exclusive_16(vaddr, value, expected)
+            })
     }
 
     fn exclusive_write32(&mut self, core_index: usize, vaddr: VAddr, value: u32) -> bool {
         let mem = self.memory.clone();
-        self.monitor.do_exclusive_operation(core_index, vaddr, |expected: u32| {
-            mem.lock().unwrap().write_exclusive_32(vaddr, value, expected)
-        })
+        self.monitor
+            .do_exclusive_operation(core_index, vaddr, |expected: u32| {
+                mem.lock()
+                    .unwrap()
+                    .write_exclusive_32(vaddr, value, expected)
+            })
     }
 
     fn exclusive_write64(&mut self, core_index: usize, vaddr: VAddr, value: u64) -> bool {
         let mem = self.memory.clone();
-        self.monitor.do_exclusive_operation(core_index, vaddr, |expected: u64| {
-            mem.lock().unwrap().write_exclusive_64(vaddr, value, expected)
-        })
+        self.monitor
+            .do_exclusive_operation(core_index, vaddr, |expected: u64| {
+                mem.lock()
+                    .unwrap()
+                    .write_exclusive_64(vaddr, value, expected)
+            })
     }
 
     fn exclusive_write128(&mut self, core_index: usize, vaddr: VAddr, value: u128) -> bool {
         let mem = self.memory.clone();
-        self.monitor.do_exclusive_operation(core_index, vaddr, |expected: u128| {
-            let value_lo = value as u64;
-            let value_hi = (value >> 64) as u64;
-            let expected_lo = expected as u64;
-            let expected_hi = (expected >> 64) as u64;
-            mem.lock().unwrap().write_exclusive_128(vaddr, value_lo, value_hi, expected_lo, expected_hi)
-        })
+        self.monitor
+            .do_exclusive_operation(core_index, vaddr, |expected: u128| {
+                let value_lo = value as u64;
+                let value_hi = (value >> 64) as u64;
+                let expected_lo = expected as u64;
+                let expected_hi = (expected >> 64) as u64;
+                mem.lock().unwrap().write_exclusive_128(
+                    vaddr,
+                    value_lo,
+                    value_hi,
+                    expected_lo,
+                    expected_hi,
+                )
+            })
     }
 }

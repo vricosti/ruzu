@@ -539,10 +539,7 @@ impl BlitImageHelper {
     }
 
     /// Port of `BlitImageHelper::FindOrEmplaceClearColorPipeline`.
-    fn find_or_emplace_clear_color_pipeline(
-        &mut self,
-        key: &BlitImagePipelineKey,
-    ) -> vk::Pipeline {
+    fn find_or_emplace_clear_color_pipeline(&mut self, key: &BlitImagePipelineKey) -> vk::Pipeline {
         if let Some(idx) = self.clear_color_keys.iter().position(|k| k == key) {
             return self.clear_color_pipelines[idx];
         }

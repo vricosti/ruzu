@@ -9,10 +9,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::os::event::Event;
 use super::errors::RESULT_CLOCK_UNINITIALIZED;
 use super::power_state_request_manager::PowerStateRequestManager;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::os::event::Event;
 
 /// Alarm type determines priority.
 ///
@@ -184,7 +184,9 @@ impl Alarms {
 
         if alarm.is_linked() {
             // Already registered — remove first
-            inner.entries.retain(|e| e.alarm_id != 0 || e.alert_time != alarm.alert_time);
+            inner
+                .entries
+                .retain(|e| e.alarm_id != 0 || e.alert_time != alarm.alert_time);
             alarm.linked = false;
         }
 
@@ -230,9 +232,9 @@ impl Alarms {
             return;
         }
 
-        inner
-            .entries
-            .retain(|e| e.alert_time != alarm.get_alert_time() || e.priority != alarm.get_priority());
+        inner.entries.retain(|e| {
+            e.alert_time != alarm.get_alert_time() || e.priority != alarm.get_priority()
+        });
         alarm.linked = false;
 
         // Upstream calls UpdateClosestAndSignal here, which updates the

@@ -59,7 +59,12 @@ pub struct NodeHeader {
 const _: () = assert!(std::mem::size_of::<NodeHeader>() == 0x10);
 
 impl NodeHeader {
-    pub fn verify(&self, node_index: i32, node_size: usize, entry_size: usize) -> Result<(), ResultCode> {
+    pub fn verify(
+        &self,
+        node_index: i32,
+        node_size: usize,
+        entry_size: usize,
+    ) -> Result<(), ResultCode> {
         if self.index != node_index {
             return Err(RESULT_INVALID_BUCKET_TREE_NODE_INDEX);
         }
@@ -99,16 +104,41 @@ pub struct ContinuousReadingInfo {
 }
 
 impl ContinuousReadingInfo {
-    pub fn new() -> Self { Self::default() }
-    pub fn reset(&mut self) { self.read_size = 0; self.skip_count = 0; self.done = false; }
-    pub fn set_skip_count(&mut self, count: i32) { assert!(count >= 0); self.skip_count = count; }
-    pub fn get_skip_count(&self) -> i32 { self.skip_count }
-    pub fn check_need_scan(&mut self) -> bool { self.skip_count -= 1; self.skip_count <= 0 }
-    pub fn done(&mut self) { self.read_size = 0; self.done = true; }
-    pub fn is_done(&self) -> bool { self.done }
-    pub fn set_read_size(&mut self, size: usize) { self.read_size = size; }
-    pub fn get_read_size(&self) -> usize { self.read_size }
-    pub fn can_do(&self) -> bool { self.read_size > 0 }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn reset(&mut self) {
+        self.read_size = 0;
+        self.skip_count = 0;
+        self.done = false;
+    }
+    pub fn set_skip_count(&mut self, count: i32) {
+        assert!(count >= 0);
+        self.skip_count = count;
+    }
+    pub fn get_skip_count(&self) -> i32 {
+        self.skip_count
+    }
+    pub fn check_need_scan(&mut self) -> bool {
+        self.skip_count -= 1;
+        self.skip_count <= 0
+    }
+    pub fn done(&mut self) {
+        self.read_size = 0;
+        self.done = true;
+    }
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+    pub fn set_read_size(&mut self, size: usize) {
+        self.read_size = size;
+    }
+    pub fn get_read_size(&self) -> usize {
+        self.read_size
+    }
+    pub fn can_do(&self) -> bool {
+        self.read_size > 0
+    }
 }
 
 fn get_entry_count(node_size: usize, entry_size: usize) -> i32 {
@@ -127,7 +157,9 @@ fn get_entry_set_count(node_size: usize, entry_size: usize, entry_count: i32) ->
 fn get_node_l2_count(node_size: usize, entry_size: usize, entry_count: i32) -> i32 {
     let offset_count_per_node = get_offset_count(node_size);
     let entry_set_count = get_entry_set_count(node_size, entry_size, entry_count);
-    if entry_set_count <= offset_count_per_node { return 0; }
+    if entry_set_count <= offset_count_per_node {
+        return 0;
+    }
     let node_l2_count = (entry_set_count + offset_count_per_node - 1) / offset_count_per_node;
     assert!(node_l2_count <= offset_count_per_node);
     let remainder = entry_set_count - (offset_count_per_node - (node_l2_count - 1));
@@ -164,7 +196,10 @@ impl BucketTree {
             offset_count: 0,
             entry_set_count: 0,
             offset_cache: Mutex::new(OffsetCache {
-                offsets: Offsets { start_offset: -1, end_offset: -1 },
+                offsets: Offsets {
+                    start_offset: -1,
+                    end_offset: -1,
+                },
                 is_initialized: false,
             }),
         }
@@ -205,7 +240,10 @@ impl BucketTree {
     pub fn initialize_empty(&mut self, node_size: usize, end_offset: i64) {
         self.node_size = node_size;
         let mut cache = self.offset_cache.lock().unwrap();
-        cache.offsets = Offsets { start_offset: 0, end_offset };
+        cache.offsets = Offsets {
+            start_offset: 0,
+            end_offset,
+        };
         cache.is_initialized = true;
     }
 
@@ -220,9 +258,15 @@ impl BucketTree {
         self.entry_set_count = 0;
     }
 
-    pub fn is_initialized(&self) -> bool { self.node_size > 0 }
-    pub fn is_empty(&self) -> bool { self.entry_size == 0 }
-    pub fn get_entry_count(&self) -> i32 { self.entry_count }
+    pub fn is_initialized(&self) -> bool {
+        self.node_size > 0
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entry_size == 0
+    }
+    pub fn get_entry_count(&self) -> i32 {
+        self.entry_count
+    }
 
     pub fn get_offsets(&self) -> Result<Offsets, ResultCode> {
         self.ensure_offset_cache()?;
@@ -232,7 +276,9 @@ impl BucketTree {
 
     fn ensure_offset_cache(&self) -> Result<(), ResultCode> {
         let mut cache = self.offset_cache.lock().unwrap();
-        if cache.is_initialized { return Ok(()); }
+        if cache.is_initialized {
+            return Ok(());
+        }
 
         if self.node_l1.len() >= std::mem::size_of::<NodeHeader>() {
             let header: &NodeHeader = unsafe { &*(self.node_l1.as_ptr() as *const NodeHeader) };
@@ -244,12 +290,14 @@ impl BucketTree {
                 let mut buf = vec![0u8; self.node_size];
                 es.read(&mut buf, self.node_size, offset_in_storage);
 
-                let entry_set_header: &NodeHeader = unsafe { &*(buf.as_ptr() as *const NodeHeader) };
+                let entry_set_header: &NodeHeader =
+                    unsafe { &*(buf.as_ptr() as *const NodeHeader) };
                 let last_entry_offset = std::mem::size_of::<NodeHeader>()
                     + (entry_set_header.count as usize - 1) * self.entry_size;
                 if last_entry_offset + 8 <= buf.len() {
                     let end_offset_bytes = &buf[last_entry_offset..last_entry_offset + 8];
-                    cache.offsets.end_offset = i64::from_le_bytes(end_offset_bytes.try_into().unwrap());
+                    cache.offsets.end_offset =
+                        i64::from_le_bytes(end_offset_bytes.try_into().unwrap());
                 }
             }
         }
@@ -318,7 +366,8 @@ impl BucketTree {
         // The end offset is stored at the position after all count entries.
         // In the node, after NodeHeader, there are `count` i64 offsets, followed by more.
         // The end offset is the i64 at NodeHeader + count * sizeof(i64).
-        let end_pos = std::mem::size_of::<NodeHeader>() + header.count as usize * std::mem::size_of::<i64>();
+        let end_pos =
+            std::mem::size_of::<NodeHeader>() + header.count as usize * std::mem::size_of::<i64>();
         if end_pos + 8 <= self.node_l1.len() {
             i64::from_le_bytes(self.node_l1[end_pos..end_pos + 8].try_into().unwrap())
         } else {
@@ -346,18 +395,24 @@ impl BucketTree {
     }
 
     pub fn query_node_storage_size(node_size: usize, entry_size: usize, entry_count: i32) -> i64 {
-        if entry_count <= 0 { return 0; }
+        if entry_count <= 0 {
+            return 0;
+        }
         (1 + get_node_l2_count(node_size, entry_size, entry_count)) as i64 * node_size as i64
     }
 
     pub fn query_entry_storage_size(node_size: usize, entry_size: usize, entry_count: i32) -> i64 {
-        if entry_count <= 0 { return 0; }
+        if entry_count <= 0 {
+            return 0;
+        }
         get_entry_set_count(node_size, entry_size, entry_count) as i64 * node_size as i64
     }
 }
 
 impl Default for BucketTree {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Entry set header.
@@ -494,11 +549,7 @@ impl<'a> Visitor<'a> {
     /// Initialize the visitor with a tree and offsets.
     ///
     /// Corresponds to upstream `Visitor::Initialize`.
-    fn initialize(
-        &mut self,
-        tree: &'a BucketTree,
-        offsets: Offsets,
-    ) -> Result<(), ResultCode> {
+    fn initialize(&mut self, tree: &'a BucketTree, offsets: Offsets) -> Result<(), ResultCode> {
         if self.entry.is_empty() {
             self.entry = vec![0u8; tree.entry_size];
             self.tree = Some(tree);
@@ -524,28 +575,24 @@ impl<'a> Visitor<'a> {
 
         if tree.is_exist_offset_l2_on_l1() && virtual_address < tree.get_l1_begin_offset() {
             // Search in the L2 offset area on L1.
-            let header: &NodeHeader =
-                unsafe { &*(tree.node_l1.as_ptr() as *const NodeHeader) };
+            let header: &NodeHeader = unsafe { &*(tree.node_l1.as_ptr() as *const NodeHeader) };
             let l2_start = header.count as usize;
             let l2_count = tree.offset_count as usize - l2_start;
             let offsets = tree.read_l1_offsets(l2_start, l2_count);
 
             // upper_bound: find first element > virtual_address, then go back one
-            let pos = offsets
-                .partition_point(|&o| o <= virtual_address);
+            let pos = offsets.partition_point(|&o| o <= virtual_address);
             if pos == 0 {
                 return Err(RESULT_OUT_OF_RANGE);
             }
             entry_set_index = (pos - 1) as i32;
         } else {
             // Search in the main offset area on L1.
-            let header: &NodeHeader =
-                unsafe { &*(tree.node_l1.as_ptr() as *const NodeHeader) };
+            let header: &NodeHeader = unsafe { &*(tree.node_l1.as_ptr() as *const NodeHeader) };
             let count = header.count as usize;
             let offsets = tree.read_l1_offsets(0, count);
 
-            let pos = offsets
-                .partition_point(|&o| o <= virtual_address);
+            let pos = offsets.partition_point(|&o| o <= virtual_address);
             if pos == 0 {
                 return Err(RESULT_OUT_OF_RANGE);
             }
@@ -578,20 +625,13 @@ impl<'a> Visitor<'a> {
     /// Find the entry set index by descending into an L2 node.
     ///
     /// Corresponds to upstream `Visitor::FindEntrySet`.
-    fn find_entry_set(
-        &self,
-        virtual_address: i64,
-        node_index: i32,
-    ) -> Result<i32, ResultCode> {
+    fn find_entry_set(&self, virtual_address: i64, node_index: i32) -> Result<i32, ResultCode> {
         let tree = self.tree.unwrap();
         let node_size = tree.node_size;
         let node_offset = (node_index as usize + 1) * node_size;
 
         // Read the L2 node.
-        let node_storage = tree
-            .node_storage
-            .as_ref()
-            .ok_or(RESULT_OUT_OF_RANGE)?;
+        let node_storage = tree.node_storage.as_ref().ok_or(RESULT_OUT_OF_RANGE)?;
         let mut buf = vec![0u8; node_size];
         node_storage.read(&mut buf, node_size, node_offset);
 
@@ -618,20 +658,13 @@ impl<'a> Visitor<'a> {
     /// Find the entry within an entry set.
     ///
     /// Corresponds to upstream `Visitor::FindEntry`.
-    fn find_entry(
-        &mut self,
-        virtual_address: i64,
-        entry_set_index: i32,
-    ) -> Result<(), ResultCode> {
+    fn find_entry(&mut self, virtual_address: i64, entry_set_index: i32) -> Result<(), ResultCode> {
         let tree = self.tree.unwrap();
         let entry_size = tree.entry_size;
         let entry_set_size = tree.node_size;
         let entry_set_offset = entry_set_index as usize * entry_set_size;
 
-        let entry_storage = tree
-            .entry_storage
-            .as_ref()
-            .ok_or(RESULT_OUT_OF_RANGE)?;
+        let entry_storage = tree.entry_storage.as_ref().ok_or(RESULT_OUT_OF_RANGE)?;
 
         // Read the entry set.
         let mut buf = vec![0u8; entry_set_size];
@@ -663,8 +696,7 @@ impl<'a> Visitor<'a> {
         // Copy the entry data.
         let entry_offset = get_bucket_tree_entry_offset(0, entry_size, index);
         if entry_offset + entry_size <= buf.len() {
-            self.entry[..entry_size]
-                .copy_from_slice(&buf[entry_offset..entry_offset + entry_size]);
+            self.entry[..entry_size].copy_from_slice(&buf[entry_offset..entry_offset + entry_size]);
         }
 
         self.entry_set = entry_set;
@@ -695,10 +727,7 @@ impl<'a> Visitor<'a> {
             let entry_set_size = tree.node_size;
             let entry_set_offset = entry_set_index as usize * entry_set_size;
 
-            let entry_storage = tree
-                .entry_storage
-                .as_ref()
-                .ok_or(RESULT_OUT_OF_RANGE)?;
+            let entry_storage = tree.entry_storage.as_ref().ok_or(RESULT_OUT_OF_RANGE)?;
 
             // Read entry set header.
             let mut header_buf = [0u8; std::mem::size_of::<EntrySetHeader>()];
@@ -734,10 +763,7 @@ impl<'a> Visitor<'a> {
             entry_size,
             entry_index,
         );
-        let entry_storage = tree
-            .entry_storage
-            .as_ref()
-            .ok_or(RESULT_OUT_OF_RANGE)?;
+        let entry_storage = tree.entry_storage.as_ref().ok_or(RESULT_OUT_OF_RANGE)?;
         entry_storage.read(&mut self.entry, entry_size, entry_offset);
 
         self.entry_index = entry_index;
@@ -767,10 +793,7 @@ impl<'a> Visitor<'a> {
             let entry_set_index = self.entry_set.index - 1;
             let entry_set_offset = entry_set_index as usize * entry_set_size;
 
-            let entry_storage = tree
-                .entry_storage
-                .as_ref()
-                .ok_or(RESULT_OUT_OF_RANGE)?;
+            let entry_storage = tree.entry_storage.as_ref().ok_or(RESULT_OUT_OF_RANGE)?;
 
             let mut header_buf = [0u8; std::mem::size_of::<EntrySetHeader>()];
             entry_storage.read(
@@ -806,10 +829,7 @@ impl<'a> Visitor<'a> {
             entry_size,
             entry_index,
         );
-        let entry_storage = tree
-            .entry_storage
-            .as_ref()
-            .ok_or(RESULT_OUT_OF_RANGE)?;
+        let entry_storage = tree.entry_storage.as_ref().ok_or(RESULT_OUT_OF_RANGE)?;
         entry_storage.read(&mut self.entry, entry_size, entry_offset);
 
         self.entry_index = entry_index;
@@ -931,7 +951,7 @@ mod tests {
         assert_eq!(info.get_skip_count(), 3);
         assert!(!info.check_need_scan()); // skip_count = 2
         assert!(!info.check_need_scan()); // skip_count = 1
-        assert!(info.check_need_scan());  // skip_count = 0
+        assert!(info.check_need_scan()); // skip_count = 0
 
         info.done();
         assert!(info.is_done());

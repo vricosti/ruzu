@@ -30,7 +30,10 @@ pub fn tex(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
         num_derivatives: 0,
     };
 
-    tv.ir.program.info.register_texture(tex_index, dim as u8, false);
+    tv.ir
+        .program
+        .info
+        .register_texture(tex_index, dim as u8, false);
 
     // Build coordinate vector from source registers
     let coord_x = tv.f(src_reg);
@@ -41,16 +44,18 @@ pub fn tex(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
     let result = match lod_mode {
         0 => {
             // Implicit LOD (fragment shader)
-            tv.ir.image_sample_implicit_lod(handle, coords, info.to_u32())
+            tv.ir
+                .image_sample_implicit_lod(handle, coords, info.to_u32())
         }
         1 => {
             // Explicit LOD
             let lod = tv.f(src_reg + 2);
-            tv.ir.image_sample_explicit_lod(handle, coords, lod, info.to_u32())
+            tv.ir
+                .image_sample_explicit_lod(handle, coords, lod, info.to_u32())
         }
-        _ => {
-            tv.ir.image_sample_implicit_lod(handle, coords, info.to_u32())
-        }
+        _ => tv
+            .ir
+            .image_sample_implicit_lod(handle, coords, info.to_u32()),
     };
 
     // Extract result components to destination registers

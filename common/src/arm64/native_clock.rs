@@ -111,10 +111,10 @@ fn get_android_board_frequency() -> Option<u64> {
     let board = read_android_property("ro.product.board")?;
 
     match board.as_str() {
-        "s5e9925" => Some(25_600_000),   // Exynos 2200
+        "s5e9925" => Some(25_600_000),    // Exynos 2200
         "exynos2100" => Some(26_000_000), // Exynos 2100
         "exynos9810" => Some(26_000_000), // Exynos 9810
-        "s5e8825" => Some(26_000_000),   // Exynos 1280
+        "s5e8825" => Some(26_000_000),    // Exynos 1280
         _ => None,
     }
 }
@@ -131,19 +131,16 @@ fn read_android_property(name: &str) -> Option<String> {
     let len = unsafe {
         // This function is available in the Android NDK
         extern "C" {
-            fn __system_property_get(name: *const libc::c_char, value: *mut libc::c_char) -> libc::c_int;
+            fn __system_property_get(
+                name: *const libc::c_char,
+                value: *mut libc::c_char,
+            ) -> libc::c_int;
         }
-        __system_property_get(
-            c_name.as_ptr(),
-            buffer.as_mut_ptr() as *mut libc::c_char,
-        )
+        __system_property_get(c_name.as_ptr(), buffer.as_mut_ptr() as *mut libc::c_char)
     };
 
     if len > 0 {
-        Some(
-            String::from_utf8_lossy(&buffer[..len as usize])
-                .to_string(),
-        )
+        Some(String::from_utf8_lossy(&buffer[..len as usize]).to_string())
     } else {
         None
     }

@@ -16,17 +16,17 @@ use std::time::{Duration, Instant};
 
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_scheduler::KScheduler;
-use crate::hle::kernel::k_thread_queue::KThreadQueue;
 use crate::hle::kernel::k_thread::{
     ConditionVariableThreadKey, KThread, ThreadWaitReasonForDebugging,
 };
+use crate::hle::kernel::k_thread_queue::KThreadQueue;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
-use crate::hle::kernel::svc_common::Handle;
-use crate::hle::kernel::svc_common::{HANDLE_WAIT_MASK, INVALID_HANDLE};
 use crate::hle::kernel::svc::svc_results::{
     RESULT_INVALID_CURRENT_MEMORY, RESULT_INVALID_HANDLE, RESULT_INVALID_STATE,
     RESULT_TERMINATION_REQUESTED,
 };
+use crate::hle::kernel::svc_common::Handle;
+use crate::hle::kernel::svc_common::{HANDLE_WAIT_MASK, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> Option<Instant> {
@@ -107,7 +107,10 @@ impl ThreadQueueImplForKConditionVariableWaitConditionVariable {
 
         // If the thread is waiting on a condvar, remove it from the tree.
         if waiting_thread.is_waiting_for_condition_variable() {
-            if let Some(parent) = waiting_thread.parent.as_ref().and_then(|parent| parent.upgrade())
+            if let Some(parent) = waiting_thread
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
             {
                 parent
                     .lock()
@@ -143,7 +146,12 @@ fn write_to_user(process_guard: &KProcess, address: u64, value: u32) -> bool {
     if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
         memory.lock().unwrap().write_32(address, value);
         true
-    } else if process_guard.process_memory.read().unwrap().is_valid_range(address, 4) {
+    } else if process_guard
+        .process_memory
+        .read()
+        .unwrap()
+        .is_valid_range(address, 4)
+    {
         process_guard
             .process_memory
             .write()
@@ -241,8 +249,7 @@ impl KConditionVariable {
                             next_thread.lock().unwrap().add_held_lock(lock_info);
                         }
                     }
-                    if let Some(next_thread) =
-                        process_guard.get_thread_by_thread_id(next_owner_id)
+                    if let Some(next_thread) = process_guard.get_thread_by_thread_id(next_owner_id)
                     {
                         next_thread.lock().unwrap().set_waiting_lock_info(None);
                         Some(next_thread)
@@ -284,19 +291,19 @@ impl KConditionVariable {
         // If necessary, signal the next owner thread.
         // Matches upstream: if (next_owner_thread != nullptr) next_owner_thread->EndWait(result);
         if let Some(ref next_owner_thread) = next_owner_thread {
-            let thread_id = next_owner_thread.lock().unwrap().get_thread_id();
             next_owner_thread
                 .lock()
                 .unwrap()
                 .end_wait(result.get_inner_value());
-            // Thread became RUNNABLE — add to priority queue.
-            process.lock().unwrap().push_back_to_priority_queue(thread_id);
         }
 
         result
     }
 
-    fn wait_for_current_thread(process: &Arc<Mutex<KProcess>>, current_thread: &Arc<Mutex<KThread>>) {
+    fn wait_for_current_thread(
+        process: &Arc<Mutex<KProcess>>,
+        current_thread: &Arc<Mutex<KThread>>,
+    ) {
         let scheduler = process
             .lock()
             .unwrap()
@@ -402,10 +409,12 @@ impl KConditionVariable {
             let address_key = ct.get_address_key();
             let is_kernel = ct.get_is_kernel_address_key();
             drop(ct);
-            owner_thread
-                .lock()
-                .unwrap()
-                .add_waiter(current_thread_id, priority, address_key, is_kernel);
+            owner_thread.lock().unwrap().add_waiter(
+                current_thread_id,
+                priority,
+                address_key,
+                is_kernel,
+            );
         }
 
         // Upstream calls owner_thread->Close() here to release the handle
@@ -424,12 +433,7 @@ impl KConditionVariable {
     ///
     /// The caller must already hold the process lock (passes `&mut KProcess`).
     /// Upstream wraps the body in `KScopedSchedulerLock sl(m_kernel)`.
-    pub fn signal(
-        &mut self,
-        process_guard: &mut KProcess,
-        cv_key: u64,
-        count: i32,
-    ) -> ResultCode {
+    pub fn signal(&mut self, process_guard: &mut KProcess, cv_key: u64, count: i32) -> ResultCode {
         let mut num_waiters = 0i32;
 
         // Iterate the tree, finding threads with matching cv_key.
@@ -443,8 +447,7 @@ impl KConditionVariable {
             }
 
             let waiting_thread_id = waiting_thread_key.thread_id;
-            let Some(waiting_thread) =
-                process_guard.get_thread_by_thread_id(waiting_thread_id)
+            let Some(waiting_thread) = process_guard.get_thread_by_thread_id(waiting_thread_id)
             else {
                 self.waiting_threads.erase(waiting_thread_key);
                 continue;
@@ -493,7 +496,14 @@ impl KConditionVariable {
         timeout: i64,
     ) -> ResultCode {
         let mut process_guard = process.lock().unwrap();
-        let result = self.wait_locked(&mut process_guard, current_thread, addr, key, value, timeout);
+        let result = self.wait_locked(
+            &mut process_guard,
+            current_thread,
+            addr,
+            key,
+            value,
+            timeout,
+        );
         drop(process_guard);
 
         if result == RESULT_SUCCESS {
@@ -550,7 +560,10 @@ impl KConditionVariable {
                     next_owner_thread.lock().unwrap().add_held_lock(lock_info);
                 }
 
-                next_owner_thread.lock().unwrap().set_waiting_lock_info(None);
+                next_owner_thread
+                    .lock()
+                    .unwrap()
+                    .set_waiting_lock_info(None);
 
                 next_value = next_owner_thread.lock().unwrap().get_address_key_value();
                 if has_waiters {
@@ -559,15 +572,10 @@ impl KConditionVariable {
 
                 // Wake up the next owner.
                 // Matches upstream: next_owner_thread->EndWait(ResultSuccess);
-                let (no_id, no_pri, no_core, no_aff, no_dummy) = {
-                    let mut guard = next_owner_thread.lock().unwrap();
-                    guard.end_wait(RESULT_SUCCESS.get_inner_value());
-                    super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(&guard)
-                };
-                // Thread transitioned WAITING → RUNNABLE — push to PQ.
-                process_guard.push_back_to_priority_queue_with_props(
-                    no_id, no_pri, no_core, no_aff, no_dummy,
-                );
+                next_owner_thread
+                    .lock()
+                    .unwrap()
+                    .end_wait(RESULT_SUCCESS.get_inner_value());
             }
 
             // Write to the cv key.
@@ -610,11 +618,7 @@ impl KConditionVariable {
     /// Uses UpdateLockAtomic to atomically update the lock tag, then either
     /// wakes the thread (if nobody held the lock) or adds it as a waiter on
     /// the previous lock owner.
-    fn signal_impl(
-        &mut self,
-        process_guard: &mut KProcess,
-        waiting_thread: &Arc<Mutex<KThread>>,
-    ) {
+    fn signal_impl(&mut self, process_guard: &mut KProcess, waiting_thread: &Arc<Mutex<KThread>>) {
         // Update the tag.
         // Matches upstream: KProcessAddress address = thread->GetAddressKey();
         //                   u32 own_tag = thread->GetAddressKeyValue();
@@ -643,7 +647,6 @@ impl KConditionVariable {
                     .lock()
                     .unwrap()
                     .end_wait(RESULT_SUCCESS.get_inner_value());
-                process_guard.push_back_to_priority_queue(waiting_thread_id);
             } else {
                 // Get the previous owner.
                 // Matches upstream: GetObjectWithoutPseudoHandle<KThread>(prev_tag & ~HandleWaitMask)
@@ -683,7 +686,6 @@ impl KConditionVariable {
                         .lock()
                         .unwrap()
                         .end_wait(RESULT_INVALID_STATE.get_inner_value());
-                    process_guard.push_back_to_priority_queue(waiting_thread_id);
                 }
             }
         } else {
@@ -693,7 +695,6 @@ impl KConditionVariable {
                 .lock()
                 .unwrap()
                 .end_wait(RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
-            process_guard.push_back_to_priority_queue(waiting_thread_id);
         }
     }
 
@@ -739,9 +740,8 @@ impl KConditionVariable {
         let mut current_thread = current_thread.lock().unwrap();
         current_thread.set_user_address_key(KProcessAddress::new(addr), value);
         current_thread.set_waiting_lock_owner_thread_id(Some(owner_thread_id));
-        current_thread.begin_wait_with_queue(
-            ThreadQueueImplForKConditionVariableWaitForAddress::queue(),
-        );
+        current_thread
+            .begin_wait_with_queue(ThreadQueueImplForKConditionVariableWaitForAddress::queue());
         current_thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
     }
 
@@ -879,13 +879,8 @@ mod tests {
             .unwrap()
             .write_32(address, owner_handle | HANDLE_WAIT_MASK);
 
-        let result = KConditionVariable::wait_for_address(
-            &process,
-            &waiter,
-            owner_handle,
-            address,
-            0x1234,
-        );
+        let result =
+            KConditionVariable::wait_for_address(&process, &waiter, owner_handle, address, 0x1234);
 
         assert_eq!(result, RESULT_SUCCESS);
         assert_eq!(waiter.lock().unwrap().get_state(), ThreadState::WAITING);
@@ -923,13 +918,8 @@ mod tests {
             assert_eq!(result, RESULT_SUCCESS);
         });
 
-        let result = KConditionVariable::wait_for_address(
-            &process,
-            &waiter,
-            owner_handle,
-            address,
-            0x1234,
-        );
+        let result =
+            KConditionVariable::wait_for_address(&process, &waiter, owner_handle, address, 0x1234);
 
         signal_thread.join().unwrap();
 
@@ -944,8 +934,7 @@ mod tests {
             let mut waiter_guard = waiter.lock().unwrap();
             waiter_guard.set_user_address_key(KProcessAddress::new(address), 0xCAFE);
             waiter_guard.begin_wait();
-            waiter_guard
-                .set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
+            waiter_guard.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
         }
         {
             let wt = waiter.lock().unwrap();
@@ -1068,27 +1057,10 @@ mod tests {
         {
             let mut process_guard = process.lock().unwrap();
             let mut cond_var = std::mem::take(&mut process_guard.cond_var);
-            cond_var.wait_locked(
-                &mut process_guard,
-                &waiter_a,
-                0x1800,
-                key,
-                0x1111,
-                -1,
-            );
-            cond_var.wait_locked(
-                &mut process_guard,
-                &waiter_b,
-                0x1810,
-                key,
-                0x2222,
-                -1,
-            );
+            cond_var.wait_locked(&mut process_guard, &waiter_a, 0x1800, key, 0x1111, -1);
+            cond_var.wait_locked(&mut process_guard, &waiter_b, 0x1810, key, 0x2222, -1);
             process_guard.cond_var = cond_var;
-            assert_eq!(
-                process_guard.cond_var.waiting_thread_ids(),
-                vec![2, 3]
-            );
+            assert_eq!(process_guard.cond_var.waiting_thread_ids(), vec![2, 3]);
         }
 
         waiter_b.lock().unwrap().set_base_priority(10);
@@ -1124,8 +1096,7 @@ mod tests {
                 .signal_condition_variable(key, 1);
         });
 
-        let result =
-            KProcess::wait_condition_variable(&process, &owner, address, key, 0x1111, -1);
+        let result = KProcess::wait_condition_variable(&process, &owner, address, key, 0x1111, -1);
 
         signal_thread.join().unwrap();
 
@@ -1151,8 +1122,7 @@ mod tests {
                 .signal_condition_variable(key, 1);
         });
 
-        let result =
-            KProcess::wait_condition_variable(&process, &owner, address, key, 0x2222, -1);
+        let result = KProcess::wait_condition_variable(&process, &owner, address, key, 0x2222, -1);
 
         crate::hle::kernel::kernel::set_current_emu_thread(None);
         signal_thread.join().unwrap();

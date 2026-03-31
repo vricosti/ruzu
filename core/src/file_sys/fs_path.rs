@@ -381,8 +381,10 @@ impl Path {
 
         // Copy old content
         unsafe {
-            let dst_buf =
-                std::slice::from_raw_parts_mut(self.write_buffer.get(), self.write_buffer.get_length());
+            let dst_buf = std::slice::from_raw_parts_mut(
+                self.write_buffer.get(),
+                self.write_buffer.get_length(),
+            );
 
             if !old_data.is_empty() && cur_len > 0 {
                 let copy_len = cur_len.min(old_data.len());
@@ -393,11 +395,7 @@ impl Path {
             dst_buf[cur_len] = b'/';
 
             // Copy child path
-            let copied = strlcpy(
-                &mut dst_buf[cur_len + 1..],
-                child_part,
-                child_len + 1,
-            );
+            let copied = strlcpy(&mut dst_buf[cur_len + 1..], child_part, child_len + 1);
             if copied != child_len {
                 return Err(RESULT_UNEXPECTED_IN_PATH_A);
             }
@@ -448,10 +446,7 @@ impl Path {
         }
 
         let p = unsafe {
-            std::slice::from_raw_parts_mut(
-                self.write_buffer.get(),
-                self.write_buffer.get_length(),
-            )
+            std::slice::from_raw_parts_mut(self.write_buffer.get(), self.write_buffer.get_length())
         };
         let mut len = strlen(p) as i32;
 
@@ -515,13 +510,16 @@ impl Path {
             // Normalize into the new buffer
             let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf.get(), size) };
             let src_slice = unsafe {
-                std::slice::from_raw_parts(
-                    self.write_buffer.get(),
-                    self.write_buffer.get_length(),
-                )
+                std::slice::from_raw_parts(self.write_buffer.get(), self.write_buffer.get_length())
             };
 
-            PathFormatter::normalize(buf_slice, size, src_slice, self.write_buffer.get_length(), flags)?;
+            PathFormatter::normalize(
+                buf_slice,
+                size,
+                src_slice,
+                self.write_buffer.get_length(),
+                flags,
+            )?;
 
             self.set_modifiable_buffer(buf);
         }

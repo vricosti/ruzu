@@ -48,7 +48,11 @@ impl IStorage {
         let offset = rp.pop_i64();
         let length = rp.pop_i64();
 
-        log::debug!("IStorage::Read called, offset=0x{:X}, length={}", offset, length);
+        log::debug!(
+            "IStorage::Read called, offset=0x{:X}, length={}",
+            offset,
+            length
+        );
 
         if offset < 0 || length < 0 {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -125,7 +129,10 @@ impl ServiceFramework for IStorage {
             }
         }
 
-        log::warn!("IStorage: unimplemented command '{}' returned stub success", cmd);
+        log::warn!(
+            "IStorage: unimplemented command '{}' returned stub success",
+            cmd
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }

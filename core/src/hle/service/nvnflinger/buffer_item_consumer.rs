@@ -13,6 +13,7 @@ use std::sync::Arc;
 use super::buffer_item::BufferItem;
 use super::buffer_queue_consumer::BufferQueueConsumer;
 use super::consumer_base::ConsumerBase;
+use super::consumer_listener::IConsumerListener;
 use super::status::Status;
 use super::ui::fence::Fence;
 
@@ -28,8 +29,11 @@ impl BufferItemConsumer {
         }
     }
 
-    pub fn connect(&self, controlled_by_app: bool) {
-        self.base.connect(controlled_by_app);
+    pub fn connect(self: &Arc<Self>, controlled_by_app: bool) -> Status {
+        self.base.connect(
+            Arc::clone(self) as Arc<dyn IConsumerListener>,
+            controlled_by_app,
+        )
     }
 
     pub fn abandon(&self) {
@@ -61,9 +65,9 @@ impl BufferItemConsumer {
     }
 
     pub fn release_buffer(&self, item: &BufferItem, release_fence: &Fence) -> Status {
-        if let Status::NoError = self
-            .base
-            .add_release_fence_locked(item.slot, &item.graphic_buffer, release_fence)
+        if let Status::NoError =
+            self.base
+                .add_release_fence_locked(item.slot, &item.graphic_buffer, release_fence)
         {
             // ok
         } else {
@@ -74,13 +78,28 @@ impl BufferItemConsumer {
             .base
             .release_buffer_locked(item.slot, &item.graphic_buffer);
         if status != Status::NoError {
-            log::warn!(
-                "BufferItemConsumer: Failed to release buffer: {:?}",
-                status
-            );
+            log::warn!("BufferItemConsumer: Failed to release buffer: {:?}", status);
             return status;
         }
 
         Status::NoError
+    }
+}
+
+impl IConsumerListener for BufferItemConsumer {
+    fn on_frame_available(&self, item: &BufferItem) {
+        self.base.on_frame_available(item);
+    }
+
+    fn on_frame_replaced(&self, item: &BufferItem) {
+        self.base.on_frame_replaced(item);
+    }
+
+    fn on_buffers_released(&self) {
+        self.base.on_buffers_released();
+    }
+
+    fn on_sideband_stream_changed(&self) {
+        self.base.on_sideband_stream_changed();
     }
 }

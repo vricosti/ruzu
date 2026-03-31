@@ -152,10 +152,22 @@ pub fn throw_fatal_error(
             generate_error_report(title_id, error_code, info);
             if let Some(reporter) = reporter {
                 reporter.save_crash_report(
-                    title_id, error_code, info.set_flags, info.program_entry_point,
-                    info.sp, info.pc, info.pstate, info.afsr0, info.afsr1,
-                    info.esr, info.far, &info.registers, &info.backtrace,
-                    info.backtrace_size, info.arch.as_str(), info.unk10,
+                    title_id,
+                    error_code,
+                    info.set_flags,
+                    info.program_entry_point,
+                    info.sp,
+                    info.pc,
+                    info.pstate,
+                    info.afsr0,
+                    info.afsr1,
+                    info.esr,
+                    info.far,
+                    &info.registers,
+                    &info.backtrace,
+                    info.backtrace_size,
+                    info.arch.as_str(),
+                    info.unk10,
                 );
             }
             // Since we have no fatal:u error screen, just assert in debug
@@ -169,10 +181,22 @@ pub fn throw_fatal_error(
             generate_error_report(title_id, error_code, info);
             if let Some(reporter) = reporter {
                 reporter.save_crash_report(
-                    title_id, error_code, info.set_flags, info.program_entry_point,
-                    info.sp, info.pc, info.pstate, info.afsr0, info.afsr1,
-                    info.esr, info.far, &info.registers, &info.backtrace,
-                    info.backtrace_size, info.arch.as_str(), info.unk10,
+                    title_id,
+                    error_code,
+                    info.set_flags,
+                    info.program_entry_point,
+                    info.sp,
+                    info.pc,
+                    info.pstate,
+                    info.afsr0,
+                    info.afsr1,
+                    info.esr,
+                    info.far,
+                    &info.registers,
+                    &info.backtrace,
+                    info.backtrace_size,
+                    info.arch.as_str(),
+                    info.unk10,
                 );
             }
         }
@@ -200,8 +224,16 @@ pub struct Interface {
 }
 
 impl Interface {
-    pub fn new(system: crate::core::SystemRef, module: std::sync::Arc<Module>, name: &'static str) -> Self {
-        Self { system, module, name }
+    pub fn new(
+        system: crate::core::SystemRef,
+        module: std::sync::Arc<Module>,
+        name: &'static str,
+    ) -> Self {
+        Self {
+            system,
+            module,
+            name,
+        }
     }
 
     /// ThrowFatal (cmd 0).
@@ -214,7 +246,13 @@ impl Interface {
         } else {
             None
         };
-        throw_fatal_error(0, error_code, FatalType::ErrorScreen, &FatalInfo::default(), reporter);
+        throw_fatal_error(
+            0,
+            error_code,
+            FatalType::ErrorScreen,
+            &FatalInfo::default(),
+            reporter,
+        );
     }
 
     /// ThrowFatalWithPolicy (cmd 1).
@@ -268,8 +306,8 @@ impl Interface {
 ///
 /// Corresponds to `LoopProcess` in upstream fatal.cpp.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     log::debug!("Fatal::LoopProcess called");
 

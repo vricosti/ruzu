@@ -5,15 +5,15 @@
 //! Core::Memory::Memory — bridges KPageTableBase with the dynarmic page table
 //! and the DeviceMemory backing store.
 
-use common::host_memory::HostMemory;
 #[cfg(target_os = "linux")]
 use common::heap_tracker::HeapTracker;
+use common::host_memory::HostMemory;
 use common::page_table::{PageInfo, PageTable, PageType};
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
 use crate::device_memory::{dram_memory_map, DeviceMemory};
 use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
-use crate::core::SystemRef;
 
 /// Page size constants matching upstream YUZU_PAGEBITS / YUZU_PAGESIZE.
 const PAGE_BITS: usize = 12;
@@ -200,7 +200,13 @@ impl Memory {
         debug_assert!((size & PAGE_MASK) == 0);
         debug_assert!((base & PAGE_MASK) == 0);
 
-        self.map_pages(page_table, base / PAGE_SIZE, size / PAGE_SIZE, 0, PageType::Unmapped);
+        self.map_pages(
+            page_table,
+            base / PAGE_SIZE,
+            size / PAGE_SIZE,
+            0,
+            PageType::Unmapped,
+        );
 
         if !page_table.fastmem_arena.is_null() {
             #[cfg(target_os = "linux")]
@@ -313,12 +319,14 @@ impl Memory {
             PageType::Unmapped => std::ptr::null_mut(),
             PageType::Memory => {
                 // Upstream: ASSERT_MSG(false, "Mapped memory page without a pointer")
-                debug_assert!(false, "Mapped memory page without a pointer @ {:#018x}", vaddr);
+                debug_assert!(
+                    false,
+                    "Mapped memory page without a pointer @ {:#018x}",
+                    vaddr
+                );
                 std::ptr::null_mut()
             }
-            PageType::DebugMemory => {
-                self.get_pointer_from_debug_memory(vaddr)
-            }
+            PageType::DebugMemory => self.get_pointer_from_debug_memory(vaddr),
             PageType::RasterizerCachedMemory => {
                 self.get_pointer_from_rasterizer_cached_memory(vaddr)
             }
@@ -342,7 +350,9 @@ impl Memory {
         }
         unsafe {
             let dm = &*self.device_memory;
-            dm.buffer.backing_base_pointer().add(backing + vaddr as usize) as *mut u8
+            dm.buffer
+                .backing_base_pointer()
+                .add(backing + vaddr as usize) as *mut u8
         }
     }
 
@@ -374,9 +384,7 @@ impl Memory {
             return;
         };
 
-        let do_collection = self
-            .system
-            .is_null()
+        let do_collection = self.system.is_null()
             || self
                 .system
                 .get()
@@ -414,7 +422,11 @@ impl Memory {
     unsafe fn read_raw<T: Copy + Default>(&self, vaddr: u64) -> T {
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
-            log::error!("Unmapped Read{} @ {:#018x}", std::mem::size_of::<T>() * 8, vaddr);
+            log::error!(
+                "Unmapped Read{} @ {:#018x}",
+                std::mem::size_of::<T>() * 8,
+                vaddr
+            );
             return T::default();
         }
         std::ptr::read_unaligned(ptr as *const T)
@@ -426,7 +438,11 @@ impl Memory {
     unsafe fn write_raw<T: Copy>(&self, vaddr: u64, data: T) {
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
-            log::error!("Unmapped Write{} @ {:#018x}", std::mem::size_of::<T>() * 8, vaddr);
+            log::error!(
+                "Unmapped Write{} @ {:#018x}",
+                std::mem::size_of::<T>() * 8,
+                vaddr
+            );
             return;
         }
         std::ptr::write_unaligned(ptr as *mut T, data);
@@ -655,9 +671,7 @@ impl Memory {
             return false;
         }
         let (pointer, ptype) = pt.pointers[page].pointer_type();
-        pointer != 0
-            || ptype == PageType::RasterizerCachedMemory
-            || ptype == PageType::DebugMemory
+        pointer != 0 || ptype == PageType::RasterizerCachedMemory || ptype == PageType::DebugMemory
     }
 
     /// Check if a virtual address range is valid (all pages mapped).
@@ -690,7 +704,12 @@ impl Memory {
         unsafe {
             let atomic = &*(ptr as *const std::sync::atomic::AtomicU8);
             atomic
-                .compare_exchange(expected, value, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .compare_exchange(
+                    expected,
+                    value,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
                 .is_ok()
         }
     }
@@ -706,7 +725,12 @@ impl Memory {
         unsafe {
             let atomic = &*(ptr as *const std::sync::atomic::AtomicU16);
             atomic
-                .compare_exchange(expected, value, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .compare_exchange(
+                    expected,
+                    value,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
                 .is_ok()
         }
     }
@@ -722,7 +746,12 @@ impl Memory {
         unsafe {
             let atomic = &*(ptr as *const std::sync::atomic::AtomicU32);
             atomic
-                .compare_exchange(expected, value, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .compare_exchange(
+                    expected,
+                    value,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
                 .is_ok()
         }
     }
@@ -738,7 +767,12 @@ impl Memory {
         unsafe {
             let atomic = &*(ptr as *const std::sync::atomic::AtomicU64);
             atomic
-                .compare_exchange(expected, value, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .compare_exchange(
+                    expected,
+                    value,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
                 .is_ok()
         }
     }
@@ -746,9 +780,12 @@ impl Memory {
     /// Exclusive write 128-bit with two 64-bit atomic CAS operations.
     /// Matches upstream `Memory::WriteExclusive128`.
     pub fn write_exclusive_128(
-        &self, vaddr: u64,
-        value_lo: u64, value_hi: u64,
-        expected_lo: u64, expected_hi: u64,
+        &self,
+        vaddr: u64,
+        value_lo: u64,
+        value_hi: u64,
+        expected_lo: u64,
+        expected_hi: u64,
     ) -> bool {
         // Upstream uses AtomicCompareAndSwap for 128-bit. On x86-64 without
         // native 128-bit CAS, fall back to two 64-bit CAS operations.

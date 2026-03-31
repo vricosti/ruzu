@@ -53,7 +53,8 @@ pub struct MiiEditAppletInputV3 {
     pub _padding: [u8; 0x64],
 }
 const _: () = assert!(
-    std::mem::size_of::<MiiEditAppletInputV3>() == 0x100 - std::mem::size_of::<MiiEditAppletInputCommon>()
+    std::mem::size_of::<MiiEditAppletInputV3>()
+        == 0x100 - std::mem::size_of::<MiiEditAppletInputCommon>()
 );
 
 impl Default for MiiEditAppletInputV3 {
@@ -76,7 +77,8 @@ pub struct MiiEditAppletInputV4 {
     pub _padding2: [u8; 0x64],
 }
 const _: () = assert!(
-    std::mem::size_of::<MiiEditAppletInputV4>() == 0x100 - std::mem::size_of::<MiiEditAppletInputCommon>()
+    std::mem::size_of::<MiiEditAppletInputV4>()
+        == 0x100 - std::mem::size_of::<MiiEditAppletInputCommon>()
 );
 
 impl Default for MiiEditAppletInputV4 {

@@ -61,13 +61,10 @@ pub fn split_path(full_path: &str) -> Option<(String, String, String)> {
 
     let dir_end = full_path.rfind('/').map(|i| i + 1).unwrap_or(0);
 
-    let fname_end = full_path.rfind('.').and_then(|i| {
-        if i < dir_end {
-            None
-        } else {
-            Some(i)
-        }
-    }).unwrap_or(full_path.len());
+    let fname_end = full_path
+        .rfind('.')
+        .and_then(|i| if i < dir_end { None } else { Some(i) })
+        .unwrap_or(full_path.len());
 
     let path = full_path[..dir_end].to_string();
     let filename = full_path[dir_end..fname_end].to_string();
@@ -186,9 +183,6 @@ mod tests {
             string_from_fixed_zero_terminated_buffer(b"hello\0extra", 11),
             "hello"
         );
-        assert_eq!(
-            string_from_fixed_zero_terminated_buffer(b"hello", 3),
-            "hel"
-        );
+        assert_eq!(string_from_fixed_zero_terminated_buffer(b"hello", 3), "hel");
     }
 }

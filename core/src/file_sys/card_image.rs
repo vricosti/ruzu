@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use super::content_archive::{NCA, NCAContentType};
+use super::content_archive::{NCAContentType, NCA};
 use super::nca_metadata::CNMT;
 use super::partition_filesystem::{PartitionFilesystem, ResultStatus};
 use super::submission_package::NSP;
@@ -359,12 +359,17 @@ impl XCI {
     }
 
     pub fn get_nca_file_by_type(&self, nca_type: NCAContentType) -> Option<VirtualFile> {
-        self.get_nca_by_type(nca_type).map(|nca| nca.get_base_file())
+        self.get_nca_by_type(nca_type)
+            .map(|nca| nca.get_base_file())
     }
 
     pub fn concatenated_pseudo_directory(&mut self) -> VirtualDir {
         let out = Arc::new(VectorVfsDirectory::new(vec![], vec![], String::new(), None));
-        for part_id in [XCIPartition::Normal, XCIPartition::Logo, XCIPartition::Secure] {
+        for part_id in [
+            XCIPartition::Normal,
+            XCIPartition::Logo,
+            XCIPartition::Secure,
+        ] {
             if let Some(part) = self.get_partition(part_id) {
                 for part_file in part.get_files() {
                     out.add_file(part_file);
@@ -377,7 +382,8 @@ impl XCI {
     pub fn get_certificate(&self) -> [u8; 0x200] {
         let mut out = [0u8; 0x200];
         let len = out.len();
-        self.file.read(&mut out, len, GAMECARD_CERTIFICATE_OFFSET as usize);
+        self.file
+            .read(&mut out, len, GAMECARD_CERTIFICATE_OFFSET as usize);
         out
     }
 

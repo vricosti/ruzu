@@ -95,9 +95,7 @@ impl BlitScreen {
         let mut presentation_recreate_required = false;
 
         // Check if scaling filter changed
-        if self.window_adapt.is_none()
-            || self.scaling_filter != Some(current_scaling_filter)
-        {
+        if self.window_adapt.is_none() || self.scaling_filter != Some(current_scaling_filter) {
             resource_update_required = true;
         }
 

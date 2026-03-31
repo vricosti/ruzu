@@ -136,7 +136,9 @@ impl QueueEntry {
 type EntryMap = HashMap<u64, [QueueEntry; NUM_CORES]>;
 
 fn ensure_entry(entries: &mut EntryMap, id: u64) {
-    entries.entry(id).or_insert_with(|| std::array::from_fn(|_| QueueEntry::new()));
+    entries
+        .entry(id)
+        .or_insert_with(|| std::array::from_fn(|_| QueueEntry::new()));
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +195,9 @@ impl KPerCoreQueue {
 
         // Link: member.prev = tail, member.next = None
         {
-            let e = entries.entry(member_id).or_insert_with(|| std::array::from_fn(|_| QueueEntry::new()));
+            let e = entries
+                .entry(member_id)
+                .or_insert_with(|| std::array::from_fn(|_| QueueEntry::new()));
             e[c].set_prev(tail_id);
             e[c].set_next(None);
         }
@@ -219,7 +223,9 @@ impl KPerCoreQueue {
 
         // Link: member.prev = None, member.next = head
         {
-            let e = entries.entry(member_id).or_insert_with(|| std::array::from_fn(|_| QueueEntry::new()));
+            let e = entries
+                .entry(member_id)
+                .or_insert_with(|| std::array::from_fn(|_| QueueEntry::new()));
             e[c].set_prev(None);
             e[c].set_next(head_id);
         }
@@ -297,7 +303,9 @@ impl KPriorityQueueImpl {
     pub fn push_back(&mut self, priority: i32, core: i32, member_id: u64, entries: &mut EntryMap) {
         debug_assert!(is_valid_core(core));
         debug_assert!(is_valid_priority(priority));
-        if priority > LOWEST_PRIORITY { return; }
+        if priority > LOWEST_PRIORITY {
+            return;
+        }
 
         let was_empty = self.queues[priority as usize].push_back(core, member_id, entries);
         if was_empty {
@@ -308,7 +316,9 @@ impl KPriorityQueueImpl {
     pub fn push_front(&mut self, priority: i32, core: i32, member_id: u64, entries: &mut EntryMap) {
         debug_assert!(is_valid_core(core));
         debug_assert!(is_valid_priority(priority));
-        if priority > LOWEST_PRIORITY { return; }
+        if priority > LOWEST_PRIORITY {
+            return;
+        }
 
         if self.queues[priority as usize].push_front(core, member_id, entries) {
             self.available_priorities[core as usize].set_bit(priority);
@@ -318,7 +328,9 @@ impl KPriorityQueueImpl {
     pub fn remove(&mut self, priority: i32, core: i32, member_id: u64, entries: &mut EntryMap) {
         debug_assert!(is_valid_core(core));
         debug_assert!(is_valid_priority(priority));
-        if priority > LOWEST_PRIORITY { return; }
+        if priority > LOWEST_PRIORITY {
+            return;
+        }
 
         if self.queues[priority as usize].remove(core, member_id, entries) {
             self.available_priorities[core as usize].clear_bit(priority);
@@ -347,10 +359,17 @@ impl KPriorityQueueImpl {
 
     /// Get the next thread after `member_id` in the queue for `core`.
     /// If no next in current priority, jump to the front of the next priority.
-    pub fn get_next(&self, core: i32, member_id: u64, member_priority: i32, entries: &EntryMap) -> Option<u64> {
+    pub fn get_next(
+        &self,
+        core: i32,
+        member_id: u64,
+        member_priority: i32,
+        entries: &EntryMap,
+    ) -> Option<u64> {
         debug_assert!(is_valid_core(core));
 
-        let next = entries.get(&member_id)
+        let next = entries
+            .get(&member_id)
             .and_then(|e| e[core as usize].get_next());
 
         if next.is_some() {
@@ -358,7 +377,8 @@ impl KPriorityQueueImpl {
         }
 
         // Jump to the next priority level
-        let next_priority = self.available_priorities[core as usize].get_next_set(member_priority) as i32;
+        let next_priority =
+            self.available_priorities[core as usize].get_next_set(member_priority) as i32;
         if next_priority <= LOWEST_PRIORITY {
             self.queues[next_priority as usize].get_front(core)
         } else {
@@ -366,7 +386,13 @@ impl KPriorityQueueImpl {
         }
     }
 
-    pub fn move_to_front(&mut self, priority: i32, core: i32, member_id: u64, entries: &mut EntryMap) {
+    pub fn move_to_front(
+        &mut self,
+        priority: i32,
+        core: i32,
+        member_id: u64,
+        entries: &mut EntryMap,
+    ) {
         debug_assert!(is_valid_core(core));
         debug_assert!(is_valid_priority(priority));
         if priority <= LOWEST_PRIORITY {
@@ -375,7 +401,13 @@ impl KPriorityQueueImpl {
         }
     }
 
-    pub fn move_to_back(&mut self, priority: i32, core: i32, member_id: u64, entries: &mut EntryMap) -> Option<u64> {
+    pub fn move_to_back(
+        &mut self,
+        priority: i32,
+        core: i32,
+        member_id: u64,
+        entries: &mut EntryMap,
+    ) -> Option<u64> {
         debug_assert!(is_valid_core(core));
         debug_assert!(is_valid_priority(priority));
         if priority <= LOWEST_PRIORITY {
@@ -464,25 +496,49 @@ impl KPriorityQueue {
         self.suggested_queue.get_front_at_priority(priority, core)
     }
 
-    pub fn get_scheduled_next(&self, core: i32, member_id: u64, member_priority: i32) -> Option<u64> {
-        self.scheduled_queue.get_next(core, member_id, member_priority, &self.entries)
+    pub fn get_scheduled_next(
+        &self,
+        core: i32,
+        member_id: u64,
+        member_priority: i32,
+    ) -> Option<u64> {
+        self.scheduled_queue
+            .get_next(core, member_id, member_priority, &self.entries)
     }
 
-    pub fn get_suggested_next(&self, core: i32, member_id: u64, member_priority: i32) -> Option<u64> {
-        self.suggested_queue.get_next(core, member_id, member_priority, &self.entries)
+    pub fn get_suggested_next(
+        &self,
+        core: i32,
+        member_id: u64,
+        member_priority: i32,
+    ) -> Option<u64> {
+        self.suggested_queue
+            .get_next(core, member_id, member_priority, &self.entries)
     }
 
     pub fn get_same_priority_next(&self, core: i32, member_id: u64) -> Option<u64> {
-        self.entries.get(&member_id)
+        self.entries
+            .get(&member_id)
             .and_then(|e| e[core as usize].get_next())
     }
 
     // -- Private push/remove with priority --
 
-    fn push_back_impl(&mut self, priority: i32, member_id: u64, active_core: i32, affinity_mask: u64) {
+    fn push_back_impl(
+        &mut self,
+        priority: i32,
+        member_id: u64,
+        active_core: i32,
+        affinity_mask: u64,
+    ) {
         debug_assert!(is_valid_priority(priority));
 
-        let Self { scheduled_queue, suggested_queue, entries, .. } = self;
+        let Self {
+            scheduled_queue,
+            suggested_queue,
+            entries,
+            ..
+        } = self;
         let mut affinity = affinity_mask;
         if active_core >= 0 {
             scheduled_queue.push_back(priority, active_core, member_id, entries);
@@ -494,10 +550,21 @@ impl KPriorityQueue {
         }
     }
 
-    fn push_front_impl(&mut self, priority: i32, member_id: u64, active_core: i32, affinity_mask: u64) {
+    fn push_front_impl(
+        &mut self,
+        priority: i32,
+        member_id: u64,
+        active_core: i32,
+        affinity_mask: u64,
+    ) {
         debug_assert!(is_valid_priority(priority));
 
-        let Self { scheduled_queue, suggested_queue, entries, .. } = self;
+        let Self {
+            scheduled_queue,
+            suggested_queue,
+            entries,
+            ..
+        } = self;
         let mut affinity = affinity_mask;
         if active_core >= 0 {
             scheduled_queue.push_front(priority, active_core, member_id, entries);
@@ -513,7 +580,12 @@ impl KPriorityQueue {
     fn remove_impl(&mut self, priority: i32, member_id: u64, active_core: i32, affinity_mask: u64) {
         debug_assert!(is_valid_priority(priority));
 
-        let Self { scheduled_queue, suggested_queue, entries, .. } = self;
+        let Self {
+            scheduled_queue,
+            suggested_queue,
+            entries,
+            ..
+        } = self;
         let mut affinity = affinity_mask;
         if active_core >= 0 {
             scheduled_queue.remove(priority, active_core, member_id, entries);
@@ -541,10 +613,25 @@ impl KPriorityQueue {
         if is_dummy {
             return;
         }
+        if let Some(existing) = self.thread_props.get(&member_id).cloned() {
+            self.remove_impl(
+                existing.priority,
+                member_id,
+                existing.active_core,
+                existing.affinity,
+            );
+        }
         ensure_entry(&mut self.entries, member_id);
-        self.thread_props.insert(member_id, ThreadProps {
-            priority, active_core, affinity, is_dummy, process_schedule_count,
-        });
+        self.thread_props.insert(
+            member_id,
+            ThreadProps {
+                priority,
+                active_core,
+                affinity,
+                is_dummy,
+                process_schedule_count,
+            },
+        );
         self.push_back_impl(priority, member_id, active_core, affinity);
     }
 
@@ -562,31 +649,73 @@ impl KPriorityQueue {
         if is_dummy {
             return;
         }
+        if let Some(existing) = self.thread_props.get(&member_id).cloned() {
+            self.remove_impl(
+                existing.priority,
+                member_id,
+                existing.active_core,
+                existing.affinity,
+            );
+        }
         ensure_entry(&mut self.entries, member_id);
-        self.thread_props.insert(member_id, ThreadProps {
-            priority, active_core, affinity, is_dummy, process_schedule_count,
-        });
+        self.thread_props.insert(
+            member_id,
+            ThreadProps {
+                priority,
+                active_core,
+                affinity,
+                is_dummy,
+                process_schedule_count,
+            },
+        );
         self.push_front_impl(priority, member_id, active_core, affinity);
     }
 
     /// Remove a thread from all its queues.
     /// Matches upstream `KPriorityQueue::Remove(member)`.
-    pub fn remove(&mut self, member_id: u64, priority: i32, active_core: i32, affinity: u64, is_dummy: bool) {
-        if is_dummy { return; }
+    pub fn remove(
+        &mut self,
+        member_id: u64,
+        priority: i32,
+        active_core: i32,
+        affinity: u64,
+        is_dummy: bool,
+    ) {
+        if is_dummy {
+            return;
+        }
         self.remove_impl(priority, member_id, active_core, affinity);
         // Keep entries around (they'll be reused on next push).
         // Remove props since thread is no longer in PQ.
         self.thread_props.remove(&member_id);
     }
 
-    pub fn move_to_scheduled_front(&mut self, member_id: u64, priority: i32, active_core: i32, is_dummy: bool) {
-        if is_dummy { return; }
-        self.scheduled_queue.move_to_front(priority, active_core, member_id, &mut self.entries);
+    pub fn move_to_scheduled_front(
+        &mut self,
+        member_id: u64,
+        priority: i32,
+        active_core: i32,
+        is_dummy: bool,
+    ) {
+        if is_dummy {
+            return;
+        }
+        self.scheduled_queue
+            .move_to_front(priority, active_core, member_id, &mut self.entries);
     }
 
-    pub fn move_to_scheduled_back(&mut self, member_id: u64, priority: i32, active_core: i32, is_dummy: bool) -> Option<u64> {
-        if is_dummy { return None; }
-        self.scheduled_queue.move_to_back(priority, active_core, member_id, &mut self.entries)
+    pub fn move_to_scheduled_back(
+        &mut self,
+        member_id: u64,
+        priority: i32,
+        active_core: i32,
+        is_dummy: bool,
+    ) -> Option<u64> {
+        if is_dummy {
+            return None;
+        }
+        self.scheduled_queue
+            .move_to_back(priority, active_core, member_id, &mut self.entries)
     }
 
     /// Change a thread's priority in the queue.
@@ -601,7 +730,9 @@ impl KPriorityQueue {
         affinity: u64,
         is_dummy: bool,
     ) {
-        if is_dummy { return; }
+        if is_dummy {
+            return;
+        }
         debug_assert!(is_valid_priority(prev_priority));
 
         self.remove_impl(prev_priority, member_id, active_core, affinity);
@@ -630,9 +761,16 @@ impl KPriorityQueue {
         priority: i32,
         is_dummy: bool,
     ) {
-        if is_dummy { return; }
+        if is_dummy {
+            return;
+        }
 
-        let Self { scheduled_queue, suggested_queue, entries, thread_props } = self;
+        let Self {
+            scheduled_queue,
+            suggested_queue,
+            entries,
+            thread_props,
+        } = self;
 
         // Remove from all old queues
         for core in 0..NUM_CORES as i32 {
@@ -678,10 +816,17 @@ impl KPriorityQueue {
         is_dummy: bool,
         to_front: bool,
     ) {
-        if is_dummy { return; }
+        if is_dummy {
+            return;
+        }
 
         if prev_core != new_core {
-            let Self { scheduled_queue, suggested_queue, entries, thread_props } = self;
+            let Self {
+                scheduled_queue,
+                suggested_queue,
+                entries,
+                thread_props,
+            } = self;
             if prev_core >= 0 {
                 scheduled_queue.remove(priority, prev_core, member_id, entries);
             }
@@ -737,7 +882,7 @@ mod tests {
         bs.set_bit(10);
         bs.set_bit(20);
 
-        assert_eq!(bs.get_next_set(3), 5);  // Next after 3 is 5
+        assert_eq!(bs.get_next_set(3), 5); // Next after 3 is 5
         assert_eq!(bs.get_next_set(5), 10); // Next after 5 is 10
         assert_eq!(bs.get_next_set(10), 20); // Next after 10 is 20
         assert_eq!(bs.get_next_set(20), 64); // Nothing after 20
@@ -821,5 +966,21 @@ mod tests {
         let mut pq = KPriorityQueue::new();
         pq.push_back(100, 16, 3, 0b1111, true, None); // is_dummy = true
         assert!(pq.get_scheduled_front(3).is_none());
+    }
+
+    #[test]
+    fn test_reinserting_same_thread_does_not_leave_stale_membership() {
+        let mut pq = KPriorityQueue::new();
+        pq.push_back(100, 16, 3, 0b1111, false, None);
+        pq.push_back(100, 16, 3, 0b1111, false, None);
+
+        assert_eq!(pq.get_scheduled_front(3), Some(100));
+
+        pq.remove(100, 16, 3, 0b1111, false);
+
+        for core in 0..NUM_CORES as i32 {
+            assert!(pq.get_scheduled_front(core).is_none());
+            assert!(pq.get_suggested_front(core).is_none());
+        }
     }
 }

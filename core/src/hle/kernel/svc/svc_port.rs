@@ -75,7 +75,10 @@ fn read_port_name(system: &System, user_name: u64) -> Result<String, ResultCode>
         return Err(RESULT_OUT_OF_RANGE);
     }
 
-    let len = name.iter().position(|&b| b == 0).unwrap_or(PORT_NAME_MAX_LENGTH);
+    let len = name
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(PORT_NAME_MAX_LENGTH);
     Ok(String::from_utf8_lossy(&name[..len]).to_string())
 }
 
@@ -115,7 +118,10 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
         log::error!("  ConnectToNamedPort: service \"{}\" not found", name);
         return RESULT_NOT_FOUND;
     };
-    log::info!("  ConnectToNamedPort: found service handler for \"{}\"", name);
+    log::info!(
+        "  ConnectToNamedPort: found service handler for \"{}\"",
+        name
+    );
 
     let session_object_id = system.kernel().unwrap().create_new_object_id() as u64;
     let client_session_object_id = system.kernel().unwrap().create_new_object_id() as u64;
@@ -142,7 +148,11 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
     match process.handle_table.add(client_session_object_id) {
         Ok(handle) => {
             *out = handle;
-            log::info!("  ConnectToNamedPort(\"{}\") -> success, handle={:#x}", name, handle);
+            log::info!(
+                "  ConnectToNamedPort(\"{}\") -> success, handle={:#x}",
+                name,
+                handle
+            );
             RESULT_SUCCESS
         }
         Err(_) => {
@@ -310,7 +320,8 @@ pub fn manage_named_port(
 
         log::info!(
             "svc::ManageNamedPort(create): name=\"{}\", server_handle=0x{:08X}",
-            name, *out_server_handle
+            name,
+            *out_server_handle
         );
 
         RESULT_SUCCESS

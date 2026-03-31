@@ -100,7 +100,8 @@ impl DisplayLayerManager {
         };
 
         let display_id = container.open_display(&Self::default_display_name())?;
-        let layer_id = container.create_managed_layer(display_id, process.lock().unwrap().get_process_id())?;
+        let layer_id =
+            container.create_managed_layer(display_id, process.lock().unwrap().get_process_id())?;
         container.set_layer_visibility(layer_id, self.visible)?;
         self.managed_display_layers.insert(layer_id);
         Ok(layer_id)

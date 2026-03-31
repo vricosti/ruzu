@@ -8,9 +8,8 @@
 //! Entry point is [`emit_glsl()`] which takes an IR program and returns
 //! a GLSL source string.
 
-pub mod var_alloc;
-pub mod glsl_emit_context;
 pub mod emit_glsl;
+pub mod emit_glsl_atomic;
 pub mod emit_glsl_barriers;
 pub mod emit_glsl_bitwise_conversion;
 pub mod emit_glsl_composite;
@@ -18,6 +17,7 @@ pub mod emit_glsl_context_get_set;
 pub mod emit_glsl_control_flow;
 pub mod emit_glsl_convert;
 pub mod emit_glsl_floating_point;
+pub mod emit_glsl_image;
 pub mod emit_glsl_integer;
 pub mod emit_glsl_logical;
 pub mod emit_glsl_memory;
@@ -27,13 +27,13 @@ pub mod emit_glsl_shared_memory;
 pub mod emit_glsl_special;
 pub mod emit_glsl_undefined;
 pub mod emit_glsl_warp;
-pub mod emit_glsl_image;
-pub mod emit_glsl_atomic;
+pub mod glsl_emit_context;
+pub mod var_alloc;
 
+use crate::backend::bindings::Bindings;
 use crate::ir;
 use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
-use crate::backend::bindings::Bindings;
 
 /// Emit GLSL source from an IR program.
 ///

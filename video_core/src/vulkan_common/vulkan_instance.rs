@@ -36,10 +36,7 @@ pub enum WindowSystemType {
 // ---------------------------------------------------------------------------
 
 /// Port of `AreExtensionsSupported` from `vulkan_instance.cpp`.
-fn are_extensions_supported(
-    entry: &ash::Entry,
-    required: &[CString],
-) -> bool {
+fn are_extensions_supported(entry: &ash::Entry, required: &[CString]) -> bool {
     let properties = match vulkan_wrapper::enumerate_instance_extension_properties(entry) {
         Some(props) => props,
         None => {
@@ -79,28 +76,23 @@ fn required_extensions(
         WindowSystemType::Headless => {}
         #[cfg(target_os = "windows")]
         WindowSystemType::Windows => {
-            extensions
-                .push(CString::new("VK_KHR_win32_surface").unwrap());
+            extensions.push(CString::new("VK_KHR_win32_surface").unwrap());
         }
         #[cfg(target_os = "macos")]
         WindowSystemType::Cocoa => {
-            extensions
-                .push(CString::new("VK_EXT_metal_surface").unwrap());
+            extensions.push(CString::new("VK_EXT_metal_surface").unwrap());
         }
         #[cfg(target_os = "android")]
         WindowSystemType::Android => {
-            extensions
-                .push(CString::new("VK_KHR_android_surface").unwrap());
+            extensions.push(CString::new("VK_KHR_android_surface").unwrap());
         }
         #[cfg(target_os = "linux")]
         WindowSystemType::X11 => {
-            extensions
-                .push(CString::new("VK_KHR_xlib_surface").unwrap());
+            extensions.push(CString::new("VK_KHR_xlib_surface").unwrap());
         }
         #[cfg(target_os = "linux")]
         WindowSystemType::Wayland => {
-            extensions
-                .push(CString::new("VK_KHR_wayland_surface").unwrap());
+            extensions.push(CString::new("VK_KHR_wayland_surface").unwrap());
         }
     }
 

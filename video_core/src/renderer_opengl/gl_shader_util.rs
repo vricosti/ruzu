@@ -100,10 +100,7 @@ fn link_separable_program(shader: u32) -> u32 {
                     std::ptr::null_mut(),
                     log.as_mut_ptr() as *mut _,
                 );
-                log::error!(
-                    "Shader link error: {}",
-                    String::from_utf8_lossy(&log)
-                );
+                log::error!("Shader link error: {}", String::from_utf8_lossy(&log));
             }
         }
 

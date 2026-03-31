@@ -95,13 +95,20 @@ pub fn ldc(tv: &mut TranslatorVisitor, insn: u64) {
             // cb_index = address[31:16] + imm_index
             // cb_offset = address[15:0]
             let address = tv.ir.iadd_32(reg_val, imm_offset);
-            let seg_index = tv.ir.bit_field_u_extract(address, Value::ImmU32(16), Value::ImmU32(16));
-            let seg_offset = tv.ir.bit_field_u_extract(address, Value::ImmU32(0), Value::ImmU32(16));
+            let seg_index =
+                tv.ir
+                    .bit_field_u_extract(address, Value::ImmU32(16), Value::ImmU32(16));
+            let seg_offset =
+                tv.ir
+                    .bit_field_u_extract(address, Value::ImmU32(0), Value::ImmU32(16));
             let final_index = tv.ir.iadd_32(seg_index, imm_index);
             (final_index, seg_offset)
         }
         LdcMode::Il | LdcMode::Isl => {
-            log::warn!("LDC: mode {:?} not implemented, using Default fallback", mode);
+            log::warn!(
+                "LDC: mode {:?} not implemented, using Default fallback",
+                mode
+            );
             let offset = tv.ir.iadd_32(reg_val, imm_offset);
             (imm_index, offset)
         }

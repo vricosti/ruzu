@@ -109,7 +109,10 @@ fn decompress_blz(data: &mut Vec<u8>) -> bool {
     }
 
     let start_offset = data.len() - compressed_size as usize;
-    data.resize(compressed_size as usize + additional_size as usize + start_offset, 0);
+    data.resize(
+        compressed_size as usize + additional_size as usize + start_offset,
+        0,
+    );
 
     let mut index = (compressed_size - init_index) as usize;
     let mut out_index = (compressed_size + additional_size) as usize;
@@ -126,8 +129,8 @@ fn decompress_blz(data: &mut Vec<u8>) -> bool {
                     return false;
                 }
                 index -= 2;
-                let mut segment_offset =
-                    data[index + start_offset] as usize | ((data[index + start_offset + 1] as usize) << 8);
+                let mut segment_offset = data[index + start_offset] as usize
+                    | ((data[index + start_offset + 1] as usize) << 8);
                 let mut segment_size = ((segment_offset >> 12) & 0xF) + 3;
                 segment_offset &= 0xFFF;
                 segment_offset += 3;
@@ -247,7 +250,12 @@ impl KIP {
     }
 
     pub fn get_name(&self) -> String {
-        let end = self.header.name.iter().position(|&b| b == 0).unwrap_or(self.header.name.len());
+        let end = self
+            .header
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.header.name.len());
         String::from_utf8_lossy(&self.header.name[..end]).into_owned()
     }
 

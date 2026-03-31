@@ -33,7 +33,9 @@ impl TextureCacheBase {
     /// `ImageFlagBits` and the runtime `DownloadStagingBuffer` / `Finish` calls.
     /// Not implementable without backend types; logs a warning and returns.
     pub fn run_garbage_collector(&mut self) {
-        log::warn!("TextureCacheBase::run_garbage_collector: backend types not yet available — GC skipped");
+        log::warn!(
+            "TextureCacheBase::run_garbage_collector: backend types not yet available — GC skipped"
+        );
     }
 
     // ── Image view resolution ──────────────────────────────────────────

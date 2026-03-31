@@ -73,8 +73,9 @@ impl SyncpointManager {
     }
 
     pub fn new_with_system(system: SystemRef) -> Self {
-        let mut syncpoints: Vec<SyncpointInfo> =
-            (0..SYNCPOINT_COUNT).map(|_| SyncpointInfo::default()).collect();
+        let mut syncpoints: Vec<SyncpointInfo> = (0..SYNCPOINT_COUNT)
+            .map(|_| SyncpointInfo::default())
+            .collect();
 
         const VBLANK0_SYNCPOINT_ID: usize = 26;
         const VBLANK1_SYNCPOINT_ID: usize = 27;
@@ -136,10 +137,20 @@ impl SyncpointManager {
         // If the interface manages counters then we don't keep track of the maximum value as it
         // handles sanity checking the values then
         if syncpoint.interface_managed {
-            (syncpoint.counter_min.load(Ordering::Relaxed).wrapping_sub(threshold)) as i32 >= 0
+            (syncpoint
+                .counter_min
+                .load(Ordering::Relaxed)
+                .wrapping_sub(threshold)) as i32
+                >= 0
         } else {
-            syncpoint.counter_max.load(Ordering::Relaxed).wrapping_sub(threshold)
-                >= syncpoint.counter_min.load(Ordering::Relaxed).wrapping_sub(threshold)
+            syncpoint
+                .counter_max
+                .load(Ordering::Relaxed)
+                .wrapping_sub(threshold)
+                >= syncpoint
+                    .counter_min
+                    .load(Ordering::Relaxed)
+                    .wrapping_sub(threshold)
         }
     }
 
@@ -272,7 +283,11 @@ impl SyncpointManager {
 
     /// Reserves a syncpoint by ID.
     /// Note: reservation_lock (the Mutex) should be held when calling this.
-    fn reserve_syncpoint_inner(syncpoints: &mut [SyncpointInfo], id: u32, client_managed: bool) -> u32 {
+    fn reserve_syncpoint_inner(
+        syncpoints: &mut [SyncpointInfo],
+        id: u32,
+        client_managed: bool,
+    ) -> u32 {
         let syncpoint = &mut syncpoints[id as usize];
 
         if syncpoint.reserved {

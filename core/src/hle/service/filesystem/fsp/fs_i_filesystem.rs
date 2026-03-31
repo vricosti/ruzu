@@ -41,8 +41,16 @@ impl IFileSystem {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
             (10, Some(Self::commit_handler), "Commit"),
-            (11, Some(Self::get_free_space_size_handler), "GetFreeSpaceSize"),
-            (12, Some(Self::get_total_space_size_handler), "GetTotalSpaceSize"),
+            (
+                11,
+                Some(Self::get_free_space_size_handler),
+                "GetFreeSpaceSize",
+            ),
+            (
+                12,
+                Some(Self::get_total_space_size_handler),
+                "GetTotalSpaceSize",
+            ),
         ]);
 
         Self {

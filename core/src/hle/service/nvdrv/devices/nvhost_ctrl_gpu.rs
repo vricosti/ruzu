@@ -10,8 +10,8 @@ use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
-use crate::hle::service::nvdrv::nvdrv::EventInterface;
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
+use crate::hle::service::nvdrv::nvdrv::EventInterface;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -270,13 +270,7 @@ impl NvHostCtrlGpu {
 }
 
 impl NvDevice for NvHostCtrlGpu {
-    fn ioctl1(
-        &self,
-        _fd: DeviceFD,
-        command: Ioctl,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> NvResult {
+    fn ioctl1(&self, _fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
         match command.group() {
             b'G' => match command.cmd() {
                 0x1 => {

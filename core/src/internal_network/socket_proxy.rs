@@ -146,12 +146,7 @@ impl SocketBase for ProxySocket {
         (0, Errno::Success)
     }
 
-    fn send_to(
-        &mut self,
-        _flags: u32,
-        message: &[u8],
-        addr: Option<&SockAddrIn>,
-    ) -> (i32, Errno) {
+    fn send_to(&mut self, _flags: u32, message: &[u8], addr: Option<&SockAddrIn>) -> (i32, Errno) {
         if !self.is_bound {
             log::error!("ProxySocket is not bound!");
             return (message.len() as i32, Errno::Success);
@@ -163,10 +158,7 @@ impl SocketBase for ProxySocket {
             local_endpoint: self.local_endpoint.clone(),
             remote_endpoint: addr.cloned().unwrap_or_default(),
             protocol: self.protocol,
-            broadcast: self.broadcast
-                && addr
-                    .map(|a| a.ip[3] == 255)
-                    .unwrap_or(false),
+            broadcast: self.broadcast && addr.map(|a| a.ip[3] == 255).unwrap_or(false),
             data: message.to_vec(),
         };
 

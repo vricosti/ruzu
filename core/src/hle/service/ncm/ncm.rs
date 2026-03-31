@@ -49,35 +49,45 @@ pub mod ncm_commands {
 
 pub struct ILocationResolver;
 impl ILocationResolver {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 pub struct IRegisteredLocationResolver;
 impl IRegisteredLocationResolver {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 pub struct IAddOnContentLocationResolver;
 impl IAddOnContentLocationResolver {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 pub struct LR;
 impl LR {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 pub struct NCM;
 impl NCM {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 /// Registers "lr" and "ncm" services.
 ///
 /// Corresponds to `LoopProcess` in upstream `ncm.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     let mut server_manager = ServerManager::new(system);
 
@@ -86,9 +96,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
         sm.register_named_service(
             name,
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(
-                    crate::hle::service::services::GenericStubService::new(&svc_name),
-                )
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
+                    &svc_name,
+                ))
             }),
             64,
         );

@@ -309,8 +309,8 @@ impl ProfileManager {
             return;
         }
 
-        let save_dir = get_ruzu_path(RuzuPath::NANDDir)
-            .join("system/save/8000000000000010/su/avators");
+        let save_dir =
+            get_ruzu_path(RuzuPath::NANDDir).join("system/save/8000000000000010/su/avators");
         if let Err(e) = std::fs::create_dir_all(&save_dir) {
             log::warn!("Failed to create profile save directory: {}", e);
             return;
@@ -326,7 +326,7 @@ impl ProfileManager {
             data.extend_from_slice(&profile.user_uuid.to_le_bytes()); // uuid2 (same as uuid)
             data.extend_from_slice(&profile.creation_time.to_le_bytes()); // timestamp
             data.extend_from_slice(&profile.username); // username
-            // Write extra_data as raw bytes (UserData is #[repr(C)], 0x80 bytes)
+                                                       // Write extra_data as raw bytes (UserData is #[repr(C)], 0x80 bytes)
             let user_data_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     &profile.data as *const UserData as *const u8,
@@ -382,9 +382,7 @@ impl ProfileManager {
             if uuid == 0 {
                 continue;
             }
-            let timestamp = u64::from_le_bytes(
-                data[offset + 32..offset + 40].try_into().unwrap(),
-            );
+            let timestamp = u64::from_le_bytes(data[offset + 32..offset + 40].try_into().unwrap());
             let mut username = [0u8; PROFILE_USERNAME_SIZE];
             username.copy_from_slice(&data[offset + 40..offset + 40 + PROFILE_USERNAME_SIZE]);
 

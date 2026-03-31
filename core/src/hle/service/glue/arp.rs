@@ -6,9 +6,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::errors;
 use super::glue_manager::{ARPManager, ApplicationLaunchProperty};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// IPC command IDs for ARP_R
 pub mod arp_r_commands {
@@ -106,7 +106,10 @@ impl IRegistrar {
         RESULT_SUCCESS
     }
 
-    pub fn set_application_launch_property(&mut self, launch: ApplicationLaunchProperty) -> ResultCode {
+    pub fn set_application_launch_property(
+        &mut self,
+        launch: ApplicationLaunchProperty,
+    ) -> ResultCode {
         if self.issued {
             return errors::RESULT_ALREADY_BOUND;
         }

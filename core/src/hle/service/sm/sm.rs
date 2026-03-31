@@ -99,7 +99,10 @@ impl ServiceManager {
     /// Sets the deferral event.
     ///
     /// Matches upstream `ServiceManager::SetDeferralEvent(Kernel::KEvent*)`.
-    pub fn set_deferral_event(&mut self, event: Option<Arc<crate::hle::service::os::event::Event>>) {
+    pub fn set_deferral_event(
+        &mut self,
+        event: Option<Arc<crate::hle::service::os::event::Event>>,
+    ) {
         self.deferral_event = event;
     }
 
@@ -200,20 +203,13 @@ impl ServiceManager {
     ///
     /// Matches upstream `ServiceManager::GetService<T>(name, true)` which polls
     /// every 100ms until the service appears.
-    /// Returns None only if timeout expires.
     pub fn get_service_blocking(
         sm: &Arc<std::sync::Mutex<Self>>,
         name: &str,
-        timeout: std::time::Duration,
-    ) -> Option<SessionRequestHandlerPtr> {
-        let start = std::time::Instant::now();
+    ) -> SessionRequestHandlerPtr {
         loop {
             if let Some(handler) = sm.lock().unwrap().get_service(name) {
-                return Some(handler);
-            }
-            if start.elapsed() >= timeout {
-                log::error!("ServiceManager::get_service_blocking: timeout waiting for '{}'", name);
-                return None;
+                return handler;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -269,7 +265,11 @@ impl Sm {
         let handlers = build_handler_map(&[
             (0, Some(Sm::initialize_handler), "Initialize"),
             (1, Some(Sm::get_service_cmif_handler), "GetService"),
-            (2, Some(Sm::register_service_cmif_handler), "RegisterService"),
+            (
+                2,
+                Some(Sm::register_service_cmif_handler),
+                "RegisterService",
+            ),
             (3, Some(Sm::unregister_service_handler), "UnregisterService"),
             (4, None, "DetachClient"),
         ]);
@@ -351,7 +351,10 @@ impl Sm {
 
         if result.is_success() {
             let mut rb = ResponseBuilder::new_with_flags(
-                ctx, 2, 0, 1,
+                ctx,
+                2,
+                0,
+                1,
                 crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
             );
             rb.push_result(result);
@@ -372,11 +375,18 @@ impl Sm {
         }
 
         let mut rb = ResponseBuilder::new_with_flags(
-            ctx, 2, 0, 1,
+            ctx,
+            2,
+            0,
+            1,
             crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
         );
         rb.push_result(result);
-        rb.push_move_objects(if result.is_success() { session_handle.unwrap_or(0) } else { 0 });
+        rb.push_move_objects(if result.is_success() {
+            session_handle.unwrap_or(0)
+        } else {
+            0
+        });
     }
 
     /// Pop service name from request: 8 bytes of ASCII, printable characters only.
@@ -511,7 +521,10 @@ impl Sm {
         // KServerPort handle that can be pushed via PushMoveObjects. Until KPort is wired,
         // push 0 as a placeholder handle so the IPC response structure matches upstream.
         let mut rb = ResponseBuilder::new_with_flags(
-            ctx, 2, 0, 1,
+            ctx,
+            2,
+            0,
+            1,
             crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
         );
         rb.push_result(RESULT_SUCCESS);
@@ -527,7 +540,11 @@ impl Sm {
 
         log::debug!("SM::UnregisterService called with name={}", name);
 
-        let result = self.service_manager.lock().unwrap().unregister_service(&name);
+        let result = self
+            .service_manager
+            .lock()
+            .unwrap()
+            .unregister_service(&name);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
     }
@@ -585,17 +602,17 @@ impl ServiceFramework for Sm {
 ///     ServerManager::RunServer(std::move(server_manager));
 /// }
 /// ```
-pub fn loop_process(
-    service_manager: &Arc<Mutex<ServiceManager>>,
-    system: crate::core::SystemRef,
-) {
+pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
     let mut server_manager = ServerManager::new(system);
 
     // Manage deferral event.
     // Upstream: server_manager->ManageDeferral(&deferral_event);
     //           service_manager.SetDeferralEvent(deferral_event);
     let (_result, deferral_event) = server_manager.manage_deferral();
-    service_manager.lock().unwrap().set_deferral_event(deferral_event);
+    service_manager
+        .lock()
+        .unwrap()
+        .set_deferral_event(deferral_event);
 
     // Register the "sm:" named port.
     // Upstream: ManageNamedPort creates a KPort and registers it via

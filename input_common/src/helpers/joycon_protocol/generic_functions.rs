@@ -31,16 +31,14 @@ impl GenericProtocol {
     /// Port of GenericProtocol::EnablePassiveMode
     pub fn enable_passive_mode(&mut self) -> DriverResult {
         let _sb = ScopedSetBlocking::new(&mut self.protocol);
-        self.protocol
-            .set_report_mode(ReportMode::SimpleHidMode)
+        self.protocol.set_report_mode(ReportMode::SimpleHidMode)
     }
 
     /// Enables active mode. This mode will return the current status every 5-15ms.
     /// Port of GenericProtocol::EnableActiveMode
     pub fn enable_active_mode(&mut self) -> DriverResult {
         let _sb = ScopedSetBlocking::new(&mut self.protocol);
-        self.protocol
-            .set_report_mode(ReportMode::StandardFull60Hz)
+        self.protocol.set_report_mode(ReportMode::StandardFull60Hz)
     }
 
     /// Enables or disables the low power mode.
@@ -81,10 +79,7 @@ impl GenericProtocol {
 
     /// Sends a request to obtain the joycon type from handle.
     /// Port of GenericProtocol::GetControllerType
-    pub fn get_controller_type(
-        &mut self,
-        controller_type: &mut ControllerType,
-    ) -> DriverResult {
+    pub fn get_controller_type(&mut self, controller_type: &mut ControllerType) -> DriverResult {
         self.protocol.get_device_type(controller_type)
     }
 

@@ -20,36 +20,30 @@ use super::system_settings_server::ISystemSettingsServer;
 ///
 /// Corresponds to `Set::LoopProcess` in upstream settings.cpp.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use std::sync::Arc;
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+    use std::sync::Arc;
 
     let mut server_manager = ServerManager::new(system);
 
     // "set" -> ISettingsServer
     server_manager.register_named_service(
         "set",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(ISettingsServer::new())
-        }),
+        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(ISettingsServer::new()) }),
         64,
     );
 
     // "set:cal" -> IFactorySettingsServer
     server_manager.register_named_service(
         "set:cal",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(IFactorySettingsServer::new())
-        }),
+        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IFactorySettingsServer::new()) }),
         64,
     );
 
     // "set:fd" -> IFirmwareDebugSettingsServer
     server_manager.register_named_service(
         "set:fd",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(IFirmwareDebugSettingsServer::new())
-        }),
+        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IFirmwareDebugSettingsServer::new()) }),
         64,
     );
 

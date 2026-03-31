@@ -4,8 +4,8 @@
 //! SPIR-V memory operation emission — maps to zuyu's
 //! `backend/spirv/emit_spirv_memory.cpp`.
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::Word;
 
 /// Emit a load from a storage buffer (SSBO).
 ///
@@ -65,12 +65,7 @@ pub fn emit_write_local(ctx: &mut SpirvEmitContext, _offset: Word, _value: Word)
 use crate::ir::{self, Opcode};
 
 /// Dispatch load IR instructions (LoadGlobal32 / LoadLocal / LoadStorage32).
-pub fn emit_load(
-    ctx: &mut SpirvEmitContext,
-    inst: &ir::Inst,
-    block_idx: u32,
-    inst_idx: u32,
-) {
+pub fn emit_load(ctx: &mut SpirvEmitContext, inst: &ir::Inst, block_idx: u32, inst_idx: u32) {
     match inst.opcode {
         Opcode::LoadGlobal32 | Opcode::LoadStorage32 => {
             log::trace!("SPIR-V: {:?} not fully implemented", inst.opcode);
@@ -90,12 +85,7 @@ pub fn emit_load(
 }
 
 /// Dispatch store IR instructions (WriteGlobal32 / WriteLocal / WriteStorage32).
-pub fn emit_store(
-    ctx: &mut SpirvEmitContext,
-    inst: &ir::Inst,
-    _block_idx: u32,
-    _inst_idx: u32,
-) {
+pub fn emit_store(ctx: &mut SpirvEmitContext, inst: &ir::Inst, _block_idx: u32, _inst_idx: u32) {
     match inst.opcode {
         Opcode::WriteGlobal32 | Opcode::WriteStorage32 => {
             log::trace!("SPIR-V: {:?} not fully implemented", inst.opcode);

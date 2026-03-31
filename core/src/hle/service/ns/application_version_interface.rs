@@ -42,19 +42,47 @@ pub struct IApplicationVersionInterface {
 impl IApplicationVersionInterface {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (commands::GET_LAUNCH_REQUIRED_VERSION, None, "GetLaunchRequiredVersion"),
-            (commands::UPGRADE_LAUNCH_REQUIRED_VERSION, None, "UpgradeLaunchRequiredVersion"),
+            (
+                commands::GET_LAUNCH_REQUIRED_VERSION,
+                None,
+                "GetLaunchRequiredVersion",
+            ),
+            (
+                commands::UPGRADE_LAUNCH_REQUIRED_VERSION,
+                None,
+                "UpgradeLaunchRequiredVersion",
+            ),
             (commands::UPDATE_VERSION_LIST, None, "UpdateVersionList"),
             (commands::PUSH_LAUNCH_VERSION, None, "PushLaunchVersion"),
             (commands::LIST_REQUIRED_VERSION, None, "ListRequiredVersion"),
             (commands::REQUEST_VERSION_LIST, None, "RequestVersionList"),
             (commands::LIST_VERSION_LIST, None, "ListVersionList"),
-            (commands::REQUEST_VERSION_LIST_DATA, None, "RequestVersionListData"),
-            (commands::IMPORT_AUTO_UPDATE_POLICY_JSON_FOR_DEBUG, None, "ImportAutoUpdatePolicyJsonForDebug"),
-            (commands::LIST_DEFAULT_AUTO_UPDATE_POLICY, None, "ListDefaultAutoUpdatePolicy"),
-            (commands::LIST_AUTO_UPDATE_POLICY_FOR_SPECIFIC_APPLICATION, None, "ListAutoUpdatePolicyForSpecificApplication"),
+            (
+                commands::REQUEST_VERSION_LIST_DATA,
+                None,
+                "RequestVersionListData",
+            ),
+            (
+                commands::IMPORT_AUTO_UPDATE_POLICY_JSON_FOR_DEBUG,
+                None,
+                "ImportAutoUpdatePolicyJsonForDebug",
+            ),
+            (
+                commands::LIST_DEFAULT_AUTO_UPDATE_POLICY,
+                None,
+                "ListDefaultAutoUpdatePolicy",
+            ),
+            (
+                commands::LIST_AUTO_UPDATE_POLICY_FOR_SPECIFIC_APPLICATION,
+                None,
+                "ListAutoUpdatePolicyForSpecificApplication",
+            ),
             (commands::PERFORM_AUTO_UPDATE, None, "PerformAutoUpdate"),
-            (commands::LIST_AUTO_UPDATE_SCHEDULE, None, "ListAutoUpdateSchedule"),
+            (
+                commands::LIST_AUTO_UPDATE_SCHEDULE,
+                None,
+                "ListAutoUpdateSchedule",
+            ),
         ]);
         Self {
             handlers,

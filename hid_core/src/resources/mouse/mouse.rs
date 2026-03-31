@@ -80,10 +80,8 @@ impl Mouse {
             self.next_state.y = (mouse_position_state.y * SCREEN_HEIGHT) as i32;
             self.next_state.delta_x = self.next_state.x - last_entry.x;
             self.next_state.delta_y = self.next_state.y - last_entry.y;
-            self.next_state.delta_wheel_x =
-                mouse_wheel_state.x - self.last_mouse_wheel_state.x;
-            self.next_state.delta_wheel_y =
-                mouse_wheel_state.y - self.last_mouse_wheel_state.y;
+            self.next_state.delta_wheel_x = mouse_wheel_state.x - self.last_mouse_wheel_state.x;
+            self.next_state.delta_wheel_y = mouse_wheel_state.y - self.last_mouse_wheel_state.y;
 
             self.last_mouse_wheel_state = *mouse_wheel_state;
             self.next_state.button = *mouse_button_state;

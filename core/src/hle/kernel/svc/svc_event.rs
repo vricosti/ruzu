@@ -15,7 +15,10 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Signals an event.
 pub fn signal_event(system: &System, event_handle: Handle) -> ResultCode {
-    log::debug!("svc::SignalEvent called, event_handle=0x{:08X}", event_handle);
+    log::debug!(
+        "svc::SignalEvent called, event_handle=0x{:08X}",
+        event_handle
+    );
 
     let mut process = system.current_process_arc().lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(event_handle) else {
@@ -32,7 +35,10 @@ pub fn signal_event(system: &System, event_handle: Handle) -> ResultCode {
 
 /// Clears an event. Tries writable event first, then readable event.
 pub fn clear_event(system: &System, event_handle: Handle) -> ResultCode {
-    log::trace!("svc::ClearEvent called, event_handle=0x{:08X}", event_handle);
+    log::trace!(
+        "svc::ClearEvent called, event_handle=0x{:08X}",
+        event_handle
+    );
 
     let process = system.current_process_arc().lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(event_handle) else {
@@ -122,9 +128,14 @@ mod tests {
             thread.thread_id = 1;
             thread.object_id = 1;
         }
-        process.lock().unwrap().register_thread_object(current_thread);
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(current_thread);
 
-        let scheduler = Arc::new(Mutex::new(crate::hle::kernel::k_scheduler::KScheduler::new(0)));
+        let scheduler = Arc::new(Mutex::new(
+            crate::hle::kernel::k_scheduler::KScheduler::new(0),
+        ));
         scheduler.lock().unwrap().initialize(1, 0, 0);
         let shared_memory = process.lock().unwrap().get_shared_memory();
 

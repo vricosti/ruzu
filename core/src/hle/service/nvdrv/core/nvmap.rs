@@ -395,7 +395,10 @@ impl NvMap {
 
         // If the handle hasn't been freed from memory, mark that
         if handle_weak.strong_count() > 0 {
-            log::debug!("nvmap handle: {} wasn't freed as it is still in use", handle_id);
+            log::debug!(
+                "nvmap handle: {} wasn't freed as it is still in use",
+                handle_id
+            );
             return Some(FreeInfo {
                 can_unlock: false,
                 ..free_info

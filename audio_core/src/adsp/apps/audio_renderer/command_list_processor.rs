@@ -147,7 +147,13 @@ impl CommandListProcessor {
             return 0;
         };
 
-        let start_time = system.lock().core_timing().lock().unwrap().get_global_time_us().as_micros() as u64;
+        let start_time = system
+            .lock()
+            .core_timing()
+            .lock()
+            .unwrap()
+            .get_global_time_us()
+            .as_micros() as u64;
         let command_base = self.commands;
 
         if self.processed_command_count > 0 {
@@ -174,12 +180,24 @@ impl CommandListProcessor {
                     "Command has invalid magic! Expected 0x{COMMAND_MAGIC:08X}, got {:08X}",
                     header.magic
                 );
-                return system.lock().core_timing().lock().unwrap().get_global_time_us().as_micros() as u64
+                return system
+                    .lock()
+                    .core_timing()
+                    .lock()
+                    .unwrap()
+                    .get_global_time_us()
+                    .as_micros() as u64
                     - start_time;
             }
             let Some(command_size) = usize::try_from(header.size).ok() else {
                 error!("Command has negative size {}", header.size);
-                return system.lock().core_timing().lock().unwrap().get_global_time_us().as_micros() as u64
+                return system
+                    .lock()
+                    .core_timing()
+                    .lock()
+                    .unwrap()
+                    .get_global_time_us()
+                    .as_micros() as u64
                     - start_time;
             };
             if command_size < size_of::<CommandHeader>() {
@@ -192,7 +210,13 @@ impl CommandListProcessor {
                     self.commands_buffer_size,
                     self.commands.saturating_add(command_size) - COMMAND_LIST_HEADER_SIZE
                 );
-                return system.lock().core_timing().lock().unwrap().get_global_time_us().as_micros() as u64
+                return system
+                    .lock()
+                    .core_timing()
+                    .lock()
+                    .unwrap()
+                    .get_global_time_us()
+                    .as_micros() as u64
                     - start_time;
             }
 
@@ -225,7 +249,13 @@ impl CommandListProcessor {
             self.commands = self.commands.saturating_add(command_size);
         }
 
-        self.end_time = system.lock().core_timing().lock().unwrap().get_global_time_us().as_micros() as u64;
+        self.end_time = system
+            .lock()
+            .core_timing()
+            .lock()
+            .unwrap()
+            .get_global_time_us()
+            .as_micros() as u64;
         if let Some(dump) = dump {
             if dump != self.last_dump {
                 self.last_dump = dump;
@@ -245,7 +275,15 @@ impl CommandListProcessor {
     pub(crate) fn current_process_time_offset(&self) -> u64 {
         self.system
             .as_ref()
-            .map(|system| system.lock().core_timing().lock().unwrap().get_global_time_us().as_micros() as u64)
+            .map(|system| {
+                system
+                    .lock()
+                    .core_timing()
+                    .lock()
+                    .unwrap()
+                    .get_global_time_us()
+                    .as_micros() as u64
+            })
             .unwrap_or(self.end_time)
             .saturating_sub(self.start_time.saturating_add(self.current_processing_time))
     }
@@ -1339,7 +1377,12 @@ mod tests {
         let system = make_system();
         let mut mix_buffers = vec![0i32; 4];
         let mut performance_frame = vec![0u8; 64];
-        system.lock().core_timing().lock().unwrap().add_ticks(10_000);
+        system
+            .lock()
+            .core_timing()
+            .lock()
+            .unwrap()
+            .add_ticks(10_000);
 
         let (bytes, stream) = serialize_commands(
             system.clone(),

@@ -96,9 +96,8 @@ impl KMemoryRegionTypeValue {
             j += 1;
         }
 
-        let new_value = self.value
-            | (1u32 << (self.next_bit + low))
-            | (1u32 << (self.next_bit + high));
+        let new_value =
+            self.value | (1u32 << (self.next_bit + low)) | (1u32 << (self.next_bit + high));
         let bits_for_dense = {
             let mut lo: usize = 0;
             let mut hi: usize = 1;
@@ -143,17 +142,15 @@ pub const K_MEMORY_REGION_TYPE_DRAM: KMemoryRegionTypeValue =
     K_MEMORY_REGION_TYPE_NONE.derive_initial(1, 2);
 
 // Dram sub-regions
-pub const K_MEMORY_REGION_TYPE_DRAM_KERNEL_BASE: KMemoryRegionTypeValue =
-    K_MEMORY_REGION_TYPE_DRAM
-        .derive_sparse(0, 3, 0)
-        .set_attribute(K_MEMORY_REGION_ATTR_NO_USER_MAP)
-        .set_attribute(K_MEMORY_REGION_ATTR_CARVEOUT_PROTECTED);
+pub const K_MEMORY_REGION_TYPE_DRAM_KERNEL_BASE: KMemoryRegionTypeValue = K_MEMORY_REGION_TYPE_DRAM
+    .derive_sparse(0, 3, 0)
+    .set_attribute(K_MEMORY_REGION_ATTR_NO_USER_MAP)
+    .set_attribute(K_MEMORY_REGION_ATTR_CARVEOUT_PROTECTED);
 pub const K_MEMORY_REGION_TYPE_DRAM_RESERVED_BASE: KMemoryRegionTypeValue =
     K_MEMORY_REGION_TYPE_DRAM.derive_sparse(0, 3, 1);
-pub const K_MEMORY_REGION_TYPE_DRAM_HEAP_BASE: KMemoryRegionTypeValue =
-    K_MEMORY_REGION_TYPE_DRAM
-        .derive_sparse(0, 3, 2)
-        .set_attribute(K_MEMORY_REGION_ATTR_LINEAR_MAPPED);
+pub const K_MEMORY_REGION_TYPE_DRAM_HEAP_BASE: KMemoryRegionTypeValue = K_MEMORY_REGION_TYPE_DRAM
+    .derive_sparse(0, 3, 2)
+    .set_attribute(K_MEMORY_REGION_ATTR_LINEAR_MAPPED);
 
 // Dram kernel code/slab/pt
 pub const K_MEMORY_REGION_TYPE_DRAM_KERNEL_CODE: KMemoryRegionTypeValue =
@@ -372,12 +369,10 @@ const _: () = assert!(K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_KERNEL_INIT_PT.get_value
 const _: () = assert!(K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_POOL_MANAGEMENT.get_value() == 0x51A);
 const _: () = assert!(K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_USER_POOL.get_value() == 0x61A);
 
-const _: () =
-    assert!(K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_APPLICATION_POOL.get_value() == 0x361A);
+const _: () = assert!(K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_APPLICATION_POOL.get_value() == 0x361A);
 const _: () = assert!(K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_APPLET_POOL.get_value() == 0x561A);
-const _: () = assert!(
-    K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_SYSTEM_NON_SECURE_POOL.get_value() == 0x661A
-);
+const _: () =
+    assert!(K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_SYSTEM_NON_SECURE_POOL.get_value() == 0x661A);
 const _: () = assert!(K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_SYSTEM_POOL.get_value() == 0x961A);
 
 const _: () = assert!(K_MEMORY_REGION_TYPE_UART.get_value() == 0x1D);

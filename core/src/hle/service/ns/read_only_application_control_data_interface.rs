@@ -69,11 +69,31 @@ pub struct IReadOnlyApplicationControlDataInterface {
 impl IReadOnlyApplicationControlDataInterface {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (commands::GET_APPLICATION_CONTROL_DATA, None, "GetApplicationControlData"),
-            (commands::GET_APPLICATION_DESIRED_LANGUAGE, None, "GetApplicationDesiredLanguage"),
-            (commands::CONVERT_APPLICATION_LANGUAGE_TO_LANGUAGE_CODE, None, "ConvertApplicationLanguageToLanguageCode"),
-            (commands::CONVERT_LANGUAGE_CODE_TO_APPLICATION_LANGUAGE, None, "ConvertLanguageCodeToApplicationLanguage"),
-            (commands::SELECT_APPLICATION_DESIRED_LANGUAGE, None, "SelectApplicationDesiredLanguage"),
+            (
+                commands::GET_APPLICATION_CONTROL_DATA,
+                None,
+                "GetApplicationControlData",
+            ),
+            (
+                commands::GET_APPLICATION_DESIRED_LANGUAGE,
+                None,
+                "GetApplicationDesiredLanguage",
+            ),
+            (
+                commands::CONVERT_APPLICATION_LANGUAGE_TO_LANGUAGE_CODE,
+                None,
+                "ConvertApplicationLanguageToLanguageCode",
+            ),
+            (
+                commands::CONVERT_LANGUAGE_CODE_TO_APPLICATION_LANGUAGE,
+                None,
+                "ConvertLanguageCodeToApplicationLanguage",
+            ),
+            (
+                commands::SELECT_APPLICATION_DESIRED_LANGUAGE,
+                None,
+                "SelectApplicationDesiredLanguage",
+            ),
         ]);
         Self {
             handlers,

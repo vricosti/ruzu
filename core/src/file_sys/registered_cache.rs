@@ -5,8 +5,8 @@
 
 use std::collections::BTreeMap;
 
-use super::content_archive::{NCA, NCAContentType};
-use super::nca_metadata::{ContentRecordType, TitleType, CNMT, ContentRecord};
+use super::content_archive::{NCAContentType, NCA};
+use super::nca_metadata::{ContentRecord, ContentRecordType, TitleType, CNMT};
 use super::vfs::vfs_concat::ConcatenatedVfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 
@@ -151,10 +151,7 @@ pub struct ContentProviderEntry {
 
 impl ContentProviderEntry {
     pub fn debug_info(&self) -> String {
-        format!(
-            "GitID={:016X}, Type={:?}",
-            self.title_id, self.record_type
-        )
+        format!("GitID={:016X}, Type={:?}", self.title_id, self.record_type)
     }
 }
 
@@ -203,11 +200,7 @@ pub trait ContentProvider: Send + Sync {
         title_id: u64,
         record_type: ContentRecordType,
     ) -> Option<VirtualFile>;
-    fn get_entry_raw(
-        &self,
-        title_id: u64,
-        record_type: ContentRecordType,
-    ) -> Option<VirtualFile>;
+    fn get_entry_raw(&self, title_id: u64, record_type: ContentRecordType) -> Option<VirtualFile>;
     fn list_entries_filter(
         &self,
         title_type: Option<TitleType>,
@@ -264,10 +257,11 @@ impl PlaceholderCache {
         let hash = hasher.finalize();
         let dirname = format!("000000{:02X}", hash[0]);
 
-        let dir2 = match super::vfs::vfs::get_or_create_directory_relative(self.dir.as_ref(), &dirname) {
-            Some(d) => d,
-            None => return false,
-        };
+        let dir2 =
+            match super::vfs::vfs::get_or_create_directory_relative(self.dir.as_ref(), &dirname) {
+                Some(d) => d,
+                None => return false,
+            };
 
         let filename = format!("{}.nca", nca_id_to_hex(id, false));
         let file = match dir2.create_file(&filename) {
@@ -292,10 +286,11 @@ impl PlaceholderCache {
         let hash = hasher.finalize();
         let dirname = format!("000000{:02X}", hash[0]);
 
-        let dir2 = match super::vfs::vfs::get_or_create_directory_relative(self.dir.as_ref(), &dirname) {
-            Some(d) => d,
-            None => return false,
-        };
+        let dir2 =
+            match super::vfs::vfs::get_or_create_directory_relative(self.dir.as_ref(), &dirname) {
+                Some(d) => d,
+                None => return false,
+            };
 
         dir2.delete_file(&format!("{}.nca", nca_id_to_hex(id, false)))
     }
@@ -703,9 +698,9 @@ impl RegisteredCache {
         }
 
         self.refresh();
-        self.yuzu_meta.values().any(|c| {
-            c.get_type() == cnmt.get_type() && c.get_title_id() == cnmt.get_title_id()
-        })
+        self.yuzu_meta
+            .values()
+            .any(|c| c.get_type() == cnmt.get_type() && c.get_title_id() == cnmt.get_title_id())
     }
 }
 
@@ -758,11 +753,7 @@ impl ContentProvider for RegisteredCache {
         self.get_file_at_id(&id)
     }
 
-    fn get_entry_raw(
-        &self,
-        title_id: u64,
-        record_type: ContentRecordType,
-    ) -> Option<VirtualFile> {
+    fn get_entry_raw(&self, title_id: u64, record_type: ContentRecordType) -> Option<VirtualFile> {
         let id = self.get_nca_id_from_metadata(title_id, record_type)?;
         // In full implementation, this would apply the parsing function.
         // For now, return the raw file.
@@ -792,9 +783,7 @@ impl ContentProvider for RegisteredCache {
                 }
 
                 // Add meta record itself
-                if record_type.is_none()
-                    || record_type == Some(ContentRecordType::Meta)
-                {
+                if record_type.is_none() || record_type == Some(ContentRecordType::Meta) {
                     out.push(ContentProviderEntry {
                         title_id: cnmt.get_title_id(),
                         record_type: ContentRecordType::Meta,
@@ -862,7 +851,11 @@ impl ContentProviderUnion {
 
     /// # Safety
     /// The caller must ensure the provider outlives this ContentProviderUnion.
-    pub unsafe fn set_slot(&mut self, slot: ContentProviderUnionSlot, provider: *mut dyn ContentProvider) {
+    pub unsafe fn set_slot(
+        &mut self,
+        slot: ContentProviderUnionSlot,
+        provider: *mut dyn ContentProvider,
+    ) {
         self.providers.insert(slot, provider);
     }
 
@@ -879,9 +872,9 @@ impl ContentProvider for ContentProviderUnion {
     }
 
     fn has_entry(&self, title_id: u64, record_type: ContentRecordType) -> bool {
-        self.providers.values().any(|&ptr| unsafe {
-            (*ptr).has_entry(title_id, record_type)
-        })
+        self.providers
+            .values()
+            .any(|&ptr| unsafe { (*ptr).has_entry(title_id, record_type) })
     }
 
     fn get_entry_version(&self, title_id: u64) -> Option<u32> {
@@ -906,11 +899,7 @@ impl ContentProvider for ContentProviderUnion {
         None
     }
 
-    fn get_entry_raw(
-        &self,
-        title_id: u64,
-        record_type: ContentRecordType,
-    ) -> Option<VirtualFile> {
+    fn get_entry_raw(&self, title_id: u64, record_type: ContentRecordType) -> Option<VirtualFile> {
         for &ptr in self.providers.values() {
             if let Some(f) = unsafe { (*ptr).get_entry_raw(title_id, record_type) } {
                 return Some(f);
@@ -927,9 +916,7 @@ impl ContentProvider for ContentProviderUnion {
     ) -> Vec<ContentProviderEntry> {
         let mut result = Vec::new();
         for &ptr in self.providers.values() {
-            result.extend(unsafe {
-                (*ptr).list_entries_filter(title_type, record_type, title_id)
-            });
+            result.extend(unsafe { (*ptr).list_entries_filter(title_type, record_type, title_id) });
         }
         result.sort();
         result.dedup();
@@ -954,9 +941,7 @@ impl ContentProviderUnion {
                     continue;
                 }
             }
-            let vec = unsafe {
-                (*ptr).list_entries_filter(title_type, record_type, title_id)
-            };
+            let vec = unsafe { (*ptr).list_entries_filter(title_type, record_type, title_id) };
             for entry in vec {
                 result.push((slot, entry));
             }
@@ -1047,11 +1032,7 @@ impl ContentProvider for ManualContentProvider {
             .map(|(_, f)| f.clone())
     }
 
-    fn get_entry_raw(
-        &self,
-        title_id: u64,
-        record_type: ContentRecordType,
-    ) -> Option<VirtualFile> {
+    fn get_entry_raw(&self, title_id: u64, record_type: ContentRecordType) -> Option<VirtualFile> {
         self.get_entry_unparsed(title_id, record_type)
     }
 

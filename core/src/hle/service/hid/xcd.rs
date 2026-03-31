@@ -42,10 +42,26 @@ impl XcdSys {
             (18, Some(Self::stub_success_handler), "ClearMifareKey"),
             (19, Some(Self::stub_success_handler), "StartMifareRead"),
             (20, Some(Self::stub_success_handler), "StartMifareWrite"),
-            (101, Some(Self::stub_success_handler), "GetAwakeTriggerReasonForLeftRail"),
-            (102, Some(Self::stub_success_handler), "GetAwakeTriggerReasonForRightRail"),
-            (103, Some(Self::stub_success_handler), "GetAwakeTriggerBatteryLevelTransitionForLeftRail"),
-            (104, Some(Self::stub_success_handler), "GetAwakeTriggerBatteryLevelTransitionForRightRail"),
+            (
+                101,
+                Some(Self::stub_success_handler),
+                "GetAwakeTriggerReasonForLeftRail",
+            ),
+            (
+                102,
+                Some(Self::stub_success_handler),
+                "GetAwakeTriggerReasonForRightRail",
+            ),
+            (
+                103,
+                Some(Self::stub_success_handler),
+                "GetAwakeTriggerBatteryLevelTransitionForLeftRail",
+            ),
+            (
+                104,
+                Some(Self::stub_success_handler),
+                "GetAwakeTriggerBatteryLevelTransitionForRightRail",
+            ),
         ]);
 
         Self {

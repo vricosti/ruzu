@@ -40,20 +40,68 @@ pub struct IAudioOut {
 impl IAudioOut {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (0, Some(Self::get_audio_out_state_handler), "GetAudioOutState"),
+            (
+                0,
+                Some(Self::get_audio_out_state_handler),
+                "GetAudioOutState",
+            ),
             (1, Some(Self::start_handler), "Start"),
             (2, Some(Self::stop_handler), "Stop"),
-            (3, Some(Self::append_audio_out_buffer_handler), "AppendAudioOutBuffer"),
-            (4, Some(Self::register_buffer_event_handler), "RegisterBufferEvent"),
-            (5, Some(Self::get_released_audio_out_buffers_handler), "GetReleasedAudioOutBuffers"),
-            (6, Some(Self::contains_audio_out_buffer_handler), "ContainsAudioOutBuffer"),
-            (7, Some(Self::append_audio_out_buffer_auto_handler), "AppendAudioOutBufferAuto"),
-            (8, Some(Self::get_released_audio_out_buffers_auto_handler), "GetReleasedAudioOutBuffersAuto"),
-            (9, Some(Self::get_audio_out_buffer_count_handler), "GetAudioOutBufferCount"),
-            (10, Some(Self::get_audio_out_played_sample_count_handler), "GetAudioOutPlayedSampleCount"),
-            (11, Some(Self::flush_audio_out_buffers_handler), "FlushAudioOutBuffers"),
-            (12, Some(Self::set_audio_out_volume_handler), "SetAudioOutVolume"),
-            (13, Some(Self::get_audio_out_volume_handler), "GetAudioOutVolume"),
+            (
+                3,
+                Some(Self::append_audio_out_buffer_handler),
+                "AppendAudioOutBuffer",
+            ),
+            (
+                4,
+                Some(Self::register_buffer_event_handler),
+                "RegisterBufferEvent",
+            ),
+            (
+                5,
+                Some(Self::get_released_audio_out_buffers_handler),
+                "GetReleasedAudioOutBuffers",
+            ),
+            (
+                6,
+                Some(Self::contains_audio_out_buffer_handler),
+                "ContainsAudioOutBuffer",
+            ),
+            (
+                7,
+                Some(Self::append_audio_out_buffer_auto_handler),
+                "AppendAudioOutBufferAuto",
+            ),
+            (
+                8,
+                Some(Self::get_released_audio_out_buffers_auto_handler),
+                "GetReleasedAudioOutBuffersAuto",
+            ),
+            (
+                9,
+                Some(Self::get_audio_out_buffer_count_handler),
+                "GetAudioOutBufferCount",
+            ),
+            (
+                10,
+                Some(Self::get_audio_out_played_sample_count_handler),
+                "GetAudioOutPlayedSampleCount",
+            ),
+            (
+                11,
+                Some(Self::flush_audio_out_buffers_handler),
+                "FlushAudioOutBuffers",
+            ),
+            (
+                12,
+                Some(Self::set_audio_out_volume_handler),
+                "SetAudioOutVolume",
+            ),
+            (
+                13,
+                Some(Self::get_audio_out_volume_handler),
+                "GetAudioOutVolume",
+            ),
         ]);
         Self {
             handlers,
@@ -109,7 +157,10 @@ impl IAudioOut {
 
         // Create pre-signaled event (so first wait returns immediately).
         if let Some((handle, readable_event)) = ctx.create_readable_event(true) {
-            log::info!("IAudioOut::RegisterBufferEvent created event handle={:#x}", handle);
+            log::info!(
+                "IAudioOut::RegisterBufferEvent created event handle={:#x}",
+                handle
+            );
             *event_guard = Some(readable_event);
             drop(event_guard);
             let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
@@ -185,10 +236,7 @@ impl IAudioOut {
         rb.push_u64(0);
     }
 
-    fn flush_audio_out_buffers_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn flush_audio_out_buffers_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioOut::FlushAudioOutBuffers (STUBBED)");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);

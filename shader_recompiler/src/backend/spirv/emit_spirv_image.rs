@@ -6,8 +6,8 @@
 //!
 //! Handles texture sampling, image loads, and texture queries.
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::Word;
 
 /// Emit ImageSampleImplicitLod (TEX/TEXS with implicit LOD).
 ///
@@ -89,21 +89,13 @@ pub fn emit_image_gather_dref(
 }
 
 /// Emit ImageQueryDimensions (TXQ).
-pub fn emit_image_query_dimensions(
-    ctx: &mut SpirvEmitContext,
-    _handle: Word,
-    _lod: Word,
-) -> Word {
+pub fn emit_image_query_dimensions(ctx: &mut SpirvEmitContext, _handle: Word, _lod: Word) -> Word {
     log::trace!("SPIR-V: emit_image_query_dimensions");
     ctx.builder.undef(ctx.u32_vec4_type, None)
 }
 
 /// Emit ImageQueryLod (TMML).
-pub fn emit_image_query_lod(
-    ctx: &mut SpirvEmitContext,
-    _handle: Word,
-    _coords: Word,
-) -> Word {
+pub fn emit_image_query_lod(ctx: &mut SpirvEmitContext, _handle: Word, _coords: Word) -> Word {
     log::trace!("SPIR-V: emit_image_query_lod");
     ctx.builder.undef(ctx.f32_vec2_type, None)
 }
@@ -122,9 +114,9 @@ pub fn emit_image_gradient(
 
 // ── IR-instruction dispatching helpers (called from spirv_emit_context) ───
 
+use crate::ir::{self, Opcode};
 use rspirv::dr::Operand;
 use rspirv::spirv;
-use crate::ir::{self, Opcode};
 
 /// Dispatch ImageSampleImplicitLod / ImageSampleExplicitLod IR instructions.
 pub fn emit_image_sample(
@@ -318,7 +310,10 @@ pub fn emit_image_query(
         };
 
         let i32_vec2 = ctx.builder.type_vector(ctx.i32_type, 2);
-        let id = ctx.builder.image_query_size_lod(i32_vec2, None, image, lod).unwrap();
+        let id = ctx
+            .builder
+            .image_query_size_lod(i32_vec2, None, image, lod)
+            .unwrap();
 
         ctx.set_value(block_idx, inst_idx, id);
     } else {

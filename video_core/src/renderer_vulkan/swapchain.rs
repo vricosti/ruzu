@@ -313,8 +313,7 @@ impl Swapchain {
     ) {
         self.has_mailbox = available_present_modes.contains(&vk::PresentModeKHR::MAILBOX);
         self.has_imm = available_present_modes.contains(&vk::PresentModeKHR::IMMEDIATE);
-        self.has_fifo_relaxed =
-            available_present_modes.contains(&vk::PresentModeKHR::FIFO_RELAXED);
+        self.has_fifo_relaxed = available_present_modes.contains(&vk::PresentModeKHR::FIFO_RELAXED);
 
         let _alpha_flags = choose_alpha_flags(capabilities);
         self.surface_format = choose_swap_surface_format(available_formats);

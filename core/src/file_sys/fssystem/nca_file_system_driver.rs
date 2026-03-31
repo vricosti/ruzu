@@ -198,8 +198,9 @@ impl Default for NcaCompressionConfiguration {
 // ============================================================================
 
 /// Key area encryption key count.
-pub const KEY_AREA_ENCRYPTION_KEY_COUNT: i32 = NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT
-    * NcaCryptoConfiguration::KEY_GENERATION_MAX as i32;
+pub const KEY_AREA_ENCRYPTION_KEY_COUNT: i32 =
+    NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT
+        * NcaCryptoConfiguration::KEY_GENERATION_MAX as i32;
 
 /// Key type.
 /// Corresponds to upstream `KeyType`.
@@ -403,12 +404,13 @@ impl NcaFileSystemDriver {
 
             log::trace!(
                 "AES-CTR decryption: fs_index={}, offset=0x{:X}, size=0x{:X}",
-                fs_index, fs_offset, fs_size
+                fs_index,
+                fs_offset,
+                fs_size
             );
 
             // Wrap the body storage in an AES-CTR decryption layer.
-            let ctr_storage: VirtualFile =
-                Arc::new(AesCtrStorage::new(body_storage, key, &iv));
+            let ctr_storage: VirtualFile = Arc::new(AesCtrStorage::new(body_storage, key, &iv));
             ctr_storage
         } else if encryption_type == NcaFsEncryptionType::None as u8 {
             // No encryption; use body storage as-is.
@@ -435,20 +437,14 @@ impl NcaFileSystemDriver {
 
     /// Create a body sub-storage for the given offset and size.
     /// Corresponds to upstream `NcaFileSystemDriver::CreateBodySubStorage`.
-    fn create_body_sub_storage(
-        &self,
-        offset: i64,
-        size: i64,
-    ) -> Result<VirtualFile, ResultCode> {
+    fn create_body_sub_storage(&self, offset: i64, size: i64) -> Result<VirtualFile, ResultCode> {
         let body_storage = self
             .reader
             .get_shared_body_storage()
             .ok_or(RESULT_INVALID_NCA_HEADER)?;
 
-        let shared_body: VirtualFile = Arc::new(SharedNcaBodyStorage::new(
-            body_storage,
-            self.reader.clone(),
-        ));
+        let shared_body: VirtualFile =
+            Arc::new(SharedNcaBodyStorage::new(body_storage, self.reader.clone()));
 
         let offset_storage: VirtualFile = Arc::new(OffsetVfsFile::new(
             shared_body,
@@ -487,13 +483,16 @@ impl NcaFileSystemDriver {
             let layer_count = sha256_data.hash_layer_count as usize;
             log::debug!(
                 "HierarchicalSha256: hash_block_size=0x{:X}, layer_count={}",
-                sha256_data.hash_block_size, layer_count
+                sha256_data.hash_block_size,
+                layer_count
             );
             for i in 0..layer_count.min(HierarchicalSha256Data::HASH_LAYER_COUNT_MAX) {
                 let r = &sha256_data.hash_layer_region[i];
                 log::trace!(
                     "  region[{}]: offset=0x{:X}, size=0x{:X}",
-                    i, r.offset.get(), r.size.get()
+                    i,
+                    r.offset.get(),
+                    r.size.get()
                 );
             }
             if layer_count >= 2 && layer_count <= HierarchicalSha256Data::HASH_LAYER_COUNT_MAX {

@@ -7,14 +7,14 @@ use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::Value;
 
 fn dfma_impl(tv: &mut TranslatorVisitor, insn: u64, src_b: Value, src_c: Value) {
-    let dst       = field(insn, 0, 8);
+    let dst = field(insn, 0, 8);
     let src_a_reg = field(insn, 8, 8);
-    let neg_b     = bit(insn, 48);
-    let neg_c     = bit(insn, 49);
+    let neg_b = bit(insn, 48);
+    let neg_c = bit(insn, 49);
 
     let src_a = tv.d(src_a_reg);
-    let op_b  = tv.ir.fp_abs_neg_64(src_b, false, neg_b);
-    let op_c  = tv.ir.fp_abs_neg_64(src_c, false, neg_c);
+    let op_b = tv.ir.fp_abs_neg_64(src_b, false, neg_b);
+    let op_c = tv.ir.fp_abs_neg_64(src_c, false, neg_c);
 
     let result = tv.ir.fp_fma_64(src_a, op_b, op_c);
     tv.set_d(dst, result);

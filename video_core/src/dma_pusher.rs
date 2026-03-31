@@ -7,8 +7,8 @@
 //! See https://envytools.readthedocs.io/en/latest/hw/fifo/dma-pusher.html
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use crate::engines::engine_interface::EngineInterface;
 use crate::engines::engine_interface::EngineTypes;
@@ -138,10 +138,12 @@ impl CommandHeader {
 }
 
 /// Build a command header from parts.
-pub fn build_command_header(method: BufferMethods, arg_count: u32, mode: SubmissionMode) -> CommandHeader {
-    let raw = (method as u32 & 0x1FFF)
-        | ((arg_count & 0x1FFF) << 16)
-        | ((mode as u32 & 0x7) << 29);
+pub fn build_command_header(
+    method: BufferMethods,
+    arg_count: u32,
+    mode: SubmissionMode,
+) -> CommandHeader {
+    let raw = (method as u32 & 0x1FFF) | ((arg_count & 0x1FFF) << 16) | ((mode as u32 & 0x7) << 29);
     CommandHeader { raw }
 }
 
@@ -240,7 +242,12 @@ impl DmaPusher {
             subchannel_type: [EngineTypes::Maxwell3D; MAX_SUBCHANNELS],
             gpu,
             memory_manager,
-            puller: Puller::new(gpu, puller_memory_manager, std::ptr::null_mut(), channel_state),
+            puller: Puller::new(
+                gpu,
+                puller_memory_manager,
+                std::ptr::null_mut(),
+                channel_state,
+            ),
         }
     }
 
@@ -268,9 +275,8 @@ impl DmaPusher {
         subchannel_id: u32,
         engine_type: EngineTypes,
     ) {
-        self.subchannels[subchannel_id as usize] = Some(unsafe {
-            std::mem::transmute::<*mut dyn EngineInterface, [usize; 2]>(engine)
-        });
+        self.subchannels[subchannel_id as usize] =
+            Some(unsafe { std::mem::transmute::<*mut dyn EngineInterface, [usize; 2]>(engine) });
         self.subchannel_type[subchannel_id as usize] = engine_type;
     }
 
@@ -285,16 +291,11 @@ impl DmaPusher {
     /// processing and method dispatch are fully implemented; engine dispatch goes
     /// through the `subchannel` engine interface.
     pub fn dispatch_calls(&mut self) {
-        log::info!(
-            "DmaPusher::dispatch_calls queued_lists={}",
-            self.dma_pushbuffer.len()
-        );
         self.dma_pushbuffer_subindex = 0;
         self.dma_state.is_last_call = true;
 
         // In the full port, this loops while system.is_powered_on().
         while self.step() {}
-        log::info!("DmaPusher::dispatch_calls complete");
 
         let gpu = unsafe { &*self.gpu };
         gpu.flush_commands();
@@ -342,10 +343,10 @@ impl DmaPusher {
             return;
         }
 
-        let dirty = self
-            .memory_manager
-            .lock()
-            .is_memory_dirty(command_gpu_addr, word_count as u64 * std::mem::size_of::<u32>() as u64);
+        let dirty = self.memory_manager.lock().is_memory_dirty(
+            command_gpu_addr,
+            word_count as u64 * std::mem::size_of::<u32>() as u64,
+        );
 
         self.set_current_engine_dirty(dirty);
     }
@@ -408,20 +409,26 @@ impl DmaPusher {
             let mm = self.memory_manager.lock();
             mm.read_block_unsafe(command_list_header.addr(), &mut raw, &|cpu_addr, dst| {
                 if !gpu.read_guest_memory(cpu_addr, dst) {
-                    log::warn!("DmaPusher: read_guest_memory FAILED cpu_addr={:#x} len={}", cpu_addr, dst.len());
+                    log::warn!(
+                        "DmaPusher: read_guest_memory FAILED cpu_addr={:#x} len={}",
+                        cpu_addr,
+                        dst.len()
+                    );
                 }
             });
             drop(mm);
 
             self.command_headers.clear();
-            self.command_headers.extend(raw.chunks_exact(4).map(|chunk| CommandHeader {
-                raw: u32::from_le_bytes(chunk.try_into().unwrap()),
-            }));
+            self.command_headers
+                .extend(raw.chunks_exact(4).map(|chunk| CommandHeader {
+                    raw: u32::from_le_bytes(chunk.try_into().unwrap()),
+                }));
             let non_zero = self.command_headers.iter().filter(|h| h.raw != 0).count();
             if non_zero > 0 {
                 log::info!(
                     "DmaPusher::step {} commands ({} non-zero) first={:#010x}",
-                    self.command_headers.len(), non_zero,
+                    self.command_headers.len(),
+                    non_zero,
                     self.command_headers.first().map_or(0, |h| h.raw),
                 );
             }
@@ -477,15 +484,20 @@ impl DmaPusher {
             let mm = self.memory_manager.lock();
             mm.read_block_unsafe(command_list_header.addr(), &mut raw, &|cpu_addr, dst| {
                 if !gpu.read_guest_memory(cpu_addr, dst) {
-                    log::warn!("DmaPusher: read_guest_memory FAILED cpu_addr={:#x} len={}", cpu_addr, dst.len());
+                    log::warn!(
+                        "DmaPusher: read_guest_memory FAILED cpu_addr={:#x} len={}",
+                        cpu_addr,
+                        dst.len()
+                    );
                 }
             });
             drop(mm);
 
             self.command_headers.clear();
-            self.command_headers.extend(raw.chunks_exact(4).map(|chunk| CommandHeader {
-                raw: u32::from_le_bytes(chunk.try_into().unwrap()),
-            }));
+            self.command_headers
+                .extend(raw.chunks_exact(4).map(|chunk| CommandHeader {
+                    raw: u32::from_le_bytes(chunk.try_into().unwrap()),
+                }));
             let commands = self.command_headers.clone();
             self.process_commands_with_engine(&commands, engine);
         }
@@ -498,8 +510,12 @@ impl DmaPusher {
         while index < commands.len() {
             total_dispatches += 1;
             if total_dispatches % 100_000 == 0 {
-                log::warn!("DmaPusher::process_commands heartbeat: {} dispatches, index={}/{}",
-                    total_dispatches, index, commands.len());
+                log::warn!(
+                    "DmaPusher::process_commands heartbeat: {} dispatches, index={}/{}",
+                    total_dispatches,
+                    index,
+                    commands.len()
+                );
             }
             let command_header = commands[index];
 
@@ -507,7 +523,8 @@ impl DmaPusher {
                 self.dma_state.dma_word_offset = (index as u64) * 4;
                 if self.dma_state.non_incrementing {
                     let max_write =
-                        std::cmp::min(index + self.dma_state.method_count as usize, commands.len()) - index;
+                        std::cmp::min(index + self.dma_state.method_count as usize, commands.len())
+                            - index;
                     self.dispatch_multi_method(&commands[index..index + max_write]);
                     self.dma_state.method_count -= max_write as u32;
                     self.dma_state.is_last_call = true;
@@ -574,10 +591,9 @@ impl DmaPusher {
                 // Data word of methods command
                 self.dma_state.dma_word_offset = (index as u64) * 4;
                 if self.dma_state.non_incrementing {
-                    let max_write = std::cmp::min(
-                        index + self.dma_state.method_count as usize,
-                        commands.len(),
-                    ) - index;
+                    let max_write =
+                        std::cmp::min(index + self.dma_state.method_count as usize, commands.len())
+                            - index;
                     self.dispatch_multi_method(&commands[index..index + max_write]);
                     self.dma_state.method_count -= max_write as u32;
                     self.dma_state.is_last_call = true;
@@ -613,8 +629,7 @@ impl DmaPusher {
                     Some(SubmissionMode::Inline) => {
                         self.dma_state.method = command_header.method();
                         self.dma_state.subchannel = command_header.subchannel();
-                        self.dma_state.dma_word_offset =
-                            (-(self.dma_state.dma_get as i64)) as u64;
+                        self.dma_state.dma_word_offset = (-(self.dma_state.dma_get as i64)) as u64;
                         self.dispatch_method(command_header.arg_count());
                         self.dma_state.non_incrementing = true;
                         self.dma_increment_once = false;
@@ -698,7 +713,11 @@ impl DmaPusher {
             );
         }
         subchannel.consume_sink();
-        subchannel.set_current_dma_segment(self.dma_state.dma_get.wrapping_add(self.dma_state.dma_word_offset));
+        subchannel.set_current_dma_segment(
+            self.dma_state
+                .dma_get
+                .wrapping_add(self.dma_state.dma_word_offset),
+        );
         subchannel.call_method(self.dma_state.method, argument, self.dma_state.is_last_call);
     }
 
@@ -733,7 +752,11 @@ impl DmaPusher {
         let subchannel: *mut dyn EngineInterface = unsafe { std::mem::transmute(raw) };
         let subchannel = unsafe { &mut *subchannel };
         subchannel.consume_sink();
-        subchannel.set_current_dma_segment(self.dma_state.dma_get.wrapping_add(self.dma_state.dma_word_offset));
+        subchannel.set_current_dma_segment(
+            self.dma_state
+                .dma_get
+                .wrapping_add(self.dma_state.dma_word_offset),
+        );
         subchannel.call_multi_method(
             self.dma_state.method,
             &args,
@@ -753,7 +776,11 @@ mod tests {
         let mut channel_state = Box::new(ChannelState::new(7));
         let memory_manager = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
         let channel_ptr: *mut ChannelState = &mut *channel_state;
-        let mut dma = Box::new(DmaPusher::new(std::ptr::null(), memory_manager, channel_ptr));
+        let mut dma = Box::new(DmaPusher::new(
+            std::ptr::null(),
+            memory_manager,
+            channel_ptr,
+        ));
         let dma_ptr: *mut DmaPusher = &mut *dma;
 
         dma.install_self_reference();

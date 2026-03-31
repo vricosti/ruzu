@@ -58,7 +58,9 @@ pub trait ServiceFramework: SessionRequestHandler {
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo>;
 
     /// Deprecated compatibility hook kept for older services.
-    fn service_manager(&self) -> Option<std::sync::Arc<std::sync::Mutex<crate::hle::service::sm::sm::ServiceManager>>> {
+    fn service_manager(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::hle::service::sm::sm::ServiceManager>>> {
         None
     }
 
@@ -72,11 +74,7 @@ pub trait ServiceFramework: SessionRequestHandler {
 
         match info {
             Some(fi) if fi.handler_callback.is_some() => {
-                log::trace!(
-                    "Service::{}: {}",
-                    self.get_service_name(),
-                    fi.name
-                );
+                log::trace!("Service::{}: {}", self.get_service_name(), fi.name);
                 if let Some(callback) = fi.handler_callback {
                     callback(self, ctx);
                 }
@@ -97,11 +95,7 @@ pub trait ServiceFramework: SessionRequestHandler {
 
         match info {
             Some(fi) if fi.handler_callback.is_some() => {
-                log::trace!(
-                    "Service::{}: {}",
-                    self.get_service_name(),
-                    fi.name
-                );
+                log::trace!("Service::{}: {}", self.get_service_name(), fi.name);
                 if let Some(callback) = fi.handler_callback {
                     callback(self, ctx);
                 }
@@ -162,8 +156,16 @@ pub trait ServiceFramework: SessionRequestHandler {
             }
             ipc::CommandType::ControlWithContext | ipc::CommandType::Control => {
                 // Matches upstream: system.ServiceManager().InvokeControlRequest(ctx)
-                log::debug!("Control cmd={} on service '{}'", ctx.get_command(), self.get_service_name());
-                if let Some(sm) = ctx.get_service_manager().cloned().or_else(|| self.service_manager()) {
+                log::debug!(
+                    "Control cmd={} on service '{}'",
+                    ctx.get_command(),
+                    self.get_service_name()
+                );
+                if let Some(sm) = ctx
+                    .get_service_manager()
+                    .cloned()
+                    .or_else(|| self.service_manager())
+                {
                     let controller = sm.lock().unwrap().controller_interface();
                     controller.invoke_request(ctx);
                 } else {
@@ -196,7 +198,11 @@ pub trait ServiceFramework: SessionRequestHandler {
 
 /// Helper to build a handler map from a slice of (id, callback, name) tuples.
 pub fn build_handler_map(
-    functions: &[(u32, Option<fn(&dyn ServiceFramework, &mut HLERequestContext)>, &'static str)],
+    functions: &[(
+        u32,
+        Option<fn(&dyn ServiceFramework, &mut HLERequestContext)>,
+        &'static str,
+    )],
 ) -> BTreeMap<u32, FunctionInfo> {
     let mut map = BTreeMap::new();
     for &(id, callback, name) in functions {
@@ -223,10 +229,7 @@ mod tests {
 
     #[test]
     fn test_build_handler_map() {
-        let map = build_handler_map(&[
-            (0, None, "Initialize"),
-            (1, None, "GetService"),
-        ]);
+        let map = build_handler_map(&[(0, None, "Initialize"), (1, None, "GetService")]);
         assert_eq!(map.len(), 2);
         assert!(map.contains_key(&0));
         assert!(map.contains_key(&1));

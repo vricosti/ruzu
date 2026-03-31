@@ -149,11 +149,8 @@ impl NCA {
             let rights_id_u128_lo = u64::from_le_bytes(rights_id[..8].try_into().unwrap());
             let rights_id_u128_hi = u64::from_le_bytes(rights_id[8..16].try_into().unwrap());
 
-            let titlekey = keys.get_key_128(
-                S128KeyType::Titlekey,
-                rights_id_u128_hi,
-                rights_id_u128_lo,
-            );
+            let titlekey =
+                keys.get_key_128(S128KeyType::Titlekey, rights_id_u128_hi, rights_id_u128_lo);
             if titlekey == [0u8; 16] {
                 nca.status = ResultStatus::ErrorMissingTitlekey;
                 drop(keys);
@@ -187,7 +184,12 @@ impl NCA {
 
         // Iterate filesystem sections.
         let fs_count = reader.get_fs_count();
-        log::debug!("NCA '{}': fs_count={}, content_type={}", file_name, fs_count, reader.get_content_type());
+        log::debug!(
+            "NCA '{}': fs_count={}, content_type={}",
+            file_name,
+            fs_count,
+            reader.get_content_type()
+        );
         let fs = if let Some(base) = base_nca {
             if let Some(ref base_reader) = base.reader {
                 NcaFileSystemDriver::with_original(base_reader.clone(), reader.clone())
@@ -202,13 +204,21 @@ impl NCA {
             let mut header_reader = NcaFsHeaderReader::new();
             let storage = match fs.open_storage(&mut header_reader, i) {
                 Ok(s) => {
-                    log::debug!("NCA '{}': section {} opened OK, fs_type={}, size={}", file_name, i, header_reader.get_fs_type(), s.get_size());
+                    log::debug!(
+                        "NCA '{}': section {} opened OK, fs_type={}, size={}",
+                        file_name,
+                        i,
+                        header_reader.get_fs_type(),
+                        s.get_size()
+                    );
                     s
                 }
                 Err(_rc) => {
                     log::error!(
                         "NCA '{}': File reader errored out during read of section {} (rc={:?})",
-                        file_name, i, _rc
+                        file_name,
+                        i,
+                        _rc
                     );
                     nca.status = ResultStatus::ErrorBadNCAHeader;
                     nca.reader = Some(reader);
@@ -224,7 +234,13 @@ impl NCA {
 
             if header_reader.get_fs_type() == NcaFsType::PartitionFs as u8 {
                 let pfs = PartitionFilesystem::new(storage.clone());
-                log::debug!("NCA '{}': PFS from section {} status={:?}, files={}", file_name, i, pfs.get_status(), pfs.get_files().len());
+                log::debug!(
+                    "NCA '{}': PFS from section {} status={:?}, files={}",
+                    file_name,
+                    i,
+                    pfs.get_status(),
+                    pfs.get_files().len()
+                );
                 if pfs.get_status() == ResultStatus::Success {
                     let npfs: VirtualDir = Arc::new(pfs);
                     nca.dirs.push(npfs.clone());

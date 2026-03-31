@@ -29,11 +29,7 @@ const MOD0_MAGIC: u32 = u32::from_le_bytes([b'M', b'O', b'D', b'0']);
 ///
 /// Upstream creates a `ReadBytes` lambda that calls `memory.ReadBlock(base + offset, ptr, size)`
 /// to read from guest memory, then passes it to the templated `GetSymbols<Word, ELFSymbol>`.
-pub fn get_symbols_from_memory(
-    base: VAddr,
-    memory: &Memory,
-    is_64: bool,
-) -> Symbols {
+pub fn get_symbols_from_memory(base: VAddr, memory: &Memory, is_64: bool) -> Symbols {
     let read_bytes = |offset: usize, size: usize| -> Vec<u8> {
         let mut buf = vec![0u8; size];
         memory.read_block(base + offset as u64, &mut buf);
@@ -159,10 +155,8 @@ trait Word {
     const SIZE: usize;
     fn read_word(read_bytes: &dyn Fn(usize, usize) -> Vec<u8>, index: usize) -> u64;
     /// Returns (st_name, st_value, st_size)
-    fn read_symbol(
-        read_bytes: &dyn Fn(usize, usize) -> Vec<u8>,
-        index: usize,
-    ) -> (u32, u64, usize);
+    fn read_symbol(read_bytes: &dyn Fn(usize, usize) -> Vec<u8>, index: usize)
+        -> (u32, u64, usize);
 }
 
 impl Word for u32 {

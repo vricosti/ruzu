@@ -106,7 +106,6 @@ impl TimeZoneBinary {
         if let Some(ref romfs) = self.time_zone_binary_romfs {
             let path = self.get_time_zone_path(name);
             if let Some(path) = path {
-
                 return romfs.get_file_relative(&path[1..]).is_some();
             }
         }
@@ -139,7 +138,6 @@ impl TimeZoneBinary {
             return Err(self.mount_result);
         }
         if let Some(ref romfs) = self.time_zone_binary_romfs {
-
             if let Some(file) = romfs.get_file_relative("version.txt") {
                 let data = file.read_all_bytes();
                 let mut version: RuleVersion = [0u8; 0x10];
@@ -162,7 +160,6 @@ impl TimeZoneBinary {
         if let Some(ref romfs) = self.time_zone_binary_romfs {
             let path = self.get_time_zone_path(name);
             if let Some(path) = path {
-    
                 if let Some(file) = romfs.get_file_relative(&path[1..]) {
                     return Ok(file.read_all_bytes());
                 }

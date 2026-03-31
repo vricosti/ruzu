@@ -48,7 +48,6 @@ pub struct AnnounceMultiplayerSession {
 
     /// Whether the session is running (announce thread is active).
     running: AtomicBool,
-
     // NOTE: The actual announce thread, shutdown_event, and RoomNetwork weak
     // reference are not fully ported since the networking layer (ENet) is
     // stubbed. The public API is preserved for structural parity.

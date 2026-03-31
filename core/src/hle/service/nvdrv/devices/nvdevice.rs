@@ -5,7 +5,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
 
@@ -13,13 +15,7 @@ use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
 /// implement the ioctl interface.
 pub trait NvDevice {
     /// Handles an ioctl1 request.
-    fn ioctl1(
-        &self,
-        fd: DeviceFD,
-        command: Ioctl,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> NvResult;
+    fn ioctl1(&self, fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult;
 
     /// Handles an ioctl2 request.
     fn ioctl2(
@@ -53,5 +49,15 @@ pub trait NvDevice {
     /// into the caller handle table. The Rust port returns the persistent readable event directly.
     fn query_event(&self, _event_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
         None
+    }
+
+    /// Rust-only adapter: records the owning guest process/scheduler for a queried persistent
+    /// event so asynchronous callbacks can wake the same waiters after the handle is copied.
+    fn register_query_event_owner(
+        &self,
+        _event_id: u32,
+        _process: Arc<Mutex<KProcess>>,
+        _scheduler: Arc<Mutex<KScheduler>>,
+    ) {
     }
 }

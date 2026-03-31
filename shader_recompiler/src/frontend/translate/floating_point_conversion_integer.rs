@@ -13,7 +13,7 @@ pub fn f2i(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let abs_src = bit(insn, 49);
     let neg_src = bit(insn, 45);
     let is_signed = bit(insn, 12);
-    let _dst_size = field(insn, 8, 2);  // 0=U8, 1=U16, 2=U32, 3=U64
+    let _dst_size = field(insn, 8, 2); // 0=U8, 1=U16, 2=U32, 3=U64
     let _src_size = field(insn, 10, 2); // 0=F16, 1=F32, 2=F64
     let _rounding = field(insn, 39, 2); // 0=RN, 1=RM, 2=RP, 3=RZ
 

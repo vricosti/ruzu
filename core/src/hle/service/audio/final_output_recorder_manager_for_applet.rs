@@ -21,10 +21,8 @@ pub struct IFinalOutputRecorderManagerForApplet {
 
 impl IFinalOutputRecorderManagerForApplet {
     pub fn new() -> Self {
-        let handlers = build_handler_map(&[
-            (0, None, "RequestSuspend"),
-            (1, None, "RequestResume"),
-        ]);
+        let handlers =
+            build_handler_map(&[(0, None, "RequestSuspend"), (1, None, "RequestResume")]);
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),

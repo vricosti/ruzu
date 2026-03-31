@@ -27,7 +27,11 @@ impl IManagerRootService {
             container,
             handlers: build_handler_map(&[
                 (2, Some(Self::get_display_service), "GetDisplayService"),
-                (3, Some(Self::get_display_service), "GetDisplayServiceWithProxyNameExchange"),
+                (
+                    3,
+                    Some(Self::get_display_service),
+                    "GetDisplayServiceWithProxyNameExchange",
+                ),
                 (100, None, "PrepareFatal"),
                 (101, None, "ShowFatal"),
                 (102, None, "DrawFatalRectangle"),
@@ -51,9 +55,10 @@ impl IManagerRootService {
 
         match service_creator::get_application_display_service(Permission::Manager, policy) {
             Ok(()) => {
-                let display_service = super::application_display_service::IApplicationDisplayService::new(
-                    Arc::clone(&root.container),
-                );
+                let display_service =
+                    super::application_display_service::IApplicationDisplayService::new(
+                        Arc::clone(&root.container),
+                    );
                 let sub: Arc<dyn SessionRequestHandler> = Arc::new(display_service);
                 super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
             }
@@ -76,7 +81,13 @@ impl SessionRequestHandler for IManagerRootService {
 }
 
 impl ServiceFramework for IManagerRootService {
-    fn get_service_name(&self) -> &str { "vi:m" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "vi:m"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }

@@ -11,16 +11,14 @@ use std::sync::{LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use log::{info, warn};
 
-use crate::settings_common::{
-    InputSetting, Setting, Specialization, SwitchableSetting,
-};
+use crate::settings_common::{InputSetting, Setting, Specialization, SwitchableSetting};
 
 // Re-export the types that consumers most commonly need.
 pub use crate::settings_enums::{
     AnisotropyMode, AntiAliasing, AppletMode, AspectRatio, AstcDecodeMode, AstcRecompression,
     AudioEngine, AudioMode, Category, ConfirmStop, ConsoleMode, CpuAccuracy, CpuBackend,
     FullscreenMode, GpuAccuracy, Language, MemoryLayout, NvdecEmulation, Region, RendererBackend,
-    ResolutionSetup, ScalingFilter, ShaderBackend, TimeZone, VramUsageMode, VSyncMode,
+    ResolutionSetup, ScalingFilter, ShaderBackend, TimeZone, VSyncMode, VramUsageMode,
 };
 pub use crate::settings_input::{
     AnalogsRaw, ButtonsRaw, PlayerInput, RingconRaw, TouchFromButtonMap, TouchscreenInput,
@@ -332,40 +330,161 @@ impl Default for Values {
 
         Self {
             // Applet
-            cabinet_applet_mode: Setting::new(AppletMode::LLE, "cabinet_applet_mode", LibraryApplet),
-            controller_applet_mode: Setting::new(AppletMode::HLE, "controller_applet_mode", LibraryApplet),
-            data_erase_applet_mode: Setting::new(AppletMode::HLE, "data_erase_applet_mode", LibraryApplet),
+            cabinet_applet_mode: Setting::new(
+                AppletMode::LLE,
+                "cabinet_applet_mode",
+                LibraryApplet,
+            ),
+            controller_applet_mode: Setting::new(
+                AppletMode::HLE,
+                "controller_applet_mode",
+                LibraryApplet,
+            ),
+            data_erase_applet_mode: Setting::new(
+                AppletMode::HLE,
+                "data_erase_applet_mode",
+                LibraryApplet,
+            ),
             error_applet_mode: Setting::new(AppletMode::LLE, "error_applet_mode", LibraryApplet),
-            net_connect_applet_mode: Setting::new(AppletMode::HLE, "net_connect_applet_mode", LibraryApplet),
-            player_select_applet_mode: Setting::new(AppletMode::HLE, "player_select_applet_mode", LibraryApplet),
+            net_connect_applet_mode: Setting::new(
+                AppletMode::HLE,
+                "net_connect_applet_mode",
+                LibraryApplet,
+            ),
+            player_select_applet_mode: Setting::new(
+                AppletMode::HLE,
+                "player_select_applet_mode",
+                LibraryApplet,
+            ),
             swkbd_applet_mode: Setting::new(AppletMode::LLE, "swkbd_applet_mode", LibraryApplet),
-            mii_edit_applet_mode: Setting::new(AppletMode::LLE, "mii_edit_applet_mode", LibraryApplet),
+            mii_edit_applet_mode: Setting::new(
+                AppletMode::LLE,
+                "mii_edit_applet_mode",
+                LibraryApplet,
+            ),
             web_applet_mode: Setting::new(AppletMode::HLE, "web_applet_mode", LibraryApplet),
             shop_applet_mode: Setting::new(AppletMode::HLE, "shop_applet_mode", LibraryApplet),
-            photo_viewer_applet_mode: Setting::new(AppletMode::LLE, "photo_viewer_applet_mode", LibraryApplet),
-            offline_web_applet_mode: Setting::new(AppletMode::LLE, "offline_web_applet_mode", LibraryApplet),
-            login_share_applet_mode: Setting::new(AppletMode::HLE, "login_share_applet_mode", LibraryApplet),
-            wifi_web_auth_applet_mode: Setting::new(AppletMode::HLE, "wifi_web_auth_applet_mode", LibraryApplet),
-            my_page_applet_mode: Setting::new(AppletMode::LLE, "my_page_applet_mode", LibraryApplet),
+            photo_viewer_applet_mode: Setting::new(
+                AppletMode::LLE,
+                "photo_viewer_applet_mode",
+                LibraryApplet,
+            ),
+            offline_web_applet_mode: Setting::new(
+                AppletMode::LLE,
+                "offline_web_applet_mode",
+                LibraryApplet,
+            ),
+            login_share_applet_mode: Setting::new(
+                AppletMode::HLE,
+                "login_share_applet_mode",
+                LibraryApplet,
+            ),
+            wifi_web_auth_applet_mode: Setting::new(
+                AppletMode::HLE,
+                "wifi_web_auth_applet_mode",
+                LibraryApplet,
+            ),
+            my_page_applet_mode: Setting::new(
+                AppletMode::LLE,
+                "my_page_applet_mode",
+                LibraryApplet,
+            ),
 
             // Audio
-            sink_id: SwitchableSetting::with_options(AudioEngine::Auto, "output_engine", Audio, Specialization::RUNTIME_LIST, true, false),
-            audio_output_device_id: SwitchableSetting::with_options("auto".to_string(), "output_device", Audio, Specialization::RUNTIME_LIST, true, false),
-            audio_input_device_id: SwitchableSetting::with_options("auto".to_string(), "input_device", Audio, Specialization::RUNTIME_LIST, true, false),
-            sound_index: SwitchableSetting::ranged(AudioMode::Stereo, AudioMode::Mono, AudioMode::Surround, "sound_index", SystemAudio),
-            volume: SwitchableSetting::ranged_with_options(100, 0, 200, "volume", Audio, Specialization::SCALAR | Specialization::PERCENTAGE, true, true),
-            audio_muted: Setting::with_options(false, "audio_muted", Audio, Specialization::DEFAULT, true, true),
+            sink_id: SwitchableSetting::with_options(
+                AudioEngine::Auto,
+                "output_engine",
+                Audio,
+                Specialization::RUNTIME_LIST,
+                true,
+                false,
+            ),
+            audio_output_device_id: SwitchableSetting::with_options(
+                "auto".to_string(),
+                "output_device",
+                Audio,
+                Specialization::RUNTIME_LIST,
+                true,
+                false,
+            ),
+            audio_input_device_id: SwitchableSetting::with_options(
+                "auto".to_string(),
+                "input_device",
+                Audio,
+                Specialization::RUNTIME_LIST,
+                true,
+                false,
+            ),
+            sound_index: SwitchableSetting::ranged(
+                AudioMode::Stereo,
+                AudioMode::Mono,
+                AudioMode::Surround,
+                "sound_index",
+                SystemAudio,
+            ),
+            volume: SwitchableSetting::ranged_with_options(
+                100,
+                0,
+                200,
+                "volume",
+                Audio,
+                Specialization::SCALAR | Specialization::PERCENTAGE,
+                true,
+                true,
+            ),
+            audio_muted: Setting::with_options(
+                false,
+                "audio_muted",
+                Audio,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
             dump_audio_commands: Setting::new(false, "dump_audio_commands", Audio),
 
             // Core
             use_multi_core: SwitchableSetting::new(true, "use_multi_core", Core),
-            memory_layout_mode: SwitchableSetting::ranged(MemoryLayout::Memory4Gb, MemoryLayout::Memory4Gb, MemoryLayout::Memory8Gb, "memory_layout_mode", Core),
-            use_speed_limit: SwitchableSetting::with_options(true, "use_speed_limit", Core, Specialization::PAIRED, false, true),
-            speed_limit: SwitchableSetting::ranged_with_options(100, 0, 9999, "speed_limit", Core, Specialization::COUNTABLE | Specialization::PERCENTAGE, true, true),
+            memory_layout_mode: SwitchableSetting::ranged(
+                MemoryLayout::Memory4Gb,
+                MemoryLayout::Memory4Gb,
+                MemoryLayout::Memory8Gb,
+                "memory_layout_mode",
+                Core,
+            ),
+            use_speed_limit: SwitchableSetting::with_options(
+                true,
+                "use_speed_limit",
+                Core,
+                Specialization::PAIRED,
+                false,
+                true,
+            ),
+            speed_limit: SwitchableSetting::ranged_with_options(
+                100,
+                0,
+                9999,
+                "speed_limit",
+                Core,
+                Specialization::COUNTABLE | Specialization::PERCENTAGE,
+                true,
+                true,
+            ),
 
             // CPU
-            cpu_backend: SwitchableSetting::ranged(CpuBackend::Dynarmic, CpuBackend::Dynarmic, CpuBackend::Dynarmic, "cpu_backend", Cpu),
-            cpu_accuracy: SwitchableSetting::ranged(CpuAccuracy::Auto, CpuAccuracy::Auto, CpuAccuracy::Paranoid, "cpu_accuracy", Cpu),
+            cpu_backend: SwitchableSetting::ranged(
+                CpuBackend::Dynarmic,
+                CpuBackend::Dynarmic,
+                CpuBackend::Dynarmic,
+                "cpu_backend",
+                Cpu,
+            ),
+            cpu_accuracy: SwitchableSetting::ranged(
+                CpuAccuracy::Auto,
+                CpuAccuracy::Auto,
+                CpuAccuracy::Paranoid,
+                "cpu_accuracy",
+                Cpu,
+            ),
             cpu_debug_mode: SwitchableSetting::new(false, "cpu_debug_mode", CpuDebug),
 
             cpuopt_page_tables: Setting::new(true, "cpuopt_page_tables", CpuDebug),
@@ -375,78 +494,371 @@ impl Default for Values {
             cpuopt_context_elimination: Setting::new(true, "cpuopt_context_elimination", CpuDebug),
             cpuopt_const_prop: Setting::new(true, "cpuopt_const_prop", CpuDebug),
             cpuopt_misc_ir: Setting::new(true, "cpuopt_misc_ir", CpuDebug),
-            cpuopt_reduce_misalign_checks: Setting::new(true, "cpuopt_reduce_misalign_checks", CpuDebug),
+            cpuopt_reduce_misalign_checks: Setting::new(
+                true,
+                "cpuopt_reduce_misalign_checks",
+                CpuDebug,
+            ),
             cpuopt_fastmem: SwitchableSetting::new(true, "cpuopt_fastmem", CpuDebug),
-            cpuopt_fastmem_exclusives: SwitchableSetting::new(true, "cpuopt_fastmem_exclusives", CpuDebug),
-            cpuopt_recompile_exclusives: Setting::new(true, "cpuopt_recompile_exclusives", CpuDebug),
-            cpuopt_ignore_memory_aborts: Setting::new(true, "cpuopt_ignore_memory_aborts", CpuDebug),
+            cpuopt_fastmem_exclusives: SwitchableSetting::new(
+                true,
+                "cpuopt_fastmem_exclusives",
+                CpuDebug,
+            ),
+            cpuopt_recompile_exclusives: Setting::new(
+                true,
+                "cpuopt_recompile_exclusives",
+                CpuDebug,
+            ),
+            cpuopt_ignore_memory_aborts: Setting::new(
+                true,
+                "cpuopt_ignore_memory_aborts",
+                CpuDebug,
+            ),
 
-            cpuopt_unsafe_unfuse_fma: SwitchableSetting::new(true, "cpuopt_unsafe_unfuse_fma", CpuUnsafe),
-            cpuopt_unsafe_reduce_fp_error: SwitchableSetting::new(true, "cpuopt_unsafe_reduce_fp_error", CpuUnsafe),
-            cpuopt_unsafe_ignore_standard_fpcr: SwitchableSetting::new(true, "cpuopt_unsafe_ignore_standard_fpcr", CpuUnsafe),
-            cpuopt_unsafe_inaccurate_nan: SwitchableSetting::new(true, "cpuopt_unsafe_inaccurate_nan", CpuUnsafe),
-            cpuopt_unsafe_fastmem_check: SwitchableSetting::new(true, "cpuopt_unsafe_fastmem_check", CpuUnsafe),
-            cpuopt_unsafe_ignore_global_monitor: SwitchableSetting::new(true, "cpuopt_unsafe_ignore_global_monitor", CpuUnsafe),
+            cpuopt_unsafe_unfuse_fma: SwitchableSetting::new(
+                true,
+                "cpuopt_unsafe_unfuse_fma",
+                CpuUnsafe,
+            ),
+            cpuopt_unsafe_reduce_fp_error: SwitchableSetting::new(
+                true,
+                "cpuopt_unsafe_reduce_fp_error",
+                CpuUnsafe,
+            ),
+            cpuopt_unsafe_ignore_standard_fpcr: SwitchableSetting::new(
+                true,
+                "cpuopt_unsafe_ignore_standard_fpcr",
+                CpuUnsafe,
+            ),
+            cpuopt_unsafe_inaccurate_nan: SwitchableSetting::new(
+                true,
+                "cpuopt_unsafe_inaccurate_nan",
+                CpuUnsafe,
+            ),
+            cpuopt_unsafe_fastmem_check: SwitchableSetting::new(
+                true,
+                "cpuopt_unsafe_fastmem_check",
+                CpuUnsafe,
+            ),
+            cpuopt_unsafe_ignore_global_monitor: SwitchableSetting::new(
+                true,
+                "cpuopt_unsafe_ignore_global_monitor",
+                CpuUnsafe,
+            ),
 
             // Renderer
-            renderer_backend: SwitchableSetting::ranged(RendererBackend::Vulkan, RendererBackend::OpenGL, RendererBackend::Null, "backend", Renderer),
-            shader_backend: SwitchableSetting::ranged_with_options(ShaderBackend::Glsl, ShaderBackend::Glsl, ShaderBackend::SpirV, "shader_backend", Renderer, Specialization::RUNTIME_LIST, true, false),
-            vulkan_device: SwitchableSetting::with_options(0, "vulkan_device", Renderer, Specialization::RUNTIME_LIST, true, false),
+            renderer_backend: SwitchableSetting::ranged(
+                RendererBackend::Vulkan,
+                RendererBackend::OpenGL,
+                RendererBackend::Null,
+                "backend",
+                Renderer,
+            ),
+            shader_backend: SwitchableSetting::ranged_with_options(
+                ShaderBackend::Glsl,
+                ShaderBackend::Glsl,
+                ShaderBackend::SpirV,
+                "shader_backend",
+                Renderer,
+                Specialization::RUNTIME_LIST,
+                true,
+                false,
+            ),
+            vulkan_device: SwitchableSetting::with_options(
+                0,
+                "vulkan_device",
+                Renderer,
+                Specialization::RUNTIME_LIST,
+                true,
+                false,
+            ),
 
             use_disk_shader_cache: SwitchableSetting::new(true, "use_disk_shader_cache", Renderer),
-            use_asynchronous_gpu_emulation: SwitchableSetting::new(true, "use_asynchronous_gpu_emulation", Renderer),
-            accelerate_astc: SwitchableSetting::ranged(AstcDecodeMode::Gpu, AstcDecodeMode::Cpu, AstcDecodeMode::CpuAsynchronous, "accelerate_astc", Renderer),
-            vsync_mode: SwitchableSetting::ranged_with_options(VSyncMode::Fifo, VSyncMode::Immediate, VSyncMode::FifoRelaxed, "use_vsync", Renderer, Specialization::RUNTIME_LIST, true, true),
-            nvdec_emulation: SwitchableSetting::new(NvdecEmulation::Gpu, "nvdec_emulation", Renderer),
-            fullscreen_mode: SwitchableSetting::ranged_with_options(FullscreenMode::Exclusive, FullscreenMode::Borderless, FullscreenMode::Exclusive, "fullscreen_mode", Renderer, Specialization::DEFAULT, true, true),
-            aspect_ratio: SwitchableSetting::ranged_with_options(AspectRatio::R16_9, AspectRatio::R16_9, AspectRatio::Stretch, "aspect_ratio", Renderer, Specialization::DEFAULT, true, true),
+            use_asynchronous_gpu_emulation: SwitchableSetting::new(
+                true,
+                "use_asynchronous_gpu_emulation",
+                Renderer,
+            ),
+            accelerate_astc: SwitchableSetting::ranged(
+                AstcDecodeMode::Gpu,
+                AstcDecodeMode::Cpu,
+                AstcDecodeMode::CpuAsynchronous,
+                "accelerate_astc",
+                Renderer,
+            ),
+            vsync_mode: SwitchableSetting::ranged_with_options(
+                VSyncMode::Fifo,
+                VSyncMode::Immediate,
+                VSyncMode::FifoRelaxed,
+                "use_vsync",
+                Renderer,
+                Specialization::RUNTIME_LIST,
+                true,
+                true,
+            ),
+            nvdec_emulation: SwitchableSetting::new(
+                NvdecEmulation::Gpu,
+                "nvdec_emulation",
+                Renderer,
+            ),
+            fullscreen_mode: SwitchableSetting::ranged_with_options(
+                FullscreenMode::Exclusive,
+                FullscreenMode::Borderless,
+                FullscreenMode::Exclusive,
+                "fullscreen_mode",
+                Renderer,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            aspect_ratio: SwitchableSetting::ranged_with_options(
+                AspectRatio::R16_9,
+                AspectRatio::R16_9,
+                AspectRatio::Stretch,
+                "aspect_ratio",
+                Renderer,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
 
             resolution_info: ResolutionScalingInfo::default(),
-            resolution_setup: SwitchableSetting::new(ResolutionSetup::Res1X, "resolution_setup", Renderer),
-            scaling_filter: SwitchableSetting::with_options(ScalingFilter::Bilinear, "scaling_filter", Renderer, Specialization::DEFAULT, true, true),
-            anti_aliasing: SwitchableSetting::with_options(AntiAliasing::None, "anti_aliasing", Renderer, Specialization::DEFAULT, true, true),
-            fsr_sharpening_slider: SwitchableSetting::ranged_with_options(25, 0, 200, "fsr_sharpening_slider", Renderer, Specialization::SCALAR | Specialization::PERCENTAGE, true, true),
+            resolution_setup: SwitchableSetting::new(
+                ResolutionSetup::Res1X,
+                "resolution_setup",
+                Renderer,
+            ),
+            scaling_filter: SwitchableSetting::with_options(
+                ScalingFilter::Bilinear,
+                "scaling_filter",
+                Renderer,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            anti_aliasing: SwitchableSetting::with_options(
+                AntiAliasing::None,
+                "anti_aliasing",
+                Renderer,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            fsr_sharpening_slider: SwitchableSetting::ranged_with_options(
+                25,
+                0,
+                200,
+                "fsr_sharpening_slider",
+                Renderer,
+                Specialization::SCALAR | Specialization::PERCENTAGE,
+                true,
+                true,
+            ),
 
-            bg_red: SwitchableSetting::with_options(0, "bg_red", Renderer, Specialization::DEFAULT, true, true),
-            bg_green: SwitchableSetting::with_options(0, "bg_green", Renderer, Specialization::DEFAULT, true, true),
-            bg_blue: SwitchableSetting::with_options(0, "bg_blue", Renderer, Specialization::DEFAULT, true, true),
+            bg_red: SwitchableSetting::with_options(
+                0,
+                "bg_red",
+                Renderer,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            bg_green: SwitchableSetting::with_options(
+                0,
+                "bg_green",
+                Renderer,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            bg_blue: SwitchableSetting::with_options(
+                0,
+                "bg_blue",
+                Renderer,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
 
             // Renderer Advanced
-            gpu_accuracy: SwitchableSetting::ranged_with_options(GpuAccuracy::High, GpuAccuracy::Normal, GpuAccuracy::Extreme, "gpu_accuracy", RendererAdvanced, Specialization::DEFAULT, true, true),
+            gpu_accuracy: SwitchableSetting::ranged_with_options(
+                GpuAccuracy::High,
+                GpuAccuracy::Normal,
+                GpuAccuracy::Extreme,
+                "gpu_accuracy",
+                RendererAdvanced,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
             current_gpu_accuracy: GpuAccuracy::High,
-            max_anisotropy: SwitchableSetting::ranged(AnisotropyMode::Automatic, AnisotropyMode::Automatic, AnisotropyMode::X16, "max_anisotropy", RendererAdvanced),
-            astc_recompression: SwitchableSetting::ranged(AstcRecompression::Uncompressed, AstcRecompression::Uncompressed, AstcRecompression::Bc3, "astc_recompression", RendererAdvanced),
-            vram_usage_mode: SwitchableSetting::ranged(VramUsageMode::Conservative, VramUsageMode::Conservative, VramUsageMode::Aggressive, "vram_usage_mode", RendererAdvanced),
-            async_presentation: SwitchableSetting::new(false, "async_presentation", RendererAdvanced),
-            renderer_force_max_clock: SwitchableSetting::new(false, "force_max_clock", RendererAdvanced),
-            use_reactive_flushing: SwitchableSetting::new(true, "use_reactive_flushing", RendererAdvanced),
-            use_asynchronous_shaders: SwitchableSetting::new(false, "use_asynchronous_shaders", RendererAdvanced),
-            use_fast_gpu_time: SwitchableSetting::with_options(true, "use_fast_gpu_time", RendererAdvanced, Specialization::DEFAULT, true, true),
-            use_vulkan_driver_pipeline_cache: SwitchableSetting::with_options(true, "use_vulkan_driver_pipeline_cache", RendererAdvanced, Specialization::DEFAULT, true, true),
-            enable_compute_pipelines: SwitchableSetting::new(false, "enable_compute_pipelines", RendererAdvanced),
-            use_video_framerate: SwitchableSetting::new(false, "use_video_framerate", RendererAdvanced),
-            barrier_feedback_loops: SwitchableSetting::new(true, "barrier_feedback_loops", RendererAdvanced),
+            max_anisotropy: SwitchableSetting::ranged(
+                AnisotropyMode::Automatic,
+                AnisotropyMode::Automatic,
+                AnisotropyMode::X16,
+                "max_anisotropy",
+                RendererAdvanced,
+            ),
+            astc_recompression: SwitchableSetting::ranged(
+                AstcRecompression::Uncompressed,
+                AstcRecompression::Uncompressed,
+                AstcRecompression::Bc3,
+                "astc_recompression",
+                RendererAdvanced,
+            ),
+            vram_usage_mode: SwitchableSetting::ranged(
+                VramUsageMode::Conservative,
+                VramUsageMode::Conservative,
+                VramUsageMode::Aggressive,
+                "vram_usage_mode",
+                RendererAdvanced,
+            ),
+            async_presentation: SwitchableSetting::new(
+                false,
+                "async_presentation",
+                RendererAdvanced,
+            ),
+            renderer_force_max_clock: SwitchableSetting::new(
+                false,
+                "force_max_clock",
+                RendererAdvanced,
+            ),
+            use_reactive_flushing: SwitchableSetting::new(
+                true,
+                "use_reactive_flushing",
+                RendererAdvanced,
+            ),
+            use_asynchronous_shaders: SwitchableSetting::new(
+                false,
+                "use_asynchronous_shaders",
+                RendererAdvanced,
+            ),
+            use_fast_gpu_time: SwitchableSetting::with_options(
+                true,
+                "use_fast_gpu_time",
+                RendererAdvanced,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            use_vulkan_driver_pipeline_cache: SwitchableSetting::with_options(
+                true,
+                "use_vulkan_driver_pipeline_cache",
+                RendererAdvanced,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            enable_compute_pipelines: SwitchableSetting::new(
+                false,
+                "enable_compute_pipelines",
+                RendererAdvanced,
+            ),
+            use_video_framerate: SwitchableSetting::new(
+                false,
+                "use_video_framerate",
+                RendererAdvanced,
+            ),
+            barrier_feedback_loops: SwitchableSetting::new(
+                true,
+                "barrier_feedback_loops",
+                RendererAdvanced,
+            ),
 
             // Renderer Debug
             renderer_debug: Setting::new(false, "debug", RendererDebug),
             renderer_shader_feedback: Setting::new(false, "shader_feedback", RendererDebug),
             enable_nsight_aftermath: Setting::new(false, "nsight_aftermath", RendererDebug),
-            disable_shader_loop_safety_checks: Setting::new(false, "disable_shader_loop_safety_checks", RendererDebug),
+            disable_shader_loop_safety_checks: Setting::new(
+                false,
+                "disable_shader_loop_safety_checks",
+                RendererDebug,
+            ),
             enable_renderdoc_hotkey: Setting::new(false, "renderdoc_hotkey", RendererDebug),
             disable_buffer_reorder: Setting::new(false, "disable_buffer_reorder", RendererDebug),
 
             // System
-            language_index: SwitchableSetting::ranged(Language::EnglishAmerican, Language::Japanese, Language::PortugueseBrazilian, "language_index", System),
-            region_index: SwitchableSetting::ranged(Region::Usa, Region::Japan, Region::Taiwan, "region_index", System),
-            time_zone_index: SwitchableSetting::ranged(TimeZone::Auto, TimeZone::Auto, TimeZone::Zulu, "time_zone_index", System),
-            custom_rtc_enabled: SwitchableSetting::with_options(false, "custom_rtc_enabled", System, Specialization::PAIRED, true, true),
-            custom_rtc: SwitchableSetting::with_options(0i64, "custom_rtc", System, Specialization::TIME, false, true),
-            custom_rtc_offset: SwitchableSetting::ranged_with_options(0i64, i32::MIN as i64, i32::MAX as i64, "custom_rtc_offset", System, Specialization::COUNTABLE, true, true),
-            rng_seed_enabled: SwitchableSetting::with_options(false, "rng_seed_enabled", System, Specialization::PAIRED, true, true),
-            rng_seed: SwitchableSetting::with_options(0u32, "rng_seed", System, Specialization::HEX, true, true),
-            device_name: Setting::with_options("yuzu".to_string(), "device_name", System, Specialization::DEFAULT, true, true),
+            language_index: SwitchableSetting::ranged(
+                Language::EnglishAmerican,
+                Language::Japanese,
+                Language::PortugueseBrazilian,
+                "language_index",
+                System,
+            ),
+            region_index: SwitchableSetting::ranged(
+                Region::Usa,
+                Region::Japan,
+                Region::Taiwan,
+                "region_index",
+                System,
+            ),
+            time_zone_index: SwitchableSetting::ranged(
+                TimeZone::Auto,
+                TimeZone::Auto,
+                TimeZone::Zulu,
+                "time_zone_index",
+                System,
+            ),
+            custom_rtc_enabled: SwitchableSetting::with_options(
+                false,
+                "custom_rtc_enabled",
+                System,
+                Specialization::PAIRED,
+                true,
+                true,
+            ),
+            custom_rtc: SwitchableSetting::with_options(
+                0i64,
+                "custom_rtc",
+                System,
+                Specialization::TIME,
+                false,
+                true,
+            ),
+            custom_rtc_offset: SwitchableSetting::ranged_with_options(
+                0i64,
+                i32::MIN as i64,
+                i32::MAX as i64,
+                "custom_rtc_offset",
+                System,
+                Specialization::COUNTABLE,
+                true,
+                true,
+            ),
+            rng_seed_enabled: SwitchableSetting::with_options(
+                false,
+                "rng_seed_enabled",
+                System,
+                Specialization::PAIRED,
+                true,
+                true,
+            ),
+            rng_seed: SwitchableSetting::with_options(
+                0u32,
+                "rng_seed",
+                System,
+                Specialization::HEX,
+                true,
+                true,
+            ),
+            device_name: Setting::with_options(
+                "yuzu".to_string(),
+                "device_name",
+                System,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
             current_user: Setting::new(0i32, "current_user", System),
-            use_docked_mode: SwitchableSetting::with_options(ConsoleMode::Docked, "use_docked_mode", System, Specialization::RADIO, true, true),
+            use_docked_mode: SwitchableSetting::with_options(
+                ConsoleMode::Docked,
+                "use_docked_mode",
+                System,
+                Specialization::RADIO,
+                true,
+                true,
+            ),
 
             // Linux
             enable_gamemode: SwitchableSetting::new(true, "enable_gamemode", Linux),
@@ -454,30 +866,88 @@ impl Default for Values {
             // Controls
             players: InputSetting::new(),
 
-            enable_raw_input: Setting::with_options(false, "enable_raw_input", Controls, Specialization::DEFAULT, false, false),
+            enable_raw_input: Setting::with_options(
+                false,
+                "enable_raw_input",
+                Controls,
+                Specialization::DEFAULT,
+                false,
+                false,
+            ),
             controller_navigation: Setting::new(true, "controller_navigation", Controls),
             enable_joycon_driver: Setting::new(true, "enable_joycon_driver", Controls),
             enable_procon_driver: Setting::new(false, "enable_procon_driver", Controls),
 
             vibration_enabled: SwitchableSetting::new(true, "vibration_enabled", Controls),
-            enable_accurate_vibrations: SwitchableSetting::new(false, "enable_accurate_vibrations", Controls),
+            enable_accurate_vibrations: SwitchableSetting::new(
+                false,
+                "enable_accurate_vibrations",
+                Controls,
+            ),
             motion_enabled: SwitchableSetting::new(true, "motion_enabled", Controls),
 
-            udp_input_servers: Setting::new("127.0.0.1:26760".to_string(), "udp_input_servers", Controls),
+            udp_input_servers: Setting::new(
+                "127.0.0.1:26760".to_string(),
+                "udp_input_servers",
+                Controls,
+            ),
             enable_udp_controller: Setting::new(false, "enable_udp_controller", Controls),
 
             pause_tas_on_load: Setting::new(true, "pause_tas_on_load", Controls),
             tas_enable: Setting::new(false, "tas_enable", Controls),
             tas_loop: Setting::new(false, "tas_loop", Controls),
 
-            mouse_panning: Setting::with_options(false, "mouse_panning", Controls, Specialization::DEFAULT, false, false),
-            mouse_panning_sensitivity: Setting::ranged(50, 1, 100, "mouse_panning_sensitivity", Controls),
+            mouse_panning: Setting::with_options(
+                false,
+                "mouse_panning",
+                Controls,
+                Specialization::DEFAULT,
+                false,
+                false,
+            ),
+            mouse_panning_sensitivity: Setting::ranged(
+                50,
+                1,
+                100,
+                "mouse_panning_sensitivity",
+                Controls,
+            ),
             mouse_enabled: Setting::new(false, "mouse_enabled", Controls),
-            mouse_panning_x_sensitivity: Setting::ranged(50, 1, 100, "mouse_panning_x_sensitivity", Controls),
-            mouse_panning_y_sensitivity: Setting::ranged(50, 1, 100, "mouse_panning_y_sensitivity", Controls),
-            mouse_panning_deadzone_counterweight: Setting::ranged(20, 0, 100, "mouse_panning_deadzone_counterweight", Controls),
-            mouse_panning_decay_strength: Setting::ranged(18, 0, 100, "mouse_panning_decay_strength", Controls),
-            mouse_panning_min_decay: Setting::ranged(6, 0, 100, "mouse_panning_min_decay", Controls),
+            mouse_panning_x_sensitivity: Setting::ranged(
+                50,
+                1,
+                100,
+                "mouse_panning_x_sensitivity",
+                Controls,
+            ),
+            mouse_panning_y_sensitivity: Setting::ranged(
+                50,
+                1,
+                100,
+                "mouse_panning_y_sensitivity",
+                Controls,
+            ),
+            mouse_panning_deadzone_counterweight: Setting::ranged(
+                20,
+                0,
+                100,
+                "mouse_panning_deadzone_counterweight",
+                Controls,
+            ),
+            mouse_panning_decay_strength: Setting::ranged(
+                18,
+                0,
+                100,
+                "mouse_panning_decay_strength",
+                Controls,
+            ),
+            mouse_panning_min_decay: Setting::ranged(
+                6,
+                0,
+                100,
+                "mouse_panning_min_decay",
+                Controls,
+            ),
 
             emulate_analog_keyboard: Setting::new(false, "emulate_analog_keyboard", Controls),
             keyboard_enabled: Setting::new(false, "keyboard_enabled", Controls),
@@ -487,7 +957,11 @@ impl Default for Values {
             debug_pad_analogs: Default::default(),
 
             touchscreen: TouchscreenInput::default(),
-            touch_device: Setting::new("min_x:100,min_y:50,max_x:1800,max_y:850".to_string(), "touch_device", Controls),
+            touch_device: Setting::new(
+                "min_x:100,min_y:50,max_x:1800,max_y:850".to_string(),
+                "touch_device",
+                Controls,
+            ),
             touch_from_button_map_index: Setting::new(0, "touch_from_button_map", Controls),
             touch_from_button_maps: Vec::new(),
 
@@ -512,16 +986,51 @@ impl Default for Values {
             program_args: Setting::new(String::new(), "program_args", Debugging),
             dump_exefs: Setting::new(false, "dump_exefs", Debugging),
             dump_nso: Setting::new(false, "dump_nso", Debugging),
-            dump_shaders: Setting::with_options(false, "dump_shaders", DebuggingGraphics, Specialization::DEFAULT, false, false),
-            dump_macros: Setting::with_options(false, "dump_macros", DebuggingGraphics, Specialization::DEFAULT, false, false),
+            dump_shaders: Setting::with_options(
+                false,
+                "dump_shaders",
+                DebuggingGraphics,
+                Specialization::DEFAULT,
+                false,
+                false,
+            ),
+            dump_macros: Setting::with_options(
+                false,
+                "dump_macros",
+                DebuggingGraphics,
+                Specialization::DEFAULT,
+                false,
+                false,
+            ),
             enable_fs_access_log: Setting::new(false, "enable_fs_access_log", Debugging),
-            reporting_services: Setting::with_options(false, "reporting_services", Debugging, Specialization::DEFAULT, false, false),
+            reporting_services: Setting::with_options(
+                false,
+                "reporting_services",
+                Debugging,
+                Specialization::DEFAULT,
+                false,
+                false,
+            ),
             quest_flag: Setting::new(false, "quest_flag", Debugging),
             disable_macro_jit: Setting::new(false, "disable_macro_jit", DebuggingGraphics),
             disable_macro_hle: Setting::new(false, "disable_macro_hle", DebuggingGraphics),
-            extended_logging: Setting::with_options(false, "extended_logging", Debugging, Specialization::DEFAULT, false, false),
+            extended_logging: Setting::with_options(
+                false,
+                "extended_logging",
+                Debugging,
+                Specialization::DEFAULT,
+                false,
+                false,
+            ),
             use_debug_asserts: Setting::new(false, "use_debug_asserts", Debugging),
-            use_auto_stub: Setting::with_options(false, "use_auto_stub", Debugging, Specialization::DEFAULT, false, false),
+            use_auto_stub: Setting::with_options(
+                false,
+                "use_auto_stub",
+                Debugging,
+                Specialization::DEFAULT,
+                false,
+                false,
+            ),
             enable_all_controllers: Setting::new(false, "enable_all_controllers", Debugging),
             perform_vulkan_check: Setting::new(true, "perform_vulkan_check", Debugging),
 
@@ -534,7 +1043,11 @@ impl Default for Values {
 
             // WebService
             enable_telemetry: Setting::new(true, "enable_telemetry", WebService),
-            web_api_url: Setting::new("https://api.yuzu-emu.org".to_string(), "web_api_url", WebService),
+            web_api_url: Setting::new(
+                "https://api.yuzu-emu.org".to_string(),
+                "web_api_url",
+                WebService,
+            ),
             yuzu_username: Setting::new(String::new(), "yuzu_username", WebService),
             yuzu_token: Setting::new(String::new(), "yuzu_token", WebService),
 
@@ -588,9 +1101,7 @@ pub fn set_nce_enabled(values: &Values, is_39bit: bool) {
         );
     }
     if is_nce_selected && !is_39bit {
-        warn!(
-            "Program does not utilize 39-bit address space, unable to natively execute code"
-        );
+        warn!("Program does not utilize 39-bit address space, unable to natively execute code");
     }
     IS_NCE_ENABLED.store(
         is_fastmem_enabled(values) && is_nce_selected && is_39bit,
@@ -767,15 +1278,24 @@ pub fn log_settings(values: &Values) {
     info!("  use_multi_core: {}", values.use_multi_core.get_value());
     info!("  cpu_accuracy: {:?}", values.cpu_accuracy.get_value());
     info!("  cpu_backend: {:?}", values.cpu_backend.get_value());
-    info!("  renderer_backend: {:?}", values.renderer_backend.get_value());
+    info!(
+        "  renderer_backend: {:?}",
+        values.renderer_backend.get_value()
+    );
     info!("  shader_backend: {:?}", values.shader_backend.get_value());
     info!("  vulkan_device: {}", values.vulkan_device.get_value());
     info!("  gpu_accuracy: {:?}", values.gpu_accuracy.get_value());
-    info!("  resolution_setup: {:?}", values.resolution_setup.get_value());
+    info!(
+        "  resolution_setup: {:?}",
+        values.resolution_setup.get_value()
+    );
     info!("  vsync_mode: {:?}", values.vsync_mode.get_value());
     info!("  language_index: {:?}", values.language_index.get_value());
     info!("  region_index: {:?}", values.region_index.get_value());
-    info!("  use_docked_mode: {:?}", values.use_docked_mode.get_value());
+    info!(
+        "  use_docked_mode: {:?}",
+        values.use_docked_mode.get_value()
+    );
     info!("  volume: {}", values.volume.get_value());
 }
 

@@ -25,8 +25,7 @@ pub const RESULT_DEBUG_HOOK_IN_USE: ResultCode =
 pub const RESULT_APPLICATION_RUNNING: ResultCode =
     ResultCode::from_module_description(ErrorModule::PM, 5);
 /// Upstream: `ResultInvalidSize{ErrorModule::PM, 6}`
-pub const RESULT_INVALID_SIZE: ResultCode =
-    ResultCode::from_module_description(ErrorModule::PM, 6);
+pub const RESULT_INVALID_SIZE: ResultCode = ResultCode::from_module_description(ErrorModule::PM, 6);
 
 /// Upstream: `NO_PROCESS_FOUND_PID`
 const NO_PROCESS_FOUND_PID: u64 = 0;
@@ -262,10 +261,7 @@ impl Info {
     ///
     /// Corresponds to `Info::GetProgramId` in upstream.
     pub fn get_program_id(&self, process_id: u64) -> Result<u64, ResultCode> {
-        log::debug!(
-            "Info::GetProgramId called, process_id={:016X}",
-            process_id
-        );
+        log::debug!("Info::GetProgramId called, process_id={:016X}", process_id);
 
         match search_process_list(&self.process_list, |p| p.process_id == process_id) {
             Some(p) => Ok(p.program_id),
@@ -320,8 +316,8 @@ impl Shell {
 ///
 /// Corresponds to `LoopProcess` in upstream `pm.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     let mut server_manager = ServerManager::new(system);
 
@@ -331,7 +327,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             name,
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
+                    &svc_name,
+                ))
             }),
             16,
         );
@@ -381,10 +379,7 @@ mod tests {
         let dm = DebugMonitor::with_process_list(make_test_process_list());
         assert_eq!(dm.get_process_id(0x0100000000001000), Ok(100));
         assert_eq!(dm.get_process_id(0x0100000000002000), Ok(200));
-        assert_eq!(
-            dm.get_process_id(0xDEAD),
-            Err(RESULT_PROCESS_NOT_FOUND)
-        );
+        assert_eq!(dm.get_process_id(0xDEAD), Err(RESULT_PROCESS_NOT_FOUND));
     }
 
     #[test]
@@ -406,10 +401,7 @@ mod tests {
     #[test]
     fn test_info_atmosphere_get_process_id() {
         let info = Info::with_process_list(make_test_process_list());
-        assert_eq!(
-            info.atmosphere_get_process_id(0x0100000000001000),
-            Ok(100)
-        );
+        assert_eq!(info.atmosphere_get_process_id(0x0100000000001000), Ok(100));
         assert_eq!(
             info.atmosphere_get_process_id(0xDEAD),
             Err(RESULT_PROCESS_NOT_FOUND)

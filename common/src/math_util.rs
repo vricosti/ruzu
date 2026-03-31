@@ -19,11 +19,7 @@ pub struct Rectangle<T> {
 
 impl<T> Rectangle<T>
 where
-    T: Copy
-        + Default
-        + PartialOrd
-        + core::ops::Sub<Output = T>
-        + core::ops::Add<Output = T>,
+    T: Copy + Default + PartialOrd + core::ops::Sub<Output = T> + core::ops::Add<Output = T>,
 {
     /// Create a new rectangle from width and height (left=0, top=0).
     #[inline]

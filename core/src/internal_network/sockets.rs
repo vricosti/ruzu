@@ -26,8 +26,12 @@ pub trait SocketBase: Send + Sync {
     fn shutdown(&mut self, how: ShutdownHow) -> Errno;
 
     fn recv(&mut self, flags: i32, message: &mut [u8]) -> (i32, Errno);
-    fn recv_from(&mut self, flags: i32, message: &mut [u8], addr: Option<&mut SockAddrIn>)
-        -> (i32, Errno);
+    fn recv_from(
+        &mut self,
+        flags: i32,
+        message: &mut [u8],
+        addr: Option<&mut SockAddrIn>,
+    ) -> (i32, Errno);
     fn send(&mut self, message: &[u8], flags: i32) -> (i32, Errno);
     fn send_to(&mut self, flags: u32, message: &[u8], addr: Option<&SockAddrIn>) -> (i32, Errno);
 
@@ -140,7 +144,6 @@ fn get_last_error() -> Errno {
         }
     }
 }
-
 
 impl Socket {
     pub fn new() -> Self {
@@ -471,12 +474,7 @@ impl SocketBase for Socket {
         }
     }
 
-    fn send_to(
-        &mut self,
-        flags: u32,
-        message: &[u8],
-        addr: Option<&SockAddrIn>,
-    ) -> (i32, Errno) {
+    fn send_to(&mut self, flags: u32, message: &[u8], addr: Option<&SockAddrIn>) -> (i32, Errno) {
         #[cfg(unix)]
         {
             let (p_addr, addrlen) = if let Some(a) = addr {

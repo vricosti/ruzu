@@ -7,8 +7,7 @@ use crate::hle::result::{ErrorModule, ResultCode};
 
 pub const RESULT_NO_DATA_IN_CHANNEL: ResultCode =
     ResultCode::from_module_description(ErrorModule::AM, 2);
-pub const RESULT_NO_MESSAGES: ResultCode =
-    ResultCode::from_module_description(ErrorModule::AM, 3);
+pub const RESULT_NO_MESSAGES: ResultCode = ResultCode::from_module_description(ErrorModule::AM, 3);
 pub const RESULT_LIBRARY_APPLET_TERMINATED: ResultCode =
     ResultCode::from_module_description(ErrorModule::AM, 22);
 pub const RESULT_INVALID_OFFSET: ResultCode =

@@ -45,8 +45,8 @@ pub unsafe fn deallocate_unsafe(ptr: *mut u8, size: usize) {
     if size == 0 {
         return;
     }
-    let layout = Layout::from_size_align(size, REQUIRED_ALIGNMENT)
-        .expect("Invalid layout for deallocation");
+    let layout =
+        Layout::from_size_align(size, REQUIRED_ALIGNMENT).expect("Invalid layout for deallocation");
     alloc::dealloc(ptr, layout);
 }
 

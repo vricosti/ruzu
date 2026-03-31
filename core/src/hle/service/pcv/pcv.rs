@@ -44,7 +44,9 @@ pub mod clkrst_session_commands {
 /// PCV service ("pcv"). All commands are unimplemented stubs.
 pub struct PCV;
 impl PCV {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 /// IClkrstSession.
@@ -62,7 +64,10 @@ impl IClkrstSession {
     }
 
     pub fn set_clock_rate(&mut self, clock_rate: u32) {
-        log::debug!("(STUBBED) IClkrstSession::set_clock_rate called, clock_rate={}", clock_rate);
+        log::debug!(
+            "(STUBBED) IClkrstSession::set_clock_rate called, clock_rate={}",
+            clock_rate
+        );
         self.clock_rate = clock_rate;
     }
 
@@ -97,15 +102,17 @@ impl CLKRST {
 /// CLKRST_A service ("clkrst:a"). All stubs.
 pub struct ClkrstA;
 impl ClkrstA {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 /// Registers "pcv", "clkrst", "clkrst:i", "clkrst:a" services.
 ///
 /// Corresponds to `LoopProcess` in upstream `pcv.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     let mut server_manager = ServerManager::new(system);
 
@@ -115,7 +122,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             name,
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
+                    &svc_name,
+                ))
             }),
             16,
         );

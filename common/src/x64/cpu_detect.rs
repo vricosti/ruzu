@@ -338,9 +338,7 @@ pub fn get_cpu_caps() -> &'static CpuCaps {
 pub fn get_processor_count() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
-        let thread_count = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .ok()?;
+        let thread_count = std::thread::available_parallelism().map(|n| n.get()).ok()?;
         // Read SMT status from sysfs
         let smt_state = std::fs::read_to_string("/sys/devices/system/cpu/smt/active").ok();
         match smt_state.as_deref().map(|s| s.trim()) {
@@ -355,9 +353,7 @@ pub fn get_processor_count() -> Option<usize> {
         // On Windows, use available_parallelism as a reasonable fallback.
         // The C++ code uses GetLogicalProcessorInformation to count physical cores;
         // the Rust standard library doesn't expose that directly.
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .ok()
+        std::thread::available_parallelism().map(|n| n.get()).ok()
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]

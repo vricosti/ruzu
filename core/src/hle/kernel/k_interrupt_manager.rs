@@ -57,7 +57,11 @@ pub fn handle_interrupt(kernel: &KernelCore, core_id: i32) {
                         // Upstream: process->PinCurrentThread();
                         {
                             let mut process = parent_arc.lock().unwrap();
-                            process.pin_current_thread(core_id, thread_id, is_termination_requested);
+                            process.pin_current_thread(
+                                core_id,
+                                thread_id,
+                                is_termination_requested,
+                            );
                         }
 
                         // Upstream: cur_thread->Pin(core_id)

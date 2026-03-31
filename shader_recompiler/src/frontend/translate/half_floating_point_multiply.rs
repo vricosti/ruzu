@@ -3,10 +3,10 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_multiply.cpp
 
-use super::{bit, field, TranslatorVisitor};
 use super::half_floating_point_helper::{
     extract, half_precision_to_fmz_mode, merge_result, HalfPrecision, Merge, Swizzle,
 };
+use super::{bit, field, TranslatorVisitor};
 use crate::ir::value::Value;
 
 /// Core HMUL2 implementation (inner `HMUL2` overloads from upstream).
@@ -24,7 +24,7 @@ fn hmul2_inner(
     src_b: Value,
     precision: HalfPrecision,
 ) {
-    let dest_reg  = field(insn, 0, 8);
+    let dest_reg = field(insn, 0, 8);
     let src_a_reg = field(insn, 8, 8);
     let src_a_val = tv.x(src_a_reg);
 
@@ -106,59 +106,100 @@ fn hmul2_inner(
 
 /// HMUL2_reg — source B from register.
 pub fn hmul2_reg(tv: &mut TranslatorVisitor, insn: u64) {
-    let sat       = bit(insn, 32);
-    let neg_b     = bit(insn, 31);
-    let abs_b     = bit(insn, 30);
-    let abs_a     = bit(insn, 44);
+    let sat = bit(insn, 32);
+    let neg_b = bit(insn, 31);
+    let abs_b = bit(insn, 30);
+    let abs_a = bit(insn, 44);
     let swizzle_b = Swizzle::from_u32(field(insn, 28, 2));
-    let merge     = Merge::from_u32(field(insn, 49, 2));
+    let merge = Merge::from_u32(field(insn, 49, 2));
     let swizzle_a = Swizzle::from_u32(field(insn, 47, 2));
     let precision = HalfPrecision::from_u32(field(insn, 39, 2));
-    let src_b     = tv.get_reg20(insn);
-    hmul2_inner(tv, insn, merge, sat, abs_a, false, swizzle_a, abs_b, neg_b, swizzle_b, src_b, precision);
+    let src_b = tv.get_reg20(insn);
+    hmul2_inner(
+        tv, insn, merge, sat, abs_a, false, swizzle_a, abs_b, neg_b, swizzle_b, src_b, precision,
+    );
 }
 
 /// HMUL2_cbuf — source B from constant buffer.
 pub fn hmul2_cbuf(tv: &mut TranslatorVisitor, insn: u64) {
-    let sat       = bit(insn, 52);
-    let abs_b     = bit(insn, 54);
-    let neg_a     = bit(insn, 43);
-    let abs_a     = bit(insn, 44);
-    let merge     = Merge::from_u32(field(insn, 49, 2));
+    let sat = bit(insn, 52);
+    let abs_b = bit(insn, 54);
+    let neg_a = bit(insn, 43);
+    let abs_a = bit(insn, 44);
+    let merge = Merge::from_u32(field(insn, 49, 2));
     let swizzle_a = Swizzle::from_u32(field(insn, 47, 2));
     let precision = HalfPrecision::from_u32(field(insn, 39, 2));
-    let src_b     = tv.get_cbuf(insn);
-    hmul2_inner(tv, insn, merge, sat, abs_a, neg_a, swizzle_a, abs_b, false, Swizzle::F32, src_b, precision);
+    let src_b = tv.get_cbuf(insn);
+    hmul2_inner(
+        tv,
+        insn,
+        merge,
+        sat,
+        abs_a,
+        neg_a,
+        swizzle_a,
+        abs_b,
+        false,
+        Swizzle::F32,
+        src_b,
+        precision,
+    );
 }
 
 /// HMUL2_imm — source B from 16-bit immediate pair.
 pub fn hmul2_imm(tv: &mut TranslatorVisitor, insn: u64) {
-    let sat      = bit(insn, 52);
+    let sat = bit(insn, 52);
     let neg_high = bit(insn, 56);
-    let high     = field(insn, 30, 9);
-    let neg_low  = bit(insn, 29);
-    let low      = field(insn, 20, 9);
-    let neg_a    = bit(insn, 43);
-    let abs_a    = bit(insn, 44);
+    let high = field(insn, 30, 9);
+    let neg_low = bit(insn, 29);
+    let low = field(insn, 20, 9);
+    let neg_a = bit(insn, 43);
+    let abs_a = bit(insn, 44);
     let imm: u32 = (low << 6)
-        | (if neg_low  { 1u32 } else { 0u32 } << 15)
+        | (if neg_low { 1u32 } else { 0u32 } << 15)
         | (high << 22)
         | (if neg_high { 1u32 } else { 0u32 } << 31);
-    let merge     = Merge::from_u32(field(insn, 49, 2));
+    let merge = Merge::from_u32(field(insn, 49, 2));
     let swizzle_a = Swizzle::from_u32(field(insn, 47, 2));
     let precision = HalfPrecision::from_u32(field(insn, 39, 2));
-    let src_b     = Value::ImmU32(imm);
-    hmul2_inner(tv, insn, merge, sat, abs_a, neg_a, swizzle_a, false, false, Swizzle::H1H0, src_b, precision);
+    let src_b = Value::ImmU32(imm);
+    hmul2_inner(
+        tv,
+        insn,
+        merge,
+        sat,
+        abs_a,
+        neg_a,
+        swizzle_a,
+        false,
+        false,
+        Swizzle::H1H0,
+        src_b,
+        precision,
+    );
 }
 
 /// HMUL2_32I — source B from 32-bit immediate.
 pub fn hmul2_32i(tv: &mut TranslatorVisitor, insn: u64) {
     let precision = HalfPrecision::from_u32(field(insn, 55, 2));
-    let sat       = bit(insn, 52);
+    let sat = bit(insn, 52);
     let swizzle_a = Swizzle::from_u32(field(insn, 53, 2));
-    let imm: u32  = field(insn, 20, 32);
-    let src_b     = Value::ImmU32(imm);
-    hmul2_inner(tv, insn, Merge::H1H0, sat, false, false, swizzle_a, false, false, Swizzle::H1H0, src_b, precision);
+    let imm: u32 = field(insn, 20, 32);
+    let src_b = Value::ImmU32(imm);
+    hmul2_inner(
+        tv,
+        insn,
+        Merge::H1H0,
+        sat,
+        false,
+        false,
+        swizzle_a,
+        false,
+        false,
+        Swizzle::H1H0,
+        src_b,
+        precision,
+    );
 }
 
 /// Public entry-point stub used when a single dispatch opcode covers HMUL2.

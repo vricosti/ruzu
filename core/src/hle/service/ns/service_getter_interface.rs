@@ -41,17 +41,61 @@ pub struct IServiceGetterInterface {
 impl IServiceGetterInterface {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (commands::GET_DYNAMIC_RIGHTS_INTERFACE, None, "GetDynamicRightsInterface"),
-            (commands::GET_READ_ONLY_APPLICATION_CONTROL_DATA_INTERFACE, None, "GetReadOnlyApplicationControlDataInterface"),
-            (commands::GET_READ_ONLY_APPLICATION_RECORD_INTERFACE, None, "GetReadOnlyApplicationRecordInterface"),
-            (commands::GET_ECOMMERCE_INTERFACE, None, "GetECommerceInterface"),
-            (commands::GET_APPLICATION_VERSION_INTERFACE, None, "GetApplicationVersionInterface"),
-            (commands::GET_FACTORY_RESET_INTERFACE, None, "GetFactoryResetInterface"),
-            (commands::GET_ACCOUNT_PROXY_INTERFACE, None, "GetAccountProxyInterface"),
-            (commands::GET_APPLICATION_MANAGER_INTERFACE, None, "GetApplicationManagerInterface"),
-            (commands::GET_DOWNLOAD_TASK_INTERFACE, None, "GetDownloadTaskInterface"),
-            (commands::GET_CONTENT_MANAGEMENT_INTERFACE, None, "GetContentManagementInterface"),
-            (commands::GET_DOCUMENT_INTERFACE, None, "GetDocumentInterface"),
+            (
+                commands::GET_DYNAMIC_RIGHTS_INTERFACE,
+                None,
+                "GetDynamicRightsInterface",
+            ),
+            (
+                commands::GET_READ_ONLY_APPLICATION_CONTROL_DATA_INTERFACE,
+                None,
+                "GetReadOnlyApplicationControlDataInterface",
+            ),
+            (
+                commands::GET_READ_ONLY_APPLICATION_RECORD_INTERFACE,
+                None,
+                "GetReadOnlyApplicationRecordInterface",
+            ),
+            (
+                commands::GET_ECOMMERCE_INTERFACE,
+                None,
+                "GetECommerceInterface",
+            ),
+            (
+                commands::GET_APPLICATION_VERSION_INTERFACE,
+                None,
+                "GetApplicationVersionInterface",
+            ),
+            (
+                commands::GET_FACTORY_RESET_INTERFACE,
+                None,
+                "GetFactoryResetInterface",
+            ),
+            (
+                commands::GET_ACCOUNT_PROXY_INTERFACE,
+                None,
+                "GetAccountProxyInterface",
+            ),
+            (
+                commands::GET_APPLICATION_MANAGER_INTERFACE,
+                None,
+                "GetApplicationManagerInterface",
+            ),
+            (
+                commands::GET_DOWNLOAD_TASK_INTERFACE,
+                None,
+                "GetDownloadTaskInterface",
+            ),
+            (
+                commands::GET_CONTENT_MANAGEMENT_INTERFACE,
+                None,
+                "GetContentManagementInterface",
+            ),
+            (
+                commands::GET_DOCUMENT_INTERFACE,
+                None,
+                "GetDocumentInterface",
+            ),
         ]);
         Self {
             handlers,
@@ -75,9 +119,7 @@ impl IServiceGetterInterface {
 
     /// GetReadOnlyApplicationRecordInterface (cmd 7991).
     pub fn get_read_only_application_record_interface(&self) {
-        log::debug!(
-            "IServiceGetterInterface::get_read_only_application_record_interface called"
-        );
+        log::debug!("IServiceGetterInterface::get_read_only_application_record_interface called");
         // Returns IReadOnlyApplicationRecordInterface.
     }
 
@@ -88,9 +130,7 @@ impl IServiceGetterInterface {
 
     /// GetApplicationVersionInterface (cmd 7993).
     pub fn get_application_version_interface(&self) {
-        log::debug!(
-            "IServiceGetterInterface::get_application_version_interface called"
-        );
+        log::debug!("IServiceGetterInterface::get_application_version_interface called");
     }
 
     /// GetFactoryResetInterface (cmd 7994).
@@ -105,9 +145,7 @@ impl IServiceGetterInterface {
 
     /// GetApplicationManagerInterface (cmd 7996).
     pub fn get_application_manager_interface(&self) {
-        log::debug!(
-            "IServiceGetterInterface::get_application_manager_interface called"
-        );
+        log::debug!("IServiceGetterInterface::get_application_manager_interface called");
     }
 
     /// GetDownloadTaskInterface (cmd 7997).
@@ -117,9 +155,7 @@ impl IServiceGetterInterface {
 
     /// GetContentManagementInterface (cmd 7998).
     pub fn get_content_management_interface(&self) {
-        log::debug!(
-            "IServiceGetterInterface::get_content_management_interface called"
-        );
+        log::debug!("IServiceGetterInterface::get_content_management_interface called");
     }
 
     /// GetDocumentInterface (cmd 7999).

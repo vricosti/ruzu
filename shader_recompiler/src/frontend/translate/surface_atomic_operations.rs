@@ -12,7 +12,10 @@ use super::TranslatorVisitor;
 /// Not yet implemented: requires surface atomic IR opcodes (ImageAtomicIAdd, etc.).
 /// Emits a no-op and logs a warning.
 pub fn suatom(tv: &mut TranslatorVisitor, insn: u64) {
-    log::warn!("SUATOM: surface atomic IR not yet ported — emitting no-op (insn={:#018x})", insn);
+    log::warn!(
+        "SUATOM: surface atomic IR not yet ported — emitting no-op (insn={:#018x})",
+        insn
+    );
     let dst = tv.dst_reg(insn);
     tv.set_x(dst, crate::ir::value::Value::ImmU32(0));
 }
@@ -22,5 +25,8 @@ pub fn suatom(tv: &mut TranslatorVisitor, insn: u64) {
 /// Not yet implemented: requires surface atomic IR opcodes.
 /// Emits a no-op and logs a warning.
 pub fn sured(_tv: &mut TranslatorVisitor, insn: u64) {
-    log::warn!("SURED: surface reduction IR not yet ported — emitting no-op (insn={:#018x})", insn);
+    log::warn!(
+        "SURED: surface reduction IR not yet ported — emitting no-op (insn={:#018x})",
+        insn
+    );
 }

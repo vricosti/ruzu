@@ -83,11 +83,7 @@ impl ParentalControlsApplet for DefaultParentalControlsApplet {
 ///
 /// Corresponds to upstream `Core::Frontend::PhotoViewerApplet`.
 pub trait PhotoViewerApplet: Applet {
-    fn show_photos_for_application(
-        &self,
-        title_id: u64,
-        finished: Box<dyn FnOnce() + Send>,
-    );
+    fn show_photos_for_application(&self, title_id: u64, finished: Box<dyn FnOnce() + Send>);
 
     fn show_all_photos(&self, finished: Box<dyn FnOnce() + Send>);
 }
@@ -102,11 +98,7 @@ impl Applet for DefaultPhotoViewerApplet {
 }
 
 impl PhotoViewerApplet for DefaultPhotoViewerApplet {
-    fn show_photos_for_application(
-        &self,
-        title_id: u64,
-        finished: Box<dyn FnOnce() + Send>,
-    ) {
+    fn show_photos_for_application(&self, title_id: u64, finished: Box<dyn FnOnce() + Send>) {
         log::info!(
             "Application requested frontend to display stored photos for title_id={:016X}",
             title_id

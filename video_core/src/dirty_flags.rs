@@ -76,5 +76,7 @@ pub fn setup_dirty_flags(tables: &mut DirtyTables) {
     // Each sub-function iterates over Maxwell3D::Regs offsets and calls fill_block_both.
     // Stubbed until the Maxwell3D register layout (Regs struct offsets) is ported.
     let _ = tables;
-    log::warn!("setup_dirty_flags: Maxwell3D register layout not ported, dirty table not configured");
+    log::warn!(
+        "setup_dirty_flags: Maxwell3D register layout not ported, dirty table not configured"
+    );
 }

@@ -90,20 +90,16 @@ impl NcaReader {
         assert!(self.body_storage.is_none());
 
         // We need to be able to generate keys.
-        let generate_key = crypto_cfg
-            .generate_key
-            .ok_or(RESULT_INVALID_ARGUMENT)?;
+        let generate_key = crypto_cfg.generate_key.ok_or(RESULT_INVALID_ARGUMENT)?;
 
         // Generate keys for header.
         use super::nca_file_system_driver::{KeyType, NcaCryptoConfiguration};
 
-        let header_key_type_values: [i32; NcaCryptoConfiguration::HEADER_ENCRYPTION_KEY_COUNT as usize] = [
-            KeyType::NCA_HEADER_KEY1,
-            KeyType::NCA_HEADER_KEY2,
-        ];
+        let header_key_type_values: [i32; NcaCryptoConfiguration::HEADER_ENCRYPTION_KEY_COUNT
+            as usize] = [KeyType::NCA_HEADER_KEY1, KeyType::NCA_HEADER_KEY2];
 
-        let mut header_decryption_keys =
-            [[0u8; NcaCryptoConfiguration::AES_128_KEY_SIZE]; NcaCryptoConfiguration::HEADER_ENCRYPTION_KEY_COUNT as usize];
+        let mut header_decryption_keys = [[0u8; NcaCryptoConfiguration::AES_128_KEY_SIZE];
+            NcaCryptoConfiguration::HEADER_ENCRYPTION_KEY_COUNT as usize];
         for i in 0..NcaCryptoConfiguration::HEADER_ENCRYPTION_KEY_COUNT as usize {
             generate_key(
                 &mut header_decryption_keys[i],
@@ -115,15 +111,14 @@ impl NcaReader {
         // Create the header storage (AES-XTS decrypted view).
         // In upstream, this creates an AesXtsStorage. We create it similarly.
         let header_iv = [0u8; super::aes_xts_storage::IV_SIZE];
-        let work_header_storage: VirtualFile = Arc::new(
-            super::aes_xts_storage::AesXtsStorage::new(
+        let work_header_storage: VirtualFile =
+            Arc::new(super::aes_xts_storage::AesXtsStorage::new(
                 base_storage.clone(),
                 &header_decryption_keys[0],
                 &header_decryption_keys[1],
                 &header_iv,
                 NcaHeader::XTS_BLOCK_SIZE,
-            ),
-        );
+            ));
 
         // Read the header.
         let mut header_bytes = vec![0u8; NcaHeader::SIZE];
@@ -185,11 +180,8 @@ impl NcaReader {
             };
             let msg = &header_raw[msg_offset..];
 
-            self.is_header_sign1_signature_valid = verify_sign1(
-                sig,
-                msg,
-                self.header.header1_signature_key_generation,
-            );
+            self.is_header_sign1_signature_valid =
+                verify_sign1(sig, msg, self.header.header1_signature_key_generation);
 
             if !self.is_header_sign1_signature_valid {
                 log::warn!("Invalid NCA header sign1");
@@ -202,8 +194,10 @@ impl NcaReader {
         }
 
         // Validate the key index.
-        if self.header.key_index >= NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT as u8
-            && self.header.key_index != NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_ZERO_KEY
+        if self.header.key_index
+            >= NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT as u8
+            && self.header.key_index
+                != NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_ZERO_KEY
         {
             return Err(RESULT_INVALID_NCA_KEY_INDEX);
         }
@@ -217,47 +211,68 @@ impl NcaReader {
             // AES-CTR key
             let ctr_offset = DECRYPTION_KEY_AES_CTR * AES_128_KEY_SIZE;
             let mut ctr_src = [0u8; AES_128_KEY_SIZE];
-            ctr_src.copy_from_slice(&self.header.encrypted_key_area[ctr_offset..ctr_offset + AES_128_KEY_SIZE]);
+            ctr_src.copy_from_slice(
+                &self.header.encrypted_key_area[ctr_offset..ctr_offset + AES_128_KEY_SIZE],
+            );
             generate_key(
                 &mut self.decryption_keys[DECRYPTION_KEY_AES_CTR],
                 &ctr_src,
-                super::nca_file_system_driver::get_key_type_value(self.header.key_index, key_generation),
+                super::nca_file_system_driver::get_key_type_value(
+                    self.header.key_index,
+                    key_generation,
+                ),
             );
 
             // AES-XTS key 1
             let xts1_offset = DECRYPTION_KEY_AES_XTS1 * AES_128_KEY_SIZE;
             let mut xts1_src = [0u8; AES_128_KEY_SIZE];
-            xts1_src.copy_from_slice(&self.header.encrypted_key_area[xts1_offset..xts1_offset + AES_128_KEY_SIZE]);
+            xts1_src.copy_from_slice(
+                &self.header.encrypted_key_area[xts1_offset..xts1_offset + AES_128_KEY_SIZE],
+            );
             generate_key(
                 &mut self.decryption_keys[DECRYPTION_KEY_AES_XTS1],
                 &xts1_src,
-                super::nca_file_system_driver::get_key_type_value(self.header.key_index, key_generation),
+                super::nca_file_system_driver::get_key_type_value(
+                    self.header.key_index,
+                    key_generation,
+                ),
             );
 
             // AES-XTS key 2
             let xts2_offset = DECRYPTION_KEY_AES_XTS2 * AES_128_KEY_SIZE;
             let mut xts2_src = [0u8; AES_128_KEY_SIZE];
-            xts2_src.copy_from_slice(&self.header.encrypted_key_area[xts2_offset..xts2_offset + AES_128_KEY_SIZE]);
+            xts2_src.copy_from_slice(
+                &self.header.encrypted_key_area[xts2_offset..xts2_offset + AES_128_KEY_SIZE],
+            );
             generate_key(
                 &mut self.decryption_keys[DECRYPTION_KEY_AES_XTS2],
                 &xts2_src,
-                super::nca_file_system_driver::get_key_type_value(self.header.key_index, key_generation),
+                super::nca_file_system_driver::get_key_type_value(
+                    self.header.key_index,
+                    key_generation,
+                ),
             );
 
             // AES-CTR-EX key
             let ctr_ex_offset = DECRYPTION_KEY_AES_CTR_EX * AES_128_KEY_SIZE;
             let mut ctr_ex_src = [0u8; AES_128_KEY_SIZE];
-            ctr_ex_src.copy_from_slice(&self.header.encrypted_key_area[ctr_ex_offset..ctr_ex_offset + AES_128_KEY_SIZE]);
+            ctr_ex_src.copy_from_slice(
+                &self.header.encrypted_key_area[ctr_ex_offset..ctr_ex_offset + AES_128_KEY_SIZE],
+            );
             generate_key(
                 &mut self.decryption_keys[DECRYPTION_KEY_AES_CTR_EX],
                 &ctr_ex_src,
-                super::nca_file_system_driver::get_key_type_value(self.header.key_index, key_generation),
+                super::nca_file_system_driver::get_key_type_value(
+                    self.header.key_index,
+                    key_generation,
+                ),
             );
 
             // Copy the hardware speed emulation key (not decrypted, just raw copy).
             let hw_offset = DECRYPTION_KEY_AES_CTR_HW * AES_128_KEY_SIZE;
-            self.decryption_keys[DECRYPTION_KEY_AES_CTR_HW]
-                .copy_from_slice(&self.header.encrypted_key_area[hw_offset..hw_offset + AES_128_KEY_SIZE]);
+            self.decryption_keys[DECRYPTION_KEY_AES_CTR_HW].copy_from_slice(
+                &self.header.encrypted_key_area[hw_offset..hw_offset + AES_128_KEY_SIZE],
+            );
         }
 
         // Log key derivation results.
@@ -432,8 +447,7 @@ impl NcaReader {
     /// Corresponds to upstream `NcaReader::GetEncryptedKey`.
     pub fn get_encrypted_key(&self, dst: &mut [u8]) {
         assert!(dst.len() >= NcaHeader::ENCRYPTED_KEY_AREA_SIZE);
-        dst[..NcaHeader::ENCRYPTED_KEY_AREA_SIZE]
-            .copy_from_slice(&self.header.encrypted_key_area);
+        dst[..NcaHeader::ENCRYPTED_KEY_AREA_SIZE].copy_from_slice(&self.header.encrypted_key_area);
     }
 
     /// Get a reference to a decryption key by index.
@@ -731,8 +745,7 @@ impl NcaFsHeaderReader {
     /// Corresponds to upstream `NcaFsHeaderReader::ExistsSparseMetaHashLayer`.
     pub fn exists_sparse_meta_hash_layer(&self) -> bool {
         assert!(self.is_initialized());
-        self.data.meta_data_hash_data_info.size.get() != 0
-            && self.exists_sparse_layer()
+        self.data.meta_data_hash_data_info.size.get() != 0 && self.exists_sparse_layer()
     }
 
     /// Get a reference to the sparse meta data hash data info.

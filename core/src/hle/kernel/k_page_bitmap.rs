@@ -219,10 +219,10 @@ impl KPageBitmap {
             for option in 0..options_per_storage {
                 if (s & free_mask) == free_mask {
                     num_valid_options += 1;
-                    if num_valid_options == 1 || self.rng.generate_random(num_valid_options as u64) == 0
+                    if num_valid_options == 1
+                        || self.rng.generate_random(num_valid_options as u64) == 0
                     {
-                        chosen_offset =
-                            (storage_index * BITS_PER_U64 + option * count) as i64;
+                        chosen_offset = (storage_index * BITS_PER_U64 + option * count) as i64;
                     }
                 }
                 s >>= count;

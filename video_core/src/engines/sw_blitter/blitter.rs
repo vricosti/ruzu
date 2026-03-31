@@ -28,18 +28,15 @@ fn nearest_neighbor(
     dst_height: u32,
     bpp: usize,
 ) {
-    let dx_du =
-        ((src_width as f64 / dst_width as f64) * ((1u64 << 32) as f64)).round() as usize;
-    let dy_dv =
-        ((src_height as f64 / dst_height as f64) * ((1u64 << 32) as f64)).round() as usize;
+    let dx_du = ((src_width as f64 / dst_width as f64) * ((1u64 << 32) as f64)).round() as usize;
+    let dy_dv = ((src_height as f64 / dst_height as f64) * ((1u64 << 32) as f64)).round() as usize;
     let mut src_y: usize = 0;
     for y in 0..dst_height as usize {
         let mut src_x: usize = 0;
         for x in 0..dst_width as usize {
             let read_from = ((src_y * src_width as usize + src_x) >> 32) * bpp;
             let write_to = (y * dst_width as usize + x) * bpp;
-            output[write_to..write_to + bpp]
-                .copy_from_slice(&input[read_from..read_from + bpp]);
+            output[write_to..write_to + bpp].copy_from_slice(&input[read_from..read_from + bpp]);
             src_x += dx_du;
         }
         src_y += dy_dv;
@@ -57,10 +54,8 @@ fn nearest_neighbor_fast(
     dst_width: u32,
     dst_height: u32,
 ) {
-    let dx_du =
-        ((src_width as f64 / dst_width as f64) * ((1u64 << 32) as f64)).round() as usize;
-    let dy_dv =
-        ((src_height as f64 / dst_height as f64) * ((1u64 << 32) as f64)).round() as usize;
+    let dx_du = ((src_width as f64 / dst_width as f64) * ((1u64 << 32) as f64)).round() as usize;
+    let dy_dv = ((src_height as f64 / dst_height as f64) * ((1u64 << 32) as f64)).round() as usize;
     let mut src_y: usize = 0;
     for y in 0..dst_height as usize {
         let mut src_x: usize = 0;
@@ -205,12 +200,7 @@ impl SoftwareBlitEngine {
     /// Stubbed — full implementation requires memory manager access to read/write surface
     /// pixels, surface format definitions, and texture decoder integration for format conversion.
     /// Upstream: SoftwareBlitEngine::Blit() in video_core/engines/sw_blitter/blitter.cpp
-    pub fn blit(
-        &mut self,
-        _src: &Surface,
-        _dst: &Surface,
-        _config: &BlitConfig,
-    ) -> bool {
+    pub fn blit(&mut self, _src: &Surface, _dst: &Surface, _config: &BlitConfig) -> bool {
         log::warn!("SoftwareBlitEngine::blit: not yet implemented (requires memory manager and format integration)");
         false
     }

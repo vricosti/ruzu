@@ -28,7 +28,12 @@ pub fn output_debug_string(system: &System, address: u64, len: u64) -> ResultCod
             String::new()
         }
     };
-    log::info!("OutputDebugString(addr=0x{:X}, len={}): {}", address, len, msg);
+    log::info!(
+        "OutputDebugString(addr=0x{:X}, len={}): {}",
+        address,
+        len,
+        msg
+    );
 
     RESULT_SUCCESS
 }

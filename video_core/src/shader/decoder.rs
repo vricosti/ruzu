@@ -307,7 +307,11 @@ impl PredicateGuard {
         } else {
             preds[self.index as usize]
         };
-        if self.negated { !val } else { val }
+        if self.negated {
+            !val
+        } else {
+            val
+        }
     }
 }
 
@@ -1884,9 +1888,12 @@ mod tests {
         assert_eq!(top16 & 0xFFF8, 0x5C98);
         let (decoded, _) = decode(insn);
         match decoded {
-            Instruction::Mov { dst, src_b: SrcB::Reg(r) } => {
+            Instruction::Mov {
+                dst,
+                src_b: SrcB::Reg(r),
+            } => {
                 assert_eq!(dst, 0); // R0 at bits [7:0]
-                // src_b reg at bits [27:20]
+                                    // src_b reg at bits [27:20]
             }
             _ => panic!("Expected Mov, got {:?}", decoded),
         }
@@ -1987,7 +1994,12 @@ mod tests {
         let insn: u64 = (0x5B00u64 << 48) | (3u64 << 39) | (2u64 << 20) | 0x0007_0100;
         let (decoded, _) = decode(insn);
         match decoded {
-            Instruction::Xmad { dst, src_a, src_b: SrcB::Reg(_), .. } => {
+            Instruction::Xmad {
+                dst,
+                src_a,
+                src_b: SrcB::Reg(_),
+                ..
+            } => {
                 assert_eq!(dst, 0);
                 assert_eq!(src_a, 1);
             }

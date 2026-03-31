@@ -135,12 +135,7 @@ impl DynarmicCP15 {
     /// Handle MRRC (read two words from coprocessor) operations.
     ///
     /// Corresponds to upstream `DynarmicCP15::CompileGetTwoWords`.
-    pub fn compile_get_two_words(
-        &self,
-        two: bool,
-        opc: u32,
-        crm: CoprocReg,
-    ) -> GetTwoWordsResult {
+    pub fn compile_get_two_words(&self, two: bool, opc: u32, crm: CoprocReg) -> GetTwoWordsResult {
         if !two && opc == 0 && crm == CoprocReg::C14 {
             // CNTPCT - return clock ticks
             return GetTwoWordsResult::Cntpct;

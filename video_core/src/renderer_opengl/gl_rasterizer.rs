@@ -12,15 +12,30 @@
 use log::debug;
 use std::sync::Arc;
 
+use common::settings;
+
+use super::gl_buffer_cache::BufferCacheParams as OpenGLBufferCacheParams;
 use super::gl_device::Device;
 use super::gl_fence_manager::{Fence, FenceManagerOpenGL};
+use crate::buffer_cache::buffer_cache::BufferCache as CommonBufferCache;
+use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::engines::maxwell_3d::DrawCall;
 use crate::engines::Framebuffer;
 use crate::fence_manager::FenceManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::query_cache::types::QueryPropertiesFlags;
+use crate::query_cache_top::QueryCacheLegacy;
 use crate::rasterizer::SoftwareRasterizer;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
+use crate::shader_cache::ShaderCache;
+use crate::texture_cache::texture_cache_base::TextureCacheBase;
+
+struct OpenGLDeviceTracker;
+static OPENGL_DEVICE_TRACKER: OpenGLDeviceTracker = OpenGLDeviceTracker;
+
+impl DeviceTracker for OpenGLDeviceTracker {
+    fn update_pages_cached_count(&self, _addr: u64, _size: u64, _delta: i32) {}
+}
 
 /// OpenGL rasterizer matching zuyu's `RasterizerOpenGL`.
 ///
@@ -31,8 +46,19 @@ pub struct RasterizerOpenGL {
     fence_manager: FenceManager<Fence>,
     frame_count: u64,
     num_queued_commands: u32,
+    has_written_global_memory: bool,
+    buffer_cache: CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker>,
+    texture_cache: TextureCacheBase,
+    shader_cache: ShaderCache,
+    query_cache: QueryCacheLegacy,
     invalidate_gpu_cache_callback: Option<Arc<dyn Fn() + Send + Sync>>,
 }
+
+// The OpenGL rasterizer is owned and used from the renderer thread. The newly restored
+// cache owners still contain backend trait-object slots that are not marked `Send`, but
+// this slice does not populate them yet. Matching the existing renderer ownership model,
+// we keep the type movable to the renderer thread.
+unsafe impl Send for RasterizerOpenGL {}
 
 impl RasterizerOpenGL {
     /// Create a new rasterizer. Must be called with a current GL context.
@@ -43,6 +69,11 @@ impl RasterizerOpenGL {
             fence_manager: FenceManager::new(),
             frame_count: 0,
             num_queued_commands: 0,
+            has_written_global_memory: false,
+            buffer_cache: CommonBufferCache::new(&OPENGL_DEVICE_TRACKER),
+            texture_cache: TextureCacheBase::new(),
+            shader_cache: ShaderCache::new(),
+            query_cache: QueryCacheLegacy::new(),
             invalidate_gpu_cache_callback: None,
         }
     }
@@ -55,16 +86,18 @@ impl RasterizerOpenGL {
             fence_manager: FenceManager::new(),
             frame_count: 0,
             num_queued_commands: 0,
+            has_written_global_memory: false,
+            buffer_cache: CommonBufferCache::new(&OPENGL_DEVICE_TRACKER),
+            texture_cache: TextureCacheBase::new(),
+            shader_cache: ShaderCache::new(),
+            query_cache: QueryCacheLegacy::new(),
             invalidate_gpu_cache_callback: None,
         }
     }
 
     /// Rust adaptation for upstream `RasterizerOpenGL::InvalidateGPUCache()`,
     /// which delegates to the owning `GPU`.
-    pub fn set_invalidate_gpu_cache_callback(
-        &mut self,
-        callback: Arc<dyn Fn() + Send + Sync>,
-    ) {
+    pub fn set_invalidate_gpu_cache_callback(&mut self, callback: Arc<dyn Fn() + Send + Sync>) {
         self.invalidate_gpu_cache_callback = Some(callback);
     }
 
@@ -89,8 +122,7 @@ impl RasterizerOpenGL {
             self.frame_count
         );
 
-        let write_backs: std::sync::Mutex<Vec<(u64, Vec<u8>)>> =
-            std::sync::Mutex::new(Vec::new());
+        let write_backs: std::sync::Mutex<Vec<(u64, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
         let gpu_write = |gpu_va: u64, data: &[u8]| {
             write_backs.lock().unwrap().push((gpu_va, data.to_vec()));
         };
@@ -221,12 +253,24 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn flush_all(&mut self) {
-        unsafe { gl::Flush(); }
+        unsafe {
+            gl::Flush();
+        }
     }
 
-    fn flush_region(&mut self, _addr: u64, _size: u64) {}
+    fn flush_region(&mut self, addr: u64, size: u64) {
+        if addr == 0 || size == 0 {
+            return;
+        }
+        self.texture_cache.download_memory(addr, size as usize);
+        self.buffer_cache.download_memory(addr, size);
+        self.query_cache.flush_region(addr, size as usize);
+    }
 
     fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+        // The Rust OpenGL port does not yet own the upstream lock/runtime graph needed
+        // for exact texture-cache flush area tracking. Keep the method conservative
+        // until `TextureCache` channel/runtime ownership reaches parity.
         false
     }
 
@@ -239,11 +283,34 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
     }
 
-    fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+    fn invalidate_region(&mut self, addr: u64, size: u64) {
+        if addr == 0 || size == 0 {
+            return;
+        }
+        self.texture_cache.write_memory(addr, size as usize);
+        self.buffer_cache.write_memory(addr, size);
+        self.shader_cache.invalidate_region(addr, size as usize);
+        self.query_cache.invalidate_region(addr, size as usize);
+    }
 
-    fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
+    fn on_cache_invalidation(&mut self, addr: u64, size: u64) {
+        if addr == 0 || size == 0 {
+            return;
+        }
+        self.texture_cache.write_memory(addr, size as usize);
+        self.buffer_cache.write_memory(addr, size);
+        self.shader_cache.on_cache_invalidation(addr, size as usize);
+    }
 
-    fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
+    fn on_cpu_write(&mut self, addr: u64, size: u64) -> bool {
+        if addr == 0 || size == 0 {
+            return false;
+        }
+        if self.buffer_cache.on_cpu_write(addr, size) {
+            return true;
+        }
+        self.texture_cache.write_memory(addr, size as usize);
+        self.shader_cache.invalidate_region(addr, size as usize);
         false
     }
 
@@ -253,11 +320,23 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
     }
 
-    fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
+    fn unmap_memory(&mut self, addr: u64, size: u64) {
+        if addr == 0 || size == 0 {
+            return;
+        }
+        self.texture_cache.unmap_memory(addr, size as usize);
+        self.buffer_cache.write_memory(addr, size);
+        self.shader_cache.on_cache_invalidation(addr, size as usize);
+    }
 
     fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
 
-    fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+    fn flush_and_invalidate_region(&mut self, addr: u64, size: u64) {
+        if settings::is_gpu_level_extreme(&settings::values()) {
+            self.flush_region(addr, size);
+        }
+        self.invalidate_region(addr, size);
+    }
 
     fn wait_for_idle(&mut self) {
         unsafe { gl::MemoryBarrier(gl::ALL_BARRIER_BITS) };
@@ -265,24 +344,36 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn fragment_barrier(&mut self) {
-        unsafe { gl::MemoryBarrier(gl::FRAMEBUFFER_BARRIER_BIT); }
+        unsafe {
+            gl::TextureBarrier();
+            gl::MemoryBarrier(gl::FRAMEBUFFER_BARRIER_BIT | gl::TEXTURE_FETCH_BARRIER_BIT);
+        }
     }
 
     fn tiled_cache_barrier(&mut self) {
-        unsafe { gl::MemoryBarrier(gl::FRAMEBUFFER_BARRIER_BIT); }
+        unsafe { gl::TextureBarrier() }
     }
 
     fn flush_commands(&mut self) {
         if self.num_queued_commands == 0 {
             return;
         }
-        unsafe { gl::Flush(); }
+        if self.has_written_global_memory {
+            self.has_written_global_memory = false;
+            unsafe { gl::MemoryBarrier(gl::BUFFER_UPDATE_BARRIER_BIT) };
+        }
+        unsafe {
+            gl::Flush();
+        }
         self.num_queued_commands = 0;
     }
 
     fn tick_frame(&mut self) {
         self.frame_count += 1;
+        self.num_queued_commands = 0;
         self.fence_manager.tick_frame();
+        self.texture_cache.tick_frame();
+        self.buffer_cache.tick_frame();
     }
 
     fn accelerate_surface_copy(&mut self) -> bool {
@@ -401,5 +492,17 @@ mod tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, 0x3000);
         assert_eq!(writes[0].1, 0xCAFE_BABEu32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn tick_frame_resets_queued_commands_like_upstream() {
+        let syncpoints = Arc::new(SyncpointManager::new());
+        let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
+        rast.num_queued_commands = 7;
+
+        rast.tick_frame();
+
+        assert_eq!(rast.num_queued_commands, 0);
+        assert_eq!(rast.frame_count, 1);
     }
 }

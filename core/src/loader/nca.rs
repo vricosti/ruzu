@@ -76,8 +76,7 @@ impl FileTypeIdentifier for AppLoaderNca {
     /// and check status + content type.
     fn identify_type(nca_file: &VirtualFile) -> FileType {
         let nca = NCA::new(nca_file.clone(), None);
-        if nca.get_status() == FsResultStatus::Success
-            && nca.get_type() == NCAContentType::Program
+        if nca.get_status() == FsResultStatus::Success && nca.get_type() == NCAContentType::Program
         {
             return FileType::NCA;
         }
@@ -176,10 +175,7 @@ impl AppLoader for AppLoaderNca {
     }
 
     /// Maps to upstream `AppLoader_NCA::VerifyIntegrity`.
-    fn verify_integrity(
-        &self,
-        progress_callback: &dyn Fn(usize, usize) -> bool,
-    ) -> ResultStatus {
+    fn verify_integrity(&self, progress_callback: &dyn Fn(usize, usize) -> bool) -> ResultStatus {
         let name = self.file.get_name();
 
         // We won't try to verify meta NCAs.
@@ -239,10 +235,7 @@ impl AppLoader for AppLoaderNca {
     }
 
     /// Maps to upstream `AppLoader_NCA::ReadRomFS`.
-    fn read_rom_fs(
-        &self,
-        out_file: &mut Option<VirtualFile>,
-    ) -> ResultStatus {
+    fn read_rom_fs(&self, out_file: &mut Option<VirtualFile>) -> ResultStatus {
         if self.nca.get_status() != FsResultStatus::Success {
             return ResultStatus::ErrorNotInitialized;
         }

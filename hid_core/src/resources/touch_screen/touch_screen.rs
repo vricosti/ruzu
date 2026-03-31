@@ -8,9 +8,9 @@ use std::sync::Mutex;
 use common::ResultCode;
 
 use crate::hid_types::TouchScreenConfigurationForNx;
-use crate::resources::touch_screen::touch_types::AutoPilotState;
-use crate::resources::touch_screen::touch_screen_resource::TouchResource;
 use crate::resources::touch_screen::touch_screen_driver::TouchScreenDriver;
+use crate::resources::touch_screen::touch_screen_resource::TouchResource;
+use crate::resources::touch_screen::touch_types::AutoPilotState;
 
 /// Handles touch requests from HID interfaces.
 /// Delegates all operations to TouchResource, with a mutex guard on each call.
@@ -41,11 +41,7 @@ impl TouchScreen {
     }
 
     /// Port of TouchScreen::Activate(u64 aruid).
-    pub fn activate_with_aruid(
-        &self,
-        resource: &mut TouchResource,
-        aruid: u64,
-    ) -> ResultCode {
+    pub fn activate_with_aruid(&self, resource: &mut TouchResource, aruid: u64) -> ResultCode {
         let _lock = self.mutex.lock().unwrap();
         resource.activate_touch_with_aruid(aruid)
     }
@@ -81,10 +77,7 @@ impl TouchScreen {
     }
 
     /// Port of TouchScreen::UnsetTouchScreenAutoPilotState.
-    pub fn unset_touch_screen_auto_pilot_state(
-        &self,
-        resource: &mut TouchResource,
-    ) -> ResultCode {
+    pub fn unset_touch_screen_auto_pilot_state(&self, resource: &mut TouchResource) -> ResultCode {
         let _lock = self.mutex.lock().unwrap();
         resource.unset_touch_screen_auto_pilot_state()
     }

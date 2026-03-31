@@ -212,9 +212,7 @@ impl TextureCacheRuntime {
 
     pub fn insert_upload_memory_barrier(&self) {
         unsafe {
-            gl::MemoryBarrier(
-                gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT,
-            );
+            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
     }
 }

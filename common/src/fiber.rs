@@ -156,7 +156,10 @@ fn dispatch_from_thread(mut target: Arc<Fiber>) {
             let context = if let Some(rewind_context) = target_imp.rewind_context.as_mut() {
                 rewind_context
             } else {
-                target_imp.context.as_mut().expect("Target fiber has no context")
+                target_imp
+                    .context
+                    .as_mut()
+                    .expect("Target fiber has no context")
             };
 
             match context.resume(()) {
@@ -385,8 +388,18 @@ mod tests {
                             let _ = j;
                         }
                         *tc2.results[idx].lock().unwrap() = result;
-                        let wf = tc2.work_fibers[idx].lock().unwrap().as_ref().unwrap().clone();
-                        let tf = tc2.thread_fibers[idx].lock().unwrap().as_ref().unwrap().clone();
+                        let wf = tc2.work_fibers[idx]
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .clone();
+                        let tf = tc2.thread_fibers[idx]
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .clone();
                         Fiber::yield_to(Arc::downgrade(&wf), &tf);
                     }));
                     *tc.work_fibers[i].lock().unwrap() = Some(Arc::clone(&work_fiber));

@@ -173,11 +173,7 @@ impl AppLoaderDeconstructedRomDirectory {
     /// Create a new deconstructed ROM directory loader from an ExeFS directory.
     ///
     /// Maps to upstream `AppLoader_DeconstructedRomDirectory(VirtualDir, bool, bool)`.
-    pub fn new_from_directory(
-        directory: VirtualDir,
-        override_update: bool,
-        is_hbl: bool,
-    ) -> Self {
+    pub fn new_from_directory(directory: VirtualDir, override_update: bool, is_hbl: bool) -> Self {
         let file = directory.get_file("main");
         Self {
             file,
@@ -241,7 +237,9 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
                 PfsResultStatus::ErrorBadNPDMHeader => ResultStatus::ErrorBadNPDMHeader,
                 PfsResultStatus::ErrorBadACIDHeader => ResultStatus::ErrorBadACIDHeader,
                 PfsResultStatus::ErrorBadACIHeader => ResultStatus::ErrorBadACIHeader,
-                PfsResultStatus::ErrorBadFileAccessControl => ResultStatus::ErrorBadFileAccessControl,
+                PfsResultStatus::ErrorBadFileAccessControl => {
+                    ResultStatus::ErrorBadFileAccessControl
+                }
                 PfsResultStatus::ErrorBadFileAccessHeader => ResultStatus::ErrorBadFileAccessHeader,
                 PfsResultStatus::ErrorBadKernelCapabilityDescriptors => {
                     ResultStatus::ErrorBadKernelCapabilityDescriptors

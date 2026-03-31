@@ -269,19 +269,25 @@ impl KMemoryBlockManager {
     /// Upstream: KPageTableBase::QueryInfoImpl calls
     /// m_memory_block_manager.FindBlock(address)->GetMemoryInfo().
     pub fn query_info(&self, address: usize) -> Option<KMemoryInfo> {
-        self.find_block(address).map(|block| block.get_memory_info())
+        self.find_block(address)
+            .map(|block| block.get_memory_info())
     }
 
     /// Dump all blocks in the tree for diagnostic purposes.
     pub fn dump_blocks(&self) {
-        log::info!("KMemoryBlockManager: {} blocks:", self.memory_block_tree.len());
+        log::info!(
+            "KMemoryBlockManager: {} blocks:",
+            self.memory_block_tree.len()
+        );
         for (_addr, block) in self.memory_block_tree.iter() {
             let info = block.get_memory_info();
             log::info!(
                 "  0x{:08X}..0x{:08X} ({:8} KB) state={:?} perm={:?}",
-                info.m_address, info.m_address + info.m_size,
+                info.m_address,
+                info.m_address + info.m_size,
                 info.m_size / 1024,
-                info.m_state, info.m_permission
+                info.m_state,
+                info.m_permission
             );
         }
     }
@@ -466,7 +472,8 @@ impl KMemoryBlockManager {
             block.split(&mut left_block, address);
             // left_block covers [original_start, address)
             // block now covers [address, original_end)
-            self.memory_block_tree.insert(left_block.get_address(), left_block);
+            self.memory_block_tree
+                .insert(left_block.get_address(), left_block);
             self.memory_block_tree.insert(block.get_address(), block);
         }
     }
@@ -538,8 +545,8 @@ impl KMemoryBlockManager {
                 // But we need to update our keys list.
                 // Since we consumed next_key, skip it.
                 i += 1; // advance past the merged key
-                         // Try merging cur with the new next (if any).
-                         // We handle this by just continuing the loop with updated i.
+                        // Try merging cur with the new next (if any).
+                        // We handle this by just continuing the loop with updated i.
             } else {
                 i += 1;
             }

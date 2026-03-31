@@ -235,10 +235,7 @@ impl CommandProcessor {
     }
 
     /// Execute pending memory operations on all engines (blit, DMA copy, etc.).
-    pub fn execute_pending_ops(
-        &mut self,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-    ) -> Vec<PendingWrite> {
+    pub fn execute_pending_ops(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         self.engines
             .iter_mut()
             .filter_map(|e| e.as_mut())
@@ -301,10 +298,7 @@ mod tests {
         fn write_reg(&mut self, method: u32, value: u32) {
             self.writes.push((method, value));
         }
-        fn execute_pending(
-            &mut self,
-            _read_gpu: &dyn Fn(u64, &mut [u8]),
-        ) -> Vec<PendingWrite> {
+        fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
             std::mem::take(&mut self.mock_pending)
         }
     }

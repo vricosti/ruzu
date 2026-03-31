@@ -114,9 +114,9 @@ mod tests {
         assert_eq!(guess_block_height_log2(720), 4); // 128 <= 720
         assert_eq!(guess_block_height_log2(768), 4);
         assert_eq!(guess_block_height_log2(1080), 4);
-        assert_eq!(guess_block_height_log2(64), 3);  // 64 <= 64
-        assert_eq!(guess_block_height_log2(32), 2);  // 32 <= 32
-        assert_eq!(guess_block_height_log2(8), 0);   // 8 <= 8
+        assert_eq!(guess_block_height_log2(64), 3); // 64 <= 64
+        assert_eq!(guess_block_height_log2(32), 2); // 32 <= 32
+        assert_eq!(guess_block_height_log2(8), 0); // 8 <= 8
     }
 
     #[test]

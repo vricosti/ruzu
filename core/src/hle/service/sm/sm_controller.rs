@@ -65,35 +65,22 @@ impl Controller {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let controller =
-            unsafe { &*(this as *const dyn ServiceFramework as *const Controller) };
+        let controller = unsafe { &*(this as *const dyn ServiceFramework as *const Controller) };
         controller.convert_current_object_to_domain(ctx);
     }
 
-    fn clone_current_object_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let controller =
-            unsafe { &*(this as *const dyn ServiceFramework as *const Controller) };
+    fn clone_current_object_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let controller = unsafe { &*(this as *const dyn ServiceFramework as *const Controller) };
         controller.clone_current_object(ctx);
     }
 
-    fn query_pointer_buffer_size_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let controller =
-            unsafe { &*(this as *const dyn ServiceFramework as *const Controller) };
+    fn query_pointer_buffer_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let controller = unsafe { &*(this as *const dyn ServiceFramework as *const Controller) };
         controller.query_pointer_buffer_size(ctx);
     }
 
-    fn clone_current_object_ex_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let controller =
-            unsafe { &*(this as *const dyn ServiceFramework as *const Controller) };
+    fn clone_current_object_ex_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let controller = unsafe { &*(this as *const dyn ServiceFramework as *const Controller) };
         controller.clone_current_object_ex(ctx);
     }
 
@@ -108,10 +95,7 @@ impl Controller {
         log::debug!("Controller::ConvertCurrentObjectToDomain called");
 
         if let Some(manager) = ctx.get_manager() {
-            manager
-                .lock()
-                .unwrap()
-                .convert_to_domain_on_request_end();
+            manager.lock().unwrap().convert_to_domain_on_request_end();
         }
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -145,10 +129,8 @@ impl Controller {
             session_handle
         );
 
-        let mut rb = ResponseBuilder::new_with_flags(
-            ctx, 2, 0, 1,
-            ResponseBuilderFlags::AlwaysMoveHandles,
-        );
+        let mut rb =
+            ResponseBuilder::new_with_flags(ctx, 2, 0, 1, ResponseBuilderFlags::AlwaysMoveHandles);
         rb.push_result(RESULT_SUCCESS);
         rb.push_move_objects(session_handle);
     }

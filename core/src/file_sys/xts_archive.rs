@@ -236,8 +236,9 @@ impl Nax {
         // Upstream: self.dec_file = make_shared<XTSEncryptionLayer>(enc_file, final_key);
         // Bridge the file_sys VirtualFile to crypto VirtualFile via FsVfsFileAdapter,
         // then wrap in XtsEncryptionLayer which implements file_sys::vfs::VfsFile.
-        let crypto_file: crate::crypto::encryption_layer::VirtualFile =
-            Arc::new(crate::crypto::encryption_layer::FsVfsFileAdapter::new(enc_file));
+        let crypto_file: crate::crypto::encryption_layer::VirtualFile = Arc::new(
+            crate::crypto::encryption_layer::FsVfsFileAdapter::new(enc_file),
+        );
         self.dec_file = Some(Arc::new(XtsEncryptionLayer::new(crypto_file, final_key))
             as std::sync::Arc<dyn crate::file_sys::vfs::vfs::VfsFile>);
 

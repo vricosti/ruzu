@@ -6,8 +6,8 @@
 //!
 //! DatabaseManager: manages the Mii database file lifecycle.
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::mii_database::{NintendoFigurineDatabase, MAX_MII_COUNT};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// DatabaseManager handles loading, saving, and querying the Mii database.
 pub struct DatabaseManager {
@@ -74,9 +74,7 @@ impl DatabaseManager {
     /// yet wired for Mii save data. When available, serialize self.database
     /// to the save file here.
     pub fn save_database(&mut self) -> ResultCode {
-        log::debug!(
-            "DatabaseManager::save_database: filesystem save not yet wired, marking clean"
-        );
+        log::debug!("DatabaseManager::save_database: filesystem save not yet wired, marking clean");
         self.is_dirty = false;
         RESULT_SUCCESS
     }

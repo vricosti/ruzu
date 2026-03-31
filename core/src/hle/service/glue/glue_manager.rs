@@ -4,9 +4,9 @@
 //! Port of zuyu/src/core/hle/service/glue/glue_manager.h
 //! Port of zuyu/src/core/hle/service/glue/glue_manager.cpp
 
-use std::collections::BTreeMap;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::errors;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use std::collections::BTreeMap;
 
 /// ApplicationLaunchProperty corresponds to upstream `ApplicationLaunchProperty` in `glue_manager.h`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -41,7 +41,10 @@ impl ARPManager {
         }
     }
 
-    pub fn get_launch_property(&self, title_id: u64) -> (ResultCode, Option<ApplicationLaunchProperty>) {
+    pub fn get_launch_property(
+        &self,
+        title_id: u64,
+    ) -> (ResultCode, Option<ApplicationLaunchProperty>) {
         if title_id == 0 {
             return (errors::RESULT_INVALID_PROCESS_ID, None);
         }

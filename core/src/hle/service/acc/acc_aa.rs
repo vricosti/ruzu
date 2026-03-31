@@ -17,7 +17,7 @@ pub mod commands {
     pub const ENSURE_CACHE_ASYNC: u32 = 0;
     pub const LOAD_CACHE: u32 = 1;
     pub const GET_DEVICE_ACCOUNT_ID: u32 = 2;
-    pub const REGISTER_NOTIFICATION_TOKEN_ASYNC: u32 = 50;  // 1.0.0 - 6.2.0
+    pub const REGISTER_NOTIFICATION_TOKEN_ASYNC: u32 = 50; // 1.0.0 - 6.2.0
     pub const UNREGISTER_NOTIFICATION_TOKEN_ASYNC: u32 = 51; // 1.0.0 - 6.2.0
 }
 

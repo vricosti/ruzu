@@ -91,25 +91,35 @@ impl FileSystemController {
 
     /// Get the System NAND RegisteredCache.
     /// Upstream: `FileSystemController::GetSystemNANDContents()`.
-    pub fn get_system_nand_contents(&self) -> Option<&crate::file_sys::registered_cache::RegisteredCache> {
+    pub fn get_system_nand_contents(
+        &self,
+    ) -> Option<&crate::file_sys::registered_cache::RegisteredCache> {
         self.bis_factory.as_ref()?.get_system_nand_contents()
     }
 
     /// Get the User NAND RegisteredCache.
     /// Upstream: `FileSystemController::GetUserNANDContents()`.
-    pub fn get_user_nand_contents(&self) -> Option<&crate::file_sys::registered_cache::RegisteredCache> {
+    pub fn get_user_nand_contents(
+        &self,
+    ) -> Option<&crate::file_sys::registered_cache::RegisteredCache> {
         self.bis_factory.as_ref()?.get_user_nand_contents()
     }
 
     /// Get the System NAND content directory.
     /// Upstream: `FileSystemController::GetSystemNANDContentDirectory()`.
-    pub fn get_system_nand_content_directory(&self) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
-        self.bis_factory.as_ref()?.get_system_nand_content_directory()
+    pub fn get_system_nand_content_directory(
+        &self,
+    ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+        self.bis_factory
+            .as_ref()?
+            .get_system_nand_content_directory()
     }
 
     /// Get the User NAND content directory.
     /// Upstream: `FileSystemController::GetUserNANDContentDirectory()`.
-    pub fn get_user_nand_content_directory(&self) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+    pub fn get_user_nand_content_directory(
+        &self,
+    ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
         self.bis_factory.as_ref()?.get_user_nand_content_directory()
     }
 
@@ -126,14 +136,18 @@ impl FileSystemController {
     ) -> u32 {
         let save_data_factory = self.create_save_data_factory(program_id);
         let mut registrations = self.registrations.lock().unwrap();
-        registrations.insert(process_id, Registration {
-            program_id,
-            romfs_factory,
-            save_data_factory,
-        });
+        registrations.insert(
+            process_id,
+            Registration {
+                program_id,
+                romfs_factory,
+                save_data_factory,
+            },
+        );
         log::debug!(
             "FileSystemController::RegisterProcess: process_id={:#x}, program_id={:#018x}",
-            process_id, program_id,
+            process_id,
+            program_id,
         );
         RESULT_SUCCESS.get_inner_value()
     }
@@ -159,9 +173,10 @@ impl FileSystemController {
             None => super::save_data_controller::SaveDataController::new(),
         };
         let romfs_controller = match &reg.romfs_factory {
-            Some(factory) => {
-                super::romfs_controller::RomFsController::with_factory(reg.program_id, factory.clone())
-            }
+            Some(factory) => super::romfs_controller::RomFsController::with_factory(
+                reg.program_id,
+                factory.clone(),
+            ),
             None => super::romfs_controller::RomFsController::new(reg.program_id),
         };
         Some((reg.program_id, save_data_controller, romfs_controller))
@@ -170,7 +185,10 @@ impl FileSystemController {
     /// Port of upstream `FileSystemController::CreateSaveDataFactory` (filesystem.cpp:347-357).
     ///
     /// Creates a SaveDataFactory for the given program_id using the NAND save directory.
-    fn create_save_data_factory(&self, program_id: ProgramId) -> Option<Arc<Mutex<SaveDataFactory>>> {
+    fn create_save_data_factory(
+        &self,
+        program_id: ProgramId,
+    ) -> Option<Arc<Mutex<SaveDataFactory>>> {
         use crate::file_sys::fs_filesystem::OpenMode;
         use common::fs::path_util::{get_ruzu_path_string, RuzuPath};
 
@@ -178,40 +196,58 @@ impl FileSystemController {
         //           auto nand_directory = vfs->OpenDirectory(NANDDir, ReadWrite);
         let vfs = self.vfs.as_ref()?;
         let nand_path = get_ruzu_path_string(RuzuPath::NANDDir);
-        let nand_directory: VirtualDir = Arc::new(
-            crate::file_sys::vfs::vfs_real::RealVfsDirectory::new(
+        let nand_directory: VirtualDir =
+            Arc::new(crate::file_sys::vfs::vfs_real::RealVfsDirectory::new(
                 vfs.clone(),
                 nand_path,
                 OpenMode::READ_WRITE,
-            ),
-        );
-        Some(Arc::new(Mutex::new(SaveDataFactory::new(program_id, nand_directory))))
+            ));
+        Some(Arc::new(Mutex::new(SaveDataFactory::new(
+            program_id,
+            nand_directory,
+        ))))
     }
 
     /// Get modification load root for a given title.
     /// Upstream: `FileSystemController::GetModificationLoadRoot`.
-    pub fn get_modification_load_root(&self, title_id: u64) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+    pub fn get_modification_load_root(
+        &self,
+        title_id: u64,
+    ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
         log::trace!("Opening mod load root for tid={:016X}", title_id);
-        self.bis_factory.as_ref()?.get_modification_load_root(title_id)
+        self.bis_factory
+            .as_ref()?
+            .get_modification_load_root(title_id)
     }
 
     /// Get SDMC modification load root for a given title.
     /// Upstream: `FileSystemController::GetSDMCModificationLoadRoot`.
-    pub fn get_sdmc_modification_load_root(&self, _title_id: u64) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+    pub fn get_sdmc_modification_load_root(
+        &self,
+        _title_id: u64,
+    ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
         // Upstream delegates to sdmc_factory which is not yet ported.
         None
     }
 
     /// Get modification dump root for a given title.
     /// Upstream: `FileSystemController::GetModificationDumpRoot`.
-    pub fn get_modification_dump_root(&self, title_id: u64) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+    pub fn get_modification_dump_root(
+        &self,
+        title_id: u64,
+    ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
         log::trace!("Opening mod dump root for tid={:016X}", title_id);
-        self.bis_factory.as_ref()?.get_modification_dump_root(title_id)
+        self.bis_factory
+            .as_ref()?
+            .get_modification_dump_root(title_id)
     }
 
     /// Get BCAT directory for a given title.
     /// Upstream: `FileSystemController::GetBCATDirectory`.
-    pub fn get_bcat_directory(&self, title_id: u64) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+    pub fn get_bcat_directory(
+        &self,
+        title_id: u64,
+    ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
         log::trace!("Opening BCAT root for tid={:016X}", title_id);
         self.bis_factory.as_ref()?.get_bcat_directory(title_id)
     }
@@ -384,10 +420,7 @@ impl VfsDirectoryServiceWrapper {
             if let Some(ref dst) = dst {
                 let full_path = dst.get_full_path();
                 if std::path::Path::new(&full_path).exists() {
-                    log::error!(
-                        "File at new_path={} already exists",
-                        full_path
-                    );
+                    log::error!("File at new_path={} already exists", full_path);
                     return Err(errors::RESULT_PATH_ALREADY_EXISTS);
                 }
             }
@@ -417,9 +450,7 @@ impl VfsDirectoryServiceWrapper {
         );
 
         let src_filename = path_util::get_filename(&src_path);
-        let src_dir = src
-            .get_containing_directory()
-            .ok_or(RESULT_UNKNOWN)?;
+        let src_dir = src.get_containing_directory().ok_or(RESULT_UNKNOWN)?;
         if !src_dir.delete_file(src_filename) {
             // Upstream TODO(DarkLordZach): Find a better error code for this
             return Err(RESULT_UNKNOWN);
@@ -465,12 +496,7 @@ impl VfsDirectoryServiceWrapper {
 
         if mode == OpenMode::ALLOW_APPEND {
             let size = file.get_size();
-            Ok(Arc::new(OffsetVfsFile::new(
-                file,
-                size,
-                0,
-                String::new(),
-            )))
+            Ok(Arc::new(OffsetVfsFile::new(file, size, 0, String::new())))
         } else {
             Ok(file)
         }
@@ -539,28 +565,25 @@ pub fn register_services(
     system: crate::core::SystemRef,
     fsc: Arc<Mutex<FileSystemController>>,
 ) {
-    let mut server_manager =
-        crate::hle::service::server_manager::ServerManager::new(system);
+    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(system);
 
     server_manager.register_named_service(
         "fsp-ldr",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(super::fsp::fsp_ldr::FspLdr::new())
-        }),
+        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(super::fsp::fsp_ldr::FspLdr::new()) }),
         64,
     );
     server_manager.register_named_service(
         "fsp:pr",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(super::fsp::fsp_pr::FspPr::new())
-        }),
+        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(super::fsp::fsp_pr::FspPr::new()) }),
         64,
     );
     let fsc_for_closure = fsc.clone();
     server_manager.register_named_service(
         "fsp-srv",
         Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::fsp::fsp_srv::FspSrv::new_with_fsc(fsc_for_closure.clone()))
+            Arc::new(super::fsp::fsp_srv::FspSrv::new_with_fsc(
+                fsc_for_closure.clone(),
+            ))
         }),
         64,
     );

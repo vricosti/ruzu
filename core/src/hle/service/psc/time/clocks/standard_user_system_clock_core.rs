@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
+use super::standard_local_system_clock_core::StandardLocalSystemClockCore;
+use super::standard_network_system_clock_core::StandardNetworkSystemClockCore;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::os::event::Event;
 use crate::hle::service::psc::time::common::{SteadyClockTimePoint, SystemClockContext};
 use crate::hle::service::psc::time::errors::RESULT_NOT_IMPLEMENTED;
-use super::standard_local_system_clock_core::StandardLocalSystemClockCore;
-use super::standard_network_system_clock_core::StandardNetworkSystemClockCore;
 
 /// StandardUserSystemClockCore coordinates between local and network clocks.
 ///

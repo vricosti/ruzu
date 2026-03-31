@@ -108,7 +108,8 @@ impl InlineToMemory {
         let remaining = self.copy_size - self.write_offset;
         let bytes_to_write = remaining.min(4) as usize;
         let word_bytes = value.to_le_bytes();
-        self.inner_buffer.extend_from_slice(&word_bytes[..bytes_to_write]);
+        self.inner_buffer
+            .extend_from_slice(&word_bytes[..bytes_to_write]);
         self.write_offset += bytes_to_write as u32;
 
         if self.write_offset >= self.copy_size {
@@ -147,10 +148,7 @@ impl Engine for InlineToMemory {
         log::trace!("InlineToMemory: reg[0x{:X}] = 0x{:X}", method, value);
     }
 
-    fn execute_pending(
-        &mut self,
-        _read_gpu: &dyn Fn(u64, &mut [u8]),
-    ) -> Vec<PendingWrite> {
+    fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         if !self.pending_write {
             return vec![];
         }

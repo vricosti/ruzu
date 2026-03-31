@@ -4,16 +4,18 @@
 //!
 //! KThreadQueue and KThreadQueueWithoutEndWait: thread wait queue abstractions.
 
-use super::k_thread::KThread;
+use std::sync::{Arc, Mutex};
+
+use super::k_hardware_timer::KHardwareTimer;
 use super::k_process::KProcess;
+use super::k_thread::KThread;
 
 /// Base KThreadQueue holding a reference to the kernel and an optional hardware timer.
 /// Matches upstream `KThreadQueue` (k_thread_queue.h).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct KThreadQueue {
     // In upstream: KernelCore& m_kernel; KHardwareTimer* m_hardware_timer;
-    // We use opaque ids / stubs here.
-    pub hardware_timer_set: bool,
+    pub hardware_timer: Option<Arc<Mutex<KHardwareTimer>>>,
     pub end_wait_allowed: bool,
     pub notify_available_impl:
         Option<fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool>,
@@ -23,7 +25,7 @@ pub struct KThreadQueue {
 impl KThreadQueue {
     pub fn new() -> Self {
         Self {
-            hardware_timer_set: false,
+            hardware_timer: None,
             end_wait_allowed: true,
             notify_available_impl: None,
             cancel_wait_impl: None,
@@ -31,11 +33,13 @@ impl KThreadQueue {
     }
 
     pub const fn with_callbacks(
-        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool>,
+        notify_available_impl: Option<
+            fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool,
+        >,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
         Self {
-            hardware_timer_set: false,
+            hardware_timer: None,
             end_wait_allowed: true,
             notify_available_impl,
             cancel_wait_impl,
@@ -43,19 +47,21 @@ impl KThreadQueue {
     }
 
     pub const fn without_end_wait(
-        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool>,
+        notify_available_impl: Option<
+            fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool,
+        >,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
         Self {
-            hardware_timer_set: false,
+            hardware_timer: None,
             end_wait_allowed: false,
             notify_available_impl,
             cancel_wait_impl,
         }
     }
 
-    pub fn set_hardware_timer(&mut self) {
-        self.hardware_timer_set = true;
+    pub fn set_hardware_timer(&mut self, hardware_timer: Arc<Mutex<KHardwareTimer>>) {
+        self.hardware_timer = Some(hardware_timer);
     }
 
     /// Upstream: virtual NotifyAvailable is UNREACHABLE in base KThreadQueue.
@@ -81,20 +87,36 @@ impl KThreadQueue {
     }
 
     pub fn base_end_wait(&self, thread: &mut KThread, wait_result: u32) {
-        // Upstream: m_hardware_timer->CancelTask(thread)
-        thread.sleep_deadline = None;
-        thread.timer_task_time = 0;
-
         thread.wait_result = wait_result;
         thread.set_state(super::k_thread::ThreadState::RUNNABLE);
         thread.clear_wait_queue();
+
+        if let (Some(hardware_timer), Some(thread_arc)) = (
+            self.hardware_timer.as_ref(),
+            thread
+                .self_reference
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade),
+        ) {
+            let thread_id = thread.get_thread_id();
+            let task_time = thread.get_timer_task_time();
+            thread.set_timer_task_time(0);
+            drop(thread_arc);
+            hardware_timer
+                .lock()
+                .unwrap()
+                .cancel_task_by_id(thread_id, task_time);
+        }
 
         // Unpark the host thread that is blocked in begin_wait.
         thread.unpark_wait();
     }
 
     pub fn end_wait(&self, thread: &mut KThread, wait_result: u32) {
-        assert!(self.end_wait_allowed, "KThreadQueueWithoutEndWait::end_wait should never be called");
+        assert!(
+            self.end_wait_allowed,
+            "KThreadQueueWithoutEndWait::end_wait should never be called"
+        );
         self.base_end_wait(thread, wait_result);
     }
 
@@ -103,14 +125,28 @@ impl KThreadQueue {
             cancel_impl(thread);
         }
 
-        if cancel_timer_task {
-            thread.sleep_deadline = None;
-            thread.timer_task_time = 0;
-        }
-
         thread.wait_result = wait_result;
         thread.set_state(super::k_thread::ThreadState::RUNNABLE);
         thread.clear_wait_queue();
+
+        if cancel_timer_task {
+            if let (Some(hardware_timer), Some(thread_arc)) = (
+                self.hardware_timer.as_ref(),
+                thread
+                    .self_reference
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade),
+            ) {
+                let thread_id = thread.get_thread_id();
+                let task_time = thread.get_timer_task_time();
+                thread.set_timer_task_time(0);
+                drop(thread_arc);
+                hardware_timer
+                    .lock()
+                    .unwrap()
+                    .cancel_task_by_id(thread_id, task_time);
+            }
+        }
 
         // Unpark the host thread that is blocked in begin_wait.
         thread.unpark_wait();
@@ -127,7 +163,7 @@ impl KThreadQueueWithoutEndWait {
     pub fn new() -> Self {
         Self {
             base: KThreadQueue {
-                hardware_timer_set: false,
+                hardware_timer: None,
                 end_wait_allowed: false,
                 notify_available_impl: None,
                 cancel_wait_impl: None,
@@ -136,7 +172,9 @@ impl KThreadQueueWithoutEndWait {
     }
 
     pub const fn with_callbacks(
-        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool>,
+        notify_available_impl: Option<
+            fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool,
+        >,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
         Self {

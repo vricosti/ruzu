@@ -189,7 +189,10 @@ mod tests {
 
     #[test]
     fn test_ir_instruction_creation() {
-        let inst = Inst::new(Opcode::FPAdd32, vec![Value::ImmF32(1.0), Value::ImmF32(2.0)]);
+        let inst = Inst::new(
+            Opcode::FPAdd32,
+            vec![Value::ImmF32(1.0), Value::ImmF32(2.0)],
+        );
         assert_eq!(inst.opcode, Opcode::FPAdd32);
         assert_eq!(inst.args.len(), 2);
         assert_eq!(inst.use_count, 0);

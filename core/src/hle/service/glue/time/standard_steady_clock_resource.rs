@@ -6,9 +6,9 @@
 //!
 //! StandardSteadyClockResource: manages RTC time and boot time for the steady clock.
 
-use std::sync::Mutex;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::psc::time::common::ClockSourceId;
+use std::sync::Mutex;
 
 /// Constants matching upstream.
 ///

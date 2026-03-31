@@ -3,6 +3,6 @@
 
 //! Port of hid_core/resources/mouse/
 
-pub mod mouse;
 pub mod debug_mouse;
+pub mod mouse;
 pub mod mouse_types;

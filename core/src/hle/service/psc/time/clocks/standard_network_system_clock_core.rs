@@ -5,9 +5,9 @@
 //!
 //! StandardNetworkSystemClockCore: network system clock with accuracy tracking.
 
+use super::system_clock_core::SystemClockCore;
 use crate::hle::result::ResultCode;
 use crate::hle::service::psc::time::common::{SteadyClockTimePoint, SystemClockContext};
-use super::system_clock_core::SystemClockCore;
 
 /// 10 days in nanoseconds (default sufficient accuracy).
 /// Matches upstream: std::chrono::duration_cast<nanoseconds>(days(10)).count()
@@ -22,9 +22,7 @@ pub struct StandardNetworkSystemClockCore {
 
 impl StandardNetworkSystemClockCore {
     pub fn new(
-        get_time_point: Box<
-            dyn Fn() -> Result<SteadyClockTimePoint, ResultCode> + Send + Sync,
-        >,
+        get_time_point: Box<dyn Fn() -> Result<SteadyClockTimePoint, ResultCode> + Send + Sync>,
     ) -> Self {
         Self {
             clock: SystemClockCore::new(get_time_point),

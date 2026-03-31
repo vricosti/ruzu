@@ -54,7 +54,7 @@ pub struct ControllerSupportArgPrivate {
     pub arg_size: u32,
     pub is_home_menu: bool,
     pub flag_1: bool,
-    pub mode: u8, // ControllerSupportMode
+    pub mode: u8,   // ControllerSupportMode
     pub caller: u8, // ControllerSupportCaller
     pub style_set: u32,
     pub joy_hold_type: u32,

@@ -137,7 +137,9 @@ impl IGeneralService {
 /// IScanRequest. All stubs.
 pub struct IScanRequest;
 impl IScanRequest {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 /// IRequest.
@@ -241,7 +243,9 @@ impl Drop for IRequest {
 /// INetworkProfile. All stubs.
 pub struct INetworkProfile;
 impl INetworkProfile {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 /// NetworkInterface ("nifm:a", "nifm:s", "nifm:u").
@@ -257,12 +261,18 @@ impl NetworkInterface {
     }
 
     pub fn create_general_service_old(&self) -> IGeneralService {
-        log::debug!("NetworkInterface({})::create_general_service_old called", self.name);
+        log::debug!(
+            "NetworkInterface({})::create_general_service_old called",
+            self.name
+        );
         IGeneralService::new()
     }
 
     pub fn create_general_service(&self) -> IGeneralService {
-        log::debug!("NetworkInterface({})::create_general_service called", self.name);
+        log::debug!(
+            "NetworkInterface({})::create_general_service called",
+            self.name
+        );
         IGeneralService::new()
     }
 }
@@ -271,8 +281,8 @@ impl NetworkInterface {
 ///
 /// Corresponds to `LoopProcess` in upstream `nifm.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     let mut server_manager = ServerManager::new(system);
 
@@ -282,7 +292,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             name,
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(&svc_name))
+                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
+                    &svc_name,
+                ))
             }),
             16,
         );

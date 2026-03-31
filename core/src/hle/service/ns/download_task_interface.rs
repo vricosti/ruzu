@@ -38,15 +38,43 @@ pub struct IDownloadTaskInterface {
 impl IDownloadTaskInterface {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (commands::CLEAR_TASK_STATUS_LIST, None, "ClearTaskStatusList"),
-            (commands::REQUEST_DOWNLOAD_TASK_LIST, None, "RequestDownloadTaskList"),
-            (commands::REQUEST_ENSURE_DOWNLOAD_TASK, None, "RequestEnsureDownloadTask"),
-            (commands::LIST_DOWNLOAD_TASK_STATUS, None, "ListDownloadTaskStatus"),
-            (commands::REQUEST_DOWNLOAD_TASK_LIST_DATA, None, "RequestDownloadTaskListData"),
-            (commands::TRY_COMMIT_CURRENT_APPLICATION_DOWNLOAD_TASK, None, "TryCommitCurrentApplicationDownloadTask"),
+            (
+                commands::CLEAR_TASK_STATUS_LIST,
+                None,
+                "ClearTaskStatusList",
+            ),
+            (
+                commands::REQUEST_DOWNLOAD_TASK_LIST,
+                None,
+                "RequestDownloadTaskList",
+            ),
+            (
+                commands::REQUEST_ENSURE_DOWNLOAD_TASK,
+                None,
+                "RequestEnsureDownloadTask",
+            ),
+            (
+                commands::LIST_DOWNLOAD_TASK_STATUS,
+                None,
+                "ListDownloadTaskStatus",
+            ),
+            (
+                commands::REQUEST_DOWNLOAD_TASK_LIST_DATA,
+                None,
+                "RequestDownloadTaskListData",
+            ),
+            (
+                commands::TRY_COMMIT_CURRENT_APPLICATION_DOWNLOAD_TASK,
+                None,
+                "TryCommitCurrentApplicationDownloadTask",
+            ),
             (commands::ENABLE_AUTO_COMMIT, None, "EnableAutoCommit"),
             (commands::DISABLE_AUTO_COMMIT, None, "DisableAutoCommit"),
-            (commands::TRIGGER_DYNAMIC_COMMIT_EVENT, None, "TriggerDynamicCommitEvent"),
+            (
+                commands::TRIGGER_DYNAMIC_COMMIT_EVENT,
+                None,
+                "TriggerDynamicCommitEvent",
+            ),
         ]);
         Self {
             handlers,

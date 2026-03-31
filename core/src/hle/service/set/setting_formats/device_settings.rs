@@ -60,8 +60,13 @@ const _: () = {
     assert!(core::mem::offset_of!(DeviceSettings, ptm_battery_lot) == 0x10);
     assert!(core::mem::offset_of!(DeviceSettings, ptm_cycle_count_reliability) == 0x44);
     assert!(core::mem::offset_of!(DeviceSettings, analog_user_stick_calibration_l) == 0x90);
-    assert!(core::mem::offset_of!(DeviceSettings, console_six_axis_sensor_acceleration_bias) == 0xD0);
-    assert!(core::mem::offset_of!(DeviceSettings, console_six_axis_sensor_angular_acceleration) == 0x13C);
+    assert!(
+        core::mem::offset_of!(DeviceSettings, console_six_axis_sensor_acceleration_bias) == 0xD0
+    );
+    assert!(
+        core::mem::offset_of!(DeviceSettings, console_six_axis_sensor_angular_acceleration)
+            == 0x13C
+    );
     assert!(core::mem::size_of::<DeviceSettings>() == 0x160);
 };
 
@@ -76,7 +81,10 @@ impl core::fmt::Debug for DeviceSettings {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DeviceSettings")
             .field("ptm_battery_version", &self.ptm_battery_version)
-            .field("ptm_cycle_count_reliability", &self.ptm_cycle_count_reliability)
+            .field(
+                "ptm_cycle_count_reliability",
+                &self.ptm_cycle_count_reliability,
+            )
             .finish()
     }
 }

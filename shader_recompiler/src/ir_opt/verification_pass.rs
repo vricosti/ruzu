@@ -43,7 +43,10 @@ fn validate_types(program: &Program) {
                 if !actual.is_compatible_with(expected) {
                     log::error!(
                         "Type mismatch in {:?}: arg {} is {:?}, expected {:?}",
-                        inst.opcode, i, actual, expected
+                        inst.opcode,
+                        i,
+                        actual,
+                        expected
                     );
                 }
             }
@@ -69,7 +72,8 @@ fn validate_uses(program: &Program) {
     }
 
     for (&(block_idx, inst_idx), &uses) in &actual_uses {
-        if block_idx < program.blocks.len() && inst_idx < program.blocks[block_idx].instructions.len()
+        if block_idx < program.blocks.len()
+            && inst_idx < program.blocks[block_idx].instructions.len()
         {
             let inst = &program.blocks[block_idx].instructions[inst_idx];
             if inst.use_count as i32 != uses {

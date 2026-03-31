@@ -6,8 +6,8 @@
 //! Fallback SSL backend when no real SSL library is available.
 //! Returns ResultInternalError for all connection attempts.
 
-use crate::hle::result::ResultCode;
 use super::ssl_backend::{SslConnectionBackend, RESULT_INTERNAL_ERROR};
+use crate::hle::result::ResultCode;
 
 /// Create an SSL connection backend.
 ///
@@ -16,8 +16,6 @@ use super::ssl_backend::{SslConnectionBackend, RESULT_INTERNAL_ERROR};
 ///
 /// Corresponds to `CreateSSLConnectionBackend` in upstream ssl_backend_none.cpp.
 pub fn create_ssl_connection_backend() -> Result<Box<dyn SslConnectionBackend>, ResultCode> {
-    log::error!(
-        "Can't create SSL connection because no SSL backend is available on this platform"
-    );
+    log::error!("Can't create SSL connection because no SSL backend is available on this platform");
     Err(RESULT_INTERNAL_ERROR)
 }

@@ -578,7 +578,10 @@ impl NfcDevice {
     /// Upstream: mounts if TagFound, deletes application area and register info, flushes.
     pub fn format(&mut self) -> ResultCode {
         if self.device_state == DeviceState::TagFound {
-            let result = self.mount(nfp_types::ModelType::Amiibo as u32, nfp_types::MountTarget::All as u32);
+            let result = self.mount(
+                nfp_types::ModelType::Amiibo as u32,
+                nfp_types::MountTarget::All as u32,
+            );
             // Upstream: allows CorruptedData and CorruptedDataWithBackup errors to continue
             if result != RESULT_SUCCESS
                 && result != nfp_result::RESULT_CORRUPTED_DATA

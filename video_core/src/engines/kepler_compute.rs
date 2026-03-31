@@ -175,7 +175,13 @@ impl KeplerCompute {
     }
 
     /// Corresponds to upstream `KeplerCompute::CallMultiMethod`.
-    pub fn call_multi_method(&mut self, method: u32, args: &[u32], _amount: u32, _methods_pending: u32) {
+    pub fn call_multi_method(
+        &mut self,
+        method: u32,
+        args: &[u32],
+        _amount: u32,
+        _methods_pending: u32,
+    ) {
         for &arg in args {
             self.call_method(method, arg, false);
         }
@@ -309,10 +315,7 @@ impl Engine for KeplerCompute {
         }
     }
 
-    fn execute_pending(
-        &mut self,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-    ) -> Vec<PendingWrite> {
+    fn execute_pending(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         if let Some(qmd_addr) = self.pending_launch.take() {
             // Read 256 bytes (64 words) of QMD from GPU memory.
             let mut raw = [0u8; QMD_WORD_COUNT * 4];
@@ -597,7 +600,8 @@ mod tests {
 
     #[test]
     fn test_bind_rasterizer_stores_reference() {
-        let syncpoints = std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
+        let syncpoints =
+            std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
         let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
         let mut engine = KeplerCompute::new();
         assert!(engine.rasterizer.is_none());

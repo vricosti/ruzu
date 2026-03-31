@@ -29,11 +29,31 @@ pub struct ISystemAppletProxy {
 impl ISystemAppletProxy {
     pub fn new(applet: Arc<Mutex<Applet>>, window_system: Arc<Mutex<WindowSystem>>) -> Self {
         let handlers = build_handler_map(&[
-            (0, Some(Self::get_common_state_getter_handler), "GetCommonStateGetter"),
-            (1, Some(Self::get_self_controller_handler), "GetSelfController"),
-            (2, Some(Self::get_window_controller_handler), "GetWindowController"),
-            (3, Some(Self::get_audio_controller_handler), "GetAudioController"),
-            (4, Some(Self::get_display_controller_handler), "GetDisplayController"),
+            (
+                0,
+                Some(Self::get_common_state_getter_handler),
+                "GetCommonStateGetter",
+            ),
+            (
+                1,
+                Some(Self::get_self_controller_handler),
+                "GetSelfController",
+            ),
+            (
+                2,
+                Some(Self::get_window_controller_handler),
+                "GetWindowController",
+            ),
+            (
+                3,
+                Some(Self::get_audio_controller_handler),
+                "GetAudioController",
+            ),
+            (
+                4,
+                Some(Self::get_display_controller_handler),
+                "GetDisplayController",
+            ),
             (
                 10,
                 Some(Self::get_process_winding_controller_handler),
@@ -44,19 +64,31 @@ impl ISystemAppletProxy {
                 Some(Self::get_library_applet_creator_handler),
                 "GetLibraryAppletCreator",
             ),
-            (20, Some(Self::get_home_menu_functions_handler), "GetHomeMenuFunctions"),
+            (
+                20,
+                Some(Self::get_home_menu_functions_handler),
+                "GetHomeMenuFunctions",
+            ),
             (
                 21,
                 Some(Self::get_global_state_controller_handler),
                 "GetGlobalStateController",
             ),
-            (22, Some(Self::get_application_creator_handler), "GetApplicationCreator"),
+            (
+                22,
+                Some(Self::get_application_creator_handler),
+                "GetApplicationCreator",
+            ),
             (
                 23,
                 Some(Self::get_applet_common_functions_handler),
                 "GetAppletCommonFunctions",
             ),
-            (1000, Some(Self::get_debug_functions_handler), "GetDebugFunctions"),
+            (
+                1000,
+                Some(Self::get_debug_functions_handler),
+                "GetDebugFunctions",
+            ),
         ]);
         Self {
             applet,
@@ -87,10 +119,7 @@ impl ISystemAppletProxy {
         }
     }
 
-    fn get_common_state_getter_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_common_state_getter_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const ISystemAppletProxy) };
         {
             let mut applet = proxy.applet.lock().unwrap();
@@ -101,7 +130,9 @@ impl ISystemAppletProxy {
         }
         Self::push_interface_response(
             ctx,
-            Arc::new(super::common_state_getter::ICommonStateGetter::new(proxy.applet.clone())),
+            Arc::new(super::common_state_getter::ICommonStateGetter::new(
+                proxy.applet.clone(),
+            )),
         );
     }
 
@@ -109,7 +140,10 @@ impl ISystemAppletProxy {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const ISystemAppletProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::self_controller::ISelfController::new(proxy.applet.clone(), None)),
+            Arc::new(super::self_controller::ISelfController::new(
+                proxy.applet.clone(),
+                None,
+            )),
         );
     }
 
@@ -117,7 +151,9 @@ impl ISystemAppletProxy {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const ISystemAppletProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::window_controller::IWindowController::new(proxy.applet.clone())),
+            Arc::new(super::window_controller::IWindowController::new(
+                proxy.applet.clone(),
+            )),
         );
     }
 
@@ -132,7 +168,9 @@ impl ISystemAppletProxy {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const ISystemAppletProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::display_controller::IDisplayController::new(proxy.applet.clone())),
+            Arc::new(super::display_controller::IDisplayController::new(
+                proxy.applet.clone(),
+            )),
         );
     }
 
@@ -143,7 +181,11 @@ impl ISystemAppletProxy {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const ISystemAppletProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::process_winding_controller::IProcessWindingController::new(proxy.applet.clone())),
+            Arc::new(
+                super::process_winding_controller::IProcessWindingController::new(
+                    proxy.applet.clone(),
+                ),
+            ),
         );
     }
 
@@ -182,14 +224,13 @@ impl ISystemAppletProxy {
         );
     }
 
-    fn get_application_creator_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_application_creator_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const ISystemAppletProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::application_creator::IApplicationCreator::new(proxy.window_system.clone())),
+            Arc::new(super::application_creator::IApplicationCreator::new(
+                proxy.window_system.clone(),
+            )),
         );
     }
 
@@ -200,9 +241,11 @@ impl ISystemAppletProxy {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const ISystemAppletProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::applet_common_functions::IAppletCommonFunctions::with_applet(
-                proxy.applet.clone(),
-            )),
+            Arc::new(
+                super::applet_common_functions::IAppletCommonFunctions::with_applet(
+                    proxy.applet.clone(),
+                ),
+            ),
         );
     }
 

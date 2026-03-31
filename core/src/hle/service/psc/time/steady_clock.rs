@@ -8,13 +8,11 @@
 
 use std::collections::BTreeMap;
 
+use super::common::SteadyClockTimePoint;
+use super::errors::{RESULT_CLOCK_UNINITIALIZED, RESULT_NOT_IMPLEMENTED, RESULT_PERMISSION_DENIED};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::common::SteadyClockTimePoint;
-use super::errors::{
-    RESULT_CLOCK_UNINITIALIZED, RESULT_NOT_IMPLEMENTED, RESULT_PERMISSION_DENIED,
-};
 
 /// IPC command IDs for ISteadyClock.
 ///
@@ -49,12 +47,20 @@ pub struct SteadyClock {
 impl SteadyClock {
     pub fn new(can_write_steady_clock: bool, can_write_uninitialized_clock: bool) -> Self {
         let handlers = build_handler_map(&[
-            (commands::GET_CURRENT_TIME_POINT, None, "GetCurrentTimePoint"),
+            (
+                commands::GET_CURRENT_TIME_POINT,
+                None,
+                "GetCurrentTimePoint",
+            ),
             (commands::GET_TEST_OFFSET, None, "GetTestOffset"),
             (commands::SET_TEST_OFFSET, None, "SetTestOffset"),
             (commands::GET_RTC_VALUE, None, "GetRtcValue"),
             (commands::IS_RTC_RESET_DETECTED, None, "IsRtcResetDetected"),
-            (commands::GET_SETUP_RESULT_VALUE, None, "GetSetupResultValue"),
+            (
+                commands::GET_SETUP_RESULT_VALUE,
+                None,
+                "GetSetupResultValue",
+            ),
             (commands::GET_INTERNAL_OFFSET, None, "GetInternalOffset"),
         ]);
         Self {

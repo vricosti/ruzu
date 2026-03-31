@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 
 use common::input::{ButtonNames, DriverResult, VibrationStatus};
 use common::param_package::ParamPackage;
-use common::settings_input::{native_button, native_analog, native_motion};
+use common::settings_input::{native_analog, native_button, native_motion};
 use common::uuid::UUID;
 
 use crate::input_engine::{InputEngine, PadIdentifier, VibrationRequest};

@@ -47,11 +47,31 @@ impl IApplicationProxy {
         window_system: Arc<Mutex<WindowSystem>>,
     ) -> Self {
         let handlers = build_handler_map(&[
-            (0, Some(Self::get_common_state_getter_handler), "GetCommonStateGetter"),
-            (1, Some(Self::get_self_controller_handler), "GetSelfController"),
-            (2, Some(Self::get_window_controller_handler), "GetWindowController"),
-            (3, Some(Self::get_audio_controller_handler), "GetAudioController"),
-            (4, Some(Self::get_display_controller_handler), "GetDisplayController"),
+            (
+                0,
+                Some(Self::get_common_state_getter_handler),
+                "GetCommonStateGetter",
+            ),
+            (
+                1,
+                Some(Self::get_self_controller_handler),
+                "GetSelfController",
+            ),
+            (
+                2,
+                Some(Self::get_window_controller_handler),
+                "GetWindowController",
+            ),
+            (
+                3,
+                Some(Self::get_audio_controller_handler),
+                "GetAudioController",
+            ),
+            (
+                4,
+                Some(Self::get_display_controller_handler),
+                "GetDisplayController",
+            ),
             (
                 10,
                 Some(Self::get_process_winding_controller_handler),
@@ -67,7 +87,11 @@ impl IApplicationProxy {
                 Some(Self::get_application_functions_handler),
                 "GetApplicationFunctions",
             ),
-            (1000, Some(Self::get_debug_functions_handler), "GetDebugFunctions"),
+            (
+                1000,
+                Some(Self::get_debug_functions_handler),
+                "GetDebugFunctions",
+            ),
         ]);
         Self {
             applet,
@@ -99,10 +123,7 @@ impl IApplicationProxy {
         }
     }
 
-    fn get_common_state_getter_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_common_state_getter_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
         {
             let mut applet = proxy.applet.lock().unwrap();
@@ -111,33 +132,50 @@ impl IApplicationProxy {
                 .lifecycle_manager
                 .ensure_operation_mode_changed_system_event(ctx);
         }
-        Self::push_interface_response(ctx, Arc::new(
-            super::common_state_getter::ICommonStateGetter::new(proxy.applet.clone())
-        ));
+        Self::push_interface_response(
+            ctx,
+            Arc::new(super::common_state_getter::ICommonStateGetter::new(
+                proxy.applet.clone(),
+            )),
+        );
     }
 
     fn get_self_controller_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
-        Self::push_interface_response(ctx, Arc::new(
-            super::self_controller::ISelfController::new(proxy.applet.clone(), proxy.process.clone())
-        ));
+        Self::push_interface_response(
+            ctx,
+            Arc::new(super::self_controller::ISelfController::new(
+                proxy.applet.clone(),
+                proxy.process.clone(),
+            )),
+        );
     }
 
     fn get_window_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let proxy = unsafe { &*(_this as *const dyn ServiceFramework as *const IApplicationProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::window_controller::IWindowController::new(proxy.applet.clone())),
+            Arc::new(super::window_controller::IWindowController::new(
+                proxy.applet.clone(),
+            )),
         );
     }
 
     fn get_audio_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        Self::push_interface_response(ctx, Arc::new(super::audio_controller::IAudioController::new()));
+        Self::push_interface_response(
+            ctx,
+            Arc::new(super::audio_controller::IAudioController::new()),
+        );
     }
 
     fn get_display_controller_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
-        Self::push_interface_response(ctx, Arc::new(super::display_controller::IDisplayController::new(proxy.applet.clone())));
+        Self::push_interface_response(
+            ctx,
+            Arc::new(super::display_controller::IDisplayController::new(
+                proxy.applet.clone(),
+            )),
+        );
     }
 
     fn get_process_winding_controller_handler(
@@ -147,7 +185,11 @@ impl IApplicationProxy {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::process_winding_controller::IProcessWindingController::new(proxy.applet.clone())),
+            Arc::new(
+                super::process_winding_controller::IProcessWindingController::new(
+                    proxy.applet.clone(),
+                ),
+            ),
         );
     }
 
@@ -165,19 +207,21 @@ impl IApplicationProxy {
         );
     }
 
-    fn get_application_functions_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_application_functions_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let proxy = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationProxy) };
         Self::push_interface_response(
             ctx,
-            Arc::new(super::application_functions::IApplicationFunctions::new(proxy.applet.clone())),
+            Arc::new(super::application_functions::IApplicationFunctions::new(
+                proxy.applet.clone(),
+            )),
         );
     }
 
     fn get_debug_functions_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        Self::push_interface_response(ctx, Arc::new(super::debug_functions::IDebugFunctions::new()));
+        Self::push_interface_response(
+            ctx,
+            Arc::new(super::debug_functions::IDebugFunctions::new()),
+        );
     }
 }
 

@@ -106,10 +106,7 @@ pub fn translate_errno_from_network(value: i32) -> Errno {
         111 => Errno::CONNREFUSED,
         115 => Errno::INPROGRESS,
         _ => {
-            log::warn!(
-                "Unimplemented errno translation for value={}",
-                value
-            );
+            log::warn!("Unimplemented errno translation for value={}", value);
             Errno::SUCCESS
         }
     }

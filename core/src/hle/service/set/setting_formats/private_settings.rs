@@ -57,7 +57,10 @@ impl core::fmt::Debug for PrivateSettings {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PrivateSettings")
             .field("shutdown_rtc_value", &self.shutdown_rtc_value)
-            .field("external_steady_clock_internal_offset", &self.external_steady_clock_internal_offset)
+            .field(
+                "external_steady_clock_internal_offset",
+                &self.external_steady_clock_internal_offset,
+            )
             .field("platform_region", &self.platform_region)
             .finish()
     }

@@ -89,12 +89,7 @@ impl FSR {
     /// The two passes are:
     /// 1. EASU (Edge Adaptive Spatial Upsampling) — scales the input to output resolution
     /// 2. RCAS (Robust Contrast Adaptive Sharpening) — sharpens the upscaled result
-    pub fn draw(
-        &self,
-        input_texture: u32,
-        input_image_width: u32,
-        input_image_height: u32,
-    ) -> u32 {
+    pub fn draw(&self, input_texture: u32, input_image_width: u32, input_image_height: u32) -> u32 {
         if self.vert == 0 || self.easu_frag == 0 || self.rcas_frag == 0 {
             // Shaders not yet compiled; return input unchanged
             return input_texture;
@@ -108,12 +103,7 @@ impl FSR {
             gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, self.framebuffer);
 
             // Pass 1: EASU upscaling
-            gl::NamedFramebufferTexture(
-                self.framebuffer,
-                gl::COLOR_ATTACHMENT0,
-                self.easu_tex,
-                0,
-            );
+            gl::NamedFramebufferTexture(self.framebuffer, gl::COLOR_ATTACHMENT0, self.easu_tex, 0);
             gl::ViewportIndexedf(0, 0.0, 0.0, output_width, output_height);
             // In full impl: program_manager.BindPresentPrograms(vert, easu_frag);
             gl::BindTextureUnit(0, input_texture);
@@ -121,12 +111,7 @@ impl FSR {
             gl::DrawArrays(gl::TRIANGLES, 0, 3);
 
             // Pass 2: RCAS sharpening
-            gl::NamedFramebufferTexture(
-                self.framebuffer,
-                gl::COLOR_ATTACHMENT0,
-                self.rcas_tex,
-                0,
-            );
+            gl::NamedFramebufferTexture(self.framebuffer, gl::COLOR_ATTACHMENT0, self.rcas_tex, 0);
             // In full impl: program_manager.BindPresentPrograms(vert, rcas_frag);
             gl::BindTextureUnit(0, self.easu_tex);
             gl::DrawArrays(gl::TRIANGLES, 0, 3);

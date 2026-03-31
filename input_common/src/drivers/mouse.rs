@@ -128,8 +128,7 @@ impl Mouse {
     /// Port of Mouse::PressButton
     pub fn press_button(&mut self, x: i32, y: i32, button: MouseButton) {
         let id = identifier();
-        self.engine
-            .set_button(&id, button as i32, true);
+        self.engine.set_button(&id, button as i32, true);
 
         // Set initial analog parameters
         self.mouse_origin = (x, y);
@@ -141,8 +140,7 @@ impl Mouse {
     /// Port of Mouse::PressMouseButton
     pub fn press_mouse_button(&mut self, button: MouseButton) {
         let id = real_mouse_identifier();
-        self.engine
-            .set_button(&id, button as i32, true);
+        self.engine.set_button(&id, button as i32, true);
     }
 
     /// Sets the status of touch finger to pressed.
@@ -151,8 +149,7 @@ impl Mouse {
         let id = touch_identifier();
         self.engine.set_axis(&id, MOUSE_AXIS_X, touch_x);
         self.engine.set_axis(&id, MOUSE_AXIS_Y, touch_y);
-        self.engine
-            .set_button(&id, button as i32, true);
+        self.engine.set_button(&id, button as i32, true);
     }
 
     /// Sets the status of all buttons bound with the key to released.
@@ -162,12 +159,9 @@ impl Mouse {
         let real_id = real_mouse_identifier();
         let touch_id = touch_identifier();
 
-        self.engine
-            .set_button(&id, button as i32, false);
-        self.engine
-            .set_button(&real_id, button as i32, false);
-        self.engine
-            .set_button(&touch_id, button as i32, false);
+        self.engine.set_button(&id, button as i32, false);
+        self.engine.set_button(&real_id, button as i32, false);
+        self.engine.set_button(&touch_id, button as i32, false);
 
         if !self.is_mouse_panning_enabled() {
             self.engine.set_axis(&id, MOUSE_AXIS_X, 0.0);

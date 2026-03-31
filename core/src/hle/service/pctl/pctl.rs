@@ -30,6 +30,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
 
     register_named_service(
         &mut server_manager,
+        system,
         "pctl",
         super::pctl_types::Capability::APPLICATION
             | super::pctl_types::Capability::SNS_POST
@@ -38,16 +39,19 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     );
     register_named_service(
         &mut server_manager,
+        system,
         "pctl:a",
         super::pctl_types::Capability::NONE,
     );
     register_named_service(
         &mut server_manager,
+        system,
         "pctl:r",
         super::pctl_types::Capability::NONE,
     );
     register_named_service(
         &mut server_manager,
+        system,
         "pctl:s",
         super::pctl_types::Capability::NONE,
     );
@@ -57,6 +61,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
 
 fn register_named_service(
     server_manager: &mut ServerManager,
+    system: crate::core::SystemRef,
     name: &str,
     capability: super::pctl_types::Capability,
 ) {
@@ -64,6 +69,7 @@ fn register_named_service(
     let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
         Arc::new(
             super::parental_control_service_factory::IParentalControlServiceFactory::new(
+                system,
                 &name_owned,
                 capability,
             ),

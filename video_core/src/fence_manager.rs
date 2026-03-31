@@ -174,8 +174,7 @@ impl<F: FenceBase> FenceManager<F> {
         mut is_fence_signaled: FS,
         mut wait_fence: FW,
         mut pop_async_flushes: FPF,
-    )
-    where
+    ) where
         FSW: FnMut() -> bool,
         FS: FnMut(&F) -> bool,
         FW: FnMut(&F),
@@ -222,8 +221,7 @@ impl<F: FenceBase> FenceManager<F> {
         mut is_fence_signaled: FS,
         mut pop_async_flushes: FPF,
         mut accumulate_flushes: FAF,
-    )
-    where
+    ) where
         FSW: FnMut() -> bool,
         FS: FnMut(&F) -> bool,
         FPF: FnMut(),
@@ -318,12 +316,14 @@ mod tests {
         let popped = Arc::new(AtomicBool::new(false));
 
         manager.fences.push_back(TestFence { stubbed: false });
-        manager.pending_operations.push_back(VecDeque::from([Box::new({
-            let released = Arc::clone(&released);
-            move || {
-                released.store(true, Ordering::Relaxed);
-            }
-        }) as Box<dyn FnOnce() + Send>]));
+        manager
+            .pending_operations
+            .push_back(VecDeque::from([Box::new({
+                let released = Arc::clone(&released);
+                move || {
+                    released.store(true, Ordering::Relaxed);
+                }
+            }) as Box<dyn FnOnce() + Send>]));
 
         manager.signal_ordering(
             || false,
@@ -364,7 +364,9 @@ mod tests {
                 let callback_hit = Arc::clone(&callback_hit);
                 move || callback_hit.store(true, Ordering::Relaxed)
             }),
-            |is_stubbed| TestFence { stubbed: is_stubbed },
+            |is_stubbed| TestFence {
+                stubbed: is_stubbed,
+            },
             |_| {},
             || false,
             |_| true,
@@ -408,7 +410,9 @@ mod tests {
                 let host = Arc::clone(&host);
                 move |value| host.store(value, Ordering::Relaxed)
             },
-            |is_stubbed| TestFence { stubbed: is_stubbed },
+            |is_stubbed| TestFence {
+                stubbed: is_stubbed,
+            },
             |_| {},
             || false,
             |_| true,

@@ -14,7 +14,7 @@ pub fn i2i(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let abs_src = bit(insn, 49);
     let neg_src = bit(insn, 45);
     let is_signed = bit(insn, 13);
-    let _dst_size = field(insn, 8, 2);  // 0=U8, 1=U16, 2=U32
+    let _dst_size = field(insn, 8, 2); // 0=U8, 1=U16, 2=U32
     let src_size = field(insn, 10, 2);
 
     // Source size masking

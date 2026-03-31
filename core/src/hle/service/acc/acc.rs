@@ -6,13 +6,15 @@
 //!
 //! Account module and Interface base class.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use super::profile_manager::{ProfileBase, ProfileManager, UserData, UserIdArray, MAX_USERS};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr};
+use crate::hle::service::hle_ipc::{
+    HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
+};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::profile_manager::{ProfileManager, ProfileBase, UserData, UserIdArray, MAX_USERS};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 /// Generate a random UUID. Upstream uses `Common::UUID::MakeRandom()`.
 fn generate_random_uuid() -> u128 {
@@ -20,10 +22,12 @@ fn generate_random_uuid() -> u128 {
     use std::hash::{BuildHasher, Hasher};
     let s = RandomState::new();
     let mut h = s.build_hasher();
-    h.write_u64(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64);
+    h.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64,
+    );
     let lo = h.finish() as u128;
     let s2 = RandomState::new();
     let mut h2 = s2.build_hasher();
@@ -94,7 +98,11 @@ impl Interface {
         (RESULT_SUCCESS, profile_manager.get_user_count() as u32)
     }
 
-    pub fn get_user_existence(&self, profile_manager: &ProfileManager, uuid: u128) -> (ResultCode, bool) {
+    pub fn get_user_existence(
+        &self,
+        profile_manager: &ProfileManager,
+        uuid: u128,
+    ) -> (ResultCode, bool) {
         log::debug!("Account::GetUserExistence called");
         (RESULT_SUCCESS, profile_manager.user_exists(uuid))
     }
@@ -125,7 +133,10 @@ impl Interface {
         (RESULT_SUCCESS, true)
     }
 
-    pub fn try_select_user_without_interaction(&self, profile_manager: &ProfileManager) -> (ResultCode, u128) {
+    pub fn try_select_user_without_interaction(
+        &self,
+        profile_manager: &ProfileManager,
+    ) -> (ResultCode, u128) {
         log::debug!("Account::TrySelectUserWithoutInteraction called");
         if profile_manager.get_user_count() != 1 {
             return (RESULT_SUCCESS, 0);
@@ -138,28 +149,44 @@ impl Interface {
         (RESULT_SUCCESS, false)
     }
 
-    pub fn list_open_context_stored_users(&self, profile_manager: &ProfileManager) -> (ResultCode, UserIdArray) {
+    pub fn list_open_context_stored_users(
+        &self,
+        profile_manager: &ProfileManager,
+    ) -> (ResultCode, UserIdArray) {
         log::debug!("Account::ListOpenContextStoredUsers called");
         (RESULT_SUCCESS, profile_manager.get_stored_opened_users())
     }
 
-    pub fn list_qualified_users(&self, profile_manager: &ProfileManager) -> (ResultCode, UserIdArray) {
+    pub fn list_qualified_users(
+        &self,
+        profile_manager: &ProfileManager,
+    ) -> (ResultCode, UserIdArray) {
         log::debug!("Account::ListQualifiedUsers called");
         (RESULT_SUCCESS, profile_manager.get_all_users())
     }
 
-    pub fn begin_user_registration(&self, profile_manager: &mut ProfileManager) -> (ResultCode, u128) {
+    pub fn begin_user_registration(
+        &self,
+        profile_manager: &mut ProfileManager,
+    ) -> (ResultCode, u128) {
         // Upstream: generates a random UUID and creates a new user with name "yuzu"
         let uuid = generate_random_uuid();
         let mut username = [0u8; super::profile_manager::PROFILE_USERNAME_SIZE];
         let name = b"yuzu";
         username[..name.len()].copy_from_slice(name);
         profile_manager.create_new_user(uuid, &username);
-        log::info!("Account::BeginUserRegistration called, uuid=0x{:032x}", uuid);
+        log::info!(
+            "Account::BeginUserRegistration called, uuid=0x{:032x}",
+            uuid
+        );
         (RESULT_SUCCESS, uuid)
     }
 
-    pub fn complete_user_registration(&self, _profile_manager: &mut ProfileManager, _uuid: u128) -> ResultCode {
+    pub fn complete_user_registration(
+        &self,
+        _profile_manager: &mut ProfileManager,
+        _uuid: u128,
+    ) -> ResultCode {
         log::debug!("Account::CompleteUserRegistration called");
         RESULT_SUCCESS
     }
@@ -215,17 +242,33 @@ impl IProfileCommon {
         name: &'static str,
         editor_commands: bool,
     ) -> Self {
-        let mut entries: Vec<(u32, Option<fn(&dyn ServiceFramework, &mut HLERequestContext)>, &str)> = vec![
+        let mut entries: Vec<(
+            u32,
+            Option<fn(&dyn ServiceFramework, &mut HLERequestContext)>,
+            &str,
+        )> = vec![
             (0, Some(IProfileCommon::get_handler), "Get"),
             (1, Some(IProfileCommon::get_base_handler), "GetBase"),
-            (10, Some(IProfileCommon::get_image_size_handler), "GetImageSize"),
+            (
+                10,
+                Some(IProfileCommon::get_image_size_handler),
+                "GetImageSize",
+            ),
             (11, Some(IProfileCommon::load_image_handler), "LoadImage"),
         ];
         if editor_commands {
             entries.push((100, Some(IProfileCommon::store_handler), "Store"));
-            entries.push((101, Some(IProfileCommon::store_with_image_handler), "StoreWithImage"));
+            entries.push((
+                101,
+                Some(IProfileCommon::store_with_image_handler),
+                "StoreWithImage",
+            ));
         }
-        let refs: Vec<(u32, Option<fn(&dyn ServiceFramework, &mut HLERequestContext)>, &str)> = entries;
+        let refs: Vec<(
+            u32,
+            Option<fn(&dyn ServiceFramework, &mut HLERequestContext)>,
+            &str,
+        )> = entries;
         let handlers = build_handler_map(&refs);
         Self {
             profile_manager,
@@ -274,7 +317,10 @@ impl IProfileCommon {
     fn get_base_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let pm = svc.profile_manager.lock().unwrap();
-        log::debug!("IProfileCommon::GetBase called, user_id=0x{:032x}", svc.user_id);
+        log::debug!(
+            "IProfileCommon::GetBase called, user_id=0x{:032x}",
+            svc.user_id
+        );
 
         if let Some(base) = pm.get_profile_base_by_uuid(svc.user_id) {
             let mut rb = ResponseBuilder::new(ctx, 16, 0, 0);
@@ -413,7 +459,12 @@ pub fn new_iprofile(
     profile_manager: Arc<Mutex<ProfileManager>>,
     user_id: u128,
 ) -> SessionRequestHandlerPtr {
-    Arc::new(IProfileCommon::new(profile_manager, user_id, "IProfile", false))
+    Arc::new(IProfileCommon::new(
+        profile_manager,
+        user_id,
+        "IProfile",
+        false,
+    ))
 }
 
 /// IProfileEditor (read-write profile interface with Store/StoreWithImage).
@@ -422,7 +473,12 @@ pub fn new_iprofile_editor(
     profile_manager: Arc<Mutex<ProfileManager>>,
     user_id: u128,
 ) -> SessionRequestHandlerPtr {
-    Arc::new(IProfileCommon::new(profile_manager, user_id, "IProfileEditor", true))
+    Arc::new(IProfileCommon::new(
+        profile_manager,
+        user_id,
+        "IProfileEditor",
+        true,
+    ))
 }
 
 /// Registers account services with the server manager.
@@ -430,9 +486,9 @@ pub fn new_iprofile_editor(
 /// Corresponds to `LoopProcess` in upstream `acc.cpp`.
 /// Services registered: acc:u0, acc:u1, acc:su, acc:aa
 pub fn loop_process(system: crate::core::SystemRef) {
-    use std::sync::Arc;
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+    use std::sync::Arc;
 
     log::debug!("Account::LoopProcess - registering acc:u0, acc:u1, acc:su, acc:aa");
 

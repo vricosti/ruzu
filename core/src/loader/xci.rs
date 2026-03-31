@@ -78,9 +78,7 @@ impl AppLoaderXci {
         // Upstream: nca_loader = make_unique<AppLoader_NCA>(xci->GetProgramNCAFile())
         // If the XCI has no program NCA file, we create the NCA loader with
         // the raw file as a fallback (it will fail gracefully on load).
-        let program_nca_file = xci
-            .get_program_nca_file()
-            .unwrap_or_else(|| file.clone());
+        let program_nca_file = xci.get_program_nca_file().unwrap_or_else(|| file.clone());
         let nca_loader = AppLoaderNca::new(program_nca_file);
 
         let icon_file: Option<VirtualFile> = None;
@@ -158,10 +156,7 @@ impl AppLoader for AppLoaderXci {
     ///
     /// Verifies the secure partition by enumerating all NCAs and verifying
     /// each one via AppLoader_NCA::VerifyIntegrity.
-    fn verify_integrity(
-        &self,
-        progress_callback: &dyn Fn(usize, usize) -> bool,
-    ) -> ResultStatus {
+    fn verify_integrity(&self, progress_callback: &dyn Fn(usize, usize) -> bool) -> ResultStatus {
         // Upstream: auto secure_partition = xci->GetSecurePartitionNSP();
         let secure_partition = match self.xci.get_secure_partition_nsp() {
             Some(sp) => sp,
@@ -183,9 +178,10 @@ impl AppLoader for AppLoaderXci {
         for nca in &ncas {
             let loader_nca = AppLoaderNca::new(nca.get_base_file());
 
-            let nca_progress_callback = |nca_processed_size: usize, _nca_total_size: usize| -> bool {
-                progress_callback(processed_size + nca_processed_size, total_size)
-            };
+            let nca_progress_callback =
+                |nca_processed_size: usize, _nca_total_size: usize| -> bool {
+                    progress_callback(processed_size + nca_processed_size, total_size)
+                };
 
             let verification_result = loader_nca.verify_integrity(&nca_progress_callback);
             if verification_result != ResultStatus::Success {
@@ -279,9 +275,7 @@ impl AppLoader for AppLoaderXci {
         // from file_sys::control_metadata::NACP. When the loader NACP type
         // is unified with file_sys NACP, this will copy the data.
         match &self.nacp_file {
-            Some(_nacp) => {
-                ResultStatus::Success
-            }
+            Some(_nacp) => ResultStatus::Success,
             None => ResultStatus::ErrorNoControl,
         }
     }

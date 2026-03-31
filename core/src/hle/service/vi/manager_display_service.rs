@@ -28,7 +28,11 @@ impl IManagerDisplayService {
                 (201, None, "FreeProcessHeapBlock"),
                 (1102, None, "GetDisplayResolution"),
                 (2010, Some(Self::create_managed_layer), "CreateManagedLayer"),
-                (2011, Some(Self::destroy_managed_layer), "DestroyManagedLayer"),
+                (
+                    2011,
+                    Some(Self::destroy_managed_layer),
+                    "DestroyManagedLayer",
+                ),
                 (2012, None, "CreateStrayLayer"),
                 (2050, None, "CreateIndirectLayer"),
                 (2051, None, "DestroyIndirectLayer"),
@@ -97,7 +101,11 @@ impl IManagerDisplayService {
                 (8227, None, "CreateSharedBufferProcessHeap"),
                 (8228, None, "GetSharedLayerLayerStacks"),
                 (8229, None, "SetSharedLayerLayerStacks"),
-                (8291, None, "PresentDetachedSharedFrameBufferToLowLevelLayer"),
+                (
+                    8291,
+                    None,
+                    "PresentDetachedSharedFrameBufferToLowLevelLayer",
+                ),
                 (8292, None, "FillDetachedSharedFrameBufferColor"),
                 (8293, None, "GetDetachedSharedFrameBufferImage"),
                 (8294, None, "SetDetachedSharedFrameBufferImage"),
@@ -122,7 +130,12 @@ impl IManagerDisplayService {
         let _padding = rp.pop_u32();
         let display_id = rp.pop_u64();
         let aruid = rp.pop_u64();
-        log::debug!("IManagerDisplayService::CreateManagedLayer flags={}, display={}, aruid={}", flags, display_id, aruid);
+        log::debug!(
+            "IManagerDisplayService::CreateManagedLayer flags={}, display={}, aruid={}",
+            flags,
+            display_id,
+            aruid
+        );
 
         match svc.container.create_managed_layer(display_id, aruid) {
             Ok(layer_id) => {
@@ -142,7 +155,10 @@ impl IManagerDisplayService {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let layer_id = rp.pop_u64();
-        log::debug!("IManagerDisplayService::DestroyManagedLayer layer_id={}", layer_id);
+        log::debug!(
+            "IManagerDisplayService::DestroyManagedLayer layer_id={}",
+            layer_id
+        );
 
         match svc.container.destroy_managed_layer(layer_id) {
             Ok(()) => {
@@ -162,7 +178,11 @@ impl IManagerDisplayService {
         let stack_id = rp.pop_u32();
         let _padding = rp.pop_u32();
         let layer_id = rp.pop_u64();
-        log::warn!("IManagerDisplayService::AddToLayerStack (STUBBED) stack_id={}, layer_id={}", stack_id, layer_id);
+        log::warn!(
+            "IManagerDisplayService::AddToLayerStack (STUBBED) stack_id={}, layer_id={}",
+            stack_id,
+            layer_id
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -174,7 +194,11 @@ impl IManagerDisplayService {
         let visible = rp.pop_u32() != 0;
         let _padding = rp.pop_u32();
         let layer_id = rp.pop_u64();
-        log::debug!("IManagerDisplayService::SetLayerVisibility layer_id={}, visible={}", layer_id, visible);
+        log::debug!(
+            "IManagerDisplayService::SetLayerVisibility layer_id={}, visible={}",
+            layer_id,
+            visible
+        );
 
         match svc.container.set_layer_visibility(layer_id, visible) {
             Ok(()) => {
@@ -199,7 +223,13 @@ impl SessionRequestHandler for IManagerDisplayService {
 }
 
 impl ServiceFramework for IManagerDisplayService {
-    fn get_service_name(&self) -> &str { "vi::IManagerDisplayService" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "vi::IManagerDisplayService"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }

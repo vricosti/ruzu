@@ -119,12 +119,13 @@ impl PipelineCache {
 /// This is the main entry point for the shader recompiler pipeline:
 /// Maxwell binary → decode opcodes → build CFG → structured CF
 /// → translate to IR → optimize → emit SPIR-V.
-pub fn compile_shader(code: &[u64], stage: ShaderStage, profile: &Profile, runtime_info: &RuntimeInfo) -> CompiledShader {
-    log::debug!(
-        "Compiling {:?} shader ({} instructions)",
-        stage,
-        code.len()
-    );
+pub fn compile_shader(
+    code: &[u64],
+    stage: ShaderStage,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+) -> CompiledShader {
+    log::debug!("Compiling {:?} shader ({} instructions)", stage, code.len());
 
     // Step 1: Build control flow graph from Maxwell instructions.
     let cfg_blocks = control_flow::build_cfg(code);

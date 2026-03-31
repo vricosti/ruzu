@@ -92,21 +92,73 @@ impl IApplicationFunctions {
         applet: std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>,
     ) -> Self {
         let handlers = build_handler_map(&[
-            (1, Some(Self::pop_launch_parameter_handler), "PopLaunchParameter"),
+            (
+                1,
+                Some(Self::pop_launch_parameter_handler),
+                "PopLaunchParameter",
+            ),
             (20, Some(Self::ensure_save_data_handler), "EnsureSaveData"),
-            (21, Some(Self::get_desired_language_handler), "GetDesiredLanguage"),
-            (22, Some(Self::set_terminate_result_handler), "SetTerminateResult"),
+            (
+                21,
+                Some(Self::get_desired_language_handler),
+                "GetDesiredLanguage",
+            ),
+            (
+                22,
+                Some(Self::set_terminate_result_handler),
+                "SetTerminateResult",
+            ),
             (40, Some(Self::notify_running_handler), "NotifyRunning"),
-            (50, Some(Self::get_pseudo_device_id_handler), "GetPseudoDeviceId"),
-            (65, Some(Self::is_game_play_recording_supported_handler), "IsGamePlayRecordingSupported"),
-            (66, Some(Self::initialize_game_play_recording_handler), "InitializeGamePlayRecording"),
-            (67, Some(Self::set_game_play_recording_state_handler), "SetGamePlayRecordingState"),
-            (90, Some(Self::enable_application_crash_report_handler), "EnableApplicationCrashReport"),
-            (100, Some(Self::initialize_application_copyright_frame_buffer_handler), "InitializeApplicationCopyrightFrameBuffer"),
-            (123, Some(Self::get_previous_program_index_handler), "GetPreviousProgramIndex"),
-            (130, Some(Self::get_gpu_error_detected_system_event_handler), "GetGpuErrorDetectedSystemEvent"),
-            (140, Some(Self::get_friend_invitation_storage_channel_event_handler), "GetFriendInvitationStorageChannelEvent"),
-            (160, Some(Self::get_health_warning_disappeared_system_event_handler), "GetHealthWarningDisappearedSystemEvent"),
+            (
+                50,
+                Some(Self::get_pseudo_device_id_handler),
+                "GetPseudoDeviceId",
+            ),
+            (
+                65,
+                Some(Self::is_game_play_recording_supported_handler),
+                "IsGamePlayRecordingSupported",
+            ),
+            (
+                66,
+                Some(Self::initialize_game_play_recording_handler),
+                "InitializeGamePlayRecording",
+            ),
+            (
+                67,
+                Some(Self::set_game_play_recording_state_handler),
+                "SetGamePlayRecordingState",
+            ),
+            (
+                90,
+                Some(Self::enable_application_crash_report_handler),
+                "EnableApplicationCrashReport",
+            ),
+            (
+                100,
+                Some(Self::initialize_application_copyright_frame_buffer_handler),
+                "InitializeApplicationCopyrightFrameBuffer",
+            ),
+            (
+                123,
+                Some(Self::get_previous_program_index_handler),
+                "GetPreviousProgramIndex",
+            ),
+            (
+                130,
+                Some(Self::get_gpu_error_detected_system_event_handler),
+                "GetGpuErrorDetectedSystemEvent",
+            ),
+            (
+                140,
+                Some(Self::get_friend_invitation_storage_channel_event_handler),
+                "GetFriendInvitationStorageChannelEvent",
+            ),
+            (
+                160,
+                Some(Self::get_health_warning_disappeared_system_event_handler),
+                "GetHealthWarningDisappearedSystemEvent",
+            ),
             (1001, Some(Self::prepare_for_jit_handler), "PrepareForJit"),
         ]);
         Self {
@@ -130,7 +182,12 @@ impl IApplicationFunctions {
     }
 
     /// Port of IApplicationFunctions::CreateCacheStorage
-    pub fn create_cache_storage(&self, _index: u16, _normal_size: u64, _journal_size: u64) -> (u32, u64) {
+    pub fn create_cache_storage(
+        &self,
+        _index: u16,
+        _normal_size: u64,
+        _journal_size: u64,
+    ) -> (u32, u64) {
         log::warn!("(STUBBED) CreateCacheStorage called");
         (1, 0) // target_media=Nand, required_size=0
     }
@@ -174,7 +231,11 @@ impl IApplicationFunctions {
 
     /// Port of IApplicationFunctions::ExecuteProgram
     pub fn execute_program(&self, _kind: ProgramSpecifyKind, value: u64) {
-        log::info!("ExecuteProgram called with kind={:?}, value={}", _kind, value);
+        log::info!(
+            "ExecuteProgram called with kind={:?}, value={}",
+            _kind,
+            value
+        );
         if !self.system.is_null() {
             self.system.get().execute_program(value as usize);
         } else {
@@ -201,7 +262,8 @@ impl IApplicationFunctions {
     }
 
     fn notify_running_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(service.notify_running());
@@ -211,7 +273,8 @@ impl IApplicationFunctions {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(service.is_game_play_recording_supported());
@@ -221,7 +284,8 @@ impl IApplicationFunctions {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let mut rp = RequestParser::new(ctx);
         service.enable_application_crash_report(rp.pop_bool());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -232,14 +296,16 @@ impl IApplicationFunctions {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_i32(service.get_previous_program_index());
     }
 
     fn prepare_for_jit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         service.prepare_for_jit();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -277,7 +343,8 @@ impl IApplicationFunctions {
     /// SetTerminateResult (cmd 22).
     /// Matches upstream: locks applet, stores result.
     fn set_terminate_result_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let mut rp = RequestParser::new(ctx);
         let result = rp.pop_u32();
         log::info!("SetTerminateResult: result={:#x}", result);
@@ -300,7 +367,10 @@ impl IApplicationFunctions {
     }
 
     /// InitializeGamePlayRecording (cmd 66)
-    fn initialize_game_play_recording_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn initialize_game_play_recording_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) InitializeGamePlayRecording called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -308,8 +378,12 @@ impl IApplicationFunctions {
 
     /// SetGamePlayRecordingState (cmd 67).
     /// Matches upstream: locks applet, stores state.
-    fn set_game_play_recording_state_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+    fn set_game_play_recording_state_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let mut rp = RequestParser::new(ctx);
         let state = rp.pop_u32();
         log::warn!("(STUBBED) SetGamePlayRecordingState: state={}", state);
@@ -326,16 +400,23 @@ impl IApplicationFunctions {
     }
 
     /// InitializeApplicationCopyrightFrameBuffer (cmd 100)
-    fn initialize_application_copyright_frame_buffer_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn initialize_application_copyright_frame_buffer_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) InitializeApplicationCopyrightFrameBuffer called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     /// GetGpuErrorDetectedSystemEvent (cmd 110): returns an event handle
-    fn get_gpu_error_detected_system_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_gpu_error_detected_system_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) GetGpuErrorDetectedSystemEvent called");
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let handle = service
             .applet
             .lock()
@@ -348,9 +429,13 @@ impl IApplicationFunctions {
     }
 
     /// GetFriendInvitationStorageChannelEvent (cmd 120): returns an event handle
-    fn get_friend_invitation_storage_channel_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_friend_invitation_storage_channel_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) GetFriendInvitationStorageChannelEvent called");
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let handle = service
             .applet
             .lock()
@@ -363,9 +448,13 @@ impl IApplicationFunctions {
     }
 
     /// GetHealthWarningDisappearedSystemEvent (cmd 160): returns an event handle
-    fn get_health_warning_disappeared_system_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_health_warning_disappeared_system_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) GetHealthWarningDisappearedSystemEvent called");
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let handle = service
             .applet
             .lock()

@@ -83,7 +83,10 @@ impl KLightLock {
         let cur_thread = current_thread_id();
 
         let mut expected = cur_thread;
-        match self.m_tag.compare_exchange(expected, 0, Ordering::Release, Ordering::Relaxed) {
+        match self
+            .m_tag
+            .compare_exchange(expected, 0, Ordering::Release, Ordering::Relaxed)
+        {
             Ok(_) => {}
             Err(_) => {
                 self.unlock_slow_path(cur_thread);

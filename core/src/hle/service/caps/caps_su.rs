@@ -9,14 +9,14 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::hle::result::ResultCode;
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::caps_manager::AlbumManager;
 use super::caps_types::{
     AlbumReportOption, ApplicationAlbumEntry, ApplicationData, ScreenShotAttribute,
     ShimLibraryVersion,
 };
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IScreenShotApplicationService.
 pub mod commands {

@@ -13,9 +13,9 @@
 ///   bcat:a, bcat:m, bcat:u, bcat:s
 ///   news:a (permissions=0xffffffff), news:p (0x1), news:c (0x2), news:v (0x4), news:m (0xd)
 pub fn loop_process(system: crate::core::SystemRef) {
-    use std::sync::Arc;
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+    use std::sync::Arc;
 
     log::debug!("BCAT::LoopProcess - registering bcat and news services");
 
@@ -45,7 +45,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             name,
             Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::news::service_creator::IServiceCreator::new(perms, &n))
+                Arc::new(super::news::service_creator::IServiceCreator::new(
+                    perms, &n,
+                ))
             }),
             64,
         );

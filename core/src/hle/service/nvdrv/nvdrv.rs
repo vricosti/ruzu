@@ -8,8 +8,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::core::SystemRef;
-use crate::hle::kernel::k_readable_event::KReadableEvent;
 use super::core::container::{Container, SessionId};
 use super::devices::nvdevice::NvDevice;
 use super::devices::nvdisp_disp0::NvDispDisp0;
@@ -22,6 +20,10 @@ use super::devices::nvhost_nvjpg::NvHostNvJpg;
 use super::devices::nvhost_vic::NvHostVic;
 use super::devices::nvmap::NvMapDevice;
 use super::nvdata::*;
+use crate::core::SystemRef;
+use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::kernel::k_scheduler::KScheduler;
 
 /// EventInterface manages kernel event creation and destruction for nvdrv.
 ///
@@ -47,14 +49,17 @@ impl EventInterface {
         let object_id = self.system.get().kernel().unwrap().create_new_object_id() as u64;
         let readable_event = Arc::new(Mutex::new(KReadableEvent::new()));
         readable_event.lock().unwrap().initialize(0, object_id);
-        log::debug!("EventInterface::create_event('{}') -> object_id={}", name, object_id);
+        log::debug!(
+            "EventInterface::create_event('{}') -> object_id={}",
+            name,
+            object_id
+        );
         readable_event
     }
 
     /// Frees a previously created event.
     /// In the C++ code: module.service_context.CloseEvent(event)
-    pub fn free_event(&self, _event: Arc<Mutex<KReadableEvent>>) {
-    }
+    pub fn free_event(&self, _event: Arc<Mutex<KReadableEvent>>) {}
 }
 
 /// The main nvdrv module, managing device file descriptors and dispatching ioctls.
@@ -109,18 +114,18 @@ impl Module {
                 self.gpu_files.lock().unwrap().insert(fd, Arc::clone(&gpu));
                 gpu
             }
-            "/dev/nvhost-ctrl-gpu" => Arc::new(NvHostCtrlGpu::new(Arc::clone(&self.events_interface))),
+            "/dev/nvhost-ctrl-gpu" => {
+                Arc::new(NvHostCtrlGpu::new(Arc::clone(&self.events_interface)))
+            }
             "/dev/nvmap" => Arc::new(NvMapDevice::new(
                 self.container.get_nv_map_file(),
                 &self.container,
             )),
             "/dev/nvdisp_disp0" => Arc::new(NvDispDisp0::new()),
-            "/dev/nvhost-ctrl" => {
-                Arc::new(NvHostCtrl::new(
-                    Arc::clone(&self.events_interface),
-                    self.container.get_syncpoint_manager(),
-                ))
-            }
+            "/dev/nvhost-ctrl" => Arc::new(NvHostCtrl::new(
+                Arc::clone(&self.events_interface),
+                self.container.get_syncpoint_manager(),
+            )),
             "/dev/nvhost-nvdec" => Arc::new(NvHostNvDec::new()),
             "/dev/nvhost-nvjpg" => Arc::new(NvHostNvJpg::new()),
             "/dev/nvhost-vic" => Arc::new(NvHostVic::new()),
@@ -249,6 +254,26 @@ impl Module {
             Some(event) => (NvResult::Success, Some(event)),
             None => (NvResult::BadParameter, None),
         }
+    }
+
+    pub fn register_query_event_owner(
+        &self,
+        fd: DeviceFD,
+        event_id: u32,
+        process: Arc<Mutex<KProcess>>,
+        scheduler: Arc<Mutex<KScheduler>>,
+    ) {
+        if fd < 0 {
+            return;
+        }
+
+        let files = self.open_files.lock().unwrap();
+        let Some(device) = files.get(&fd).cloned() else {
+            return;
+        };
+        drop(files);
+
+        device.register_query_event_owner(event_id, process, scheduler);
     }
 
     pub fn get_container(&self) -> &Container {

@@ -21,7 +21,8 @@ pub fn query_memory(
 ) -> ResultCode {
     log::trace!(
         "svc::QueryMemory called, out_memory_info=0x{:016X}, query_address=0x{:016X}",
-        out_memory_info, query_address
+        out_memory_info,
+        query_address
     );
 
     // QueryMemory is just QueryProcessMemory on the current process.
@@ -44,7 +45,8 @@ pub fn query_process_memory(
 ) -> ResultCode {
     log::trace!(
         "svc::QueryProcessMemory called process=0x{:08X} address=0x{:X}",
-        process_handle, address
+        process_handle,
+        address
     );
 
     // Get the process from the handle.

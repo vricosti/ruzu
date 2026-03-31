@@ -6,9 +6,9 @@
 //! CPU tick counts. Uses a priority queue (BinaryHeap) of events, and can
 //! schedule/unschedule events and advance time. This is CRITICAL for emulation.
 
-use parking_lot::Mutex;
 use common::thread::Event;
 use common::wall_clock::{self, WallClock};
+use parking_lot::Mutex;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,8 +20,7 @@ const MAX_SLICE_LENGTH: i64 = 10000;
 
 /// A callback that may be scheduled for a particular core timing event.
 /// Returns an optional reschedule time in nanoseconds.
-pub type TimedCallback =
-    Box<dyn Fn(i64, Duration) -> Option<Duration> + Send + Sync>;
+pub type TimedCallback = Box<dyn Fn(i64, Duration) -> Option<Duration> + Send + Sync>;
 
 /// Contains the characteristics of a particular event.
 pub struct EventType {
@@ -207,7 +206,11 @@ impl CoreTiming {
                 // Note: upstream accesses CoreTiming fields directly (no outer mutex).
                 // We must minimize lock holding to avoid deadlocking with CPU threads
                 // that call get_clock_ticks() under the same mutex.
-                ct_clone.lock().unwrap().has_started.store(true, Ordering::SeqCst);
+                ct_clone
+                    .lock()
+                    .unwrap()
+                    .has_started
+                    .store(true, Ordering::SeqCst);
                 // Ensure the timer thread starts unpaused.
                 // sync_pause(false) from System::run() may not have been called yet.
                 paused.store(false, Ordering::SeqCst);
@@ -257,11 +260,11 @@ impl CoreTiming {
                                 (ct.event_queue.peek().map(|e| e.time), ct.event_queue.len())
                             };
                             if let Some(next_ns) = next_time {
-                                let now_ns = ct_clone.lock().unwrap()
-                                    .get_global_time_ns().as_nanos() as i64;
+                                let now_ns =
+                                    ct_clone.lock().unwrap().get_global_time_ns().as_nanos() as i64;
                                 let wait_time = next_ns - now_ns;
                                 if wait_time > 0 {
-                                        // Sleep directly instead of using event.wait_for(),
+                                    // Sleep directly instead of using event.wait_for(),
                                     // which can return immediately if the event flag is
                                     // spuriously set by other CoreTiming operations.
                                     std::thread::sleep(std::time::Duration::from_nanos(
@@ -447,9 +450,7 @@ impl CoreTiming {
     /// Collect all due events from the queue without firing callbacks.
     /// Returns Vec of (event_type_arc, fire_time, reschedule_time).
     /// Used by the timer thread to fire callbacks outside the CoreTiming lock.
-    pub fn collect_due_events(
-        &mut self,
-    ) -> Vec<(Arc<parking_lot::Mutex<EventType>>, i64, i64)> {
+    pub fn collect_due_events(&mut self) -> Vec<(Arc<parking_lot::Mutex<EventType>>, i64, i64)> {
         self.global_timer = self.get_global_time_ns().as_nanos() as i64;
         let mut result = Vec::new();
         loop {

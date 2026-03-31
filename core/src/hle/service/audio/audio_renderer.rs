@@ -45,18 +45,46 @@ impl IAudioRenderer {
         let handlers = build_handler_map(&[
             (0, Some(Self::get_sample_rate_handler), "GetSampleRate"),
             (1, Some(Self::get_sample_count_handler), "GetSampleCount"),
-            (2, Some(Self::get_mix_buffer_count_handler), "GetMixBufferCount"),
+            (
+                2,
+                Some(Self::get_mix_buffer_count_handler),
+                "GetMixBufferCount",
+            ),
             (3, Some(Self::get_state_handler), "GetState"),
             (4, Some(Self::request_update_handler), "RequestUpdate"),
             (5, Some(Self::start_handler), "Start"),
             (6, Some(Self::stop_handler), "Stop"),
-            (7, Some(Self::query_system_event_handler), "QuerySystemEvent"),
-            (8, Some(Self::set_rendering_time_limit_handler), "SetRenderingTimeLimit"),
-            (9, Some(Self::get_rendering_time_limit_handler), "GetRenderingTimeLimit"),
-            (10, Some(Self::request_update_auto_handler), "RequestUpdateAuto"),
+            (
+                7,
+                Some(Self::query_system_event_handler),
+                "QuerySystemEvent",
+            ),
+            (
+                8,
+                Some(Self::set_rendering_time_limit_handler),
+                "SetRenderingTimeLimit",
+            ),
+            (
+                9,
+                Some(Self::get_rendering_time_limit_handler),
+                "GetRenderingTimeLimit",
+            ),
+            (
+                10,
+                Some(Self::request_update_auto_handler),
+                "RequestUpdateAuto",
+            ),
             (11, None, "ExecuteAudioRendererRendering"),
-            (12, Some(Self::set_voice_drop_parameter_handler), "SetVoiceDropParameter"),
-            (13, Some(Self::get_voice_drop_parameter_handler), "GetVoiceDropParameter"),
+            (
+                12,
+                Some(Self::set_voice_drop_parameter_handler),
+                "SetVoiceDropParameter",
+            ),
+            (
+                13,
+                Some(Self::get_voice_drop_parameter_handler),
+                "GetVoiceDropParameter",
+            ),
         ]);
         Self {
             handlers,
@@ -147,7 +175,10 @@ impl IAudioRenderer {
         if let Some(ref readable) = *event_guard {
             // Event already created — return an additional handle to it.
             if let Some(handle) = ctx.copy_handle_for_readable_event(Arc::clone(readable)) {
-                log::info!("IAudioRenderer::QuerySystemEvent returning existing event handle={:#x}", handle);
+                log::info!(
+                    "IAudioRenderer::QuerySystemEvent returning existing event handle={:#x}",
+                    handle
+                );
                 let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
                 rb.push_result(RESULT_SUCCESS);
                 rb.push_copy_objects(handle);
@@ -167,7 +198,10 @@ impl IAudioRenderer {
             return;
         };
 
-        log::info!("IAudioRenderer::QuerySystemEvent created event handle={:#x}", handle);
+        log::info!(
+            "IAudioRenderer::QuerySystemEvent created event handle={:#x}",
+            handle
+        );
 
         *event_guard = Some(readable_event);
         drop(event_guard);
@@ -177,38 +211,26 @@ impl IAudioRenderer {
         rb.push_copy_objects(handle);
     }
 
-    fn set_rendering_time_limit_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn set_rendering_time_limit_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioRenderer::SetRenderingTimeLimit");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_rendering_time_limit_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_rendering_time_limit_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioRenderer::GetRenderingTimeLimit");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(100); // 100% rendering time limit
     }
 
-    fn set_voice_drop_parameter_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn set_voice_drop_parameter_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioRenderer::SetVoiceDropParameter");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_voice_drop_parameter_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_voice_drop_parameter_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioRenderer::GetVoiceDropParameter");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);

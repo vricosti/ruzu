@@ -81,7 +81,10 @@ impl<T> VirtualBuffer<T> {
     pub fn with_count(count: usize) -> Self {
         let alloc_size = count * std::mem::size_of::<T>();
         let base_ptr = allocate_memory_pages(alloc_size) as *mut T;
-        assert!(!base_ptr.is_null() || alloc_size == 0, "Failed to allocate virtual memory");
+        assert!(
+            !base_ptr.is_null() || alloc_size == 0,
+            "Failed to allocate virtual memory"
+        );
         Self {
             base_ptr,
             alloc_size,

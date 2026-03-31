@@ -23,7 +23,9 @@ pub struct IApplicationCreator {
 }
 
 impl IApplicationCreator {
-    pub fn new(window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>) -> Self {
+    pub fn new(
+        window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
+    ) -> Self {
         let handlers = build_handler_map(&[
             (0, None, "CreateApplication"),
             (1, None, "PopLaunchRequestedApplication"),

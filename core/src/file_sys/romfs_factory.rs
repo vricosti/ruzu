@@ -43,7 +43,9 @@ pub struct RomFSFactory {
     packed_update_raw: Option<VirtualFile>,
     updatable: bool,
     content_provider: Option<Arc<dyn ContentProvider>>,
-    filesystem_controller: Option<Arc<std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>>,
+    filesystem_controller: Option<
+        Arc<std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
+    >,
 }
 
 impl RomFSFactory {
@@ -55,7 +57,9 @@ impl RomFSFactory {
     pub fn new(
         app_loader: &dyn crate::loader::loader::AppLoader,
         content_provider: Arc<dyn ContentProvider>,
-        filesystem_controller: Arc<std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
+        filesystem_controller: Arc<
+            std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>,
+        >,
     ) -> Self {
         // Upstream: app_loader.ReadRomFS(file)
         let mut file = None;
@@ -81,7 +85,11 @@ impl RomFSFactory {
         file: Option<VirtualFile>,
         updatable: bool,
         content_provider: Option<Arc<dyn ContentProvider>>,
-        filesystem_controller: Option<Arc<std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>>,
+        filesystem_controller: Option<
+            Arc<
+                std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>,
+            >,
+        >,
     ) -> Self {
         Self {
             file,
@@ -140,11 +148,7 @@ impl RomFSFactory {
 
         let fs_ctrl = self.filesystem_controller.as_ref()?;
         let fs_ctrl_guard = fs_ctrl.lock().unwrap();
-        let patch_manager = PatchManager::new(
-            title_id,
-            &fs_ctrl_guard,
-            provider.as_ref(),
-        );
+        let patch_manager = PatchManager::new(title_id, &fs_ctrl_guard, provider.as_ref());
         Some(patch_manager.patch_romfs(romfs, type_, None, true))
     }
 

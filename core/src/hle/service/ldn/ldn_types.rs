@@ -286,7 +286,11 @@ impl Ssid {
     }
 
     pub fn get_string_value(&self) -> String {
-        let end = self.raw.iter().position(|&b| b == 0).unwrap_or(self.raw.len());
+        let end = self
+            .raw
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.raw.len());
         String::from_utf8_lossy(&self.raw[..end]).to_string()
     }
 }
@@ -312,11 +316,7 @@ impl std::hash::Hash for MacAddress {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let mut value: u64 = 0;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.raw.as_ptr(),
-                &mut value as *mut u64 as *mut u8,
-                6,
-            );
+            std::ptr::copy_nonoverlapping(self.raw.as_ptr(), &mut value as *mut u64 as *mut u8, 6);
         }
         value.hash(state);
     }

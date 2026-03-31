@@ -224,10 +224,8 @@ impl ClusteringProcessor {
 
         let window_start_x = self.current_config.window_of_interest.x as usize;
         let window_start_y = self.current_config.window_of_interest.y as usize;
-        let window_end_x =
-            window_start_x + self.current_config.window_of_interest.width as usize;
-        let window_end_y =
-            window_start_y + self.current_config.window_of_interest.height as usize;
+        let window_end_x = window_start_x + self.current_config.window_of_interest.width as usize;
+        let window_end_y = window_start_y + self.current_config.window_of_interest.height as usize;
 
         for y in window_start_y..window_end_y {
             for x in window_start_x..window_end_x {
@@ -259,12 +257,9 @@ impl ClusteringProcessor {
     pub fn set_config(&mut self, config: PackedClusteringProcessorConfig) {
         self.current_config.camera_config.exposure_time = config.camera_config.exposure_time;
         self.current_config.camera_config.gain = config.camera_config.gain as u32;
-        self.current_config.camera_config.is_negative_used =
-            config.camera_config.is_negative_used;
+        self.current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
         self.current_config.camera_config.light_target = unsafe {
-            std::mem::transmute::<u32, CameraLightTarget>(
-                config.camera_config.light_target as u32,
-            )
+            std::mem::transmute::<u32, CameraLightTarget>(config.camera_config.light_target as u32)
         };
         self.current_config.window_of_interest = config.window_of_interest;
         self.current_config.pixel_count_min = config.pixel_count_min;

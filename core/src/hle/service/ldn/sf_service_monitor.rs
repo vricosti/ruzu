@@ -6,8 +6,8 @@
 //!
 //! ISfServiceMonitor: LP2P service monitor.
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::ldn_types::GroupInfo;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// IPC command table for ISfServiceMonitor.
 ///

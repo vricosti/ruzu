@@ -28,8 +28,16 @@ impl IAudioOutManager {
         let handlers = build_handler_map(&[
             (0, Some(Self::list_audio_outs_handler), "ListAudioOuts"),
             (1, Some(Self::open_audio_out_handler), "OpenAudioOut"),
-            (2, Some(Self::list_audio_outs_auto_handler), "ListAudioOutsAuto"),
-            (3, Some(Self::open_audio_out_auto_handler), "OpenAudioOutAuto"),
+            (
+                2,
+                Some(Self::list_audio_outs_auto_handler),
+                "ListAudioOutsAuto",
+            ),
+            (
+                3,
+                Some(Self::open_audio_out_auto_handler),
+                "OpenAudioOutAuto",
+            ),
         ]);
         Self {
             handlers,

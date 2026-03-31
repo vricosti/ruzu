@@ -50,9 +50,9 @@ impl ChannelInfo {
         // later resolution.  When real engine types exist these will hold
         // proper references or Arc handles.
         Self {
-            maxwell3d_index: 0,   // placeholder
+            maxwell3d_index: 0,      // placeholder
             kepler_compute_index: 0, // placeholder
-            gpu_memory_index: 0,  // placeholder
+            gpu_memory_index: 0,     // placeholder
             program_id: channel_state.program_id,
         }
     }
@@ -157,7 +157,8 @@ impl<P> ChannelSetupCaches<P> {
             self.channel_storage[id] = P::from_channel_state(channel);
             id
         } else {
-            self.channel_storage.push_back(P::from_channel_state(channel));
+            self.channel_storage
+                .push_back(P::from_channel_state(channel));
             self.channel_storage.len() - 1
         };
 
@@ -352,9 +353,9 @@ mod tests {
 
     #[test]
     fn test_create_and_erase_channel() {
-        use std::sync::Arc;
-        use parking_lot::Mutex;
         use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex;
+        use std::sync::Arc;
 
         let mut caches: ChannelSetupCaches<ChannelInfo> = ChannelSetupCaches::new();
 
@@ -373,9 +374,9 @@ mod tests {
 
     #[test]
     fn test_bind_to_channel() {
-        use std::sync::Arc;
-        use parking_lot::Mutex;
         use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex;
+        use std::sync::Arc;
 
         let mut caches: ChannelSetupCaches<ChannelInfo> = ChannelSetupCaches::new();
 

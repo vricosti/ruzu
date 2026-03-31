@@ -5,9 +5,9 @@
 //!
 //! StandardLocalSystemClockCore: local system clock, derived from SystemClockCore.
 
+use super::system_clock_core::SystemClockCore;
 use crate::hle::result::ResultCode;
 use crate::hle::service::psc::time::common::{SteadyClockTimePoint, SystemClockContext};
-use super::system_clock_core::SystemClockCore;
 
 /// StandardLocalSystemClockCore wraps a SystemClockCore with local-clock-specific
 /// initialization logic.
@@ -17,9 +17,7 @@ pub struct StandardLocalSystemClockCore {
 
 impl StandardLocalSystemClockCore {
     pub fn new(
-        get_time_point: Box<
-            dyn Fn() -> Result<SteadyClockTimePoint, ResultCode> + Send + Sync,
-        >,
+        get_time_point: Box<dyn Fn() -> Result<SteadyClockTimePoint, ResultCode> + Send + Sync>,
     ) -> Self {
         Self {
             clock: SystemClockCore::new(get_time_point),

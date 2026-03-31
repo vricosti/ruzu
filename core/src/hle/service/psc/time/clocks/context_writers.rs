@@ -180,10 +180,7 @@ impl NetworkSystemClockContextWriter {
         self.set_shared_memory = Some(cb);
     }
 
-    pub fn set_get_current_time_callback(
-        &mut self,
-        cb: Box<dyn Fn() -> i64 + Send + Sync>,
-    ) {
+    pub fn set_get_current_time_callback(&mut self, cb: Box<dyn Fn() -> i64 + Send + Sync>) {
         self.get_current_time = Some(cb);
     }
 }

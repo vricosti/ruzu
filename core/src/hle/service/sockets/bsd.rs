@@ -20,9 +20,7 @@ use crate::internal_network::network::{
     Domain as NetDomain, Errno as NetErrno, Protocol as NetProtocol, ShutdownHow as NetShutdownHow,
     SockAddrIn as NetSockAddrIn, Type as NetType,
 };
-use crate::internal_network::sockets::{
-    self as net_sockets, Socket, SocketBase,
-};
+use crate::internal_network::sockets::{self as net_sockets, Socket, SocketBase};
 
 /// Maximum number of file descriptors.
 ///
@@ -164,9 +162,7 @@ fn translate_sockaddr_to_network(value: &SockAddrIn) -> NetSockAddrIn {
     // Note: 6 is incorrect, but can be passed by homebrew (because libnx sets
     // sin_len to 6 when deserializing getaddrinfo results).
     assert!(
-        value.len == 0
-            || value.len == std::mem::size_of::<SockAddrIn>() as u8
-            || value.len == 6
+        value.len == 0 || value.len == std::mem::size_of::<SockAddrIn>() as u8 || value.len == 6
     );
 
     let domain = match value.family {
@@ -353,7 +349,12 @@ impl Bsd {
     /// SocketImpl -- create a new socket.
     ///
     /// Corresponds to `BSD::SocketImpl` in upstream bsd.cpp.
-    pub fn socket_impl(&mut self, domain: Domain, mut ty: Type, protocol: Protocol) -> (i32, Errno) {
+    pub fn socket_impl(
+        &mut self,
+        domain: Domain,
+        mut ty: Type,
+        protocol: Protocol,
+    ) -> (i32, Errno) {
         if ty == Type::SEQPACKET {
             log::warn!("SOCK_SEQPACKET errno management unimplemented");
         } else if ty == Type::RAW && (domain != Domain::INET || protocol != Protocol::ICMP) {
@@ -755,7 +756,9 @@ impl Bsd {
             }
             assert!(linger.onoff == 0 || linger.onoff == 1);
             return translate_errno(
-                descriptor.socket.set_linger(linger.onoff != 0, linger.linger),
+                descriptor
+                    .socket
+                    .set_linger(linger.onoff != 0, linger.linger),
             );
         }
 
@@ -869,17 +872,13 @@ impl Bsd {
             }
         }
 
-        let p_addr_in = if use_addr {
-            Some(&mut addr_in)
-        } else {
-            None
-        };
+        let p_addr_in = if use_addr { Some(&mut addr_in) } else { None };
 
-        let (ret, bsd_errno) = translate_result(
-            descriptor
-                .socket
-                .recv_from(flags as i32, message.as_mut_slice(), p_addr_in),
-        );
+        let (ret, bsd_errno) = translate_result(descriptor.socket.recv_from(
+            flags as i32,
+            message.as_mut_slice(),
+            p_addr_in,
+        ));
 
         // Restore original state
         if (descriptor.flags & FLAG_O_NONBLOCK) == 0 {
@@ -1050,7 +1049,10 @@ impl Bsd {
     /// OnProxyPacketReceived -- handle incoming proxy packet.
     ///
     /// Corresponds to `BSD::OnProxyPacketReceived` in upstream bsd.cpp.
-    pub fn on_proxy_packet_received(&mut self, packet: &crate::internal_network::network::ProxyPacket) {
+    pub fn on_proxy_packet_received(
+        &mut self,
+        packet: &crate::internal_network::network::ProxyPacket,
+    ) {
         for optional_descriptor in self.file_descriptors.iter_mut() {
             if let Some(descriptor) = optional_descriptor {
                 descriptor.socket.handle_proxy_packet(packet);
@@ -1373,7 +1375,11 @@ impl Bsd {
         let mut rp = RequestParser::new(ctx);
         let initval = rp.pop_u64();
         let flags = rp.pop_u32();
-        log::warn!("(STUBBED) BSD::EventFd called, initval={}, flags={}", initval, flags);
+        log::warn!(
+            "(STUBBED) BSD::EventFd called, initval={}, flags={}",
+            initval,
+            flags
+        );
         Bsd::build_errno_response_ipc(ctx, Errno::SUCCESS);
     }
 }
@@ -1384,13 +1390,21 @@ impl SessionRequestHandler for Bsd {
     }
 
     fn service_name(&self) -> &str {
-        if self.is_privileged { "bsd:s" } else { "bsd:u" }
+        if self.is_privileged {
+            "bsd:s"
+        } else {
+            "bsd:u"
+        }
     }
 }
 
 impl ServiceFramework for Bsd {
     fn get_service_name(&self) -> &str {
-        if self.is_privileged { "bsd:s" } else { "bsd:u" }
+        if self.is_privileged {
+            "bsd:s"
+        } else {
+            "bsd:u"
+        }
     }
 
     fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {

@@ -79,15 +79,18 @@ impl<T: Copy + Default> MultiLevelPageTable<T> {
                 0,
             );
             if base == libc::MAP_FAILED {
-                panic!("MultiLevelPageTable: mmap failed to allocate {} bytes", alloc_size);
+                panic!(
+                    "MultiLevelPageTable: mmap failed to allocate {} bytes",
+                    alloc_size
+                );
             }
             base as *mut T
         };
 
         #[cfg(not(unix))]
         let base_ptr = {
-            let layout = std::alloc::Layout::from_size_align(alloc_size, 4096)
-                .expect("Invalid layout");
+            let layout =
+                std::alloc::Layout::from_size_align(alloc_size, 4096).expect("Invalid layout");
             unsafe {
                 let ptr = std::alloc::alloc_zeroed(layout);
                 assert!(!ptr.is_null(), "Failed to allocate memory");

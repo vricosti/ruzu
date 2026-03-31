@@ -291,10 +291,7 @@ impl Joycons {
         let mut mapping = MotionMapping::new();
         let mut left_motion_params = self.get_param_package(port, pad_left_type);
         left_motion_params.set_int("motion", 0);
-        mapping.insert(
-            native_motion::Values::MotionLeft as i32,
-            left_motion_params,
-        );
+        mapping.insert(native_motion::Values::MotionLeft as i32, left_motion_params);
 
         let mut right_motion_params = self.get_param_package(port, pad_right_type);
         right_motion_params.set_int("motion", 1);

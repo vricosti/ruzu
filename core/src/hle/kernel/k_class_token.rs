@@ -389,15 +389,27 @@ mod tests {
     fn test_derived_classes_include_base_bits() {
         // KThread derives from KSynchronizationObject -> KAutoObject
         // So it should include the KSynchronizationObject bit
-        assert!(is_derived_from(TOKEN_K_THREAD, TOKEN_K_SYNCHRONIZATION_OBJECT));
+        assert!(is_derived_from(
+            TOKEN_K_THREAD,
+            TOKEN_K_SYNCHRONIZATION_OBJECT
+        ));
         assert!(is_derived_from(TOKEN_K_THREAD, TOKEN_K_AUTO_OBJECT));
 
         // KProcess also derives from KSynchronizationObject
-        assert!(is_derived_from(TOKEN_K_PROCESS, TOKEN_K_SYNCHRONIZATION_OBJECT));
+        assert!(is_derived_from(
+            TOKEN_K_PROCESS,
+            TOKEN_K_SYNCHRONIZATION_OBJECT
+        ));
 
         // KInterruptEvent derives from KReadableEvent -> KAutoObject
-        assert!(is_derived_from(TOKEN_K_INTERRUPT_EVENT, TOKEN_K_READABLE_EVENT));
-        assert!(is_derived_from(TOKEN_K_INTERRUPT_EVENT, TOKEN_K_AUTO_OBJECT));
+        assert!(is_derived_from(
+            TOKEN_K_INTERRUPT_EVENT,
+            TOKEN_K_READABLE_EVENT
+        ));
+        assert!(is_derived_from(
+            TOKEN_K_INTERRUPT_EVENT,
+            TOKEN_K_AUTO_OBJECT
+        ));
     }
 
     #[test]

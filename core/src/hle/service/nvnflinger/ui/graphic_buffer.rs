@@ -88,7 +88,13 @@ impl NvGraphicBuffer {
         self.offset
     }
 
-    pub fn needs_reallocation(&self, width: u32, height: u32, format: PixelFormat, usage: u32) -> bool {
+    pub fn needs_reallocation(
+        &self,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        usage: u32,
+    ) -> bool {
         if width as i32 != self.width {
             return true;
         }
@@ -132,17 +138,41 @@ impl GraphicBuffer {
     }
 
     // Delegate accessors to inner buffer
-    pub fn get_width(&self) -> u32 { self.buffer.get_width() }
-    pub fn get_height(&self) -> u32 { self.buffer.get_height() }
-    pub fn get_stride(&self) -> u32 { self.buffer.get_stride() }
-    pub fn get_usage(&self) -> u32 { self.buffer.get_usage() }
-    pub fn get_format(&self) -> PixelFormat { self.buffer.get_format() }
-    pub fn get_buffer_id(&self) -> u32 { self.buffer.get_buffer_id() }
-    pub fn get_external_format(&self) -> PixelFormat { self.buffer.get_external_format() }
-    pub fn get_handle(&self) -> u32 { self.buffer.get_handle() }
-    pub fn get_offset(&self) -> u32 { self.buffer.get_offset() }
+    pub fn get_width(&self) -> u32 {
+        self.buffer.get_width()
+    }
+    pub fn get_height(&self) -> u32 {
+        self.buffer.get_height()
+    }
+    pub fn get_stride(&self) -> u32 {
+        self.buffer.get_stride()
+    }
+    pub fn get_usage(&self) -> u32 {
+        self.buffer.get_usage()
+    }
+    pub fn get_format(&self) -> PixelFormat {
+        self.buffer.get_format()
+    }
+    pub fn get_buffer_id(&self) -> u32 {
+        self.buffer.get_buffer_id()
+    }
+    pub fn get_external_format(&self) -> PixelFormat {
+        self.buffer.get_external_format()
+    }
+    pub fn get_handle(&self) -> u32 {
+        self.buffer.get_handle()
+    }
+    pub fn get_offset(&self) -> u32 {
+        self.buffer.get_offset()
+    }
 
-    pub fn needs_reallocation(&self, width: u32, height: u32, format: PixelFormat, usage: u32) -> bool {
+    pub fn needs_reallocation(
+        &self,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        usage: u32,
+    ) -> bool {
         self.buffer.needs_reallocation(width, height, format, usage)
     }
 }

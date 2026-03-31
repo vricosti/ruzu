@@ -139,16 +139,14 @@ pub struct OperationEvent {
     event: std::sync::Arc<crate::hle::service::os::event::Event>,
 }
 
-static NEXT_OPERATION_EVENT_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static NEXT_OPERATION_EVENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl OperationEvent {
     /// Create a new OperationEvent.
     ///
     /// Corresponds to `OperationEvent::OperationEvent(Core::System&)` in upstream.
     pub fn new() -> Self {
-        let id = NEXT_OPERATION_EVENT_ID
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = NEXT_OPERATION_EVENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             id,
             event: std::sync::Arc::new(crate::hle::service::os::event::Event::new()),

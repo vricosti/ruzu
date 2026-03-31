@@ -382,18 +382,22 @@ fn main() {
                         log::error!("Failed to create OpenGL renderer: {}", e);
                         std::process::exit(1);
                     });
-                    renderer.rasterizer_mut().set_invalidate_gpu_cache_callback(Arc::new(
-                        move || unsafe {
+                    renderer
+                        .rasterizer_mut()
+                        .set_invalidate_gpu_cache_callback(Arc::new(move || unsafe {
                             (&*(gpu_ptr as *const video_core::gpu::Gpu)).invalidate_gpu_cache();
-                        },
-                    ));
+                        }));
                     Box::new(renderer)
                 }
                 "vulkan" => {
                     log::warn!("Vulkan renderer not yet implemented, falling back to null");
-                    Box::new(video_core::renderer_null::renderer_null::RendererNull::new(syncpoints.clone()))
+                    Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
+                        syncpoints.clone(),
+                    ))
                 }
-                _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(syncpoints.clone())),
+                _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
+                    syncpoints.clone(),
+                )),
             };
         gpu.bind_renderer(renderer);
         gpu.set_guest_memory_reader(Arc::new(move |addr, output: &mut [u8]| {

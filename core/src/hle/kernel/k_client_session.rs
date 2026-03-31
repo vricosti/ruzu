@@ -60,12 +60,7 @@ impl KClientSession {
 
     /// Send an asynchronous IPC request.
     /// Port of upstream `KClientSession::SendAsyncRequest`.
-    pub fn send_async_request(
-        &mut self,
-        _event_id: u64,
-        _address: usize,
-        _size: usize,
-    ) -> u32 {
+    pub fn send_async_request(&mut self, _event_id: u64, _address: usize, _size: usize) -> u32 {
         // HLE services bypass kernel IPC; requests are handled by SessionRequestManager.
         0 // ResultSuccess
     }

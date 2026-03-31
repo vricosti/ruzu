@@ -242,10 +242,10 @@ impl ThreadManager {
     /// Push GPU command entries to be processed.
     /// Matches upstream `ThreadManager::SubmitList(s32, CommandList&&)`.
     pub fn submit_list(&self, channel: i32, entries: CommandList) {
-        self.push_command(CommandData::SubmitList(SubmitListCommand {
-            channel,
-            entries,
-        }), false);
+        self.push_command(
+            CommandData::SubmitList(SubmitListCommand { channel, entries }),
+            false,
+        );
     }
 
     /// Notify rasterizer that a region should be flushed to Switch memory.
@@ -320,11 +320,19 @@ impl ThreadManager {
                 // Already processed (GPU thread was fast)
                 return fence;
             }
-            log::trace!("push_command: waiting for fence {} (signaled={})", fence, signaled);
+            log::trace!(
+                "push_command: waiting for fence {} (signaled={})",
+                fence,
+                signaled
+            );
             let lock = self.state.write_lock.lock().unwrap();
-            let _guard = self.state.cv.wait_while(lock, |_| {
-                fence > self.state.signaled_fence.load(Ordering::Relaxed)
-            }).unwrap();
+            let _guard = self
+                .state
+                .cv
+                .wait_while(lock, |_| {
+                    fence > self.state.signaled_fence.load(Ordering::Relaxed)
+                })
+                .unwrap();
             log::trace!("push_command: fence {} done", fence);
         }
 

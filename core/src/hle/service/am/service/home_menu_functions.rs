@@ -43,11 +43,23 @@ impl IHomeMenuFunctions {
         window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
     ) -> Self {
         let handlers = build_handler_map(&[
-            (10, Some(Self::request_to_get_foreground_handler), "RequestToGetForeground"),
+            (
+                10,
+                Some(Self::request_to_get_foreground_handler),
+                "RequestToGetForeground",
+            ),
             (11, Some(Self::lock_foreground_handler), "LockForeground"),
-            (12, Some(Self::unlock_foreground_handler), "UnlockForeground"),
+            (
+                12,
+                Some(Self::unlock_foreground_handler),
+                "UnlockForeground",
+            ),
             (20, None, "PopFromGeneralChannel"),
-            (21, Some(Self::get_pop_from_general_channel_event_handler), "GetPopFromGeneralChannelEvent"),
+            (
+                21,
+                Some(Self::get_pop_from_general_channel_event_handler),
+                "GetPopFromGeneralChannelEvent",
+            ),
             (30, None, "GetHomeButtonWriterLockAccessor"),
             (31, None, "GetWriterLockAccessorEx"),
             (40, None, "IsSleepEnabled"),
@@ -66,9 +78,8 @@ impl IHomeMenuFunctions {
         let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
             "IHomeMenuFunctions".to_string(),
         );
-        let pop_from_general_channel_event_handle = service_context.create_event(
-            "IHomeMenuFunctions:PopFromGeneralChannelEvent".to_string(),
-        );
+        let pop_from_general_channel_event_handle = service_context
+            .create_event("IHomeMenuFunctions:PopFromGeneralChannelEvent".to_string());
         Self {
             applet,
             window_system,
@@ -81,13 +92,15 @@ impl IHomeMenuFunctions {
 
     /// Port of IHomeMenuFunctions::RequestToGetForeground
     /// Upstream calls m_window_system.RequestHomeMenuToGetForeground() then R_SUCCEED.
-    fn request_to_get_foreground_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
+    fn request_to_get_foreground_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
         log::info!("IHomeMenuFunctions::RequestToGetForeground called");
-        service.window_system.lock().unwrap().request_home_menu_to_get_foreground();
+        service
+            .window_system
+            .lock()
+            .unwrap()
+            .request_home_menu_to_get_foreground();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -96,9 +109,14 @@ impl IHomeMenuFunctions {
     /// Port of IHomeMenuFunctions::LockForeground
     /// Upstream calls m_window_system.RequestLockHomeMenuIntoForeground() then R_SUCCEED.
     fn lock_foreground_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
         log::info!("IHomeMenuFunctions::LockForeground called");
-        service.window_system.lock().unwrap().request_lock_home_menu_into_foreground();
+        service
+            .window_system
+            .lock()
+            .unwrap()
+            .request_lock_home_menu_into_foreground();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -107,9 +125,14 @@ impl IHomeMenuFunctions {
     /// Port of IHomeMenuFunctions::UnlockForeground
     /// Upstream calls m_window_system.RequestUnlockHomeMenuIntoForeground() then R_SUCCEED.
     fn unlock_foreground_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
         log::info!("IHomeMenuFunctions::UnlockForeground called");
-        service.window_system.lock().unwrap().request_unlock_home_menu_into_foreground();
+        service
+            .window_system
+            .lock()
+            .unwrap()
+            .request_unlock_home_menu_into_foreground();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -121,7 +144,8 @@ impl IHomeMenuFunctions {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let _service = unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
+        let _service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IHomeMenuFunctions) };
         log::info!("IHomeMenuFunctions::GetPopFromGeneralChannelEvent called");
 
         if let Some(handle) = ctx.create_readable_event_handle(false) {

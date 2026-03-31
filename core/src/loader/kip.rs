@@ -66,13 +66,12 @@ impl AppLoaderKip {
     /// Upstream: `kip = std::make_unique<FileSys::KIP>(file)`.
     pub fn new(file: VirtualFile) -> Self {
         let kip = KIP::new(&file);
-        let kip_opt = if kip.get_status()
-            == crate::file_sys::partition_filesystem::ResultStatus::Success
-        {
-            Some(kip)
-        } else {
-            Some(kip) // Keep even on failure, upstream stores it and checks status in GetFileType/Load
-        };
+        let kip_opt =
+            if kip.get_status() == crate::file_sys::partition_filesystem::ResultStatus::Success {
+                Some(kip)
+            } else {
+                Some(kip) // Keep even on failure, upstream stores it and checks status in GetFileType/Load
+            };
         Self {
             file,
             is_loaded: false,
@@ -157,19 +156,17 @@ impl AppLoader for AppLoaderKip {
         let mut program_image: Vec<u8> = Vec::new();
 
         // Helper closure matching upstream `load_segment` lambda.
-        let mut load_segment =
-            |segment_index: usize, data: &[u8], offset: u32| {
-                let offset = offset as usize;
-                code_set.segments[segment_index].addr = offset as u64;
-                code_set.segments[segment_index].offset = offset;
-                code_set.segments[segment_index].size =
-                    page_align_size(data.len() as u32);
-                let needed = offset + data.len();
-                if program_image.len() < needed {
-                    program_image.resize(needed, 0);
-                }
-                program_image[offset..offset + data.len()].copy_from_slice(data);
-            };
+        let mut load_segment = |segment_index: usize, data: &[u8], offset: u32| {
+            let offset = offset as usize;
+            code_set.segments[segment_index].addr = offset as u64;
+            code_set.segments[segment_index].offset = offset;
+            code_set.segments[segment_index].size = page_align_size(data.len() as u32);
+            let needed = offset + data.len();
+            if program_image.len() < needed {
+                program_image.resize(needed, 0);
+            }
+            program_image[offset..offset + data.len()].copy_from_slice(data);
+        };
 
         // Text (index 0), ROData (index 1), Data (index 2)
         load_segment(0, kip.get_text_section(), kip.get_text_offset());
@@ -199,11 +196,7 @@ impl AppLoader for AppLoaderKip {
         let base_address = process.get_entry_point().get();
         process.load_module(code_set, base_address);
 
-        log::debug!(
-            "loaded module {} @ {:#X}",
-            kip.get_name(),
-            base_address
-        );
+        log::debug!("loaded module {} @ {:#X}", kip.get_name(), base_address);
 
         self.is_loaded = true;
 

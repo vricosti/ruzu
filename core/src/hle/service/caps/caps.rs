@@ -10,10 +10,10 @@
 ///
 /// Corresponds to `Service::Capture::LoopProcess` in upstream caps.cpp.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use std::sync::{Arc, Mutex};
-    use crate::hle::service::server_manager::ServerManager;
-    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use super::caps_manager::AlbumManager;
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+    use std::sync::{Arc, Mutex};
 
     log::debug!("Capture::LoopProcess called");
 
@@ -45,7 +45,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
     server_manager.register_named_service(
         "caps:u",
         Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::caps_u::IAlbumApplicationService::new(Arc::clone(&mgr)))
+            Arc::new(super::caps_u::IAlbumApplicationService::new(Arc::clone(
+                &mgr,
+            )))
         }),
         64,
     );
@@ -74,7 +76,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
     server_manager.register_named_service(
         "caps:su",
         Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::caps_su::IScreenShotApplicationService::new(Arc::clone(&mgr)))
+            Arc::new(super::caps_su::IScreenShotApplicationService::new(
+                Arc::clone(&mgr),
+            ))
         }),
         64,
     );

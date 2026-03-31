@@ -21,10 +21,10 @@ pub fn f2f(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
 
     // Apply rounding
     let mut result = match rounding {
-        0 => a,                             // RN (default)
-        1 => tv.ir.fp_floor_32(a),          // RM (floor)
-        2 => tv.ir.fp_ceil_32(a),           // RP (ceil)
-        3 => tv.ir.fp_trunc_32(a),          // RZ (trunc)
+        0 => a,                    // RN (default)
+        1 => tv.ir.fp_floor_32(a), // RM (floor)
+        2 => tv.ir.fp_ceil_32(a),  // RP (ceil)
+        3 => tv.ir.fp_trunc_32(a), // RZ (trunc)
         _ => a,
     };
 

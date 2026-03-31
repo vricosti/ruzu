@@ -80,7 +80,8 @@ mod tests {
         let storage = MemoryResourceBufferHoldStorage::new(make_test_storage(vec![0u8; 10]), 64);
         assert!(storage.is_valid());
 
-        let storage_zero = MemoryResourceBufferHoldStorage::new(make_test_storage(vec![0u8; 10]), 0);
+        let storage_zero =
+            MemoryResourceBufferHoldStorage::new(make_test_storage(vec![0u8; 10]), 0);
         assert!(!storage_zero.is_valid());
     }
 

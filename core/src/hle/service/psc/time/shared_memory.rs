@@ -55,12 +55,12 @@ pub struct LockFreeAtomicContinuousAdjustment {
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct SharedMemoryStruct {
-    pub steady_time_points: LockFreeAtomicSteadyClockTimePoint,         // 0x000
-    pub local_system_clock_contexts: LockFreeAtomicSystemClockContext,   // 0x038
+    pub steady_time_points: LockFreeAtomicSteadyClockTimePoint, // 0x000
+    pub local_system_clock_contexts: LockFreeAtomicSystemClockContext, // 0x038
     pub network_system_clock_contexts: LockFreeAtomicSystemClockContext, // 0x080
-    pub automatic_corrections: LockFreeAtomicBool,                      // 0x0C8
+    pub automatic_corrections: LockFreeAtomicBool,              // 0x0C8
     pub continuous_adjustment_time_points: LockFreeAtomicContinuousAdjustment, // 0x0D0
-    pub _pad0148: [u8; 0xEB8],                                         // 0x148 (pad to 0x1000)
+    pub _pad0148: [u8; 0xEB8],                                  // 0x148 (pad to 0x1000)
 }
 
 // Upstream offset assertions
@@ -208,8 +208,11 @@ impl SharedMemory {
     /// Corresponds to `SharedMemory::SetLocalSystemContext` in upstream.
     pub fn set_local_system_context(&mut self, context: &SystemClockContext) {
         let s = self.shared_mut();
-        write_lock_free(&mut s.local_system_clock_contexts.counter,
-                        &mut s.local_system_clock_contexts.value, *context);
+        write_lock_free(
+            &mut s.local_system_clock_contexts.counter,
+            &mut s.local_system_clock_contexts.value,
+            *context,
+        );
     }
 
     /// SetNetworkSystemContext.
@@ -217,22 +220,26 @@ impl SharedMemory {
     /// Corresponds to `SharedMemory::SetNetworkSystemContext` in upstream.
     pub fn set_network_system_context(&mut self, context: &SystemClockContext) {
         let s = self.shared_mut();
-        write_lock_free(&mut s.network_system_clock_contexts.counter,
-                        &mut s.network_system_clock_contexts.value, *context);
+        write_lock_free(
+            &mut s.network_system_clock_contexts.counter,
+            &mut s.network_system_clock_contexts.value,
+            *context,
+        );
     }
 
     /// SetSteadyClockTimePoint.
     ///
     /// Corresponds to `SharedMemory::SetSteadyClockTimePoint` in upstream.
-    pub fn set_steady_clock_time_point(
-        &mut self,
-        clock_source_id: ClockSourceId,
-        time_point: i64,
-    ) {
+    pub fn set_steady_clock_time_point(&mut self, clock_source_id: ClockSourceId, time_point: i64) {
         let s = self.shared_mut();
-        write_lock_free(&mut s.steady_time_points.counter,
-                        &mut s.steady_time_points.value,
-                        SteadyClockTimePoint { time_point, clock_source_id });
+        write_lock_free(
+            &mut s.steady_time_points.counter,
+            &mut s.steady_time_points.value,
+            SteadyClockTimePoint {
+                time_point,
+                clock_source_id,
+            },
+        );
     }
 
     /// SetContinuousAdjustment.
@@ -240,8 +247,11 @@ impl SharedMemory {
     /// Corresponds to `SharedMemory::SetContinuousAdjustment` in upstream.
     pub fn set_continuous_adjustment(&mut self, time_point: &ContinuousAdjustmentTimePoint) {
         let s = self.shared_mut();
-        write_lock_free(&mut s.continuous_adjustment_time_points.counter,
-                        &mut s.continuous_adjustment_time_points.value, *time_point);
+        write_lock_free(
+            &mut s.continuous_adjustment_time_points.counter,
+            &mut s.continuous_adjustment_time_points.value,
+            *time_point,
+        );
     }
 
     /// SetAutomaticCorrection.
@@ -249,8 +259,11 @@ impl SharedMemory {
     /// Corresponds to `SharedMemory::SetAutomaticCorrection` in upstream.
     pub fn set_automatic_correction(&mut self, automatic_correction: bool) {
         let s = self.shared_mut();
-        write_lock_free(&mut s.automatic_corrections.counter,
-                        &mut s.automatic_corrections.value, automatic_correction);
+        write_lock_free(
+            &mut s.automatic_corrections.counter,
+            &mut s.automatic_corrections.value,
+            automatic_correction,
+        );
     }
 
     /// UpdateBaseTime.
@@ -260,11 +273,14 @@ impl SharedMemory {
     /// and writes it back.
     pub fn update_base_time(&mut self, time: i64) {
         let s = self.shared_mut();
-        let mut time_point = read_lock_free(&s.steady_time_points.counter,
-                                            &s.steady_time_points.value);
+        let mut time_point =
+            read_lock_free(&s.steady_time_points.counter, &s.steady_time_points.value);
         time_point.time_point = time;
-        write_lock_free(&mut s.steady_time_points.counter,
-                        &mut s.steady_time_points.value, time_point);
+        write_lock_free(
+            &mut s.steady_time_points.counter,
+            &mut s.steady_time_points.value,
+            time_point,
+        );
     }
 
     // =====================================================================

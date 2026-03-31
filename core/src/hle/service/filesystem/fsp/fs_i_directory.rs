@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use crate::file_sys::fsa::fs_i_directory::IDirectory as FsaIDirectory;
 use crate::file_sys::fs_directory::DirectoryEntry;
 use crate::file_sys::fs_filesystem::OpenDirectoryMode;
+use crate::file_sys::fsa::fs_i_directory::IDirectory as FsaIDirectory;
 use crate::file_sys::vfs::vfs_types::VirtualDir;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};

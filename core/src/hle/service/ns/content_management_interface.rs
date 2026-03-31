@@ -8,10 +8,10 @@
 
 use std::collections::BTreeMap;
 
+use super::ns_types::{ApplicationOccupiedSize, ApplicationOccupiedSizeEntity};
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::ns_types::{ApplicationOccupiedSize, ApplicationOccupiedSizeEntity};
 
 /// IPC command table for IContentManagementInterface.
 ///
@@ -38,14 +38,38 @@ pub struct IContentManagementInterface {
 impl IContentManagementInterface {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (commands::CALCULATE_APPLICATION_OCCUPIED_SIZE, None, "CalculateApplicationOccupiedSize"),
-            (commands::CHECK_SD_CARD_MOUNT_STATUS, None, "CheckSdCardMountStatus"),
+            (
+                commands::CALCULATE_APPLICATION_OCCUPIED_SIZE,
+                None,
+                "CalculateApplicationOccupiedSize",
+            ),
+            (
+                commands::CHECK_SD_CARD_MOUNT_STATUS,
+                None,
+                "CheckSdCardMountStatus",
+            ),
             (commands::GET_TOTAL_SPACE_SIZE, None, "GetTotalSpaceSize"),
             (commands::GET_FREE_SPACE_SIZE, None, "GetFreeSpaceSize"),
-            (commands::COUNT_APPLICATION_CONTENT_META, None, "CountApplicationContentMeta"),
-            (commands::LIST_APPLICATION_CONTENT_META_STATUS, None, "ListApplicationContentMetaStatus"),
-            (commands::LIST_APPLICATION_CONTENT_META_STATUS_WITH_RIGHTS_CHECK, None, "ListApplicationContentMetaStatusWithRightsCheck"),
-            (commands::IS_ANY_APPLICATION_RUNNING, None, "IsAnyApplicationRunning"),
+            (
+                commands::COUNT_APPLICATION_CONTENT_META,
+                None,
+                "CountApplicationContentMeta",
+            ),
+            (
+                commands::LIST_APPLICATION_CONTENT_META_STATUS,
+                None,
+                "ListApplicationContentMetaStatus",
+            ),
+            (
+                commands::LIST_APPLICATION_CONTENT_META_STATUS_WITH_RIGHTS_CHECK,
+                None,
+                "ListApplicationContentMetaStatusWithRightsCheck",
+            ),
+            (
+                commands::IS_ANY_APPLICATION_RUNNING,
+                None,
+                "IsAnyApplicationRunning",
+            ),
         ]);
         Self {
             handlers,
@@ -68,7 +92,7 @@ impl IContentManagementInterface {
         let stub_entity = ApplicationOccupiedSizeEntity {
             storage_id: 3, // StorageId::SdCard
             _padding: [0; 7],
-            app_size: 8 * 1024 * 1024 * 1024,  // 8 GiB
+            app_size: 8 * 1024 * 1024 * 1024,   // 8 GiB
             patch_size: 2 * 1024 * 1024 * 1024, // 2 GiB
             aoc_size: 12 * 1024 * 1024,         // 12 MiB
         };
@@ -90,7 +114,10 @@ impl IContentManagementInterface {
     ///
     /// Corresponds to upstream `IContentManagementInterface::GetTotalSpaceSize`.
     pub fn get_total_space_size(&self, storage_id: u8) -> Result<i64, ResultCode> {
-        log::info!("(STUBBED) GetTotalSpaceSize called, storage_id={}", storage_id);
+        log::info!(
+            "(STUBBED) GetTotalSpaceSize called, storage_id={}",
+            storage_id
+        );
         // Upstream: system.GetFileSystemController().GetTotalSpaceSize(storage_id)
         // FileSystemController::get_total_space_size is not yet ported — it requires
         // sdmc_factory/bis_factory integration to query real filesystem sizes.
@@ -102,7 +129,10 @@ impl IContentManagementInterface {
     ///
     /// Corresponds to upstream `IContentManagementInterface::GetFreeSpaceSize`.
     pub fn get_free_space_size(&self, storage_id: u8) -> Result<i64, ResultCode> {
-        log::info!("(STUBBED) GetFreeSpaceSize called, storage_id={}", storage_id);
+        log::info!(
+            "(STUBBED) GetFreeSpaceSize called, storage_id={}",
+            storage_id
+        );
         // Upstream: system.GetFileSystemController().GetFreeSpaceSize(storage_id)
         // FileSystemController::get_free_space_size is not yet ported — it requires
         // sdmc_factory/bis_factory integration to query real filesystem sizes.

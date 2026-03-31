@@ -7,14 +7,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use super::newly_arrived_event_holder::INewlyArrivedEventHolder;
 use super::news_data_service::INewsDataService;
 use super::news_database_service::INewsDatabaseService;
 use super::news_service::INewsService;
 use super::overwrite_event_holder::IOverwriteEventHolder;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for News::IServiceCreator
 pub mod commands {
@@ -37,10 +37,26 @@ impl IServiceCreator {
     pub fn new(permissions: u32, name: &str) -> Self {
         let handlers = build_handler_map(&[
             (commands::CREATE_NEWS_SERVICE, None, "CreateNewsService"),
-            (commands::CREATE_NEWLY_ARRIVED_EVENT_HOLDER, None, "CreateNewlyArrivedEventHolder"),
-            (commands::CREATE_NEWS_DATA_SERVICE, None, "CreateNewsDataService"),
-            (commands::CREATE_NEWS_DATABASE_SERVICE, None, "CreateNewsDatabaseService"),
-            (commands::CREATE_OVERWRITE_EVENT_HOLDER, None, "CreateOverwriteEventHolder"),
+            (
+                commands::CREATE_NEWLY_ARRIVED_EVENT_HOLDER,
+                None,
+                "CreateNewlyArrivedEventHolder",
+            ),
+            (
+                commands::CREATE_NEWS_DATA_SERVICE,
+                None,
+                "CreateNewsDataService",
+            ),
+            (
+                commands::CREATE_NEWS_DATABASE_SERVICE,
+                None,
+                "CreateNewsDatabaseService",
+            ),
+            (
+                commands::CREATE_OVERWRITE_EVENT_HOLDER,
+                None,
+                "CreateOverwriteEventHolder",
+            ),
         ]);
 
         Self {
@@ -57,9 +73,7 @@ impl IServiceCreator {
         (RESULT_SUCCESS, service)
     }
 
-    pub fn create_newly_arrived_event_holder(
-        &self,
-    ) -> (ResultCode, Arc<INewlyArrivedEventHolder>) {
+    pub fn create_newly_arrived_event_holder(&self) -> (ResultCode, Arc<INewlyArrivedEventHolder>) {
         log::info!("News::IServiceCreator::create_newly_arrived_event_holder called");
         let service = Arc::new(INewlyArrivedEventHolder::new());
         (RESULT_SUCCESS, service)
@@ -77,9 +91,7 @@ impl IServiceCreator {
         (RESULT_SUCCESS, service)
     }
 
-    pub fn create_overwrite_event_holder(
-        &self,
-    ) -> (ResultCode, Arc<IOverwriteEventHolder>) {
+    pub fn create_overwrite_event_holder(&self) -> (ResultCode, Arc<IOverwriteEventHolder>) {
         log::info!("News::IServiceCreator::create_overwrite_event_holder called");
         let service = Arc::new(IOverwriteEventHolder::new());
         (RESULT_SUCCESS, service)

@@ -5,13 +5,13 @@
 //!
 //! ETicket service ("es").
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-use crate::crypto::key_manager::{KeyManager, Key128, S128KeyType, Ticket, TicketData};
+use crate::crypto::key_manager::{Key128, KeyManager, S128KeyType, Ticket, TicketData};
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 /// Upstream: `ERROR_INVALID_ARGUMENT{ErrorModule::ETicket, 2}`
 pub const ERROR_INVALID_ARGUMENT: ResultCode =
@@ -28,7 +28,12 @@ pub const ERROR_INVALID_RIGHTS_ID: ResultCode =
 fn ticket_to_bytes(ticket: &Ticket) -> Vec<u8> {
     match ticket {
         Ticket::Invalid => Vec::new(),
-        Ticket::RSA4096 { sig_type, sig_data, _padding, data } => {
+        Ticket::RSA4096 {
+            sig_type,
+            sig_data,
+            _padding,
+            data,
+        } => {
             let mut buf = Vec::with_capacity(0x500);
             buf.extend_from_slice(&(*sig_type as u32).to_le_bytes());
             buf.extend_from_slice(sig_data);
@@ -42,7 +47,12 @@ fn ticket_to_bytes(ticket: &Ticket) -> Vec<u8> {
             buf.extend_from_slice(data_bytes);
             buf
         }
-        Ticket::RSA2048 { sig_type, sig_data, _padding, data } => {
+        Ticket::RSA2048 {
+            sig_type,
+            sig_data,
+            _padding,
+            data,
+        } => {
             let mut buf = Vec::with_capacity(0x400);
             buf.extend_from_slice(&(*sig_type as u32).to_le_bytes());
             buf.extend_from_slice(sig_data);
@@ -56,7 +66,12 @@ fn ticket_to_bytes(ticket: &Ticket) -> Vec<u8> {
             buf.extend_from_slice(data_bytes);
             buf
         }
-        Ticket::ECDSA { sig_type, sig_data, _padding, data } => {
+        Ticket::ECDSA {
+            sig_type,
+            sig_data,
+            _padding,
+            data,
+        } => {
             let mut buf = Vec::with_capacity(0x340);
             buf.extend_from_slice(&(*sig_type as u32).to_le_bytes());
             buf.extend_from_slice(sig_data);
@@ -91,15 +106,47 @@ impl ETicket {
             (6, None, "DeleteAllPersonalizedTicket"),
             (7, None, "DeleteAllPersonalizedTicketEx"),
             (8, Some(ETicket::get_title_key_handler), "GetTitleKey"),
-            (9, Some(ETicket::count_common_ticket_handler), "CountCommonTicket"),
-            (10, Some(ETicket::count_personalized_ticket_handler), "CountPersonalizedTicket"),
-            (11, Some(ETicket::list_common_ticket_rights_ids_handler), "ListCommonTicketRightsIds"),
-            (12, Some(ETicket::list_personalized_ticket_rights_ids_handler), "ListPersonalizedTicketRightsIds"),
+            (
+                9,
+                Some(ETicket::count_common_ticket_handler),
+                "CountCommonTicket",
+            ),
+            (
+                10,
+                Some(ETicket::count_personalized_ticket_handler),
+                "CountPersonalizedTicket",
+            ),
+            (
+                11,
+                Some(ETicket::list_common_ticket_rights_ids_handler),
+                "ListCommonTicketRightsIds",
+            ),
+            (
+                12,
+                Some(ETicket::list_personalized_ticket_rights_ids_handler),
+                "ListPersonalizedTicketRightsIds",
+            ),
             (13, None, "ListMissingPersonalizedTicket"),
-            (14, Some(ETicket::get_common_ticket_size_handler), "GetCommonTicketSize"),
-            (15, Some(ETicket::get_personalized_ticket_size_handler), "GetPersonalizedTicketSize"),
-            (16, Some(ETicket::get_common_ticket_data_handler), "GetCommonTicketData"),
-            (17, Some(ETicket::get_personalized_ticket_data_handler), "GetPersonalizedTicketData"),
+            (
+                14,
+                Some(ETicket::get_common_ticket_size_handler),
+                "GetCommonTicketSize",
+            ),
+            (
+                15,
+                Some(ETicket::get_personalized_ticket_size_handler),
+                "GetPersonalizedTicketSize",
+            ),
+            (
+                16,
+                Some(ETicket::get_common_ticket_data_handler),
+                "GetCommonTicketData",
+            ),
+            (
+                17,
+                Some(ETicket::get_personalized_ticket_data_handler),
+                "GetPersonalizedTicketData",
+            ),
             (18, None, "OwnTicket"),
             (19, None, "GetTicketInfo"),
             (20, None, "ListLightTicketInfo"),
@@ -118,7 +165,11 @@ impl ETicket {
             (33, None, "ListPrepurchaseRecordRightsIdsEx"),
             (34, None, "GetEncryptedTicketSize"),
             (35, None, "GetEncryptedTicketData"),
-            (36, None, "DeleteAllInactiveELicenseRequiredPersonalizedTicket"),
+            (
+                36,
+                None,
+                "DeleteAllInactiveELicenseRequiredPersonalizedTicket",
+            ),
             (37, None, "OwnTicket2"),
             (38, None, "OwnTicket3"),
             (39, None, "DeleteAllInactivePersonalizedTicket"),
@@ -466,7 +517,10 @@ impl ETicket {
         rb.push_u32(count);
     }
 
-    fn list_common_ticket_rights_ids_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn list_common_ticket_rights_ids_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const ETicket) };
         let max_entries = ctx.get_write_buffer_size(0) / std::mem::size_of::<u128>();
         let (count, ids) = svc.list_common_ticket_rights_ids(max_entries);
@@ -484,7 +538,10 @@ impl ETicket {
         rb.push_u32(count);
     }
 
-    fn list_personalized_ticket_rights_ids_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn list_personalized_ticket_rights_ids_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const ETicket) };
         let max_entries = ctx.get_write_buffer_size(0) / std::mem::size_of::<u128>();
         let (count, ids) = svc.list_personalized_ticket_rights_ids(max_entries);
@@ -519,7 +576,10 @@ impl ETicket {
         }
     }
 
-    fn get_personalized_ticket_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_personalized_ticket_size_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const ETicket) };
         let mut rp = RequestParser::new(ctx);
         let rights_id = rp.pop_raw::<u128>();
@@ -555,7 +615,10 @@ impl ETicket {
         }
     }
 
-    fn get_personalized_ticket_data_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_personalized_ticket_data_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const ETicket) };
         let mut rp = RequestParser::new(ctx);
         let rights_id = rp.pop_raw::<u128>();
@@ -579,30 +642,36 @@ impl SessionRequestHandler for ETicket {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { "es" }
+    fn service_name(&self) -> &str {
+        "es"
+    }
 }
 
 impl ServiceFramework for ETicket {
-    fn get_service_name(&self) -> &str { "es" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "es"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// Registers "es" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `es.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use std::sync::Arc;
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+    use std::sync::Arc;
 
     let mut server_manager = ServerManager::new(system);
 
     server_manager.register_named_service(
         "es",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            Arc::new(ETicket::new())
-        }),
+        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(ETicket::new()) }),
         64,
     );
 

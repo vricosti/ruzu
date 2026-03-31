@@ -26,7 +26,9 @@ pub fn global_memory_to_storage_buffer_pass(
     _program: &mut Program,
     _host_info: &HostTranslateInfo,
 ) {
-    log::warn!("GlobalMemoryToStorageBufferPass not yet implemented — global memory ops left as-is");
+    log::warn!(
+        "GlobalMemoryToStorageBufferPass not yet implemented — global memory ops left as-is"
+    );
 }
 
 /// Join storage buffer descriptors from `source` into `base`.

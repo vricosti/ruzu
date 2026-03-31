@@ -250,10 +250,10 @@ impl Default for Settings {
 pub struct AmiiboSettings {
     pub settings: Settings,
     pub country_code_id: u8,
-    pub crc_counter: u16,    // big-endian
+    pub crc_counter: u16, // big-endian
     pub init_date: AmiiboDate,
     pub write_date: AmiiboDate,
-    pub crc: u32,            // big-endian
+    pub crc: u32,                               // big-endian
     pub amiibo_name: [u16; AMIIBO_NAME_LENGTH], // big-endian UTF-16
 }
 const _: () = assert!(core::mem::size_of::<AmiiboSettings>() == 0x20);
@@ -272,10 +272,10 @@ impl Default for AmiiboSettings {
 pub struct AmiiboModelInfo {
     pub character_id: u16,
     pub character_variant: u8,
-    pub amiibo_type: u8,     // AmiiboType
-    pub model_number: u16,   // big-endian
-    pub series: u8,          // AmiiboSeries
-    pub tag_type: u8,        // PackedTagType
+    pub amiibo_type: u8,   // AmiiboType
+    pub model_number: u16, // big-endian
+    pub series: u8,        // AmiiboSeries
+    pub tag_type: u8,      // PackedTagType
     pub unknown: [u8; 0x4],
 }
 const _: () = assert!(core::mem::size_of::<AmiiboModelInfo>() == 0xC);
@@ -305,7 +305,7 @@ impl Default for Ntag215Password {
     }
 }
 
-use crate::hle::service::mii::types::ver3_store_data::{Ver3StoreData, NfpStoreDataExtension};
+use crate::hle::service::mii::types::ver3_store_data::{NfpStoreDataExtension, Ver3StoreData};
 
 /// Corresponds to `EncryptedAmiiboFile` in upstream nfp_types.h.
 /// This is the user_memory portion of the encrypted NTAG215 dump.
@@ -313,24 +313,24 @@ use crate::hle::service::mii::types::ver3_store_data::{Ver3StoreData, NfpStoreDa
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct EncryptedAmiiboFile {
-    pub constant_value: u8,              // Must be 0xA5
-    pub write_counter: u16,              // big-endian
+    pub constant_value: u8, // Must be 0xA5
+    pub write_counter: u16, // big-endian
     pub amiibo_version: u8,
-    pub settings: AmiiboSettings,        // 0x20
-    pub hmac_tag: HashData,              // 0x20
-    pub model_info: AmiiboModelInfo,     // 0xC
-    pub keygen_salt: HashData,           // 0x20
-    pub hmac_data: HashData,             // 0x20
-    pub owner_mii: Ver3StoreData,        // 0x60
-    pub application_id: u64,             // big-endian
-    pub application_write_counter: u16,  // big-endian
-    pub application_area_id: u32,        // big-endian
+    pub settings: AmiiboSettings,       // 0x20
+    pub hmac_tag: HashData,             // 0x20
+    pub model_info: AmiiboModelInfo,    // 0xC
+    pub keygen_salt: HashData,          // 0x20
+    pub hmac_data: HashData,            // 0x20
+    pub owner_mii: Ver3StoreData,       // 0x60
+    pub application_id: u64,            // big-endian
+    pub application_write_counter: u16, // big-endian
+    pub application_area_id: u32,       // big-endian
     pub application_id_byte: u8,
     pub unknown: u8,
     pub mii_extension: NfpStoreDataExtension, // 0x8
-    pub unknown2: [u32; 0x5],            // 0x14
-    pub register_info_crc: u32,          // big-endian
-    pub application_area: ApplicationArea, // 0xD8
+    pub unknown2: [u32; 0x5],                 // 0x14
+    pub register_info_crc: u32,               // big-endian
+    pub application_area: ApplicationArea,    // 0xD8
 }
 const _: () = assert!(core::mem::size_of::<EncryptedAmiiboFile>() == 0x1F8);
 
@@ -358,29 +358,29 @@ pub struct Ntag215File {
     pub internal_number: u8,
     pub static_lock: u16,
     pub compatibility_container: u32,
-    pub hmac_data: HashData,                     // 0x20 bytes
-    pub constant_value: u8,                      // Must be 0xA5
-    pub write_counter: u16,                      // big-endian
+    pub hmac_data: HashData, // 0x20 bytes
+    pub constant_value: u8,  // Must be 0xA5
+    pub write_counter: u16,  // big-endian
     pub amiibo_version: u8,
-    pub settings: AmiiboSettings,                // 0x20
-    pub owner_mii: Ver3StoreData,                // 0x60
-    pub application_id: u64,                     // big-endian
-    pub application_write_counter: u16,          // big-endian
-    pub application_area_id: u32,                // big-endian
+    pub settings: AmiiboSettings,       // 0x20
+    pub owner_mii: Ver3StoreData,       // 0x60
+    pub application_id: u64,            // big-endian
+    pub application_write_counter: u16, // big-endian
+    pub application_area_id: u32,       // big-endian
     pub application_id_byte: u8,
     pub unknown: u8,
-    pub mii_extension: NfpStoreDataExtension,    // 0x8
-    pub unknown2: [u32; 0x5],                    // 0x14
-    pub register_info_crc: u32,                  // big-endian
-    pub application_area: ApplicationArea,       // 0xD8
-    pub hmac_tag: HashData,                      // 0x20
-    pub uid: TagUuid,                            // 0x8
-    pub model_info: AmiiboModelInfo,             // 0xC
-    pub keygen_salt: HashData,                   // 0x20
+    pub mii_extension: NfpStoreDataExtension, // 0x8
+    pub unknown2: [u32; 0x5],                 // 0x14
+    pub register_info_crc: u32,               // big-endian
+    pub application_area: ApplicationArea,    // 0xD8
+    pub hmac_tag: HashData,                   // 0x20
+    pub uid: TagUuid,                         // 0x8
+    pub model_info: AmiiboModelInfo,          // 0xC
+    pub keygen_salt: HashData,                // 0x20
     pub dynamic_lock: u32,
     pub cfg0: u32,
     pub cfg1: u32,
-    pub password: Ntag215Password,               // 0x8
+    pub password: Ntag215Password, // 0x8
 }
 const _: () = assert!(core::mem::size_of::<Ntag215File>() == 0x21C);
 
@@ -396,16 +396,16 @@ impl Default for Ntag215File {
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct EncryptedNtag215File {
-    pub uuid: TagUuid,                           // 0x8
+    pub uuid: TagUuid, // 0x8
     pub uuid_crc_check2: u8,
     pub internal_number: u8,
     pub static_lock: u16,
     pub compatibility_container: u32,
-    pub user_memory: EncryptedAmiiboFile,         // 0x1F8
+    pub user_memory: EncryptedAmiiboFile, // 0x1F8
     pub dynamic_lock: u32,
     pub cfg0: u32,
     pub cfg1: u32,
-    pub password: Ntag215Password,               // 0x8
+    pub password: Ntag215Password, // 0x8
 }
 const _: () = assert!(core::mem::size_of::<EncryptedNtag215File>() == 0x21C);
 

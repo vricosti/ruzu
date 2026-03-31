@@ -15,9 +15,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use super::ldn_results::*;
 use super::ldn_types::*;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Fake SSID used for LAN discovery (matches upstream `fake_ssid`).
 pub const FAKE_SSID: &str = "YuzuFakeSsidForLdn";

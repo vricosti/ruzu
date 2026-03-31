@@ -211,7 +211,11 @@ impl AlignmentMatchingStorageImpl {
         // Write the core portion.
         if core_size > 0 {
             let buf_start = core_offset - offset;
-            base_storage.write(&buffer[buf_start..buf_start + core_size], core_size, core_offset);
+            base_storage.write(
+                &buffer[buf_start..buf_start + core_size],
+                core_size,
+                core_offset,
+            );
         }
 
         // Handle the head portion.
@@ -221,8 +225,7 @@ impl AlignmentMatchingStorageImpl {
 
             base_storage.read(work_buf, data_alignment, head_offset);
             let dst_offset = offset - head_offset;
-            work_buf[dst_offset..dst_offset + head_size]
-                .copy_from_slice(&buffer[..head_size]);
+            work_buf[dst_offset..dst_offset + head_size].copy_from_slice(&buffer[..head_size]);
             base_storage.write(work_buf, data_alignment, head_offset);
         }
 

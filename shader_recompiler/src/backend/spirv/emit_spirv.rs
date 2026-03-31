@@ -7,9 +7,9 @@
 //! Contains the `EmitSPIRV` entry point and constants for rescaling/render area
 //! push constant layouts.
 
+use super::spirv_emit_context::SpirvEmitContext;
 use crate::ir;
 use crate::runtime_info::RuntimeInfo;
-use super::spirv_emit_context::SpirvEmitContext;
 
 /// Number of u32 words for texture rescaling data.
 pub const NUM_TEXTURE_SCALING_WORDS: u32 = 4;

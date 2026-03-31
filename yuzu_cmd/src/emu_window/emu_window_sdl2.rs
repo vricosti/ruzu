@@ -75,8 +75,7 @@ impl EmuWindowSdl2 {
             )
         };
         if ret < 0 {
-            let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }
-                .to_string_lossy();
+            let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();
             log::error!("Failed to initialize SDL2: {}, Exiting...", err);
             std::process::exit(1);
         }
@@ -86,7 +85,9 @@ impl EmuWindowSdl2 {
             let current_driver = if current_driver.is_null() {
                 "<null>".to_string()
             } else {
-                CStr::from_ptr(current_driver).to_string_lossy().into_owned()
+                CStr::from_ptr(current_driver)
+                    .to_string_lossy()
+                    .into_owned()
             };
             let display_count = sdl::SDL_GetNumVideoDisplays();
             log::info!(
@@ -289,7 +290,11 @@ impl EmuWindowSdl2 {
         // Upstream: input_subsystem->GetKeyboard()->PressKey(key) / ReleaseKey(key)
         // InputSubsystem not yet ported.
         let _ = (key, state);
-        log::trace!("on_key_event: key={} state={} (InputSubsystem not yet ported)", key, state);
+        log::trace!(
+            "on_key_event: key={} state={} (InputSubsystem not yet ported)",
+            key,
+            state
+        );
     }
 
     /// Converts an SDL mouse button constant to the `MouseButton` enum used by
@@ -300,9 +305,9 @@ impl EmuWindowSdl2 {
         // SDL_BUTTON_LEFT=1, SDL_BUTTON_MIDDLE=2, SDL_BUTTON_RIGHT=3,
         // SDL_BUTTON_X1=4, SDL_BUTTON_X2=5
         match button {
-            1 => MouseButton::Left,   // SDL_BUTTON_LEFT
-            3 => MouseButton::Right,  // SDL_BUTTON_RIGHT
-            2 => MouseButton::Wheel,  // SDL_BUTTON_MIDDLE
+            1 => MouseButton::Left,     // SDL_BUTTON_LEFT
+            3 => MouseButton::Right,    // SDL_BUTTON_RIGHT
+            2 => MouseButton::Wheel,    // SDL_BUTTON_MIDDLE
             4 => MouseButton::Backward, // SDL_BUTTON_X1
             5 => MouseButton::Forward,  // SDL_BUTTON_X2
             _ => MouseButton::Undefined,
@@ -334,7 +339,11 @@ impl EmuWindowSdl2 {
         // Upstream: SDLButtonToMouseButton + input_subsystem->GetMouse()->PressButton / ReleaseButton
         let _mouse_button = self.sdl_button_to_mouse_button(button);
         let _ = (state, x, y);
-        log::trace!("on_mouse_button: button={} state={} (InputSubsystem not yet ported)", button, state);
+        log::trace!(
+            "on_mouse_button: button={} state={} (InputSubsystem not yet ported)",
+            button,
+            state
+        );
     }
 
     /// Called when the mouse cursor moves.
@@ -344,7 +353,11 @@ impl EmuWindowSdl2 {
     pub(crate) fn on_mouse_motion(&mut self, x: i32, y: i32) {
         // Upstream: MouseToTouchPos + input_subsystem->GetMouse()->Move / MouseMove / TouchMove
         let _pos = self.mouse_to_touch_pos(x, y);
-        log::trace!("on_mouse_motion: x={} y={} (InputSubsystem not yet ported)", x, y);
+        log::trace!(
+            "on_mouse_motion: x={} y={} (InputSubsystem not yet ported)",
+            x,
+            y
+        );
     }
 
     /// Called when a finger starts touching the touchscreen.
@@ -353,7 +366,12 @@ impl EmuWindowSdl2 {
     /// Note: InputSubsystem not yet ported — logs and returns.
     pub(crate) fn on_finger_down(&mut self, x: f32, y: f32, id: usize) {
         // Upstream: input_subsystem->GetTouchScreen()->TouchPressed(x, y, id)
-        log::trace!("on_finger_down: x={} y={} id={} (InputSubsystem not yet ported)", x, y, id);
+        log::trace!(
+            "on_finger_down: x={} y={} id={} (InputSubsystem not yet ported)",
+            x,
+            y,
+            id
+        );
     }
 
     /// Called when a finger moves on the touchscreen.
@@ -362,7 +380,12 @@ impl EmuWindowSdl2 {
     /// Note: InputSubsystem not yet ported — logs and returns.
     pub(crate) fn on_finger_motion(&mut self, x: f32, y: f32, id: usize) {
         // Upstream: input_subsystem->GetTouchScreen()->TouchMoved(x, y, id)
-        log::trace!("on_finger_motion: x={} y={} id={} (InputSubsystem not yet ported)", x, y, id);
+        log::trace!(
+            "on_finger_motion: x={} y={} id={} (InputSubsystem not yet ported)",
+            x,
+            y,
+            id
+        );
     }
 
     /// Called when a finger lifts from the touchscreen.
@@ -388,7 +411,11 @@ impl EmuWindowSdl2 {
         let mut height: i32 = 0;
         unsafe { sdl::SDL_GL_GetDrawableSize(self.render_window, &mut width, &mut height) };
         // UpdateCurrentFramebufferLayout not yet ported (Core::Frontend).
-        log::trace!("on_resize: {}x{} (UpdateCurrentFramebufferLayout not yet ported)", width, height);
+        log::trace!(
+            "on_resize: {}x{} (UpdateCurrentFramebufferLayout not yet ported)",
+            width,
+            height
+        );
     }
 
     /// Shows or hides the mouse cursor.
@@ -396,7 +423,11 @@ impl EmuWindowSdl2 {
     /// Maps to C++ `EmuWindow_SDL2::ShowCursor`.
     pub(crate) fn show_cursor(&self, show: bool) {
         // Maps to: SDL_ShowCursor(show_cursor ? SDL_ENABLE : SDL_DISABLE)
-        let toggle = if show { sdl::SDL_ENABLE as i32 } else { sdl::SDL_DISABLE as i32 };
+        let toggle = if show {
+            sdl::SDL_ENABLE as i32
+        } else {
+            sdl::SDL_DISABLE as i32
+        };
         unsafe { sdl::SDL_ShowCursor(toggle) };
     }
 
@@ -418,9 +449,7 @@ impl EmuWindowSdl2 {
             }
             _ => sdl::SDL_WindowFlags::SDL_WINDOW_FULLSCREEN_DESKTOP as u32,
         };
-        let ret = unsafe {
-            sdl::SDL_SetWindowFullscreen(self.render_window, sdl_flag)
-        };
+        let ret = unsafe { sdl::SDL_SetWindowFullscreen(self.render_window, sdl_flag) };
         if ret != 0 {
             let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();
             log::error!("Borderless fullscreening failed: {}", err);
@@ -453,7 +482,9 @@ impl Drop for EmuWindowSdl2 {
     fn drop(&mut self) {
         // Upstream: system.HIDCore().UnloadInputDevices(); input_subsystem->Shutdown(); SDL_Quit();
         // HIDCore/InputSubsystem not yet ported.
-        log::debug!("EmuWindowSdl2::drop — calling SDL_Quit (HIDCore/InputSubsystem not yet ported)");
+        log::debug!(
+            "EmuWindowSdl2::drop — calling SDL_Quit (HIDCore/InputSubsystem not yet ported)"
+        );
         unsafe { sdl::SDL_Quit() };
     }
 }

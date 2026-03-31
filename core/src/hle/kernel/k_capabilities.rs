@@ -53,8 +53,7 @@ pub const PHYSICAL_MAP_ALLOWED_MASK: u64 = (1u64 << 36) - 1;
 
 /// Initialize-once flag set.
 /// Upstream: CorePriority | ProgramType | KernelVersion | HandleTable | DebugFlags
-pub const INITIALIZE_ONCE_FLAGS: u32 =
-    (1 << 3) | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16);
+pub const INITIALIZE_ONCE_FLAGS: u32 = (1 << 3) | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16);
 
 /// Determine the capability type from a raw value.
 /// Matches upstream `GetCapabilityType`.
@@ -118,10 +117,18 @@ impl KCapabilities {
 
     // -- Getters matching upstream --
 
-    pub fn get_core_mask(&self) -> u64 { self.core_mask }
-    pub fn get_physical_core_mask(&self) -> u64 { self.phys_core_mask }
-    pub fn get_priority_mask(&self) -> u64 { self.priority_mask }
-    pub fn get_handle_table_size(&self) -> i32 { self.handle_table_size }
+    pub fn get_core_mask(&self) -> u64 {
+        self.core_mask
+    }
+    pub fn get_physical_core_mask(&self) -> u64 {
+        self.phys_core_mask
+    }
+    pub fn get_priority_mask(&self) -> u64 {
+        self.priority_mask
+    }
+    pub fn get_handle_table_size(&self) -> i32 {
+        self.handle_table_size
+    }
 
     pub fn is_permitted_svc(&self, id: u32) -> bool {
         (id as usize) < SVC_ACCESS_FLAG_COUNT && self.svc_access_flags[id as usize]
@@ -151,7 +158,11 @@ impl KCapabilities {
 
     /// Initialize capabilities for a KIP (kernel initial process).
     /// Matches upstream `KCapabilities::InitializeForKip`.
-    pub fn initialize_for_kip(&mut self, kern_caps: &[u32], page_table: Option<&mut KProcessPageTable>) -> u32 {
+    pub fn initialize_for_kip(
+        &mut self,
+        kern_caps: &[u32],
+        page_table: Option<&mut KProcessPageTable>,
+    ) -> u32 {
         self.svc_access_flags = [false; SVC_ACCESS_FLAG_COUNT];
         self.irq_access_flags = [false; INTERRUPT_ID_COUNT];
         self.debug_capabilities = 0;
@@ -177,7 +188,11 @@ impl KCapabilities {
 
     /// Initialize capabilities for a user process.
     /// Matches upstream `KCapabilities::InitializeForUser`.
-    pub fn initialize_for_user(&mut self, user_caps: &[u32], page_table: Option<&mut KProcessPageTable>) -> u32 {
+    pub fn initialize_for_user(
+        &mut self,
+        user_caps: &[u32],
+        page_table: Option<&mut KProcessPageTable>,
+    ) -> u32 {
         // Reset all fields.
         self.svc_access_flags = [false; SVC_ACCESS_FLAG_COUNT];
         self.irq_access_flags = [false; INTERRUPT_ID_COUNT];
@@ -198,7 +213,11 @@ impl KCapabilities {
 
     /// Parse a capabilities array.
     /// Matches upstream `KCapabilities::SetCapabilities`.
-    fn set_capabilities(&mut self, caps: &[u32], mut page_table: Option<&mut KProcessPageTable>) -> u32 {
+    fn set_capabilities(
+        &mut self,
+        caps: &[u32],
+        mut page_table: Option<&mut KProcessPageTable>,
+    ) -> u32 {
         let mut set_flags = 0u32;
         let mut set_svc = 0u32;
         let mut i = 0;
@@ -238,7 +257,13 @@ impl KCapabilities {
 
     /// Process a single capability.
     /// Matches upstream `KCapabilities::SetCapability`.
-    fn set_capability(&mut self, cap: u32, set_flags: &mut u32, set_svc: &mut u32, page_table: &mut Option<&mut KProcessPageTable>) -> u32 {
+    fn set_capability(
+        &mut self,
+        cap: u32,
+        set_flags: &mut u32,
+        set_svc: &mut u32,
+        page_table: &mut Option<&mut KProcessPageTable>,
+    ) -> u32 {
         let cap_type = get_capability_type(cap);
 
         // Invalid type.
@@ -300,7 +325,7 @@ impl KCapabilities {
         //   bits [15..10] = highest_thread_priority (6 bits)
         //   bits [23..16] = minimum_core_id (8 bits)
         //   bits [31..24] = maximum_core_id (8 bits)
-        let max_prio = ((cap >> 4) & 0x3F) as u32;  // lowest_thread_priority
+        let max_prio = ((cap >> 4) & 0x3F) as u32; // lowest_thread_priority
         let min_prio = ((cap >> 10) & 0x3F) as u32; // highest_thread_priority
         let min_core = ((cap >> 16) & 0xFF) as u32;
         let max_core = ((cap >> 24) & 0xFF) as u32;
@@ -346,8 +371,12 @@ impl KCapabilities {
         log::debug!(
             "KCapabilities::SetCorePriorityCapability: cores=[{}..{}], priority=[{}..{}], \
              core_mask={:#x}, priority_mask={:#018x}",
-            min_core, max_core, min_prio, max_prio,
-            self.core_mask, self.priority_mask
+            min_core,
+            max_core,
+            min_prio,
+            max_prio,
+            self.core_mask,
+            self.priority_mask
         );
 
         0 // success
@@ -617,16 +646,24 @@ mod tests {
             | (59 << 4)      // lowest_thread_priority
             | (28 << 10)     // highest_thread_priority
             | (0 << 16)      // minimum_core_id
-            | (2 << 24);     // maximum_core_id
+            | (2 << 24); // maximum_core_id
         let result = caps.set_core_priority_capability(cap);
         assert_eq!(result, 0);
         assert_eq!(caps.core_mask, 0b111); // cores 0,1,2
-        // Priority mask should have bits 28..59 set.
+                                           // Priority mask should have bits 28..59 set.
         for prio in 0..64 {
             if prio >= 28 && prio <= 59 {
-                assert!(caps.priority_mask & (1u64 << prio) != 0, "prio {} should be set", prio);
+                assert!(
+                    caps.priority_mask & (1u64 << prio) != 0,
+                    "prio {} should be set",
+                    prio
+                );
             } else {
-                assert!(caps.priority_mask & (1u64 << prio) == 0, "prio {} should NOT be set", prio);
+                assert!(
+                    caps.priority_mask & (1u64 << prio) == 0,
+                    "prio {} should NOT be set",
+                    prio
+                );
             }
         }
     }

@@ -126,15 +126,33 @@ impl AbstractPad {
         }
 
         // Rollback on failure
-        if stage > 9 { self.battery_handler.decrement_ref_counter(); }
-        if stage > 8 { self.button_handler.decrement_ref_counter(); }
-        if stage > 7 { self.sixaxis_handler.decrement_ref_counter(); }
-        if stage > 6 { self.vibration_handler.decrement_ref_counter(); }
-        if stage > 5 { self.nfc_handler.decrement_ref_counter(); }
-        if stage > 4 { self.mcu_handler.decrement_ref_counter(); }
-        if stage > 3 { self.ir_sensor_handler.decrement_ref_counter(); }
-        if stage > 2 { self.led_handler.decrement_ref_counter(); }
-        if stage > 1 { self.properties_handler.decrement_ref_counter(); }
+        if stage > 9 {
+            self.battery_handler.decrement_ref_counter();
+        }
+        if stage > 8 {
+            self.button_handler.decrement_ref_counter();
+        }
+        if stage > 7 {
+            self.sixaxis_handler.decrement_ref_counter();
+        }
+        if stage > 6 {
+            self.vibration_handler.decrement_ref_counter();
+        }
+        if stage > 5 {
+            self.nfc_handler.decrement_ref_counter();
+        }
+        if stage > 4 {
+            self.mcu_handler.decrement_ref_counter();
+        }
+        if stage > 3 {
+            self.ir_sensor_handler.decrement_ref_counter();
+        }
+        if stage > 2 {
+            self.led_handler.decrement_ref_counter();
+        }
+        if stage > 1 {
+            self.properties_handler.decrement_ref_counter();
+        }
 
         result
     }

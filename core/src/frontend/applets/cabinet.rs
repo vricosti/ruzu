@@ -4,8 +4,8 @@
 //! Port of zuyu/src/core/frontend/applets/cabinet.h and cabinet.cpp
 //! Cabinet (Amiibo) applet interface.
 
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 use super::applet::Applet;
 use crate::hle::service::nfc::common::device::NfcDevice;

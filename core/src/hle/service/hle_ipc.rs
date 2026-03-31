@@ -116,7 +116,9 @@ impl SessionRequestManager {
 
     /// Create with a ServerManager reference, matching upstream constructor:
     /// `SessionRequestManager(KernelCore& kernel, ServerManager& server_manager)`.
-    pub fn new_with_server_manager(server_manager: Arc<Mutex<super::server_manager::ServerManager>>) -> Self {
+    pub fn new_with_server_manager(
+        server_manager: Arc<Mutex<super::server_manager::ServerManager>>,
+    ) -> Self {
         Self {
             convert_to_domain: false,
             is_domain: false,
@@ -361,7 +363,8 @@ pub struct HLERequestContext {
 
     /// Temporary: holds the server session from the last create_session_with_manager call,
     /// so that push_ipc_interface can register it with the ServerManager.
-    pub(crate) last_created_server_session: Option<Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>>,
+    pub(crate) last_created_server_session:
+        Option<Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>>,
 }
 
 impl HLERequestContext {
@@ -459,9 +462,7 @@ impl HLERequestContext {
     }
 
     /// Returns the requesting process shared memory backing.
-    pub fn get_shared_memory(
-        &self,
-    ) -> Option<crate::hle::kernel::k_process::SharedProcessMemory> {
+    pub fn get_shared_memory(&self) -> Option<crate::hle::kernel::k_process::SharedProcessMemory> {
         self.shared_memory.clone()
     }
 
@@ -496,9 +497,7 @@ impl HLERequestContext {
     }
 
     pub fn is_tipc(&self) -> bool {
-        self.command_header
-            .as_ref()
-            .map_or(false, |h| h.is_tipc())
+        self.command_header.as_ref().map_or(false, |h| h.is_tipc())
     }
 
     pub fn get_command_type(&self) -> ipc::CommandType {
@@ -557,12 +556,14 @@ impl HLERequestContext {
 
     /// Convenience: add a move object from a raw handle.
     pub fn add_move_handle(&mut self, handle: Handle) {
-        self.outgoing_move_objects.push(KAutoObjectRef::Handle(handle));
+        self.outgoing_move_objects
+            .push(KAutoObjectRef::Handle(handle));
     }
 
     /// Convenience: add a copy object from a raw handle.
     pub fn add_copy_handle(&mut self, handle: Handle) {
-        self.outgoing_copy_objects.push(KAutoObjectRef::Handle(handle));
+        self.outgoing_copy_objects
+            .push(KAutoObjectRef::Handle(handle));
     }
 
     pub fn add_domain_object(&mut self, object: SessionRequestHandlerPtr) {
@@ -726,7 +727,8 @@ impl HLERequestContext {
     ///
     /// Matches upstream `ServiceContext::CreateEvent` + signal pattern.
     pub fn create_readable_event_handle(&self, signaled: bool) -> Option<Handle> {
-        self.create_readable_event(signaled).map(|(handle, _)| handle)
+        self.create_readable_event(signaled)
+            .map(|(handle, _)| handle)
     }
 
     /// Installs an existing readable event object into the current process handle table.
@@ -921,20 +923,6 @@ impl HLERequestContext {
         let size = data.len().min(buffer_size);
         let address = self.buffer_b_descriptors[buffer_index].address();
         self.write_guest_memory(address, &data[..size]);
-        if (size == 32 && (data[0] == 0x04 || data[0] == 0x08))
-            || (size == 24 && data.len() >= 24 && data[4] == 0x00 && data[5] == 0x00)
-            || (size == 48 && data.len() >= 48 && data[24] == 0x00 && data[28] == 0x00)
-            || (size == 64 && data.len() >= 64 && data[8] == 0x30 && data[12] == 0x00)
-        {
-            let verify = self.read_guest_memory(address, size.min(64));
-            log::debug!(
-                "WriteBufferB probe addr=0x{:X} size=0x{:X} data_prefix={:02X?} verify_prefix={:02X?}",
-                address,
-                size,
-                &data[..size.min(64)],
-                &verify[..verify.len().min(64)]
-            );
-        }
         size
     }
 
@@ -949,20 +937,6 @@ impl HLERequestContext {
         let size = data.len().min(buffer_size);
         let address = self.buffer_c_descriptors[buffer_index].address();
         self.write_guest_memory(address, &data[..size]);
-        if (size == 32 && (data[0] == 0x04 || data[0] == 0x08))
-            || (size == 24 && data.len() >= 24 && data[4] == 0x00 && data[5] == 0x00)
-            || (size == 48 && data.len() >= 48 && data[24] == 0x00 && data[28] == 0x00)
-            || (size == 64 && data.len() >= 64 && data[8] == 0x30 && data[12] == 0x00)
-        {
-            let verify = self.read_guest_memory(address, size.min(64));
-            log::debug!(
-                "WriteBufferC probe addr=0x{:X} size=0x{:X} data_prefix={:02X?} verify_prefix={:02X?}",
-                address,
-                size,
-                &data[..size.min(64)],
-                &verify[..verify.len().min(64)]
-            );
-        }
         size
     }
 
@@ -1436,7 +1410,8 @@ mod tests {
             mem.write_32(tls_address + 16, 0xdead_beef);
         }
 
-        let mut ctx = HLERequestContext::new_with_thread(thread, shared_memory.clone(), tls_address);
+        let mut ctx =
+            HLERequestContext::new_with_thread(thread, shared_memory.clone(), tls_address);
         ctx.write_size = 4;
         ctx.cmd_buf[0] = 0x1111_1111;
         ctx.cmd_buf[1] = 0x2222_2222;

@@ -179,11 +179,7 @@ impl AppLoader for AppLoaderNsp {
         if !self.nsp.is_extracted_type()
             && self
                 .nsp
-                .get_nca(
-                    title_id,
-                    ContentRecordType::Program,
-                    TitleType::Application,
-                )
+                .get_nca(title_id, ContentRecordType::Program, TitleType::Application)
                 .is_none()
         {
             if !KeyManager::key_file_exists(false) {
@@ -214,10 +210,7 @@ impl AppLoader for AppLoaderNsp {
     }
 
     /// Maps to upstream `AppLoader_NSP::VerifyIntegrity`.
-    fn verify_integrity(
-        &self,
-        progress_callback: &dyn Fn(usize, usize) -> bool,
-    ) -> ResultStatus {
+    fn verify_integrity(&self, progress_callback: &dyn Fn(usize, usize) -> bool) -> ResultStatus {
         // Extracted-type NSPs can't be verified.
         if self.nsp.is_extracted_type() {
             return ResultStatus::ErrorIntegrityVerificationNotImplemented;
@@ -238,9 +231,10 @@ impl AppLoader for AppLoaderNsp {
         for nca in &ncas {
             let loader_nca = AppLoaderNca::new(nca.get_base_file());
 
-            let nca_progress_callback = |nca_processed_size: usize, _nca_total_size: usize| -> bool {
-                progress_callback(processed_size + nca_processed_size, total_size)
-            };
+            let nca_progress_callback =
+                |nca_processed_size: usize, _nca_total_size: usize| -> bool {
+                    progress_callback(processed_size + nca_processed_size, total_size)
+                };
 
             let verification_result = loader_nca.verify_integrity(&nca_progress_callback);
             if verification_result != ResultStatus::Success {

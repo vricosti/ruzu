@@ -19,7 +19,8 @@ use super::k_thread::KThread;
 pub struct KScopedSchedulerLockAndSleep<'a> {
     m_scheduler_lock: &'a KAbstractSchedulerLock,
     m_timeout_tick: i64,
-    m_thread: Arc<Mutex<KThread>>,
+    m_thread_id: u64,
+    m_thread_ptr: usize,
     m_timer: Option<Arc<Mutex<KHardwareTimer>>>,
 }
 
@@ -33,7 +34,8 @@ impl<'a> KScopedSchedulerLockAndSleep<'a> {
     pub fn new(
         scheduler_lock: &'a KAbstractSchedulerLock,
         hardware_timer: Option<&Arc<Mutex<KHardwareTimer>>>,
-        thread: Arc<Mutex<KThread>>,
+        thread_id: u64,
+        thread_ptr: usize,
         timeout_tick: i64,
     ) -> (Self, Option<Arc<Mutex<KHardwareTimer>>>) {
         // Lock the scheduler.
@@ -51,7 +53,8 @@ impl<'a> KScopedSchedulerLockAndSleep<'a> {
             Self {
                 m_scheduler_lock: scheduler_lock,
                 m_timeout_tick: timeout_tick,
-                m_thread: thread,
+                m_thread_id: thread_id,
+                m_thread_ptr: thread_ptr,
                 m_timer: timer,
             },
             out_timer,
@@ -75,10 +78,11 @@ impl Drop for KScopedSchedulerLockAndSleep<'_> {
         // Register the sleep timer if the timeout is still positive.
         if self.m_timeout_tick > 0 {
             if let Some(ref timer) = self.m_timer {
-                timer
-                    .lock()
-                    .unwrap()
-                    .register_absolute_task(&self.m_thread, self.m_timeout_tick);
+                timer.lock().unwrap().register_absolute_task_by_id(
+                    self.m_thread_id,
+                    self.m_thread_ptr,
+                    self.m_timeout_tick,
+                );
             }
         }
 
@@ -95,8 +99,11 @@ mod tests {
     fn test_cancel_sleep() {
         let lock = KAbstractSchedulerLock::new();
         let thread = Arc::new(Mutex::new(KThread::new()));
-        let (mut slp, _timer) =
-            KScopedSchedulerLockAndSleep::new(&lock, None, thread, 100);
+        let thread_ptr = {
+            let mut thread = thread.lock().unwrap();
+            (&mut *thread) as *mut KThread as usize
+        };
+        let (mut slp, _timer) = KScopedSchedulerLockAndSleep::new(&lock, None, 1, thread_ptr, 100);
         assert!(slp.has_timer());
         slp.cancel_sleep();
         assert!(!slp.has_timer());

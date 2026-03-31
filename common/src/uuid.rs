@@ -91,8 +91,8 @@ impl UUID {
     pub const fn make_default() -> Self {
         Self {
             uuid: [
-                b'y', b'u', b'z', b'u', b' ', b'D', b'e', b'f', b'a', b'u', b'l', b't', b' ',
-                b'U', b'I', b'D',
+                b'y', b'u', b'z', b'u', b' ', b'D', b'e', b'f', b'a', b'u', b'l', b't', b' ', b'U',
+                b'I', b'D',
             ],
         }
     }
@@ -270,8 +270,10 @@ mod tests {
         let uuid = UUID::from_string("00112233445566778899aabbccddeeff");
         assert_eq!(
             uuid.uuid,
-            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-             0xee, 0xff]
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ]
         );
     }
 
@@ -280,8 +282,10 @@ mod tests {
         let uuid = UUID::from_string("00112233-4455-6677-8899-aabbccddeeff");
         assert_eq!(
             uuid.uuid,
-            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-             0xee, 0xff]
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ]
         );
     }
 

@@ -5,8 +5,8 @@
 //!
 //! HID result codes. Uses common::ResultCode.
 
-use common::ResultCode;
 use common::error::module;
+use common::ResultCode;
 
 /// Module ID for nn::irsensor results.
 const IRSENSOR_MODULE: u32 = 205;
@@ -20,7 +20,8 @@ pub const NPAD_DEVICE_INDEX_OUT_OF_RANGE: ResultCode = ResultCode::new(module::H
 pub const RESULT_VIBRATION_NOT_INITIALIZED: ResultCode = ResultCode::new(module::HID, 121);
 pub const RESULT_VIBRATION_INVALID_STYLE_INDEX: ResultCode = ResultCode::new(module::HID, 122);
 pub const RESULT_VIBRATION_INVALID_NPAD_ID: ResultCode = ResultCode::new(module::HID, 123);
-pub const RESULT_VIBRATION_DEVICE_INDEX_OUT_OF_RANGE: ResultCode = ResultCode::new(module::HID, 124);
+pub const RESULT_VIBRATION_DEVICE_INDEX_OUT_OF_RANGE: ResultCode =
+    ResultCode::new(module::HID, 124);
 pub const RESULT_VIBRATION_STRENGTH_OUT_OF_RANGE: ResultCode = ResultCode::new(module::HID, 126);
 pub const RESULT_VIBRATION_ARRAY_SIZE_MISMATCH: ResultCode = ResultCode::new(module::HID, 131);
 pub const INVALID_SIX_AXIS_FUSION_RANGE: ResultCode = ResultCode::new(module::HID, 423);

@@ -172,11 +172,7 @@ impl ArmInterfaceBase {
         process: &crate::hle::kernel::k_process::KProcess,
         ctx: &ThreadContext,
     ) {
-        log::error!(
-            "Backtrace, sp={:016X}, pc={:016X}",
-            ctx.sp,
-            ctx.pc
-        );
+        log::error!("Backtrace, sp={:016X}, pc={:016X}", ctx.sp, ctx.pc);
         log::error!(
             "{:20}{:20}{:20}{:20}{}",
             "Module Name",

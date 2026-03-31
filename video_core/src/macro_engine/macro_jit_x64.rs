@@ -120,7 +120,9 @@ impl MacroJitX64Impl {
         // Upstream uses Xbyak to emit x64 instructions for each macro opcode.
         // A full Rust port would use dynasm-rs or cranelift for native code generation.
         // The interpreter backend (MacroInterpreter) provides equivalent functionality.
-        log::warn!("MacroJITx64: JIT compilation is stubbed; interpreter backend should be used instead");
+        log::warn!(
+            "MacroJITx64: JIT compilation is stubbed; interpreter backend should be used instead"
+        );
     }
 }
 

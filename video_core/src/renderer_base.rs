@@ -108,7 +108,9 @@ impl RendererBaseData {
         self.settings.screenshot_bits = data;
         self.settings.screenshot_complete_callback = Some(callback);
         self.settings.screenshot_framebuffer_layout = layout;
-        self.settings.screenshot_requested.store(true, Ordering::Relaxed);
+        self.settings
+            .screenshot_requested
+            .store(true, Ordering::Relaxed);
     }
 }
 

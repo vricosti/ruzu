@@ -38,8 +38,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
     let container = Arc::new(Container::new(system));
     *SHARED_CONTAINER.lock().unwrap() = Some(Arc::downgrade(&container));
 
-    let mut server_manager =
-        crate::hle::service::server_manager::ServerManager::new(system);
+    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(system);
 
     // vi:u — IApplicationRootService (cmd 0 = GetDisplayService)
     let container_u = Arc::clone(&container);

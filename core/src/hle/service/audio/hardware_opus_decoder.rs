@@ -31,16 +31,52 @@ pub struct IHardwareOpusDecoder {
 impl IHardwareOpusDecoder {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (0, Some(Self::decode_interleaved_old_handler), "DecodeInterleavedOld"),
+            (
+                0,
+                Some(Self::decode_interleaved_old_handler),
+                "DecodeInterleavedOld",
+            ),
             (1, Some(Self::set_context_handler), "SetContext"),
-            (2, Some(Self::decode_interleaved_for_multi_stream_old_handler), "DecodeInterleavedForMultiStreamOld"),
-            (3, Some(Self::set_context_for_multi_stream_handler), "SetContextForMultiStream"),
-            (4, Some(Self::decode_interleaved_with_perf_old_handler), "DecodeInterleavedWithPerfOld"),
-            (5, Some(Self::decode_interleaved_for_multi_stream_with_perf_old_handler), "DecodeInterleavedForMultiStreamWithPerfOld"),
-            (6, Some(Self::decode_interleaved_with_perf_and_reset_old_handler), "DecodeInterleavedWithPerfAndResetOld"),
-            (7, Some(Self::decode_interleaved_for_multi_stream_with_perf_and_reset_old_handler), "DecodeInterleavedForMultiStreamWithPerfAndResetOld"),
-            (8, Some(Self::decode_interleaved_handler), "DecodeInterleaved"),
-            (9, Some(Self::decode_interleaved_for_multi_stream_handler), "DecodeInterleavedForMultiStream"),
+            (
+                2,
+                Some(Self::decode_interleaved_for_multi_stream_old_handler),
+                "DecodeInterleavedForMultiStreamOld",
+            ),
+            (
+                3,
+                Some(Self::set_context_for_multi_stream_handler),
+                "SetContextForMultiStream",
+            ),
+            (
+                4,
+                Some(Self::decode_interleaved_with_perf_old_handler),
+                "DecodeInterleavedWithPerfOld",
+            ),
+            (
+                5,
+                Some(Self::decode_interleaved_for_multi_stream_with_perf_old_handler),
+                "DecodeInterleavedForMultiStreamWithPerfOld",
+            ),
+            (
+                6,
+                Some(Self::decode_interleaved_with_perf_and_reset_old_handler),
+                "DecodeInterleavedWithPerfAndResetOld",
+            ),
+            (
+                7,
+                Some(Self::decode_interleaved_for_multi_stream_with_perf_and_reset_old_handler),
+                "DecodeInterleavedForMultiStreamWithPerfAndResetOld",
+            ),
+            (
+                8,
+                Some(Self::decode_interleaved_handler),
+                "DecodeInterleaved",
+            ),
+            (
+                9,
+                Some(Self::decode_interleaved_for_multi_stream_handler),
+                "DecodeInterleavedForMultiStream",
+            ),
         ]);
         Self {
             handlers,
@@ -62,10 +98,7 @@ impl IHardwareOpusDecoder {
         }
     }
 
-    fn decode_interleaved_old_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn decode_interleaved_old_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         Self::decode_stub(ctx, "DecodeInterleavedOld", false);
     }
 
@@ -116,7 +149,11 @@ impl IHardwareOpusDecoder {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        Self::decode_stub(ctx, "DecodeInterleavedForMultiStreamWithPerfAndResetOld", true);
+        Self::decode_stub(
+            ctx,
+            "DecodeInterleavedForMultiStreamWithPerfAndResetOld",
+            true,
+        );
     }
 
     fn decode_interleaved_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

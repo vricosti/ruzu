@@ -256,7 +256,10 @@ impl RingController {
         // then handles JoyPollingMode::SixAxisSensorEnable by writing ring lifo data
         // (RingConData from GetSensorValue) into transfer_memory via system.ApplicationMemory().
         // This requires kernel memory write support (ApplicationMemory) which is not yet available.
-        log::error!("Polling mode not fully supported {:?}", self.base.polling_mode);
+        log::error!(
+            "Polling mode not fully supported {:?}",
+            self.base.polling_mode
+        );
     }
 
     pub fn get_device_id(&self) -> u8 {
@@ -298,18 +301,12 @@ impl RingController {
                 assert!(data.len() == 0x14, "data.size is not 0x14 bytes");
                 // Parse SaveCalData: skip 4 bytes of command, read UserCalibration
                 if data.len() >= 0x14 {
-                    self.user_calibration.os_max.value =
-                        i16::from_le_bytes([data[4], data[5]]);
-                    self.user_calibration.os_max.crc =
-                        u16::from_le_bytes([data[6], data[7]]);
-                    self.user_calibration.hk_max.value =
-                        i16::from_le_bytes([data[8], data[9]]);
-                    self.user_calibration.hk_max.crc =
-                        u16::from_le_bytes([data[10], data[11]]);
-                    self.user_calibration.zero.value =
-                        i16::from_le_bytes([data[12], data[13]]);
-                    self.user_calibration.zero.crc =
-                        u16::from_le_bytes([data[14], data[15]]);
+                    self.user_calibration.os_max.value = i16::from_le_bytes([data[4], data[5]]);
+                    self.user_calibration.os_max.crc = u16::from_le_bytes([data[6], data[7]]);
+                    self.user_calibration.hk_max.value = i16::from_le_bytes([data[8], data[9]]);
+                    self.user_calibration.hk_max.crc = u16::from_le_bytes([data[10], data[11]]);
+                    self.user_calibration.zero.value = i16::from_le_bytes([data[12], data[13]]);
+                    self.user_calibration.zero.crc = u16::from_le_bytes([data[14], data[15]]);
                 }
                 // Upstream signals send_command_async_event here.
                 // Requires kernel event (KEvent) integration which is not yet available.
@@ -463,9 +460,7 @@ impl RingController {
     fn get_data<T: Sized>(reply: &T, out_data: &mut [u8]) -> u64 {
         let reply_size = std::mem::size_of::<T>();
         let data_size = reply_size.min(out_data.len());
-        let src = unsafe {
-            std::slice::from_raw_parts(reply as *const T as *const u8, reply_size)
-        };
+        let src = unsafe { std::slice::from_raw_parts(reply as *const T as *const u8, reply_size) };
         out_data[..data_size].copy_from_slice(&src[..data_size]);
         data_size as u64
     }

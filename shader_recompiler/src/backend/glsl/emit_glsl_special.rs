@@ -10,8 +10,14 @@ use super::glsl_emit_context::EmitContext;
 pub fn emit_phi(_ctx: &mut EmitContext) {}
 pub fn emit_void(_ctx: &mut EmitContext) {}
 pub fn emit_reference(_ctx: &mut EmitContext) {}
-pub fn emit_phi_move(ctx: &mut EmitContext) { ctx.add_line("// phi move"); }
+pub fn emit_phi_move(ctx: &mut EmitContext) {
+    ctx.add_line("// phi move");
+}
 pub fn emit_prologue(_ctx: &mut EmitContext) {}
 pub fn emit_epilogue(_ctx: &mut EmitContext) {}
-pub fn emit_emit_vertex(ctx: &mut EmitContext) { ctx.add_line("EmitVertex();"); }
-pub fn emit_end_primitive(ctx: &mut EmitContext) { ctx.add_line("EndPrimitive();"); }
+pub fn emit_emit_vertex(ctx: &mut EmitContext) {
+    ctx.add_line("EmitVertex();");
+}
+pub fn emit_end_primitive(ctx: &mut EmitContext) {
+    ctx.add_line("EndPrimitive();");
+}

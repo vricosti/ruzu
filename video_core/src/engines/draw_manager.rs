@@ -309,9 +309,7 @@ impl DrawManager {
     ///
     /// Corresponds to `DrawManager::DrawDeferred`.
     pub fn draw_deferred(&mut self, maxwell3d: &mut dyn Maxwell3DAccess) {
-        if self.draw_state.draw_mode != DrawMode::Instance
-            || self.draw_state.instance_count == 0
-        {
+        if self.draw_state.draw_mode != DrawMode::Instance || self.draw_state.instance_count == 0 {
             return;
         }
         let instance_count = self.draw_state.instance_count + 1;

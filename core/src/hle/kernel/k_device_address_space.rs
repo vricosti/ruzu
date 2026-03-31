@@ -87,12 +87,7 @@ impl KDeviceAddressSpace {
     /// Port of upstream `KDeviceAddressSpace::Unmap`.
     /// Upstream validates address range, locks pages, then calls m_table.Unmap
     /// (currently commented out in upstream too).
-    pub fn unmap(
-        &self,
-        _process_address: u64,
-        size: usize,
-        device_address: u64,
-    ) -> ResultCode {
+    pub fn unmap(&self, _process_address: u64, size: usize, device_address: u64) -> ResultCode {
         // Validate address range.
         if !(self.m_space_address <= device_address
             && device_address + size as u64 - 1 <= self.m_space_address + self.m_space_size - 1)

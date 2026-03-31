@@ -305,7 +305,9 @@ impl MacroInterpreter {
 
     /// Clear macro code starting from the given offset. Matches upstream
     /// `MacroEngine::ClearCode` — resets code storage from the pointer onward.
-    pub fn code_size(&self) -> usize { self.code.len() }
+    pub fn code_size(&self) -> usize {
+        self.code.len()
+    }
 
     pub fn clear_code(&mut self, offset: u32) {
         let idx = offset as usize;
@@ -362,7 +364,11 @@ impl MacroInterpreter {
         while self.step(false, processor) {
             steps += 1;
             if steps > 1_000_000 {
-                log::warn!("Macro slot {}: exceeded 1M steps, breaking (PC={})", slot, self.pc);
+                log::warn!(
+                    "Macro slot {}: exceeded 1M steps, breaking (PC={})",
+                    slot,
+                    self.pc
+                );
                 break;
             }
         }
@@ -401,22 +407,13 @@ impl MacroInterpreter {
                     self.get_register(opcode.src_a()),
                     self.get_register(opcode.src_b()),
                 );
-                self.process_result(
-                    opcode.result_operation(),
-                    opcode.dst(),
-                    result,
-                    processor,
-                );
+                self.process_result(opcode.result_operation(), opcode.dst(), result, processor);
             }
             Operation::AddImmediate => {
-                let result =
-                    self.get_register(opcode.src_a()).wrapping_add(opcode.immediate() as u32);
-                self.process_result(
-                    opcode.result_operation(),
-                    opcode.dst(),
-                    result,
-                    processor,
-                );
+                let result = self
+                    .get_register(opcode.src_a())
+                    .wrapping_add(opcode.immediate() as u32);
+                self.process_result(opcode.result_operation(), opcode.dst(), result, processor);
             }
             Operation::ExtractInsert => {
                 let mut dst_val = self.get_register(opcode.src_a());
@@ -427,12 +424,7 @@ impl MacroInterpreter {
                 dst_val &= !(mask << opcode.bf_dst_bit());
                 dst_val |= extracted << opcode.bf_dst_bit();
 
-                self.process_result(
-                    opcode.result_operation(),
-                    opcode.dst(),
-                    dst_val,
-                    processor,
-                );
+                self.process_result(opcode.result_operation(), opcode.dst(), dst_val, processor);
             }
             Operation::ExtractShiftLeftImmediate => {
                 let dst_val = self.get_register(opcode.src_a());
@@ -440,36 +432,22 @@ impl MacroInterpreter {
 
                 let result = ((src_val >> dst_val) & opcode.bitfield_mask()) << opcode.bf_dst_bit();
 
-                self.process_result(
-                    opcode.result_operation(),
-                    opcode.dst(),
-                    result,
-                    processor,
-                );
+                self.process_result(opcode.result_operation(), opcode.dst(), result, processor);
             }
             Operation::ExtractShiftLeftRegister => {
                 let dst_val = self.get_register(opcode.src_a());
                 let src_val = self.get_register(opcode.src_b());
 
-                let result =
-                    ((src_val >> opcode.bf_src_bit()) & opcode.bitfield_mask()) << dst_val;
+                let result = ((src_val >> opcode.bf_src_bit()) & opcode.bitfield_mask()) << dst_val;
 
-                self.process_result(
-                    opcode.result_operation(),
-                    opcode.dst(),
-                    result,
-                    processor,
-                );
+                self.process_result(opcode.result_operation(), opcode.dst(), result, processor);
             }
             Operation::Read => {
-                let addr = self.get_register(opcode.src_a()).wrapping_add(opcode.immediate() as u32);
+                let addr = self
+                    .get_register(opcode.src_a())
+                    .wrapping_add(opcode.immediate() as u32);
                 let result = processor.macro_read(addr);
-                self.process_result(
-                    opcode.result_operation(),
-                    opcode.dst(),
-                    result,
-                    processor,
-                );
+                self.process_result(opcode.result_operation(), opcode.dst(), result, processor);
             }
             Operation::Branch => {
                 debug_assert!(!is_delay_slot, "Branch in delay slot is invalid");
@@ -479,8 +457,7 @@ impl MacroInterpreter {
                     BranchCondition::NotZero => value != 0,
                 };
                 if taken {
-                    let target =
-                        (base_pc as i32 + opcode.branch_target() / 4) as u32;
+                    let target = (base_pc as i32 + opcode.branch_target() / 4) as u32;
                     if opcode.branch_annul() {
                         // Skip delay slot.
                         self.pc = target;
@@ -571,7 +548,9 @@ impl MacroInterpreter {
                 result as u32
             }
             ALUOperation::SubtractWithBorrow => {
-                let result = (a as u64).wrapping_sub(b as u64).wrapping_sub((!self.carry) as u64);
+                let result = (a as u64)
+                    .wrapping_sub(b as u64)
+                    .wrapping_sub((!self.carry) as u64);
                 self.carry = result < 0x1_0000_0000;
                 result as u32
             }
@@ -595,7 +574,11 @@ impl MacroInterpreter {
         let word = if idx < self.code.len() {
             self.code[idx]
         } else {
-            log::warn!("Macro: PC {} out of bounds (code size {})", idx, self.code.len());
+            log::warn!(
+                "Macro: PC {} out of bounds (code size {})",
+                idx,
+                self.code.len()
+            );
             0
         };
         Opcode(word)
@@ -712,13 +695,7 @@ mod tests {
     }
 
     /// Build an AddImmediate opcode (operation=1). Immediate is in bits[31:14].
-    fn encode_add_imm(
-        result_op: u32,
-        is_exit: bool,
-        dst: u32,
-        src_a: u32,
-        imm: i32,
-    ) -> u32 {
+    fn encode_add_imm(result_op: u32, is_exit: bool, dst: u32, src_a: u32, imm: i32) -> u32 {
         let base = (1u32) // operation = AddImmediate
             | ((result_op & 0x7) << 4)
             | ((is_exit as u32) << 7)
@@ -747,13 +724,7 @@ mod tests {
     }
 
     /// Build a Read opcode (operation=5).
-    fn encode_read(
-        result_op: u32,
-        is_exit: bool,
-        dst: u32,
-        src_a: u32,
-        imm: i32,
-    ) -> u32 {
+    fn encode_read(result_op: u32, is_exit: bool, dst: u32, src_a: u32, imm: i32) -> u32 {
         let base = 5u32
             | ((result_op & 0x7) << 4)
             | ((is_exit as u32) << 7)
@@ -774,8 +745,7 @@ mod tests {
         bf_size: u32,
         bf_dst_bit: u32,
     ) -> u32 {
-        2u32
-            | ((result_op & 0x7) << 4)
+        2u32 | ((result_op & 0x7) << 4)
             | ((is_exit as u32) << 7)
             | ((dst & 0x7) << 8)
             | ((src_a & 0x7) << 11)
@@ -796,8 +766,7 @@ mod tests {
         bf_size: u32,
         bf_dst_bit: u32,
     ) -> u32 {
-        3u32
-            | ((result_op & 0x7) << 4)
+        3u32 | ((result_op & 0x7) << 4)
             | ((is_exit as u32) << 7)
             | ((dst & 0x7) << 8)
             | ((src_a & 0x7) << 11)
@@ -818,8 +787,7 @@ mod tests {
         bf_size: u32,
         bf_dst_bit: u32,
     ) -> u32 {
-        4u32
-            | ((result_op & 0x7) << 4)
+        4u32 | ((result_op & 0x7) << 4)
             | ((is_exit as u32) << 7)
             | ((dst & 0x7) << 8)
             | ((src_a & 0x7) << 11)
@@ -835,12 +803,7 @@ mod tests {
     fn test_opcode_fields() {
         // Build: operation=5(Read), result_op=3(FetchAndSend), exit=true,
         //        dst=2, src_a=4, immediate=0x100
-        let raw = 5u32
-            | (3 << 4)
-            | (1 << 7)
-            | (2 << 8)
-            | (4 << 11)
-            | (0x100 << 14);
+        let raw = 5u32 | (3 << 4) | (1 << 7) | (2 << 8) | (4 << 11) | (0x100 << 14);
         let op = Opcode(raw);
         assert_eq!(op.operation(), Operation::Read);
         assert_eq!(op.result_operation(), ResultOperation::FetchAndSend);
@@ -1110,8 +1073,8 @@ mod tests {
         // Instruction 2: AddImm, Move, dst=r4, imm=30 (should NOT execute)
         let code = vec![
             encode_add_imm(1, true, 2, 0, 10),  // exit=true
-            encode_add_imm(1, false, 3, 0, 20),  // delay slot
-            encode_add_imm(1, false, 4, 0, 30),  // unreachable
+            encode_add_imm(1, false, 3, 0, 20), // delay slot
+            encode_add_imm(1, false, 4, 0, 30), // unreachable
         ];
         let mut interp = MacroInterpreter::new();
         for (i, &w) in code.iter().enumerate() {
@@ -1124,7 +1087,7 @@ mod tests {
 
         assert_eq!(interp.registers[2], 10);
         assert_eq!(interp.registers[3], 20); // Delay slot executed.
-        assert_eq!(interp.registers[4], 0);  // Not executed.
+        assert_eq!(interp.registers[4], 0); // Not executed.
     }
 
     #[test]
@@ -1147,7 +1110,7 @@ mod tests {
         let mut proc = MockProcessor::new();
         interp.execute(0, &[0], &mut proc); // param[0]=0 → r1=0
 
-        assert_eq!(interp.registers[2], 0);  // Skipped.
+        assert_eq!(interp.registers[2], 0); // Skipped.
         assert_eq!(interp.registers[3], 42); // Executed.
     }
 
@@ -1189,7 +1152,7 @@ mod tests {
         // bf_src_bit unused for this op, bf_size=8, bf_dst_bit=4.
         // result = ((0xABCD >> 4) & 0xFF) << 4 = (0xABC & 0xFF) << 4 = 0xBC << 4 = 0xBC0
         let code = vec![
-            encode_add_imm(1, false, 2, 0, 4),     // r2 = 4
+            encode_add_imm(1, false, 2, 0, 4),      // r2 = 4
             encode_add_imm(1, false, 3, 0, 0xABCD), // r3 = 0xABCD
             encode_extract_shift_left_imm(1, true, 4, 2, 3, 0, 8, 4),
         ];
@@ -1214,7 +1177,7 @@ mod tests {
         // result = ((0xABCD >> 4) & 0xFF) << 8 = 0xBC << 8 = 0xBC00
         let code = vec![
             encode_add_imm(1, false, 2, 0, 8),      // r2 = 8
-            encode_add_imm(1, false, 3, 0, 0xABCD),  // r3 = 0xABCD
+            encode_add_imm(1, false, 3, 0, 0xABCD), // r3 = 0xABCD
             encode_extract_shift_left_reg(1, true, 4, 2, 3, 4, 8, 0),
         ];
         let mut interp = MacroInterpreter::new();
@@ -1310,7 +1273,7 @@ mod tests {
         let mut proc = MockProcessor::new();
         interp.execute(0, &[0], &mut proc);
 
-        assert_eq!(interp.registers[2], 0);  // Skipped (annulled).
+        assert_eq!(interp.registers[2], 0); // Skipped (annulled).
         assert_eq!(interp.registers[3], 42); // Target executed.
     }
 
@@ -1345,10 +1308,8 @@ mod tests {
         // Move result into dst, set method address = result,
         // send (result >> 12) & 0x3F.
         let method_raw = 0x300 | (5 << 12); // addr=0x300, incr=5
-        // (method_raw >> 12) & 0x3F = 5
-        let code = vec![
-            encode_add_imm(7, true, 2, 0, method_raw as i32),
-        ];
+                                            // (method_raw >> 12) & 0x3F = 5
+        let code = vec![encode_add_imm(7, true, 2, 0, method_raw as i32)];
         let mut interp = MacroInterpreter::new();
         for (i, &w) in code.iter().enumerate() {
             interp.upload_code(i as u32, w);
@@ -1388,7 +1349,7 @@ mod tests {
         interp.execute(0, &[0], &mut proc); // r1=0, NotZero → not taken
 
         assert_eq!(interp.registers[2], 42); // Fallthrough executed.
-        assert_eq!(interp.registers[3], 0);  // Target not reached.
+        assert_eq!(interp.registers[3], 0); // Target not reached.
     }
 
     #[test]
@@ -1432,12 +1393,12 @@ mod tests {
         let method_raw = 0x50;
 
         let code = vec![
-            encode_add_imm(1, false, 2, 1, 0),              // Move r2 = r1
-            encode_add_imm(2, false, 3, 0, method_raw),     // MoveAndSetMethod r3 = 0x50
-            encode_add_imm(4, false, 4, 2, 0),              // MoveAndSend r4 = r2, send r2
-            encode_add_imm(1, false, 2, 2, -1i32 as i32),   // Move r2 = r2 - 1
-            encode_branch(1, true, false, 2, -2),            // Branch NotZero r2, target=-2, annul
-            encode_add_imm(1, true, 5, 0, 0),               // exit
+            encode_add_imm(1, false, 2, 1, 0),            // Move r2 = r1
+            encode_add_imm(2, false, 3, 0, method_raw),   // MoveAndSetMethod r3 = 0x50
+            encode_add_imm(4, false, 4, 2, 0),            // MoveAndSend r4 = r2, send r2
+            encode_add_imm(1, false, 2, 2, -1i32 as i32), // Move r2 = r2 - 1
+            encode_branch(1, true, false, 2, -2),         // Branch NotZero r2, target=-2, annul
+            encode_add_imm(1, true, 5, 0, 0),             // exit
         ];
         let mut interp = MacroInterpreter::new();
         for (i, &w) in code.iter().enumerate() {

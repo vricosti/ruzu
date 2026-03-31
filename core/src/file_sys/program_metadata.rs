@@ -312,13 +312,19 @@ impl ProgramMetadata {
         let kac_count = self.aci_header.kac_size as usize / 4;
         self.aci_kernel_capabilities.resize(kac_count, 0);
         let read_size = self.aci_header.kac_size as usize;
-        let read_offset = self.npdm_header.aci_offset as usize + self.aci_header.kac_offset as usize;
+        let read_offset =
+            self.npdm_header.aci_offset as usize + self.aci_header.kac_offset as usize;
         let mut kac_buf = vec![0u8; read_size];
         if file.read(&mut kac_buf, read_size, read_offset) != read_size {
             return ResultStatus::ErrorBadKernelCapabilityDescriptors;
         }
         for i in 0..kac_count {
-            let bytes = [kac_buf[i * 4], kac_buf[i * 4 + 1], kac_buf[i * 4 + 2], kac_buf[i * 4 + 3]];
+            let bytes = [
+                kac_buf[i * 4],
+                kac_buf[i * 4 + 1],
+                kac_buf[i * 4 + 2],
+                kac_buf[i * 4 + 3],
+            ];
             self.aci_kernel_capabilities[i] = u32::from_le_bytes(bytes);
         }
 
@@ -404,13 +410,35 @@ impl ProgramMetadata {
     }
 
     pub fn print(&self) {
-        log::debug!("Magic:                  {:?}", std::str::from_utf8(&self.npdm_header.magic));
-        log::debug!("Main thread priority:   0x{:02X}", self.npdm_header.main_thread_priority);
-        log::debug!("Main thread core:       {}", self.npdm_header.main_thread_cpu);
-        log::debug!("Main thread stack size: 0x{:X} bytes", self.npdm_header.main_stack_size);
-        log::debug!("Process category:       {}", self.npdm_header.process_category);
+        log::debug!(
+            "Magic:                  {:?}",
+            std::str::from_utf8(&self.npdm_header.magic)
+        );
+        log::debug!(
+            "Main thread priority:   0x{:02X}",
+            self.npdm_header.main_thread_priority
+        );
+        log::debug!(
+            "Main thread core:       {}",
+            self.npdm_header.main_thread_cpu
+        );
+        log::debug!(
+            "Main thread stack size: 0x{:X} bytes",
+            self.npdm_header.main_stack_size
+        );
+        log::debug!(
+            "Process category:       {}",
+            self.npdm_header.process_category
+        );
         log::debug!("Flags:                  0x{:02X}", self.npdm_header.flags);
-        log::debug!(" > 64-bit instructions: {}", if self.is_64_bit_program() { "YES" } else { "NO" });
+        log::debug!(
+            " > 64-bit instructions: {}",
+            if self.is_64_bit_program() {
+                "YES"
+            } else {
+                "NO"
+            }
+        );
 
         let address_space = match self.get_address_space_type() {
             ProgramAddressSpaceType::Is36Bit => "64-bit (36-bit address space)",
@@ -420,15 +448,36 @@ impl ProgramMetadata {
         };
         log::debug!(" > Address space:       {}", address_space);
 
-        log::debug!("Magic:                  {:?}", std::str::from_utf8(&self.acid_header.magic));
+        log::debug!(
+            "Magic:                  {:?}",
+            std::str::from_utf8(&self.acid_header.magic)
+        );
         log::debug!("Flags:                  0x{:02X}", self.acid_header.flags);
-        log::debug!("Title ID Min:           0x{:016X}", self.acid_header.title_id_min);
-        log::debug!("Title ID Max:           0x{:016X}", self.acid_header.title_id_max);
-        log::debug!("Filesystem Access:      0x{:016X}", self.acid_file_access.permissions);
+        log::debug!(
+            "Title ID Min:           0x{:016X}",
+            self.acid_header.title_id_min
+        );
+        log::debug!(
+            "Title ID Max:           0x{:016X}",
+            self.acid_header.title_id_max
+        );
+        log::debug!(
+            "Filesystem Access:      0x{:016X}",
+            self.acid_file_access.permissions
+        );
 
-        log::debug!("Magic:                  {:?}", std::str::from_utf8(&self.aci_header.magic));
-        log::debug!("Title ID:               0x{:016X}", self.aci_header.title_id);
-        log::debug!("Filesystem Access:      0x{:016X}", self.aci_file_access.permissions);
+        log::debug!(
+            "Magic:                  {:?}",
+            std::str::from_utf8(&self.aci_header.magic)
+        );
+        log::debug!(
+            "Title ID:               0x{:016X}",
+            self.aci_header.title_id
+        );
+        log::debug!(
+            "Filesystem Access:      0x{:016X}",
+            self.aci_file_access.permissions
+        );
     }
 }
 

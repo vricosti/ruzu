@@ -10,11 +10,11 @@ use crate::ir::value::Value;
 ///
 /// Upstream: `TranslatorVisitor::FSWZADD(u64 insn)`
 pub fn fswzadd(tv: &mut TranslatorVisitor, insn: u64) {
-    let dst      = field(insn, 0, 8);
-    let swizzle  = field(insn, 28, 8);
-    let _ndv     = bit(insn, 38);
-    let _ftz     = bit(insn, 44);
-    let _cc      = bit(insn, 47);
+    let dst = field(insn, 0, 8);
+    let swizzle = field(insn, 28, 8);
+    let _ndv = bit(insn, 38);
+    let _ftz = bit(insn, 44);
+    let _cc = bit(insn, 47);
 
     let src_a = tv.get_float_reg8(insn);
     let src_b = tv.get_float_reg20(insn);

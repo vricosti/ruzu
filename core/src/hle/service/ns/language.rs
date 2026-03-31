@@ -407,9 +407,7 @@ pub fn convert_to_application_language(language_code: LanguageCode) -> Option<Ap
         LanguageCode::ZH_TW | LanguageCode::ZH_HANT => {
             Some(ApplicationLanguage::TraditionalChinese)
         }
-        LanguageCode::ZH_CN | LanguageCode::ZH_HANS => {
-            Some(ApplicationLanguage::SimplifiedChinese)
-        }
+        LanguageCode::ZH_CN | LanguageCode::ZH_HANS => Some(ApplicationLanguage::SimplifiedChinese),
         LanguageCode::PT_BR => Some(ApplicationLanguage::BrazilianPortuguese),
         _ => None,
     }

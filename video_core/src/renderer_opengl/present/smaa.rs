@@ -106,12 +106,7 @@ impl SMAA {
 
             // Pass 1: Edge detection
             gl::BindTextureUnit(0, input_texture);
-            gl::NamedFramebufferTexture(
-                self.framebuffer,
-                gl::COLOR_ATTACHMENT0,
-                self.edges_tex,
-                0,
-            );
+            gl::NamedFramebufferTexture(self.framebuffer, gl::COLOR_ATTACHMENT0, self.edges_tex, 0);
             gl::Clear(gl::COLOR_BUFFER_BIT);
             // In full impl: program_manager.BindPresentPrograms(edge_detection_vert, edge_detection_frag);
             gl::DrawArrays(gl::TRIANGLES, 0, 3);
@@ -120,12 +115,7 @@ impl SMAA {
             gl::BindTextureUnit(0, self.edges_tex);
             gl::BindTextureUnit(1, self.area_tex);
             gl::BindTextureUnit(2, self.search_tex);
-            gl::NamedFramebufferTexture(
-                self.framebuffer,
-                gl::COLOR_ATTACHMENT0,
-                self.blend_tex,
-                0,
-            );
+            gl::NamedFramebufferTexture(self.framebuffer, gl::COLOR_ATTACHMENT0, self.blend_tex, 0);
             gl::Clear(gl::COLOR_BUFFER_BIT);
             // In full impl: program_manager.BindPresentPrograms(blending_weight_calculation_vert, blending_weight_calculation_frag);
             gl::DrawArrays(gl::TRIANGLES, 0, 3);
@@ -133,12 +123,7 @@ impl SMAA {
             // Pass 3: Neighborhood blending
             gl::BindTextureUnit(0, input_texture);
             gl::BindTextureUnit(1, self.blend_tex);
-            gl::NamedFramebufferTexture(
-                self.framebuffer,
-                gl::COLOR_ATTACHMENT0,
-                self.texture,
-                0,
-            );
+            gl::NamedFramebufferTexture(self.framebuffer, gl::COLOR_ATTACHMENT0, self.texture, 0);
             // In full impl: program_manager.BindPresentPrograms(neighborhood_blending_vert, neighborhood_blending_frag);
             gl::Clear(gl::COLOR_BUFFER_BIT);
             gl::DrawArrays(gl::TRIANGLES, 0, 3);

@@ -171,7 +171,8 @@ fn decompress_segment(compressed_data: &[u8], expected_size: u32) -> Vec<u8> {
             if written != expected_size as usize {
                 log::warn!(
                     "NSO LZ4 decompression: expected {} bytes, got {}",
-                    expected_size, written
+                    expected_size,
+                    written
                 );
             }
         }
@@ -190,8 +191,7 @@ fn decompress_segment(compressed_data: &[u8], expected_size: u32) -> Vec<u8> {
 pub fn read_object<T: Copy + Default>(file: &dyn VfsFile, offset: usize) -> Option<T> {
     let size = std::mem::size_of::<T>();
     let mut obj = T::default();
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(&mut obj as *mut T as *mut u8, size) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(&mut obj as *mut T as *mut u8, size) };
     let read = file.read(bytes, size, offset);
     if read == size {
         Some(obj)
@@ -276,23 +276,31 @@ impl AppLoaderNso {
             if nso_header.is_segment_compressed(i) {
                 data = decompress_segment(&data, nso_header.segments[i].size);
             }
-            log::info!("NSO segment[{}]: location={:#x} size={:#x} compressed={:#x} data.len={:#x}",
-                i, nso_header.segments[i].location, nso_header.segments[i].size,
-                nso_header.segments_compressed_size[i], data.len());
-            let needed_size =
-                module_start + nso_header.segments[i].location as usize + data.len();
+            log::info!(
+                "NSO segment[{}]: location={:#x} size={:#x} compressed={:#x} data.len={:#x}",
+                i,
+                nso_header.segments[i].location,
+                nso_header.segments[i].size,
+                nso_header.segments_compressed_size[i],
+                data.len()
+            );
+            let needed_size = module_start + nso_header.segments[i].location as usize + data.len();
             if program_image.len() < needed_size {
                 program_image.resize(needed_size, 0);
             }
             let loc = module_start + nso_header.segments[i].location as usize;
             program_image[loc..loc + data.len()].copy_from_slice(&data);
 
-            code_set.segments[i].addr = (module_start + nso_header.segments[i].location as usize) as u64;
+            code_set.segments[i].addr =
+                (module_start + nso_header.segments[i].location as usize) as u64;
             code_set.segments[i].offset = module_start + nso_header.segments[i].location as usize;
             code_set.segments[i].size = nso_header.segments[i].size;
         }
-        log::info!("NSO bss_size={:#x} program_image.len={:#x}",
-            nso_header.segments[2].alignment_or_bss_size, program_image.len());
+        log::info!(
+            "NSO bss_size={:#x} program_image.len={:#x}",
+            nso_header.segments[2].alignment_or_bss_size,
+            program_image.len()
+        );
 
         // Upstream: arguments are added BEFORE BSS, matching upstream ordering.
         // Upstream condition: `should_pass_arguments && !Settings::values.program_args.GetValue().empty()`
@@ -358,11 +366,7 @@ impl AppLoaderNso {
         // Load codeset into process.
         code_set.memory = program_image;
         process.load_module(code_set, load_base);
-        log::info!(
-            "NSO: loaded {} bytes at {:#X}",
-            image_size,
-            load_base
-        );
+        log::info!("NSO: loaded {} bytes at {:#X}", image_size, load_base);
 
         Some(load_base + image_size as u64)
     }
@@ -397,8 +401,7 @@ impl AppLoader for AppLoaderNso {
             return (ResultStatus::ErrorLoadingNSO, None);
         }
 
-        self.modules
-            .insert(base_address, self.file.get_name());
+        self.modules.insert(base_address, self.file.get_name());
         log::debug!(
             "loaded module {} @ {:#X}",
             self.file.get_name(),

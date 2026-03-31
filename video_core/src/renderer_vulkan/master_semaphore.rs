@@ -82,11 +82,7 @@ impl MasterSemaphore {
     ///
     /// Creates a new master semaphore. If `has_timeline` is true, creates
     /// a timeline semaphore; otherwise sets up fence-based fallback.
-    pub fn new(
-        device: ash::Device,
-        graphics_queue: vk::Queue,
-        has_timeline: bool,
-    ) -> Self {
+    pub fn new(device: ash::Device, graphics_queue: vk::Queue, has_timeline: bool) -> Self {
         let semaphore = if has_timeline {
             let type_ci = vk::SemaphoreTypeCreateInfo::builder()
                 .semaphore_type(vk::SemaphoreType::TIMELINE)
@@ -209,9 +205,7 @@ impl MasterSemaphore {
             let lock = self.free_mutex.lock().unwrap();
             let _guard = self
                 .free_cv
-                .wait_while(lock, |_| {
-                    self.gpu_tick.load(Ordering::Relaxed) < tick
-                })
+                .wait_while(lock, |_| self.gpu_tick.load(Ordering::Relaxed) < tick)
                 .unwrap();
             return;
         }
@@ -236,10 +230,7 @@ impl MasterSemaphore {
             .build();
 
         loop {
-            let result = unsafe {
-                self.device
-                    .wait_semaphores(&wait_info, u64::MAX)
-            };
+            let result = unsafe { self.device.wait_semaphores(&wait_info, u64::MAX) };
             match result {
                 Ok(_) => break,
                 Err(vk::Result::TIMEOUT) => continue,
@@ -264,9 +255,21 @@ impl MasterSemaphore {
         host_tick: u64,
     ) -> vk::Result {
         if self.has_timeline {
-            self.submit_queue_timeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick)
+            self.submit_queue_timeline(
+                cmdbuf,
+                upload_cmdbuf,
+                signal_semaphore,
+                wait_semaphore,
+                host_tick,
+            )
         } else {
-            self.submit_queue_fence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick)
+            self.submit_queue_fence(
+                cmdbuf,
+                upload_cmdbuf,
+                signal_semaphore,
+                wait_semaphore,
+                host_tick,
+            )
         }
     }
 
@@ -399,9 +402,7 @@ impl MasterSemaphore {
     pub fn process_wait_queue(&self) {
         let mut wait_queue = self.wait_mutex.lock().unwrap();
         while let Some(&(host_tick, fence)) = wait_queue.front() {
-            let result = unsafe {
-                self.device.get_fence_status(fence)
-            };
+            let result = unsafe { self.device.get_fence_status(fence) };
             match result {
                 Ok(true) => {
                     // Fence is signaled

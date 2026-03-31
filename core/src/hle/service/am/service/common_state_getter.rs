@@ -4,7 +4,9 @@
 //! Port of zuyu/src/core/hle/service/am/service/common_state_getter.h
 //! Port of zuyu/src/core/hle/service/am/service/common_state_getter.cpp
 
-use crate::hle::service::am::am_types::{AppletMessage, FocusState, OperationMode, SystemButtonType};
+use crate::hle::service::am::am_types::{
+    AppletMessage, FocusState, OperationMode, SystemButtonType,
+};
 use crate::hle::service::am::applet::Applet;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -78,7 +80,6 @@ impl ICommonStateGetter {
     /// Create with an applet reference, matching upstream constructor:
     /// `ICommonStateGetter(Core::System&, std::shared_ptr<Applet>)`
     pub fn new(applet: Arc<Mutex<Applet>>) -> Self {
-
         let handlers = build_handler_map(&[
             (0, Some(Self::get_event_handle_handler), "GetEventHandle"),
             (1, Some(Self::receive_message_handler), "ReceiveMessage"),
@@ -157,7 +158,10 @@ impl ICommonStateGetter {
     pub fn set_vr_mode_enabled(&self, enabled: bool) {
         let mut applet = self.applet.lock().unwrap();
         applet.vr_mode_enabled = enabled;
-        log::warn!("VR Mode is {}", if applet.vr_mode_enabled { "on" } else { "off" });
+        log::warn!(
+            "VR Mode is {}",
+            if applet.vr_mode_enabled { "on" } else { "off" }
+        );
     }
 
     /// Port of ICommonStateGetter::IsInControllerFirmwareUpdateSection
@@ -207,7 +211,8 @@ impl ICommonStateGetter {
     /// GetEventHandle (cmd 0): returns a copy handle to the message event.
     /// Matches upstream: `*out_event = m_applet->lifecycle_manager.GetSystemEvent().GetHandle()`
     fn get_event_handle_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let handle = service
             .applet
             .lock()
@@ -215,7 +220,10 @@ impl ICommonStateGetter {
             .lifecycle_manager
             .ensure_system_event(ctx)
             .unwrap_or(0);
-        log::debug!("ICommonStateGetter::GetEventHandle called -> handle={:#x}", handle);
+        log::debug!(
+            "ICommonStateGetter::GetEventHandle called -> handle={:#x}",
+            handle
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0); // 1 copy handle
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);
@@ -224,7 +232,8 @@ impl ICommonStateGetter {
     /// ReceiveMessage (cmd 1): receives an applet message.
     /// Matches upstream: `m_applet->lifecycle_manager.PopMessage(out_applet_message)`
     fn receive_message_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut applet = service.applet.lock().unwrap();
         let mut message = AppletMessage::None;
 
@@ -235,9 +244,8 @@ impl ICommonStateGetter {
             rb.push_u32(message as u32);
         } else {
             log::debug!("ICommonStateGetter::ReceiveMessage -> NoMessages");
-            let result_no_messages = ResultCode::from_module_description(
-                crate::hle::result::ErrorModule::AM, 3
-            );
+            let result_no_messages =
+                ResultCode::from_module_description(crate::hle::result::ErrorModule::AM, 3);
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(result_no_messages);
         }
@@ -254,8 +262,12 @@ impl ICommonStateGetter {
 
     /// RequestToAcquireSleepLock (cmd 10): acquires sleep lock immediately.
     /// Matches upstream: signals sleep_lock_event.
-    fn request_to_acquire_sleep_lock_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+    fn request_to_acquire_sleep_lock_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         log::warn!("(STUBBED) RequestToAcquireSleepLock called");
         let _ = {
             let mut applet = service.applet.lock().unwrap();
@@ -283,8 +295,12 @@ impl ICommonStateGetter {
 
     /// GetAcquiredSleepLockEvent (cmd 13): returns event handle for sleep lock.
     /// Matches upstream: returns OutCopyHandle<KReadableEvent> from sleep_lock_event.
-    fn get_acquired_sleep_lock_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+    fn get_acquired_sleep_lock_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         log::warn!("(STUBBED) GetAcquiredSleepLockEvent called");
         let handle = service
             .applet
@@ -298,7 +314,8 @@ impl ICommonStateGetter {
     }
 
     fn get_operation_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u8(service.get_operation_mode() as u8);
@@ -311,21 +328,24 @@ impl ICommonStateGetter {
     }
 
     fn get_current_focus_state_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u8(service.get_current_focus_state() as u8);
     }
 
     fn is_vr_mode_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(service.is_vr_mode_enabled());
     }
 
     fn set_vr_mode_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut rp = RequestParser::new(ctx);
         service.set_vr_mode_enabled(rp.pop_bool());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -336,7 +356,8 @@ impl ICommonStateGetter {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(service.is_in_controller_firmware_update_section());
@@ -346,7 +367,8 @@ impl ICommonStateGetter {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let (w, h) = service.get_default_display_resolution();
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -358,7 +380,8 @@ impl ICommonStateGetter {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let handle = service
             .applet
             .lock()
@@ -371,11 +394,9 @@ impl ICommonStateGetter {
         rb.push_copy_objects(handle);
     }
 
-    fn get_built_in_display_type_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+    fn get_built_in_display_type_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_i32(service.get_built_in_display_type());
@@ -385,7 +406,8 @@ impl ICommonStateGetter {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut rp = RequestParser::new(ctx);
         let button = match rp.pop_i32() {
             1 => SystemButtonType::HomeButtonShortPressing,
@@ -403,7 +425,8 @@ impl ICommonStateGetter {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(service.get_operation_mode_system_info());
@@ -413,7 +436,8 @@ impl ICommonStateGetter {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         service.set_request_exit_to_library_applet_at_execute_next_program_enabled();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);

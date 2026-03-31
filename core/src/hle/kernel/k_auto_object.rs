@@ -169,7 +169,10 @@ impl KAutoObjectBase for KAutoObject {
 
 impl KAutoObject {
     pub fn get_static_type_obj() -> TypeObj {
-        TypeObj::new("KAutoObject", k_class_token::class_token(k_class_token::ObjectType::KAutoObject))
+        TypeObj::new(
+            "KAutoObject",
+            k_class_token::class_token(k_class_token::ObjectType::KAutoObject),
+        )
     }
 
     pub fn get_static_type_name() -> &'static str {

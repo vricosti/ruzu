@@ -14,8 +14,7 @@ pub const RESULT_WRONG_APPLICATION_AREA_SIZE: ResultCode =
 pub const RESULT_WRONG_DEVICE_STATE: ResultCode =
     ResultCode::from_module_description(ErrorModule::NFP, 73);
 // Note: upstream uses ErrorModule::NFC (not NFP) for this one
-pub const RESULT_UNKNOWN_74: ResultCode =
-    ResultCode::from_module_description(ErrorModule::NFC, 74);
+pub const RESULT_UNKNOWN_74: ResultCode = ResultCode::from_module_description(ErrorModule::NFC, 74);
 pub const RESULT_NFC_DISABLED: ResultCode =
     ResultCode::from_module_description(ErrorModule::NFP, 80);
 pub const RESULT_WRITE_AMIIBO_FAILED: ResultCode =

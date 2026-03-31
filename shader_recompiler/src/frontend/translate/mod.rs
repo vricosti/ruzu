@@ -315,7 +315,9 @@ impl<'a> TranslatorVisitor<'a> {
         let cb_offset = field(insn, 20, 14) << 2;
         let binding = Value::ImmU32(cb_index);
         self.ir.program.info.register_cbuf(cb_index);
-        let lo = self.ir.get_cbuf_u32(binding.clone(), Value::ImmU32(cb_offset));
+        let lo = self
+            .ir
+            .get_cbuf_u32(binding.clone(), Value::ImmU32(cb_offset));
         let hi = self.ir.get_cbuf_u32(binding, Value::ImmU32(cb_offset + 4));
         let vec = self.ir.composite_construct_u32x2(lo, hi);
         self.ir.pack_double_2x32(vec)
@@ -439,9 +441,7 @@ impl<'a> TranslatorVisitor<'a> {
             }
 
             // integer_scaled_add.cpp
-            MaxwellOpcode::ISCADD_reg
-            | MaxwellOpcode::ISCADD_cbuf
-            | MaxwellOpcode::ISCADD_imm => {
+            MaxwellOpcode::ISCADD_reg | MaxwellOpcode::ISCADD_cbuf | MaxwellOpcode::ISCADD_imm => {
                 self::integer_scaled_add::iscadd(self, insn, opcode);
             }
 

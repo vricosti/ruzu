@@ -94,23 +94,34 @@ fn read_object_from_buf<T: Copy + Default>(data: &[u8], offset: usize) -> Option
     Some(obj)
 }
 
-fn get_directory_entry(ctx: &RomFSTraversalContext, offset: usize) -> Option<(DirectoryEntry, String)> {
+fn get_directory_entry(
+    ctx: &RomFSTraversalContext,
+    offset: usize,
+) -> Option<(DirectoryEntry, String)> {
     let entry: DirectoryEntry = read_object_from_buf(&ctx.directory_meta, offset)?;
     let entry_end = offset + std::mem::size_of::<DirectoryEntry>();
-    let name_length = (entry.name_length as usize).min(ctx.directory_meta.len().saturating_sub(entry_end));
-    let name = String::from_utf8_lossy(&ctx.directory_meta[entry_end..entry_end + name_length]).into_owned();
+    let name_length =
+        (entry.name_length as usize).min(ctx.directory_meta.len().saturating_sub(entry_end));
+    let name = String::from_utf8_lossy(&ctx.directory_meta[entry_end..entry_end + name_length])
+        .into_owned();
     Some((entry, name))
 }
 
 fn get_file_entry(ctx: &RomFSTraversalContext, offset: usize) -> Option<(FileEntry, String)> {
     let entry: FileEntry = read_object_from_buf(&ctx.file_meta, offset)?;
     let entry_end = offset + std::mem::size_of::<FileEntry>();
-    let name_length = (entry.name_length as usize).min(ctx.file_meta.len().saturating_sub(entry_end));
-    let name = String::from_utf8_lossy(&ctx.file_meta[entry_end..entry_end + name_length]).into_owned();
+    let name_length =
+        (entry.name_length as usize).min(ctx.file_meta.len().saturating_sub(entry_end));
+    let name =
+        String::from_utf8_lossy(&ctx.file_meta[entry_end..entry_end + name_length]).into_owned();
     Some((entry, name))
 }
 
-fn process_file(ctx: &RomFSTraversalContext, mut this_file_offset: u32, parent: &VectorVfsDirectory) {
+fn process_file(
+    ctx: &RomFSTraversalContext,
+    mut this_file_offset: u32,
+    parent: &VectorVfsDirectory,
+) {
     while this_file_offset != ROMFS_ENTRY_EMPTY {
         let (entry, name) = match get_file_entry(ctx, this_file_offset as usize) {
             Some(v) => v,
@@ -128,7 +139,11 @@ fn process_file(ctx: &RomFSTraversalContext, mut this_file_offset: u32, parent: 
     }
 }
 
-fn process_directory(ctx: &RomFSTraversalContext, mut this_dir_offset: u32, parent: &VectorVfsDirectory) {
+fn process_directory(
+    ctx: &RomFSTraversalContext,
+    mut this_dir_offset: u32,
+    parent: &VectorVfsDirectory,
+) {
     while this_dir_offset != ROMFS_ENTRY_EMPTY {
         let (entry, name) = match get_directory_entry(ctx, this_dir_offset as usize) {
             Some(v) => v,

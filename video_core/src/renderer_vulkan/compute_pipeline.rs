@@ -133,9 +133,9 @@ impl ComputePipeline {
         // Wait for build if async
         if !self.is_built.load(Ordering::Acquire) {
             let lock = self.build_mutex.lock().unwrap();
-            let _guard = self.build_condvar.wait_while(lock, |_| {
-                !self.is_built.load(Ordering::Relaxed)
-            });
+            let _guard = self
+                .build_condvar
+                .wait_while(lock, |_| !self.is_built.load(Ordering::Relaxed));
         }
 
         if self.pipeline == vk::Pipeline::null() {

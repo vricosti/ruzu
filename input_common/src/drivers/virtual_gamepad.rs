@@ -79,12 +79,7 @@ impl VirtualGamepad {
 
     /// Sets the status of all buttons bound with the key to pressed (by int id).
     /// Port of VirtualGamepad::SetButtonState(size_t, int, bool)
-    pub fn set_button_state_by_id(
-        &mut self,
-        player_index: usize,
-        button_id: i32,
-        value: bool,
-    ) {
+    pub fn set_button_state_by_id(&mut self, player_index: usize, button_id: i32, value: bool) {
         if player_index > PLAYER_INDEX_COUNT {
             return;
         }
@@ -94,12 +89,7 @@ impl VirtualGamepad {
 
     /// Sets the status of all buttons bound with the key to pressed (by enum).
     /// Port of VirtualGamepad::SetButtonState(size_t, VirtualButton, bool)
-    pub fn set_button_state(
-        &mut self,
-        player_index: usize,
-        button_id: VirtualButton,
-        value: bool,
-    ) {
+    pub fn set_button_state(&mut self, player_index: usize, button_id: VirtualButton, value: bool) {
         self.set_button_state_by_id(player_index, button_id as i32, value);
     }
 
@@ -117,7 +107,8 @@ impl VirtualGamepad {
         }
         let identifier = self.get_identifier(player_index);
         self.engine.set_axis(&identifier, axis_id * 2, x_value);
-        self.engine.set_axis(&identifier, (axis_id * 2) + 1, y_value);
+        self.engine
+            .set_axis(&identifier, (axis_id * 2) + 1, y_value);
     }
 
     /// Sets the status of a stick to a specific player index (by enum).

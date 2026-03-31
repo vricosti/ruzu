@@ -26,17 +26,41 @@ impl Hidbus {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
             (1, Some(Self::stub_success_handler), "GetBusHandle"),
-            (2, Some(Self::stub_success_handler), "IsExternalDeviceConnected"),
+            (
+                2,
+                Some(Self::stub_success_handler),
+                "IsExternalDeviceConnected",
+            ),
             (3, Some(Self::stub_success_handler), "Initialize"),
             (4, Some(Self::stub_success_handler), "Finalize"),
             (5, Some(Self::stub_success_handler), "EnableExternalDevice"),
             (6, Some(Self::stub_success_handler), "GetExternalDeviceId"),
             (7, Some(Self::stub_success_handler), "SendCommandAsync"),
-            (8, Some(Self::stub_success_handler), "GetSendCommandAsynceResult"),
-            (9, Some(Self::stub_success_handler), "SetEventForSendCommandAsycResult"),
-            (10, Some(Self::stub_success_handler), "GetSharedMemoryHandle"),
-            (11, Some(Self::stub_success_handler), "EnableJoyPollingReceiveMode"),
-            (12, Some(Self::stub_success_handler), "DisableJoyPollingReceiveMode"),
+            (
+                8,
+                Some(Self::stub_success_handler),
+                "GetSendCommandAsynceResult",
+            ),
+            (
+                9,
+                Some(Self::stub_success_handler),
+                "SetEventForSendCommandAsycResult",
+            ),
+            (
+                10,
+                Some(Self::stub_success_handler),
+                "GetSharedMemoryHandle",
+            ),
+            (
+                11,
+                Some(Self::stub_success_handler),
+                "EnableJoyPollingReceiveMode",
+            ),
+            (
+                12,
+                Some(Self::stub_success_handler),
+                "DisableJoyPollingReceiveMode",
+            ),
             (13, Some(Self::stub_success_handler), "GetPollingData"),
             (14, Some(Self::stub_success_handler), "SetStatusManagerType"),
         ]);

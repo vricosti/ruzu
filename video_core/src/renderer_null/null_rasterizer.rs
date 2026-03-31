@@ -382,8 +382,7 @@ mod tests {
     #[test]
     fn test_trait_object() {
         let sp = Arc::new(SyncpointManager::new());
-        let mut rast: Box<dyn RasterizerInterface> =
-            Box::new(RasterizerNull::new(sp));
+        let mut rast: Box<dyn RasterizerInterface> = Box::new(RasterizerNull::new(sp));
 
         // Should work through the trait object
         rast.draw(false, 1);

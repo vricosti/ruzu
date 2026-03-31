@@ -157,11 +157,7 @@ impl DeviceManager {
     ///
     /// Upstream: calls `GetDeviceHandle` then `device->StartDetection(tag_protocol)`,
     /// then `VerifyDeviceResult`.
-    pub fn start_detection(
-        &mut self,
-        device_handle: u64,
-        protocol: NfcProtocol,
-    ) -> ResultCode {
+    pub fn start_detection(&mut self, device_handle: u64, protocol: NfcProtocol) -> ResultCode {
         let device = match self.get_device_handle_checked_mut(device_handle) {
             Ok(d) => d,
             Err(e) => return e,
@@ -203,12 +199,7 @@ impl DeviceManager {
     ///
     /// Upstream: calls `GetDeviceHandle` then `device->Mount(model_type, mount_target)`,
     /// then `VerifyDeviceResult`.
-    pub fn mount(
-        &mut self,
-        device_handle: u64,
-        model_type: u32,
-        mount_target: u32,
-    ) -> ResultCode {
+    pub fn mount(&mut self, device_handle: u64, model_type: u32, mount_target: u32) -> ResultCode {
         let device = match self.get_device_handle_checked_mut(device_handle) {
             Ok(d) => d,
             Err(e) => return e,
@@ -288,11 +279,7 @@ impl DeviceManager {
     ///
     /// Upstream: calls `GetDeviceHandle` then `device->OpenApplicationArea(access_id)`,
     /// then `VerifyDeviceResult`.
-    pub fn open_application_area(
-        &mut self,
-        device_handle: u64,
-        access_id: u32,
-    ) -> ResultCode {
+    pub fn open_application_area(&mut self, device_handle: u64, access_id: u32) -> ResultCode {
         let device = match self.get_device_handle_checked_mut(device_handle) {
             Ok(d) => d,
             Err(e) => return e,
@@ -325,11 +312,7 @@ impl DeviceManager {
     ///
     /// Upstream: calls `GetDeviceHandle` then `device->SetApplicationArea(data)`,
     /// then `VerifyDeviceResult`.
-    pub fn set_application_area(
-        &mut self,
-        device_handle: u64,
-        data: &[u8],
-    ) -> ResultCode {
+    pub fn set_application_area(&mut self, device_handle: u64, data: &[u8]) -> ResultCode {
         let device = match self.get_device_handle_checked_mut(device_handle) {
             Ok(d) => d,
             Err(e) => return e,
@@ -393,10 +376,7 @@ impl DeviceManager {
     ///
     /// Upstream: calls `GetDeviceHandle` then `device->ExistsApplicationArea(has_area)`,
     /// then `VerifyDeviceResult`.
-    pub fn exists_application_area(
-        &self,
-        device_handle: u64,
-    ) -> Result<bool, ResultCode> {
+    pub fn exists_application_area(&self, device_handle: u64) -> Result<bool, ResultCode> {
         let device = self.get_device_handle_checked(device_handle)?;
         let result = device.exists_application_area();
         match result {
@@ -439,10 +419,7 @@ impl DeviceManager {
     ///
     /// Upstream: calls `GetDeviceHandle` then `device->GetCommonInfo(common_info)`,
     /// then `VerifyDeviceResult`.
-    pub fn get_common_info(
-        &self,
-        device_handle: u64,
-    ) -> Result<nfp_types::CommonInfo, ResultCode> {
+    pub fn get_common_info(&self, device_handle: u64) -> Result<nfp_types::CommonInfo, ResultCode> {
         let device = self.get_device_handle_checked(device_handle)?;
         let result = device.get_common_info();
         match result {
@@ -543,11 +520,7 @@ impl DeviceManager {
     /// then `device->ReadBackupData(tag_info.uuid, tag_info.uuid_length, data)`.
     /// NfcDevice does not yet have read_backup_data; returns success after state check
     /// since the operation requires filesystem backup support not yet available.
-    pub fn read_backup_data(
-        &self,
-        device_handle: u64,
-        _data: &mut [u8],
-    ) -> ResultCode {
+    pub fn read_backup_data(&self, device_handle: u64, _data: &mut [u8]) -> ResultCode {
         match self.get_device_handle_checked(device_handle) {
             Ok(_) => RESULT_SUCCESS,
             Err(e) => e,
@@ -560,11 +533,7 @@ impl DeviceManager {
     /// then `device->WriteBackupData(tag_info.uuid, tag_info.uuid_length, data)`.
     /// NfcDevice does not yet have write_backup_data; returns success after state check
     /// since the operation requires filesystem backup support not yet available.
-    pub fn write_backup_data(
-        &mut self,
-        device_handle: u64,
-        _data: &[u8],
-    ) -> ResultCode {
+    pub fn write_backup_data(&mut self, device_handle: u64, _data: &[u8]) -> ResultCode {
         match self.get_device_handle_checked_mut(device_handle) {
             Ok(_) => RESULT_SUCCESS,
             Err(e) => e,
@@ -577,12 +546,7 @@ impl DeviceManager {
     /// then `VerifyDeviceResult`. The write_type parameter is accepted but
     /// not used (matches upstream).
     /// NfcDevice does not yet have write_ntf; returns success after state check.
-    pub fn write_ntf(
-        &mut self,
-        device_handle: u64,
-        _write_type: u32,
-        _data: &[u8],
-    ) -> ResultCode {
+    pub fn write_ntf(&mut self, device_handle: u64, _write_type: u32, _data: &[u8]) -> ResultCode {
         match self.get_device_handle_checked_mut(device_handle) {
             Ok(_) => RESULT_SUCCESS,
             Err(e) => e,
@@ -705,20 +669,14 @@ impl DeviceManager {
     ///
     /// Upstream `GetDeviceHandle`: calls `GetDeviceFromHandle(handle, device, true)`,
     /// then `CheckDeviceState(device)`.
-    fn get_device_handle_checked(
-        &self,
-        handle: u64,
-    ) -> Result<&NfcDevice, ResultCode> {
+    fn get_device_handle_checked(&self, handle: u64) -> Result<&NfcDevice, ResultCode> {
         self.get_device_from_handle(handle, true)
         // CheckDeviceState upstream: returns ResultInvalidArgument if device is null.
         // In Rust the reference is always valid if we got here.
     }
 
     /// Gets a device handle with full state and device checks (mutable).
-    fn get_device_handle_checked_mut(
-        &mut self,
-        handle: u64,
-    ) -> Result<&mut NfcDevice, ResultCode> {
+    fn get_device_handle_checked_mut(&mut self, handle: u64) -> Result<&mut NfcDevice, ResultCode> {
         self.get_device_from_handle_mut(handle, true)
     }
 

@@ -6,13 +6,13 @@
 
 use std::collections::BTreeMap;
 
+use super::bcat_result;
+use super::bcat_types::*;
 use crate::file_sys::vfs::vfs::{VfsDirectory, VfsFile};
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::bcat_result;
-use super::bcat_types::*;
 
 /// IPC command IDs for IDeliveryCacheFileService
 pub mod commands {

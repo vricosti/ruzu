@@ -86,32 +86,32 @@ pub const MAX_GUIDE_TEXT_LENGTH: usize = 256;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SwkbdConfigCommon {
-    pub swkbd_type: u32,                                   // +0
-    pub ok_text: [u16; MAX_OK_TEXT_LENGTH + 1],            // +4  (18 bytes)
-    pub left_optional_symbol_key: u16,                     // +22
-    pub right_optional_symbol_key: u16,                    // +24
-    pub use_prediction: bool,                              // +26
+    pub swkbd_type: u32,                        // +0
+    pub ok_text: [u16; MAX_OK_TEXT_LENGTH + 1], // +4  (18 bytes)
+    pub left_optional_symbol_key: u16,          // +22
+    pub right_optional_symbol_key: u16,         // +24
+    pub use_prediction: bool,                   // +26
     // 1 byte implicit padding here → key_disable_flags at +28
-    pub key_disable_flags: SwkbdKeyDisableFlags,           // +28
-    pub initial_cursor_position: u32,                      // +32
-    pub header_text: [u16; MAX_HEADER_TEXT_LENGTH + 1],    // +36  (130 bytes)
-    pub sub_text: [u16; MAX_SUB_TEXT_LENGTH + 1],          // +166 (258 bytes)
-    pub guide_text: [u16; MAX_GUIDE_TEXT_LENGTH + 1],      // +424 (514 bytes)
+    pub key_disable_flags: SwkbdKeyDisableFlags, // +28
+    pub initial_cursor_position: u32,            // +32
+    pub header_text: [u16; MAX_HEADER_TEXT_LENGTH + 1], // +36  (130 bytes)
+    pub sub_text: [u16; MAX_SUB_TEXT_LENGTH + 1], // +166 (258 bytes)
+    pub guide_text: [u16; MAX_GUIDE_TEXT_LENGTH + 1], // +424 (514 bytes)
     // 2 bytes implicit padding here → max_text_length at +940
-    pub max_text_length: u32,                              // +940
-    pub min_text_length: u32,                              // +944
-    pub password_mode: u32,                                // +948
-    pub text_draw_type: u32,                               // +952
-    pub enable_return_button: bool,                        // +956
-    pub use_utf8: bool,                                    // +957
-    pub use_blur_background: bool,                         // +958
+    pub max_text_length: u32,       // +940
+    pub min_text_length: u32,       // +944
+    pub password_mode: u32,         // +948
+    pub text_draw_type: u32,        // +952
+    pub enable_return_button: bool, // +956
+    pub use_utf8: bool,             // +957
+    pub use_blur_background: bool,  // +958
     // 1 byte implicit padding here → initial_string_offset at +960
-    pub initial_string_offset: u32,                        // +960
-    pub initial_string_length: u32,                        // +964
-    pub user_dictionary_offset: u32,                       // +968
-    pub user_dictionary_entries: u32,                      // +972
-    pub use_text_check: bool,                              // +976
-    // 3 bytes implicit padding (struct alignment to 4)
+    pub initial_string_offset: u32,   // +960
+    pub initial_string_length: u32,   // +964
+    pub user_dictionary_offset: u32,  // +968
+    pub user_dictionary_entries: u32, // +972
+    pub use_text_check: bool,         // +976
+                                      // 3 bytes implicit padding (struct alignment to 4)
 }
 const _: () = assert!(std::mem::size_of::<SwkbdConfigCommon>() == 0x3D4);
 

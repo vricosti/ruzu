@@ -74,15 +74,13 @@ impl Keyboard {
     /// Sets the status of all buttons bound with the key to pressed.
     /// Port of Keyboard::PressKey
     pub fn press_key(&mut self, key_code: i32) {
-        self.engine
-            .set_button(&key_identifier(), key_code, true);
+        self.engine.set_button(&key_identifier(), key_code, true);
     }
 
     /// Sets the status of all buttons bound with the key to released.
     /// Port of Keyboard::ReleaseKey
     pub fn release_key(&mut self, key_code: i32) {
-        self.engine
-            .set_button(&key_identifier(), key_code, false);
+        self.engine.set_button(&key_identifier(), key_code, false);
     }
 
     /// Sets the status of the keyboard key to pressed.

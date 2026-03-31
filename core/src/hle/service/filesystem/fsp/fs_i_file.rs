@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::file_sys::fsa::fs_i_file::IFile as FsaIFile;
 use crate::file_sys::fs_file::{ReadOption, WriteOption};
+use crate::file_sys::fsa::fs_i_file::IFile as FsaIFile;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -72,7 +72,10 @@ impl IFile {
         let read_size = std::cmp::min(size as usize, buffer_size);
         let mut output = vec![0u8; read_size];
 
-        match service.backend.read(offset, &mut output, read_size, &option) {
+        match service
+            .backend
+            .read(offset, &mut output, read_size, &option)
+        {
             Ok(bytes_read) => {
                 ctx.write_buffer(&output[..bytes_read], 0);
                 let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
@@ -109,7 +112,10 @@ impl IFile {
         let data = ctx.read_buffer(0);
         let write_size = std::cmp::min(size as usize, data.len());
 
-        match service.backend.write(offset, &data[..write_size], write_size, &option) {
+        match service
+            .backend
+            .write(offset, &data[..write_size], write_size, &option)
+        {
             Ok(()) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(RESULT_SUCCESS);

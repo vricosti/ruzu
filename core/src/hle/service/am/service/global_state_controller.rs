@@ -52,8 +52,16 @@ impl IGlobalStateController {
             (11, None, "NotifyCecSettingsChanged"),
             (12, None, "SetDefaultHomeButtonLongPressTime"),
             (13, None, "UpdateDefaultDisplayResolution"),
-            (14, Some(Self::should_sleep_on_boot_handler), "ShouldSleepOnBoot"),
-            (15, Some(Self::get_hdcp_authentication_failed_event_handler), "GetHdcpAuthenticationFailedEvent"),
+            (
+                14,
+                Some(Self::should_sleep_on_boot_handler),
+                "ShouldSleepOnBoot",
+            ),
+            (
+                15,
+                Some(Self::get_hdcp_authentication_failed_event_handler),
+                "GetHdcpAuthenticationFailedEvent",
+            ),
             (
                 30,
                 Some(Self::open_cradle_firmware_updater_handler),
@@ -63,9 +71,8 @@ impl IGlobalStateController {
         let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
             "IGlobalStateController".to_string(),
         );
-        let hdcp_authentication_failed_event_handle = service_context.create_event(
-            "IGlobalStateController:HdcpAuthenticationFailedEvent".to_string(),
-        );
+        let hdcp_authentication_failed_event_handle = service_context
+            .create_event("IGlobalStateController:HdcpAuthenticationFailedEvent".to_string());
         Self {
             service_context,
             hdcp_authentication_failed_event_handle,

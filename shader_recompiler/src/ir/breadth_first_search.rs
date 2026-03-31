@@ -19,11 +19,7 @@ use super::value::Value;
 /// If the entire SSA tree is traversed without finding a match, returns `None`.
 ///
 /// Visits the rightmost arguments first, matching upstream behavior.
-pub fn breadth_first_search<T, F>(
-    value: &Value,
-    instructions: &[Vec<Inst>],
-    pred: F,
-) -> Option<T>
+pub fn breadth_first_search<T, F>(value: &Value, instructions: &[Vec<Inst>], pred: F) -> Option<T>
 where
     F: Fn(&Inst) -> Option<T>,
 {

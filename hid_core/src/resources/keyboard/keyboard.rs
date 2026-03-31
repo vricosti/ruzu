@@ -63,7 +63,9 @@ impl Keyboard {
             self.next_state.attribute = KeyboardAttribute { raw: 1 };
         }
 
-        shared_memory.keyboard_lifo.write_next_entry(self.next_state);
+        shared_memory
+            .keyboard_lifo
+            .write_next_entry(self.next_state);
     }
 }
 

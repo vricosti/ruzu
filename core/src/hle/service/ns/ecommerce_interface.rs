@@ -38,12 +38,28 @@ impl IECommerceInterface {
     pub fn new(system: crate::core::SystemRef) -> Self {
         let handlers = build_handler_map(&[
             (commands::REQUEST_LINK_DEVICE, None, "RequestLinkDevice"),
-            (commands::REQUEST_CLEANUP_ALL_PRE_INSTALLED_APPLICATIONS, None, "RequestCleanupAllPreInstalledApplications"),
-            (commands::REQUEST_CLEANUP_PRE_INSTALLED_APPLICATION, None, "RequestCleanupPreInstalledApplication"),
+            (
+                commands::REQUEST_CLEANUP_ALL_PRE_INSTALLED_APPLICATIONS,
+                None,
+                "RequestCleanupAllPreInstalledApplications",
+            ),
+            (
+                commands::REQUEST_CLEANUP_PRE_INSTALLED_APPLICATION,
+                None,
+                "RequestCleanupPreInstalledApplication",
+            ),
             (commands::REQUEST_SYNC_RIGHTS, None, "RequestSyncRights"),
             (commands::REQUEST_UNLINK_DEVICE, None, "RequestUnlinkDevice"),
-            (commands::REQUEST_REVOKE_ALL_E_LICENSE, None, "RequestRevokeAllELicense"),
-            (commands::REQUEST_SYNC_RIGHTS_BASED_ON_ASSIGNED_E_LICENSES, None, "RequestSyncRightsBasedOnAssignedELicenses"),
+            (
+                commands::REQUEST_REVOKE_ALL_E_LICENSE,
+                None,
+                "RequestRevokeAllELicense",
+            ),
+            (
+                commands::REQUEST_SYNC_RIGHTS_BASED_ON_ASSIGNED_E_LICENSES,
+                None,
+                "RequestSyncRightsBasedOnAssignedELicenses",
+            ),
         ]);
         Self {
             system,

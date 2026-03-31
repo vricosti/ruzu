@@ -122,7 +122,10 @@ mod tests {
 
     #[test]
     fn test_hex_string_to_vector() {
-        assert_eq!(hex_string_to_vector("deadbeef", false), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            hex_string_to_vector("deadbeef", false),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
         assert_eq!(hex_string_to_vector("0102", true), vec![0x02, 0x01]);
     }
 

@@ -213,12 +213,8 @@ pub fn concat_path_safe(base: &Path, offset: &Path) -> PathBuf {
 ///
 /// Maps to upstream `IsPathSandboxed`.
 pub fn is_path_sandboxed(base: &Path, path: &Path) -> bool {
-    let base_string = path_to_utf8_string(&remove_trailing_separators(
-        &normalize_path(base),
-    ));
-    let path_string = path_to_utf8_string(&remove_trailing_separators(
-        &normalize_path(path),
-    ));
+    let base_string = path_to_utf8_string(&remove_trailing_separators(&normalize_path(base)));
+    let path_string = path_to_utf8_string(&remove_trailing_separators(&normalize_path(path)));
 
     if path_string.len() < base_string.len() {
         return false;
@@ -565,10 +561,7 @@ mod tests {
             Path::new("/base"),
             Path::new("/other/path")
         ));
-        assert!(is_path_sandboxed(
-            Path::new("/base"),
-            Path::new("/base")
-        ));
+        assert!(is_path_sandboxed(Path::new("/base"), Path::new("/base")));
     }
 
     #[test]

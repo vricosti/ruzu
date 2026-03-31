@@ -49,8 +49,7 @@ pub unsafe fn create_surface(
     let surface = match window_info.window_type {
         #[cfg(target_os = "linux")]
         WindowSystemType::X11 => {
-            let xlib_surface_fn =
-                ash::extensions::khr::XlibSurface::new(entry, instance);
+            let xlib_surface_fn = ash::extensions::khr::XlibSurface::new(entry, instance);
             let create_info = vk::XlibSurfaceCreateInfoKHR::builder()
                 .dpy(window_info.display_connection as *mut _)
                 .window(window_info.render_surface as u64)
@@ -61,8 +60,7 @@ pub unsafe fn create_surface(
         }
         #[cfg(target_os = "linux")]
         WindowSystemType::Wayland => {
-            let wayland_surface_fn =
-                ash::extensions::khr::WaylandSurface::new(entry, instance);
+            let wayland_surface_fn = ash::extensions::khr::WaylandSurface::new(entry, instance);
             let create_info = vk::WaylandSurfaceCreateInfoKHR::builder()
                 .display(window_info.display_connection as *mut _)
                 .surface(window_info.render_surface as *mut _)
@@ -73,8 +71,7 @@ pub unsafe fn create_surface(
         }
         #[cfg(target_os = "windows")]
         WindowSystemType::Windows => {
-            let win32_surface_fn =
-                ash::extensions::khr::Win32Surface::new(entry, instance);
+            let win32_surface_fn = ash::extensions::khr::Win32Surface::new(entry, instance);
             let create_info = vk::Win32SurfaceCreateInfoKHR::builder()
                 .hinstance(std::ptr::null_mut())
                 .hwnd(window_info.render_surface as isize)
@@ -85,8 +82,7 @@ pub unsafe fn create_surface(
         }
         #[cfg(target_os = "macos")]
         WindowSystemType::Cocoa => {
-            let metal_surface_fn =
-                ash::extensions::ext::MetalSurface::new(entry, instance);
+            let metal_surface_fn = ash::extensions::ext::MetalSurface::new(entry, instance);
             let create_info = vk::MetalSurfaceCreateInfoEXT::builder()
                 .layer(window_info.render_surface as *const _)
                 .build();
@@ -96,8 +92,7 @@ pub unsafe fn create_surface(
         }
         #[cfg(target_os = "android")]
         WindowSystemType::Android => {
-            let android_surface_fn =
-                ash::extensions::khr::AndroidSurface::new(entry, instance);
+            let android_surface_fn = ash::extensions::khr::AndroidSurface::new(entry, instance);
             let create_info = vk::AndroidSurfaceCreateInfoKHR::builder()
                 .window(window_info.render_surface as *mut _)
                 .build();

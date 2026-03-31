@@ -55,27 +55,25 @@ impl ThreadWorker {
 
             let handle = std::thread::Builder::new()
                 .name(format!("ImageTranscode:{}", i))
-                .spawn(move || {
-                    loop {
-                        let work = {
-                            let mut locked = queue.lock().unwrap();
-                            loop {
-                                if stop_flag.load(Ordering::Relaxed) {
-                                    return;
-                                }
-                                if let Some(item) = locked.pop() {
-                                    break Some(item);
-                                }
-                                locked = condvar.wait(locked).unwrap();
+                .spawn(move || loop {
+                    let work = {
+                        let mut locked = queue.lock().unwrap();
+                        loop {
+                            if stop_flag.load(Ordering::Relaxed) {
+                                return;
                             }
-                        };
-
-                        if let Some(work) = work {
-                            active_count.fetch_add(1, Ordering::Release);
-                            work();
-                            active_count.fetch_sub(1, Ordering::Release);
-                            done_condvar.notify_all();
+                            if let Some(item) = locked.pop() {
+                                break Some(item);
+                            }
+                            locked = condvar.wait(locked).unwrap();
                         }
+                    };
+
+                    if let Some(work) = work {
+                        active_count.fetch_add(1, Ordering::Release);
+                        work();
+                        active_count.fetch_sub(1, Ordering::Release);
+                        done_condvar.notify_all();
                     }
                 })
                 .expect("Failed to spawn ImageTranscode thread");

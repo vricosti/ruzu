@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::core::SystemRef;
+use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
-use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_server_session::KServerSession;
 use crate::hle::kernel::k_synchronization_object;
@@ -321,7 +321,11 @@ impl ServerManager {
 
         // Check if any session has a pending request.
         for i in 0..self.sessions.len() {
-            let is_signaled = self.sessions[i].server_session.lock().unwrap().is_signaled();
+            let is_signaled = self.sessions[i]
+                .server_session
+                .lock()
+                .unwrap()
+                .is_signaled();
             if is_signaled {
                 self.on_session_event(i);
                 return true;
@@ -417,7 +421,10 @@ impl ServerManager {
         };
 
         let mut process = process.lock().unwrap();
-        let _ = readable_event.lock().unwrap().signal(&mut process, &scheduler);
+        let _ = readable_event
+            .lock()
+            .unwrap()
+            .signal(&mut process, &scheduler);
     }
 
     fn clear_guest_wakeup_signal(&self) {

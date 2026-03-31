@@ -132,7 +132,9 @@ impl CachedMacro for HleDrawIndirectByteCount {
         // Stubbed — requires Maxwell3D reference to set draw_auto_stride/byte_count registers
         // and call draw_manager->DrawArrayIndirect(topology) with is_byte_count=true.
         // Upstream: HLE_DrawIndirectByteCount::Execute() in video_core/macro/macro_hle.cpp
-        log::warn!("HLE_DrawIndirectByteCount: not yet implemented (requires Maxwell3D integration)");
+        log::warn!(
+            "HLE_DrawIndirectByteCount: not yet implemented (requires Maxwell3D integration)"
+        );
     }
 }
 
@@ -212,7 +214,9 @@ impl CachedMacro for HleSetRasterBoundingBox {
         //   scratch_data = regs.shadow_scratch[52]
         //   regs.raster_bounding_box.raw = raster_mode & 0xFFFFF00F
         //   regs.raster_bounding_box.pad = scratch_data & raster_enabled
-        log::warn!("HLE_SetRasterBoundingBox: not yet implemented (requires Maxwell3D integration)");
+        log::warn!(
+            "HLE_SetRasterBoundingBox: not yet implemented (requires Maxwell3D integration)"
+        );
     }
 }
 
@@ -272,7 +276,9 @@ impl CachedMacro for HleTransformFeedbackSetup {
         //   CallMethod(launch_dma, 0x1011, true)
         //   CallMethod(inline_data, tf.controls[0].stride, true)
         //   Rasterizer().RegisterTransformFeedback(upload.dest.Address())
-        log::warn!("HLE_TransformFeedbackSetup: not yet implemented (requires Maxwell3D integration)");
+        log::warn!(
+            "HLE_TransformFeedbackSetup: not yet implemented (requires Maxwell3D integration)"
+        );
     }
 }
 

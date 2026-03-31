@@ -7,11 +7,11 @@
 //! Fatal_P -- "fatal:p" service interface.
 //! This service provides private fatal error query interface.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Fatal_P service.
 ///
@@ -25,10 +25,8 @@ pub struct FatalP {
 
 impl FatalP {
     pub fn new(module: Arc<super::fatal::Module>) -> Self {
-        let handlers = build_handler_map(&[
-            (0, None, "GetFatalEvent"),
-            (10, None, "GetFatalContext"),
-        ]);
+        let handlers =
+            build_handler_map(&[(0, None, "GetFatalEvent"), (10, None, "GetFatalContext")]);
 
         log::debug!("fatal:p created");
         Self {
@@ -43,11 +41,19 @@ impl SessionRequestHandler for FatalP {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { "fatal:p" }
+    fn service_name(&self) -> &str {
+        "fatal:p"
+    }
 }
 
 impl ServiceFramework for FatalP {
-    fn get_service_name(&self) -> &str { "fatal:p" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "fatal:p"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }

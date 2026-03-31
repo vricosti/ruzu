@@ -367,7 +367,10 @@ impl ILogger {
         }
     }
 
-    fn log_handler(_this: &dyn crate::hle::service::service::ServiceFramework, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) {
+    fn log_handler(
+        _this: &dyn crate::hle::service::service::ServiceFramework,
+        ctx: &mut crate::hle::service::hle_ipc::HLERequestContext,
+    ) {
         // Upstream: always returns success. Log data is read from the buffer.
         let data = ctx.read_buffer(0);
         // Parse and output the log message (stateless — no need to mutate ILogger).
@@ -380,7 +383,10 @@ impl ILogger {
         rb.push_result(crate::hle::result::RESULT_SUCCESS);
     }
 
-    fn set_destination_handler(_this: &dyn crate::hle::service::service::ServiceFramework, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) {
+    fn set_destination_handler(
+        _this: &dyn crate::hle::service::service::ServiceFramework,
+        ctx: &mut crate::hle::service::hle_ipc::HLERequestContext,
+    ) {
         let mut rp = crate::hle::service::ipc_helpers::RequestParser::new(ctx);
         let destination = rp.pop_u32();
         log::debug!("ILogger::SetDestination: {:#x}", destination);
@@ -394,10 +400,7 @@ impl ILogger {
     /// This function always succeeds (matching upstream).
     pub fn log(&mut self, data: &[u8]) {
         if data.len() < std::mem::size_of::<LogPacketHeader>() {
-            log::error!(
-                "Data size is too small for header! size={}",
-                data.len()
-            );
+            log::error!("Data size is too small for header! size={}", data.len());
             return;
         }
 
@@ -457,7 +460,10 @@ impl ILogger {
 }
 
 impl crate::hle::service::hle_ipc::SessionRequestHandler for ILogger {
-    fn handle_sync_request(&self, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) -> crate::hle::result::ResultCode {
+    fn handle_sync_request(
+        &self,
+        ctx: &mut crate::hle::service::hle_ipc::HLERequestContext,
+    ) -> crate::hle::result::ResultCode {
         use crate::hle::service::service::ServiceFramework;
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
@@ -476,11 +482,15 @@ impl crate::hle::service::service::ServiceFramework for ILogger {
         1
     }
 
-    fn handlers(&self) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+    fn handlers(
+        &self,
+    ) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
         &self.handlers
     }
 
-    fn handlers_tipc(&self) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+    fn handlers_tipc(
+        &self,
+    ) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
         &self.handlers_tipc
     }
 }
@@ -495,16 +505,21 @@ pub struct LM {
 
 impl LM {
     pub fn new() -> Self {
-        let handlers = crate::hle::service::service::build_handler_map(&[
-            (0, Some(LM::open_logger_handler), "OpenLogger"),
-        ]);
+        let handlers = crate::hle::service::service::build_handler_map(&[(
+            0,
+            Some(LM::open_logger_handler),
+            "OpenLogger",
+        )]);
         Self {
             handlers,
             handlers_tipc: std::collections::BTreeMap::new(),
         }
     }
 
-    fn open_logger_handler(_this: &dyn crate::hle::service::service::ServiceFramework, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) {
+    fn open_logger_handler(
+        _this: &dyn crate::hle::service::service::ServiceFramework,
+        ctx: &mut crate::hle::service::hle_ipc::HLERequestContext,
+    ) {
         log::debug!("LM::OpenLogger called");
         // Upstream: IPC::ResponseBuilder rb{ctx, 2, 0, 1}; rb.Push(ResultSuccess); rb.PushIpcInterface<ILogger>(system);
         let logger: std::sync::Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
@@ -516,7 +531,10 @@ impl LM {
 }
 
 impl crate::hle::service::hle_ipc::SessionRequestHandler for LM {
-    fn handle_sync_request(&self, ctx: &mut crate::hle::service::hle_ipc::HLERequestContext) -> crate::hle::result::ResultCode {
+    fn handle_sync_request(
+        &self,
+        ctx: &mut crate::hle::service::hle_ipc::HLERequestContext,
+    ) -> crate::hle::result::ResultCode {
         use crate::hle::service::service::ServiceFramework;
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
@@ -535,11 +553,15 @@ impl crate::hle::service::service::ServiceFramework for LM {
         42
     }
 
-    fn handlers(&self) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+    fn handlers(
+        &self,
+    ) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
         &self.handlers
     }
 
-    fn handlers_tipc(&self) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+    fn handlers_tipc(
+        &self,
+    ) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
         &self.handlers_tipc
     }
 }
@@ -578,10 +600,7 @@ mod tests {
             destination_to_string(LogDestination::ALL),
             "TargetManager | Uart | UartSleep"
         );
-        assert_eq!(
-            destination_to_string(LogDestination(0)),
-            "No Destination"
-        );
+        assert_eq!(destination_to_string(LogDestination(0)), "No Destination");
         // Any non-zero destination matches ALL (0xffff) via bitwise AND,
         // so individual flags also produce the "All" string -- matching upstream.
         assert_eq!(
@@ -596,7 +615,7 @@ mod tests {
 
         // Build a minimal packet: HEAD | TAIL, severity=Info, no payload
         let mut data = vec![0u8; 24]; // LogPacketHeader size
-        // pid = 1
+                                      // pid = 1
         data[0..8].copy_from_slice(&1u64.to_le_bytes());
         // tid = 2
         data[8..16].copy_from_slice(&2u64.to_le_bytes());

@@ -284,15 +284,13 @@ impl RumbleProtocol {
 
     /// Port of RumbleProtocol::EncodeHighFrequency
     fn encode_high_frequency(&self, frequency: f32) -> u16 {
-        let new_frequency =
-            ((frequency / 10.0f32).log2() * 32.0).clamp(0.0, 255.0) as u8;
+        let new_frequency = ((frequency / 10.0f32).log2() * 32.0).clamp(0.0, 255.0) as u8;
         ((new_frequency.wrapping_sub(0x60)) as u16) * 4
     }
 
     /// Port of RumbleProtocol::EncodeLowFrequency
     fn encode_low_frequency(&self, frequency: f32) -> u8 {
-        let new_frequency =
-            ((frequency / 10.0f32).log2() * 32.0).clamp(0.0, 255.0) as u8;
+        let new_frequency = ((frequency / 10.0f32).log2() * 32.0).clamp(0.0, 255.0) as u8;
         new_frequency.wrapping_sub(0x40)
     }
 

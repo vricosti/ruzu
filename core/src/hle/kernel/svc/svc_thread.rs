@@ -22,10 +22,12 @@ fn sleep_timeout_tick_from_ns(current_tick: i64, ns: i64) -> i64 {
 
     let offset_tick = ns;
     if offset_tick > 0 {
-        let timeout = current_tick
-            .saturating_add(offset_tick)
-            .saturating_add(2);
-        if timeout <= 0 { i64::MAX } else { timeout }
+        let timeout = current_tick.saturating_add(offset_tick).saturating_add(2);
+        if timeout <= 0 {
+            i64::MAX
+        } else {
+            timeout
+        }
     } else {
         i64::MAX
     }
@@ -55,9 +57,13 @@ pub fn create_thread(
     priority: i32,
     mut core_id: i32,
 ) -> ResultCode {
-    log::info!(
+    log::debug!(
         "svc::CreateThread called entry=0x{:08X}, arg=0x{:08X}, stack=0x{:08X}, prio={}, core={}",
-        entry_point, arg, stack_bottom, priority, core_id
+        entry_point,
+        arg,
+        stack_bottom,
+        priority,
+        core_id
     );
 
     let current_process = system.current_process_arc().clone();
@@ -200,14 +206,19 @@ pub fn sleep_thread(system: &System, ns: i64) {
             .and_then(|kernel| kernel.hardware_timer())
             .map(|timer| timer.lock().unwrap().get_tick())
             .unwrap_or(i64::MAX);
-        let result = thread.lock().unwrap().sleep(sleep_timeout_tick_from_ns(current_tick, ns));
+        let result = thread
+            .lock()
+            .unwrap()
+            .sleep(sleep_timeout_tick_from_ns(current_tick, ns));
         if result != RESULT_SUCCESS.get_inner_value() {
             log::warn!("svc::SleepThread(sleep) failed: {:#x}", result);
             return;
         }
 
-        // thread.sleep() → set_state(WAITING) → notify_state_transition removes
-        // from PQ via GSC and notifies the scheduler automatically.
+        // Upstream KThread::Sleep() blocks via KScopedSchedulerLockAndSleep.
+        // Rust cannot block inside KThread::sleep(), so explicitly request a
+        // reschedule after the thread transitions to WAITING.
+        system.scheduler_arc().lock().unwrap().request_schedule();
         return;
     }
 
@@ -228,20 +239,21 @@ pub fn sleep_thread(system: &System, ns: i64) {
 }
 
 /// Gets the thread context.
-pub fn get_thread_context3(_system: &System, out_context: u64, thread_handle: Handle) -> ResultCode {
+pub fn get_thread_context3(
+    _system: &System,
+    out_context: u64,
+    thread_handle: Handle,
+) -> ResultCode {
     log::debug!(
         "svc::GetThreadContext3 called, out_context=0x{:08X}, thread_handle=0x{:X}",
-        out_context, thread_handle
+        out_context,
+        thread_handle
     );
     RESULT_NOT_IMPLEMENTED
 }
 
 /// Gets the priority for the specified thread.
-pub fn get_thread_priority(
-    system: &System,
-    out_priority: &mut i32,
-    handle: Handle,
-) -> ResultCode {
+pub fn get_thread_priority(system: &System, out_priority: &mut i32, handle: Handle) -> ResultCode {
     let Some(thread) = resolve_thread_handle(system, handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -285,7 +297,12 @@ pub fn get_thread_list(
         return RESULT_OUT_OF_RANGE;
     }
 
-    *out_num_threads = system.current_process_arc().lock().unwrap().thread_list.len() as i32;
+    *out_num_threads = system
+        .current_process_arc()
+        .lock()
+        .unwrap()
+        .thread_list
+        .len() as i32;
     RESULT_NOT_IMPLEMENTED
 }
 
@@ -338,7 +355,11 @@ pub fn set_thread_core_mask(
 }
 
 /// Gets the ID for the specified thread.
-pub fn get_thread_id(system: &System, out_thread_id: &mut u64, thread_handle: Handle) -> ResultCode {
+pub fn get_thread_id(
+    system: &System,
+    out_thread_id: &mut u64,
+    thread_handle: Handle,
+) -> ResultCode {
     let Some(thread) = resolve_thread_handle(system, thread_handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -367,7 +388,9 @@ mod tests {
 
         let process = Arc::new(Mutex::new(process));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
-        let scheduler = Arc::new(Mutex::new(crate::hle::kernel::k_scheduler::KScheduler::new(0)));
+        let scheduler = Arc::new(Mutex::new(
+            crate::hle::kernel::k_scheduler::KScheduler::new(0),
+        ));
         {
             let mut thread = current_thread.lock().unwrap();
             thread.initialize_main_thread(0x200000, 0x250000, 0, 0x23f000, &process, 1, 1, false);
@@ -405,16 +428,42 @@ mod tests {
         let thread = process.get_thread_by_object_id(object_id).unwrap();
         drop(process);
 
-        assert_eq!(thread.lock().unwrap().get_state(), crate::hle::kernel::k_thread::ThreadState::INITIALIZED);
+        assert_eq!(
+            thread.lock().unwrap().get_state(),
+            crate::hle::kernel::k_thread::ThreadState::INITIALIZED
+        );
 
         let result = start_thread(&system, handle);
         assert_eq!(result, RESULT_SUCCESS);
-        assert_eq!(thread.lock().unwrap().get_state(), crate::hle::kernel::k_thread::ThreadState::RUNNABLE);
+        assert_eq!(
+            thread.lock().unwrap().get_state(),
+            crate::hle::kernel::k_thread::ThreadState::RUNNABLE
+        );
     }
 
     #[test]
     fn sleep_thread_uses_upstream_absolute_timeout_tick() {
         assert_eq!(sleep_timeout_tick_from_ns(1234, 10), 1246);
+    }
+
+    #[test]
+    fn sleep_thread_positive_requests_reschedule_and_blocks_current_thread() {
+        let system = test_system();
+
+        assert!(!system.scheduler_arc().lock().unwrap().needs_scheduling());
+
+        sleep_thread(&system, 10);
+
+        let current_thread = system.current_thread().unwrap();
+        let thread = current_thread.lock().unwrap();
+        assert_eq!(thread.get_state(), ThreadState::WAITING);
+        assert_eq!(
+            thread.get_wait_reason_for_debugging(),
+            crate::hle::kernel::k_thread::ThreadWaitReasonForDebugging::Sleep
+        );
+        drop(thread);
+
+        assert!(system.scheduler_arc().lock().unwrap().needs_scheduling());
     }
 
     #[test]

@@ -207,19 +207,14 @@ impl PipelineCache {
             .initial_data(cache_data)
             .build();
 
-        unsafe {
-            self.device
-                .create_pipeline_cache(&cache_ci, None)
-                .ok()
-        }
+        unsafe { self.device.create_pipeline_cache(&cache_ci, None).ok() }
     }
 }
 
 impl Drop for PipelineCache {
     fn drop(&mut self) {
         // Save the pipeline cache before destroying
-        if self.use_vulkan_pipeline_cache
-            && self.vulkan_pipeline_cache != vk::PipelineCache::null()
+        if self.use_vulkan_pipeline_cache && self.vulkan_pipeline_cache != vk::PipelineCache::null()
         {
             let filename = self.vulkan_pipeline_cache_filename.clone();
             if !filename.as_os_str().is_empty() {

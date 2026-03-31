@@ -9,12 +9,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::common::SystemClockContext;
+use super::errors::{RESULT_CLOCK_UNINITIALIZED, RESULT_PERMISSION_DENIED};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::common::SystemClockContext;
-use super::errors::{RESULT_CLOCK_UNINITIALIZED, RESULT_PERMISSION_DENIED};
 
 /// IPC command IDs for ISystemClock.
 ///
@@ -49,9 +49,21 @@ impl SystemClock {
         let handlers = build_handler_map(&[
             (commands::GET_CURRENT_TIME, None, "GetCurrentTime"),
             (commands::SET_CURRENT_TIME, None, "SetCurrentTime"),
-            (commands::GET_SYSTEM_CLOCK_CONTEXT, None, "GetSystemClockContext"),
-            (commands::SET_SYSTEM_CLOCK_CONTEXT, None, "SetSystemClockContext"),
-            (commands::GET_OPERATION_EVENT_READABLE_HANDLE, None, "GetOperationEventReadableHandle"),
+            (
+                commands::GET_SYSTEM_CLOCK_CONTEXT,
+                None,
+                "GetSystemClockContext",
+            ),
+            (
+                commands::SET_SYSTEM_CLOCK_CONTEXT,
+                None,
+                "SetSystemClockContext",
+            ),
+            (
+                commands::GET_OPERATION_EVENT_READABLE_HANDLE,
+                None,
+                "GetOperationEventReadableHandle",
+            ),
         ]);
         Self {
             can_write_clock,
@@ -113,7 +125,10 @@ impl SystemClock {
         if check.is_error() {
             return Err(check);
         }
-        log::debug!("SystemClock::GetSystemClockContext: offset={}", self.context.offset);
+        log::debug!(
+            "SystemClock::GetSystemClockContext: offset={}",
+            self.context.offset
+        );
         Ok(self.context)
     }
 
@@ -121,7 +136,10 @@ impl SystemClock {
     ///
     /// Corresponds to `SystemClock::SetSystemClockContext` in upstream system_clock.cpp.
     pub fn set_system_clock_context(&mut self, context: &SystemClockContext) -> ResultCode {
-        log::debug!("SystemClock::SetSystemClockContext: offset={}", context.offset);
+        log::debug!(
+            "SystemClock::SetSystemClockContext: offset={}",
+            context.offset
+        );
         if !self.can_write_clock {
             return RESULT_PERMISSION_DENIED;
         }

@@ -3,10 +3,10 @@
 
 //! Port of hid_core/ — Nintendo Switch HID (Human Interface Device) subsystem.
 
-pub mod hid_types;
-pub mod hid_result;
-pub mod hid_util;
 pub mod hid_core;
+pub mod hid_result;
+pub mod hid_types;
+pub mod hid_util;
 pub mod resource_manager;
 
 pub mod frontend;

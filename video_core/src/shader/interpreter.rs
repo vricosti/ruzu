@@ -162,9 +162,7 @@ impl<'a> ShaderExecContext<'a> {
     fn resolve_src_b_f32(&self, src: &SrcB) -> f32 {
         match src {
             SrcB::Reg(r) => self.read_reg_f32(*r),
-            SrcB::Cbuf { index, offset } => {
-                f32::from_bits(self.read_cbuf(*index, *offset as i32))
-            }
+            SrcB::Cbuf { index, offset } => f32::from_bits(self.read_cbuf(*index, *offset as i32)),
             SrcB::Imm20(val) => {
                 // For FP instructions, the 20-bit immediate is interpreted as the
                 // high 20 bits of a 32-bit float (low 12 bits = 0).
@@ -211,7 +209,11 @@ impl<'a> ShaderExecContext<'a> {
     #[inline]
     fn apply_f32_mods(val: f32, abs: bool, neg: bool) -> f32 {
         let v = if abs { val.abs() } else { val };
-        if neg { -v } else { v }
+        if neg {
+            -v
+        } else {
+            v
+        }
     }
 
     /// Execute the shader program to completion.
@@ -609,9 +611,7 @@ impl<'a> ShaderExecContext<'a> {
                 };
 
                 let val = match interp_mode {
-                    IpaInterpMode::Multiply => {
-                        val * self.read_reg_f32(*multiplier_reg)
-                    }
+                    IpaInterpMode::Multiply => val * self.read_reg_f32(*multiplier_reg),
                     IpaInterpMode::Constant => {
                         // Flat shading: use provoking vertex value directly.
                         val
@@ -713,7 +713,7 @@ impl<'a> ShaderExecContext<'a> {
                 let product = if *psl { product << 16 } else { product };
 
                 let result = match mode {
-                    0 => product.wrapping_add(c),           // CLO
+                    0 => product.wrapping_add(c),              // CLO
                     1 => product.wrapping_add(c & 0xFFFF0000), // CHI: add only high 16 of C
                     2 => {
                         // CSFU: sign extend product, add C
@@ -750,7 +750,11 @@ impl<'a> ShaderExecContext<'a> {
                     let (a_s, b_s) = (a as i32, b as i32);
                     (if p { a_s.min(b_s) } else { a_s.max(b_s) }) as u32
                 } else {
-                    if p { a.min(b) } else { a.max(b) }
+                    if p {
+                        a.min(b)
+                    } else {
+                        a.max(b)
+                    }
                 };
                 self.write_reg(*dst, result);
             }
@@ -962,11 +966,7 @@ impl<'a> ShaderExecContext<'a> {
             }
 
             // ── Predicate to register ───────────────────────────────────
-            Instruction::P2r {
-                dst,
-                src_a,
-                src_b,
-            } => {
+            Instruction::P2r { dst, src_a, src_b } => {
                 let mask = self.resolve_src_b(src_b) as u8;
                 let base = self.read_reg(*src_a);
                 let mut pred_bits = 0u32;
@@ -1254,10 +1254,7 @@ impl<'a> ShaderExecContext<'a> {
             }
         }
 
-        super::VertexShaderOutput {
-            position,
-            generics,
-        }
+        super::VertexShaderOutput { position, generics }
     }
 
     /// Collect fragment shader output: color from output_attrs offsets 0x00-0x0C.
@@ -1397,14 +1394,14 @@ mod tests {
         let ald = (0xEFD8u64 << 48)
             | (3u64 << 47)  // size=3 (4 components)
             | (0u64 << 20)  // offset=0
-            | 0x0007_FF00;  // dst=R0, index_reg=RZ
+            | 0x0007_FF00; // dst=R0, index_reg=RZ
 
         // AST a[0x70].xyzw, R0 (write position from R0-R3)
         // Pattern: 0xEFF0
         let ast = (0xEFF0u64 << 48)
             | (3u64 << 47)     // size=3 (4 components)
             | (0x70u64 << 20)  // offset=0x70 (position)
-            | 0x0007_FF00;     // src=R0, index_reg=RZ
+            | 0x0007_FF00; // src=R0, index_reg=RZ
 
         let exit = 0xE300_0000_0007_0000u64;
 
@@ -1435,7 +1432,7 @@ mod tests {
             | (1u64 << 20)     // src_b_reg = R1
             | 0x0007_0100      // src_a=R1 at [15:8]... actually:
             | (0u64 << 3)      // pred_a = P0
-            | 7u64;            // pred_b = P7
+            | 7u64; // pred_b = P7
 
         // Adjust: src_a = R0 (bits[15:8]=0), but it's already 0 by default from the ORs above.
         // Actually let me build this more carefully:
@@ -1446,14 +1443,14 @@ mod tests {
             | (0x0007u64 << 16) // predicate guard = PT
             | (0u64 << 8)     // src_a = R0
             | (0u64 << 3)     // pred_a = P0
-            | 7u64;           // pred_b = P7
+            | 7u64; // pred_b = P7
 
         // MOV R2, 99.0 (this should execute since P0 is true)
         // We'll use MOV32I with P0 guard
         let mov_guarded = (0x0100u64 << 48)
             | ((99.0f32.to_bits() as u64) << 20)
             | (0u64 << 16) // guard = P0 (index=0, not negated)
-            | 0x0002;      // dst = R2
+            | 0x0002; // dst = R2
 
         let exit = 0xE300_0000_0007_0000u64;
 
@@ -1502,7 +1499,11 @@ mod tests {
         ctx.run(&program);
 
         let result = ctx.read_reg_f32(1);
-        assert!((result - 0.25).abs() < 1e-6, "Expected 0.25, got {}", result);
+        assert!(
+            (result - 0.25).abs() < 1e-6,
+            "Expected 0.25, got {}",
+            result
+        );
     }
 
     #[test]
@@ -1777,7 +1778,7 @@ mod tests {
         // Funnel shift right: (high:low) >> shift
         ctx.write_reg(1, 0x0000_0010); // low
         ctx.write_reg(3, 0xABCD_0000); // high
-        // shift = 4
+                                       // shift = 4
 
         ctx.execute(&Instruction::Shf {
             dst: 0,

@@ -13,10 +13,7 @@ pub fn strlen(s: &[u8]) -> usize {
 /// Matches C++ `Strnlen<T>`.
 pub fn strnlen(s: &[u8], count: usize) -> usize {
     let limit = count.min(s.len());
-    s[..limit]
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(limit)
+    s[..limit].iter().position(|&b| b == 0).unwrap_or(limit)
 }
 
 /// Compare two null-terminated byte slices up to `count` bytes.
@@ -163,7 +160,10 @@ pub fn convert_character_utf8_to_utf32(src: &[u8]) -> (CharacterEncodingResult, 
 /// `dst` receives up to 4 bytes of the character (null-padded).
 /// Returns the encoding result and the number of bytes consumed.
 /// Corresponds to C++ `PickOutCharacterFromUtf8String`.
-pub fn pick_out_character_from_utf8_string(src: &[u8], pos: usize) -> (CharacterEncodingResult, [u8; 4], usize) {
+pub fn pick_out_character_from_utf8_string(
+    src: &[u8],
+    pos: usize,
+) -> (CharacterEncodingResult, [u8; 4], usize) {
     let mut dst = [0u8; 4];
 
     if pos >= src.len() {

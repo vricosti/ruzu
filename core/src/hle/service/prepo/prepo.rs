@@ -5,13 +5,13 @@
 //!
 //! PlayReport service -- "prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u".
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use crate::reporter;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Play report type, matching upstream Reporter::PlayReportType.
 ///
@@ -38,33 +38,101 @@ pub struct PlayReport {
 impl PlayReport {
     pub fn new(name: &str, reporter: Arc<reporter::Reporter>) -> Self {
         let handlers = build_handler_map(&[
-            (10100, Some(PlayReport::save_report_old_handler), "SaveReportOld"),
-            (10101, Some(PlayReport::save_report_with_user_old_handler), "SaveReportWithUserOld"),
-            (10102, Some(PlayReport::save_report_old2_handler), "SaveReportOld2"),
-            (10103, Some(PlayReport::save_report_with_user_old2_handler), "SaveReportWithUserOld2"),
-            (10104, Some(PlayReport::save_report_new_handler), "SaveReport"),
-            (10105, Some(PlayReport::save_report_with_user_new_handler), "SaveReportWithUser"),
-            (10200, Some(PlayReport::request_immediate_transmission_handler), "RequestImmediateTransmission"),
-            (10300, Some(PlayReport::get_transmission_status_handler), "GetTransmissionStatus"),
-            (10400, Some(PlayReport::get_system_session_id_handler), "GetSystemSessionId"),
-            (20100, Some(PlayReport::save_system_report_handler), "SaveSystemReport"),
-            (20101, Some(PlayReport::save_system_report_with_user_handler), "SaveSystemReportWithUser"),
+            (
+                10100,
+                Some(PlayReport::save_report_old_handler),
+                "SaveReportOld",
+            ),
+            (
+                10101,
+                Some(PlayReport::save_report_with_user_old_handler),
+                "SaveReportWithUserOld",
+            ),
+            (
+                10102,
+                Some(PlayReport::save_report_old2_handler),
+                "SaveReportOld2",
+            ),
+            (
+                10103,
+                Some(PlayReport::save_report_with_user_old2_handler),
+                "SaveReportWithUserOld2",
+            ),
+            (
+                10104,
+                Some(PlayReport::save_report_new_handler),
+                "SaveReport",
+            ),
+            (
+                10105,
+                Some(PlayReport::save_report_with_user_new_handler),
+                "SaveReportWithUser",
+            ),
+            (
+                10200,
+                Some(PlayReport::request_immediate_transmission_handler),
+                "RequestImmediateTransmission",
+            ),
+            (
+                10300,
+                Some(PlayReport::get_transmission_status_handler),
+                "GetTransmissionStatus",
+            ),
+            (
+                10400,
+                Some(PlayReport::get_system_session_id_handler),
+                "GetSystemSessionId",
+            ),
+            (
+                20100,
+                Some(PlayReport::save_system_report_handler),
+                "SaveSystemReport",
+            ),
+            (
+                20101,
+                Some(PlayReport::save_system_report_with_user_handler),
+                "SaveSystemReportWithUser",
+            ),
             (20200, Some(PlayReport::stub_handler), "SetOperationMode"),
             (30100, Some(PlayReport::stub_handler), "ClearStorage"),
             (30200, Some(PlayReport::stub_handler), "ClearStatistics"),
             (30300, Some(PlayReport::stub_handler), "GetStorageUsage"),
             (30400, Some(PlayReport::stub_handler), "GetStatistics"),
-            (30401, Some(PlayReport::stub_handler), "GetThroughputHistory"),
+            (
+                30401,
+                Some(PlayReport::stub_handler),
+                "GetThroughputHistory",
+            ),
             (30500, Some(PlayReport::stub_handler), "GetLastUploadError"),
-            (30600, Some(PlayReport::stub_handler), "GetApplicationUploadSummary"),
-            (40100, Some(PlayReport::stub_handler), "IsUserAgreementCheckEnabled"),
-            (40101, Some(PlayReport::stub_handler), "SetUserAgreementCheckEnabled"),
-            (50100, Some(PlayReport::stub_handler), "ReadAllApplicationReportFiles"),
+            (
+                30600,
+                Some(PlayReport::stub_handler),
+                "GetApplicationUploadSummary",
+            ),
+            (
+                40100,
+                Some(PlayReport::stub_handler),
+                "IsUserAgreementCheckEnabled",
+            ),
+            (
+                40101,
+                Some(PlayReport::stub_handler),
+                "SetUserAgreementCheckEnabled",
+            ),
+            (
+                50100,
+                Some(PlayReport::stub_handler),
+                "ReadAllApplicationReportFiles",
+            ),
             (90100, Some(PlayReport::stub_handler), "ReadAllReportFiles"),
             (90101, Some(PlayReport::stub_handler), "Unknown90101"),
             (90102, Some(PlayReport::stub_handler), "Unknown90102"),
             (90200, Some(PlayReport::stub_handler), "GetStatistics"),
-            (90201, Some(PlayReport::stub_handler), "GetThroughputHistory"),
+            (
+                90201,
+                Some(PlayReport::stub_handler),
+                "GetThroughputHistory",
+            ),
             (90300, Some(PlayReport::stub_handler), "GetLastUploadError"),
         ]);
 
@@ -106,7 +174,8 @@ impl PlayReport {
         } else {
             vec![data1, data2]
         };
-        self.reporter.save_play_report(reporter_type, title_id, &data, Some(process_id), None);
+        self.reporter
+            .save_play_report(reporter_type, title_id, &data, Some(process_id), None);
     }
 
     /// SaveReportWithUser -- saves a play report with a user ID.
@@ -141,7 +210,13 @@ impl PlayReport {
         } else {
             vec![data1, data2]
         };
-        self.reporter.save_play_report(reporter_type, title_id, &data, Some(process_id), Some(user_id));
+        self.reporter.save_play_report(
+            reporter_type,
+            title_id,
+            &data,
+            Some(process_id),
+            Some(user_id),
+        );
     }
 
     /// RequestImmediateTransmission (cmd 10200).
@@ -183,7 +258,13 @@ impl PlayReport {
         } else {
             vec![data1, data2]
         };
-        self.reporter.save_play_report(reporter::PlayReportType::System, title_id, &data, None, None);
+        self.reporter.save_play_report(
+            reporter::PlayReportType::System,
+            title_id,
+            &data,
+            None,
+            None,
+        );
     }
 
     /// SaveSystemReportWithUser (cmd 20101).
@@ -209,7 +290,13 @@ impl PlayReport {
         } else {
             vec![data1, data2]
         };
-        self.reporter.save_play_report(reporter::PlayReportType::System, title_id, &data, None, Some(user_id));
+        self.reporter.save_play_report(
+            reporter::PlayReportType::System,
+            title_id,
+            &data,
+            None,
+            Some(user_id),
+        );
     }
 
     // --- Handler bridge functions ---
@@ -280,7 +367,10 @@ impl PlayReport {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn save_report_with_user_old2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn save_report_with_user_old2_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
         let mut rp = RequestParser::new(ctx);
         let user_id = rp.pop_raw::<u128>();
@@ -358,7 +448,10 @@ impl PlayReport {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn save_system_report_with_user_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn save_system_report_with_user_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
         let mut rp = RequestParser::new(ctx);
         let user_id = rp.pop_raw::<u128>();
@@ -378,7 +471,10 @@ impl PlayReport {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn request_immediate_transmission_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn request_immediate_transmission_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const PlayReport) };
         service.request_immediate_transmission();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -406,21 +502,29 @@ impl SessionRequestHandler for PlayReport {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { &self.name }
+    fn service_name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl ServiceFramework for PlayReport {
-    fn get_service_name(&self) -> &str { &self.name }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        &self.name
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// Registers "prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u" services.
 ///
 /// Corresponds to `LoopProcess` in upstream prepo.cpp.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     log::debug!("PlayReport::LoopProcess called");
 

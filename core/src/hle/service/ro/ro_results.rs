@@ -11,14 +11,10 @@ pub const RESULT_OUT_OF_ADDRESS_SPACE: ResultCode =
     ResultCode::from_module_description(ErrorModule::RO, 2);
 pub const RESULT_ALREADY_LOADED: ResultCode =
     ResultCode::from_module_description(ErrorModule::RO, 3);
-pub const RESULT_INVALID_NRO: ResultCode =
-    ResultCode::from_module_description(ErrorModule::RO, 4);
-pub const RESULT_INVALID_NRR: ResultCode =
-    ResultCode::from_module_description(ErrorModule::RO, 6);
-pub const RESULT_TOO_MANY_NRO: ResultCode =
-    ResultCode::from_module_description(ErrorModule::RO, 7);
-pub const RESULT_TOO_MANY_NRR: ResultCode =
-    ResultCode::from_module_description(ErrorModule::RO, 8);
+pub const RESULT_INVALID_NRO: ResultCode = ResultCode::from_module_description(ErrorModule::RO, 4);
+pub const RESULT_INVALID_NRR: ResultCode = ResultCode::from_module_description(ErrorModule::RO, 6);
+pub const RESULT_TOO_MANY_NRO: ResultCode = ResultCode::from_module_description(ErrorModule::RO, 7);
+pub const RESULT_TOO_MANY_NRR: ResultCode = ResultCode::from_module_description(ErrorModule::RO, 8);
 pub const RESULT_NOT_AUTHORIZED: ResultCode =
     ResultCode::from_module_description(ErrorModule::RO, 9);
 pub const RESULT_INVALID_NRR_KIND: ResultCode =

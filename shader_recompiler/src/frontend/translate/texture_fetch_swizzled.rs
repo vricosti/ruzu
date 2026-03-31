@@ -36,7 +36,9 @@ pub fn texs(tv: &mut TranslatorVisitor, insn: u64) {
     let coords = tv.ir.composite_construct_f32x2(coord_x, coord_y);
     let handle = Value::ImmU32(tex_index);
 
-    let result = tv.ir.image_sample_implicit_lod(handle, coords, info.to_u32());
+    let result = tv
+        .ir
+        .image_sample_implicit_lod(handle, coords, info.to_u32());
 
     let r = tv.ir.composite_extract_f32x4(result, Value::ImmU32(0));
     let g = tv.ir.composite_extract_f32x4(result, Value::ImmU32(1));

@@ -119,7 +119,7 @@ pub const THI_NUM_REGS: usize = 0x20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ThiMethod {
-    IncSyncpt = 0,  // offsetof(increment_syncpt) / 4
+    IncSyncpt = 0,   // offsetof(increment_syncpt) / 4
     SetMethod0 = 16, // offsetof(method_0) / 4
     SetMethod1 = 17, // offsetof(method_1) / 4
 }

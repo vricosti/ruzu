@@ -6,7 +6,7 @@
 //! The upstream C++ implementation wraps std::mutex with Lock/Unlock/TryLock methods.
 //! KAlignedSpinLock and KNotAlignedSpinLock are aliases (upstream: "Alias for now").
 
-use parking_lot::{Mutex, lock_api::RawMutex as RawMutexTrait};
+use parking_lot::{lock_api::RawMutex as RawMutexTrait, Mutex};
 
 /// KSpinLock — wraps a mutex with Lock/Unlock/TryLock interface.
 /// Mirrors upstream `Kernel::KSpinLock`.

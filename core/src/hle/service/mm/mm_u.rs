@@ -5,12 +5,12 @@
 //!
 //! MM_U service ("mm:u").
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 /// Interior mutable state for MM_U.
 struct MmUState {
@@ -63,7 +63,11 @@ impl MmU {
     }
 
     pub fn set_and_wait_old(&self, min: u32, max: u32) {
-        log::debug!("(STUBBED) MmU::set_and_wait_old called, min={:#x}, max={:#x}", min, max);
+        log::debug!(
+            "(STUBBED) MmU::set_and_wait_old called, min={:#x}, max={:#x}",
+            min,
+            max
+        );
         let mut s = self.state.lock().unwrap();
         s.min = min;
         s.max = max;
@@ -174,28 +178,34 @@ impl SessionRequestHandler for MmU {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { "mm:u" }
+    fn service_name(&self) -> &str {
+        "mm:u"
+    }
 }
 
 impl ServiceFramework for MmU {
-    fn get_service_name(&self) -> &str { "mm:u" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "mm:u"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// Registers "mm:u" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `mm_u.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::server_manager::ServerManager;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
 
     let mut server_manager = ServerManager::new(system);
     server_manager.register_named_service(
         "mm:u",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(MmU::new())
-        }),
+        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(MmU::new()) }),
         64,
     );
     ServerManager::run_server(server_manager);

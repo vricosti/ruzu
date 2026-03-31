@@ -45,7 +45,11 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         let module = module.clone();
         let controller = controller.clone();
         Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::apm_interface::APM::new(module.clone(), controller.clone(), "apm"))
+            Arc::new(super::apm_interface::APM::new(
+                module.clone(),
+                controller.clone(),
+                "apm",
+            ))
         })
     };
     server_manager.register_named_service("apm", factory, 64);

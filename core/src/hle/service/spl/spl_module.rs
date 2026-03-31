@@ -8,11 +8,11 @@
 
 use std::collections::BTreeMap;
 
+use super::spl_results;
+use super::spl_types::ConfigItem;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use super::spl_results;
-use super::spl_types::ConfigItem;
 
 /// Atmosphere release version constants.
 ///
@@ -96,10 +96,7 @@ impl ModuleInterface {
             | Some(ConfigItem::RegulatorType)
             | Some(ConfigItem::DeviceUniqueKeyGeneration)
             | Some(ConfigItem::Package2Hash) => {
-                log::error!(
-                    "GetConfig: config_item={:?} not implemented",
-                    config_item
-                );
+                log::error!("GetConfig: config_item={:?} not implemented", config_item);
                 Err(spl_results::RESULT_SECURE_MONITOR_NOT_IMPLEMENTED)
             }
             Some(ConfigItem::ExosphereApiVersion) => {
@@ -118,31 +115,17 @@ impl ModuleInterface {
                 // We are executing, so we aren't in the process of shutting down.
                 Ok(0)
             }
-            Some(ConfigItem::ExosphereGitCommitHash) => {
-                Ok(0)
-            }
-            Some(ConfigItem::ExosphereHasRcmBugPatch) => {
-                Ok(0)
-            }
-            Some(ConfigItem::ExosphereBlankProdInfo) => {
-                Ok(0)
-            }
-            Some(ConfigItem::ExosphereAllowCalWrites) => {
-                Ok(0)
-            }
-            Some(ConfigItem::ExosphereEmummcType) => {
-                Ok(0)
-            }
+            Some(ConfigItem::ExosphereGitCommitHash) => Ok(0),
+            Some(ConfigItem::ExosphereHasRcmBugPatch) => Ok(0),
+            Some(ConfigItem::ExosphereBlankProdInfo) => Ok(0),
+            Some(ConfigItem::ExosphereAllowCalWrites) => Ok(0),
+            Some(ConfigItem::ExosphereEmummcType) => Ok(0),
             Some(ConfigItem::ExospherePayloadAddress) => {
                 // Gets the physical address of the reboot payload buffer, if one exists.
                 Err(spl_results::RESULT_SECURE_MONITOR_NOT_INITIALIZED)
             }
-            Some(ConfigItem::ExosphereLogConfiguration) => {
-                Ok(0)
-            }
-            Some(ConfigItem::ExosphereForceEnableUsb30) => {
-                Ok(0)
-            }
+            Some(ConfigItem::ExosphereLogConfiguration) => Ok(0),
+            Some(ConfigItem::ExosphereForceEnableUsb30) => Ok(0),
             None => {
                 log::error!("GetConfig: unknown config_item={}", config_item_raw);
                 Err(spl_results::RESULT_SECURE_MONITOR_INVALID_ARGUMENT)

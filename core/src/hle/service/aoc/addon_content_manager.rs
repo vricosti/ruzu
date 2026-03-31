@@ -99,7 +99,8 @@ impl IAddOnContentManager {
         let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
             "IAddOnContentManager".to_string(),
         );
-        let aoc_change_event_handle = service_context.create_event("GetAddOnContentListChangedEvent".to_string());
+        let aoc_change_event_handle =
+            service_context.create_event("GetAddOnContentListChangedEvent".to_string());
         Self {
             system,
             add_on_content: Vec::new(),
@@ -127,9 +128,7 @@ impl IAddOnContentManager {
         }
         self.add_on_content
             .iter()
-            .filter(|&&tid| {
-                crate::file_sys::common_funcs::get_base_title_id(tid) == current
-            })
+            .filter(|&&tid| crate::file_sys::common_funcs::get_base_title_id(tid) == current)
             .count() as u32
     }
 
@@ -148,8 +147,9 @@ impl IAddOnContentManager {
             offset,
             count
         );
-        let current =
-            crate::file_sys::common_funcs::get_base_title_id(self.system.get().runtime_program_id());
+        let current = crate::file_sys::common_funcs::get_base_title_id(
+            self.system.get().runtime_program_id(),
+        );
         let disabled = common::settings::values()
             .disabled_addons
             .get(&current)
@@ -208,7 +208,9 @@ impl IAddOnContentManager {
     ///
     /// Returns the readable side of the AOC change event.
     /// Upstream: `GetAddOnContentListChangedEvent` returns `aoc_change_event->GetReadableEvent()`.
-    pub fn get_add_on_content_list_changed_event(&self) -> Option<Arc<crate::hle::service::os::event::Event>> {
+    pub fn get_add_on_content_list_changed_event(
+        &self,
+    ) -> Option<Arc<crate::hle::service::os::event::Event>> {
         log::debug!("IAddOnContentManager::get_add_on_content_list_changed_event called");
         self.service_context.get_event(self.aoc_change_event_handle)
     }
@@ -216,8 +218,13 @@ impl IAddOnContentManager {
     /// GetAddOnContentListChangedEventWithProcessId (cmd 10)
     ///
     /// Same as GetAddOnContentListChangedEvent but takes a process_id parameter.
-    pub fn get_add_on_content_list_changed_event_with_process_id(&self, _process_id: u64) -> Option<Arc<crate::hle::service::os::event::Event>> {
-        log::debug!("IAddOnContentManager::get_add_on_content_list_changed_event_with_process_id called");
+    pub fn get_add_on_content_list_changed_event_with_process_id(
+        &self,
+        _process_id: u64,
+    ) -> Option<Arc<crate::hle::service::os::event::Event>> {
+        log::debug!(
+            "IAddOnContentManager::get_add_on_content_list_changed_event_with_process_id called"
+        );
         self.service_context.get_event(self.aoc_change_event_handle)
     }
 
@@ -237,14 +244,20 @@ impl IAddOnContentManager {
     }
 
     /// Stubbed: CreateEcPurchasedEventManager (cmd 100)
-    pub fn create_ec_purchased_event_manager(&self) -> Arc<super::purchase_event_manager::IPurchaseEventManager> {
+    pub fn create_ec_purchased_event_manager(
+        &self,
+    ) -> Arc<super::purchase_event_manager::IPurchaseEventManager> {
         log::warn!("(STUBBED) IAddOnContentManager::create_ec_purchased_event_manager called");
         Arc::new(super::purchase_event_manager::IPurchaseEventManager::new())
     }
 
     /// Stubbed: CreatePermanentEcPurchasedEventManager (cmd 101)
-    pub fn create_permanent_ec_purchased_event_manager(&self) -> Arc<super::purchase_event_manager::IPurchaseEventManager> {
-        log::warn!("(STUBBED) IAddOnContentManager::create_permanent_ec_purchased_event_manager called");
+    pub fn create_permanent_ec_purchased_event_manager(
+        &self,
+    ) -> Arc<super::purchase_event_manager::IPurchaseEventManager> {
+        log::warn!(
+            "(STUBBED) IAddOnContentManager::create_permanent_ec_purchased_event_manager called"
+        );
         Arc::new(super::purchase_event_manager::IPurchaseEventManager::new())
     }
 
@@ -271,10 +284,7 @@ impl IAddOnContentManager {
         rb.push_u64(base_id);
     }
 
-    fn prepare_add_on_content_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn prepare_add_on_content_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
         let mut rp = RequestParser::new(ctx);
@@ -362,10 +372,10 @@ impl IAddOnContentManager {
 /// }
 /// ```
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
-    let mut server_manager =
-        crate::hle::service::server_manager::ServerManager::new(system);
-    let factory: SessionRequestHandlerFactory =
-        Box::new(move || -> SessionRequestHandlerPtr { Arc::new(IAddOnContentManager::new(system)) });
+    let mut server_manager = crate::hle::service::server_manager::ServerManager::new(system);
+    let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
+        Arc::new(IAddOnContentManager::new(system))
+    });
     server_manager.register_named_service("aoc:u", factory, 64);
     crate::hle::service::server_manager::ServerManager::run_server(server_manager);
 }

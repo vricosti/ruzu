@@ -623,7 +623,11 @@ pub trait OutputDevice: Send + Sync {
         NfcState::NotSupported
     }
 
-    fn read_mifare_data(&mut self, _request: &MifareRequest, _out_data: &mut MifareRequest) -> NfcState {
+    fn read_mifare_data(
+        &mut self,
+        _request: &MifareRequest,
+        _out_data: &mut MifareRequest,
+    ) -> NfcState {
         NfcState::NotSupported
     }
 
@@ -661,13 +665,15 @@ pub trait OutputDeviceFactory: Send + Sync {
 
 /// Global factory list for input devices.
 fn input_factory_list() -> &'static Mutex<HashMap<String, Arc<dyn InputDeviceFactory>>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<String, Arc<dyn InputDeviceFactory>>>> = OnceLock::new();
+    static INSTANCE: OnceLock<Mutex<HashMap<String, Arc<dyn InputDeviceFactory>>>> =
+        OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Global factory list for output devices.
 fn output_factory_list() -> &'static Mutex<HashMap<String, Arc<dyn OutputDeviceFactory>>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<String, Arc<dyn OutputDeviceFactory>>>> = OnceLock::new();
+    static INSTANCE: OnceLock<Mutex<HashMap<String, Arc<dyn OutputDeviceFactory>>>> =
+        OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -803,8 +809,14 @@ mod tests {
     #[test]
     fn test_basic_output_device() {
         let mut device = BasicOutputDevice::new();
-        assert_eq!(device.set_led(&LedStatus::default()), DriverResult::NotSupported);
-        assert_eq!(device.set_vibration(&VibrationStatus::default()), DriverResult::NotSupported);
+        assert_eq!(
+            device.set_led(&LedStatus::default()),
+            DriverResult::NotSupported
+        );
+        assert_eq!(
+            device.set_vibration(&VibrationStatus::default()),
+            DriverResult::NotSupported
+        );
         assert!(!device.is_vibration_enabled());
         assert_eq!(device.supports_nfc(), NfcState::NotSupported);
     }

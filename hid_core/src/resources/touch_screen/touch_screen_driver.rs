@@ -8,8 +8,8 @@
 
 use common::ResultCode;
 
-use crate::hid_types::{TouchAttribute, TouchScreenModeForNx};
 use super::touch_types::*;
+use crate::hid_types::{TouchAttribute, TouchScreenModeForNx};
 
 /// Maximum number of fingers tracked by the touch driver.
 /// Matches upstream `Core::HID::TouchFingerState` array size.
@@ -89,7 +89,10 @@ impl TouchScreenDriver {
     /// Processes raw touch finger input from the emulated console.
     /// This corresponds to the body of upstream WaitForInput() that reads
     /// from EmulatedConsole::GetTouch() and processes finger state transitions.
-    pub fn process_touch_input(&mut self, touch_input: &[(u32, bool, f32, f32); MAX_TOUCH_FINGERS]) {
+    pub fn process_touch_input(
+        &mut self,
+        touch_input: &[(u32, bool, f32, f32); MAX_TOUCH_FINGERS],
+    ) {
         self.touch_status = TouchScreenState::default();
 
         for id in 0..self.touch_status.states.len() {
@@ -142,8 +145,10 @@ impl TouchScreenDriver {
         for id in 0..MAX_TOUCH_FINGERS {
             if id < active_count {
                 let touch_entry = &mut self.touch_status.states[id];
-                touch_entry.position_x = (active_fingers[id].position_x * TOUCH_SENSOR_WIDTH as f32) as u32;
-                touch_entry.position_y = (active_fingers[id].position_y * TOUCH_SENSOR_HEIGHT as f32) as u32;
+                touch_entry.position_x =
+                    (active_fingers[id].position_x * TOUCH_SENSOR_WIDTH as f32) as u32;
+                touch_entry.position_y =
+                    (active_fingers[id].position_y * TOUCH_SENSOR_HEIGHT as f32) as u32;
                 // Upstream reads diameter and rotation from Settings::values.touchscreen
                 touch_entry.diameter_x = 15;
                 touch_entry.diameter_y = 15;

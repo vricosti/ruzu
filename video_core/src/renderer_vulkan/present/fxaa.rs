@@ -65,11 +65,8 @@ impl Fxaa {
                 extent,
                 vk::Format::R16G16B16A16_SFLOAT,
             );
-            let image_view = util::create_wrapped_image_view(
-                &device,
-                image,
-                vk::Format::R16G16B16A16_SFLOAT,
-            );
+            let image_view =
+                util::create_wrapped_image_view(&device, image, vk::Format::R16G16B16A16_SFLOAT);
             dynamic_images.push(FxaaImage {
                 descriptor_sets: Vec::new(),
                 framebuffer: vk::Framebuffer::null(),
@@ -87,12 +84,8 @@ impl Fxaa {
 
         // Create framebuffers
         for img in &mut dynamic_images {
-            img.framebuffer = util::create_wrapped_framebuffer(
-                &device,
-                renderpass,
-                img.image_view,
-                extent,
-            );
+            img.framebuffer =
+                util::create_wrapped_framebuffer(&device, renderpass, img.image_view, extent);
         }
 
         // Create sampler
@@ -129,10 +122,7 @@ impl Fxaa {
         }
 
         // Create pipeline layout
-        let pipeline_layout = util::create_wrapped_pipeline_layout(
-            &device,
-            descriptor_set_layout,
-        );
+        let pipeline_layout = util::create_wrapped_pipeline_layout(&device, descriptor_set_layout);
 
         // Create pipeline
         let pipeline = util::create_wrapped_pipeline(

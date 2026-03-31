@@ -20,16 +20,8 @@ pub fn ffma(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let neg_c = bit(insn, 49);
     let sat = bit(insn, 50);
 
-    let a = if neg_a {
-        tv.ir.fp_neg_32(src_a)
-    } else {
-        src_a
-    };
-    let c = if neg_c {
-        tv.ir.fp_neg_32(src_c)
-    } else {
-        src_c
-    };
+    let a = if neg_a { tv.ir.fp_neg_32(src_a) } else { src_a };
+    let c = if neg_c { tv.ir.fp_neg_32(src_c) } else { src_c };
 
     let mut result = tv.ir.fp_fma_32(a, src_b, c);
 

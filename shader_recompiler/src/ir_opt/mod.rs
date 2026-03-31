@@ -10,13 +10,13 @@
 //! 3. DeadCodeEliminationPass
 //! 4. CollectShaderInfoPass
 
-pub mod identity_removal;
-pub mod dead_code_elimination;
-pub mod constant_propagation;
 pub mod collect_info;
 pub mod conditional_barrier_pass;
+pub mod constant_propagation;
+pub mod dead_code_elimination;
 pub mod dual_vertex_pass;
 pub mod global_memory_to_storage_buffer_pass;
+pub mod identity_removal;
 pub mod layer_pass;
 pub mod lower_fp16_to_fp32;
 pub mod lower_fp64_to_fp32;
@@ -141,11 +141,7 @@ mod tests {
         let mut program = make_test_program();
         {
             let mut emitter = Emitter::new(&mut program, 0);
-            let _ = emitter.select_u32(
-                Value::ImmU1(true),
-                Value::ImmU32(100),
-                Value::ImmU32(200),
-            );
+            let _ = emitter.select_u32(Value::ImmU1(true), Value::ImmU32(100), Value::ImmU32(200));
         }
 
         constant_propagation::constant_propagation_pass(&mut program);
@@ -166,9 +162,10 @@ mod tests {
         program.blocks[0]
             .instructions
             .push(Inst::new(Opcode::Identity, vec![Value::ImmU32(42)]));
-        program.blocks[0]
-            .instructions
-            .push(Inst::new(Opcode::FPAdd32, vec![Value::ImmF32(1.0), Value::ImmF32(2.0)]));
+        program.blocks[0].instructions.push(Inst::new(
+            Opcode::FPAdd32,
+            vec![Value::ImmF32(1.0), Value::ImmF32(2.0)],
+        ));
 
         assert_eq!(program.blocks[0].instructions.len(), 2);
 

@@ -6,10 +6,10 @@
 //!
 //! IBtmDebug — "btm:dbg".
 
-use std::collections::BTreeMap;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
 
 /// IBtmDebug.
 pub struct IBtmDebug {
@@ -47,11 +47,19 @@ impl SessionRequestHandler for IBtmDebug {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { "btm:dbg" }
+    fn service_name(&self) -> &str {
+        "btm:dbg"
+    }
 }
 
 impl ServiceFramework for IBtmDebug {
-    fn get_service_name(&self) -> &str { "btm:dbg" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "btm:dbg"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }

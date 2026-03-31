@@ -51,14 +51,14 @@ pub enum FileType {
 ///
 /// Maps to upstream `Loader::IdentifyFile`.
 pub fn identify_file(file: &VirtualFile) -> FileType {
+    use super::deconstructed_rom_directory::AppLoaderDeconstructedRomDirectory;
+    use super::kip::AppLoaderKip;
+    use super::nax::AppLoaderNax;
+    use super::nca::AppLoaderNca;
+    use super::nro::AppLoaderNro;
+    use super::nso::AppLoaderNso;
     use super::nsp::AppLoaderNsp;
     use super::xci::AppLoaderXci;
-    use super::nro::AppLoaderNro;
-    use super::nca::AppLoaderNca;
-    use super::nax::AppLoaderNax;
-    use super::kip::AppLoaderKip;
-    use super::nso::AppLoaderNso;
-    use super::deconstructed_rom_directory::AppLoaderDeconstructedRomDirectory;
 
     if let Some(ft) = identify_file_loader::<AppLoaderNsp>(file) {
         return ft;
@@ -118,11 +118,7 @@ pub fn guess_from_filename(name: &str) -> FileType {
         return FileType::NCA;
     }
 
-    let extension = name
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let extension = name.rsplit('.').next().unwrap_or("").to_lowercase();
 
     match extension.as_str() {
         "nro" => FileType::NRO,
@@ -353,10 +349,7 @@ pub trait AppLoader: Send + Sync {
     fn load(&mut self, process: &mut KProcess, system: &mut System) -> LoadResult;
 
     /// Try to verify the integrity of the file.
-    fn verify_integrity(
-        &self,
-        _progress_callback: &dyn Fn(usize, usize) -> bool,
-    ) -> ResultStatus {
+    fn verify_integrity(&self, _progress_callback: &dyn Fn(usize, usize) -> bool) -> ResultStatus {
         ResultStatus::ErrorIntegrityVerificationNotImplemented
     }
 
@@ -443,20 +436,28 @@ fn get_file_loader(
         FileType::XCI => {
             // XCI loader requires FileSystemController and ContentProvider
             // for full NCA extraction. Created with stub until those are ported.
-            Some(Box::new(super::xci::AppLoaderXci::new(file, _program_id, _program_index)))
+            Some(Box::new(super::xci::AppLoaderXci::new(
+                file,
+                _program_id,
+                _program_index,
+            )))
         }
         FileType::NAX => Some(Box::new(super::nax::AppLoaderNax::new(file))),
         FileType::NSP => {
             // NSP loader requires FileSystemController and ContentProvider
             // for control NCA parsing. Created with stub until those are ported.
-            Some(Box::new(super::nsp::AppLoaderNsp::new(file, _program_id, _program_index)))
+            Some(Box::new(super::nsp::AppLoaderNsp::new(
+                file,
+                _program_id,
+                _program_index,
+            )))
         }
         FileType::KIP => Some(Box::new(super::kip::AppLoaderKip::new(file))),
-        FileType::DeconstructedRomDirectory => {
-            Some(Box::new(
-                super::deconstructed_rom_directory::AppLoaderDeconstructedRomDirectory::new_from_file(file),
-            ))
-        }
+        FileType::DeconstructedRomDirectory => Some(Box::new(
+            super::deconstructed_rom_directory::AppLoaderDeconstructedRomDirectory::new_from_file(
+                file,
+            ),
+        )),
         _ => None,
     }
 }

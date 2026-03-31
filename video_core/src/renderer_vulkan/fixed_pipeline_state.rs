@@ -1068,7 +1068,8 @@ impl FixedPipelineState {
         self.raw2 = 0;
 
         self.set_topology(draw.topology);
-        self.dynamic_state.set_cull_enable(draw.rasterizer.cull_enable);
+        self.dynamic_state
+            .set_cull_enable(draw.rasterizer.cull_enable);
         self.dynamic_state.set_cull_face(draw.rasterizer.cull_face);
         self.dynamic_state
             .set_front_face(draw.rasterizer.front_face);
@@ -1266,9 +1267,21 @@ mod tests {
 
     #[test]
     fn test_polygon_offset_lut() {
-        assert_eq!(POLYGON_OFFSET_ENABLE_LUT[PrimitiveTopology::Points as usize], POINT);
-        assert_eq!(POLYGON_OFFSET_ENABLE_LUT[PrimitiveTopology::Lines as usize], LINE);
-        assert_eq!(POLYGON_OFFSET_ENABLE_LUT[PrimitiveTopology::Triangles as usize], POLYGON);
-        assert_eq!(POLYGON_OFFSET_ENABLE_LUT[PrimitiveTopology::Patches as usize], POLYGON);
+        assert_eq!(
+            POLYGON_OFFSET_ENABLE_LUT[PrimitiveTopology::Points as usize],
+            POINT
+        );
+        assert_eq!(
+            POLYGON_OFFSET_ENABLE_LUT[PrimitiveTopology::Lines as usize],
+            LINE
+        );
+        assert_eq!(
+            POLYGON_OFFSET_ENABLE_LUT[PrimitiveTopology::Triangles as usize],
+            POLYGON
+        );
+        assert_eq!(
+            POLYGON_OFFSET_ENABLE_LUT[PrimitiveTopology::Patches as usize],
+            POLYGON
+        );
     }
 }

@@ -56,10 +56,7 @@ const EMPTY_REGION: FontRegion = FontRegion { offset: 0, size: 0 };
 const MAX_ELEMENT_COUNT: usize = 6;
 
 const SHARED_FONTS: [(FontArchives, &[u8]); 6] = [
-    (
-        FontArchives::Standard,
-        &font_standard::FONT_STANDARD,
-    ),
+    (FontArchives::Standard, &font_standard::FONT_STANDARD),
     (
         FontArchives::ChineseSimple,
         &font_chinese_simplified::FONT_CHINESE_SIMPLIFIED,
@@ -72,10 +69,7 @@ const SHARED_FONTS: [(FontArchives, &[u8]); 6] = [
         FontArchives::ChineseTraditional,
         &font_chinese_traditional::FONT_CHINESE_TRADITIONAL,
     ),
-    (
-        FontArchives::Korean,
-        &font_korean::FONT_KOREAN,
-    ),
+    (FontArchives::Korean, &font_korean::FONT_KOREAN),
     (
         FontArchives::Extension,
         &font_nintendo_extended::FONT_NINTENDO_EXTENDED,
@@ -91,10 +85,22 @@ pub const IPLATFORM_SERVICE_MANAGER_COMMANDS: &[(u32, bool, &str)] = &[
     (5, true, "GetSharedFontInOrderOfPriority"),
     (6, true, "GetSharedFontInOrderOfPriorityForSystem"),
     (100, false, "RequestApplicationFunctionAuthorization"),
-    (101, false, "RequestApplicationFunctionAuthorizationByProcessId"),
-    (102, false, "RequestApplicationFunctionAuthorizationByApplicationId"),
+    (
+        101,
+        false,
+        "RequestApplicationFunctionAuthorizationByProcessId",
+    ),
+    (
+        102,
+        false,
+        "RequestApplicationFunctionAuthorizationByApplicationId",
+    ),
     (103, false, "RefreshApplicationFunctionBlackListDebugRecord"),
-    (104, false, "RequestApplicationFunctionAuthorizationByProgramId"),
+    (
+        104,
+        false,
+        "RequestApplicationFunctionAuthorizationByProgramId",
+    ),
     (105, false, "GetFunctionBlackListSystemVersionToAuthorize"),
     (106, false, "GetFunctionBlackListVersion"),
     (1000, false, "LoadNgWordDataForPlatformRegionChina"),
@@ -189,7 +195,8 @@ impl IPlatformServiceManager {
         let thread = ctx.get_thread()?;
         let parent = thread.lock().unwrap().parent.as_ref()?.upgrade()?;
 
-        let system_ptr = self.system.get() as *const crate::core::System as *mut crate::core::System;
+        let system_ptr =
+            self.system.get() as *const crate::core::System as *mut crate::core::System;
         let device_memory_ptr = unsafe { (*system_ptr).device_memory() as *const _ };
         let kernel = unsafe { (*system_ptr).kernel_mut()? };
 

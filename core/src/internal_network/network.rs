@@ -268,7 +268,10 @@ pub fn get_host_ipv4_address() -> Option<IPv4Address> {
 ///
 /// Corresponds to upstream `Network::IPv4AddressToString`.
 pub fn ipv4_address_to_string(ip_addr: IPv4Address) -> String {
-    format!("{}.{}.{}.{}", ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3])
+    format!(
+        "{}.{}.{}.{}",
+        ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]
+    )
 }
 
 /// Convert IPv4 address to integer (big-endian / network order).
@@ -302,7 +305,12 @@ pub fn get_address_info(
             .unwrap_or(std::ptr::null());
 
         let ret = unsafe {
-            libc::getaddrinfo(c_host.as_ptr(), service_ptr, std::ptr::null(), &mut result_ptr)
+            libc::getaddrinfo(
+                c_host.as_ptr(),
+                service_ptr,
+                std::ptr::null(),
+                &mut result_ptr,
+            )
         };
 
         if ret != 0 {
@@ -322,7 +330,9 @@ pub fn get_address_info(
             };
 
             let mut addr = SockAddrIn::default();
-            if !info.ai_addr.is_null() && info.ai_addrlen >= std::mem::size_of::<libc::sockaddr_in>() as u32 {
+            if !info.ai_addr.is_null()
+                && info.ai_addrlen >= std::mem::size_of::<libc::sockaddr_in>() as u32
+            {
                 let sa = unsafe { &*(info.ai_addr as *const libc::sockaddr_in) };
                 let ip_bytes = u32::from_be(sa.sin_addr.s_addr).to_ne_bytes();
                 addr.family = Some(Domain::INET);

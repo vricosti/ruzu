@@ -55,7 +55,8 @@ impl SharedMemoryHolder {
         // SAFETY: SharedMemoryFormat is repr(C) and zero-initialized is valid (matches upstream
         // behavior where shared memory pages are zero-filled by the kernel).
         let format: Box<super::shared_memory_format::SharedMemoryFormat> = unsafe {
-            let layout = std::alloc::Layout::new::<super::shared_memory_format::SharedMemoryFormat>();
+            let layout =
+                std::alloc::Layout::new::<super::shared_memory_format::SharedMemoryFormat>();
             let ptr = std::alloc::alloc_zeroed(layout)
                 as *mut super::shared_memory_format::SharedMemoryFormat;
             if ptr.is_null() {
@@ -87,7 +88,9 @@ impl SharedMemoryHolder {
 
     /// Get a mutable reference to the shared memory format.
     /// Upstream: SharedMemoryFormat* GetAddress().
-    pub fn get_address_mut(&mut self) -> Option<&mut super::shared_memory_format::SharedMemoryFormat> {
+    pub fn get_address_mut(
+        &mut self,
+    ) -> Option<&mut super::shared_memory_format::SharedMemoryFormat> {
         self.address.as_deref_mut()
     }
 

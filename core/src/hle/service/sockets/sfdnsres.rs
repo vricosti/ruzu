@@ -110,19 +110,43 @@ impl Sfdnsres {
         let handlers = build_handler_map(&[
             (0, None, "SetDnsAddressesPrivateRequest"),
             (1, None, "GetDnsAddressPrivateRequest"),
-            (2, Some(Sfdnsres::get_host_by_name_request_handler), "GetHostByNameRequest"),
+            (
+                2,
+                Some(Sfdnsres::get_host_by_name_request_handler),
+                "GetHostByNameRequest",
+            ),
             (3, None, "GetHostByAddrRequest"),
             (4, None, "GetHostStringErrorRequest"),
-            (5, Some(Sfdnsres::get_gai_string_error_handler), "GetGaiStringErrorRequest"),
-            (6, Some(Sfdnsres::get_addr_info_request_handler), "GetAddrInfoRequest"),
+            (
+                5,
+                Some(Sfdnsres::get_gai_string_error_handler),
+                "GetGaiStringErrorRequest",
+            ),
+            (
+                6,
+                Some(Sfdnsres::get_addr_info_request_handler),
+                "GetAddrInfoRequest",
+            ),
             (7, None, "GetNameInfoRequest"),
             (8, None, "RequestCancelHandleRequest"),
             (9, None, "CancelRequest"),
-            (10, Some(Sfdnsres::get_host_by_name_request_with_options_handler), "GetHostByNameRequestWithOptions"),
+            (
+                10,
+                Some(Sfdnsres::get_host_by_name_request_with_options_handler),
+                "GetHostByNameRequestWithOptions",
+            ),
             (11, None, "GetHostByAddrRequestWithOptions"),
-            (12, Some(Sfdnsres::get_addr_info_request_with_options_handler), "GetAddrInfoRequestWithOptions"),
+            (
+                12,
+                Some(Sfdnsres::get_addr_info_request_with_options_handler),
+                "GetAddrInfoRequestWithOptions",
+            ),
             (13, None, "GetNameInfoRequestWithOptions"),
-            (14, Some(Sfdnsres::resolver_set_option_request_handler), "ResolverSetOptionRequest"),
+            (
+                14,
+                Some(Sfdnsres::resolver_set_option_request_handler),
+                "ResolverSetOptionRequest",
+            ),
             (15, None, "ResolverGetOptionRequest"),
         ]);
 
@@ -491,7 +515,10 @@ impl Sfdnsres {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn resolver_set_option_request_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn resolver_set_option_request_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Sfdnsres) };
         let bsd_errno = svc.resolver_set_option_request();
 

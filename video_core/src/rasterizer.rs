@@ -8,10 +8,10 @@
 //! alpha blending, scissor clipping, color write masks, and back-face culling.
 
 use crate::engines::maxwell_3d::{
-    BlendColorInfo, BlendEquation, BlendFactor, BlendInfo, ColorMaskInfo, ComponentType,
-    ComparisonOp, CullFace, DepthStencilInfo, DrawCall, FrontFace, IndexFormat,
-    PrimitiveTopology, RasterizerInfo, SamplerDescriptor, ScissorInfo, ShaderStageType, StencilOp,
-    SwizzleSource, TextureDescriptor, TextureFilter, TextureFormat, TextureType, TicHeaderVersion,
+    BlendColorInfo, BlendEquation, BlendFactor, BlendInfo, ColorMaskInfo, ComparisonOp,
+    ComponentType, CullFace, DepthStencilInfo, DrawCall, FrontFace, IndexFormat, PrimitiveTopology,
+    RasterizerInfo, SamplerDescriptor, ScissorInfo, ShaderStageType, StencilOp, SwizzleSource,
+    TextureDescriptor, TextureFilter, TextureFormat, TextureType, TicHeaderVersion,
     VertexAttribSize, VertexAttribType, WrapMode,
 };
 use crate::engines::Framebuffer;
@@ -143,9 +143,7 @@ fn decode_texel(bytes: &[u8], fmt: TextureFormat, comp_type: ComponentType) -> O
                 Some([bytes[0], bytes[1], bytes[2], bytes[3]])
             }
         }
-        TextureFormat::R8G8B8A8 => {
-            Some([bytes[3], bytes[2], bytes[1], bytes[0]])
-        }
+        TextureFormat::R8G8B8A8 => Some([bytes[3], bytes[2], bytes[1], bytes[0]]),
         TextureFormat::B5G6R5 => {
             let val = u16::from_le_bytes([bytes[0], bytes[1]]);
             let b = (val & 0x1F) as u8;
@@ -212,7 +210,12 @@ fn decode_texel(bytes: &[u8], fmt: TextureFormat, comp_type: ComponentType) -> O
                         (af.clamp(0.0, 1.0) * 255.0).round() as u8,
                     ])
                 }
-                _ => Some([(r >> 8) as u8, (g >> 8) as u8, (b >> 8) as u8, (a >> 8) as u8]),
+                _ => Some([
+                    (r >> 8) as u8,
+                    (g >> 8) as u8,
+                    (b >> 8) as u8,
+                    (a >> 8) as u8,
+                ]),
             }
         }
         TextureFormat::R32 => {
@@ -324,7 +327,11 @@ fn apply_wrap_mode(coord: f32, size: u32, mode: WrapMode) -> u32 {
             let period = s * 2;
             let i = coord.floor() as i32;
             let m = ((i % period) + period) % period;
-            if m < s { m as u32 } else { (period - 1 - m) as u32 }
+            if m < s {
+                m as u32
+            } else {
+                (period - 1 - m) as u32
+            }
         }
         _ => {
             // Border, MirrorOnce variants — fall back to clamp.
@@ -346,11 +353,7 @@ const GOB_SIZE: u32 = 512;
 /// Compute intra-GOB byte offset using the Tegra X1 swizzle formula.
 /// `x` is the byte offset within the GOB row (0..63), `y` is the row (0..7).
 fn gob_offset(x: u32, y: u32) -> u32 {
-    ((x % 64) / 32) * 256
-        + ((y % 8) / 2) * 64
-        + ((x % 32) / 16) * 32
-        + (y % 2) * 16
-        + (x % 16)
+    ((x % 64) / 32) * 256 + ((y % 8) / 2) * 64 + ((x % 32) / 16) * 32 + (y % 2) * 16 + (x % 16)
 }
 
 /// Compute the memory size (in bytes) of a BlockLinear texture, aligned to
@@ -499,13 +502,11 @@ fn decode_alpha_block(block: &[u8; 8]) -> [u8; 16] {
 
     if a0 > a1 {
         for i in 1..7u16 {
-            palette[(i + 1) as usize] =
-                (((7 - i) * a0 as u16 + i * a1 as u16 + 3) / 7) as u8;
+            palette[(i + 1) as usize] = (((7 - i) * a0 as u16 + i * a1 as u16 + 3) / 7) as u8;
         }
     } else {
         for i in 1..5u16 {
-            palette[(i + 1) as usize] =
-                (((5 - i) * a0 as u16 + i * a1 as u16 + 2) / 5) as u8;
+            palette[(i + 1) as usize] = (((5 - i) * a0 as u16 + i * a1 as u16 + 2) / 5) as u8;
         }
         palette[6] = 0;
         palette[7] = 255;
@@ -689,8 +690,7 @@ fn decompress_bc7_block(block: &[u8; 16]) -> [[u8; 4]; 16] {
                 let ep0 = endpoints[subset][0];
                 let ep1 = endpoints[subset][1];
                 for c in 0..3 {
-                    result[i][c] =
-                        (((64 - w) * ep0[c] as u32 + w * ep1[c] as u32 + 32) / 64) as u8;
+                    result[i][c] = (((64 - w) * ep0[c] as u32 + w * ep1[c] as u32 + 32) / 64) as u8;
                 }
                 result[i][3] = 255;
             }
@@ -742,8 +742,7 @@ fn decompress_bc7_block(block: &[u8; 16]) -> [[u8; 4]; 16] {
                 let ep0 = endpoints[subset][0];
                 let ep1 = endpoints[subset][1];
                 for c in 0..3 {
-                    result[i][c] =
-                        (((64 - w) * ep0[c] as u32 + w * ep1[c] as u32 + 32) / 64) as u8;
+                    result[i][c] = (((64 - w) * ep0[c] as u32 + w * ep1[c] as u32 + 32) / 64) as u8;
                 }
                 result[i][3] = 255;
             }
@@ -822,70 +821,70 @@ fn bc7_interpolation_weight(index_bits: u32, index: u32) -> u32 {
 fn bc7_partition_table_2(partition: usize) -> [u8; 16] {
     // Standard BC7 2-subset partition table.
     const TABLE: [[u8; 16]; 64] = [
-        [0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1],
-        [0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1],
-        [0,1,1,1,0,1,1,1,0,1,1,1,0,1,1,1],
-        [0,0,0,1,0,0,1,1,0,0,1,1,0,1,1,1],
-        [0,0,0,0,0,0,0,1,0,0,0,1,0,0,1,1],
-        [0,0,1,1,0,1,1,1,0,1,1,1,1,1,1,1],
-        [0,0,0,1,0,0,1,1,0,1,1,1,1,1,1,1],
-        [0,0,0,0,0,0,0,1,0,0,1,1,0,1,1,1],
-        [0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,1],
-        [0,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1],
-        [0,0,0,0,0,0,0,1,0,1,1,1,1,1,1,1],
-        [0,0,0,0,0,0,0,0,0,0,0,1,0,1,1,1],
-        [0,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1],
-        [0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1],
-        [0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1],
-        [0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1],
-        [0,0,0,0,1,0,0,0,1,1,1,0,1,1,1,1],
-        [0,1,1,1,0,0,0,1,0,0,0,0,0,0,0,0],
-        [0,0,0,0,0,0,0,0,1,0,0,0,1,1,1,0],
-        [0,1,1,1,0,0,1,1,0,0,0,1,0,0,0,0],
-        [0,0,1,1,0,0,0,1,0,0,0,0,0,0,0,0],
-        [0,0,0,0,1,0,0,0,1,1,0,0,1,1,1,0],
-        [0,0,0,0,0,0,0,0,1,0,0,0,1,1,0,0],
-        [0,1,1,1,0,0,1,1,0,0,1,1,0,0,0,1],
-        [0,0,1,1,0,0,0,1,0,0,0,1,0,0,0,0],
-        [0,0,0,0,1,0,0,0,1,0,0,0,1,1,0,0],
-        [0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0],
-        [0,0,1,1,0,1,1,0,0,1,1,0,1,1,0,0],
-        [0,0,0,1,0,1,1,1,1,1,1,0,1,0,0,0],
-        [0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0],
-        [0,1,1,1,0,0,0,1,1,0,0,0,1,1,1,0],
-        [0,0,1,1,1,0,0,1,1,0,0,1,1,1,0,0],
-        [0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1],
-        [0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1],
-        [0,1,0,1,1,0,1,0,0,1,0,1,1,0,1,0],
-        [0,0,1,1,0,0,1,1,1,1,0,0,1,1,0,0],
-        [0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0],
-        [0,1,0,1,0,1,0,1,1,0,1,0,1,0,1,0],
-        [0,1,1,0,1,0,0,1,0,1,1,0,1,0,0,1],
-        [0,1,0,1,1,0,1,0,1,0,1,0,0,1,0,1],
-        [0,1,1,1,0,0,1,1,1,1,0,0,1,1,1,0],
-        [0,0,0,1,0,0,1,1,1,1,0,0,1,0,0,0],
-        [0,0,1,1,0,0,1,0,0,1,0,0,1,1,0,0],
-        [0,0,1,1,1,0,1,1,1,1,0,1,1,1,0,0],
-        [0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0],
-        [0,0,1,1,1,1,0,0,1,1,0,0,0,0,1,1],
-        [0,1,1,0,0,1,1,0,1,0,0,1,1,0,0,1],
-        [0,0,0,0,0,1,1,0,0,1,1,0,0,0,0,0],
-        [0,1,0,0,1,1,1,0,0,1,0,0,0,0,0,0],
-        [0,0,1,0,0,1,1,1,0,0,1,0,0,0,0,0],
-        [0,0,0,0,0,0,1,0,0,1,1,1,0,0,1,0],
-        [0,0,0,0,0,1,0,0,1,1,1,0,0,1,0,0],
-        [0,1,1,0,1,1,0,0,1,0,0,1,0,0,1,1],
-        [0,0,1,1,0,1,1,0,1,1,0,0,1,0,0,1],
-        [0,1,1,0,0,0,1,1,1,0,0,1,1,1,0,0],
-        [0,0,1,1,1,0,0,1,1,1,0,0,0,1,1,0],
-        [0,1,1,0,1,1,0,0,1,1,0,0,1,0,0,1],
-        [0,1,1,0,0,0,1,1,0,0,1,1,1,0,0,1],
-        [0,1,1,1,1,1,1,0,1,0,0,0,0,0,0,1],
-        [0,0,0,1,1,0,0,0,1,1,1,0,0,1,1,1],
-        [0,0,0,0,1,1,1,1,0,0,1,1,0,0,1,1],
-        [0,0,1,1,0,0,1,1,1,1,1,1,0,0,0,0],
-        [0,0,1,0,0,0,1,0,1,1,1,0,1,1,1,0],
-        [0,1,0,0,0,1,0,0,0,1,1,1,0,1,1,1],
+        [0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1],
+        [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+        [0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1],
+        [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1],
+        [0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1],
+        [0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1],
+        [0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1],
+        [0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+        [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1],
+        [0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1],
+        [0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0],
+        [0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0],
+        [0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1],
+        [0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0],
+        [0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0],
+        [0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0],
+        [0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+        [0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0],
+        [0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0],
+        [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+        [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1],
+        [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0],
+        [0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+        [0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0],
+        [0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1],
+        [0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1],
+        [0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0],
+        [0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0],
+        [0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0],
+        [0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 0],
+        [0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1],
+        [0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1],
+        [0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0],
+        [0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1],
+        [0, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1],
+        [0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0],
+        [0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0],
+        [0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1],
+        [0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1],
+        [0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1],
+        [0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1],
+        [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1],
+        [0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0],
+        [0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1],
     ];
     TABLE[partition % 64]
 }
@@ -894,14 +893,9 @@ fn bc7_partition_table_2(partition: usize) -> [u8; 16] {
 fn bc7_anchor_indices_2(partition: usize) -> [usize; 2] {
     // First subset anchor is always 0. Second subset anchor:
     const ANCHOR2: [usize; 64] = [
-        15,15,15,15,15,15,15,15,
-        15,15,15,15,15,15,15,15,
-        15, 2, 8, 2, 2, 8, 8,15,
-         2, 8, 2, 2, 8, 8, 2, 2,
-        15,15, 6, 8, 2, 8,15,15,
-         2, 8, 2, 2, 2,15,15, 6,
-         6, 2, 6, 8,15,15, 2, 2,
-        15,15,15,15,15, 2, 2,15,
+        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 2, 8, 2, 2, 8, 8, 15,
+        2, 8, 2, 2, 8, 8, 2, 2, 15, 15, 6, 8, 2, 8, 15, 15, 2, 8, 2, 2, 2, 15, 15, 6, 6, 2, 6, 8,
+        15, 15, 2, 2, 15, 15, 15, 15, 15, 2, 2, 15,
     ];
     [0, ANCHOR2[partition % 64]]
 }
@@ -1044,20 +1038,20 @@ fn fetch_texture_coords(
     vertex_count: usize,
 ) -> Option<Vec<[f32; 2]>> {
     // Heuristic: find a Float R32G32 attrib that is NOT the position attribute.
-    let uv_attrib = draw
-        .vertex_attribs
-        .iter()
-        .find(|a| {
-            a.attrib_type == VertexAttribType::Float
-                && a.size == VertexAttribSize::R32G32
-                && a.buffer_index != 0
-        })
-        .or_else(|| {
-            // Fallback: any Float attrib with 2 components, not the first attribute.
-            draw.vertex_attribs.iter().skip(1).find(|a| {
-                a.attrib_type == VertexAttribType::Float && a.size.component_count() == 2
+    let uv_attrib =
+        draw.vertex_attribs
+            .iter()
+            .find(|a| {
+                a.attrib_type == VertexAttribType::Float
+                    && a.size == VertexAttribSize::R32G32
+                    && a.buffer_index != 0
             })
-        })?;
+            .or_else(|| {
+                // Fallback: any Float attrib with 2 components, not the first attribute.
+                draw.vertex_attribs.iter().skip(1).find(|a| {
+                    a.attrib_type == VertexAttribType::Float && a.size.component_count() == 2
+                })
+            })?;
 
     let stream = draw
         .vertex_streams
@@ -1097,10 +1091,7 @@ fn fetch_texture_coords(
 }
 
 /// Load TIC/TSC entry 0, bulk-decode the texture to RGBA8.
-fn load_texture(
-    draw: &DrawCall,
-    read_gpu: &dyn Fn(u64, &mut [u8]),
-) -> Option<SampledTexture> {
+fn load_texture(draw: &DrawCall, read_gpu: &dyn Fn(u64, &mut [u8])) -> Option<SampledTexture> {
     if draw.tex_header_pool_addr == 0 {
         return None;
     }
@@ -1135,7 +1126,11 @@ fn load_texture(
         let sam_desc = SamplerDescriptor::from_words(&tsc_words);
         (sam_desc.wrap_u, sam_desc.wrap_v, sam_desc.mag_filter)
     } else {
-        (WrapMode::ClampToEdge, WrapMode::ClampToEdge, TextureFilter::Nearest)
+        (
+            WrapMode::ClampToEdge,
+            WrapMode::ClampToEdge,
+            TextureFilter::Nearest,
+        )
     };
 
     let texel_count = (tex_desc.width * tex_desc.height) as usize;
@@ -1162,17 +1157,10 @@ fn load_texture(
             TicHeaderVersion::BlockLinear => {
                 // For BlockLinear compressed, treat each block as an element:
                 // effective width = blocks_x, effective height = blocks_y, bpt = bpb.
-                let tiled_size =
-                    block_linear_size(blocks_x, blocks_y, bpb, tex_desc.block_height);
+                let tiled_size = block_linear_size(blocks_x, blocks_y, bpb, tex_desc.block_height);
                 let mut tiled = vec![0u8; tiled_size];
                 read_gpu(tex_desc.address, &mut tiled);
-                deswizzle_block_linear(
-                    &tiled,
-                    blocks_x,
-                    blocks_y,
-                    bpb,
-                    tex_desc.block_height,
-                )
+                deswizzle_block_linear(&tiled, blocks_x, blocks_y, bpb, tex_desc.block_height)
             }
             _ => return None,
         };
@@ -1283,12 +1271,8 @@ fn load_texture(
                 buf
             }
             TicHeaderVersion::BlockLinear => {
-                let tiled_size = block_linear_size(
-                    tex_desc.width,
-                    tex_desc.height,
-                    bpt,
-                    tex_desc.block_height,
-                );
+                let tiled_size =
+                    block_linear_size(tex_desc.width, tex_desc.height, bpt, tex_desc.block_height);
                 let mut tiled = vec![0u8; tiled_size];
                 read_gpu(tex_desc.address, &mut tiled);
                 deswizzle_block_linear(
@@ -1340,8 +1324,7 @@ fn load_texture(
                 .min(7)
                 .min(max_mip_count(tex_desc.width, tex_desc.height).saturating_sub(1));
             // Compute base level byte size to find the start of level 1.
-            let mut mip_addr =
-                tex_desc.address + (tex_desc.width * tex_desc.height * bpt) as u64;
+            let mut mip_addr = tex_desc.address + (tex_desc.width * tex_desc.height * bpt) as u64;
             let mut mip_w = tex_desc.width / 2;
             let mut mip_h = tex_desc.height / 2;
             for _ in 0..level_count {
@@ -1362,11 +1345,8 @@ fn load_texture(
                     if end > raw.len() {
                         break;
                     }
-                    let rgba = match decode_texel(
-                        &raw[off..end],
-                        tex_desc.format,
-                        tex_desc.r_type,
-                    ) {
+                    let rgba = match decode_texel(&raw[off..end], tex_desc.format, tex_desc.r_type)
+                    {
                         Some(c) => c,
                         None => [255, 255, 255, 255],
                     };
@@ -1656,9 +1636,21 @@ fn render_draw_shader(
         } else {
             // Fall back to fixed-function fragment shading with vertex shader output.
             // Use generic 0 as color if present, else white.
-            let c0 = out0.generics.get(&0).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            let c1 = out1.generics.get(&0).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            let c2 = out2.generics.get(&0).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let c0 = out0
+                .generics
+                .get(&0)
+                .copied()
+                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let c1 = out1
+                .generics
+                .get(&0)
+                .copied()
+                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let c2 = out2
+                .generics
+                .get(&0)
+                .copied()
+                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
             let uv0 = extract_uv_from_generics(out0);
             let uv1 = extract_uv_from_generics(out1);
             let uv2 = extract_uv_from_generics(out2);
@@ -1898,14 +1890,10 @@ fn rasterize_triangle_shader(
 
             // Interpolate depth and apply depth bias.
             let mut z = v0[2] * w0 + v1[2] * w1 + v2[2] * w2;
-            if rasterizer_info.depth_bias != 0.0
-                || rasterizer_info.slope_scale_depth_bias != 0.0
-            {
+            if rasterizer_info.depth_bias != 0.0 || rasterizer_info.slope_scale_depth_bias != 0.0 {
                 // Compute depth gradients (triangle is planar, so constant per-triangle).
-                let dzdx = (v1[2] - v0[2]) * (v2[1] - v0[1])
-                    - (v2[2] - v0[2]) * (v1[1] - v0[1]);
-                let dzdy = (v2[2] - v0[2]) * (v1[0] - v0[0])
-                    - (v1[2] - v0[2]) * (v2[0] - v0[0]);
+                let dzdx = (v1[2] - v0[2]) * (v2[1] - v0[1]) - (v2[2] - v0[2]) * (v1[1] - v0[1]);
+                let dzdy = (v2[2] - v0[2]) * (v1[0] - v0[0]) - (v1[2] - v0[2]) * (v2[0] - v0[0]);
                 let max_slope = dzdx.abs().max(dzdy.abs()) / area.abs();
                 let min_resolvable = 1.0 / (1u32 << 24) as f32;
                 let bias = rasterizer_info.slope_scale_depth_bias * max_slope
@@ -1997,10 +1985,7 @@ fn rasterize_triangle_shader(
 }
 
 /// Fetch vertex positions from GPU memory for a draw call.
-fn fetch_positions(
-    draw: &DrawCall,
-    read_gpu: &dyn Fn(u64, &mut [u8]),
-) -> Vec<[f32; 4]> {
+fn fetch_positions(draw: &DrawCall, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<[f32; 4]> {
     // Find the position attribute (index 0 by convention, or first Float with >= 2 components).
     let pos_attrib = draw.vertex_attribs.iter().find(|a| {
         a.buffer_index == 0
@@ -2014,7 +1999,11 @@ fn fetch_positions(
                 return vec![];
             }
             // Fall back to first attribute with >= 2 components.
-            match draw.vertex_attribs.iter().find(|a| a.size.component_count() >= 2) {
+            match draw
+                .vertex_attribs
+                .iter()
+                .find(|a| a.size.component_count() >= 2)
+            {
                 Some(a) => a,
                 None => return vec![],
             }
@@ -2217,9 +2206,9 @@ fn fetch_vertex_colors(
         .iter()
         .find(|a| a.buffer_index == 1)
         .or_else(|| {
-            draw.vertex_attribs.iter().find(|a| {
-                a.attrib_type == VertexAttribType::UNorm && a.size.component_count() >= 3
-            })
+            draw.vertex_attribs
+                .iter()
+                .find(|a| a.attrib_type == VertexAttribType::UNorm && a.size.component_count() >= 3)
         })
         .or_else(|| {
             if draw.vertex_attribs.len() >= 2 {
@@ -2261,8 +2250,7 @@ fn fetch_vertex_colors(
     let mut colors = Vec::with_capacity(vertex_count);
 
     for idx in indices.iter().take(vertex_count) {
-        let addr =
-            stream.address + (*idx as u64) * (stream.stride as u64) + (attrib.offset as u64);
+        let addr = stream.address + (*idx as u64) * (stream.stride as u64) + (attrib.offset as u64);
 
         let mut color = white;
 
@@ -2517,9 +2505,12 @@ fn apply_blend_factor(
             [f, f, f, 1.0]
         }
         BlendFactor::ConstantColor => constant,
-        BlendFactor::OneMinusConstantColor => {
-            [1.0 - constant[0], 1.0 - constant[1], 1.0 - constant[2], 1.0 - constant[3]]
-        }
+        BlendFactor::OneMinusConstantColor => [
+            1.0 - constant[0],
+            1.0 - constant[1],
+            1.0 - constant[2],
+            1.0 - constant[3],
+        ],
         BlendFactor::ConstantAlpha => [constant[3], constant[3], constant[3], constant[3]],
         BlendFactor::OneMinusConstantAlpha => {
             let a = 1.0 - constant[3];
@@ -2570,8 +2561,7 @@ fn blend_colors(
     if blend.separate_alpha {
         let sa = apply_blend_factor(blend.alpha_src, src, dst, constant);
         let da = apply_blend_factor(blend.alpha_dst, src, dst, constant);
-        result[3] =
-            blend_equation(blend.alpha_op, src[3] * sa[3], dst[3] * da[3]).clamp(0.0, 1.0);
+        result[3] = blend_equation(blend.alpha_op, src[3] * sa[3], dst[3] * da[3]).clamp(0.0, 1.0);
     } else {
         result[3] = blend_equation(blend.color_op, src[3] * sf[3], dst[3] * df[3]).clamp(0.0, 1.0);
     }
@@ -2633,12 +2623,11 @@ fn rasterize_triangle(
     // Compute per-triangle mipmap LOD from screen-space vs texture-space area ratio.
     let tri_lod = if let Some(tex) = texture {
         if !tex.mip_levels.is_empty() && tex.normalized_coords {
-            let screen_area = 0.5
-                * ((v1[0] - v0[0]) * (v2[1] - v0[1]) - (v2[0] - v0[0]) * (v1[1] - v0[1])).abs();
+            let screen_area =
+                0.5 * ((v1[0] - v0[0]) * (v2[1] - v0[1]) - (v2[0] - v0[0]) * (v1[1] - v0[1])).abs();
             let tex_area_uv = 0.5
-                * ((uv1[0] - uv0[0]) * (uv2[1] - uv0[1])
-                    - (uv2[0] - uv0[0]) * (uv1[1] - uv0[1]))
-                .abs();
+                * ((uv1[0] - uv0[0]) * (uv2[1] - uv0[1]) - (uv2[0] - uv0[0]) * (uv1[1] - uv0[1]))
+                    .abs();
             let texel_area = tex_area_uv * tex.width as f32 * tex.height as f32;
             if screen_area > 0.0 && texel_area > 0.0 {
                 let lod = 0.5 * (texel_area / screen_area).log2();
@@ -2977,10 +2966,26 @@ mod tests {
         let v1 = [5.0, 0.0, 0.0, 1.0];
         let v2 = [0.0, 5.0, 0.0, 1.0];
         rasterize_triangle(
-            v0, v1, v2, white, white, white,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            v0,
+            v1,
+            v2,
+            white,
+            white,
+            white,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &default_depth_stencil(),
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // Pixel (1, 1) should be inside the triangle.
@@ -3006,10 +3011,26 @@ mod tests {
         let v1 = [100.0, -10.0, 0.0, 1.0];
         let v2 = [-10.0, 100.0, 0.0, 1.0];
         rasterize_triangle(
-            v0, v1, v2, white, white, white,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            v0,
+            v1,
+            v2,
+            white,
+            white,
+            white,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &default_depth_stencil(),
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // All pixels should be filled (triangle covers everything).
@@ -3162,9 +3183,7 @@ mod tests {
     fn test_blend_equation_variants() {
         assert!((blend_equation(BlendEquation::Add, 0.3, 0.5) - 0.8).abs() < 0.001);
         assert!((blend_equation(BlendEquation::Subtract, 0.5, 0.3) - 0.2).abs() < 0.001);
-        assert!(
-            (blend_equation(BlendEquation::ReverseSubtract, 0.3, 0.5) - 0.2).abs() < 0.001
-        );
+        assert!((blend_equation(BlendEquation::ReverseSubtract, 0.3, 0.5) - 0.2).abs() < 0.001);
         assert!((blend_equation(BlendEquation::Min, 0.3, 0.5) - 0.3).abs() < 0.001);
         assert!((blend_equation(BlendEquation::Max, 0.3, 0.5) - 0.5).abs() < 0.001);
     }
@@ -3187,10 +3206,26 @@ mod tests {
         let c2 = [0.0, 0.0, 1.0, 1.0]; // blue
 
         rasterize_triangle(
-            v0, v1, v2, c0, c1, c2,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            v0,
+            v1,
+            v2,
+            c0,
+            c1,
+            c2,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &default_depth_stencil(),
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // Center pixel (~5, ~4) should have a mix of colors (not pure white or black).
@@ -3205,7 +3240,10 @@ mod tests {
         assert!(g > 0, "green channel should be > 0");
         assert!(b > 0, "blue channel should be > 0");
         // No single channel should be 255 at the centroid.
-        assert!(r < 255 || g < 255 || b < 255, "should be a mix, not pure white");
+        assert!(
+            r < 255 || g < 255 || b < 255,
+            "should be a mix, not pure white"
+        );
     }
 
     #[test]
@@ -3232,10 +3270,26 @@ mod tests {
         let v2 = [-1.0, 20.0, 0.5, 1.0];
         let red = [1.0, 0.0, 0.0, 1.0];
         rasterize_triangle(
-            v0, v1, v2, red, red, red,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &ds,
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            v0,
+            v1,
+            v2,
+            red,
+            red,
+            red,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &ds,
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         let off = ((1 * width + 1) * 4) as usize;
@@ -3248,10 +3302,26 @@ mod tests {
         let v1b = [20.0, -1.0, 0.3, 1.0];
         let v2b = [-1.0, 20.0, 0.3, 1.0];
         rasterize_triangle(
-            v0b, v1b, v2b, green, green, green,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &ds,
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            v0b,
+            v1b,
+            v2b,
+            green,
+            green,
+            green,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &ds,
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         assert_eq!(pixels[off], 0);
@@ -3263,10 +3333,26 @@ mod tests {
         let v1c = [20.0, -1.0, 0.8, 1.0];
         let v2c = [-1.0, 20.0, 0.8, 1.0];
         rasterize_triangle(
-            v0c, v1c, v2c, blue, blue, blue,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &ds,
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            v0c,
+            v1c,
+            v2c,
+            blue,
+            blue,
+            blue,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &ds,
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         assert_eq!(pixels[off], 0);
@@ -3286,21 +3372,51 @@ mod tests {
         // First triangle: red at z=0.3.
         let red = [1.0, 0.0, 0.0, 1.0];
         rasterize_triangle(
-            [-1.0, -1.0, 0.3, 1.0], [20.0, -1.0, 0.3, 1.0], [-1.0, 20.0, 0.3, 1.0],
-            red, red, red,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &ds,
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            [-1.0, -1.0, 0.3, 1.0],
+            [20.0, -1.0, 0.3, 1.0],
+            [-1.0, 20.0, 0.3, 1.0],
+            red,
+            red,
+            red,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &ds,
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // Second triangle: blue at z=0.8 (farther). Should still overwrite because depth disabled.
         let blue = [0.0, 0.0, 1.0, 1.0];
         rasterize_triangle(
-            [-1.0, -1.0, 0.8, 1.0], [20.0, -1.0, 0.8, 1.0], [-1.0, 20.0, 0.8, 1.0],
-            blue, blue, blue,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &ds,
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            [-1.0, -1.0, 0.8, 1.0],
+            [20.0, -1.0, 0.8, 1.0],
+            [-1.0, 20.0, 0.8, 1.0],
+            blue,
+            blue,
+            blue,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &ds,
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         let off = ((1 * width + 1) * 4) as usize;
@@ -3319,11 +3435,26 @@ mod tests {
         // Fill background with solid red.
         let red = [1.0, 0.0, 0.0, 1.0];
         rasterize_triangle(
-            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
-            red, red, red,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            [-1.0, -1.0, 0.0, 1.0],
+            [20.0, -1.0, 0.0, 1.0],
+            [-1.0, 20.0, 0.0, 1.0],
+            red,
+            red,
+            red,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &default_depth_stencil(),
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // Overlay with 50% transparent green.
@@ -3339,11 +3470,26 @@ mod tests {
         };
         let green_half = [0.0, 1.0, 0.0, 0.5];
         rasterize_triangle(
-            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
-            green_half, green_half, green_half,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
-            &blend, &default_blend_color(), &default_color_mask(),
+            [-1.0, -1.0, 0.0, 1.0],
+            [20.0, -1.0, 0.0, 1.0],
+            [-1.0, 20.0, 0.0, 1.0],
+            green_half,
+            green_half,
+            green_half,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &default_depth_stencil(),
+            &blend,
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         let off = ((1 * width + 1) * 4) as usize;
@@ -3373,11 +3519,26 @@ mod tests {
 
         // Big triangle covering entire framebuffer.
         rasterize_triangle(
-            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
-            white, white, white,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &scissor, &default_depth_stencil(),
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            [-1.0, -1.0, 0.0, 1.0],
+            [20.0, -1.0, 0.0, 1.0],
+            [-1.0, 20.0, 0.0, 1.0],
+            white,
+            white,
+            white,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &scissor,
+            &default_depth_stencil(),
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // Pixel (1, 1) should be empty (outside scissor).
@@ -3418,15 +3579,30 @@ mod tests {
         let white = [1.0f32, 1.0, 1.0, 1.0];
 
         rasterize_triangle(
-            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
-            white, white, white,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &default_depth_stencil(),
-            &default_blend(), &default_blend_color(), &mask,
+            [-1.0, -1.0, 0.0, 1.0],
+            [20.0, -1.0, 0.0, 1.0],
+            [-1.0, 20.0, 0.0, 1.0],
+            white,
+            white,
+            white,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &default_depth_stencil(),
+            &default_blend(),
+            &default_blend_color(),
+            &mask,
         );
 
         let off = ((1 * width + 1) * 4) as usize;
-        assert_eq!(pixels[off], 255);     // R written
+        assert_eq!(pixels[off], 255); // R written
         assert_eq!(pixels[off + 1], 128); // G preserved
         assert_eq!(pixels[off + 2], 255); // B written
         assert_eq!(pixels[off + 3], 255); // A preserved
@@ -3435,7 +3611,11 @@ mod tests {
     #[test]
     fn test_backface_culling() {
         // signed_area([0,0,0,1], [1,0,0,1], [0,1,0,1]) = (1)*(1) - (0)*(0) = 1.0 (positive = CCW).
-        let area = signed_area([0.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]);
+        let area = signed_area(
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+        );
         assert!(area > 0.0); // Positive = CCW winding
 
         // CCW front_face + Back culling: positive area = CCW = front → NOT culled.
@@ -3571,21 +3751,30 @@ mod tests {
         let fb = result.unwrap();
 
         // Filled pixels should be white (255, 255, 255, 255).
-        let has_white = fb.pixels.chunks_exact(4).any(|px| {
-            px[0] == 255 && px[1] == 255 && px[2] == 255 && px[3] == 255
-        });
+        let has_white = fb
+            .pixels
+            .chunks_exact(4)
+            .any(|px| px[0] == 255 && px[1] == 255 && px[2] == 255 && px[3] == 255);
         assert!(has_white, "with no color attribute, pixels should be white");
     }
 
     #[test]
     fn test_signed_area_winding() {
         // CCW in math coords, but we're in screen space.
-        let area = signed_area([0.0, 0.0, 0.0, 1.0], [10.0, 0.0, 0.0, 1.0], [0.0, 10.0, 0.0, 1.0]);
+        let area = signed_area(
+            [0.0, 0.0, 0.0, 1.0],
+            [10.0, 0.0, 0.0, 1.0],
+            [0.0, 10.0, 0.0, 1.0],
+        );
         // (10-0)*(10-0) - (0-0)*(0-0) = 100 > 0
         assert!(area > 0.0);
 
         // Reversed winding.
-        let area_rev = signed_area([0.0, 0.0, 0.0, 1.0], [0.0, 10.0, 0.0, 1.0], [10.0, 0.0, 0.0, 1.0]);
+        let area_rev = signed_area(
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 10.0, 0.0, 1.0],
+            [10.0, 0.0, 0.0, 1.0],
+        );
         assert!(area_rev < 0.0);
     }
 
@@ -3638,10 +3827,9 @@ mod tests {
         bytes[4..8].copy_from_slice(&(0.25f32).to_le_bytes());
         bytes[8..12].copy_from_slice(&(1.0f32).to_le_bytes());
         bytes[12..16].copy_from_slice(&(0.75f32).to_le_bytes());
-        let rgba =
-            decode_texel(&bytes, TextureFormat::R32G32B32A32, ComponentType::Float).unwrap();
+        let rgba = decode_texel(&bytes, TextureFormat::R32G32B32A32, ComponentType::Float).unwrap();
         assert_eq!(rgba[0], 128); // 0.5 * 255 = 127.5 → 128
-        assert_eq!(rgba[1], 64);  // 0.25 * 255 = 63.75 → 64
+        assert_eq!(rgba[1], 64); // 0.25 * 255 = 63.75 → 64
         assert_eq!(rgba[2], 255); // 1.0 * 255 = 255
         assert_eq!(rgba[3], 191); // 0.75 * 255 = 191.25 → 191
     }
@@ -3650,15 +3838,30 @@ mod tests {
     fn test_apply_swizzle() {
         let rgba = [10, 20, 30, 40];
         // Identity: RGBA → RGBA.
-        let identity = [SwizzleSource::R, SwizzleSource::G, SwizzleSource::B, SwizzleSource::A];
+        let identity = [
+            SwizzleSource::R,
+            SwizzleSource::G,
+            SwizzleSource::B,
+            SwizzleSource::A,
+        ];
         assert_eq!(apply_swizzle(rgba, &identity), [10, 20, 30, 40]);
 
         // Swap R and B.
-        let swap_rb = [SwizzleSource::B, SwizzleSource::G, SwizzleSource::R, SwizzleSource::A];
+        let swap_rb = [
+            SwizzleSource::B,
+            SwizzleSource::G,
+            SwizzleSource::R,
+            SwizzleSource::A,
+        ];
         assert_eq!(apply_swizzle(rgba, &swap_rb), [30, 20, 10, 40]);
 
         // Zero and One.
-        let special = [SwizzleSource::Zero, SwizzleSource::OneFloat, SwizzleSource::R, SwizzleSource::Zero];
+        let special = [
+            SwizzleSource::Zero,
+            SwizzleSource::OneFloat,
+            SwizzleSource::R,
+            SwizzleSource::Zero,
+        ];
         assert_eq!(apply_swizzle(rgba, &special), [0, 255, 10, 0]);
     }
 
@@ -3695,9 +3898,9 @@ mod tests {
     fn test_sample_texture_basic() {
         // 2x2 texture: red, green, blue, white.
         let data = vec![
-            255, 0, 0, 255,    // (0,0) red
-            0, 255, 0, 255,    // (1,0) green
-            0, 0, 255, 255,    // (0,1) blue
+            255, 0, 0, 255, // (0,0) red
+            0, 255, 0, 255, // (1,0) green
+            0, 0, 255, 255, // (0,1) blue
             255, 255, 255, 255, // (1,1) white
         ];
         let tex = SampledTexture {
@@ -3735,7 +3938,9 @@ mod tests {
 
         // Solid red 2x2 texture.
         let tex = SampledTexture {
-            data: vec![255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255],
+            data: vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ],
             width: 2,
             height: 2,
             wrap_u: WrapMode::ClampToEdge,
@@ -3747,12 +3952,26 @@ mod tests {
 
         // Large triangle covering the framebuffer, UVs spanning [0,1].
         rasterize_triangle(
-            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
-            white, white, white,
-            [0.0, 0.0], [1.0, 0.0], [0.0, 1.0], Some(&tex),
-            &mut pixels, &mut depth_buf, &mut stencil_buf,
-            width, height, &default_scissor(), &default_depth_stencil(),
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            [-1.0, -1.0, 0.0, 1.0],
+            [20.0, -1.0, 0.0, 1.0],
+            [-1.0, 20.0, 0.0, 1.0],
+            white,
+            white,
+            white,
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            Some(&tex),
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &default_depth_stencil(),
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // Center pixel should be red.
@@ -3865,10 +4084,7 @@ mod tests {
             for x in 0..width {
                 let lin_off = ((y * width + x) * bpt) as usize;
                 let id = (y * width + x) as u8;
-                assert_eq!(
-                    linear[lin_off], id,
-                    "pixel ({}, {}) R mismatch", x, y
-                );
+                assert_eq!(linear[lin_off], id, "pixel ({}, {}) R mismatch", x, y);
             }
         }
     }
@@ -3895,9 +4111,8 @@ mod tests {
                 let gob_y = y / GOB_SIZE_Y;
                 let block_y = gob_y / bh_gobs;
                 let gob_in_block = gob_y % bh_gobs;
-                let base = block_y * block_size
-                    + gob_x * GOB_SIZE * bh_gobs
-                    + gob_in_block * GOB_SIZE;
+                let base =
+                    block_y * block_size + gob_x * GOB_SIZE * bh_gobs + gob_in_block * GOB_SIZE;
                 let intra = gob_offset(x_bytes % GOB_SIZE_X, y % GOB_SIZE_Y);
                 let off = (base + intra) as usize;
                 let id = ((y * width + x) & 0xFF) as u8;
@@ -3939,9 +4154,8 @@ mod tests {
                 let gob_y = y / GOB_SIZE_Y;
                 let block_y = gob_y / bh_gobs;
                 let gob_in_block = gob_y % bh_gobs;
-                let base = block_y * block_size
-                    + gob_x * GOB_SIZE * bh_gobs
-                    + gob_in_block * GOB_SIZE;
+                let base =
+                    block_y * block_size + gob_x * GOB_SIZE * bh_gobs + gob_in_block * GOB_SIZE;
                 let intra = gob_offset(x_bytes % GOB_SIZE_X, y % GOB_SIZE_Y);
                 let off = (base + intra) as usize;
                 let id = ((y * width + x) & 0xFF) as u8;
@@ -3988,8 +4202,14 @@ mod tests {
         let mut tic_words = [0u32; 8];
         // word0: format=A8B8G8R8(0x1D), types=UNorm(2), swizzle=RGBA(2,3,4,5)
         tic_words[0] = 0x1D
-            | (2 << 7) | (2 << 10) | (2 << 13) | (2 << 16)
-            | (2 << 19) | (3 << 22) | (4 << 25) | (5 << 28);
+            | (2 << 7)
+            | (2 << 10)
+            | (2 << 13)
+            | (2 << 16)
+            | (2 << 19)
+            | (3 << 22)
+            | (4 << 25)
+            | (5 << 28);
         // word1: addr_low = 0x2000
         tic_words[1] = 0x2000;
         // word2: header_version = BlockLinear(3) at [23:21]
@@ -4053,12 +4273,8 @@ mod tests {
             written.lock().unwrap().push((addr, data.to_vec()));
         };
 
-        let result = SoftwareRasterizer::render_draw_calls(
-            &[draw],
-            &|_, _| {},
-            &write_gpu,
-            Some(base_fb),
-        );
+        let result =
+            SoftwareRasterizer::render_draw_calls(&[draw], &|_, _| {}, &write_gpu, Some(base_fb));
         let fb = result.unwrap();
         let writes = written.into_inner().unwrap();
         assert_eq!(writes.len(), 1);
@@ -4081,12 +4297,7 @@ mod tests {
             written.lock().unwrap().push((addr, data.to_vec()));
         };
 
-        SoftwareRasterizer::render_draw_calls(
-            &[],
-            &|_, _| {},
-            &write_gpu,
-            Some(base_fb),
-        );
+        SoftwareRasterizer::render_draw_calls(&[], &|_, _| {}, &write_gpu, Some(base_fb));
         let writes = written.into_inner().unwrap();
         assert!(writes.is_empty(), "no writeback should occur when gpu_va=0");
     }
@@ -4099,10 +4310,10 @@ mod tests {
     fn test_bilinear_center() {
         // Sampling at exact texel center should match nearest.
         let data = vec![
-            255, 0, 0, 255,    // (0,0) red
-            0, 255, 0, 255,    // (1,0) green
-            0, 0, 255, 255,    // (0,1) blue
-            255, 255, 0, 255,  // (1,1) yellow
+            255, 0, 0, 255, // (0,0) red
+            0, 255, 0, 255, // (1,0) green
+            0, 0, 255, 255, // (0,1) blue
+            255, 255, 0, 255, // (1,1) yellow
         ];
         let tex = SampledTexture {
             data: data.clone(),
@@ -4126,10 +4337,10 @@ mod tests {
     fn test_bilinear_midpoint() {
         // Sampling between (0,0) red and (1,0) green → average.
         let data = vec![
-            255, 0, 0, 255,    // (0,0) red
-            0, 255, 0, 255,    // (1,0) green
-            255, 0, 0, 255,    // (0,1) red
-            0, 255, 0, 255,    // (1,1) green
+            255, 0, 0, 255, // (0,0) red
+            0, 255, 0, 255, // (1,0) green
+            255, 0, 0, 255, // (0,1) red
+            0, 255, 0, 255, // (1,1) green
         ];
         let tex = SampledTexture {
             data,
@@ -4151,10 +4362,7 @@ mod tests {
     #[test]
     fn test_bilinear_filter_mode_dispatch() {
         let data = vec![
-            255, 0, 0, 255,
-            0, 255, 0, 255,
-            0, 0, 255, 255,
-            255, 255, 0, 255,
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ];
         let tex_nearest = SampledTexture {
             data: data.clone(),
@@ -4192,9 +4400,18 @@ mod tests {
         assert_eq!(block_format_info(TextureFormat::Bc4), Some((4, 4, 8)));
         assert_eq!(block_format_info(TextureFormat::Bc5), Some((4, 4, 16)));
         assert_eq!(block_format_info(TextureFormat::Bc7), Some((4, 4, 16)));
-        assert_eq!(block_format_info(TextureFormat::Astc2d4x4), Some((4, 4, 16)));
-        assert_eq!(block_format_info(TextureFormat::Astc2d8x8), Some((8, 8, 16)));
-        assert_eq!(block_format_info(TextureFormat::Astc2d12x12), Some((12, 12, 16)));
+        assert_eq!(
+            block_format_info(TextureFormat::Astc2d4x4),
+            Some((4, 4, 16))
+        );
+        assert_eq!(
+            block_format_info(TextureFormat::Astc2d8x8),
+            Some((8, 8, 16))
+        );
+        assert_eq!(
+            block_format_info(TextureFormat::Astc2d12x12),
+            Some((12, 12, 16))
+        );
         // Uncompressed → None.
         assert_eq!(block_format_info(TextureFormat::A8B8G8R8), None);
     }
@@ -4207,7 +4424,10 @@ mod tests {
         block[0..2].copy_from_slice(&0xF800u16.to_le_bytes());
         block[2..4].copy_from_slice(&0xF800u16.to_le_bytes());
         // All indices = 0 (use color 0).
-        block[4] = 0; block[5] = 0; block[6] = 0; block[7] = 0;
+        block[4] = 0;
+        block[5] = 0;
+        block[6] = 0;
+        block[7] = 0;
 
         let result = decompress_bc1_block(&block);
         for texel in &result {
@@ -4227,7 +4447,9 @@ mod tests {
         block[2..4].copy_from_slice(&0x0000u16.to_le_bytes());
         // First row indices: 0,1,2,3 = 0b11_10_01_00 = 0xE4.
         block[4] = 0xE4;
-        block[5] = 0; block[6] = 0; block[7] = 0;
+        block[5] = 0;
+        block[6] = 0;
+        block[7] = 0;
 
         let result = decompress_bc1_block(&block);
         // Index 0 = c0 (white).
@@ -4267,7 +4489,7 @@ mod tests {
         let mut block = [0u8; 8];
         block[0] = 200; // a0
         block[1] = 100; // a1
-        // All indices = 0 → use a0=200.
+                        // All indices = 0 → use a0=200.
         block[2..8].fill(0);
 
         let result = decompress_bc4_block(&block);
@@ -4307,8 +4529,14 @@ mod tests {
         let mut tic_words = [0u32; 8];
         // word0: format=Bc1Rgba(0x25), types=UNorm(2), swizzle=RGBA(2,3,4,5)
         tic_words[0] = 0x25
-            | (2 << 7) | (2 << 10) | (2 << 13) | (2 << 16)
-            | (2 << 19) | (3 << 22) | (4 << 25) | (5 << 28);
+            | (2 << 7)
+            | (2 << 10)
+            | (2 << 13)
+            | (2 << 16)
+            | (2 << 19)
+            | (3 << 22)
+            | (4 << 25)
+            | (5 << 28);
         // word1: addr_low = 0x2000
         tic_words[1] = 0x2000;
         // word2: header_version = Pitch(2) at [23:21]
@@ -4349,7 +4577,12 @@ mod tests {
         assert_eq!(tex.height, 4);
         // All pixels should be red.
         for i in 0..16 {
-            assert!(tex.data[i * 4] >= 248, "R at pixel {}: {}", i, tex.data[i * 4]);
+            assert!(
+                tex.data[i * 4] >= 248,
+                "R at pixel {}: {}",
+                i,
+                tex.data[i * 4]
+            );
             assert_eq!(tex.data[i * 4 + 1], 0, "G at pixel {}", i);
             assert_eq!(tex.data[i * 4 + 2], 0, "B at pixel {}", i);
             assert_eq!(tex.data[i * 4 + 3], 255, "A at pixel {}", i);
@@ -4432,11 +4665,26 @@ mod tests {
 
         let white = [1.0f32, 1.0, 1.0, 1.0];
         rasterize_triangle(
-            [-1.0, -1.0, 0.0, 1.0], [20.0, -1.0, 0.0, 1.0], [-1.0, 20.0, 0.0, 1.0],
-            white, white, white,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &ds,
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            [-1.0, -1.0, 0.0, 1.0],
+            [20.0, -1.0, 0.0, 1.0],
+            [-1.0, 20.0, 0.0, 1.0],
+            white,
+            white,
+            white,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &ds,
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // Pixels should remain black (stencil rejected all).
@@ -4444,7 +4692,10 @@ mod tests {
         assert_eq!(pixels[off], 0);
         // But stencil buffer should have ref_value=1 (fail_op = Replace).
         let stencil_idx = (1 * width + 1) as usize;
-        assert_eq!(stencil_buf[stencil_idx], 1, "stencil should be written on fail");
+        assert_eq!(
+            stencil_buf[stencil_idx], 1,
+            "stencil should be written on fail"
+        );
     }
 
     #[test]
@@ -4477,11 +4728,26 @@ mod tests {
 
         let white = [1.0f32, 1.0, 1.0, 1.0];
         rasterize_triangle(
-            [-1.0, -1.0, 0.5, 1.0], [20.0, -1.0, 0.5, 1.0], [-1.0, 20.0, 0.5, 1.0],
-            white, white, white,
-            [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], None, &mut pixels, &mut depth_buf,
-            &mut stencil_buf, width, height, &default_scissor(), &ds,
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            [-1.0, -1.0, 0.5, 1.0],
+            [20.0, -1.0, 0.5, 1.0],
+            [-1.0, 20.0, 0.5, 1.0],
+            white,
+            white,
+            white,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            None,
+            &mut pixels,
+            &mut depth_buf,
+            &mut stencil_buf,
+            width,
+            height,
+            &default_scissor(),
+            &ds,
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // Pixels should remain black (depth test failed).
@@ -4489,7 +4755,10 @@ mod tests {
         assert_eq!(pixels[off], 0);
         // Stencil should have zfail_op=Replace → ref_value=42.
         let stencil_idx = (1 * width + 1) as usize;
-        assert_eq!(stencil_buf[stencil_idx], 42, "stencil should have zfail_op applied");
+        assert_eq!(
+            stencil_buf[stencil_idx], 42,
+            "stencil should have zfail_op applied"
+        );
     }
 
     // Part D: Perspective Correction
@@ -4510,9 +4779,9 @@ mod tests {
         // Gradient texture: left=black, right=white.
         let tex = SampledTexture {
             data: vec![
-                0, 0, 0, 255,      // (0,0) black
+                0, 0, 0, 255, // (0,0) black
                 255, 255, 255, 255, // (1,0) white
-                0, 0, 0, 255,      // (0,1) black
+                0, 0, 0, 255, // (0,1) black
                 255, 255, 255, 255, // (1,1) white
             ],
             width: 2,
@@ -4528,22 +4797,50 @@ mod tests {
 
         // Uniform W=1.0: standard screen-space interpolation.
         rasterize_triangle(
-            [1.0, 1.0, 0.0, 1.0], [18.0, 1.0, 0.0, 1.0], [10.0, 18.0, 0.0, 1.0],
-            white, white, white,
-            [0.0, 0.5], [1.0, 0.5], [0.5, 0.5], Some(&tex),
-            &mut pixels_uniform, &mut depth_uniform, &mut stencil_uniform,
-            width, height, &default_scissor(), &default_depth_stencil(),
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            [1.0, 1.0, 0.0, 1.0],
+            [18.0, 1.0, 0.0, 1.0],
+            [10.0, 18.0, 0.0, 1.0],
+            white,
+            white,
+            white,
+            [0.0, 0.5],
+            [1.0, 0.5],
+            [0.5, 0.5],
+            Some(&tex),
+            &mut pixels_uniform,
+            &mut depth_uniform,
+            &mut stencil_uniform,
+            width,
+            height,
+            &default_scissor(),
+            &default_depth_stencil(),
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // Varying W: v0 closer (W=1), v1 farther (W=4).
         rasterize_triangle(
-            [1.0, 1.0, 0.0, 1.0], [18.0, 1.0, 0.0, 4.0], [10.0, 18.0, 0.0, 2.0],
-            white, white, white,
-            [0.0, 0.5], [1.0, 0.5], [0.5, 0.5], Some(&tex),
-            &mut pixels_persp, &mut depth_persp, &mut stencil_persp,
-            width, height, &default_scissor(), &default_depth_stencil(),
-            &default_blend(), &default_blend_color(), &default_color_mask(),
+            [1.0, 1.0, 0.0, 1.0],
+            [18.0, 1.0, 0.0, 4.0],
+            [10.0, 18.0, 0.0, 2.0],
+            white,
+            white,
+            white,
+            [0.0, 0.5],
+            [1.0, 0.5],
+            [0.5, 0.5],
+            Some(&tex),
+            &mut pixels_persp,
+            &mut depth_persp,
+            &mut stencil_persp,
+            width,
+            height,
+            &default_scissor(),
+            &default_depth_stencil(),
+            &default_blend(),
+            &default_blend_color(),
+            &default_color_mask(),
         );
 
         // The two renderings should differ at some interior pixel due to perspective correction.
@@ -4554,15 +4851,24 @@ mod tests {
                 break;
             }
         }
-        assert!(differs, "perspective correction should produce different results with varying W");
+        assert!(
+            differs,
+            "perspective correction should produce different results with varying W"
+        );
     }
 
     #[test]
     fn test_mipmap_lod_selection() {
         // Level 0: 4×4 red texture.
-        let data_l0 = vec![[255u8, 0, 0, 255]; 16].into_iter().flatten().collect::<Vec<_>>();
+        let data_l0 = vec![[255u8, 0, 0, 255]; 16]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         // Level 1: 2×2 green texture.
-        let data_l1 = vec![[0u8, 255, 0, 255]; 4].into_iter().flatten().collect::<Vec<_>>();
+        let data_l1 = vec![[0u8, 255, 0, 255]; 4]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         // Level 2: 1×1 blue texture.
         let data_l2 = vec![0u8, 0, 255, 255];
 
@@ -4590,19 +4896,31 @@ mod tests {
 
         // LOD 0 → red (level 0).
         let c0 = sample_texture_lod(&tex, 0.5, 0.5, 0);
-        assert!(c0[0] > 0.9 && c0[1] < 0.1 && c0[2] < 0.1, "LOD 0 should be red");
+        assert!(
+            c0[0] > 0.9 && c0[1] < 0.1 && c0[2] < 0.1,
+            "LOD 0 should be red"
+        );
 
         // LOD 1 → green (level 1).
         let c1 = sample_texture_lod(&tex, 0.5, 0.5, 1);
-        assert!(c1[0] < 0.1 && c1[1] > 0.9 && c1[2] < 0.1, "LOD 1 should be green");
+        assert!(
+            c1[0] < 0.1 && c1[1] > 0.9 && c1[2] < 0.1,
+            "LOD 1 should be green"
+        );
 
         // LOD 2 → blue (level 2).
         let c2 = sample_texture_lod(&tex, 0.5, 0.5, 2);
-        assert!(c2[0] < 0.1 && c2[1] < 0.1 && c2[2] > 0.9, "LOD 2 should be blue");
+        assert!(
+            c2[0] < 0.1 && c2[1] < 0.1 && c2[2] > 0.9,
+            "LOD 2 should be blue"
+        );
 
         // LOD beyond max → clamped to highest level (blue).
         let c3 = sample_texture_lod(&tex, 0.5, 0.5, 5);
-        assert!(c3[0] < 0.1 && c3[1] < 0.1 && c3[2] > 0.9, "LOD >max should clamp to last level");
+        assert!(
+            c3[0] < 0.1 && c3[1] < 0.1 && c3[2] > 0.9,
+            "LOD >max should clamp to last level"
+        );
     }
 
     #[test]

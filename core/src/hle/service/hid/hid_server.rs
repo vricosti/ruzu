@@ -654,11 +654,6 @@ impl IHidServer {
         let aruid = rp.pop_u64();
 
         let result = server.resource_manager.lock().create_applet_resource(aruid);
-        log::debug!(
-            "IHidServer::CreateAppletResource called, aruid={}, result=0x{:X}",
-            aruid,
-            result.raw()
-        );
 
         let applet_resource: Arc<dyn SessionRequestHandler> =
             Arc::new(super::applet_resource::IAppletResource::new(

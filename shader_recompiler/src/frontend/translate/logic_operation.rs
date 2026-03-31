@@ -16,8 +16,16 @@ pub fn lop(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let inv_b = bit(insn, 40);
     let lop_op = field(insn, 41, 2);
 
-    let a = if inv_a { tv.ir.bitwise_not_32(src_a) } else { src_a };
-    let b = if inv_b { tv.ir.bitwise_not_32(src_b) } else { src_b };
+    let a = if inv_a {
+        tv.ir.bitwise_not_32(src_a)
+    } else {
+        src_a
+    };
+    let b = if inv_b {
+        tv.ir.bitwise_not_32(src_b)
+    } else {
+        src_b
+    };
 
     let result = match lop_op {
         0 => tv.ir.bitwise_and_32(a, b),
@@ -38,7 +46,11 @@ pub fn lop32i(tv: &mut TranslatorVisitor, insn: u64) {
     let lop_op = field(insn, 53, 2);
     let inv_a = bit(insn, 55);
 
-    let a = if inv_a { tv.ir.bitwise_not_32(src_a) } else { src_a };
+    let a = if inv_a {
+        tv.ir.bitwise_not_32(src_a)
+    } else {
+        src_a
+    };
     let b = Value::ImmU32(imm);
 
     let result = match lop_op {

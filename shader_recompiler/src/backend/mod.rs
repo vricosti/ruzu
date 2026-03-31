@@ -53,7 +53,11 @@ impl Default for Profile {
 ///
 /// Returns the SPIR-V words ready to be loaded into a VkShaderModule.
 /// Delegates to `spirv::emit_spirv::emit_spirv`.
-pub fn emit_spirv(program: &ir::Program, profile: &Profile, runtime_info: &RuntimeInfo) -> Vec<u32> {
+pub fn emit_spirv(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+) -> Vec<u32> {
     spirv::emit_spirv::emit_spirv(program, profile, runtime_info)
 }
 
@@ -132,12 +136,13 @@ mod tests {
     #[test]
     fn test_emit_with_cbuf_descriptors() {
         let mut program = ir::Program::new(ShaderStage::Vertex);
-        program.info.constant_buffer_descriptors.push(
-            crate::ir::program::CbufDescriptor {
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(crate::ir::program::CbufDescriptor {
                 index: 0,
                 size: 0x10000,
-            },
-        );
+            });
         program.blocks.push(Block::new());
 
         {

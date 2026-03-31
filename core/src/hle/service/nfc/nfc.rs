@@ -6,8 +6,8 @@
 //!
 //! NFC service registration and inner service classes.
 
-use super::nfc_types::BackendType;
 use super::nfc_interface::NfcInterface;
+use super::nfc_types::BackendType;
 
 /// IPC command table for IUser (NFC::IUser)
 ///

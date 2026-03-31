@@ -10,9 +10,9 @@
 //!   - newly_arrived_event_holder.h / newly_arrived_event_holder.cpp
 //!   - overwrite_event_holder.h / overwrite_event_holder.cpp
 
-pub mod service_creator;
-pub mod news_service;
-pub mod news_database_service;
-pub mod news_data_service;
 pub mod newly_arrived_event_holder;
+pub mod news_data_service;
+pub mod news_database_service;
+pub mod news_service;
 pub mod overwrite_event_holder;
+pub mod service_creator;

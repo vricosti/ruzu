@@ -6,13 +6,13 @@
 //!
 //! IBtmUserCore — BLE user core interface.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// IBtmUserCore.
 ///
@@ -99,11 +99,19 @@ impl SessionRequestHandler for IBtmUserCore {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
-    fn service_name(&self) -> &str { "IBtmUserCore" }
+    fn service_name(&self) -> &str {
+        "IBtmUserCore"
+    }
 }
 
 impl ServiceFramework for IBtmUserCore {
-    fn get_service_name(&self) -> &str { "IBtmUserCore" }
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+    fn get_service_name(&self) -> &str {
+        "IBtmUserCore"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }

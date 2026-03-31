@@ -99,15 +99,12 @@ impl KThreadLocalPage {
 
     /// Get the address of region `i`.
     fn get_region_address(&self, i: usize) -> KProcessAddress {
-        KProcessAddress::new(
-            self.virt_addr.get() + (i * THREAD_LOCAL_REGION_SIZE) as u64,
-        )
+        KProcessAddress::new(self.virt_addr.get() + (i * THREAD_LOCAL_REGION_SIZE) as u64)
     }
 
     /// Check if `addr` falls within this page.
     fn contains(&self, addr: KProcessAddress) -> bool {
-        self.virt_addr.get() <= addr.get()
-            && addr.get() < self.virt_addr.get() + PAGE_SIZE as u64
+        self.virt_addr.get() <= addr.get() && addr.get() < self.virt_addr.get() + PAGE_SIZE as u64
     }
 
     /// Get the region index for a given address.

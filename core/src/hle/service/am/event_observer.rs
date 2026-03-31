@@ -105,9 +105,11 @@ impl EventObserver {
             .set_user_data(UserDataTag::AppletProcess as usize);
 
         let mut state = self.shared.state.lock().unwrap();
-        if state.process_holder_list.iter().any(|existing| {
-            Arc::ptr_eq(existing.get_process(), holder.get_process())
-        }) {
+        if state
+            .process_holder_list
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing.get_process(), holder.get_process()))
+        {
             return;
         }
 
@@ -174,10 +176,7 @@ impl EventObserver {
                 let (applet, process_running, terminated) = {
                     let mut state = shared.state.lock().unwrap();
                     let Some(index) = state.process_holder_list.iter().position(|candidate| {
-                        std::ptr::eq(
-                            candidate.get_multi_wait_holder(),
-                            unsafe { &*holder },
-                        )
+                        std::ptr::eq(candidate.get_multi_wait_holder(), unsafe { &*holder })
                     }) else {
                         return;
                     };
@@ -198,8 +197,7 @@ impl EventObserver {
                     if terminated {
                         state.process_holder_list.remove(index);
                     } else {
-                        let deferred_wait_list =
-                            &mut state.deferred_wait_list as *mut MultiWait;
+                        let deferred_wait_list = &mut state.deferred_wait_list as *mut MultiWait;
                         process.lock().unwrap().reset();
                         state.process_holder_list[index]
                             .get_multi_wait_holder_mut()

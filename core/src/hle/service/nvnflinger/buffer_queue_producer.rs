@@ -14,34 +14,185 @@
 //! The struct and method signatures are fully ported; method bodies that
 //! require complex interactions with other subsystems use todo!().
 
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+
+use crate::hle::kernel::k_event::KEvent;
+use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::kernel::k_scheduler::KScheduler;
 
 use super::binder::IBinder;
 use super::buffer_queue_core::BufferQueueCore;
 use super::graphic_buffer_producer::{QueueBufferInput, QueueBufferOutput};
 use super::parcel::{InputParcel, OutputParcel};
 use super::pixel_format::PixelFormat;
+use super::producer_listener::IProducerListener;
 use super::status::Status;
 use super::ui::fence::Fence;
 use super::ui::graphic_buffer::{GraphicBuffer, NvGraphicBuffer};
-use super::window::{NativeWindow, NativeWindowApi};
-use super::producer_listener::IProducerListener;
+use super::window::{NativeWindow, NativeWindowApi, NativeWindowScalingMode};
 
 pub struct BufferQueueProducer {
     core: Arc<BufferQueueCore>,
-    sticky_transform: u32,
-    next_callback_ticket: i32,
-    current_callback_ticket: i32,
+    buffer_wait_event: Arc<Mutex<KEvent>>,
+    buffer_wait_readable_event: Arc<Mutex<KReadableEvent>>,
+    buffer_wait_event_owner: Mutex<Option<BufferWaitEventOwner>>,
+    sticky_transform: Mutex<u32>,
+    next_callback_ticket: Mutex<i32>,
+    current_callback_ticket: Mutex<i32>,
+    callback_condition: Condvar,
+}
+
+struct BufferWaitEventOwner {
+    process: Weak<Mutex<KProcess>>,
+    scheduler: Weak<Mutex<KScheduler>>,
 }
 
 impl BufferQueueProducer {
     pub fn new(core: Arc<BufferQueueCore>) -> Self {
+        let (buffer_wait_event, buffer_wait_readable_event) = Self::new_buffer_wait_event();
         Self {
             core,
-            sticky_transform: 0,
-            next_callback_ticket: 0,
-            current_callback_ticket: 0,
+            buffer_wait_event,
+            buffer_wait_readable_event,
+            buffer_wait_event_owner: Mutex::new(None),
+            sticky_transform: Mutex::new(0),
+            next_callback_ticket: Mutex::new(0),
+            current_callback_ticket: Mutex::new(0),
+            callback_condition: Condvar::new(),
         }
+    }
+
+    fn new_buffer_wait_event() -> (Arc<Mutex<KEvent>>, Arc<Mutex<KReadableEvent>>) {
+        static NEXT_EVENT_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0x2100_0000);
+
+        let event_object_id = NEXT_EVENT_ID.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        let readable_object_id = event_object_id + 1;
+        let event = Arc::new(Mutex::new(KEvent::new()));
+        let readable_event = Arc::new(Mutex::new(KReadableEvent::new()));
+        readable_event
+            .lock()
+            .unwrap()
+            .initialize(event_object_id, readable_object_id);
+        event.lock().unwrap().initialize(0, readable_object_id);
+        (event, readable_event)
+    }
+
+    fn signal_buffer_wait_event(&self) {
+        let owner = self.buffer_wait_event_owner.lock().unwrap();
+        let maybe_process = owner.as_ref().and_then(|owner| owner.process.upgrade());
+        let maybe_scheduler = owner.as_ref().and_then(|owner| owner.scheduler.upgrade());
+        drop(owner);
+
+        if let (Some(process), Some(scheduler)) = (maybe_process, maybe_scheduler) {
+            let mut process = process.lock().unwrap();
+            self.buffer_wait_event
+                .lock()
+                .unwrap()
+                .signal(&mut process, &scheduler);
+        } else {
+            self.buffer_wait_readable_event.lock().unwrap().is_signaled = true;
+        }
+    }
+
+    fn wait_for_free_slot_then_relock<'a>(
+        &self,
+        async_flag: bool,
+        found: &mut i32,
+        return_flags: &mut i32,
+        mut inner: std::sync::MutexGuard<'a, super::buffer_queue_core::BufferQueueCoreInner>,
+    ) -> (
+        Status,
+        std::sync::MutexGuard<'a, super::buffer_queue_core::BufferQueueCoreInner>,
+    ) {
+        let mut try_again = true;
+
+        while try_again {
+            if inner.is_abandoned {
+                log::error!("BufferQueueProducer: BufferQueue has been abandoned");
+                return (Status::NoInit, inner);
+            }
+
+            let max_buffer_count = inner.get_max_buffer_count_locked(async_flag);
+            if async_flag
+                && inner.override_max_buffer_count != 0
+                && inner.override_max_buffer_count < max_buffer_count
+            {
+                *found = BufferQueueCore::INVALID_BUFFER_SLOT;
+                return (Status::BadValue, inner);
+            }
+
+            for slot in max_buffer_count as usize..super::buffer_queue_defs::NUM_BUFFER_SLOTS {
+                debug_assert!(
+                    inner.slots[slot].buffer_state == super::buffer_slot::BufferState::Free
+                );
+                if inner.slots[slot].graphic_buffer.is_some()
+                    && inner.slots[slot].buffer_state == super::buffer_slot::BufferState::Free
+                    && !inner.slots[slot].is_preallocated
+                {
+                    inner.free_buffer_locked(slot as i32);
+                    *return_flags |= Status::RELEASE_ALL_BUFFERS as i32;
+                }
+            }
+
+            *found = BufferQueueCore::INVALID_BUFFER_SLOT;
+            let mut dequeued_count = 0;
+            let mut acquired_count = 0;
+            for slot in 0..max_buffer_count as usize {
+                match inner.slots[slot].buffer_state {
+                    super::buffer_slot::BufferState::Dequeued => {
+                        dequeued_count += 1;
+                    }
+                    super::buffer_slot::BufferState::Acquired => {
+                        acquired_count += 1;
+                    }
+                    super::buffer_slot::BufferState::Free => {
+                        if *found == BufferQueueCore::INVALID_BUFFER_SLOT
+                            || inner.slots[slot].frame_number
+                                < inner.slots[*found as usize].frame_number
+                        {
+                            *found = slot as i32;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if inner.override_max_buffer_count == 0 && dequeued_count != 0 {
+                log::error!(
+                    "BufferQueueProducer: can't dequeue multiple buffers without setting the buffer count"
+                );
+                return (Status::InvalidOperation, inner);
+            }
+
+            if inner.buffer_has_been_queued {
+                let new_undequeued_count = max_buffer_count - (dequeued_count + 1);
+                let min_undequeued_count = inner.get_min_undequeued_buffer_count_locked(async_flag);
+                if new_undequeued_count < min_undequeued_count {
+                    log::error!(
+                        "BufferQueueProducer: min undequeued buffer count({}) exceeded (dequeued={} undequeued={})",
+                        min_undequeued_count,
+                        dequeued_count,
+                        new_undequeued_count
+                    );
+                    return (Status::InvalidOperation, inner);
+                }
+            }
+
+            let too_many_buffers = inner.queue.len() > max_buffer_count as usize;
+            try_again = (*found == BufferQueueCore::INVALID_BUFFER_SLOT) || too_many_buffers;
+            if try_again {
+                if inner.dequeue_buffer_cannot_block
+                    && acquired_count <= inner.max_acquired_buffer_count
+                {
+                    return (Status::WouldBlock, inner);
+                }
+                inner = self.core.wait_for_dequeue_condition(inner);
+            }
+        }
+
+        (Status::NoError, inner)
     }
 
     pub fn request_buffer(&self, slot: i32) -> (Status, Option<Arc<GraphicBuffer>>) {
@@ -53,6 +204,15 @@ impl BufferQueueProducer {
         if slot < 0 || slot as usize >= super::buffer_queue_defs::NUM_BUFFER_SLOTS {
             log::error!("BufferQueueProducer: slot {} out of range", slot);
             return (Status::BadValue, None);
+        } else if inner.slots[slot as usize].buffer_state
+            != super::buffer_slot::BufferState::Dequeued
+        {
+            log::error!(
+                "BufferQueueProducer: slot {} is not owned by producer (state={:?})",
+                slot,
+                inner.slots[slot as usize].buffer_state
+            );
+            return (Status::BadValue, None);
         }
         inner.slots[slot as usize].request_buffer_called = true;
         let buf = inner.slots[slot as usize].graphic_buffer.clone();
@@ -60,8 +220,12 @@ impl BufferQueueProducer {
     }
 
     pub fn set_buffer_count(&self, buffer_count: i32) -> Status {
-        log::debug!("BufferQueueProducer::set_buffer_count count={}", buffer_count);
+        log::debug!(
+            "BufferQueueProducer::set_buffer_count count={}",
+            buffer_count
+        );
         let mut inner = self.core.mutex.lock().unwrap();
+        inner.wait_while_allocating_locked();
 
         if inner.is_abandoned {
             log::error!("BufferQueueProducer: BufferQueue has been abandoned");
@@ -69,14 +233,49 @@ impl BufferQueueProducer {
         }
 
         if buffer_count > super::buffer_queue_defs::NUM_BUFFER_SLOTS as i32 {
-            log::error!("BufferQueueProducer: buffer_count {} too large", buffer_count);
+            log::error!(
+                "BufferQueueProducer: buffer_count {} too large",
+                buffer_count
+            );
             return Status::BadValue;
         }
 
+        for slot in 0..super::buffer_queue_defs::NUM_BUFFER_SLOTS {
+            if inner.slots[slot].buffer_state == super::buffer_slot::BufferState::Dequeued {
+                log::error!("BufferQueueProducer: buffer owned by producer");
+                return Status::BadValue;
+            }
+        }
+
+        if buffer_count == 0 {
+            inner.override_max_buffer_count = 0;
+            drop(inner);
+            self.core.signal_dequeue_condition();
+            return Status::NoError;
+        }
+
+        let min_buffer_slots = inner.get_min_max_buffer_count_locked(false);
+        if buffer_count < min_buffer_slots {
+            log::error!(
+                "BufferQueueProducer: requested buffer count {} is less than minimum {}",
+                buffer_count,
+                min_buffer_slots
+            );
+            return Status::BadValue;
+        }
+
+        if inner.get_preallocated_buffer_count_locked() <= 0 {
+            inner.free_all_buffers_locked();
+        }
+
         inner.override_max_buffer_count = buffer_count;
-        inner.free_all_buffers_locked();
+        let listener = inner.consumer_listener.clone();
         drop(inner);
         self.core.signal_dequeue_condition();
+        self.signal_buffer_wait_event();
+        if let Some(listener) = listener {
+            listener.on_buffers_released();
+        }
 
         Status::NoError
     }
@@ -84,66 +283,134 @@ impl BufferQueueProducer {
     pub fn dequeue_buffer(
         &self,
         async_flag: bool,
-        width: u32,
-        height: u32,
-        _format: PixelFormat,
-        _usage: u32,
-    ) -> (Status, i32, Fence) {
-        let mut inner = self.core.mutex.lock().unwrap();
-
-        if inner.is_abandoned {
-            return (Status::NoInit, -1, Fence::default());
+        mut width: u32,
+        mut height: u32,
+        mut format: PixelFormat,
+        mut usage: u32,
+    ) -> (i32, i32, Fence) {
+        if (width != 0 && height == 0) || (width == 0 && height != 0) {
+            log::error!(
+                "BufferQueueProducer: invalid size: w={} h={}",
+                width,
+                height
+            );
+            return (Status::BadValue as i32, -1, Fence::default());
         }
 
-        let max_buffer_count = inner.get_max_buffer_count_locked(async_flag);
+        let mut return_flags = Status::NoError as i32;
+        let attached_by_consumer;
+        let out_slot;
+        let out_fence;
+        {
+            let mut inner = self.core.mutex.lock().unwrap();
+            inner.wait_while_allocating_locked();
 
-        // Find a free slot with a graphic buffer (preallocated).
-        // Upstream: WaitForFreeSlotThenRelock picks the oldest free buffer.
-        let mut found: i32 = -1;
-        for s in 0..(max_buffer_count as usize) {
-            if inner.slots[s].buffer_state == super::buffer_slot::BufferState::Free
-                && inner.slots[s].graphic_buffer.is_some()
-            {
-                if found == -1
-                    || inner.slots[s].frame_number < inner.slots[found as usize].frame_number
-                {
-                    found = s as i32;
+            if format == PixelFormat::NoFormat {
+                format = inner.default_buffer_format;
+            }
+            usage |= inner.consumer_usage_bit;
+
+            let mut found = 0;
+            let (status, mut inner) = self.wait_for_free_slot_then_relock(
+                async_flag,
+                &mut found,
+                &mut return_flags,
+                inner,
+            );
+            if status != Status::NoError {
+                return (status as i32, -1, Fence::default());
+            }
+
+            if found == BufferQueueCore::INVALID_BUFFER_SLOT {
+                log::error!("BufferQueueProducer: no available buffer slots");
+                return (Status::Busy as i32, -1, Fence::default());
+            }
+
+            out_slot = found;
+            attached_by_consumer = inner.slots[found as usize].attached_by_consumer;
+
+            if width == 0 && height == 0 {
+                width = inner.default_width;
+                height = inner.default_height;
+            }
+
+            inner.slots[found as usize].buffer_state = super::buffer_slot::BufferState::Dequeued;
+
+            let needs_reallocation = match inner.slots[found as usize].graphic_buffer.as_ref() {
+                Some(buffer) => {
+                    buffer.get_width() != width
+                        || buffer.get_height() != height
+                        || buffer.get_format() != format
+                        || (buffer.get_usage() & usage) != usage
                 }
+                None => true,
+            };
+
+            if needs_reallocation {
+                inner.slots[found as usize].acquire_called = false;
+                inner.slots[found as usize].graphic_buffer = None;
+                inner.slots[found as usize].request_buffer_called = false;
+                inner.slots[found as usize].fence = Fence::no_fence();
+                return_flags |= Status::BUFFER_NEEDS_REALLOCATION as i32;
+            }
+
+            out_fence = inner.slots[found as usize].fence;
+            inner.slots[found as usize].fence = Fence::no_fence();
+        }
+
+        if (return_flags & Status::BUFFER_NEEDS_REALLOCATION as i32) != 0 {
+            log::debug!(
+                "BufferQueueProducer::dequeue_buffer allocating a new buffer for slot {}",
+                out_slot
+            );
+            let graphic_buffer = Arc::new(GraphicBuffer::new(width, height, format, usage));
+            {
+                let mut inner = self.core.mutex.lock().unwrap();
+                if inner.is_abandoned {
+                    log::error!("BufferQueueProducer: BufferQueue has been abandoned");
+                    return (Status::NoInit as i32, -1, Fence::default());
+                }
+                inner.slots[out_slot as usize].frame_number = u32::MAX as u64;
+                inner.slots[out_slot as usize].graphic_buffer = Some(graphic_buffer);
             }
         }
 
-        if found == -1 {
-            // No free buffers — upstream would block via condition variable.
-            // Return WouldBlock so the caller can retry.
-            return (Status::WouldBlock, -1, Fence::default());
+        if attached_by_consumer {
+            return_flags |= Status::BUFFER_NEEDS_REALLOCATION as i32;
         }
 
-        let s = found as usize;
-        inner.slots[s].buffer_state = super::buffer_slot::BufferState::Dequeued;
-
-        // Use default size if width/height are 0.
-        let _w = if width == 0 { inner.default_width } else { width };
-        let _h = if height == 0 { inner.default_height } else { height };
-
-        let fence = inner.slots[s].fence;
-        inner.slots[s].fence = Fence::no_fence();
-
-        log::debug!("BufferQueueProducer::dequeue_buffer -> slot={}", found);
-        (Status::NoError, found, fence)
+        log::debug!(
+            "BufferQueueProducer::dequeue_buffer returning slot={} flags={}",
+            out_slot,
+            return_flags
+        );
+        (return_flags, out_slot, out_fence)
     }
 
-    pub fn queue_buffer(
-        &self,
-        slot: i32,
-        input: &QueueBufferInput,
-    ) -> (Status, QueueBufferOutput) {
+    pub fn queue_buffer(&self, slot: i32, input: &QueueBufferInput) -> (Status, QueueBufferOutput) {
+        match input.scaling_mode {
+            NativeWindowScalingMode::Freeze
+            | NativeWindowScalingMode::ScaleToWindow
+            | NativeWindowScalingMode::ScaleCrop
+            | NativeWindowScalingMode::NoScaleCrop
+            | NativeWindowScalingMode::PreserveAspectRatio => {}
+        }
+
         let mut inner = self.core.mutex.lock().unwrap();
 
         if inner.is_abandoned {
             return (Status::NoInit, QueueBufferOutput::new());
         }
 
-        if slot < 0 || slot as usize >= super::buffer_queue_defs::NUM_BUFFER_SLOTS {
+        let max_buffer_count = inner.get_max_buffer_count_locked(input.async_flag != 0);
+        if input.async_flag != 0
+            && inner.override_max_buffer_count != 0
+            && inner.override_max_buffer_count < max_buffer_count
+        {
+            return (Status::BadValue, QueueBufferOutput::new());
+        }
+
+        if slot < 0 || slot >= max_buffer_count {
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
@@ -151,18 +418,17 @@ impl BufferQueueProducer {
         if inner.slots[s].buffer_state != super::buffer_slot::BufferState::Dequeued {
             log::error!(
                 "BufferQueueProducer::queue_buffer: slot {} not dequeued (state={:?})",
-                slot, inner.slots[s].buffer_state
+                slot,
+                inner.slots[s].buffer_state
             );
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
-        // Transition to Queued.
         inner.slots[s].buffer_state = super::buffer_slot::BufferState::Queued;
         inner.slots[s].fence = input.fence;
         inner.frame_counter += 1;
         inner.slots[s].frame_number = inner.frame_counter;
 
-        // Push to the FIFO queue for the consumer.
         let gb = inner.slots[s].graphic_buffer.clone();
         let frame_num = inner.frame_counter;
         let item = super::buffer_item::BufferItem {
@@ -176,11 +442,53 @@ impl BufferQueueProducer {
             is_auto_timestamp: input.is_auto_timestamp != 0,
             frame_number: frame_num,
             swap_interval: input.swap_interval,
-            is_droppable: false,
+            is_droppable: inner.dequeue_buffer_cannot_block || input.async_flag != 0,
             acquire_called: false,
             transform_to_display_inverse: false,
         };
-        inner.queue.push(item);
+        let mut callback_item = super::buffer_item::BufferItem {
+            graphic_buffer: item.graphic_buffer.clone(),
+            fence: item.fence,
+            crop: item.crop,
+            transform: item.transform,
+            scaling_mode: item.scaling_mode,
+            timestamp: item.timestamp,
+            is_auto_timestamp: item.is_auto_timestamp,
+            frame_number: item.frame_number,
+            slot: item.slot,
+            is_droppable: item.is_droppable,
+            acquire_called: item.acquire_called,
+            transform_to_display_inverse: item.transform_to_display_inverse,
+            swap_interval: item.swap_interval,
+        };
+        let mut frame_available_listener = None;
+        let mut frame_replaced_listener = None;
+
+        *self.sticky_transform.lock().unwrap() = input.sticky_transform;
+
+        if inner.queue.is_empty() {
+            inner.queue.push(item);
+            frame_available_listener = inner.consumer_listener.clone();
+        } else {
+            let front_is_droppable = inner.queue[0].is_droppable;
+            if front_is_droppable {
+                let (front_slot, front_still_tracking) = {
+                    let front = &inner.queue[0];
+                    (front.slot, inner.still_tracking(front))
+                };
+                if front_still_tracking {
+                    inner.slots[front_slot as usize].buffer_state =
+                        super::buffer_slot::BufferState::Free;
+                    inner.slots[front_slot as usize].frame_number = 0;
+                }
+                inner.queue[0] = item;
+                frame_replaced_listener = inner.consumer_listener.clone();
+            } else {
+                inner.queue.push(item);
+                frame_available_listener = inner.consumer_listener.clone();
+            }
+        }
+        inner.buffer_has_been_queued = true;
 
         let mut output = QueueBufferOutput::new();
         output.inflate(
@@ -190,12 +498,41 @@ impl BufferQueueProducer {
             inner.queue.len() as u32,
         );
 
-        // Upstream: notify consumer (onFrameAvailable).
-        // Signal that a buffer is available for the consumer to acquire.
+        let callback_ticket = {
+            let mut next_callback_ticket = self.next_callback_ticket.lock().unwrap();
+            let ticket = *next_callback_ticket;
+            *next_callback_ticket += 1;
+            ticket
+        };
+
         drop(inner);
         self.core.signal_dequeue_condition();
+        callback_item.graphic_buffer = None;
+        callback_item.slot = super::buffer_item::BufferItem::INVALID_BUFFER_SLOT;
 
-        log::debug!("BufferQueueProducer::queue_buffer slot={} frame={}", slot, self.core.mutex.lock().unwrap().frame_counter);
+        let mut current_callback_ticket = self.current_callback_ticket.lock().unwrap();
+        while callback_ticket != *current_callback_ticket {
+            current_callback_ticket = self
+                .callback_condition
+                .wait(current_callback_ticket)
+                .unwrap();
+        }
+
+        if let Some(listener) = frame_available_listener {
+            listener.on_frame_available(&callback_item);
+        } else if let Some(listener) = frame_replaced_listener {
+            listener.on_frame_replaced(&callback_item);
+        }
+
+        *current_callback_ticket += 1;
+        self.callback_condition.notify_all();
+        drop(current_callback_ticket);
+
+        log::debug!(
+            "BufferQueueProducer::queue_buffer slot={} frame={}",
+            slot,
+            self.core.mutex.lock().unwrap().frame_counter
+        );
         (Status::NoError, output)
     }
 
@@ -212,6 +549,7 @@ impl BufferQueueProducer {
         inner.slots[slot as usize].fence = *fence;
         drop(inner);
         self.core.signal_dequeue_condition();
+        self.signal_buffer_wait_event();
     }
 
     pub fn query(&self, what: NativeWindow) -> (Status, i32) {
@@ -254,12 +592,18 @@ impl BufferQueueProducer {
         }
 
         if inner.connected_api != NativeWindowApi::NoConnectedApi {
-            log::error!("BufferQueueProducer: already connected (api={:?})", inner.connected_api);
+            log::error!(
+                "BufferQueueProducer: already connected (api={:?})",
+                inner.connected_api
+            );
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
         inner.connected_api = api;
         inner.connected_producer_listener = listener;
+        inner.buffer_has_been_queued = false;
+        inner.dequeue_buffer_cannot_block =
+            inner.consumer_controlled_by_app && producer_controlled_by_app;
 
         let mut output = QueueBufferOutput::new();
         output.inflate(
@@ -290,9 +634,11 @@ impl BufferQueueProducer {
 
         inner.connected_api = NativeWindowApi::NoConnectedApi;
         inner.connected_producer_listener = None;
+        inner.queue.clear();
         inner.free_all_buffers_locked();
         drop(inner);
         self.core.signal_dequeue_condition();
+        self.signal_buffer_wait_event();
 
         Status::NoError
     }
@@ -312,17 +658,21 @@ impl BufferQueueProducer {
         inner.free_buffer_locked(slot);
 
         if let Some(buf) = buffer {
-            inner.slots[s].graphic_buffer = Some(Arc::new(GraphicBuffer::from_nv_buffer(*buf, false)));
+            inner.slots[s].graphic_buffer =
+                Some(Arc::new(GraphicBuffer::from_nv_buffer(*buf, false)));
             inner.slots[s].is_preallocated = true;
+            inner.override_max_buffer_count = inner.get_preallocated_buffer_count_locked();
 
             if inner.default_width != buf.get_width() || inner.default_height != buf.get_height() {
                 inner.default_width = buf.get_width();
                 inner.default_height = buf.get_height();
             }
+            inner.default_buffer_format = buf.get_format();
         }
 
         drop(inner);
         self.core.signal_dequeue_condition();
+        self.signal_buffer_wait_event();
 
         Status::NoError
     }
@@ -349,6 +699,7 @@ impl IBinder for BufferQueueProducer {
         }
 
         let mut status = Status::NoError;
+        let mut raw_status: Option<i32> = None;
         let mut parcel_in = InputParcel::new(parcel_data);
         let mut parcel_out = OutputParcel::new();
 
@@ -387,7 +738,20 @@ impl IBinder for BufferQueueProducer {
 
                 let (new_status, slot, fence) =
                     self.dequeue_buffer(is_async, width, height, pixel_format, usage);
-                status = new_status;
+                raw_status = Some(new_status);
+                status = match new_status {
+                    0 => Status::NoError,
+                    1 => Status::BUFFER_NEEDS_REALLOCATION,
+                    2 => Status::RELEASE_ALL_BUFFERS,
+                    3 => Status::BUFFER_NEEDS_REALLOCATION,
+                    -11 => Status::WouldBlock,
+                    -12 => Status::NoMemory,
+                    -16 => Status::Busy,
+                    -19 => Status::NoInit,
+                    -22 => Status::BadValue,
+                    -38 => Status::InvalidOperation,
+                    _ => Status::NoError,
+                };
                 parcel_out.write(&slot);
                 parcel_out.write_flattened_object(Some(&fence));
             }
@@ -443,7 +807,10 @@ impl IBinder for BufferQueueProducer {
                         parcel_out.write(&value);
                     }
                     _ => {
-                        log::error!("BufferQueueProducer::transact Query unknown what={}", what_raw);
+                        log::error!(
+                            "BufferQueueProducer::transact Query unknown what={}",
+                            what_raw
+                        );
                         status = Status::BadValue;
                     }
                 }
@@ -470,7 +837,10 @@ impl IBinder for BufferQueueProducer {
             x if x == TransactionId::DetachBuffer as u32 => {
                 let slot = parcel_in.read::<i32>();
                 status = Status::BadValue;
-                log::warn!("BufferQueueProducer::transact DetachBuffer(slot={}) unimplemented", slot);
+                log::warn!(
+                    "BufferQueueProducer::transact DetachBuffer(slot={}) unimplemented",
+                    slot
+                );
             }
             x if x == TransactionId::SetBufferCount as u32 => {
                 let buffer_count = parcel_in.read::<i32>();
@@ -497,14 +867,200 @@ impl IBinder for BufferQueueProducer {
             }
         }
 
-        parcel_out.write(&status);
+        let status_to_write = raw_status.unwrap_or(status as i32);
+        parcel_out.write(&status_to_write);
         let serialized = parcel_out.serialize();
         let copy_len = std::cmp::min(parcel_reply.len(), serialized.len());
         parcel_reply[..copy_len].copy_from_slice(&serialized[..copy_len]);
     }
 
-    fn get_native_handle(&self, type_id: u32) -> Option<u32> {
-        log::warn!("BufferQueueProducer::get_native_handle type_id={} (STUBBED)", type_id);
-        None
+    fn get_native_handle(&self, _type_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
+        Some(Arc::clone(&self.buffer_wait_readable_event))
+    }
+
+    fn register_native_handle_owner(
+        &self,
+        process: Arc<Mutex<KProcess>>,
+        scheduler: Arc<Mutex<KScheduler>>,
+    ) {
+        {
+            let mut process_guard = process.lock().unwrap();
+            let event_object_id = self
+                .buffer_wait_readable_event
+                .lock()
+                .unwrap()
+                .get_parent_id()
+                .unwrap_or(0);
+            let readable_object_id = self.buffer_wait_readable_event.lock().unwrap().object_id;
+
+            self.buffer_wait_event.lock().unwrap().owner_process_id =
+                Some(process_guard.process_id);
+            process_guard
+                .register_event_object(event_object_id, Arc::clone(&self.buffer_wait_event));
+            process_guard.register_readable_event_object(
+                readable_object_id,
+                Arc::clone(&self.buffer_wait_readable_event),
+            );
+        }
+
+        *self.buffer_wait_event_owner.lock().unwrap() = Some(BufferWaitEventOwner {
+            process: Arc::downgrade(&process),
+            scheduler: Arc::downgrade(&scheduler),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::graphic_buffer_producer::QueueBufferInput;
+    use super::super::pixel_format::PixelFormat;
+    use super::*;
+
+    #[test]
+    fn get_native_handle_returns_persistent_buffer_wait_event() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(core);
+
+        let first = producer.get_native_handle(0).unwrap();
+        let second = producer.get_native_handle(15).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn connect_sets_nonblocking_flag_from_core_and_producer_control() {
+        let core = BufferQueueCore::new();
+        core.mutex.lock().unwrap().consumer_controlled_by_app = true;
+        let producer = BufferQueueProducer::new(core.clone());
+
+        let (status, _) = producer.connect(None, NativeWindowApi::Egl, true);
+        assert_eq!(status, Status::NoError);
+        assert!(core.mutex.lock().unwrap().dequeue_buffer_cannot_block);
+    }
+
+    #[test]
+    fn disconnect_signals_buffer_wait_event() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(core);
+        let event = producer.get_native_handle(0).unwrap();
+        assert!(!event.lock().unwrap().is_signaled());
+
+        let (status, _) = producer.connect(None, NativeWindowApi::Egl, false);
+        assert_eq!(status, Status::NoError);
+        assert_eq!(producer.disconnect(NativeWindowApi::Egl), Status::NoError);
+
+        assert!(event.lock().unwrap().is_signaled());
+    }
+
+    #[test]
+    fn set_preallocated_buffer_signals_wait_event_and_updates_defaults() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(core.clone());
+        let event = producer.get_native_handle(0).unwrap();
+        let buffer = Arc::new(NvGraphicBuffer::new(1280, 720, PixelFormat::Rgba8888, 0));
+
+        assert_eq!(
+            producer.set_preallocated_buffer(0, Some(buffer)),
+            Status::NoError
+        );
+        assert!(event.lock().unwrap().is_signaled());
+
+        let inner = core.mutex.lock().unwrap();
+        assert_eq!(inner.default_width, 1280);
+        assert_eq!(inner.default_height, 720);
+        assert_eq!(inner.override_max_buffer_count, 1);
+    }
+
+    #[test]
+    fn queue_buffer_marks_core_as_having_queued_buffers() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(core.clone());
+        let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
+        assert_eq!(
+            producer.set_preallocated_buffer(0, Some(buffer)),
+            Status::NoError
+        );
+
+        let (status, slot, _fence) =
+            producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
+        assert_eq!(status, Status::NoError as i32);
+        assert_eq!(slot, 0);
+
+        let (status, _) = producer.queue_buffer(slot, &QueueBufferInput::default());
+        assert_eq!(status, Status::NoError);
+        assert!(core.mutex.lock().unwrap().buffer_has_been_queued);
+    }
+
+    #[test]
+    fn request_buffer_rejects_slot_not_owned_by_producer() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(core.clone());
+        core.mutex.lock().unwrap().slots[0].graphic_buffer = Some(Arc::new(GraphicBuffer::new(
+            16,
+            16,
+            PixelFormat::Rgba8888,
+            0,
+        )));
+
+        let (status, buffer) = producer.request_buffer(0);
+        assert_eq!(status, Status::BadValue);
+        assert!(buffer.is_none());
+    }
+
+    #[test]
+    fn dequeue_buffer_requires_explicit_buffer_count_for_second_dequeue() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(core.clone());
+        assert_eq!(
+            producer.set_preallocated_buffer(
+                0,
+                Some(Arc::new(NvGraphicBuffer::new(
+                    16,
+                    16,
+                    PixelFormat::Rgba8888,
+                    0
+                )))
+            ),
+            Status::NoError
+        );
+        assert_eq!(
+            producer.set_preallocated_buffer(
+                1,
+                Some(Arc::new(NvGraphicBuffer::new(
+                    16,
+                    16,
+                    PixelFormat::Rgba8888,
+                    0
+                )))
+            ),
+            Status::NoError
+        );
+
+        let (status, slot, _) = producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
+        assert_eq!(status, Status::NoError as i32);
+        assert_eq!(slot, 0);
+
+        let (status, slot, _) = producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
+        assert_eq!(status, Status::InvalidOperation as i32);
+        assert_eq!(slot, -1);
+    }
+
+    #[test]
+    fn dequeue_buffer_sets_reallocation_flag_for_empty_slot() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(core.clone());
+        core.mutex.lock().unwrap().override_max_buffer_count = 1;
+
+        let (status, slot, _) = producer.dequeue_buffer(false, 32, 32, PixelFormat::Rgba8888, 0);
+        assert_eq!(status, Status::BUFFER_NEEDS_REALLOCATION as i32);
+        assert_eq!(slot, 0);
+
+        let inner = core.mutex.lock().unwrap();
+        assert!(inner.slots[0].graphic_buffer.is_some());
+        assert_eq!(
+            inner.slots[0].buffer_state,
+            super::super::buffer_slot::BufferState::Dequeued
+        );
+        assert!(!inner.slots[0].request_buffer_called);
     }
 }

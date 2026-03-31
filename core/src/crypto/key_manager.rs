@@ -126,20 +126,14 @@ fn read_ticket_data(raw_data: &[u8], data_offset: usize) -> TicketData {
     let mut ticket_data = TicketData::default();
     if raw_data.len() >= data_offset + td_size {
         let dst = unsafe {
-            std::slice::from_raw_parts_mut(
-                &mut ticket_data as *mut TicketData as *mut u8,
-                td_size,
-            )
+            std::slice::from_raw_parts_mut(&mut ticket_data as *mut TicketData as *mut u8, td_size)
         };
         dst.copy_from_slice(&raw_data[data_offset..data_offset + td_size]);
     } else if raw_data.len() > data_offset {
         // Partial copy - some tools provide short ticket data
         let available = raw_data.len() - data_offset;
         let dst = unsafe {
-            std::slice::from_raw_parts_mut(
-                &mut ticket_data as *mut TicketData as *mut u8,
-                td_size,
-            )
+            std::slice::from_raw_parts_mut(&mut ticket_data as *mut TicketData as *mut u8, td_size)
         };
         dst[..available].copy_from_slice(&raw_data[data_offset..]);
     }
@@ -203,12 +197,7 @@ impl Ticket {
             return Ticket::Invalid;
         }
 
-        let sig_type_val = u32::from_le_bytes([
-            raw_data[0],
-            raw_data[1],
-            raw_data[2],
-            raw_data[3],
-        ]);
+        let sig_type_val = u32::from_le_bytes([raw_data[0], raw_data[1], raw_data[2], raw_data[3]]);
 
         match sig_type_val {
             // RSA-4096 types
@@ -395,8 +384,8 @@ pub enum SourceKeyType {
     AESKeyGeneration = 2,
     RSAOaepKekGeneration = 3,
     Master = 4,
-    Keyblob = 5,     // f2=crypto revision
-    KeyAreaKey = 6,   // f2=KeyAreaKeyType
+    Keyblob = 5,    // f2=crypto revision
+    KeyAreaKey = 6, // f2=KeyAreaKeyType
     Titlekek = 7,
     Package2 = 8,
     HeaderKek = 9,
@@ -442,33 +431,153 @@ pub struct KeyIndex<T: Ord> {
 /// Port of upstream `s128_file_id`.
 const S128_FILE_ID: &[(&str, S128KeyType, u64, u64)] = &[
     ("eticket_rsa_kek", S128KeyType::ETicketRSAKek, 0, 0),
-    ("eticket_rsa_kek_source", S128KeyType::Source, SourceKeyType::ETicketKek as u64, 0),
-    ("eticket_rsa_kekek_source", S128KeyType::Source, SourceKeyType::ETicketKekek as u64, 0),
-    ("rsa_kek_mask_0", S128KeyType::RSAKek, RSAKekType::Mask0 as u64, 0),
-    ("rsa_kek_seed_3", S128KeyType::RSAKek, RSAKekType::Seed3 as u64, 0),
-    ("rsa_oaep_kek_generation_source", S128KeyType::Source, SourceKeyType::RSAOaepKekGeneration as u64, 0),
-    ("sd_card_kek_source", S128KeyType::Source, SourceKeyType::SDKek as u64, 0),
-    ("aes_kek_generation_source", S128KeyType::Source, SourceKeyType::AESKekGeneration as u64, 0),
-    ("aes_key_generation_source", S128KeyType::Source, SourceKeyType::AESKeyGeneration as u64, 0),
-    ("package2_key_source", S128KeyType::Source, SourceKeyType::Package2 as u64, 0),
-    ("master_key_source", S128KeyType::Source, SourceKeyType::Master as u64, 0),
-    ("header_kek_source", S128KeyType::Source, SourceKeyType::HeaderKek as u64, 0),
-    ("key_area_key_application_source", S128KeyType::Source, SourceKeyType::KeyAreaKey as u64, KeyAreaKeyType::Application as u64),
-    ("key_area_key_ocean_source", S128KeyType::Source, SourceKeyType::KeyAreaKey as u64, KeyAreaKeyType::Ocean as u64),
-    ("key_area_key_system_source", S128KeyType::Source, SourceKeyType::KeyAreaKey as u64, KeyAreaKeyType::System as u64),
-    ("titlekek_source", S128KeyType::Source, SourceKeyType::Titlekek as u64, 0),
-    ("keyblob_mac_key_source", S128KeyType::Source, SourceKeyType::KeyblobMAC as u64, 0),
+    (
+        "eticket_rsa_kek_source",
+        S128KeyType::Source,
+        SourceKeyType::ETicketKek as u64,
+        0,
+    ),
+    (
+        "eticket_rsa_kekek_source",
+        S128KeyType::Source,
+        SourceKeyType::ETicketKekek as u64,
+        0,
+    ),
+    (
+        "rsa_kek_mask_0",
+        S128KeyType::RSAKek,
+        RSAKekType::Mask0 as u64,
+        0,
+    ),
+    (
+        "rsa_kek_seed_3",
+        S128KeyType::RSAKek,
+        RSAKekType::Seed3 as u64,
+        0,
+    ),
+    (
+        "rsa_oaep_kek_generation_source",
+        S128KeyType::Source,
+        SourceKeyType::RSAOaepKekGeneration as u64,
+        0,
+    ),
+    (
+        "sd_card_kek_source",
+        S128KeyType::Source,
+        SourceKeyType::SDKek as u64,
+        0,
+    ),
+    (
+        "aes_kek_generation_source",
+        S128KeyType::Source,
+        SourceKeyType::AESKekGeneration as u64,
+        0,
+    ),
+    (
+        "aes_key_generation_source",
+        S128KeyType::Source,
+        SourceKeyType::AESKeyGeneration as u64,
+        0,
+    ),
+    (
+        "package2_key_source",
+        S128KeyType::Source,
+        SourceKeyType::Package2 as u64,
+        0,
+    ),
+    (
+        "master_key_source",
+        S128KeyType::Source,
+        SourceKeyType::Master as u64,
+        0,
+    ),
+    (
+        "header_kek_source",
+        S128KeyType::Source,
+        SourceKeyType::HeaderKek as u64,
+        0,
+    ),
+    (
+        "key_area_key_application_source",
+        S128KeyType::Source,
+        SourceKeyType::KeyAreaKey as u64,
+        KeyAreaKeyType::Application as u64,
+    ),
+    (
+        "key_area_key_ocean_source",
+        S128KeyType::Source,
+        SourceKeyType::KeyAreaKey as u64,
+        KeyAreaKeyType::Ocean as u64,
+    ),
+    (
+        "key_area_key_system_source",
+        S128KeyType::Source,
+        SourceKeyType::KeyAreaKey as u64,
+        KeyAreaKeyType::System as u64,
+    ),
+    (
+        "titlekek_source",
+        S128KeyType::Source,
+        SourceKeyType::Titlekek as u64,
+        0,
+    ),
+    (
+        "keyblob_mac_key_source",
+        S128KeyType::Source,
+        SourceKeyType::KeyblobMAC as u64,
+        0,
+    ),
     ("tsec_key", S128KeyType::TSEC, 0, 0),
     ("secure_boot_key", S128KeyType::SecureBoot, 0, 0),
     ("sd_seed", S128KeyType::SDSeed, 0, 0),
-    ("bis_key_0_crypt", S128KeyType::BIS, 0, BISKeyType::Crypto as u64),
-    ("bis_key_0_tweak", S128KeyType::BIS, 0, BISKeyType::Tweak as u64),
-    ("bis_key_1_crypt", S128KeyType::BIS, 1, BISKeyType::Crypto as u64),
-    ("bis_key_1_tweak", S128KeyType::BIS, 1, BISKeyType::Tweak as u64),
-    ("bis_key_2_crypt", S128KeyType::BIS, 2, BISKeyType::Crypto as u64),
-    ("bis_key_2_tweak", S128KeyType::BIS, 2, BISKeyType::Tweak as u64),
-    ("bis_key_3_crypt", S128KeyType::BIS, 3, BISKeyType::Crypto as u64),
-    ("bis_key_3_tweak", S128KeyType::BIS, 3, BISKeyType::Tweak as u64),
+    (
+        "bis_key_0_crypt",
+        S128KeyType::BIS,
+        0,
+        BISKeyType::Crypto as u64,
+    ),
+    (
+        "bis_key_0_tweak",
+        S128KeyType::BIS,
+        0,
+        BISKeyType::Tweak as u64,
+    ),
+    (
+        "bis_key_1_crypt",
+        S128KeyType::BIS,
+        1,
+        BISKeyType::Crypto as u64,
+    ),
+    (
+        "bis_key_1_tweak",
+        S128KeyType::BIS,
+        1,
+        BISKeyType::Tweak as u64,
+    ),
+    (
+        "bis_key_2_crypt",
+        S128KeyType::BIS,
+        2,
+        BISKeyType::Crypto as u64,
+    ),
+    (
+        "bis_key_2_tweak",
+        S128KeyType::BIS,
+        2,
+        BISKeyType::Tweak as u64,
+    ),
+    (
+        "bis_key_3_crypt",
+        S128KeyType::BIS,
+        3,
+        BISKeyType::Crypto as u64,
+    ),
+    (
+        "bis_key_3_tweak",
+        S128KeyType::BIS,
+        3,
+        BISKeyType::Tweak as u64,
+    ),
     ("header_kek", S128KeyType::HeaderKek, 0, 0),
     ("sd_card_kek", S128KeyType::SDKek, 0, 0),
 ];
@@ -477,11 +586,31 @@ const S128_FILE_ID: &[(&str, S128KeyType, u64, u64)] = &[
 /// Port of upstream `s256_file_id`.
 const S256_FILE_ID: &[(&str, S256KeyType, u64, u64)] = &[
     ("header_key", S256KeyType::Header, 0, 0),
-    ("sd_card_save_key_source", S256KeyType::SDKeySource, SDKeyType::Save as u64, 0),
-    ("sd_card_nca_key_source", S256KeyType::SDKeySource, SDKeyType::NCA as u64, 0),
+    (
+        "sd_card_save_key_source",
+        S256KeyType::SDKeySource,
+        SDKeyType::Save as u64,
+        0,
+    ),
+    (
+        "sd_card_nca_key_source",
+        S256KeyType::SDKeySource,
+        SDKeyType::NCA as u64,
+        0,
+    ),
     ("header_key_source", S256KeyType::HeaderSource, 0, 0),
-    ("sd_card_save_key", S256KeyType::SDKey, SDKeyType::Save as u64, 0),
-    ("sd_card_nca_key", S256KeyType::SDKey, SDKeyType::NCA as u64, 0),
+    (
+        "sd_card_save_key",
+        S256KeyType::SDKey,
+        SDKeyType::Save as u64,
+        0,
+    ),
+    (
+        "sd_card_nca_key",
+        S256KeyType::SDKey,
+        SDKeyType::NCA as u64,
+        0,
+    ),
 ];
 
 /// Variable-length 128-bit key names with a trailing hex revision index.
@@ -493,7 +622,11 @@ const KEYS_VARIABLE_LENGTH: &[(S128KeyType, u64, &str)] = &[
     (S128KeyType::Package1, 0, "package1_key_"),
     (S128KeyType::Package2, 0, "package2_key_"),
     (S128KeyType::Titlekek, 0, "titlekek_"),
-    (S128KeyType::Source, SourceKeyType::Keyblob as u64, "keyblob_key_source_"),
+    (
+        S128KeyType::Source,
+        SourceKeyType::Keyblob as u64,
+        "keyblob_key_source_",
+    ),
     (S128KeyType::Keyblob, 0, "keyblob_key_"),
     (S128KeyType::KeyblobMAC, 0, "keyblob_mac_key_"),
 ];
@@ -501,7 +634,10 @@ const KEYS_VARIABLE_LENGTH: &[(S128KeyType, u64, &str)] = &[
 /// Key area key prefixes with their KeyAreaKeyType index.
 /// Port of upstream `kak_names` array.
 const KAK_NAMES: &[(&str, u64)] = &[
-    ("key_area_key_application_", KeyAreaKeyType::Application as u64),
+    (
+        "key_area_key_application_",
+        KeyAreaKeyType::Application as u64,
+    ),
     ("key_area_key_ocean_", KeyAreaKeyType::Ocean as u64),
     ("key_area_key_system_", KeyAreaKeyType::System as u64),
 ];
@@ -573,9 +709,7 @@ fn resolve_keys_dir() -> PathBuf {
 
     // Prefer any directory that actually contains prod.keys or dev.keys.
     // Check primary first, then fallbacks.
-    let has_crypto_keys = |p: &PathBuf| {
-        p.join("prod.keys").exists() || p.join("dev.keys").exists()
-    };
+    let has_crypto_keys = |p: &PathBuf| p.join("prod.keys").exists() || p.join("dev.keys").exists();
 
     if has_crypto_keys(&primary) {
         return primary;
@@ -774,11 +908,7 @@ impl KeyManager {
                 self.write_key_to_file(category, &format!("keyblob_key_{:02X}", field1), &key);
             }
             S128KeyType::KeyblobMAC => {
-                self.write_key_to_file(
-                    category,
-                    &format!("keyblob_mac_key_{:02X}", field1),
-                    &key,
-                );
+                self.write_key_to_file(category, &format!("keyblob_mac_key_{:02X}", field1), &key);
             }
             S128KeyType::Source if field1 == SourceKeyType::Keyblob as u64 => {
                 self.write_key_to_file(
@@ -849,11 +979,7 @@ impl KeyManager {
 
         for i in 0..CURRENT_CRYPTO_REVISION as u64 {
             if !self.has_key_128(S128KeyType::Master, i, 0)
-                || !self.has_key_128(
-                    S128KeyType::KeyArea,
-                    i,
-                    KeyAreaKeyType::Application as u64,
-                )
+                || !self.has_key_128(S128KeyType::KeyArea, i, KeyAreaKeyType::Application as u64)
                 || !self.has_key_128(S128KeyType::KeyArea, i, KeyAreaKeyType::Ocean as u64)
                 || !self.has_key_128(S128KeyType::KeyArea, i, KeyAreaKeyType::System as u64)
                 || !self.has_key_128(S128KeyType::Titlekek, i, 0)
@@ -899,11 +1025,9 @@ impl KeyManager {
         // Find which revisions have keyblob sources and encrypted keyblobs
         let mut revisions = [false; 32];
         for i in 0..32 {
-            revisions[i] = self.has_key_128(
-                S128KeyType::Source,
-                SourceKeyType::Keyblob as u64,
-                i as u64,
-            ) && self.encrypted_keyblobs[i] != [0u8; 0xB0];
+            revisions[i] =
+                self.has_key_128(S128KeyType::Source, SourceKeyType::Keyblob as u64, i as u64)
+                    && self.encrypted_keyblobs[i] != [0u8; 0xB0];
         }
 
         if !revisions.iter().any(|&b| b) {
@@ -919,11 +1043,8 @@ impl KeyManager {
             }
 
             // Derive keyblob key
-            let source = self.get_key_128(
-                S128KeyType::Source,
-                SourceKeyType::Keyblob as u64,
-                i as u64,
-            );
+            let source =
+                self.get_key_128(S128KeyType::Source, SourceKeyType::Keyblob as u64, i as u64);
             let key = derive_keyblob_key(&sbk, &tsec, source);
             self.set_key_128(S128KeyType::Keyblob, key, i as u64, 0);
 
@@ -1015,10 +1136,8 @@ impl KeyManager {
             );
             self.set_key_128(S128KeyType::HeaderKek, header_kek, 0, 0);
 
-            let mut header_cipher = super::aes_util::AesCipher::new_128(
-                header_kek,
-                super::aes_util::Mode::ECB,
-            );
+            let mut header_cipher =
+                super::aes_util::AesCipher::new_128(header_kek, super::aes_util::Mode::ECB);
             let mut out = self.get_key_256(S256KeyType::HeaderSource, 0, 0);
             let src = out;
             header_cipher.transcode(&src, &mut out, super::aes_util::Op::Decrypt);
@@ -1085,20 +1204,10 @@ impl KeyManager {
             );
         }
         if seed3 != [0u8; 16] {
-            self.set_key_128(
-                S128KeyType::RSAKek,
-                seed3,
-                RSAKekType::Seed3 as u64,
-                0,
-            );
+            self.set_key_128(S128KeyType::RSAKek, seed3, RSAKekType::Seed3 as u64, 0);
         }
         if mask0 != [0u8; 16] {
-            self.set_key_128(
-                S128KeyType::RSAKek,
-                mask0,
-                RSAKekType::Mask0 as u64,
-                0,
-            );
+            self.set_key_128(S128KeyType::RSAKek, mask0, RSAKekType::Mask0 as u64, 0);
         }
 
         if eticket_kek == [0u8; 16]
@@ -1133,11 +1242,7 @@ impl KeyManager {
 
         let mut es_master =
             super::aes_util::AesCipher::new_128(master_00, super::aes_util::Mode::ECB);
-        es_master.transcode(
-            &rsa_oaep_kek,
-            &mut temp_kek,
-            super::aes_util::Op::Decrypt,
-        );
+        es_master.transcode(&rsa_oaep_kek, &mut temp_kek, super::aes_util::Op::Decrypt);
         let mut es_kekek =
             super::aes_util::AesCipher::new_128(temp_kek, super::aes_util::Mode::ECB);
         es_kekek.transcode(
@@ -1289,12 +1394,7 @@ impl KeyManager {
         }
 
         if data.has_fuses() {
-            self.set_key_wrapped_128(
-                S128KeyType::SecureBoot,
-                data.get_secure_boot_key(),
-                0,
-                0,
-            );
+            self.set_key_wrapped_128(S128KeyType::SecureBoot, data.get_secure_boot_key(), 0, 0);
         }
 
         self.derive_base();
@@ -1312,9 +1412,7 @@ impl KeyManager {
         // Get TZ master keys
         let masters = data.get_tz_master_keys(latest_master);
         for i in 0..masters.len() {
-            if masters[i] != [0u8; 16]
-                && !self.has_key_128(S128KeyType::Master, i as u64, 0)
-            {
+            if masters[i] != [0u8; 16] && !self.has_key_128(S128KeyType::Master, i as u64, 0) {
                 self.set_key_128(S128KeyType::Master, masters[i], i as u64, 0);
             }
         }
@@ -1329,8 +1427,7 @@ impl KeyManager {
         let mut package2_keys = [[0u8; 16]; 0x20];
         for i in 0..package2_keys.len() {
             if self.has_key_128(S128KeyType::Package2, i as u64, 0) {
-                package2_keys[i] =
-                    self.get_key_128(S128KeyType::Package2, i as u64, 0);
+                package2_keys[i] = self.get_key_128(S128KeyType::Package2, i as u64, 0);
             }
         }
         data.decrypt_package2(
@@ -1426,11 +1523,9 @@ impl KeyManager {
         let rights_id_u128 = ((rights_id_hi as u128) << 64) | (rights_id_lo as u128);
 
         if data.key_type == TitleKeyType::Common {
-            self.common_tickets
-                .insert(rights_id_u128, ticket.clone());
+            self.common_tickets.insert(rights_id_u128, ticket.clone());
         } else {
-            self.personal_tickets
-                .insert(rights_id_u128, ticket.clone());
+            self.personal_tickets.insert(rights_id_u128, ticket.clone());
         }
 
         if self.has_key_128(S128KeyType::Titlekey, rights_id_hi, rights_id_lo) {
@@ -1540,12 +1635,24 @@ impl KeyManager {
                 let rights_id_raw: [u8; 16] = hex_string_to_array(&name);
                 // Interpret as u128 (two u64s in little-endian byte order, matching upstream memcpy)
                 let rights_id_lo = u64::from_le_bytes([
-                    rights_id_raw[0], rights_id_raw[1], rights_id_raw[2], rights_id_raw[3],
-                    rights_id_raw[4], rights_id_raw[5], rights_id_raw[6], rights_id_raw[7],
+                    rights_id_raw[0],
+                    rights_id_raw[1],
+                    rights_id_raw[2],
+                    rights_id_raw[3],
+                    rights_id_raw[4],
+                    rights_id_raw[5],
+                    rights_id_raw[6],
+                    rights_id_raw[7],
                 ]);
                 let rights_id_hi = u64::from_le_bytes([
-                    rights_id_raw[8], rights_id_raw[9], rights_id_raw[10], rights_id_raw[11],
-                    rights_id_raw[12], rights_id_raw[13], rights_id_raw[14], rights_id_raw[15],
+                    rights_id_raw[8],
+                    rights_id_raw[9],
+                    rights_id_raw[10],
+                    rights_id_raw[11],
+                    rights_id_raw[12],
+                    rights_id_raw[13],
+                    rights_id_raw[14],
+                    rights_id_raw[15],
                 ]);
                 let key: Key128 = hex_string_to_array(&value);
                 // Upstream stores: s128_keys[{Titlekey, rights_id[1], rights_id[0]}] = key
@@ -1566,7 +1673,11 @@ impl KeyManager {
                     if value.len() >= 32 {
                         let key: Key128 = hex_string_to_array(&value);
                         self.s128_keys.insert(
-                            KeyIndex { key_type: kt, field1: f1, field2: f2 },
+                            KeyIndex {
+                                key_type: kt,
+                                field1: f1,
+                                field2: f2,
+                            },
                             key,
                         );
                     }
@@ -1578,7 +1689,11 @@ impl KeyManager {
                     if value.len() >= 64 {
                         let key: Key256 = hex_string_to_array(&value);
                         self.s256_keys.insert(
-                            KeyIndex { key_type: kt, field1: f1, field2: f2 },
+                            KeyIndex {
+                                key_type: kt,
+                                field1: f1,
+                                field2: f2,
+                            },
                             key,
                         );
                     }
@@ -1587,8 +1702,7 @@ impl KeyManager {
 
                 // Try keyblob_XX (not keyblob_key_* or keyblob_mac_key_*)
                 if lower_name.starts_with("keyblob_") && !lower_name.starts_with("keyblob_k") {
-                    if valid_crypto_revision_string(&lower_name, 8, 2) && value.len() >= 0x90 * 2
-                    {
+                    if valid_crypto_revision_string(&lower_name, 8, 2) && value.len() >= 0x90 * 2 {
                         let index =
                             u64::from_str_radix(&lower_name[8..10], 16).unwrap_or(0) as usize;
                         if index < 0x20 {
@@ -1600,9 +1714,7 @@ impl KeyManager {
 
                 // Try encrypted_keyblob_XX
                 if lower_name.starts_with("encrypted_keyblob_") {
-                    if valid_crypto_revision_string(&lower_name, 18, 2)
-                        && value.len() >= 0xB0 * 2
-                    {
+                    if valid_crypto_revision_string(&lower_name, 18, 2) && value.len() >= 0xB0 * 2 {
                         let index =
                             u64::from_str_radix(&lower_name[18..20], 16).unwrap_or(0) as usize;
                         if index < 0x20 {
@@ -1642,21 +1754,27 @@ impl KeyManager {
                         continue;
                     }
                     if lower_name.starts_with(prefix) {
-                        let index = u64::from_str_radix(
-                            &lower_name[prefix.len()..prefix.len() + 2],
-                            16,
-                        )
-                        .unwrap_or(0);
+                        let index =
+                            u64::from_str_radix(&lower_name[prefix.len()..prefix.len() + 2], 16)
+                                .unwrap_or(0);
                         if value.len() >= 32 {
                             let key: Key128 = hex_string_to_array(&value);
                             if sub_id == 0 {
                                 self.s128_keys.insert(
-                                    KeyIndex { key_type, field1: index, field2: 0 },
+                                    KeyIndex {
+                                        key_type,
+                                        field1: index,
+                                        field2: 0,
+                                    },
                                     key,
                                 );
                             } else {
                                 self.s128_keys.insert(
-                                    KeyIndex { key_type, field1: sub_id, field2: index },
+                                    KeyIndex {
+                                        key_type,
+                                        field1: sub_id,
+                                        field2: index,
+                                    },
                                     key,
                                 );
                             }
@@ -1808,10 +1926,16 @@ impl KeyManager {
     /// Derive general purpose keys for a given crypto revision.
     /// Corresponds to upstream `KeyManager::DeriveGeneralPurposeKeys`.
     fn derive_general_purpose_keys(&mut self, crypto_revision: usize) {
-        let kek_generation_source =
-            self.get_key_128(S128KeyType::Source, SourceKeyType::AESKekGeneration as u64, 0);
-        let key_generation_source =
-            self.get_key_128(S128KeyType::Source, SourceKeyType::AESKeyGeneration as u64, 0);
+        let kek_generation_source = self.get_key_128(
+            S128KeyType::Source,
+            SourceKeyType::AESKekGeneration as u64,
+            0,
+        );
+        let key_generation_source = self.get_key_128(
+            S128KeyType::Source,
+            SourceKeyType::AESKeyGeneration as u64,
+            0,
+        );
 
         if self.has_key_128(S128KeyType::Master, crypto_revision as u64, 0) {
             for kak_type in [
@@ -1844,15 +1968,13 @@ impl KeyManager {
                 }
             }
 
-            let master_key =
-                self.get_key_128(S128KeyType::Master, crypto_revision as u64, 0);
+            let master_key = self.get_key_128(S128KeyType::Master, crypto_revision as u64, 0);
             let mut master_cipher =
                 super::aes_util::AesCipher::new_128(master_key, super::aes_util::Mode::ECB);
 
             for key_type in [SourceKeyType::Titlekek, SourceKeyType::Package2] {
                 if self.has_key_128(S128KeyType::Source, key_type as u64, 0) {
-                    let source =
-                        self.get_key_128(S128KeyType::Source, key_type as u64, 0);
+                    let source = self.get_key_128(S128KeyType::Source, key_type as u64, 0);
                     let mut key = [0u8; 16];
                     master_cipher.transcode(&source, &mut key, super::aes_util::Op::Decrypt);
                     let target_type = if key_type == SourceKeyType::Titlekek {
@@ -1888,11 +2010,10 @@ impl KeyManager {
             super::aes_util::Op::Decrypt,
         );
 
-        self.eticket_rsa_keypair.decryption_key[..0x100]
-            .copy_from_slice(&extended_dec[..0x100]);
-        self.eticket_rsa_keypair.modulus[..0x100]
-            .copy_from_slice(&extended_dec[0x100..0x200]);
-        self.eticket_rsa_keypair.exponent
+        self.eticket_rsa_keypair.decryption_key[..0x100].copy_from_slice(&extended_dec[..0x100]);
+        self.eticket_rsa_keypair.modulus[..0x100].copy_from_slice(&extended_dec[0x100..0x200]);
+        self.eticket_rsa_keypair
+            .exponent
             .copy_from_slice(&extended_dec[0x200..0x204]);
     }
 
@@ -2031,7 +2152,11 @@ pub fn decrypt_keyblob(encrypted_keyblob: &[u8; 0xB0], key: &Key128) -> [u8; 0x9
     let mut keyblob = [0u8; 0x90];
     let mut cipher = AesCipher::new_128(*key, Mode::CTR);
     cipher.set_iv(&encrypted_keyblob[0x10..0x20]);
-    cipher.transcode(&encrypted_keyblob[0x20..0x20 + 0x90], &mut keyblob, Op::Decrypt);
+    cipher.transcode(
+        &encrypted_keyblob[0x20..0x20 + 0x90],
+        &mut keyblob,
+        Op::Decrypt,
+    );
     keyblob
 }
 
@@ -2121,13 +2246,11 @@ fn calculate_cmac(source: &[u8], key: &Key128) -> [u8; 16] {
 /// Attempt to derive the SD seed. Port of upstream DeriveSDSeed.
 /// Reads system save 8000000000000043 and Nintendo/Contents/private from NAND/SDMC.
 pub fn derive_sd_seed() -> Option<Key128> {
-    let system_save_43_path =
-        get_ruzu_path(RuzuPath::NANDDir).join("system/save/8000000000000043");
+    let system_save_43_path = get_ruzu_path(RuzuPath::NANDDir).join("system/save/8000000000000043");
 
     let save_43_data = std::fs::read(&system_save_43_path).ok()?;
 
-    let sd_private_path =
-        get_ruzu_path(RuzuPath::SDMCDir).join("Nintendo/Contents/private");
+    let sd_private_path = get_ruzu_path(RuzuPath::SDMCDir).join("Nintendo/Contents/private");
 
     let sd_private_data = std::fs::read(&sd_private_path).ok()?;
 
@@ -2166,22 +2289,34 @@ pub fn derive_sd_keys(
     if !keys.has_key_128(S128KeyType::Source, SourceKeyType::SDKek as u64, 0) {
         return Err("ErrorMissingSDKEKSource");
     }
-    if !keys.has_key_128(S128KeyType::Source, SourceKeyType::AESKekGeneration as u64, 0) {
+    if !keys.has_key_128(
+        S128KeyType::Source,
+        SourceKeyType::AESKekGeneration as u64,
+        0,
+    ) {
         return Err("ErrorMissingAESKEKGenerationSource");
     }
-    if !keys.has_key_128(S128KeyType::Source, SourceKeyType::AESKeyGeneration as u64, 0) {
+    if !keys.has_key_128(
+        S128KeyType::Source,
+        SourceKeyType::AESKeyGeneration as u64,
+        0,
+    ) {
         return Err("ErrorMissingAESKeyGenerationSource");
     }
 
-    let sd_kek_source =
-        keys.get_key_128(S128KeyType::Source, SourceKeyType::SDKek as u64, 0);
-    let aes_kek_gen =
-        keys.get_key_128(S128KeyType::Source, SourceKeyType::AESKekGeneration as u64, 0);
-    let aes_key_gen =
-        keys.get_key_128(S128KeyType::Source, SourceKeyType::AESKeyGeneration as u64, 0);
+    let sd_kek_source = keys.get_key_128(S128KeyType::Source, SourceKeyType::SDKek as u64, 0);
+    let aes_kek_gen = keys.get_key_128(
+        S128KeyType::Source,
+        SourceKeyType::AESKekGeneration as u64,
+        0,
+    );
+    let aes_key_gen = keys.get_key_128(
+        S128KeyType::Source,
+        SourceKeyType::AESKeyGeneration as u64,
+        0,
+    );
     let master_00 = keys.get_key_128(S128KeyType::Master, 0, 0);
-    let sd_kek =
-        generate_key_encryption_key(sd_kek_source, master_00, aes_kek_gen, aes_key_gen);
+    let sd_kek = generate_key_encryption_key(sd_kek_source, master_00, aes_kek_gen, aes_key_gen);
     keys.set_key_128(S128KeyType::SDKek, sd_kek, 0, 0);
 
     if !keys.has_key_128(S128KeyType::SDSeed, 0, 0) {
@@ -2214,18 +2349,8 @@ pub fn derive_sd_keys(
         cipher.transcode(source, &mut sd_keys[i], super::aes_util::Op::Decrypt);
     }
 
-    keys.set_key_256(
-        S256KeyType::SDKey,
-        sd_keys[0],
-        SDKeyType::Save as u64,
-        0,
-    );
-    keys.set_key_256(
-        S256KeyType::SDKey,
-        sd_keys[1],
-        SDKeyType::NCA as u64,
-        0,
-    );
+    keys.set_key_256(S256KeyType::SDKey, sd_keys[0], SDKeyType::Save as u64, 0);
+    keys.set_key_256(S256KeyType::SDKey, sd_keys[1], SDKeyType::NCA as u64, 0);
 
     Ok(())
 }

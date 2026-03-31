@@ -11,30 +11,32 @@ use crate::ir::value::{Pred, Value};
 fn fp_compare(tv: &mut TranslatorVisitor, cmp: u32, a: Value, b: Value) -> Value {
     match cmp {
         0 => tv.ir.imm_u1(false),                      // F (false)
-        1 => tv.ir.fp_ord_less_than_32(a, b),           // LT
-        2 => tv.ir.fp_ord_equal_32(a, b),               // EQ
-        3 => tv.ir.fp_ord_less_than_equal_32(a, b),     // LE
-        4 => tv.ir.fp_ord_greater_than_32(a, b),        // GT
-        5 => tv.ir.fp_ord_not_equal_32(a, b),           // NE
-        6 => tv.ir.fp_ord_greater_than_equal_32(a, b),  // GE
-        7 => {                                            // NUM (ordered)
+        1 => tv.ir.fp_ord_less_than_32(a, b),          // LT
+        2 => tv.ir.fp_ord_equal_32(a, b),              // EQ
+        3 => tv.ir.fp_ord_less_than_equal_32(a, b),    // LE
+        4 => tv.ir.fp_ord_greater_than_32(a, b),       // GT
+        5 => tv.ir.fp_ord_not_equal_32(a, b),          // NE
+        6 => tv.ir.fp_ord_greater_than_equal_32(a, b), // GE
+        7 => {
+            // NUM (ordered)
             let nan_a = tv.ir.fp_is_nan_32(a);
             let nan_b = tv.ir.fp_is_nan_32(b);
             let either_nan = tv.ir.logical_or(nan_a, nan_b);
             tv.ir.logical_not(either_nan)
         }
-        8 => {                                            // NAN (unordered)
+        8 => {
+            // NAN (unordered)
             let nan_a = tv.ir.fp_is_nan_32(a);
             let nan_b = tv.ir.fp_is_nan_32(b);
             tv.ir.logical_or(nan_a, nan_b)
         }
-        9 => tv.ir.fp_unord_less_than_32(a, b),          // LTU
-        10 => tv.ir.fp_unord_equal_32(a, b),              // EQU
-        11 => tv.ir.fp_unord_less_than_32(a, b),          // LEU (approximation)
-        12 => tv.ir.fp_unord_greater_than_32(a, b),       // GTU
-        13 => tv.ir.fp_unord_not_equal_32(a, b),          // NEU
-        14 => tv.ir.fp_unord_greater_than_32(a, b),       // GEU (approximation)
-        15 => tv.ir.imm_u1(true),                         // T (true)
+        9 => tv.ir.fp_unord_less_than_32(a, b),     // LTU
+        10 => tv.ir.fp_unord_equal_32(a, b),        // EQU
+        11 => tv.ir.fp_unord_less_than_32(a, b),    // LEU (approximation)
+        12 => tv.ir.fp_unord_greater_than_32(a, b), // GTU
+        13 => tv.ir.fp_unord_not_equal_32(a, b),    // NEU
+        14 => tv.ir.fp_unord_greater_than_32(a, b), // GEU (approximation)
+        15 => tv.ir.imm_u1(true),                   // T (true)
         _ => tv.ir.imm_u1(false),
     }
 }

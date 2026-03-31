@@ -12,32 +12,29 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use super::code_set::CodeSet;
 use super::k_capabilities::KCapabilities;
 use super::k_client_session::KClientSession;
-use super::k_resource_limit::{KResourceLimit, LimitableResource};
 use super::k_condition_variable::KConditionVariable;
 use super::k_event::KEvent;
-use super::k_handle_table::MAX_TABLE_SIZE;
 use super::k_handle_table::KHandleTable;
-use super::k_memory_block::{
-    KMemoryPermission, KMemoryState,
-    PAGE_SIZE,
-};
+use super::k_handle_table::MAX_TABLE_SIZE;
+use super::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
 use super::k_process_page_table::KProcessPageTable;
 use super::k_readable_event::KReadableEvent;
+use super::k_resource_limit::{KResourceLimit, LimitableResource};
 // KPriorityQueueMember/ThreadAccessor removed: PQ now self-contained.
+use super::k_memory_manager;
 use super::k_scheduler::KScheduler;
 use super::k_session::KSession;
-use super::k_memory_manager;
 use super::k_synchronization_object;
 use super::k_synchronization_object::SynchronizationObjectState;
 use super::k_system_resource::KSecureSystemResource;
 use super::k_thread::KThread;
 use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAGE_SIZE};
-use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
 use super::k_typed_address::KProcessAddress;
+use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
 use super::svc_common::Handle;
 use super::svc_types::{CreateProcessFlag, ADDRESS_SPACE_MASK};
-use crate::hardware_properties::NUM_CPU_CORES;
 use crate::file_sys::program_metadata::{PoolPartition, ProgramAddressSpaceType, ProgramMetadata};
+use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::RESULT_SUCCESS;
@@ -361,12 +358,14 @@ pub struct KProcess {
     /// Exclusive monitor for multi-core LDXR/STXR synchronization.
     /// Upstream: `std::unique_ptr<Core::ExclusiveMonitor> m_exclusive_monitor` (k_process.h:130).
     /// Created in `initialize_interfaces()` via `make_exclusive_monitor(memory, NUM_CPU_CORES)`.
-    pub exclusive_monitor: Option<Box<crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor>>,
+    pub exclusive_monitor:
+        Option<Box<crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor>>,
 
     /// Per-core ARM JIT interfaces.
     /// Upstream: `std::array<std::unique_ptr<Core::ArmInterface>, NUM_CPU_CORES> m_arm_interfaces`.
     /// Created in `initialize_interfaces()` — ArmDynarmic64 for 64-bit processes, ArmDynarmic32 for 32-bit.
-    pub arm_interfaces: [Option<Box<dyn crate::arm::arm_interface::ArmInterface>>; NUM_CPU_CORES as usize],
+    pub arm_interfaces:
+        [Option<Box<dyn crate::arm::arm_interface::ArmInterface>>; NUM_CPU_CORES as usize],
 
     // -- Thread-local page trees (stubbed as Vecs) --
     // In upstream these are intrusive red-black trees of KThreadLocalPage.
@@ -388,7 +387,8 @@ pub struct KProcess {
     pub cond_var: KConditionVariable,
     /// Reference to the global scheduler context that owns the priority queue.
     /// Upstream: accessed via kernel.GlobalSchedulerContext().
-    pub global_scheduler_context: Option<Arc<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>>,
+    pub global_scheduler_context:
+        Option<Arc<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>>,
     /// Address arbiter for this process.
     /// Upstream: `KAddressArbiter m_address_arbiter{m_system}`.
     pub address_arbiter: super::k_address_arbiter::KAddressArbiter,
@@ -585,7 +585,11 @@ impl KProcess {
     // -- Getters matching upstream --
 
     pub fn get_name(&self) -> &str {
-        let end = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
+        let end = self
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.name.len());
         std::str::from_utf8(&self.name[..end]).unwrap_or("")
     }
 
@@ -659,13 +663,12 @@ impl KProcess {
         crate::arm::dynarmic::arm_dynarmic::ScopedJitExecution::register_handler();
 
         // Create one ARM JIT per core.
-        let em_ptr = self.exclusive_monitor.as_mut().unwrap().as_mut()
-            as *mut DynarmicExclusiveMonitor;
+        let em_ptr =
+            self.exclusive_monitor.as_mut().unwrap().as_mut() as *mut DynarmicExclusiveMonitor;
 
         let dummy_system: u32 = 0;
-        let process = unsafe {
-            &*(self as *const KProcess as *const crate::arm::arm_interface::KProcess)
-        };
+        let process =
+            unsafe { &*(self as *const KProcess as *const crate::arm::arm_interface::KProcess) };
 
         for i in 0..hardware_properties::NUM_CPU_CORES as usize {
             let jit: Box<dyn crate::arm::arm_interface::ArmInterface> = if self.is_64bit() {
@@ -704,18 +707,28 @@ impl KProcess {
         log::info!(
             "KProcess: initialized {} ARM {} interfaces with exclusive monitor",
             hardware_properties::NUM_CPU_CORES,
-            if self.is_64bit() { "AArch64" } else { "AArch32" }
+            if self.is_64bit() {
+                "AArch64"
+            } else {
+                "AArch32"
+            }
         );
     }
 
     /// Get the ARM interface for a specific core.
     /// Upstream: `KProcess::GetArmInterface(core_index)` (k_process.h:486).
-    pub fn get_arm_interface(&self, core_index: usize) -> Option<&Box<dyn crate::arm::arm_interface::ArmInterface>> {
+    pub fn get_arm_interface(
+        &self,
+        core_index: usize,
+    ) -> Option<&Box<dyn crate::arm::arm_interface::ArmInterface>> {
         self.arm_interfaces[core_index].as_ref()
     }
 
     /// Get the ARM interface for a specific core (mutable).
-    pub fn get_arm_interface_mut(&mut self, core_index: usize) -> Option<&mut Box<dyn crate::arm::arm_interface::ArmInterface>> {
+    pub fn get_arm_interface_mut(
+        &mut self,
+        core_index: usize,
+    ) -> Option<&mut Box<dyn crate::arm::arm_interface::ArmInterface>> {
         self.arm_interfaces[core_index].as_mut()
     }
 
@@ -777,7 +790,9 @@ impl KProcess {
     pub fn get_total_user_physical_memory_size(&self) -> usize {
         // Get the amount of free and used size.
         let free_size = if let Some(ref rl) = self.resource_limit {
-            rl.lock().unwrap().get_free_value(LimitableResource::PhysicalMemoryMax) as usize
+            rl.lock()
+                .unwrap()
+                .get_free_value(LimitableResource::PhysicalMemoryMax) as usize
         } else {
             0
         };
@@ -811,7 +826,9 @@ impl KProcess {
     pub fn get_total_non_system_user_physical_memory_size(&self) -> usize {
         // Get the amount of free and used size.
         let free_size = if let Some(ref rl) = self.resource_limit {
-            rl.lock().unwrap().get_free_value(LimitableResource::PhysicalMemoryMax) as usize
+            rl.lock()
+                .unwrap()
+                .get_free_value(LimitableResource::PhysicalMemoryMax) as usize
         } else {
             0
         };
@@ -930,7 +947,8 @@ impl KProcess {
     }
 
     pub fn add_cpu_time(&self, diff: i64) {
-        self.cpu_time.fetch_add(diff, std::sync::atomic::Ordering::Relaxed);
+        self.cpu_time
+            .fetch_add(diff, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn get_cpu_time(&self) -> i64 {
@@ -938,13 +956,21 @@ impl KProcess {
     }
 
     pub fn get_scheduled_count(&self) -> i64 {
-        self.schedule_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.schedule_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Upstream: IncrementScheduledCount(thread) — increments the owning process counter.
     /// Invalidates threads' cached yield-schedule-count so next yield does real work.
     pub fn increment_scheduled_count(&self) {
-        self.schedule_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.schedule_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn refresh_registered_thread_scheduler_state(&self) {
+        for thread in self.thread_objects.values() {
+            thread.lock().unwrap().inherit_process_scheduler_state(self);
+        }
     }
 
     pub fn attach_scheduler(&mut self, scheduler: &Arc<Mutex<KScheduler>>) {
@@ -954,6 +980,16 @@ impl KProcess {
         if let Some(ref gsc) = sched.global_scheduler_context {
             self.global_scheduler_context = Some(Arc::clone(gsc));
         }
+        drop(sched);
+        self.refresh_registered_thread_scheduler_state();
+    }
+
+    pub fn set_global_scheduler_context(
+        &mut self,
+        gsc: Arc<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>,
+    ) {
+        self.global_scheduler_context = Some(gsc);
+        self.refresh_registered_thread_scheduler_state();
     }
 
     pub fn bind_self_reference(&mut self, process: &Arc<Mutex<KProcess>>) {
@@ -1052,7 +1088,11 @@ impl KProcess {
     ) {
         if let Some(ref gsc) = self.global_scheduler_context {
             gsc.lock().unwrap().push_back_to_priority_queue(
-                thread_id, priority, active_core, affinity, is_dummy,
+                thread_id,
+                priority,
+                active_core,
+                affinity,
+                is_dummy,
                 Some(std::sync::Arc::clone(&self.schedule_count)),
             );
         }
@@ -1071,7 +1111,11 @@ impl KProcess {
     ) {
         if let Some(ref gsc) = self.global_scheduler_context {
             gsc.lock().unwrap().remove_from_priority_queue(
-                thread_id, priority, active_core, affinity, is_dummy,
+                thread_id,
+                priority,
+                active_core,
+                affinity,
+                is_dummy,
             );
         }
         // Upstream: IncrementScheduledCount(thread) in OnThreadStateChanged
@@ -1084,7 +1128,9 @@ impl KProcess {
         if let Some(thread) = self.get_thread_by_thread_id(thread_id) {
             let guard = thread.lock().unwrap();
             let (id, pri, core, aff, dummy) =
-                super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(&guard);
+                super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(
+                    &guard,
+                );
             drop(guard);
             self.push_back_to_priority_queue_with_props(id, pri, core, aff, dummy);
         }
@@ -1095,7 +1141,9 @@ impl KProcess {
         if let Some(thread) = self.get_thread_by_thread_id(thread_id) {
             let guard = thread.lock().unwrap();
             let (id, pri, core, aff, dummy) =
-                super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(&guard);
+                super::global_scheduler_context::GlobalSchedulerContext::extract_thread_props(
+                    &guard,
+                );
             drop(guard);
             self.remove_from_priority_queue_with_props(id, pri, core, aff, dummy);
         }
@@ -1127,8 +1175,14 @@ impl KProcess {
     ) {
         if let Some(ref gsc) = self.global_scheduler_context {
             gsc.lock().unwrap().on_thread_priority_changed(
-                thread_id, old_priority, new_priority, active_core, affinity,
-                is_running, is_dummy, thread_id,
+                thread_id,
+                old_priority,
+                new_priority,
+                active_core,
+                affinity,
+                is_running,
+                is_dummy,
+                thread_id,
             );
         }
     }
@@ -1190,7 +1244,8 @@ impl KProcess {
         tls_region_end: u64,
         stack_size: usize,
     ) -> (u64, u64) {
-        let aligned_stack_size = ((stack_size as u64) + (PAGE_SIZE as u64 - 1)) & !(PAGE_SIZE as u64 - 1);
+        let aligned_stack_size =
+            ((stack_size as u64) + (PAGE_SIZE as u64 - 1)) & !(PAGE_SIZE as u64 - 1);
         let stack_base = tls_region_end + 0x4000;
         let stack_top = stack_base + aligned_stack_size;
 
@@ -1205,12 +1260,17 @@ impl KProcess {
 
         // Zero the stack in DeviceMemory.
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
-            memory.lock().unwrap().zero_block(stack_base, aligned_stack_size as usize);
+            memory
+                .lock()
+                .unwrap()
+                .zero_block(stack_base, aligned_stack_size as usize);
         }
 
         self.main_thread_stack_size = aligned_stack_size as usize;
-        self.page_table
-            .set_stack_region(KProcessAddress::new(stack_base), aligned_stack_size as usize);
+        self.page_table.set_stack_region(
+            KProcessAddress::new(stack_base),
+            aligned_stack_size as usize,
+        );
         let address_space_end = self
             .page_table
             .get_address_space_start()
@@ -1246,15 +1306,21 @@ impl KProcess {
         // physical address (DramBase + virt) matching our existing convention.
         use super::svc_types::MemoryState as SvcMemoryState;
         let tls_num_pages = THREAD_LOCAL_PAGE_SIZE / PAGE_SIZE;
-        let region_start = self.page_table.get_base().get_region_address(SvcMemoryState::ThreadLocal);
-        let region_size = self.page_table.get_base().get_region_size(SvcMemoryState::ThreadLocal);
+        let region_start = self
+            .page_table
+            .get_base()
+            .get_region_address(SvcMemoryState::ThreadLocal);
+        let region_size = self
+            .page_table
+            .get_base()
+            .get_region_size(SvcMemoryState::ThreadLocal);
         let region_num_pages = region_size / PAGE_SIZE;
 
         let (result, page_addr) = self.page_table.map_pages_find_free(
             tls_num_pages,
-            PAGE_SIZE,  // alignment = PageSize
-            0,          // phys_addr = 0 (will be computed by map_pages_find_free)
-            false,      // is_pa_valid = false (upstream: allocate physical memory)
+            PAGE_SIZE, // alignment = PageSize
+            0,         // phys_addr = 0 (will be computed by map_pages_find_free)
+            false,     // is_pa_valid = false (upstream: allocate physical memory)
             KProcessAddress::new(region_start as u64),
             region_num_pages,
             KMemoryState::THREAD_LOCAL,
@@ -1272,7 +1338,10 @@ impl KProcess {
 
         // Zero the TLS page in DeviceMemory.
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
-            memory.lock().unwrap().zero_block(page_address, THREAD_LOCAL_PAGE_SIZE);
+            memory
+                .lock()
+                .unwrap()
+                .zero_block(page_address, THREAD_LOCAL_PAGE_SIZE);
         }
 
         let mut page = KThreadLocalPage::new(KProcessAddress::new(page_address));
@@ -1293,7 +1362,13 @@ impl KProcess {
         1
     }
 
-    pub fn set_running_thread(&mut self, core: i32, thread_id: u64, idle_count: u64, switch_count: u64) {
+    pub fn set_running_thread(
+        &mut self,
+        core: i32,
+        thread_id: u64,
+        idle_count: u64,
+        switch_count: u64,
+    ) {
         let c = core as usize;
         self.running_threads[c] = Some(thread_id);
         self.running_thread_idle_counts[c] = idle_count;
@@ -1303,7 +1378,8 @@ impl KProcess {
     /// Increment running thread count.
     /// Matches upstream `KProcess::IncrementRunningThreadCount()`.
     pub fn increment_running_thread_count(&self) {
-        self.num_running_threads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.num_running_threads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Decrement running thread count.
@@ -1315,7 +1391,9 @@ impl KProcess {
     /// deadlock with terminate()'s thread iteration. The caller must drop its
     /// locks and then call `process.terminate()`.
     pub fn decrement_running_thread_count(&mut self) -> bool {
-        let prev = self.num_running_threads.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let prev = self
+            .num_running_threads
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         prev == 1
     }
 
@@ -1357,7 +1435,12 @@ impl KProcess {
     ///
     /// The caller must also call `thread.pin(core_id)` on the KThread separately,
     /// since KProcess stores thread IDs (not references) in pinned_threads.
-    pub fn pin_current_thread(&mut self, core_id: i32, thread_id: u64, is_termination_requested: bool) {
+    pub fn pin_current_thread(
+        &mut self,
+        core_id: i32,
+        thread_id: u64,
+        is_termination_requested: bool,
+    ) {
         if !is_termination_requested {
             self.pin_thread(core_id, thread_id);
             // Upstream: KScheduler::SetSchedulerUpdateNeeded(m_kernel)
@@ -1525,10 +1608,7 @@ impl KProcess {
 
         // Initialize capabilities (upstream line 434-435).
         let mut caps = std::mem::take(&mut self.capabilities);
-        let caps_result = caps.initialize_for_user(
-            user_caps,
-            Some(&mut self.page_table),
-        );
+        let caps_result = caps.initialize_for_user(user_caps, Some(&mut self.page_table));
         self.capabilities = caps;
         if caps_result != RESULT_SUCCESS.get_inner_value() {
             self.page_table.finalize();
@@ -1573,10 +1653,17 @@ impl KProcess {
     /// initialized.
     ///
     /// NOTE: `is_real` controls whether a PLR (process local region) is created.
-    pub fn initialize(&mut self, name: &[u8], flags: u32, program_id: u64,
-                      code_address: u64, code_num_pages: u64, version: u32,
-                      resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
-                      is_real: bool) -> u32 {
+    pub fn initialize(
+        &mut self,
+        name: &[u8],
+        flags: u32,
+        program_id: u64,
+        code_address: u64,
+        code_num_pages: u64,
+        version: u32,
+        resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+        is_real: bool,
+    ) -> u32 {
         // Create and clear PLR if real.
         if is_real {
             if let Some(plr) = self.create_thread_local_region() {
@@ -1597,7 +1684,8 @@ impl KProcess {
         // Set misc fields.
         self.state = ProcessState::Created;
         self.main_thread_stack_size = 0;
-        self.used_kernel_memory_size.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.used_kernel_memory_size
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.ideal_core_id = 0;
         self.flags = flags;
         self.version = version;
@@ -1618,8 +1706,8 @@ impl KProcess {
         // Upstream reads from page_table.GetHeapRegionSize()/GetAliasRegionSize().
         let as_mask = flags & ADDRESS_SPACE_MASK;
         if as_mask == CreateProcessFlag::ADDRESS_SPACE_32_BIT_WITHOUT_ALIAS.bits() {
-            self.max_process_memory = self.page_table.get_heap_region_size()
-                + self.page_table.get_alias_region_size();
+            self.max_process_memory =
+                self.page_table.get_heap_region_size() + self.page_table.get_alias_region_size();
         } else {
             self.max_process_memory = self.page_table.get_heap_region_size();
         }
@@ -1641,12 +1729,18 @@ impl KProcess {
         }
 
         // Clear remaining fields.
-        self.num_running_threads.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.num_process_switches.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.num_thread_switches.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.num_fpu_switches.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.num_supervisor_calls.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.num_ipc_messages.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_running_threads
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_process_switches
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_thread_switches
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_fpu_switches
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_supervisor_calls
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.num_ipc_messages
+            .store(0, std::sync::atomic::Ordering::Relaxed);
 
         self.is_signaled = false;
         self.exception_thread_id = None;
@@ -1690,8 +1784,8 @@ impl KProcess {
         // Upstream: m_kernel.MemoryManager().GetSize(pool). Requires kernel reference.
         let physical_memory_size: i64 = match pool {
             k_memory_manager::Pool::Application => 0xCD500000, // ~3.2 GiB (Switch Application pool)
-            k_memory_manager::Pool::Applet => 0x1FB00000,       // ~507 MiB
-            _ => 0x2C600000,                                     // ~710 MiB (System)
+            k_memory_manager::Pool::Applet => 0x1FB00000,      // ~507 MiB
+            _ => 0x2C600000,                                   // ~710 MiB (System)
         };
 
         let res_limit = Arc::new(Mutex::new(
@@ -1734,7 +1828,8 @@ impl KProcess {
 
         // Build parameters (upstream lines 1206-1215).
         let code_num_pages = code_size / PAGE_SIZE as u64;
-        let system_resource_num_pages = metadata.get_system_resource_size() as u64 / PAGE_SIZE as u64;
+        let system_resource_num_pages =
+            metadata.get_system_resource_size() as u64 / PAGE_SIZE as u64;
 
         // Initialize for application process (upstream line 1222-1224).
         // Calls the 5-arg Initialize which sets up page table, maps code,
@@ -1947,11 +2042,7 @@ impl KProcess {
     /// use blocking `KThread::terminate_thread()` when the target is already in
     /// a state that can complete immediately without needing guest execution.
     fn terminate_children(&mut self, thread_to_not_terminate_id: Option<u64>) -> u32 {
-        let children: Vec<Arc<Mutex<KThread>>> = self
-            .thread_objects
-            .values()
-            .cloned()
-            .collect();
+        let children: Vec<Arc<Mutex<KThread>>> = self.thread_objects.values().cloned().collect();
 
         for child in &children {
             let mut guard = child.lock().unwrap();
@@ -2048,8 +2139,14 @@ impl KProcess {
         //   stack_top = stack_bottom + stack_size;
         use super::svc_types::MemoryState as SvcMemoryState;
         let stack_num_pages = stack_size / PAGE_SIZE;
-        let stack_region_start = self.page_table.get_base().get_region_address(SvcMemoryState::Stack);
-        let stack_region_size = self.page_table.get_base().get_region_size(SvcMemoryState::Stack);
+        let stack_region_start = self
+            .page_table
+            .get_base()
+            .get_region_address(SvcMemoryState::Stack);
+        let stack_region_size = self
+            .page_table
+            .get_base()
+            .get_region_size(SvcMemoryState::Stack);
         let stack_region_num_pages = stack_region_size / PAGE_SIZE;
 
         let (map_result, stack_bottom) = self.page_table.map_pages_find_free(
@@ -2077,7 +2174,9 @@ impl KProcess {
         }
         // Upstream: m_page_table.SetMaxHeapSize(m_max_process_memory -
         //           (m_main_thread_stack_size + m_code_size))
-        let max_heap = self.max_process_memory.saturating_sub(self.main_thread_stack_size + self.code_size);
+        let max_heap = self
+            .max_process_memory
+            .saturating_sub(self.main_thread_stack_size + self.code_size);
         self.page_table.set_max_heap_size(max_heap);
 
         let main_thread = Arc::new(Mutex::new(KThread::new()));
@@ -2091,7 +2190,9 @@ impl KProcess {
                 ideal_core_id,
                 self_weak,
                 scheduler_weak,
-                self.global_scheduler_context.as_ref().map(|g| Arc::downgrade(g)),
+                self.global_scheduler_context
+                    .as_ref()
+                    .map(|g| Arc::downgrade(g)),
                 Some(Arc::clone(&self.schedule_count)),
                 tls_address,
                 main_thread_id,
@@ -2250,10 +2351,12 @@ impl KProcess {
             // Preserve upstream-style self ownership so KThread::Exit can queue
             // itself directly as a worker task.
             thread_guard.bind_self_reference(&thread);
+            thread_guard.inherit_process_scheduler_state(self);
             (thread_guard.thread_id, thread_guard.object_id)
         };
         self.register_thread(thread_id);
-        self.thread_objects_by_thread_id.insert(thread_id, Arc::clone(&thread));
+        self.thread_objects_by_thread_id
+            .insert(thread_id, Arc::clone(&thread));
         self.thread_objects.insert(object_id, thread);
     }
 
@@ -2294,7 +2397,8 @@ impl KProcess {
         object_id: u64,
         client_session: Arc<Mutex<KClientSession>>,
     ) {
-        self.client_session_objects.insert(object_id, client_session);
+        self.client_session_objects
+            .insert(object_id, client_session);
     }
 
     pub fn unregister_client_session_object_by_object_id(&mut self, object_id: u64) {
@@ -2321,7 +2425,8 @@ impl KProcess {
         object_id: u64,
         readable_event: Arc<Mutex<KReadableEvent>>,
     ) {
-        self.readable_event_objects.insert(object_id, readable_event);
+        self.readable_event_objects
+            .insert(object_id, readable_event);
     }
 
     pub fn unregister_readable_event_object_by_object_id(&mut self, object_id: u64) {
@@ -2421,7 +2526,10 @@ impl KProcess {
         // Write code to DeviceMemory via Memory::write_block.
         // Upstream: this->GetMemory().WriteBlock(base_addr, code_set.memory.data(), ...)
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
-            memory.lock().unwrap().write_block(base_addr, &code_set.memory);
+            memory
+                .lock()
+                .unwrap()
+                .write_block(base_addr, &code_set.memory);
         }
 
         // Set per-segment permissions via the page table, matching upstream
@@ -2434,11 +2542,7 @@ impl KProcess {
             }
             let addr = base_addr + segment.addr;
             let size = segment.size as usize;
-            page_table.set_process_memory_permission(
-                KProcessAddress::new(addr),
-                size,
-                permission,
-            );
+            page_table.set_process_memory_permission(KProcessAddress::new(addr), size, permission);
         };
 
         reprotect_segment(
@@ -2446,7 +2550,11 @@ impl KProcess {
             code_set.code_segment(),
             KMemoryPermission::USER_READ_EXECUTE,
         );
-        reprotect_segment(&mut self.page_table, code_set.rodata_segment(), KMemoryPermission::USER_READ);
+        reprotect_segment(
+            &mut self.page_table,
+            code_set.rodata_segment(),
+            KMemoryPermission::USER_READ,
+        );
         reprotect_segment(
             &mut self.page_table,
             code_set.data_segment(),
@@ -2484,7 +2592,8 @@ impl KProcess {
             0x80_0000_0000usize
         };
         let width = if base < 0x1_0000_0000 { 32 } else { 39 };
-        self.page_table.configure_address_space(KProcessAddress::new(0), address_space_size, width);
+        self.page_table
+            .configure_address_space(KProcessAddress::new(0), address_space_size, width);
         self.page_table
             .set_code_region(KProcessAddress::new(base), size);
     }
@@ -2550,6 +2659,7 @@ impl Default for KProcess {
 mod tests {
     use super::*;
     use crate::file_sys::program_metadata::{ProgramAddressSpaceType, ProgramMetadata};
+    use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
     use crate::hle::kernel::k_scheduler::KScheduler;
 
     #[test]
@@ -2580,12 +2690,11 @@ mod tests {
             process_guard.initialize_thread_local_region_allocation(0x1c0000);
         }
 
-        let (main_thread, main_thread_handle, stack_base, stack_top) =
-            process
-                .lock()
-                .unwrap()
-                .run(0, 0x100000, 1, 1, false, None)
-                .expect("process runtime bootstrap should succeed");
+        let (main_thread, main_thread_handle, stack_base, stack_top) = process
+            .lock()
+            .unwrap()
+            .run(0, 0x100000, 1, 1, false, None)
+            .expect("process runtime bootstrap should succeed");
 
         assert_ne!(main_thread_handle, 0);
         assert_eq!(process.lock().unwrap().state, ProcessState::Running);
@@ -2603,7 +2712,10 @@ mod tests {
         assert_eq!(thread.get_tls_address().get(), 0x1c4000);
         assert_eq!(stack_base, 0x1c9000);
         assert_eq!(stack_top, 0x2c9000);
-        assert_eq!(thread.get_state(), super::super::k_thread::ThreadState::RUNNABLE);
+        assert_eq!(
+            thread.get_state(),
+            super::super::k_thread::ThreadState::RUNNABLE
+        );
     }
 
     #[test]
@@ -2766,6 +2878,68 @@ mod tests {
             .and_then(Weak::upgrade)
             .expect("thread self reference must be bound during process registration");
         assert!(Arc::ptr_eq(&rebound, &thread));
+    }
+
+    #[test]
+    fn register_thread_object_inherits_scheduler_state_from_process() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        scheduler.lock().unwrap().global_scheduler_context = Some(gsc.clone());
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.attach_scheduler(&scheduler);
+        }
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = 3;
+            guard.object_id = 33;
+        }
+
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(thread.clone());
+
+        let guard = thread.lock().unwrap();
+        assert!(guard.scheduler.as_ref().and_then(Weak::upgrade).is_some());
+        assert!(guard
+            .global_scheduler_context
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some());
+        assert!(guard.process_schedule_count.is_some());
+    }
+
+    #[test]
+    fn attach_scheduler_backfills_existing_registered_threads() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = 7;
+            guard.object_id = 77;
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(thread.clone());
+
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        scheduler.lock().unwrap().global_scheduler_context = Some(gsc.clone());
+        process.lock().unwrap().attach_scheduler(&scheduler);
+
+        let guard = thread.lock().unwrap();
+        assert!(guard.scheduler.as_ref().and_then(Weak::upgrade).is_some());
+        assert!(guard
+            .global_scheduler_context
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some());
+        assert!(guard.process_schedule_count.is_some());
     }
 
     #[test]

@@ -254,10 +254,7 @@ impl Palma {
         ResultCode::SUCCESS
     }
 
-    pub fn set_palma_unique_code_invalid(
-        &mut self,
-        handle: &PalmaConnectionHandle,
-    ) -> ResultCode {
+    pub fn set_palma_unique_code_invalid(&mut self, handle: &PalmaConnectionHandle) -> ResultCode {
         if handle.npad_id != self.active_handle.npad_id {
             return INVALID_PALMA_HANDLE;
         }
@@ -306,8 +303,7 @@ impl Palma {
             return INVALID_PALMA_HANDLE;
         }
         self.database_id_version = database_id_version;
-        self.operation.operation =
-            PackedPalmaOperationType::ReadDataBaseIdentificationVersion;
+        self.operation.operation = PackedPalmaOperationType::ReadDataBaseIdentificationVersion;
         self.operation.result = PALMA_RESULT_SUCCESS;
         self.operation.data = [0u8; 0x140];
         ResultCode::SUCCESS
@@ -320,8 +316,7 @@ impl Palma {
         if handle.npad_id != self.active_handle.npad_id {
             return INVALID_PALMA_HANDLE;
         }
-        self.operation.operation =
-            PackedPalmaOperationType::ReadDataBaseIdentificationVersion;
+        self.operation.operation = PackedPalmaOperationType::ReadDataBaseIdentificationVersion;
         self.operation.result = PALMA_RESULT_SUCCESS;
         self.operation.data = [0u8; 0x140];
         self.operation.data[0] = self.database_id_version as u8;

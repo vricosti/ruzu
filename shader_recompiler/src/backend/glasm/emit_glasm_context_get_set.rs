@@ -59,7 +59,10 @@ pub fn emit_get_attribute(ctx: &mut EmitContext, attr_raw: u32, _vertex: u32) {
         ctx.add_fmt(format!("MOV.F RC.x,vertex.position.{};", swizzle));
         return;
     }
-    ctx.add_fmt(format!("; GetAttribute({}) not fully implemented", attr_raw));
+    ctx.add_fmt(format!(
+        "; GetAttribute({}) not fully implemented",
+        attr_raw
+    ));
 }
 
 /// Write a shader output attribute.
@@ -75,5 +78,8 @@ pub fn emit_set_attribute(ctx: &mut EmitContext, attr_raw: u32, _value: u32) {
         ctx.add_fmt(format!("MOV.F result.position.{},RC.x;", swizzle));
         return;
     }
-    ctx.add_fmt(format!("; SetAttribute({}) not fully implemented", attr_raw));
+    ctx.add_fmt(format!(
+        "; SetAttribute({}) not fully implemented",
+        attr_raw
+    ));
 }

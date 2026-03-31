@@ -202,7 +202,13 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::BindGraphicsUniformBuffer`.
-    pub fn bind_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32, _gpu_addr: u64, _size: u32) {
+    pub fn bind_graphics_uniform_buffer(
+        &mut self,
+        _stage: usize,
+        _index: u32,
+        _gpu_addr: u64,
+        _size: u32,
+    ) {
         // Delegates to buffer_cache.BindGraphicsUniformBuffer
     }
 
@@ -341,7 +347,12 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::AccelerateInlineToMemory`.
-    pub fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {
+    pub fn accelerate_inline_to_memory(
+        &mut self,
+        _address: u64,
+        _copy_size: usize,
+        _memory: &[u8],
+    ) {
         // Delegates to buffer_cache.InlineMemory
     }
 
@@ -366,7 +377,11 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::AccelerateDisplay`.
-    pub fn accelerate_display(&mut self, _framebuffer_addr: u64, _pixel_stride: u32) -> Option<FramebufferTextureInfo> {
+    pub fn accelerate_display(
+        &mut self,
+        _framebuffer_addr: u64,
+        _pixel_stride: u32,
+    ) -> Option<FramebufferTextureInfo> {
         // Attempts to use the texture cache to directly present an existing
         // GPU texture instead of copying data to CPU and back
         None
@@ -458,7 +473,11 @@ pub fn get_viewport_state(
         if scale < 1.0 {
             let sign = value.is_sign_negative();
             let new_value = new_value.abs().round();
-            if sign { -new_value } else { new_value }
+            if sign {
+                -new_value
+            } else {
+                new_value
+            }
         } else {
             new_value
         }
@@ -573,7 +592,9 @@ mod tests {
 
     #[test]
     fn viewport_identity_scale() {
-        let vp = get_viewport_state(320.0, 320.0, 240.0, 240.0, 0.5, 0.5, 1.0, false, false, false, 480.0, false);
+        let vp = get_viewport_state(
+            320.0, 320.0, 240.0, 240.0, 0.5, 0.5, 1.0, false, false, false, 480.0, false,
+        );
         assert_eq!(vp.x, 0.0);
         assert_eq!(vp.width, 640.0);
         assert_eq!(vp.y, 0.0);

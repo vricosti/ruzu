@@ -7,9 +7,9 @@ use crate::hle::service::psc::time::common::{
 };
 use crate::hle::service::set::settings_types::{
     AccountNotificationSettings, AccountSettings, AudioOutputMode, ChineseTraditionalInputMethod,
-    ColorSet, ErrorReportSharePermission, EulaVersion, InitialLaunchSettingsPacked,
-    KeyboardLayout, LanguageCode, NotificationSettings, PrimaryAlbumStorage, QuestFlag,
-    SleepSettings, SystemRegionCode, TouchScreenMode, TvSettings,
+    ColorSet, ErrorReportSharePermission, EulaVersion, InitialLaunchSettingsPacked, KeyboardLayout,
+    LanguageCode, NotificationSettings, PrimaryAlbumStorage, QuestFlag, SleepSettings,
+    SystemRegionCode, TouchScreenMode, TvSettings,
 };
 
 /// Port of Service::Set::SystemSettings
@@ -533,7 +533,9 @@ const _: () = {
     assert!(core::mem::offset_of!(SystemSettings, nx_controller_settings_count) == 0x94F0);
     assert!(core::mem::offset_of!(SystemSettings, nx_controller_legacy_settings) == 0x9500);
     assert!(core::mem::offset_of!(SystemSettings, external_rtc_reset_flag) == 0x98F0);
-    assert!(core::mem::offset_of!(SystemSettings, push_notification_activity_mode_on_sleep) == 0x9930);
+    assert!(
+        core::mem::offset_of!(SystemSettings, push_notification_activity_mode_on_sleep) == 0x9930
+    );
     assert!(core::mem::offset_of!(SystemSettings, allowed_ssl_host_count) == 0x99F4);
     assert!(core::mem::offset_of!(SystemSettings, host_fs_mount_point) == 0x9A30);
     assert!(core::mem::offset_of!(SystemSettings, allowed_ssl_hosts) == 0x9B30);
@@ -544,22 +546,42 @@ const _: () = {
     assert!(core::mem::offset_of!(SystemSettings, pctl_ready_flag) == 0xB110);
     assert!(core::mem::offset_of!(SystemSettings, theme_id_type0) == 0xB150);
     assert!(core::mem::offset_of!(SystemSettings, chinese_traditional_input_method) == 0xB350);
-    assert!(core::mem::offset_of!(SystemSettings, button_config_registered_settings_count) == 0xB3D0);
+    assert!(
+        core::mem::offset_of!(SystemSettings, button_config_registered_settings_count) == 0xB3D0
+    );
     assert!(core::mem::offset_of!(SystemSettings, button_config_settings_count) == 0xB3E0);
     assert!(core::mem::offset_of!(SystemSettings, button_config_settings) == 0xB3E8);
-    assert!(core::mem::offset_of!(SystemSettings, button_config_registered_settings_embedded) == 0x1D3E0);
-    assert!(core::mem::offset_of!(SystemSettings, console_six_axis_sensor_acceleration_bias) == 0x29370);
+    assert!(
+        core::mem::offset_of!(SystemSettings, button_config_registered_settings_embedded)
+            == 0x1D3E0
+    );
+    assert!(
+        core::mem::offset_of!(SystemSettings, console_six_axis_sensor_acceleration_bias) == 0x29370
+    );
     assert!(core::mem::offset_of!(SystemSettings, lock_screen_flag) == 0x29470);
     assert!(core::mem::offset_of!(SystemSettings, battery_percentage_flag) == 0x294A0);
     assert!(core::mem::offset_of!(SystemSettings, field_testing_flag) == 0x294C0);
     assert!(core::mem::offset_of!(SystemSettings, backlight_settings_mixed_up) == 0x294F0);
     assert!(core::mem::offset_of!(SystemSettings, user_system_clock_context) == 0x29580);
     assert!(core::mem::offset_of!(SystemSettings, network_system_clock_context) == 0x295A0);
-    assert!(core::mem::offset_of!(SystemSettings, user_system_clock_automatic_correction_enabled) == 0x295C0);
-    assert!(core::mem::offset_of!(SystemSettings, user_system_clock_automatic_correction_updated_time_point) == 0x295C8);
+    assert!(
+        core::mem::offset_of!(
+            SystemSettings,
+            user_system_clock_automatic_correction_enabled
+        ) == 0x295C0
+    );
+    assert!(
+        core::mem::offset_of!(
+            SystemSettings,
+            user_system_clock_automatic_correction_updated_time_point
+        ) == 0x295C8
+    );
     assert!(core::mem::offset_of!(SystemSettings, account_settings) == 0x295F0);
     assert!(core::mem::offset_of!(SystemSettings, audio_volume_type0) == 0x296F0);
-    assert!(core::mem::offset_of!(SystemSettings, hearing_protection_safeguard_remaining_time) == 0x29730);
+    assert!(
+        core::mem::offset_of!(SystemSettings, hearing_protection_safeguard_remaining_time)
+            == 0x29730
+    );
     assert!(core::mem::offset_of!(SystemSettings, automatic_application_download_flag) == 0x297B0);
     assert!(core::mem::offset_of!(SystemSettings, notification_settings) == 0x297B8);
     assert!(core::mem::offset_of!(SystemSettings, account_notification_settings) == 0x29840);
@@ -574,7 +596,10 @@ const _: () = {
     assert!(core::mem::offset_of!(SystemSettings, eula_version_count) == 0x2A140);
     assert!(core::mem::offset_of!(SystemSettings, device_nick_name) == 0x2A950);
     assert!(core::mem::offset_of!(SystemSettings, bluetooth_device_settings_last_14) == 0x2AAA0);
-    assert!(core::mem::offset_of!(SystemSettings, nx_controller_settings_data_from_offset_30) == 0x2E6A0);
+    assert!(
+        core::mem::offset_of!(SystemSettings, nx_controller_settings_data_from_offset_30)
+            == 0x2E6A0
+    );
     assert!(core::mem::size_of::<SystemSettings>() == 0x336A0);
 };
 

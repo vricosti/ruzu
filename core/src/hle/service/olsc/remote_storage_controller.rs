@@ -24,8 +24,7 @@ pub struct IRemoteStorageController {
 
 impl IRemoteStorageController {
     pub fn new(system: crate::core::SystemRef) -> Self {
-        let s: Option<fn(&dyn ServiceFramework, &mut HLERequestContext)> =
-            Some(Self::stub_handler);
+        let s: Option<fn(&dyn ServiceFramework, &mut HLERequestContext)> = Some(Self::stub_handler);
         let handlers = build_handler_map(&[
             (0, s, "Unknown0"),
             (1, s, "Unknown1"),
@@ -63,10 +62,7 @@ impl IRemoteStorageController {
     ///
     /// Returns whether a secondary save exists for the given application.
     /// Upstream always returns false with zeroed output (stubbed).
-    pub fn get_secondary_save(
-        &self,
-        application_id: u64,
-    ) -> (ResultCode, bool, [u64; 3]) {
+    pub fn get_secondary_save(&self, application_id: u64) -> (ResultCode, bool, [u64; 3]) {
         log::error!(
             "(STUBBED) IRemoteStorageController::get_secondary_save called, application_id={:016X}",
             application_id

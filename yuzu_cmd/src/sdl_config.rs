@@ -272,7 +272,9 @@ impl SdlConfig {
     fn read_debug_control_values(&mut self) {
         // Upstream reads debug_pad_buttons and debug_pad_analogs from INI.
         // INI read infrastructure not yet ported.
-        log::trace!("SdlConfig::read_debug_control_values: Config::ReadStringSetting not yet ported");
+        log::trace!(
+            "SdlConfig::read_debug_control_values: Config::ReadStringSetting not yet ported"
+        );
     }
 
     /// Reads Hidbus (ring controller) values.
@@ -336,7 +338,9 @@ impl SdlConfig {
     fn save_debug_control_values(&mut self) {
         // Upstream writes debug_pad_buttons and debug_pad_analogs to INI.
         // INI write infrastructure not yet ported.
-        log::trace!("SdlConfig::save_debug_control_values: Config::WriteStringSetting not yet ported");
+        log::trace!(
+            "SdlConfig::save_debug_control_values: Config::WriteStringSetting not yet ported"
+        );
     }
 
     /// Saves Hidbus (ring controller) values.

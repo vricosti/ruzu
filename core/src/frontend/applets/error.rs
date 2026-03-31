@@ -73,12 +73,7 @@ impl ErrorApplet for DefaultErrorApplet {
         );
     }
 
-    fn show_error_with_timestamp(
-        &self,
-        error: ResultCode,
-        time: i64,
-        _finished: FinishedCallback,
-    ) {
+    fn show_error_with_timestamp(&self, error: ResultCode, time: i64, _finished: FinishedCallback) {
         log::error!(
             "Application requested error display: {:04X}-{:04X} (raw={:08X}) with timestamp={:016X}",
             error.get_module(),

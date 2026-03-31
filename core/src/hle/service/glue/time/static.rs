@@ -184,7 +184,11 @@ impl StaticService {
     ) {
         let service = Self::as_self(this);
         log::debug!("Glue::Time::StaticService::GetStandardUserSystemClock called");
-        let sub = service.wrapped_service.lock().unwrap().get_standard_user_system_clock();
+        let sub = service
+            .wrapped_service
+            .lock()
+            .unwrap()
+            .get_standard_user_system_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
@@ -195,18 +199,23 @@ impl StaticService {
     ) {
         let service = Self::as_self(this);
         log::debug!("Glue::Time::StaticService::GetStandardNetworkSystemClock called");
-        let sub = service.wrapped_service.lock().unwrap().get_standard_network_system_clock();
+        let sub = service
+            .wrapped_service
+            .lock()
+            .unwrap()
+            .get_standard_network_system_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
     /// GetStandardSteadyClock (cmd 2) handler.
-    fn get_standard_steady_clock_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_standard_steady_clock_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         log::debug!("Glue::Time::StaticService::GetStandardSteadyClock called");
-        let sub = service.wrapped_service.lock().unwrap().get_standard_steady_clock();
+        let sub = service
+            .wrapped_service
+            .lock()
+            .unwrap()
+            .get_standard_steady_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
@@ -214,10 +223,7 @@ impl StaticService {
     ///
     /// Unlike the other sub-service commands, upstream creates a Glue::Time::TimeZoneService
     /// rather than delegating to the PSC wrapped service.
-    fn get_time_zone_service_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_time_zone_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         log::debug!("Glue::Time::StaticService::GetTimeZoneService called");
         match service.get_time_zone_service() {
@@ -238,7 +244,11 @@ impl StaticService {
     ) {
         let service = Self::as_self(this);
         log::debug!("Glue::Time::StaticService::GetStandardLocalSystemClock called");
-        let sub = service.wrapped_service.lock().unwrap().get_standard_local_system_clock();
+        let sub = service
+            .wrapped_service
+            .lock()
+            .unwrap()
+            .get_standard_local_system_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
@@ -249,7 +259,11 @@ impl StaticService {
     ) {
         let service = Self::as_self(this);
         log::debug!("Glue::Time::StaticService::GetEphemeralNetworkSystemClock called");
-        let sub = service.wrapped_service.lock().unwrap().get_ephemeral_network_system_clock();
+        let sub = service
+            .wrapped_service
+            .lock()
+            .unwrap()
+            .get_ephemeral_network_system_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
@@ -288,8 +302,7 @@ impl StaticService {
 
             static NEXT_SHMEM_ID: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0x3000_0000);
-            let object_id =
-                NEXT_SHMEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let object_id = NEXT_SHMEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             // Register the KSharedMemory from PscSharedMemory so that
             // MapSharedMemory SVC can find it and map its physical pages.
@@ -310,7 +323,8 @@ impl StaticService {
                 // The physical pages and device memory pointer are shared.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        psc.get_k_shared_memory() as *const crate::hle::kernel::k_shared_memory::KSharedMemory,
+                        psc.get_k_shared_memory()
+                            as *const crate::hle::kernel::k_shared_memory::KSharedMemory,
                         &mut shmem as *mut crate::hle::kernel::k_shared_memory::KSharedMemory,
                         1,
                     );
@@ -521,10 +535,7 @@ impl StaticService {
     }
 
     /// GetClockSnapshot (cmd 400) handler.
-    fn get_clock_snapshot_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_clock_snapshot_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let type_val = rp.pop_u32();
@@ -629,10 +640,7 @@ impl StaticService {
     }
 
     /// CalculateSpanBetween (cmd 501) handler.
-    fn calculate_span_between_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn calculate_span_between_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
 
         let buf_a = ctx.read_buffer(0);
@@ -714,7 +722,8 @@ impl StaticService {
 
     pub fn get_standard_steady_clock_rtc_value(&self) -> Result<i64, ResultCode> {
         log::debug!("Glue::Time::StaticService::GetStandardSteadyClockRtcValue called");
-        self.standard_steady_clock_resource.get_rtc_time_in_seconds()
+        self.standard_steady_clock_resource
+            .get_rtc_time_in_seconds()
     }
 
     pub fn is_standard_user_system_clock_automatic_correction_enabled(
@@ -742,9 +751,7 @@ impl StaticService {
     /// In upstream, delegates to m_set_sys->GetSettingsItemValueImpl<s32>(
     ///     "time", "standard_user_clock_initial_year").
     pub fn get_standard_user_system_clock_initial_year(&self) -> Result<i32, ResultCode> {
-        log::debug!(
-            "Glue::Time::StaticService::GetStandardUserSystemClockInitialYear called"
-        );
+        log::debug!("Glue::Time::StaticService::GetStandardUserSystemClockInitialYear called");
         // Upstream delegates to m_set_sys->GetSettingsItemValueImpl<s32>(
         // "time", "standard_user_clock_initial_year"). The ISystemSettingsServer
         // (set:sys) service is not yet wired. The default value in upstream
@@ -761,7 +768,10 @@ impl StaticService {
     }
 
     pub fn get_clock_snapshot(&self, type_: TimeType) -> Result<ClockSnapshot, ResultCode> {
-        self.wrapped_service.lock().unwrap().get_clock_snapshot(type_)
+        self.wrapped_service
+            .lock()
+            .unwrap()
+            .get_clock_snapshot(type_)
     }
 
     pub fn get_clock_snapshot_from_system_clock_context(
@@ -784,9 +794,7 @@ impl StaticService {
         &self,
         context: &SystemClockContext,
     ) -> Result<i64, ResultCode> {
-        log::debug!(
-            "Glue::Time::StaticService::CalculateMonotonicSystemClockBaseTimePoint called"
-        );
+        log::debug!("Glue::Time::StaticService::CalculateMonotonicSystemClockBaseTimePoint called");
         self.wrapped_service
             .lock()
             .unwrap()
@@ -872,7 +880,12 @@ mod tests {
 
     #[test]
     fn get_time_zone_service_returns_glue_service_object() {
-        let service = StaticService::new(user_setup(), "time:u", std::ptr::null(), std::ptr::null_mut());
+        let service = StaticService::new(
+            user_setup(),
+            "time:u",
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
         let time_zone_service = service.get_time_zone_service().unwrap();
 
         let name = time_zone_service.get_device_location_name().unwrap();
@@ -893,13 +906,22 @@ mod tests {
     #[test]
     fn delegated_correction_queries_follow_wrapped_psc_static_service() {
         // Use admin setup so we have can_write_user_clock permission
-        let service = StaticService::new(admin_setup(), "time:a", std::ptr::null(), std::ptr::null_mut());
+        let service = StaticService::new(
+            admin_setup(),
+            "time:a",
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
         {
             let mut wrapped = service.wrapped_service.lock().unwrap();
             wrapped.set_user_clock_initialized(true);
             wrapped.set_steady_clock_initialized(true);
             let rc = wrapped.set_standard_user_system_clock_automatic_correction_enabled(true);
-            assert!(rc.is_success(), "Failed to enable automatic correction: {:?}", rc);
+            assert!(
+                rc.is_success(),
+                "Failed to enable automatic correction: {:?}",
+                rc
+            );
         }
 
         assert_eq!(

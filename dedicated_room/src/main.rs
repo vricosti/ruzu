@@ -16,7 +16,9 @@ use clap::Parser;
 use common::announce_multiplayer_room::GameInfo;
 use network::announce_multiplayer_session::AnnounceMultiplayerSession;
 use network::network::RoomNetwork;
-use network::room::{BanList, IpBanList, UsernameBanList, DEFAULT_ROOM_PORT, MAX_CONCURRENT_CONNECTIONS};
+use network::room::{
+    BanList, IpBanList, UsernameBanList, DEFAULT_ROOM_PORT, MAX_CONCURRENT_CONNECTIONS,
+};
 use network::verify_user::{Backend, NullBackend, UserData};
 
 // ---------------------------------------------------------------------------
@@ -154,8 +156,7 @@ fn pad_token(token: &mut String) {
 }
 
 /// Standard base64 alphabet used by mbedtls_base64_encode / mbedtls_base64_decode.
-const BASE64_CHARS: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BASE64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Decodes a base64 string, returning the raw bytes or None on invalid input.
 ///
@@ -233,8 +234,8 @@ fn base64_encode(input: &[u8]) -> String {
 ///
 /// Maps to C++ `UsernameFromDisplayToken`.
 fn username_from_display_token(display_token: &str) -> String {
-    let decoded_bytes = base64_decode(display_token.as_bytes())
-        .expect("display token must be valid base64");
+    let decoded_bytes =
+        base64_decode(display_token.as_bytes()).expect("display token must be valid base64");
     let decoded = String::from_utf8_lossy(&decoded_bytes);
     decoded
         .find(TOKEN_DELIMITER)
@@ -246,8 +247,8 @@ fn username_from_display_token(display_token: &str) -> String {
 ///
 /// Maps to C++ `TokenFromDisplayToken`.
 fn token_from_display_token(display_token: &str) -> String {
-    let decoded_bytes = base64_decode(display_token.as_bytes())
-        .expect("display token must be valid base64");
+    let decoded_bytes =
+        base64_decode(display_token.as_bytes()).expect("display token must be valid base64");
     let decoded = String::from_utf8_lossy(&decoded_bytes);
     decoded
         .find(TOKEN_DELIMITER)
@@ -570,12 +571,7 @@ mod tests {
             (b"Man", "TWFu"),
         ];
         for (raw, encoded) in cases {
-            assert_eq!(
-                base64_encode(raw),
-                *encoded,
-                "encode failed for {:?}",
-                raw
-            );
+            assert_eq!(base64_encode(raw), *encoded, "encode failed for {:?}", raw);
             if encoded.is_empty() {
                 assert_eq!(
                     base64_decode(encoded.as_bytes()),

@@ -47,9 +47,8 @@ impl IDirectory {
             max_entries as usize,
             self.entries.len() - self.next_entry_index,
         );
-        let result: Vec<DirectoryEntry> = self.entries
-            [self.next_entry_index..self.next_entry_index + actual]
-            .to_vec();
+        let result: Vec<DirectoryEntry> =
+            self.entries[self.next_entry_index..self.next_entry_index + actual].to_vec();
         self.next_entry_index += actual;
         Ok(result)
     }

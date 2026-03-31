@@ -308,7 +308,11 @@ impl<Traits: DeviceMemoryManagerTraits> DeviceMemoryManager<Traits> {
     const MAX_DEVICE_AREA: u32 = {
         // device_virtual_bits is at most 34; clamp to fit u32 for FlatAllocator.
         let bits = Traits::DEVICE_VIRTUAL_BITS;
-        if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 }
+        if bits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << bits) - 1
+        }
     };
 
     /// Create a new DeviceMemoryManager backed by the given DeviceMemory.
@@ -363,7 +367,10 @@ impl<Traits: DeviceMemoryManagerTraits> DeviceMemoryManager<Traits> {
             .allocate(size as u32)
             .map(|addr| addr as u64)
             .unwrap_or_else(|| {
-                log::error!("DeviceMemoryManager::allocate: address space exhausted (size={})", size);
+                log::error!(
+                    "DeviceMemoryManager::allocate: address space exhausted (size={})",
+                    size
+                );
                 0
             })
     }
@@ -683,8 +690,7 @@ impl<Traits: DeviceMemoryManagerTraits> DeviceMemoryManager<Traits> {
     }
 
     fn insert_cpu_backing(&mut self, page_index: usize, address: u64, asid: Asid) {
-        self.cpu_backing_address[page_index] =
-            address | ((asid.id as u64) << Self::ASID_START_BIT);
+        self.cpu_backing_address[page_index] = address | ((asid.id as u64) << Self::ASID_START_BIT);
     }
 
     /// Gather all device addresses that map to a single physical address.

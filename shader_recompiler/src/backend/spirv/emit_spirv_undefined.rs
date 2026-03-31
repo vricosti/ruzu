@@ -4,8 +4,8 @@
 //! SPIR-V undefined value emission — maps to zuyu's
 //! `backend/spirv/emit_spirv_undefined.cpp`.
 
-use rspirv::spirv::Word;
 use super::spirv_emit_context::SpirvEmitContext;
+use rspirv::spirv::Word;
 
 /// Emit `OpUndef` for U1 (bool).
 ///

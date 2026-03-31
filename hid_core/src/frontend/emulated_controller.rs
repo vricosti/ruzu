@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use parking_lot::Mutex;
 
-use crate::hid_types::*;
 use crate::frontend::motion_input::IS_AT_REST_STANDARD;
+use crate::hid_types::*;
 
 pub const MAX_EMULATED_CONTROLLERS: usize = 2;
 pub const OUTPUT_DEVICES_SIZE: usize = 5;
@@ -250,7 +250,10 @@ impl EmulatedController {
         // motion state via MotionInput::ResetRotations/ResetQuaternion. Depends on
         // Common::Input::CreateInputDevice from zuyu/src/common/input.h and
         // Settings::values.players from zuyu/src/common/settings.h.
-        log::debug!("EmulatedController::reload_input called for {:?}", self.npad_id_type);
+        log::debug!(
+            "EmulatedController::reload_input called for {:?}",
+            self.npad_id_type
+        );
     }
 
     pub fn reload_from_settings(&mut self) {
@@ -262,26 +265,38 @@ impl EmulatedController {
         // strings. Calls SetNpadStyleIndex, connect/disconnect based on player.connected,
         // then ReloadInput(). Depends on Settings::values.players (PlayerInput struct)
         // from zuyu/src/common/settings.h and NpadIdTypeToIndex from hid_core/hid_util.h.
-        log::debug!("EmulatedController::reload_from_settings called for {:?}", self.npad_id_type);
+        log::debug!(
+            "EmulatedController::reload_from_settings called for {:?}",
+            self.npad_id_type
+        );
     }
 
     /// Port of EmulatedController::SaveCurrentConfig.
     pub fn save_current_config(&self) {
         // Upstream saves current parameters to Settings::values.players[player_index].
         // Requires Settings integration.
-        log::debug!("EmulatedController::save_current_config called for {:?}", self.npad_id_type);
+        log::debug!(
+            "EmulatedController::save_current_config called for {:?}",
+            self.npad_id_type
+        );
     }
 
     /// Port of EmulatedController::RestoreConfig.
     pub fn restore_config(&mut self) {
         // Upstream reloads from settings and reconnects if needed.
-        log::debug!("EmulatedController::restore_config called for {:?}", self.npad_id_type);
+        log::debug!(
+            "EmulatedController::restore_config called for {:?}",
+            self.npad_id_type
+        );
     }
 
     /// Port of EmulatedController::ReloadColorsFromSettings.
     pub fn reload_colors_from_settings(&mut self) {
         // Upstream reads body_color_left/right from player settings.
-        log::debug!("EmulatedController::reload_colors_from_settings called for {:?}", self.npad_id_type);
+        log::debug!(
+            "EmulatedController::reload_colors_from_settings called for {:?}",
+            self.npad_id_type
+        );
     }
 
     /// Port of EmulatedController::IsControllerFullkey.

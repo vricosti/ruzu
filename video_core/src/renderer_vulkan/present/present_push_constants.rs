@@ -36,10 +36,22 @@ impl ScreenRectVertex {
 /// Creates a 4x4 orthographic projection matrix for screen-space rendering.
 pub fn make_orthographic_matrix(width: f32, height: f32) -> [f32; 16] {
     [
-        2.0 / width, 0.0,          0.0, 0.0,
-        0.0,         2.0 / height, 0.0, 0.0,
-        0.0,         0.0,          1.0, 0.0,
-       -1.0,        -1.0,          0.0, 1.0,
+        2.0 / width,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        2.0 / height,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        -1.0,
+        -1.0,
+        0.0,
+        1.0,
     ]
 }
 

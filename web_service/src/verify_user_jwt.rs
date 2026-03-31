@@ -27,7 +27,9 @@ pub fn get_public_key(host: &str) -> String {
         }
     }
     let mut client = Client::new(host.to_string(), String::new(), String::new());
-    let key = client.get_plain("/jwt/external/key.pem", true).returned_data;
+    let key = client
+        .get_plain("/jwt/external/key.pem", true)
+        .returned_data;
     if key.is_empty() {
         log::error!("Could not fetch external JWT public key, verification may fail");
     } else {

@@ -73,7 +73,8 @@ pub fn s2r(tv: &mut TranslatorVisitor, insn: u64) {
         SpecialRegister::InvocationId => tv.ir.invocation_id(),
         SpecialRegister::ThreadKill => {
             let is_helper = tv.ir.is_helper_invocation();
-            tv.ir.select_u32(is_helper, Value::ImmU32(u32::MAX), Value::ImmU32(0))
+            tv.ir
+                .select_u32(is_helper, Value::ImmU32(u32::MAX), Value::ImmU32(0))
         }
         SpecialRegister::InvocationInfo => tv.ir.invocation_info(),
         SpecialRegister::Tid => {
@@ -83,8 +84,11 @@ pub fn s2r(tv: &mut TranslatorVisitor, insn: u64) {
             let x = tv.ir.composite_extract_u32x2(tid, Value::ImmU32(0));
             let y = tv.ir.composite_extract_u32x2(tid, Value::ImmU32(1));
             let z = tv.ir.composite_extract_u32x2(tid, Value::ImmU32(2));
-            let xy = tv.ir.bit_field_insert(x, y, Value::ImmU32(16), Value::ImmU32(8));
-            tv.ir.bit_field_insert(xy, z, Value::ImmU32(26), Value::ImmU32(6))
+            let xy = tv
+                .ir
+                .bit_field_insert(x, y, Value::ImmU32(16), Value::ImmU32(8));
+            tv.ir
+                .bit_field_insert(xy, z, Value::ImmU32(26), Value::ImmU32(6))
         }
         SpecialRegister::TidX => {
             let tid = tv.ir.local_invocation_id();
@@ -137,7 +141,11 @@ pub fn s2r(tv: &mut TranslatorVisitor, insn: u64) {
             Value::ImmU32(0)
         }
         SpecialRegister::Unknown(idx) => {
-            log::warn!("S2R: unknown special register {} (0x{:X}), returning 0", idx, idx);
+            log::warn!(
+                "S2R: unknown special register {} (0x{:X}), returning 0",
+                idx,
+                idx
+            );
             Value::ImmU32(0)
         }
     };

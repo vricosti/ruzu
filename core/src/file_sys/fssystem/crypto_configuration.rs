@@ -52,13 +52,17 @@ fn generate_key(dst_key: &mut [u8], src_key: &[u8], key_type: i32) {
     }
 
     // Derive from key area encryption keys via AES-ECB decrypt.
-    let key_generation =
-        std::cmp::max(key_type / NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT, 1)
-            - 1;
-    let key_index =
-        key_type % NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT;
+    let key_generation = std::cmp::max(
+        key_type / NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT,
+        1,
+    ) - 1;
+    let key_index = key_type % NcaCryptoConfiguration::KEY_AREA_ENCRYPTION_KEY_INDEX_COUNT;
 
-    let kak = keys.get_key_128(S128KeyType::KeyArea, key_generation as u64, key_index as u64);
+    let kak = keys.get_key_128(
+        S128KeyType::KeyArea,
+        key_generation as u64,
+        key_index as u64,
+    );
     if kak == [0u8; 16] {
         // Key not available; copy source as-is (will likely fail downstream).
         let copy_len = dst_key.len().min(src_key.len());

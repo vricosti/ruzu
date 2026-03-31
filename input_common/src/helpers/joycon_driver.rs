@@ -439,7 +439,10 @@ impl JoyconDriver {
     /// Port of static JoyconDriver::GetDeviceType
     ///
     /// Returns the controller type for a given product ID.
-    pub fn get_device_type_from_product_id(product_id: u16, vendor_id: u16) -> (DriverResult, ControllerType) {
+    pub fn get_device_type_from_product_id(
+        product_id: u16,
+        vendor_id: u16,
+    ) -> (DriverResult, ControllerType) {
         const NINTENDO_VENDOR_ID: u16 = 0x057e;
         const SUPPORTED_DEVICES: [(u16, ControllerType); 3] = [
             (0x2006, ControllerType::Left),
@@ -448,7 +451,10 @@ impl JoyconDriver {
         ];
 
         if vendor_id != NINTENDO_VENDOR_ID {
-            return (DriverResult::UnsupportedControllerType, ControllerType::None);
+            return (
+                DriverResult::UnsupportedControllerType,
+                ControllerType::None,
+            );
         }
 
         for &(pid, ctype) in &SUPPORTED_DEVICES {
@@ -456,7 +462,10 @@ impl JoyconDriver {
                 return (DriverResult::Success, ctype);
             }
         }
-        (DriverResult::UnsupportedControllerType, ControllerType::None)
+        (
+            DriverResult::UnsupportedControllerType,
+            ControllerType::None,
+        )
     }
 
     // ---- Private methods ----

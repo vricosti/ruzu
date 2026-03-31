@@ -36,9 +36,7 @@ impl RangeMutex {
         let mut list = self.inner.lock().unwrap();
         list = self
             .cv
-            .wait_while(list, |list| {
-                Self::has_intersection(list, address, size)
-            })
+            .wait_while(list, |list| Self::has_intersection(list, address, size))
             .unwrap();
         list.push(RangeEntry { address, size });
     }

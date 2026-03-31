@@ -161,10 +161,9 @@ impl KSecureSystemResource {
         self.resource_size = size;
 
         // Allocate secure memory via KSystemControl.
-        let resource_address = super::board::k_system_control::allocate_secure_memory(
-            mm, size, pool as u32,
-        )
-        .map_err(|_| ())?;
+        let resource_address =
+            super::board::k_system_control::allocate_secure_memory(mm, size, pool as u32)
+                .map_err(|_| ())?;
 
         self.resource_address = resource_address;
 
@@ -176,7 +175,10 @@ impl KSecureSystemResource {
         if size <= rc_size {
             // Clean up on failure.
             super::board::k_system_control::free_secure_memory(
-                mm, resource_address, size, pool as u32,
+                mm,
+                resource_address,
+                size,
+                pool as u32,
             );
             return Err(());
         }
@@ -188,7 +190,10 @@ impl KSecureSystemResource {
             .is_err()
         {
             super::board::k_system_control::free_secure_memory(
-                mm, resource_address, size, pool as u32,
+                mm,
+                resource_address,
+                size,
+                pool as u32,
             );
             return Err(());
         }

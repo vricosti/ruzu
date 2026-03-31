@@ -11,7 +11,9 @@
 use common::input::DriverResult;
 
 use super::common_protocol::{JoyconCommonProtocol, ScopedSetBlocking};
-use super::joycon_types::{CalibrationMagic, JoyStickCalibration, MotionCalibration, RingCalibration, SpiAddress};
+use super::joycon_types::{
+    CalibrationMagic, JoyStickCalibration, MotionCalibration, RingCalibration, SpiAddress,
+};
 
 /// Default stick center value.
 const DEFAULT_STICK_CENTER: u16 = 0x800;
@@ -197,10 +199,7 @@ impl CalibrationProtocol {
 
     /// Sends a request to obtain the motion calibration from memory.
     /// Port of CalibrationProtocol::GetImuCalibration
-    pub fn get_imu_calibration(
-        &mut self,
-        calibration: &mut MotionCalibration,
-    ) -> DriverResult {
+    pub fn get_imu_calibration(&mut self, calibration: &mut MotionCalibration) -> DriverResult {
         let _sb = ScopedSetBlocking::new(&mut self.protocol);
         let mut result = DriverResult::Success;
         let mut spi_calibration = ImuSpiCalibration::default();

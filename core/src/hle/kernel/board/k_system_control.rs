@@ -168,7 +168,10 @@ pub fn allocate_secure_memory(
     use super::super::k_memory_manager::{Direction, Pool};
 
     // Applet secure memory is handled separately.
-    assert!(pool != Pool::Applet as u32, "Applet secure memory not implemented");
+    assert!(
+        pool != Pool::Applet as u32,
+        "Applet secure memory not implemented"
+    );
 
     // Determine alignment.
     let alignment = if pool == Pool::System as u32 {
@@ -208,7 +211,11 @@ pub fn free_secure_memory(
 
     assert!(pool != 2, "Applet secure memory not implemented");
 
-    let alignment = if pool == 0 { PAGE_SIZE } else { SECURE_ALIGNMENT };
+    let alignment = if pool == 0 {
+        PAGE_SIZE
+    } else {
+        SECURE_ALIGNMENT
+    };
     assert!(address as usize % alignment == 0);
     assert!(size % alignment == 0);
 
