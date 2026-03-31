@@ -64,14 +64,30 @@ impl DataStatusFlag {
         }
     }
 
-    pub fn set_is_initialized(&mut self, value: bool) { self.set_bit(0, value); }
-    pub fn set_is_assigned(&mut self, value: bool) { self.set_bit(1, value); }
-    pub fn set_enable_pad_input(&mut self, value: bool) { self.set_bit(16, value); }
-    pub fn set_enable_six_axis_sensor(&mut self, value: bool) { self.set_bit(17, value); }
-    pub fn set_bit_18(&mut self, value: bool) { self.set_bit(18, value); }
-    pub fn set_is_palma_connectable(&mut self, value: bool) { self.set_bit(19, value); }
-    pub fn set_enable_palma_boost_mode(&mut self, value: bool) { self.set_bit(20, value); }
-    pub fn set_enable_touchscreen(&mut self, value: bool) { self.set_bit(21, value); }
+    pub fn set_is_initialized(&mut self, value: bool) {
+        self.set_bit(0, value);
+    }
+    pub fn set_is_assigned(&mut self, value: bool) {
+        self.set_bit(1, value);
+    }
+    pub fn set_enable_pad_input(&mut self, value: bool) {
+        self.set_bit(16, value);
+    }
+    pub fn set_enable_six_axis_sensor(&mut self, value: bool) {
+        self.set_bit(17, value);
+    }
+    pub fn set_bit_18(&mut self, value: bool) {
+        self.set_bit(18, value);
+    }
+    pub fn set_is_palma_connectable(&mut self, value: bool) {
+        self.set_bit(19, value);
+    }
+    pub fn set_enable_palma_boost_mode(&mut self, value: bool) {
+        self.set_bit(20, value);
+    }
+    pub fn set_enable_touchscreen(&mut self, value: bool) {
+        self.set_bit(21, value);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -286,6 +302,23 @@ impl AppletResource {
         self.active_aruid
     }
 
+    /// Port of upstream `AppletResource::GetSharedMemoryHandle`.
+    ///
+    /// Upstream returns `shared_memory_holder[index].GetHandle()`, which is a
+    /// `Kernel::KSharedMemory*`. The hid_core crate cannot own kernel objects
+    /// without a dependency cycle into `core`, so the Rust port returns the
+    /// validated holder index instead. The `core` service layer uses that
+    /// index to mirror the same shared-memory payload into a real
+    /// `KSharedMemory` object and hand out the copy handle.
+    pub fn get_shared_memory_handle(&self, aruid: u64) -> Result<usize, ResultCode> {
+        let index = self.get_index_from_aruid(aruid);
+        if index >= ARUID_INDEX_MAX {
+            return Err(hid_result::RESULT_ARUID_NOT_REGISTERED);
+        }
+
+        Ok(index)
+    }
+
     pub fn get_aruid_data(&self, aruid: u64) -> Option<&AruidData> {
         let aruid_index = self.get_index_from_aruid(aruid);
         if aruid_index == ARUID_INDEX_MAX {
@@ -455,7 +488,9 @@ impl AppletResource {
             return;
         }
 
-        self.data[index].flag.set_is_palma_connectable(is_connectable);
+        self.data[index]
+            .flag
+            .set_is_palma_connectable(is_connectable);
     }
 
     pub fn enable_palma_boost_mode(&mut self, aruid: u64, is_enabled: bool) {
@@ -464,7 +499,9 @@ impl AppletResource {
             return;
         }
 
-        self.data[index].flag.set_enable_palma_boost_mode(is_enabled);
+        self.data[index]
+            .flag
+            .set_enable_palma_boost_mode(is_enabled);
     }
 
     pub fn register_core_applet_resource(&mut self) -> ResultCode {
@@ -548,5 +585,24 @@ impl AppletResource {
 impl Default for AppletResource {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppletResource, ARUID_INDEX_MAX};
+
+    #[test]
+    fn get_shared_memory_handle_returns_registered_holder_index() {
+        let mut resource = AppletResource::new();
+
+        assert!(resource
+            .register_applet_resource_user_id(0x1234, true)
+            .is_success());
+        assert!(resource.create_applet_resource(0x1234).is_success());
+
+        let index = resource.get_shared_memory_handle(0x1234).unwrap();
+        assert!(index < ARUID_INDEX_MAX);
+        assert_eq!(resource.get_shared_memory_format(0x1234).is_some(), true);
     }
 }

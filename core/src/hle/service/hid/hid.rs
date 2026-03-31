@@ -22,9 +22,10 @@ use crate::hle::service::server_manager::ServerManager;
 pub fn loop_process(system: crate::core::SystemRef) {
     let firmware_settings = Arc::new(HidFirmwareSettings::new());
     let hid_core = Arc::new(parking_lot::Mutex::new(HIDCore::new()));
-    let resource_manager = Arc::new(parking_lot::Mutex::new(
-        ResourceManager::new(firmware_settings.clone(), hid_core),
-    ));
+    let resource_manager = Arc::new(parking_lot::Mutex::new(ResourceManager::new(
+        firmware_settings.clone(),
+        hid_core,
+    )));
 
     resource_manager.lock().initialize();
 
@@ -34,9 +35,15 @@ pub fn loop_process(system: crate::core::SystemRef) {
     {
         let rm = resource_manager.clone();
         let fw = firmware_settings.clone();
-        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::hid_server::IHidServer::new(rm.clone(), fw.clone()))
-        });
+        let system_ref = system;
+        let factory: SessionRequestHandlerFactory =
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(super::hid_server::IHidServer::new(
+                    system_ref,
+                    rm.clone(),
+                    fw.clone(),
+                ))
+            });
         server_manager.register_named_service("hid", factory, 64);
     }
 
@@ -44,9 +51,13 @@ pub fn loop_process(system: crate::core::SystemRef) {
     {
         let rm = resource_manager.clone();
         let fw = firmware_settings.clone();
-        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::hid_debug_server::IHidDebugServer::new(rm.clone(), fw.clone()))
-        });
+        let factory: SessionRequestHandlerFactory =
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(super::hid_debug_server::IHidDebugServer::new(
+                    rm.clone(),
+                    fw.clone(),
+                ))
+            });
         server_manager.register_named_service("hid:dbg", factory, 64);
     }
 
@@ -54,41 +65,43 @@ pub fn loop_process(system: crate::core::SystemRef) {
     {
         let rm = resource_manager.clone();
         let fw = firmware_settings.clone();
-        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::hid_system_server::IHidSystemServer::new(rm.clone(), fw.clone()))
-        });
+        let factory: SessionRequestHandlerFactory =
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(super::hid_system_server::IHidSystemServer::new(
+                    rm.clone(),
+                    fw.clone(),
+                ))
+            });
         server_manager.register_named_service("hid:sys", factory, 64);
     }
 
     // "hidbus" -> Hidbus
     {
-        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::hidbus::Hidbus::new())
-        });
+        let factory: SessionRequestHandlerFactory =
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(super::hidbus::Hidbus::new())
+            });
         server_manager.register_named_service("hidbus", factory, 64);
     }
 
     // "irs" -> IRS
     {
-        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::irs::Irs::new())
-        });
+        let factory: SessionRequestHandlerFactory =
+            Box::new(move || -> SessionRequestHandlerPtr { Arc::new(super::irs::Irs::new()) });
         server_manager.register_named_service("irs", factory, 64);
     }
 
     // "irs:sys" -> IRS_SYS
     {
-        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::irs::IrsSys::new())
-        });
+        let factory: SessionRequestHandlerFactory =
+            Box::new(move || -> SessionRequestHandlerPtr { Arc::new(super::irs::IrsSys::new()) });
         server_manager.register_named_service("irs:sys", factory, 64);
     }
 
     // "xcd:sys" -> XCD_SYS
     {
-        let factory: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::xcd::XcdSys::new())
-        });
+        let factory: SessionRequestHandlerFactory =
+            Box::new(move || -> SessionRequestHandlerPtr { Arc::new(super::xcd::XcdSys::new()) });
         server_manager.register_named_service("xcd:sys", factory, 64);
     }
 

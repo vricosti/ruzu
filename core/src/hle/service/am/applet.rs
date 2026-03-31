@@ -10,6 +10,7 @@ use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 use crate::hle::service::os::process::Process;
+use crate::core::SystemRef;
 
 use super::am_types::*;
 use super::applet_data_broker::AppletDataBroker;
@@ -111,10 +112,13 @@ pub struct Applet {
 }
 
 impl Applet {
-    pub fn new(is_application: bool) -> Self {
+    pub fn new(system: SystemRef, is_application: bool) -> Self {
+        let process = Process::new();
+        let hid_registration = super::hid_registration::HidRegistration::new(system, &process);
+
         Self {
             lifecycle_manager: LifecycleManager::new(is_application),
-            process: Process::new(),
+            process,
             is_process_running: false,
             applet_id: AppletId::default(),
             aruid: AppletResourceUserId::default(),
@@ -177,7 +181,7 @@ impl Applet {
             sleep_lock_event_handle: None,
             state_changed_event: None,
             state_changed_event_handle: None,
-            hid_registration: super::hid_registration::HidRegistration::new(&Process::new(), None),
+            hid_registration,
         }
     }
 
@@ -201,7 +205,11 @@ impl Applet {
         process: &mut KProcess,
         readable_event: &Arc<Mutex<KReadableEvent>>,
     ) {
-        let Some(scheduler) = process.scheduler.as_ref().and_then(|scheduler| scheduler.upgrade()) else {
+        let Some(scheduler) = process
+            .scheduler
+            .as_ref()
+            .and_then(|scheduler| scheduler.upgrade())
+        else {
             return;
         };
         readable_event.lock().unwrap().signal(process, &scheduler);

@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::am::applet::Applet;
 use crate::hle::service::am::window_system::WindowSystem;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -32,9 +32,21 @@ pub struct IAllSystemAppletProxiesService {
 impl IAllSystemAppletProxiesService {
     pub fn new(window_system: Arc<Mutex<WindowSystem>>) -> Self {
         let handlers = build_handler_map(&[
-            (100, Some(Self::open_system_applet_proxy_handler), "OpenSystemAppletProxy"),
-            (200, Some(Self::open_library_applet_proxy_old_handler), "OpenLibraryAppletProxyOld"),
-            (201, Some(Self::open_library_applet_proxy_handler), "OpenLibraryAppletProxy"),
+            (
+                100,
+                Some(Self::open_system_applet_proxy_handler),
+                "OpenSystemAppletProxy",
+            ),
+            (
+                200,
+                Some(Self::open_library_applet_proxy_old_handler),
+                "OpenLibraryAppletProxyOld",
+            ),
+            (
+                201,
+                Some(Self::open_library_applet_proxy_handler),
+                "OpenLibraryAppletProxy",
+            ),
             (300, None, "OpenOverlayAppletProxy"),
             (350, None, "OpenSystemApplicationProxy"),
             (400, None, "CreateSelfLibraryAppletCreatorForDevelop"),
@@ -48,37 +60,11 @@ impl IAllSystemAppletProxiesService {
         }
     }
 
-    /// Create a default applet for proxy services, seeding it with PID from the request context.
-    fn create_applet(ctx: &mut HLERequestContext) -> Arc<Mutex<Applet>> {
-        let applet = Arc::new(Mutex::new(Applet::new(false)));
-        {
-            let mut applet_guard = applet.lock().unwrap();
-            if ctx.get_pid() != 0 {
-                applet_guard.aruid.pid = ctx.get_pid();
-            }
-            if let Some(thread) = ctx.get_thread() {
-                if let Some(process) = thread
-                    .lock()
-                    .unwrap()
-                    .parent
-                    .as_ref()
-                    .and_then(|p| p.upgrade())
-                {
-                    let process = process.lock().unwrap();
-                    if applet_guard.aruid.pid == 0 {
-                        applet_guard.aruid.pid = process.get_process_id();
-                    }
-                    applet_guard.program_id = process.get_program_id();
-                }
-            }
-            applet_guard.is_process_running = true;
-            log::info!(
-                "AllSystemAppletProxies: created applet aruid={:#x} program_id={:#x}",
-                applet_guard.aruid.pid,
-                applet_guard.program_id
-            );
-        }
-        applet
+    fn get_applet_from_process_id(&self, pid: u64) -> Option<Arc<Mutex<Applet>>> {
+        self.window_system
+            .lock()
+            .unwrap()
+            .get_by_applet_resource_user_id(pid)
     }
 
     fn push_interface_response(
@@ -102,13 +88,31 @@ impl IAllSystemAppletProxiesService {
         }
     }
 
-    fn open_system_applet_proxy_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAllSystemAppletProxiesService) };
+    fn open_system_applet_proxy_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe {
+            &*(this as *const dyn ServiceFramework as *const IAllSystemAppletProxiesService)
+        };
         log::debug!("IAllSystemAppletProxiesService::OpenSystemAppletProxy");
-        let applet = Self::create_applet(ctx);
+        let pid = if ctx.get_pid() != 0 {
+            ctx.get_pid()
+        } else {
+            ctx.get_thread()
+                .and_then(|thread| {
+                    thread
+                        .lock()
+                        .unwrap()
+                        .parent
+                        .as_ref()
+                        .and_then(|p| p.upgrade())
+                })
+                .map(|process| process.lock().unwrap().get_process_id())
+                .unwrap_or(0)
+        };
+        let Some(applet) = service.get_applet_from_process_id(pid) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
         let proxy = Arc::new(super::system_applet_proxy::ISystemAppletProxy::new(
             applet,
             service.window_system.clone(),
@@ -120,9 +124,30 @@ impl IAllSystemAppletProxiesService {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAllSystemAppletProxiesService) };
+        let service = unsafe {
+            &*(this as *const dyn ServiceFramework as *const IAllSystemAppletProxiesService)
+        };
         log::debug!("IAllSystemAppletProxiesService::OpenLibraryAppletProxyOld");
-        let applet = Self::create_applet(ctx);
+        let pid = if ctx.get_pid() != 0 {
+            ctx.get_pid()
+        } else {
+            ctx.get_thread()
+                .and_then(|thread| {
+                    thread
+                        .lock()
+                        .unwrap()
+                        .parent
+                        .as_ref()
+                        .and_then(|p| p.upgrade())
+                })
+                .map(|process| process.lock().unwrap().get_process_id())
+                .unwrap_or(0)
+        };
+        let Some(applet) = service.get_applet_from_process_id(pid) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
         let proxy = Arc::new(super::library_applet_proxy::ILibraryAppletProxy::new(
             applet,
             service.window_system.clone(),
@@ -130,13 +155,31 @@ impl IAllSystemAppletProxiesService {
         Self::push_interface_response(ctx, proxy);
     }
 
-    fn open_library_applet_proxy_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IAllSystemAppletProxiesService) };
+    fn open_library_applet_proxy_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe {
+            &*(this as *const dyn ServiceFramework as *const IAllSystemAppletProxiesService)
+        };
         log::debug!("IAllSystemAppletProxiesService::OpenLibraryAppletProxy");
-        let applet = Self::create_applet(ctx);
+        let pid = if ctx.get_pid() != 0 {
+            ctx.get_pid()
+        } else {
+            ctx.get_thread()
+                .and_then(|thread| {
+                    thread
+                        .lock()
+                        .unwrap()
+                        .parent
+                        .as_ref()
+                        .and_then(|p| p.upgrade())
+                })
+                .map(|process| process.lock().unwrap().get_process_id())
+                .unwrap_or(0)
+        };
+        let Some(applet) = service.get_applet_from_process_id(pid) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
         let proxy = Arc::new(super::library_applet_proxy::ILibraryAppletProxy::new(
             applet,
             service.window_system.clone(),

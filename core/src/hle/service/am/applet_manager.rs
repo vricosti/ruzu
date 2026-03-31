@@ -34,7 +34,7 @@ const LAUNCH_PARAMETER_ACCOUNT_PRESELECTED_USER_MAGIC: u32 = 0xC79497CA;
 struct LaunchParameterAccountPreselectedUser {
     magic: u32,
     is_account_selected: u32,
-    current_user: [u8; 16],    // Common::UUID — 16 bytes, alignment 1
+    current_user: [u8; 16], // Common::UUID — 16 bytes, alignment 1
     _padding: [u8; 0x70],
 }
 const _: () = assert!(std::mem::size_of::<LaunchParameterAccountPreselectedUser>() == 0x88);
@@ -47,13 +47,18 @@ const _: () = assert!(std::mem::size_of::<LaunchParameterAccountPreselectedUser>
 ///
 /// Creates a caller-applet broker on `applet` and returns a reference to its
 /// in-data channel so callers can push launch arguments.
-fn initialize_fake_caller_applet(applet: &mut Applet) -> &super::applet_data_broker::AppletStorageChannel {
+fn initialize_fake_caller_applet(
+    applet: &mut Applet,
+) -> &super::applet_data_broker::AppletStorageChannel {
     applet.caller_applet_broker = Some(Arc::new(AppletDataBroker::new()));
     applet.caller_applet_broker.as_ref().unwrap().get_in_data()
 }
 
 /// Upstream: `void PushInShowQlaunch(system, channel)`
-fn push_in_show_qlaunch(system_tick: u64, channel: &super::applet_data_broker::AppletStorageChannel) {
+fn push_in_show_qlaunch(
+    system_tick: u64,
+    channel: &super::applet_data_broker::AppletStorageChannel,
+) {
     let arguments = CommonArguments {
         arguments_version: CommonArgumentVersion::Version3,
         size: CommonArgumentSize::Version3 as u32,
@@ -104,7 +109,7 @@ fn push_in_show_controller(
     channel: &super::applet_data_broker::AppletStorageChannel,
 ) {
     use crate::hle::service::am::frontend::applet_controller::{
-        ControllerAppletVersion, ControllerSupportArgNew, ControllerSupportArgHeader,
+        ControllerAppletVersion, ControllerSupportArgHeader, ControllerSupportArgNew,
         ControllerSupportArgPrivate,
     };
 
@@ -136,8 +141,8 @@ fn push_in_show_controller(
         arg_size: std::mem::size_of::<ControllerSupportArgNew>() as u32,
         is_home_menu: true,
         flag_1: true,
-        mode: 0, // ControllerSupportMode::ShowControllerSupport
-        caller: 0, // ControllerSupportCaller::Application
+        mode: 0,      // ControllerSupportMode::ShowControllerSupport
+        caller: 0,    // ControllerSupportCaller::Application
         style_set: 0, // NpadStyleSet::None
         joy_hold_type: 0,
     };
@@ -265,10 +270,8 @@ fn push_in_show_software_keyboard(
     // Upstream: argument_data, then swkbd_data (config_common concatenated with config_new),
     // then work_buffer (empty — initial_string_length = 0).
     let mut arg_buf = vec![0u8; std::mem::size_of::<CommonArguments>()];
-    let mut swkbd_buf = vec![
-        0u8;
-        std::mem::size_of::<SwkbdConfigCommon>() + std::mem::size_of::<SwkbdConfigNew>()
-    ];
+    let mut swkbd_buf =
+        vec![0u8; std::mem::size_of::<SwkbdConfigCommon>() + std::mem::size_of::<SwkbdConfigNew>()];
     unsafe {
         std::ptr::copy_nonoverlapping(
             &arguments as *const _ as *const u8,
@@ -282,7 +285,9 @@ fn push_in_show_software_keyboard(
         );
         std::ptr::copy_nonoverlapping(
             &swkbd_config_new as *const _ as *const u8,
-            swkbd_buf.as_mut_ptr().add(std::mem::size_of::<SwkbdConfigCommon>()),
+            swkbd_buf
+                .as_mut_ptr()
+                .add(std::mem::size_of::<SwkbdConfigCommon>()),
             std::mem::size_of::<SwkbdConfigNew>(),
         );
     }
@@ -400,8 +405,10 @@ impl AppletManager {
         drop(inner);
 
         // Build the applet. Upstream: `auto applet = std::make_shared<Applet>(m_system, process, ...)`
-        let mut applet = Applet::new(params.applet_id == AppletId::Application);
+        let mut applet = Applet::new(self.system, params.applet_id == AppletId::Application);
         applet.process = Process::with_process(process.clone());
+        applet.hid_registration =
+            super::hid_registration::HidRegistration::new(self.system, &applet.process);
         applet.aruid.pid = process.lock().unwrap().get_process_id();
         applet.program_id = params.program_id;
         applet.applet_id = params.applet_id;
@@ -413,8 +420,7 @@ impl AppletManager {
         // `if (params.launch_type == LaunchType::ApplicationInitiated)`
         if params.launch_type == LaunchType::ApplicationInitiated {
             if !self.system.is_null() {
-                let user_channel: VecDeque<Vec<u8>> =
-                    self.system.get().get_user_channel_snapshot();
+                let user_channel: VecDeque<Vec<u8>> = self.system.get().get_user_channel_snapshot();
                 applet.user_channel_launch_parameter = user_channel;
             }
         }
@@ -428,8 +434,7 @@ impl AppletManager {
                 _padding: [0u8; 0x70],
             };
 
-            let profile_manager =
-                crate::hle::service::acc::profile_manager::ProfileManager::new();
+            let profile_manager = crate::hle::service::acc::profile_manager::ProfileManager::new();
             let current_user_idx = *common::settings::values().current_user.get_value() as usize;
             if let Some(uuid) = profile_manager.get_user(current_user_idx) {
                 lp.current_user = uuid.to_le_bytes();
@@ -483,7 +488,9 @@ impl AppletManager {
 
         // Upstream: `applet->lifecycle_manager.SetFocusState(FocusState::InFocus)`
         applet.is_process_running = true;
-        applet.lifecycle_manager.set_focus_state(FocusState::InFocus);
+        applet
+            .lifecycle_manager
+            .set_focus_state(FocusState::InFocus);
 
         let applet = Arc::new(Mutex::new(applet));
         let ws = window_system.lock().unwrap();
@@ -492,7 +499,8 @@ impl AppletManager {
             {
                 let mut ag = applet.lock().unwrap();
                 ag.lifecycle_manager.set_focus_handling_mode(false);
-                ag.lifecycle_manager.set_out_of_focus_suspending_enabled(false);
+                ag.lifecycle_manager
+                    .set_out_of_focus_suspending_enabled(false);
             }
             ws.track_applet(applet, false);
             ws.request_home_menu_to_get_foreground();
