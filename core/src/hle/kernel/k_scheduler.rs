@@ -391,6 +391,32 @@ impl KScheduler {
         }
     }
 
+    /// Raw helper for wait owners that already know the current thread became
+    /// non-runnable and need the same immediate handoff as upstream
+    /// `RescheduleCurrentCore()`, but cannot hold the scheduler mutex across a
+    /// fiber yield.
+    ///
+    /// # Safety
+    /// Same requirements as `schedule_raw_if_needed`.
+    pub unsafe fn reschedule_current_core_raw(sched: *mut KScheduler) {
+        if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
+            cur_thread.lock().unwrap().enable_dispatch();
+        }
+
+        if let Some(gsc_arc) = &(*sched).global_scheduler_context {
+            let update_fn = {
+                let gsc = gsc_arc.lock().unwrap();
+                gsc.scheduler_lock().get_update_callback()
+            };
+            if let Some(f) = update_fn {
+                f();
+            }
+        }
+
+        (*sched).state.needs_scheduling.store(true, Ordering::SeqCst);
+        (*sched).reschedule_current_core_impl();
+    }
+
     /// Initialize the switch fiber for this scheduler.
     /// Must be called after the scheduler is wrapped in Arc<Mutex<>>.
     ///

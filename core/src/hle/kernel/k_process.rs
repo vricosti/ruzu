@@ -1004,24 +1004,32 @@ impl KProcess {
         tag: u32,
         timeout: i64,
     ) -> u32 {
-        let mut cond_var = {
+        let result = {
             let mut process_guard = process.lock().unwrap();
-            std::mem::take(&mut process_guard.cond_var)
+            let cond_var_ptr: *mut KConditionVariable = &mut process_guard.cond_var;
+
+            // Keep the condition variable owned by KProcess while waiting.
+            // Upstream always waits/signals against the process-owned condvar tree.
+            unsafe {
+                (*cond_var_ptr).wait(
+                    process,
+                    current_thread,
+                    address,
+                    cv_key,
+                    tag,
+                    timeout,
+                )
+            }
         };
 
-        let result = cond_var.wait(process, current_thread, address, cv_key, tag, timeout);
-
-        process.lock().unwrap().cond_var = cond_var;
         result.get_inner_value()
     }
 
     pub fn signal_condition_variable(&mut self, cv_key: u64, count: i32) {
-        // Take cond_var out temporarily to avoid borrowing self while passing
-        // &mut self to signal(). This is safe because no other code accesses
-        // cond_var while we hold &mut self.
-        let mut cond_var = std::mem::take(&mut self.cond_var);
-        let _ = cond_var.signal(self, cv_key, count);
-        self.cond_var = cond_var;
+        let cond_var_ptr: *mut KConditionVariable = &mut self.cond_var;
+        unsafe {
+            let _ = (*cond_var_ptr).signal(self, cv_key, count);
+        }
     }
 
     /// Port of upstream `KProcess::SignalAddressArbiter`.
@@ -1051,24 +1059,18 @@ impl KProcess {
     }
 
     pub fn before_update_condition_variable_priority(&mut self, thread_id: u64) {
-        let mut cond_var = std::mem::take(&mut self.cond_var);
-        cond_var.before_update_priority(thread_id);
-        self.cond_var = cond_var;
+        self.cond_var.before_update_priority(thread_id);
     }
 
     pub fn after_update_condition_variable_priority(
         &mut self,
         thread_key: super::k_thread::ConditionVariableThreadKey,
     ) {
-        let mut cond_var = std::mem::take(&mut self.cond_var);
-        cond_var.after_update_priority(thread_key);
-        self.cond_var = cond_var;
+        self.cond_var.after_update_priority(thread_key);
     }
 
     pub fn remove_condition_variable_waiter(&mut self, thread_id: u64) {
-        let mut cond_var = std::mem::take(&mut self.cond_var);
-        cond_var.remove_waiter(thread_id);
-        self.cond_var = cond_var;
+        self.cond_var.remove_waiter(thread_id);
     }
 
     // -- Priority queue operations --

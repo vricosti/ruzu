@@ -1026,7 +1026,7 @@ pub fn wait(
     if super::kernel::get_current_thread_pointer().is_some() {
         loop {
             unsafe {
-                KScheduler::schedule_raw_if_needed(sched_ptr);
+                KScheduler::reschedule_current_core_raw(sched_ptr);
             }
 
             let state = current_thread.lock().unwrap().get_state();

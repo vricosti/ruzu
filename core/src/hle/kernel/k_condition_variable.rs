@@ -300,16 +300,24 @@ impl KConditionVariable {
         result
     }
 
-    fn wait_for_current_thread(
+    pub(crate) fn wait_for_current_thread(
         process: &Arc<Mutex<KProcess>>,
         current_thread: &Arc<Mutex<KThread>>,
     ) {
-        let scheduler = process
+        let scheduler = current_thread
             .lock()
             .unwrap()
             .scheduler
             .as_ref()
-            .and_then(|scheduler| scheduler.upgrade());
+            .and_then(|scheduler| scheduler.upgrade())
+            .or_else(|| {
+                process
+                    .lock()
+                    .unwrap()
+                    .scheduler
+                    .as_ref()
+                    .and_then(|scheduler| scheduler.upgrade())
+            });
 
         if let Some(scheduler) = scheduler {
             scheduler.lock().unwrap().request_schedule();
@@ -319,27 +327,17 @@ impl KConditionVariable {
                 &mut *scheduler_guard as *mut KScheduler
             };
 
-            if super::kernel::get_current_thread_pointer().is_some() {
-                loop {
-                    unsafe {
-                        KScheduler::schedule_raw_if_needed(sched_ptr);
-                    }
-
-                    let state = current_thread.lock().unwrap().get_state();
-                    if state != super::k_thread::ThreadState::WAITING {
-                        break;
-                    }
-
-                    std::thread::yield_now();
+            loop {
+                unsafe {
+                    KScheduler::reschedule_current_core_raw(sched_ptr);
                 }
-            } else {
-                loop {
-                    let state = current_thread.lock().unwrap().get_state();
-                    if state != super::k_thread::ThreadState::WAITING {
-                        break;
-                    }
-                    std::thread::yield_now();
+
+                let state = current_thread.lock().unwrap().get_state();
+                if state != super::k_thread::ThreadState::WAITING {
+                    break;
                 }
+
+                std::thread::yield_now();
             }
         } else {
             loop {
@@ -527,10 +525,31 @@ impl KConditionVariable {
         timeout: i64,
     ) -> ResultCode {
         let current_thread_id = current_thread.lock().unwrap().get_thread_id();
+        let scheduler_lock_ptr = current_thread.lock().unwrap().scheduler_lock_ptr;
+        if scheduler_lock_ptr == 0 {
+            return RESULT_INVALID_STATE;
+        }
+        let scheduler_lock =
+            unsafe { &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock) };
+        let hardware_timer = super::kernel::get_hardware_timer_arc();
+        let mut wait_queue = ThreadQueueImplForKConditionVariableWaitConditionVariable::queue();
+        let thread_ptr = {
+            let mut guard = current_thread.lock().unwrap();
+            (&mut *guard) as *mut KThread as usize
+        };
+
+        let (mut sleep_guard, timer) = super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep::new(
+            scheduler_lock,
+            hardware_timer.as_ref(),
+            current_thread_id,
+            thread_ptr,
+            timeout,
+        );
 
         // Check that the thread isn't terminating.
         // Matches upstream: if (cur_thread->IsTerminationRequested()) { slp.CancelSleep(); ... }
         if current_thread.lock().unwrap().is_termination_requested() {
+            sleep_guard.cancel_sleep();
             return RESULT_TERMINATION_REQUESTED;
         }
 
@@ -553,6 +572,7 @@ impl KConditionVariable {
                 let Some(next_owner_thread) =
                     process_guard.get_thread_by_thread_id(next_owner_thread_id)
                 else {
+                    sleep_guard.cancel_sleep();
                     return RESULT_INVALID_STATE;
                 };
 
@@ -582,6 +602,7 @@ impl KConditionVariable {
             // Matches upstream: WriteToUser(m_kernel, key, &has_waiter_flag);
             //                   std::atomic_thread_fence(std::memory_order_seq_cst);
             if !write_to_user(process_guard, key, 1) {
+                sleep_guard.cancel_sleep();
                 return RESULT_INVALID_CURRENT_MEMORY;
             }
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -589,6 +610,7 @@ impl KConditionVariable {
             // Write the value to userspace.
             // Matches upstream: WriteToUser(m_kernel, addr, &next_value)
             if !write_to_user(process_guard, addr, next_value) {
+                sleep_guard.cancel_sleep();
                 return RESULT_INVALID_CURRENT_MEMORY;
             }
         }
@@ -596,16 +618,18 @@ impl KConditionVariable {
         // If timeout is zero, time out.
         // Matches upstream: R_UNLESS(timeout != 0, ResultTimedOut);
         if timeout == 0 {
+            sleep_guard.cancel_sleep();
             return crate::hle::kernel::svc::svc_results::RESULT_TIMED_OUT;
         }
 
-        // Thread leaves RUNNABLE — remove from priority queue.
-        process_guard.remove_from_priority_queue(current_thread_id);
+        if let Some(timer) = timer {
+            wait_queue.set_hardware_timer(timer);
+        }
 
         // Update condition variable tracking.
         // Matches upstream: cur_thread->SetConditionVariable(&m_tree, addr, key, value);
         //                   m_tree.insert(*cur_thread);
-        Self::begin_wait_condition_variable(current_thread, addr, key, value, timeout);
+        Self::begin_wait_condition_variable(current_thread, wait_queue, addr, key, value, timeout);
         let thread_key = current_thread.lock().unwrap().condition_variable_tree_key();
         self.waiting_threads.insert(thread_key);
 
@@ -752,6 +776,7 @@ impl KConditionVariable {
     ///   cur_thread->BeginWait(&wait_queue);
     fn begin_wait_condition_variable(
         current_thread: &Arc<Mutex<KThread>>,
+        wait_queue: KThreadQueue,
         addr: u64,
         key: u64,
         value: u32,
@@ -760,9 +785,7 @@ impl KConditionVariable {
         let mut current_thread = current_thread.lock().unwrap();
         current_thread.set_condition_variable(KProcessAddress::new(addr), key, value);
         current_thread.set_waiting_lock_owner_thread_id(None);
-        current_thread.begin_wait_with_queue(
-            ThreadQueueImplForKConditionVariableWaitConditionVariable::queue(),
-        );
+        current_thread.begin_wait_with_queue(wait_queue);
         current_thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
         if timeout > 0 {
             current_thread.sleep_deadline =
@@ -1004,6 +1027,43 @@ mod tests {
             ConditionVariableTreeState::None
         );
         drop(waiter_guard);
+        assert!(process
+            .lock()
+            .unwrap()
+            .cond_var
+            .waiting_thread_ids()
+            .is_empty());
+    }
+
+    #[test]
+    fn process_owned_condition_variable_is_visible_to_signalers_while_waiting() {
+        let (process, _owner, waiter, _owner_handle, address) = setup_threads();
+        let key = 0x1c40;
+
+        let waiter_process = Arc::clone(&process);
+        let waiter_thread = Arc::clone(&waiter);
+        let wait_handle = std::thread::spawn(move || {
+            KProcess::wait_condition_variable(
+                &waiter_process,
+                &waiter_thread,
+                address,
+                key,
+                0x1234,
+                5_000_000,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        {
+            let process_guard = process.lock().unwrap();
+            assert_eq!(process_guard.cond_var.waiting_thread_ids(), vec![2]);
+        }
+
+        process.lock().unwrap().signal_condition_variable(key, 1);
+
+        let result = wait_handle.join().unwrap();
+        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+        assert_eq!(waiter.lock().unwrap().get_state(), ThreadState::RUNNABLE);
         assert!(process
             .lock()
             .unwrap()
