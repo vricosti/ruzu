@@ -7,11 +7,15 @@
 use std::sync::{Arc, Mutex};
 
 use crate::core::System;
+use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
 use crate::hle::kernel::k_thread::KThread;
+use crate::hle::kernel::k_typed_address::KProcessAddress;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, PseudoHandle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+
+const FALLBACK_USER_THREAD_STACK_SIZE: u64 = 0x100000;
 
 fn is_valid_virtual_core_id(core_id: i32) -> bool {
     (0..4).contains(&core_id)
@@ -57,6 +61,7 @@ pub fn create_thread(
     priority: i32,
     mut core_id: i32,
 ) -> ResultCode {
+    let requested_core_id = core_id;
     log::debug!(
         "svc::CreateThread called entry=0x{:08X}, arg=0x{:08X}, stack=0x{:08X}, prio={}, core={}",
         entry_point,
@@ -86,10 +91,24 @@ pub fn create_thread(
         if !process.check_thread_priority(priority) {
             return RESULT_INVALID_PRIORITY;
         }
+
+        log::info!(
+            "svc::CreateThread resolved entry=0x{:08X} prio={} requested_core={} effective_core={} process_ideal_core={}",
+            entry_point,
+            priority,
+            requested_core_id,
+            core_id,
+            process.get_ideal_core_id(),
+        );
     }
 
     let object_id = system.kernel().unwrap().create_new_object_id() as u64;
     let thread_id = system.kernel().unwrap().create_new_thread_id();
+
+    {
+        let mut process = current_process.lock().unwrap();
+        ensure_user_stack_mapping(&mut process, stack_bottom);
+    }
 
     // Create the guest thread fiber entry — matches upstream
     // `system.GetCpuManager().GetGuestThreadFunc()`.
@@ -151,11 +170,9 @@ pub fn create_thread(
     }
 
     process.register_thread_object(thread);
-    let scheduler = system.scheduler_arc().clone();
     match process.handle_table.add(object_id) {
         Ok(handle) => {
             *out_handle = handle;
-            scheduler.lock().unwrap().request_schedule();
             RESULT_SUCCESS
         }
         Err(_) => {
@@ -164,6 +181,107 @@ pub fn create_thread(
             RESULT_OUT_OF_HANDLES
         }
     }
+}
+
+fn ensure_user_stack_mapping(
+    process: &mut crate::hle::kernel::k_process::KProcess,
+    stack_top: u64,
+) {
+    if stack_top == 0 {
+        return;
+    }
+
+    let probe_addr = stack_top.saturating_sub(0x10);
+    let shared_probe = process.process_memory.read().unwrap().read_bytes(probe_addr, 0x10);
+    let memory_probe = process
+        .page_table
+        .get_base()
+        .m_memory
+        .as_ref()
+        .map(|memory| {
+            let memory = memory.lock().unwrap();
+            let mut bytes = [0u8; 0x10];
+            let valid = memory.is_valid_virtual_address_range(probe_addr, bytes.len() as u64);
+            if valid {
+                let _ = memory.read_block(probe_addr, &mut bytes);
+            }
+            (valid, bytes)
+        });
+
+    let stack_top_page = (stack_top + PAGE_SIZE as u64 - 1) & !((PAGE_SIZE as u64) - 1);
+    let stack_base = stack_top_page.saturating_sub(FALLBACK_USER_THREAD_STACK_SIZE);
+    if stack_base >= stack_top_page {
+        return;
+    }
+
+    let size = (stack_top_page - stack_base) as usize;
+    let query_addr = stack_top.saturating_sub(1) as usize;
+    let Some(info) = process.page_table.query_info(query_addr) else {
+        return;
+    };
+    let heap_start = process.page_table.get_heap_region_start().get();
+    let heap_size = process.page_table.get_current_heap_size();
+    let heap_end = heap_start.saturating_add(heap_size as u64);
+    let in_heap = probe_addr >= heap_start && probe_addr < heap_end;
+
+    log::info!(
+        "svc::CreateThread stack probe top={:#x} query_state={:?} heap=[{:#x}..{:#x}) in_heap={} shared={:02x?} memory={:?}",
+        stack_top,
+        info.get_state(),
+        heap_start,
+        heap_end,
+        in_heap,
+        shared_probe,
+        memory_probe
+    );
+
+    if info.get_state() == KMemoryState::FREE {
+        let iter_start = probe_addr.saturating_sub((PAGE_SIZE as u64) * 4) as usize;
+        for block in process
+            .page_table
+            .get_base()
+            .get_memory_block_manager()
+            .find_iterator(iter_start)
+            .take(6)
+        {
+            let block_info = block.get_memory_info();
+            log::info!(
+                "svc::CreateThread nearby block [{:#x}..{:#x}) state={:?} perm={:?} attr={:?}",
+                block_info.m_address,
+                block_info.m_address + block_info.m_size,
+                block_info.m_state,
+                block_info.m_permission,
+                block_info.m_attribute
+            );
+        }
+    }
+
+    if info.get_state() != KMemoryState::FREE {
+        return;
+    }
+
+    let num_pages = size / PAGE_SIZE;
+    let result = process.page_table.map_pages_at_address(
+        KProcessAddress::new(stack_base),
+        num_pages,
+        KMemoryState::STACK,
+        KMemoryPermission::USER_READ_WRITE,
+    );
+    if result != RESULT_SUCCESS.get_inner_value() {
+        log::warn!(
+            "svc::CreateThread: failed to map fallback stack [{:#x}..{:#x}) result={:#x}",
+            stack_base,
+            stack_top_page,
+            result
+        );
+        return;
+    }
+
+    log::info!(
+        "svc::CreateThread: mapped fallback user stack [{:#x}..{:#x})",
+        stack_base,
+        stack_top_page
+    );
 }
 
 /// Starts the thread for the provided handle.
@@ -175,8 +293,24 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
     };
 
     let result = thread.lock().unwrap().run();
-    // thread.run() → set_state(RUNNABLE) → notify_state_transition pushes
-    // to PQ via GSC and notifies the scheduler automatically.
+    {
+        let thread_guard = thread.lock().unwrap();
+        log::info!(
+            "svc::StartThread result handle=0x{:08X} tid={} state={:?} core_id={} current_core={} affinity=0x{:X} result={:#x}",
+            thread_handle,
+            thread_guard.get_thread_id(),
+            thread_guard.get_state(),
+            thread_guard.get_active_core(),
+            thread_guard.get_current_core(),
+            thread_guard.physical_affinity_mask.get_affinity_mask(),
+            result,
+        );
+    }
+    if result == RESULT_SUCCESS.get_inner_value() {
+        if let Some(parent) = thread.lock().unwrap().parent.as_ref().and_then(|w| w.upgrade()) {
+            parent.lock().unwrap().increment_running_thread_count();
+        }
+    }
     ResultCode::new(result)
 }
 
@@ -196,7 +330,7 @@ pub fn sleep_thread(system: &System, ns: i64) {
     log::trace!("svc::SleepThread called nanoseconds={}", ns);
 
     if ns > 0 {
-        let Some(thread) = resolve_current_thread(system) else {
+        let Some(current_thread_id) = system.current_thread_id() else {
             log::warn!("svc::SleepThread(sleep): current thread missing");
             return;
         };
@@ -206,19 +340,19 @@ pub fn sleep_thread(system: &System, ns: i64) {
             .and_then(|kernel| kernel.hardware_timer())
             .map(|timer| timer.lock().unwrap().get_tick())
             .unwrap_or(i64::MAX);
-        let result = thread
-            .lock()
-            .unwrap()
-            .sleep(sleep_timeout_tick_from_ns(current_tick, ns));
+        let timeout = sleep_timeout_tick_from_ns(current_tick, ns);
+        let Some(result) =
+            crate::hle::kernel::kernel::with_current_thread_fast_mut(|thread| thread.sleep(timeout))
+        else {
+            log::warn!("svc::SleepThread(sleep): current thread cache missing");
+            return;
+        };
         if result != RESULT_SUCCESS.get_inner_value() {
             log::warn!("svc::SleepThread(sleep) failed: {:#x}", result);
             return;
         }
 
-        // Upstream KThread::Sleep() blocks via KScopedSchedulerLockAndSleep.
-        // Rust cannot block inside KThread::sleep(), so explicitly request a
-        // reschedule after the thread transitions to WAITING.
-        system.scheduler_arc().lock().unwrap().request_schedule();
+        log::info!("svc::SleepThread(sleep): tid={} ns={} -> wait armed", current_thread_id, ns);
         return;
     }
 
@@ -226,6 +360,27 @@ pub fn sleep_thread(system: &System, ns: i64) {
         log::warn!("svc::SleepThread(yield): current thread missing");
         return;
     };
+    if let Some(thread) = resolve_current_thread(system) {
+        let thread = thread.lock().unwrap();
+        log::info!(
+            "svc::SleepThread(yield) ctx: tid={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+            current_thread_id,
+            thread.thread_context.pc as u32,
+            thread.thread_context.lr as u32,
+            thread.thread_context.sp as u32,
+        );
+    }
+    log::info!(
+        "svc::SleepThread(yield): tid={} ns={} branch={}",
+        current_thread_id,
+        ns,
+        match ns {
+            x if x == YieldType::WithoutCoreMigration as i64 => "without_core_migration",
+            x if x == YieldType::WithCoreMigration as i64 => "with_core_migration",
+            x if x == YieldType::ToAnyThread as i64 => "to_any_thread",
+            _ => "invalid_noop",
+        }
+    );
     let current_process = system.current_process_arc();
     let sched_arc = system.scheduler_arc();
     let mut scheduler = sched_arc.lock().unwrap();
@@ -334,6 +489,10 @@ pub fn set_thread_core_mask(
         core_id = process.get_ideal_core_id();
         affinity_mask = 1u64 << core_id;
     } else {
+        let process_core_mask = process.get_core_mask();
+        if (affinity_mask | process_core_mask) != process_core_mask {
+            return RESULT_INVALID_CORE_ID;
+        }
         if affinity_mask == 0 {
             return RESULT_INVALID_COMBINATION;
         }

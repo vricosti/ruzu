@@ -10,7 +10,7 @@ use crate::hle::kernel::k_interrupt_manager;
 use crate::hle::kernel::kernel::KernelCore;
 use common::fiber::Fiber;
 use common::thread::Barrier;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Per-core data held by the CPU manager.
@@ -63,6 +63,7 @@ pub struct CpuManager {
 
 /// Maximum number of cycle runs before preemption in single-core mode.
 const _MAX_CYCLE_RUNS: usize = 5;
+static TID17_HALT_SAMPLE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 impl CpuManager {
     /// Creates a new CpuManager.
@@ -365,6 +366,10 @@ impl CpuManager {
     /// handling interrupts between runs.
     pub fn multi_core_run_guest_thread(kernel: &KernelCore) {
         // Upstream: auto* thread = Kernel::GetCurrentThreadPointer(kernel);
+        let thread_arc = match super::hle::kernel::kernel::get_current_thread_pointer() {
+            Some(thread) => thread,
+            None => return,
+        };
         // kernel.CurrentScheduler()->OnThreadStart();
         // Upstream: kernel.CurrentScheduler()->OnThreadStart();
         // OnThreadStart just calls thread.EnableDispatch().
@@ -372,7 +377,7 @@ impl CpuManager {
         // guest_activate → scheduler.activate() → schedule_impl_fiber
         // (the lock is on the suspended kernel main thread's stack).
         // Call EnableDispatch directly matching what OnThreadStart does.
-        if let Some(thread_arc) = super::hle::kernel::kernel::get_current_thread_pointer() {
+        {
             let mut t = thread_arc.lock().unwrap();
             if t.get_disable_dispatch_count() > 0 {
                 t.enable_dispatch();
@@ -388,7 +393,7 @@ impl CpuManager {
                 Self::handle_interrupt(kernel);
             }
             while !physical_core.is_interrupted() {
-                Self::run_guest_thread_once(kernel, physical_core);
+                Self::run_guest_thread_once(kernel, physical_core, &thread_arc);
                 // Upstream: physical_core = &kernel.CurrentPhysicalCore();
                 physical_core = kernel.current_physical_core();
             }
@@ -409,14 +414,9 @@ impl CpuManager {
     fn run_guest_thread_once(
         kernel: &KernelCore,
         physical_core: &super::hle::kernel::physical_core::PhysicalCore,
+        thread_arc: &Arc<Mutex<super::hle::kernel::k_thread::KThread>>,
     ) {
         use crate::arm::arm_interface::KThread as OpaqueKThread;
-
-        let thread_arc = match super::hle::kernel::kernel::get_current_thread_pointer() {
-            Some(t) => t,
-            None => return,
-        };
-
         let thread = thread_arc.lock().unwrap();
         // Get the owner process to access the ARM JIT interface.
         let parent_weak = match thread.parent.as_ref() {
@@ -439,14 +439,6 @@ impl CpuManager {
         // Get the ARM interface from the process for this core.
         // Upstream: auto* interface = process->GetArmInterface(m_core_index);
         let mut process = parent_arc.lock().unwrap();
-        let scheduler = match process
-            .scheduler
-            .as_ref()
-            .and_then(|scheduler| scheduler.upgrade())
-        {
-            Some(scheduler) => scheduler,
-            None => return,
-        };
         let is_64bit = process.is_64bit();
         let jit = match process.get_arm_interface_mut(core_index) {
             Some(j) => j as *mut _ as *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
@@ -457,6 +449,10 @@ impl CpuManager {
             }
         };
         drop(process);
+        let scheduler = match kernel.current_scheduler() {
+            Some(scheduler) => scheduler.clone(),
+            None => return,
+        };
 
         // Safety: The JIT is owned by the process which lives as long as the thread.
         // We hold the raw pointer only for the duration of this call.
@@ -495,6 +491,41 @@ impl CpuManager {
                     mut svc_args,
                 } => {
                     let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
+                    if current_thread_id == 17 || current_thread_id >= 18 {
+                        let mut tc = crate::arm::arm_interface::ThreadContext::default();
+                        jit_ref.get_context(&mut tc);
+                        log::info!(
+                            "multi_core_run_guest_thread: host={} tid={} core={} svc=0x{:x} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} arg0=0x{:X} arg1=0x{:X} arg2=0x{:X}",
+                            std::thread::current().name().unwrap_or("?"),
+                            current_thread_id,
+                            core_index,
+                            svc_num,
+                            tc.pc,
+                            tc.lr,
+                            tc.sp,
+                            svc_args[0],
+                            svc_args[1],
+                            svc_args[2],
+                        );
+                        if svc_num == 0x1c {
+                            log::info!(
+                                "multi_core_run_guest_thread: tid={} WaitProcessWideKeyAtomic args addr=0x{:X} key=0x{:X} tag=0x{:08X} timeout_lo=0x{:08X} timeout_hi=0x{:08X}",
+                                current_thread_id,
+                                svc_args[0] as u32,
+                                svc_args[1] as u32,
+                                svc_args[2] as u32,
+                                svc_args[3] as u32,
+                                svc_args[4] as u32,
+                            );
+                        } else if svc_num == 0x1d {
+                            log::info!(
+                                "multi_core_run_guest_thread: tid={} SignalProcessWideKey args key=0x{:X} count={}",
+                                current_thread_id,
+                                svc_args[0] as u32,
+                                svc_args[1] as i32,
+                            );
+                        }
+                    }
                     let system_ref = kernel.system();
                     if !system_ref.is_null() {
                         let system = system_ref.get();
@@ -504,33 +535,73 @@ impl CpuManager {
                             is_64bit,
                             &mut svc_args,
                         );
-                        jit_ref.set_svc_arguments(&svc_args);
-                        let mut thread_context =
-                            crate::arm::arm_interface::ThreadContext::default();
-                        physical_core.handoff_after_svc(
-                            jit_ref,
-                            &mut thread_context,
-                            &scheduler,
-                            &parent_arc,
+                        let (switched_scheduler_thread, needs_scheduling) = {
+                            let scheduler = scheduler.lock().unwrap();
+                            (
+                                scheduler.get_scheduler_current_thread_id()
+                                    != Some(current_thread_id),
+                                scheduler.needs_scheduling(),
+                            )
+                        };
+                        let current_thread_blocked = {
+                            let thread = thread_arc.lock().unwrap();
+                            thread.get_state()
+                                != crate::hle::kernel::k_thread::ThreadState::RUNNABLE
+                        };
+                        if switched_scheduler_thread || current_thread_blocked || needs_scheduling {
+                            log::info!(
+                                "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} reschedule after SVC switched={} blocked={} needs_sched={}",
+                                current_thread_id,
+                                core_index,
+                                svc_num,
+                                switched_scheduler_thread,
+                                current_thread_blocked,
+                                needs_scheduling,
+                            );
+                            Self::reschedule_current_core_raw(kernel);
+                            return;
+                        }
+                        log::info!(
+                            "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} returned from svc_dispatch r0=0x{:X} r1=0x{:X}",
+                            current_thread_id,
+                            core_index,
+                            svc_num,
+                            svc_args[0],
+                            svc_args[1],
                         );
-                        // Upstream `PhysicalCore::RunThread()` returns immediately after
-                        // `Svc::Call(...)`, letting the outer scheduler logic decide whether
-                        // another thread should run. Do the same here instead of relying on a
-                        // heuristic snapshot of the current thread state, which can already be
-                        // stale again once timer callbacks or wait wakeups race with the host
-                        // callback thread.
-                        let _ = current_thread_id;
-                        Self::reschedule_current_core_raw(kernel);
+                        return;
                     }
                 }
                 crate::hle::kernel::physical_core::PhysicalCoreExecutionEvent::Halted(
                     halt_reason,
                 ) => {
+                    let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
                     let interrupt = halt_reason.contains(HaltReason::BREAK_LOOP);
                     let data_abort = halt_reason.contains(HaltReason::DATA_ABORT);
                     let prefetch_abort = halt_reason.contains(HaltReason::PREFETCH_ABORT);
                     let breakpoint = halt_reason.contains(HaltReason::INSTRUCTION_BREAKPOINT);
-
+                    if current_thread_id == 17
+                        && TID17_HALT_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) < 32
+                    {
+                        let mut tc = crate::arm::arm_interface::ThreadContext::default();
+                        jit_ref.get_context(&mut tc);
+                        log::info!(
+                            "multi_core_run_guest_thread: tid=17 core={} halted={:?} interrupt={} data_abort={} prefetch_abort={} breakpoint={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} r0=0x{:X} r1=0x{:X} r2=0x{:X} r3=0x{:X}",
+                            core_index,
+                            halt_reason,
+                            interrupt,
+                            data_abort,
+                            prefetch_abort,
+                            breakpoint,
+                            tc.pc,
+                            tc.lr,
+                            tc.sp,
+                            tc.r[0],
+                            tc.r[1],
+                            tc.r[2],
+                            tc.r[3],
+                        );
+                    }
                 }
             }
         }
@@ -627,7 +698,11 @@ impl CpuManager {
             // Upstream: physical_core->RunThread(thread)
             let physical_core = kernel.current_physical_core();
             if !physical_core.is_interrupted() {
-                Self::run_guest_thread_once(kernel, physical_core);
+                let thread_arc = match kernel.get_current_emu_thread() {
+                    Some(thread) => thread,
+                    None => return,
+                };
+                Self::run_guest_thread_once(kernel, physical_core, &thread_arc);
             }
 
             // Upstream: kernel.SetIsPhantomModeForSingleCore(true);
@@ -815,19 +890,23 @@ impl CpuManager {
                 super::hle::kernel::kernel::set_current_emu_thread(Some(&thread_arc));
 
                 // Get the guest thread's host context for fiber switching.
-                let thread = thread_arc.lock().unwrap();
-                if let Some(thread_host_ctx) = thread.get_host_context() {
-                    let thread_host_ctx = thread_host_ctx.clone();
+                let mut thread = thread_arc.lock().unwrap();
+                if let Some(thread_host_ctx) = thread.get_or_create_host_context() {
                     drop(thread);
                     drop(scheduler);
 
                     // Upstream: Common::Fiber::YieldTo(data.host_context, *thread->GetHostContext());
                     log::info!(
-                        "RunThread core {}: yielding from host fiber to main thread fiber",
-                        core
+                        "RunThread core {} host={}: yielding from host fiber to main thread fiber",
+                        core,
+                        std::thread::current().name().unwrap_or("?"),
                     );
                     Fiber::yield_to(Arc::downgrade(&host_ctx), &thread_host_ctx);
-                    log::info!("RunThread core {}: returned from main thread fiber", core);
+                    log::info!(
+                        "RunThread core {} host={}: returned from main thread fiber",
+                        core,
+                        std::thread::current().name().unwrap_or("?"),
+                    );
                 } else {
                     drop(thread);
                     drop(scheduler);

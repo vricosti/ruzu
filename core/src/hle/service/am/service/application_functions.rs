@@ -5,13 +5,18 @@
 //! Port of zuyu/src/core/hle/service/am/service/application_functions.cpp
 
 use crate::hle::service::am::am_types::{
-    GamePlayRecordingState, ProgramSpecifyKind, WindowOriginMode,
+    GamePlayRecordingState, LaunchParameterKind, ProgramSpecifyKind, WindowOriginMode,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use crate::file_sys::patch_manager::PatchManager;
+use crate::file_sys::registered_cache::get_update_title_id;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::am::am_results;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::ns::read_only_application_control_data_interface::IReadOnlyApplicationControlDataInterface;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IApplicationFunctions:
@@ -89,6 +94,7 @@ pub struct IApplicationFunctions {
 
 impl IApplicationFunctions {
     pub fn new(
+        system: crate::core::SystemRef,
         applet: std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>,
     ) -> Self {
         let handlers = build_handler_map(&[
@@ -163,7 +169,7 @@ impl IApplicationFunctions {
         ]);
         Self {
             applet,
-            system: crate::core::SystemRef::null(),
+            system,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -243,15 +249,42 @@ impl IApplicationFunctions {
         }
     }
 
-    /// Set the System reference, matching upstream constructor pattern.
-    pub fn set_system(&mut self, system: crate::core::SystemRef) {
-        self.system = system;
-    }
-
     /// Port of IApplicationFunctions::GetPreviousProgramIndex
     pub fn get_previous_program_index(&self) -> i32 {
         log::warn!("(STUBBED) GetPreviousProgramIndex called");
         0
+    }
+
+    fn get_desired_language(&self) -> Result<u64, ResultCode> {
+        let program_id = {
+            let applet = self.applet.lock().unwrap();
+            applet.program_id
+        };
+
+        let fs_controller = self.system.get().get_filesystem_controller();
+        let fs_controller = fs_controller.lock().unwrap();
+
+        let mut supported_languages = 0u32;
+        if let Some(provider) = self.system.get().get_content_provider() {
+            let provider = provider.lock().unwrap();
+
+            let patch_manager = PatchManager::new(program_id, &fs_controller, &*provider);
+            let metadata = patch_manager.get_control_metadata();
+            if let Some(nacp) = metadata.0 {
+                supported_languages = nacp.get_supported_languages();
+            } else {
+                let update_patch_manager =
+                    PatchManager::new(get_update_title_id(program_id), &fs_controller, &*provider);
+                let update_metadata = update_patch_manager.get_control_metadata();
+                if let Some(nacp) = update_metadata.0 {
+                    supported_languages = nacp.get_supported_languages();
+                }
+            }
+        }
+
+        let read_only = IReadOnlyApplicationControlDataInterface::new();
+        let application_language = read_only.get_application_desired_language(supported_languages)?;
+        read_only.convert_application_language_to_language_code(application_language)
     }
 
     /// Port of IApplicationFunctions::PrepareForJit
@@ -311,14 +344,69 @@ impl IApplicationFunctions {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    /// PopLaunchParameter (cmd 1): returns empty launch parameter
-    fn pop_launch_parameter_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::warn!("(STUBBED) PopLaunchParameter called");
-        // Upstream returns LaunchParameterData via IStorage.
-        // For bring-up, return ResultNoDataInChannel.
-        let result = ResultCode::from_module_description(crate::hle::result::ErrorModule::AM, 2);
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(result);
+    fn push_interface_response(ctx: &mut HLERequestContext, object: Arc<dyn SessionRequestHandler>) {
+        let is_domain = ctx
+            .get_manager()
+            .map_or(false, |manager| manager.lock().unwrap().is_domain());
+        let move_handle = if is_domain {
+            0
+        } else {
+            ctx.create_session_for_service(object.clone()).unwrap_or(0)
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        if is_domain {
+            ctx.add_domain_object(object);
+        } else {
+            rb.push_move_objects(move_handle);
+        }
+    }
+
+    /// Port of IApplicationFunctions::PopLaunchParameter.
+    fn pop_launch_parameter(&self, launch_parameter_kind: LaunchParameterKind) -> Result<Vec<u8>, ResultCode> {
+        log::info!("PopLaunchParameter called, kind={:?}", launch_parameter_kind);
+
+        let mut applet = self.applet.lock().unwrap();
+        let channel = if launch_parameter_kind == LaunchParameterKind::UserChannel {
+            &mut applet.user_channel_launch_parameter
+        } else {
+            &mut applet.preselected_user_launch_parameter
+        };
+
+        let Some(data) = channel.pop_back() else {
+            log::warn!(
+                "Attempted to pop launch parameter {:?} but none was found",
+                launch_parameter_kind
+            );
+            return Err(am_results::RESULT_NO_DATA_IN_CHANNEL);
+        };
+
+        Ok(data)
+    }
+
+    fn pop_launch_parameter_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let mut rp = RequestParser::new(ctx);
+        let launch_parameter_kind = match rp.pop_u32() {
+            1 => LaunchParameterKind::UserChannel,
+            2 => LaunchParameterKind::AccountPreselectedUser,
+            _ => LaunchParameterKind::UserChannel,
+        };
+
+        match service.pop_launch_parameter(launch_parameter_kind) {
+            Ok(data) => {
+                let storage = Arc::new(super::storage::IStorage::new_with_system(
+                    service.system,
+                    data,
+                ));
+                Self::push_interface_response(ctx, storage);
+            }
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
+        }
     }
 
     /// EnsureSaveData (cmd 20): ensures save data exists for the given user.
@@ -331,13 +419,20 @@ impl IApplicationFunctions {
     }
 
     /// GetDesiredLanguage (cmd 21): returns the desired language code.
-    fn get_desired_language_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::warn!("(STUBBED) GetDesiredLanguage called");
-        // "en" language code
-        let language_code: u64 = u64::from_le_bytes([b'e', b'n', 0, 0, 0, 0, 0, 0]);
+    fn get_desired_language_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u64(language_code);
+        match service.get_desired_language() {
+            Ok(language_code) => {
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u64(language_code);
+            }
+            Err(result) => {
+                rb.push_result(result);
+                rb.push_u64(0);
+            }
+        }
     }
 
     /// SetTerminateResult (cmd 22).
@@ -347,7 +442,13 @@ impl IApplicationFunctions {
             unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
         let mut rp = RequestParser::new(ctx);
         let result = rp.pop_u32();
-        log::info!("SetTerminateResult: result={:#x}", result);
+        let result_code = crate::hle::result::ResultCode::new(result);
+        log::info!(
+            "SetTerminateResult: result={:#x} module={:?} description={}",
+            result,
+            result_code.get_module(),
+            result_code.get_description()
+        );
 
         let mut applet = service.applet.lock().unwrap();
         applet.terminate_result = result;

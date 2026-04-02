@@ -354,4 +354,8 @@ impl IBinder for BufferQueueConsumer {
         );
         None
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

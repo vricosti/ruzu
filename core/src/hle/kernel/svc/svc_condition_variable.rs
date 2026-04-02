@@ -17,7 +17,7 @@ pub fn wait_process_wide_key_atomic(
     tag: u32,
     timeout_ns: i64,
 ) -> ResultCode {
-    log::trace!(
+    log::info!(
         "svc::WaitProcessWideKeyAtomic called address=0x{:X}, cv_key=0x{:X}, tag=0x{:08X}, timeout_ns={}",
         address, cv_key, tag, timeout_ns
     );
@@ -68,12 +68,19 @@ pub fn wait_process_wide_key_atomic(
         timeout,
     );
 
+    log::info!(
+        "svc::WaitProcessWideKeyAtomic return address=0x{:X}, cv_key=0x{:X}, result={:#x}",
+        address,
+        aligned_cv_key,
+        result
+    );
+
     ResultCode::new(result)
 }
 
 /// Signal process wide key.
 pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
-    log::trace!(
+    log::info!(
         "svc::SignalProcessWideKey called, cv_key=0x{:X}, count=0x{:08X}",
         cv_key,
         count
@@ -86,4 +93,9 @@ pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
         .lock()
         .unwrap()
         .signal_condition_variable(aligned_cv_key, count);
+    log::info!(
+        "svc::SignalProcessWideKey return cv_key=0x{:X}, count={}",
+        aligned_cv_key,
+        count
+    );
 }

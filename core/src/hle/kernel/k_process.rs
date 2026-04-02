@@ -1004,15 +1004,26 @@ impl KProcess {
         tag: u32,
         timeout: i64,
     ) -> u32 {
+        log::info!(
+            "KProcess::wait_condition_variable enter tid={} address=0x{:X} cv_key=0x{:X} tag=0x{:08X} timeout={}",
+            current_thread.lock().unwrap().get_thread_id(),
+            address,
+            cv_key,
+            tag,
+            timeout
+        );
         let result = {
             let mut process_guard = process.lock().unwrap();
             let cond_var_ptr: *mut KConditionVariable = &mut process_guard.cond_var;
 
             // Keep the condition variable owned by KProcess while waiting.
-            // Upstream always waits/signals against the process-owned condvar tree.
+            // Upstream always waits/signals against the process-owned condvar tree,
+            // but the wait body itself runs under the existing owner context.
+            // Calling KConditionVariable::wait() from here would relock the same
+            // process mutex through the Arc owner and deadlock locally.
             unsafe {
-                (*cond_var_ptr).wait(
-                    process,
+                (*cond_var_ptr).wait_locked(
+                    &mut process_guard,
                     current_thread,
                     address,
                     cv_key,
@@ -1022,14 +1033,37 @@ impl KProcess {
             }
         };
 
+        let result = if result == RESULT_SUCCESS {
+            KConditionVariable::wait_for_current_thread(process, current_thread);
+            crate::hle::result::ResultCode::new(current_thread.lock().unwrap().get_wait_result())
+        } else {
+            result
+        };
+
+        log::info!(
+            "KProcess::wait_condition_variable return tid={} result={:#x}",
+            current_thread.lock().unwrap().get_thread_id(),
+            result.get_inner_value()
+        );
+
         result.get_inner_value()
     }
 
     pub fn signal_condition_variable(&mut self, cv_key: u64, count: i32) {
+        log::info!(
+            "KProcess::signal_condition_variable enter cv_key=0x{:X} count={}",
+            cv_key,
+            count
+        );
         let cond_var_ptr: *mut KConditionVariable = &mut self.cond_var;
         unsafe {
             let _ = (*cond_var_ptr).signal(self, cv_key, count);
         }
+        log::info!(
+            "KProcess::signal_condition_variable return cv_key=0x{:X} count={}",
+            cv_key,
+            count
+        );
     }
 
     /// Port of upstream `KProcess::SignalAddressArbiter`.
@@ -2104,6 +2138,13 @@ impl KProcess {
         if handle_result != RESULT_SUCCESS.get_inner_value() {
             return Err(handle_result);
         }
+        log::info!(
+            "KProcess::run enter pid={} main_thread_id={} prio={} stack_size=0x{:x}",
+            self.process_id,
+            main_thread_id,
+            priority,
+            stack_size
+        );
 
         let mut thread_reservation = KScopedResourceReservation::new(
             self.resource_limit.clone(),
@@ -2133,6 +2174,11 @@ impl KProcess {
         let tls_address = self
             .create_thread_local_region()
             .ok_or_else(|| RESULT_INVALID_STATE.get_inner_value())?;
+        log::info!(
+            "KProcess::run tls allocated pid={} tls={:#x}",
+            self.process_id,
+            tls_address.get()
+        );
 
         // Allocate stack using find-free MapPages, matching upstream exactly.
         // Upstream KProcess::Run (k_process.cpp:938-940):
@@ -2169,6 +2215,12 @@ impl KProcess {
             log::error!("run: stack MapPages find-free failed ({:#x})", map_result);
             return Err(map_result);
         }
+        log::info!(
+            "KProcess::run stack mapped pid={} stack=[{:#x}..{:#x})",
+            self.process_id,
+            stack_base,
+            stack_top
+        );
 
         // Zero the stack in DeviceMemory (if Memory is wired).
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
@@ -2207,9 +2259,20 @@ impl KProcess {
             }
             thread.thread_type = super::k_thread::ThreadType::Main;
         }
+        log::info!(
+            "KProcess::run main thread initialized pid={} tid={} obj={}",
+            self.process_id,
+            main_thread_id,
+            main_object_id
+        );
 
         let thread_handle = {
             self.register_thread_object(main_thread.clone());
+            log::info!(
+                "KProcess::run main thread registered pid={} tid={}",
+                self.process_id,
+                main_thread_id
+            );
 
             let thread_handle = self.handle_table.add(main_object_id)?;
             {
@@ -2243,6 +2306,11 @@ impl KProcess {
             if let Some(gsc) = &self.global_scheduler_context {
                 gsc.lock().unwrap().add_thread(main_thread.clone());
             }
+            log::info!(
+                "KProcess::run about to run main thread pid={} tid={}",
+                self.process_id,
+                main_thread_id
+            );
 
             let mut thread = main_thread.lock().unwrap();
             let run_result = thread.run();
@@ -2250,6 +2318,11 @@ impl KProcess {
                 return Err(run_result);
             }
             drop(thread);
+            log::info!(
+                "KProcess::run main thread runnable pid={} tid={}",
+                self.process_id,
+                main_thread_id
+            );
 
             // Increment running thread count (thread.run() no longer does this
             // to avoid deadlock when called with process lock held).

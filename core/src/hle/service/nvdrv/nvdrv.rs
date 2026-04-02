@@ -69,6 +69,7 @@ pub struct Module {
     next_fd: Mutex<DeviceFD>,
     open_files: Mutex<HashMap<DeviceFD, Arc<dyn NvDevice + Send + Sync>>>,
     gpu_files: Mutex<HashMap<DeviceFD, Arc<NvHostGpu>>>,
+    disp_files: Mutex<HashMap<DeviceFD, Arc<NvDispDisp0>>>,
     events_interface: Arc<EventInterface>,
 }
 
@@ -80,6 +81,7 @@ impl Module {
             next_fd: Mutex::new(1),
             open_files: Mutex::new(HashMap::new()),
             gpu_files: Mutex::new(HashMap::new()),
+            disp_files: Mutex::new(HashMap::new()),
             events_interface: Arc::new(EventInterface::new(system)),
         })
     }
@@ -115,13 +117,20 @@ impl Module {
                 gpu
             }
             "/dev/nvhost-ctrl-gpu" => {
-                Arc::new(NvHostCtrlGpu::new(Arc::clone(&self.events_interface)))
+                Arc::new(NvHostCtrlGpu::new(
+                    self.system,
+                    Arc::clone(&self.events_interface),
+                ))
             }
             "/dev/nvmap" => Arc::new(NvMapDevice::new(
                 self.container.get_nv_map_file(),
                 &self.container,
             )),
-            "/dev/nvdisp_disp0" => Arc::new(NvDispDisp0::new()),
+            "/dev/nvdisp_disp0" => {
+                let disp = Arc::new(NvDispDisp0::new(self.system, self.container.get_nv_map_file()));
+                self.disp_files.lock().unwrap().insert(fd, Arc::clone(&disp));
+                disp
+            }
             "/dev/nvhost-ctrl" => Arc::new(NvHostCtrl::new(
                 Arc::clone(&self.events_interface),
                 self.container.get_syncpoint_manager(),
@@ -219,6 +228,7 @@ impl Module {
         let mut files = self.open_files.lock().unwrap();
         if let Some(device) = files.remove(&fd) {
             self.gpu_files.lock().unwrap().remove(&fd);
+            self.disp_files.lock().unwrap().remove(&fd);
             device.on_close(fd);
             NvResult::Success
         } else {
@@ -286,5 +296,9 @@ impl Module {
 
     pub fn get_gpu_device(&self, fd: DeviceFD) -> Option<Arc<NvHostGpu>> {
         self.gpu_files.lock().unwrap().get(&fd).cloned()
+    }
+
+    pub fn get_disp_device(&self, fd: DeviceFD) -> Option<Arc<NvDispDisp0>> {
+        self.disp_files.lock().unwrap().get(&fd).cloned()
     }
 }

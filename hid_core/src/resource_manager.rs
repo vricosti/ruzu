@@ -189,6 +189,14 @@ impl ResourceManager {
         self.touch_screen.clone()
     }
 
+    pub fn get_touch_resource(&self) -> Option<Arc<Mutex<TouchResource>>> {
+        self.touch_resource.clone()
+    }
+
+    pub fn get_touch_driver(&self) -> Option<Arc<Mutex<TouchScreenDriver>>> {
+        self.touch_driver.clone()
+    }
+
     pub fn get_unique_pad(&self) -> Option<Arc<Mutex<UniquePad>>> {
         self.unique_pad.clone()
     }
@@ -218,9 +226,24 @@ impl ResourceManager {
         if let Some(ref six_axis) = self.six_axis {
             six_axis.lock().activation.activate();
         }
-        // Upstream: touch_screen->Activate() and gesture->Activate()
-        // These require touch_resource and touch_driver references which are managed
-        // through the touch subsystem's own activation path.
+        if let (Some(touch_screen), Some(touch_resource), Some(touch_driver)) = (
+            self.touch_screen.as_ref(),
+            self.touch_resource.as_ref(),
+            self.touch_driver.as_ref(),
+        ) {
+            let mut resource = touch_resource.lock();
+            let mut driver = touch_driver.lock();
+            let _ = touch_screen.lock().activate(&mut resource, &mut driver);
+        }
+        if let (Some(gesture), Some(touch_resource), Some(touch_driver)) = (
+            self.gesture.as_ref(),
+            self.touch_resource.as_ref(),
+            self.touch_driver.as_ref(),
+        ) {
+            let mut resource = touch_resource.lock();
+            let mut driver = touch_driver.lock();
+            let _ = gesture.lock().activate(&mut resource, &mut driver);
+        }
 
         // Upstream: GetNpad()->ActivateNpadResource(aruid)
         if let Some(ref npad) = self.npad {
@@ -672,6 +695,37 @@ impl ResourceManager {
         }
     }
 
+    /// Port of the touch-update callback wired from upstream
+    /// `ResourceManager::InitializeTouchScreenSampler()`.
+    ///
+    /// In upstream this is invoked by the CoreTiming event `touch_update_event`
+    /// and forwards to `TouchResource::OnTouchUpdate(time)`.
+    pub fn update_touch_screen(&self, timestamp: i64) {
+        let _lock = self.shared_mutex.read();
+
+        let is_handheld_hid_enabled = self
+            .handheld_config
+            .as_ref()
+            .map(|cfg| cfg.lock().is_handheld_hid_enabled)
+            .unwrap_or(true);
+
+        if let (Some(touch_screen), Some(touch_resource), Some(touch_driver)) = (
+            self.touch_screen.as_ref(),
+            self.touch_resource.as_ref(),
+            self.touch_driver.as_ref(),
+        ) {
+            let touch_screen = touch_screen.lock();
+            let mut touch_resource = touch_resource.lock();
+            let mut touch_driver = touch_driver.lock();
+            touch_screen.on_touch_update(
+                &mut touch_resource,
+                &mut touch_driver,
+                is_handheld_hid_enabled,
+                timestamp,
+            );
+        }
+    }
+
     fn initialize_handheld_config(&mut self) {
         let mut config = HandheldConfig {
             is_handheld_hid_enabled: true,
@@ -800,12 +854,15 @@ impl ResourceManager {
         self.touch_screen = Some(Arc::new(Mutex::new(TouchScreen::new())));
         self.gesture = Some(Arc::new(Mutex::new(Gesture::new())));
 
-        // Upstream: touch_resource->SetTouchDriver(touch_driver)
-        // touch_resource->SetAppletResource(applet_resource, &shared_mutex)
-        // touch_resource->SetInputEvent(input_event, &input_mutex)
-        // touch_resource->SetHandheldConfig(handheld_config)
-        // touch_resource->SetTimerEvent(touch_update_event)
-        // These are wired through the touch resource's own initialization path.
+        if let Some(ref touch_resource) = self.touch_resource {
+            let mut resource = touch_resource.lock();
+            if let Some(ref applet_resource) = self.applet_resource {
+                resource.set_applet_resource(applet_resource.clone());
+            }
+            if let Some(ref handheld_config) = self.handheld_config {
+                resource.set_handheld_config(handheld_config.clone());
+            }
+        }
     }
 
     fn initialize_console_six_axis_sampler(&mut self) {

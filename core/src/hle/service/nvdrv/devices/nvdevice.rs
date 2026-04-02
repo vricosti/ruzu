@@ -14,6 +14,10 @@ use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
 /// Represents an abstract nvidia device node. It is to be subclassed by concrete device nodes to
 /// implement the ioctl interface.
 pub trait NvDevice {
+    fn as_any(&self) -> &dyn std::any::Any {
+        panic!("as_any() not implemented for nvdevice")
+    }
+
     /// Handles an ioctl1 request.
     fn ioctl1(&self, fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult;
 

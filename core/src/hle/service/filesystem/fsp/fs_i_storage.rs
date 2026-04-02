@@ -5,10 +5,16 @@
 use std::collections::BTreeMap;
 
 use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::errors;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+#[inline]
+fn to_ipc_result(r: common::ResultCode) -> ResultCode {
+    ResultCode::new(r.raw())
+}
 
 /// IPC command table for IStorage:
 ///
@@ -47,30 +53,38 @@ impl IStorage {
         let mut rp = RequestParser::new(ctx);
         let offset = rp.pop_i64();
         let length = rp.pop_i64();
+        let backend_size = storage.backend.get_size();
 
         log::debug!(
-            "IStorage::Read called, offset=0x{:X}, length={}",
+            "IStorage::Read called, offset=0x{:X}, length={}, backend_size={}",
             offset,
-            length
+            length,
+            backend_size
         );
 
-        if offset < 0 || length < 0 {
+        if length < 0 {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(RESULT_SUCCESS);
+            rb.push_result(to_ipc_result(errors::RESULT_INVALID_SIZE));
+            return;
+        }
+        if offset < 0 {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(to_ipc_result(errors::RESULT_INVALID_OFFSET));
             return;
         }
 
-        let output_size = ctx.get_write_buffer_size(0);
-        let read_len = usize::min(length as usize, output_size);
-        let data = storage.backend.read_bytes(read_len, offset as usize);
-
-        // Write read data to the output buffer.
-        // Upstream: ctx.WriteBuffer(output);
-        let mut padded = data;
-        if read_len > padded.len() {
-            padded.resize(read_len, 0);
+        let mut data = vec![0u8; length as usize];
+        let bytes_read = storage.backend.read(&mut data, length as usize, offset as usize);
+        if bytes_read != length as usize {
+            log::warn!(
+                "IStorage::Read short read, offset=0x{:X}, requested={}, read={}, backend_size={}",
+                offset,
+                length,
+                bytes_read,
+                backend_size
+            );
         }
-        ctx.write_buffer(&padded, 0);
+        ctx.write_buffer(&data, 0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);

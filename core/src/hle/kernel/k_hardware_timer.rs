@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use super::k_hardware_timer_base::KHardwareTimerBase;
+use super::k_scheduler_lock::KScopedSchedulerLock;
 use super::k_thread::KThread;
 use crate::core_timing::{self, CoreTiming, EventType, UnscheduleEventType};
 
@@ -276,55 +277,68 @@ impl KHardwareTimer {
     /// Called by the CoreTiming callback.
     /// Matches upstream: `KHardwareTimer::DoTask()`
     fn do_task(&mut self) {
-        if !self.get_interrupt_enabled() {
-            return;
-        }
-
-        // Disable the timer interrupt while we handle this.
-        // Not necessary due to core timing already having popped this event.
-        self.m_wakeup_time = i64::MAX;
-
-        let cur_tick = self.get_tick();
-
-        let (fired_task_ids, next_time) = self.base.collect_expired_tasks(cur_tick);
         let gsc = self.gsc.as_ref().and_then(Weak::upgrade);
+        let scheduler_lock = gsc
+            .as_ref()
+            .map(|gsc| {
+                let guard = gsc.lock().unwrap();
+                std::ptr::addr_of!(guard.m_scheduler_lock)
+            })
+            .unwrap_or(std::ptr::null());
 
-        for task_id in fired_task_ids {
-            let target = if let Some(gsc) = gsc.as_ref() {
-                gsc.lock()
-                    .unwrap()
-                    .get_thread_by_thread_id(task_id)
-                    .map(TimerTaskTarget::ThreadArc)
-            } else {
-                None
-            }
-            .or_else(|| {
-                self.thread_ptrs
-                    .get(&task_id)
-                    .copied()
-                    .filter(|ptr| *ptr != 0)
-                    .map(TimerTaskTarget::RawPtr)
-            });
+        let _scheduler_guard = if scheduler_lock.is_null() {
+            None
+        } else {
+            Some(KScopedSchedulerLock::new(unsafe { &*scheduler_lock }))
+        };
+        let timer_lock = self.base.get_lock() as *const std::sync::Mutex<()>;
+        let _timer_guard = unsafe { (&*timer_lock).lock().unwrap() };
 
-            match target {
-                Some(TimerTaskTarget::ThreadArc(thread)) => {
-                    let mut thread = thread.lock().unwrap();
-                    thread.set_timer_task_time(0);
-                    thread.on_timer();
+        if self.get_interrupt_enabled() {
+            // Disable the timer interrupt while we handle this.
+            // Not necessary due to core timing already having popped this event.
+            self.m_wakeup_time = i64::MAX;
+
+            let cur_tick = self.get_tick();
+            let (fired_task_ids, next_time) = self.base.collect_expired_tasks(cur_tick);
+
+            for task_id in fired_task_ids {
+                let target = if let Some(gsc) = gsc.as_ref() {
+                    gsc.lock()
+                        .unwrap()
+                        .get_thread_by_thread_id(task_id)
+                        .map(TimerTaskTarget::ThreadArc)
+                } else {
+                    None
                 }
-                Some(TimerTaskTarget::RawPtr(thread_ptr)) => {
-                    let thread = unsafe { &mut *(thread_ptr as *mut KThread) };
-                    thread.set_timer_task_time(0);
-                    thread.on_timer();
+                .or_else(|| {
+                    self.thread_ptrs
+                        .get(&task_id)
+                        .copied()
+                        .filter(|ptr| *ptr != 0)
+                        .map(TimerTaskTarget::RawPtr)
+                });
+
+                match target {
+                    Some(TimerTaskTarget::ThreadArc(thread)) => {
+                        let mut thread = thread.lock().unwrap();
+                        thread.set_timer_task_time(0);
+                        thread.on_timer();
+                    }
+                    Some(TimerTaskTarget::RawPtr(thread_ptr)) => {
+                        let thread = unsafe { &mut *(thread_ptr as *mut KThread) };
+                        thread.set_timer_task_time(0);
+                        thread.on_timer();
+                    }
+                    None => {}
                 }
-                None => {}
+
+                self.thread_ptrs.remove(&task_id);
             }
 
-            self.thread_ptrs.remove(&task_id);
-        }
-
-        if next_time > 0 && next_time <= self.m_wakeup_time {
-            self.enable_interrupt(next_time);
+            if next_time > 0 && next_time <= self.m_wakeup_time {
+                self.enable_interrupt(next_time);
+            }
         }
     }
 }
@@ -338,7 +352,9 @@ impl Default for KHardwareTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_timing::CoreTiming;
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
+    use crate::hle::kernel::k_thread::ThreadState;
 
     #[test]
     fn resolve_task_target_falls_back_to_gsc_thread_lookup() {
@@ -355,5 +371,36 @@ mod tests {
             }
             _ => panic!("expected GSC-backed timer target"),
         }
+    }
+
+    #[test]
+    fn do_task_wakes_waiting_thread_via_gsc_owner() {
+        let mut timer = KHardwareTimer::new();
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        let mut core_timing = CoreTiming::new();
+        core_timing.set_multicore(true);
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = 17;
+            guard.begin_wait();
+            guard.set_timer_task_time(10);
+            guard.bind_self_reference(&thread);
+        }
+        gsc.lock().unwrap().add_thread(Arc::clone(&thread));
+        timer.set_gsc(Arc::downgrade(&gsc));
+        timer.core_timing = Some(Arc::new(Mutex::new(core_timing)));
+        timer.m_wakeup_time = 10;
+        timer.base.register_absolute_task_impl(17, 10);
+
+        timer.do_task();
+
+        let guard = thread.lock().unwrap();
+        assert_eq!(guard.get_state(), ThreadState::RUNNABLE);
+        assert_eq!(
+            guard.wait_result,
+            crate::hle::kernel::svc::svc_results::RESULT_TIMED_OUT.get_inner_value()
+        );
+        assert_eq!(guard.get_timer_task_time(), 0);
     }
 }

@@ -364,6 +364,10 @@ impl NvdrvService {
         }
     }
 
+    pub fn get_module(&self) -> Arc<Module> {
+        self.interface.lock().unwrap().get_module()
+    }
+
     // read_buffer / write_buffer removed — use ctx.read_buffer() / ctx.write_buffer()
     // from HLERequestContext (matches upstream where these are methods on HLERequestContext,
     // not on individual service classes).
@@ -719,6 +723,10 @@ impl SessionRequestHandler for NvdrvService {
 
     fn service_name(&self) -> &str {
         &self.name
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

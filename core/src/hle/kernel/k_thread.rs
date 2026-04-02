@@ -25,7 +25,7 @@ use crate::arm::arm_interface::ThreadContext as ArmThreadContext;
 use crate::core::SystemRef;
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results::{
-    RESULT_CANCELLED, RESULT_INVALID_STATE, RESULT_NO_SYNCHRONIZATION_OBJECT,
+    RESULT_CANCELLED, RESULT_INVALID_COMBINATION, RESULT_INVALID_STATE, RESULT_NO_SYNCHRONIZATION_OBJECT,
     RESULT_OUT_OF_RESOURCE, RESULT_TERMINATION_REQUESTED, RESULT_TIMED_OUT,
 };
 use crate::hle::result::RESULT_SUCCESS;
@@ -511,6 +511,14 @@ pub struct KThread {
     /// Host fiber context for this thread.
     /// Upstream: `std::shared_ptr<Common::Fiber> m_host_context`
     pub host_context: Option<Arc<common::fiber::Fiber>>,
+    /// Rust-only pending host fiber entry used to create `host_context` lazily
+    /// on the first core thread that actually runs this KThread.
+    ///
+    /// Upstream eagerly constructs `m_host_context` in `InitializeThread`.
+    /// We defer the actual `Fiber` allocation because the current Rust fiber
+    /// backend still leaks creator-thread ownership into first execution for
+    /// user threads created on one core and first scheduled on another.
+    pub pending_host_context_init: Option<Box<dyn FnOnce() + Send>>,
     /// Context guard for fiber switching.
     /// Upstream: `KSpinLock m_context_guard`
     pub context_guard: parking_lot::Mutex<()>,
@@ -636,6 +644,7 @@ impl KThread {
             is_kernel_address_key: false,
             stack_parameters: StackParameters::default(),
             host_context: None,
+            pending_host_context_init: None,
             context_guard: parking_lot::Mutex::new(()),
             thread_type: ThreadType::User,
             step_state: StepState::default(),
@@ -756,6 +765,25 @@ impl KThread {
     /// Set the host fiber context for this thread.
     pub fn set_host_context(&mut self, ctx: Arc<common::fiber::Fiber>) {
         self.host_context = Some(ctx);
+        self.pending_host_context_init = None;
+    }
+
+    /// Materialize the host fiber lazily on the current host core thread.
+    pub fn get_or_create_host_context(&mut self) -> Option<Arc<common::fiber::Fiber>> {
+        if self.host_context.is_none() {
+            if let Some(init) = self.pending_host_context_init.take() {
+                log::info!(
+                    "KThread::get_or_create_host_context tid={} host={} core_id={} current_core={} affinity=0x{:X}",
+                    self.thread_id,
+                    std::thread::current().name().unwrap_or("?"),
+                    self.core_id,
+                    self.current_core_id,
+                    self.physical_affinity_mask.get_affinity_mask(),
+                );
+                self.host_context = Some(common::fiber::Fiber::new(init));
+            }
+        }
+        self.host_context.clone()
     }
 
     /// Read the user-mode disable count from the thread's TLS region in guest memory.
@@ -1335,14 +1363,6 @@ impl KThread {
     }
 
     pub fn begin_wait_synchronization(&mut self, wait_set: SynchronizationWaitSet, timeout: i64) {
-        if trace_waitstate_for_thread(self.thread_id) {
-            log::info!(
-                "KThread::begin_wait_synchronization tid={} timeout={} active_before={}",
-                self.thread_id,
-                timeout,
-                wait_set.is_active()
-            );
-        }
         self.synchronization_wait = wait_set;
         self.synced_index = -1;
         self.wait_result = RESULT_SUCCESS.get_inner_value();
@@ -1528,9 +1548,7 @@ impl KThread {
 
         // Initialize emulation parameters — create host fiber context.
         // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
-        if let Some(func) = init_func {
-            self.host_context = Some(common::fiber::Fiber::new(func));
-        }
+        self.pending_host_context_init = init_func;
     }
 
     /// Initialize as a kernel main thread (no process owner).
@@ -1584,9 +1602,7 @@ impl KThread {
 
         // Initialize emulation parameters — create host fiber context.
         // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
-        if let Some(func) = init_func {
-            self.host_context = Some(common::fiber::Fiber::new(func));
-        }
+        self.pending_host_context_init = init_func;
     }
 
     /// Initialize as a kernel idle thread (no process owner).
@@ -1767,9 +1783,7 @@ impl KThread {
 
         // Initialize emulation parameters — create host fiber context.
         // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
-        if let Some(func) = init_func {
-            self.host_context = Some(common::fiber::Fiber::new(func));
-        }
+        self.pending_host_context_init = init_func;
 
         RESULT_SUCCESS.get_inner_value()
     }
@@ -1924,7 +1938,7 @@ impl KThread {
                 crate::hle::kernel::svc::svc_thread::exit_thread(system.get());
             }
         });
-        self.host_context = Some(common::fiber::Fiber::new(wrapped_func));
+        self.pending_host_context_init = Some(wrapped_func);
 
         log::info!(
             "KThread::initialize_service_thread: thread_id={} priority={} core={}",
@@ -2427,15 +2441,6 @@ impl KThread {
     /// Matches upstream `KThread::SetState()`.
     pub fn set_state(&mut self, state: ThreadState) {
         let old_state = self.get_raw_state();
-        if trace_waitstate_for_thread(self.thread_id) {
-            log::info!(
-                "KThread::set_state tid={} old={:?} new_base={:?} wait_reason_before={:?}",
-                self.thread_id,
-                old_state,
-                state,
-                self.wait_reason_for_debugging
-            );
-        }
         self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::None);
         let new_state = (old_state & !ThreadState::MASK) | (state & ThreadState::MASK);
         self.thread_state.store(new_state.bits(), Ordering::Relaxed);
@@ -2456,6 +2461,7 @@ impl KThread {
         // Upstream: KScheduler::OnThreadStateChanged(kernel, this, old_state)
         // Updates the PQ directly via GetPriorityQueue(kernel).
         // We access the GSC directly (bypassing the process lock) to match upstream.
+        let mut notified_gsc = false;
         if let Some(gsc_arc) = self
             .global_scheduler_context
             .as_ref()
@@ -2477,14 +2483,17 @@ impl KThread {
                 is_dummy,
                 self.process_schedule_count.clone(),
             );
+            notified_gsc = true;
         }
 
-        // Notify the scheduler for dispatch.
-        if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
-            scheduler
-                .lock()
-                .unwrap()
-                .on_thread_state_changed(self.thread_id, old_base, new_base);
+        // Fallback only when no global scheduler context owner exists.
+        if !notified_gsc {
+            if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
+                scheduler
+                    .lock()
+                    .unwrap()
+                    .on_thread_state_changed(self.thread_id, old_base, new_base);
+            }
         }
     }
 
@@ -2493,11 +2502,18 @@ impl KThread {
         // due to lock ordering. Callers holding the process lock should call
         // process.change_priority_in_queue directly.
 
-        if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
-            scheduler
-                .lock()
-                .unwrap()
-                .on_thread_priority_changed(self.thread_id, old_priority);
+        if self
+            .global_scheduler_context
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_none()
+        {
+            if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
+                scheduler
+                    .lock()
+                    .unwrap()
+                    .on_thread_priority_changed(self.thread_id, old_priority);
+            }
         }
     }
 
@@ -2610,15 +2626,6 @@ impl KThread {
     /// Matches upstream `KThread::BeginWait(KThreadQueue* queue)`:
     /// sets state to Waiting and assigns the wait queue.
     pub fn begin_wait_with_queue(&mut self, wait_queue: KThreadQueue) {
-        if trace_waitstate_for_thread(self.thread_id) {
-            log::info!(
-                "KThread::begin_wait_with_queue tid={} end_wait_allowed={} has_notify_impl={} has_cancel_impl={}",
-                self.thread_id,
-                wait_queue.end_wait_allowed,
-                wait_queue.notify_available_impl.is_some(),
-                wait_queue.cancel_wait_impl.is_some()
-            );
-        }
         self.set_state(ThreadState::WAITING);
         self.wait_queue = Some(wait_queue);
     }
@@ -2656,14 +2663,6 @@ impl KThread {
     /// End wait with a result.
     /// Matches upstream `KThread::EndWait()`.
     pub fn end_wait(&mut self, _wait_result: u32) {
-        if trace_waitstate_for_thread(self.thread_id) {
-            log::info!(
-                "KThread::end_wait tid={} result=0x{:X} wait_reason={:?}",
-                self.thread_id,
-                _wait_result,
-                self.wait_reason_for_debugging
-            );
-        }
         self.sleep_deadline = None;
         self.waiting_lock_info = None;
         self.clear_wait_synchronization();
@@ -2779,22 +2778,68 @@ impl KThread {
     /// Set core mask.
     /// Matches upstream `KThread::SetCoreMask()`.
     pub fn set_core_mask(&mut self, cpu_core_id: i32, affinity_mask: u64) -> u32 {
-        let old_virtual_ideal_core_id = self.virtual_ideal_core_id;
-        let old_virtual_affinity_mask = self.virtual_affinity_mask;
+        debug_assert!(affinity_mask != 0);
 
-        if cpu_core_id >= 0 {
-            self.virtual_ideal_core_id = cpu_core_id;
-            self.physical_ideal_core_id = cpu_core_id;
-            self.core_id = cpu_core_id;
-            self.current_core_id = cpu_core_id;
+        let mut core_id = cpu_core_id;
+        if core_id != crate::hle::kernel::svc_types::IDEAL_CORE_NO_UPDATE {
+            self.virtual_ideal_core_id = core_id;
+        } else {
+            core_id = self.virtual_ideal_core_id;
+            if ((1u64 << core_id) & affinity_mask) == 0 {
+                return RESULT_INVALID_COMBINATION.get_inner_value();
+            }
         }
-        self.virtual_affinity_mask = affinity_mask;
-        self.physical_affinity_mask.set_affinity_mask(affinity_mask);
 
-        if self.virtual_ideal_core_id != old_virtual_ideal_core_id
-            || self.virtual_affinity_mask != old_virtual_affinity_mask
-        {
-            self.request_schedule();
+        self.virtual_affinity_mask = affinity_mask;
+
+        if core_id >= 0 {
+            core_id = crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[core_id as usize];
+        }
+
+        let physical_affinity_mask =
+            crate::hardware_properties::convert_virtual_core_mask_to_physical(affinity_mask);
+
+        if self.num_core_migration_disables == 0 {
+            let old_mask = self.physical_affinity_mask.clone();
+            let old_active_core = self.get_active_core();
+
+            self.physical_ideal_core_id = core_id;
+            self.physical_affinity_mask
+                .set_affinity_mask(physical_affinity_mask);
+
+            if self.physical_affinity_mask.get_affinity_mask() != old_mask.get_affinity_mask() {
+                if old_active_core >= 0
+                    && (self.physical_affinity_mask.get_affinity_mask() & (1u64 << old_active_core))
+                        == 0
+                {
+                    let new_core = if self.physical_ideal_core_id >= 0 {
+                        self.physical_ideal_core_id
+                    } else {
+                        let mask = self.physical_affinity_mask.get_affinity_mask();
+                        (63 - mask.leading_zeros()) as i32
+                    };
+                    self.set_active_core(new_core);
+                }
+
+                if self.get_state() == ThreadState::RUNNABLE {
+                    if let Some(gsc) = self.global_scheduler_context.as_ref().and_then(Weak::upgrade)
+                    {
+                        gsc.lock().unwrap().on_thread_affinity_changed(
+                            self.thread_id,
+                            old_active_core,
+                            old_mask.get_affinity_mask(),
+                            self.get_active_core(),
+                            self.physical_affinity_mask.get_affinity_mask(),
+                            self.priority,
+                            self.is_dummy_thread(),
+                        );
+                    }
+                }
+            }
+        } else {
+            self.original_physical_ideal_core_id = core_id;
+            self.original_physical_affinity_mask
+                .set_affinity_mask(physical_affinity_mask);
         }
 
         RESULT_SUCCESS.get_inner_value()
@@ -2868,6 +2913,7 @@ impl KThread {
         // Release host emulation members.
         // Upstream: m_host_context.reset()
         self.host_context = None;
+        self.pending_host_context_init = None;
 
         // Perform inherited finalization.
         // Upstream: KSynchronizationObject::Finalize()
@@ -3388,6 +3434,29 @@ mod tests {
     }
 
     #[test]
+    fn lazy_host_context_creation_consumes_pending_init_once() {
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runs_for_init = Arc::clone(&runs);
+
+        let mut thread = KThread::new();
+        thread.pending_host_context_init = Some(Box::new(move || {
+            runs_for_init.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let first = thread
+            .get_or_create_host_context()
+            .expect("host context should be created");
+        let second = thread
+            .get_or_create_host_context()
+            .expect("host context should be reused");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(thread.pending_host_context_init.is_none());
+        assert!(thread.host_context.is_some());
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn test_finalize_unregisters_thread_object_from_owner_process() {
         let process = Arc::new(Mutex::new(KProcess::new()));
         let thread = Arc::new(Mutex::new(KThread::new()));
@@ -3488,6 +3557,26 @@ mod tests {
             RESULT_SUCCESS.get_inner_value()
         );
         assert!(scheduler.lock().unwrap().needs_scheduling());
+    }
+
+    #[test]
+    fn test_core_mask_dont_care_rehomes_active_core_to_allowed_affinity() {
+        let mut thread = KThread::new();
+        thread.thread_id = 1;
+        thread.set_state(ThreadState::RUNNABLE);
+        thread.virtual_ideal_core_id = crate::hle::kernel::svc_types::IDEAL_CORE_DONT_CARE;
+        thread.virtual_affinity_mask = 0x1;
+        thread.physical_ideal_core_id = crate::hle::kernel::svc_types::IDEAL_CORE_DONT_CARE;
+        thread.physical_affinity_mask.set_affinity_mask(0x1);
+        thread.set_active_core(0);
+        thread.set_current_core(0);
+
+        assert_eq!(
+            thread.set_core_mask(crate::hle::kernel::svc_types::IDEAL_CORE_DONT_CARE, 0x2),
+            RESULT_SUCCESS.get_inner_value()
+        );
+        assert_eq!(thread.get_active_core(), 1);
+        assert_eq!(thread.physical_affinity_mask.get_affinity_mask(), 0x2);
     }
 
     #[test]

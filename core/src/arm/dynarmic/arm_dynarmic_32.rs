@@ -1180,7 +1180,10 @@ impl ArmInterface for ArmDynarmic32 {
                             );
                         } else {
                             last_hr = jit.step();
-                            if !last_hr.is_empty() {
+                            if !last_hr.is_empty()
+                                && last_hr
+                                    != rdynarmic::halt_reason::HaltReason::STEP
+                            {
                                 log::info!("[A32TRACE] halt while searching: {:?}", last_hr);
                                 break;
                             }
@@ -1190,7 +1193,7 @@ impl ArmInterface for ArmDynarmic32 {
                             continue;
                         }
                     }
-                    if pc < start || pc >= end || logged_steps >= trace_limit {
+                    if logged_steps >= trace_limit {
                         break;
                     }
                     let cpsr = jit.get_cpsr();
@@ -1218,7 +1221,10 @@ impl ArmInterface for ArmDynarmic32 {
                     );
                     logged_steps += 1;
                     last_hr = jit.step();
-                    if !last_hr.is_empty() {
+                    if !last_hr.is_empty()
+                        && last_hr
+                            != rdynarmic::halt_reason::HaltReason::STEP
+                    {
                         log::info!("[A32TRACE] halt={:?}", last_hr);
                         break;
                     }
