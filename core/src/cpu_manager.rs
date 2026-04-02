@@ -581,25 +581,21 @@ impl CpuManager {
                     let prefetch_abort = halt_reason.contains(HaltReason::PREFETCH_ABORT);
                     let breakpoint = halt_reason.contains(HaltReason::INSTRUCTION_BREAKPOINT);
                     if current_thread_id == 17
-                        && TID17_HALT_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) < 32
+                        && TID17_HALT_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) < 500
                     {
                         let mut tc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc);
                         log::info!(
-                            "multi_core_run_guest_thread: tid=17 core={} halted={:?} interrupt={} data_abort={} prefetch_abort={} breakpoint={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} r0=0x{:X} r1=0x{:X} r2=0x{:X} r3=0x{:X}",
+                            "multi_core_run_guest_thread: tid=17 core={} halted={:?} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} r4=0x{:X} r7=0x{:X} r0=0x{:X} r1=0x{:X}",
                             core_index,
                             halt_reason,
-                            interrupt,
-                            data_abort,
-                            prefetch_abort,
-                            breakpoint,
                             tc.pc,
                             tc.lr,
                             tc.sp,
+                            tc.r[4],
+                            tc.r[7],
                             tc.r[0],
                             tc.r[1],
-                            tc.r[2],
-                            tc.r[3],
                         );
                     }
                 }
