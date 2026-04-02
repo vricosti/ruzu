@@ -7,6 +7,11 @@
 //! Account module and Interface base class.
 
 use super::profile_manager::{ProfileBase, ProfileManager, UserData, UserIdArray, MAX_USERS};
+use crate::file_sys::romfs_factory::StorageId;
+use crate::hle::service::acc::errors::{
+    RESULT_APPLICATION_INFO_ALREADY_INITIALIZED, RESULT_INVALID_APPLICATION,
+};
+use crate::hle::service::glue::glue_manager::ApplicationLaunchProperty;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
     HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
@@ -49,16 +54,22 @@ pub enum ApplicationType {
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct ApplicationInfo {
-    pub title_id: u64,
+    pub launch_property: ApplicationLaunchProperty,
     pub application_type: ApplicationType,
 }
 
 impl Default for ApplicationInfo {
     fn default() -> Self {
         Self {
-            title_id: 0,
+            launch_property: ApplicationLaunchProperty::default(),
             application_type: ApplicationType::Unknown,
         }
+    }
+}
+
+impl ApplicationInfo {
+    fn is_initialized(&self) -> bool {
+        self.launch_property.title_id != 0
     }
 }
 
@@ -197,23 +208,296 @@ impl Interface {
         (RESULT_SUCCESS, editor)
     }
 
+    fn initialize_application_info_base(&mut self) -> ResultCode {
+        if self.application_info.is_initialized() {
+            log::error!("Account::InitializeApplicationInfoBase: already initialized");
+            return RESULT_APPLICATION_INFO_ALREADY_INITIALIZED;
+        }
+
+        let system = self.system.get();
+        let title_id = system
+            .current_process_arc
+            .as_ref()
+            .map(|process| process.lock().unwrap().get_program_id())
+            .unwrap_or_else(|| system.runtime_program_id());
+        let (result, launch_property) = system
+            .arp_manager()
+            .lock()
+            .unwrap()
+            .get_launch_property(title_id);
+
+        if result != RESULT_SUCCESS {
+            log::error!(
+                "Account::InitializeApplicationInfoBase: failed to get launch property for {:016X}",
+                title_id
+            );
+            return RESULT_INVALID_APPLICATION;
+        }
+
+        let Some(launch_property) = launch_property else {
+            log::error!(
+                "Account::InitializeApplicationInfoBase: ARP returned no launch property"
+            );
+            return RESULT_INVALID_APPLICATION;
+        };
+
+        let application_type = match launch_property.base_game_storage_id {
+            x if x == StorageId::GameCard as u8 => ApplicationType::GameCard,
+            x if x == StorageId::Host as u8
+                || x == StorageId::NandUser as u8
+                || x == StorageId::SdCard as u8
+                || x == StorageId::None as u8 =>
+            {
+                ApplicationType::Digital
+            }
+            storage_id => {
+                log::error!(
+                    "Account::InitializeApplicationInfoBase: invalid game storage id {}",
+                    storage_id
+                );
+                return RESULT_INVALID_APPLICATION;
+            }
+        };
+
+        self.application_info.launch_property = launch_property;
+        self.application_info.application_type = application_type;
+
+        log::warn!("Account::InitializeApplicationInfoBase: ApplicationInfo init required");
+        RESULT_SUCCESS
+    }
+
     pub fn initialize_application_info(&mut self) -> ResultCode {
         log::debug!("Account::InitializeApplicationInfo called");
-        // Upstream: calls InitializeApplicationInfoBase() which checks ARP manager
-        // for launch property and sets application_type based on storage_id.
-        // For now, default to Digital since we don't have full ARP integration.
-        self.application_info.application_type = ApplicationType::Digital;
-        RESULT_SUCCESS
+        self.initialize_application_info_base()
     }
 
     pub fn initialize_application_info_restricted(&mut self) -> ResultCode {
         log::debug!("Account::InitializeApplicationInfoRestricted called");
-        RESULT_SUCCESS
+        self.initialize_application_info_base()
     }
 
     pub fn initialize_application_info_v2(&mut self) -> ResultCode {
         log::debug!("Account::InitializeApplicationInfoV2 called");
         RESULT_SUCCESS
+    }
+
+    pub fn get_baas_account_manager_for_application(
+        &self,
+    ) -> (ResultCode, SessionRequestHandlerPtr) {
+        log::debug!("Account::GetBaasAccountManagerForApplication called");
+        (
+            RESULT_SUCCESS,
+            Arc::new(IManagerForApplication::new(
+                self.system,
+                self.profile_manager.clone(),
+            )),
+        )
+    }
+}
+
+fn push_interface_response(ctx: &mut HLERequestContext, object: SessionRequestHandlerPtr) {
+    let is_domain = ctx
+        .get_manager()
+        .map_or(false, |manager| manager.lock().unwrap().is_domain());
+    let move_handle = if is_domain {
+        0
+    } else {
+        ctx.create_session_for_service(object.clone()).unwrap_or(0)
+    };
+    let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+    rb.push_result(RESULT_SUCCESS);
+    if is_domain {
+        ctx.add_domain_object(object);
+    } else {
+        rb.push_move_objects(move_handle);
+    }
+}
+
+struct EnsureTokenIdCacheAsyncInterface {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl EnsureTokenIdCacheAsyncInterface {
+    fn new() -> Self {
+        let handlers = build_handler_map(&[
+            (0, Some(Self::unknown0_handler), "Unknown0"),
+            (1, Some(Self::load_id_token_cache_handler), "LoadIdTokenCache"),
+            (2, Some(Self::unknown2_handler), "Unknown2"),
+            (3, Some(Self::unknown3_handler), "Unknown3"),
+            (100, Some(Self::cancel_handler), "Cancel"),
+            (101, Some(Self::get_result_handler), "GetResult"),
+        ]);
+        Self {
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn unknown0_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn load_id_token_cache_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        ctx.write_buffer(&[], 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn unknown2_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn unknown3_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn cancel_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_result_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for EnsureTokenIdCacheAsyncInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+}
+
+impl ServiceFramework for EnsureTokenIdCacheAsyncInterface {
+    fn get_service_name(&self) -> &str {
+        "EnsureTokenIdCacheAsyncInterface"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+struct IManagerForApplication {
+    profile_manager: Arc<Mutex<ProfileManager>>,
+    ensure_token_id: SessionRequestHandlerPtr,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IManagerForApplication {
+    fn new(
+        _system: crate::core::SystemRef,
+        profile_manager: Arc<Mutex<ProfileManager>>,
+    ) -> Self {
+        let handlers = build_handler_map(&[
+            (0, Some(Self::check_availability_handler), "CheckAvailability"),
+            (1, Some(Self::get_account_id_handler), "GetAccountId"),
+            (
+                2,
+                Some(Self::ensure_id_token_cache_async_handler),
+                "EnsureIdTokenCacheAsync",
+            ),
+            (3, Some(Self::load_id_token_cache_handler), "LoadIdTokenCache"),
+            (
+                130,
+                Some(
+                    Self::get_nintendo_account_user_resource_cache_for_application_handler,
+                ),
+                "GetNintendoAccountUserResourceCacheForApplication",
+            ),
+            (150, None, "CreateAuthorizationRequest"),
+            (160, Some(Self::store_open_context_handler), "StoreOpenContext"),
+            (170, None, "LoadNetworkServiceLicenseKindAsync"),
+        ]);
+        Self {
+            profile_manager,
+            ensure_token_id: Arc::new(EnsureTokenIdCacheAsyncInterface::new()),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn check_availability_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(false);
+    }
+
+    fn get_account_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
+        let pm = svc.profile_manager.lock().unwrap();
+        let hash =
+            common::uuid::UUID::from_bytes(pm.get_last_opened_user().to_le_bytes()).hash_value();
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(hash);
+    }
+
+    fn ensure_id_token_cache_async_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
+        push_interface_response(ctx, svc.ensure_token_id.clone());
+    }
+
+    fn load_id_token_cache_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
+        svc.ensure_token_id.handle_sync_request(ctx);
+    }
+
+    fn get_nintendo_account_user_resource_cache_for_application_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
+        ctx.write_buffer(&vec![0u8; 0x68], 0);
+        if ctx.can_write_buffer(1) {
+            ctx.write_buffer(&vec![0u8; ctx.get_write_buffer_size(1)], 1);
+        }
+
+        let pm = svc.profile_manager.lock().unwrap();
+        let hash =
+            common::uuid::UUID::from_bytes(pm.get_last_opened_user().to_le_bytes()).hash_value();
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(hash);
+    }
+
+    fn store_open_context_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
+        svc.profile_manager.lock().unwrap().store_opened_users();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for IManagerForApplication {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+}
+
+impl ServiceFramework for IManagerForApplication {
+    fn get_service_name(&self) -> &str {
+        "IManagerForApplication"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
 
@@ -552,4 +836,84 @@ pub fn loop_process(system: crate::core::SystemRef) {
     }
 
     ServerManager::run_server(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_interface(system: crate::core::SystemRef) -> Interface {
+        Interface::new(
+            Arc::new(Module),
+            Arc::new(Mutex::new(ProfileManager::new())),
+            system,
+            "acc:u0",
+        )
+    }
+
+    #[test]
+    fn initialize_application_info_base_uses_arp_launch_property() {
+        let mut system = crate::core::System::new();
+        let program_id = 0x0100_1520_0002_2000;
+        system.set_runtime_program_id(program_id);
+        system
+            .arp_manager()
+            .lock()
+            .unwrap()
+            .register(
+                program_id,
+                ApplicationLaunchProperty {
+                    title_id: program_id,
+                    version: 0,
+                    base_game_storage_id: StorageId::Host as u8,
+                    update_storage_id: StorageId::None as u8,
+                    program_index: 0,
+                    reserved: 0,
+                },
+                vec![0; 0x4000],
+            );
+
+        let mut interface = make_interface(crate::core::SystemRef::from_ref(&system));
+        let result = interface.initialize_application_info();
+
+        assert_eq!(result, RESULT_SUCCESS);
+        assert_eq!(
+            interface.application_info.launch_property.title_id,
+            program_id
+        );
+        assert_eq!(
+            interface.application_info.application_type,
+            ApplicationType::Digital
+        );
+    }
+
+    #[test]
+    fn initialize_application_info_base_rejects_second_initialization() {
+        let mut system = crate::core::System::new();
+        let program_id = 0x0100_1520_0002_2000;
+        system.set_runtime_program_id(program_id);
+        system
+            .arp_manager()
+            .lock()
+            .unwrap()
+            .register(
+                program_id,
+                ApplicationLaunchProperty {
+                    title_id: program_id,
+                    version: 0,
+                    base_game_storage_id: StorageId::Host as u8,
+                    update_storage_id: StorageId::None as u8,
+                    program_index: 0,
+                    reserved: 0,
+                },
+                vec![0; 0x4000],
+            );
+
+        let mut interface = make_interface(crate::core::SystemRef::from_ref(&system));
+        assert_eq!(interface.initialize_application_info(), RESULT_SUCCESS);
+        assert_eq!(
+            interface.initialize_application_info(),
+            RESULT_APPLICATION_INFO_ALREADY_INITIALIZED
+        );
+    }
 }

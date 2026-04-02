@@ -799,6 +799,17 @@ mod tests {
         fn push_gpu_entries(&self, channel_id: i32, entries: GpuCommandList) {
             self.pushed.lock().unwrap().push((channel_id, entries));
         }
+
+        fn request_composite(
+            &self,
+            _layers: Vec<crate::gpu_core::FramebufferConfig>,
+            _fences: Vec<crate::hle::service::nvdrv::nvdata::NvFence>,
+        ) {
+        }
+
+        fn on_cpu_write(&self, _addr: u64, _size: u64) -> bool {
+            false
+        }
     }
 
     #[test]

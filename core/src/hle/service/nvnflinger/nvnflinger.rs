@@ -32,9 +32,9 @@ pub struct Nvnflinger {
 }
 
 impl Nvnflinger {
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Self {
         let server = HosBinderDriverServer::new();
-        let surface_flinger = SurfaceFlinger::new(Arc::clone(&server));
+        let surface_flinger = SurfaceFlinger::new(system, Arc::clone(&server));
         let binder_driver = Arc::new(IHosBinderDriver::new(
             Arc::clone(&server),
             Arc::clone(&surface_flinger),
@@ -60,15 +60,9 @@ impl Nvnflinger {
     }
 }
 
-impl Default for Nvnflinger {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Matches upstream `Service::Nvnflinger::LoopProcess(Core::System& system)`.
 pub fn loop_process(system: crate::core::SystemRef) {
-    let nvnflinger = Arc::new(Nvnflinger::new());
+    let nvnflinger = Arc::new(Nvnflinger::new(system));
 
     let mut server_manager = ServerManager::new(system);
     let binder_driver = Arc::clone(nvnflinger.get_binder_driver());

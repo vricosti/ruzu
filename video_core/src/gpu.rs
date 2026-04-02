@@ -16,8 +16,11 @@ use crate::renderer_base::RendererBase;
 use common::settings;
 use ruzu_core::core::SystemRef;
 use ruzu_core::gpu_core::{
-    GpuChannelHandle, GpuCommandList, GpuCoreInterface, GpuMemoryManagerHandle,
+    BlendMode as CoreBlendMode, BufferTransformFlags as CoreBufferTransformFlags,
+    FramebufferConfig as CoreFramebufferConfig, GpuChannelHandle, GpuCommandList,
+    GpuCoreInterface, GpuMemoryManagerHandle, RectI as CoreRectI,
 };
+use ruzu_core::hle::service::nvdrv::nvdata::NvFence;
 
 struct VideoGpuChannelHandle {
     gpu: *const Gpu,
@@ -244,7 +247,8 @@ impl Gpu {
 
         if let Some(rasterizer) = self.rasterizer_ptr() {
             let rasterizer = unsafe { &mut *rasterizer };
-            rasterizer.bind_channel(channel_state.lock().bind_id);
+            let channel_state = channel_state.lock();
+            rasterizer.bind_channel(&channel_state);
         }
     }
 
@@ -600,7 +604,7 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
         if let Some(rasterizer) = gpu.rasterizer_ptr() {
             let rasterizer = unsafe { &mut *rasterizer };
             channel_state.bind_rasterizer(rasterizer);
-            rasterizer.initialize_channel(channel_state.bind_id);
+            rasterizer.initialize_channel(&channel_state);
         }
     }
 
@@ -697,6 +701,46 @@ impl GpuCoreInterface for Gpu {
         Gpu::push_gpu_entries(self, channel_id, command_list);
     }
 
+    fn request_composite(&self, layers: Vec<CoreFramebufferConfig>, _fences: Vec<NvFence>) {
+        let layers = layers
+            .into_iter()
+            .map(|layer| FramebufferConfig {
+                address: layer.address,
+                offset: layer.offset,
+                width: layer.width,
+                height: layer.height,
+                stride: layer.stride,
+                pixel_format: crate::framebuffer_config::AndroidPixelFormat(layer.pixel_format),
+                transform_flags: crate::framebuffer_config::BufferTransformFlags(
+                    match layer.transform_flags {
+                        CoreBufferTransformFlags(bits) => bits,
+                    },
+                ),
+                crop_rect: match layer.crop_rect {
+                    CoreRectI {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    } => crate::framebuffer_config::RectI {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    },
+                },
+                blending: match layer.blending {
+                    CoreBlendMode::Opaque => crate::framebuffer_config::BlendMode::Opaque,
+                    CoreBlendMode::Premultiplied => {
+                        crate::framebuffer_config::BlendMode::Premultiplied
+                    }
+                    CoreBlendMode::Coverage => crate::framebuffer_config::BlendMode::Coverage,
+                },
+            })
+            .collect();
+        Gpu::request_composite(self, layers);
+    }
+
     fn on_cpu_write(&self, addr: u64, size: u64) -> bool {
         Gpu::on_cpu_write(self, addr, size)
     }
@@ -778,11 +822,14 @@ mod tests {
             _memory: &[u8],
         ) {
         }
-        fn initialize_channel(&mut self, channel_id: i32) {
-            self.initialized_channels.lock().unwrap().push(channel_id);
+        fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+            self.initialized_channels
+                .lock()
+                .unwrap()
+                .push(channel.bind_id);
         }
-        fn bind_channel(&mut self, channel_id: i32) {
-            self.bound_channels.lock().unwrap().push(channel_id);
+        fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+            self.bound_channels.lock().unwrap().push(channel.bind_id);
         }
     }
 

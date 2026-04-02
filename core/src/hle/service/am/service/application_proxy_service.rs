@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::am::window_system::WindowSystem;
@@ -17,19 +18,21 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// IPC command table for IApplicationProxyService ("appletOE"):
 /// - 0: OpenApplicationProxy
 pub struct IApplicationProxyService {
+    system: SystemRef,
     window_system: Arc<Mutex<WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IApplicationProxyService {
-    pub fn new(window_system: Arc<Mutex<WindowSystem>>) -> Self {
+    pub fn new(system: SystemRef, window_system: Arc<Mutex<WindowSystem>>) -> Self {
         let handlers = build_handler_map(&[(
             0,
             Some(Self::open_application_proxy_handler),
             "OpenApplicationProxy",
         )]);
         Self {
+            system,
             window_system,
             handlers,
             handlers_tipc: BTreeMap::new(),
@@ -93,6 +96,7 @@ impl IApplicationProxyService {
             })
             .map(|process| process as Arc<Mutex<KProcess>>);
         let proxy = Arc::new(super::application_proxy::IApplicationProxy::new(
+            service.system,
             applet,
             process,
             service.window_system.clone(),

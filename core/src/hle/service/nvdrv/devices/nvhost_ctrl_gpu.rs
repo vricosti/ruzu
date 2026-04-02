@@ -6,6 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
@@ -149,13 +150,15 @@ const _: () = assert!(std::mem::size_of::<IoctlGetGpuTime>() == 0x10);
 
 /// nvhost_ctrl_gpu device.
 pub struct NvHostCtrlGpu {
+    system: SystemRef,
     error_notifier_event: Arc<Mutex<KReadableEvent>>,
     unknown_event: Arc<Mutex<KReadableEvent>>,
 }
 
 impl NvHostCtrlGpu {
-    pub fn new(events_interface: Arc<EventInterface>) -> Self {
+    pub fn new(system: SystemRef, events_interface: Arc<EventInterface>) -> Self {
         Self {
+            system,
             error_notifier_event: events_interface.create_event("CtrlGpuErrorNotifier"),
             unknown_event: events_interface.create_event("CtrlGpuUnknownEvent"),
         }
@@ -263,8 +266,14 @@ impl NvHostCtrlGpu {
 
     pub fn get_gpu_time(&self, params: &mut IoctlGetGpuTime) -> NvResult {
         log::debug!("nvhost_ctrl_gpu::GetGpuTime called");
-        // Stubbed: would read from CoreTiming
-        params.gpu_time = 0;
+        params.gpu_time = self
+            .system
+            .get()
+            .core_timing()
+            .lock()
+            .unwrap()
+            .get_global_time_ns()
+            .as_nanos() as u64;
         NvResult::Success
     }
 }
@@ -404,5 +413,34 @@ impl NvDevice for NvHostCtrlGpu {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::System;
+
+    #[test]
+    fn get_gpu_time_uses_core_timing() {
+        let system = System::new();
+        system.core_timing().lock().unwrap().add_ticks(1234);
+
+        let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
+        let ctrl_gpu = NvHostCtrlGpu::new(SystemRef::from_ref(&system), events);
+        let mut params = IoctlGetGpuTime::default();
+
+        let result = ctrl_gpu.get_gpu_time(&mut params);
+
+        assert_eq!(result, NvResult::Success);
+        assert_eq!(
+            params.gpu_time,
+            system
+                .core_timing()
+                .lock()
+                .unwrap()
+                .get_global_time_ns()
+                .as_nanos() as u64
+        );
     }
 }

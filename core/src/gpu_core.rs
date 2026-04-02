@@ -7,6 +7,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::hle::service::nvdrv::nvdata::NvFence;
+
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct GpuCommandListHeader {
@@ -23,6 +25,38 @@ pub struct GpuCommandHeader {
 pub struct GpuCommandList {
     pub command_lists: Vec<GpuCommandListHeader>,
     pub prefetch_command_list: Vec<GpuCommandHeader>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendMode {
+    #[default]
+    Opaque,
+    Premultiplied,
+    Coverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BufferTransformFlags(pub u32);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RectI {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FramebufferConfig {
+    pub address: u64,
+    pub offset: u32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pixel_format: u32,
+    pub transform_flags: BufferTransformFlags,
+    pub crop_rect: RectI,
+    pub blending: BlendMode,
 }
 
 /// Opaque GPU memory-manager state handle.
@@ -77,6 +111,9 @@ pub trait GpuCoreInterface: Any + Send {
 
     /// Mirrors the upstream `GPU::PushGPUEntries(s32, CommandList&&)`.
     fn push_gpu_entries(&self, channel_id: i32, entries: GpuCommandList);
+
+    /// Mirrors the upstream `GPU::RequestComposite(layers, fences)`.
+    fn request_composite(&self, layers: Vec<FramebufferConfig>, fences: Vec<NvFence>);
 
     /// Mirrors the upstream `GPU::OnCPUWrite(DAddr, u64)`.
     fn on_cpu_write(&self, addr: u64, size: u64) -> bool;

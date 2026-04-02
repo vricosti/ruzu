@@ -54,17 +54,23 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         .expect("failed to spawn am:SetWindowSystem thread");
 
     let ws = window_system.clone();
+    let system_oe = system;
     let factory_oe: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
         Arc::new(
-            super::service::application_proxy_service::IApplicationProxyService::new(ws.clone()),
+            super::service::application_proxy_service::IApplicationProxyService::new(
+                system_oe,
+                ws.clone(),
+            ),
         )
     });
     server_manager.register_named_service("appletOE", factory_oe, 64);
 
     let ws = window_system.clone();
+    let system_ae = system;
     let factory_ae: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
         Arc::new(
             super::service::all_system_applet_proxies_service::IAllSystemAppletProxiesService::new(
+                system_ae,
                 ws.clone(),
             ),
         )

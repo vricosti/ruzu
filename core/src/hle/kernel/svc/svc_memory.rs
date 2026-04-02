@@ -187,7 +187,7 @@ pub fn set_memory_attribute(
 
 /// Maps a memory range into a different range.
 pub fn map_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) -> ResultCode {
-    log::trace!(
+    log::info!(
         "svc::MapMemory called, dst_addr=0x{:X}, src_addr=0x{:X}, size=0x{:X}",
         dst_addr,
         src_addr,
@@ -202,9 +202,7 @@ pub fn map_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) -> R
     let mut process = system.current_process_arc().lock().unwrap();
     let dst_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(dst_addr);
     let src_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(src_addr);
-    let r = process
-        .page_table
-        .map_memory(dst_kpa, src_kpa, size as usize);
+    let r = process.page_table.map_memory(dst_kpa, src_kpa, size as usize);
     ResultCode::new(r)
 }
 

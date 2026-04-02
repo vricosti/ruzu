@@ -11,6 +11,7 @@ use crate::core_timing::CoreTiming;
 use crate::cpu_manager::CpuManager;
 use crate::device_memory::DeviceMemory;
 use crate::file_sys::fs_filesystem::OpenMode;
+use crate::file_sys::romfs_factory::StorageId;
 use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
 use crate::hardware_properties;
@@ -22,6 +23,7 @@ use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::am::applet_manager::{
     AppletManager, FrontendAppletParameters, LaunchType,
 };
+use crate::hle::service::glue::glue_manager::{ARPManager, ApplicationLaunchProperty};
 use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 use crate::memory::memory::Memory;
@@ -130,6 +132,10 @@ pub struct System {
 
     /// Applet manager used to register frontend-launched applets with AM.
     applet_manager: AppletManager,
+
+    /// Shared ARP manager for application launch/control properties.
+    /// Upstream: `System::GetARPManager()`.
+    arp_manager: Arc<StdMutex<ARPManager>>,
 
     /// Filesystem controller (process registrations, factory management).
     /// Upstream: `FileSystemController& GetFileSystemController()`.
@@ -291,6 +297,7 @@ impl System {
             audio_core: None,
             service_manager: None,
             applet_manager: AppletManager::new(),
+            arp_manager: Arc::new(StdMutex::new(ARPManager::new())),
             filesystem_controller: Arc::new(StdMutex::new(
                 crate::hle::service::filesystem::filesystem::FileSystemController::new(),
             )),
@@ -548,7 +555,7 @@ impl System {
 
         // Get the appropriate loader for this file type.
         let mut loader_system = crate::loader::loader::System {
-            content_provider: None, // ContentProvider is not yet created at System level.
+            content_provider: self.content_provider.clone(),
             filesystem_controller: Some(self.filesystem_controller.clone()),
         };
         let loader = crate::loader::loader::get_loader(&mut loader_system, file, 0, 0);
@@ -600,6 +607,32 @@ impl System {
         self.load_parameters = load_parameters;
         self.current_process = Some(process);
 
+        if let Some(ref process) = self.current_process {
+            let program_id = process.get_program_id();
+            let launch = ApplicationLaunchProperty {
+                title_id: program_id,
+                version: 0,
+                base_game_storage_id: StorageId::Host as u8,
+                update_storage_id: StorageId::None as u8,
+                program_index: 0,
+                reserved: 0,
+            };
+            let control =
+                vec![0u8; std::mem::size_of::<crate::file_sys::control_metadata::RawNACP>()];
+            let result = self
+                .arp_manager
+                .lock()
+                .unwrap()
+                .register(program_id, launch, control);
+            if result != crate::hle::result::RESULT_SUCCESS {
+                log::warn!(
+                    "System::load: failed to register ARP launch property for {:016X}: {:?}",
+                    program_id,
+                    result
+                );
+            }
+        }
+
         // Phase 3: Set up GPU, audio, services (upstream: SetupForApplicationProcess)
         self.setup_for_application_process();
 
@@ -609,14 +642,21 @@ impl System {
         // (see kernel.create_new_user_process_id() above), so registration must
         // happen here instead.
         if let Some(ref process) = self.current_process {
-            // Upstream passes a RomFSFactory constructed from the app_loader,
-            // content_provider, and filesystem_controller. Content provider is
-            // not yet wired at the System level, so we pass None for now.
-            // When content_provider is available, construct RomFSFactory here.
+            let romfs_factory = self
+                .app_loader
+                .as_ref()
+                .zip(self.content_provider.as_ref())
+                .map(|(app_loader, content_provider)| {
+                    Arc::new(crate::file_sys::romfs_factory::RomFSFactory::new(
+                        app_loader.as_ref(),
+                        content_provider.clone(),
+                        self.filesystem_controller.clone(),
+                    ))
+                });
             self.filesystem_controller.lock().unwrap().register_process(
                 process.process_id,
                 process.get_program_id(),
-                None, // romfs_factory — requires content_provider
+                romfs_factory,
             );
         }
 
@@ -925,6 +965,12 @@ impl System {
         &self,
     ) -> Option<&Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>> {
         self.content_provider.as_ref()
+    }
+
+    /// Get the shared ARP manager.
+    /// Upstream: `System::GetARPManager()`.
+    pub fn arp_manager(&self) -> Arc<StdMutex<ARPManager>> {
+        self.arp_manager.clone()
     }
 
     /// Register the subsystem factory callback.

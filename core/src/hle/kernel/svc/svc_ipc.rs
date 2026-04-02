@@ -62,11 +62,6 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     // where memory = client_thread->GetOwnerProcess()->GetMemory()
     let mut context =
         HLERequestContext::new_with_thread(current_thread, shared_memory, tls_address);
-    // Set the Memory bridge for TLS access — matches upstream's
-    // memory.GetPointer(client_message) for reading the command buffer.
-    if let Some(memory) = system.get_svc_memory() {
-        context.set_memory(memory);
-    }
     context.set_session_request_manager(request_manager.clone());
     let service_manager = system.service_manager().unwrap();
     context.set_service_manager(service_manager);
@@ -101,43 +96,6 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     // StubSuccess paths the response is only in cmd_buf and needs to be flushed.
     // Calling it again for Session/Domain is safe — it just re-writes the same data.
     context.write_to_outgoing_command_buffer();
-
-    if (session_handler_name == "sm:" && context.get_command() == 1)
-        || (session_handler_name == "lm" && context.get_command() == 0)
-        || (session_handler_name == "nvdrv" && context.get_command() == 1)
-    {
-        if let Some(memory) = system.get_svc_memory() {
-            let m = memory.lock().unwrap();
-            log::info!(
-                "  SendSyncRequest response: service={} cmd={} tls=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                session_handler_name,
-                context.get_command(),
-                m.read_32(tls_address),
-                m.read_32(tls_address + 4),
-                m.read_32(tls_address + 8),
-                m.read_32(tls_address + 12),
-                m.read_32(tls_address + 16),
-                m.read_32(tls_address + 20),
-                m.read_32(tls_address + 24),
-                m.read_32(tls_address + 28),
-            );
-        } else {
-            let mem = debug_memory.read().unwrap();
-            log::info!(
-                "  SendSyncRequest response: service={} cmd={} tls=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                session_handler_name,
-                context.get_command(),
-                mem.read_32(tls_address),
-                mem.read_32(tls_address + 4),
-                mem.read_32(tls_address + 8),
-                mem.read_32(tls_address + 12),
-                mem.read_32(tls_address + 16),
-                mem.read_32(tls_address + 20),
-                mem.read_32(tls_address + 24),
-                mem.read_32(tls_address + 28),
-            );
-        }
-    }
 
     // Upstream: SendSyncRequest always returns ResultSuccess to the guest.
     // RESULT_SESSION_CLOSED is an internal signal consumed by the kernel

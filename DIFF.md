@@ -4146,6 +4146,35 @@
 ### Intentional differences
 - Rust does not store `Core::System&`, `KEvent*`, or `CoreTiming::EventType` directly in this owner because `hid_core` cannot depend on `core`. The owner keeps the upstream behavioral methods, while timing/event wiring is bridged from the `core` HID service layer.
 
+## 2026-04-02 — core/src/hle/service/nvdrv/nvdrv_interface.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv_interface.cpp
+
+### Intentional differences
+- Rust still resolves handles through the current process handle table and `Arc<Mutex<KProcess>>` instead of upstream raw `KProcess*` object accessors. This is the existing object-ownership adaptation.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `NVDRV::Open` contained temporary descriptor probes (`buffer_descriptor_a/x`, `read_buffer_a`, `read_buffer_x`, manual memory probe) that do not exist upstream. Those extra reads could trigger spurious `BufferDescriptorX invalid buffer_index` errors on valid A-only traffic.
+
+### Missing items
+- `MapSharedMem`, `SetAruidForTest`, and `InitializeDevtools` are still unimplemented, matching the already documented gaps in this service owner.
+
+### Binary layout verification
+- PASS: IPC payload shape unchanged; this pass only removes non-upstream debug reads from `Open`.
+
+## 2026-04-02 — core/src/hle/service/filesystem/fsp/fs_i_filesystem.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fs_i_filesystem.cpp
+
+### Intentional differences
+- The Rust owner now holds the upstream conceptual owners `FileSys::Fsa::IFileSystem` and `SizeGetter`, but `SizeGetter` is still a Rust closure pair instead of the upstream helper factory object.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `read_path_from_buffer()` no longer forces `ReadBufferX(0)` first. Upstream `InLargeData<..., BufferAttr_HipcPointer>` is deserialized generically through CMIF buffer selection; the Rust owner now matches that by using `ctx.read_buffer(0)` directly.
+- fixed in this pass: temporary descriptor probe logging for `A`/`X` path payloads was removed from the owner after the IPC buffer-owner issue was narrowed elsewhere.
+
+### Missing items
+- Port the remaining `IFileSystem` commands in this owner (`CreateFile`, `DeleteFile`, `CreateDirectory`, `DeleteDirectory`, `DeleteDirectoryRecursively`, `RenameFile`, `CleanDirectoryRecursively`, `GetFileTimeStampRaw`, `GetFileSystemAttribute`) to full upstream behavior.
+
+### Binary layout verification
+- PASS: `FileSys::Sf::Path` remains `repr(C)` and the Rust owner still copies exactly `size_of::<Path>()` bytes before decoding.
+
 ### Unintentional differences (to fix)
 - fixed in this pass: `ActivateTouch(aruid)` and `ActivateGesture(aruid, basic_gesture_id)` now initialize the per-ARUID touch/gesture LIFOs in the matching owner instead of staying stubbed.
 - fixed in this pass: `SetTouchScreenResolution`, `SetTouchScreenConfiguration`, and `GetTouchScreenConfiguration` now update/read the per-ARUID touch owner data instead of returning placeholder success.
@@ -4363,12 +4392,18 @@
 
 ### Intentional differences
 - Rust exposes a raw helper `reschedule_current_core_raw(...)` so wait owners can trigger the upstream `RescheduleCurrentCore()` handoff without holding the per-core scheduler mutex across a fiber yield. Upstream does not need this helper because it does not wrap `KScheduler` in a `Mutex`.
+- Rust still keeps a local `scan_runnable_threads(...)` fallback because some wakeup owners are not fully parity-complete yet. Upstream has no equivalent global scan because runnable-thread ownership stays entirely inside the priority queue.
 
 ### Unintentional differences (to fix)
 - fixed in this pass: wait owners no longer rely only on `schedule_raw_if_needed(...)`, which could leave a just-blocked current thread spinning if the scheduling flag was not observed on that path. They now force the raw equivalent of upstream `RescheduleCurrentCore()` after transitioning the thread to `WAITING`.
+- fixed in this pass: the Rust-only fallback `scan_runnable_threads(...)` no longer steals a runnable thread from another core when the local PQ is empty. It now filters on `active_core == self.core_id` and physical affinity containing the scheduler core, matching the ownership assumptions upstream gets from `GetScheduledFront(core)` instead of a global scan.
+- fixed in this pass: `reschedule_current_core_raw(...)` no longer unconditionally calls `EnableDispatch()` on the current thread. That panic path was invalid for server/synchronization waits that enter the raw helper with `disable_dispatch_count == 0`.
+- fixed in this pass: `EnableScheduling(...)` now keeps `needs_scheduling` set when the current thread became non-runnable but the Rust port must defer the actual switch until after the owner releases the thread mutex. Upstream reschedules immediately from this point; the Rust adaptation now preserves the same pending-handoff state instead of silently clearing it.
 
 ### Missing items
 - Re-audit other wait owners still using ad hoc host-side reschedule loops and convert them to the same raw helper only where they truly model upstream `RescheduleCurrentCore()`.
+- Remove the Rust-only `scan_runnable_threads(...)` fallback entirely once all wakeup paths always repopulate the PQ correctly.
+- Re-audit the `RUNNABLE -> WAITING` removal path in the global priority queue. The latest runtime still shows some sleeping worker threads reappearing as the per-core highest-priority thread immediately after switching to idle, which suggests a remaining PQ/state parity bug outside `EnableScheduling(...)` itself.
 
 ### Binary layout verification
 - PASS: scheduler control-flow only; no binary layout involved.
@@ -4386,3 +4421,81 @@
 
 ### Binary layout verification
 - PASS: wait/scheduler handoff only; no guest-visible struct layout changed.
+
+## 2026-04-02 — core/src/hle/kernel/k_page_table_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.cpp
+
+### Intentional differences
+- Rust still does not model upstream `KScopedLightLock`, `KMemoryBlockManagerUpdateAllocator`, or `KScopedPageTableUpdater` as separate RAII owner types. The equivalent ordering remains inside the owner methods in `k_page_table_base.rs`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `MapMemory` no longer assumes `phys_addr = DRAM_BASE + src_address`. It now reconstructs the true source page backing through a Rust `make_page_group(...)` helper and remaps the destination through `map_page_group_impl(...)`, matching upstream `MakePageGroup(pg, src_address, num_pages)` plus `MapPageGroupImpl(...)`.
+- still wrong: `make_page_group(...)` currently walks the Rust `PageTable` one page at a time through `get_physical_address(...)` instead of using upstream traversal helpers and block-info manager ownership. Behavior is closer to upstream, but the internal structure is still simplified.
+
+### Missing items
+- Re-audit `UnmapMemory` against upstream allocator/update ordering. This pass targeted the source-page selection bug in `MapMemory`.
+
+### Binary layout verification
+- PASS: page-table remap behavior only; no guest-visible struct layout changed.
+
+## 2026-04-02 — core/src/cpu_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/cpu_manager.cpp
+
+### Intentional differences
+- Rust still wraps scheduler/core owners in `Arc<Mutex<...>>` and splits some helper logic across `cpu_manager.rs` and `physical_core.rs`, while upstream keeps these as direct object references. Ownership for the guest-thread loop remains in `cpu_manager.rs`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: the multicore guest loop no longer forces `reschedule_current_core_raw(...)` after every SVC return. Upstream `PhysicalCore::RunThread()` returns immediately after `Svc::Call(...)`, and `CpuManager::MultiCoreRunGuestThread()` simply re-enters the loop with the scheduler-visible current thread/core state. Rust now only performs the handoff when the SVC left the current thread non-runnable after owner locks were released.
+- fixed in this pass: after `svc_dispatch`, the multicore guest loop now checks both the scheduler's pending handoff bit and the current thread's base state before re-entering guest execution. This lets deferred wait owners model upstream immediate reschedule semantics without running the same guest SVC block again first.
+- still wrong: the Rust guest loop still uses extra host-side reschedule helpers on some interrupt/idle paths because fiber handoff is not yet fully parity-identical to upstream's direct scheduler/fiber integration.
+
+### Missing items
+- Re-audit the remaining `reschedule_current_core_raw(...)` call sites in `cpu_manager.rs` against upstream `MultiCoreRunGuestThread()` / `MultiCoreRunIdleThread()` to remove any other over-eager host-side reschedule that does not correspond to an upstream scheduler transition.
+
+### Binary layout verification
+- PASS: control-flow/scheduler behavior only; no guest-visible struct layout changed.
+
+## 2026-04-02 — core/src/hle/kernel/svc/svc_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_thread.cpp
+
+### Intentional differences
+- Rust still carries targeted bootstrap diagnostics in this owner while the thread-start/sleep parity work is in flight. The owner remains correct: thread SVC behavior stays in `svc_thread.rs`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `SleepThread(ns > 0)` no longer only sets a scheduler request bit and returns to the guest loop. Upstream `GetCurrentThread(kernel).Sleep(timeout)` blocks immediately through `KScopedSchedulerLockAndSleep`; the Rust port now arms the wait there and leaves the immediate core handoff to the post-SVC CPU owner once the thread lock is released.
+- fixed in this pass: `SetThreadCoreMask(...)` now validates `affinity_mask` against the process core mask before delegating to `KThread::set_core_mask(...)`, matching upstream `svc_thread.cpp`.
+- still wrong: `CreateThread` still contains Rust-only fallback stack probing/mapping (`ensure_user_stack_mapping(...)`) that does not exist upstream and should be removed once the real stack mapping bug is fully understood and fixed in the correct owner.
+
+### Missing items
+- Re-audit `StartThread`/`Run()` with the latest worker-bootstrap comparison once the sleep handoff is validated; the bootstrap still carries extra diagnostics and may still differ in handle/thread-lifecycle details.
+
+### Binary layout verification
+- PASS: SVC control-flow only; no guest-visible struct layout changed.
+
+## 2026-04-02 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp
+
+### Intentional differences
+- Rust still omits the full pinned-waiter retry loop inside `SetCoreMask(...)`; the current port keeps ownership in `k_thread.rs` but only implements the affinity/core-state updates that are exercised by the MK8D worker bootstrap.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `set_core_mask(...)` previously treated negative core ids as a no-op on `active_core/current_core` and copied the virtual mask directly into the physical mask. Upstream preserves `IdealCoreNoUpdate`, translates the virtual mask through `VirtualToPhysicalCoreMap`, and rehomes `active_core` when the old core is no longer allowed. Rust now matches that behavior for the active affinity update path.
+- still wrong: the post-affinity-change pinned waiter handling from upstream `ThreadQueueImplForKThreadSetProperty` is not yet ported, so running pinned threads still do not retry this update path literally.
+
+### Missing items
+- `GetPhysicalCoreMask`
+- full pinned waiter retry/update loop in `SetCoreMask(...)`
+
+### Binary layout verification
+- PASS: thread scheduler/control-flow behavior only; no raw guest-visible struct layout changed.
+
+## 2026-04-02 — core/src/hle/kernel/k_hardware_timer.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_hardware_timer.cpp
+
+### Intentional differences
+- Rust still resolves timer tasks through `Arc<Mutex<KThread>>` or a cached raw pointer instead of upstream inheritance from `KTimerTask`. Ownership remains in `k_hardware_timer.rs`, and the callback still targets the owning `KThread`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `KHardwareTimer::DoTask()` previously ran without taking the scheduler lock. Upstream executes `DoTask()` under `KScopedSchedulerLock` and the timer's own lock before waking timed-out threads. Rust now takes the owner scheduler lock and the timer base lock before collecting expired tasks and calling `thread.on_timer()`.
+- still simplified: the Rust timer lock is a `Mutex<()>` from `KHardwareTimerBase` instead of upstream `KScopedSpinLock`, and the current callback does not yet model interrupt clearing beyond the existing event unschedule/rearm behavior.
+
+### Missing items
+- Re-audit `RegisterAbsoluteTask` / `CancelTask` ordering against upstream `KScopedDisableDispatch` + timer-lock interplay once the runtime wake path is validated.
+
+### Binary layout verification
+- PASS: timer/scheduler behavior only; no guest-visible struct layout changed.

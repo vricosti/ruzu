@@ -1087,9 +1087,6 @@ impl KernelCore {
             if let Some(ref gsc) = self.global_scheduler_context {
                 scheduler.lock().unwrap().global_scheduler_context = Some(gsc.clone());
             }
-            // Initialize the switch fiber for this scheduler.
-            // Upstream: done implicitly during ScheduleImplFiber's first yield.
-            KScheduler::init_switch_fiber(&scheduler);
             self.schedulers.push(scheduler.clone());
             self.cores
                 .push(Arc::new(PhysicalCore::new(i, self.is_multicore)));

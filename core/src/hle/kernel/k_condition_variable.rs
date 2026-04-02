@@ -285,6 +285,15 @@ impl KConditionVariable {
                 RESULT_INVALID_CURRENT_MEMORY
             };
 
+            log::info!(
+                "KConditionVariable::signal_to_address owner_tid={} addr=0x{:X} next_owner={:?} has_result={:#x} next_value=0x{:08X}",
+                current_thread_id,
+                addr,
+                next_owner_thread.as_ref().map(|t| t.lock().unwrap().get_thread_id()),
+                result.get_inner_value(),
+                next_value
+            );
+
             (next_owner_thread, result)
         };
 
@@ -304,12 +313,16 @@ impl KConditionVariable {
         process: &Arc<Mutex<KProcess>>,
         current_thread: &Arc<Mutex<KThread>>,
     ) {
-        let scheduler = current_thread
-            .lock()
-            .unwrap()
-            .scheduler
-            .as_ref()
-            .and_then(|scheduler| scheduler.upgrade())
+        let scheduler = super::kernel::get_kernel_ref()
+            .and_then(|kernel| kernel.current_scheduler().cloned())
+            .or_else(|| {
+                current_thread
+                    .lock()
+                    .unwrap()
+                    .scheduler
+                    .as_ref()
+                    .and_then(|scheduler| scheduler.upgrade())
+            })
             .or_else(|| {
                 process
                     .lock()
@@ -382,6 +395,14 @@ impl KConditionVariable {
         // If the tag isn't the handle (with wait mask), we're done.
         // Matches upstream: R_SUCCEED_IF(test_tag != (handle | HandleWaitMask))
         if test_tag != (handle | HANDLE_WAIT_MASK) {
+            log::info!(
+                "KConditionVariable::wait_for_address no_wait tid={} handle=0x{:08X} addr=0x{:X} value=0x{:08X} test_tag=0x{:08X}",
+                current_thread_id,
+                handle,
+                addr,
+                value,
+                test_tag
+            );
             return RESULT_SUCCESS;
         }
 
@@ -415,13 +436,29 @@ impl KConditionVariable {
             );
         }
 
+        log::info!(
+            "KConditionVariable::wait_for_address sleep tid={} owner_tid={} handle=0x{:08X} addr=0x{:X} value=0x{:08X}",
+            current_thread_id,
+            owner_thread_id,
+            handle,
+            addr,
+            value
+        );
+
         // Upstream calls owner_thread->Close() here to release the handle
         // reference. In Rust, Arc reference counting handles this automatically.
         drop(process_guard);
 
         Self::wait_for_current_thread(process, current_thread);
-
-        ResultCode::new(current_thread.lock().unwrap().get_wait_result())
+        let wait_result = current_thread.lock().unwrap().get_wait_result();
+        log::info!(
+            "KConditionVariable::wait_for_address woke tid={} handle=0x{:08X} addr=0x{:X} wait_result={:#x}",
+            current_thread_id,
+            handle,
+            addr,
+            wait_result
+        );
+        ResultCode::new(wait_result)
     }
 
     // -- Condition variable --
@@ -433,6 +470,12 @@ impl KConditionVariable {
     /// Upstream wraps the body in `KScopedSchedulerLock sl(m_kernel)`.
     pub fn signal(&mut self, process_guard: &mut KProcess, cv_key: u64, count: i32) -> ResultCode {
         let mut num_waiters = 0i32;
+        log::info!(
+            "KConditionVariable::signal begin cv_key=0x{:X} count={} first_waiter={:?}",
+            cv_key,
+            count,
+            self.waiting_threads.nfind_key(cv_key).map(|key| key.thread_id)
+        );
 
         // Iterate the tree, finding threads with matching cv_key.
         // Matches upstream: auto it = m_tree.nfind_key({cv_key, -1});
@@ -465,6 +508,11 @@ impl KConditionVariable {
             // Signal the thread.
             // Matches upstream: this->SignalImpl(target_thread);
             self.signal_impl(process_guard, &waiting_thread);
+            log::info!(
+                "KConditionVariable::signal woke waiter tid={} cv_key=0x{:X}",
+                waiting_thread_id,
+                cv_key
+            );
 
             num_waiters += 1;
         }
@@ -632,6 +680,14 @@ impl KConditionVariable {
         Self::begin_wait_condition_variable(current_thread, wait_queue, addr, key, value, timeout);
         let thread_key = current_thread.lock().unwrap().condition_variable_tree_key();
         self.waiting_threads.insert(thread_key);
+        log::info!(
+            "KConditionVariable::wait_locked enqueued tid={} addr=0x{:X} key=0x{:X} tag=0x{:08X} timeout={}",
+            current_thread_id,
+            addr,
+            key,
+            value,
+            timeout
+        );
 
         RESULT_SUCCESS
     }
@@ -662,6 +718,13 @@ impl KConditionVariable {
         };
 
         let waiting_thread_id = waiting_thread.lock().unwrap().get_thread_id();
+        log::info!(
+            "KConditionVariable::signal_impl tid={} addr=0x{:X} own_tag=0x{:08X} prev_tag={:?}",
+            waiting_thread_id,
+            address.get(),
+            own_tag,
+            prev_tag
+        );
 
         if let Some(prev_tag) = prev_tag {
             if prev_tag == INVALID_HANDLE {
@@ -800,7 +863,9 @@ impl KConditionVariable {
 
 impl ConditionVariableThreadTree {
     fn insert(&mut self, key: ConditionVariableThreadKey) {
-        self.by_thread_id.insert(key.thread_id, key);
+        if let Some(existing) = self.by_thread_id.insert(key.thread_id, key) {
+            self.ordered.remove(&existing);
+        }
         self.ordered.insert(key);
     }
 
@@ -948,6 +1013,33 @@ mod tests {
 
         assert_eq!(result, RESULT_SUCCESS);
         assert_eq!(waiter.lock().unwrap().get_state(), ThreadState::RUNNABLE);
+    }
+
+    #[test]
+    fn thread_tree_reinsert_replaces_stale_key_for_same_thread() {
+        let mut tree = ConditionVariableThreadTree::default();
+
+        tree.insert(ConditionVariableThreadKey {
+            cv_key: 0x1000,
+            priority: 10,
+            thread_id: 42,
+        });
+        tree.insert(ConditionVariableThreadKey {
+            cv_key: 0x2000,
+            priority: 10,
+            thread_id: 42,
+        });
+
+        assert_eq!(
+            tree.nfind_key(0x1000).map(|key| (key.cv_key, key.thread_id)),
+            Some((0x2000, 42))
+        );
+        assert_eq!(
+            tree.nfind_key(0x2000).map(|key| (key.cv_key, key.thread_id)),
+            Some((0x2000, 42))
+        );
+        assert_eq!(tree.ordered.len(), 1);
+        assert_eq!(tree.by_thread_id.len(), 1);
     }
 
     #[test]

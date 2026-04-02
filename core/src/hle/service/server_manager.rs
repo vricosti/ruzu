@@ -575,9 +575,6 @@ impl ServerManager {
             return;
         };
 
-        if let Some(memory) = self.system.get().get_svc_memory() {
-            context.set_memory(memory);
-        }
         context.set_session_request_manager(manager.clone());
         if let Some(sm) = self.service_manager() {
             context.set_service_manager(sm);

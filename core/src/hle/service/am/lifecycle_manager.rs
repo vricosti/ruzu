@@ -5,9 +5,12 @@
 //! Port of zuyu/src/core/hle/service/am/lifecycle_manager.cpp
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
+use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::kernel::k_thread::KThread;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 
 use super::am_types::{AppletMessage, FocusState};
@@ -46,6 +49,8 @@ pub struct LifecycleManager {
     pub system_event_handle: u32,
     operation_mode_changed_system_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub operation_mode_changed_system_event_handle: u32,
+    event_owner_process: Option<Weak<Mutex<KProcess>>>,
+    event_owner_scheduler: Option<Weak<Mutex<KScheduler>>>,
 
     // Cached signal state for SignalSystemEventIfNeeded
     system_event_signaled: bool,
@@ -92,6 +97,8 @@ impl LifecycleManager {
             system_event_handle: 0,
             operation_mode_changed_system_event: None,
             operation_mode_changed_system_event_handle: 0,
+            event_owner_process: None,
+            event_owner_scheduler: None,
             system_event_signaled: false,
             operation_mode_changed_system_event_signaled: false,
             unordered_messages: VecDeque::new(),
@@ -140,6 +147,7 @@ impl LifecycleManager {
 
     pub fn ensure_system_event(&mut self, ctx: &HLERequestContext) -> Option<Handle> {
         let signaled = self.should_signal_system_event();
+        self.bind_event_owner(ctx);
         Self::ensure_event(
             ctx,
             &mut self.system_event,
@@ -153,6 +161,7 @@ impl LifecycleManager {
         ctx: &HLERequestContext,
     ) -> Option<Handle> {
         let signaled = self.operation_mode_changed_system_event_signaled;
+        self.bind_event_owner(ctx);
         Self::ensure_event(
             ctx,
             &mut self.operation_mode_changed_system_event,
@@ -209,6 +218,7 @@ impl LifecycleManager {
             self.has_performance_mode_changed = true;
         }
         self.operation_mode_changed_system_event_signaled = true;
+        self.signal_readable_event_if_possible(self.operation_mode_changed_system_event.as_ref());
         self.signal_system_event_if_needed();
     }
 
@@ -357,9 +367,11 @@ impl LifecycleManager {
             if !applet_message_available {
                 self.system_event_signaled = true;
                 self.applet_message_available = true;
+                self.signal_readable_event_if_possible(self.system_event.as_ref());
             } else {
                 self.system_event_signaled = false;
                 self.applet_message_available = false;
+                self.clear_readable_event_if_possible(self.system_event.as_ref());
             }
         }
     }
@@ -538,5 +550,67 @@ impl LifecycleManager {
         *readable_event = Some(new_event);
         *handle = new_handle;
         Some(new_handle)
+    }
+
+    fn bind_event_owner(&mut self, ctx: &HLERequestContext) {
+        if self.event_owner_process.is_some() && self.event_owner_scheduler.is_some() {
+            return;
+        }
+
+        let Some(thread) = ctx.get_thread() else {
+            return;
+        };
+        let Some((process, scheduler)) = Self::event_owner_from_thread(&thread) else {
+            return;
+        };
+        self.event_owner_process = Some(Arc::downgrade(&process));
+        self.event_owner_scheduler = Some(Arc::downgrade(&scheduler));
+    }
+
+    fn event_owner_from_thread(
+        thread: &Arc<Mutex<KThread>>,
+    ) -> Option<(Arc<Mutex<KProcess>>, Arc<Mutex<KScheduler>>)> {
+        let thread_guard = thread.lock().unwrap();
+        let parent = thread_guard.parent.as_ref()?.upgrade()?;
+        let scheduler = parent.lock().unwrap().scheduler.as_ref()?.upgrade()?;
+        Some((parent, scheduler))
+    }
+
+    fn signal_readable_event_if_possible(
+        &self,
+        readable_event: Option<&Arc<Mutex<KReadableEvent>>>,
+    ) {
+        let Some(readable_event) = readable_event else {
+            return;
+        };
+        let Some(process) = self
+            .event_owner_process
+            .as_ref()
+            .and_then(Weak::upgrade)
+        else {
+            return;
+        };
+        let Some(scheduler) = self
+            .event_owner_scheduler
+            .as_ref()
+            .and_then(Weak::upgrade)
+        else {
+            return;
+        };
+
+        readable_event
+            .lock()
+            .unwrap()
+            .signal(&mut process.lock().unwrap(), &scheduler);
+    }
+
+    fn clear_readable_event_if_possible(
+        &self,
+        readable_event: Option<&Arc<Mutex<KReadableEvent>>>,
+    ) {
+        let Some(readable_event) = readable_event else {
+            return;
+        };
+        readable_event.lock().unwrap().clear();
     }
 }

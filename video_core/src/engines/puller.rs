@@ -720,9 +720,22 @@ impl Puller {
     fn process_semaphore_trigger_method(&mut self) {
         let semaphore_op_mask = 0xF;
         let op = self.regs.semaphore_trigger() & semaphore_op_mask;
+        eprintln!(
+            "PULLER_SEMTRIG op=0x{:X} trigger=0x{:X} addr=0x{:X} payload=0x{:X}",
+            op,
+            self.regs.semaphore_trigger(),
+            self.regs.semaphore_address(),
+            self.regs.semaphore_sequence()
+        );
         if op == GpuSemaphoreOperation::WriteLong as u32 {
             let sequence_address = self.regs.semaphore_address();
             let payload = self.regs.semaphore_sequence();
+            log::info!(
+                "Puller::SemaphoreTrigger WriteLong gpu_addr=0x{:X} payload=0x{:X} trigger=0x{:X}",
+                sequence_address,
+                payload,
+                self.regs.semaphore_trigger()
+            );
             let gpu = self.gpu as usize;
             let gpu_ticks = unsafe { &*(gpu as *const crate::gpu::Gpu) }.get_ticks();
             let memory_manager = Arc::clone(&self.memory_manager);
@@ -740,6 +753,13 @@ impl Puller {
                             gpu_addr,
                             bytes,
                             &mut |cpu_addr, data| {
+                                log::info!(
+                                    "Puller::SemaphoreTrigger writeback gpu_addr=0x{:X} cpu_addr=0x{:X} len=0x{:X} bytes={:02X?}",
+                                    gpu_addr,
+                                    cpu_addr,
+                                    data.len(),
+                                    &data[..std::cmp::min(data.len(), 16)]
+                                );
                                 gpu.write_guest_memory(cpu_addr, data);
                             },
                         );
@@ -795,7 +815,7 @@ impl Puller {
     fn process_semaphore_release(&mut self) {
         let sequence_address = self.regs.semaphore_address();
         let payload = self.regs.semaphore_release();
-        log::trace!(
+        log::info!(
             "Puller::SemaphoreRelease addr=0x{:X} payload=0x{:X}",
             sequence_address,
             payload

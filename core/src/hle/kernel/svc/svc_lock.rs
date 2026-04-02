@@ -18,7 +18,7 @@ pub fn arbitrate_lock(
     address: u64,
     tag: u32,
 ) -> ResultCode {
-    log::trace!(
+    log::info!(
         "svc::ArbitrateLock called thread_handle=0x{:08X}, address=0x{:X}, tag=0x{:08X}",
         thread_handle,
         address,
@@ -45,12 +45,20 @@ pub fn arbitrate_lock(
         tag,
     );
 
+    log::info!(
+        "svc::ArbitrateLock return thread_handle=0x{:08X}, address=0x{:X}, tag=0x{:08X}, result={:#x}",
+        thread_handle,
+        address,
+        tag,
+        result.get_inner_value()
+    );
+
     result
 }
 
 /// Unlocks a mutex.
 pub fn arbitrate_unlock(system: &System, address: u64) -> ResultCode {
-    log::trace!("svc::ArbitrateUnlock called address=0x{:X}", address);
+    log::info!("svc::ArbitrateUnlock called address=0x{:X}", address);
 
     // Validate the input address.
     if is_kernel_address(address as usize) {
@@ -68,6 +76,12 @@ pub fn arbitrate_unlock(system: &System, address: u64) -> ResultCode {
         system.current_process_arc(),
         &current_thread,
         address,
+    );
+
+    log::info!(
+        "svc::ArbitrateUnlock return address=0x{:X}, result={:#x}",
+        address,
+        result.get_inner_value()
     );
 
     result

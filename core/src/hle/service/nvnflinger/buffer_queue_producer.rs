@@ -23,6 +23,7 @@ use crate::hle::kernel::k_scheduler::KScheduler;
 
 use super::binder::IBinder;
 use super::buffer_queue_core::BufferQueueCore;
+use super::buffer_slot::BufferSlot;
 use super::graphic_buffer_producer::{QueueBufferInput, QueueBufferOutput};
 use super::parcel::{InputParcel, OutputParcel};
 use super::pixel_format::PixelFormat;
@@ -648,25 +649,23 @@ impl BufferQueueProducer {
         slot: i32,
         buffer: Option<Arc<NvGraphicBuffer>>,
     ) -> Status {
-        let mut inner = self.core.mutex.lock().unwrap();
-
         if slot < 0 || slot as usize >= super::buffer_queue_defs::NUM_BUFFER_SLOTS {
             return Status::BadValue;
         }
 
+        let mut inner = self.core.mutex.lock().unwrap();
         let s = slot as usize;
-        inner.free_buffer_locked(slot);
+        inner.slots[s] = BufferSlot::default();
+        inner.slots[s].fence = Fence::no_fence();
+        inner.slots[s].frame_number = 0;
 
         if let Some(buf) = buffer {
             inner.slots[s].graphic_buffer =
                 Some(Arc::new(GraphicBuffer::from_nv_buffer(*buf, false)));
             inner.slots[s].is_preallocated = true;
             inner.override_max_buffer_count = inner.get_preallocated_buffer_count_locked();
-
-            if inner.default_width != buf.get_width() || inner.default_height != buf.get_height() {
-                inner.default_width = buf.get_width();
-                inner.default_height = buf.get_height();
-            }
+            inner.default_width = buf.get_width();
+            inner.default_height = buf.get_height();
             inner.default_buffer_format = buf.get_format();
         }
 
@@ -878,6 +877,10 @@ impl IBinder for BufferQueueProducer {
         Some(Arc::clone(&self.buffer_wait_readable_event))
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn register_native_handle_owner(
         &self,
         process: Arc<Mutex<KProcess>>,
@@ -969,6 +972,33 @@ mod tests {
         assert_eq!(inner.default_width, 1280);
         assert_eq!(inner.default_height, 720);
         assert_eq!(inner.override_max_buffer_count, 1);
+    }
+
+    #[test]
+    fn set_preallocated_buffer_resets_slot_and_uses_no_fence() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(core.clone());
+
+        {
+            let mut inner = core.mutex.lock().unwrap();
+            inner.slots[0].request_buffer_called = true;
+            inner.slots[0].frame_number = 99;
+            inner.slots[0].is_preallocated = true;
+            inner.slots[0].fence = Fence {
+                num_fences: 1,
+                ..Fence::default()
+            };
+        }
+
+        assert_eq!(producer.set_preallocated_buffer(0, None), Status::NoError);
+
+        let inner = core.mutex.lock().unwrap();
+        assert!(inner.slots[0].graphic_buffer.is_none());
+        assert!(!inner.slots[0].request_buffer_called);
+        assert_eq!(inner.slots[0].frame_number, 0);
+        assert!(!inner.slots[0].is_preallocated);
+        assert_eq!(inner.slots[0].fence.num_fences, 0);
+        assert_eq!(inner.slots[0].fence.fences[0].id, -1);
     }
 
     #[test]

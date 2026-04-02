@@ -20,6 +20,7 @@ use crate::hle::kernel::k_scheduler::KScheduler;
 pub trait IBinder: Send + Sync {
     fn transact(&self, code: u32, parcel_data: &[u8], parcel_reply: &mut [u8], flags: u32);
     fn get_native_handle(&self, type_id: u32) -> Option<Arc<Mutex<KReadableEvent>>>;
+    fn as_any(&self) -> &dyn std::any::Any;
 
     /// Rust-only adapter: lets binder owners learn which process/scheduler currently owns
     /// the copied handle so later event signaling can wake WaitSynchronization waiters.

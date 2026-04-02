@@ -5,6 +5,7 @@
 //! Port of zuyu/src/core/hle/service/acc/profile_manager.cpp
 
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
+use common::uuid::UUID;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
@@ -13,6 +14,36 @@ pub const PROFILE_USERNAME_SIZE: usize = 32;
 
 pub type ProfileUsername = [u8; PROFILE_USERNAME_SIZE];
 pub type UserIdArray = [u128; MAX_USERS];
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct UserRaw {
+    uuid: [u8; 16],
+    uuid2: [u8; 16],
+    timestamp: u64,
+    username: ProfileUsername,
+    extra_data: UserData,
+}
+
+const _: () = assert!(core::mem::size_of::<UserRaw>() == 0xC8);
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct ProfileDataRaw {
+    _padding: [u8; 0x10],
+    users: [UserRaw; MAX_USERS],
+}
+
+const _: () = assert!(core::mem::size_of::<ProfileDataRaw>() == 0x650);
+
+impl Default for ProfileDataRaw {
+    fn default() -> Self {
+        Self {
+            _padding: [0u8; 0x10],
+            users: [UserRaw::default(); MAX_USERS],
+        }
+    }
+}
 
 /// Contains extra data related to a user.
 ///
@@ -109,6 +140,25 @@ impl ProfileManager {
             last_opened_user: 0,
         };
         manager.parse_user_save_file();
+        if manager.user_count == 0 {
+            let mut username = [0u8; PROFILE_USERNAME_SIZE];
+            username[..4].copy_from_slice(b"yuzu");
+            let _ = manager.create_new_user(UUID::make_random().as_u128(), &username);
+            manager.write_user_save_file();
+        }
+
+        let current = (*common::settings::values().current_user.get_value() as usize)
+            .clamp(0, MAX_USERS - 1);
+        let current = if manager.user_exists_index(current) {
+            current
+        } else {
+            common::settings::values_mut().current_user.set_value(0);
+            0
+        };
+
+        if let Some(uuid) = manager.get_user(current) {
+            manager.open_user(uuid);
+        }
         manager
     }
 
@@ -226,13 +276,12 @@ impl ProfileManager {
 
     pub fn get_open_users(&self) -> UserIdArray {
         let mut users = [0u128; MAX_USERS];
-        let mut idx = 0;
-        for profile in &self.profiles[..self.user_count] {
+        for (i, profile) in self.profiles.iter().enumerate() {
             if profile.is_open {
-                users[idx] = profile.user_uuid;
-                idx += 1;
+                users[i] = profile.user_uuid;
             }
         }
+        users.sort_by_key(|uuid| *uuid == 0);
         users
     }
 
@@ -251,10 +300,11 @@ impl ProfileManager {
     pub fn get_stored_opened_users(&self) -> UserIdArray {
         let mut users = [0u128; MAX_USERS];
         for (i, profile) in self.stored_opened_profiles.iter().enumerate() {
-            if profile.user_uuid != 0 {
+            if profile.is_open {
                 users[i] = profile.user_uuid;
             }
         }
+        users.sort_by_key(|uuid| *uuid == 0);
         users
     }
 
@@ -318,23 +368,24 @@ impl ProfileManager {
 
         let save_path = save_dir.join("profiles.dat");
 
-        // Serialize profiles: for each user, write uuid(16) + uuid2(16) + timestamp(8) + username(32) + extra_data(128) = 200 bytes per user
-        let mut data = Vec::with_capacity(MAX_USERS * 200);
+        let mut raw = ProfileDataRaw::default();
         for i in 0..MAX_USERS {
             let profile = &self.profiles[i];
-            data.extend_from_slice(&profile.user_uuid.to_le_bytes()); // uuid
-            data.extend_from_slice(&profile.user_uuid.to_le_bytes()); // uuid2 (same as uuid)
-            data.extend_from_slice(&profile.creation_time.to_le_bytes()); // timestamp
-            data.extend_from_slice(&profile.username); // username
-                                                       // Write extra_data as raw bytes (UserData is #[repr(C)], 0x80 bytes)
-            let user_data_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    &profile.data as *const UserData as *const u8,
-                    std::mem::size_of::<UserData>(),
-                )
+            raw.users[i] = UserRaw {
+                uuid: profile.user_uuid.to_le_bytes(),
+                uuid2: profile.user_uuid.to_le_bytes(),
+                timestamp: profile.creation_time,
+                username: profile.username,
+                extra_data: profile.data,
             };
-            data.extend_from_slice(user_data_bytes);
         }
+
+        let data: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                &raw as *const ProfileDataRaw as *const u8,
+                core::mem::size_of::<ProfileDataRaw>(),
+            )
+        };
 
         match std::fs::write(&save_path, &data) {
             Ok(()) => {
@@ -364,44 +415,35 @@ impl ProfileManager {
             }
         };
 
-        // Each user record is 200 bytes: uuid(16) + uuid2(16) + timestamp(8) + username(32) + extra_data(128)
-        let record_size = 200;
-        if data.len() < MAX_USERS * record_size {
+        if data.len() < core::mem::size_of::<ProfileDataRaw>() {
             log::warn!(
                 "profiles.dat is smaller than expected ({} < {})... \
                  Generating new user 'yuzu' with random UUID.",
                 data.len(),
-                MAX_USERS * record_size,
+                core::mem::size_of::<ProfileDataRaw>(),
             );
             return;
         }
 
-        for i in 0..MAX_USERS {
-            let offset = i * record_size;
-            let uuid = u128::from_le_bytes(data[offset..offset + 16].try_into().unwrap());
+        let raw = unsafe { &*(data.as_ptr() as *const ProfileDataRaw) };
+
+        for user in raw.users {
+            let uuid = u128::from_le_bytes(user.uuid);
             if uuid == 0 {
                 continue;
             }
-            let timestamp = u64::from_le_bytes(data[offset + 32..offset + 40].try_into().unwrap());
-            let mut username = [0u8; PROFILE_USERNAME_SIZE];
-            username.copy_from_slice(&data[offset + 40..offset + 40 + PROFILE_USERNAME_SIZE]);
 
             self.add_user(&ProfileInfo {
                 user_uuid: uuid,
-                username,
-                creation_time: timestamp,
-                data: UserData::default(),
+                username: user.username,
+                creation_time: user.timestamp,
+                data: user.extra_data,
                 is_open: false,
             });
         }
 
         // Sort valid profiles first (matching upstream stable_partition).
-        let count = self.user_count;
-        self.profiles[..count].sort_by(|a, b| {
-            let a_valid = a.user_uuid != 0;
-            let b_valid = b.user_uuid != 0;
-            b_valid.cmp(&a_valid)
-        });
+        self.profiles.sort_by_key(|profile| profile.user_uuid == 0);
     }
 
     fn add_to_profiles(&mut self, profile: &ProfileInfo) -> Option<usize> {
@@ -419,13 +461,73 @@ impl ProfileManager {
         if index >= self.user_count {
             return false;
         }
-        // Shift profiles down
-        for i in index..self.user_count - 1 {
-            self.profiles[i] = self.profiles[i + 1].clone();
-        }
-        self.profiles[self.user_count - 1] = ProfileInfo::default();
-        self.user_count -= 1;
+        self.profiles[index] = ProfileInfo::default();
+        self.profiles.sort_by_key(|profile| profile.user_uuid == 0);
+        self.user_count = self.profiles.iter().filter(|profile| profile.user_uuid != 0).count();
         self.is_save_needed = true;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProfileManager, PROFILE_USERNAME_SIZE};
+    use common::fs::path_util::{set_ruzu_path, RuzuPath};
+    use common::uuid::UUID;
+
+    #[test]
+    fn profile_manager_new_creates_and_opens_default_user() {
+        let base = std::env::temp_dir().join(format!(
+            "ruzu_profile_manager_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        set_ruzu_path(RuzuPath::NANDDir, &base);
+        common::settings::values_mut().current_user.set_value(0);
+
+        let manager = ProfileManager::new();
+        assert_eq!(manager.get_user_count(), 1);
+        assert_eq!(manager.get_open_user_count(), 1);
+
+        let user = manager.get_user(0).unwrap();
+        assert_ne!(user, 0);
+
+        let mut expected_name = [0u8; PROFILE_USERNAME_SIZE];
+        expected_name[..4].copy_from_slice(b"yuzu");
+        assert_eq!(manager.get_profile_base(Some(0)).unwrap().username, expected_name);
+
+        let user_bytes = user.to_le_bytes();
+        assert_ne!(user_bytes, UUID::new().uuid);
+    }
+
+    #[test]
+    fn profile_manager_write_user_save_file_uses_profile_data_raw_layout() {
+        let base = std::env::temp_dir().join(format!(
+            "ruzu_profile_manager_layout_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        set_ruzu_path(RuzuPath::NANDDir, &base);
+        common::settings::values_mut().current_user.set_value(0);
+
+        let mut manager = ProfileManager::new();
+        manager.write_user_save_file();
+
+        let save_path = base.join("system/save/8000000000000010/su/avators/profiles.dat");
+        let data = std::fs::read(save_path).unwrap();
+        assert_eq!(data.len(), core::mem::size_of::<super::ProfileDataRaw>());
+        assert_eq!(&data[..0x10], &[0u8; 0x10]);
+
+        let user = manager.get_user(0).unwrap();
+        assert_eq!(&data[0x10..0x20], &user.to_le_bytes());
+        assert_eq!(&data[0x20..0x30], &user.to_le_bytes());
     }
 }
