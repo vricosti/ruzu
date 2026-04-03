@@ -200,6 +200,11 @@ impl FspSrv {
                     "OpenDataStorageByCurrentProcess",
                 ),
                 (
+                    202,
+                    Some(Self::open_data_storage_by_data_id_handler),
+                    "OpenDataStorageByDataId",
+                ),
+                (
                     203,
                     Some(Self::open_patch_data_storage_by_current_process_handler),
                     "OpenPatchDataStorageByCurrentProcess",
@@ -432,6 +437,41 @@ impl FspSrv {
         };
 
         Self::push_interface_response(ctx, Arc::new(IStorage::new(backend)));
+    }
+
+    /// Port of upstream `FSP_SRV::OpenDataStorageByDataId`.
+    /// Opens a system data archive by title ID. Tries to synthesize
+    /// known system archives (MiiModel, NgWord, SharedFont, etc.).
+    fn open_data_storage_by_data_id_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut rp = RequestParser::new(ctx);
+        let storage_id = rp.pop_raw::<u8>();
+        let _unknown = rp.pop_raw::<u32>();
+        let title_id = rp.pop_raw::<u64>();
+
+        log::info!(
+            "FspSrv::OpenDataStorageByDataId called, storage_id={}, title_id={:#x}",
+            storage_id,
+            title_id
+        );
+
+        // Try synthesizing the system archive (matches upstream fallback path)
+        if let Some(archive) = crate::file_sys::system_archive::system_archive::synthesize_system_archive(title_id) {
+            log::info!(
+                "FspSrv::OpenDataStorageByDataId: synthesized archive for title_id={:#x}",
+                title_id
+            );
+            Self::push_interface_response(ctx, Arc::new(IStorage::new(archive)));
+            return;
+        }
+
+        log::warn!(
+            "FspSrv::OpenDataStorageByDataId: no data for title_id={:#x}, returning error",
+            title_id
+        );
+        Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
     }
 
     fn open_patch_data_storage_by_current_process_handler(

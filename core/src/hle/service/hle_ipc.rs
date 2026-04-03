@@ -208,7 +208,16 @@ impl SessionRequestManager {
 
     fn prepare_sync_request(&self, context: &HLERequestContext) -> PreparedSyncRequest {
         if !self.has_session_request_handler(context) {
-            log::error!("Session handler is invalid, stubbing response!");
+            let (is_dom, obj_id, cmd) = if self.is_domain() && context.has_domain_message_header() {
+                let h = context.get_domain_message_header().unwrap();
+                (true, h.object_id(), format!("{:?}", h.command()))
+            } else {
+                (false, 0, String::new())
+            };
+            log::error!(
+                "Session handler is invalid! is_domain={} object_id={} dom_cmd={} handler_count={}",
+                is_dom, obj_id, cmd, self.domain_handler_count()
+            );
             return PreparedSyncRequest::StubSuccess;
         }
 
