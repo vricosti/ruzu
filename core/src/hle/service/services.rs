@@ -52,12 +52,51 @@ impl crate::hle::service::hle_ipc::SessionRequestHandler for GenericStubService 
         &self,
         ctx: &mut crate::hle::service::hle_ipc::HLERequestContext,
     ) -> crate::hle::result::ResultCode {
+        let is_domain = ctx
+            .get_manager()
+            .map_or(false, |m| m.lock().unwrap().is_domain());
+        let has_domain_header = ctx.has_domain_message_header();
+
         log::warn!(
-            "GenericStubService({}): unhandled command, returning success",
-            self.name
+            "GenericStubService({}): unhandled command {}, domain={}, returning success",
+            self.name,
+            ctx.get_command(),
+            is_domain
         );
-        let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(crate::hle::result::RESULT_SUCCESS);
+
+        // In domain mode, commands that return sub-services (Out<SharedPointer<T>>)
+        // need a domain object pushed. We can't know which commands return objects,
+        // but the "Create*Service" pattern is typically cmd 0 on the initial service.
+        // For safety, push a stub domain object on the initial domain "SendMessage"
+        // to cmd 0, which is the most common pattern.
+        let cmd = ctx.get_command();
+        // Commands that return sub-services (Out<SharedPointer<T>>) need a
+        // domain object (in domain mode) or a move handle (in non-domain mode).
+        // The "Create*Service" pattern is typically cmd 0 on the initial service.
+        let cmd = ctx.get_command();
+        let should_push_sub = cmd == 0;
+
+        if should_push_sub {
+            let sub_name = format!("{}_sub", self.name);
+            let stub_obj: std::sync::Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
+                std::sync::Arc::new(GenericStubService::new(&sub_name));
+
+            if is_domain {
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 1);
+                rb.push_result(crate::hle::result::RESULT_SUCCESS);
+                ctx.add_domain_object(stub_obj);
+            } else {
+                let move_handle = ctx
+                    .create_session_for_service(stub_obj)
+                    .unwrap_or(0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 1);
+                rb.push_result(crate::hle::result::RESULT_SUCCESS);
+                rb.push_move_objects(move_handle);
+            }
+        } else {
+            let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(crate::hle::result::RESULT_SUCCESS);
+        }
         crate::hle::result::RESULT_SUCCESS
     }
 
@@ -541,9 +580,7 @@ impl Services {
     }
 
     fn loop_process_mii(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
-        let mut server_manager = ServerManager::new(system);
-        register_stub_services(&mut server_manager, &["mii:u", "mii:e"]);
-        ServerManager::run_server(server_manager);
+        super::mii::mii::loop_process(system);
     }
 
     fn loop_process_mm(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
