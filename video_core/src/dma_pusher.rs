@@ -379,7 +379,7 @@ impl DmaPusher {
             self.dma_pushbuffer.pop_front();
         } else {
             let command_list_header = command_list.command_lists[self.dma_pushbuffer_subindex];
-            log::info!(
+            log::trace!(
                 "DmaPusher::step command_list addr=0x{:X} size={} non_main={}",
                 command_list_header.addr(),
                 command_list_header.size(),
@@ -425,7 +425,7 @@ impl DmaPusher {
                 }));
             let non_zero = self.command_headers.iter().filter(|h| h.raw != 0).count();
             if non_zero > 0 {
-                log::info!(
+                log::trace!(
                     "DmaPusher::step {} commands ({} non-zero) first={:#010x}",
                     self.command_headers.len(),
                     non_zero,
@@ -658,7 +658,7 @@ impl DmaPusher {
         if self.dma_state.method < NON_PULLER_METHODS {
             let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if trace_idx < 48 {
-                log::info!(
+                log::trace!(
                     "DmaPusher::dispatch_method puller method=0x{:X} arg=0x{:X} subch={} pending={}",
                     self.dma_state.method,
                     argument,
@@ -692,7 +692,7 @@ impl DmaPusher {
         if !subchannel.execution_mask()[self.dma_state.method as usize] {
             let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if trace_idx < 48 {
-                log::info!(
+                log::trace!(
                     "DmaPusher::dispatch_method sink method=0x{:X} arg=0x{:X} subch={}",
                     self.dma_state.method,
                     argument,
@@ -704,7 +704,7 @@ impl DmaPusher {
         }
         let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if trace_idx < 48 {
-            log::info!(
+            log::trace!(
                 "DmaPusher::dispatch_method execute method=0x{:X} arg=0x{:X} subch={} dma_seg=0x{:X}",
                 self.dma_state.method,
                 argument,
@@ -727,7 +727,7 @@ impl DmaPusher {
         let args: Vec<u32> = commands.iter().map(|c| c.argument()).collect();
         if self.dma_state.method >= 0x45 && self.dma_state.method <= 0x48 {
             let preview: Vec<String> = args.iter().take(6).map(|v| format!("{:08X}", v)).collect();
-            log::info!(
+            log::trace!(
                 "DmaPusher::dispatch_multi_method method=0x{:X} subch={} count={} pending={} args[0..]={:?}",
                 self.dma_state.method,
                 self.dma_state.subchannel,

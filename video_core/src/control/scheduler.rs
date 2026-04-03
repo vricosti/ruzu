@@ -57,7 +57,7 @@ impl Scheduler {
     ///
     /// Corresponds to `Scheduler::Push(s32 channel, CommandList&& entries)`.
     pub fn push(&self, channel: i32, entries: CommandList) {
-        log::info!(
+        log::trace!(
             "Scheduler::push channel={} command_lists={} prefetch={}",
             channel,
             entries.command_lists.len(),

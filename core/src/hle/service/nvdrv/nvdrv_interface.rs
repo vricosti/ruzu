@@ -102,7 +102,7 @@ impl NvdrvInterface {
         } else {
             NvResult::FileOperationFailed
         };
-        log::info!(
+        log::trace!(
             "NVDRV::Open device_name={} -> fd={} nv_result={:?}",
             device_name,
             fd,
@@ -119,14 +119,14 @@ impl NvdrvInterface {
         input: &[u8],
         output: &mut [u8],
     ) -> NvResult {
-        log::info!("Ioctl1 called fd={}, ioctl=0x{:08X}", fd, command.raw);
+        log::trace!("Ioctl1 called fd={}, ioctl=0x{:08X}", fd, command.raw);
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
             return NvResult::NotInitialized;
         }
 
         if Self::should_trace_ioctl_payload(command) {
-            log::info!(
+            log::trace!(
                 "Ioctl1 input fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
                 fd,
                 command.raw,
@@ -135,14 +135,14 @@ impl NvdrvInterface {
             );
         }
         let nv_result = self.nvdrv.ioctl1(fd, command, input, output);
-        log::info!(
+        log::trace!(
             "Ioctl1 result fd={}, ioctl=0x{:08X}, nv_result={:?}",
             fd,
             command.raw,
             nv_result
         );
         if Self::should_trace_ioctl_payload(command) {
-            log::info!(
+            log::trace!(
                 "Ioctl1 output fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
                 fd,
                 command.raw,
@@ -162,14 +162,14 @@ impl NvdrvInterface {
         inline_input: &[u8],
         output: &mut [u8],
     ) -> NvResult {
-        log::info!("Ioctl2 called fd={}, ioctl=0x{:08X}", fd, command.raw);
+        log::trace!("Ioctl2 called fd={}, ioctl=0x{:08X}", fd, command.raw);
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
             return NvResult::NotInitialized;
         }
 
         if Self::should_trace_ioctl_payload(command) {
-            log::info!(
+            log::trace!(
                 "Ioctl2 input fd={} ioctl=0x{:08X} len0=0x{:X} len1=0x{:X} bytes0=[{}] bytes1=[{}]",
                 fd,
                 command.raw,
@@ -180,14 +180,14 @@ impl NvdrvInterface {
             );
         }
         let nv_result = self.nvdrv.ioctl2(fd, command, input, inline_input, output);
-        log::info!(
+        log::trace!(
             "Ioctl2 result fd={}, ioctl=0x{:08X}, nv_result={:?}",
             fd,
             command.raw,
             nv_result
         );
         if Self::should_trace_ioctl_payload(command) {
-            log::info!(
+            log::trace!(
                 "Ioctl2 output fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
                 fd,
                 command.raw,
@@ -207,14 +207,14 @@ impl NvdrvInterface {
         output: &mut [u8],
         inline_output: &mut [u8],
     ) -> NvResult {
-        log::info!("Ioctl3 called fd={}, ioctl=0x{:08X}", fd, command.raw);
+        log::trace!("Ioctl3 called fd={}, ioctl=0x{:08X}", fd, command.raw);
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
             return NvResult::NotInitialized;
         }
 
         if Self::should_trace_ioctl_payload(command) {
-            log::info!(
+            log::trace!(
                 "Ioctl3 input fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
                 fd,
                 command.raw,
@@ -223,14 +223,14 @@ impl NvdrvInterface {
             );
         }
         let nv_result = self.nvdrv.ioctl3(fd, command, input, output, inline_output);
-        log::info!(
+        log::trace!(
             "Ioctl3 result fd={}, ioctl=0x{:08X}, nv_result={:?}",
             fd,
             command.raw,
             nv_result
         );
         if Self::should_trace_ioctl_payload(command) {
-            log::info!(
+            log::trace!(
                 "Ioctl3 output fd={} ioctl=0x{:08X} len0=0x{:X} len1=0x{:X} bytes0=[{}] bytes1=[{}]",
                 fd,
                 command.raw,
@@ -403,7 +403,7 @@ impl NvdrvService {
         let input = ctx.read_buffer(0);
         let write_size = ctx.get_write_buffer_size(0);
         let mut output = vec![0; write_size];
-        log::info!(
+        log::trace!(
             "NVDRV::ioctl1_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X}",
             fd,
             command.raw,
@@ -415,7 +415,7 @@ impl NvdrvService {
             .lock()
             .unwrap()
             .ioctl1(fd, command, &input, &mut output);
-        log::info!(
+        log::trace!(
             "NVDRV::ioctl1_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
             fd,
             command.raw,
@@ -520,7 +520,7 @@ impl NvdrvService {
         let input = ctx.read_buffer(0);
         let inline_input = ctx.read_buffer(1);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
-        log::info!(
+        log::trace!(
             "NVDRV::ioctl2_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} inline_in_len=0x{:X} out_len=0x{:X}",
             fd,
             command.raw,
@@ -535,7 +535,7 @@ impl NvdrvService {
             &inline_input,
             &mut output,
         );
-        log::info!(
+        log::trace!(
             "NVDRV::ioctl2_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
             fd,
             command.raw,
@@ -555,7 +555,7 @@ impl NvdrvService {
         let input = ctx.read_buffer(0);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
         let mut inline_output = vec![0; ctx.get_write_buffer_size(1)];
-        log::info!(
+        log::trace!(
             "NVDRV::ioctl3_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X} inline_out_len=0x{:X}",
             fd,
             command.raw,
@@ -570,7 +570,7 @@ impl NvdrvService {
             &mut output,
             &mut inline_output,
         );
-        log::info!(
+        log::trace!(
             "NVDRV::ioctl3_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
             fd,
             command.raw,

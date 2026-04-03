@@ -285,7 +285,7 @@ impl KConditionVariable {
                 RESULT_INVALID_CURRENT_MEMORY
             };
 
-            log::info!(
+            log::trace!(
                 "KConditionVariable::signal_to_address owner_tid={} addr=0x{:X} next_owner={:?} has_result={:#x} next_value=0x{:08X}",
                 current_thread_id,
                 addr,
@@ -395,7 +395,7 @@ impl KConditionVariable {
         // If the tag isn't the handle (with wait mask), we're done.
         // Matches upstream: R_SUCCEED_IF(test_tag != (handle | HandleWaitMask))
         if test_tag != (handle | HANDLE_WAIT_MASK) {
-            log::info!(
+            log::trace!(
                 "KConditionVariable::wait_for_address no_wait tid={} handle=0x{:08X} addr=0x{:X} value=0x{:08X} test_tag=0x{:08X}",
                 current_thread_id,
                 handle,
@@ -436,7 +436,7 @@ impl KConditionVariable {
             );
         }
 
-        log::info!(
+        log::trace!(
             "KConditionVariable::wait_for_address sleep tid={} owner_tid={} handle=0x{:08X} addr=0x{:X} value=0x{:08X}",
             current_thread_id,
             owner_thread_id,
@@ -451,7 +451,7 @@ impl KConditionVariable {
 
         Self::wait_for_current_thread(process, current_thread);
         let wait_result = current_thread.lock().unwrap().get_wait_result();
-        log::info!(
+        log::trace!(
             "KConditionVariable::wait_for_address woke tid={} handle=0x{:08X} addr=0x{:X} wait_result={:#x}",
             current_thread_id,
             handle,
@@ -470,7 +470,7 @@ impl KConditionVariable {
     /// Upstream wraps the body in `KScopedSchedulerLock sl(m_kernel)`.
     pub fn signal(&mut self, process_guard: &mut KProcess, cv_key: u64, count: i32) -> ResultCode {
         let mut num_waiters = 0i32;
-        log::info!(
+        log::trace!(
             "KConditionVariable::signal begin cv_key=0x{:X} count={} first_waiter={:?}",
             cv_key,
             count,
@@ -508,7 +508,7 @@ impl KConditionVariable {
             // Signal the thread.
             // Matches upstream: this->SignalImpl(target_thread);
             self.signal_impl(process_guard, &waiting_thread);
-            log::info!(
+            log::trace!(
                 "KConditionVariable::signal woke waiter tid={} cv_key=0x{:X}",
                 waiting_thread_id,
                 cv_key
@@ -680,7 +680,7 @@ impl KConditionVariable {
         Self::begin_wait_condition_variable(current_thread, wait_queue, addr, key, value, timeout);
         let thread_key = current_thread.lock().unwrap().condition_variable_tree_key();
         self.waiting_threads.insert(thread_key);
-        log::info!(
+        log::trace!(
             "KConditionVariable::wait_locked enqueued tid={} addr=0x{:X} key=0x{:X} tag=0x{:08X} timeout={}",
             current_thread_id,
             addr,
@@ -718,7 +718,7 @@ impl KConditionVariable {
         };
 
         let waiting_thread_id = waiting_thread.lock().unwrap().get_thread_id();
-        log::info!(
+        log::trace!(
             "KConditionVariable::signal_impl tid={} addr=0x{:X} own_tag=0x{:08X} prev_tag={:?}",
             waiting_thread_id,
             address.get(),

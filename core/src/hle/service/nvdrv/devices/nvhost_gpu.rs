@@ -412,7 +412,7 @@ impl NvHostGpu {
     ) -> NvResult {
         let command_count = params.num_entries as usize;
         let entry_size = std::mem::size_of::<GpuCommandListHeader>();
-        log::info!(
+        log::trace!(
             "nvhost_gpu::SubmitGPFIFOBase1 kickoff={} num_entries={} address=0x{:X} input_len=0x{:X}",
             kickoff,
             params.num_entries,
@@ -464,7 +464,7 @@ impl NvHostGpu {
         let command_count = params.num_entries as usize;
         let entry_size = std::mem::size_of::<GpuCommandListHeader>();
         let available_entries = commands.len() / entry_size;
-        log::info!(
+        log::trace!(
             "nvhost_gpu::SubmitGPFIFOBase2 num_entries={} address=0x{:X} inline_len=0x{:X}",
             params.num_entries,
             params.address,
@@ -496,7 +496,7 @@ impl NvHostGpu {
     }
 
     pub fn get_waitbase(&self, params: &mut IoctlGetWaitbase) -> NvResult {
-        log::info!(
+        log::trace!(
             "nvhost_gpu::GetWaitbase called, unknown=0x{:X}",
             params.unknown
         );
@@ -505,7 +505,7 @@ impl NvHostGpu {
     }
 
     pub fn channel_set_timeout(&self, params: &mut IoctlChannelSetTimeout) -> NvResult {
-        log::info!(
+        log::trace!(
             "nvhost_gpu::ChannelSetTimeout called, timeout=0x{:X}",
             params.timeout
         );
@@ -513,7 +513,7 @@ impl NvHostGpu {
     }
 
     pub fn channel_set_timeslice(&self, params: &mut IoctlSetTimeslice) -> NvResult {
-        log::info!(
+        log::trace!(
             "nvhost_gpu::ChannelSetTimeslice called, timeslice=0x{:X}",
             params.timeslice
         );

@@ -704,7 +704,7 @@ impl KProcess {
             self.arm_interfaces[i] = Some(jit);
         }
 
-        log::info!(
+        log::trace!(
             "KProcess: initialized {} ARM {} interfaces with exclusive monitor",
             hardware_properties::NUM_CPU_CORES,
             if self.is_64bit() {
@@ -1004,7 +1004,7 @@ impl KProcess {
         tag: u32,
         timeout: i64,
     ) -> u32 {
-        log::info!(
+        log::trace!(
             "KProcess::wait_condition_variable enter tid={} address=0x{:X} cv_key=0x{:X} tag=0x{:08X} timeout={}",
             current_thread.lock().unwrap().get_thread_id(),
             address,
@@ -1040,7 +1040,7 @@ impl KProcess {
             result
         };
 
-        log::info!(
+        log::trace!(
             "KProcess::wait_condition_variable return tid={} result={:#x}",
             current_thread.lock().unwrap().get_thread_id(),
             result.get_inner_value()
@@ -1050,7 +1050,7 @@ impl KProcess {
     }
 
     pub fn signal_condition_variable(&mut self, cv_key: u64, count: i32) {
-        log::info!(
+        log::trace!(
             "KProcess::signal_condition_variable enter cv_key=0x{:X} count={}",
             cv_key,
             count
@@ -1059,7 +1059,7 @@ impl KProcess {
         unsafe {
             let _ = (*cond_var_ptr).signal(self, cv_key, count);
         }
-        log::info!(
+        log::trace!(
             "KProcess::signal_condition_variable return cv_key=0x{:X} count={}",
             cv_key,
             count
@@ -2138,7 +2138,7 @@ impl KProcess {
         if handle_result != RESULT_SUCCESS.get_inner_value() {
             return Err(handle_result);
         }
-        log::info!(
+        log::trace!(
             "KProcess::run enter pid={} main_thread_id={} prio={} stack_size=0x{:x}",
             self.process_id,
             main_thread_id,
@@ -2174,7 +2174,7 @@ impl KProcess {
         let tls_address = self
             .create_thread_local_region()
             .ok_or_else(|| RESULT_INVALID_STATE.get_inner_value())?;
-        log::info!(
+        log::trace!(
             "KProcess::run tls allocated pid={} tls={:#x}",
             self.process_id,
             tls_address.get()
@@ -2215,7 +2215,7 @@ impl KProcess {
             log::error!("run: stack MapPages find-free failed ({:#x})", map_result);
             return Err(map_result);
         }
-        log::info!(
+        log::trace!(
             "KProcess::run stack mapped pid={} stack=[{:#x}..{:#x})",
             self.process_id,
             stack_base,
@@ -2259,7 +2259,7 @@ impl KProcess {
             }
             thread.thread_type = super::k_thread::ThreadType::Main;
         }
-        log::info!(
+        log::trace!(
             "KProcess::run main thread initialized pid={} tid={} obj={}",
             self.process_id,
             main_thread_id,
@@ -2268,7 +2268,7 @@ impl KProcess {
 
         let thread_handle = {
             self.register_thread_object(main_thread.clone());
-            log::info!(
+            log::trace!(
                 "KProcess::run main thread registered pid={} tid={}",
                 self.process_id,
                 main_thread_id
@@ -2306,7 +2306,7 @@ impl KProcess {
             if let Some(gsc) = &self.global_scheduler_context {
                 gsc.lock().unwrap().add_thread(main_thread.clone());
             }
-            log::info!(
+            log::trace!(
                 "KProcess::run about to run main thread pid={} tid={}",
                 self.process_id,
                 main_thread_id
@@ -2318,7 +2318,7 @@ impl KProcess {
                 return Err(run_result);
             }
             drop(thread);
-            log::info!(
+            log::trace!(
                 "KProcess::run main thread runnable pid={} tid={}",
                 self.process_id,
                 main_thread_id
