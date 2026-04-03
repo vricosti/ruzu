@@ -993,11 +993,7 @@ impl ArmDynarmic32 {
         {
             OptimizationFlag::NO_OPTIMIZATIONS
         } else {
-            // All safe optimizations except GetSetElimination (0x08) which has a
-            // known bug: VMRS APSR_nzcv + CMP + BNE loses CMP's flags when GSE
-            // is active, causing infinite loops in FP-heavy code.
-            // TODO: fix GSE to handle multiple cpsr_nzcv writes correctly.
-            optimization_flags_from_mask(0x3F & !0x08)
+            optimization_flags_from_mask(0x3F)
         };
 
         let config = JitConfig {
