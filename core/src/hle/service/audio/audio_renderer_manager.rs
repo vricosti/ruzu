@@ -65,7 +65,7 @@ impl IAudioRendererManager {
     fn open_audio_renderer_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::info!("IAudioRendererManager::OpenAudioRenderer");
         let renderer = Arc::new(super::audio_renderer::IAudioRenderer::new());
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
         rb.push_ipc_interface(renderer);
     }
@@ -88,7 +88,7 @@ impl IAudioRendererManager {
         let device = Arc::new(super::audio_device::IAudioDevice::new(
             0, 0x52455631, device_num,
         )); // 'REV1'
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
         rb.push_ipc_interface(device);
     }
@@ -105,7 +105,7 @@ impl IAudioRendererManager {
             .num_audio_devices
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let device = Arc::new(super::audio_device::IAudioDevice::new(0, 0, device_num));
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
         rb.push_ipc_interface(device);
     }

@@ -4499,3 +4499,70 @@
 
 ### Binary layout verification
 - PASS: timer/scheduler behavior only; no guest-visible struct layout changed.
+
+## 2026-04-03 — core/src/hle/service/friend/friend_interface.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/friend/friend_interface.cpp
+
+### Intentional differences
+- Rust stores `Core::System` and `Module` explicitly on `Friend`, while upstream inherits the shared module owner through `Module::Interface`. Ownership still remains in `friend_interface.rs`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `CreateFriendService` and `CreateNotificationService` were registered with `None` callbacks, so the service always fell through to generic unimplemented-success handling instead of constructing the upstream sub-services.
+- fixed in this pass: cmd `0`/`1` now push a real `IFriendService` / `INotificationService` object using the same domain vs non-domain response pattern as other upstream-like factory services.
+- still simplified: cmd `2` (`CreateDaemonSuspendSessionService`) remains unimplemented, matching the existing null upstream handler registration.
+
+### Missing items
+- No daemon suspend session service owner yet.
+
+### Binary layout verification
+- PASS: IPC control-flow only; no raw guest-visible struct layout changed.
+
+## 2026-04-03 — core/src/hle/service/friend/friend.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/friend/friend.cpp
+
+### Intentional differences
+- Rust currently keeps only the exercised command subset from upstream in the handler table rather than registering every null entry. The implemented methods still live in the correct owner file.
+- `INotificationService::Pop` still returns success without serializing the notification payload bytes; state mutation and event ownership are now correct, but the payload layout is still missing.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `IFriendService` and `INotificationService` existed only as plain structs and were not `SessionRequestHandler`s, so any pushed sub-service would still have been invalid at IPC dispatch time.
+- fixed in this pass: the exercised upstream command handlers now build real IPC responses in this owner file, including copy-event returns for `GetCompletionEvent` and `GetEvent`.
+- still simplified: UUID parsing uses raw `u128` words instead of an upstream `Common::UUID` owner type.
+
+### Missing items
+- Full upstream null-command table coverage for `IFriendService`.
+- `INotificationService::Pop` output payload serialization.
+- Destructor-parity cleanup for friend service events if later required beyond handle-table lifetime ownership.
+
+### Binary layout verification
+- PASS: no raw struct copy was introduced on an IPC payload boundary in this pass; event/object ownership only.
+
+## 2026-04-03 — core/src/hle/service/audio/audio_renderer_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer_manager.cpp
+
+### Intentional differences
+- Rust still stubs most renderer/backend construction details and does not yet pass the upstream parameter block, transfer-memory handle, process handle, or ARUID into a real `IAudioRenderer` backend. Ownership remains in `audio_renderer_manager.rs`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `OpenAudioRenderer`, `GetAudioDeviceService`, and `GetAudioDeviceServiceWithRevisionInfo` were constructing the IPC response with `num_objects_to_move = 0` while still pushing an IPC interface. That produced a response header with no outgoing object slots even though the command returns a sub-service upstream. These handlers now reserve one moved object in the response header, matching upstream `Out<SharedPointer<...>>`.
+
+### Missing items
+- Full upstream request parsing and validation for `OpenAudioRenderer`.
+- Real `AudioCore::Renderer::Manager` ownership and session-count enforcement.
+- Upstream ARUID/revision/process-handle propagation into `IAudioDevice` and `IAudioRenderer`.
+
+### Binary layout verification
+- PASS: this slice changes IPC response header/object counts only; no raw guest-visible struct layout changed.
+
+## 2026-04-03 — core/src/hle/service/audio/audio_renderer.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer.cpp
+
+### Intentional differences
+- Rust still uses a stubbed `IAudioRenderer` without the upstream `AudioCore::Renderer::Renderer` backend, transfer-memory ownership, process-handle ownership, or event lifecycle/destructor parity. Ownership remains in `audio_renderer.rs`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `RequestUpdate` / `RequestUpdateAuto` previously reported success while leaving output buffers untouched (`WriteBuffer` with an empty slice). Upstream always writes renderer output through the provided out-buffers. The Rust stub now explicitly zero-initializes every writable output buffer so callers do not consume stale guest memory after a successful result.
+
+### Missing items
+- Full upstream renderer initialization and `impl->RequestUpdate(...)` behavior.
+- Destructor parity (`Finalize`, `CloseEvent`, `process_handle->Close()`).
+- Upstream state/sample-rate/sample-count values sourced from the real renderer backend instead of fixed stub values.
+
+### Binary layout verification
+- PASS: this slice only changes guest buffer initialization and IPC behavior; no raw struct definition layout changed.

@@ -144,7 +144,15 @@ impl IAudioRenderer {
     /// (KReadableEvent does not auto-clear), so WaitSynchronization always
     /// returns immediately. This prevents the game from blocking on audio.
     fn request_update_impl(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        ctx.write_buffer(&[], 0);
+        for buffer_index in 0..2 {
+            if ctx.can_write_buffer(buffer_index) {
+                let buffer_size = ctx.get_write_buffer_size(buffer_index);
+                if buffer_size > 0 {
+                    let zeroed = vec![0u8; buffer_size];
+                    ctx.write_buffer(&zeroed, buffer_index);
+                }
+            }
+        }
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
