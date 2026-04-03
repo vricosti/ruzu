@@ -92,7 +92,7 @@ pub fn create_thread(
             return RESULT_INVALID_PRIORITY;
         }
 
-        log::info!(
+        log::trace!(
             "svc::CreateThread resolved entry=0x{:08X} prio={} requested_core={} effective_core={} process_ideal_core={}",
             entry_point,
             priority,
@@ -224,7 +224,7 @@ fn ensure_user_stack_mapping(
     let heap_end = heap_start.saturating_add(heap_size as u64);
     let in_heap = probe_addr >= heap_start && probe_addr < heap_end;
 
-    log::info!(
+    log::trace!(
         "svc::CreateThread stack probe top={:#x} query_state={:?} heap=[{:#x}..{:#x}) in_heap={} shared={:02x?} memory={:?}",
         stack_top,
         info.get_state(),
@@ -245,7 +245,7 @@ fn ensure_user_stack_mapping(
             .take(6)
         {
             let block_info = block.get_memory_info();
-            log::info!(
+            log::trace!(
                 "svc::CreateThread nearby block [{:#x}..{:#x}) state={:?} perm={:?} attr={:?}",
                 block_info.m_address,
                 block_info.m_address + block_info.m_size,
@@ -277,7 +277,7 @@ fn ensure_user_stack_mapping(
         return;
     }
 
-    log::info!(
+    log::trace!(
         "svc::CreateThread: mapped fallback user stack [{:#x}..{:#x})",
         stack_base,
         stack_top_page
@@ -295,7 +295,7 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
     let result = thread.lock().unwrap().run();
     {
         let thread_guard = thread.lock().unwrap();
-        log::info!(
+        log::trace!(
             "svc::StartThread result handle=0x{:08X} tid={} state={:?} core_id={} current_core={} affinity=0x{:X} result={:#x}",
             thread_handle,
             thread_guard.get_thread_id(),
@@ -352,7 +352,7 @@ pub fn sleep_thread(system: &System, ns: i64) {
             return;
         }
 
-        log::info!("svc::SleepThread(sleep): tid={} ns={} -> wait armed", current_thread_id, ns);
+        log::trace!("svc::SleepThread(sleep): tid={} ns={} -> wait armed", current_thread_id, ns);
         return;
     }
 
@@ -362,7 +362,7 @@ pub fn sleep_thread(system: &System, ns: i64) {
     };
     if let Some(thread) = resolve_current_thread(system) {
         let thread = thread.lock().unwrap();
-        log::info!(
+        log::trace!(
             "svc::SleepThread(yield) ctx: tid={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
             current_thread_id,
             thread.thread_context.pc as u32,
@@ -370,7 +370,7 @@ pub fn sleep_thread(system: &System, ns: i64) {
             thread.thread_context.sp as u32,
         );
     }
-    log::info!(
+    log::trace!(
         "svc::SleepThread(yield): tid={} ns={} branch={}",
         current_thread_id,
         ns,

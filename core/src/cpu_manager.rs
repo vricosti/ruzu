@@ -494,7 +494,7 @@ impl CpuManager {
                     if current_thread_id == 17 || current_thread_id >= 18 {
                         let mut tc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc);
-                        log::info!(
+                        log::trace!(
                             "multi_core_run_guest_thread: host={} tid={} core={} svc=0x{:x} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} arg0=0x{:X} arg1=0x{:X} arg2=0x{:X}",
                             std::thread::current().name().unwrap_or("?"),
                             current_thread_id,
@@ -508,7 +508,7 @@ impl CpuManager {
                             svc_args[2],
                         );
                         if svc_num == 0x1c {
-                            log::info!(
+                            log::trace!(
                                 "multi_core_run_guest_thread: tid={} WaitProcessWideKeyAtomic args addr=0x{:X} key=0x{:X} tag=0x{:08X} timeout_lo=0x{:08X} timeout_hi=0x{:08X}",
                                 current_thread_id,
                                 svc_args[0] as u32,
@@ -518,7 +518,7 @@ impl CpuManager {
                                 svc_args[4] as u32,
                             );
                         } else if svc_num == 0x1d {
-                            log::info!(
+                            log::trace!(
                                 "multi_core_run_guest_thread: tid={} SignalProcessWideKey args key=0x{:X} count={}",
                                 current_thread_id,
                                 svc_args[0] as u32,
@@ -549,7 +549,7 @@ impl CpuManager {
                                 != crate::hle::kernel::k_thread::ThreadState::RUNNABLE
                         };
                         if switched_scheduler_thread || current_thread_blocked || needs_scheduling {
-                            log::info!(
+                            log::trace!(
                                 "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} reschedule after SVC switched={} blocked={} needs_sched={}",
                                 current_thread_id,
                                 core_index,
@@ -561,7 +561,7 @@ impl CpuManager {
                             Self::reschedule_current_core_raw(kernel);
                             return;
                         }
-                        log::info!(
+                        log::trace!(
                             "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} returned from svc_dispatch r0=0x{:X} r1=0x{:X}",
                             current_thread_id,
                             core_index,
@@ -585,7 +585,7 @@ impl CpuManager {
                     {
                         let mut tc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc);
-                        log::info!(
+                        log::trace!(
                             "multi_core_run_guest_thread: tid=17 core={} halted={:?} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} r4=0x{:X} r7=0x{:X} r0=0x{:X} r1=0x{:X}",
                             core_index,
                             halt_reason,

@@ -772,7 +772,7 @@ impl KThread {
     pub fn get_or_create_host_context(&mut self) -> Option<Arc<common::fiber::Fiber>> {
         if self.host_context.is_none() {
             if let Some(init) = self.pending_host_context_init.take() {
-                log::info!(
+                log::trace!(
                     "KThread::get_or_create_host_context tid={} host={} core_id={} current_core={} affinity=0x{:X}",
                     self.thread_id,
                     std::thread::current().name().unwrap_or("?"),
@@ -1940,7 +1940,7 @@ impl KThread {
         });
         self.pending_host_context_init = Some(wrapped_func);
 
-        log::info!(
+        log::trace!(
             "KThread::initialize_service_thread: thread_id={} priority={} core={}",
             thread_id,
             priority,

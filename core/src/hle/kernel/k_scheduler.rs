@@ -478,7 +478,7 @@ impl KScheduler {
             return;
         }
 
-        log::info!(
+        log::trace!(
             "KScheduler::ensure_switch_fiber core={} host={}",
             self.core_id,
             std::thread::current().name().unwrap_or("?"),
@@ -487,7 +487,7 @@ impl KScheduler {
         self.switch_fiber = Some(Fiber::new(Box::new(move || {
             loop {
                 let sched = unsafe { &mut *(sched_ptr as *mut KScheduler) };
-                log::info!(
+                log::trace!(
                     "KScheduler::switch_fiber entry core={} host={}",
                     sched.core_id,
                     std::thread::current().name().unwrap_or("?"),
@@ -572,7 +572,7 @@ impl KScheduler {
             };
             jit.set_context(arm_ctx);
             jit.set_tpidrro_el0(thread_guard.get_tls_address().get());
-            log::info!(
+            log::trace!(
                 "KScheduler::Reload: core={} r15/PC=0x{:X} r13/SP=0x{:X}",
                 self.core_id,
                 k_ctx.r[15],
@@ -973,7 +973,7 @@ impl KScheduler {
         let prev = self.state.highest_priority_thread_id;
         if prev != highest_thread_id {
             if self.core_id == 0 || self.core_id == 1 {
-                log::info!(
+                log::trace!(
                     "update_highest_priority_thread: core={} prev={:?} next={:?}",
                     self.core_id,
                     prev,
@@ -1431,7 +1431,7 @@ impl KScheduler {
         };
         let target_id = target.as_ref().map(|thread| thread.lock().unwrap().get_thread_id());
         if self.core_id == 0 || self.core_id == 1 {
-            log::info!(
+            log::trace!(
                 "schedule_impl_fiber: core={} cur={:?} highest={:?} target={:?} interrupted={}",
                 self.core_id,
                 self.current_thread_id,
@@ -1568,7 +1568,7 @@ impl KScheduler {
         // Reload the guest thread context.
         if let Some(ref hpt) = highest_priority_thread {
             let hpt_id = hpt.lock().unwrap().get_thread_id();
-            log::info!(
+            log::trace!(
                 "schedule_impl_fiber_loop: Reload + YieldTo thread {}",
                 hpt_id
             );
@@ -1579,7 +1579,7 @@ impl KScheduler {
             if let Some(ref switch_fiber) = self.switch_fiber {
                 let host_ctx = hpt.lock().unwrap().get_or_create_host_context();
                 if let Some(ref ctx) = host_ctx {
-                    log::info!(
+                    log::trace!(
                         "schedule_impl_fiber_loop: host={} core={} yielding from switch_fiber to thread {} fiber",
                         std::thread::current().name().unwrap_or("?"),
                         self.core_id,
@@ -1601,7 +1601,7 @@ impl KScheduler {
     fn switch_thread_impl(&mut self, next_thread_id: u64) {
         let cur_thread_id = self.current_thread_id;
 
-        log::info!(
+        log::trace!(
             "switch_thread_impl: cur={:?} next={} has_gsc={}",
             cur_thread_id,
             next_thread_id,
@@ -1610,7 +1610,7 @@ impl KScheduler {
 
         // If same thread, nothing to do.
         if Some(next_thread_id) == cur_thread_id {
-            log::info!("switch_thread_impl: same thread, skipping");
+            log::trace!("switch_thread_impl: same thread, skipping");
             return;
         }
 

@@ -78,7 +78,7 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         (manager.is_domain(), handler_name)
     };
 
-    log::info!(
+    log::trace!(
         "  SendSyncRequest: handle={:#x} tls={:#x} service={} cmd_type={:?} is_domain={} parsed_cmd={}",
         session_handle,
         tls_address,
