@@ -257,7 +257,7 @@ impl System {
         &mut self,
         params: &AudioRendererParameterInternal,
         transfer_memory_size: u64,
-        process_handle_present: bool,
+        process_handle: *mut KProcess,
         applet_resource_user_id: u64,
         session_id: i32,
     ) -> Result {
@@ -267,7 +267,7 @@ impl System {
         if Self::get_work_buffer_size(params) > transfer_memory_size {
             return RESULT_INSUFFICIENT_BUFFER;
         }
-        if !process_handle_present {
+        if process_handle.is_null() {
             return RESULT_INVALID_HANDLE;
         }
 
@@ -280,6 +280,7 @@ impl System {
         self.execution_mode = params.execution_mode;
         self.applet_resource_user_id = applet_resource_user_id;
         self.session_id = session_id;
+        self.process = ProcessHandle::from_ptr(process_handle as *mut ());
         self.drop_voice_enabled =
             params.voice_drop_enabled != 0 && params.execution_mode == ExecutionMode::Auto;
         self.behavior.set_user_lib_revision(params.revision);
@@ -334,7 +335,7 @@ impl System {
         );
         self.command_workbuffer = vec![0u8; command_workbuffer_size as usize];
         self.command_workbuffer_pool = MemoryPoolInfo::new(PoolLocation::Dsp);
-        let pool_mapper = PoolMapper::new(None, false);
+        let pool_mapper = PoolMapper::new(process_handle, false);
         let voice_state_bytes = typed_slice_as_bytes(self.voice_context.dsp_shared_states());
         let _ = pool_mapper.initialize_system_pool(
             &mut self.voice_state_pool,
@@ -413,7 +414,7 @@ impl System {
         self.voice_drop_parameter = 1.0;
         let memory_pool_count = self.memory_pool_workbuffer.len() as u32;
         PoolMapper::clear_use_state(&mut self.memory_pool_workbuffer, memory_pool_count);
-        let pool_mapper = PoolMapper::new(None, false);
+        let pool_mapper = PoolMapper::new(self.get_process(), false);
         for pool in &mut self.memory_pool_workbuffer {
             if pool.is_mapped() {
                 let _ = pool_mapper.unmap_pool(pool);
@@ -477,19 +478,23 @@ impl System {
         let mut updater = crate::renderer::behavior::info_updater::InfoUpdater::new(
             input,
             output,
+            self.get_process(),
             &mut self.behavior,
         );
 
         let mut result = updater.update_behavior_info();
         if result.is_error() {
+            log::error!("Failed to update BehaviorInfo!");
             return result;
         }
         result = updater.update_memory_pools(&mut self.memory_pool_workbuffer, pool_count);
         if result.is_error() {
+            log::error!("Failed to update MemoryPools!");
             return result;
         }
         result = updater.update_voice_channel_resources(&mut self.voice_context);
         if result.is_error() {
+            log::error!("Failed to update VoiceChannelResources!");
             return result;
         }
         result = updater.update_voices(
@@ -498,6 +503,7 @@ impl System {
             pool_count,
         );
         if result.is_error() {
+            log::error!("Failed to update Voices!");
             return result;
         }
         result = updater.update_effects(
@@ -507,11 +513,13 @@ impl System {
             pool_count,
         );
         if result.is_error() {
+            log::error!("Failed to update Effects!");
             return result;
         }
         if splitter_supported {
             result = updater.update_splitter_info(&mut self.splitter_context);
             if result.is_error() {
+                log::error!("Failed to update SplitterInfo!");
                 return result;
             }
         }
@@ -522,6 +530,7 @@ impl System {
             &mut self.splitter_context,
         );
         if result.is_error() {
+            log::error!("Failed to update Mixes!");
             return result;
         }
         result = updater.update_sinks(
@@ -531,6 +540,7 @@ impl System {
             &mut self.upsampler_manager,
         );
         if result.is_error() {
+            log::error!("Failed to update Sinks!");
             return result;
         }
         result = updater.update_performance_buffer(
@@ -540,20 +550,24 @@ impl System {
                 .then_some(&mut self.performance_manager),
         );
         if result.is_error() {
+            log::error!("Failed to update PerformanceBuffer!");
             return result;
         }
         result = updater.update_error_info();
         if result.is_error() {
+            log::error!("Failed to update ErrorInfo!");
             return result;
         }
         if elapsed_frame_count_supported {
             result = updater.update_renderer_info(self.frames_elapsed);
             if result.is_error() {
+                log::error!("Failed to update RendererInfo!");
                 return result;
             }
         }
         result = updater.check_consumed_size();
         if result.is_error() {
+            log::error!("Invalid consume size!");
             return result;
         }
         drop(updater);
@@ -1142,7 +1156,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1163,7 +1177,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1179,7 +1193,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
         system.start();
@@ -1208,7 +1222,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1264,7 +1278,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 77, 9),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 77, 9),
             ResultCode::SUCCESS
         );
 
@@ -1303,7 +1317,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 77, 9),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 77, 9),
             ResultCode::SUCCESS
         );
 
@@ -1322,7 +1336,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1389,7 +1403,7 @@ mod tests {
         let transfer_size = minimum_transfer_size + extra_transfer_size;
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1415,7 +1429,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1474,7 +1488,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
         system.start();
@@ -1501,7 +1515,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1525,7 +1539,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1556,7 +1570,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 

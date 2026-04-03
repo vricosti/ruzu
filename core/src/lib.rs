@@ -26,6 +26,7 @@ pub mod telemetry_session;
 
 // ARM CPU interface
 pub mod arm;
+pub mod audio_core;
 
 // Memory subsystem
 pub mod memory;

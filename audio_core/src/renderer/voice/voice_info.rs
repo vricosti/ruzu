@@ -18,11 +18,18 @@ pub enum ServerPlayState {
     Paused,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct Flags {
-    pub is_voice_played_sample_count_reset_at_loop_point_supported: bool,
-    pub is_voice_pitch_and_src_skipped_supported: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct Flags(pub u8);
+
+impl Flags {
+    pub fn is_voice_played_sample_count_reset_at_loop_point_supported(self) -> bool {
+        self.0 & 0x1 != 0
+    }
+
+    pub fn is_voice_pitch_and_src_skipped_supported(self) -> bool {
+        self.0 & 0x2 != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -85,6 +92,11 @@ pub struct InParameter {
     pub src_quality: SrcQuality,
     pub _unk15f: [u8; 0x11],
 }
+
+const _: () = assert!(size_of::<WaveBufferInternal>() == 0x38);
+const _: () = assert!(size_of::<BiquadFilterParameter>() == 0x0c);
+const _: () = assert!(size_of::<InParameter>() == 0x170);
+const _: () = assert!(size_of::<OutStatus>() == 0x10);
 
 impl Default for InParameter {
     fn default() -> Self {
@@ -353,11 +365,11 @@ impl VoiceInfo {
             self.flags |= u16::from(
                 params
                     .flags
-                    .is_voice_played_sample_count_reset_at_loop_point_supported,
+                    .is_voice_played_sample_count_reset_at_loop_point_supported(),
             );
         }
         if behavior.is_voice_pitch_and_src_skipped_supported() {
-            self.flags |= u16::from(params.flags.is_voice_pitch_and_src_skipped_supported) << 1;
+            self.flags |= u16::from(params.flags.is_voice_pitch_and_src_skipped_supported()) << 1;
         }
         if params.clear_voice_drop {
             self.voice_dropped = false;

@@ -30,6 +30,7 @@ use crate::renderer::voice::voice_info::{
 use crate::renderer::voice::VoiceContext;
 use crate::Result;
 use common::ResultCode;
+use ruzu_core::hle::kernel::k_process::KProcess;
 use std::mem::size_of;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -59,11 +60,17 @@ pub struct InfoUpdater<'a> {
     out_header: UpdateDataHeader,
     expected_input_size: u64,
     expected_output_size: u64,
+    process_handle: *mut KProcess,
     behavior: *mut BehaviorInfo,
 }
 
 impl<'a> InfoUpdater<'a> {
-    pub fn new(input: &'a [u8], output: &'a mut [u8], behavior: &'a mut BehaviorInfo) -> Self {
+    pub fn new(
+        input: &'a [u8],
+        output: &'a mut [u8],
+        process_handle: *mut KProcess,
+        behavior: &'a mut BehaviorInfo,
+    ) -> Self {
         let header_size = size_of::<UpdateDataHeader>();
         let output_len = output.len();
         let in_header = read_pod::<UpdateDataHeader>(input, 0).unwrap_or_default();
@@ -85,6 +92,7 @@ impl<'a> InfoUpdater<'a> {
             out_header,
             expected_input_size: input.len() as u64,
             expected_output_size: output_len as u64,
+            process_handle,
             behavior: behavior as *mut BehaviorInfo,
         }
     }
@@ -127,7 +135,10 @@ impl<'a> InfoUpdater<'a> {
                 memory_pool_count as usize,
             )
         };
-        let mapper = PoolMapper::new(None, self.behavior().is_memory_force_mapping_enabled());
+        let mapper = PoolMapper::new(
+            self.process_handle,
+            self.behavior().is_memory_force_mapping_enabled(),
+        );
         for (index, in_param) in in_params.iter().enumerate() {
             let mut out_param = MemoryPoolOutStatus::default();
             let state = mapper.update(&mut memory_pools[index], in_param, &mut out_param);
@@ -214,7 +225,7 @@ impl<'a> InfoUpdater<'a> {
         }
 
         let mapper = PoolMapper::with_pools(
-            None,
+            self.process_handle,
             memory_pools,
             memory_pool_count,
             self.behavior().is_memory_force_mapping_enabled(),
@@ -350,7 +361,7 @@ impl<'a> InfoUpdater<'a> {
             )
         };
         let mapper = PoolMapper::with_pools(
-            None,
+            self.process_handle,
             memory_pools,
             memory_pool_count,
             self.behavior().is_memory_force_mapping_enabled(),
@@ -406,7 +417,7 @@ impl<'a> InfoUpdater<'a> {
             )
         };
         let mapper = PoolMapper::with_pools(
-            None,
+            self.process_handle,
             memory_pools,
             memory_pool_count,
             self.behavior().is_memory_force_mapping_enabled(),
@@ -507,20 +518,10 @@ impl<'a> InfoUpdater<'a> {
         let mut total_buffer_count = 0u32;
         for params in in_params {
             if params.in_use {
-                if params.buffer_count > i16::MAX as u32 {
-                    return RESULT_INVALID_UPDATE_INFO;
-                }
                 total_buffer_count = total_buffer_count.saturating_add(params.buffer_count);
                 if params.dest_mix_id > mix_context.get_count()
                     && params.dest_mix_id != UNUSED_MIX_ID
                     && params.mix_id != FINAL_MIX_ID
-                {
-                    return RESULT_INVALID_UPDATE_INFO;
-                }
-                if params.dest_mix_id == UNUSED_MIX_ID
-                    && params.dest_splitter_id != UNUSED_SPLITTER_ID
-                    && (params.dest_splitter_id < 0
-                        || params.dest_splitter_id as u32 >= splitter_context.get_info_count())
                 {
                     return RESULT_INVALID_UPDATE_INFO;
                 }
@@ -539,9 +540,6 @@ impl<'a> InfoUpdater<'a> {
             } else {
                 i as i32
             };
-            if mix_id < 0 || mix_id >= mix_context.get_count() {
-                return RESULT_INVALID_UPDATE_INFO;
-            }
             if let Some(mix) = mix_context.get_info_mut(mix_id) {
                 if mix.in_use != params.in_use {
                     mix.in_use = params.in_use;
@@ -599,7 +597,7 @@ impl<'a> InfoUpdater<'a> {
             )
         };
         let mapper = PoolMapper::with_pools(
-            None,
+            self.process_handle,
             memory_pools,
             memory_pool_count,
             self.behavior().is_memory_force_mapping_enabled(),
@@ -859,7 +857,7 @@ mod tests {
         );
         let effect_context = EffectContext::new();
         let mut output = vec![0u8; size_of::<UpdateDataHeader>()];
-        let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+        let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
 
         assert_eq!(
             updater.update_mixes(&mut mix_context, 2, &effect_context, &mut splitter_context),
@@ -899,7 +897,7 @@ mod tests {
         let effect_context = EffectContext::new();
         let mut splitter_context = SplitterContext::new();
         let mut output = vec![0u8; size_of::<UpdateDataHeader>()];
-        let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+        let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
 
         assert_eq!(
             updater.update_mixes(&mut mix_context, 4, &effect_context, &mut splitter_context),
@@ -941,7 +939,7 @@ mod tests {
         }
 
         let mut output = vec![0u8; size_of::<UpdateDataHeader>()];
-        let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+        let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
 
         assert_eq!(
             updater.update_voice_channel_resources(&mut voice_context),
@@ -1019,7 +1017,7 @@ mod tests {
         }
 
         {
-            let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+            let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
             assert_eq!(
                 updater.update_effects(&mut effect_context, false, &mut [], 0),
                 ResultCode::SUCCESS
@@ -1079,7 +1077,7 @@ mod tests {
         }
 
         {
-            let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+            let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
             assert_eq!(
                 updater.update_effects(&mut effect_context, false, &mut [], 0),
                 ResultCode::SUCCESS
@@ -1121,7 +1119,7 @@ mod tests {
         push_pod(&mut input, &perf_in);
 
         let mut output = vec![0u8; size_of::<UpdateDataHeader>() + size_of::<PerfOutStatus>()];
-        let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+        let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
         let mut performance_manager = PerformanceManager::new();
 
         assert_eq!(
@@ -1153,7 +1151,7 @@ mod tests {
         push_pod(&mut input, &sink_in);
 
         let mut output = vec![0u8; size_of::<UpdateDataHeader>() + size_of::<SinkOutStatus>()];
-        let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+        let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
         let mut sink_context = SinkContext::default();
         sink_context.initialize(vec![Default::default()], 1);
         let mut upsampler_manager = UpsamplerManager::new(1);
@@ -1193,7 +1191,7 @@ mod tests {
         mix_context.initialize(1, 1, &behavior);
         let effect_context = EffectContext::new();
         let mut splitter_context = SplitterContext::new();
-        let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+        let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
 
         assert_eq!(
             updater.update_mixes(&mut mix_context, 1, &effect_context, &mut splitter_context),
@@ -1250,7 +1248,7 @@ mod tests {
                 revision: behavior.get_process_revision(),
             },
         );
-        let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+        let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
 
         assert_eq!(
             updater.update_mixes(&mut mix_context, 1, &effect_context, &mut splitter_context),
@@ -1284,7 +1282,7 @@ mod tests {
         mix_context.initialize(1, 0, &behavior);
         let effect_context = EffectContext::new();
         let mut splitter_context = SplitterContext::new();
-        let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+        let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
 
         assert_eq!(
             updater.update_mixes(
@@ -1319,7 +1317,7 @@ mod tests {
         push_pod(&mut input, &voice);
 
         let mut output = vec![0u8; size_of::<UpdateDataHeader>() + size_of::<VoiceOutStatus>()];
-        let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+        let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
         let mut voice_context = VoiceContext::new();
         voice_context.initialize(1, 1, 1);
 
@@ -1352,7 +1350,7 @@ mod tests {
         push_pod(&mut input, &voice);
 
         let mut output = vec![0u8; size_of::<UpdateDataHeader>() + size_of::<VoiceOutStatus>()];
-        let mut updater = InfoUpdater::new(&input, &mut output, &mut behavior);
+        let mut updater = InfoUpdater::new(&input, &mut output, std::ptr::null_mut(), &mut behavior);
         let mut voice_context = VoiceContext::new();
         voice_context.initialize(1, 1, 1);
 

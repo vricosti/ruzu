@@ -7,15 +7,17 @@ use crate::renderer::memory::{
 use common::alignment::is_4kb_aligned;
 use common::ResultCode;
 
+use ruzu_core::hle::kernel::k_process::KProcess;
+
 pub struct PoolMapper<'a> {
-    process_handle: Option<u32>,
+    process_handle: *mut KProcess,
     pool_infos: Option<&'a mut [MemoryPoolInfo]>,
     pool_count: u64,
     force_map: bool,
 }
 
 impl<'a> PoolMapper<'a> {
-    pub fn new(process_handle: Option<u32>, force_map: bool) -> Self {
+    pub fn new(process_handle: *mut KProcess, force_map: bool) -> Self {
         Self {
             process_handle,
             pool_infos: None,
@@ -25,7 +27,7 @@ impl<'a> PoolMapper<'a> {
     }
 
     pub fn with_pools(
-        process_handle: Option<u32>,
+        process_handle: *mut KProcess,
         pool_infos: &'a mut [MemoryPoolInfo],
         pool_count: u32,
         force_map: bool,
@@ -140,10 +142,10 @@ impl<'a> PoolMapper<'a> {
         self.force_map
     }
 
-    pub fn get_process_handle(&self, pool: &MemoryPoolInfo) -> Option<u32> {
+    pub fn get_process_handle(&self, pool: &MemoryPoolInfo) -> *mut KProcess {
         match pool.get_location() {
             PoolLocation::Cpu => self.process_handle,
-            PoolLocation::Dsp => None,
+            PoolLocation::Dsp => std::ptr::null_mut(),
         }
     }
 

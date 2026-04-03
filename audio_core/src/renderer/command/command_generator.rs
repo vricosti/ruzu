@@ -519,9 +519,11 @@ impl<'a> CommandGenerator<'a> {
                     continue;
                 };
                 if self.command_list_header.sample_rate != TARGET_SAMPLE_RATE
-                    && sink.device_state.upsampler_info.is_none()
+                    && sink.device_state.upsampler_index().is_none()
                 {
-                    sink.device_state.upsampler_info = self.upsampler_manager.allocate();
+                    if let Some(index) = self.upsampler_manager.allocate() {
+                        sink.device_state.set_upsampler_index(index);
+                    }
                 }
                 sink.get_node_id() as i32
             };
@@ -622,7 +624,8 @@ impl<'a> CommandGenerator<'a> {
             );
         }
 
-        let sample_buffer = if let Some(upsampler_index) = sink_info.device_state.upsampler_info {
+        let sample_buffer = if let Some(upsampler_index) = sink_info.device_state.upsampler_index()
+        {
             let upsample_meta =
                 if let Some(upsampler_info) = self.upsampler_manager.get_mut(upsampler_index) {
                     upsampler_info.input_count = sink_info.device_parameter.input_count;
@@ -1793,7 +1796,7 @@ mod tests {
             in_use: true,
             node_id: 0x55,
             device_state: crate::renderer::sink::DeviceState {
-                upsampler_info: Some(upsampler_index),
+                upsampler_info: std::num::NonZeroUsize::new(upsampler_index + 1),
                 ..Default::default()
             },
             device_parameter: DeviceInParameter {

@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::audio_core::{AudioRendererSessionHandle, ExecutionMode};
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -32,6 +33,7 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 pub struct IAudioRenderer {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
+    renderer_impl: Arc<dyn AudioRendererSessionHandle>,
     /// The rendered event — signals the game that audio rendering is complete.
     /// Upstream: `Kernel::KEvent* rendered_event` created in constructor via
     /// `service_context.CreateEvent("IAudioRendererEvent")`.
@@ -41,7 +43,7 @@ pub struct IAudioRenderer {
 }
 
 impl IAudioRenderer {
-    pub fn new() -> Self {
+    pub fn new(renderer_impl: Arc<dyn AudioRendererSessionHandle>) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::get_sample_rate_handler), "GetSampleRate"),
             (1, Some(Self::get_sample_count_handler), "GetSampleCount"),
@@ -89,6 +91,7 @@ impl IAudioRenderer {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            renderer_impl,
             rendered_event: Mutex::new(None),
         }
     }
@@ -98,31 +101,31 @@ impl IAudioRenderer {
     }
 
     fn get_sample_rate_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::GetSampleRate");
+        let svc = Self::as_self(_this);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(48000);
+        rb.push_u32(svc.renderer_impl.get_sample_rate());
     }
 
     fn get_sample_count_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::GetSampleCount");
+        let svc = Self::as_self(_this);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(240);
+        rb.push_u32(svc.renderer_impl.get_sample_count());
     }
 
     fn get_mix_buffer_count_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::GetMixBufferCount");
+        let svc = Self::as_self(_this);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0);
+        rb.push_u32(svc.renderer_impl.get_mix_buffer_count());
     }
 
     fn get_state_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::GetState");
+        let svc = Self::as_self(_this);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // 0 = started (upstream: `!impl->GetSystem().IsActive()`)
+        rb.push_u32(svc.renderer_impl.get_state());
     }
 
     /// Port of upstream `IAudioRenderer::RequestUpdate` → delegates to RequestUpdateAuto.
@@ -143,28 +146,51 @@ impl IAudioRenderer {
     /// The rendered event was created as pre-signaled and stays signaled
     /// (KReadableEvent does not auto-clear), so WaitSynchronization always
     /// returns immediately. This prevents the game from blocking on audio.
-    fn request_update_impl(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        for buffer_index in 0..2 {
-            if ctx.can_write_buffer(buffer_index) {
-                let buffer_size = ctx.get_write_buffer_size(buffer_index);
-                if buffer_size > 0 {
-                    let zeroed = vec![0u8; buffer_size];
-                    ctx.write_buffer(&zeroed, buffer_index);
-                }
-            }
+    fn request_update_impl(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let input = if ctx.can_read_buffer(0) {
+            ctx.read_buffer(0)
+        } else {
+            Vec::new()
+        };
+        let mut performance = if ctx.can_write_buffer(1) {
+            vec![0u8; ctx.get_write_buffer_size(1)]
+        } else {
+            Vec::new()
+        };
+        let mut output = if ctx.can_write_buffer(0) {
+            vec![0u8; ctx.get_write_buffer_size(0)]
+        } else {
+            Vec::new()
+        };
+        let result = svc
+            .renderer_impl
+            .request_update(&input, &mut performance, &mut output);
+        log::info!(
+            "IAudioRenderer::RequestUpdate result={:#x} input_len={} output_len={} perf_len={}",
+            result,
+            input.len(),
+            output.len(),
+            performance.len()
+        );
+        if !output.is_empty() {
+            ctx.write_buffer(&output, 0);
+        }
+        if !performance.is_empty() {
+            ctx.write_buffer(&performance, 1);
         }
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(crate::hle::result::ResultCode::new(result));
     }
 
     fn start_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::Start");
+        Self::as_self(_this).renderer_impl.start();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     fn stop_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::Stop");
+        Self::as_self(_this).renderer_impl.stop();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -177,6 +203,14 @@ impl IAudioRenderer {
     fn query_system_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::info!("IAudioRenderer::QuerySystemEvent");
         let svc = Self::as_self(this);
+        if svc.renderer_impl.execution_mode() == ExecutionMode::Manual {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(crate::hle::result::ResultCode::from_module_description(
+                crate::hle::result::ErrorModule::Audio,
+                513,
+            ));
+            return;
+        }
 
         let mut event_guard = svc.rendered_event.lock().unwrap();
 
@@ -198,7 +232,6 @@ impl IAudioRenderer {
             return;
         }
 
-        // Create the event (signaled=true so first WaitSynchronization returns immediately).
         let Some((handle, readable_event)) = ctx.create_readable_event(true) else {
             log::error!("IAudioRenderer::QuerySystemEvent failed to create KReadableEvent");
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -220,29 +253,35 @@ impl IAudioRenderer {
     }
 
     fn set_rendering_time_limit_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::SetRenderingTimeLimit");
+        let limit = crate::hle::service::ipc_helpers::RequestParser::new(ctx).pop_u32();
+        Self::as_self(_this)
+            .renderer_impl
+            .set_rendering_time_limit(limit);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     fn get_rendering_time_limit_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::GetRenderingTimeLimit");
+        let svc = Self::as_self(_this);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(100); // 100% rendering time limit
+        rb.push_u32(svc.renderer_impl.get_rendering_time_limit());
     }
 
     fn set_voice_drop_parameter_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::SetVoiceDropParameter");
+        let value = crate::hle::service::ipc_helpers::RequestParser::new(ctx).pop_f32();
+        Self::as_self(_this)
+            .renderer_impl
+            .set_voice_drop_parameter(value);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     fn get_voice_drop_parameter_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRenderer::GetVoiceDropParameter");
+        let svc = Self::as_self(_this);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_f32(0.0);
+        rb.push_f32(svc.renderer_impl.get_voice_drop_parameter());
     }
 }
 

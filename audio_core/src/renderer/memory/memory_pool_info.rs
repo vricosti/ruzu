@@ -1,12 +1,15 @@
 use crate::common::common::CpuAddr;
+use std::mem::size_of;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum PoolLocation {
     Cpu = 1,
     Dsp = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum MemoryPoolState {
     Invalid,
     Acquired,
@@ -18,6 +21,7 @@ pub enum MemoryPoolState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum MemoryPoolResultState {
     Success,
     BadParam,
@@ -62,6 +66,9 @@ impl Default for MemoryPoolOutStatus {
         }
     }
 }
+
+const _: () = assert!(size_of::<MemoryPoolInParameter>() == 0x20);
+const _: () = assert!(size_of::<MemoryPoolOutStatus>() == 0x10);
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryPoolInfo {

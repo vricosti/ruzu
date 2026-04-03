@@ -13,6 +13,7 @@ use super::common::SystemClockContext;
 use super::errors::{RESULT_CLOCK_UNINITIALIZED, RESULT_PERMISSION_DENIED};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
@@ -47,11 +48,15 @@ pub struct SystemClock {
 impl SystemClock {
     pub fn new(can_write_clock: bool, can_write_uninitialized_clock: bool) -> Self {
         let handlers = build_handler_map(&[
-            (commands::GET_CURRENT_TIME, None, "GetCurrentTime"),
+            (
+                commands::GET_CURRENT_TIME,
+                Some(SystemClock::get_current_time_handler),
+                "GetCurrentTime",
+            ),
             (commands::SET_CURRENT_TIME, None, "SetCurrentTime"),
             (
                 commands::GET_SYSTEM_CLOCK_CONTEXT,
-                None,
+                Some(SystemClock::get_system_clock_context_handler),
                 "GetSystemClockContext",
             ),
             (
@@ -75,6 +80,10 @@ impl SystemClock {
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const SystemClock) }
     }
 
     /// Mark this clock as initialized.
@@ -164,6 +173,44 @@ impl SystemClock {
             .get_or_insert_with(|| Arc::new(Event::new()));
         Arc::clone(event)
     }
+
+    fn get_current_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        match service.get_current_time() {
+            Ok(time) => {
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i64(time);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn get_system_clock_context_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        match service.get_system_clock_context() {
+            Ok(context) => {
+                let mut rb = ResponseBuilder::new(
+                    ctx,
+                    2 + (core::mem::size_of::<SystemClockContext>() / 4) as u32,
+                    0,
+                    0,
+                );
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_raw(&context);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
 }
 
 impl SessionRequestHandler for SystemClock {
@@ -187,5 +234,29 @@ impl ServiceFramework for SystemClock {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exercised_handlers_are_registered() {
+        let service = SystemClock::new(false, false);
+        assert!(
+            service
+                .handlers()
+                .get(&commands::GET_CURRENT_TIME)
+                .and_then(|info| info.handler_callback)
+                .is_some()
+        );
+        assert!(
+            service
+                .handlers()
+                .get(&commands::GET_SYSTEM_CLOCK_CONTEXT)
+                .and_then(|info| info.handler_callback)
+                .is_some()
+        );
     }
 }

@@ -29,7 +29,7 @@ impl Renderer {
         &mut self,
         params: &AudioRendererParameterInternal,
         transfer_memory_size: u64,
-        process_handle_present: bool,
+        process_handle: *mut KProcess,
         applet_resource_user_id: u64,
         session_id: i32,
     ) -> Result {
@@ -43,7 +43,7 @@ impl Renderer {
         let result = self.system.lock().initialize(
             params,
             transfer_memory_size,
-            process_handle_present,
+            process_handle,
             applet_resource_user_id,
             session_id,
         );
@@ -175,7 +175,7 @@ mod tests {
         let mut renderer = Renderer::new(manager.clone(), system);
         let params = make_params();
 
-        let result = renderer.initialize(&params, 0, true, 1, 0);
+        let result = renderer.initialize(&params, 0, std::ptr::dangling_mut(), 1, 0);
 
         assert!(result.is_error());
         assert!(!renderer.is_initialized());
@@ -199,7 +199,7 @@ mod tests {
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            renderer.initialize(&params, transfer_size, true, 1, 0),
+            renderer.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
         renderer.start();

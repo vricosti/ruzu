@@ -2,10 +2,12 @@ use crate::common::common::{CpuAddr, SampleFormat, MAX_CHANNELS};
 use crate::renderer::behavior::behavior_info::ErrorInfo;
 use crate::renderer::memory::{AddressInfo, PoolMapper};
 use crate::renderer::upsampler::UpsamplerManager;
-use common::fixed_point::FixedPoint;
 use common::ResultCode;
+use std::mem::size_of;
+use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SinkType {
     Invalid,
     DeviceSink,
@@ -19,6 +21,7 @@ impl Default for SinkType {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct DeviceInParameter {
     pub name: [u8; 0x100],
     pub input_count: u32,
@@ -42,9 +45,12 @@ impl Default for DeviceInParameter {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct DeviceState {
-    pub upsampler_info: Option<usize>,
-    pub downmix_coeff: [FixedPoint<16, 16>; 4],
+    // Rust adaptation: upstream stores an UpsamplerInfo* here.
+    // We store a compact optional slot index (+1) so the field stays pointer-sized.
+    pub upsampler_info: Option<NonZeroUsize>,
+    pub downmix_coeff: [i32; 4],
     pub unk18: [u8; 0x18],
 }
 
@@ -52,13 +58,28 @@ impl Default for DeviceState {
     fn default() -> Self {
         Self {
             upsampler_info: None,
-            downmix_coeff: [FixedPoint::from_base(0); 4],
+            downmix_coeff: [0; 4],
             unk18: [0; 0x18],
         }
     }
 }
 
+impl DeviceState {
+    pub fn upsampler_index(&self) -> Option<usize> {
+        self.upsampler_info.map(|index| index.get() - 1)
+    }
+
+    pub fn set_upsampler_index(&mut self, index: usize) {
+        self.upsampler_info = NonZeroUsize::new(index + 1);
+    }
+
+    pub fn clear_upsampler_index(&mut self) {
+        self.upsampler_info = None;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct CircularBufferInParameter {
     pub cpu_address: u64,
     pub size: u32,
@@ -88,6 +109,7 @@ impl Default for CircularBufferInParameter {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
 pub struct CircularBufferState {
     pub last_pos2: u32,
     pub current_pos: i32,
@@ -96,21 +118,45 @@ pub struct CircularBufferState {
     pub address_info: AddressInfo,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SinkInParameter {
-    pub sink_type: SinkType,
-    pub in_use: bool,
-    pub node_id: u32,
-    pub unk08: [u8; 0x18],
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub union SinkSpecificInParameter {
     pub device: DeviceInParameter,
     pub circular_buffer: CircularBufferInParameter,
 }
 
+impl Default for SinkSpecificInParameter {
+    fn default() -> Self {
+        Self {
+            device: DeviceInParameter::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct SinkInParameter {
+    pub sink_type: SinkType,
+    pub in_use: bool,
+    pub _padding: [u8; 2],
+    pub node_id: u32,
+    pub unk08: [u8; 0x18],
+    pub specific: SinkSpecificInParameter,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
 pub struct SinkOutStatus {
     pub write_offset: u32,
     pub unk04: [u8; 0x1C],
 }
+
+const _: () = assert!(size_of::<DeviceInParameter>() == 0x11c);
+const _: () = assert!(size_of::<DeviceState>() == 0x30);
+const _: () = assert!(size_of::<CircularBufferInParameter>() == 0x28);
+const _: () = assert!(size_of::<CircularBufferState>() == 0x30);
+const _: () = assert!(size_of::<SinkInParameter>() == 0x140);
+const _: () = assert!(size_of::<SinkOutStatus>() == 0x20);
 
 #[derive(Debug, Clone, Default)]
 pub struct SinkInfoBase {
@@ -134,7 +180,8 @@ impl SinkInfoBase {
     }
 
     pub fn clean_up_with_upsampler(&mut self, upsampler_manager: &mut UpsamplerManager) {
-        if let Some(index) = self.device_state.upsampler_info.take() {
+        if let Some(index) = self.device_state.upsampler_index() {
+            self.device_state.clear_upsampler_index();
             upsampler_manager.free(index);
         }
         self.clean_up();
@@ -166,7 +213,7 @@ impl SinkInfoBase {
                 error_info.address = CpuAddr::default();
             }
             SinkType::DeviceSink => {
-                let device_params = in_params.device;
+                let device_params = unsafe { in_params.specific.device };
                 if self.in_use == in_params.in_use {
                     self.device_parameter.downmix_enabled = device_params.downmix_enabled;
                     self.device_parameter.downmix_coeff = device_params.downmix_coeff;
@@ -182,7 +229,7 @@ impl SinkInfoBase {
                     .iter_mut()
                     .zip(self.device_parameter.downmix_coeff)
                 {
-                    *dst = FixedPoint::from_f32(src);
+                    *dst = (src * 65536.0) as i32;
                 }
                 self.buffer_unmapped = false;
                 *out_status = SinkOutStatus::default();
@@ -190,7 +237,7 @@ impl SinkInfoBase {
                 error_info.address = CpuAddr::default();
             }
             SinkType::CircularBufferSink => {
-                let buffer_params = in_params.circular_buffer;
+                let buffer_params = unsafe { in_params.specific.circular_buffer };
                 if self.in_use == buffer_params.in_use && !self.buffer_unmapped {
                     error_info.error_code = ResultCode::SUCCESS;
                     error_info.address = CpuAddr::default();

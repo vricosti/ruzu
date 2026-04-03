@@ -117,7 +117,7 @@ impl PerformanceManager {
         let history_frames = frame_count.saturating_sub(1) as usize;
         self.current_frame = vec![0; self.frame_size as usize];
         self.current_frame_pool = MemoryPoolInfo::new(PoolLocation::Dsp);
-        let pool_mapper = PoolMapper::new(None, false);
+        let pool_mapper = PoolMapper::new(std::ptr::null_mut(), false);
         let _ = pool_mapper.initialize_system_pool(
             &mut self.current_frame_pool,
             &self.current_frame,

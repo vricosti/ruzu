@@ -18,7 +18,7 @@ impl CircularBufferSinkInfo {
     }
 
     pub fn clean_up(&mut self) {
-        self.base.device_state.upsampler_info = None;
+        self.base.device_state.clear_upsampler_index();
         self.base.circular_parameter = Default::default();
         self.base.sink_type = SinkType::Invalid;
     }
@@ -30,7 +30,7 @@ impl CircularBufferSinkInfo {
         in_params: &SinkInParameter,
         pool_mapper: &PoolMapper<'_>,
     ) {
-        let buffer_params = in_params.circular_buffer;
+        let buffer_params = unsafe { in_params.specific.circular_buffer };
 
         if self.base.in_use == buffer_params.in_use && !self.base.buffer_unmapped {
             error_info.error_code = ResultCode::SUCCESS;

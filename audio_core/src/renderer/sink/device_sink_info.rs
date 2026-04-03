@@ -2,7 +2,6 @@ use crate::common::common::CpuAddr;
 use crate::renderer::behavior::behavior_info::ErrorInfo;
 use crate::renderer::memory::PoolMapper;
 use crate::renderer::sink::{SinkInParameter, SinkInfoBase, SinkOutStatus, SinkType};
-use common::fixed_point::FixedPoint;
 use common::ResultCode;
 
 #[derive(Debug, Clone, Default)]
@@ -21,7 +20,7 @@ impl DeviceSinkInfo {
     }
 
     pub fn clean_up(&mut self) {
-        self.base.device_state.upsampler_info = None;
+        self.base.device_state.clear_upsampler_index();
         self.base.device_parameter = Default::default();
         self.base.sink_type = SinkType::Invalid;
     }
@@ -33,7 +32,7 @@ impl DeviceSinkInfo {
         in_params: &SinkInParameter,
         _pool_mapper: &PoolMapper<'_>,
     ) {
-        let device_params = in_params.device;
+        let device_params = unsafe { in_params.specific.device };
         if self.base.in_use == in_params.in_use {
             self.base.device_parameter.downmix_enabled = device_params.downmix_enabled;
             self.base.device_parameter.downmix_coeff = device_params.downmix_coeff;
@@ -51,7 +50,7 @@ impl DeviceSinkInfo {
             .iter_mut()
             .zip(self.base.device_parameter.downmix_coeff)
         {
-            *dst = FixedPoint::from_f32(src);
+            *dst = (src * 65536.0) as i32;
         }
 
         *out_status = SinkOutStatus::default();

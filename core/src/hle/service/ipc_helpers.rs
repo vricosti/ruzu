@@ -506,6 +506,19 @@ impl<'a> RequestParser<'a> {
             self.index += 4 - (self.index & 3);
         }
     }
+
+    /// Align the current position forward to the natural alignment of `T`.
+    ///
+    /// Matches the raw-data layout rules used by upstream CMIF serialization.
+    pub fn align_for<T>(&mut self) {
+        let align = core::mem::align_of::<T>();
+        if align <= 1 {
+            return;
+        }
+        let byte_index = self.index * core::mem::size_of::<u32>();
+        let aligned = (byte_index + (align - 1)) & !(align - 1);
+        self.index = aligned / core::mem::size_of::<u32>();
+    }
 }
 
 /// Assign bits into a u32 value at position with given width.
@@ -608,5 +621,14 @@ mod tests {
             .handle_table
             .get_object(handle)
             .is_some());
+    }
+
+    #[test]
+    fn request_parser_align_for_u64_advances_after_0x34_bytes() {
+        let ctx = HLERequestContext::new();
+        let mut parser = RequestParser::from_buffer(&ctx);
+        parser.set_current_offset(0x34 / 4);
+        parser.align_for::<u64>();
+        assert_eq!(parser.get_current_offset(), 0x38 / 4);
     }
 }

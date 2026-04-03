@@ -21,7 +21,7 @@ impl UpsamplerManager {
             infos_pool: MemoryPoolInfo::new(PoolLocation::Dsp),
             workbuffer_pool: MemoryPoolInfo::new(PoolLocation::Dsp),
         };
-        let pool_mapper = PoolMapper::new(None, false);
+        let pool_mapper = PoolMapper::new(std::ptr::null_mut(), false);
         let infos_bytes = typed_slice_as_bytes(&manager.upsampler_infos);
         let _ = pool_mapper.initialize_system_pool(
             &mut manager.infos_pool,

@@ -30,7 +30,6 @@ use crate::memory::memory::Memory;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 
 use parking_lot::Mutex;
-use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -167,7 +166,7 @@ pub struct System {
     /// Upstream: `std::unique_ptr<AudioCore::AudioCore> audio_core`.
     /// Type-erased because audio_core crate depends on core (circular dep).
     /// The frontend creates the concrete AudioCore and sets it via set_audio_core().
-    audio_core: Option<Box<dyn Any + Send>>,
+    audio_core: Option<Box<dyn crate::audio_core::AudioCoreInterface>>,
 
     /// Device memory (emulated Switch DRAM).
     device_memory: Option<Box<DeviceMemory>>,
@@ -1002,19 +1001,19 @@ impl System {
     /// Called by the frontend after System::load() since audio_core crate depends
     /// on core (circular dependency prevents core from creating AudioCore directly).
     /// Upstream: created inside SetupForApplicationProcess() (core.cpp:283).
-    pub fn set_audio_core(&mut self, audio_core: Box<dyn Any + Send>) {
+    pub fn set_audio_core(&mut self, audio_core: Box<dyn crate::audio_core::AudioCoreInterface>) {
         self.audio_core = Some(audio_core);
     }
 
     /// Get the AudioCore subsystem (type-erased).
     /// Callers must downcast to the concrete AudioCore type.
     /// Upstream: `System::AudioCore()` returns `AudioCore::AudioCore&`.
-    pub fn audio_core(&self) -> Option<&(dyn Any + Send)> {
+    pub fn audio_core(&self) -> Option<&dyn crate::audio_core::AudioCoreInterface> {
         self.audio_core.as_deref()
     }
 
     /// Get the AudioCore subsystem mutably (type-erased).
-    pub fn audio_core_mut(&mut self) -> Option<&mut (dyn Any + Send)> {
+    pub fn audio_core_mut(&mut self) -> Option<&mut dyn crate::audio_core::AudioCoreInterface> {
         self.audio_core.as_deref_mut()
     }
 
