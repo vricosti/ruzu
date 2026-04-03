@@ -197,6 +197,9 @@ pub struct KScheduler {
     pub switch_cur_thread: Option<Weak<Mutex<KThread>>>,
     pub switch_highest_priority_thread: Option<Weak<Mutex<KThread>>>,
     pub switch_from_schedule: bool,
+    /// Host fiber context for this core's idle/host thread.
+    /// Used to yield from idle to switch_fiber when cur_thread is None.
+    pub host_context: Option<Arc<Fiber>>,
 }
 
 impl KScheduler {
@@ -282,6 +285,7 @@ impl KScheduler {
             switch_cur_thread: None,
             switch_highest_priority_thread: None,
             switch_from_schedule: false,
+            host_context: None,
         }
     }
 
@@ -820,8 +824,15 @@ impl KScheduler {
         let mut migrations: Vec<(u64, i32)> = Vec::new();
 
         // Select top thread per core from PQ.
+        let pq_size = 0; // placeholder
         for core_id in 0..NUM_CPU_CORES as usize {
             let top_thread_id = gsc.m_priority_queue.get_scheduled_front(core_id as i32);
+            if core_id <= 1 || top_thread_id.is_some() {
+                log::debug!(
+                    "UpdateHighestImpl: core={} top_thread={:?} pq_size={}",
+                    core_id, top_thread_id, pq_size
+                );
+            }
             // Upstream: check pinned thread for the process.
             // If the top thread's process has a pinned thread for this core,
             // and it's different from the top thread, prefer the pinned one
@@ -1462,6 +1473,19 @@ impl KScheduler {
                     let host_weak = Arc::downgrade(host_ctx);
                     drop(cur_lock); // release thread lock before yield
                     Fiber::yield_to(host_weak, switch_fiber);
+                }
+            }
+        } else if target.is_some() {
+            // No current thread (idle/dummy context) but we have a target —
+            // yield from the host context to the switch fiber.
+            // This happens when the idle loop needs to switch to a real thread.
+            if let Some(ref switch_fiber) = self.switch_fiber {
+                if let Some(ref host_ctx) = self.host_context {
+                    log::info!(
+                        "schedule_impl_fiber: core={} idle->thread yield (target={:?})",
+                        self.core_id, target_id
+                    );
+                    Fiber::yield_to(Arc::downgrade(host_ctx), switch_fiber);
                 }
             }
         }

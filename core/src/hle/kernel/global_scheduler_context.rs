@@ -115,6 +115,10 @@ impl GlobalSchedulerContext {
             }
         } else if new_state == ThreadState::RUNNABLE {
             // Was not runnable, now is — add to PQ.
+            log::info!(
+                "GSC: thread {} INITIALIZED->RUNNABLE active_core={} prio={} affinity=0x{:X} is_dummy={}",
+                thread_id, active_core, priority, affinity, is_dummy
+            );
             self.m_priority_queue.push_back(
                 thread_id,
                 priority,
@@ -137,9 +141,18 @@ impl GlobalSchedulerContext {
             if active_core >= 0 {
                 if let Some(kernel) = super::kernel::get_kernel_ref() {
                     if let Some(core) = kernel.physical_core(active_core as usize) {
+                        log::debug!(
+                            "GSC::on_thread_state_changed: waking core {} for tid={} prio={}",
+                            active_core, thread_id, priority
+                        );
                         core.interrupt();
                     }
                 }
+            } else {
+                log::debug!(
+                    "GSC::on_thread_state_changed: tid={} active_core={} (no interrupt), affinity=0x{:X}",
+                    thread_id, active_core, affinity
+                );
             }
         }
 

@@ -624,7 +624,23 @@ impl CpuManager {
             }
             drop(t);
             if let Some(scheduler_arc) = kernel.current_scheduler() {
-                scheduler_arc.lock().unwrap().on_thread_start(&thread_arc);
+                let mut sched = scheduler_arc.lock().unwrap();
+                sched.on_thread_start(&thread_arc);
+                // Store the host fiber context so schedule_impl_fiber can yield
+                // from idle to a real thread.
+                let core_index = kernel.current_physical_core_index();
+                if sched.host_context.is_none() {
+                    let sys_ref = kernel.system();
+                    if !sys_ref.is_null() {
+                        let system = sys_ref.get();
+                        if let Some(host_ctx) = system.get_cpu_manager().core_host_context(core_index as usize) {
+                            log::info!("multi_core_run_idle_thread: core={} stored host_context in scheduler", core_index);
+                            sched.host_context = Some(host_ctx);
+                        } else {
+                            log::warn!("multi_core_run_idle_thread: core={} host_context NOT available yet", core_index);
+                        }
+                    }
+                }
             }
         }
 
