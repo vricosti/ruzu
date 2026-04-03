@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::core::SystemRef;
 use crate::core_timing;
+use crate::hle::service::nvnflinger::surface_flinger::SurfaceFlinger;
 use crate::hle::service::os::event::Event;
 
 use super::vsync_manager::VsyncManager;
@@ -31,11 +32,16 @@ pub struct Conductor {
     swap_interval: i32,
     compose_speed_scale: f32,
     system: SystemRef,
+    /// Surface flinger reference for composition.
+    /// Upstream: Conductor holds Container& and calls Container::ComposeOnDisplay
+    /// which delegates to SurfaceFlinger::ComposeDisplay. We skip the Container
+    /// indirection to avoid circular references.
+    surface_flinger: Arc<SurfaceFlinger>,
     event: Option<Arc<parking_lot::Mutex<core_timing::EventType>>>,
 }
 
 impl Conductor {
-    pub fn new(system: SystemRef, display_ids: &[u64]) -> Self {
+    pub fn new(system: SystemRef, display_ids: &[u64], surface_flinger: Arc<SurfaceFlinger>) -> Self {
         let mut vsync_managers = HashMap::new();
         for &id in display_ids {
             vsync_managers.insert(id, VsyncManager::new());
@@ -46,6 +52,7 @@ impl Conductor {
             swap_interval: 1,
             compose_speed_scale: 1.0,
             system,
+            surface_flinger,
             event: None,
         }
     }
@@ -93,22 +100,16 @@ impl Conductor {
         }
     }
 
-    /// Process a vsync tick: signal vsync events for each display.
+    /// Process a vsync tick: compose each display, then signal vsync events.
     /// Port of upstream `Conductor::ProcessVsync`.
     fn process_vsync(&mut self) {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static VSYNC_COUNT: AtomicU32 = AtomicU32::new(0);
-        let c = VSYNC_COUNT.fetch_add(1, Ordering::Relaxed);
-        let total_events: usize = self.vsync_managers.values().map(|m| m.event_count()).sum();
-        if c < 5 || c % 300 == 0 {
-            log::info!(
-                "Conductor::process_vsync #{} managers={} total_events={}",
-                c,
-                self.vsync_managers.len(),
-                total_events
+        for (&display_id, manager) in self.vsync_managers.iter() {
+            // Upstream: m_container.ComposeOnDisplay(&m_swap_interval, &m_compose_speed_scale, display_id);
+            self.surface_flinger.compose_display(
+                &mut self.swap_interval,
+                &mut self.compose_speed_scale,
+                display_id,
             );
-        }
-        for (_display_id, manager) in self.vsync_managers.iter() {
             manager.signal_vsync();
         }
     }
