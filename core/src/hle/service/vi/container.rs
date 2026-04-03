@@ -89,7 +89,7 @@ impl Container {
             surface_flinger.add_display(id);
         }
 
-        let conductor = Arc::new(Mutex::new(Conductor::new(system, &display_ids)));
+        let conductor = Arc::new(Mutex::new(Conductor::new(system, &display_ids, Arc::clone(&surface_flinger))));
         Conductor::start(&conductor);
 
         Self {
