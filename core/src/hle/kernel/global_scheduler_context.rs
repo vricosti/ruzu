@@ -115,10 +115,6 @@ impl GlobalSchedulerContext {
             }
         } else if new_state == ThreadState::RUNNABLE {
             // Was not runnable, now is — add to PQ.
-            log::info!(
-                "GSC: thread {} INITIALIZED->RUNNABLE active_core={} prio={} affinity=0x{:X} is_dummy={}",
-                thread_id, active_core, priority, affinity, is_dummy
-            );
             self.m_priority_queue.push_back(
                 thread_id,
                 priority,
@@ -140,19 +136,22 @@ impl GlobalSchedulerContext {
             // on cores whose highest priority changed.
             if active_core >= 0 {
                 if let Some(kernel) = super::kernel::get_kernel_ref() {
+                    // Set needs_scheduling directly on the target core's scheduler.
+                    // This ensures the core will call schedule_impl_fiber even if
+                    // update_highest_priority_threads_impl was already consumed by
+                    // another core.
+                    if let Some(sched_arc) = kernel.scheduler(active_core as usize) {
+                        sched_arc
+                            .lock()
+                            .unwrap()
+                            .state
+                            .needs_scheduling
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(core) = kernel.physical_core(active_core as usize) {
-                        log::debug!(
-                            "GSC::on_thread_state_changed: waking core {} for tid={} prio={}",
-                            active_core, thread_id, priority
-                        );
                         core.interrupt();
                     }
                 }
-            } else {
-                log::debug!(
-                    "GSC::on_thread_state_changed: tid={} active_core={} (no interrupt), affinity=0x{:X}",
-                    thread_id, active_core, affinity
-                );
             }
         }
 
@@ -230,6 +229,15 @@ impl GlobalSchedulerContext {
         );
         self.m_scheduler_update_needed
             .store(true, std::sync::atomic::Ordering::Release);
+
+        // Wake the target core so it picks up the new thread.
+        if !is_dummy && active_core >= 0 {
+            if let Some(kernel) = super::kernel::get_kernel_ref() {
+                if let Some(core) = kernel.physical_core(active_core as usize) {
+                    core.interrupt();
+                }
+            }
+        }
     }
 
     pub fn remove_from_priority_queue(

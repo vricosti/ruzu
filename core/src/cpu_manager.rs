@@ -575,29 +575,13 @@ impl CpuManager {
                 crate::hle::kernel::physical_core::PhysicalCoreExecutionEvent::Halted(
                     halt_reason,
                 ) => {
-                    let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
-                    let interrupt = halt_reason.contains(HaltReason::BREAK_LOOP);
-                    let data_abort = halt_reason.contains(HaltReason::DATA_ABORT);
-                    let prefetch_abort = halt_reason.contains(HaltReason::PREFETCH_ABORT);
-                    let breakpoint = halt_reason.contains(HaltReason::INSTRUCTION_BREAKPOINT);
-                    if current_thread_id == 17
-                        && TID17_HALT_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) < 500
-                    {
-                        let mut tc = crate::arm::arm_interface::ThreadContext::default();
-                        jit_ref.get_context(&mut tc);
-                        log::trace!(
-                            "multi_core_run_guest_thread: tid=17 core={} halted={:?} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} r4=0x{:X} r7=0x{:X} r0=0x{:X} r1=0x{:X}",
-                            core_index,
-                            halt_reason,
-                            tc.pc,
-                            tc.lr,
-                            tc.sp,
-                            tc.r[4],
-                            tc.r[7],
-                            tc.r[0],
-                            tc.r[1],
-                        );
-                    }
+                    // Upstream: when the JIT halts (BREAK_LOOP = interrupt, or
+                    // other halt reasons), return to the caller's while loop
+                    // which will check is_interrupted() and reschedule.
+                    // For BREAK_LOOP specifically, the interrupt flag on the
+                    // physical core was already set, so the while loop will exit
+                    // and handle_interrupt + reschedule will run.
+                    return;
                 }
             }
         }
@@ -634,10 +618,7 @@ impl CpuManager {
                     if !sys_ref.is_null() {
                         let system = sys_ref.get();
                         if let Some(host_ctx) = system.get_cpu_manager().core_host_context(core_index as usize) {
-                            log::info!("multi_core_run_idle_thread: core={} stored host_context in scheduler", core_index);
                             sched.host_context = Some(host_ctx);
-                        } else {
-                            log::warn!("multi_core_run_idle_thread: core={} host_context NOT available yet", core_index);
                         }
                     }
                 }
@@ -653,9 +634,6 @@ impl CpuManager {
 
             Self::handle_interrupt(kernel);
             Self::shutdown_if_requested(kernel);
-            // Upstream: RequestScheduleOnInterrupt → ScheduleOnInterrupt → Schedule →
-            // ScheduleImpl (fiber yield).  We do the fiber switch here, outside of any
-            // Mutex lock, to avoid the scheduler Mutex being held across the yield.
             Self::reschedule_current_core_raw(kernel);
         }
     }

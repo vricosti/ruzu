@@ -534,8 +534,9 @@ impl PhysicalCore {
         // Interrupt ourselves (wake from idle).
         self.m_on_interrupt.notify_one();
 
-        // If there is no thread running, we are done.
+        // If there is no thread running, we are done (idle wake only).
         let (Some(arm_ptr), Some(thread_ptr)) = (arm_interface, current_thread) else {
+            log::trace!("PhysicalCore::interrupt: no running thread (idle wake)");
             return;
         };
 

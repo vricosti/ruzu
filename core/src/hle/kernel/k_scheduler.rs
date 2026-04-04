@@ -415,19 +415,31 @@ impl KScheduler {
     ///
     /// # Safety
     /// Same requirements as `activate_and_schedule_raw`.
+    /// Port of upstream `ScheduleOnInterrupt`.
+    ///
+    /// Upstream flow:
+    /// 1. The SVC/operation that changed thread state used `KScopedSchedulerLock`
+    /// 2. When that lock was released, `UpdateHighestPriorityThreads` ran and
+    ///    set `highest_priority_thread_id` + `needs_scheduling` for affected cores
+    /// 3. `EnableScheduling` interrupted other cores
+    /// 4. Each interrupted core calls `ScheduleOnInterrupt` which just does:
+    ///    `DisableDispatch(); ScheduleImpl(); EnableDispatch();`
+    ///
+    /// Our implementation mirrors this: we trust that `highest_priority_thread_id`
+    /// and `needs_scheduling` were already set correctly by the scheduler lock's
+    /// unlock callback. We just need to call `schedule_impl_fiber` if needed.
     pub unsafe fn schedule_raw_if_needed(sched: *mut KScheduler) {
-        // Trigger UpdateHighestPriorityThreads to sync PQ → highest_priority_thread_id.
-        // Upstream: this happens in KScopedSchedulerLock::Unlock() before ScheduleImpl.
-        // We call it here because our dispatch loop doesn't use KScopedSchedulerLock.
+        // Read the PQ directly for our core and update highest atomically.
+        // This avoids the race where update_highest_priority_threads_impl
+        // on another core overwrites our highest between the update and
+        // schedule_impl_fiber.
         if let Some(gsc_arc) = &(*sched).global_scheduler_context {
-            // Get callback fn pointer while holding GSC lock, then release
-            // GSC before calling (the callback re-locks GSC internally).
-            let update_fn = {
-                let gsc = gsc_arc.lock().unwrap();
-                gsc.scheduler_lock().get_update_callback()
-            };
-            if let Some(f) = update_fn {
-                f();
+            let gsc = gsc_arc.lock().unwrap();
+            let pq_top = gsc.m_priority_queue.get_scheduled_front((*sched).core_id);
+            let prev = (*sched).state.highest_priority_thread_id;
+            if pq_top != prev {
+                (*sched).state.highest_priority_thread_id = pq_top;
+                (*sched).state.needs_scheduling.store(true, Ordering::Relaxed);
             }
         }
 
@@ -824,15 +836,8 @@ impl KScheduler {
         let mut migrations: Vec<(u64, i32)> = Vec::new();
 
         // Select top thread per core from PQ.
-        let pq_size = 0; // placeholder
         for core_id in 0..NUM_CPU_CORES as usize {
             let top_thread_id = gsc.m_priority_queue.get_scheduled_front(core_id as i32);
-            if core_id <= 1 || top_thread_id.is_some() {
-                log::debug!(
-                    "UpdateHighestImpl: core={} top_thread={:?} pq_size={}",
-                    core_id, top_thread_id, pq_size
-                );
-            }
             // Upstream: check pinned thread for the process.
             // If the top thread's process has a pinned thread for this core,
             // and it's different from the top thread, prefer the pinned one
@@ -1430,6 +1435,9 @@ impl KScheduler {
         std::sync::atomic::fence(Ordering::SeqCst);
 
         let cur_thread = self.current_thread.as_ref().and_then(Weak::upgrade);
+        // Use the cached highest set by update_highest_priority_threads_impl.
+        // Don't re-read from PQ — the PQ may have changed between the update
+        // and this read due to concurrent operations on other cores.
         let highest = self.state.highest_priority_thread_id;
 
         let target = if self.state.interrupt_task_runnable {
@@ -1441,14 +1449,10 @@ impl KScheduler {
             })
         };
         let target_id = target.as_ref().map(|thread| thread.lock().unwrap().get_thread_id());
-        if self.core_id == 0 || self.core_id == 1 {
+        if self.core_id <= 2 {
             log::trace!(
-                "schedule_impl_fiber: core={} cur={:?} highest={:?} target={:?} interrupted={}",
-                self.core_id,
-                self.current_thread_id,
-                highest,
-                target_id,
-                self.state.interrupt_task_runnable
+                "schedule_impl_fiber: core={} cur={:?} highest={:?} target={:?}",
+                self.core_id, self.current_thread_id, highest, target_id
             );
         }
 
@@ -1466,27 +1470,17 @@ impl KScheduler {
         self.switch_from_schedule = true;
 
         // Upstream: Common::Fiber::YieldTo(cur_thread->m_host_context, *m_switch_fiber)
-        if let Some(ref cur) = cur_thread {
-            let cur_lock = cur.lock().unwrap();
-            if let Some(ref host_ctx) = cur_lock.host_context {
-                if let Some(ref switch_fiber) = self.switch_fiber {
-                    let host_weak = Arc::downgrade(host_ctx);
-                    drop(cur_lock); // release thread lock before yield
-                    Fiber::yield_to(host_weak, switch_fiber);
-                }
-            }
-        } else if target.is_some() {
-            // No current thread (idle/dummy context) but we have a target —
-            // yield from the host context to the switch fiber.
-            // This happens when the idle loop needs to switch to a real thread.
-            if let Some(ref switch_fiber) = self.switch_fiber {
-                if let Some(ref host_ctx) = self.host_context {
-                    log::info!(
-                        "schedule_impl_fiber: core={} idle->thread yield (target={:?})",
-                        self.core_id, target_id
-                    );
-                    Fiber::yield_to(Arc::downgrade(host_ctx), switch_fiber);
-                }
+        // Get the fiber to yield FROM: prefer cur_thread.host_context, fall back to
+        // self.host_context (the core's host fiber, used when the current thread is
+        // a dummy/idle thread without its own fiber context).
+        let yield_from: Option<Arc<Fiber>> = cur_thread
+            .as_ref()
+            .and_then(|t| t.lock().unwrap().host_context.clone())
+            .or_else(|| self.host_context.clone());
+
+        if let (Some(ref from_ctx), Some(ref switch_fiber)) = (&yield_from, &self.switch_fiber) {
+            if target.is_some() {
+                Fiber::yield_to(Arc::downgrade(from_ctx), switch_fiber);
             }
         }
     }

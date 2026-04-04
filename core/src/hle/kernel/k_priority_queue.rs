@@ -68,6 +68,10 @@ impl BitSet64 {
         }
     }
 
+    pub const fn raw(&self) -> u64 {
+        self.bits
+    }
+
     /// Returns the next set bit after `bit`, or 64 if none.
     pub const fn get_next_set(&self, bit: i32) -> u32 {
         // Mask out bit `bit` and all higher-priority (lower-numbered) bits.
@@ -543,6 +547,15 @@ impl KPriorityQueue {
         if active_core >= 0 {
             scheduled_queue.push_back(priority, active_core, member_id, entries);
             clear_affinity_bit(&mut affinity, active_core);
+
+            // Sanity check: the thread must be retrievable after push.
+            let front = scheduled_queue.get_front_at_priority(priority, active_core);
+            if front.is_none() {
+                log::error!(
+                    "PQ BUG: push_back_impl tid={} prio={} core={} — get_front returns None after push!",
+                    member_id, priority, active_core
+                );
+            }
         }
 
         while affinity != 0 {
@@ -685,8 +698,6 @@ impl KPriorityQueue {
             return;
         }
         self.remove_impl(priority, member_id, active_core, affinity);
-        // Keep entries around (they'll be reused on next push).
-        // Remove props since thread is no longer in PQ.
         self.thread_props.remove(&member_id);
     }
 
@@ -982,5 +993,41 @@ mod tests {
             assert!(pq.get_scheduled_front(core).is_none());
             assert!(pq.get_suggested_front(core).is_none());
         }
+    }
+
+    #[test]
+    fn test_priority_ordering_core1() {
+        let mut pq = KPriorityQueue::new();
+        pq.push_back(35, 43, 1, 0x2, false, None);
+        pq.push_back(42, 31, 1, 0x2, false, None);
+        assert_eq!(pq.get_scheduled_front(1), Some(42),
+            "tid=42 (prio=31) should be front over tid=35 (prio=43)");
+    }
+
+    #[test]
+    fn test_push_remove_push_preserves_higher_prio() {
+        let mut pq = KPriorityQueue::new();
+        // Simulate: tid=35 pushed, then removed (SleepThread), then re-pushed (wakeup)
+        pq.push_back(35, 43, 1, 0x2, false, None);
+        pq.remove(35, 43, 1, 0x2, false);
+        pq.push_back(35, 43, 1, 0x2, false, None);
+        // Then tid=42 pushed
+        pq.push_back(42, 31, 1, 0x2, false, None);
+        assert_eq!(pq.get_scheduled_front(1), Some(42),
+            "After cycles, tid=42 should still be front");
+    }
+
+    #[test]
+    fn test_many_push_remove_cycles() {
+        let mut pq = KPriorityQueue::new();
+        // Simulate many SleepThread/wakeup cycles for tid=35
+        for _ in 0..100 {
+            pq.push_back(35, 43, 1, 0x2, false, None);
+            pq.remove(35, 43, 1, 0x2, false);
+        }
+        pq.push_back(35, 43, 1, 0x2, false, None);
+        pq.push_back(42, 31, 1, 0x2, false, None);
+        assert_eq!(pq.get_scheduled_front(1), Some(42),
+            "After many cycles, PQ should still work");
     }
 }
