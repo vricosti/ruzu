@@ -48,6 +48,22 @@ pub struct SystemClock {
 
 impl SystemClock {
     pub fn new(can_write_clock: bool, can_write_uninitialized_clock: bool) -> Self {
+        Self::with_state(
+            can_write_clock,
+            can_write_uninitialized_clock,
+            false,
+            SystemClockContext::default(),
+            0,
+        )
+    }
+
+    pub fn with_state(
+        can_write_clock: bool,
+        can_write_uninitialized_clock: bool,
+        initialized: bool,
+        context: SystemClockContext,
+        current_time: i64,
+    ) -> Self {
         let handlers = build_handler_map(&[
             (
                 commands::GET_CURRENT_TIME,
@@ -79,9 +95,9 @@ impl SystemClock {
             can_write_clock,
             can_write_uninitialized_clock,
             state: Mutex::new(SystemClockState {
-                initialized: false,
-                context: SystemClockContext::default(),
-                current_time: 0,
+                initialized,
+                context,
+                current_time,
                 operation_event: None,
             }),
             handlers,

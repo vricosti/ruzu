@@ -982,10 +982,12 @@ impl HLERequestContext {
 
     /// Read `size` bytes from guest virtual address.
     ///
-    /// In upstream, the HLE IPC path reads through a single coherent `Memory`
-    /// owner. Rust still carries both the `Memory` bridge and
-    /// `SharedProcessMemory`, so prefer `Memory` when it can resolve the range
-    /// and fall back to process memory only on failure.
+    /// In upstream, the HLE IPC path reads through a single coherent guest-memory
+    /// owner (`Core::Memory::Memory`). Rust still carries both the `Memory`
+    /// bridge and `SharedProcessMemory`; keep `Memory` as the primary owner
+    /// here too, and only fall back to `SharedProcessMemory` when the bridge
+    /// cannot satisfy the read. TLS command-buffer reads already use
+    /// `Memory` first in `populate_from_incoming_command_buffer()`.
     fn read_guest_memory(&self, address: u64, size: usize) -> Vec<u8> {
         if size == 0 || address == 0 {
             return Vec::new();
@@ -995,7 +997,13 @@ impl HLERequestContext {
             let ok = memory.lock().unwrap().read_block(address, &mut buf);
             if ok {
                 return buf;
-            } else if let Some(ref thread) = self.thread {
+            }
+
+            if let Some(ref shared_memory) = self.shared_memory {
+                return shared_memory.read().unwrap().read_bytes(address, size);
+            }
+
+            if let Some(ref thread) = self.thread {
                 let parent = {
                     let thread_guard = thread.lock().unwrap();
                     thread_guard.parent.as_ref().and_then(|weak| weak.upgrade())
@@ -1507,6 +1515,44 @@ mod tests {
 
         let shared_memory = ctx.shared_memory.expect("owner shared memory must be installed");
         assert_eq!(shared_memory.read().unwrap().read_8(0x2000), 0x41);
+    }
+
+    #[test]
+    fn read_guest_memory_prefers_memory_then_falls_back_to_shared_process_memory() {
+        let device_memory = Box::new(DeviceMemory::new());
+        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
+        let memory = Arc::new(Mutex::new(unsafe {
+            Memory::new(SystemRef::null(), device_memory.as_ref() as *const _, buffer_ptr)
+        }));
+
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        process.lock().unwrap().page_table.set_memory(memory.clone());
+
+        {
+            let process_guard = process.lock().unwrap();
+            let mut process_memory = process_guard.process_memory.write().unwrap();
+            process_memory.allocate(0x3000, 0x1000);
+            process_memory.write_8(0x3000, 0x41);
+        }
+
+        memory.lock().unwrap().write_8(0x3000, 0x7a);
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+        let ctx = HLERequestContext::new_with_thread(thread, shared_memory, 0x2000);
+
+        assert_eq!(ctx.read_guest_memory(0x3000, 1), vec![0x7a]);
+
+        {
+            let process_guard = process.lock().unwrap();
+            let mut process_memory = process_guard.process_memory.write().unwrap();
+            process_memory.allocate(0x4000, 0x1000);
+            process_memory.write_8(0x4000, 0x42);
+        }
+
+        assert_eq!(ctx.read_guest_memory(0x4000, 1), vec![0x42]);
     }
 
     #[test]

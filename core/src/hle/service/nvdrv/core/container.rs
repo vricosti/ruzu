@@ -6,7 +6,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/core/container.cpp
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use super::heap_mapper::HeapMapper;
 use super::nvmap::NvMap;
@@ -68,7 +68,7 @@ struct ContainerInner {
 
 /// Container manages syncpoints on the host and provides access to NvMap and SyncpointManager.
 pub struct Container {
-    file: NvMap,
+    file: Arc<NvMap>,
     manager: SyncpointManager,
     device_file_data: Host1xDeviceFileData,
     inner: Mutex<ContainerInner>,
@@ -81,7 +81,7 @@ impl Container {
 
     pub fn new_with_system(system: SystemRef) -> Self {
         Self {
-            file: NvMap::new(),
+            file: Arc::new(NvMap::new()),
             manager: SyncpointManager::new_with_system(system),
             device_file_data: Host1xDeviceFileData::default(),
             inner: Mutex::new(ContainerInner {
@@ -198,7 +198,11 @@ impl Container {
     }
 
     pub fn get_nv_map_file(&self) -> &NvMap {
-        &self.file
+        self.file.as_ref()
+    }
+
+    pub fn get_nv_map_file_handle(&self) -> Arc<NvMap> {
+        Arc::clone(&self.file)
     }
 
     pub fn get_syncpoint_manager(&self) -> &SyncpointManager {

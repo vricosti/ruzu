@@ -8,7 +8,17 @@
 
 use std::collections::BTreeMap;
 
+use crate::file_sys::control_metadata::RawNACP;
+use crate::file_sys::patch_manager::PatchManager;
+use crate::hle::result::RESULT_SUCCESS;
 use crate::hle::result::ResultCode;
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::ns::language::{
+    convert_to_application_language, convert_to_language_code,
+    get_application_language_priority_list, get_supported_language_flag, ApplicationLanguage,
+};
+use crate::hle::service::ns::ns_results::RESULT_APPLICATION_LANGUAGE_NOT_FOUND;
+use crate::hle::service::set::settings_server::get_language_code_from_index;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
@@ -21,30 +31,6 @@ pub enum ApplicationControlSource {
     CacheOnly = 0,
     Storage = 1,
     StorageOnly = 2,
-}
-
-/// Application language (used in GetApplicationDesiredLanguage).
-///
-/// Corresponds to `ApplicationLanguage` in upstream ns/language.h.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ApplicationLanguage {
-    AmericanEnglish = 0,
-    BritishEnglish = 1,
-    Japanese = 2,
-    French = 3,
-    German = 4,
-    LatinAmericanSpanish = 5,
-    Spanish = 6,
-    Italian = 7,
-    Dutch = 8,
-    CanadianFrench = 9,
-    Portuguese = 10,
-    Russian = 11,
-    Korean = 12,
-    TraditionalChinese = 13,
-    SimplifiedChinese = 14,
-    BrazilianPortuguese = 15,
 }
 
 /// IPC command table for IReadOnlyApplicationControlDataInterface.
@@ -62,26 +48,27 @@ pub mod commands {
 ///
 /// Corresponds to `IReadOnlyApplicationControlDataInterface` in upstream.
 pub struct IReadOnlyApplicationControlDataInterface {
+    system: crate::core::SystemRef,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IReadOnlyApplicationControlDataInterface {
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Self {
         let handlers = build_handler_map(&[
             (
                 commands::GET_APPLICATION_CONTROL_DATA,
-                None,
+                Some(Self::get_application_control_data_handler),
                 "GetApplicationControlData",
             ),
             (
                 commands::GET_APPLICATION_DESIRED_LANGUAGE,
-                None,
+                Some(Self::get_application_desired_language_handler),
                 "GetApplicationDesiredLanguage",
             ),
             (
                 commands::CONVERT_APPLICATION_LANGUAGE_TO_LANGUAGE_CODE,
-                None,
+                Some(Self::convert_application_language_to_language_code_handler),
                 "ConvertApplicationLanguageToLanguageCode",
             ),
             (
@@ -96,6 +83,7 @@ impl IReadOnlyApplicationControlDataInterface {
             ),
         ]);
         Self {
+            system,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -116,22 +104,58 @@ impl IReadOnlyApplicationControlDataInterface {
             application_id
         );
 
-        // Upstream reads NACP + icon via PatchManager::GetControlMetadata().
-        // PatchManager is not yet ported; zero-fill the NACP area as a stub.
         const NACP_SIZE: usize = 0x4000;
-        if out_buffer.len() < NACP_SIZE {
+        debug_assert_eq!(NACP_SIZE, std::mem::size_of::<RawNACP>());
+
+        let metadata = if self.system.is_null() {
+            (None, None)
+        } else {
+            let system = self.system.get();
+            let fs_controller = system.get_filesystem_controller();
+            let fs_controller = fs_controller.lock().unwrap();
+            let provider = system.get_content_provider();
+            match provider {
+                Some(provider) => {
+                    let provider = provider.lock().unwrap();
+                    let patch_manager = PatchManager::new(application_id, &fs_controller, &*provider);
+                    patch_manager.get_control_metadata()
+                }
+                None => (None, None),
+            }
+        };
+
+        let icon_size = metadata.1.as_ref().map(|icon| icon.get_size()).unwrap_or(0);
+        let total_size = NACP_SIZE + icon_size;
+
+        if out_buffer.len() < total_size {
             log::error!(
                 "output buffer is too small! (actual={:#x}, expected_min={:#x})",
                 out_buffer.len(),
-                NACP_SIZE
+                total_size
             );
             return Err(ResultCode::new(1)); // ResultUnknown
         }
 
-        // Zero-fill NACP.
-        out_buffer[..NACP_SIZE].fill(0);
+        if let Some(nacp) = metadata.0 {
+            let bytes = nacp.get_raw_bytes();
+            out_buffer[..NACP_SIZE].copy_from_slice(&bytes[..NACP_SIZE]);
+        } else {
+            log::warn!(
+                "missing NACP data for application_id={:#018x}, defaulting to zero",
+                application_id
+            );
+            out_buffer[..NACP_SIZE].fill(0);
+        }
 
-        Ok(NACP_SIZE as u32)
+        if let Some(icon) = metadata.1 {
+            let icon_size = icon.get_size();
+            let read = icon.read(&mut out_buffer[NACP_SIZE..NACP_SIZE + icon_size], icon_size, 0);
+            debug_assert_eq!(read, icon_size);
+        } else {
+            log::warn!("missing icon data for application_id={:#018x}", application_id);
+        }
+
+        Ok(total_size as u32)
     }
 
     /// GetApplicationDesiredLanguage (cmd 1).
@@ -146,19 +170,28 @@ impl IReadOnlyApplicationControlDataInterface {
             supported_languages
         );
 
-        // Default to AmericanEnglish.
-        // Upstream uses ns::language.cpp ConvertToApplicationLanguage + priority list.
-        // Full language priority matching is not yet ported; this approximation
-        // covers the common case (AmericanEnglish) and falls back to first supported.
-        if supported_languages == 0 || (supported_languages & (1 << 0)) != 0 {
-            return Ok(ApplicationLanguage::AmericanEnglish);
-        }
+        let language_index = *common::settings::values().language_index.get_value() as usize;
+        let language_code = get_language_code_from_index(language_index);
+        let application_language = convert_to_application_language(language_code).ok_or_else(|| {
+            log::error!(
+                "Could not convert application language! language_code={:#018x}",
+                language_code as u64
+            );
+            RESULT_APPLICATION_LANGUAGE_NOT_FOUND
+        })?;
+        let priority_list =
+            get_application_language_priority_list(application_language).ok_or_else(|| {
+                log::error!(
+                    "Could not find application language priorities! application_language={:?}",
+                    application_language
+                );
+                RESULT_APPLICATION_LANGUAGE_NOT_FOUND
+            })?;
 
-        // Find first supported language.
-        for i in 0..16u32 {
-            if (supported_languages & (1 << i)) != 0 {
-                // Safety: i is 0..15, all valid ApplicationLanguage variants.
-                return Ok(unsafe { std::mem::transmute(i as u8) });
+        for &lang in priority_list {
+            let supported_flag = get_supported_language_flag(lang);
+            if supported_languages == 0 || (supported_languages & supported_flag) == supported_flag {
+                return Ok(lang);
             }
         }
 
@@ -166,7 +199,7 @@ impl IReadOnlyApplicationControlDataInterface {
             "Could not find a valid language! supported_languages={:#010x}",
             supported_languages
         );
-        Err(ResultCode::new(1)) // ResultApplicationLanguageNotFound
+        Err(RESULT_APPLICATION_LANGUAGE_NOT_FOUND)
     }
 
     /// ConvertApplicationLanguageToLanguageCode (cmd 2).
@@ -176,28 +209,110 @@ impl IReadOnlyApplicationControlDataInterface {
         &self,
         application_language: ApplicationLanguage,
     ) -> Result<u64, ResultCode> {
-        use crate::hle::service::set::settings_types::LanguageCode;
+        convert_to_language_code(application_language)
+            .map(|language_code| language_code as u64)
+            .ok_or_else(|| {
+                log::error!(
+                    "Language not found! application_language={:?}",
+                    application_language
+                );
+                RESULT_APPLICATION_LANGUAGE_NOT_FOUND
+            })
+    }
 
-        let language_code = match application_language {
-            ApplicationLanguage::AmericanEnglish => LanguageCode::EnUs,
-            ApplicationLanguage::BritishEnglish => LanguageCode::EnGb,
-            ApplicationLanguage::Japanese => LanguageCode::Ja,
-            ApplicationLanguage::French => LanguageCode::Fr,
-            ApplicationLanguage::German => LanguageCode::De,
-            ApplicationLanguage::LatinAmericanSpanish => LanguageCode::Es419,
-            ApplicationLanguage::Spanish => LanguageCode::Es,
-            ApplicationLanguage::Italian => LanguageCode::It,
-            ApplicationLanguage::Dutch => LanguageCode::Nl,
-            ApplicationLanguage::CanadianFrench => LanguageCode::FrCa,
-            ApplicationLanguage::Portuguese => LanguageCode::Pt,
-            ApplicationLanguage::Russian => LanguageCode::Ru,
-            ApplicationLanguage::Korean => LanguageCode::Ko,
-            ApplicationLanguage::TraditionalChinese => LanguageCode::ZhHant,
-            ApplicationLanguage::SimplifiedChinese => LanguageCode::ZhHans,
-            ApplicationLanguage::BrazilianPortuguese => LanguageCode::PtBr,
+    fn get_application_control_data_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe {
+            &*(this as *const dyn ServiceFramework as *const IReadOnlyApplicationControlDataInterface)
         };
+        let mut rp = RequestParser::new(ctx);
+        let source = match rp.pop_u8() {
+            0 => ApplicationControlSource::CacheOnly,
+            1 => ApplicationControlSource::Storage,
+            2 => ApplicationControlSource::StorageOnly,
+            other => {
+                log::error!("Invalid ApplicationControlSource {}", other);
+                ApplicationControlSource::Storage
+            }
+        };
+        let application_id = rp.pop_u64();
+        let mut out_buffer = vec![0u8; ctx.get_write_buffer_size(0)];
+        match service.get_application_control_data(source, application_id, &mut out_buffer) {
+            Ok(actual_size) => {
+                ctx.write_buffer(&out_buffer, 0);
+                let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u32(actual_size);
+            }
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
+        }
+    }
 
-        Ok(language_code as u64)
+    fn get_application_desired_language_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe {
+            &*(this as *const dyn ServiceFramework as *const IReadOnlyApplicationControlDataInterface)
+        };
+        let mut rp = RequestParser::new(ctx);
+        let supported_languages = rp.pop_u32();
+        match service.get_application_desired_language(supported_languages) {
+            Ok(language) => {
+                let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u32(language as u32);
+            }
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
+        }
+    }
+
+    fn convert_application_language_to_language_code_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe {
+            &*(this as *const dyn ServiceFramework as *const IReadOnlyApplicationControlDataInterface)
+        };
+        let mut rp = RequestParser::new(ctx);
+        let application_language = match rp.pop_u8() {
+            0 => ApplicationLanguage::AmericanEnglish,
+            1 => ApplicationLanguage::BritishEnglish,
+            2 => ApplicationLanguage::Japanese,
+            3 => ApplicationLanguage::French,
+            4 => ApplicationLanguage::German,
+            5 => ApplicationLanguage::LatinAmericanSpanish,
+            6 => ApplicationLanguage::Spanish,
+            7 => ApplicationLanguage::Italian,
+            8 => ApplicationLanguage::Dutch,
+            9 => ApplicationLanguage::CanadianFrench,
+            10 => ApplicationLanguage::Portuguese,
+            11 => ApplicationLanguage::Russian,
+            12 => ApplicationLanguage::Korean,
+            13 => ApplicationLanguage::TraditionalChinese,
+            14 => ApplicationLanguage::SimplifiedChinese,
+            15 => ApplicationLanguage::BrazilianPortuguese,
+            _ => ApplicationLanguage::Count,
+        };
+        match service.convert_application_language_to_language_code(application_language) {
+            Ok(language_code) => {
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u64(language_code);
+            }
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
+        }
     }
 }
 
@@ -222,5 +337,95 @@ impl ServiceFramework for IReadOnlyApplicationControlDataInterface {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::settings::Language;
+    use crate::core::SystemRef;
+
+    #[test]
+    fn desired_language_uses_upstream_priority_list() {
+        let previous = *common::settings::values().language_index.get_value();
+        common::settings::values_mut()
+            .language_index
+            .set_value(Language::EnglishAmerican);
+
+        let service =
+            IReadOnlyApplicationControlDataInterface::new(crate::core::SystemRef::null());
+        let supported = get_supported_language_flag(ApplicationLanguage::BritishEnglish)
+            | get_supported_language_flag(ApplicationLanguage::French);
+        let result = service.get_application_desired_language(supported).unwrap();
+
+        common::settings::values_mut()
+            .language_index
+            .set_value(previous);
+
+        assert_eq!(result, ApplicationLanguage::BritishEnglish);
+    }
+
+    #[test]
+    fn convert_application_language_to_language_code_uses_ns_language_owner() {
+        let service =
+            IReadOnlyApplicationControlDataInterface::new(crate::core::SystemRef::null());
+        let result = service
+            .convert_application_language_to_language_code(ApplicationLanguage::BrazilianPortuguese)
+            .unwrap();
+        assert_eq!(
+            result,
+            crate::hle::service::set::settings_types::LanguageCode::PtBr as u64
+        );
+    }
+
+    #[test]
+    fn get_application_control_data_null_system_zero_fills_nacp() {
+        let service = IReadOnlyApplicationControlDataInterface::new(SystemRef::null());
+        let mut buffer = vec![0xAA; 0x4000];
+
+        let size = service
+            .get_application_control_data(ApplicationControlSource::Storage, 0x0100, &mut buffer)
+            .unwrap();
+
+        assert_eq!(size, 0x4000);
+        assert!(buffer.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn get_application_control_data_rejects_too_small_buffer() {
+        let service = IReadOnlyApplicationControlDataInterface::new(SystemRef::null());
+        let mut buffer = vec![0u8; 0x3FFF];
+
+        let result =
+            service.get_application_control_data(ApplicationControlSource::Storage, 0x0100, &mut buffer);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exercised_cmif_handlers_are_registered() {
+        let service = IReadOnlyApplicationControlDataInterface::new(SystemRef::null());
+        assert!(
+            service
+                .handlers()
+                .get(&commands::GET_APPLICATION_CONTROL_DATA)
+                .and_then(|fi| fi.handler_callback)
+                .is_some()
+        );
+        assert!(
+            service
+                .handlers()
+                .get(&commands::GET_APPLICATION_DESIRED_LANGUAGE)
+                .and_then(|fi| fi.handler_callback)
+                .is_some()
+        );
+        assert!(
+            service
+                .handlers()
+                .get(&commands::CONVERT_APPLICATION_LANGUAGE_TO_LANGUAGE_CODE)
+                .and_then(|fi| fi.handler_callback)
+                .is_some()
+        );
     }
 }

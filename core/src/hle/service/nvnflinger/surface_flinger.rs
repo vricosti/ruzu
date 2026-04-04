@@ -182,7 +182,10 @@ impl SurfaceFlinger {
     pub fn create_buffer_queue(&self) -> (i32, i32) {
         let core = BufferQueueCore::new();
         let consumer = Arc::new(BufferQueueConsumer::new(Arc::clone(&core)));
-        let producer_binder: Arc<dyn IBinder> = Arc::new(BufferQueueProducer::new(Arc::clone(&core)));
+        let producer_binder: Arc<dyn IBinder> = Arc::new(BufferQueueProducer::new(
+            Arc::clone(&core),
+            self.nvdrv.get_container().get_nv_map_file_handle(),
+        ));
         let consumer_binder: Arc<dyn IBinder> = consumer.clone();
 
         let consumer_binder_id = self.server.register_binder(consumer_binder);

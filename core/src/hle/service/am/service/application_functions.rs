@@ -282,7 +282,7 @@ impl IApplicationFunctions {
             }
         }
 
-        let read_only = IReadOnlyApplicationControlDataInterface::new();
+        let read_only = IReadOnlyApplicationControlDataInterface::new(self.system);
         let application_language = read_only.get_application_desired_language(supported_languages)?;
         read_only.convert_application_language_to_language_code(application_language)
     }

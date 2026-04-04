@@ -65,10 +65,11 @@ static SCHEDULER_CALLBACKS: super::k_scheduler_lock::SchedulerCallbacks =
     };
 
 fn real_disable_scheduling() {
-    with_current_thread_fast_mut(|t| {
-        debug_assert!(t.get_disable_dispatch_count() >= 0);
-        t.disable_dispatch();
-    });
+    if let Some(current_thread) = get_current_emu_thread() {
+        let mut thread = current_thread.lock().unwrap();
+        debug_assert!(thread.get_disable_dispatch_count() >= 0);
+        thread.disable_dispatch();
+    }
 }
 
 fn real_enable_scheduling(cores_needing_scheduling: u64) {
@@ -154,8 +155,23 @@ fn real_update_highest_priority_threads() -> u64 {
     if !migrations.is_empty() {
         let gsc = gsc_arc.lock().unwrap();
         for (thread_id, new_core) in migrations {
-            if let Some(thread) = gsc.get_thread_by_thread_id(thread_id) {
-                thread.lock().unwrap().set_active_core(new_core);
+            let Some(thread) = gsc.get_thread_by_thread_id(thread_id) else {
+                continue;
+            };
+
+            // Unlike upstream raw-pointer ownership, Rust may still hold the
+            // thread mutex while `KThread::run()` unwinds out of `StartThread`.
+            // Applying deferred migration with a blocking lock here can deadlock
+            // the scheduler-lock unlock path. Keep the update opportunistic.
+            let try_lock_result = thread.try_lock();
+            if let Ok(mut thread_guard) = try_lock_result {
+                thread_guard.set_active_core(new_core);
+            } else {
+                log::trace!(
+                    "real_update_highest_priority_threads: deferred active_core update tid={} new_core={}",
+                    thread_id,
+                    new_core
+                );
             }
         }
     }
@@ -579,11 +595,11 @@ impl KernelCore {
             .register_thread_object(Arc::clone(&thread));
         self.register_kernel_object(thread.lock().unwrap().get_object_id());
 
-        // Make the thread runnable. t.run() → set_state(RUNNABLE) →
+        // Make the thread runnable. KThread::run_thread() → set_state(RUNNABLE) →
         // notify_state_transition pushes to PQ via the GSC reference
         // (wired during initialize_service_thread from the process).
         // Must be called OUTSIDE GSC lock scope to avoid deadlock.
-        thread.lock().unwrap().run();
+        super::k_thread::KThread::run_thread(&thread);
 
         // Request reschedule so the scheduler picks up the new thread.
         // Upstream: SetSchedulerUpdateNeeded + KScopedSchedulerLock release triggers reschedule.

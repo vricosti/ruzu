@@ -7,6 +7,10 @@
 //! Port of zuyu/src/core/hle/service/nvnflinger/ui/graphic_buffer.h
 //! Port of zuyu/src/core/hle/service/nvnflinger/ui/graphic_buffer.cpp
 
+use std::sync::Arc;
+
+use crate::hle::service::nvdrv::core::nvmap::NvMap;
+
 use super::super::pixel_format::PixelFormat;
 
 /// Raw NV graphic buffer data structure.
@@ -114,26 +118,29 @@ impl NvGraphicBuffer {
 /// A GraphicBuffer wraps an NvGraphicBuffer and optionally tracks NvMap ownership.
 ///
 /// In upstream C++, GraphicBuffer inherits from NvGraphicBuffer and holds an optional
-/// NvMap pointer for cleanup. Here we use composition.
+/// NvMap pointer for cleanup. Here we use composition plus an `Arc<NvMap>` owner.
 pub struct GraphicBuffer {
     pub buffer: NvGraphicBuffer,
-    // In upstream, m_nvmap is used for cleanup via NvMap. We track whether we have
-    // an nvmap reference but the actual cleanup depends on NvMap infrastructure.
-    has_nvmap: bool,
+    nvmap: Option<Arc<NvMap>>,
 }
 
 impl GraphicBuffer {
     pub fn new(width: u32, height: u32, format: PixelFormat, usage: u32) -> Self {
         Self {
             buffer: NvGraphicBuffer::new(width, height, format, usage),
-            has_nvmap: false,
+            nvmap: None,
         }
     }
 
-    pub fn from_nv_buffer(buffer: NvGraphicBuffer, _has_nvmap: bool) -> Self {
+    pub fn from_nv_buffer(nvmap: Arc<NvMap>, buffer: NvGraphicBuffer) -> Self {
+        if buffer.get_buffer_id() > 0 {
+            nvmap.duplicate_handle(buffer.get_buffer_id(), true);
+            nvmap.pin_handle(buffer.get_buffer_id(), false);
+        }
+
         Self {
             buffer,
-            has_nvmap: _has_nvmap,
+            nvmap: Some(nvmap),
         }
     }
 
@@ -174,5 +181,18 @@ impl GraphicBuffer {
         usage: u32,
     ) -> bool {
         self.buffer.needs_reallocation(width, height, format, usage)
+    }
+}
+
+impl Drop for GraphicBuffer {
+    fn drop(&mut self) {
+        let Some(nvmap) = &self.nvmap else {
+            return;
+        };
+
+        if self.buffer.get_buffer_id() > 0 {
+            nvmap.unpin_handle(self.buffer.get_buffer_id());
+            let _ = nvmap.free_handle(self.buffer.get_buffer_id(), true);
+        }
     }
 }

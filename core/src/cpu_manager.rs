@@ -64,6 +64,18 @@ pub struct CpuManager {
 /// Maximum number of cycle runs before preemption in single-core mode.
 const _MAX_CYCLE_RUNS: usize = 5;
 static TID17_HALT_SAMPLE_COUNT: AtomicU32 = AtomicU32::new(0);
+static THREAD_PROBE_HALT_COUNT: AtomicU32 = AtomicU32::new(0);
+static PC_PROBE_HALT_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn parse_hex_env_u64(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    let trimmed = value.trim();
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    u64::from_str_radix(hex, 16).ok()
+}
 
 impl CpuManager {
     /// Creates a new CpuManager.
@@ -597,6 +609,99 @@ impl CpuManager {
                             tc.r[0],
                             tc.r[1],
                         );
+                    }
+                    if std::env::var_os("RUZU_LOG_THREAD_PROBE").is_some()
+                        && THREAD_PROBE_HALT_COUNT.fetch_add(1, Ordering::Relaxed) < 400
+                    {
+                        let mut tc = crate::arm::arm_interface::ThreadContext::default();
+                        jit_ref.get_context(&mut tc);
+                        log::info!(
+                            "thread_probe: tid={} core={} halted={:?} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} interrupt={} data_abort={} prefetch_abort={} breakpoint={}",
+                            current_thread_id,
+                            core_index,
+                            halt_reason,
+                            tc.pc,
+                            tc.lr,
+                            tc.sp,
+                            interrupt,
+                            data_abort,
+                            prefetch_abort,
+                            breakpoint,
+                        );
+                    }
+                    if let Some(probe_pc) = parse_hex_env_u64("RUZU_PC_PROBE") {
+                        let mut tc = crate::arm::arm_interface::ThreadContext::default();
+                        jit_ref.get_context(&mut tc);
+                        if tc.pc == probe_pc
+                            && PC_PROBE_HALT_COUNT.fetch_add(1, Ordering::Relaxed) < 120
+                        {
+                            let (op_m2, op_m1, op_0, op_p1, op_p2, stack_words) = {
+                                let system_ref = kernel.system();
+                                if system_ref.is_null() {
+                                    (0, 0, 0, 0, 0, [0; 8])
+                                } else if let Some(memory) = system_ref.get().memory_shared() {
+                                    let mem = memory.lock().unwrap();
+                                    (
+                                        mem.read_32(tc.pc.wrapping_sub(8)),
+                                        mem.read_32(tc.pc.wrapping_sub(4)),
+                                        mem.read_32(tc.pc),
+                                        mem.read_32(tc.pc + 4),
+                                        mem.read_32(tc.pc + 8),
+                                        [
+                                            mem.read_32(tc.sp),
+                                            mem.read_32(tc.sp.wrapping_add(4)),
+                                            mem.read_32(tc.sp.wrapping_add(8)),
+                                            mem.read_32(tc.sp.wrapping_add(12)),
+                                            mem.read_32(tc.sp.wrapping_add(16)),
+                                            mem.read_32(tc.sp.wrapping_add(20)),
+                                            mem.read_32(tc.sp.wrapping_add(24)),
+                                            mem.read_32(tc.sp.wrapping_add(28)),
+                                        ],
+                                    )
+                                } else {
+                                    (0, 0, 0, 0, 0, [0; 8])
+                                }
+                            };
+                            log::info!(
+                                "pc_probe: tid={} core={} halted={:?} pc=0x{:08X} pstate=0x{:08X} op_m2=0x{:08X} op_m1=0x{:08X} op_0=0x{:08X} op_p1=0x{:08X} op_p2=0x{:08X} lr=0x{:08X} sp=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X}",
+                                current_thread_id,
+                                core_index,
+                                halt_reason,
+                                tc.pc as u32,
+                                tc.pstate,
+                                op_m2,
+                                op_m1,
+                                op_0,
+                                op_p1,
+                                op_p2,
+                                tc.lr as u32,
+                                tc.sp as u32,
+                                tc.r[0] as u32,
+                                tc.r[1] as u32,
+                                tc.r[2] as u32,
+                                tc.r[3] as u32,
+                                tc.r[4] as u32,
+                                tc.r[5] as u32,
+                                tc.r[6] as u32,
+                                tc.r[7] as u32,
+                                tc.r[8] as u32,
+                                tc.r[9] as u32,
+                                tc.r[10] as u32,
+                                tc.r[11] as u32,
+                                tc.r[12] as u32,
+                            );
+                            log::info!(
+                                "pc_probe_stack: [sp+00]=0x{:08X} [sp+04]=0x{:08X} [sp+08]=0x{:08X} [sp+0C]=0x{:08X} [sp+10]=0x{:08X} [sp+14]=0x{:08X} [sp+18]=0x{:08X} [sp+1C]=0x{:08X}",
+                                stack_words[0],
+                                stack_words[1],
+                                stack_words[2],
+                                stack_words[3],
+                                stack_words[4],
+                                stack_words[5],
+                                stack_words[6],
+                                stack_words[7],
+                            );
+                        }
                     }
                 }
             }

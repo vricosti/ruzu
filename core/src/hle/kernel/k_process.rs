@@ -2320,7 +2320,7 @@ impl KProcess {
             // Don't re-initialize the scheduler — it was already initialized
             // with the kernel main thread in initialize_physical_cores.
             // Just mark the user thread as needing scheduling.
-            // (highest_priority_thread_id is set below after thread.run())
+            // (highest_priority_thread_id is set below after KThread::run_thread())
 
             thread_handle
         };
@@ -2342,26 +2342,23 @@ impl KProcess {
                 main_thread_id
             );
 
-            let mut thread = main_thread.lock().unwrap();
-            let run_result = thread.run();
+            let run_result = KThread::run_thread(&main_thread);
             if run_result != RESULT_SUCCESS.get_inner_value() {
                 return Err(run_result);
             }
-            drop(thread);
             log::trace!(
                 "KProcess::run main thread runnable pid={} tid={}",
                 self.process_id,
                 main_thread_id
             );
 
-            // Increment running thread count (thread.run() no longer does this
-            // to avoid deadlock when called with process lock held).
+            // The upstream owner is KThread::Run(), but the Rust port still
+            // compensates here for the main-thread bootstrap because KProcess::run()
+            // invokes thread.run() while holding the process mutex.
             self.increment_running_thread_count();
 
-            // thread.run() → set_state(RUNNABLE) → notify_state_transition now
-            // pushes to PQ via the GSC reference and notifies the scheduler
-            // automatically, matching upstream's KThread::Run() + KScopedSchedulerLock
-            // destructor path.
+            // KThread::run_thread() → set_state(RUNNABLE) → notify_state_transition now
+            // pushes to PQ via the GSC reference and notifies the scheduler.
         }
 
         thread_reservation.commit();
