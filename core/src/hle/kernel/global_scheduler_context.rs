@@ -56,8 +56,22 @@ impl GlobalSchedulerContext {
     // -- Thread list management --
 
     pub fn add_thread(&self, thread: Arc<Mutex<KThread>>) {
+        // Matches upstream intrusive ownership: the thread list must never
+        // silently accept an invalid identifier. Callers that already hold the
+        // thread mutex must use add_thread_with_id() to avoid re-locking.
         let thread_id = thread.lock().unwrap().get_thread_id();
-        self.m_thread_list.lock().unwrap().push((thread_id, thread));
+        self.m_thread_list
+            .lock()
+            .unwrap()
+            .push((thread_id, thread));
+    }
+
+    /// Add a thread when the thread_id is already known (avoids re-locking).
+    pub fn add_thread_with_id(&self, thread_id: u64, thread: Arc<Mutex<KThread>>) {
+        self.m_thread_list
+            .lock()
+            .unwrap()
+            .push((thread_id, thread));
     }
 
     pub fn remove_thread(&self, thread_id: u64) {

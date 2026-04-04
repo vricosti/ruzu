@@ -379,6 +379,14 @@ impl StaticService {
         RESULT_NOT_IMPLEMENTED
     }
 
+    pub fn get_shared_memory_arc(
+        &self,
+    ) -> Option<Arc<crate::hle::kernel::k_shared_memory::KSharedMemory>> {
+        let shared_time = self.shared_time.as_ref()?;
+        let time = shared_time.lock().unwrap();
+        Some(time.shared_memory.get_k_shared_memory_arc())
+    }
+
     // =========================================================================
     // Commands 50-51: Steady clock operations
     // =========================================================================

@@ -5,15 +5,16 @@
 //! Port of zuyu/src/core/hle/service/am/display_layer_manager.cpp
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use crate::hle::service::vi::container::Container;
 use crate::hle::service::vi::application_display_service::IApplicationDisplayService;
 use crate::hle::service::vi::manager_display_service::IManagerDisplayService;
-use crate::hle::service::vi::vi;
 use crate::hle::service::vi::vi_results;
+use crate::hle::service::vi::manager_root_service::IManagerRootService;
+use crate::hle::service::vi::vi_types::Policy;
 
 use super::am_types::{AppletId, LibraryAppletMode};
 
@@ -22,10 +23,9 @@ use super::am_types::{AppletId, LibraryAppletMode};
 /// Manages VI display layers for an applet.
 /// Stubbed: requires VI service integration.
 pub struct DisplayLayerManager {
-    container: Option<Arc<Container>>,
     display_service: Option<Arc<IApplicationDisplayService>>,
     manager_display_service: Option<Arc<IManagerDisplayService>>,
-    process: Option<Arc<std::sync::Mutex<KProcess>>>,
+    process: Option<Arc<Mutex<KProcess>>>,
     managed_display_layers: BTreeSet<u64>,
     managed_display_recording_layers: BTreeSet<u64>,
     system_shared_buffer_id: u64,
@@ -45,7 +45,6 @@ impl Default for DisplayLayerManager {
 impl DisplayLayerManager {
     pub fn new() -> Self {
         Self {
-            container: None,
             display_service: None,
             manager_display_service: None,
             process: None,
@@ -68,19 +67,29 @@ impl DisplayLayerManager {
 
     pub fn initialize(
         &mut self,
-        process: Arc<std::sync::Mutex<KProcess>>,
+        system: SystemRef,
+        process: Arc<Mutex<KProcess>>,
         applet_id: AppletId,
         mode: LibraryAppletMode,
     ) {
-        self.container = vi::get_shared_container();
-        self.display_service = self
-            .container
-            .as_ref()
-            .map(|container| Arc::new(IApplicationDisplayService::new(Arc::clone(container))));
-        self.manager_display_service = self
-            .container
-            .as_ref()
-            .map(|container| Arc::new(IManagerDisplayService::new(Arc::clone(container))));
+        self.display_service = None;
+        self.manager_display_service = None;
+
+        if let Some(service_manager) = system.get().service_manager() {
+            let manager_root = crate::hle::service::sm::sm::ServiceManager::get_service_blocking(
+                &service_manager,
+                "vi:m",
+            );
+            let manager_root = manager_root
+                .as_any()
+                .downcast_ref::<IManagerRootService>()
+                .expect("vi:m must be IManagerRootService");
+            if let Ok(display_service) = manager_root.create_display_service(Policy::Compositor) {
+                self.manager_display_service = Some(display_service.get_manager_display_service());
+                self.display_service = Some(display_service);
+            }
+        }
+
         self.process = Some(process);
         self.system_shared_buffer_id = 0;
         self.system_shared_layer_id = 0;
@@ -108,7 +117,6 @@ impl DisplayLayerManager {
         self.managed_display_recording_layers.clear();
         self.manager_display_service = None;
         self.display_service = None;
-        self.container = None;
         self.process = None;
     }
 

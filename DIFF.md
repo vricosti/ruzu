@@ -2622,6 +2622,62 @@
 ### Binary layout verification
 - PASS: no raw serialized structs in this file.
 
+## 2026-04-04 — `core/src/hle/service/am/service/application_proxy.rs` vs `core/hle/service/am/service/application_proxy.cpp`
+
+### Intentional differences
+- Rust still creates sub-services through `push_interface_response(...)` and domain/session helpers rather than CMIF `Out<SharedPointer<...>>` templates; this is the mechanical adaptation already used across AM service owners.
+
+### Unintentional differences (to fix)
+- None newly identified in this slice after wiring `IWindowController` to the real `WindowSystem` owner.
+
+### Missing items
+- No missing items identified in this pass.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/am/service/window_controller.rs` vs `core/hle/service/am/service/window_controller.cpp`
+
+### Intentional differences
+- `AppletResourceUserId` is still returned as raw `u64` in handler code instead of a dedicated CMIF wrapper type; the bit pattern matches upstream.
+
+### Unintentional differences (to fix)
+- `IWindowController` still omits upstream cmd `0` (`CreateWindow`) as a registered null handler entry.
+
+### Missing items
+- Add the explicit null registration for cmd `0` to mirror upstream command-table shape exactly.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/am/service/library_applet_proxy.rs` vs `core/hle/service/am/service/library_applet_proxy.cpp`
+
+### Intentional differences
+- Rust still creates returned sub-services through the shared `push_interface_response(...)` helper rather than CMIF `Out<SharedPointer<...>>` templates.
+
+### Unintentional differences (to fix)
+- None newly identified in this slice after wiring `IWindowController` to the real `WindowSystem` owner.
+
+### Missing items
+- No missing items identified in this pass.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/am/service/system_applet_proxy.rs` vs `core/hle/service/am/service/system_applet_proxy.cpp`
+
+### Intentional differences
+- Rust still creates returned sub-services through the shared `push_interface_response(...)` helper rather than CMIF `Out<SharedPointer<...>>` templates.
+
+### Unintentional differences (to fix)
+- None newly identified in this slice after wiring `IWindowController` to the real `WindowSystem` owner.
+
+### Missing items
+- No missing items identified in this pass.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
 ## 2026-03-30 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
 
 ### Intentional differences
@@ -2888,6 +2944,48 @@
 
 ### Binary layout verification
 - PASS: no raw serialized struct layout changed in this slice.
+
+## 2026-04-05 — `core/src/hle/service/psc/time/manager.rs` vs `core/hle/service/psc/time/manager.h/.cpp`
+
+### Intentional differences
+- Rust keeps `TimeManager` as an owned struct rather than the upstream direct `Core::System&` owner, but the ownership boundary remains here.
+
+### Unintentional differences (to fix)
+- Test/default construction still falls back to `SharedMemory::new_for_test()`; production now uses the real kernel-backed shared memory owner when `DeviceMemory` and `KMemoryManager` are available.
+
+### Missing items
+- No additional missing items identified in the exercised shared-memory ownership path.
+
+### Binary layout verification
+- PASS: no raw serialized structs are defined in this file.
+
+## 2026-04-05 — `core/src/hle/service/psc/time/static.rs` vs `core/hle/service/psc/time/static.cpp`
+
+### Intentional differences
+- PSC shared-memory handle registration still happens at the Rust IPC handler layer instead of through CMIF `OutCopyHandle` templates, but ownership now resolves through the real `TimeManager`-owned shared memory.
+
+### Unintentional differences (to fix)
+- `get_shared_memory_native_handle()` still returns `ResultNotImplemented` at the pure PSC service layer; only the Glue IPC path is currently exercised and owner-correct.
+
+### Missing items
+- Literal PSC cmd 20 CMIF copy-handle parity if/when `time:s` starts exercising the direct PSC owner path.
+
+### Binary layout verification
+- PASS: no raw serialized structs changed in this slice.
+
+## 2026-04-05 — `core/src/hle/service/glue/time/manager.rs` vs `core/hle/service/glue/time/manager.cpp`
+
+### Intentional differences
+- Rust passes `DeviceMemory`/`KMemoryManager` explicitly into the PSC time owner during construction instead of retrieving them implicitly through a stored `Core::System&`.
+
+### Unintentional differences (to fix)
+- None newly identified in the exercised shared-memory ownership path after wiring the real PSC shared memory into the manager.
+
+### Missing items
+- No additional missing items identified in this pass.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
 
 ## 2026-03-30 — video_core/src/renderer_null/null_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_null/null_rasterizer.cpp
 
@@ -5426,3 +5524,247 @@
 
 ### Binary layout verification
 - PASS: no raw serialized structs changed in this slice.
+## 2026-04-04 — `core/src/hle/kernel/global_scheduler_context.rs` vs `core/hle/kernel/global_scheduler_context.h/.cpp`
+
+### Intentional differences
+- Thread list storage uses `Vec<(u64, Arc<Mutex<KThread>>)>` instead of intrusive `KThread*` links: Rust needs owned references and cannot use the upstream intrusive object layout directly.
+
+### Unintentional differences (to fix)
+- `GlobalSchedulerContext::add_thread()` still relocks the thread object to fetch `thread_id`: upstream can identify threads without relocking because the ID is available from the intrusive object itself.
+
+### Missing items
+- No further missing items identified in this pass.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/kernel/svc/svc_condition_variable.rs` vs `core/hle/kernel/svc/svc_condition_variable.cpp`
+
+### Intentional differences
+- Rust acquires the current thread's `KAbstractSchedulerLock` through `scheduler_lock_ptr` before forwarding `SignalProcessWideKey`: upstream reaches the same effect via `KConditionVariable::Signal()` taking `KScopedSchedulerLock` internally, but the Rust owner split currently requires acquiring the scheduler lock at the SVC boundary.
+
+### Unintentional differences (to fix)
+- `KConditionVariable::Signal()` ownership still differs from upstream because the scheduler lock is taken in the SVC wrapper rather than inside `k_condition_variable.rs`.
+
+### Missing items
+- `SignalProcessWideKey` still lacks a more literal owner-local port where `KConditionVariable::signal()` itself manages the scheduler lock.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/kernel/k_condition_variable.rs` vs `core/hle/kernel/k_condition_variable.h/.cpp`
+
+### Intentional differences
+- Rust still uses a `BTreeSet` plus `HashMap` instead of upstream intrusive RB-tree nodes: this preserves ordering semantics while keeping ownership safe in Rust.
+
+### Unintentional differences (to fix)
+- `KConditionVariable::signal()` still relies on the scheduler lock being acquired by the SVC wrapper rather than taking it literally inside the owner, unlike upstream `KConditionVariable::Signal()`.
+
+### Missing items
+- `wait_for_current_thread()` still has a fallback host-thread polling path when no scheduler is discoverable; upstream always resumes through kernel scheduling.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/vi/manager_root_service.rs` vs `core/hle/service/vi/manager_root_service.cpp`
+
+### Intentional differences
+- Rust exposes `create_display_service(policy)` as a typed helper so `DisplayLayerManager` can follow the upstream owner path through `vi:m` without fabricating IPC requests.
+
+### Unintentional differences (to fix)
+- The Rust service still does not store the upstream `Core::System&` directly in this owner; it reconstructs the returned `IApplicationDisplayService` from the shared container only.
+
+### Missing items
+- `GetDisplayServiceWithProxyNameExchange`
+- Fatal-drawing commands `100-103`
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/vi/application_display_service.rs` vs `core/hle/service/vi/application_display_service.cpp`
+
+### Intentional differences
+- Rust exposes `get_manager_display_service()` as a typed owner-local helper so AM can obtain `IManagerDisplayService` through the same conceptual owner as upstream.
+
+### Unintentional differences (to fix)
+- The owner still lacks the upstream `Core::System&`/`m_context` state, so helper construction is container-based rather than literal `system`-based.
+
+### Missing items
+- Remaining stubbed exercised commands, especially `GetSystemDisplayService`
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/am/display_layer_manager.rs` vs `core/hle/service/am/display_layer_manager.cpp`
+
+### Intentional differences
+- Rust stores `Arc<Mutex<KProcess>>` instead of raw `Kernel::KProcess*`.
+
+### Unintentional differences (to fix)
+- `Initialize()` now follows the upstream owner chain `vi:m -> GetDisplayService(Compositor) -> GetManagerDisplayService`, but still relies on `ServiceManager::get_service_blocking()` plus downcast instead of the literal typed `GetService<T>()` helper upstream.
+- `WriteAppletCaptureBuffer()` is still missing.
+
+### Missing items
+- `write_applet_capture_buffer`
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/am/service/self_controller.rs` vs `core/hle/service/am/service/self_controller.cpp`
+
+### Intentional differences
+- Rust passes `SystemRef` explicitly into `ISelfController::new(...)` so the owner can initialize `DisplayLayerManager` with the same upstream system dependency.
+
+### Unintentional differences (to fix)
+- Several upstream commands remain unimplemented or stubbed in this owner.
+
+### Missing items
+- `EnterFatalSection`
+- `LeaveFatalSection`
+- Remaining later commands still registered as `None`
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/am/service/application_proxy.rs` vs `core/hle/service/am/service/application_proxy.cpp`
+
+### Intentional differences
+- Rust returns sub-services through `push_interface_response(...)` rather than CMIF serialization helpers, but ownership now matches upstream for `ISelfController`.
+
+### Unintentional differences (to fix)
+- None identified in this pass for exercised ownership.
+
+### Missing items
+- No additional missing items identified in this pass.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/am/service/library_applet_proxy.rs` vs `core/hle/service/am/service/library_applet_proxy.cpp`
+
+### Intentional differences
+- Rust stores `Option<Arc<Mutex<KProcess>>>` instead of raw `Kernel::KProcess*`.
+
+### Unintentional differences (to fix)
+- This owner had incorrectly dropped the upstream process pointer entirely; it now preserves and forwards it to `ISelfController`.
+
+### Missing items
+- No additional missing items identified in this pass.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/am/service/system_applet_proxy.rs` vs `core/hle/service/am/service/system_applet_proxy.cpp`
+
+### Intentional differences
+- Rust stores `Option<Arc<Mutex<KProcess>>>` instead of raw `Kernel::KProcess*`.
+
+### Unintentional differences (to fix)
+- This owner had incorrectly dropped the upstream process pointer entirely; it now preserves and forwards it to `ISelfController`.
+
+### Missing items
+- No additional missing items identified in this pass.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/service/am/service/all_system_applet_proxies_service.rs` vs `core/hle/service/am/service/all_system_applet_proxies_service.cpp`
+
+### Intentional differences
+- Rust reconstructs the caller process from `HLERequestContext` and stores it as `Option<Arc<Mutex<KProcess>>>` instead of raw `Kernel::KProcess*`.
+
+### Unintentional differences (to fix)
+- The owner still derives the process through the current thread/context rather than using the upstream typed CMIF `ProcessId` + process pointer flow end-to-end.
+
+### Missing items
+- Remaining unimplemented proxy-opening commands
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/kernel/k_synchronization_object.rs` vs `core/hle/kernel/k_synchronization_object.cpp`
+
+### Intentional differences
+- Rust still models wait sets and waiter links with owned Rust structs instead of the upstream stack array of intrusive `ThreadListNode` plus raw `KSynchronizationObject**`.
+- `wait_for_current_thread(...)` now loops while the thread remains `WAITING`. This is a temporary Rust-specific guard to preserve the upstream synchronous wait contract until the fiber scheduler stops returning to the waiter before `EndWait()`/`CancelWait()`.
+
+### Unintentional differences (to fix)
+- The owner path now uses `KScopedSchedulerLockAndSleep`, but the file still carries the older parallel Rust wait-set implementation and not the literal upstream stack-node queue layout.
+- `WaitableObject::Process` still routes through Rust `KProcess` helper methods rather than a literal `KSynchronizationObject` base owner for process waits.
+
+### Missing items
+- Closer literal parity for `ThreadQueueImplForKSynchronizationObjectWait`
+- Removal of the remaining Rust-specific wait-set bookkeeping layer once the intrusive owner graph is ported more directly
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-04 — `core/src/hle/kernel/k_condition_variable.rs` vs `core/hle/kernel/k_condition_variable.cpp`
+
+### Intentional differences
+- `wait_for_current_thread(...)` now loops while the thread remains `WAITING`. This is a temporary Rust-specific guard to preserve the upstream blocking `WaitProcessWideKeyAtomic` contract until the fiber scheduler no longer returns control to the waiter before `EndWait()`.
+
+### Unintentional differences (to fix)
+- The file still routes the synchronous wait through a Rust helper after `Wait()` instead of relying purely on the upstream kernel/fiber return path.
+- `UpdateLockAtomic` is still serialized via the process owner instead of using the upstream exclusive-monitor loop.
+
+### Missing items
+- Removal of the temporary blocking loop once scheduler/fiber parity is strict enough that one handoff is sufficient
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+## 2026-04-05 — `core/src/hle/service/nvnflinger/buffer_item_consumer.rs` vs `src/core/hle/service/nvnflinger/buffer_item_consumer.cpp`
+
+### Intentional differences
+- `ConsumerBase` is composed behind interior mutability instead of inherited directly: required by Rust object model while preserving the same ownership boundary.
+
+### Unintentional differences (to fix)
+- None currently identified in the exercised `AcquireBuffer` / `ReleaseBuffer` path after this change.
+
+### Missing items
+- Full upstream lock parity around `ConsumerBase`-owned mutexes is still represented through interior mutability rather than a literal external lock field on `BufferItemConsumer`.
+
+### Binary layout verification
+- PASS: no raw serialized structs introduced in this slice.
+
+## 2026-04-05 — `core/src/hle/service/nvnflinger/consumer_base.rs` vs `src/core/hle/service/nvnflinger/consumer_base.cpp`
+
+### Intentional differences
+- `ConsumerBase` uses an internal `Mutex<ConsumerBaseInner>` instead of exposing the upstream `mutex` field directly: required Rust adaptation, but slot ownership and method ownership remain in this file.
+
+### Unintentional differences (to fix)
+- None currently identified in the exercised slot-cache path after this change.
+
+### Missing items
+- Destructor parity remains partial; Rust relies on `abandon()`/drop discipline instead of a literal upstream destructor assert path.
+
+### Binary layout verification
+- PASS: no shared raw payload struct defined in this file.
+
+## 2026-04-05 — `core/src/hle/service/psc/time/shared_memory.rs` vs `core/hle/service/psc/time/shared_memory.h/.cpp`
+
+### Intentional differences
+- Rust stores the upstream `Kernel::KSharedMemory&` as `Arc<KSharedMemory>` because process handle-table registration needs shared ownership across services; method ownership remains in this file.
+
+### Unintentional differences (to fix)
+- `new_for_test()` still uses a heap-backed raw `SharedMemoryStruct` fallback instead of a literal kernel-owned shared memory object; this is limited to tests.
+
+### Missing items
+- No additional missing items identified in the exercised owner path.
+
+### Binary layout verification
+- PASS: `SharedMemoryStruct` offset and size assertions still match upstream (`0x1000` total size).
+
+## 2026-04-05 — `core/src/hle/service/glue/time/static.rs` vs `core/hle/service/glue/time/static.cpp`
+
+### Intentional differences
+- Rust caches the copied handle value in `shared_memory_handle` after registering the owner `KSharedMemory` in the process handle table; upstream returns `OutCopyHandle<Kernel::KSharedMemory>` directly through CMIF serialization.
+
+### Unintentional differences (to fix)
+- None newly identified in the exercised `GetSharedMemoryNativeHandle` path after returning the real PSC-owned `KSharedMemory`.
+
+### Missing items
+- Remaining later time-service commands still marked unimplemented/stubbed outside the exercised boot path.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout changed in this slice.

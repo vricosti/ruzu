@@ -36,23 +36,32 @@ impl TimeManager {
     /// Create a new TimeManager with a reference to the ServiceManager.
     ///
     /// Matches upstream `TimeManager::TimeManager(Core::System& system)`.
-    pub fn new(service_manager: Arc<Mutex<ServiceManager>>, system: SystemRef) -> Self {
+    pub fn new(
+        service_manager: Arc<Mutex<ServiceManager>>,
+        system: SystemRef,
+        device_memory: *const crate::device_memory::DeviceMemory,
+        memory_manager: *mut crate::hle::kernel::k_memory_manager::KMemoryManager,
+    ) -> Self {
         log::debug!("Glue::Time::TimeManager::new called");
-        let psc_time = Arc::new(Mutex::new(
-            crate::hle::service::psc::time::manager::TimeManager::new(Box::new(move || {
-                if system.is_null() {
-                    0
-                } else {
-                    system
-                        .get()
-                        .core_timing()
-                        .lock()
-                        .unwrap()
-                        .get_global_time_ns()
-                        .as_nanos() as i64
-                }
-            })),
-        ));
+        let psc_time = Arc::new(Mutex::new(unsafe {
+            crate::hle::service::psc::time::manager::TimeManager::new_with_shared_memory(
+                Box::new(move || {
+                    if system.is_null() {
+                        0
+                    } else {
+                        system
+                            .get()
+                            .core_timing()
+                            .lock()
+                            .unwrap()
+                            .get_global_time_ns()
+                            .as_nanos() as i64
+                    }
+                }),
+                (!device_memory.is_null()).then_some(&*device_memory),
+                (!memory_manager.is_null()).then_some(&mut *memory_manager),
+            )
+        }));
         let time_sm = Arc::new(PscStaticService::with_time_manager(
             StaticServiceSetupInfo {
                 can_write_local_clock: true,

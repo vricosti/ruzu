@@ -126,6 +126,10 @@ impl IApplicationDisplayService {
         self.container.open_display(display_name)
     }
 
+    pub fn get_manager_display_service(&self) -> Arc<IManagerDisplayService> {
+        Arc::new(IManagerDisplayService::new(Arc::clone(&self.container)))
+    }
+
     /// cmd 100 / 103: GetRelayService / GetIndirectDisplayTransactionService
     /// Returns the real IHOSBinderDriver from the Container.
     fn get_relay_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -153,8 +157,7 @@ impl IApplicationDisplayService {
     fn get_manager_display_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         log::warn!("IApplicationDisplayService::GetManagerDisplayService (STUBBED)");
-        let sub: Arc<dyn SessionRequestHandler> =
-            Arc::new(IManagerDisplayService::new(Arc::clone(&svc.container)));
+        let sub: Arc<dyn SessionRequestHandler> = svc.get_manager_display_service();
         super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(
             ctx, sub,
         );

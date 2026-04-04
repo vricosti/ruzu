@@ -332,32 +332,19 @@ impl KConditionVariable {
                     .and_then(|scheduler| scheduler.upgrade())
             });
 
-        if let Some(scheduler) = scheduler {
-            scheduler.lock().unwrap().request_schedule();
+        while current_thread.lock().unwrap().get_state() == super::k_thread::ThreadState::WAITING {
+            if let Some(scheduler) = scheduler.as_ref() {
+                scheduler.lock().unwrap().request_schedule();
 
-            let sched_ptr = {
-                let mut scheduler_guard = scheduler.lock().unwrap();
-                &mut *scheduler_guard as *mut KScheduler
-            };
+                let sched_ptr = {
+                    let mut scheduler_guard = scheduler.lock().unwrap();
+                    &mut *scheduler_guard as *mut KScheduler
+                };
 
-            loop {
                 unsafe {
                     KScheduler::reschedule_current_core_raw(sched_ptr);
                 }
-
-                let state = current_thread.lock().unwrap().get_state();
-                if state != super::k_thread::ThreadState::WAITING {
-                    break;
-                }
-
-                std::thread::yield_now();
-            }
-        } else {
-            loop {
-                let state = current_thread.lock().unwrap().get_state();
-                if state != super::k_thread::ThreadState::WAITING {
-                    break;
-                }
+            } else {
                 std::thread::yield_now();
             }
         }

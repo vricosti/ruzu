@@ -366,21 +366,40 @@ impl LockWithPriorityInheritanceInfo {
     /// Add a waiter thread. The caller must provide the waiter's priority and thread_id.
     /// Matches upstream `AddWaiter(KThread*)`.
     pub fn add_waiter(&mut self, priority: i32, thread_id: u64) {
-        self.tree.insert(LockWaiterKey {
+        let inserted = self.tree.insert(LockWaiterKey {
             priority,
             thread_id,
         });
-        self.waiter_count += 1;
+        if inserted {
+            self.waiter_count += 1;
+        } else {
+            debug_assert!(
+                false,
+                "LockWithPriorityInheritanceInfo::add_waiter duplicate waiter priority={} thread_id={}",
+                priority,
+                thread_id
+            );
+        }
     }
 
     /// Remove a waiter thread. Returns true if the lock has no more waiters.
     /// Matches upstream `RemoveWaiter(KThread*)`.
     pub fn remove_waiter(&mut self, priority: i32, thread_id: u64) -> bool {
-        self.tree.remove(&LockWaiterKey {
+        let removed = self.tree.remove(&LockWaiterKey {
             priority,
             thread_id,
         });
-        self.waiter_count -= 1;
+        if removed {
+            self.waiter_count -= 1;
+        } else {
+            debug_assert!(
+                false,
+                "LockWithPriorityInheritanceInfo::remove_waiter missing waiter priority={} thread_id={}",
+                priority,
+                thread_id
+            );
+            self.waiter_count = self.tree.len() as u32;
+        }
         self.waiter_count == 0
     }
 
@@ -1854,7 +1873,11 @@ impl KThread {
             .as_ref()
             .cloned()
         {
-            gsc.lock().unwrap().add_thread(Arc::clone(thread_ref));
+            // Use add_thread_with_id to avoid re-locking the thread mutex
+            // (we're called under thread.lock() from run_on_guest_core_process).
+            gsc.lock()
+                .unwrap()
+                .add_thread_with_id(thread_id, Arc::clone(thread_ref));
         }
 
         self.object_id = object_id;
@@ -1872,22 +1895,26 @@ impl KThread {
         self.suspend_request_flags = 0;
         self.parent = Some(owner_weak);
         self.scheduler = scheduler;
-        {
+        // Extract process data WITHOUT holding the process lock during GSC lock,
+        // to avoid AB/BA deadlock (process → GSC vs GSC → process).
+        let (gsc_weak, scheduler_lock_ptr, schedule_count) = {
             let proc = owner.lock().unwrap();
-            self.global_scheduler_context = proc
-                .global_scheduler_context
-                .as_ref()
-                .map(|g| Arc::downgrade(g));
-            self.scheduler_lock_ptr = proc
-                .global_scheduler_context
+            let gsc_ref = proc.global_scheduler_context.as_ref().cloned();
+            let sc = Arc::clone(&proc.schedule_count);
+            drop(proc); // Release process lock BEFORE locking GSC
+            let ptr = gsc_ref
                 .as_ref()
                 .map(|gsc| {
                     let guard = gsc.lock().unwrap();
                     std::ptr::addr_of!(guard.m_scheduler_lock) as usize
                 })
                 .unwrap_or(0);
-            self.process_schedule_count = Some(Arc::clone(&proc.schedule_count));
-        }
+            let weak = gsc_ref.as_ref().map(Arc::downgrade);
+            (weak, ptr, sc)
+        };
+        self.global_scheduler_context = gsc_weak;
+        self.scheduler_lock_ptr = scheduler_lock_ptr;
+        self.process_schedule_count = Some(schedule_count);
         self.core_id = core;
         self.current_core_id = core;
         self.wait_result = RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value();

@@ -57,9 +57,10 @@ impl BufferItemConsumer {
         // In upstream, if wait_for_fence is true, it would wait on the fence.
         // This is UNIMPLEMENTED in upstream as well.
 
-        // Note: The slot's graphic_buffer is assigned by acquire_buffer_locked.
-        // We need to copy it to the item. In upstream this reads from slots[item->slot].
-        // The ConsumerBase already handles this internally.
+        // Upstream rewrites item->graphic_buffer from the cached ConsumerBase slot after
+        // AcquireBufferLocked(). This preserves the cached GraphicBuffer even when the
+        // queue consumer returned a null graphic_buffer for already-acquired slots.
+        item.graphic_buffer = self.base.get_slot_graphic_buffer(item.slot);
 
         Status::NoError
     }
@@ -101,5 +102,38 @@ impl IConsumerListener for BufferItemConsumer {
 
     fn on_sideband_stream_changed(&self) {
         self.base.on_sideband_stream_changed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::hle::service::nvnflinger::buffer_queue_core::BufferQueueCore;
+    use crate::hle::service::nvnflinger::pixel_format::PixelFormat;
+    use crate::hle::service::nvnflinger::ui::graphic_buffer::GraphicBuffer;
+
+    use super::*;
+
+    #[test]
+    fn acquire_buffer_restores_cached_graphic_buffer_from_consumer_base_slot() {
+        let core = BufferQueueCore::new();
+        let consumer = Arc::new(BufferQueueConsumer::new(Arc::clone(&core)));
+        let bic = BufferItemConsumer::new(consumer);
+
+        let expected = Arc::new(GraphicBuffer::new(1280, 720, PixelFormat::Rgba8888, 0));
+        bic.base.set_slot_graphic_buffer_for_test(3, Some(Arc::clone(&expected)));
+
+        let mut item = BufferItem::default();
+        item.slot = 3;
+        item.graphic_buffer = None;
+
+        item.graphic_buffer = bic.base.get_slot_graphic_buffer(item.slot);
+
+        assert!(item.graphic_buffer.is_some());
+        assert_eq!(
+            item.graphic_buffer.as_ref().unwrap().get_handle(),
+            expected.get_handle()
+        );
     }
 }
