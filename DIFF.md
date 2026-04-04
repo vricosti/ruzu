@@ -146,18 +146,22 @@
 ## 2026-03-23 — common/src/fiber.rs vs /Users/vricosti/Dev/emulators/zuyu/src/common/fiber.cpp
 
 ### Intentional differences
-- Linux still uses `ucontext` instead of upstream `boost::context::detail::fcontext_t`: existing Rust backend retained, while method ownership and guard/order semantics stay in `fiber.rs`.
-- macOS uses `corosensei` as the stack-switching backend because macOS ARM64 does not provide `getcontext`/`makecontext`/`swapcontext`: this preserves same-thread stack switching without introducing thread-per-fiber scheduling.
-- The macOS backend uses a dispatcher inside `Fiber::yield_to` to route `YieldTo` requests through `corosensei`'s parent-yield model: this is a mechanical adaptation to recover upstream arbitrary fiber-to-fiber transfer semantics while keeping `Start`, `Rewind`, `YieldTo`, and `Exit` owned by `fiber.rs`.
-- On macOS, the pre-rewind coroutine remains stored in `context` while the active post-rewind coroutine is stored in `rewind_context` and selected first on dispatch: upstream discards the old `fcontext_t` immediately, but the retained suspended coroutine is not resumed again and exists only as backend bookkeeping.
+- Rust uses `corosensei` instead of upstream `boost::context::detail::fcontext_t`: platform/backend replacement documented here, while keeping `Start`, `Rewind`, `YieldTo`, and `Exit` owned by `fiber.rs`.
+- The Rust backend still keeps a dispatcher inside `Fiber::yield_to` for thread fibers because `corosensei` resumes coroutines from the host thread rather than exposing a raw `jump_fcontext` entrypoint. This is a backend adaptation, not an ownership change.
+- The Rust backend still models rewind with a second coroutine object (`rewind_context`) instead of upstream `rewind_stack_limit`/`fcontext_t` swapping. This remains backend bookkeeping inside the same owner file.
 
 ### Unintentional differences (to fix)
-- `FiberImpl` field layout on macOS is backend-oriented (`context`/`rewind_context` coroutines plus dispatcher state) instead of mirroring upstream `stack_limit`/`rewind_stack_limit` more directly.
-- Full crate validation is still incomplete because `cargo test -p common` currently reaches an unrelated `elf` test `SIGBUS` after the fiber tests pass, so this change has only been validated with the focused fiber tests.
+- `FiberImpl` field layout remains backend-oriented (`context`/`rewind_context` coroutines plus dispatcher state) instead of mirroring upstream `stack_limit`/`rewind_stack_limit` more directly.
+- The Rust stack size remains `2 MiB` instead of upstream `512 KiB`; this was kept because earlier Rust debug/service paths overflowed the smaller stack, but it is still a structural divergence from upstream.
+- Full crate validation is still incomplete because `cargo test -p common` beyond the focused fiber tests still hits unrelated crate issues.
 
 ### Missing items
-- Re-audit whether the retained suspended pre-rewind coroutine on macOS can be safely dropped/reset earlier without violating upstream lifecycle semantics.
-- Full `cargo test -p common` green run once the unrelated `elf` test crash is resolved.
+- Re-audit whether the retained suspended pre-rewind coroutine can be dropped/reset earlier without violating upstream lifecycle semantics.
+- Re-audit cross-host-thread exchange behavior against the upstream scheduler once more runtime evidence is gathered on the clean restart branch.
+- Full `cargo test -p common` green run once unrelated crate issues are resolved.
+
+### Binary layout verification
+- PASS: runtime-only fiber backend; no raw-serialized structs are defined here.
 
 ## 2026-03-28 — core/src/hle/kernel/kernel.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_hardware_timer.cpp
 
@@ -4408,6 +4412,21 @@
 ### Binary layout verification
 - PASS: scheduler control-flow only; no binary layout involved.
 
+## 2026-04-04 — core/src/hle/kernel/k_scheduler.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp
+
+### Intentional differences
+- Rust still cannot perform the upstream immediate fiber switch from `EnableScheduling(...)` while the current owner path holds `&mut KThread` (for example `KThread::sleep()`). The port now defers that handoff uniformly for non-runnable current threads, including nested dispatch-disable cases, and leaves `needs_scheduling` set so the outer `CpuManager` loop performs the switch immediately after the SVC returns.
+
+### Unintentional differences (to fix)
+- `EnableScheduling(...)` still depends on the outer Rust execution loop to consume the deferred handoff instead of matching upstream's in-place reschedule literally.
+- The broader scheduler/fiber interaction still differs structurally from upstream because the Rust port wraps schedulers in `Mutex` and uses the current `corosensei` backend.
+
+### Missing items
+- Re-audit the remaining `EnableScheduling(...)` callers once the current MK8D blocker moves past the first `SleepThread(5ms)` handoff.
+
+### Binary layout verification
+- PASS: scheduler control-flow only; no binary layout involved.
+
 ## 2026-04-02 — core/src/hle/kernel/k_synchronization_object.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_synchronization_object.cpp
 
 ### Intentional differences
@@ -4566,3 +4585,302 @@
 
 ### Binary layout verification
 - PASS: this slice only changes guest buffer initialization and IPC behavior; no raw struct definition layout changed.
+
+## 2026-04-04 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp
+
+### Intentional differences
+- Rust still stores `m_host_context` as `Arc<Fiber>` and thread ownership behind `Arc<Mutex<KThread>>` rather than upstream raw pointers and `std::shared_ptr`. Ownership remains in `k_thread.rs`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: Rust had introduced a non-upstream lazy `pending_host_context_init` path that deferred `m_host_context` allocation until first schedule. Upstream constructs `m_host_context` eagerly in `InitializeThread(...)`; Rust now creates the fiber immediately in the matching initialization owners.
+
+### Missing items
+- Re-audit `common/src/fiber.rs` against upstream `common/fiber.cpp`/`.h`; `KThread` now matches the owner/lifecycle timing, but the underlying Rust fiber backend is still not a literal port.
+
+### Binary layout verification
+- PASS: host fiber lifecycle only; no guest-visible binary layout changed.
+
+## 2026-04-04 — core/src/hle/service/psc/time/system_clock.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/psc/time/system_clock.cpp
+
+### Intentional differences
+- Rust keeps clock state in a local `Mutex<SystemClockState>` instead of holding upstream `SystemClockCore&` and `OperationEvent`. Ownership remains in `system_clock.rs`, and the exercised IPC behavior now lives in the correct owner file.
+
+### Unintentional differences (to fix)
+- fixed in this pass: exercised commands were registered with `None`, so `ISystemClock` fell through to auto-stub success instead of executing `GetCurrentTime` / `GetSystemClockContext` and related handlers.
+- still simplified: the state is still local Rust state, not yet wired to the full upstream PSC clock-core graph.
+
+### Missing items
+- Reconnect this owner to `SystemClockCore` / `OperationEvent` parity.
+
+### Binary layout verification
+- PASS: `SystemClockContext` stays `repr(C)` and is serialized raw; this pass changed handler routing and local state ownership only.
+
+## 2026-04-04 — core/src/hle/service/glue/time/time_zone.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/glue/time/time_zone.cpp
+
+### Intentional differences
+- Rust still omits upstream `FileTimestampWorker`, `set:sys` persistence, and operation-event fanout. Ownership remains in `glue/time/time_zone.rs`, and exercised read-only delegation stays in this owner.
+
+### Unintentional differences (to fix)
+- fixed in this pass: exercised read-only commands, especially `ToCalendarTimeWithMyRule`, were registered with `None`, so `time:u` returned auto-stub success and MK8D later aborted.
+- still simplified: `ToCalendarTime` currently reconstructs the input rule from the first read buffer using existing IPC helpers instead of a dedicated `InLargeData<Tz::Rule, BufferAttr_HipcMapAlias>` abstraction.
+
+### Missing items
+- Full upstream callback coverage for every registered command.
+- `SetDeviceLocationNameWithTimeZoneRule`, `ParseTimeZoneBinary`, and operation-event lifecycle parity.
+- `FileTimestampWorker` and `set:sys` persistence side effects.
+
+### Binary layout verification
+- PASS: `CalendarTime`, `CalendarAdditionalInfo`, `LocationName`, and `RuleVersion` remain raw-serialized via their existing `repr(C)` layouts; this pass changed handler routing only.
+
+## 2026-04-04 — core/src/core.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/core.cpp
+
+### Intentional differences
+- Rust still cannot own `AudioCore::AudioCore` directly inside `System` because `audio_core` depends on `core`. This pass narrows the existing type-erasure to a dedicated `AudioCoreInterface` bridge instead of a fully opaque `Any`, preserving the upstream owner boundary (`System` owns audio core) for exercised service calls.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `System::audio_core` was stored as `Box<dyn Any + Send>`, so audio services could not call even the exercised upstream `AudioCore::Renderer::Manager::GetWorkBufferSize` path.
+
+### Missing items
+- Reconnect the rest of the exercised audio service surface (`OpenAudioRenderer`, real renderer/session ownership) through the same owner bridge or a stricter parity alternative.
+
+### Binary layout verification
+- PASS: owner bridge only; no guest-visible struct layout changed.
+
+## 2026-04-04 — core/src/hle/service/audio/audio.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio.cpp
+
+### Intentional differences
+- `audctl` remains a stubbed named service in Rust because `IAudioController` is still unported as a real session handler.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `audren:u` was registered without passing `SystemRef` into `IAudioRendererManager`, which diverged from upstream `std::make_shared<IAudioRendererManager>(system)` and blocked access to the real audio-core owner.
+
+### Missing items
+- Full system-owned constructors for the remaining audio service managers.
+
+### Binary layout verification
+- PASS: service registration ownership only; no guest-visible struct layout changed.
+
+## 2026-04-04 — core/src/hle/service/audio/audio_renderer_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer_manager.cpp
+
+### Intentional differences
+- Rust still does not construct a full upstream `IAudioRenderer` backend in `OpenAudioRenderer`; that owner remains simplified and separate from this `GetWorkBufferSize` parity slice.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `GetWorkBufferSize` returned a hardcoded `0x4000` and ignored the upstream `AudioRendererParameterInternal` request payload entirely.
+- fixed in this pass: the manager had no `System` owner, so it could not delegate to the audio-core backend as upstream does.
+
+### Missing items
+- Full upstream request parsing/validation for `OpenAudioRenderer`.
+- Real backend/session construction for `IAudioRenderer`.
+- Real `IAudioDevice` revision/ARUID propagation.
+
+### Binary layout verification
+- PASS: the request payload is now forwarded as a raw `[u8; 0x34]` blob to the backend bridge without reinterpretation in the wrong owner; response remains a raw `u64`.
+
+## 2026-04-04 — audio_core/src/audio_core.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/audio_core.cpp
+
+### Intentional differences
+- Rust implements the exercised `GetWorkBufferSize` owner bridge directly on `AudioCore` because `core` cannot name concrete `audio_core` types across the crate cycle.
+
+### Unintentional differences (to fix)
+- fixed in this pass: there was no way for `core` services to call the already-ported audio-core work-buffer calculation, so `audren:u` fell back to a fake constant.
+
+### Missing items
+- Reconnect `OpenAudioRenderer` and live renderer/session ownership through the same `AudioCore` owner.
+- Re-audit frontend construction: `yuzu_cmd` still instantiates `AudioCore` with a detached Rust `System`, unlike upstream `AudioCore(system)`.
+
+### Binary layout verification
+- PASS: the bridge consumes the exact 0x34-byte `AudioRendererParameterInternal` payload and reinterprets it with unaligned raw-copy semantics matching the upstream binary layout.
+
+## 2026-04-04 — core/src/hle/service/ipc_helpers.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ipc_helpers.h
+
+### Intentional differences
+- Rust keeps request parsing as a manual helper API instead of the upstream C++ template-based CMIF serializer. This pass narrows that gap by adding an explicit natural-alignment helper for raw CMIF data, without changing file ownership.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `RequestParser` had no way to reproduce upstream CMIF raw-data natural alignment, so handlers that manually parsed a non-8-byte-sized blob followed by `u64` read the next argument one word too early.
+
+### Missing items
+- Broader audit of manual request parsers that still depend on implicit packed layout assumptions.
+- Full parity with upstream `cmif_serialization.h` argument-layout generation.
+
+### Binary layout verification
+- PASS: regression test covers a `0x34`-byte blob followed by two naturally aligned `u64` values and verifies the parser lands on the same words as upstream CMIF layout rules.
+
+## 2026-04-04 — core/src/hle/service/audio/audio_renderer_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer_manager.cpp
+
+### Intentional differences
+- Rust still routes backend construction through the crate-bridge `AudioCoreInterface` instead of instantiating the concrete upstream `IAudioRenderer` type directly in this owner.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `OpenAudioRenderer` manually parsed `AudioRendererParameterInternal` and then read `u64` fields without restoring the upstream 8-byte alignment after the `0x34`-byte blob, shifting `tmem_size` left by 32 bits and causing a huge audio workbuffer allocation.
+
+### Missing items
+- Pass the real transfer-memory/process owners all the way to the concrete audio renderer service/backend, like upstream `KTransferMemory*` and `KProcess*`.
+- Re-audit `GetAudioDeviceService*` ARUID/revision propagation against upstream.
+
+### Binary layout verification
+- PASS: `AudioRendererParameterInternal` remains a raw 0x34-byte payload; this pass only restores the upstream-aligned position of the following `u64` arguments.
+
+## 2026-04-04 — core/src/hle/service/audio/audio_renderer.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer.cpp
+
+### Intentional differences
+- Rust still lazily creates only the readable end of the audio system event instead of owning a full upstream `KEvent` via `ServiceContext`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `QuerySystemEvent` created the event in a signaled state, diverging from the upstream service-context event lifecycle and making the returned event immediately ready.
+
+### Missing items
+- Port the full upstream `ServiceContext`/`KEvent` ownership for `rendered_event`.
+- Wire actual render completion to the returned event instead of keeping audio-render completion as a separate `AtomicBool`.
+- Open/close and retain the real process handle like upstream.
+
+### Binary layout verification
+- PASS: response shape remains one copied readable-event handle; this pass changes only initial signal state and owner notes.
+
+## 2026-04-04 — core/src/hle/service/audio/audio_renderer_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer_manager.cpp
+
+### Intentional differences
+- Rust still creates the service-owned audio event manually in this file instead of through upstream `KernelHelpers::ServiceContext`, because the Rust `ServiceContext` owner is not yet ported to real `KEvent` ownership.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `OpenAudioRenderer` created the backend session first and only then created a separate service-local event path, so the backend `audio_core` renderer never received the same render-completion event owner as upstream.
+
+### Missing items
+- Port the full upstream `ServiceContext` owner instead of manual event-object registration.
+- Re-audit `OpenAudioRenderer` request/handle ownership against the upstream `KTransferMemory*` path.
+
+### Binary layout verification
+- PASS: no guest-visible struct layout changed; the response still returns one IPC object and no raw payload changes.
+
+## 2026-04-04 — audio_core/src/audio_core.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/audio_core.cpp
+
+### Intentional differences
+- Rust still bridges `core` to `audio_core` with traits because the crates cannot name each other’s concrete owners directly.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `open_audio_renderer()` could not receive or preserve the upstream service-owned rendered event, so the backend `Renderer/System` had no way to signal the same kernel object returned by `QuerySystemEvent`.
+
+### Missing items
+- Re-audit the remaining `AudioCore` construction path against upstream `AudioCore(system)`, especially the detached Rust `System` ownership noted earlier.
+
+### Binary layout verification
+- PASS: the audio parameter blob remains a raw 0x34-byte reinterpretation; this slice only adds owner propagation for the event object.
+
+## 2026-04-04 — audio_core/src/renderer/audio_renderer.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/audio_renderer.cpp
+
+### Intentional differences
+- Rust still stores the upstream `System` owner behind `Arc<Mutex<...>>` because the manager/session bridge is shared across crates.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `Renderer::new()`/`System::new()` did not accept the upstream rendered-event owner, so `Renderer` diverged structurally from `Renderer(system, manager, Kernel::KEvent*)`.
+
+### Missing items
+- Re-audit `Initialize/Finalize` ordering against the upstream `Renderer` once the remaining audio boot stall is fixed.
+
+### Binary layout verification
+- PASS: no raw payload layout is affected by this owner-only constructor change.
+
+## 2026-04-04 — audio_core/src/renderer/system.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/system.cpp
+
+### Intentional differences
+- Rust still uses `ProcessHandle` as an opaque raw pointer wrapper instead of upstream `KProcess*` directly because the ADSP command-buffer bridge keeps process ownership erased at that boundary.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `System` used a private `AtomicBool rendered_event` instead of the upstream `Kernel::KEvent* adsp_rendered_event`, so `Update()` and `SendCommandToDsp()` never cleared/signaled the same kernel object exported by `IAudioRenderer::QuerySystemEvent`.
+
+### Missing items
+- Re-audit the exact `Start/QuerySystemEvent/RequestUpdate` boot sequence against upstream, because MK8D still stalls before repeated `RequestUpdate`.
+- Port any remaining `CoreTiming`/thread-priority details from upstream `SystemManager::ThreadFunc` if they prove relevant.
+
+### Binary layout verification
+- PASS: all guest-facing audio buffers remain unchanged; only kernel-event ownership and signaling behavior changed.
+
+## 2026-04-04 — core/src/hle/kernel/k_condition_variable.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.cpp
+
+### Intentional differences
+- Rust still has to thread `Arc<Mutex<KProcess>>` through the wait path because the upstream owner has no process-wide mutex; the implementation now mirrors the upstream lock order more closely by acquiring the scheduler sleep guard before re-entering the process owner.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `KProcess::wait_condition_variable()` / `KConditionVariable::wait()` held the process mutex while trying to acquire the global scheduler lock, creating a Rust-only AB/BA deadlock that upstream cannot hit because it has no outer process mutex.
+
+### Missing items
+- Port the upstream `Signal()` scheduler-lock ownership literally; the current Rust process-owner wrapper still bypasses that owner boundary.
+- Re-audit `WaitForAddress()` against upstream, which still lacks a literal `KScopedSchedulerLock` wrapper in the Rust port.
+
+### Binary layout verification
+- PASS: no guest-visible payload changed; only lock ordering and owner access changed.
+
+## 2026-04-04 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp
+
+### Intentional differences
+- Rust still routes condition-variable waits through `Arc<Mutex<KProcess>>` rather than a raw process owner pointer.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `WaitConditionVariable()` reacquired the process mutex before the scheduler sleep guard, which inverted upstream lock order and contributed to deadlock on multithreaded boot.
+
+### Missing items
+- Re-audit the remaining process-owned condvar/address-arbiter wrappers for the same mutex-vs-scheduler ordering issue.
+
+### Binary layout verification
+- PASS: owner-only control flow change; no raw struct layout changed.
+
+## 2026-04-04 — core/src/hle/kernel/k_hardware_timer.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_hardware_timer.h/.cpp
+
+### Intentional differences
+- Rust stores timer state in an internal `Mutex<KHardwareTimerState>` instead of relying on upstream `KScopedSpinLock` + raw owner object. This preserves the upstream ownership shape (`Arc<KHardwareTimer>` with internal synchronization) while avoiding the previous outer-object mutex divergence.
+- Thread resolution still uses `thread_id -> raw ptr` / `GSC` lookup because Rust does not model `KThread : KTimerTask` inheritance literally.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `KHardwareTimer` was previously wrapped in an outer `Arc<Mutex<KHardwareTimer>>`, which created a Rust-only lock-order deadlock with `KScopedSchedulerLockAndSleep` and the CoreTiming callback.
+- fixed in this pass: callback wiring used the outer mutex owner instead of an upstream-like direct timer object.
+
+### Missing items
+- Re-audit `KHardwareTimerBase` against upstream intrusive-tree behavior; it still uses `BTreeMap` and thread IDs rather than literal `KTimerTask*` ordering semantics.
+- Remove temporary trace logging once the current MK8D blocker is fully isolated.
+
+### Binary layout verification
+- PASS: kernel-owner/lifecycle change only; no guest-visible payload layout changed.
+
+## 2026-04-04 — core/src/hle/kernel/kernel.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp
+
+### Intentional differences
+- Rust still stores the kernel timer as `Option<Arc<KHardwareTimer>>` rather than an in-place member object, because multiple Rust owners need shared access to the timer.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `KernelCore` exposed the hardware timer as `Arc<Mutex<KHardwareTimer>>`, propagating the outer-object mutex mismatch through all wait paths.
+
+### Missing items
+- Re-audit shutdown/finalize ordering for other shared kernel owners now that the timer no longer uses an outer mutex wrapper.
+
+### Binary layout verification
+- PASS: owner-only change.
+
+## 2026-04-04 — core/src/hle/kernel/k_thread_queue.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread_queue.h/.cpp
+
+### Intentional differences
+- Rust still stores an optional `Arc<KHardwareTimer>` on wait queues because it cannot rely on upstream raw pointer/member inheritance.
+
+### Unintentional differences (to fix)
+- fixed in this pass: wait queues carried `Arc<Mutex<KHardwareTimer>>`, which forced cancellation paths through the same outer-object timer mutex that did not exist upstream.
+
+### Missing items
+- Re-audit all wait-queue derived owners for exact parity on timer-cancel ordering once tracing is removed.
+
+### Binary layout verification
+- PASS: queue-owner change only.
+
+## 2026-04-04 — core/src/hle/kernel/k_scoped_scheduler_lock_and_sleep.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h
+
+### Intentional differences
+- Rust still returns the timer owner as `Option<Arc<KHardwareTimer>>` from `new()` because downstream wait queues need shared ownership rather than a raw pointer.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `Drop` had temporarily diverged from upstream by unlocking before timer registration to avoid the deadlock caused by the old outer `Mutex<KHardwareTimer>`.
+- fixed in this pass: exact upstream order is restored now that the timer owner no longer sits behind an outer object mutex.
+
+### Missing items
+- Remove temporary caller/debug tracing once the current MK8D scheduler/runtime blocker is fully isolated.
+
+### Binary layout verification
+- PASS: RAII/lifecycle change only; no guest-visible binary layout involved.

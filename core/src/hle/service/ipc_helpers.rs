@@ -506,6 +506,21 @@ impl<'a> RequestParser<'a> {
             self.index += 4 - (self.index & 3);
         }
     }
+
+    /// Align the current raw-data position forward to the natural alignment of `T`.
+    ///
+    /// CMIF raw input/output data is laid out with per-argument natural alignment, not
+    /// just packed word-by-word. This helper matches the upstream serialization rule used
+    /// by `cmif_serialization.h`.
+    pub fn align_for<T>(&mut self) {
+        let align_words = core::mem::align_of::<T>() / core::mem::size_of::<u32>();
+        if align_words > 1 {
+            let rem = self.index % align_words;
+            if rem != 0 {
+                self.index += align_words - rem;
+            }
+        }
+    }
 }
 
 /// Assign bits into a u32 value at position with given width.
@@ -608,5 +623,25 @@ mod tests {
             .handle_table
             .get_object(handle)
             .is_some());
+    }
+
+    #[test]
+    fn request_parser_align_for_u64_skips_single_word_after_0x34_blob() {
+        let mut ctx = HLERequestContext::new();
+        let start = 12usize;
+        ctx.cmd_buf[start + 13] = 0;
+        ctx.cmd_buf[start + 14] = 0x0005_B000;
+        ctx.cmd_buf[start + 15] = 0;
+        ctx.cmd_buf[start + 16] = 0x51;
+        ctx.cmd_buf[start + 17] = 0;
+
+        let mut rp = RequestParser::from_buffer(&ctx);
+        rp.set_current_offset(start);
+        let _: [u8; 0x34] = rp.pop_raw();
+        assert_eq!(rp.get_current_offset(), start + 13);
+        rp.align_for::<u64>();
+        assert_eq!(rp.get_current_offset(), start + 14);
+        assert_eq!(rp.pop_u64(), 0x0005_B000);
+        assert_eq!(rp.pop_u64(), 0x51);
     }
 }

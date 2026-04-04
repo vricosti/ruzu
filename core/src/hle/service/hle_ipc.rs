@@ -782,6 +782,14 @@ impl HLERequestContext {
         process.handle_table.add(object_id).ok()
     }
 
+    pub fn owner_process_arc(
+        &self,
+    ) -> Option<Arc<std::sync::Mutex<crate::hle::kernel::k_process::KProcess>>> {
+        let thread = self.thread.as_ref()?;
+        let thread_guard = thread.lock().unwrap();
+        thread_guard.parent.as_ref()?.upgrade()
+    }
+
     pub fn get_is_deferred(&self) -> bool {
         self.is_deferred
     }

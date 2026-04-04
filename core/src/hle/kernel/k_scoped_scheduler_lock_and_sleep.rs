@@ -5,12 +5,10 @@
 //! KScopedSchedulerLockAndSleep — RAII guard that locks the scheduler and
 //! optionally registers a timer task on drop.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::k_hardware_timer::KHardwareTimer;
 use super::k_scheduler_lock::KAbstractSchedulerLock;
-use super::k_thread::KThread;
-
 /// KScopedSchedulerLockAndSleep — acquires the scheduler lock on construction,
 /// and on drop registers an absolute timer task if the timeout is positive,
 /// then releases the scheduler lock.
@@ -21,7 +19,7 @@ pub struct KScopedSchedulerLockAndSleep<'a> {
     m_timeout_tick: i64,
     m_thread_id: u64,
     m_thread_ptr: usize,
-    m_timer: Option<Arc<Mutex<KHardwareTimer>>>,
+    m_timer: Option<Arc<KHardwareTimer>>,
 }
 
 impl<'a> KScopedSchedulerLockAndSleep<'a> {
@@ -31,13 +29,22 @@ impl<'a> KScopedSchedulerLockAndSleep<'a> {
     /// - Locks the scheduler lock
     /// - Sets the hardware timer reference if timeout > 0
     /// - Returns the timer reference via `out_timer` for caller use
+    #[track_caller]
     pub fn new(
         scheduler_lock: &'a KAbstractSchedulerLock,
-        hardware_timer: Option<&Arc<Mutex<KHardwareTimer>>>,
+        hardware_timer: Option<&Arc<KHardwareTimer>>,
         thread_id: u64,
         thread_ptr: usize,
         timeout_tick: i64,
-    ) -> (Self, Option<Arc<Mutex<KHardwareTimer>>>) {
+    ) -> (Self, Option<Arc<KHardwareTimer>>) {
+        let caller = std::panic::Location::caller();
+        log::trace!(
+            "KScopedSchedulerLockAndSleep::new tid={} timeout_tick={} caller={}:{}",
+            thread_id,
+            timeout_tick,
+            caller.file(),
+            caller.line()
+        );
         // Lock the scheduler.
         scheduler_lock.lock();
 
@@ -75,25 +82,40 @@ impl<'a> KScopedSchedulerLockAndSleep<'a> {
 
 impl Drop for KScopedSchedulerLockAndSleep<'_> {
     fn drop(&mut self) {
-        // Register the sleep timer if the timeout is still positive.
-        if self.m_timeout_tick > 0 {
-            if let Some(ref timer) = self.m_timer {
-                timer.lock().unwrap().register_absolute_task_by_id(
-                    self.m_thread_id,
-                    self.m_thread_ptr,
-                    self.m_timeout_tick,
-                );
+        let timeout_tick = self.m_timeout_tick;
+        let thread_id = self.m_thread_id;
+        let thread_ptr = self.m_thread_ptr;
+        let timer = self.m_timer.clone();
+        log::trace!(
+            "KScopedSchedulerLockAndSleep::drop tid={} timeout_tick={} timer={}",
+            self.m_thread_id,
+            self.m_timeout_tick,
+            self.m_timer.is_some()
+        );
+        if timeout_tick > 0 {
+            if let Some(timer) = timer {
+                timer.register_absolute_task_by_id(thread_id, thread_ptr, timeout_tick);
             }
         }
 
-        // Unlock the scheduler.
+        log::trace!(
+            "KScopedSchedulerLockAndSleep::drop tid={} before unlock",
+            self.m_thread_id
+        );
         self.m_scheduler_lock.unlock();
+        log::trace!(
+            "KScopedSchedulerLockAndSleep::drop tid={} after unlock",
+            self.m_thread_id
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use crate::hle::kernel::k_thread::KThread;
 
     #[test]
     fn test_cancel_sleep() {

@@ -137,11 +137,30 @@ impl KAbstractSchedulerLock {
     /// Lock the scheduler lock.
     /// Matches upstream `KAbstractSchedulerLock::Lock()`.
     pub fn lock(&self) {
+        let current_tid = super::kernel::get_current_thread_id_fast();
+        log::trace!(
+            "KAbstractSchedulerLock::lock enter current_tid={:?} owner={} count={}",
+            current_tid,
+            self.m_owner_thread.load(Ordering::Relaxed),
+            self.m_lock_count.get()
+        );
         if self.is_locked_by_current_thread() {
             debug_assert!(self.m_lock_count.get() > 0);
         } else {
+            log::trace!(
+                "KAbstractSchedulerLock::lock current_tid={:?} before disable_scheduling",
+                current_tid
+            );
             (self.callbacks.disable_scheduling)();
+            log::trace!(
+                "KAbstractSchedulerLock::lock current_tid={:?} before spin_lock",
+                current_tid
+            );
             self.m_spin_lock.lock();
+            log::trace!(
+                "KAbstractSchedulerLock::lock current_tid={:?} acquired spin_lock",
+                current_tid
+            );
 
             debug_assert!(self.m_lock_count.get() == 0);
             debug_assert!(self.m_owner_thread.load(Ordering::Relaxed) == 0);
@@ -158,6 +177,12 @@ impl KAbstractSchedulerLock {
         }
 
         self.m_lock_count.set(self.m_lock_count.get() + 1);
+        log::trace!(
+            "KAbstractSchedulerLock::lock exit current_tid={:?} owner={} count={}",
+            current_tid,
+            self.m_owner_thread.load(Ordering::Relaxed),
+            self.m_lock_count.get()
+        );
     }
 
     /// Unlock the scheduler lock.
@@ -166,6 +191,11 @@ impl KAbstractSchedulerLock {
         debug_assert!(self.is_locked_by_current_thread());
         debug_assert!(self.m_lock_count.get() > 0);
 
+        log::trace!(
+            "KAbstractSchedulerLock::unlock enter owner={} count={}",
+            self.m_owner_thread.load(Ordering::Relaxed),
+            self.m_lock_count.get()
+        );
         let new_count = self.m_lock_count.get() - 1;
         self.m_lock_count.set(new_count);
 
@@ -173,10 +203,16 @@ impl KAbstractSchedulerLock {
             std::sync::atomic::fence(Ordering::SeqCst);
 
             let cores_needing_scheduling = (self.callbacks.update_highest_priority_threads)();
+            log::trace!(
+                "KAbstractSchedulerLock::unlock zero-count cores_needing_scheduling=0x{:x}",
+                cores_needing_scheduling
+            );
 
             self.m_owner_thread.store(0, Ordering::Relaxed);
             self.m_spin_lock.unlock();
+            log::trace!("KAbstractSchedulerLock::unlock before enable_scheduling");
             (self.callbacks.enable_scheduling)(cores_needing_scheduling);
+            log::trace!("KAbstractSchedulerLock::unlock after enable_scheduling");
         }
     }
 

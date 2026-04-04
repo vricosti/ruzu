@@ -511,14 +511,6 @@ pub struct KThread {
     /// Host fiber context for this thread.
     /// Upstream: `std::shared_ptr<Common::Fiber> m_host_context`
     pub host_context: Option<Arc<common::fiber::Fiber>>,
-    /// Rust-only pending host fiber entry used to create `host_context` lazily
-    /// on the first core thread that actually runs this KThread.
-    ///
-    /// Upstream eagerly constructs `m_host_context` in `InitializeThread`.
-    /// We defer the actual `Fiber` allocation because the current Rust fiber
-    /// backend still leaks creator-thread ownership into first execution for
-    /// user threads created on one core and first scheduled on another.
-    pub pending_host_context_init: Option<Box<dyn FnOnce() + Send>>,
     /// Context guard for fiber switching.
     /// Upstream: `KSpinLock m_context_guard`
     pub context_guard: parking_lot::Mutex<()>,
@@ -644,7 +636,6 @@ impl KThread {
             is_kernel_address_key: false,
             stack_parameters: StackParameters::default(),
             host_context: None,
-            pending_host_context_init: None,
             context_guard: parking_lot::Mutex::new(()),
             thread_type: ThreadType::User,
             step_state: StepState::default(),
@@ -765,25 +756,10 @@ impl KThread {
     /// Set the host fiber context for this thread.
     pub fn set_host_context(&mut self, ctx: Arc<common::fiber::Fiber>) {
         self.host_context = Some(ctx);
-        self.pending_host_context_init = None;
     }
 
-    /// Materialize the host fiber lazily on the current host core thread.
-    pub fn get_or_create_host_context(&mut self) -> Option<Arc<common::fiber::Fiber>> {
-        if self.host_context.is_none() {
-            if let Some(init) = self.pending_host_context_init.take() {
-                log::trace!(
-                    "KThread::get_or_create_host_context tid={} host={} core_id={} current_core={} affinity=0x{:X}",
-                    self.thread_id,
-                    std::thread::current().name().unwrap_or("?"),
-                    self.core_id,
-                    self.current_core_id,
-                    self.physical_affinity_mask.get_affinity_mask(),
-                );
-                self.host_context = Some(common::fiber::Fiber::new(init));
-            }
-        }
-        self.host_context.clone()
+    fn initialize_host_context(&mut self, init_func: Option<Box<dyn FnOnce() + Send>>) {
+        self.host_context = init_func.map(common::fiber::Fiber::new);
     }
 
     /// Read the user-mode disable count from the thread's TLS region in guest memory.
@@ -1546,9 +1522,9 @@ impl KThread {
         // The TLS address is stored in m_tls_address and passed to the JIT
         // via SetTpidrroEl0 (CP15 URO) during LoadContext, not via ctx.tpidr (UPRW).
 
-        // Initialize emulation parameters — create host fiber context.
+        // Initialize emulation parameters.
         // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
-        self.pending_host_context_init = init_func;
+        self.initialize_host_context(init_func);
     }
 
     /// Initialize as a kernel main thread (no process owner).
@@ -1600,9 +1576,9 @@ impl KThread {
         // No owner → use 64-bit thread context (upstream: m_parent == nullptr → 64-bit path).
         self.reset_thread_context64(0, 0, 0);
 
-        // Initialize emulation parameters — create host fiber context.
+        // Initialize emulation parameters.
         // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
-        self.pending_host_context_init = init_func;
+        self.initialize_host_context(init_func);
     }
 
     /// Initialize as a kernel idle thread (no process owner).
@@ -1781,9 +1757,9 @@ impl KThread {
         // Upstream does NOT set thread_context.tpidr here.
         // The TLS address is passed via SetTpidrroEl0 (CP15 URO) during LoadContext.
 
-        // Initialize emulation parameters — create host fiber context.
+        // Initialize emulation parameters.
         // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
-        self.pending_host_context_init = init_func;
+        self.initialize_host_context(init_func);
 
         RESULT_SUCCESS.get_inner_value()
     }
@@ -1938,7 +1914,7 @@ impl KThread {
                 crate::hle::kernel::svc::svc_thread::exit_thread(system.get());
             }
         });
-        self.pending_host_context_init = Some(wrapped_func);
+        self.initialize_host_context(Some(wrapped_func));
 
         log::trace!(
             "KThread::initialize_service_thread: thread_id={} priority={} core={}",
@@ -2731,6 +2707,12 @@ impl KThread {
             return RESULT_INVALID_STATE.get_inner_value();
         }
 
+        log::trace!(
+            "KThread::sleep enter tid={} timeout_tick={} disable_dispatch={}",
+            self.thread_id,
+            timeout,
+            self.get_disable_dispatch_count()
+        );
         self.wait_result = RESULT_SUCCESS.get_inner_value();
         let current_tick = super::kernel::get_current_hardware_tick();
         self.sleep_deadline = deadline_from_timeout_tick(timeout, current_tick);
@@ -2762,10 +2744,16 @@ impl KThread {
             }
 
             self.set_timer_task_time(timeout);
+            log::trace!(
+                "KThread::sleep tid={} before begin_wait_with_queue",
+                self.thread_id
+            );
             self.begin_wait_with_queue(wait_queue.base);
             self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Sleep);
+            log::trace!("KThread::sleep tid={} wait armed", self.thread_id);
         }
 
+        log::trace!("KThread::sleep exit tid={}", self.thread_id);
         RESULT_SUCCESS.get_inner_value()
     }
 
@@ -2913,7 +2901,6 @@ impl KThread {
         // Release host emulation members.
         // Upstream: m_host_context.reset()
         self.host_context = None;
-        self.pending_host_context_init = None;
 
         // Perform inherited finalization.
         // Upstream: KSynchronizationObject::Finalize()
@@ -2940,12 +2927,26 @@ impl KThread {
 
     /// OnTimer callback.
     pub fn on_timer(&mut self) {
+        log::trace!(
+            "KThread::on_timer tid={} state={:?} active_core={} current_core={} wait_queue={}",
+            self.thread_id,
+            self.get_state(),
+            self.get_active_core(),
+            self.get_current_core(),
+            self.wait_queue.is_some()
+        );
         if self.get_state() == ThreadState::WAITING {
             self.synced_index = -1;
             self.wait_result = RESULT_TIMED_OUT.get_inner_value();
             if let Some(wait_queue) = self.wait_queue.clone() {
                 wait_queue.cancel_wait(self, RESULT_TIMED_OUT.get_inner_value(), false);
             }
+            log::trace!(
+                "KThread::on_timer tid={} post-cancel state={:?} wait_result=0x{:x}",
+                self.thread_id,
+                self.get_state(),
+                self.wait_result
+            );
         }
     }
 
@@ -3434,24 +3435,25 @@ mod tests {
     }
 
     #[test]
-    fn lazy_host_context_creation_consumes_pending_init_once() {
+    fn initialize_host_context_creates_fiber_eagerly() {
         let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let runs_for_init = Arc::clone(&runs);
 
         let mut thread = KThread::new();
-        thread.pending_host_context_init = Some(Box::new(move || {
+        thread.initialize_host_context(Some(Box::new(move || {
             runs_for_init.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }));
+        })));
 
         let first = thread
-            .get_or_create_host_context()
-            .expect("host context should be created");
+            .get_host_context()
+            .cloned()
+            .expect("host context should be created eagerly");
         let second = thread
-            .get_or_create_host_context()
+            .get_host_context()
+            .cloned()
             .expect("host context should be reused");
 
         assert!(Arc::ptr_eq(&first, &second));
-        assert!(thread.pending_host_context_init.is_none());
         assert!(thread.host_context.is_some());
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
     }

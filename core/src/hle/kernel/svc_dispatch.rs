@@ -31,6 +31,7 @@ use crate::hle::kernel::svc::svc_shared_memory;
 use crate::hle::kernel::svc::svc_synchronization;
 use crate::hle::kernel::svc::svc_thread;
 use crate::hle::kernel::svc::svc_tick;
+use crate::hle::kernel::svc::svc_transfer_memory;
 use crate::hle::kernel::svc::svc_types::MemoryPermission;
 
 fn decode_memory_permission(raw: u32) -> MemoryPermission {
@@ -994,9 +995,20 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::CreateTransferMemory) => {
-            // OUT: ret=arg32[0], handle=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle(system));
+            // IN: address=arg32[1], size=arg32[2], perm=arg32[3]; OUT: ret=arg32[0], handle=arg32[1]
+            let address = get_arg32(args, 1) as u64;
+            let size = get_arg32(args, 2) as u64;
+            let map_perm = unsafe { std::mem::transmute(get_arg32(args, 3)) };
+            let mut handle = 0;
+            let result = svc_transfer_memory::create_transfer_memory(
+                system,
+                &mut handle,
+                address,
+                size,
+                map_perm,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, handle);
         }
         Some(SvcId::CreateSharedMemory) => {
             // OUT: ret=arg32[0], handle=arg32[1]
@@ -1004,10 +1016,22 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::MapTransferMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            // IN: handle=arg32[1], address=arg32[2], size=arg32[3], perm=arg32[4]; OUT: ret=arg32[0]
+            let handle = get_arg32(args, 1);
+            let address = get_arg32(args, 2) as u64;
+            let size = get_arg32(args, 3) as u64;
+            let map_perm = unsafe { std::mem::transmute(get_arg32(args, 4)) };
+            let result =
+                svc_transfer_memory::map_transfer_memory(system, handle, address, size, map_perm);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::UnmapTransferMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            // IN: handle=arg32[1], address=arg32[2], size=arg32[3]; OUT: ret=arg32[0]
+            let handle = get_arg32(args, 1);
+            let address = get_arg32(args, 2) as u64;
+            let size = get_arg32(args, 3) as u64;
+            let result = svc_transfer_memory::unmap_transfer_memory(system, handle, address, size);
+            set_arg32(args, 0, result.get_inner_value());
         }
 
         // =====================================================================

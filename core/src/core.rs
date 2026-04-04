@@ -30,7 +30,6 @@ use crate::memory::memory::Memory;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 
 use parking_lot::Mutex;
-use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -112,6 +111,60 @@ impl SystemRef {
 /// Type used for the frontend to designate a callback for System to exit the application.
 pub type ExitCallback = Box<dyn Fn() + Send>;
 
+/// Minimal bridge from `core` to a concrete `audio_core::renderer::Renderer`
+/// session owned by AudioCore.
+///
+/// Upstream `IAudioRenderer` owns `AudioCore::Renderer::Renderer` directly.
+/// Rust cannot name that concrete type from `core`, so exercised service calls
+/// go through this owner-preserving trait object.
+pub trait AudioRendererSessionInterface: Send {
+    fn get_sample_rate(&self) -> u32;
+    fn get_sample_count(&self) -> u32;
+    fn get_mix_buffer_count(&self) -> u32;
+    fn get_state(&self) -> u32;
+    fn request_update(
+        &self,
+        input: &[u8],
+        performance: &mut [u8],
+        output: &mut [u8],
+    ) -> crate::hle::result::ResultCode;
+    fn start(&self);
+    fn stop(&self);
+    fn supports_system_event(&self) -> bool;
+    fn set_process(&self, process: *mut crate::hle::kernel::k_process::KProcess);
+    fn set_rendering_time_limit(&self, rendering_time_limit: u32);
+    fn get_rendering_time_limit(&self) -> u32;
+    fn set_voice_drop_parameter(&self, voice_drop_parameter: f32);
+    fn get_voice_drop_parameter(&self) -> f32;
+}
+
+/// Minimal bridge from `core` to the concrete `audio_core` crate.
+///
+/// Upstream `Core::System` owns `AudioCore::AudioCore` directly. Rust cannot do
+/// that without a crate cycle, so `System` stores a trait object that preserves
+/// the same owner boundary for exercised service calls.
+pub trait AudioCoreInterface: Send {
+    /// Mirror `AudioCore::Renderer::Manager::GetWorkBufferSize`.
+    fn get_audio_renderer_work_buffer_size(&self, params: &[u8; 0x34]) -> Option<u64>;
+
+    /// Mirror `IAudioRendererManager::OpenAudioRenderer` by creating an owned
+    /// audio renderer session backed by the real audio_core renderer owners.
+    fn open_audio_renderer(
+        &self,
+        params: &[u8; 0x34],
+        transfer_memory: *mut crate::hle::kernel::k_transfer_memory::KTransferMemory,
+        transfer_memory_size: u64,
+        process: *mut crate::hle::kernel::k_process::KProcess,
+        applet_resource_user_id: u64,
+        rendered_event: std::sync::Arc<
+            std::sync::Mutex<crate::hle::kernel::k_event::KEvent>,
+        >,
+    ) -> std::result::Result<
+        Box<dyn AudioRendererSessionInterface>,
+        crate::hle::result::ResultCode,
+    >;
+}
+
 /// The main System struct. Top-level orchestrator that owns all subsystems.
 ///
 /// In C++, this uses a Pimpl pattern (System::Impl). In Rust, we flatten
@@ -165,9 +218,8 @@ pub struct System {
 
     /// AudioCore subsystem (audio sinks, ADSP, audio manager).
     /// Upstream: `std::unique_ptr<AudioCore::AudioCore> audio_core`.
-    /// Type-erased because audio_core crate depends on core (circular dep).
     /// The frontend creates the concrete AudioCore and sets it via set_audio_core().
-    audio_core: Option<Box<dyn Any + Send>>,
+    audio_core: Option<Box<dyn AudioCoreInterface>>,
 
     /// Device memory (emulated Switch DRAM).
     device_memory: Option<Box<DeviceMemory>>,
@@ -1002,20 +1054,14 @@ impl System {
     /// Called by the frontend after System::load() since audio_core crate depends
     /// on core (circular dependency prevents core from creating AudioCore directly).
     /// Upstream: created inside SetupForApplicationProcess() (core.cpp:283).
-    pub fn set_audio_core(&mut self, audio_core: Box<dyn Any + Send>) {
+    pub fn set_audio_core(&mut self, audio_core: Box<dyn AudioCoreInterface>) {
         self.audio_core = Some(audio_core);
     }
 
-    /// Get the AudioCore subsystem (type-erased).
-    /// Callers must downcast to the concrete AudioCore type.
+    /// Get the AudioCore subsystem bridge.
     /// Upstream: `System::AudioCore()` returns `AudioCore::AudioCore&`.
-    pub fn audio_core(&self) -> Option<&(dyn Any + Send)> {
+    pub fn audio_core(&self) -> Option<&dyn AudioCoreInterface> {
         self.audio_core.as_deref()
-    }
-
-    /// Get the AudioCore subsystem mutably (type-erased).
-    pub fn audio_core_mut(&mut self) -> Option<&mut (dyn Any + Send)> {
-        self.audio_core.as_deref_mut()
     }
 
     /// Set NVDEC active state.

@@ -158,13 +158,9 @@ impl Sink for CubebSink {
         builder.name(name.to_string()).latency(minimum_latency);
 
         if stream_type == StreamType::In {
-            builder
-                .input(self.input_device, &params)
-                .default_output(&params);
+            builder.input(self.input_device, &params);
         } else {
-            builder
-                .default_input(&params)
-                .output(self.output_device, &params);
+            builder.output(self.output_device, &params);
         }
 
         builder

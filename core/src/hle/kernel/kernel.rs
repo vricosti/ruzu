@@ -18,7 +18,7 @@ use super::super::service::server_manager::ServerManager;
 use super::k_memory_manager::KMemoryManager;
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
-use super::k_thread::KThread;
+use super::k_thread::{KThread, ThreadState};
 
 use super::global_scheduler_context::GlobalSchedulerContext;
 use super::init::init_slab_setup::KSlabResourceCounts;
@@ -88,6 +88,19 @@ fn real_enable_scheduling(cores_needing_scheduling: u64) {
         return;
     }
     let current_scheduler = kernel.current_scheduler();
+
+    let current_tid = get_current_thread_id_fast();
+    let disable_dispatch =
+        with_current_thread_fast_mut(|t| t.get_disable_dispatch_count()).unwrap_or(-1);
+    let state = with_current_thread_fast_mut(|t| t.get_state()).unwrap_or(ThreadState::INITIALIZED);
+    log::trace!(
+        "real_enable_scheduling: tid={:?} disable_dispatch={} state={:?} cores=0x{:x} has_scheduler={}",
+        current_tid,
+        disable_dispatch,
+        state,
+        cores_needing_scheduling,
+        current_scheduler.is_some()
+    );
 
     KScheduler::enable_scheduling_with_scheduler(
         cores_needing_scheduling,
@@ -260,13 +273,26 @@ pub fn get_current_hardware_tick() -> Option<i64> {
     }
 
     let kernel = unsafe { &*kernel_ptr };
-    kernel
-        .hardware_timer()
-        .map(|timer| timer.lock().unwrap().get_tick())
+    if let Some(core_timing) = kernel.core_timing() {
+        if let Ok(core_timing) = core_timing.try_lock() {
+            return Some(core_timing.get_global_time_ns().as_nanos() as i64);
+        }
+
+        if kernel.is_multicore() {
+            return Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or(std::time::Duration::ZERO)
+                    .as_nanos() as i64,
+            );
+        }
+    }
+
+    kernel.hardware_timer().map(|timer| timer.get_tick())
 }
 
 /// Get the global hardware timer Arc for the active kernel instance.
-pub fn get_hardware_timer_arc() -> Option<Arc<Mutex<KHardwareTimer>>> {
+pub fn get_hardware_timer_arc() -> Option<Arc<KHardwareTimer>> {
     let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
     if kernel_ptr.is_null() {
         return None;
@@ -299,7 +325,7 @@ pub struct KernelCore {
     next_thread_id: AtomicU64,
 
     // -- Subsystems --
-    hardware_timer: Option<Arc<Mutex<KHardwareTimer>>>,
+    hardware_timer: Option<Arc<KHardwareTimer>>,
     global_object_list_container: Option<KAutoObjectWithListContainer>,
     global_scheduler_context: Option<Arc<Mutex<GlobalSchedulerContext>>>,
     object_name_global_data: Option<KObjectNameGlobalData>,
@@ -426,7 +452,7 @@ impl KernelCore {
 
     /// Initialize the kernel.
     pub fn initialize(&mut self) {
-        self.hardware_timer = Some(Arc::new(Mutex::new(KHardwareTimer::new())));
+        self.hardware_timer = Some(Arc::new(KHardwareTimer::new()));
 
         self.global_object_list_container = Some(KAutoObjectWithListContainer::new());
         self.global_scheduler_context = Some(Arc::new(Mutex::new(GlobalSchedulerContext::new())));
@@ -725,8 +751,10 @@ impl KernelCore {
         }
         self.global_object_list_container = None;
 
-        if let Some(ref timer) = self.hardware_timer {
-            timer.lock().unwrap().finalize();
+        if let Some(timer) = self.hardware_timer.as_mut() {
+            Arc::get_mut(timer)
+                .expect("hardware timer still shared at shutdown")
+                .finalize();
         }
         self.hardware_timer = None;
 
@@ -934,7 +962,7 @@ impl KernelCore {
     }
 
     /// Get the hardware timer (Arc reference).
-    pub fn hardware_timer(&self) -> Option<&Arc<Mutex<KHardwareTimer>>> {
+    pub fn hardware_timer(&self) -> Option<&Arc<KHardwareTimer>> {
         self.hardware_timer.as_ref()
     }
 

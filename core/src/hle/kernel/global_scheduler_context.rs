@@ -98,6 +98,16 @@ impl GlobalSchedulerContext {
         is_dummy: bool,
         process_schedule_count: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     ) {
+        log::trace!(
+            "GSC::on_thread_state_changed tid={} {:?}->{:?} prio={} active_core={} affinity=0x{:x} dummy={}",
+            thread_id,
+            old_state,
+            new_state,
+            priority,
+            active_core,
+            affinity,
+            is_dummy
+        );
         if old_state == new_state {
             return;
         }
@@ -137,6 +147,11 @@ impl GlobalSchedulerContext {
             if active_core >= 0 {
                 if let Some(kernel) = super::kernel::get_kernel_ref() {
                     if let Some(core) = kernel.physical_core(active_core as usize) {
+                        log::trace!(
+                            "GSC::on_thread_state_changed tid={} interrupting core {}",
+                            thread_id,
+                            active_core
+                        );
                         core.interrupt();
                     }
                 }
