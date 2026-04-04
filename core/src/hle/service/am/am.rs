@@ -36,22 +36,32 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         let mut guard = window_system.lock().unwrap();
         guard.set_event_observer(event_observer);
     }
-    // Spawn set_window_system on a dedicated background thread so it can block on
-    // the condition variable while this thread proceeds to run_server.
-    // Matches upstream: AM::LoopProcess calls SetWindowSystem inside LoopProcess, which
-    // runs on a guest kernel thread via RunOnGuestCoreProcess, allowing the setup thread
-    // to call CreateAndInsertByFrontendAppletParameters concurrently.
+    // Rust still cannot call `AppletManager::set_window_system(this)` literally
+    // from `WindowSystem::SetEventObserver()` because `WindowSystem` does not yet
+    // own the upstream `System&`. Run the waiter on a real kernel-managed host
+    // thread instead of a raw OS thread so later process/bootstrap work executes
+    // with valid kernel host-thread registration.
     let ws_for_thread = window_system.clone();
     let system_for_thread = system;
-    std::thread::Builder::new()
-        .name("am:SetWindowSystem".to_string())
-        .spawn(move || {
+    if !system.is_null() {
+        let kernel = system.get().kernel().expect("kernel must exist for AM");
+        kernel.run_on_host_core_process("am:SetWindowSystem", Box::new(move || {
             system_for_thread
                 .get()
                 .get_applet_manager()
                 .set_window_system(Some(ws_for_thread));
-        })
-        .expect("failed to spawn am:SetWindowSystem thread");
+        }));
+    } else {
+        std::thread::Builder::new()
+            .name("am:SetWindowSystem".to_string())
+            .spawn(move || {
+                system_for_thread
+                    .get()
+                    .get_applet_manager()
+                    .set_window_system(Some(ws_for_thread));
+            })
+            .expect("failed to spawn am:SetWindowSystem thread");
+    }
 
     let ws = window_system.clone();
     let system_oe = system;

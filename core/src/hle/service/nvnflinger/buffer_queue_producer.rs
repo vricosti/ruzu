@@ -20,6 +20,7 @@ use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::service::nvdrv::core::nvmap::NvMap;
 
 use super::binder::IBinder;
 use super::buffer_queue_core::BufferQueueCore;
@@ -42,6 +43,7 @@ pub struct BufferQueueProducer {
     next_callback_ticket: Mutex<i32>,
     current_callback_ticket: Mutex<i32>,
     callback_condition: Condvar,
+    nvmap: Arc<NvMap>,
 }
 
 struct BufferWaitEventOwner {
@@ -50,7 +52,7 @@ struct BufferWaitEventOwner {
 }
 
 impl BufferQueueProducer {
-    pub fn new(core: Arc<BufferQueueCore>) -> Self {
+    pub fn new(core: Arc<BufferQueueCore>, nvmap: Arc<NvMap>) -> Self {
         let (buffer_wait_event, buffer_wait_readable_event) = Self::new_buffer_wait_event();
         Self {
             core,
@@ -61,6 +63,7 @@ impl BufferQueueProducer {
             next_callback_ticket: Mutex::new(0),
             current_callback_ticket: Mutex::new(0),
             callback_condition: Condvar::new(),
+            nvmap,
         }
     }
 
@@ -660,8 +663,10 @@ impl BufferQueueProducer {
         inner.slots[s].frame_number = 0;
 
         if let Some(buf) = buffer {
-            inner.slots[s].graphic_buffer =
-                Some(Arc::new(GraphicBuffer::from_nv_buffer(*buf, false)));
+            inner.slots[s].graphic_buffer = Some(Arc::new(GraphicBuffer::from_nv_buffer(
+                Arc::clone(&self.nvmap),
+                *buf,
+            )));
             inner.slots[s].is_preallocated = true;
             inner.override_max_buffer_count = inner.get_preallocated_buffer_count_locked();
             inner.default_width = buf.get_width();
@@ -915,14 +920,20 @@ impl IBinder for BufferQueueProducer {
 
 #[cfg(test)]
 mod tests {
+    use crate::hle::service::nvdrv::core::container::Container;
+
     use super::super::graphic_buffer_producer::QueueBufferInput;
     use super::super::pixel_format::PixelFormat;
     use super::*;
 
+    fn test_nvmap() -> Arc<NvMap> {
+        Container::new().get_nv_map_file_handle()
+    }
+
     #[test]
     fn get_native_handle_returns_persistent_buffer_wait_event() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core);
+        let producer = BufferQueueProducer::new(core, test_nvmap());
 
         let first = producer.get_native_handle(0).unwrap();
         let second = producer.get_native_handle(15).unwrap();
@@ -934,7 +945,7 @@ mod tests {
     fn connect_sets_nonblocking_flag_from_core_and_producer_control() {
         let core = BufferQueueCore::new();
         core.mutex.lock().unwrap().consumer_controlled_by_app = true;
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
 
         let (status, _) = producer.connect(None, NativeWindowApi::Egl, true);
         assert_eq!(status, Status::NoError);
@@ -944,7 +955,7 @@ mod tests {
     #[test]
     fn disconnect_signals_buffer_wait_event() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core);
+        let producer = BufferQueueProducer::new(core, test_nvmap());
         let event = producer.get_native_handle(0).unwrap();
         assert!(!event.lock().unwrap().is_signaled());
 
@@ -958,7 +969,7 @@ mod tests {
     #[test]
     fn set_preallocated_buffer_signals_wait_event_and_updates_defaults() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
         let event = producer.get_native_handle(0).unwrap();
         let buffer = Arc::new(NvGraphicBuffer::new(1280, 720, PixelFormat::Rgba8888, 0));
 
@@ -977,7 +988,7 @@ mod tests {
     #[test]
     fn set_preallocated_buffer_resets_slot_and_uses_no_fence() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
 
         {
             let mut inner = core.mutex.lock().unwrap();
@@ -1004,7 +1015,7 @@ mod tests {
     #[test]
     fn queue_buffer_marks_core_as_having_queued_buffers() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
         let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
         assert_eq!(
             producer.set_preallocated_buffer(0, Some(buffer)),
@@ -1024,7 +1035,7 @@ mod tests {
     #[test]
     fn request_buffer_rejects_slot_not_owned_by_producer() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
         core.mutex.lock().unwrap().slots[0].graphic_buffer = Some(Arc::new(GraphicBuffer::new(
             16,
             16,
@@ -1040,7 +1051,7 @@ mod tests {
     #[test]
     fn dequeue_buffer_requires_explicit_buffer_count_for_second_dequeue() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
         assert_eq!(
             producer.set_preallocated_buffer(
                 0,
@@ -1078,7 +1089,7 @@ mod tests {
     #[test]
     fn dequeue_buffer_sets_reallocation_flag_for_empty_slot() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
         core.mutex.lock().unwrap().override_max_buffer_count = 1;
 
         let (status, slot, _) = producer.dequeue_buffer(false, 32, 32, PixelFormat::Rgba8888, 0);

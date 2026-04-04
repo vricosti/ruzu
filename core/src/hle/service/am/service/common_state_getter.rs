@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/common_state_getter.cpp
 
 use crate::hle::service::am::am_types::{
-    AppletMessage, FocusState, OperationMode, SystemButtonType,
+    AppletId, AppletMessage, FocusState, OperationMode, SystemButtonType,
 };
 use crate::hle::service::am::applet::Applet;
 use std::collections::BTreeMap;
@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::set::settings_types::PlatformRegion;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for ICommonStateGetter:
@@ -89,8 +90,13 @@ impl ICommonStateGetter {
             (9, Some(Self::get_current_focus_state_handler), "GetCurrentFocusState"),
             (10, Some(Self::request_to_acquire_sleep_lock_handler), "RequestToAcquireSleepLock"),
             (13, Some(Self::get_acquired_sleep_lock_event_handler), "GetAcquiredSleepLockEvent"),
+            (31, Some(Self::get_reader_lock_accessor_ex_handler), "GetReaderLockAccessorEx"),
+            (32, Some(Self::get_writer_lock_accessor_ex_handler), "GetWriterLockAccessorEx"),
             (50, Some(Self::is_vr_mode_enabled_handler), "IsVrModeEnabled"),
             (51, Some(Self::set_vr_mode_enabled_handler), "SetVrModeEnabled"),
+            (52, Some(Self::set_lcd_backlight_off_enabled_handler), "SetLcdBacklighOffEnabled"),
+            (53, Some(Self::begin_vr_mode_ex_handler), "BeginVrModeEx"),
+            (54, Some(Self::end_vr_mode_ex_handler), "EndVrModeEx"),
             (
                 55,
                 Some(Self::is_in_controller_firmware_update_section_handler),
@@ -116,6 +122,11 @@ impl ICommonStateGetter {
                 200,
                 Some(Self::get_operation_mode_system_info_handler),
                 "GetOperationModeSystemInfo",
+            ),
+            (
+                300,
+                Some(Self::get_settings_platform_region_handler),
+                "GetSettingsPlatformRegion",
             ),
             (
                 900,
@@ -164,6 +175,27 @@ impl ICommonStateGetter {
         );
     }
 
+    /// Port of ICommonStateGetter::SetLcdBacklighOffEnabled
+    pub fn set_lcd_backlight_off_enabled(&self, enabled: bool) {
+        log::warn!(
+            "(STUBBED) SetLcdBacklighOffEnabled called, enabled={}",
+            enabled
+        );
+        self.applet.lock().unwrap().lcd_backlight_off_enabled = enabled;
+    }
+
+    /// Port of ICommonStateGetter::BeginVrModeEx
+    pub fn begin_vr_mode_ex(&self) {
+        log::warn!("(STUBBED) BeginVrModeEx called");
+        self.applet.lock().unwrap().vr_mode_enabled = true;
+    }
+
+    /// Port of ICommonStateGetter::EndVrModeEx
+    pub fn end_vr_mode_ex(&self) {
+        log::warn!("(STUBBED) EndVrModeEx called");
+        self.applet.lock().unwrap().vr_mode_enabled = false;
+    }
+
     /// Port of ICommonStateGetter::IsInControllerFirmwareUpdateSection
     pub fn is_in_controller_firmware_update_section(&self) -> bool {
         log::info!("IsInControllerFirmwareUpdateSection called");
@@ -197,6 +229,12 @@ impl ICommonStateGetter {
         0
     }
 
+    /// Port of ICommonStateGetter::GetSettingsPlatformRegion
+    pub fn get_settings_platform_region(&self) -> PlatformRegion {
+        log::info!("GetSettingsPlatformRegion called");
+        PlatformRegion::Global
+    }
+
     /// Port of ICommonStateGetter::SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled
     ///
     /// Upstream takes no parameter — it unconditionally sets the flag to true.
@@ -206,6 +244,27 @@ impl ICommonStateGetter {
             .lock()
             .unwrap()
             .request_exit_to_library_applet_at_execute_next_program_enabled = true;
+    }
+
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
+        let is_domain = ctx
+            .get_manager()
+            .map_or(false, |manager| manager.lock().unwrap().is_domain());
+        let move_handle = if is_domain {
+            0
+        } else {
+            ctx.create_session_for_service(object.clone()).unwrap_or(0)
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        if is_domain {
+            ctx.add_domain_object(object);
+        } else {
+            rb.push_move_objects(move_handle);
+        }
     }
 
     /// GetEventHandle (cmd 0): returns a copy handle to the message event.
@@ -313,6 +372,44 @@ impl ICommonStateGetter {
         rb.push_copy_objects(handle);
     }
 
+    fn get_reader_lock_accessor_ex_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut rp = RequestParser::new(ctx);
+        let button_type = rp.pop_u32();
+        log::info!(
+            "ICommonStateGetter::GetReaderLockAccessorEx called, button_type={}",
+            button_type
+        );
+        let owner_process = ctx
+            .owner_process_arc()
+            .expect("ICommonStateGetter::GetReaderLockAccessorEx requires owner process");
+        Self::push_interface_response(
+            ctx,
+            Arc::new(super::lock_accessor::ILockAccessor::new(owner_process)),
+        );
+    }
+
+    fn get_writer_lock_accessor_ex_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut rp = RequestParser::new(ctx);
+        let button_type = rp.pop_u32();
+        log::info!(
+            "ICommonStateGetter::GetWriterLockAccessorEx called, button_type={}",
+            button_type
+        );
+        let owner_process = ctx
+            .owner_process_arc()
+            .expect("ICommonStateGetter::GetWriterLockAccessorEx requires owner process");
+        Self::push_interface_response(
+            ctx,
+            Arc::new(super::lock_accessor::ILockAccessor::new(owner_process)),
+        );
+    }
+
     fn get_operation_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
@@ -348,6 +445,34 @@ impl ICommonStateGetter {
             unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut rp = RequestParser::new(ctx);
         service.set_vr_mode_enabled(rp.pop_bool());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_lcd_backlight_off_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rp = RequestParser::new(ctx);
+        service.set_lcd_backlight_off_enabled(rp.pop_bool());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn begin_vr_mode_ex_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        service.begin_vr_mode_ex();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn end_vr_mode_ex_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        service.end_vr_mode_ex();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -432,6 +557,17 @@ impl ICommonStateGetter {
         rb.push_u32(service.get_operation_mode_system_info());
     }
 
+    fn get_settings_platform_region_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(service.get_settings_platform_region() as u32);
+    }
+
     fn set_request_exit_to_library_applet_at_execute_next_program_enabled_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
@@ -461,5 +597,52 @@ impl ServiceFramework for ICommonStateGetter {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exercised_common_state_handlers_are_registered() {
+        let service = ICommonStateGetter::new(Arc::new(Mutex::new(Applet::new(
+            crate::core::SystemRef::null(),
+            false,
+        ))));
+
+        for cmd in [31u32, 32, 52, 53, 54, 300] {
+            assert!(
+                service
+                    .handlers()
+                    .get(&cmd)
+                    .and_then(|info| info.handler)
+                    .is_some(),
+                "cmd {} should have a real handler",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn get_settings_platform_region_returns_global() {
+        let service = ICommonStateGetter::new(Arc::new(Mutex::new(Applet::new(
+            crate::core::SystemRef::null(),
+            false,
+        ))));
+        assert_eq!(service.get_settings_platform_region(), PlatformRegion::Global);
+    }
+
+    #[test]
+    fn vr_mode_ex_handlers_toggle_vr_mode() {
+        let service = ICommonStateGetter::new(Arc::new(Mutex::new(Applet::new(
+            crate::core::SystemRef::null(),
+            false,
+        ))));
+        assert!(!service.is_vr_mode_enabled());
+        service.begin_vr_mode_ex();
+        assert!(service.is_vr_mode_enabled());
+        service.end_vr_mode_ex();
+        assert!(!service.is_vr_mode_enabled());
     }
 }

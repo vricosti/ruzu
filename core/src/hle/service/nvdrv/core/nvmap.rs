@@ -6,7 +6,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/core/nvmap.cpp
 
 use std::collections::{HashMap, LinkedList};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::service::nvdrv::core::container::SessionId;
@@ -55,7 +55,7 @@ pub type HandleId = u32;
 /// need to modify handle state behind shared references.
 pub struct Handle {
     pub id: HandleId,
-    pub orig_size: u64,
+    orig_size: AtomicU64,
     inner: Mutex<HandleInner>,
 }
 
@@ -82,7 +82,7 @@ impl Handle {
     pub fn new(size: u64, id: HandleId) -> Self {
         Self {
             id,
-            orig_size: size,
+            orig_size: AtomicU64::new(size),
             inner: Mutex::new(HandleInner {
                 align: 0,
                 size,
@@ -162,6 +162,14 @@ impl Handle {
         }
 
         NvResult::Success
+    }
+
+    pub fn orig_size(&self) -> u64 {
+        self.orig_size.load(Ordering::Relaxed)
+    }
+
+    pub fn set_orig_size(&self, size: u64) {
+        self.orig_size.store(size, Ordering::Relaxed);
     }
 
     /// Locks the inner state and returns the guard for direct access.

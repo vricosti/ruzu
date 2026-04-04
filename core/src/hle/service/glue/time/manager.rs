@@ -15,6 +15,11 @@ use super::file_timestamp_worker::FileTimestampWorker;
 use super::standard_steady_clock_resource::StandardSteadyClockResource;
 use super::worker::TimeWorker;
 
+use crate::core::SystemRef;
+use crate::hle::service::psc::time::common::{
+    CalendarTime, StaticServiceSetupInfo, SteadyClockTimePoint, SystemClockContext,
+};
+use crate::hle::service::psc::time::r#static::StaticService as PscStaticService;
 use crate::hle::service::sm::sm::ServiceManager;
 
 /// TimeManager corresponds to upstream `Glue::Time::TimeManager`.
@@ -22,6 +27,8 @@ pub struct TimeManager {
     pub worker: TimeWorker,
     pub file_timestamp_worker: FileTimestampWorker,
     pub steady_clock_resource: StandardSteadyClockResource,
+    pub psc_time: Arc<Mutex<crate::hle::service::psc::time::manager::TimeManager>>,
+    pub time_sm: Arc<PscStaticService>,
     service_manager: Arc<Mutex<ServiceManager>>,
 }
 
@@ -29,14 +36,46 @@ impl TimeManager {
     /// Create a new TimeManager with a reference to the ServiceManager.
     ///
     /// Matches upstream `TimeManager::TimeManager(Core::System& system)`.
-    pub fn new(service_manager: Arc<Mutex<ServiceManager>>) -> Self {
+    pub fn new(service_manager: Arc<Mutex<ServiceManager>>, system: SystemRef) -> Self {
         log::debug!("Glue::Time::TimeManager::new called");
+        let psc_time = Arc::new(Mutex::new(
+            crate::hle::service::psc::time::manager::TimeManager::new(Box::new(move || {
+                if system.is_null() {
+                    0
+                } else {
+                    system
+                        .get()
+                        .core_timing()
+                        .lock()
+                        .unwrap()
+                        .get_global_time_ns()
+                        .as_nanos() as i64
+                }
+            })),
+        ));
+        let time_sm = Arc::new(PscStaticService::with_time_manager(
+            StaticServiceSetupInfo {
+                can_write_local_clock: true,
+                can_write_user_clock: true,
+                can_write_network_clock: true,
+                can_write_timezone_device_location: true,
+                can_write_steady_clock: true,
+                can_write_uninitialized_clock: false,
+            },
+            Arc::clone(&psc_time),
+        ));
         Self {
             worker: TimeWorker::new(),
             file_timestamp_worker: FileTimestampWorker::new(),
             steady_clock_resource: StandardSteadyClockResource::new(),
+            psc_time,
+            time_sm,
             service_manager,
         }
+    }
+
+    pub fn make_static_service(&self, setup_info: StaticServiceSetupInfo) -> PscStaticService {
+        PscStaticService::with_time_manager(setup_info, Arc::clone(&self.psc_time))
     }
 
     /// Initialize the time manager — the core initialization sequence.
@@ -124,21 +163,41 @@ impl TimeManager {
                 format_uuid(&new_clock_source_id)
             );
         }
+        {
+            let mut time = self.psc_time.lock().unwrap();
+            time.standard_steady_clock
+                .initialize(new_clock_source_id, 0, 0, 0, false);
+            *time.steady_clock_source_id.lock().unwrap() = new_clock_source_id;
+            time.shared_memory
+                .set_automatic_correction(false);
+        }
 
         // === SetupStandardLocalSystemClockCore ===
         // Upstream: m_set_sys->GetUserSystemClockContext(&context)
         {
             let inner = set_sys_svc.inner.lock().unwrap();
-            let _user_context = inner.get_user_system_clock_context();
+            let user_context = decode_system_clock_context(&inner.get_user_system_clock_context());
             log::info!("ISystemSettingsServer::GetUserSystemClockContext called");
+            let epoch_time = get_epoch_time_from_initial_year(set_sys_svc);
+            self.psc_time
+                .lock()
+                .unwrap()
+                .standard_local_system_clock
+                .initialize(&user_context, epoch_time);
         }
 
         // === SetupStandardNetworkSystemClockCore ===
         // Upstream: m_set_sys->GetNetworkSystemClockContext(&context)
         {
             let inner = set_sys_svc.inner.lock().unwrap();
-            let _network_context = inner.get_network_system_clock_context();
+            let network_context =
+                decode_system_clock_context(&inner.get_network_system_clock_context());
             log::info!("ISystemSettingsServer::GetNetworkSystemClockContext called");
+            self.psc_time
+                .lock()
+                .unwrap()
+                .standard_network_system_clock
+                .initialize(&network_context, 10 * 24 * 60 * 60 * 1_000_000_000);
         }
 
         // === SetupStandardUserSystemClockCore ===
@@ -151,10 +210,15 @@ impl TimeManager {
                 "ISystemSettingsServer::IsUserSystemClockAutomaticCorrectionEnabled called, out_automatic_correction_enabled={}",
                 enabled
             );
-            let _updated_time = inner.get_user_system_clock_automatic_correction_updated_time();
+            let updated_time = decode_steady_clock_time_point(
+                &inner.get_user_system_clock_automatic_correction_updated_time(),
+            );
             log::info!(
                 "ISystemSettingsServer::GetUserSystemClockAutomaticCorrectionUpdatedTime called"
             );
+            let mut time = self.psc_time.lock().unwrap();
+            time.standard_user_system_clock.set_time_point_and_signal(&updated_time);
+            time.shared_memory.set_automatic_correction(enabled);
         }
 
         // === SetupTimeZoneServiceCore ===
@@ -187,8 +251,17 @@ impl TimeManager {
             inner.set_device_time_zone_location_updated_time([0u8; 0x18]);
             log::info!("ISystemSettingsServer::SetDeviceTimeZoneLocationUpdatedTime called");
 
-            let _updated = inner.get_device_time_zone_location_updated_time();
+            let updated =
+                decode_steady_clock_time_point(&inner.get_device_time_zone_location_updated_time());
             log::info!("ISystemSettingsServer::GetDeviceTimeZoneLocationUpdatedTime called");
+
+            let mut time = self.psc_time.lock().unwrap();
+            let rc = time.time_zone.parse_binary(&tz_name, b"");
+            if rc.is_error() {
+                log::error!("TimeManager: failed to set default timezone rule");
+            }
+            time.time_zone.set_time_point(&updated);
+            time.time_zone.set_initialized();
         }
 
         // === Post-setup: write back clock contexts ===
@@ -220,9 +293,29 @@ impl TimeManager {
             );
         }
 
+        self.psc_time
+            .lock()
+            .unwrap()
+            .ephemeral_network_clock
+            .clock
+            .set_initialized();
+
         self.worker.initialize();
         log::info!("Glue::Time::TimeManager: initialization complete");
     }
+}
+
+fn get_epoch_time_from_initial_year(
+    _set_sys: &crate::hle::service::set::system_settings_server::SystemSettingsService,
+) -> i64 {
+    calendar_time_to_epoch(CalendarTime {
+        year: 2023,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+    })
 }
 
 fn format_uuid(id: &[u8; 16]) -> String {
@@ -247,4 +340,40 @@ fn generate_clock_source_id() -> [u8; 16] {
     id[6] = (id[6] & 0x0f) | 0x40;
     id[8] = (id[8] & 0x3f) | 0x80;
     id
+}
+
+fn decode_system_clock_context(bytes: &[u8; 0x20]) -> SystemClockContext {
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const SystemClockContext) }
+}
+
+fn decode_steady_clock_time_point(bytes: &[u8; 0x18]) -> SteadyClockTimePoint {
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const SteadyClockTimePoint) }
+}
+
+fn calendar_time_to_epoch(calendar: CalendarTime) -> i64 {
+    const MONTH_START_DAY_OF_YEAR: [i32; 12] =
+        [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+    let month_s16 = calendar.month as i16;
+    let month = (((month_s16 * 43) & !i16::MAX) + ((month_s16 * 43) >> 9)) as i8;
+    let mut month_index = calendar.month - 12 * month;
+    if month_index == 0 {
+        month_index = 12;
+    }
+    let year = (month as i32 + calendar.year as i32) - i32::from(month_index == 0);
+    let v8 = if year >= 0 { year } else { year + 3 };
+
+    let mut days_since_epoch =
+        calendar.day as i64 + MONTH_START_DAY_OF_YEAR[month_index as usize - 1] as i64;
+    days_since_epoch +=
+        (year as i64 * 365) + (v8 / 4) as i64 - (year / 100) as i64 + (year / 400) as i64 - 365;
+
+    let is_leap = |y: i32| -> bool { (y % 4 == 0) && ((y % 100 != 0) || (y % 400 == 0)) };
+    if month_index <= 2 && is_leap(year) {
+        days_since_epoch -= 1;
+    }
+
+    (((24 * days_since_epoch + calendar.hour as i64) * 60 + calendar.minute as i64) * 60
+        + calendar.second as i64)
+        - 62_135_683_200
 }

@@ -7,6 +7,7 @@
 //! ISteadyClock: provides steady clock time point queries.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use super::common::SteadyClockTimePoint;
 use super::errors::{RESULT_CLOCK_UNINITIALIZED, RESULT_NOT_IMPLEMENTED, RESULT_PERMISSION_DENIED};
@@ -35,7 +36,7 @@ pub struct SteadyClock {
     can_write_uninitialized_clock: bool,
     // State for the clock core
     initialized: bool,
-    test_offset: i64,
+    test_offset: Mutex<i64>,
     internal_offset: i64,
     current_time_point: SteadyClockTimePoint,
     setup_result: ResultCode,
@@ -46,32 +47,74 @@ pub struct SteadyClock {
 
 impl SteadyClock {
     pub fn new(can_write_steady_clock: bool, can_write_uninitialized_clock: bool) -> Self {
+        Self::with_state(
+            can_write_steady_clock,
+            can_write_uninitialized_clock,
+            false,
+            0,
+            0,
+            SteadyClockTimePoint::default(),
+            RESULT_SUCCESS,
+            false,
+        )
+    }
+
+    pub fn with_state(
+        can_write_steady_clock: bool,
+        can_write_uninitialized_clock: bool,
+        initialized: bool,
+        test_offset: i64,
+        internal_offset: i64,
+        current_time_point: SteadyClockTimePoint,
+        setup_result: ResultCode,
+        rtc_reset_detected: bool,
+    ) -> Self {
         let handlers = build_handler_map(&[
             (
                 commands::GET_CURRENT_TIME_POINT,
-                None,
+                Some(Self::get_current_time_point_handler),
                 "GetCurrentTimePoint",
             ),
-            (commands::GET_TEST_OFFSET, None, "GetTestOffset"),
-            (commands::SET_TEST_OFFSET, None, "SetTestOffset"),
-            (commands::GET_RTC_VALUE, None, "GetRtcValue"),
-            (commands::IS_RTC_RESET_DETECTED, None, "IsRtcResetDetected"),
+            (
+                commands::GET_TEST_OFFSET,
+                Some(Self::get_test_offset_handler),
+                "GetTestOffset",
+            ),
+            (
+                commands::SET_TEST_OFFSET,
+                Some(Self::set_test_offset_handler),
+                "SetTestOffset",
+            ),
+            (
+                commands::GET_RTC_VALUE,
+                Some(Self::get_rtc_value_handler),
+                "GetRtcValue",
+            ),
+            (
+                commands::IS_RTC_RESET_DETECTED,
+                Some(Self::is_rtc_reset_detected_handler),
+                "IsRtcResetDetected",
+            ),
             (
                 commands::GET_SETUP_RESULT_VALUE,
-                None,
+                Some(Self::get_setup_result_value_handler),
                 "GetSetupResultValue",
             ),
-            (commands::GET_INTERNAL_OFFSET, None, "GetInternalOffset"),
+            (
+                commands::GET_INTERNAL_OFFSET,
+                Some(Self::get_internal_offset_handler),
+                "GetInternalOffset",
+            ),
         ]);
         Self {
             can_write_steady_clock,
             can_write_uninitialized_clock,
-            initialized: false,
-            test_offset: 0,
-            internal_offset: 0,
-            current_time_point: SteadyClockTimePoint::default(),
-            setup_result: RESULT_SUCCESS,
-            rtc_reset_detected: false,
+            initialized,
+            test_offset: Mutex::new(test_offset),
+            internal_offset,
+            current_time_point,
+            setup_result,
+            rtc_reset_detected,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -114,15 +157,15 @@ impl SteadyClock {
         }
         log::debug!(
             "SteadyClock::GetTestOffset: test_offset={}",
-            self.test_offset
+            *self.test_offset.lock().unwrap()
         );
-        Ok(self.test_offset)
+        Ok(*self.test_offset.lock().unwrap())
     }
 
     /// SetTestOffset (cmd 3).
     ///
     /// Corresponds to `SteadyClock::SetTestOffset` in upstream steady_clock.cpp.
-    pub fn set_test_offset(&mut self, test_offset: i64) -> ResultCode {
+    pub fn set_test_offset(&self, test_offset: i64) -> ResultCode {
         log::debug!("SteadyClock::SetTestOffset: test_offset={}", test_offset);
         if !self.can_write_steady_clock {
             return RESULT_PERMISSION_DENIED;
@@ -131,7 +174,7 @@ impl SteadyClock {
         if check.is_error() {
             return check;
         }
-        self.test_offset = test_offset;
+        *self.test_offset.lock().unwrap() = test_offset;
         RESULT_SUCCESS
     }
 
@@ -196,6 +239,121 @@ impl SteadyClock {
             self.internal_offset
         );
         Ok(self.internal_offset)
+    }
+
+    fn get_current_time_point_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        match service.get_current_time_point() {
+            Ok(time_point) => {
+                let words = (core::mem::size_of::<SteadyClockTimePoint>() / 4) as u32;
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(
+                    ctx,
+                    2 + words,
+                    0,
+                    0,
+                );
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_raw(&time_point);
+            }
+            Err(rc) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn get_test_offset_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        match service.get_test_offset() {
+            Ok(offset) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i64(offset);
+            }
+            Err(rc) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn set_test_offset_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut rp = crate::hle::service::ipc_helpers::RequestParser::new(ctx);
+        let offset = rp.pop_i64();
+        let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(service.set_test_offset(offset));
+    }
+
+    fn get_rtc_value_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        match service.get_rtc_value() {
+            Ok(value) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i64(value);
+            }
+            Err(rc) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn is_rtc_reset_detected_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        match service.is_rtc_reset_detected() {
+            Ok(detected) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 3, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u32(if detected { 1 } else { 0 });
+            }
+            Err(rc) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn get_setup_result_value_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        match service.get_setup_result_value() {
+            Ok(result) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 3, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u32(result.get_inner_value());
+            }
+            Err(rc) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn get_internal_offset_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        match service.get_internal_offset() {
+            Ok(offset) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i64(offset);
+            }
+            Err(rc) => {
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
     }
 }
 

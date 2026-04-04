@@ -65,6 +65,19 @@ impl TimeZone {
         self.rule_version = *rule_version;
     }
 
+    pub fn snapshot(&self) -> Self {
+        let _lock = self.mutex.lock().unwrap();
+        Self {
+            initialized: self.initialized,
+            mutex: Mutex::new(()),
+            location: self.location,
+            my_rule: self.my_rule.clone(),
+            steady_clock_time_point: self.steady_clock_time_point,
+            total_location_name_count: self.total_location_name_count,
+            rule_version: self.rule_version,
+        }
+    }
+
     pub fn get_location_name(&self) -> Result<LocationName, ResultCode> {
         let _lock = self.mutex.lock().unwrap();
         Ok(self.location)

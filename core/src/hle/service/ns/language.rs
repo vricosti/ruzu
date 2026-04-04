@@ -5,6 +5,8 @@
 //!
 //! nn::ns::detail::ApplicationLanguage and conversion utilities.
 
+use crate::hle::service::set::settings_types::LanguageCode;
+
 /// nn::ns::detail::ApplicationLanguage
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -34,31 +36,6 @@ pub type ApplicationLanguagePriorityList = [ApplicationLanguage; APPLICATION_LAN
 
 pub const fn get_supported_language_flag(lang: ApplicationLanguage) -> u32 {
     1u32 << (lang as u32)
-}
-
-/// LanguageCode values matching upstream Set::LanguageCode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-#[allow(non_camel_case_types)]
-pub enum LanguageCode {
-    JA = 0x000000000000616A,
-    EN_US = 0x00000053552D6E65,
-    FR = 0x0000000000007266,
-    DE = 0x0000000000006564,
-    IT = 0x0000000000007469,
-    ES = 0x0000000000007365,
-    ZH_CN = 0x0000004E432D687A,
-    KO = 0x00000000000006F6B,
-    NL = 0x0000000000006C6E,
-    PT = 0x0000000000007470,
-    RU = 0x0000000000007572,
-    ZH_TW = 0x00000057542D687A,
-    EN_GB = 0x00000042472D6E65,
-    FR_CA = 0x00000041432D7266,
-    ES_419 = 0x0039_3134_2D73_65,
-    ZH_HANS = 0x00736E61482D687A,
-    ZH_HANT = 0x00746E61482D687A,
-    PT_BR = 0x00000052422D7470,
 }
 
 const PRIORITY_LIST_AMERICAN_ENGLISH: ApplicationLanguagePriorityList = [
@@ -391,46 +368,46 @@ pub fn get_application_language_priority_list(
 
 pub fn convert_to_application_language(language_code: LanguageCode) -> Option<ApplicationLanguage> {
     match language_code {
-        LanguageCode::EN_US => Some(ApplicationLanguage::AmericanEnglish),
-        LanguageCode::EN_GB => Some(ApplicationLanguage::BritishEnglish),
-        LanguageCode::JA => Some(ApplicationLanguage::Japanese),
-        LanguageCode::FR => Some(ApplicationLanguage::French),
-        LanguageCode::DE => Some(ApplicationLanguage::German),
-        LanguageCode::ES_419 => Some(ApplicationLanguage::LatinAmericanSpanish),
-        LanguageCode::ES => Some(ApplicationLanguage::Spanish),
-        LanguageCode::IT => Some(ApplicationLanguage::Italian),
-        LanguageCode::NL => Some(ApplicationLanguage::Dutch),
-        LanguageCode::FR_CA => Some(ApplicationLanguage::CanadianFrench),
-        LanguageCode::PT => Some(ApplicationLanguage::Portuguese),
-        LanguageCode::RU => Some(ApplicationLanguage::Russian),
-        LanguageCode::KO => Some(ApplicationLanguage::Korean),
-        LanguageCode::ZH_TW | LanguageCode::ZH_HANT => {
+        LanguageCode::EnUs => Some(ApplicationLanguage::AmericanEnglish),
+        LanguageCode::EnGb => Some(ApplicationLanguage::BritishEnglish),
+        LanguageCode::Ja => Some(ApplicationLanguage::Japanese),
+        LanguageCode::Fr => Some(ApplicationLanguage::French),
+        LanguageCode::De => Some(ApplicationLanguage::German),
+        LanguageCode::Es419 => Some(ApplicationLanguage::LatinAmericanSpanish),
+        LanguageCode::Es => Some(ApplicationLanguage::Spanish),
+        LanguageCode::It => Some(ApplicationLanguage::Italian),
+        LanguageCode::Nl => Some(ApplicationLanguage::Dutch),
+        LanguageCode::FrCa => Some(ApplicationLanguage::CanadianFrench),
+        LanguageCode::Pt => Some(ApplicationLanguage::Portuguese),
+        LanguageCode::Ru => Some(ApplicationLanguage::Russian),
+        LanguageCode::Ko => Some(ApplicationLanguage::Korean),
+        LanguageCode::ZhTw | LanguageCode::ZhHant => {
             Some(ApplicationLanguage::TraditionalChinese)
         }
-        LanguageCode::ZH_CN | LanguageCode::ZH_HANS => Some(ApplicationLanguage::SimplifiedChinese),
-        LanguageCode::PT_BR => Some(ApplicationLanguage::BrazilianPortuguese),
+        LanguageCode::ZhCn | LanguageCode::ZhHans => Some(ApplicationLanguage::SimplifiedChinese),
+        LanguageCode::PtBr => Some(ApplicationLanguage::BrazilianPortuguese),
         _ => None,
     }
 }
 
 pub fn convert_to_language_code(lang: ApplicationLanguage) -> Option<LanguageCode> {
     match lang {
-        ApplicationLanguage::AmericanEnglish => Some(LanguageCode::EN_US),
-        ApplicationLanguage::BritishEnglish => Some(LanguageCode::EN_GB),
-        ApplicationLanguage::Japanese => Some(LanguageCode::JA),
-        ApplicationLanguage::French => Some(LanguageCode::FR),
-        ApplicationLanguage::German => Some(LanguageCode::DE),
-        ApplicationLanguage::LatinAmericanSpanish => Some(LanguageCode::ES_419),
-        ApplicationLanguage::Spanish => Some(LanguageCode::ES),
-        ApplicationLanguage::Italian => Some(LanguageCode::IT),
-        ApplicationLanguage::Dutch => Some(LanguageCode::NL),
-        ApplicationLanguage::CanadianFrench => Some(LanguageCode::FR_CA),
-        ApplicationLanguage::Portuguese => Some(LanguageCode::PT),
-        ApplicationLanguage::Russian => Some(LanguageCode::RU),
-        ApplicationLanguage::Korean => Some(LanguageCode::KO),
-        ApplicationLanguage::TraditionalChinese => Some(LanguageCode::ZH_HANT),
-        ApplicationLanguage::SimplifiedChinese => Some(LanguageCode::ZH_HANS),
-        ApplicationLanguage::BrazilianPortuguese => Some(LanguageCode::PT_BR),
+        ApplicationLanguage::AmericanEnglish => Some(LanguageCode::EnUs),
+        ApplicationLanguage::BritishEnglish => Some(LanguageCode::EnGb),
+        ApplicationLanguage::Japanese => Some(LanguageCode::Ja),
+        ApplicationLanguage::French => Some(LanguageCode::Fr),
+        ApplicationLanguage::German => Some(LanguageCode::De),
+        ApplicationLanguage::LatinAmericanSpanish => Some(LanguageCode::Es419),
+        ApplicationLanguage::Spanish => Some(LanguageCode::Es),
+        ApplicationLanguage::Italian => Some(LanguageCode::It),
+        ApplicationLanguage::Dutch => Some(LanguageCode::Nl),
+        ApplicationLanguage::CanadianFrench => Some(LanguageCode::FrCa),
+        ApplicationLanguage::Portuguese => Some(LanguageCode::Pt),
+        ApplicationLanguage::Russian => Some(LanguageCode::Ru),
+        ApplicationLanguage::Korean => Some(LanguageCode::Ko),
+        ApplicationLanguage::TraditionalChinese => Some(LanguageCode::ZhHant),
+        ApplicationLanguage::SimplifiedChinese => Some(LanguageCode::ZhHans),
+        ApplicationLanguage::BrazilianPortuguese => Some(LanguageCode::PtBr),
         _ => None,
     }
 }

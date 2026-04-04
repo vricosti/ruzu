@@ -941,6 +941,10 @@ pub struct ArmDynarmic32 {
 
     /// Last exception address reported by dynarmic for the current halt.
     last_exception_address: Arc<AtomicU64>,
+
+    /// Cached fastmem pointer for bounded instruction tracing.
+    /// Temporary diagnostic state, not an upstream field.
+    trace_fastmem_ptr: *const u8,
 }
 
 impl ArmDynarmic32 {
@@ -1051,6 +1055,7 @@ impl ArmDynarmic32 {
             jit,
             cp15_uro: 0,
             last_exception_address,
+            trace_fastmem_ptr: fastmem_pointer.unwrap_or(std::ptr::null_mut()) as *const u8,
         };
 
         // NOTE: The parent pointer is NOT set here because `result` will be moved
@@ -1060,6 +1065,13 @@ impl ArmDynarmic32 {
         // This is safe because callbacks are only invoked during run_thread().
 
         result
+    }
+
+    fn trace_read_code_word(&self, vaddr: u32) -> u32 {
+        if self.trace_fastmem_ptr.is_null() {
+            return 0;
+        }
+        unsafe { (self.trace_fastmem_ptr.add(vaddr as usize) as *const u32).read_unaligned() }
     }
 
     /// Set the parent pointer so callbacks can access this ArmDynarmic32.
@@ -1128,6 +1140,7 @@ unsafe impl Send for ArmDynarmic32 {}
 impl ArmInterface for ArmDynarmic32 {
     fn run_thread(&mut self, _thread: &mut KThread) -> HaltReason {
         self.last_exception_address.store(0, Ordering::Relaxed);
+        let trace_fastmem_ptr = self.trace_fastmem_ptr;
         let jit = match self.jit.as_mut() {
             Some(jit) => jit,
             None => {
@@ -1196,12 +1209,24 @@ impl ArmInterface for ArmDynarmic32 {
                         break;
                     }
                     let cpsr = jit.get_cpsr();
+                    let read_code_word = |vaddr: u32| -> u32 {
+                        if trace_fastmem_ptr.is_null() {
+                            return 0;
+                        }
+                        unsafe {
+                            (trace_fastmem_ptr.add(vaddr as usize) as *const u32).read_unaligned()
+                        }
+                    };
                     log::info!(
-                        "[A32TRACE] step={} search_step={} pc=0x{:08x} cpsr=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} r4=0x{:08x} r5=0x{:08x} r6=0x{:08x} r7=0x{:08x} r8=0x{:08x} r9=0x{:08x} r10=0x{:08x} r11=0x{:08x} r12=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
+                        "[A32TRACE] step={} search_step={} pc=0x{:08x} cpsr=0x{:08x} op_m1=0x{:08x} op_0=0x{:08x} op_p1=0x{:08x} op_p2=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} r4=0x{:08x} r5=0x{:08x} r6=0x{:08x} r7=0x{:08x} r8=0x{:08x} r9=0x{:08x} r10=0x{:08x} r11=0x{:08x} r12=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
                         logged_steps,
                         step,
                         pc,
                         cpsr,
+                        read_code_word(pc.saturating_sub(4)),
+                        read_code_word(pc),
+                        read_code_word(pc.saturating_add(4)),
+                        read_code_word(pc.saturating_add(8)),
                         jit.get_register(0),
                         jit.get_register(1),
                         jit.get_register(2),

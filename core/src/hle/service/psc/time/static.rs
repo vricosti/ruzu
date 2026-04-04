@@ -17,6 +17,8 @@ use super::common::{
     get_span_between_time_points, ClockSnapshot, StaticServiceSetupInfo, SteadyClockTimePoint,
     SystemClockContext, TimeType,
 };
+use super::manager::TimeManager;
+use super::clocks::steady_clock_core::SteadyClockCoreImpl;
 use super::errors::{
     RESULT_CLOCK_MISMATCH, RESULT_CLOCK_UNINITIALIZED, RESULT_NOT_IMPLEMENTED,
     RESULT_PERMISSION_DENIED, RESULT_TIME_NOT_FOUND,
@@ -96,6 +98,9 @@ pub struct StaticService {
     /// TimeZone reference for calendar conversions in GetClockSnapshotImpl.
     /// Matches upstream `m_time_zone` (reference to `m_time->m_time_zone`).
     time_zone: TimeZone,
+    /// Shared PSC::Time::TimeManager owner when this StaticService is created from
+    /// the real time bootstrap path.
+    shared_time: Option<Arc<Mutex<TimeManager>>>,
     /// Boot instant for CalculateMonotonicSystemClockBaseTimePoint.
     /// Matches upstream `m_system.CoreTiming().GetClockTicks()` converted to time.
     boot_instant: std::time::Instant,
@@ -137,10 +142,20 @@ impl StaticService {
             network_context: SystemClockContext::default(),
             steady_clock_time_point: SteadyClockTimePoint::default(),
             time_zone: TimeZone::new(),
+            shared_time: None,
             boot_instant: std::time::Instant::now(),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    pub fn with_time_manager(
+        setup_info: StaticServiceSetupInfo,
+        shared_time: Arc<Mutex<TimeManager>>,
+    ) -> Self {
+        let mut service = Self::new(setup_info);
+        service.shared_time = Some(shared_time);
+        service
     }
 
     pub fn set_user_clock_initialized(&mut self, initialized: bool) {
@@ -180,6 +195,29 @@ impl StaticService {
     /// Creates a SystemClock sub-service for the user system clock.
     pub fn get_standard_user_system_clock(&self) -> SystemClock {
         log::debug!("PSC::Time::StaticService::GetStandardUserSystemClock called");
+        if let Some(shared_time) = &self.shared_time {
+            let mut time = shared_time.lock().unwrap();
+            let local = std::ptr::addr_of_mut!(time.standard_local_system_clock);
+            let network = std::ptr::addr_of!(time.standard_network_system_clock);
+            if let Ok(context) = unsafe {
+                time.standard_user_system_clock
+                    .get_context(&mut *local, &*network)
+            } {
+                let initialized = time.standard_local_system_clock.clock.is_initialized();
+                let current_time = time
+                    .standard_local_system_clock
+                    .clock
+                    .get_current_time()
+                    .unwrap_or(0);
+                return SystemClock::with_state(
+                    self.setup_info.can_write_user_clock,
+                    self.setup_info.can_write_uninitialized_clock,
+                    initialized,
+                    context,
+                    current_time,
+                );
+            }
+        }
         SystemClock::new(
             self.setup_info.can_write_user_clock,
             self.setup_info.can_write_uninitialized_clock,
@@ -192,6 +230,26 @@ impl StaticService {
     /// Creates a SystemClock sub-service for the network system clock.
     pub fn get_standard_network_system_clock(&self) -> SystemClock {
         log::debug!("PSC::Time::StaticService::GetStandardNetworkSystemClock called");
+        if let Some(shared_time) = &self.shared_time {
+            let time = shared_time.lock().unwrap();
+            let context = time
+                .standard_network_system_clock
+                .clock
+                .get_context()
+                .unwrap_or_default();
+            let current_time = time
+                .standard_network_system_clock
+                .clock
+                .get_current_time()
+                .unwrap_or(0);
+            return SystemClock::with_state(
+                self.setup_info.can_write_network_clock,
+                self.setup_info.can_write_uninitialized_clock,
+                time.standard_network_system_clock.clock.is_initialized(),
+                context,
+                current_time,
+            );
+        }
         SystemClock::new(
             self.setup_info.can_write_network_clock,
             self.setup_info.can_write_uninitialized_clock,
@@ -204,6 +262,25 @@ impl StaticService {
     /// Creates a SteadyClock sub-service.
     pub fn get_standard_steady_clock(&self) -> SteadyClock {
         log::debug!("PSC::Time::StaticService::GetStandardSteadyClock called");
+        if let Some(shared_time) = &self.shared_time {
+            let time = shared_time.lock().unwrap();
+            let core = &time.standard_steady_clock;
+            let current_time_point =
+                crate::hle::service::psc::time::clocks::steady_clock_core::get_current_time_point(
+                    core,
+                )
+                .unwrap_or_default();
+            return SteadyClock::with_state(
+                self.setup_info.can_write_steady_clock,
+                self.setup_info.can_write_uninitialized_clock,
+                core.state.is_initialized(),
+                core.get_test_offset_impl(),
+                core.get_internal_offset_impl(),
+                current_time_point,
+                core.get_setup_result_value_impl(),
+                core.state.is_reset_detected(),
+            );
+        }
         SteadyClock::new(
             self.setup_info.can_write_steady_clock,
             self.setup_info.can_write_uninitialized_clock,
@@ -216,6 +293,13 @@ impl StaticService {
     /// Creates a TimeZoneService sub-service.
     pub fn get_time_zone_service(&self) -> TimeZoneService {
         log::debug!("PSC::Time::StaticService::GetTimeZoneService called");
+        if let Some(shared_time) = &self.shared_time {
+            let time = shared_time.lock().unwrap();
+            return TimeZoneService::from_time_zone(
+                self.setup_info.can_write_timezone_device_location,
+                &time.time_zone,
+            );
+        }
         TimeZoneService::new(self.setup_info.can_write_timezone_device_location)
     }
 
@@ -225,6 +309,22 @@ impl StaticService {
     /// Creates a SystemClock sub-service for the local system clock.
     pub fn get_standard_local_system_clock(&self) -> SystemClock {
         log::debug!("PSC::Time::StaticService::GetStandardLocalSystemClock called");
+        if let Some(shared_time) = &self.shared_time {
+            let time = shared_time.lock().unwrap();
+            let context = time
+                .standard_local_system_clock
+                .clock
+                .get_context()
+                .unwrap_or_default();
+            let current_time = time.standard_local_system_clock.clock.get_current_time().unwrap_or(0);
+            return SystemClock::with_state(
+                self.setup_info.can_write_local_clock,
+                self.setup_info.can_write_uninitialized_clock,
+                time.standard_local_system_clock.clock.is_initialized(),
+                context,
+                current_time,
+            );
+        }
         SystemClock::new(
             self.setup_info.can_write_local_clock,
             self.setup_info.can_write_uninitialized_clock,
@@ -237,6 +337,22 @@ impl StaticService {
     /// Creates a SystemClock sub-service for the ephemeral network clock.
     pub fn get_ephemeral_network_system_clock(&self) -> SystemClock {
         log::debug!("PSC::Time::StaticService::GetEphemeralNetworkSystemClock called");
+        if let Some(shared_time) = &self.shared_time {
+            let time = shared_time.lock().unwrap();
+            let context = time
+                .ephemeral_network_clock
+                .clock
+                .get_context()
+                .unwrap_or_default();
+            let current_time = time.ephemeral_network_clock.clock.get_current_time().unwrap_or(0);
+            return SystemClock::with_state(
+                self.setup_info.can_write_network_clock,
+                self.setup_info.can_write_uninitialized_clock,
+                time.ephemeral_network_clock.clock.is_initialized(),
+                context,
+                current_time,
+            );
+        }
         SystemClock::new(
             self.setup_info.can_write_network_clock,
             self.setup_info.can_write_uninitialized_clock,

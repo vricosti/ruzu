@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
+use super::k_scheduler_lock::KScopedSchedulerLock;
 use super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep;
 use super::k_synchronization_object;
 use super::k_synchronization_object::SynchronizationObjectState;
@@ -1988,31 +1989,126 @@ impl KThread {
     /// Run the thread.
     /// Matches upstream `KThread::Run()`.
     pub fn run(&mut self) -> u32 {
-        // Check termination.
-        if self.termination_requested.load(Ordering::Relaxed) {
-            return RESULT_TERMINATION_REQUESTED.get_inner_value();
+        loop {
+            let _lk = if self.scheduler_lock_ptr != 0 {
+                Some(KScopedSchedulerLock::new(unsafe {
+                    &*(self.scheduler_lock_ptr
+                        as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+                }))
+            } else {
+                None
+            };
+
+            if self.termination_requested.load(Ordering::Relaxed) {
+                return RESULT_TERMINATION_REQUESTED.get_inner_value();
+            }
+
+            let current_termination_requested = super::kernel::with_current_thread_fast_mut(|t| {
+                t.is_termination_requested()
+            })
+            .unwrap_or(false);
+            if current_termination_requested {
+                return RESULT_TERMINATION_REQUESTED.get_inner_value();
+            }
+
+            if self.get_state() != ThreadState::INITIALIZED {
+                return RESULT_INVALID_STATE.get_inner_value();
+            }
+
+            let current_suspended =
+                super::kernel::with_current_thread_fast_mut(|t| t.is_suspended()).unwrap_or(false);
+            if current_suspended {
+                super::kernel::with_current_thread_fast_mut(|t| t.update_state());
+                continue;
+            }
+
+            if self.is_user_thread() && self.is_suspended() {
+                self.update_state();
+            }
+
+            // Upstream increments the owning process running-thread count here.
+            // Rust still cannot do this literally in all call sites because
+            // KProcess::run() invokes thread.run() while holding the process mutex.
+            // The main-thread bootstrap owner compensates in KProcess::run().
+            if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
+                if let Ok(process) = parent.try_lock() {
+                    process.increment_running_thread_count();
+                }
+            }
+
+            // Upstream calls Open() here. Rust KThread still lacks literal
+            // KAutoObject inheritance, so there is no equivalent owner-local
+            // refcount operation to invoke yet.
+
+            self.set_state(ThreadState::RUNNABLE);
+            return RESULT_SUCCESS.get_inner_value();
         }
-        // Upstream also checks current thread termination — we skip as single-thread.
+    }
 
-        // Validate state.
-        if self.get_state() != ThreadState::INITIALIZED {
-            return RESULT_INVALID_STATE.get_inner_value();
+    /// Arc-backed entry used by runtime owners that must not hold the thread
+    /// mutex across scheduler-lock release.
+    ///
+    /// Upstream `KThread::Run()` operates on a raw `KThread*` and does not have
+    /// an outer object mutex. Keep the Rust runtime path as close as possible by
+    /// taking the thread lock only for the actual state mutation, then dropping
+    /// it before `KScopedSchedulerLock` unwinds.
+    pub fn run_thread(thread: &Arc<Mutex<KThread>>) -> u32 {
+        loop {
+            let scheduler_lock_ptr = {
+                let thread = thread.lock().unwrap();
+                thread.scheduler_lock_ptr
+            };
+            let _lk = if scheduler_lock_ptr != 0 {
+                Some(KScopedSchedulerLock::new(unsafe {
+                    &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+                }))
+            } else {
+                None
+            };
+
+            let current_termination_requested = super::kernel::with_current_thread_fast_mut(|t| {
+                t.is_termination_requested()
+            })
+            .unwrap_or(false);
+            if current_termination_requested {
+                return RESULT_TERMINATION_REQUESTED.get_inner_value();
+            }
+
+            {
+                let mut thread = thread.lock().unwrap();
+
+                if thread.termination_requested.load(Ordering::Relaxed) {
+                    return RESULT_TERMINATION_REQUESTED.get_inner_value();
+                }
+
+                if thread.get_state() != ThreadState::INITIALIZED {
+                    return RESULT_INVALID_STATE.get_inner_value();
+                }
+
+                let current_suspended = super::kernel::with_current_thread_fast_mut(|t| {
+                    t.is_suspended()
+                })
+                .unwrap_or(false);
+                if current_suspended {
+                    super::kernel::with_current_thread_fast_mut(|t| t.update_state());
+                    continue;
+                }
+
+                if thread.is_user_thread() && thread.is_suspended() {
+                    thread.update_state();
+                }
+
+                if let Some(parent) = thread.parent.as_ref().and_then(Weak::upgrade) {
+                    if let Ok(process) = parent.try_lock() {
+                        process.increment_running_thread_count();
+                    }
+                }
+
+                thread.set_state(ThreadState::RUNNABLE);
+            }
+
+            return RESULT_SUCCESS.get_inner_value();
         }
-
-        // If this is a user thread that is suspended, update its state.
-        if self.is_user_thread() && self.is_suspended() {
-            self.update_state();
-        }
-
-        // Increment parent's running thread count.
-        // NOTE: We do NOT lock the parent here — the caller (KProcess::Run)
-        // typically already holds the process lock. The caller is responsible
-        // for calling process.increment_running_thread_count() after thread.run().
-        // This avoids a deadlock (thread.run called while process lock is held).
-
-        // Set state to Runnable.
-        self.set_state(ThreadState::RUNNABLE);
-        RESULT_SUCCESS.get_inner_value()
     }
 
     /// Start the termination sequence.
@@ -3257,6 +3353,51 @@ mod tests {
         assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
         assert!(thread.get_sleep_deadline().is_none());
         assert_eq!(thread.get_wait_result(), RESULT_TIMED_OUT.get_inner_value());
+    }
+
+    #[test]
+    fn test_run_marks_thread_runnable_and_increments_parent_running_count() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let mut thread = KThread::new();
+        thread.parent = Some(Arc::downgrade(&process));
+        thread.thread_type = ThreadType::User;
+
+        let result = thread.run();
+
+        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+        assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
+        assert_eq!(
+            process
+                .lock()
+                .unwrap()
+                .num_running_threads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn test_run_thread_marks_thread_runnable_and_increments_parent_running_count() {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut thread_guard = thread.lock().unwrap();
+            thread_guard.parent = Some(Arc::downgrade(&process));
+            thread_guard.thread_type = ThreadType::User;
+        }
+
+        let result = KThread::run_thread(&thread);
+
+        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+        assert_eq!(thread.lock().unwrap().get_state(), ThreadState::RUNNABLE);
+        assert_eq!(
+            process
+                .lock()
+                .unwrap()
+                .num_running_threads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

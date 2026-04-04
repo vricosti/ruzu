@@ -292,7 +292,7 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
         return RESULT_INVALID_HANDLE;
     };
 
-    let result = thread.lock().unwrap().run();
+    let result = KThread::run_thread(&thread);
     {
         let thread_guard = thread.lock().unwrap();
         log::trace!(
@@ -305,11 +305,6 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
             thread_guard.physical_affinity_mask.get_affinity_mask(),
             result,
         );
-    }
-    if result == RESULT_SUCCESS.get_inner_value() {
-        if let Some(parent) = thread.lock().unwrap().parent.as_ref().and_then(|w| w.upgrade()) {
-            parent.lock().unwrap().increment_running_thread_count();
-        }
     }
     ResultCode::new(result)
 }

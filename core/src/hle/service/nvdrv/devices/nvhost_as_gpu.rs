@@ -590,7 +590,7 @@ impl NvHostAsGpu {
         };
         let (handle_align, handle_orig_size) = {
             let inner = handle.lock_inner();
-            (inner.align, handle.orig_size)
+            (inner.align, handle.orig_size())
         };
         let device_address = self
             .nvmap()

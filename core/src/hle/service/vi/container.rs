@@ -9,6 +9,7 @@
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::SessionRequestHandler;
+use crate::hle::service::nvnflinger::buffer_queue_producer::BufferQueueProducer;
 use crate::hle::service::nvnflinger::hos_binder_driver::IHosBinderDriver;
 use crate::hle::service::nvnflinger::hos_binder_driver_server::HosBinderDriverServer;
 use crate::hle::service::nvnflinger::surface_flinger::SurfaceFlinger;
@@ -19,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use super::conductor::Conductor;
 use super::display_list::DisplayList;
 use super::layer_list::LayerList;
+use super::shared_buffer_manager::SharedBufferManager;
 use super::vi_results;
 use super::vi_types::DisplayName;
 
@@ -43,6 +45,7 @@ pub struct Container {
     conductor: Arc<Mutex<Conductor>>,
     /// System reference for accessing process/scheduler from service handlers.
     system: crate::core::SystemRef,
+    shared_buffer_manager: Arc<SharedBufferManager>,
 }
 
 struct ContainerInner {
@@ -53,57 +56,75 @@ struct ContainerInner {
 
 impl Container {
     /// Create a new Container with the standard display set.
-    pub fn new(system: crate::core::SystemRef) -> Self {
-        let mut displays = DisplayList::default();
-        let default_name = Self::make_display_name(b"Default");
-        let external_name = Self::make_display_name(b"External");
-        let edid_name = Self::make_display_name(b"Edid");
-        let internal_name = Self::make_display_name(b"Internal");
-        let null_name = Self::make_display_name(b"Null");
+    pub fn new(system: crate::core::SystemRef) -> Arc<Self> {
+        Arc::new_cyclic(|weak_self| {
+            let mut displays = DisplayList::default();
+            let default_name = Self::make_display_name(b"Default");
+            let external_name = Self::make_display_name(b"External");
+            let edid_name = Self::make_display_name(b"Edid");
+            let internal_name = Self::make_display_name(b"Internal");
+            let null_name = Self::make_display_name(b"Null");
 
-        displays.create_display(&default_name);
-        displays.create_display(&external_name);
-        displays.create_display(&edid_name);
-        displays.create_display(&internal_name);
-        displays.create_display(&null_name);
+            displays.create_display(&default_name);
+            displays.create_display(&external_name);
+            displays.create_display(&edid_name);
+            displays.create_display(&internal_name);
+            displays.create_display(&null_name);
 
-        let mut display_ids = Vec::new();
-        displays.for_each_display(|d| {
-            display_ids.push(d.get_id());
-        });
+            let mut display_ids = Vec::new();
+            displays.for_each_display(|d| {
+                display_ids.push(d.get_id());
+            });
 
-        let service_manager = system
-            .get()
-            .service_manager()
-            .expect("Container::new: missing ServiceManager");
-        let binder_driver = ServiceManager::get_service_blocking(&service_manager, "dispdrv");
-        let binder_driver_impl = binder_driver
-            .as_any()
-            .downcast_ref::<IHosBinderDriver>()
-            .expect("Container::new: dispdrv is not IHosBinderDriver");
-        let server = Arc::clone(binder_driver_impl.get_server());
-        let surface_flinger = binder_driver_impl.get_surface_flinger();
+            let service_manager = system
+                .get()
+                .service_manager()
+                .expect("Container::new: missing ServiceManager");
+            let binder_driver = ServiceManager::get_service_blocking(&service_manager, "dispdrv");
+            let binder_driver_impl = binder_driver
+                .as_any()
+                .downcast_ref::<IHosBinderDriver>()
+                .expect("Container::new: dispdrv is not IHosBinderDriver");
+            let server = Arc::clone(binder_driver_impl.get_server());
+            let surface_flinger = binder_driver_impl.get_surface_flinger();
 
-        // Register all displays with the surface flinger
-        for &id in &display_ids {
-            surface_flinger.add_display(id);
-        }
+            let nvdrv = ServiceManager::get_service_blocking(&service_manager, "nvdrv:s");
+            let nvdrv = nvdrv
+                .as_any()
+                .downcast_ref::<crate::hle::service::nvdrv::nvdrv_interface::NvdrvService>()
+                .expect("Container::new: nvdrv:s is not NvdrvService")
+                .get_module();
+            let shared_buffer_manager = Arc::new(SharedBufferManager::new(
+                system,
+                weak_self.clone(),
+                nvdrv,
+            ));
 
-        let conductor = Arc::new(Mutex::new(Conductor::new(system, &display_ids, Arc::clone(&surface_flinger))));
-        Conductor::start(&conductor);
+            for &id in &display_ids {
+                surface_flinger.add_display(id);
+            }
 
-        Self {
-            inner: Mutex::new(ContainerInner {
-                displays,
-                layers: LayerList::default(),
-                is_shut_down: false,
-            }),
-            binder_driver,
-            server,
-            surface_flinger,
-            conductor,
-            system,
-        }
+            let conductor = Arc::new(Mutex::new(Conductor::new(
+                system,
+                &display_ids,
+                Arc::clone(&surface_flinger),
+            )));
+            Conductor::start(&conductor);
+
+            Self {
+                inner: Mutex::new(ContainerInner {
+                    displays,
+                    layers: LayerList::default(),
+                    is_shut_down: false,
+                }),
+                binder_driver,
+                server,
+                surface_flinger,
+                conductor,
+                system,
+                shared_buffer_manager,
+            }
+        })
     }
 
     fn make_display_name(name: &[u8]) -> DisplayName {
@@ -119,9 +140,37 @@ impl Container {
         Arc::clone(&self.binder_driver)
     }
 
+    /// Upstream `Container::GetLayerProducerHandle(...)`.
+    pub fn get_layer_producer_handle(
+        &self,
+        layer_id: u64,
+    ) -> Result<Arc<BufferQueueProducer>, ResultCode> {
+        let inner = self.inner.lock().unwrap();
+        let layer = inner
+            .layers
+            .get_layer_by_id(layer_id)
+            .ok_or(vi_results::RESULT_NOT_FOUND)?;
+
+        let binder = self
+            .server
+            .try_get_binder(layer.get_producer_binder_id())
+            .ok_or(vi_results::RESULT_NOT_FOUND)?;
+
+        if !binder.as_any().is::<BufferQueueProducer>() {
+            return Err(vi_results::RESULT_NOT_FOUND);
+        }
+
+        let raw = Arc::into_raw(binder) as *const BufferQueueProducer;
+        Ok(unsafe { Arc::from_raw(raw) })
+    }
+
     /// Get the system reference.
     pub fn system(&self) -> crate::core::SystemRef {
         self.system
+    }
+
+    pub fn get_shared_buffer_manager(&self) -> Arc<SharedBufferManager> {
+        Arc::clone(&self.shared_buffer_manager)
     }
 
     pub fn on_terminate(&self) {

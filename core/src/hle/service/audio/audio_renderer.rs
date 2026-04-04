@@ -221,6 +221,17 @@ impl IAudioRenderer {
             performance.len(),
             result.get_inner_value()
         );
+        if std::env::var_os("RUZU_LOG_AUDIO_UPDATE_BYTES").is_some() && !output.is_empty() {
+            let preview_words: Vec<u32> = output
+                .chunks_exact(4)
+                .take(8)
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            log::info!(
+                "IAudioRenderer::RequestUpdate output_preview={:08X?}",
+                preview_words
+            );
+        }
         if result.is_success() {
             if !output.is_empty() {
                 ctx.write_buffer(&output, 0);

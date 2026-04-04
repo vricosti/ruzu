@@ -339,10 +339,10 @@ impl EnsureTokenIdCacheAsyncInterface {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn load_id_token_cache_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        ctx.write_buffer(&[], 0);
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+    fn load_id_token_cache_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc =
+            unsafe { &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface) };
+        svc.load_id_token_cache(ctx);
     }
 
     fn unknown2_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -363,6 +363,13 @@ impl EnsureTokenIdCacheAsyncInterface {
     fn get_result_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn load_id_token_cache(&self, ctx: &mut HLERequestContext) {
+        ctx.write_buffer(&[], 0);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(0);
     }
 }
 
@@ -388,7 +395,7 @@ impl ServiceFramework for EnsureTokenIdCacheAsyncInterface {
 
 struct IManagerForApplication {
     profile_manager: Arc<Mutex<ProfileManager>>,
-    ensure_token_id: SessionRequestHandlerPtr,
+    ensure_token_id: Arc<EnsureTokenIdCacheAsyncInterface>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -452,7 +459,7 @@ impl IManagerForApplication {
 
     fn load_id_token_cache_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
-        svc.ensure_token_id.handle_sync_request(ctx);
+        svc.ensure_token_id.load_id_token_cache(ctx);
     }
 
     fn get_nintendo_account_user_resource_cache_for_application_handler(
@@ -841,6 +848,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::service::hle_ipc::HLERequestContext;
 
     fn make_interface(system: crate::core::SystemRef) -> Interface {
         Interface::new(
@@ -915,5 +923,14 @@ mod tests {
             interface.initialize_application_info(),
             RESULT_APPLICATION_INFO_ALREADY_INITIALIZED
         );
+    }
+
+    #[test]
+    fn ensure_token_id_load_id_token_cache_uses_upstream_response_shape() {
+        let mut ctx = HLERequestContext::new();
+
+        EnsureTokenIdCacheAsyncInterface::new().load_id_token_cache(&mut ctx);
+
+        assert_eq!(ctx.write_size, 3);
     }
 }

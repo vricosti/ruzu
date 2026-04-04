@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/glue/time/static.cpp
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -18,6 +18,7 @@ use crate::hle::service::psc::time::shared_memory::SharedMemory as PscSharedMemo
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::file_timestamp_worker::FileTimestampWorker;
+use super::manager::TimeManager as GlueTimeManager;
 use super::standard_steady_clock_resource::StandardSteadyClockResource;
 use super::time_zone::TimeZoneService;
 use super::time_zone_binary::TimeZoneBinary;
@@ -67,6 +68,7 @@ impl StaticService {
     pub fn new(
         setup_info: StaticServiceSetupInfo,
         name: &str,
+        time_manager: Arc<Mutex<GlueTimeManager>>,
         device_memory: *const crate::device_memory::DeviceMemory,
         memory_manager: *mut crate::hle::kernel::k_memory_manager::KMemoryManager,
     ) -> Self {
@@ -125,10 +127,15 @@ impl StaticService {
             (commands::CALCULATE_SPAN_BETWEEN_STANDARD_USER_SYSTEM_CLOCKS, Some(StaticService::calculate_span_between_handler), "CalculateSpanBetweenStandardUserSystemClocks"),
         ]);
 
+        let wrapped_service = {
+            let manager = time_manager.lock().unwrap();
+            manager.make_static_service(setup_info)
+        };
+
         Self {
             service_name: name.to_string(),
             setup_info,
-            wrapped_service: Mutex::new(psc_static::StaticService::new(setup_info)),
+            wrapped_service: Mutex::new(wrapped_service),
             file_timestamp_worker: FileTimestampWorker::new(),
             standard_steady_clock_resource: StandardSteadyClockResource::new(),
             time_zone_binary: Mutex::new(time_zone_binary),
@@ -691,10 +698,13 @@ impl StaticService {
 
     pub fn get_time_zone_service(&self) -> Result<TimeZoneService, ResultCode> {
         log::debug!("Glue::Time::StaticService::GetTimeZoneService called");
-
-        let _binary = self.time_zone_binary.lock().unwrap();
-        Ok(TimeZoneService::new(
+        let wrapped = self.wrapped_service.lock().unwrap().get_time_zone_service();
+        let mut binary = TimeZoneBinary::new();
+        let _ = binary.mount();
+        Ok(TimeZoneService::with_wrapped(
             self.setup_info.can_write_timezone_device_location,
+            wrapped,
+            binary,
         ))
     }
 
@@ -867,6 +877,13 @@ mod tests {
     use super::*;
     use crate::hle::service::psc::time::common::SteadyClockTimePoint;
 
+    fn make_time_manager() -> Arc<Mutex<GlueTimeManager>> {
+        Arc::new(Mutex::new(GlueTimeManager::new(
+            Arc::new(Mutex::new(crate::hle::service::sm::sm::ServiceManager::new())),
+            crate::core::SystemRef::null(),
+        )))
+    }
+
     fn user_setup() -> StaticServiceSetupInfo {
         StaticServiceSetupInfo {
             can_write_local_clock: false,
@@ -883,6 +900,7 @@ mod tests {
         let service = StaticService::new(
             user_setup(),
             "time:u",
+            make_time_manager(),
             std::ptr::null(),
             std::ptr::null_mut(),
         );
@@ -909,6 +927,7 @@ mod tests {
         let service = StaticService::new(
             admin_setup(),
             "time:a",
+            make_time_manager(),
             std::ptr::null(),
             std::ptr::null_mut(),
         );

@@ -1576,6 +1576,14 @@ impl KPageTableBase {
 
         let src_state = out_src_state.unwrap_or(KMemoryState::NORMAL);
 
+        // Build the source page group first, matching upstream
+        // `MakePageGroup(pg, src_address, num_pages)` before any permission change.
+        let mut pg = super::k_page_group::KPageGroup::new();
+        let make_pg_result = self.make_page_group(&mut pg, src, num_pages);
+        if make_pg_result != 0 {
+            return make_pg_result;
+        }
+
         // Reprotect source as KernelRead | NotMapped.
         let src_new_perm = KMemoryPermission::from_bits_truncate(
             KMemoryPermission::KERNEL_READ.bits() | KMemoryPermission::NOT_MAPPED.bits(),
@@ -1596,28 +1604,6 @@ impl KPageTableBase {
         );
         if op_result != 0 {
             return op_result;
-        }
-
-        // Build the source page group from the current page table traversal,
-        // matching upstream MakePageGroup(pg, src_address, num_pages).
-        let mut pg = super::k_page_group::KPageGroup::new();
-        let make_pg_result = self.make_page_group(&mut pg, src, num_pages);
-        if make_pg_result != 0 {
-            let revert_props = KPageProperties {
-                perm: KMemoryPermission::USER_READ_WRITE,
-                io: false,
-                uncached: false,
-                disable_merge_attributes: DisableMergeAttribute::ENABLE_HEAD_BODY_TAIL,
-            };
-            let _ = self.operate(
-                src,
-                num_pages,
-                0,
-                false,
-                revert_props,
-                OperationType::ChangePermissions,
-            );
-            return make_pg_result;
         }
 
         let dst_props = KPageProperties {

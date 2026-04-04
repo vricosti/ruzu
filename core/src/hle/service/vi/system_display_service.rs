@@ -6,9 +6,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use common::math_util::Rectangle;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::nvnflinger::ui::fence::Fence;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::container::Container;
@@ -61,16 +64,36 @@ impl ISystemDisplayService {
                 (3217, None, "SetDisplayCmuLuma"),
                 (3218, None, "SetDisplayCrcMode"),
                 (6013, None, "GetLayerPresentationSubmissionTimestamps"),
-                (8225, None, "GetSharedBufferMemoryHandleId"),
+                (
+                    8225,
+                    Some(Self::get_shared_buffer_memory_handle_id),
+                    "GetSharedBufferMemoryHandleId",
+                ),
                 (8250, Some(Self::open_shared_layer), "OpenSharedLayer"),
                 (8251, None, "CloseSharedLayer"),
                 (8252, Some(Self::connect_shared_layer), "ConnectSharedLayer"),
                 (8253, None, "DisconnectSharedLayer"),
-                (8254, None, "AcquireSharedFrameBuffer"),
-                (8255, None, "PresentSharedFrameBuffer"),
-                (8256, None, "GetSharedFrameBufferAcquirableEvent"),
+                (
+                    8254,
+                    Some(Self::acquire_shared_frame_buffer),
+                    "AcquireSharedFrameBuffer",
+                ),
+                (
+                    8255,
+                    Some(Self::present_shared_frame_buffer),
+                    "PresentSharedFrameBuffer",
+                ),
+                (
+                    8256,
+                    Some(Self::get_shared_frame_buffer_acquirable_event),
+                    "GetSharedFrameBufferAcquirableEvent",
+                ),
                 (8257, None, "FillSharedFrameBufferColor"),
-                (8258, None, "CancelSharedFrameBuffer"),
+                (
+                    8258,
+                    Some(Self::cancel_shared_frame_buffer),
+                    "CancelSharedFrameBuffer",
+                ),
                 (9000, None, "GetDp2hdmiController"),
             ]),
             handlers_tipc: BTreeMap::new(),
@@ -178,6 +201,37 @@ impl ISystemDisplayService {
         rb.push_result(RESULT_SUCCESS);
     }
 
+    fn get_shared_buffer_memory_handle_id(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let buffer_id = rp.pop_u64();
+        let aruid = rp.pop_u64();
+
+        match svc
+            .container
+            .get_shared_buffer_manager()
+            .get_shared_buffer_memory_handle_id(buffer_id, aruid)
+        {
+            Ok((size, nvmap_handle, pool_layout)) => {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &pool_layout as *const _ as *const u8,
+                        std::mem::size_of_val(&pool_layout),
+                    )
+                };
+                ctx.write_buffer(bytes, 0);
+                let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i32(nvmap_handle);
+                rb.push_u64(size);
+            }
+            Err(err) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(err);
+            }
+        }
+    }
+
     /// cmd 8250: OpenSharedLayer
     fn open_shared_layer(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
@@ -200,6 +254,92 @@ impl ISystemDisplayService {
         );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn acquire_shared_frame_buffer(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let layer_id = rp.pop_u64();
+
+        match svc
+            .container
+            .get_shared_buffer_manager()
+            .acquire_shared_frame_buffer(layer_id)
+        {
+            Ok((fence, slots, target_slot)) => {
+                let mut rb = ResponseBuilder::new(ctx, 8, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_raw(&fence);
+                for slot in slots {
+                    rb.push_i32(slot);
+                }
+                rb.push_i64(target_slot);
+            }
+            Err(err) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(err);
+            }
+        }
+    }
+
+    fn present_shared_frame_buffer(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let fence: Fence = rp.pop_raw();
+        let crop_region: Rectangle<i32> = rp.pop_raw();
+        let window_transform = rp.pop_u32();
+        let swap_interval = rp.pop_i32();
+        let layer_id = rp.pop_u64();
+        let surface_id = rp.pop_i64();
+
+        let result = svc
+            .container
+            .get_shared_buffer_manager()
+            .present_shared_frame_buffer(
+                fence,
+                crop_region,
+                window_transform,
+                swap_interval,
+                layer_id,
+                surface_id,
+            );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result.err().unwrap_or(RESULT_SUCCESS));
+    }
+
+    fn get_shared_frame_buffer_acquirable_event(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let layer_id = rp.pop_u64();
+
+        let handle = svc
+            .container
+            .get_shared_buffer_manager()
+            .get_shared_frame_buffer_acquirable_event(layer_id)
+            .ok()
+            .and_then(|event| ctx.copy_handle_for_readable_event(event))
+            .unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
+    }
+
+    fn cancel_shared_frame_buffer(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let layer_id = rp.pop_u64();
+        let slot = rp.pop_i64();
+
+        let result = svc
+            .container
+            .get_shared_buffer_manager()
+            .cancel_shared_frame_buffer(layer_id, slot);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result.err().unwrap_or(RESULT_SUCCESS));
     }
 }
 

@@ -301,4 +301,17 @@ impl Module {
     pub fn get_disp_device(&self, fd: DeviceFD) -> Option<Arc<NvDispDisp0>> {
         self.disp_files.lock().unwrap().get(&fd).cloned()
     }
+
+    pub fn get_nvmap_device(&self, fd: DeviceFD) -> Option<Arc<NvMapDevice>> {
+        let files = self.open_files.lock().unwrap();
+        let device = files.get(&fd)?.clone();
+        drop(files);
+
+        if !device.as_any().is::<NvMapDevice>() {
+            return None;
+        }
+
+        let raw = Arc::into_raw(device) as *const NvMapDevice;
+        Some(unsafe { Arc::from_raw(raw) })
+    }
 }
