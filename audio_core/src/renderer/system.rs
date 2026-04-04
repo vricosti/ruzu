@@ -22,10 +22,12 @@ use crate::renderer::voice::{VoiceChannelResource, VoiceContext, VoiceInfo, Voic
 use crate::{Result, SharedSystem};
 use common::ResultCode;
 use parking_lot::{Condvar, Mutex};
+use ruzu_core::hle::kernel::k_event::KEvent;
 use ruzu_core::hle::kernel::k_process::KProcess;
+use ruzu_core::hle::kernel::k_transfer_memory::KTransferMemory;
 use std::mem::{size_of, size_of_val};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -72,7 +74,7 @@ pub struct System {
     core: SharedSystem,
     audio_renderer: AudioRendererHandle,
     initialized: bool,
-    rendered_event: Arc<AtomicBool>,
+    rendered_event: Arc<StdMutex<KEvent>>,
     terminate_event: Arc<TerminateEvent>,
     behavior: BehaviorInfo,
     voice_context: VoiceContext,
@@ -120,12 +122,16 @@ pub struct System {
 }
 
 impl System {
-    pub fn new(core: SharedSystem, audio_renderer: AudioRendererHandle) -> Self {
+    pub fn new(
+        core: SharedSystem,
+        audio_renderer: AudioRendererHandle,
+        rendered_event: Arc<StdMutex<KEvent>>,
+    ) -> Self {
         Self {
             core,
             audio_renderer,
             initialized: false,
-            rendered_event: Arc::new(AtomicBool::new(false)),
+            rendered_event,
             terminate_event: Arc::new(TerminateEvent::new()),
             behavior: BehaviorInfo::new(),
             voice_context: VoiceContext::new(),
@@ -170,6 +176,54 @@ impl System {
             rendering_time_limit_percent: 100,
             drop_voice_enabled: false,
             voice_drop_parameter: 1.0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(core: SharedSystem, audio_renderer: AudioRendererHandle) -> Self {
+        Self::new(core, audio_renderer, Arc::new(StdMutex::new(KEvent::new())))
+    }
+
+    fn clear_rendered_event(&self) {
+        if !self.rendered_event.lock().unwrap().is_initialized() {
+            return;
+        }
+
+        let process_ptr = self.process.as_ptr() as *mut KProcess;
+        if process_ptr.is_null() {
+            return;
+        }
+
+        unsafe {
+            let process = &*process_ptr;
+            let _ = self.rendered_event.lock().unwrap().clear(process);
+        }
+    }
+
+    fn signal_rendered_event(&self) {
+        if !self.rendered_event.lock().unwrap().is_initialized() {
+            return;
+        }
+
+        let process_ptr = self.process.as_ptr() as *mut KProcess;
+        if process_ptr.is_null() {
+            return;
+        }
+
+        unsafe {
+            let process = &mut *process_ptr;
+            let Some(scheduler) = process
+                .scheduler
+                .as_ref()
+                .and_then(|scheduler| scheduler.upgrade())
+            else {
+                return;
+            };
+            let _ = self
+                .rendered_event
+                .lock()
+                .unwrap()
+                .signal(process, &scheduler);
         }
     }
 
@@ -240,7 +294,7 @@ impl System {
                 PerformanceManager::get_required_buffer_size_for_performance_metrics_per_frame(
                     behavior, params,
                 );
-            size += align_audio(perf_size * (params.perf_frames as u64 + 1) + 0xC, 0x100);
+            size += align_audio(perf_size * (params.perf_frames as u64 + 1) + 0xC0, 0x100);
         }
         align_audio(size, 0x40)
     }
@@ -256,8 +310,9 @@ impl System {
     pub fn initialize(
         &mut self,
         params: &AudioRendererParameterInternal,
+        transfer_memory: *mut KTransferMemory,
         transfer_memory_size: u64,
-        process_handle_present: bool,
+        process: *mut KProcess,
         applet_resource_user_id: u64,
         session_id: i32,
     ) -> Result {
@@ -267,7 +322,10 @@ impl System {
         if Self::get_work_buffer_size(params) > transfer_memory_size {
             return RESULT_INSUFFICIENT_BUFFER;
         }
-        if !process_handle_present {
+        if process.is_null() {
+            return RESULT_INVALID_HANDLE;
+        }
+        if transfer_memory.is_null() {
             return RESULT_INVALID_HANDLE;
         }
 
@@ -280,6 +338,14 @@ impl System {
         self.execution_mode = params.execution_mode;
         self.applet_resource_user_id = applet_resource_user_id;
         self.session_id = session_id;
+        self.set_process(process);
+        let transfer_memory_source_address = unsafe { (*transfer_memory).get_source_address() };
+        if let Some(memory) = self.core.lock().get_svc_memory() {
+            memory
+                .lock()
+                .unwrap()
+                .zero_block(transfer_memory_source_address, transfer_memory_size as usize);
+        }
         self.drop_voice_enabled =
             params.voice_drop_enabled != 0 && params.execution_mode == ExecutionMode::Auto;
         self.behavior.set_user_lib_revision(params.revision);
@@ -329,9 +395,8 @@ impl System {
         } else {
             self.performance_manager = PerformanceManager::new();
         }
-        let command_workbuffer_size = transfer_memory_size.saturating_sub(
-            Self::get_pre_command_workbuffer_size(&self.behavior, params),
-        );
+        let command_workbuffer_size = transfer_memory_size
+            .saturating_sub(Self::get_pre_command_workbuffer_size(&self.behavior, params));
         self.command_workbuffer = vec![0u8; command_workbuffer_size as usize];
         self.command_workbuffer_pool = MemoryPoolInfo::new(PoolLocation::Dsp);
         let pool_mapper = PoolMapper::new(None, false);
@@ -384,7 +449,7 @@ impl System {
         self.command_buffer_size = 0;
         self.reset_command_buffers = true;
         self.active = false;
-        self.rendered_event.store(false, Ordering::SeqCst);
+        self.clear_rendered_event();
         self.terminate_event.reset();
         self.initialized = true;
         ResultCode::SUCCESS
@@ -446,12 +511,18 @@ impl System {
         self.command_buffer_size = 0;
         self.reset_command_buffers = false;
         self.active = false;
-        self.rendered_event.store(false, Ordering::SeqCst);
+        self.clear_rendered_event();
         self.terminate_event.reset();
         self.initialized = false;
     }
 
     pub fn start(&mut self) {
+        log::info!(
+            "audio_core::renderer::System::start session_id={} active_before={} exec_mode={:?}",
+            self.session_id,
+            self.active,
+            self.execution_mode
+        );
         self.frames_elapsed = 0;
         self.state = State::Started;
         self.active = true;
@@ -477,19 +548,32 @@ impl System {
         let mut updater = crate::renderer::behavior::info_updater::InfoUpdater::new(
             input,
             output,
+            Some(self.get_process() as usize),
             &mut self.behavior,
         );
 
         let mut result = updater.update_behavior_info();
         if result.is_error() {
+            log::error!(
+                "audio_core::renderer::System::update fail stage=behavior_info result=0x{:08X}",
+                result.raw()
+            );
             return result;
         }
         result = updater.update_memory_pools(&mut self.memory_pool_workbuffer, pool_count);
         if result.is_error() {
+            log::error!(
+                "audio_core::renderer::System::update fail stage=memory_pools result=0x{:08X}",
+                result.raw()
+            );
             return result;
         }
         result = updater.update_voice_channel_resources(&mut self.voice_context);
         if result.is_error() {
+            log::error!(
+                "audio_core::renderer::System::update fail stage=voice_channel_resources result=0x{:08X}",
+                result.raw()
+            );
             return result;
         }
         result = updater.update_voices(
@@ -498,6 +582,10 @@ impl System {
             pool_count,
         );
         if result.is_error() {
+            log::error!(
+                "audio_core::renderer::System::update fail stage=voices result=0x{:08X}",
+                result.raw()
+            );
             return result;
         }
         result = updater.update_effects(
@@ -507,11 +595,19 @@ impl System {
             pool_count,
         );
         if result.is_error() {
+            log::error!(
+                "audio_core::renderer::System::update fail stage=effects result=0x{:08X}",
+                result.raw()
+            );
             return result;
         }
         if splitter_supported {
             result = updater.update_splitter_info(&mut self.splitter_context);
             if result.is_error() {
+                log::error!(
+                    "audio_core::renderer::System::update fail stage=splitter_info result=0x{:08X}",
+                    result.raw()
+                );
                 return result;
             }
         }
@@ -522,6 +618,10 @@ impl System {
             &mut self.splitter_context,
         );
         if result.is_error() {
+            log::error!(
+                "audio_core::renderer::System::update fail stage=mixes result=0x{:08X}",
+                result.raw()
+            );
             return result;
         }
         result = updater.update_sinks(
@@ -531,6 +631,10 @@ impl System {
             &mut self.upsampler_manager,
         );
         if result.is_error() {
+            log::error!(
+                "audio_core::renderer::System::update fail stage=sinks result=0x{:08X}",
+                result.raw()
+            );
             return result;
         }
         result = updater.update_performance_buffer(
@@ -540,25 +644,41 @@ impl System {
                 .then_some(&mut self.performance_manager),
         );
         if result.is_error() {
+            log::error!(
+                "audio_core::renderer::System::update fail stage=performance result=0x{:08X}",
+                result.raw()
+            );
             return result;
         }
         result = updater.update_error_info();
         if result.is_error() {
+            log::error!(
+                "audio_core::renderer::System::update fail stage=error_info result=0x{:08X}",
+                result.raw()
+            );
             return result;
         }
         if elapsed_frame_count_supported {
             result = updater.update_renderer_info(self.frames_elapsed);
             if result.is_error() {
+                log::error!(
+                    "audio_core::renderer::System::update fail stage=renderer_info result=0x{:08X}",
+                    result.raw()
+                );
                 return result;
             }
         }
         result = updater.check_consumed_size();
         if result.is_error() {
+            log::error!(
+                "audio_core::renderer::System::update fail stage=check_consumed_size result=0x{:08X}",
+                result.raw()
+            );
             return result;
         }
         drop(updater);
 
-        self.rendered_event.store(false, Ordering::SeqCst);
+        self.clear_rendered_event();
         self.num_times_updated = self.num_times_updated.saturating_add(1);
         self.ticks_spent_updating = self
             .ticks_spent_updating
@@ -604,10 +724,16 @@ impl System {
 
     pub fn send_command_to_dsp(&mut self) {
         if !self.initialized {
+            log::info!("audio_core::renderer::System::send_command_to_dsp skip uninitialized");
             return;
         }
 
         if !self.is_active() || self.session_id < 0 {
+            log::info!(
+                "audio_core::renderer::System::send_command_to_dsp inactive session_id={} active={}",
+                self.session_id,
+                self.active
+            );
             if self.session_id >= 0 {
                 self.audio_renderer
                     .lock()
@@ -623,6 +749,12 @@ impl System {
             .audio_renderer
             .lock()
             .get_remain_command_count(self.session_id);
+        log::info!(
+            "audio_core::renderer::System::send_command_to_dsp session_id={} remaining={} reset={}",
+            self.session_id,
+            remaining_command_count,
+            self.reset_command_buffers
+        );
         let mut command_size = self.command_buffer_size;
         if remaining_command_count > 0 {
             self.adsp_behind = true;
@@ -664,7 +796,7 @@ impl System {
         self.command_buffer_size = command_size;
         self.reset_command_buffers = false;
         if remaining_command_count == 0 {
-            self.rendered_event.store(true, Ordering::SeqCst);
+            self.signal_rendered_event();
         }
     }
 
@@ -905,7 +1037,7 @@ impl System {
         self.initialized
     }
 
-    pub fn get_rendered_event(&self) -> Arc<AtomicBool> {
+    pub fn get_rendered_event(&self) -> Arc<StdMutex<KEvent>> {
         self.rendered_event.clone()
     }
 
@@ -970,9 +1102,13 @@ mod tests {
     use crate::sink::null_sink::NullSink;
     use crate::sink::sink::new_sink_handle;
     use parking_lot::Mutex;
+    use ruzu_core::hle::kernel::k_event::KEvent;
+    use ruzu_core::hle::kernel::k_readable_event::KReadableEvent;
+    use ruzu_core::hle::kernel::k_scheduler::KScheduler;
     use std::mem::size_of;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
 
     fn make_shared_system() -> SharedSystem {
         Arc::new(Mutex::new(ruzu_core::core::System::new()))
@@ -983,6 +1119,35 @@ mod tests {
             core,
             new_sink_handle(Box::new(NullSink::new("test"))),
         )))
+    }
+
+    fn make_kernel_rendered_event(
+    ) -> (
+        Arc<StdMutex<KEvent>>,
+        Box<KProcess>,
+        Arc<StdMutex<KScheduler>>,
+        u64,
+    ) {
+        let event_object_id = 1;
+        let readable_event_object_id = 2;
+        let scheduler = Arc::new(StdMutex::new(KScheduler::new(0)));
+        let mut process = Box::new(KProcess::new());
+        process.attach_scheduler(&scheduler);
+
+        let event = Arc::new(StdMutex::new(KEvent::new()));
+        let readable = Arc::new(StdMutex::new(KReadableEvent::new()));
+        event
+            .lock()
+            .unwrap()
+            .initialize(process.get_process_id(), readable_event_object_id);
+        readable
+            .lock()
+            .unwrap()
+            .initialize(event_object_id, readable_event_object_id);
+        process.register_event_object(event_object_id, Arc::clone(&event));
+        process.register_readable_event_object(readable_event_object_id, readable);
+
+        (event, process, scheduler, readable_event_object_id)
     }
 
     fn make_params() -> AudioRendererParameterInternal {
@@ -1069,7 +1234,7 @@ mod tests {
                 PerformanceManager::get_required_buffer_size_for_performance_metrics_per_frame(
                     &behavior, params,
                 );
-            size += align_audio(perf_size * (params.perf_frames as u64 + 1) + 0xC, 0x100);
+            size += align_audio(perf_size * (params.perf_frames as u64 + 1) + 0xC0, 0x100);
         }
         size = align_audio(size, 0x40);
         size += System::get_minimum_command_workbuffer_size(&behavior, params);
@@ -1128,7 +1293,7 @@ mod tests {
                 PerformanceManager::get_required_buffer_size_for_performance_metrics_per_frame(
                     &behavior, params,
                 );
-            size += align_audio(perf_size * (params.perf_frames as u64 + 1) + 0xC, 0x100);
+            size += align_audio(perf_size * (params.perf_frames as u64 + 1) + 0xC0, 0x100);
         }
         align_audio(size, 0x40)
     }
@@ -1137,12 +1302,12 @@ mod tests {
     fn start_resets_elapsed_frames() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1157,13 +1322,13 @@ mod tests {
     fn initialize_sets_user_rendering_time_limit_to_one_hundred_percent() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let mut params = make_params();
         params.revision = 1;
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1174,12 +1339,12 @@ mod tests {
     fn generate_command_increments_elapsed_frames_and_clears_pool_use_state() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
         system.start();
@@ -1202,13 +1367,13 @@ mod tests {
     fn update_increments_update_counters_on_success() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let mut params = make_params();
         params.revision = make_magic('R', 'E', 'V', '1');
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1257,14 +1422,14 @@ mod tests {
     fn finalize_clears_initialized_runtime_state() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let mut params = make_params();
         params.voices = 1;
         params.effects = 1;
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 77, 9),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 77, 9),
             ResultCode::SUCCESS
         );
 
@@ -1297,13 +1462,13 @@ mod tests {
     fn finalize_does_not_wait_when_auto_mode_was_never_started() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let mut params = make_params();
         params.execution_mode = ExecutionMode::Auto;
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 77, 9),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 77, 9),
             ResultCode::SUCCESS
         );
 
@@ -1316,13 +1481,13 @@ mod tests {
     fn initialize_aligns_depop_buffer_to_workbuffer_formula() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let mut params = make_params();
         params.mixes = 3;
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1344,7 +1509,7 @@ mod tests {
     fn generate_command_returns_zero_when_not_initialized() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let mut command_buffer = vec![0u8; 0x2000];
         let command_buffer_len = command_buffer.len() as u64;
 
@@ -1358,7 +1523,7 @@ mod tests {
     fn get_session_id_preserves_negative_bits() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let system = System::new(core, audio_renderer);
+        let system = System::new_for_tests(core, audio_renderer);
 
         assert_eq!(system.get_session_id(), u32::MAX);
     }
@@ -1367,7 +1532,7 @@ mod tests {
     fn get_mix_buffer_count_does_not_alias_negative_values() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         system.mix_buffer_count = -1;
 
         assert_eq!(system.get_mix_buffer_count(), 0);
@@ -1377,7 +1542,7 @@ mod tests {
     fn initialize_gives_command_workbuffer_all_remaining_transfer_memory() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let mut params = make_params();
         params.voices = 2;
         params.sub_mixes = 1;
@@ -1389,7 +1554,7 @@ mod tests {
         let transfer_size = minimum_transfer_size + extra_transfer_size;
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1409,18 +1574,22 @@ mod tests {
     fn update_clears_rendered_event_and_send_command_to_dsp_signals_it() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let (rendered_event, mut process, _scheduler, readable_event_object_id) =
+            make_kernel_rendered_event();
+        let mut system = System::new(core, audio_renderer, rendered_event);
         let mut params = make_params();
         params.revision = make_magic('R', 'E', 'V', '1');
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, &mut *process, 1, 0),
             ResultCode::SUCCESS
         );
 
-        let rendered_event = system.get_rendered_event();
-        rendered_event.store(true, Ordering::SeqCst);
+        let readable_event = process
+            .get_readable_event_by_object_id(readable_event_object_id)
+            .unwrap();
+        readable_event.lock().unwrap().signal(&mut process, &_scheduler);
 
         let mut input = Vec::new();
         let header = UpdateDataHeader {
@@ -1457,24 +1626,24 @@ mod tests {
             system.update(&input, &mut performance, &mut output),
             ResultCode::SUCCESS
         );
-        assert!(!rendered_event.load(Ordering::SeqCst));
+        assert!(!readable_event.lock().unwrap().is_signaled());
 
         system.start();
         system.send_command_to_dsp();
 
-        assert!(rendered_event.load(Ordering::SeqCst));
+        assert!(readable_event.lock().unwrap().is_signaled());
     }
 
     #[test]
     fn generate_command_uses_voice_channels_plus_mixes_for_buffer_count() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
         system.start();
@@ -1495,13 +1664,13 @@ mod tests {
     fn inactive_send_command_to_dsp_signals_terminate_event() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let mut params = make_params();
         params.execution_mode = ExecutionMode::Auto;
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1520,12 +1689,12 @@ mod tests {
     fn send_command_to_dsp_forwards_process_pointer() {
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer.clone());
+        let mut system = System::new_for_tests(core, audio_renderer.clone());
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 
@@ -1550,13 +1719,13 @@ mod tests {
 
         let core = make_shared_system();
         let audio_renderer = make_renderer_handle(core.clone());
-        let mut system = System::new(core, audio_renderer);
+        let mut system = System::new_for_tests(core, audio_renderer);
         let mut params = make_params();
         params.execution_mode = ExecutionMode::Auto;
         let transfer_size = System::get_work_buffer_size(&params);
 
         assert_eq!(
-            system.initialize(&params, transfer_size, true, 1, 0),
+            system.initialize(&params, transfer_size, std::ptr::dangling_mut(), 1, 0),
             ResultCode::SUCCESS
         );
 

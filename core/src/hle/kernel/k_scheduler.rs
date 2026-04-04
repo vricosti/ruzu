@@ -170,6 +170,31 @@ mod tests {
 
         assert_eq!(scheduler.scan_runnable_threads(&process), Some(17));
     }
+
+    #[test]
+    fn enable_scheduling_defers_switch_for_nested_non_runnable_current_thread() {
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.thread_id = 99;
+            thread.disable_dispatch();
+            thread.disable_dispatch();
+            thread.set_state(ThreadState::WAITING);
+        }
+
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+        KScheduler::enable_scheduling_with_scheduler(0, Some(&scheduler), false);
+
+        {
+            let thread = current_thread.lock().unwrap();
+            assert_eq!(thread.get_disable_dispatch_count(), 1);
+            assert_eq!(thread.get_state(), ThreadState::WAITING);
+        }
+        assert!(scheduler.lock().unwrap().needs_scheduling());
+
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+    }
 }
 
 /// The per-core kernel scheduler.
@@ -725,44 +750,28 @@ impl KScheduler {
             sched.reschedule_other_cores(cores_needing_scheduling);
         }
 
-        if initial_disable_dispatch > 1 {
+        let current_state = super::kernel::with_current_thread_fast_mut(|t| t.get_state())
+            .unwrap_or(ThreadState::INITIALIZED);
+
+        if current_state != ThreadState::RUNNABLE {
+            // Upstream reschedules immediately when the current thread became
+            // non-runnable while dispatch was disabled. Rust cannot safely do
+            // that from owner paths like `KThread::sleep()` because those
+            // paths still hold the current thread object through `&mut self`.
+            // Defer the actual fiber switch to the outer owner (`CpuManager`)
+            // after the current owner releases its locks, but keep the
+            // scheduler flag set so the handoff happens immediately on return
+            // from the SVC.
+            scheduler.lock().unwrap().request_schedule();
             super::kernel::with_current_thread_fast_mut(|t| {
                 t.enable_dispatch();
             });
-
-            // Rust reaches `EnableScheduling(...)` from owner paths like
-            // `KScopedSchedulerLockAndSleep` while still executing inside the
-            // same host callback/fiber that initiated the wait transition.
-            // If the current thread became non-runnable during that locked
-            // region, simply decrementing dispatch leaves a WAITING thread
-            // running until some later owner happens to reschedule again.
-            // Upstream never allows a non-runnable current thread to keep
-            // executing past this point; the scheduler regains control before
-            // guest execution continues.
-            let current_state = super::kernel::with_current_thread_fast_mut(|t| t.get_state())
-                .unwrap_or(ThreadState::INITIALIZED);
-            if current_state != ThreadState::RUNNABLE {
-                scheduler.lock().unwrap().request_schedule();
-                scheduler.lock().unwrap().reschedule_current_core();
-            }
+        } else if initial_disable_dispatch > 1 {
+            super::kernel::with_current_thread_fast_mut(|t| {
+                t.enable_dispatch();
+            });
         } else {
-            let current_state = super::kernel::with_current_thread_fast_mut(|t| t.get_state())
-                .unwrap_or(ThreadState::INITIALIZED);
-            if current_state != ThreadState::RUNNABLE {
-                // Upstream reschedules immediately here. The Rust port cannot do
-                // that safely while owner paths like KThread::sleep() still hold
-                // the current thread's Mutex via `&mut self`; scheduling would
-                // recurse into thread locking before the SVC path returns. Defer
-                // the actual switch to the outer owner (`CpuManager`) once the
-                // thread lock is released, but keep the scheduler flag set so
-                // the outer owner can observe the pending handoff immediately.
-                scheduler.lock().unwrap().request_schedule();
-                super::kernel::with_current_thread_fast_mut(|t| {
-                    t.enable_dispatch();
-                });
-            } else {
-                scheduler.lock().unwrap().reschedule_current_core();
-            }
+            scheduler.lock().unwrap().reschedule_current_core();
         }
     }
 
@@ -1577,7 +1586,7 @@ impl KScheduler {
             // Yield back from switch_fiber to the newly scheduled thread's host_context.
             // Upstream: Common::Fiber::YieldTo(m_switch_fiber, *highest_priority_thread->m_host_context)
             if let Some(ref switch_fiber) = self.switch_fiber {
-                let host_ctx = hpt.lock().unwrap().get_or_create_host_context();
+                let host_ctx = hpt.lock().unwrap().get_host_context().cloned();
                 if let Some(ref ctx) = host_ctx {
                     log::trace!(
                         "schedule_impl_fiber_loop: host={} core={} yielding from switch_fiber to thread {} fiber",

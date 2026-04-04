@@ -37,8 +37,7 @@ pub fn wait_process_wide_key_atomic(
         if offset_tick > 0 {
             let hardware_tick = system
                 .kernel()
-                .and_then(|k| k.hardware_timer())
-                .map(|ht| ht.lock().unwrap().get_tick())
+                .and_then(|_| crate::hle::kernel::kernel::get_current_hardware_tick())
                 .unwrap_or(0);
             let t = hardware_tick + offset_tick + 2;
             if t <= 0 {

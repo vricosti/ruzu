@@ -886,9 +886,8 @@ impl CpuManager {
                 super::hle::kernel::kernel::set_current_emu_thread(Some(&thread_arc));
 
                 // Get the guest thread's host context for fiber switching.
-                let mut thread = thread_arc.lock().unwrap();
-                if let Some(thread_host_ctx) = thread.get_or_create_host_context() {
-                    drop(thread);
+                let thread_host_ctx = thread_arc.lock().unwrap().get_host_context().cloned();
+                if let Some(thread_host_ctx) = thread_host_ctx {
                     drop(scheduler);
 
                     // Upstream: Common::Fiber::YieldTo(data.host_context, *thread->GetHostContext());
@@ -904,7 +903,6 @@ impl CpuManager {
                         std::thread::current().name().unwrap_or("?"),
                     );
                 } else {
-                    drop(thread);
                     drop(scheduler);
                     log::warn!(
                         "CpuManager: {} — scheduler current thread has no host context",

@@ -334,19 +334,37 @@ pub fn sleep_thread(system: &System, ns: i64) {
             log::warn!("svc::SleepThread(sleep): current thread missing");
             return;
         };
+        log::trace!(
+            "svc::SleepThread(sleep): tid={} before get_current_hardware_tick",
+            current_thread_id
+        );
 
         let current_tick = system
             .kernel()
-            .and_then(|kernel| kernel.hardware_timer())
-            .map(|timer| timer.lock().unwrap().get_tick())
+            .and_then(|_| crate::hle::kernel::kernel::get_current_hardware_tick())
             .unwrap_or(i64::MAX);
+        log::trace!(
+            "svc::SleepThread(sleep): tid={} current_tick={}",
+            current_thread_id,
+            current_tick
+        );
         let timeout = sleep_timeout_tick_from_ns(current_tick, ns);
+        log::trace!(
+            "svc::SleepThread(sleep): tid={} timeout_tick={} before thread.sleep",
+            current_thread_id,
+            timeout
+        );
         let Some(result) =
             crate::hle::kernel::kernel::with_current_thread_fast_mut(|thread| thread.sleep(timeout))
         else {
             log::warn!("svc::SleepThread(sleep): current thread cache missing");
             return;
         };
+        log::trace!(
+            "svc::SleepThread(sleep): tid={} thread.sleep returned result=0x{:x}",
+            current_thread_id,
+            result
+        );
         if result != RESULT_SUCCESS.get_inner_value() {
             log::warn!("svc::SleepThread(sleep) failed: {:#x}", result);
             return;

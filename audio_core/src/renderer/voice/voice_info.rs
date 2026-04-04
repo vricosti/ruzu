@@ -18,11 +18,23 @@ pub enum ServerPlayState {
     Paused,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct Flags {
-    pub is_voice_played_sample_count_reset_at_loop_point_supported: bool,
-    pub is_voice_pitch_and_src_skipped_supported: bool,
+    raw: u8,
+}
+
+impl Flags {
+    const VOICE_PLAYED_SAMPLE_COUNT_RESET_AT_LOOP_POINT_SUPPORTED: u8 = 1 << 0;
+    const VOICE_PITCH_AND_SRC_SKIPPED_SUPPORTED: u8 = 1 << 1;
+
+    pub fn is_voice_played_sample_count_reset_at_loop_point_supported(self) -> bool {
+        (self.raw & Self::VOICE_PLAYED_SAMPLE_COUNT_RESET_AT_LOOP_POINT_SUPPORTED) != 0
+    }
+
+    pub fn is_voice_pitch_and_src_skipped_supported(self) -> bool {
+        (self.raw & Self::VOICE_PITCH_AND_SRC_SKIPPED_SUPPORTED) != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -353,11 +365,11 @@ impl VoiceInfo {
             self.flags |= u16::from(
                 params
                     .flags
-                    .is_voice_played_sample_count_reset_at_loop_point_supported,
+                    .is_voice_played_sample_count_reset_at_loop_point_supported(),
             );
         }
         if behavior.is_voice_pitch_and_src_skipped_supported() {
-            self.flags |= u16::from(params.flags.is_voice_pitch_and_src_skipped_supported) << 1;
+            self.flags |= u16::from(params.flags.is_voice_pitch_and_src_skipped_supported()) << 1;
         }
         if params.clear_voice_drop {
             self.voice_dropped = false;
@@ -729,6 +741,7 @@ impl VoiceInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::{offset_of, size_of};
 
     #[test]
     fn invalid_negative_channel_count_does_not_generate_commands() {
@@ -752,5 +765,17 @@ mod tests {
 
         assert!(!voice.wavebuffers[0].sent_to_dsp);
         assert_eq!(states[0].wave_buffers_consumed, 0);
+    }
+
+    #[test]
+    fn in_parameter_binary_layout_matches_upstream() {
+        assert_eq!(size_of::<Flags>(), 0x1);
+        assert_eq!(size_of::<BiquadFilterParameter>(), 0xC);
+        assert_eq!(size_of::<WaveBufferInternal>(), 0x38);
+        assert_eq!(size_of::<InParameter>(), 0x170);
+        assert_eq!(size_of::<OutStatus>(), 0x10);
+        assert_eq!(offset_of!(InParameter, flags), 0x15C);
+        assert_eq!(offset_of!(InParameter, src_quality), 0x15E);
+        assert_eq!(offset_of!(InParameter, _unk15f), 0x15F);
     }
 }

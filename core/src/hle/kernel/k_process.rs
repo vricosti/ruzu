@@ -429,6 +429,7 @@ pub struct KProcess {
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
     pub readable_event_objects: BTreeMap<u64, Arc<Mutex<KReadableEvent>>>,
     pub shared_memory_objects: BTreeMap<u64, Arc<super::k_shared_memory::KSharedMemory>>,
+    pub transfer_memory_objects: BTreeMap<u64, Arc<Mutex<super::k_transfer_memory::KTransferMemory>>>,
     pub sync_object: SynchronizationObjectState,
     pub self_reference: Option<Weak<Mutex<KProcess>>>,
     pub scheduler: Option<Weak<Mutex<KScheduler>>>,
@@ -557,6 +558,7 @@ impl KProcess {
             event_objects: BTreeMap::new(),
             readable_event_objects: BTreeMap::new(),
             shared_memory_objects: BTreeMap::new(),
+            transfer_memory_objects: BTreeMap::new(),
             sync_object: SynchronizationObjectState::new(),
             self_reference: None,
             scheduler: None,
@@ -1012,23 +1014,51 @@ impl KProcess {
             tag,
             timeout
         );
+
+        let current_thread_id = current_thread.lock().unwrap().get_thread_id();
+        let scheduler_lock_ptr = current_thread.lock().unwrap().scheduler_lock_ptr;
+        if scheduler_lock_ptr == 0 {
+            return svc_results::RESULT_INVALID_STATE.get_inner_value();
+        }
+        let scheduler_lock = unsafe {
+            &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+        };
+        let hardware_timer = super::kernel::get_hardware_timer_arc();
+        let thread_ptr = {
+            let mut guard = current_thread.lock().unwrap();
+            (&mut *guard) as *mut KThread as usize
+        };
+
         let result = {
+            let (mut sleep_guard, timer) =
+                super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep::new(
+                    scheduler_lock,
+                    hardware_timer.as_ref(),
+                    current_thread_id,
+                    thread_ptr,
+                    timeout,
+                );
+            log::trace!(
+                "KProcess::wait_condition_variable tid={} acquired sleep_guard",
+                current_thread_id
+            );
             let mut process_guard = process.lock().unwrap();
+            log::trace!(
+                "KProcess::wait_condition_variable tid={} acquired process_guard",
+                current_thread_id
+            );
             let cond_var_ptr: *mut KConditionVariable = &mut process_guard.cond_var;
 
-            // Keep the condition variable owned by KProcess while waiting.
-            // Upstream always waits/signals against the process-owned condvar tree,
-            // but the wait body itself runs under the existing owner context.
-            // Calling KConditionVariable::wait() from here would relock the same
-            // process mutex through the Arc owner and deadlock locally.
             unsafe {
-                (*cond_var_ptr).wait_locked(
+                (*cond_var_ptr).wait_locked_after_sleep_guard(
                     &mut process_guard,
                     current_thread,
                     address,
                     cv_key,
                     tag,
                     timeout,
+                    &mut sleep_guard,
+                    timer,
                 )
             }
         };
@@ -2409,6 +2439,7 @@ impl KProcess {
         self.event_objects.clear();
         self.readable_event_objects.clear();
         self.shared_memory_objects.clear();
+        self.transfer_memory_objects.clear();
 
         // Perform inherited finalization.
         // Upstream: KSynchronizationObject::Finalize();
@@ -2528,6 +2559,25 @@ impl KProcess {
         object_id: u64,
     ) -> Option<Arc<super::k_shared_memory::KSharedMemory>> {
         self.shared_memory_objects.get(&object_id).cloned()
+    }
+
+    pub fn register_transfer_memory_object(
+        &mut self,
+        object_id: u64,
+        transfer_memory: Arc<Mutex<super::k_transfer_memory::KTransferMemory>>,
+    ) {
+        self.transfer_memory_objects.insert(object_id, transfer_memory);
+    }
+
+    pub fn unregister_transfer_memory_object_by_object_id(&mut self, object_id: u64) {
+        self.transfer_memory_objects.remove(&object_id);
+    }
+
+    pub fn get_transfer_memory_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<super::k_transfer_memory::KTransferMemory>>> {
+        self.transfer_memory_objects.get(&object_id).cloned()
     }
 
     /// Unregister a thread from this process.

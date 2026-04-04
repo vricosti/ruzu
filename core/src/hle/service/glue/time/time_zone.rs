@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::psc::time::common::{
     CalendarAdditionalInfo, CalendarTime, LocationName, RuleVersion, SteadyClockTimePoint,
 };
@@ -72,7 +73,7 @@ impl TimeZoneService {
         build_handler_map(&[
             (
                 commands::GET_DEVICE_LOCATION_NAME,
-                None,
+                Some(Self::get_device_location_name_handler),
                 "GetDeviceLocationName",
             ),
             (
@@ -82,7 +83,7 @@ impl TimeZoneService {
             ),
             (
                 commands::GET_TOTAL_LOCATION_NAME_COUNT,
-                None,
+                Some(Self::get_total_location_name_count_handler),
                 "GetTotalLocationNameCount",
             ),
             (
@@ -93,12 +94,12 @@ impl TimeZoneService {
             (commands::LOAD_TIME_ZONE_RULE, None, "LoadTimeZoneRule"),
             (
                 commands::GET_TIME_ZONE_RULE_VERSION,
-                None,
+                Some(Self::get_time_zone_rule_version_handler),
                 "GetTimeZoneRuleVersion",
             ),
             (
                 commands::GET_DEVICE_LOCATION_NAME_AND_UPDATED_TIME,
-                None,
+                Some(Self::get_device_location_name_and_updated_time_handler),
                 "GetDeviceLocationNameAndUpdatedTime",
             ),
             (
@@ -116,10 +117,14 @@ impl TimeZoneService {
                 None,
                 "GetDeviceLocationNameOperationEventReadableHandle",
             ),
-            (commands::TO_CALENDAR_TIME, None, "ToCalendarTime"),
+            (
+                commands::TO_CALENDAR_TIME,
+                Some(Self::to_calendar_time_handler),
+                "ToCalendarTime",
+            ),
             (
                 commands::TO_CALENDAR_TIME_WITH_MY_RULE,
-                None,
+                Some(Self::to_calendar_time_with_my_rule_handler),
                 "ToCalendarTimeWithMyRule",
             ),
             (commands::TO_POSIX_TIME, None, "ToPosixTime"),
@@ -160,6 +165,10 @@ impl TimeZoneService {
             handlers: Self::build_handlers(),
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
     }
 
     /// GetDeviceLocationName (cmd 0).
@@ -353,6 +362,139 @@ impl TimeZoneService {
         }
         Ok(out_times[0])
     }
+
+    fn get_device_location_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        match service.get_device_location_name() {
+            Ok(name) => {
+                let mut rb = ResponseBuilder::new(
+                    ctx,
+                    2 + (core::mem::size_of::<LocationName>() / 4) as u32,
+                    0,
+                    0,
+                );
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_raw(&name);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn get_total_location_name_count_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        match service.get_total_location_name_count() {
+            Ok(count) => {
+                let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u32(count);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn get_time_zone_rule_version_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        match service.get_time_zone_rule_version() {
+            Ok(version) => {
+                let mut rb = ResponseBuilder::new(
+                    ctx,
+                    2 + (core::mem::size_of::<RuleVersion>() / 4) as u32,
+                    0,
+                    0,
+                );
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_raw(&version);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn get_device_location_name_and_updated_time_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        match service.get_device_location_name_and_updated_time() {
+            Ok((name, time_point)) => {
+                let words = 2
+                    + (core::mem::size_of::<LocationName>() / 4) as u32
+                    + (core::mem::size_of::<SteadyClockTimePoint>() / 4) as u32;
+                let mut rb = ResponseBuilder::new(ctx, words, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_raw(&name);
+                rb.push_raw(&time_point);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn to_calendar_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let time = rp.pop_i64();
+        let rule = ctx
+            .read_buffer(0)
+            .get(..core::mem::size_of::<TzRule>())
+            .map(|bytes| unsafe { core::ptr::read(bytes.as_ptr() as *const TzRule) })
+            .unwrap_or_default();
+        match service.to_calendar_time(time, &rule) {
+            Ok((calendar, additional)) => {
+                let words = 2
+                    + (core::mem::size_of::<CalendarTime>() / 4) as u32
+                    + (core::mem::size_of::<CalendarAdditionalInfo>() / 4) as u32;
+                let mut rb = ResponseBuilder::new(ctx, words, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_raw(&calendar);
+                rb.push_raw(&additional);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
+
+    fn to_calendar_time_with_my_rule_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let time = rp.pop_i64();
+        match service.to_calendar_time_with_my_rule(time) {
+            Ok((calendar, additional)) => {
+                let words = 2
+                    + (core::mem::size_of::<CalendarTime>() / 4) as u32
+                    + (core::mem::size_of::<CalendarAdditionalInfo>() / 4) as u32;
+                let mut rb = ResponseBuilder::new(ctx, words, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_raw(&calendar);
+                rb.push_raw(&additional);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
+    }
 }
 
 impl SessionRequestHandler for TimeZoneService {
@@ -376,5 +518,25 @@ impl ServiceFramework for TimeZoneService {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exercised_handlers_are_registered() {
+        let service = TimeZoneService::new(false);
+        assert!(service
+            .handlers()
+            .get(&commands::GET_DEVICE_LOCATION_NAME)
+            .and_then(|f| f.handler_callback)
+            .is_some());
+        assert!(service
+            .handlers()
+            .get(&commands::TO_CALENDAR_TIME_WITH_MY_RULE)
+            .and_then(|f| f.handler_callback)
+            .is_some());
     }
 }

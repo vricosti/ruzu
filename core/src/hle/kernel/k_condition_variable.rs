@@ -541,16 +541,41 @@ impl KConditionVariable {
         value: u32,
         timeout: i64,
     ) -> ResultCode {
-        let mut process_guard = process.lock().unwrap();
-        let result = self.wait_locked(
-            &mut process_guard,
-            current_thread,
-            addr,
-            key,
-            value,
-            timeout,
-        );
-        drop(process_guard);
+        let current_thread_id = current_thread.lock().unwrap().get_thread_id();
+        let scheduler_lock_ptr = current_thread.lock().unwrap().scheduler_lock_ptr;
+        if scheduler_lock_ptr == 0 {
+            return RESULT_INVALID_STATE;
+        }
+        let scheduler_lock = unsafe {
+            &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+        };
+        let hardware_timer = super::kernel::get_hardware_timer_arc();
+        let thread_ptr = {
+            let mut guard = current_thread.lock().unwrap();
+            (&mut *guard) as *mut KThread as usize
+        };
+
+        let result = {
+            let (mut sleep_guard, timer) =
+                super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep::new(
+                    scheduler_lock,
+                    hardware_timer.as_ref(),
+                    current_thread_id,
+                    thread_ptr,
+                    timeout,
+                );
+            let mut process_guard = process.lock().unwrap();
+            self.wait_locked_after_sleep_guard(
+                &mut process_guard,
+                current_thread,
+                addr,
+                key,
+                value,
+                timeout,
+                &mut sleep_guard,
+                timer,
+            )
+        };
 
         if result == RESULT_SUCCESS {
             Self::wait_for_current_thread(process, current_thread);
@@ -586,6 +611,13 @@ impl KConditionVariable {
             (&mut *guard) as *mut KThread as usize
         };
 
+        log::trace!(
+            "KConditionVariable::wait_locked tid={} before scoped_sleep_lock addr=0x{:X} key=0x{:X}",
+            current_thread_id,
+            addr,
+            key
+        );
+
         let (mut sleep_guard, timer) = super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep::new(
             scheduler_lock,
             hardware_timer.as_ref(),
@@ -593,6 +625,36 @@ impl KConditionVariable {
             thread_ptr,
             timeout,
         );
+        log::trace!(
+            "KConditionVariable::wait_locked tid={} after scoped_sleep_lock",
+            current_thread_id
+        );
+
+        self.wait_locked_after_sleep_guard(
+            process_guard,
+            current_thread,
+            addr,
+            key,
+            value,
+            timeout,
+            &mut sleep_guard,
+            timer,
+        )
+    }
+
+    pub(crate) fn wait_locked_after_sleep_guard(
+        &mut self,
+        process_guard: &mut KProcess,
+        current_thread: &Arc<Mutex<KThread>>,
+        addr: u64,
+        key: u64,
+        value: u32,
+        timeout: i64,
+        sleep_guard: &mut super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep<'_>,
+        timer: Option<Arc<super::k_hardware_timer::KHardwareTimer>>,
+    ) -> ResultCode {
+        let current_thread_id = current_thread.lock().unwrap().get_thread_id();
+        let mut wait_queue = ThreadQueueImplForKConditionVariableWaitConditionVariable::queue();
 
         // Check that the thread isn't terminating.
         // Matches upstream: if (cur_thread->IsTerminationRequested()) { slp.CancelSleep(); ... }
@@ -611,6 +673,12 @@ impl KConditionVariable {
                 KProcessAddress::new(addr),
                 false, // user address key
                 &mut has_waiters,
+            );
+            log::trace!(
+                "KConditionVariable::wait_locked tid={} after remove_waiter_by_key next_owner={:?} has_waiters={}",
+                current_thread_id,
+                next_owner_result.as_ref().map(|(tid, _, _)| *tid),
+                has_waiters
             );
 
             // Update for the next owner thread.
@@ -654,6 +722,10 @@ impl KConditionVariable {
                 return RESULT_INVALID_CURRENT_MEMORY;
             }
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            log::trace!(
+                "KConditionVariable::wait_locked tid={} after write_to_user key",
+                current_thread_id
+            );
 
             // Write the value to userspace.
             // Matches upstream: WriteToUser(m_kernel, addr, &next_value)
@@ -661,6 +733,11 @@ impl KConditionVariable {
                 sleep_guard.cancel_sleep();
                 return RESULT_INVALID_CURRENT_MEMORY;
             }
+            log::trace!(
+                "KConditionVariable::wait_locked tid={} after write_to_user addr next_value=0x{:08X}",
+                current_thread_id,
+                next_value
+            );
         }
 
         // If timeout is zero, time out.
@@ -673,6 +750,10 @@ impl KConditionVariable {
         if let Some(timer) = timer {
             wait_queue.set_hardware_timer(timer);
         }
+        log::trace!(
+            "KConditionVariable::wait_locked tid={} before begin_wait_condition_variable",
+            current_thread_id
+        );
 
         // Update condition variable tracking.
         // Matches upstream: cur_thread->SetConditionVariable(&m_tree, addr, key, value);

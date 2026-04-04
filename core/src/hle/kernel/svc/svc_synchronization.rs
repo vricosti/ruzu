@@ -145,8 +145,7 @@ pub fn wait_synchronization(
     let timeout = if timeout_ns > 0 {
         let current_tick = system
             .kernel()
-            .and_then(|kernel| kernel.hardware_timer())
-            .map(|timer| timer.lock().unwrap().get_tick())
+            .and_then(|_| crate::hle::kernel::kernel::get_current_hardware_tick())
             .unwrap_or(i64::MAX);
         synchronization_timeout_tick_from_ns(current_tick, timeout_ns)
     } else {
