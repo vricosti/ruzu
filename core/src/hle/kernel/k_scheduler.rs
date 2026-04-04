@@ -437,18 +437,26 @@ impl KScheduler {
     /// # Safety
     /// Same requirements as `activate_and_schedule_raw`.
     pub unsafe fn schedule_raw_if_needed(sched: *mut KScheduler) {
-        // Trigger UpdateHighestPriorityThreads to sync PQ → highest_priority_thread_id.
-        // Upstream: this happens in KScopedSchedulerLock::Unlock() before ScheduleImpl.
-        // We call it here because our dispatch loop doesn't use KScopedSchedulerLock.
+        // Read the PQ directly for our core under the GSC lock.
+        // This is the authoritative source — avoids the race where another core
+        // clears m_scheduler_update_needed before we can run the global update.
+        //
+        // Upstream: KScopedSchedulerLock::Unlock() atomically does
+        // UpdateHighestPriorityThreads + EnableScheduling. Our port can't do
+        // that atomically, so we read the PQ per-core instead of relying on
+        // the global update callback.
         if let Some(gsc_arc) = &(*sched).global_scheduler_context {
-            // Get callback fn pointer while holding GSC lock, then release
-            // GSC before calling (the callback re-locks GSC internally).
-            let update_fn = {
-                let gsc = gsc_arc.lock().unwrap();
-                gsc.scheduler_lock().get_update_callback()
-            };
-            if let Some(f) = update_fn {
-                f();
+            let gsc = gsc_arc.lock().unwrap();
+            let core_id = (*sched).core_id;
+            let pq_top = gsc.m_priority_queue.get_scheduled_front(core_id);
+            let prev = (*sched).state.highest_priority_thread_id;
+            if pq_top != prev {
+                (*sched).state.highest_priority_thread_id = pq_top;
+                (*sched).state.needs_scheduling.store(true, Ordering::Relaxed);
+            }
+            // Also check if current thread is no longer the highest — need reschedule.
+            if pq_top.is_some() && pq_top != (*sched).current_thread_id {
+                (*sched).state.needs_scheduling.store(true, Ordering::Relaxed);
             }
         }
 
@@ -1464,14 +1472,25 @@ impl KScheduler {
         self.switch_from_schedule = true;
 
         // Upstream: Common::Fiber::YieldTo(cur_thread->m_host_context, *m_switch_fiber)
-        if let Some(ref cur) = cur_thread {
-            let cur_lock = cur.lock().unwrap();
-            if let Some(ref host_ctx) = cur_lock.host_context {
-                if let Some(ref switch_fiber) = self.switch_fiber {
-                    let host_weak = Arc::downgrade(host_ctx);
-                    drop(cur_lock); // release thread lock before yield
-                    Fiber::yield_to(host_weak, switch_fiber);
+        // Get the fiber to yield FROM: prefer cur_thread.host_context, fall back to
+        // the core's host fiber stored in CpuManager (for idle/dummy threads
+        // that don't have their own fiber context).
+        let yield_from: Option<Arc<Fiber>> = cur_thread
+            .as_ref()
+            .and_then(|t| t.lock().unwrap().host_context.clone())
+            .or_else(|| {
+                // Fallback: get the host fiber from CpuManager for this core.
+                let kernel = super::kernel::get_kernel_ref()?;
+                let sys_ref = kernel.system();
+                if sys_ref.is_null() {
+                    return None;
                 }
+                sys_ref.get().get_cpu_manager().core_host_context(self.core_id as usize)
+            });
+
+        if let (Some(ref from_ctx), Some(ref switch_fiber)) = (&yield_from, &self.switch_fiber) {
+            if target.is_some() {
+                Fiber::yield_to(Arc::downgrade(from_ctx), switch_fiber);
             }
         }
     }

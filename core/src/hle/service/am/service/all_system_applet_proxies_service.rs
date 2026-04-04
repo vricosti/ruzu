@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::core::SystemRef;
+use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::am::applet::Applet;
 use crate::hle::service::am::window_system::WindowSystem;
@@ -70,6 +71,17 @@ impl IAllSystemAppletProxiesService {
             .get_by_applet_resource_user_id(pid)
     }
 
+    fn get_process_from_context(ctx: &HLERequestContext) -> Option<Arc<Mutex<KProcess>>> {
+        ctx.get_thread().and_then(|thread| {
+            thread
+                .lock()
+                .unwrap()
+                .parent
+                .as_ref()
+                .and_then(|p| p.upgrade())
+        })
+    }
+
     fn push_interface_response(
         ctx: &mut HLERequestContext,
         object: Arc<dyn SessionRequestHandler>,
@@ -119,6 +131,7 @@ impl IAllSystemAppletProxiesService {
         let proxy = Arc::new(super::system_applet_proxy::ISystemAppletProxy::new(
             service.system,
             applet,
+            Self::get_process_from_context(ctx),
             service.window_system.clone(),
         ));
         Self::push_interface_response(ctx, proxy);
@@ -155,6 +168,7 @@ impl IAllSystemAppletProxiesService {
         let proxy = Arc::new(super::library_applet_proxy::ILibraryAppletProxy::new(
             service.system,
             applet,
+            Self::get_process_from_context(ctx),
             service.window_system.clone(),
         ));
         Self::push_interface_response(ctx, proxy);
@@ -188,6 +202,7 @@ impl IAllSystemAppletProxiesService {
         let proxy = Arc::new(super::library_applet_proxy::ILibraryAppletProxy::new(
             service.system,
             applet,
+            Self::get_process_from_context(ctx),
             service.window_system.clone(),
         ));
         Self::push_interface_response(ctx, proxy);

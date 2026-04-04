@@ -41,6 +41,18 @@ impl IManagerRootService {
         }
     }
 
+    pub fn create_display_service(
+        &self,
+        policy: Policy,
+    ) -> Result<Arc<super::application_display_service::IApplicationDisplayService>, ResultCode> {
+        service_creator::get_application_display_service(Permission::Manager, policy)?;
+        Ok(Arc::new(
+            super::application_display_service::IApplicationDisplayService::new(
+                Arc::clone(&self.container),
+            ),
+        ))
+    }
+
     fn get_display_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let root = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         log::debug!("IManagerRootService::GetDisplayService called");
@@ -53,13 +65,9 @@ impl IManagerRootService {
             return;
         };
 
-        match service_creator::get_application_display_service(Permission::Manager, policy) {
-            Ok(()) => {
-                let display_service =
-                    super::application_display_service::IApplicationDisplayService::new(
-                        Arc::clone(&root.container),
-                    );
-                let sub: Arc<dyn SessionRequestHandler> = Arc::new(display_service);
+        match root.create_display_service(policy) {
+            Ok(display_service) => {
+                let sub: Arc<dyn SessionRequestHandler> = display_service;
                 super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
             }
             Err(_) => {
@@ -77,6 +85,9 @@ impl SessionRequestHandler for IManagerRootService {
     }
     fn service_name(&self) -> &str {
         ServiceFramework::get_service_name(self)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

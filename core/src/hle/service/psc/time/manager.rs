@@ -50,6 +50,14 @@ impl TimeManager {
     /// Corresponds to `TimeManager::TimeManager(Core::System&)` in upstream.
     /// The `get_ticks_ns` callback provides CoreTiming ticks in nanoseconds.
     pub fn new(get_ticks_ns: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        Self::new_with_shared_memory(get_ticks_ns, None, None)
+    }
+
+    pub fn new_with_shared_memory(
+        get_ticks_ns: Box<dyn Fn() -> i64 + Send + Sync>,
+        device_memory: Option<&crate::device_memory::DeviceMemory>,
+        memory_manager: Option<&mut crate::hle::kernel::k_memory_manager::KMemoryManager>,
+    ) -> Self {
         let get_ticks_ns = Arc::new(get_ticks_ns);
         let steady_clock_source_id = Arc::new(Mutex::new([0u8; 16]));
 
@@ -111,7 +119,12 @@ impl TimeManager {
         let time_zone = TimeZone::new();
 
         // SharedMemory
-        let shared_memory = SharedMemory::new_for_test();
+        let shared_memory = match (device_memory, memory_manager) {
+            (Some(device_memory), Some(memory_manager)) => {
+                SharedMemory::new(device_memory, memory_manager)
+            }
+            _ => SharedMemory::new_for_test(),
+        };
 
         // PowerStateRequestManager
         let power_state_request_manager = PowerStateRequestManager::new();

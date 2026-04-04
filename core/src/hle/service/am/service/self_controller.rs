@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -60,6 +61,7 @@ pub struct ISelfController {
 
 impl ISelfController {
     pub fn new(
+        system: SystemRef,
         applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
         process: Option<Arc<Mutex<KProcess>>>,
     ) -> Self {
@@ -73,7 +75,7 @@ impl ISelfController {
             if let Some(process_for_display) = process_for_display {
                 applet_guard
                     .display_layer_manager
-                    .initialize(process_for_display, applet_id, mode);
+                    .initialize(system, process_for_display, applet_id, mode);
             }
         }
         let handlers = build_handler_map(&[

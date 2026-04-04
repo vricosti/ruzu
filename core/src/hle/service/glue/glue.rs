@@ -63,7 +63,12 @@ pub fn loop_process(
     // Create the Glue::Time::TimeManager, matching upstream constructor.
     // This makes direct calls to time:m and set:sys via ServiceManager.
     use crate::hle::service::glue::time::manager::TimeManager;
-    let time_manager = Arc::new(Mutex::new(TimeManager::new(service_manager.clone(), system)));
+    let time_manager = Arc::new(Mutex::new(TimeManager::new(
+        service_manager.clone(),
+        system,
+        dm_addr as *const _,
+        mm_addr as *mut _,
+    )));
     time_manager.lock().unwrap().initialize();
     log::info!("Glue::LoopProcess: TimeManager initialized");
 
@@ -89,8 +94,6 @@ pub fn loop_process(
                 user_setup,
                 "time:u",
                 Arc::clone(&time_manager_user),
-                dm_addr as *const _,
-                mm_addr as *mut _,
             ))
         });
         server_manager.register_named_service("time:u", factory, 64);
@@ -111,8 +114,6 @@ pub fn loop_process(
                 admin_setup,
                 "time:a",
                 Arc::clone(&time_manager_admin),
-                dm_addr as *const _,
-                mm_addr as *mut _,
             ))
         });
         server_manager.register_named_service("time:a", factory, 64);
@@ -133,8 +134,6 @@ pub fn loop_process(
                 repair_setup,
                 "time:r",
                 Arc::clone(&time_manager_repair),
-                dm_addr as *const _,
-                mm_addr as *mut _,
             ))
         });
         server_manager.register_named_service("time:r", factory, 64);
@@ -156,8 +155,6 @@ pub fn loop_process(
                 psc_setup,
                 "time:s",
                 Arc::clone(&time_manager_psc),
-                dm_addr as *const _,
-                mm_addr as *mut _,
             ))
         });
         server_manager.register_named_service("time:s", factory, 64);

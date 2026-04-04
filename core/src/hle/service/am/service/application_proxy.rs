@@ -150,6 +150,7 @@ impl IApplicationProxy {
         Self::push_interface_response(
             ctx,
             Arc::new(super::self_controller::ISelfController::new(
+                proxy.system,
                 proxy.applet.clone(),
                 proxy.process.clone(),
             )),
@@ -162,6 +163,7 @@ impl IApplicationProxy {
             ctx,
             Arc::new(super::window_controller::IWindowController::new(
                 proxy.applet.clone(),
+                proxy.window_system.clone(),
             )),
         );
     }
