@@ -35,13 +35,9 @@ use crate::hle::service::sm::sm::ServiceManager;
 /// }
 /// ```
 ///
-/// `dm_addr` / `mm_addr` are usize-encoded pointers to DeviceMemory and
-/// KMemoryManager, needed by time services for shared memory allocation.
 pub fn loop_process(
     service_manager: &Arc<Mutex<ServiceManager>>,
     system: crate::core::SystemRef,
-    dm_addr: usize,
-    mm_addr: usize,
 ) {
     let mut server_manager = ServerManager::new(system);
 
@@ -63,12 +59,7 @@ pub fn loop_process(
     // Create the Glue::Time::TimeManager, matching upstream constructor.
     // This makes direct calls to time:m and set:sys via ServiceManager.
     use crate::hle::service::glue::time::manager::TimeManager;
-    let time_manager = Arc::new(Mutex::new(TimeManager::new(
-        service_manager.clone(),
-        system,
-        dm_addr as *const _,
-        mm_addr as *mut _,
-    )));
+    let time_manager = Arc::new(Mutex::new(TimeManager::new(service_manager.clone(), system)));
     time_manager.lock().unwrap().initialize();
     log::info!("Glue::LoopProcess: TimeManager initialized");
 

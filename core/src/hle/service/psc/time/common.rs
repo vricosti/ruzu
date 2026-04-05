@@ -132,6 +132,7 @@ const _: () = assert!(core::mem::size_of::<StaticServiceSetupInfo>() == 0x6);
 ///
 /// Here we use an ID-based approach: each OperationEvent gets a unique ID so it
 /// can be tracked in the ContextWriter's list and removed if needed.
+#[derive(Clone)]
 pub struct OperationEvent {
     id: u64,
     /// Kernel event for signaling context changes.
@@ -163,6 +164,10 @@ impl OperationEvent {
     /// Corresponds to `m_event->Signal()` in upstream.
     pub fn signal(&self) {
         self.event.signal();
+    }
+
+    pub fn get_event(&self) -> std::sync::Arc<crate::hle::service::os::event::Event> {
+        std::sync::Arc::clone(&self.event)
     }
 }
 

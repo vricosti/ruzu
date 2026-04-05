@@ -303,11 +303,11 @@ impl Services {
         });
         let sm = service_manager.clone();
         guest_service!("psc", move || {
-            Self::loop_process_psc(&sm, system);
+            Self::loop_process_psc(&sm, system, dm_addr, mm_addr);
         });
         let sm = service_manager.clone();
         guest_service!("glue", move || {
-            crate::hle::service::glue::glue::loop_process(&sm, system, dm_addr, mm_addr);
+            crate::hle::service::glue::glue::loop_process(&sm, system);
         });
         let sm = service_manager.clone();
         guest_service!("grc", move || {
@@ -533,7 +533,12 @@ impl Services {
         crate::hle::service::set::settings::loop_process(system);
     }
 
-    fn loop_process_psc(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+    fn loop_process_psc(
+        _sm: &Arc<Mutex<ServiceManager>>,
+        system: crate::core::SystemRef,
+        dm_addr: usize,
+        mm_addr: usize,
+    ) {
         let mut server_manager = ServerManager::new(system);
         // psc:c, psc:m as stubs
         register_stub_services(&mut server_manager, &["psc:c", "psc:m"]);
@@ -541,8 +546,12 @@ impl Services {
         server_manager.register_named_service(
             "time:m",
             Box::new(
-                || -> Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> {
-                    Arc::new(super::psc::time::service_manager::TimeServiceManager::new())
+                move || -> Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> {
+                    Arc::new(super::psc::time::service_manager::TimeServiceManager::new(
+                        system,
+                        dm_addr as *const _,
+                        mm_addr as *mut _,
+                    ))
                 },
             ),
             64,

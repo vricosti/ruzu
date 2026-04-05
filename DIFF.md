@@ -2945,6 +2945,105 @@
 ### Binary layout verification
 - PASS: no raw serialized struct layout changed in this slice.
 
+## 2026-04-05 — `core/src/hle/service/set/system_settings_server.rs` vs `core/hle/service/set/system_settings_server.h/.cpp`
+
+### Intentional differences
+- Rust exposes owner-local helpers `get_settings_item_value_bytes()` / `get_settings_item_value_i32()` for non-IPC callers in Glue/PSC. This preserves the upstream ownership in `ISystemSettingsServer` while adapting the C++ template helper `GetSettingsItemValueImpl<T>()` to Rust.
+
+### Unintentional differences (to fix)
+- The helper layer only exposes the `i32` path currently exercised by Glue time setup. Additional typed variants from upstream still need owner-local Rust equivalents if other callers require them.
+
+### Missing items
+- Additional typed helper accessors matching broader upstream `GetSettingsItemValueImpl<T>()` usage.
+
+### Binary layout verification
+- PASS: no raw serialized structs changed in this file.
+
+## 2026-04-05 — `core/src/hle/service/psc/time/clocks/standard_user_system_clock_core.rs` vs `core/hle/service/psc/time/clocks/standard_user_system_clock_core.h/.cpp`
+
+### Intentional differences
+- Rust stores the upstream `Kernel::KEvent` as `Arc<Event>` and exposes it through `get_event()`. This preserves owner placement while adapting raw kernel object ownership to Rust shared ownership.
+
+### Unintentional differences (to fix)
+- `set_automatic_correction()` still returns `RESULT_SUCCESS` when the network clock source does not match, whereas the upstream owner only mutates state under the stricter clock/core wiring path. The observable behavior in the currently exercised setup path matches, but the control flow is still simplified.
+
+### Missing items
+- No additional missing items identified in the exercised setup/update path.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-05 — `core/src/hle/service/psc/time/service_manager.rs` vs `core/hle/service/psc/time/service_manager.h/.cpp`
+
+### Intentional differences
+- Rust does not yet own the upstream `ServerManager&` and therefore cannot literally implement `SetupSAndP()` service registration for `time:s` / `time:p` in this owner. `Services` still performs top-level registration externally.
+- Event-returning commands `50/51/52/60/200` are still temporary success stubs because the exact upstream `KReadableEvent` copy-handle path is not fully wired in this owner yet.
+
+### Unintentional differences (to fix)
+- `TimeServiceManager` still does not own or link the upstream `OperationEvent` members (`m_local_operation`, `m_network_operation`, `m_ephemeral_operation`) or the `ContextWriter::Link(...)` setup from the constructor.
+- The Rust owner still updates shared memory directly inside setup methods because `SystemClockCore::set_context_writer(...)` and the `ContextWriter` graph are not yet wired literally from this constructor.
+
+### Missing items
+- `CheckAndSetupServicesSAndP`
+- `SetupSAndP`
+- Real `GetStandardLocalClockOperationEvent`
+- Real `GetStandardNetworkClockOperationEventForServiceManager`
+- Real `GetEphemeralNetworkClockOperationEventForServiceManager`
+- Real `GetStandardUserSystemClockAutomaticCorrectionUpdatedEvent`
+- Real `GetClosestAlarmUpdatedEvent`
+
+### Binary layout verification
+- PASS: command payload structs used here (`SystemClockContext`, `SteadyClockTimePoint`, `AlarmInfo`) retain their existing upstream-sized `repr(C)` layout.
+
+## 2026-04-05 — `core/src/hle/service/glue/time/manager.rs` vs `core/hle/service/glue/time/manager.h/.cpp`
+
+### Intentional differences
+- Rust keeps a `ServiceManager` handle and downcasts `time:m` / `set:sys` on demand because there is no literal upstream typed `system.ServiceManager().GetService<T>(..., true)` helper in this port. The ownership remains in Glue `TimeManager`.
+- Rust stores the upstream `m_time_m` only indirectly by caching the shared PSC `TimeManager` owner and the `time:sm` static service. This avoids holding a borrowed trait-object reference across the struct lifetime.
+
+### Unintentional differences (to fix)
+- `GetTimeZoneString(...)` now follows the upstream settings-driven path instead of forcing `UTC`, but it still approximates `Settings::GetTimeZoneString(...)` with existing Rust `common::settings` / `common::time_zone` helpers rather than porting the exact helper into the matching common owner.
+- `TimeWorker::Initialize(...)` and the later `m_time_sm->GetStandardUserSystemClock(...)` / `GetTimeZoneService(...)` wiring are still missing from this owner; Glue only performs the setup calls and starts the worker thread flag.
+
+### Missing items
+- Literal `m_set_sys` owner member
+- Literal persistent `m_time_m` owner member
+- Full `TimeWorker::Initialize(m_time_sm, m_set_sys)` parity
+- `m_file_timestamp_worker.m_system_clock` / `m_time_zone` acquisition through `time:sm`
+- End-of-constructor filesystem POSIX time update path
+
+### Binary layout verification
+- PASS: no raw serialized structs were introduced in this file; the helper byte conversions continue to target existing `repr(C)` PSC time structs.
+
+## 2026-04-05 — `core/src/hle/service/glue/glue.rs` vs `core/hle/service/glue/glue.cpp`
+
+### Intentional differences
+- Rust no longer forwards raw `DeviceMemory` / `KMemoryManager` pointers into Glue `TimeManager`; those owners now live under PSC `time:m`, which is closer to upstream ownership.
+
+### Unintentional differences (to fix)
+- None newly identified in the exercised Glue time-manager construction path after moving PSC shared-memory ownership back under `time:m`.
+
+### Missing items
+- No additional missing items identified in this pass.
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
+## 2026-04-05 — `core/src/hle/service/services.rs` vs `core/hle/service/services.cpp`
+
+### Intentional differences
+- Rust still constructs `time:m` explicitly from the global services loop rather than through the exact upstream `ServerManager` registration helper graph. This is existing top-level architecture in the Rust port.
+
+### Unintentional differences (to fix)
+- `time:m` construction now owns shared-memory pointers correctly, but `Services` still lacks the upstream deferred `time:s` / `time:p` registration trigger that belongs under `PSC::Time::ServiceManager::SetupSAndP()`.
+
+### Missing items
+- Deferred registration parity for `time:s`
+- Deferred registration parity for `time:p`
+
+### Binary layout verification
+- PASS: no raw serialized structs in this file.
+
 ## 2026-04-05 — `core/src/hle/service/psc/time/manager.rs` vs `core/hle/service/psc/time/manager.h/.cpp`
 
 ### Intentional differences
@@ -5768,3 +5867,78 @@
 
 ### Binary layout verification
 - PASS: no raw serialized struct layout changed in this slice.
+
+## 2026-04-05 — `core/src/hle/service/psc/time/service_manager.rs` vs `core/hle/service/psc/time/service_manager.h/.cpp`
+
+### Intentional differences
+- Rust stores persistent readable-event caches as `Mutex<Option<Arc<Mutex<KReadableEvent>>>>` and lazily binds them to the upstream `OperationEvent`/`Event` owners on first IPC request. This preserves the upstream ownership boundary while adapting `OutCopyHandle` to Rust's process handle-table flow.
+- Rust does not yet own the upstream `ServerManager&` or implement `SetupSAndP`; the current owner still exposes only `time:m` methods directly.
+
+### Unintentional differences (to fix)
+- `CheckAndSetupServicesSAndP()` / `SetupSAndP()` are still missing, so `time:s`/`time:p` are not spawned from `time:m` the way upstream does.
+- The constructor currently links `OperationEvent`s directly in Rust owner code, but the broader upstream service-manager lifecycle around `m_is_s_and_p_setup` is still absent.
+
+### Missing items
+- `CheckAndSetupServicesSAndP`
+- `SetupSAndP`
+- literal upstream `ServerManager` integration for spawned `time:s` / `time:p`
+
+### Binary layout verification
+- PASS: no raw serialized structs are defined in this file.
+
+## 2026-04-05 — `core/src/hle/service/psc/time/power_state_service.rs` vs `core/hle/service/psc/time/power_state_service.h/.cpp`
+
+### Intentional differences
+- Rust stores the upstream `PowerStateRequestManager&` as `Arc<PowerStateRequestManager>`.
+- The readable-end copy handle is created lazily on first IPC request and then rebound to the persistent upstream-style `Event` owner.
+
+### Unintentional differences (to fix)
+- This owner is now behaviorally correct for cmd `0/1`, but it is not yet registered through upstream `time:m -> SetupSAndP`.
+
+### Missing items
+- Upstream registration path via `ServiceManager::SetupSAndP`
+
+### Binary layout verification
+- PASS: no raw serialized structs are defined in this file.
+
+## 2026-04-05 — `core/src/hle/service/psc/time/common.rs` vs `core/hle/service/psc/time/common.h/.cpp`
+
+### Intentional differences
+- `OperationEvent` is `Clone` in Rust so the same upstream event owner can be linked into writer lists while remaining owned by `time:m`; clones share the same underlying service `Event`.
+
+### Unintentional differences (to fix)
+- `OperationEvent` still does not model the upstream intrusive-list node literally; it uses Vec-managed list membership through the context-writer owners.
+
+### Missing items
+- Closer intrusive-list parity for `OperationEventList`
+
+### Binary layout verification
+- PASS: all raw IPC structs in this file keep their explicit size assertions (`SteadyClockTimePoint`, `SystemClockContext`, `ClockSnapshot`, `ContinuousAdjustmentTimePoint`, `AlarmInfo`, `StaticServiceSetupInfo`).
+
+## 2026-04-05 — `core/src/hle/service/psc/time/alarms.rs` vs `core/hle/service/psc/time/alarms.h/.cpp`
+
+### Intentional differences
+- Rust exposes the upstream `m_event` through `get_event()` so `time:m` can return copy handles to the same owner instead of fabricating one-shot handles.
+
+### Unintentional differences (to fix)
+- `Alarms` still uses a simplified Vec-based alarm store instead of the upstream intrusive alarm list and closest-alarm pointer.
+
+### Missing items
+- Closer intrusive-list parity for alarm ownership and closest-alarm tracking
+
+### Binary layout verification
+- PASS: `AlarmInfo` size remains asserted in `common.rs`; this file introduces no additional raw serialized payloads.
+
+## 2026-04-05 — `core/src/hle/service/os/event.rs` vs `core/hle/service/os/event.h/.cpp`
+
+### Intentional differences
+- Rust adds `attach_kernel_event(...)` so service owners can bind a kernel readable-end lazily when an IPC client first requests a copy handle. This is a Rust adaptation of the upstream `KEvent` ownership, not a change of file ownership.
+
+### Unintentional differences (to fix)
+- The bridge is still stored behind an internal `Mutex<Option<...>>` rather than a literal upstream `KEvent*` owner from construction time.
+
+### Missing items
+- No additional missing items identified in the exercised owner path.
+
+### Binary layout verification
+- PASS: no raw serialized structs are defined in this file.

@@ -748,6 +748,16 @@ impl ISystemSettingsServer {
         self.headphone_volume_update_flag = flag;
         self.set_save_needed();
     }
+
+    pub fn get_settings_item_value_bytes(&self, category: &str, name: &str) -> Option<Vec<u8>> {
+        get_settings().get(category)?.get(name).cloned()
+    }
+
+    pub fn get_settings_item_value_i32(&self, category: &str, name: &str) -> Option<i32> {
+        let bytes = self.get_settings_item_value_bytes(category, name)?;
+        let raw: [u8; 4] = bytes.as_slice().try_into().ok()?;
+        Some(i32::from_le_bytes(raw))
+    }
 }
 
 /// Returns the built-in settings item map, matching upstream `GetSettings()` in
