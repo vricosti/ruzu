@@ -10,7 +10,7 @@
 //! passed by callers (process + thread Arcs) because the kernel singleton
 //! pattern does not map directly to Rust ownership.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,7 +57,7 @@ pub struct KConditionVariable {
 
 #[derive(Default)]
 struct ConditionVariableThreadTree {
-    ordered: BTreeSet<ConditionVariableThreadKey>,
+    ordered: BTreeMap<(u64, i32), Vec<u64>>,
     by_thread_id: HashMap<u64, ConditionVariableThreadKey>,
 }
 
@@ -874,11 +874,7 @@ impl KConditionVariable {
 
     /// Get all waiting thread IDs in tree order.
     pub fn waiting_thread_ids(&self) -> Vec<u64> {
-        self.waiting_threads
-            .ordered
-            .iter()
-            .map(|entry| entry.thread_id)
-            .collect()
+        self.waiting_threads.ordered_thread_ids()
     }
 
     /// Set up a thread to wait for an address lock.
@@ -932,19 +928,22 @@ impl KConditionVariable {
 impl ConditionVariableThreadTree {
     fn insert(&mut self, key: ConditionVariableThreadKey) {
         if let Some(existing) = self.by_thread_id.insert(key.thread_id, key) {
-            self.ordered.remove(&existing);
+            self.remove_from_bucket(existing.cv_key, existing.priority, existing.thread_id);
         }
-        self.ordered.insert(key);
+
+        self.ordered
+            .entry((key.cv_key, key.priority))
+            .or_default()
+            .push(key.thread_id);
     }
 
     fn erase(&mut self, key: ConditionVariableThreadKey) {
-        self.by_thread_id.remove(&key.thread_id);
-        self.ordered.remove(&key);
+        self.erase_by_thread_id(key.thread_id);
     }
 
     fn erase_by_thread_id(&mut self, thread_id: u64) {
         if let Some(existing) = self.by_thread_id.remove(&thread_id) {
-            self.ordered.remove(&existing);
+            self.remove_from_bucket(existing.cv_key, existing.priority, thread_id);
         }
     }
 
@@ -952,15 +951,40 @@ impl ConditionVariableThreadTree {
     /// Matches upstream `m_tree.nfind_key({cv_key, -1})`.
     fn nfind_key(&self, cv_key: u64) -> Option<ConditionVariableThreadKey> {
         self.ordered
-            .range(
-                ConditionVariableThreadKey {
-                    cv_key,
-                    priority: i32::MIN,
-                    thread_id: 0,
-                }..,
-            )
-            .next()
-            .copied()
+            .range((cv_key, i32::MIN)..)
+            .find_map(|(_, thread_ids)| {
+                thread_ids
+                    .first()
+                    .and_then(|thread_id| self.by_thread_id.get(thread_id))
+                    .copied()
+            })
+    }
+
+    fn ordered_thread_ids(&self) -> Vec<u64> {
+        self.ordered
+            .values()
+            .flat_map(|thread_ids| thread_ids.iter().copied())
+            .collect()
+    }
+
+    fn bucket_count(&self) -> usize {
+        self.ordered.len()
+    }
+
+    fn remove_from_bucket(&mut self, cv_key: u64, priority: i32, thread_id: u64) {
+        let bucket_key = (cv_key, priority);
+        let should_remove_bucket = if let Some(thread_ids) = self.ordered.get_mut(&bucket_key) {
+            if let Some(position) = thread_ids.iter().position(|existing| *existing == thread_id) {
+                thread_ids.remove(position);
+            }
+            thread_ids.is_empty()
+        } else {
+            false
+        };
+
+        if should_remove_bucket {
+            self.ordered.remove(&bucket_key);
+        }
     }
 }
 
@@ -1106,8 +1130,39 @@ mod tests {
             tree.nfind_key(0x2000).map(|key| (key.cv_key, key.thread_id)),
             Some((0x2000, 42))
         );
-        assert_eq!(tree.ordered.len(), 1);
+        assert_eq!(tree.bucket_count(), 1);
         assert_eq!(tree.by_thread_id.len(), 1);
+    }
+
+    #[test]
+    fn thread_tree_allows_multiple_waiters_with_same_key_and_priority() {
+        let mut tree = ConditionVariableThreadTree::default();
+
+        tree.insert(ConditionVariableThreadKey {
+            cv_key: 0x3000,
+            priority: 10,
+            thread_id: 41,
+        });
+        tree.insert(ConditionVariableThreadKey {
+            cv_key: 0x3000,
+            priority: 10,
+            thread_id: 42,
+        });
+
+        assert_eq!(tree.bucket_count(), 1);
+        assert_eq!(tree.by_thread_id.len(), 2);
+        assert_eq!(tree.ordered_thread_ids(), vec![41, 42]);
+        assert_eq!(
+            tree.nfind_key(0x3000).map(|key| (key.cv_key, key.priority, key.thread_id)),
+            Some((0x3000, 10, 41))
+        );
+
+        tree.erase_by_thread_id(41);
+        assert_eq!(tree.ordered_thread_ids(), vec![42]);
+        assert_eq!(
+            tree.nfind_key(0x3000).map(|key| (key.cv_key, key.priority, key.thread_id)),
+            Some((0x3000, 10, 42))
+        );
     }
 
     #[test]
