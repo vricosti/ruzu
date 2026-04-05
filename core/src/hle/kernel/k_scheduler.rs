@@ -779,7 +779,13 @@ impl KScheduler {
                 t.enable_dispatch();
             });
         } else {
-            scheduler.lock().unwrap().reschedule_current_core();
+            let sched_ptr = {
+                let guard = scheduler.lock().unwrap();
+                &*guard as *const KScheduler as *mut KScheduler
+            };
+            unsafe {
+                (*sched_ptr).reschedule_current_core();
+            }
         }
     }
 
