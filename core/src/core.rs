@@ -147,6 +147,41 @@ pub trait AudioCoreInterface: Send {
     /// Mirror `AudioCore::Renderer::Manager::GetWorkBufferSize`.
     fn get_audio_renderer_work_buffer_size(&self, params: &[u8; 0x34]) -> Option<u64>;
 
+    /// Mirror `AudioCore::Renderer::AudioDevice::ListAudioDeviceName`.
+    fn list_audio_device_name(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        out_names: &mut [[u8; 0x100]],
+    ) -> u32;
+
+    /// Mirror `AudioCore::Renderer::AudioDevice::ListAudioOutputDeviceName`.
+    fn list_audio_output_device_name(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        out_names: &mut [[u8; 0x100]],
+    ) -> u32;
+
+    /// Mirror `AudioCore::Renderer::AudioDevice::SetDeviceVolumes`.
+    fn set_audio_device_volume(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        volume: f32,
+    );
+
+    /// Mirror `AudioCore::Renderer::AudioDevice::GetDeviceVolume`.
+    fn get_audio_device_volume(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        name: &str,
+    ) -> f32;
+
+    /// Mirror `AudioCore::Sink::Sink::GetSystemChannels`.
+    fn get_audio_output_system_channels(&self) -> u32;
+
     /// Mirror `IAudioRendererManager::OpenAudioRenderer` by creating an owned
     /// audio renderer session backed by the real audio_core renderer owners.
     fn open_audio_renderer(

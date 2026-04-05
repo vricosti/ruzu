@@ -2,6 +2,7 @@ use crate::adsp::ADSP;
 use crate::audio_render_manager::Manager as AudioRenderManager;
 use crate::common::audio_renderer_parameter::AudioRendererParameterInternal;
 use crate::audio_manager::AudioManager;
+use crate::renderer::audio_device::AudioDevice;
 use crate::renderer::{Renderer, System as RendererSystem};
 use crate::sink::sink::{new_sink_handle, SinkHandle};
 use crate::sink::sink_details::create_sink_from_id;
@@ -172,6 +173,60 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
             core::ptr::read_unaligned(params.as_ptr() as *const AudioRendererParameterInternal)
         };
         Some(RendererSystem::get_work_buffer_size(&parsed))
+    }
+
+    fn list_audio_device_name(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        out_names: &mut [[u8; 0x100]],
+    ) -> u32 {
+        let device = AudioDevice::new(self.get_output_sink(), applet_resource_user_id, revision);
+        let mut names = vec![crate::renderer::audio_device::AudioDeviceName::new(); out_names.len()];
+        let count = device.list_audio_device_name(&mut names) as usize;
+        for (dst, src) in out_names.iter_mut().zip(names.iter()).take(count) {
+            *dst = src.name;
+        }
+        count as u32
+    }
+
+    fn list_audio_output_device_name(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        out_names: &mut [[u8; 0x100]],
+    ) -> u32 {
+        let device = AudioDevice::new(self.get_output_sink(), applet_resource_user_id, revision);
+        let mut names = vec![crate::renderer::audio_device::AudioDeviceName::new(); out_names.len()];
+        let count = device.list_audio_output_device_name(&mut names) as usize;
+        for (dst, src) in out_names.iter_mut().zip(names.iter()).take(count) {
+            *dst = src.name;
+        }
+        count as u32
+    }
+
+    fn set_audio_device_volume(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        volume: f32,
+    ) {
+        let device = AudioDevice::new(self.get_output_sink(), applet_resource_user_id, revision);
+        device.set_device_volumes(volume);
+    }
+
+    fn get_audio_device_volume(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        name: &str,
+    ) -> f32 {
+        let device = AudioDevice::new(self.get_output_sink(), applet_resource_user_id, revision);
+        device.get_device_volume(name)
+    }
+
+    fn get_audio_output_system_channels(&self) -> u32 {
+        self.get_output_sink().lock().get_system_channels()
     }
 
     fn open_audio_renderer(

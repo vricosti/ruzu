@@ -240,11 +240,16 @@ impl IAudioRendererManager {
     fn get_audio_device_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioRendererManager::GetAudioDeviceService");
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut rp = RequestParser::new(ctx);
+        let applet_resource_user_id = rp.pop_u64();
         let device_num = svc
             .num_audio_devices
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let device = Arc::new(super::audio_device::IAudioDevice::new(
-            0, 0x52455631, device_num,
+            svc.system,
+            applet_resource_user_id,
+            0x52455631,
+            device_num,
         )); // 'REV1'
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
@@ -259,10 +264,19 @@ impl IAudioRendererManager {
     ) {
         log::debug!("IAudioRendererManager::GetAudioDeviceServiceWithRevisionInfo");
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut rp = RequestParser::new(ctx);
+        let revision = rp.pop_u32();
+        rp.align_for::<u64>();
+        let applet_resource_user_id = rp.pop_u64();
         let device_num = svc
             .num_audio_devices
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let device = Arc::new(super::audio_device::IAudioDevice::new(0, 0, device_num));
+        let device = Arc::new(super::audio_device::IAudioDevice::new(
+            svc.system,
+            applet_resource_user_id,
+            revision,
+            device_num,
+        ));
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
         rb.push_ipc_interface(device);

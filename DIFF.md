@@ -6280,3 +6280,144 @@
 
 ### Binary layout verification
 - PASS: the new regression test covers the upstream `SetPreallocatedBuffer(nullptr)` behavior and keeps the slot payload zero-initialized rather than absent.
+
+## 2026-04-05 — `core/src/hle/service/nvnflinger/consumer_base.rs` vs `core/hle/service/nvnflinger/consumer_base.h/.cpp`
+
+### Intentional differences
+- Rust still keeps the upstream `mutex`, `slots`, `is_abandoned`, and `consumer` state inside one private `ConsumerBaseInner` guarded by `Mutex<_>` instead of exposing protected members to subclasses. File ownership remains the same.
+- To preserve the upstream single-lock lifetime across `BufferItemConsumer::AcquireBuffer` / `ReleaseBuffer`, this file now offers combined owner-local methods (`acquire_buffer_locked_with_cached_graphic_buffer`, `release_buffer_locked_with_fence`) rather than exposing the raw inner mutex to sibling modules.
+
+### Unintentional differences (to fix)
+- `Connect(...)` still does not literally use upstream inheritance plus `shared_from_this()`; listener wiring remains adapted through explicit `Arc<dyn IConsumerListener>` passing from Rust callers.
+- The Rust port still uses boxed slot storage and cloned `Arc<GraphicBuffer>` handles instead of the upstream plain `std::array<Slot, N>` member layout.
+
+### Missing items
+- No additional missing methods identified in the exercised owner path.
+
+### Binary layout verification
+- PASS: no shared raw serialized payloads are owned by this file.
+
+## 2026-04-05 — `core/src/hle/service/nvnflinger/buffer_item_consumer.rs` vs `core/hle/service/nvnflinger/buffer_item_consumer.h/.cpp`
+
+### Intentional differences
+- Rust keeps `BufferItemConsumer` as composition over `ConsumerBase` instead of inheritance. The owner file still matches the upstream `BufferItemConsumer` methods, and the underlying lock/state ownership remains in `consumer_base.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `AcquireBuffer(...)` no longer relocks `ConsumerBase` in separate steps around the cached `graphic_buffer` rewrite; it now performs the upstream-equivalent acquire plus slot-cache readback through one owner-local lock path.
+- Fixed in this pass: `ReleaseBuffer(...)` no longer splits `AddReleaseFenceLocked(...)` and `ReleaseBufferLocked(...)` across separate lock acquisitions; it now executes the fence update and release under one owner-local lock path.
+
+### Missing items
+- No new missing items identified in the exercised acquire/release path.
+
+### Binary layout verification
+- PASS: no shared raw payload structs changed in this slice.
+
+## 2026-04-05 — `core/src/hle/kernel/k_thread.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp`
+
+### Intentional differences
+- Rust still needs the bridge helper `sleep_current_thread(...)` because `svc_thread.rs` and the runtime own `Arc<Mutex<KThread>>` handles, while upstream `KThread::Sleep()` executes on a raw `KThread*`.
+- Fixed in this pass: `sleep_current_thread(...)` no longer holds the outer `Arc<Mutex<KThread>>` guard while calling `KThread::sleep()`. It now takes a stable raw pointer under a short lock, matching the upstream ownership more closely and mirroring the existing `KThread::run_thread(...)` adaptation.
+- Fixed in this pass: after waiting for the timed wake, the Rust bridge now returns `RESULT_SUCCESS` rather than leaking the internal timeout wake code (`0xea01`) back through the SVC helper. Upstream `KThread::Sleep()` always returns success once the thread resumes.
+
+### Unintentional differences (to fix)
+- The Rust port still relies on the helper loop `wait_for_current_thread(...)` after `KThread::sleep()` returns, whereas upstream simply returns after arming the wait and leaves the host/runtime handoff entirely to scheduler execution.
+- `KThread::Sleep()` still writes `sleep_deadline` for local diagnostics; upstream does not expose an equivalent Rust-side field.
+
+### Missing items
+- No new missing methods identified in the exercised `SleepThread` owner path.
+
+### Binary layout verification
+- PASS: no raw serialized payload layout changed in this slice.
+
+## 2026-04-05 — `core/src/hle/service/vi/vsync_manager.rs` vs `core/hle/service/vi/vsync_manager.h/.cpp`
+
+### Intentional differences
+- Rust stores `Arc<Event>` values in a `Vec` rather than upstream raw `Event*` inside `std::set<Event*>`, because service events are shared Rust owners. This file now preserves the upstream set semantics explicitly by deduplicating on `Arc::ptr_eq(...)`.
+
+### Unintentional differences (to fix)
+- The container type still differs from upstream (`Vec<Arc<Event>>` vs `std::set<Event*>`), so iteration order is insertion order rather than pointer order. No exercised behavior currently depends on that ordering.
+
+### Missing items
+- No missing methods remain in the exercised `SignalVsync` / `LinkVsyncEvent` / `UnlinkVsyncEvent` owner path.
+
+### Binary layout verification
+- PASS: no shared raw payload structs are serialized in this file.
+
+## 2026-04-05 — `core/src/hle/service/vi/conductor.rs` vs `core/hle/service/vi/conductor.h/.cpp`
+
+### Intentional differences
+- Rust still owns `SurfaceFlinger` directly instead of upstream `Container&`, to avoid a Rust reference cycle between `Container` and `Conductor`. The owner/file boundary remains the same and `process_vsync()` still delegates composition from this file.
+- Rust uses an explicit `Arc<(Mutex<bool>, Condvar)>` plus `JoinHandle<()>` for the multicore wake thread instead of upstream `Common::Event` plus `std::jthread`. This preserves the same owner responsibilities and lifecycle ordering inside this file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: multicore `ScreenComposition` callbacks no longer call `process_vsync()` directly. They now signal a dedicated `VSyncThread`, matching upstream execution ownership more closely.
+- Fixed in this pass: `get_next_ticks()` no longer returns a fixed 60 FPS interval. It now follows the upstream `use_multi_core` / `use_speed_limit` / `speed_limit` / `use_video_framerate` inputs plus `compose_speed_scale`.
+- The Rust port still does not call back through `Container::ComposeOnDisplay(...)` literally; it composes through the direct `SurfaceFlinger` owner kept in this file.
+
+### Missing items
+- No additional missing methods remain in the exercised `Conductor` owner path.
+
+### Binary layout verification
+- PASS: no shared raw payload structs are serialized in this file.
+
+## 2026-04-05 — `core/src/hle/service/audio/audio_renderer_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer_manager.cpp`
+
+### Intentional differences
+- `OpenAudioRenderer` and the audio-device subservice creation still go through the Rust `AudioCoreInterface` bridge owned by [core.rs](/home/vricosti/Dev/emulators/ruzu/core/src/core.rs), because `core` cannot directly own `audio_core` concrete types without recreating the upstream C++ circular ownership.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GetAudioDeviceService` no longer constructs `IAudioDevice` with `aruid=0`. It now parses the incoming `ClientAppletResourceUserId` and forwards it to the service owner like upstream.
+- Fixed in this pass: `GetAudioDeviceServiceWithRevisionInfo` no longer constructs `IAudioDevice` with `revision=0` / `aruid=0`. It now parses both fields with the upstream CMIF alignment order and forwards them to the service owner.
+
+### Missing items
+- `OpenAudioRendererForManualExecution` remains unimplemented, matching the existing broader owner status of this file.
+
+### Binary layout verification
+- PASS: no new raw payload layouts were introduced; the request parsing uses the existing CMIF `RequestParser` alignment rules.
+
+## 2026-04-05 — `core/src/hle/service/audio/audio_device.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_device.h/.cpp`
+
+### Intentional differences
+- Rust still lazily creates the readable event on the first `Query*Event` call rather than literally constructing `Kernel::KEvent* event` in the constructor, because the HLE event handle owner lives in the request context. The same owner/file boundary is preserved.
+- Instead of owning `std::unique_ptr<AudioCore::Renderer::AudioDevice>` directly, this file now queries the upstream-equivalent backend through the [AudioCoreInterface](/home/vricosti/Dev/emulators/ruzu/core/src/core.rs) bridge. This preserves service ownership in this file while avoiding a forbidden direct `core -> audio_core` dependency.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the service no longer hardcodes one `AudioTvOutput` name, `1.0f`, and stereo for all exercised calls. `ListAudioDeviceName*`, `ListAudioOutputDeviceName`, `Set/GetAudioDeviceOutputVolume*`, and `GetActiveChannelCount` now forward to the backend owner through `AudioCoreInterface`, much closer to upstream `impl`.
+- The Rust port still does not model the upstream constructor-owned `service_context` and destructor-owned `CloseEvent(event)` literally; event lifecycle remains adapted through the HLE request context.
+- Buffer size validation still does not return the exact upstream audio error results for undersized `InArray`/`OutArray` buffers.
+
+### Missing items
+- Exact upstream buffer-size error codes for undersized name arrays.
+- Literal constructor/destructor parity for `service_context` once event ownership can move out of `HLERequestContext`.
+
+### Binary layout verification
+- PASS: device-name payloads are still written as packed 0x100-byte arrays, matching upstream `AudioDevice::AudioDeviceName`.
+
+## 2026-04-05 — `core/src/core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core.h`
+
+### Intentional differences
+- Rust still replaces the upstream direct `System::AudioCore()` concrete ownership with the `AudioCoreInterface` trait bridge to avoid the cross-crate cycle between `core` and `audio_core`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the bridge now exposes the exercised `AudioDevice` owner methods needed by [audio_device.rs](/home/vricosti/Dev/emulators/ruzu/core/src/hle/service/audio/audio_device.rs), so the HLE service no longer has to guess names/volume/channel counts locally.
+
+### Missing items
+- More backend bridge methods may still be needed as other `audio_core` owners are exercised.
+
+### Binary layout verification
+- PASS: trait-only bridge expansion; no shared raw payload layout changed here.
+
+## 2026-04-05 — `audio_core/src/audio_core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/audio_core/audio_core.h/.cpp`
+
+### Intentional differences
+- The new `AudioDevice`-related bridge methods exist only because Rust splits `audio_core` into a separate crate and `core` cannot directly instantiate `AudioCore::Renderer::AudioDevice`. Ownership of the real backend work still stays in this crate.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `audio_core` now exposes owner-local `AudioDevice` behavior through the existing `AudioCoreInterface` bridge, instead of leaving `IAudioDevice` in `core` to return hardcoded values.
+- These bridge methods currently construct a temporary `Renderer::AudioDevice` on demand for each call, whereas upstream `IAudioDevice` owns one persistent `impl` instance.
+
+### Missing items
+- Closer lifetime parity if the `AudioCoreInterface` bridge can eventually expose a persistent `IAudioDevice`-backing owner without reintroducing a crate cycle.
+
+### Binary layout verification
+- PASS: bridge methods operate on existing 0x100-byte device-name arrays; no new shared raw layout was introduced.
