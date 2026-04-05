@@ -133,7 +133,7 @@ struct Mapping {
 
 struct Allocation {
     size: u64,
-    mappings: Vec<u64>,
+    mappings: Vec<Arc<Mapping>>,
     page_size: u32,
     sparse: bool,
     big_pages: bool,
@@ -179,8 +179,9 @@ pub struct NvHostAsGpu {
     module: *const Module,
     container: *const Container,
     nvmap: *const NvMap,
+    mutex: Mutex<()>,
     vm: Mutex<VM>,
-    mapping_map: Mutex<BTreeMap<u64, Mapping>>,
+    mapping_map: Mutex<BTreeMap<u64, Arc<Mapping>>>,
     allocation_map: Mutex<BTreeMap<u64, Allocation>>,
     gmmu: Mutex<Option<Arc<dyn GpuMemoryManagerHandle>>>,
 }
@@ -198,6 +199,7 @@ impl NvHostAsGpu {
             module: module as *const _,
             container: container as *const _,
             nvmap: container.get_nv_map_file() as *const _,
+            mutex: Mutex::new(()),
             vm: Mutex::new(VM::default()),
             mapping_map: Mutex::new(BTreeMap::new()),
             allocation_map: Mutex::new(BTreeMap::new()),
@@ -220,7 +222,7 @@ impl NvHostAsGpu {
     fn free_mapping_locked(
         &self,
         vm: &mut VM,
-        mapping_map: &mut BTreeMap<u64, Mapping>,
+        mapping_map: &mut BTreeMap<u64, Arc<Mapping>>,
         offset: u64,
     ) -> NvResult {
         let Some(mapping) = mapping_map.remove(&offset) else {
@@ -269,6 +271,7 @@ impl NvHostAsGpu {
             params.big_page_size
         );
 
+        let _owner_guard = self.mutex.lock().unwrap();
         let mut vm = self.vm.lock().unwrap();
 
         if vm.initialised {
@@ -340,6 +343,7 @@ impl NvHostAsGpu {
             params.flags
         );
 
+        let _owner_guard = self.mutex.lock().unwrap();
         let mut vm = self.vm.lock().unwrap();
         if !vm.initialised {
             return NvResult::BadValue;
@@ -414,6 +418,7 @@ impl NvHostAsGpu {
             params.page_size
         );
 
+        let _owner_guard = self.mutex.lock().unwrap();
         let mut vm = self.vm.lock().unwrap();
         if !vm.initialised {
             return NvResult::BadValue;
@@ -432,8 +437,8 @@ impl NvHostAsGpu {
         }
 
         let mut mapping_map = self.mapping_map.lock().unwrap();
-        for mapping_offset in &allocation.mappings {
-            let _ = self.free_mapping_locked(&mut vm, &mut mapping_map, *mapping_offset);
+        for mapping in &allocation.mappings {
+            let _ = self.free_mapping_locked(&mut vm, &mut mapping_map, mapping.offset);
         }
 
         let page_size_bits = if allocation.big_pages {
@@ -467,6 +472,7 @@ impl NvHostAsGpu {
             entries.len()
         );
 
+        let _owner_guard = self.mutex.lock().unwrap();
         let vm = self.vm.lock().unwrap();
         if !vm.initialised {
             return NvResult::BadValue;
@@ -541,6 +547,7 @@ impl NvHostAsGpu {
             params.offset
         );
 
+        let _owner_guard = self.mutex.lock().unwrap();
         let mut vm = self.vm.lock().unwrap();
         if !vm.initialised {
             return NvResult::BadValue;
@@ -634,21 +641,19 @@ impl NvHostAsGpu {
             if let Some(gmmu) = self.gmmu.lock().unwrap().as_ref().cloned() {
                 gmmu.map(offset, device_address, size, params.kind, use_big_pages);
             }
-            alloc.mappings.push(offset);
             let sparse_alloc = alloc.sparse;
-            drop(alloc_map);
-            self.mapping_map.lock().unwrap().insert(
+            let mapping = Arc::new(Mapping {
+                handle: params.handle,
+                ptr: device_address,
                 offset,
-                Mapping {
-                    handle: params.handle,
-                    ptr: device_address,
-                    offset,
-                    size,
-                    fixed: true,
-                    big_page: use_big_pages,
-                    sparse_alloc,
-                },
-            );
+                size,
+                fixed: true,
+                big_page: use_big_pages,
+                sparse_alloc,
+            });
+            alloc.mappings.push(Arc::clone(&mapping));
+            drop(alloc_map);
+            self.mapping_map.lock().unwrap().insert(offset, mapping);
             log::debug!(
                 "nvhost_as_gpu::MapBufferEx fixed result handle={} gpu_offset=0x{:X} device_address=0x{:X} size=0x{:X} big_page={}",
                 params.handle,
@@ -696,7 +701,7 @@ impl NvHostAsGpu {
         }
         self.mapping_map.lock().unwrap().insert(
             params.offset as u64,
-            Mapping {
+            Arc::new(Mapping {
                 handle: params.handle,
                 ptr: device_address,
                 offset: params.offset as u64,
@@ -704,7 +709,7 @@ impl NvHostAsGpu {
                 fixed: false,
                 big_page,
                 sparse_alloc: false,
-            },
+            }),
         );
         log::debug!(
             "nvhost_as_gpu::MapBufferEx dynamic result handle={} gpu_offset=0x{:X} device_address=0x{:X} size=0x{:X} big_page={}",
@@ -723,6 +728,7 @@ impl NvHostAsGpu {
             params.offset
         );
 
+        let _owner_guard = self.mutex.lock().unwrap();
         let vm = self.vm.lock().unwrap();
         if !vm.initialised {
             return NvResult::BadValue;
@@ -757,6 +763,7 @@ impl NvHostAsGpu {
             params.buf_size
         );
 
+        let _owner_guard = self.mutex.lock().unwrap();
         let vm = self.vm.lock().unwrap();
         if !vm.initialised {
             return NvResult::BadValue;
@@ -1153,6 +1160,63 @@ mod tests {
 
         let handle = container.get_nv_map_file().get_handle(handle.id).unwrap();
         assert_eq!(handle.lock_inner().pins, 0);
+    }
+
+    #[test]
+    fn fixed_mapping_uses_shared_mapping_owner_between_maps() {
+        let system = System::new_for_test();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new();
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+        let mut alloc_as = IoctlAllocAsEx::default();
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
+
+        let mut space = IoctlAllocSpace {
+            pages: 1,
+            page_size: 0x1000,
+            flags: MappingFlags::FIXED.bits(),
+            offset: 0x2100_0000,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.allocate_space(&mut space), NvResult::Success);
+
+        let handle = container.get_nv_map_file().create_handle(0x1000).unwrap();
+        assert_eq!(
+            handle.alloc(
+                HandleFlags { raw: 0 },
+                0x1000,
+                0,
+                0x3100_0000,
+                SessionId::default(),
+            ),
+            NvResult::Success
+        );
+
+        let mut map = IoctlMapBufferEx {
+            flags: MappingFlags::FIXED.bits(),
+            handle: handle.id,
+            mapping_size: 0x1000,
+            offset: space.offset as i64,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.map_buffer_ex(&mut map), NvResult::Success);
+
+        let mapping_from_map = gpu_as
+            .mapping_map
+            .lock()
+            .unwrap()
+            .get(&(space.offset as u64))
+            .cloned()
+            .expect("fixed mapping should exist in mapping_map");
+        let mapping_from_alloc = gpu_as
+            .allocation_map
+            .lock()
+            .unwrap()
+            .get(&(space.offset as u64))
+            .and_then(|allocation| allocation.mappings.first().cloned())
+            .expect("fixed allocation should reference its mapping");
+
+        assert!(Arc::ptr_eq(&mapping_from_map, &mapping_from_alloc));
     }
 
     #[test]

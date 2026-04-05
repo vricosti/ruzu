@@ -200,6 +200,21 @@ fn build_increment_with_wfi_command_list(fence: NvFence) -> GpuCommandList {
     result
 }
 
+fn command_list_headers_as_bytes_mut(
+    headers: &mut [GpuCommandListHeader],
+) -> &mut [u8] {
+    let byte_len = std::mem::size_of_val(headers);
+    unsafe { std::slice::from_raw_parts_mut(headers.as_mut_ptr().cast::<u8>(), byte_len) }
+}
+
+fn copy_command_list_headers_from_bytes(
+    dest: &mut [GpuCommandListHeader],
+    src: &[u8],
+) {
+    let byte_len = std::mem::size_of_val(dest);
+    command_list_headers_as_bytes_mut(dest).copy_from_slice(&src[..byte_len]);
+}
+
 /// nvhost_gpu device.
 pub struct NvHostGpu {
     system: SystemRef,
@@ -217,6 +232,7 @@ pub struct NvHostGpu {
     channel_timeslice: Mutex<u32>,
     channel_state: Arc<dyn GpuChannelHandle>,
     bound_address_space: AtomicBool,
+    channel_mutex: Mutex<()>,
     sessions: Mutex<HashMap<DeviceFD, SessionId>>,
 }
 
@@ -253,6 +269,7 @@ impl NvHostGpu {
             channel_timeslice: Mutex::new(0),
             channel_state,
             bound_address_space: AtomicBool::new(false),
+            channel_mutex: Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -363,13 +380,16 @@ impl NvHostGpu {
             params.flags
         );
 
-        let channel_syncpoint = self.channel_syncpoint.load(Ordering::Acquire);
-        let bind_id = self.channel_state.bind_id();
         let gpu = self
             .system
             .get()
             .gpu_core()
             .expect("GPU core must remain available while nvhost_gpu is alive");
+
+        let _channel_guard = self.channel_mutex.lock().unwrap();
+        let channel_syncpoint = self.channel_syncpoint.load(Ordering::Acquire);
+        let bind_id = self.channel_state.bind_id();
+
         if params.fence_wait() {
             if params.increment_value() {
                 return NvResult::BadParameter;
@@ -412,6 +432,7 @@ impl NvHostGpu {
     ) -> NvResult {
         let command_count = params.num_entries as usize;
         let entry_size = std::mem::size_of::<GpuCommandListHeader>();
+        let available_entries = commands.len() / entry_size;
         log::trace!(
             "nvhost_gpu::SubmitGPFIFOBase1 kickoff={} num_entries={} address=0x{:X} input_len=0x{:X}",
             kickoff,
@@ -419,37 +440,28 @@ impl NvHostGpu {
             params.address,
             commands.len()
         );
-        let command_lists = if kickoff {
-            let Some(process) = self.system.get().current_process() else {
-                log::error!("nvhost_gpu::SubmitGPFIFOBase1 kickoff path without current process");
+        if command_count > available_entries {
+            log::error!(
+                "nvhost_gpu::SubmitGPFIFOBase1 invalid size num_entries={} available_entries={}",
+                params.num_entries,
+                available_entries
+            );
+            return NvResult::InvalidSize;
+        }
+
+        let mut command_lists = vec![GpuCommandListHeader::default(); command_count];
+        if kickoff {
+            let Some(memory) = self.system.get().get_svc_memory() else {
+                log::error!("nvhost_gpu::SubmitGPFIFOBase1 kickoff path without application memory");
                 return NvResult::InvalidState;
             };
-            let bytes = process.read_memory_vec(params.address, command_count * entry_size);
-            bytes
-                .chunks_exact(entry_size)
-                .take(command_count)
-                .map(|chunk| GpuCommandListHeader {
-                    raw: u64::from_le_bytes(chunk.try_into().unwrap()),
-                })
-                .collect::<Vec<_>>()
+            memory
+                .lock()
+                .unwrap()
+                .read_block(params.address, command_list_headers_as_bytes_mut(&mut command_lists));
         } else {
-            let available_entries = commands.len() / entry_size;
-            if command_count > available_entries {
-                log::error!(
-                    "nvhost_gpu::SubmitGPFIFOBase1 invalid size num_entries={} available_entries={}",
-                    params.num_entries,
-                    available_entries
-                );
-                return NvResult::InvalidSize;
-            }
-            commands
-                .chunks_exact(entry_size)
-                .take(command_count)
-                .map(|chunk| GpuCommandListHeader {
-                    raw: u64::from_le_bytes(chunk.try_into().unwrap()),
-                })
-                .collect::<Vec<_>>()
-        };
+            copy_command_list_headers_from_bytes(&mut command_lists, commands);
+        }
 
         self.submit_gpfifo_impl(
             params,
@@ -479,13 +491,8 @@ impl NvHostGpu {
             return NvResult::InvalidSize;
         }
 
-        let command_lists = commands
-            .chunks_exact(entry_size)
-            .take(command_count)
-            .map(|chunk| GpuCommandListHeader {
-                raw: u64::from_le_bytes(chunk.try_into().unwrap()),
-            })
-            .collect();
+        let mut command_lists = vec![GpuCommandListHeader::default(); command_count];
+        copy_command_list_headers_from_bytes(&mut command_lists, commands);
         self.submit_gpfifo_impl(
             params,
             GpuCommandList {
@@ -874,6 +881,33 @@ mod tests {
         assert_eq!(pushed[0].0, 1);
         assert_eq!(pushed[0].1.command_lists.len(), 1);
         assert_eq!(pushed[1].1.prefetch_command_list.len(), 6);
+    }
+
+    #[test]
+    fn submit_gpfifo_base1_kickoff_validates_size_before_memory_read() {
+        let mut system = crate::core::System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore::default()));
+        let container = Container::new();
+        let events = Arc::new(EventInterface::new(crate::core::SystemRef::from_ref(
+            &system,
+        )));
+        let gpu = NvHostGpu::new(
+            crate::core::SystemRef::from_ref(&system),
+            events,
+            &container,
+        );
+        let mut alloc = IoctlAllocGpfifoEx2::default();
+        assert_eq!(gpu.alloc_gpfifo_ex2(&mut alloc, 1), NvResult::Success);
+
+        let mut params = IoctlSubmitGpfifo {
+            num_entries: 2,
+            ..Default::default()
+        };
+        let commands = [0u8; 8];
+
+        let result = gpu.submit_gpfifo_base1(&mut params, &commands, true);
+
+        assert_eq!(result, NvResult::InvalidSize);
     }
 
     #[test]

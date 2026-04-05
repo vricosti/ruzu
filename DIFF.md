@@ -6106,19 +6106,20 @@
 
 ### Intentional differences
 - Rust stores upstream `std::shared_ptr<Mapping>` ownership as `Arc<Mapping>` inside the same owner file. `mapping_map` and `Allocation.mappings` now share the same mapping object, preserving the upstream ownership topology while adapting to Rust smart pointers.
-- The upstream single device mutex is still represented as several Rust `Mutex` fields (`vm`, `mapping_map`, `allocation_map`, `gmmu`) to satisfy borrow and aliasing rules. The owner file remains the same, but lock granularity is still a documented adaptation.
+- Rust still keeps the upstream single device mutex plus several inner `Mutex` fields (`vm`, `mapping_map`, `allocation_map`, `gmmu`) to satisfy borrow and aliasing rules. The outer owner mutex now matches upstream operation serialization; the inner locks remain a Rust adaptation.
 
 ### Unintentional differences (to fix)
-- Rust still does not use one single owner mutex around all address-space operations the way upstream does, so lock ordering and atomicity across `vm`/`mapping_map`/`allocation_map`/`gmmu` can still diverge from upstream.
+- Fixed in this pass: the exercised AS operations (`AllocAsEx`, `AllocateSpace`, `FreeSpace`, `Remap`, `MapBufferEx`, `UnmapBuffer`, `GetVARegions`) now all enter through one outer owner mutex, matching upstream `std::scoped_lock lock(mutex)` serialization.
 - `Allocation.mappings` now matches upstream shared ownership for fixed mappings, but dynamic mappings still are not linked into an `Allocation` owner because upstream only tracks them in `mapping_map`; this is behaviorally fine, yet the surrounding Rust container layering still differs from the exact C++ mutex-and-container setup.
 - `QueryEvent(...)` still returns `None` for all event ids and logs an error; this matches exercised behavior today but remains structurally unimplemented compared with the upstream virtual override.
 
 ### Missing items
-- Full single-mutex parity for AS operations.
 - Upstream event owner parity for `QueryEvent(...)` if future call sites exercise it.
 
 ### Binary layout verification
 - PASS: `IoctlAllocAsEx`, `IoctlAllocSpace`, `IoctlFreeSpace`, `IoctlRemapEntry`, `IoctlMapBufferEx`, `IoctlUnmapBuffer`, `IoctlBindChannel`, `IoctlGetVaRegions`, and `VaRegion` keep the upstream sizes in this owner file.
+- PASS: fixed-allocation mappings now share the same `Arc<Mapping>` owner between `mapping_map` and `Allocation.mappings`, matching the upstream `std::shared_ptr<Mapping>` topology; the focused regression test `fixed_mapping_uses_shared_mapping_owner_between_maps` covers this slice.
+- PASS: the owner mutex now serializes the same exercised AS entrypoints as upstream before touching `vm`/`mapping_map`/`allocation_map`/`gmmu`.
 
 ## 2026-04-05 — `core/src/hle/kernel/k_condition_variable.rs` vs `core/hle/kernel/k_condition_variable.h/.cpp`
 
@@ -6151,18 +6152,20 @@
 
 ### Binary layout verification
 - PASS: no shared raw payload structs are serialized in this file.
+- PASS: the focused regression test `register_replace_cancel_and_collect_keep_order` now covers same-owner re-registration/cancel ordering in the Rust timer tree.
 
 ## 2026-04-05 — `core/src/hle/kernel/k_thread.rs` vs `core/hle/kernel/k_thread.h/.cpp`
 
 ### Intentional differences
-- Rust still cannot rely on the upstream scheduler-lock unlock to suspend the host thread implicitly, because `svc::SleepThread` reaches `KThread::sleep()` through `with_current_thread_fast_mut(...)` and must release the current-thread mutex before any reschedule loop. The wait bridge therefore lives as `k_thread::wait_for_current_thread(...)`, owned by this file and called by the SVC layer after `sleep()` arms the wait.
+- Rust still cannot rely on the upstream scheduler-lock unlock to suspend the host thread implicitly while holding an external `Arc<Mutex<KThread>>`. The wait bridge therefore lives as `k_thread::sleep_current_thread(...)` / `k_thread::wait_for_current_thread(...)`, owned by this file, so `KThread::sleep()` itself can stay closer to upstream and return `RESULT_SUCCESS` after arming the wait.
 
 ### Unintentional differences (to fix)
-- `KThread::sleep()` still is not a literal upstream `R_SUCCEED()` path driven entirely by scheduler/fiber ownership; Rust still needs the explicit post-arm wait bridge to emulate the same blocking lifecycle.
+- `KThread::sleep()` still is not a literal upstream `R_SUCCEED()` path driven entirely by scheduler/fiber ownership; Rust still needs the explicit `sleep_current_thread(...)` bridge to emulate the same blocking lifecycle around the external thread mutex.
 - This file still contains broader Rust-specific scheduler bridging around `run_thread(...)` / deferred state notifications that is not yet fully audited back to upstream.
 
 ### Missing items
 - Closer parity for the remaining `KThread::Run()` / scheduler-notification plumbing still documented elsewhere in this file.
+- Remove the Rust-only `sleep_current_thread(...)` bridge once the surrounding scheduler/fiber ownership can suspend without any external `KThread` mutex.
 
 ### Binary layout verification
 - PASS: no shared raw serialized structs were changed in this slice; the new helper only changes wait lifecycle.
@@ -6170,7 +6173,7 @@
 ## 2026-04-05 — `core/src/hle/kernel/svc/svc_thread.rs` vs `core/hle/kernel/svc/svc_thread.cpp`
 
 ### Intentional differences
-- `svc::SleepThread` now performs the Rust-only post-arm wait bridge after `KThread::sleep()` returns, so the current-thread mutex is no longer held across the reschedule loop. Upstream blocks implicitly through scheduler/fiber ownership inside `KThread::Sleep()`, but the effective lifecycle is preserved.
+- `svc::SleepThread` now forwards the positive-timeout path to the file-owned Rust bridge `k_thread::sleep_current_thread(...)` instead of calling `with_current_thread_fast_mut(|thread| thread.sleep(...))` directly. This keeps the wait bridge in `k_thread.rs`, which is the upstream owner of sleep behavior, while still avoiding an external `KThread` mutex across the reschedule loop.
 
 ### Unintentional differences (to fix)
 - `SleepThread` still depends on the Rust bridge helper instead of the exact upstream kernel/fiber ownership chain.
@@ -6180,6 +6183,24 @@
 
 ### Binary layout verification
 - PASS: SVC handler only; no shared payload layout involved.
+
+## 2026-04-05 — `core/src/hle/service/nvdrv/devices/nvhost_gpu.rs` vs `core/hle/service/nvdrv/devices/nvhost_gpu.h/.cpp`
+
+### Intentional differences
+- Rust still keeps the upstream device/session ownership through `Arc<dyn GpuChannelHandle>`, `Arc<Mutex<KReadableEvent>>`, and separate small mutex fields instead of raw pointers plus direct `KEvent*`. The owner file remains the same.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `SubmitGPFIFOImpl(...)` did not serialize submission through the upstream `channel_mutex`, so concurrent guest submissions could interleave bind-id/syncpoint/GPU push sequencing that upstream keeps under one device-local mutex.
+- Fixed in this pass: `SubmitGPFIFOBase1(...)` and `SubmitGPFIFOBase2(...)` now allocate the destination `GpuCommandList` first and copy/fill it like upstream instead of rebuilding headers through iterator decoding.
+- Fixed in this pass: `SubmitGPFIFOBase1(kickoff=true)` now reads command-list headers through the global `Memory::read_block(...)` owner path returned by `System::get_svc_memory()`, which is the current Rust equivalent of upstream `system.ApplicationMemory().ReadBlock(...)`.
+- Fixed in this pass: `SubmitGPFIFOBase1(...)` now validates `num_entries > commands.size()` even on the kickoff path, matching upstream ordering.
+
+### Missing items
+- Re-audit the still-stubbed exercised owners `SetErrorNotifier(...)`, `SetChannelPriority(...)`, and `AllocateObjectContext(...)` if later traces prove one of them is the next blocker.
+
+### Binary layout verification
+- PASS: no ioctl payload struct layout changed in this slice; only submission serialization ownership changed.
+- PASS: focused regression tests now cover both the exercised fence-return path (`submit_gpfifo_base1_returns_signalled_fence_and_clears_flags`) and the upstream ordering requirement that kickoff-mode size validation happens before any memory read (`submit_gpfifo_base1_kickoff_validates_size_before_memory_read`).
 
 ## 2026-04-05 — `core/src/hle/service/vi/shared_buffer_manager.rs` vs `core/hle/service/vi/shared_buffer_manager.h/.cpp`
 
@@ -6198,6 +6219,7 @@
 
 ### Binary layout verification
 - PASS: `SharedMemorySlot` remains `0x18` and `SharedMemoryPoolLayout` remains `0x188`, and the new test keeps the slot-offset layout aligned with upstream constants.
+- PASS: `GetSharedBufferMemoryHandleId(...)` now returns manager-owned `m_pool_layout` state instead of bypassing that owner with the file-level constant.
 
 ## 2026-04-05 — `core/src/hle/service/nvnflinger/surface_flinger.rs` vs `core/hle/service/nvnflinger/surface_flinger.h/.cpp`
 
@@ -6214,6 +6236,7 @@
 
 ### Binary layout verification
 - PASS: no shared raw payload structs changed in this slice.
+- PASS: `CreateLayer(...)` now recovers the consumer through the binder server, matching the upstream owner chain instead of a Rust-only side map in `SurfaceFlinger`.
 
 ## 2026-04-05 — `core/src/hle/service/nvnflinger/hos_binder_driver_server.rs` vs `core/hle/service/nvnflinger/hos_binder_driver_server.h/.cpp`
 
@@ -6228,6 +6251,7 @@
 
 ### Binary layout verification
 - PASS: no shared raw payload structs are serialized in this file.
+- PASS: typed binder recovery is covered by a focused regression test (`try_get_binder_as_downcasts_registered_type`), though full `cargo test -p core` remains blocked by unrelated pre-existing compile failures in `ipc_helpers.rs` and `common_state_getter.rs`.
 
 ## 2026-04-05 — `core/src/hle/service/nvnflinger/ui/graphic_buffer.rs` vs `core/hle/service/nvnflinger/ui/graphic_buffer.h/.cpp`
 
