@@ -57,6 +57,7 @@ pub mod commands {
 /// - `m_operation_event` (OperationEvent)
 /// - `m_set_sys` (shared_ptr<Set::ISystemSettingsServer>)
 pub struct TimeZoneService {
+    system: crate::core::SystemRef,
     can_write_timezone_device_location: bool,
     /// Wrapped PSC timezone service. Upstream: `m_wrapped_service`.
     wrapped_service: Mutex<PscTimeZoneService>,
@@ -149,10 +150,11 @@ impl TimeZoneService {
         ])
     }
 
-    pub fn new(can_write_timezone_device_location: bool) -> Self {
-        let mut tz_binary = TimeZoneBinary::new();
+    pub fn new(system: crate::core::SystemRef, can_write_timezone_device_location: bool) -> Self {
+        let mut tz_binary = TimeZoneBinary::new(system);
         let _ = tz_binary.mount();
         Self {
+            system,
             can_write_timezone_device_location,
             wrapped_service: Mutex::new(PscTimeZoneService::new(
                 can_write_timezone_device_location,
@@ -166,11 +168,13 @@ impl TimeZoneService {
 
     /// Create with an existing wrapped PSC service and timezone binary.
     pub fn with_wrapped(
+        system: crate::core::SystemRef,
         can_write_timezone_device_location: bool,
         wrapped_service: PscTimeZoneService,
         time_zone_binary: TimeZoneBinary,
     ) -> Self {
         Self {
+            system,
             can_write_timezone_device_location,
             wrapped_service: Mutex::new(wrapped_service),
             time_zone_binary: Mutex::new(time_zone_binary),
@@ -729,7 +733,7 @@ mod tests {
 
     #[test]
     fn exercised_handlers_are_registered() {
-        let service = TimeZoneService::new(false);
+        let service = TimeZoneService::new(crate::core::SystemRef::null(), false);
         assert!(service
             .handlers()
             .get(&commands::GET_DEVICE_LOCATION_NAME)

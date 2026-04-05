@@ -48,6 +48,7 @@ pub mod commands {
 /// `Glue::Time::StaticService`.
 pub struct StaticService {
     pub service_name: String,
+    system: crate::core::SystemRef,
     pub setup_info: StaticServiceSetupInfo,
     wrapped_service: Mutex<psc_static::StaticService>,
     file_timestamp_worker: FileTimestampWorker,
@@ -62,6 +63,7 @@ pub struct StaticService {
 
 impl StaticService {
     pub fn new(
+        system: crate::core::SystemRef,
         setup_info: StaticServiceSetupInfo,
         name: &str,
         time_manager: Arc<Mutex<GlueTimeManager>>,
@@ -96,7 +98,7 @@ impl StaticService {
             log::error!("  -> Unknown setup_info variant");
         }
 
-        let mut time_zone_binary = TimeZoneBinary::new();
+        let mut time_zone_binary = TimeZoneBinary::new(system);
         let _ = time_zone_binary.mount();
 
         let handlers = build_handler_map(&[
@@ -128,6 +130,7 @@ impl StaticService {
 
         Self {
             service_name: name.to_string(),
+            system,
             setup_info,
             wrapped_service: Mutex::new(wrapped_service),
             file_timestamp_worker: FileTimestampWorker::new(),
@@ -664,9 +667,10 @@ impl StaticService {
     pub fn get_time_zone_service(&self) -> Result<TimeZoneService, ResultCode> {
         log::debug!("Glue::Time::StaticService::GetTimeZoneService called");
         let wrapped = self.wrapped_service.lock().unwrap().get_time_zone_service();
-        let mut binary = TimeZoneBinary::new();
+        let mut binary = TimeZoneBinary::new(self.system);
         let _ = binary.mount();
         Ok(TimeZoneService::with_wrapped(
+            self.system,
             self.setup_info.can_write_timezone_device_location,
             wrapped,
             binary,
@@ -863,6 +867,7 @@ mod tests {
     #[test]
     fn get_time_zone_service_returns_glue_service_object() {
         let service = StaticService::new(
+            crate::core::SystemRef::null(),
             user_setup(),
             "time:u",
             make_time_manager(),
@@ -888,6 +893,7 @@ mod tests {
     fn delegated_correction_queries_follow_wrapped_psc_static_service() {
         // Use admin setup so we have can_write_user_clock permission
         let service = StaticService::new(
+            crate::core::SystemRef::null(),
             admin_setup(),
             "time:a",
             make_time_manager(),
@@ -921,7 +927,12 @@ mod tests {
     #[test]
     fn shared_memory_handle_uses_wrapped_psc_time_owner() {
         let time_manager = make_time_manager();
-        let service = StaticService::new(user_setup(), "time:u", Arc::clone(&time_manager));
+        let service = StaticService::new(
+            crate::core::SystemRef::null(),
+            user_setup(),
+            "time:u",
+            Arc::clone(&time_manager),
+        );
 
         let expected = {
             let manager = time_manager.lock().unwrap();

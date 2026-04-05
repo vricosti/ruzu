@@ -5992,3 +5992,95 @@
 
 ### Binary layout verification
 - PASS: this file does not define raw serialized payload structs in this slice.
+
+## 2026-04-05 — `core/src/hle/service/glue/time/time_zone_binary.rs` vs `core/hle/service/glue/time/time_zone_binary.h/.cpp`
+
+### Intentional differences
+- Rust stores the upstream `Core::System&` as `SystemRef` and the RomFS owner as `Option<VirtualDir>`, which preserves the file owner boundary while adapting C++ pointer/reference lifetimes to Rust.
+- `Read(...)` returns a borrowed byte slice into the owned scratch buffer instead of filling an explicit `std::span<u8>` plus out-size pair; the scratch-buffer ownership and size validation stay in this file, matching upstream responsibility.
+
+### Unintentional differences (to fix)
+- `mount()` still reaches NAND through the Rust filesystem-controller API (`get_filesystem_controller().lock().unwrap()`) instead of the upstream direct `system.GetFileSystemController()`/`GetSystemNANDContents()` object graph.
+- `get_time_zone_version()` still uses a Rust copy-length clamp rather than the literal upstream `rule_version_buffer[bytes_read] = 0` write after `Read(...)`, although the resulting zero-termination behavior is equivalent for the exercised path.
+
+### Missing items
+- No additional missing items identified in the exercised `Mount`/`Read`/`GetTimeZoneRule` path.
+
+### Binary layout verification
+- PASS: `LocationName` and `RuleVersion` remain defined in `psc/time/common.rs` with explicit fixed-size arrays; this file only fills those buffers and the 0x2800 scratch space deterministically.
+
+## 2026-04-05 — `core/src/hle/service/glue/time/static.rs` vs `core/hle/service/glue/time/static.h/.cpp`
+
+### Intentional differences
+- Rust stores the upstream `Core::System&` as `SystemRef`, and keeps `m_set_sys` implicit by obtaining `set:sys` through the shared Glue/PSC time managers instead of owning a separate C++ shared_ptr field in this file.
+
+### Unintentional differences (to fix)
+- `StaticService` still re-mounts a fresh `TimeZoneBinary` when building `ITimeZoneService`, whereas upstream passes the manager-owned `m_time_zone_binary` by reference.
+- The file still keeps extra Rust-side cached state (`shared_memory_handle`) for process handle registration that has no literal upstream field equivalent.
+
+### Missing items
+- Full owner parity for `m_set_sys` as a dedicated field in this file.
+- Reuse of the manager-owned `TimeZoneBinary` reference instead of constructing a fresh Rust owner.
+
+### Binary layout verification
+- PASS: this file does not define new raw serialized payload structs; shared-memory handle IPC still uses the upstream-owned `KSharedMemory`.
+
+## 2026-04-05 — `core/src/hle/service/glue/time/time_zone.rs` vs `core/hle/service/glue/time/time_zone.h/.cpp`
+
+### Intentional differences
+- Rust stores the upstream `Core::System&` as `SystemRef` and keeps the wrapped PSC owner behind `Mutex<PscTimeZoneService>`, preserving the same owner file while adapting `shared_ptr`/mutable service state to Rust.
+
+### Unintentional differences (to fix)
+- `TimeZoneService::new(...)` still constructs its own PSC wrapped service in Rust instead of always receiving the upstream-wired `m_wrapped_service` from `StaticService`.
+- The file still omits full upstream `m_set_sys`, `FileTimestampWorker`, and operation-event list ownership, so write paths remain structurally incomplete compared with upstream.
+
+### Missing items
+- Literal `m_set_sys` owner parity.
+- Full `FileTimestampWorker` and operation-event fanout parity for writeable timezone-location paths.
+
+### Binary layout verification
+- PASS: this file delegates raw `LocationName`, `RuleVersion`, `CalendarTime`, and `CalendarAdditionalInfo` payload handling to upstream-mapped PSC/common owners without introducing new serialized structs.
+
+## 2026-04-05 — `core/src/file_sys/system_archive/time_zone_binary.rs` vs `core/file_sys/system_archive/time_zone_binary.h/.cpp`
+
+### Intentional differences
+- Rust does not embed `nx_tzdb`; this owner synthesizes the upstream archive shape from the host tzdb at `/usr/share/zoneinfo` instead. The file ownership remains identical, but the data source is a documented platform replacement.
+- `binaryList.txt` and `version.txt` are generated from the host tzdb contents (`zoneinfo` traversal plus `tzdata.zi` version parsing) instead of upstream `NxTzdb::base`.
+
+### Unintentional differences (to fix)
+- The generated root `zoneinfo` file set is filtered heuristically from the host tzdb root, not from the exact upstream `NxTzdb::zoneinfo` table.
+- Host-specific tzdb content can differ slightly from the upstream bundled tzdb version, so archive contents are not yet bit-identical across machines.
+
+### Missing items
+- Exact upstream `nx_tzdb` embedding or an equivalent vendored data source for deterministic archive contents.
+
+### Binary layout verification
+- PASS: this file only synthesizes VFS files/directories; no raw serialized structs are defined here.
+
+## 2026-04-05 — `core/src/file_sys/fsmitm_romfsbuild.rs` vs `core/file_sys/fsmitm_romfsbuild.h/.cpp`
+
+### Intentional differences
+- Rust stores build nodes in indexed `Vec` owners instead of upstream `shared_ptr` graphs; the file still owns all RomFS build state and ordering logic, matching upstream responsibility.
+
+### Unintentional differences (to fix)
+- The root-path owner had diverged from upstream: Rust stored a literal NUL string (`\"\\0\"`) instead of the upstream empty `std::string`, which shifted every child path by one byte and truncated every serialized RomFS name by one character after round-trip. This is now fixed.
+
+### Missing items
+- No additional missing items identified in the exercised builder path.
+
+### Binary layout verification
+- PASS: `RomFSHeader`, `RomFSDirectoryEntry`, and `RomFSFileEntry` keep the same sizes and field order as upstream.
+
+## 2026-04-05 — `core/src/file_sys/romfs.rs` vs `core/file_sys/romfs.h/.cpp`
+
+### Intentional differences
+- Rust represents the temporary root container as `Arc<VectorVfsDirectory>` and uses `Option<VirtualFile>`/`Option<VirtualDir>` instead of upstream nullable smart pointers.
+
+### Unintentional differences (to fix)
+- No new behavioral differences identified in this slice after the root-path fix; the added regression test now covers exact filename preservation through `CreateRomFS` -> `ExtractRomFS`.
+
+### Missing items
+- No additional missing items identified in the exercised extract/create path.
+
+### Binary layout verification
+- PASS: `RomFSHeader`, `DirectoryEntry`, and `FileEntry` keep the upstream sizes (`0x50`, `0x18`, `0x20`), and the new regression test confirms filename bytes survive round-trip unchanged.

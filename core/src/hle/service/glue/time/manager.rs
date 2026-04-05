@@ -43,7 +43,7 @@ impl TimeManager {
             worker: TimeWorker::new(),
             file_timestamp_worker: FileTimestampWorker::new(),
             steady_clock_resource: StandardSteadyClockResource::new(),
-            time_zone_binary: TimeZoneBinary::new(),
+            time_zone_binary: TimeZoneBinary::new(_system),
             psc_time: time_m.shared_time(),
             time_sm: time_m.get_static_service_as_service_manager(),
             service_manager,
