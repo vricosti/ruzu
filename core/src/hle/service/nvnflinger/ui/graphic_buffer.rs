@@ -144,6 +144,10 @@ impl GraphicBuffer {
         }
     }
 
+    pub fn from_optional_nv_buffer(nvmap: Arc<NvMap>, buffer: Option<&NvGraphicBuffer>) -> Self {
+        Self::from_nv_buffer(nvmap, buffer.copied().unwrap_or_default())
+    }
+
     // Delegate accessors to inner buffer
     pub fn get_width(&self) -> u32 {
         self.buffer.get_width()
@@ -194,5 +198,27 @@ impl Drop for GraphicBuffer {
             nvmap.unpin_handle(self.buffer.get_buffer_id());
             let _ = nvmap.free_handle(self.buffer.get_buffer_id(), true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::hle::service::nvdrv::core::container::Container;
+
+    use super::*;
+
+    fn test_nvmap() -> Arc<NvMap> {
+        Container::new().get_nv_map_file_handle()
+    }
+
+    #[test]
+    fn from_optional_nv_buffer_none_keeps_zero_initialized_payload() {
+        let graphic_buffer = GraphicBuffer::from_optional_nv_buffer(test_nvmap(), None);
+
+        assert_eq!(graphic_buffer.get_width(), 0);
+        assert_eq!(graphic_buffer.get_height(), 0);
+        assert_eq!(graphic_buffer.get_buffer_id(), 0);
+        assert_eq!(graphic_buffer.get_handle(), 0);
+        assert_eq!(graphic_buffer.get_offset(), 0);
     }
 }
