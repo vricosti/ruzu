@@ -1589,32 +1589,26 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     }
 
     // Structured SVC trace — enabled by RUZU_SVC_TRACE=1
-    let trace_enabled = {
-        use std::sync::atomic::{AtomicU8, Ordering};
-        static INIT: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
-        match INIT.load(Ordering::Relaxed) {
-            2 => true,
-            1 => false,
-            _ => {
-                let on = std::env::var("RUZU_SVC_TRACE").is_ok();
-                INIT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-                on
-            }
-        }
-    };
+    // Format matches zuyu trace: [  T.TTTTTT] SVC_IN  imm=0xNN core=C tid=T args=[...]
+    let trace_enabled = super::trace_format::is_svc_trace_enabled();
 
     if trace_enabled {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SVC_SEQ: AtomicU32 = AtomicU32::new(0);
-        let seq = SVC_SEQ.fetch_add(1, Ordering::Relaxed);
-        let svc_name = SvcId::from_u32(imm).map_or("???".to_string(), |s| format!("{:?}", s));
+        let (core_id, tid) = {
+            if let Some(thread) = system.current_thread() {
+                let t = thread.lock().unwrap();
+                (t.get_current_core(), t.get_thread_id() as i64)
+            } else {
+                (-1, -1)
+            }
+        };
 
         // Log SVC entry
         eprintln!(
-            "SVC[{:04}] #{:#04x} ({}) IN  args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-            seq,
+            "[{:>10.6}] SVC_IN  imm={:#04x} core={} tid={} args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            super::trace_format::elapsed_secs(),
             imm,
-            svc_name,
+            core_id,
+            tid,
             dispatch_args[0],
             dispatch_args[1],
             dispatch_args[2],
@@ -1624,23 +1618,6 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             dispatch_args[6],
             dispatch_args[7]
         );
-
-        // For SendSyncRequest, dump TLS before
-        if imm == 0x21 {
-            if let Some(memory) = system.get_svc_memory() {
-                let m = memory.lock().unwrap();
-                if let Some(thread) = system.current_thread() {
-                    let tls = thread.lock().unwrap().get_tls_address().get();
-                    let mut words = [0u32; 16];
-                    for i in 0..16 {
-                        words[i] = m.read_32(tls + i as u64 * 4);
-                    }
-                    eprintln!("  TLS_REQ [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
-                        tls, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
-                        words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
-                }
-            }
-        }
 
         if is_64bit {
             call64(system, imm, &mut dispatch_args);
@@ -1650,10 +1627,9 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
 
         // Log SVC exit
         eprintln!(
-            "SVC[{:04}] #{:#04x} ({}) OUT args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-            seq,
+            "[{:>10.6}] SVC_OUT imm={:#04x} args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            super::trace_format::elapsed_secs(),
             imm,
-            svc_name,
             dispatch_args[0],
             dispatch_args[1],
             dispatch_args[2],
@@ -1663,23 +1639,6 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             dispatch_args[6],
             dispatch_args[7]
         );
-
-        // For SendSyncRequest, dump TLS after (response)
-        if imm == 0x21 {
-            if let Some(memory) = system.get_svc_memory() {
-                let m = memory.lock().unwrap();
-                if let Some(thread) = system.current_thread() {
-                    let tls = thread.lock().unwrap().get_tls_address().get();
-                    let mut words = [0u32; 16];
-                    for i in 0..16 {
-                        words[i] = m.read_32(tls + i as u64 * 4);
-                    }
-                    eprintln!("  TLS_RSP [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
-                        tls, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
-                        words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
-                }
-            }
-        }
     } else {
         if is_64bit {
             call64(system, imm, &mut dispatch_args);
