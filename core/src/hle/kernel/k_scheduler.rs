@@ -1648,6 +1648,9 @@ impl KScheduler {
             return;
         }
 
+        // Emit SCHED trace line (zuyu-compatible format).
+        super::trace_format::trace_sched(self.core_id, cur_thread_id, next_thread_id);
+
         // Update CPU time tracking.
         let prev_tick = self.last_context_switch_time;
         let cur_tick = if let Some(ref ct) = self.core_timing {
