@@ -4661,6 +4661,9 @@
 ### Binary layout verification
 - PASS: scheduler control-flow only; no binary layout involved.
 
+### Notes
+- 2026-04-05 follow-up: `EnableScheduling(...)` no longer holds the per-core scheduler `Mutex` across `reschedule_current_core()`. Upstream can call `RescheduleCurrentCore()` directly because `KScheduler` is not externally mutex-wrapped; the Rust port must drop that outer mutex before any path that can fiber-switch, or late `StartThread()` deadlocks inside `KAbstractSchedulerLock::unlock -> EnableScheduling`.
+
 ## 2026-04-04 — core/src/hle/kernel/k_scheduler.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp
 
 ### Intentional differences
@@ -5942,3 +5945,50 @@
 
 ### Binary layout verification
 - PASS: no raw serialized structs are defined in this file.
+
+## 2026-04-05 — `core/src/hle/kernel/k_process.rs` vs `core/hle/kernel/k_process.h/.cpp`
+
+### Intentional differences
+- Rust still exposes `wait_condition_variable(...)` as a static-style helper taking `Arc<Mutex<KProcess>>` and `Arc<Mutex<KThread>>`, because the surrounding kernel object model is `Arc<Mutex<...>>` rather than upstream raw pointers/references.
+
+### Unintentional differences (to fix)
+- `SignalAddressArbiter` / `WaitAddressArbiter` remain wrappers around the Rust owner types rather than literal upstream member-call syntax, though the ownership is already aligned.
+
+### Missing items
+- No additional missing items identified for the exercised condition-variable wrapper path.
+
+### Binary layout verification
+- PASS: this file does not define raw serialized payload structs in this slice.
+
+### Notes
+- 2026-04-05 follow-up: the forwarding path must drop `process.lock()` before calling into `cond_var.wait(...)`, otherwise Rust recursively relocks the same `KProcess` mutex and deadlocks at the first worker `WaitProcessWideKeyAtomic` after `StartThread`.
+- 2026-04-05 follow-up: `KProcess::run()` no longer manually increments `running_thread_count` after `KThread::run_thread()`. Upstream `KProcess::Run()` only calls `main_thread->Run()`, and `KThread::Run()` already performs `owner->IncrementRunningThreadCount()`.
+
+## 2026-04-05 — `core/src/hle/kernel/k_thread.rs` vs `core/hle/kernel/k_thread.cpp`
+
+### Intentional differences
+- Rust still needs an `Arc<Mutex<KThread>>` entrypoint (`run_thread(...)`) because kernel objects are mutex-owned Rust values rather than upstream raw `KThread*`.
+
+### Unintentional differences (to fix)
+- `Open()` is still missing from `KThread::Run()` because the Rust port does not yet model literal `KAutoObject` refcount ownership at this file boundary.
+
+### Missing items
+- Full intrusive-tree parity for condition-variable waiters.
+
+### Binary layout verification
+- PASS: this file does not define new raw serialized payload structs in this slice.
+
+## 2026-04-05 — `core/src/hle/kernel/k_condition_variable.rs` vs `core/hle/kernel/k_condition_variable.h/.cpp`
+
+### Intentional differences
+- Rust still uses a dedicated tree helper owned by `k_condition_variable.rs` instead of upstream intrusive red-black tree members on `KThread`. The effective ordering now matches upstream `(cv_key, priority)`, while exact ordering among waiters with identical key and priority is represented by per-bucket insertion order.
+
+### Unintentional differences (to fix)
+- `wait_for_current_thread(...)` still uses a Rust-side scheduler handoff loop instead of the literal upstream blocking return path after `KScopedSchedulerLockAndSleep`.
+- The tree owner is still external to `KThread`, so full intrusive-node parity remains missing.
+
+### Missing items
+- Literal intrusive `ConditionVariableThreadTreeType` ownership on `KThread`.
+
+### Binary layout verification
+- PASS: this file does not define raw serialized payload structs in this slice.

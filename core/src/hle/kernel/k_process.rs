@@ -1014,60 +1014,11 @@ impl KProcess {
             tag,
             timeout
         );
-
-        let current_thread_id = current_thread.lock().unwrap().get_thread_id();
-        let scheduler_lock_ptr = current_thread.lock().unwrap().scheduler_lock_ptr;
-        if scheduler_lock_ptr == 0 {
-            return svc_results::RESULT_INVALID_STATE.get_inner_value();
-        }
-        let scheduler_lock = unsafe {
-            &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-        };
-        let hardware_timer = super::kernel::get_hardware_timer_arc();
-        let thread_ptr = {
-            let mut guard = current_thread.lock().unwrap();
-            (&mut *guard) as *mut KThread as usize
-        };
-
         let result = {
-            let (mut sleep_guard, timer) =
-                super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep::new(
-                    scheduler_lock,
-                    hardware_timer.as_ref(),
-                    current_thread_id,
-                    thread_ptr,
-                    timeout,
-                );
-            log::trace!(
-                "KProcess::wait_condition_variable tid={} acquired sleep_guard",
-                current_thread_id
-            );
             let mut process_guard = process.lock().unwrap();
-            log::trace!(
-                "KProcess::wait_condition_variable tid={} acquired process_guard",
-                current_thread_id
-            );
             let cond_var_ptr: *mut KConditionVariable = &mut process_guard.cond_var;
-
-            unsafe {
-                (*cond_var_ptr).wait_locked_after_sleep_guard(
-                    &mut process_guard,
-                    current_thread,
-                    address,
-                    cv_key,
-                    tag,
-                    timeout,
-                    &mut sleep_guard,
-                    timer,
-                )
-            }
-        };
-
-        let result = if result == RESULT_SUCCESS {
-            KConditionVariable::wait_for_current_thread(process, current_thread);
-            crate::hle::result::ResultCode::new(current_thread.lock().unwrap().get_wait_result())
-        } else {
-            result
+            drop(process_guard);
+            unsafe { (*cond_var_ptr).wait(process, current_thread, address, cv_key, tag, timeout) }
         };
 
         log::trace!(
@@ -1086,9 +1037,7 @@ impl KProcess {
             count
         );
         let cond_var_ptr: *mut KConditionVariable = &mut self.cond_var;
-        unsafe {
-            let _ = (*cond_var_ptr).signal(self, cv_key, count);
-        }
+        unsafe { (*cond_var_ptr).signal(self, cv_key, count); }
         log::trace!(
             "KProcess::signal_condition_variable return cv_key=0x{:X} count={}",
             cv_key,
@@ -2351,11 +2300,6 @@ impl KProcess {
                 self.process_id,
                 main_thread_id
             );
-
-            // The upstream owner is KThread::Run(), but the Rust port still
-            // compensates here for the main-thread bootstrap because KProcess::run()
-            // invokes thread.run() while holding the process mutex.
-            self.increment_running_thread_count();
 
             // KThread::run_thread() → set_state(RUNNABLE) → notify_state_transition now
             // pushes to PQ via the GSC reference and notifies the scheduler.
