@@ -32,7 +32,7 @@ struct KernelEventBridge {
 pub struct Event {
     signaled: Arc<Mutex<bool>>,
     cv: Arc<Condvar>,
-    kernel_bridge: Option<KernelEventBridge>,
+    kernel_bridge: Mutex<Option<KernelEventBridge>>,
 }
 
 impl Event {
@@ -40,7 +40,7 @@ impl Event {
         Self {
             signaled: Arc::new(Mutex::new(false)),
             cv: Arc::new(Condvar::new()),
-            kernel_bridge: None,
+            kernel_bridge: Mutex::new(None),
         }
     }
 
@@ -56,11 +56,31 @@ impl Event {
         Self {
             signaled: Arc::new(Mutex::new(false)),
             cv: Arc::new(Condvar::new()),
-            kernel_bridge: Some(KernelEventBridge {
+            kernel_bridge: Mutex::new(Some(KernelEventBridge {
                 readable_event,
                 process,
                 scheduler,
-            }),
+            })),
+        }
+    }
+
+    /// Install a kernel bridge lazily.
+    ///
+    /// This keeps service owners faithful to upstream `Event` ownership while allowing
+    /// the kernel readable-end to be materialized only when an IPC handle is requested.
+    pub fn attach_kernel_event(
+        &self,
+        readable_event: Arc<Mutex<KReadableEvent>>,
+        process: Arc<Mutex<KProcess>>,
+        scheduler: Arc<Mutex<KScheduler>>,
+    ) {
+        let mut bridge = self.kernel_bridge.lock().unwrap();
+        if bridge.is_none() {
+            *bridge = Some(KernelEventBridge {
+                readable_event,
+                process,
+                scheduler,
+            });
         }
     }
 
@@ -75,7 +95,7 @@ impl Event {
         // Drop signaled lock before acquiring kernel locks to avoid deadlock.
 
         // Bridge to kernel: signal the KReadableEvent to wake WaitSynchronization.
-        if let Some(ref bridge) = self.kernel_bridge {
+        if let Some(ref bridge) = *self.kernel_bridge.lock().unwrap() {
             let mut process = bridge.process.lock().unwrap();
             bridge
                 .readable_event

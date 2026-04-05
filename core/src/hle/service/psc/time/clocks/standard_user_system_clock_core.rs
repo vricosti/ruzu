@@ -23,6 +23,7 @@ use crate::hle::service::psc::time::errors::RESULT_NOT_IMPLEMENTED;
 pub struct StandardUserSystemClockCore {
     automatic_correction: bool,
     time_point: SteadyClockTimePoint,
+    initialized: bool,
     /// Kernel event signaled when automatic correction changes.
     /// Corresponds to `Kernel::KEvent* m_event` in upstream.
     event: Arc<Event>,
@@ -33,12 +34,25 @@ impl StandardUserSystemClockCore {
         Self {
             automatic_correction: false,
             time_point: SteadyClockTimePoint::default(),
+            initialized: false,
             event: Arc::new(Event::new()),
         }
     }
 
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    pub fn set_initialized(&mut self) {
+        self.initialized = true;
+    }
+
     pub fn get_automatic_correction(&self) -> bool {
         self.automatic_correction
+    }
+
+    pub fn get_event(&self) -> Arc<Event> {
+        Arc::clone(&self.event)
     }
 
     /// Set automatic correction mode.
