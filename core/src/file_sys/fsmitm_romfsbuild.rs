@@ -173,7 +173,7 @@ impl RomFSBuildContext {
 
         // Create root directory
         ctx.directories.push(RomFSBuildDirectoryContext {
-            path: "\0".to_string(),
+            path: String::new(),
             cur_path_ofs: 0,
             path_len: 0,
             entry_offset: 0,

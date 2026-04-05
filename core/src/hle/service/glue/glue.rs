@@ -80,8 +80,10 @@ pub fn loop_process(
             can_write_uninitialized_clock: false,
         };
         let time_manager_user = Arc::clone(&time_manager);
+        let system_user = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
+                system_user,
                 user_setup,
                 "time:u",
                 Arc::clone(&time_manager_user),
@@ -100,8 +102,10 @@ pub fn loop_process(
             can_write_uninitialized_clock: false,
         };
         let time_manager_admin = Arc::clone(&time_manager);
+        let system_admin = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
+                system_admin,
                 admin_setup,
                 "time:a",
                 Arc::clone(&time_manager_admin),
@@ -120,8 +124,10 @@ pub fn loop_process(
             can_write_uninitialized_clock: false,
         };
         let time_manager_repair = Arc::clone(&time_manager);
+        let system_repair = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
+                system_repair,
                 repair_setup,
                 "time:r",
                 Arc::clone(&time_manager_repair),
@@ -141,8 +147,10 @@ pub fn loop_process(
             can_write_uninitialized_clock: false,
         };
         let time_manager_psc = Arc::clone(&time_manager);
+        let system_psc = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
+                system_psc,
                 psc_setup,
                 "time:s",
                 Arc::clone(&time_manager_psc),

@@ -7,11 +7,13 @@
 //! TimeZoneBinary: mount and read operations for timezone data from the system archive.
 
 use crate::file_sys::romfs;
+use crate::file_sys::nca_metadata::ContentRecordType;
 use crate::file_sys::system_archive::system_archive;
-use crate::file_sys::vfs::vfs::{VfsDirectory, VfsFile};
+use crate::file_sys::registered_cache::ContentProvider;
 use crate::file_sys::vfs::vfs_types::VirtualDir;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::psc::time::common::{LocationName, RuleVersion};
+use crate::hle::service::psc::time::errors::{RESULT_FAILED, RESULT_TIME_ZONE_NOT_FOUND};
 
 /// Title ID for the timezone binary system archive.
 ///
@@ -37,15 +39,17 @@ pub struct TimeZoneBinary {
     /// The mounted RomFS directory tree.
     /// Corresponds to `time_zone_binary_romfs` in upstream.
     time_zone_binary_romfs: Option<VirtualDir>,
+    system: crate::core::SystemRef,
 }
 
 impl TimeZoneBinary {
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Self {
         Self {
             time_zone_scratch_space: vec![0u8; 0x2800],
-            mount_result: ResultCode(1), // ResultUnknown
+            mount_result: RESULT_UNKNOWN,
             mounted: false,
             time_zone_binary_romfs: None,
+            system,
         }
     }
 
@@ -54,7 +58,8 @@ impl TimeZoneBinary {
     /// Corresponds to `TimeZoneBinary::Reset` in upstream.
     fn reset(&mut self) {
         self.mounted = false;
-        self.mount_result = ResultCode(1);
+        self.mount_result = RESULT_UNKNOWN;
+        self.time_zone_binary_romfs = None;
         self.time_zone_scratch_space.clear();
         self.time_zone_scratch_space.resize(0x2800, 0);
     }
@@ -70,28 +75,69 @@ impl TimeZoneBinary {
     pub fn mount(&mut self) -> ResultCode {
         self.reset();
 
-        // Try to synthesize the system archive (fallback path, same as upstream
-        // when NAND NCA is not available).
-        let romfs_file = system_archive::synthesize_system_archive(TIME_ZONE_BINARY_ID);
+        if self.system.is_null() {
+            return RESULT_UNKNOWN;
+        }
 
-        if let Some(romfs_file) = romfs_file {
-            // Extract the RomFS binary into a VirtualDir tree.
-            // Matches upstream: FileSys::ExtractRomFS(romfs)
-            let extracted = romfs::extract_romfs(Some(romfs_file));
-            if let Some(dir) = extracted {
-                self.time_zone_binary_romfs = Some(dir);
-                self.mount_result = RESULT_SUCCESS;
-                self.mounted = true;
-                return RESULT_SUCCESS;
+        let fsc = self.system.get().get_filesystem_controller();
+
+        if let Some(nca) = fsc
+            .lock()
+            .unwrap()
+            .get_system_nand_contents()
+            .and_then(|cache| cache.get_entry(TIME_ZONE_BINARY_ID, ContentRecordType::Data))
+        {
+            self.time_zone_binary_romfs = romfs::extract_romfs(nca.get_romfs());
+        }
+
+        if self.time_zone_binary_romfs.is_some() {
+            self.mount_result = RESULT_SUCCESS;
+            let mut etc_gmt = [0u8; 0x24];
+            let bytes = b"Etc/GMT";
+            etc_gmt[..bytes.len()].copy_from_slice(bytes);
+            if !self.is_valid(&etc_gmt) {
+                self.reset();
             }
         }
 
-        // If synthesis or extraction failed, still mark as mounted
-        // with empty data so the system can proceed.
-        log::warn!("TimeZoneBinary::Mount: synthesis/extraction failed, using empty fallback");
+        if self.time_zone_binary_romfs.is_none() {
+            if let Some(romfs_file) = system_archive::synthesize_system_archive(TIME_ZONE_BINARY_ID) {
+                self.time_zone_binary_romfs = romfs::extract_romfs(Some(romfs_file));
+            }
+        }
+
+        if self.time_zone_binary_romfs.is_none() {
+            return RESULT_UNKNOWN;
+        }
+
         self.mount_result = RESULT_SUCCESS;
         self.mounted = true;
         RESULT_SUCCESS
+    }
+
+    fn read(&mut self, out_buffer_size: usize, path: &str) -> Result<&[u8], ResultCode> {
+        if self.mount_result != RESULT_SUCCESS {
+            return Err(self.mount_result);
+        }
+
+        let romfs = self.time_zone_binary_romfs.as_ref().ok_or(RESULT_UNKNOWN)?;
+        let file = romfs.get_file_relative(path).ok_or(RESULT_UNKNOWN)?;
+        let file_size = file.get_size();
+        if file_size == 0 {
+            return Err(RESULT_UNKNOWN);
+        }
+        if file_size > out_buffer_size {
+            return Err(RESULT_FAILED);
+        }
+
+        let bytes = file.read_all_bytes();
+        if bytes.is_empty() {
+            return Err(RESULT_UNKNOWN);
+        }
+
+        let read_size = bytes.len().min(self.time_zone_scratch_space.len());
+        self.time_zone_scratch_space[..read_size].copy_from_slice(&bytes[..read_size]);
+        Ok(&self.time_zone_scratch_space[..read_size])
     }
 
     /// Check if a timezone location name is valid.
@@ -103,15 +149,13 @@ impl TimeZoneBinary {
         if self.mount_result.is_error() {
             return false;
         }
-        if let Some(ref romfs) = self.time_zone_binary_romfs {
-            let path = self.get_time_zone_path(name);
-            if let Some(path) = path {
-                return romfs.get_file_relative(&path[1..]).is_some();
-            }
-        }
-        // If no romfs is available, accept all names when mounted
-        // (fallback behavior when system archive synthesis produced no files).
-        self.mounted
+        let Some(romfs) = self.time_zone_binary_romfs.as_ref() else {
+            return false;
+        };
+        let Some(path) = self.get_time_zone_path(name) else {
+            return false;
+        };
+        romfs.get_file_relative(&path).is_some_and(|file| file.get_size() != 0)
     }
 
     /// Get the total number of timezone locations.
@@ -119,14 +163,14 @@ impl TimeZoneBinary {
     /// Corresponds to `TimeZoneBinary::GetTimeZoneCount` in upstream.
     /// Upstream reads binaryList.txt and counts newlines.
     pub fn get_time_zone_count(&mut self) -> u32 {
-        if self.mount_result.is_error() {
+        let Some(path) = self.get_list_path() else {
             return 0;
-        }
-        if let Some(names) = self.read_binary_list() {
-            return names.len() as u32;
-        }
-        // Fallback when romfs has no binaryList.txt
-        1
+        };
+        let Ok(bytes) = self.read(0x2800, &path) else {
+            return 0;
+        };
+
+        bytes.iter().filter(|&&b| b == b'\n').count() as u32
     }
 
     /// Get the timezone rule version.
@@ -134,19 +178,12 @@ impl TimeZoneBinary {
     /// Corresponds to `TimeZoneBinary::GetTimeZoneVersion` in upstream.
     /// Upstream reads version.txt from the mounted romfs.
     pub fn get_time_zone_version(&mut self) -> Result<RuleVersion, ResultCode> {
-        if self.mount_result.is_error() {
-            return Err(self.mount_result);
-        }
-        if let Some(ref romfs) = self.time_zone_binary_romfs {
-            if let Some(file) = romfs.get_file_relative("version.txt") {
-                let data = file.read_all_bytes();
-                let mut version: RuleVersion = [0u8; 0x10];
-                let copy_len = data.len().min(0x10);
-                version[..copy_len].copy_from_slice(&data[..copy_len]);
-                return Ok(version);
-            }
-        }
-        Ok([0u8; 0x10])
+        let path = self.get_version_path().ok_or(self.mount_result)?;
+        let bytes = self.read(core::mem::size_of::<RuleVersion>(), &path)?;
+        let mut version = [0u8; 0x10];
+        let copy_len = bytes.len().min(version.len().saturating_sub(1));
+        version[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        Ok(version)
     }
 
     /// Get the timezone rule data for a location.
@@ -154,19 +191,13 @@ impl TimeZoneBinary {
     /// Corresponds to `TimeZoneBinary::GetTimeZoneRule` in upstream.
     /// Upstream reads `/zoneinfo/{name}` from the mounted romfs.
     pub fn get_time_zone_rule(&mut self, name: &LocationName) -> Result<Vec<u8>, ResultCode> {
-        if self.mount_result.is_error() {
-            return Err(self.mount_result);
-        }
-        if let Some(ref romfs) = self.time_zone_binary_romfs {
-            let path = self.get_time_zone_path(name);
-            if let Some(path) = path {
-                if let Some(file) = romfs.get_file_relative(&path[1..]) {
-                    return Ok(file.read_all_bytes());
-                }
-            }
-        }
-        log::warn!("TimeZoneBinary::GetTimeZoneRule: file not found in romfs");
-        Ok(Vec::new())
+        let path = self
+            .get_time_zone_path(name)
+            .ok_or(RESULT_TIME_ZONE_NOT_FOUND)?;
+        let bytes = self
+            .read(self.time_zone_scratch_space.len(), &path)
+            .map_err(|_| RESULT_TIME_ZONE_NOT_FOUND)?;
+        Ok(bytes.to_vec())
     }
 
     /// Get a list of timezone location names.
@@ -178,57 +209,30 @@ impl TimeZoneBinary {
         max_names: usize,
         index: u32,
     ) -> Result<Vec<LocationName>, ResultCode> {
-        if self.mount_result.is_error() {
-            return Err(self.mount_result);
-        }
-
-        if let Some(all_names) = self.read_binary_list() {
-            let start = index as usize;
-            if start >= all_names.len() {
-                return Ok(Vec::new());
-            }
-            let end = (start + max_names).min(all_names.len());
-            return Ok(all_names[start..end].to_vec());
-        }
-
-        // Fallback: return UTC when no romfs data is available
-        if index > 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut utc: LocationName = [0u8; 0x24];
-        utc[0] = b'U';
-        utc[1] = b'T';
-        utc[2] = b'C';
-
-        let mut result = Vec::new();
-        if max_names > 0 {
-            result.push(utc);
-        }
-        Ok(result)
-    }
-
-    /// Read and parse binaryList.txt from the romfs.
-    /// Returns a list of LocationName entries, or None if the file is not available.
-    fn read_binary_list(&self) -> Option<Vec<LocationName>> {
-        let romfs = self.time_zone_binary_romfs.as_ref()?;
-
-        let file = romfs.get_file_relative("binaryList.txt")?;
-        let data = file.read_all_bytes();
-        let text = std::str::from_utf8(&data).ok()?;
+        let path = self.get_list_path().ok_or(self.mount_result)?;
+        let data = self.read(self.time_zone_scratch_space.len(), &path)?.to_vec();
+        let text = std::str::from_utf8(&data).map_err(|_| RESULT_FAILED)?;
         let mut names = Vec::new();
         for line in text.lines() {
-            let trimmed = line.trim();
+            let trimmed = line.trim_end_matches('\r');
             if trimmed.is_empty() {
                 continue;
             }
             let mut name: LocationName = [0u8; 0x24];
             let bytes = trimmed.as_bytes();
-            let copy_len = bytes.len().min(0x24);
+            if bytes.len() > name.len().saturating_sub(1) {
+                return Err(RESULT_FAILED);
+            }
+            let copy_len = bytes.len();
             name[..copy_len].copy_from_slice(&bytes[..copy_len]);
             names.push(name);
+            if names.len() >= index as usize + max_names {
+                break;
+            }
         }
-        Some(names)
+        let start = (index as usize).min(names.len());
+        let end = (start + max_names).min(names.len());
+        Ok(names[start..end].to_vec())
     }
 
     /// Get the path for the binary list file.
