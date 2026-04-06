@@ -193,21 +193,11 @@ impl System {
         Self::new(core, audio_renderer, Arc::new(StdMutex::new(KEvent::new())))
     }
 
+    /// Matches upstream `adsp_rendered_event->Clear()` at the end of Update().
     fn clear_rendered_event(&self) {
-        // Upstream clears the KEvent here, resetting KReadableEvent::is_signaled.
-        // In the cooperative scheduler this races with WaitSynchronization:
-        //   1. clear_rendered_event() sets is_signaled = false (called from RequestUpdate)
-        //   2. game thread calls WaitSync → first_signaled_index sees false → blocks
-        //   3. ADSP re-signals 5ms later but the host-thread signal can't reliably
-        //      wake the blocked game thread (scheduler lock livelock).
-        //
-        // Instead, leave is_signaled alone. The game's WaitSync will find the
-        // event already signaled (from the prior ADSP cycle) and return SUCCESS.
-        // The game then calls ClearEvent (SVC 0x17) which properly resets
-        // is_signaled under the scheduler lock from the game's own fiber.
-        //
-        // The KEvent layer is still cleared so the ADSP's internal tracking
-        // (via rendered_event.is_initialized checks) remains correct.
+        if let Some(ref readable_event) = self.rendered_readable_event {
+            readable_event.lock().unwrap().clear();
+        }
     }
 
     fn signal_rendered_event(&self) {
@@ -771,11 +761,6 @@ impl System {
         }
 
         if !self.is_active() || self.session_id < 0 {
-            log::info!(
-                "audio_core::renderer::System::send_command_to_dsp inactive session_id={} active={}",
-                self.session_id,
-                self.active
-            );
             if self.session_id >= 0 {
                 self.audio_renderer
                     .lock()

@@ -842,7 +842,6 @@ impl UserCallbacks for DynarmicCallbacks32 {
                 self.parent().base.log_backtrace(process, &ctx);
 
                 let code = self.mem().read_32(pc);
-
                 log::error!(
                     "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X}, thumb = {})",
                     exception,
@@ -850,6 +849,13 @@ impl UserCallbacks for DynarmicCallbacks32 {
                     code,
                     self.parent().is_in_thumb_mode()
                 );
+
+                // Store exception info and halt. The run loop will advance PC
+                // past unimplemented instructions (e.g. NEON/SIMD).
+                self.parent()
+                    .last_exception_address
+                    .store(pc, Ordering::Relaxed);
+                self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
         }
     }

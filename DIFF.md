@@ -6833,3 +6833,102 @@
 
 ### Binary layout verification
 - PASS: the command-buffer layout itself is unchanged; this slice only changes source selection.
+
+## 2026-04-07 — `audio_core/src/adsp/apps/audio_renderer/audio_renderer.rs` vs `src/audio_core/adsp/apps/audio_renderer/audio_renderer.cpp`
+
+### Intentional differences
+- Rust uses an extracted shared release owner on [`sink_stream.rs`](/home/vricosti/Dev/emulators/ruzu/audio_core/src/sink/sink_stream.rs) instead of waiting under the `SinkStream` mutex directly. This is a bounded Rust adaptation to avoid lock inversion between the ADSP render loop and the cubeb callback.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the renderer no longer holds the `SinkStream` mutex while waiting for free space on stream 0.
+
+### Missing items
+- No new missing items identified in this audio-renderer wait slice.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-07 — `audio_core/src/renderer/system.rs` vs `src/audio_core/renderer/system.cpp`
+
+### Intentional differences
+- Rust stores the readable rendered-event owner explicitly and clears it through the stored `Arc<Mutex<KReadableEvent>>`, instead of reaching it through the exact C++ object graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `clear_rendered_event()` no longer keeps the temporary workaround that skipped clearing the readable event entirely.
+
+### Missing items
+- No new missing items identified in this rendered-event slice.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-07 — `audio_core/src/sink/sink_stream.rs` vs `src/audio_core/sink/sink_stream.cpp`
+
+### Intentional differences
+- Rust does not model upstream inheritance (`CubebSinkStream final : SinkStream`). Instead, [`sink_stream.rs`](/home/vricosti/Dev/emulators/ruzu/audio_core/src/sink/sink_stream.rs) owns a small backend-control callback and an extracted shared release-sync owner so the sink callback can operate without re-entering the outer `parking_lot::Mutex<SinkStream>`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: queue size / pause state used by `WaitFreeSpace` no longer depend on holding the outer stream mutex while the cubeb callback is draining buffers.
+- Fixed in this pass: `start()` / `stop()` now drive the backend stream owner rather than only flipping the local pause flag.
+
+### Missing items
+- Full literal parity with upstream queue primitives is still incomplete because Rust uses `VecDeque` plus atomics/condvar instead of the C++ queue types.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-07 — `audio_core/src/sink/cubeb_sink.rs` vs `src/audio_core/sink/cubeb_sink.cpp`
+
+### Intentional differences
+- Rust cannot subclass `SinkStream` like upstream `CubebSinkStream`. The cubeb backend therefore installs a start/stop callback into the shared sink-stream owner instead of overriding virtual `Start()` / `Stop()` methods.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the cubeb backend now exposes real `cubeb_stream_start` / `cubeb_stream_stop` control to `SinkStream::start()` / `stop()`.
+
+### Missing items
+- No new missing items identified in this cubeb ownership slice.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-07 — `core/src/hle/service/server_manager.rs` vs `src/core/hle/service/server_manager.cpp`
+
+### Intentional differences
+- Rust still builds a minimal `HLERequestContext` directly in `server_manager.rs` instead of receiving it from a real upstream `KServerSession::ReceiveRequestHLE(...)` transport path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ServerManager` no longer passes the old shared-memory owner into `HLERequestContext::new_with_thread(...)`. It now follows the new owner model where the context derives `Memory` from the requesting thread's owner process.
+
+### Missing items
+- Full `KServerSession`-owned HLE request creation remains incomplete in Rust.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-07 — `core/src/hle/kernel/k_thread.rs` vs `src/core/hle/kernel/k_thread.cpp`
+
+### Intentional differences
+- Rust sets `ThreadContext.pstate` T-bit and aligns the stored PC on direct Thumb entry. This is a bounded rdynarmic adaptation: upstream dynarmic accepts the raw entry state differently, while the current Rust JIT path needs an explicit Thumb-mode seed.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `reset_thread_context32()` no longer stores a Thumb entry address verbatim into both `pc` and `r15` with bit 0 intact while leaving CPSR.T cleared.
+
+### Missing items
+- The broader thread/context lifecycle still has additional Rust adaptations documented in earlier `k_thread.rs` entries.
+
+### Binary layout verification
+- PASS: `ThreadContext` field ordering is unchanged in this slice; only initialized values differ.
+
+## 2026-04-07 — `core/src/arm/dynarmic/arm_dynarmic_32.rs` vs `src/core/arm/dynarmic/arm_dynarmic_32.cpp`
+
+### Intentional differences
+- Rust halts explicitly on rdynarmic `EXCEPTION_RAISED` and records `last_exception_address`. This is a bounded backend adaptation because rdynarmic exposes exception halts differently from upstream dynarmic and the higher-level CPU manager consumes that halt state through `ArmInterface::get_last_exception_address()`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: A32 exception callbacks no longer only log the exception; they now preserve the exception PC for the run loop and surface the halt through the backend.
+
+### Missing items
+- Full parity with upstream dynarmic exception semantics remains incomplete while `rdynarmic` is still being brought up.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.

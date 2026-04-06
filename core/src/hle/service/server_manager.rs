@@ -548,24 +548,20 @@ impl ServerManager {
         // have a guest thread context, so we use a minimal context with the
         // process memory from the system.
         let mut context = if !self.system.is_null() {
-            let process_arc = self.system.get().current_process_arc();
-            let shared_memory = process_arc.lock().unwrap().get_shared_memory();
             let thread = self.system.get().current_thread();
 
-            let ctx = if let Some(thread) = thread {
+            if let Some(thread) = thread {
                 let tls = thread.lock().unwrap().get_tls_address().get();
-                HLERequestContext::new_with_thread(thread, shared_memory, tls)
+                HLERequestContext::new_with_thread(thread, tls)
             } else {
-                // No guest thread — create context with just shared memory.
+                // No guest thread — create minimal context.
                 HLERequestContext::new_with_thread(
                     Arc::new(std::sync::Mutex::new(
                         crate::hle::kernel::k_thread::KThread::new(),
                     )),
-                    shared_memory,
                     0,
                 )
-            };
-            ctx
+            }
         } else {
             // Null system — can't dispatch without memory access.
             log::warn!(
