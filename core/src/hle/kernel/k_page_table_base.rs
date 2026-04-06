@@ -192,6 +192,16 @@ impl KPageTableBase {
     pub fn is_kernel(&self) -> bool {
         self.m_is_kernel
     }
+
+    fn clear_fresh_backing_region(&self, address: usize, size: usize) {
+        if size == 0 {
+            return;
+        }
+        if let Some(memory) = &self.m_memory {
+            memory.lock().unwrap().zero_block(address as u64, size);
+        }
+    }
+
     /// Finalize the page table, releasing all resources.
     /// Port of upstream `KPageTableBase::Finalize`.
     ///
@@ -1032,9 +1042,8 @@ impl KPageTableBase {
                         Self::convert_to_memory_permission(properties.perm),
                         false,
                     );
-                }
 
-                // Upstream: if phys_addr is heap, call MemoryManager.Open(phys_addr, num_pages)
+                }
 
                 0
             }
@@ -1335,12 +1344,7 @@ impl KPageTableBase {
         // Upstream: the kernel allocates zeroed physical pages from KPageHeap.
         // In our emulator, DeviceMemory is pre-allocated and may contain stale data,
         // so we must explicitly zero the heap region after mapping.
-        if let Some(memory) = &self.m_memory {
-            memory
-                .lock()
-                .unwrap()
-                .zero_block(cur_address as u64, allocation_size);
-        }
+        self.clear_fresh_backing_region(cur_address, allocation_size);
 
         memory_reservation.commit();
 
@@ -2186,6 +2190,8 @@ impl KPageTableBase {
             if op_result != 0 {
                 return (op_result, 0);
             }
+
+            self.clear_fresh_backing_region(addr, num_pages * PAGE_SIZE);
         }
 
         // Update blocks.
@@ -2250,6 +2256,8 @@ impl KPageTableBase {
         if op_result != 0 {
             return op_result;
         }
+
+        self.clear_fresh_backing_region(addr, size);
 
         // Update blocks.
         self.m_memory_block_manager.update(
@@ -2754,6 +2762,8 @@ impl KPageTableBase {
         if op != 0 {
             return op;
         }
+
+        self.clear_fresh_backing_region(addr, size);
 
         self.m_memory_block_manager.update(
             addr,
