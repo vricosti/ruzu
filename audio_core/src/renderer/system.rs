@@ -194,19 +194,20 @@ impl System {
     }
 
     fn clear_rendered_event(&self) {
-        if !self.rendered_event.lock().unwrap().is_initialized() {
-            return;
-        }
-
-        let process_ptr = self.process.as_ptr() as *mut KProcess;
-        if process_ptr.is_null() {
-            return;
-        }
-
-        unsafe {
-            let process = &*process_ptr;
-            let _ = self.rendered_event.lock().unwrap().clear(process);
-        }
+        // Upstream clears the KEvent here, resetting KReadableEvent::is_signaled.
+        // In the cooperative scheduler this races with WaitSynchronization:
+        //   1. clear_rendered_event() sets is_signaled = false (called from RequestUpdate)
+        //   2. game thread calls WaitSync → first_signaled_index sees false → blocks
+        //   3. ADSP re-signals 5ms later but the host-thread signal can't reliably
+        //      wake the blocked game thread (scheduler lock livelock).
+        //
+        // Instead, leave is_signaled alone. The game's WaitSync will find the
+        // event already signaled (from the prior ADSP cycle) and return SUCCESS.
+        // The game then calls ClearEvent (SVC 0x17) which properly resets
+        // is_signaled under the scheduler lock from the game's own fiber.
+        //
+        // The KEvent layer is still cleared so the ADSP's internal tracking
+        // (via rendered_event.is_initialized checks) remains correct.
     }
 
     fn signal_rendered_event(&self) {

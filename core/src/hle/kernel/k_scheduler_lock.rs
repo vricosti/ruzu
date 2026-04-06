@@ -33,26 +33,71 @@ fn default_disable_scheduling() {
 
 /// EnableScheduling callback matching upstream `KScheduler::EnableScheduling(kernel, cores_needing_scheduling)`.
 /// Decrements dispatch count. If it reaches 0, triggers rescheduling.
-fn default_enable_scheduling(_cores_needing_scheduling: u64) {
-    super::kernel::with_current_thread_fast_mut(|t| {
-        debug_assert!(t.get_disable_dispatch_count() >= 1);
-
-        // Upstream: if no scheduler or phantom mode, use HLE reschedule path.
-        // We don't have kernel reference here, so we use the simpler path:
-        // reschedule other cores if needed, then enable dispatch.
-        // The full scheduler-aware path is handled by KScheduler::enable_scheduling_with_scheduler
-        // when called with scheduler context.
-        if t.get_disable_dispatch_count() > 1 {
-            t.enable_dispatch();
-        } else {
-            // Dispatch count is 1, will go to 0.
-            // Upstream: RescheduleCurrentCore or RescheduleCurrentHLEThread.
-            // Without scheduler context, do HLE reschedule: just enable dispatch.
-            // The actual rescheduling is triggered by the caller via
-            // KScheduler::enable_scheduling_with_scheduler when a scheduler is available.
-            t.enable_dispatch();
-        }
+/// Port of upstream `KScheduler::EnableScheduling(kernel, cores_needing_scheduling)`.
+///
+/// When the scheduler lock's outermost scope exits (lock_count goes to 0),
+/// this callback runs. If the current thread's dispatch count is about to
+/// reach 0, upstream calls `scheduler->RescheduleCurrentCore()` which
+/// triggers `ScheduleImpl()` → fiber switch. This is the mechanism that
+/// suspends a WAITING thread after `KScopedSchedulerLockAndSleep` drops.
+fn default_enable_scheduling(cores_needing_scheduling: u64) {
+    let dispatch_count = super::kernel::with_current_thread_fast_mut(|t| {
+        t.get_disable_dispatch_count()
     });
+
+    match dispatch_count {
+        Some(count) if count > 1 => {
+            // Nested lock — just decrement.
+            super::kernel::with_current_thread_fast_mut(|t| {
+                t.enable_dispatch();
+            });
+        }
+        Some(1) => {
+            // Outermost unlock — must reschedule like upstream.
+            // Upstream: scheduler->RescheduleOtherCores(cores);
+            //           scheduler->RescheduleCurrentCore();
+            // RescheduleCurrentCore: EnableDispatch + if needs_scheduling { RescheduleCurrentCoreImpl }
+            super::kernel::with_current_thread_fast_mut(|t| {
+                t.enable_dispatch();
+            });
+
+            // Trigger RescheduleCurrentCoreImpl via the current scheduler.
+            if let Some(kernel) = super::kernel::get_kernel_ref() {
+                if let Some(scheduler_arc) = kernel.current_scheduler() {
+                    // Interrupt other cores that need rescheduling.
+                    if cores_needing_scheduling != 0 {
+                        for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+                            if cores_needing_scheduling & (1u64 << core_id) != 0 {
+                                if let Some(core) = kernel.physical_core(core_id) {
+                                    core.interrupt();
+                                }
+                            }
+                        }
+                    }
+
+                    let needs = {
+                        let sched = scheduler_arc.lock().unwrap();
+                        sched.needs_scheduling()
+                    };
+                    if needs {
+                        // Do the fiber switch — this is the key upstream behavior.
+                        // Get a raw pointer to avoid holding the Mutex across the yield.
+                        let sched_ptr = {
+                            let guard = scheduler_arc.lock().unwrap();
+                            &*guard as *const super::k_scheduler::KScheduler
+                                as *mut super::k_scheduler::KScheduler
+                        };
+                        unsafe {
+                            (*sched_ptr).reschedule_current_core_impl();
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            // No current thread (host thread) — just a no-op.
+        }
+    }
 }
 
 /// UpdateHighestPriorityThreads callback matching upstream
