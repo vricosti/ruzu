@@ -1060,9 +1060,13 @@ pub fn wait(
         crate::hle::result::RESULT_SUCCESS
     };
 
-    if result == crate::hle::result::RESULT_SUCCESS {
-        wait_for_current_thread(process, current_thread, scheduler);
-    }
+    // Upstream: the KScopedSchedulerLockAndSleep destructor triggers
+    // EnableScheduling → RescheduleCurrentCore → ScheduleImpl → fiber switch.
+    // The WAITING thread's fiber is suspended at this point. When EndWait or
+    // CancelWait transitions it back to RUNNABLE and the scheduler picks it up,
+    // execution resumes HERE — after the fiber switch returns.
+    //
+    // No polling loop needed — the fiber switch handles everything.
 
     let thread = current_thread.lock().unwrap();
     *out_index = thread.get_synced_index();
@@ -1106,6 +1110,12 @@ fn wait_for_current_thread(
             unsafe {
                 KScheduler::reschedule_current_core_raw(sched_ptr);
             }
+
+            // Yield to give host threads (hardware timer, audio ADSP) a chance
+            // to acquire the scheduler spinlock. Without this, the guest thread
+            // continuously cycles through reschedule_current_core_raw, starving
+            // the timer thread that needs the spinlock to fire cancel_wait.
+            std::thread::yield_now();
         } else {
             std::thread::yield_now();
         }

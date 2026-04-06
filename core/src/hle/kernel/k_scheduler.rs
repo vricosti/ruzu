@@ -687,7 +687,7 @@ impl KScheduler {
         }
     }
 
-    fn reschedule_current_core_impl(&mut self) {
+    pub(crate) fn reschedule_current_core_impl(&mut self) {
         // Upstream: if (m_state.needs_scheduling.load()) [[likely]] {
         //     GetCurrentThread(m_kernel).DisableDispatch();
         //     Schedule();
@@ -762,18 +762,18 @@ impl KScheduler {
             .unwrap_or(ThreadState::INITIALIZED);
 
         if current_state != ThreadState::RUNNABLE {
-            // Upstream reschedules immediately when the current thread became
-            // non-runnable while dispatch was disabled. Rust cannot safely do
-            // that from owner paths like `KThread::sleep()` because those
-            // paths still hold the current thread object through `&mut self`.
-            // Defer the actual fiber switch to the outer owner (`CpuManager`)
-            // after the current owner releases its locks, but keep the
-            // scheduler flag set so the handoff happens immediately on return
-            // from the SVC.
-            scheduler.lock().unwrap().request_schedule();
-            super::kernel::with_current_thread_fast_mut(|t| {
-                t.enable_dispatch();
-            });
+            // Upstream: RescheduleCurrentCore when the thread became non-runnable.
+            // The fiber switch properly suspends the WAITING thread's fiber and
+            // switches to the next runnable thread (or idle). When EndWait or
+            // CancelWait transitions the thread back to RUNNABLE, the scheduler
+            // picks it up and resumes this fiber.
+            let sched_ptr = {
+                let guard = scheduler.lock().unwrap();
+                &*guard as *const KScheduler as *mut KScheduler
+            };
+            unsafe {
+                (*sched_ptr).reschedule_current_core();
+            }
         } else if initial_disable_dispatch > 1 {
             super::kernel::with_current_thread_fast_mut(|t| {
                 t.enable_dispatch();
@@ -1494,10 +1494,11 @@ impl KScheduler {
                 sys_ref.get().get_cpu_manager().core_host_context(self.core_id as usize)
             });
 
+        // Upstream always yields to the switch fiber when highest != current,
+        // even when highest is null (the switch fiber handles it by falling
+        // through to the idle thread).
         if let (Some(ref from_ctx), Some(ref switch_fiber)) = (&yield_from, &self.switch_fiber) {
-            if target.is_some() {
-                Fiber::yield_to(Arc::downgrade(from_ctx), switch_fiber);
-            }
+            Fiber::yield_to(Arc::downgrade(from_ctx), switch_fiber);
         }
     }
 
