@@ -6664,3 +6664,172 @@
 
 ### Binary layout verification
 - PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/service/nvnflinger/hos_binder_driver_server.rs` vs `src/core/hle/service/nvnflinger/hos_binder_driver_server.cpp`
+
+### Intentional differences
+- Rust keeps an extra typed `buffer_queue_producers` map next to the upstream-generic binder map. This is a bounded Rust-only adaptation to preserve the same owner (`HosBinderDriverServer`) while avoiding reconstruction of `Arc<BufferQueueProducer>` from a raw pointer.
+
+### Unintentional differences (to fix)
+- None in this slice.
+
+### Missing items
+- No new missing items identified in this binder-owner slice.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/service/vi/container.rs` vs `src/core/hle/service/vi/container.cpp`
+
+### Intentional differences
+- Rust returns `Arc<BufferQueueProducer>` from a typed binder-server helper instead of `std::static_pointer_cast` on a generic binder object. The ownership remains in `container.rs`, matching upstream `GetLayerProducerHandle(...)`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Container::get_layer_producer_handle(...)` no longer rebuilds an `Arc<BufferQueueProducer>` with `Arc::into_raw`/`Arc::from_raw`.
+
+### Missing items
+- No new missing items identified in this producer-handle slice.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/service/nvnflinger/surface_flinger.rs` vs `src/core/hle/service/nvnflinger/surface_flinger.cpp`
+
+### Intentional differences
+- Rust registers producer binders through a dedicated server helper so the server can keep the same generic binder ownership plus a concrete `BufferQueueProducer` view.
+
+### Unintentional differences (to fix)
+- None in this slice.
+
+### Missing items
+- No new missing items identified in this registration slice.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/service/nvdrv/nvdrv.rs` vs `src/core/hle/service/nvdrv/nvdrv.cpp`
+
+### Intentional differences
+- Rust keeps typed fd maps for selected device subclasses (`NvHostGpu`, `NvDispDisp0`, `NvMapDevice`) next to the upstream-generic `open_files` map. This is a bounded adaptation to preserve typed accessors without raw `Arc` reconstruction.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Module::get_nvmap_device(...)` no longer reinterprets `Arc<dyn NvDevice>` as `Arc<NvMapDevice>` through `Arc::into_raw`/`Arc::from_raw`.
+
+### Missing items
+- No new missing items identified in this typed-device lookup slice.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/kernel/k_hardware_timer.rs` vs `src/core/hle/kernel/k_hardware_timer.cpp`
+
+### Intentional differences
+- Rust still wraps timer state in `Mutex<KHardwareTimerState>` and keeps a weak thread-owner lookup map because upstream stores intrusive `KTimerTask*` directly inside the thread object. This is the current Rust adaptation for shared ownership.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Rust-only fallback no longer stores long-lived raw `KThread*` integers in `thread_ptrs`. It now stores `Weak<Mutex<KThread>>`, eliminating timer delivery through stale raw pointers.
+
+### Missing items
+- Full upstream intrusive `KTimerTask` ownership parity is still missing; Rust still routes timer tasks through thread IDs and weak owners.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/kernel/k_scoped_scheduler_lock_and_sleep.rs` vs `src/core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h`
+
+### Intentional differences
+- Rust passes a weak self-owner into the timer registration path instead of a raw `KThread*`. This preserves the same file/method ownership while avoiding a Rust-only stale-pointer hazard.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KScopedSchedulerLockAndSleep` no longer forwards a raw `usize` thread pointer to the hardware timer.
+
+### Missing items
+- No new missing items identified in this scoped-sleep slice.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/kernel/k_thread.rs` vs `src/core/hle/kernel/k_thread.cpp`
+
+### Intentional differences
+- Rust sleep/wait helpers still thread a `Weak<Mutex<KThread>>` self-owner through timer registration because there is no intrusive `KTimerTask` subobject in the Rust struct layout.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KThread::sleep()` no longer passes a raw thread pointer through `KScopedSchedulerLockAndSleep`.
+
+### Missing items
+- Full intrusive timer-task parity remains incomplete in Rust.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/kernel/k_condition_variable.rs` vs `src/core/hle/kernel/k_condition_variable.cpp`
+
+### Intentional differences
+- Rust condition-variable waits still route timer ownership through the thread's weak self-reference rather than an intrusive `KTimerTask*`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: both scoped-sleep wait paths no longer pass a raw thread pointer into the hardware timer.
+
+### Missing items
+- Remaining structural differences in the condition-variable waiter tree and wait queue layout are tracked in earlier entries.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/kernel/k_synchronization_object.rs` vs `src/core/hle/kernel/k_synchronization_object.cpp`
+
+### Intentional differences
+- Rust wait-sleep bridging uses the thread's weak self-owner instead of a raw `KThread*` when arming the hardware timer.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KSynchronizationObject::wait()` no longer passes a raw thread pointer into `KScopedSchedulerLockAndSleep`.
+
+### Missing items
+- No new missing items identified in this synchronization wait slice.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/kernel/svc/svc_ipc.rs` vs `src/core/hle/kernel/svc/svc_ipc.cpp`
+
+### Intentional differences
+- Rust still dispatches HLE service requests without the full upstream `KClientSession`/`KServerSession` kernel transport path. The current adaptation keeps the logic in `svc_ipc.rs` but routes the message address explicitly into `HLERequestContext`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `SendSyncRequestWithUserBuffer` no longer locks the caller-provided message buffer and then dispatches on the caller TLS buffer anyway. It now dispatches on `message`, matching upstream `SendSyncRequestImpl(kernel, message, buffer_size, session_handle)`.
+
+### Missing items
+- Full kernel-owned `KClientSession::SendSyncRequest(message, buffer_size)` transport parity is still incomplete; Rust still performs direct HLE dispatch in `svc_ipc.rs`.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/kernel/svc_dispatch.rs` vs `src/core/hle/kernel/svc.cpp`
+
+### Intentional differences
+- Rust keeps the SVC wrapper switch inside `svc_dispatch.rs` instead of generated wrapper functions in `svc.cpp`. This is the standing Rust dispatcher adaptation for the SVC table.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `SvcId::SendSyncRequestWithUserBuffer` is no longer a stub-success path. It now forwards the real `(message_buffer, message_buffer_size, session_handle)` tuple to `svc_ipc::send_sync_request_with_user_buffer(...)`, matching the upstream wrapper argument order.
+- Fixed in this pass: `SvcId::SendAsyncRequestWithUserBuffer`, `SvcId::ReplyAndReceive`, and `SvcId::ReplyAndReceiveWithUserBuffer` no longer return unconditional stub success in the dispatcher. They now forward to the existing `svc_ipc.rs` owners with upstream wrapper argument order.
+
+### Missing items
+- `ReplyAndReceiveLight` still remains stubbed in this dispatcher and needs a separate parity pass.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-06 — `core/src/hle/service/hle_ipc.rs` vs `src/core/hle/service/hle_ipc.cpp`
+
+### Intentional differences
+- Rust still parses from its local `cmd_buf` array rather than directly from a `u32*` source pointer, because the command buffer is stored as a fixed Rust array on the context.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `populate_from_incoming_command_buffer(...)` now honors an explicit source command buffer when provided, instead of always re-reading guest memory through `tls_address` whenever a `Memory` owner exists.
+
+### Missing items
+- Full upstream `KServerSession` ownership of HLE request creation is still incomplete in Rust; some HLE contexts are still created from higher-level service glue.
+
+### Binary layout verification
+- PASS: the command-buffer layout itself is unchanged; this slice only changes source selection.

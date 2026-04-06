@@ -323,7 +323,7 @@ pub fn complete_sync_request(
 /// Corresponds to upstream `HLERequestContext`.
 ///
 /// Upstream stores `KThread* thread`, `Core::Memory::Memory& memory`, `KernelCore& kernel`,
-/// and `KServerSession* server_session`. We store the thread, shared memory, and TLS address
+/// and `KServerSession* server_session`. We store the thread, memory, and TLS address
 /// to match the upstream access pattern (thread→process→handle_table, memory write-back).
 pub struct HLERequestContext {
     /// IPC command buffer.
@@ -331,11 +331,7 @@ pub struct HLERequestContext {
 
     /// The requesting thread. Matches upstream `KThread* thread`.
     thread: Option<Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>>,
-    /// Guest memory (legacy flat buffer, used as fallback when Memory bridge is not available).
-    shared_memory: Option<crate::hle::kernel::k_process::SharedProcessMemory>,
     /// Guest memory bridge. Matches upstream `Core::Memory::Memory& memory`.
-    /// When present, this is the authoritative path for TLS reads/writes,
-    /// matching upstream `memory.GetPointer(tls_address)`.
     memory: Option<Arc<std::sync::Mutex<crate::memory::memory::Memory>>>,
     /// TLS address for command buffer read/write.
     /// Upstream derives this from `thread->GetTlsAddress()`.
@@ -377,21 +373,16 @@ pub struct HLERequestContext {
 }
 
 impl HLERequestContext {
-    fn owner_process_context(
+    fn owner_process_memory(
         thread: &Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>,
-    ) -> Option<(
-        Arc<std::sync::Mutex<crate::memory::memory::Memory>>,
-        crate::hle::kernel::k_process::SharedProcessMemory,
-    )> {
+    ) -> Option<Arc<std::sync::Mutex<crate::memory::memory::Memory>>> {
         let parent = {
             let thread_guard = thread.lock().unwrap();
             thread_guard.parent.as_ref()?.clone()
         }
         .upgrade()?;
         let process = parent.lock().unwrap();
-        let memory = process.page_table.get_base().m_memory.clone()?;
-        let shared_memory = process.get_shared_memory();
-        Some((memory, shared_memory))
+        process.page_table.get_base().m_memory.clone()
     }
 
     /// Create a context with thread/memory access, matching upstream constructor.
@@ -399,14 +390,13 @@ impl HLERequestContext {
     /// Upstream: `HLERequestContext(KernelCore&, Memory&, KServerSession*, KThread*)`
     pub fn new_with_thread(
         thread: Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>,
-        shared_memory: crate::hle::kernel::k_process::SharedProcessMemory,
         tls_address: u64,
     ) -> Self {
-        let mut ctx = Self {
+        let memory = Self::owner_process_memory(&thread);
+        Self {
             cmd_buf: [0u32; ipc::COMMAND_BUFFER_LENGTH],
             thread: Some(thread),
-            shared_memory: Some(shared_memory),
-            memory: None,
+            memory,
             tls_address,
             command_header: None,
             handle_descriptor_header: None,
@@ -432,15 +422,7 @@ impl HLERequestContext {
             service_manager: None,
             is_deferred: false,
             last_created_server_session: None,
-        };
-        if let Some(ref thread) = ctx.thread {
-            if let Some((memory, shared_memory)) = Self::owner_process_context(thread) {
-                ctx.memory = Some(memory);
-                ctx.shared_memory = Some(shared_memory);
-            }
         }
-        ctx.cmd_buf[0] = 0;
-        ctx
     }
 
     /// Create a context without thread/memory (for tests or contexts where
@@ -449,7 +431,6 @@ impl HLERequestContext {
         Self {
             cmd_buf: [0u32; ipc::COMMAND_BUFFER_LENGTH],
             thread: None,
-            shared_memory: None,
             memory: None,
             tls_address: 0,
             command_header: None,
@@ -491,11 +472,6 @@ impl HLERequestContext {
         &self,
     ) -> Option<Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>> {
         self.thread.clone()
-    }
-
-    /// Returns the requesting process shared memory backing.
-    pub fn get_shared_memory(&self) -> Option<crate::hle::kernel::k_process::SharedProcessMemory> {
-        self.shared_memory.clone()
     }
 
     /// Returns a mutable pointer to the IPC command buffer.
@@ -856,9 +832,7 @@ impl HLERequestContext {
     // hle_ipc.cpp lines 317-506).
     //
     // Upstream uses `Core::Memory::Memory& memory` (page-table-aware) to
-    // read/write guest buffers. Ruzu uses the same `Memory` bridge when
-    // available, falling back to `shared_memory` (ProcessMemoryData) for
-    // test paths.
+    // read/write guest buffers. Ruzu uses the same `Memory` bridge.
     //
     // Upstream `ReadBuffer` returns `std::span<const u8>` (zero-copy).
     // We return `Vec<u8>` (copy) because the Memory bridge is behind a Mutex.
@@ -981,59 +955,18 @@ impl HLERequestContext {
     }
 
     /// Read `size` bytes from guest virtual address.
-    ///
-    /// In upstream, the HLE IPC path reads through a single coherent guest-memory
-    /// owner (`Core::Memory::Memory`). Rust still carries both the `Memory`
-    /// bridge and `SharedProcessMemory`; keep `Memory` as the primary owner
-    /// here too, and only fall back to `SharedProcessMemory` when the bridge
-    /// cannot satisfy the read. TLS command-buffer reads already use
-    /// `Memory` first in `populate_from_incoming_command_buffer()`.
+    /// Matches upstream `memory.ReadBlock(address, buffer, size)`.
     fn read_guest_memory(&self, address: u64, size: usize) -> Vec<u8> {
         if size == 0 || address == 0 {
             return Vec::new();
         }
         let mut buf = vec![0u8; size];
         if let Some(ref memory) = self.memory {
-            let ok = memory.lock().unwrap().read_block(address, &mut buf);
-            if ok {
-                return buf;
-            }
-
-            if let Some(ref shared_memory) = self.shared_memory {
-                return shared_memory.read().unwrap().read_bytes(address, size);
-            }
-
-            if let Some(ref thread) = self.thread {
-                let parent = {
-                    let thread_guard = thread.lock().unwrap();
-                    thread_guard.parent.as_ref().and_then(|weak| weak.upgrade())
-                };
-                if let Some(parent) = parent {
-                    let process = parent.lock().unwrap();
-                    let query = process.page_table.query_info(address as usize);
-                    log::info!(
-                        "read_guest_memory fail: addr={:#x} size={:#x} tls={:#x} query={:?}",
-                        address,
-                        size,
-                        self.tls_address,
-                        query.map(|info| (
-                            info.get_address(),
-                            info.get_size(),
-                            info.get_state(),
-                            info.get_permission(),
-                            info.get_attribute()
-                        ))
-                    );
-                }
-            }
+            memory.lock().unwrap().read_block(address, &mut buf);
+            return buf;
         }
-
-        if let Some(ref shared_memory) = self.shared_memory {
-            return shared_memory.read().unwrap().read_bytes(address, size);
-        }
-
         log::error!(
-            "read_guest_memory: no memory accessor available for addr={:#x} size={:#x}",
+            "read_guest_memory: no Memory available for addr={:#x} size={:#x}",
             address,
             size
         );
@@ -1041,18 +974,16 @@ impl HLERequestContext {
     }
 
     /// Write bytes to guest virtual address.
+    /// Matches upstream `memory.WriteBlock(address, buffer, size)`.
     fn write_guest_memory(&self, address: u64, data: &[u8]) {
         if data.is_empty() || address == 0 {
             return;
         }
-        if let Some(ref shared_memory) = self.shared_memory {
-            shared_memory.write().unwrap().write_block(address, data);
-        }
         if let Some(ref memory) = self.memory {
             memory.lock().unwrap().write_block(address, data);
-        } else if self.shared_memory.is_none() {
+        } else {
             log::error!(
-                "write_guest_memory: no memory accessor available for addr={:#x} size={:#x}",
+                "write_guest_memory: no Memory available for addr={:#x} size={:#x}",
                 address,
                 data.len()
             );
@@ -1066,15 +997,16 @@ impl HLERequestContext {
     /// reads directly from guest memory. Falls back to the provided buffer
     /// if no memory is available (test path).
     pub fn populate_from_incoming_command_buffer(&mut self, src_cmdbuf: &[u32]) {
-        if let Some(ref memory) = self.memory {
+        if !src_cmdbuf.is_empty() {
+            let len = src_cmdbuf.len().min(ipc::COMMAND_BUFFER_LENGTH);
+            self.cmd_buf[..len].copy_from_slice(&src_cmdbuf[..len]);
+            if len < ipc::COMMAND_BUFFER_LENGTH {
+                self.cmd_buf[len..].fill(0);
+            }
+        } else if let Some(ref memory) = self.memory {
             let m = memory.lock().unwrap();
             for i in 0..ipc::COMMAND_BUFFER_LENGTH {
                 self.cmd_buf[i] = m.read_32(self.tls_address + (i as u64 * 4));
-            }
-        } else if let Some(ref mem) = self.shared_memory {
-            let mem = mem.read().unwrap();
-            for i in 0..ipc::COMMAND_BUFFER_LENGTH {
-                self.cmd_buf[i] = mem.read_32(self.tls_address + (i as u64 * 4));
             }
         } else {
             // Test/fallback path: copy from provided buffer.
@@ -1380,11 +1312,6 @@ impl HLERequestContext {
             for i in 0..write_words {
                 m.write_32(self.tls_address + (i as u64 * 4), self.cmd_buf[i]);
             }
-        } else if let Some(ref mem) = self.shared_memory {
-            let mut mem = mem.write().unwrap();
-            for i in 0..write_words {
-                mem.write_32(self.tls_address + (i as u64 * 4), self.cmd_buf[i]);
-            }
         }
 
         RESULT_SUCCESS
@@ -1450,20 +1377,16 @@ mod tests {
         let thread = Arc::new(Mutex::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
-        let shared_memory = process.lock().unwrap().get_shared_memory();
         let tls_address = 0x2000;
-        {
-            let mut mem = shared_memory.write().unwrap();
-            mem.allocate(0x2000, 0x1000);
-            mem.write_32(tls_address, ipc::CommandType::Request as u32);
-            mem.write_32(tls_address + 4, 1u32 << 31);
-            mem.write_32(tls_address + 8, 1);
-            mem.write_32(tls_address + 12, 0);
-            mem.write_32(tls_address + 16, 0);
-        }
-
-        let mut ctx = HLERequestContext::new_with_thread(thread, shared_memory, tls_address);
-        ctx.populate_from_incoming_command_buffer(&[]);
+        let mut ctx = HLERequestContext::new_with_thread(thread, tls_address);
+        // No Memory bridge in this test — use the cmdbuf fallback path.
+        ctx.populate_from_incoming_command_buffer(&[
+            ipc::CommandType::Request as u32,
+            1u32 << 31, // has_special_header
+            1,          // send_pid = true
+            0,
+            0,
+        ]);
 
         assert_eq!(ctx.get_pid(), 0x51);
     }
@@ -1482,43 +1405,14 @@ mod tests {
         let thread = Arc::new(Mutex::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
-        let shared_memory = process.lock().unwrap().get_shared_memory();
-        let ctx = HLERequestContext::new_with_thread(thread, shared_memory, 0x2000);
+        let ctx = HLERequestContext::new_with_thread(thread, 0x2000);
 
         assert!(ctx.memory.is_some());
         assert!(Arc::ptr_eq(ctx.memory.as_ref().unwrap(), &memory));
     }
 
     #[test]
-    fn new_with_thread_uses_owner_process_shared_memory() {
-        let owner_process = Arc::new(Mutex::new(KProcess::new()));
-        let foreign_process = Arc::new(Mutex::new(KProcess::new()));
-
-        {
-            let owner_guard = owner_process.lock().unwrap();
-            let mut owner_mem = owner_guard.process_memory.write().unwrap();
-            owner_mem.allocate(0x2000, 0x1000);
-            owner_mem.write_8(0x2000, 0x41);
-        }
-        {
-            let foreign_guard = foreign_process.lock().unwrap();
-            let mut foreign_mem = foreign_guard.process_memory.write().unwrap();
-            foreign_mem.allocate(0x2000, 0x1000);
-            foreign_mem.write_8(0x2000, 0x7a);
-        }
-
-        let thread = Arc::new(Mutex::new(KThread::new()));
-        thread.lock().unwrap().parent = Some(Arc::downgrade(&owner_process));
-
-        let foreign_shared_memory = foreign_process.lock().unwrap().get_shared_memory();
-        let ctx = HLERequestContext::new_with_thread(thread, foreign_shared_memory, 0x2000);
-
-        let shared_memory = ctx.shared_memory.expect("owner shared memory must be installed");
-        assert_eq!(shared_memory.read().unwrap().read_8(0x2000), 0x41);
-    }
-
-    #[test]
-    fn read_guest_memory_prefers_memory_then_falls_back_to_shared_process_memory() {
+    fn read_guest_memory_uses_memory_bridge() {
         let device_memory = Box::new(DeviceMemory::new());
         let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
         let memory = Arc::new(Mutex::new(unsafe {
@@ -1528,49 +1422,34 @@ mod tests {
         let process = Arc::new(Mutex::new(KProcess::new()));
         process.lock().unwrap().page_table.set_memory(memory.clone());
 
-        {
-            let process_guard = process.lock().unwrap();
-            let mut process_memory = process_guard.process_memory.write().unwrap();
-            process_memory.allocate(0x3000, 0x1000);
-            process_memory.write_8(0x3000, 0x41);
-        }
-
         memory.lock().unwrap().write_8(0x3000, 0x7a);
 
         let thread = Arc::new(Mutex::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
-        let shared_memory = process.lock().unwrap().get_shared_memory();
-        let ctx = HLERequestContext::new_with_thread(thread, shared_memory, 0x2000);
+        let ctx = HLERequestContext::new_with_thread(thread, 0x2000);
 
         assert_eq!(ctx.read_guest_memory(0x3000, 1), vec![0x7a]);
-
-        {
-            let process_guard = process.lock().unwrap();
-            let mut process_memory = process_guard.process_memory.write().unwrap();
-            process_memory.allocate(0x4000, 0x1000);
-            process_memory.write_8(0x4000, 0x42);
-        }
-
-        assert_eq!(ctx.read_guest_memory(0x4000, 1), vec![0x42]);
     }
 
     #[test]
     fn write_to_outgoing_command_buffer_only_writes_write_size_words() {
+        let device_memory = Box::new(DeviceMemory::new());
+        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
+        let memory = Arc::new(Mutex::new(unsafe {
+            Memory::new(SystemRef::null(), device_memory.as_ref() as *const _, buffer_ptr)
+        }));
+
         let process = Arc::new(Mutex::new(KProcess::new()));
+        process.lock().unwrap().page_table.set_memory(memory.clone());
+
+        let tls_address = 0x3000u64;
+        memory.lock().unwrap().write_32(tls_address + 16, 0xdead_beef);
+
         let thread = Arc::new(Mutex::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
-        let shared_memory = process.lock().unwrap().get_shared_memory();
-        let tls_address = 0x3000;
-        {
-            let mut mem = shared_memory.write().unwrap();
-            mem.allocate(tls_address, 0x1000);
-            mem.write_32(tls_address + 16, 0xdead_beef);
-        }
-
-        let mut ctx =
-            HLERequestContext::new_with_thread(thread, shared_memory.clone(), tls_address);
+        let mut ctx = HLERequestContext::new_with_thread(thread, tls_address);
         ctx.write_size = 4;
         ctx.cmd_buf[0] = 0x1111_1111;
         ctx.cmd_buf[1] = 0x2222_2222;
@@ -1580,12 +1459,12 @@ mod tests {
 
         assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
 
-        let mem = shared_memory.read().unwrap();
-        assert_eq!(mem.read_32(tls_address), 0x1111_1111);
-        assert_eq!(mem.read_32(tls_address + 4), 0x2222_2222);
-        assert_eq!(mem.read_32(tls_address + 8), 0x3333_3333);
-        assert_eq!(mem.read_32(tls_address + 12), 0x4444_4444);
-        assert_eq!(mem.read_32(tls_address + 16), 0xdead_beef);
+        let m = memory.lock().unwrap();
+        assert_eq!(m.read_32(tls_address), 0x1111_1111);
+        assert_eq!(m.read_32(tls_address + 4), 0x2222_2222);
+        assert_eq!(m.read_32(tls_address + 8), 0x3333_3333);
+        assert_eq!(m.read_32(tls_address + 12), 0x4444_4444);
+        assert_eq!(m.read_32(tls_address + 16), 0xdead_beef);
     }
 
     #[test]
