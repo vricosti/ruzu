@@ -45,6 +45,16 @@ std::thread_local! {
 static KERNEL_PTR: std::sync::atomic::AtomicPtr<KernelCore> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
+/// Deferred `KThread::SetActiveCore()` updates that could not be applied
+/// immediately because the target thread mutex was still held.
+///
+/// Upstream applies active-core migration while still under the scheduler lock.
+/// Rust cannot safely block on a `Mutex<KThread>` there, so preserve the
+/// migration request here and retry it from later scheduler callbacks until it
+/// succeeds. Dropping the migration outright leaves a runnable thread tagged to
+/// the wrong core and can strand all guest cores in idle.
+static PENDING_ACTIVE_CORE_UPDATES: Mutex<Vec<(u64, i32)>> = Mutex::new(Vec::new());
+
 /// Public accessor for KERNEL_PTR — used by GSC to interrupt cores on thread state changes.
 pub fn get_kernel_ref() -> Option<&'static KernelCore> {
     let ptr = KERNEL_PTR.load(Ordering::Acquire);
@@ -65,6 +75,8 @@ static SCHEDULER_CALLBACKS: super::k_scheduler_lock::SchedulerCallbacks =
     };
 
 fn real_disable_scheduling() {
+    apply_pending_active_core_updates();
+
     if let Some(current_thread) = get_current_emu_thread() {
         let mut thread = current_thread.lock().unwrap();
         debug_assert!(thread.get_disable_dispatch_count() >= 0);
@@ -73,6 +85,8 @@ fn real_disable_scheduling() {
 }
 
 fn real_enable_scheduling(cores_needing_scheduling: u64) {
+    apply_pending_active_core_updates();
+
     let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
     if kernel_ptr.is_null() {
         return;
@@ -149,34 +163,75 @@ fn real_update_highest_priority_threads() -> u64 {
         // GSC lock released here.
     }
 
-    // Apply deferred migration core_id updates (outside GSC lock to avoid deadlock).
-    // Upstream: SetActiveCore is called inside UpdateHighestPriorityThreadsImpl under
-    // the scheduler lock. We defer it because our lock ordering is thread→GSC.
     if !migrations.is_empty() {
-        let gsc = gsc_arc.lock().unwrap();
-        for (thread_id, new_core) in migrations {
-            let Some(thread) = gsc.get_thread_by_thread_id(thread_id) else {
-                continue;
-            };
+        enqueue_pending_active_core_updates(migrations);
+    }
 
-            // Unlike upstream raw-pointer ownership, Rust may still hold the
-            // thread mutex while `KThread::run()` unwinds out of `StartThread`.
-            // Applying deferred migration with a blocking lock here can deadlock
-            // the scheduler-lock unlock path. Keep the update opportunistic.
-            let try_lock_result = thread.try_lock();
-            if let Ok(mut thread_guard) = try_lock_result {
-                thread_guard.set_active_core(new_core);
-            } else {
-                log::trace!(
-                    "real_update_highest_priority_threads: deferred active_core update tid={} new_core={}",
-                    thread_id,
-                    new_core
-                );
-            }
+    apply_pending_active_core_updates();
+
+    cores_needing_scheduling
+}
+
+fn enqueue_pending_active_core_updates(migrations: Vec<(u64, i32)>) {
+    let mut pending = PENDING_ACTIVE_CORE_UPDATES.lock().unwrap();
+    for (thread_id, new_core) in migrations {
+        if let Some(existing) = pending.iter_mut().find(|(pending_tid, _)| *pending_tid == thread_id)
+        {
+            existing.1 = new_core;
+        } else {
+            pending.push((thread_id, new_core));
+        }
+    }
+}
+
+fn apply_pending_active_core_updates() {
+    let kernel_ptr = KERNEL_PTR.load(Ordering::Acquire);
+    if kernel_ptr.is_null() {
+        return;
+    }
+    let kernel = unsafe { &*kernel_ptr };
+    let Some(gsc_arc) = kernel.global_scheduler_context() else {
+        return;
+    };
+
+    let pending_work = {
+        let mut pending = PENDING_ACTIVE_CORE_UPDATES.lock().unwrap();
+        if pending.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *pending)
+    };
+
+    let gsc = gsc_arc.lock().unwrap();
+    let mut still_pending = Vec::new();
+
+    for (thread_id, new_core) in pending_work {
+        let Some(thread) = gsc.get_thread_by_thread_id(thread_id) else {
+            continue;
+        };
+
+        let try_lock_result = thread.try_lock();
+        if let Ok(mut thread_guard) = try_lock_result {
+            thread_guard.set_active_core(new_core);
+        } else {
+            still_pending.push((thread_id, new_core));
         }
     }
 
-    cores_needing_scheduling
+    drop(gsc);
+
+    if !still_pending.is_empty() {
+        let mut pending = PENDING_ACTIVE_CORE_UPDATES.lock().unwrap();
+        for (thread_id, new_core) in still_pending {
+            if let Some(existing) =
+                pending.iter_mut().find(|(pending_tid, _)| *pending_tid == thread_id)
+            {
+                existing.1 = new_core;
+            } else {
+                pending.push((thread_id, new_core));
+            }
+        }
+    }
 }
 
 // Thread-local current thread pointer.
@@ -554,12 +609,8 @@ impl KernelCore {
 
         // Create the service thread.
         let thread = Arc::new(Mutex::new(super::k_thread::KThread::new()));
-        let (thread_id, object_id) = {
-            static NEXT_SERVICE_THREAD_ID: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0x8000_0000);
-            let id = NEXT_SERVICE_THREAD_ID.fetch_add(1, Ordering::Relaxed);
-            (id, id)
-        };
+        let thread_id = self.create_new_thread_id();
+        let object_id = self.create_new_object_id() as u64;
 
         // Give the process a scheduler reference for the target core.
         // Upstream: service threads run on core 3, so use core 3's scheduler.
@@ -851,6 +902,45 @@ impl KernelCore {
         }
 
         self.interrupt_all_cores();
+    }
+
+    /// Rust helper for owner lookups that upstream performs through the kernel
+    /// process list. Returns the frontend application process or a guest
+    /// service process with the matching process id.
+    pub fn get_process_by_id(&self, process_id: u64) -> Option<Arc<Mutex<KProcess>>> {
+        if let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() {
+            if process.lock().unwrap().get_process_id() == process_id {
+                return Some(process);
+            }
+        }
+
+        self.service_processes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|process| process.lock().unwrap().get_process_id() == process_id)
+            .cloned()
+    }
+
+    /// Rust helper for event owner lookup via the kernel process list.
+    pub fn get_event_owner_process_id(&self, event_object_id: u64) -> Option<u64> {
+        if let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() {
+            let process_guard = process.lock().unwrap();
+            if process_guard.get_event_by_object_id(event_object_id).is_some() {
+                return Some(process_guard.get_process_id());
+            }
+        }
+
+        self.service_processes
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|process| {
+                let process_guard = process.lock().unwrap();
+                process_guard
+                    .get_event_by_object_id(event_object_id)
+                    .map(|_| process_guard.get_process_id())
+            })
     }
 
     /// Get the global scheduler context (Arc reference).

@@ -32,7 +32,7 @@ use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAG
 use super::k_typed_address::KProcessAddress;
 use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
 use super::svc_common::Handle;
-use super::svc_types::{CreateProcessFlag, ADDRESS_SPACE_MASK};
+use super::svc_types::{CreateProcessFlag, ProcessActivity, ADDRESS_SPACE_MASK};
 use crate::file_sys::program_metadata::{PoolPartition, ProgramAddressSpaceType, ProgramMetadata};
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results;
@@ -887,6 +887,63 @@ impl KProcess {
 
     pub fn set_suspended(&mut self, suspended: bool) {
         self.is_suspended = suspended;
+    }
+
+    fn lock_scheduler_for_process(
+        &self,
+    ) -> Option<super::k_scheduler_lock::KScopedSchedulerLock<'static>> {
+        let scheduler_lock = {
+            let gsc = self.global_scheduler_context.as_ref()?.lock().unwrap();
+            std::ptr::addr_of!(*gsc.scheduler_lock())
+                as *const super::k_scheduler_lock::KAbstractSchedulerLock
+        };
+
+        if scheduler_lock.is_null() {
+            return None;
+        }
+
+        Some(super::k_scheduler_lock::KScopedSchedulerLock::new(unsafe {
+            &*scheduler_lock
+        }))
+    }
+
+    /// Matches upstream `KProcess::SetActivity()`.
+    pub fn set_activity(&mut self, activity: ProcessActivity) -> u32 {
+        let _scheduler_guard = self.lock_scheduler_for_process();
+
+        if self.state == ProcessState::Terminating || self.state == ProcessState::Terminated {
+            return RESULT_INVALID_STATE.get_inner_value();
+        }
+
+        let threads: Vec<Arc<Mutex<KThread>>> = self
+            .thread_list
+            .iter()
+            .filter_map(|id| self.thread_objects.get(id).cloned())
+            .collect();
+
+        if activity == ProcessActivity::Paused {
+            if self.is_suspended {
+                return RESULT_INVALID_STATE.get_inner_value();
+            }
+
+            for thread in threads {
+                thread.lock().unwrap().request_suspend(super::k_thread::SuspendType::Process);
+            }
+
+            self.set_suspended(true);
+        } else {
+            if !self.is_suspended {
+                return RESULT_INVALID_STATE.get_inner_value();
+            }
+
+            for thread in threads {
+                thread.lock().unwrap().resume(super::k_thread::SuspendType::Process);
+            }
+
+            self.set_suspended(false);
+        }
+
+        RESULT_SUCCESS.get_inner_value()
     }
 
     pub fn is_terminated(&self) -> bool {
@@ -2977,6 +3034,54 @@ mod tests {
             .and_then(Weak::upgrade)
             .is_some());
         assert!(guard.process_schedule_count.is_some());
+    }
+
+    #[test]
+    fn set_activity_pauses_and_resumes_registered_threads() {
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        scheduler.lock().unwrap().global_scheduler_context = Some(gsc.clone());
+
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.attach_scheduler(&scheduler);
+            process_guard.state = ProcessState::Running;
+        }
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = 9;
+            guard.object_id = 99;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
+        }
+
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(thread.clone());
+
+        assert_eq!(
+            process.lock().unwrap().set_activity(ProcessActivity::Paused),
+            RESULT_SUCCESS.get_inner_value()
+        );
+        assert!(process.lock().unwrap().is_suspended());
+        assert!(thread
+            .lock()
+            .unwrap()
+            .is_suspend_requested_type(super::super::k_thread::SuspendType::Process));
+
+        assert_eq!(
+            process.lock().unwrap().set_activity(ProcessActivity::Runnable),
+            RESULT_SUCCESS.get_inner_value()
+        );
+        assert!(!process.lock().unwrap().is_suspended());
+        assert!(!thread
+            .lock()
+            .unwrap()
+            .is_suspend_requested_type(super::super::k_thread::SuspendType::Process));
     }
 
     #[test]

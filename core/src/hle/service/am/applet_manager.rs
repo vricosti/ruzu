@@ -405,12 +405,11 @@ impl AppletManager {
         drop(inner);
 
         // Build the applet. Upstream: `auto applet = std::make_shared<Applet>(m_system, process, ...)`
-        let mut applet = Applet::new(self.system, params.applet_id == AppletId::Application);
-        applet.process = Process::with_process(process.clone());
-        applet.hid_registration =
-            super::hid_registration::HidRegistration::new(self.system, &applet.process);
-        applet.aruid.pid = process.lock().unwrap().get_process_id();
-        applet.program_id = params.program_id;
+        let mut applet = Applet::new(
+            self.system,
+            Process::with_process(process.clone()),
+            params.applet_id == AppletId::Application,
+        );
         applet.applet_id = params.applet_id;
         applet.applet_type = params.applet_type;
         applet.previous_program_index = params.previous_program_index;
