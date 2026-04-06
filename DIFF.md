@@ -6932,3 +6932,22 @@
 
 ### Binary layout verification
 - PASS: no raw serialized struct layout involved in this slice.
+
+## 2026-04-07 — `core/src/hle/kernel/k_page_table_base.rs` vs `src/core/hle/kernel/k_page_table_base.cpp`
+
+### Intentional differences
+- Rust still lacks the full upstream `KMemoryManager::AllocateAndOpen(...)`/`KPageGroup` ownership in several simplified allocation paths, so fresh-page clearing is expressed through a local helper on `KPageTableBase` instead of iterating a real page group at every call site.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: Rust no longer clears memory in the generic `OperationType::Map` path, which was broader than upstream `ClearBackingRegion(...)` and risked zeroing non-fresh mappings.
+- Fixed in this pass: fresh-page clearing is now restricted to the simplified Rust equivalents of the upstream allocation call sites:
+  - heap growth in `set_heap_size()`
+  - insecure memory allocation in `map_insecure_memory()`
+  - fresh page allocation in `map_pages_find_free(..., is_pa_valid = false)`
+  - fresh page allocation in `map_pages_at_address()`
+
+### Missing items
+- Full literal parity with upstream `AllocateAndOpen(...)` + `KPageGroup` iteration is still incomplete in the simplified Rust allocation paths.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved in this slice.
