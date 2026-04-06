@@ -24,6 +24,7 @@ use common::ResultCode;
 use parking_lot::{Condvar, Mutex};
 use ruzu_core::hle::kernel::k_event::KEvent;
 use ruzu_core::hle::kernel::k_process::KProcess;
+use ruzu_core::hle::kernel::k_readable_event::KReadableEvent;
 use ruzu_core::hle::kernel::k_transfer_memory::KTransferMemory;
 use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
@@ -75,6 +76,12 @@ pub struct System {
     audio_renderer: AudioRendererHandle,
     initialized: bool,
     rendered_event: Arc<StdMutex<KEvent>>,
+    /// Direct reference to the readable end of the rendered event.
+    rendered_readable_event: Option<Arc<StdMutex<KReadableEvent>>>,
+    /// Process Arc for safe signal_rendered_event access. The raw process_ptr
+    /// bypasses Mutex synchronization, causing data races when the audio thread
+    /// reads waiter state that the game thread writes under Mutex protection.
+    process_arc: Option<Arc<StdMutex<KProcess>>>,
     terminate_event: Arc<TerminateEvent>,
     behavior: BehaviorInfo,
     voice_context: VoiceContext,
@@ -132,6 +139,8 @@ impl System {
             audio_renderer,
             initialized: false,
             rendered_event,
+            rendered_readable_event: None,
+            process_arc: None,
             terminate_event: Arc::new(TerminateEvent::new()),
             behavior: BehaviorInfo::new(),
             voice_context: VoiceContext::new(),
@@ -205,11 +214,33 @@ impl System {
             return;
         }
 
+        // Use the process Arc for thread-safe access. The raw process_ptr
+        // bypasses Mutex synchronization, causing data races when the audio
+        // thread traverses the waiter list that the game thread modifies
+        // under Mutex protection.
+        if let (Some(ref readable_event), Some(ref process_arc)) =
+            (&self.rendered_readable_event, &self.process_arc)
+        {
+            let mut process = process_arc.lock().unwrap();
+            let Some(scheduler) = process
+                .scheduler
+                .as_ref()
+                .and_then(|s| s.upgrade())
+            else {
+                return;
+            };
+            readable_event
+                .lock()
+                .unwrap()
+                .signal(&mut process, &scheduler);
+            return;
+        }
+
+        // Fallback: signal through KEvent with raw process pointer.
         let process_ptr = self.process.as_ptr() as *mut KProcess;
         if process_ptr.is_null() {
             return;
         }
-
         unsafe {
             let process = &mut *process_ptr;
             let Some(scheduler) = process
@@ -952,6 +983,14 @@ impl System {
 
     pub fn set_process(&mut self, process: *mut KProcess) {
         self.process = ProcessHandle::from_ptr(process as *mut ());
+    }
+
+    pub fn set_rendered_readable_event(&mut self, event: Arc<StdMutex<KReadableEvent>>) {
+        self.rendered_readable_event = Some(event);
+    }
+
+    pub fn set_process_arc(&mut self, process: Arc<StdMutex<KProcess>>) {
+        self.process_arc = Some(process);
     }
 
     pub fn get_process(&self) -> *mut KProcess {

@@ -136,6 +136,18 @@ pub trait AudioRendererSessionInterface: Send {
     fn get_rendering_time_limit(&self) -> u32;
     fn set_voice_drop_parameter(&self, voice_drop_parameter: f32);
     fn get_voice_drop_parameter(&self) -> f32;
+    /// Pass the readable event Arc so the audio thread can signal it directly.
+    fn set_rendered_readable_event(
+        &self,
+        _event: std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>,
+    ) {
+    }
+    /// Pass the process Arc for thread-safe waiter notification.
+    fn set_process_arc(
+        &self,
+        _process: std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_process::KProcess>>,
+    ) {
+    }
 }
 
 /// Minimal bridge from `core` to the concrete `audio_core` crate.
