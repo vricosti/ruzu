@@ -532,10 +532,13 @@ fn assign_bits(value: u32, field: u32, position: usize, bits: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device_memory::DeviceMemory;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::KThread;
     use crate::hle::result::ResultCode;
     use crate::hle::service::hle_ipc::{SessionRequestHandler, SessionRequestManager};
+    use crate::memory::memory::Memory;
+    use crate::core::SystemRef;
     use std::sync::{Arc, Mutex};
 
     struct TestHandler;
@@ -577,24 +580,29 @@ mod tests {
 
     #[test]
     fn push_ipc_interface_writes_move_handle_into_response() {
+        let device_memory = Box::new(DeviceMemory::new());
+        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
+        let memory = Arc::new(Mutex::new(unsafe {
+            Memory::new(SystemRef::null(), device_memory.as_ref() as *const _, buffer_ptr)
+        }));
+
         let process = Arc::new(Mutex::new(KProcess::new()));
-        assert_eq!(
-            process.lock().unwrap().ensure_handle_table_initialized(),
-            RESULT_SUCCESS.get_inner_value()
-        );
+        {
+            let mut process_guard = process.lock().unwrap();
+            assert_eq!(
+                process_guard.ensure_handle_table_initialized(),
+                RESULT_SUCCESS.get_inner_value()
+            );
+            process_guard.page_table.set_memory(memory.clone());
+        }
 
         let thread = Arc::new(Mutex::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
-        let shared_memory = process.lock().unwrap().get_shared_memory();
         let tls_address = 0x4000;
-        {
-            let mut mem = shared_memory.write().unwrap();
-            mem.allocate(tls_address, 0x1000);
-        }
 
         let mut ctx =
-            HLERequestContext::new_with_thread(thread, shared_memory.clone(), tls_address);
+            HLERequestContext::new_with_thread(thread, tls_address);
         let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
         ctx.set_session_request_manager(manager);
 
@@ -614,7 +622,7 @@ mod tests {
 
         assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
 
-        let mem = shared_memory.read().unwrap();
+        let mem = memory.lock().unwrap();
         let handle_word = mem.read_32(tls_address + 12);
         assert_eq!(handle_word, handle);
         assert!(process

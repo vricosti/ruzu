@@ -921,24 +921,72 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             }
         }
         Some(SvcId::SendSyncRequestWithUserBuffer) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let message_buffer = get_arg32(args, 0) as u64;
+            let message_buffer_size = get_arg32(args, 1) as u64;
+            let session_handle = get_arg32(args, 2);
+            let result = svc_ipc::send_sync_request_with_user_buffer(
+                system,
+                message_buffer,
+                message_buffer_size,
+                session_handle,
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SendAsyncRequestWithUserBuffer) => {
-            // OUT: ret=arg32[0], event_handle=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle(system));
+            let message_buffer = get_arg32(args, 0) as u64;
+            let message_buffer_size = get_arg32(args, 1) as u64;
+            let session_handle = get_arg32(args, 2);
+            let mut out_event_handle = 0;
+            let result = svc_ipc::send_async_request_with_user_buffer(
+                system,
+                &mut out_event_handle,
+                message_buffer,
+                message_buffer_size,
+                session_handle,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out_event_handle);
         }
         Some(SvcId::ReplyAndReceiveLight) => {
             set_arg32(args, 0, STUB_SUCCESS);
         }
         Some(SvcId::ReplyAndReceive) => {
-            // OUT: ret=arg32[0], index=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, 0);
+            let handles = get_arg32(args, 0) as u64;
+            let num_handles = get_arg32(args, 1) as i32;
+            let reply_target = get_arg32(args, 2);
+            let timeout_ns = ((get_arg32(args, 4) as u64) << 32 | get_arg32(args, 3) as u64) as i64;
+            let mut out_index = 0;
+            let result = svc_ipc::reply_and_receive(
+                system,
+                &mut out_index,
+                handles,
+                num_handles,
+                reply_target,
+                timeout_ns,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out_index as u32);
         }
         Some(SvcId::ReplyAndReceiveWithUserBuffer) => {
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, 0);
+            let message_buffer = get_arg32(args, 0) as u64;
+            let message_buffer_size = get_arg32(args, 1) as u64;
+            let handles = get_arg32(args, 2) as u64;
+            let num_handles = get_arg32(args, 3) as i32;
+            let reply_target = get_arg32(args, 4);
+            let timeout_ns = ((get_arg32(args, 6) as u64) << 32 | get_arg32(args, 5) as u64) as i64;
+            let mut out_index = 0;
+            let result = svc_ipc::reply_and_receive_with_user_buffer(
+                system,
+                &mut out_index,
+                message_buffer,
+                message_buffer_size,
+                handles,
+                num_handles,
+                reply_target,
+                timeout_ns,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out_index as u32);
         }
         Some(SvcId::CreateSession) => {
             // OUT: ret=arg32[0], server=arg32[1], client=arg32[2]

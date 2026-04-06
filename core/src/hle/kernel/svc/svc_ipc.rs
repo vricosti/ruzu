@@ -12,25 +12,17 @@ use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{complete_sync_request, HLERequestContext};
 
-/// Makes a blocking IPC call to a service.
-///
-/// Matches upstream `SendSyncRequest` → `SendSyncRequestImpl`:
-/// 1. Get current thread and TLS address
-/// 2. Resolve client session from handle
-/// 3. Create HLERequestContext with thread/memory references
-/// 4. Read command buffer from TLS, dispatch to handler
-/// 5. Write response back to TLS (inside write_to_outgoing_command_buffer)
-pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode {
+fn send_sync_request_impl(
+    system: &System,
+    session_handle: Handle,
+    message_address: u64,
+) -> ResultCode {
     let current_thread = match system.current_thread() {
         Some(thread) => thread,
         None => return RESULT_INVALID_HANDLE,
     };
-    let tls_address = {
-        let thread = current_thread.lock().unwrap();
-        thread.get_tls_address().get()
-    };
 
-    let (client_session, shared_memory) = {
+    let client_session = {
         let process = system.current_process_arc().lock().unwrap();
         let Some(object_id) = process.handle_table.get_object(session_handle) else {
             log::error!(
@@ -49,7 +41,7 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         process
             .num_ipc_messages
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        (client_session, process.get_shared_memory())
+        client_session
     };
 
     let request_manager = match client_session.lock().unwrap().request_manager() {
@@ -57,16 +49,12 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         None => return RESULT_INVALID_HANDLE,
     };
 
-    // Create context with thread/memory references (matches upstream constructor).
-    // Upstream: HLERequestContext(kernel, memory, server_session, thread)
-    // where memory = client_thread->GetOwnerProcess()->GetMemory()
-    let mut context =
-        HLERequestContext::new_with_thread(current_thread, shared_memory, tls_address);
+    // Upstream SendSyncRequestImpl/KServerSession path uses the caller TLS for plain
+    // SendSyncRequest, and the user-supplied message buffer for SendSyncRequestWithUserBuffer.
+    let mut context = HLERequestContext::new_with_thread(current_thread, message_address);
     context.set_session_request_manager(request_manager.clone());
     let service_manager = system.service_manager().unwrap();
     context.set_service_manager(service_manager);
-
-    // Read command buffer from TLS and parse (done inside populate).
     context.populate_from_incoming_command_buffer(&[]);
 
     let (is_domain, session_handler_name) = {
@@ -79,33 +67,39 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     };
 
     log::trace!(
-        "  SendSyncRequest: handle={:#x} tls={:#x} service={} cmd_type={:?} is_domain={} parsed_cmd={}",
+        "  SendSyncRequest: handle={:#x} message={:#x} service={} cmd_type={:?} is_domain={} parsed_cmd={}",
         session_handle,
-        tls_address,
+        message_address,
         session_handler_name,
         context.get_command_type(),
         is_domain,
         context.get_command(),
     );
 
-    // Dispatch to service handler.
     let result = complete_sync_request(&request_manager, &mut context);
-
-    // Write response back to TLS. For Session/Domain dispatches, this is also
-    // called inside handle_sync_request_impl, but for CloseVirtualHandle and
-    // StubSuccess paths the response is only in cmd_buf and needs to be flushed.
-    // Calling it again for Session/Domain is safe — it just re-writes the same data.
     context.write_to_outgoing_command_buffer();
 
-    // Upstream: SendSyncRequest always returns ResultSuccess to the guest.
-    // RESULT_SESSION_CLOSED is an internal signal consumed by the kernel
-    // (KServerSession closes the session), not exposed to user code.
-    // The success response is already written to TLS by the Close handler.
     if result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED {
         return RESULT_SUCCESS;
     }
 
     result
+}
+
+/// Makes a blocking IPC call to a service.
+///
+/// Matches upstream `SendSyncRequest` → `SendSyncRequestImpl`:
+/// 1. Get current thread and TLS address
+/// 2. Resolve client session from handle
+/// 3. Create HLERequestContext with thread/memory references
+/// 4. Read command buffer from TLS, dispatch to handler
+/// 5. Write response back to TLS (inside write_to_outgoing_command_buffer)
+pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode {
+    let tls_address = match system.current_thread() {
+        Some(thread) => thread.lock().unwrap().get_tls_address().get(),
+        None => return RESULT_INVALID_HANDLE,
+    };
+    send_sync_request_impl(system, session_handle, tls_address)
 }
 
 #[cfg(test)]
@@ -219,15 +213,19 @@ mod tests {
 
     fn write_control_query_pointer_buffer_size_request(system: &System) {
         let tls_base = get_tls_base(system);
+        write_control_query_pointer_buffer_size_request_at(system, tls_base);
+    }
+
+    fn write_control_query_pointer_buffer_size_request_at(system: &System, base: u64) {
         let control_type = ipc::CommandType::Control as u32;
         let sfci_magic = u32::from_le_bytes([b'S', b'F', b'C', b'I']);
         let mut mem = system.shared_process_memory().write().unwrap();
-        mem.write_32(tls_base, control_type);
-        mem.write_32(tls_base + 4, 0);
-        mem.write_32(tls_base + 0x10, sfci_magic);
-        mem.write_32(tls_base + 0x14, 0);
-        mem.write_32(tls_base + 0x18, 3);
-        mem.write_32(tls_base + 0x1C, 0);
+        mem.write_32(base, control_type);
+        mem.write_32(base + 4, 0);
+        mem.write_32(base + 0x10, sfci_magic);
+        mem.write_32(base + 0x14, 0);
+        mem.write_32(base + 0x18, 3);
+        mem.write_32(base + 0x1C, 0);
     }
 
     #[test]
@@ -266,7 +264,6 @@ mod tests {
             .unwrap();
         let mut request_context = HLERequestContext::new_with_thread(
             current_thread,
-            system.shared_process_memory().clone(),
             tls_base,
         );
         let service_manager = system.service_manager().unwrap();
@@ -286,6 +283,43 @@ mod tests {
         );
         assert_eq!(mem.read_32(tls_base + 0x1C), 0);
         assert_eq!(mem.read_32(tls_base + 0x20), 0x8000);
+    }
+
+    #[test]
+    fn send_sync_request_with_user_buffer_dispatches_on_message_buffer() {
+        let system = test_system();
+        let message = 0x23A0000u64;
+        {
+            let process = system.current_process_arc();
+            let process_guard = process.lock().unwrap();
+            let mut mem = process_guard.process_memory.write().unwrap();
+            mem.allocate(message, PAGE_SIZE as usize);
+        }
+
+        let current_thread = system
+            .current_process_arc()
+            .lock()
+            .unwrap()
+            .get_thread_by_thread_id(1)
+            .unwrap();
+        let mut request_context = HLERequestContext::new_with_thread(current_thread, message);
+        let service_manager = system.service_manager().unwrap();
+        request_context.set_service_manager(service_manager);
+        let lm_handler: SessionRequestHandlerPtr = Arc::new(crate::hle::service::lm::lm::LM::new());
+        let lm_handle = request_context
+            .create_session_for_service(lm_handler)
+            .unwrap();
+
+        write_control_query_pointer_buffer_size_request_at(&system, message);
+        assert_eq!(
+            send_sync_request_with_user_buffer(&system, message, PAGE_SIZE, lm_handle),
+            RESULT_SUCCESS
+        );
+
+        let mem = system.shared_process_memory().read().unwrap();
+        assert_eq!(mem.read_32(message + 0x18), RESULT_SUCCESS.get_inner_value());
+        assert_eq!(mem.read_32(message + 0x1C), 0);
+        assert_eq!(mem.read_32(message + 0x20), 0x8000);
     }
 }
 
@@ -327,8 +361,9 @@ pub fn send_sync_request_with_user_buffer(
         }
     }
 
-    // Send the sync request (reusing the standard path which reads from TLS/message buffer).
-    let result = send_sync_request(system, session_handle);
+    // Upstream SendSyncRequestWithUserBuffer dispatches on the user-provided message
+    // buffer, not the caller TLS command buffer.
+    let result = send_sync_request_impl(system, session_handle, message);
 
     // Unlock the message buffer.
     {
