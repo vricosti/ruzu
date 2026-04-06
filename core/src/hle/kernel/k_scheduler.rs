@@ -641,6 +641,7 @@ impl KScheduler {
         if core_mask == 0 {
             return;
         }
+        log::trace!("KScheduler::reschedule_cores mask=0x{:x}", core_mask);
 
         if let Some(kernel) = super::kernel::get_kernel_ref() {
             for i in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
@@ -862,6 +863,14 @@ impl KScheduler {
                 if let Some(pid) = prev_id {
                     gsc.m_priority_queue.increment_scheduled_count(pid);
                 }
+            }
+        }
+
+        {
+            use std::sync::atomic::{AtomicU32, Ordering as AO};
+            static UC: AtomicU32 = AtomicU32::new(0);
+            if UC.fetch_add(1, AO::Relaxed) < 20 || cores_needing_scheduling != 0 {
+                log::info!("update_highest_prio: cores_needing=0x{:x} idle=0x{:x} tops={:?}", cores_needing_scheduling, idle_cores, top_threads);
             }
         }
 

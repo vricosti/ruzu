@@ -153,15 +153,10 @@ impl Container {
 
         let binder = self
             .server
-            .try_get_binder(layer.get_producer_binder_id())
+            .try_get_buffer_queue_producer(layer.get_producer_binder_id())
             .ok_or(vi_results::RESULT_NOT_FOUND)?;
 
-        if !binder.as_any().is::<BufferQueueProducer>() {
-            return Err(vi_results::RESULT_NOT_FOUND);
-        }
-
-        let raw = Arc::into_raw(binder) as *const BufferQueueProducer;
-        Ok(unsafe { Arc::from_raw(raw) })
+        Ok(binder)
     }
 
     /// Get the system reference.

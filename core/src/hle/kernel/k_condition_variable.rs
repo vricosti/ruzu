@@ -538,8 +538,8 @@ impl KConditionVariable {
         };
         let hardware_timer = super::kernel::get_hardware_timer_arc();
         let thread_ptr = {
-            let mut guard = current_thread.lock().unwrap();
-            (&mut *guard) as *mut KThread as usize
+            let guard = current_thread.lock().unwrap();
+            &*guard as *const super::k_thread::KThread as usize
         };
 
         let result = {
@@ -594,8 +594,8 @@ impl KConditionVariable {
         let hardware_timer = super::kernel::get_hardware_timer_arc();
         let mut wait_queue = ThreadQueueImplForKConditionVariableWaitConditionVariable::queue();
         let thread_ptr = {
-            let mut guard = current_thread.lock().unwrap();
-            (&mut *guard) as *mut KThread as usize
+            let guard = current_thread.lock().unwrap();
+            &*guard as *const super::k_thread::KThread as usize
         };
 
         log::trace!(

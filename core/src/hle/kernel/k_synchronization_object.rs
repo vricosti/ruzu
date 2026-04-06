@@ -997,14 +997,17 @@ pub fn wait(
         &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
     };
     let hardware_timer = super::kernel::get_hardware_timer_arc();
-    let thread_ref = current_thread.lock().unwrap().self_reference.clone();
+    let thread_ptr = {
+        let guard = current_thread.lock().unwrap();
+        &*guard as *const super::k_thread::KThread as usize
+    };
 
     let result = {
         let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
             scheduler_lock,
             hardware_timer.as_ref(),
             current_thread_id,
-            thread_ref,
+            thread_ptr,
             timeout_ns,
         );
 
