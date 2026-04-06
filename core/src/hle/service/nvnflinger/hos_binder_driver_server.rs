@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 
 use super::binder::IBinder;
+use super::buffer_queue_producer::BufferQueueProducer;
 
 /// Manages registered binder objects by ID.
 pub struct HosBinderDriverServer {
@@ -22,6 +23,7 @@ pub struct HosBinderDriverServer {
 
 struct HosBinderDriverServerInner {
     binders: HashMap<i32, Arc<dyn IBinder>>,
+    buffer_queue_producers: HashMap<i32, Arc<BufferQueueProducer>>,
     next_id: i32,
 }
 
@@ -30,6 +32,7 @@ impl HosBinderDriverServer {
         Arc::new(Self {
             inner: Mutex::new(HosBinderDriverServerInner {
                 binders: HashMap::new(),
+                buffer_queue_producers: HashMap::new(),
                 next_id: 1,
             }),
         })
@@ -44,16 +47,35 @@ impl HosBinderDriverServer {
         id
     }
 
+    /// Register a producer binder and remember its concrete type, mirroring upstream
+    /// `static_pointer_cast<BufferQueueProducer>(TryGetBinder(...))` without rebuilding an Arc
+    /// from a raw pointer.
+    pub fn register_buffer_queue_producer(&self, binder: Arc<BufferQueueProducer>) -> i32 {
+        let binder_trait: Arc<dyn IBinder> = binder.clone();
+        let mut inner = self.inner.lock().unwrap();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.binders.insert(id, binder_trait);
+        inner.buffer_queue_producers.insert(id, binder);
+        id
+    }
+
     /// Unregister a binder by ID.
     pub fn unregister_binder(&self, id: i32) {
         let mut inner = self.inner.lock().unwrap();
         inner.binders.remove(&id);
+        inner.buffer_queue_producers.remove(&id);
     }
 
     /// Try to get a binder by ID.
     pub fn try_get_binder(&self, id: i32) -> Option<Arc<dyn IBinder>> {
         let inner = self.inner.lock().unwrap();
         inner.binders.get(&id).cloned()
+    }
+
+    pub fn try_get_buffer_queue_producer(&self, id: i32) -> Option<Arc<BufferQueueProducer>> {
+        let inner = self.inner.lock().unwrap();
+        inner.buffer_queue_producers.get(&id).cloned()
     }
 
     /// Perform a binder transaction.
@@ -88,6 +110,7 @@ impl Default for HosBinderDriverServer {
         Self {
             inner: Mutex::new(HosBinderDriverServerInner {
                 binders: HashMap::new(),
+                buffer_queue_producers: HashMap::new(),
                 next_id: 1,
             }),
         }
@@ -126,5 +149,20 @@ mod tests {
 
         assert_eq!(first, 1);
         assert_eq!(second, 2);
+    }
+
+    #[test]
+    fn unregister_binder_clears_buffer_queue_producer_marker() {
+        let server = HosBinderDriverServer::new();
+        let producer = Arc::new(crate::hle::service::nvnflinger::buffer_queue_producer::BufferQueueProducer::new(
+            crate::hle::service::nvnflinger::buffer_queue_core::BufferQueueCore::new(),
+            Arc::new(crate::hle::service::nvdrv::core::nvmap::NvMap::new()),
+        ));
+
+        let id = server.register_buffer_queue_producer(producer);
+        assert!(server.try_get_buffer_queue_producer(id).is_some());
+
+        server.unregister_binder(id);
+        assert!(server.try_get_buffer_queue_producer(id).is_none());
     }
 }

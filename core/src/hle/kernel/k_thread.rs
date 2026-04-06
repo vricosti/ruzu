@@ -2849,11 +2849,12 @@ impl KThread {
 
         {
             let scheduler_lock = unsafe { &*scheduler_lock_ptr };
+            let thread_ptr = self as *mut KThread as usize;
             let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
                 scheduler_lock,
                 hardware_timer.as_ref(),
                 self.thread_id,
-                (self as *mut KThread) as usize,
+                thread_ptr,
                 timeout,
             );
 

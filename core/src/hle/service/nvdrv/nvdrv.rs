@@ -70,6 +70,7 @@ pub struct Module {
     open_files: Mutex<HashMap<DeviceFD, Arc<dyn NvDevice + Send + Sync>>>,
     gpu_files: Mutex<HashMap<DeviceFD, Arc<NvHostGpu>>>,
     disp_files: Mutex<HashMap<DeviceFD, Arc<NvDispDisp0>>>,
+    nvmap_files: Mutex<HashMap<DeviceFD, Arc<NvMapDevice>>>,
     events_interface: Arc<EventInterface>,
 }
 
@@ -82,6 +83,7 @@ impl Module {
             open_files: Mutex::new(HashMap::new()),
             gpu_files: Mutex::new(HashMap::new()),
             disp_files: Mutex::new(HashMap::new()),
+            nvmap_files: Mutex::new(HashMap::new()),
             events_interface: Arc::new(EventInterface::new(system)),
         })
     }
@@ -122,10 +124,17 @@ impl Module {
                     Arc::clone(&self.events_interface),
                 ))
             }
-            "/dev/nvmap" => Arc::new(NvMapDevice::new(
-                self.container.get_nv_map_file(),
-                &self.container,
-            )),
+            "/dev/nvmap" => {
+                let nvmap = Arc::new(NvMapDevice::new(
+                    self.container.get_nv_map_file(),
+                    &self.container,
+                ));
+                self.nvmap_files
+                    .lock()
+                    .unwrap()
+                    .insert(fd, Arc::clone(&nvmap));
+                nvmap
+            }
             "/dev/nvdisp_disp0" => {
                 let disp = Arc::new(NvDispDisp0::new(self.system, self.container.get_nv_map_file()));
                 self.disp_files.lock().unwrap().insert(fd, Arc::clone(&disp));
@@ -229,6 +238,7 @@ impl Module {
         if let Some(device) = files.remove(&fd) {
             self.gpu_files.lock().unwrap().remove(&fd);
             self.disp_files.lock().unwrap().remove(&fd);
+            self.nvmap_files.lock().unwrap().remove(&fd);
             device.on_close(fd);
             NvResult::Success
         } else {
@@ -303,15 +313,6 @@ impl Module {
     }
 
     pub fn get_nvmap_device(&self, fd: DeviceFD) -> Option<Arc<NvMapDevice>> {
-        let files = self.open_files.lock().unwrap();
-        let device = files.get(&fd)?.clone();
-        drop(files);
-
-        if !device.as_any().is::<NvMapDevice>() {
-            return None;
-        }
-
-        let raw = Arc::into_raw(device) as *const NvMapDevice;
-        Some(unsafe { Arc::from_raw(raw) })
+        self.nvmap_files.lock().unwrap().get(&fd).cloned()
     }
 }
