@@ -608,6 +608,7 @@ mod tests {
     fn exercised_common_state_handlers_are_registered() {
         let service = ICommonStateGetter::new(Arc::new(Mutex::new(Applet::new(
             crate::core::SystemRef::null(),
+            crate::hle::service::os::process::Process::new(),
             false,
         ))));
 
@@ -628,6 +629,7 @@ mod tests {
     fn get_settings_platform_region_returns_global() {
         let service = ICommonStateGetter::new(Arc::new(Mutex::new(Applet::new(
             crate::core::SystemRef::null(),
+            crate::hle::service::os::process::Process::new(),
             false,
         ))));
         assert_eq!(service.get_settings_platform_region(), PlatformRegion::Global);
@@ -637,6 +639,7 @@ mod tests {
     fn vr_mode_ex_handlers_toggle_vr_mode() {
         let service = ICommonStateGetter::new(Arc::new(Mutex::new(Applet::new(
             crate::core::SystemRef::null(),
+            crate::hle::service::os::process::Process::new(),
             false,
         ))));
         assert!(!service.is_vr_mode_enabled());

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::kernel::k_event::KEvent;
+use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -109,6 +110,7 @@ impl IAudioRenderer {
     }
 
     pub(crate) fn create_rendered_event(
+        kernel: &KernelCore,
         owner_process: &Arc<Mutex<KProcess>>,
     ) -> (
         u64,
@@ -116,14 +118,8 @@ impl IAudioRenderer {
         Arc<Mutex<KEvent>>,
         Arc<Mutex<KReadableEvent>>,
     ) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT_AUDIO_EVENT_OBJECT_ID: AtomicU64 = AtomicU64::new(0x2200_0000);
-
-        let rendered_event_object_id =
-            NEXT_AUDIO_EVENT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
-        let rendered_readable_event_object_id =
-            NEXT_AUDIO_EVENT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
+        let rendered_event_object_id = kernel.create_new_object_id() as u64;
+        let rendered_readable_event_object_id = kernel.create_new_object_id() as u64;
 
         let mut event = KEvent::new();
         let mut readable_event = KReadableEvent::new();

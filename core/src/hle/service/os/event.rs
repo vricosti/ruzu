@@ -96,6 +96,11 @@ impl Event {
 
         // Bridge to kernel: signal the KReadableEvent to wake WaitSynchronization.
         if let Some(ref bridge) = *self.kernel_bridge.lock().unwrap() {
+            let readable_object_id = bridge.readable_event.lock().unwrap().object_id;
+            log::trace!(
+                "Service::Event::signal bridging readable_object_id={}",
+                readable_object_id
+            );
             let mut process = bridge.process.lock().unwrap();
             bridge
                 .readable_event
@@ -108,8 +113,18 @@ impl Event {
     /// Clear the event (reset signaled state).
     /// Port of upstream `Event::Clear()` → `m_event->Clear()`.
     pub fn clear(&self) {
-        let mut signaled = self.signaled.lock().unwrap();
-        *signaled = false;
+        {
+            let mut signaled = self.signaled.lock().unwrap();
+            *signaled = false;
+        }
+
+        // Bridge to kernel: clear the readable end too, matching upstream
+        // Event::Clear() -> KEvent::Clear().
+        if let Some(ref bridge) = *self.kernel_bridge.lock().unwrap() {
+            let process = bridge.process.lock().unwrap();
+            bridge.readable_event.lock().unwrap().clear();
+            drop(process);
+        }
     }
 
     /// Check if the event is currently signaled.
@@ -134,5 +149,34 @@ impl Event {
 impl Default for Event {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_bridges_to_kernel_readable_event() {
+        let mut process = KProcess::new();
+        let readable = Arc::new(Mutex::new(KReadableEvent::new()));
+        readable.lock().unwrap().initialize(1, 2);
+        process.register_readable_event_object(2, Arc::clone(&readable));
+
+        let process = Arc::new(Mutex::new(process));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let event = Event::new_with_kernel_event(
+            Arc::clone(&readable),
+            Arc::clone(&process),
+            Arc::clone(&scheduler),
+        );
+
+        event.signal();
+        assert!(event.is_signaled());
+        assert!(readable.lock().unwrap().is_signaled());
+
+        event.clear();
+        assert!(!event.is_signaled());
+        assert!(!readable.lock().unwrap().is_signaled());
     }
 }

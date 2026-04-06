@@ -128,12 +128,17 @@ impl IAudioRendererManager {
             return;
         };
 
+        let kernel = svc
+            .system
+            .get()
+            .kernel()
+            .expect("OpenAudioRenderer requires KernelCore");
         let (
             rendered_event_object_id,
             rendered_readable_event_object_id,
             rendered_event,
             rendered_readable_event,
-        ) = super::audio_renderer::IAudioRenderer::create_rendered_event(&owner_process);
+        ) = super::audio_renderer::IAudioRenderer::create_rendered_event(kernel, &owner_process);
 
         let result = svc
             .system
