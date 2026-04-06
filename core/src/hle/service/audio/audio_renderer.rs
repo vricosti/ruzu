@@ -118,7 +118,7 @@ impl IAudioRenderer {
     ) {
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        static NEXT_AUDIO_EVENT_OBJECT_ID: AtomicU64 = AtomicU64::new(0x2100_0000);
+        static NEXT_AUDIO_EVENT_OBJECT_ID: AtomicU64 = AtomicU64::new(0x2200_0000);
 
         let rendered_event_object_id =
             NEXT_AUDIO_EVENT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
