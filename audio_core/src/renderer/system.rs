@@ -214,10 +214,17 @@ impl System {
             return;
         }
 
-        // Use the process Arc for thread-safe access. The raw process_ptr
-        // bypasses Mutex synchronization, causing data races when the audio
-        // thread traverses the waiter list that the game thread modifies
-        // under Mutex protection.
+        // Signal the readable event directly using the stored Arc references.
+        // IMPORTANT: we must NOT hold the process Mutex when calling signal(),
+        // because signal() acquires the scheduler lock internally, and the
+        // game thread's WaitSynchronization holds scheduler_lock → process.lock()
+        // (the opposite order). Holding process.lock() → scheduler_lock here
+        // would deadlock.
+        //
+        // Instead, extract the scheduler Arc under the process lock, drop the
+        // process lock, then call signal() with a raw process reference.
+        // The scheduler lock inside signal() provides the synchronization
+        // needed for notify_available to see linked waiters.
         if let (Some(ref readable_event), Some(ref process_arc)) =
             (&self.rendered_readable_event, &self.process_arc)
         {
@@ -229,10 +236,13 @@ impl System {
             else {
                 return;
             };
+            // Hold the process lock during signal_from_host so that
+            // notify_available → waiter_snapshot sees waiters linked by
+            // the game thread under the same Mutex.
             readable_event
                 .lock()
                 .unwrap()
-                .signal(&mut process, &scheduler);
+                .signal_from_host(&mut process, &scheduler);
             return;
         }
 
