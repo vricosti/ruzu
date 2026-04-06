@@ -61,13 +61,24 @@ impl KReadableEvent {
 
     /// Signal the readable event.
     /// Matches upstream `KReadableEvent::Signal`.
+    ///
+    /// Re-notifies on every call (not just false→true transitions) because
+    /// in the cooperative scheduler, signals from host threads can fire
+    /// before waiters are linked.
     pub fn signal(&mut self, process: &mut KProcess, scheduler: &Arc<Mutex<KScheduler>>) -> u32 {
         let _scheduler_guard = Self::lock_scheduler();
+        self.is_signaled = true;
+        self.notify_available(process, scheduler);
+        RESULT_SUCCESS.get_inner_value()
+    }
 
-        if !self.is_signaled {
-            self.is_signaled = true;
-            self.notify_available(process, scheduler);
-        }
+    /// Signal without acquiring the scheduler lock. Used by host threads
+    /// (audio ADSP, vsync conductor) where the scheduler spinlock causes
+    /// livelock because guest-fiber OS threads hold it continuously during
+    /// their wait/reschedule loops.
+    pub fn signal_from_host(&mut self, process: &mut KProcess, scheduler: &Arc<Mutex<KScheduler>>) -> u32 {
+        self.is_signaled = true;
+        self.notify_available(process, scheduler);
         RESULT_SUCCESS.get_inner_value()
     }
 
@@ -82,7 +93,6 @@ impl KReadableEvent {
     /// Matches upstream `KReadableEvent::Reset`.
     pub fn reset(&mut self) -> u32 {
         let _scheduler_guard = Self::lock_scheduler();
-
         if !self.is_signaled {
             return RESULT_INVALID_STATE.get_inner_value();
         }

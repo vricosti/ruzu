@@ -124,10 +124,11 @@ impl SynchronizationWaiters {
     }
 
     pub fn snapshot(&self, process: &KProcess) -> Vec<u64> {
-        self.handles(process)
+        let result: Vec<u64> = self.handles(process)
             .into_iter()
             .map(|handle| handle.thread_id)
-            .collect()
+            .collect();
+        result
     }
 
     pub fn handles(&self, process: &KProcess) -> Vec<SynchronizationWaitNodeHandle> {
@@ -996,17 +997,14 @@ pub fn wait(
         &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
     };
     let hardware_timer = super::kernel::get_hardware_timer_arc();
-    let thread_ptr = {
-        let mut guard = current_thread.lock().unwrap();
-        (&mut *guard) as *mut KThread as usize
-    };
+    let thread_ref = current_thread.lock().unwrap().self_reference.clone();
 
     let result = {
         let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
             scheduler_lock,
             hardware_timer.as_ref(),
             current_thread_id,
-            thread_ptr,
+            thread_ref,
             timeout_ns,
         );
 
@@ -1031,6 +1029,20 @@ pub fn wait(
 
         wait_set.bind_thread(current_thread_id);
         link_wait_set(&mut process_guard, &wait_set);
+
+        // Double-check: the event may have been signaled between the first
+        // first_signaled_index check and link_wait_set (the signaling thread
+        // runs on a different OS thread in the cooperative scheduler).
+        // Upstream doesn't need this because KScopedSchedulerLock serializes
+        // both paths on the same core; in Rust the scheduler lock is a
+        // spinlock that doesn't block host-thread signal producers during
+        // the gap between the two checks.
+        if let Some(index) = first_signaled_index(&process_guard, &wait_set) {
+            *out_index = index as i32;
+            unlink_wait_set(&mut process_guard, current_thread_id, &wait_set, None);
+            sleep_guard.cancel_sleep();
+            return crate::hle::result::RESULT_SUCCESS;
+        }
 
         let mut wait_queue = ThreadQueueImplForKSynchronizationObjectWait::queue();
         if let Some(timer) = timer {
