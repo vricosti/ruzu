@@ -84,6 +84,20 @@ impl Renderer {
         self.system.lock().set_process(process);
     }
 
+    pub fn set_rendered_readable_event(
+        &self,
+        event: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_readable_event::KReadableEvent>>,
+    ) {
+        self.system.lock().set_rendered_readable_event(event);
+    }
+
+    pub fn set_process_arc(
+        &self,
+        process: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_process::KProcess>>,
+    ) {
+        self.system.lock().set_process_arc(process);
+    }
+
     pub fn get_process(&self) -> *mut KProcess {
         self.system.lock().get_process()
     }

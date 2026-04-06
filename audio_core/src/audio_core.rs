@@ -165,6 +165,24 @@ impl ruzu_core::core::AudioRendererSessionInterface for AudioRendererSession {
             .lock()
             .get_voice_drop_parameter()
     }
+
+    fn set_rendered_readable_event(
+        &self,
+        event: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_readable_event::KReadableEvent>>,
+    ) {
+        self.renderer
+            .lock()
+            .set_rendered_readable_event(event);
+    }
+
+    fn set_process_arc(
+        &self,
+        process: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_process::KProcess>>,
+    ) {
+        self.renderer
+            .lock()
+            .set_process_arc(process);
+    }
 }
 
 impl ruzu_core::core::AudioCoreInterface for AudioCore {

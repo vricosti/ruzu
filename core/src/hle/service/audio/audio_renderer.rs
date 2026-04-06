@@ -97,6 +97,12 @@ impl IAudioRenderer {
                 "GetVoiceDropParameter",
             ),
         ]);
+        // Pass the readable event Arc and process Arc directly to the audio
+        // renderer system so it can signal events with proper Mutex synchronization
+        // instead of the unsafe raw process pointer path.
+        renderer.set_rendered_readable_event(Arc::clone(&rendered_readable_event));
+        renderer.set_process_arc(Arc::clone(&owner_process));
+
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
