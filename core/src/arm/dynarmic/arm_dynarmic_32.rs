@@ -1060,6 +1060,12 @@ impl ArmDynarmic32 {
             } else {
                 fastmem_pointer
             },
+            // Upstream: config.define_unpredictable_behaviour = true
+            define_unpredictable_behaviour: true,
+            // Upstream: config.processor_id = m_core_index
+            processor_id: core_index as usize,
+            // Upstream: config.wall_clock_cntpct = m_uses_wall_clock
+            wall_clock_cntpct: uses_wall_clock,
         };
 
         log::warn!(
