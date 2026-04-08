@@ -114,6 +114,11 @@ impl IApplicationFunctions {
                 Some(Self::set_terminate_result_handler),
                 "SetTerminateResult",
             ),
+            (
+                23,
+                Some(Self::get_display_version_handler),
+                "GetDisplayVersion",
+            ),
             (40, Some(Self::notify_running_handler), "NotifyRunning"),
             (
                 50,
@@ -455,6 +460,37 @@ impl IApplicationFunctions {
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// GetDisplayVersion (cmd 23): returns the application display version string.
+    ///
+    /// Port of upstream IApplicationFunctions::GetDisplayVersion.
+    /// Upstream reads version from NACP metadata via PatchManager, falls back to "1.0.0".
+    /// The result is a 16-byte null-terminated string (DisplayVersion struct).
+    fn get_display_version_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+
+        // Try to read version from NACP metadata.
+        // For now, default to "1.0.0" matching upstream fallback.
+        let mut version_bytes = [0u8; 16];
+        let default_version = b"1.0.0\0";
+        version_bytes[..default_version.len()].copy_from_slice(default_version);
+        version_bytes[15] = 0; // ensure null termination
+
+        log::info!(
+            "GetDisplayVersion: returning '{}'",
+            std::str::from_utf8(&version_bytes).unwrap_or("?").trim_end_matches('\0')
+        );
+
+        // Response: header (2 words) + 16 bytes = 4 u32 words = 2 u64
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        // Push 16-byte DisplayVersion as two u64
+        let lo = u64::from_le_bytes(version_bytes[0..8].try_into().unwrap());
+        let hi = u64::from_le_bytes(version_bytes[8..16].try_into().unwrap());
+        rb.push_u64(lo);
+        rb.push_u64(hi);
     }
 
     /// GetPseudoDeviceId (cmd 50): returns a pseudo device ID (UUID).
