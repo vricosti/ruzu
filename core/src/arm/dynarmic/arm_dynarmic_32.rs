@@ -1316,10 +1316,8 @@ impl ArmInterface for ArmDynarmic32 {
         };
 
         jit.clear_exclusive_state();
-        // Upstream uses jit.Run() — full-speed block execution.
-        // step() single-steps one instruction at a time, which is correct
-        // but extremely slow. Use run() for normal execution.
-        let rdynarmic_hr = jit.run();
+        // Upstream uses m_jit->Step() for single-instruction stepping.
+        let rdynarmic_hr = jit.step();
         translate_halt_reason(rdynarmic_hr)
     }
 
