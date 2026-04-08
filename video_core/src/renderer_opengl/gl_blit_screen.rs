@@ -45,6 +45,7 @@ impl BlitScreen {
         layout: &FramebufferLayout,
         state_tracker: &mut StateTracker,
         invert_y: bool,
+        device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) {
         // Notify state tracker about state changes we're about to make.
         // Port of the state_tracker.Notify*() calls in upstream DrawScreen.
@@ -91,7 +92,7 @@ impl BlitScreen {
 
         self.create_window_adapt();
         if let Some(ref window_adapt) = self.window_adapt {
-            window_adapt.draw_to_framebuffer(&mut self.layers, framebuffers, layout, invert_y);
+            window_adapt.draw_to_framebuffer(&mut self.layers, framebuffers, layout, invert_y, device_memory);
         }
     }
 
