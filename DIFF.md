@@ -6951,3 +6951,16 @@
 
 ### Binary layout verification
 - PASS: no raw serialized struct layout involved in this slice.
+## 2026-04-07 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp
+
+### Intentional differences
+- Rust still stores thread state in the existing `ThreadContext` wrapper and mirrors the upstream reset helpers through Rust field assignment. This is a mechanical adaptation while preserving owner/file parity in `k_thread.rs`.
+
+### Unintentional differences (to fix)
+- `reset_thread_context32()` had drifted from upstream by clearing bit 0 from the entry PC and force-setting CPSR.T for direct Thumb entry. Upstream stores the raw `entry_point` in `r[15]` and does not seed CPSR.T here. Fixed in this pass.
+
+### Missing items
+- Re-audit the remaining Rust-only thread bootstrap differences in `k_thread.rs`, especially around TLS page allocation and guest-thread init plumbing.
+
+### Binary layout verification
+- PASS: no raw-serialized structs changed in this slice; only thread bootstrap field initialization was realigned.

@@ -94,6 +94,11 @@ impl Memory {
     /// `process.IsApplication() && Settings::IsFastmemEnabled()`.
     /// Settings are available via `common::settings::values()` but fastmem
     /// enablement depends on the process context which varies at runtime.
+    /// Raw pointer to current page table (for diagnostics).
+    pub fn current_page_table_raw(&self) -> *mut PageTable {
+        self.current_page_table
+    }
+
     pub fn set_current_page_table(&mut self, page_table: *mut PageTable) {
         self.current_page_table = page_table;
         if !page_table.is_null() && !self.buffer.is_null() {

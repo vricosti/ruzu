@@ -670,14 +670,10 @@ impl System {
         // Create a KProcess and call the loader.
         let mut process = crate::loader::loader::KProcess::new();
 
-        // Wire the Memory bridge to the process page table BEFORE loading.
-        // Upstream: Memory is passed to KPageTableBase::InitializeForProcess
-        // which is called during KProcess::Initialize, before LoadModule.
-        // We must set it here so that initialize_for_process can pass it
-        // to the page table, and operate(Map) can call map_memory_region.
-        if let Some(ref memory) = self.memory {
-            process.page_table.set_memory(memory.clone());
-        }
+        // Create per-process Memory (matching upstream `Core::Memory::Memory m_memory`
+        // owned by KProcess). Each process gets its own Memory instance with its
+        // own current_page_table, sharing the DeviceMemory backing with System.
+        process.create_memory(self);
 
         let (result_status, load_parameters) = loader.load(&mut process, &mut loader_system);
 
@@ -796,17 +792,14 @@ impl System {
             // the guest thread starts it can immediately call get_arm_interface_mut().
             // Must happen before create_and_insert_by_frontend_applet_parameters so
             // it is done before set_window_system calls process.run().
-            if let Some(core_memory) = self.memory_shared() {
+            {
                 let shared_memory = process_arc.lock().unwrap().get_shared_memory();
                 let core_timing = self.core_timing.clone();
                 process_arc.lock().unwrap().initialize_interfaces(
-                    core_memory,
                     shared_memory,
                     core_timing,
                 );
                 log::info!("ARM JIT interfaces initialized for application process");
-            } else {
-                log::warn!("Cannot initialize ARM interfaces: Memory not available");
             }
 
             // Dump the memory block layout for diagnostics.
@@ -1133,7 +1126,25 @@ impl System {
 
     /// Gets a shared reference to the Memory bridge, if initialized.
     /// Upstream: `System::Memory()`.
+    /// Get the application process's Memory bridge.
+    /// Upstream: `System::ApplicationMemory()` → `ApplicationProcess()->GetMemory()`.
+    /// Falls back to the legacy `self.memory` if no application process is set.
     pub fn memory_shared(&self) -> Option<Arc<StdMutex<Memory>>> {
+        // Try per-process Memory first (the correct upstream path)
+        if let Some(ref process) = self.current_process {
+            if let Some(mem) = process.get_memory() {
+                return Some(mem);
+            }
+        }
+        // Try via Arc<Mutex<KProcess>> current_process_arc
+        if let Some(ref process_arc) = self.current_process_arc {
+            if let Ok(process) = process_arc.lock() {
+                if let Some(mem) = process.get_memory() {
+                    return Some(mem);
+                }
+            }
+        }
+        // Fallback to legacy global Memory
         self.memory.clone()
     }
 
@@ -1164,6 +1175,16 @@ impl System {
         self.device_memory
             .as_ref()
             .expect("DeviceMemory not initialized; call System::initialize() first")
+    }
+
+    /// Raw pointers to DeviceMemory and its HostMemory buffer, for creating
+    /// per-process Memory instances.  Both pointers remain valid for the
+    /// lifetime of System (they live in `self.device_memory`).
+    pub fn device_memory_ptrs(&self) -> (*const DeviceMemory, *const common::host_memory::HostMemory) {
+        let dm = self.device_memory();
+        let dm_ptr = dm as *const DeviceMemory;
+        let buffer_ptr = &dm.buffer as *const common::host_memory::HostMemory;
+        (dm_ptr, buffer_ptr)
     }
 
     /// Gets a mutable reference to the device memory.
@@ -1607,10 +1628,8 @@ impl System {
         // Upstream: KProcess::InitializeInterfaces() (k_process.cpp:1263-1291).
         // Creates the exclusive monitor and one ARM JIT per core, owned by KProcess.
         {
-            let core_memory = self.memory_shared();
             let core_timing = self.core_timing_shared();
             process.lock().unwrap().initialize_interfaces(
-                core_memory.unwrap(),
                 shared_memory.clone(),
                 core_timing,
             );

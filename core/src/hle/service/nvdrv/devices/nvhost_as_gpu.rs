@@ -270,6 +270,16 @@ impl NvHostAsGpu {
             "nvhost_as_gpu::AllocAsEx called, big_page_size=0x{:X}",
             params.big_page_size
         );
+        log::debug!(
+            "nvhost_as_gpu::AllocAsEx params flags=0x{:X} as_fd={} big_page_size=0x{:X} reserved=0x{:X} va_start=0x{:016X} va_end=0x{:016X} va_split=0x{:016X}",
+            params.flags,
+            params.as_fd,
+            params.big_page_size,
+            params.reserved,
+            params.va_range_start,
+            params.va_range_end,
+            params.va_range_split
+        );
 
         let _owner_guard = self.mutex.lock().unwrap();
         let mut vm = self.vm.lock().unwrap();
@@ -298,10 +308,26 @@ impl NvHostAsGpu {
             vm.va_range_start = (params.big_page_size as u64) << VM::VA_START_SHIFT;
         }
 
-        if params.va_range_start != 0 {
+        // Only apply custom VA ranges if all three fields look valid.
+        // The game may leave these uninitialized (stack garbage containing FP
+        // residue like -1.0 = 0xBFF0...). Upstream's max default is 1<<37;
+        // values above 1<<40 are clearly uninitialized memory.
+        const MAX_VALID_VA: u64 = 1u64 << 40;
+        if params.va_range_start != 0
+            && params.va_range_start < MAX_VALID_VA
+            && params.va_range_end > 0
+            && params.va_range_end <= MAX_VALID_VA
+            && params.va_range_split <= MAX_VALID_VA
+            && params.va_range_start < params.va_range_end
+        {
             vm.va_range_start = params.va_range_start;
             vm.va_range_split = params.va_range_split;
             vm.va_range_end = params.va_range_end;
+        } else if params.va_range_start != 0 {
+            log::warn!(
+                "AllocAsEx: ignoring invalid VA range start={:#x} end={:#x} split={:#x}",
+                params.va_range_start, params.va_range_end, params.va_range_split
+            );
         }
 
         let start_pages = (vm.va_range_start >> VM::PAGE_SIZE_BITS) as u32;

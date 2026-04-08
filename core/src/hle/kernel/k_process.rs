@@ -449,6 +449,10 @@ pub struct KProcess {
     /// callbacks hold a reference to it via `process->GetMemory()`.
     /// Here we use `Arc<RwLock<ProcessMemoryData>>` for shared access.
     pub process_memory: SharedProcessMemory,
+    /// Per-process Memory bridge — matches upstream `Core::Memory::Memory m_memory`.
+    /// Each process owns its own Memory instance with its own `current_page_table`,
+    /// sharing the backing `DeviceMemory` with all other processes via `System`.
+    pub memory: Option<Arc<Mutex<crate::memory::memory::Memory>>>,
     pub debug_page_refcounts: BTreeMap<u64, u64>,
     pub cpu_time: AtomicI64,
     pub num_process_switches: AtomicI64,
@@ -571,6 +575,7 @@ impl KProcess {
             pinned_threads: [None; NUM_CPU_CORES as usize],
             watchpoints: [DebugWatchpoint::default(); NUM_WATCHPOINTS],
             process_memory: process_memory.clone(),
+            memory: None,
             debug_page_refcounts: BTreeMap::new(),
             cpu_time: AtomicI64::new(0),
             num_process_switches: AtomicI64::new(0),
@@ -582,6 +587,37 @@ impl KProcess {
             num_ipc_receives: AtomicI64::new(0),
             address_arbiter: super::k_address_arbiter::KAddressArbiter::with_memory(process_memory),
         }
+    }
+
+    /// Create a per-process Memory instance using System's DeviceMemory.
+    /// Matches upstream `KProcess::KProcess()` which constructs `m_memory{kernel.System()}`.
+    /// Each process gets its own Memory with its own `current_page_table`.
+    pub fn create_memory(
+        &mut self,
+        system: &crate::core::System,
+    ) {
+        if self.memory.is_some() {
+            return; // already created
+        }
+        let (dm_ptr, buffer_ptr) = system.device_memory_ptrs();
+        let mut memory = unsafe {
+            crate::memory::memory::Memory::new(
+                crate::core::SystemRef::from_ref(system),
+                dm_ptr,
+                buffer_ptr,
+            )
+        };
+        memory.set_gpu_dirty_managers(system.gpu_dirty_memory_managers());
+        let memory_arc = Arc::new(Mutex::new(memory));
+        // Wire into page table so page-table-level operations can use it
+        self.page_table.get_base_mut().m_memory = Some(memory_arc.clone());
+        self.memory = Some(memory_arc);
+    }
+
+    /// Get the per-process Memory bridge.
+    /// Matches upstream `KProcess::GetMemory()`.
+    pub fn get_memory(&self) -> Option<Arc<Mutex<crate::memory::memory::Memory>>> {
+        self.memory.clone()
     }
 
     // -- Getters matching upstream --
@@ -644,12 +680,14 @@ impl KProcess {
     ///
     /// Upstream: `KProcess::InitializeInterfaces()` (k_process.cpp:1263-1291).
     /// Creates the exclusive monitor and one ARM JIT per core.
+    /// Uses the per-process Memory created by `create_memory()`.
     pub fn initialize_interfaces(
         &mut self,
-        memory: std::sync::Arc<std::sync::Mutex<crate::memory::memory::Memory>>,
         shared_memory: crate::hle::kernel::k_process::SharedProcessMemory,
         core_timing: std::sync::Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
     ) {
+        let memory = self.memory.clone()
+            .expect("create_memory() must be called before initialize_interfaces()");
         use crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor;
         use crate::hardware_properties;
 
