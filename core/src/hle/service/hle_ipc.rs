@@ -956,6 +956,8 @@ impl HLERequestContext {
 
     /// Read `size` bytes from guest virtual address.
     /// Matches upstream `memory.ReadBlock(address, buffer, size)`.
+    /// With per-process Memory, `self.memory` has its own stable
+    /// `current_page_table` — no pinning needed.
     fn read_guest_memory(&self, address: u64, size: usize) -> Vec<u8> {
         if size == 0 || address == 0 {
             return Vec::new();

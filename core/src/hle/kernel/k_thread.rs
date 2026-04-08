@@ -1436,35 +1436,14 @@ impl KThread {
 
     fn reset_thread_context32(&mut self, stack_top: u64, entry_point: u64, arg: u64) {
         // Upstream: ctx = {}; ctx.r[0]=arg; ctx.r[15]=entry; ctx.r[13]=sp; ctx.fpcr=0; ctx.fpsr=0;
-        //
-        // Upstream sets ctx.r[15] = entry_point (which may have bit 0 set for Thumb).
-        // The JIT's set_context → set_register(15, ...) stores the raw value (including
-        // bit 0). When run() computes the location hash, it uses reg[15] | (upper << 32).
-        // Upstream dynarmic's Jit::Run() calls GetCurrentBlock() which does:
-        //   A32LocationDescriptor{reg[15], cpsr, fpscr} where cpsr T-bit determines
-        //   ARM vs Thumb mode.
-        //
-        // But upstream ResetThreadContext32 doesn't set pstate (CPSR), so T=0 (ARM).
-        // This works in upstream because the game's crt0 entry is ARM code that
-        // eventually switches to Thumb via BX/BLX.
-        //
-        // However, if entry_point has bit 0 set (direct Thumb entry), we must set
-        // CPSR.T = 1 for the JIT to translate as Thumb. We also clear bit 0 from
-        // the stored PC (matching ARM interworking semantics where bit 0 is the
-        // mode indicator, not part of the actual address).
         self.thread_context = ThreadContext::default();
         self.thread_context.r[0] = arg;
-        let is_thumb = entry_point & 1 != 0;
-        let aligned_entry = if is_thumb { entry_point & !1 } else { entry_point & !3 };
-        self.thread_context.r[15] = aligned_entry;
+        self.thread_context.r[15] = entry_point;
         self.thread_context.r[13] = stack_top;
         self.thread_context.sp = stack_top;
-        self.thread_context.pc = aligned_entry;
+        self.thread_context.pc = entry_point;
         self.thread_context.fpcr = 0;
         self.thread_context.fpsr = 0;
-        if is_thumb {
-            self.thread_context.pstate |= 1 << 5; // CPSR.T = 1
-        }
     }
 
     fn reset_thread_context64(&mut self, stack_top: u64, entry_point: u64, arg: u64) {
