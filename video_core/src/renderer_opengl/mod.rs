@@ -98,6 +98,10 @@ pub struct RendererOpenGL {
     capture_renderbuffer: OGLRenderbuffer,
     /// Current framebuffer layout (window size + screen region).
     framebuffer_layout: FramebufferLayout,
+    /// Device memory reader for framebuffer loading.
+    /// Upstream: `Tegra::MaxwellDeviceMemoryManager& device_memory` held in RendererBase.
+    /// Set post-construction via `set_device_memory_reader()`.
+    device_memory: Option<crate::renderer_base::DeviceMemoryReader>,
 }
 
 impl RendererOpenGL {
@@ -203,6 +207,7 @@ impl RendererOpenGL {
             capture_framebuffer,
             capture_renderbuffer,
             framebuffer_layout: FramebufferLayout::default(),
+            device_memory: None,
         })
     }
 
@@ -238,6 +243,7 @@ impl RendererOpenGL {
             &self.framebuffer_layout,
             &mut self.state_tracker,
             false,
+            self.device_memory.as_ref(),
         );
 
         self.base_data.current_frame += 1;
@@ -390,6 +396,10 @@ impl RendererBase for RendererOpenGL {
 
     fn composite(&mut self, layers: &[FramebufferConfig]) {
         self.composite_impl(layers);
+    }
+
+    fn set_device_memory_reader(&mut self, reader: crate::renderer_base::DeviceMemoryReader) {
+        self.device_memory = Some(reader);
     }
 
     fn get_applet_capture_buffer(&self) -> Vec<u8> {

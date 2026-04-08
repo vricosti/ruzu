@@ -39,6 +39,11 @@ impl Default for RendererSettings {
     }
 }
 
+/// Callback for reading guest GPU memory by address.
+/// Upstream: `Tegra::MaxwellDeviceMemoryManager& device_memory`.
+/// In Rust, we use a shared callback since Memory is behind locks.
+pub type DeviceMemoryReader = std::sync::Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>;
+
 /// Abstract renderer base trait.
 ///
 /// Renderers (OpenGL, Vulkan, Null) implement this trait.
@@ -71,6 +76,11 @@ pub trait RendererBase: Send {
 
     /// Returns true if a screenshot is being processed.
     fn is_screenshot_pending(&self) -> bool;
+
+    /// Set the device memory reader for framebuffer loading.
+    /// Upstream passes `device_memory` in the constructor; in Rust we set it
+    /// post-construction since the GPU creates the renderer before memory is wired.
+    fn set_device_memory_reader(&mut self, _reader: DeviceMemoryReader) {}
 }
 
 /// Concrete base renderer data, shared by all renderer implementations.

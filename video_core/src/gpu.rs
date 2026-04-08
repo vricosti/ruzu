@@ -257,6 +257,10 @@ impl Gpu {
     }
 
     pub fn set_guest_memory_reader(&self, reader: Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>) {
+        // Also propagate to the renderer for framebuffer display.
+        if let Some(ref mut renderer) = *self.renderer.lock().unwrap() {
+            renderer.set_device_memory_reader(reader.clone());
+        }
         *self.guest_memory_reader.lock().unwrap() = Some(reader);
     }
 

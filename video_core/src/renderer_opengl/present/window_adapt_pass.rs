@@ -178,6 +178,7 @@ impl WindowAdaptPass {
         framebuffers: &[FramebufferConfig],
         layout: &FramebufferLayout,
         invert_y: bool,
+        device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) {
         if self.program == 0 {
             return;
@@ -208,6 +209,7 @@ impl WindowAdaptPass {
                 &framebuffers[i],
                 layout,
                 invert_y,
+                device_memory,
             );
             textures.push(texture);
             matrices.push(matrix);

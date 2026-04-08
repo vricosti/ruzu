@@ -117,8 +117,9 @@ impl Layer {
         framebuffer: &FramebufferConfig,
         layout: &FramebufferLayout,
         invert_y: bool,
+        device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) -> u32 {
-        let info = self.prepare_render_target(framebuffer);
+        let info = self.prepare_render_target(framebuffer, device_memory);
         let crop = framebuffer_config::normalize_crop(framebuffer, info.width, info.height);
         let texture = info.display_texture;
 
@@ -159,7 +160,11 @@ impl Layer {
     /// then load framebuffer data.
     ///
     /// Port of `Layer::PrepareRenderTarget()`.
-    fn prepare_render_target(&mut self, framebuffer: &FramebufferConfig) -> FramebufferTextureInfo {
+    fn prepare_render_target(
+        &mut self,
+        framebuffer: &FramebufferConfig,
+        device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
+    ) -> FramebufferTextureInfo {
         if self.framebuffer_texture.width != framebuffer.width as i32
             || self.framebuffer_texture.height != framebuffer.height as i32
             || self.framebuffer_texture.pixel_format != framebuffer.pixel_format.0
@@ -168,7 +173,7 @@ impl Layer {
             self.configure_framebuffer_texture(framebuffer);
         }
 
-        self.load_fb_to_screen_info(framebuffer)
+        self.load_fb_to_screen_info(framebuffer, device_memory)
     }
 
     /// Load the framebuffer from emulated memory into the screen texture.
@@ -178,22 +183,97 @@ impl Layer {
     /// Upstream flow:
     /// 1. Try rasterizer.AccelerateDisplay() — GPU-cached texture fast path
     /// 2. If miss: read from device_memory, unswizzle, upload via glTextureSubImage2D
-    ///
-    /// Since we don't yet have device_memory or rasterizer.AccelerateDisplay() wired,
-    /// this returns the existing texture (which will show black until GPU memory
-    /// integration is complete). The texture is properly allocated by
-    /// configure_framebuffer_texture().
     fn load_fb_to_screen_info(
         &mut self,
         framebuffer: &FramebufferConfig,
+        device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) -> FramebufferTextureInfo {
-        // The full implementation would:
-        // 1. let framebuffer_addr = framebuffer.address + framebuffer.offset as u64;
-        // 2. Try rasterizer.accelerate_display(framebuffer, framebuffer_addr, framebuffer.stride)
-        // 3. If miss: read host_ptr from device_memory, unswizzle, upload to texture
-        //
-        // For now, return the texture info without loading data.
-        // The texture exists at the correct dimensions from configure_framebuffer_texture().
+        let framebuffer_addr = framebuffer.address + framebuffer.offset as u64;
+
+        // TODO: Try rasterizer.AccelerateDisplay() fast path first.
+        // For now, always use the slow path (read from device memory + unswizzle).
+
+        if framebuffer_addr == 0 {
+            // No framebuffer address — return empty texture.
+            return FramebufferTextureInfo {
+                display_texture: self.framebuffer_texture.resource,
+                width: framebuffer.width,
+                height: framebuffer.height,
+                scaled_width: framebuffer.width,
+                scaled_height: framebuffer.height,
+            };
+        }
+
+        if let Some(reader) = device_memory {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "LoadFBToScreenInfo: addr={:#x} offset={} {}x{} stride={} fmt={}",
+                    framebuffer.address, framebuffer.offset,
+                    framebuffer.width, framebuffer.height,
+                    framebuffer.stride, framebuffer.pixel_format.0,
+                );
+            }
+
+            // Determine bytes per pixel from pixel format.
+            let bytes_per_pixel: u32 = match framebuffer.pixel_format.0 {
+                1 | 5 => 4, // RGBA8888, BGRA8888
+                4 => 2,     // RGB565
+                _ => 4,     // default RGBA8
+            };
+
+            // Calculate tiled buffer size.
+            // Upstream hardcodes block_height_log2 = 4 (TODO: read from HLE).
+            let block_height_log2: u32 = 4;
+            let size_in_bytes = crate::textures::decoders::calculate_size(
+                true, // tiled (Tegra block-linear)
+                bytes_per_pixel,
+                framebuffer.stride, // width in pixels
+                framebuffer.height,
+                1, // depth
+                block_height_log2,
+                0, // block_depth
+            );
+
+            // Read tiled framebuffer data from GPU memory.
+            let mut tiled_data = vec![0u8; size_in_bytes];
+            reader(framebuffer_addr, &mut tiled_data);
+
+            // Unswizzle from Tegra block-linear to linear layout.
+            let linear_size = (framebuffer.stride * framebuffer.height * bytes_per_pixel) as usize;
+            if self.gl_framebuffer_data.len() < linear_size {
+                self.gl_framebuffer_data.resize(linear_size, 0);
+            }
+            crate::textures::decoders::unswizzle_texture(
+                &mut self.gl_framebuffer_data[..linear_size],
+                &tiled_data,
+                bytes_per_pixel,
+                framebuffer.stride, // width in pixels (stride)
+                framebuffer.height,
+                1, // depth
+                block_height_log2,
+                0, // block_depth
+                1, // stride_alignment
+            );
+
+            // Upload to GL texture.
+            unsafe {
+                gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
+                gl::PixelStorei(gl::UNPACK_ROW_LENGTH, framebuffer.stride as i32);
+                gl::TextureSubImage2D(
+                    self.framebuffer_texture.resource,
+                    0, // level
+                    0, 0, // x, y offset
+                    framebuffer.width as i32,
+                    framebuffer.height as i32,
+                    self.framebuffer_texture.gl_format,
+                    self.framebuffer_texture.gl_type,
+                    self.gl_framebuffer_data.as_ptr() as *const _,
+                );
+                gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+            }
+        }
 
         FramebufferTextureInfo {
             display_texture: self.framebuffer_texture.resource,
